@@ -115,7 +115,7 @@ async def quotes(request: Request):
     chunk = 50
     base_idx = 0
 
-    async with httpx.AsyncClient(http2=True) as client:
+    async with httpx.AsyncClient() as client:
         tasks = []
         meta = []
 
@@ -222,7 +222,7 @@ async def charts(request: Request):
 
     out: Dict[str, Any] = {}
 
-    async with httpx.AsyncClient(http2=True) as client:
+    async with httpx.AsyncClient() as client:
         tasks, meta = [], []
         for s in symbols:
             key = f"yc::{s}::{p1}::{p2}"
@@ -282,7 +282,7 @@ async def fund(request: Request, code: str):
         return {"data": cached}
 
     url = f"{TAD_BASE.rstrip('/')}/{quote(code)}"
-    async with httpx.AsyncClient(http2=True) as client:
+    async with httpx.AsyncClient() as client:
         j = await _fetch_json(client, url)
 
     rows = []
