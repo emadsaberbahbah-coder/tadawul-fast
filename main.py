@@ -1,11 +1,12 @@
 # main.py
-import os, time
+import os, time, re
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import httpx
+from bs4 import BeautifulSoup
 
 # -------------------------------------------------------------------
 # Config (env-driven)
@@ -22,6 +23,13 @@ YQ_BASES: List[str] = [
 ]
 YC_BASE: str  = "https://query1.finance.yahoo.com/v8/finance/chart/"
 TAD_BASE: str = "https://www.saudiexchange.sa/api/chart/trading-data/mutual-funds/"
+
+# Argaam base(s) – we’ll probe a couple patterns
+ARGAAM_CANDIDATES = [
+    "https://www.argaam.com/en/company/{code}",
+    "https://www.argaam.com/en/company/financials/{code}",
+    "https://www.argaam.com/en/tadawul/company?symbol={code}",
+]
 
 # -------------------------------------------------------------------
 # simple in-memory TTL cache
@@ -73,6 +81,29 @@ async def _fetch_json(client: httpx.AsyncClient, url: str, retries: int = 2, tim
     # if all retries failed:
     return None
 
+async def _fetch_html(client: httpx.AsyncClient, url: str, retries: int = 2, timeout: int = 15) -> Optional[str]:
+    """
+    GET HTML with retry. Returns None on failure.
+    """
+    for i in range(retries + 1):
+        try:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Pragma": "no-cache",
+                    "Cache-Control": "no-cache",
+                },
+                timeout=timeout,
+            )
+            if r.status_code == 200 and r.text and len(r.text) > 1000:
+                return r.text
+        except Exception:
+            pass
+        await asyncio_sleep(0.12 * (2 ** i))
+    return None
+
 async def gather_all(tasks):
     import asyncio
     if not tasks:
@@ -98,7 +129,14 @@ def root():
         "ok": True,
         "name": "tadawul-fast",
         "version": "v33",
-        "endpoints": ["/health", "/healthz", "/v33/quotes (POST)", "/v33/charts (POST)", "/v33/fund/{code} (GET)"],
+        "endpoints": [
+            "/health",
+            "/healthz",
+            "/v33/quotes (POST)",
+            "/v33/charts (POST)",
+            "/v33/fund/{code} (GET)",
+            "/v33/argaam/quotes (POST)"
+        ],
     }
 
 @app.get("/health")
@@ -360,6 +398,255 @@ async def fund(request: Request, code: str):
 
     _cache_put(key, rows, 6 * 3600)
     resp = {"data": rows}
+    if errors:
+        resp["error"] = "; ".join(errors)
+    return resp
+
+# ===================================================================
+#                          A R G A A M
+#          Enrichment endpoint for TASI fundamentals/liquidity
+#    POST /v33/argaam/quotes  body: { tickers: ["1120","2010",...],
+#                                     urls?: { "1120": "..." } }
+# ===================================================================
+
+def _num_like(s: Optional[str]) -> Optional[float]:
+    """
+    Parse numeric-ish strings, handling Arabic digits and common suffixes (k/m/b, %).
+    Returns float or None.
+    """
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    t = str(s).strip()
+    if not t:
+        return None
+
+    # Arabic → Latin digits
+    t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    # remove thousand separators
+    t = t.replace(",", " ")
+
+    # pick first number-ish token (allows spaces)
+    m = re.search(r"(-?\d+(\s?\d{3})*(\.\d+)?)(\s*[%kKmMbBtT]n?)?", t)
+    if not m:
+        # fallback: strip spaces and retry basic float
+        t2 = t.replace(" ", "")
+        try:
+            return float(t2)
+        except Exception:
+            return None
+
+    core = m.group(1).replace(" ", "")
+    suf = (m.group(4) or "").strip().lower()
+
+    try:
+        val = float(core)
+    except Exception:
+        return None
+
+    if suf == "%":
+        return val / 100.0
+    mult = {"k":1e3, "m":1e6, "b":1e9, "bn":1e9, "t":1e12}
+    # normalize suffix variants
+    for key in list(mult.keys()):
+        mult[key.upper()] = mult[key]
+    if suf in mult:
+        val *= mult[suf]
+    return val
+
+def _extract_after_label(soup: BeautifulSoup, labels: List[str]) -> Optional[float]:
+    """
+    Find a label (English/Arabic) and return the nearest numeric-looking value in its siblings.
+    """
+    if not soup:
+        return None
+    pat = re.compile("|".join([re.escape(x) for x in labels]), flags=re.I)
+    # Search by direct string match anywhere
+    for node in soup.find_all(string=pat):
+        # Try same parent siblings
+        try:
+            parent = node.parent
+            if parent:
+                # right siblings first
+                sib = parent.next_siblings
+                for s in sib:
+                    if hasattr(s, "get_text"):
+                        v = _num_like(s.get_text(" ", strip=True))
+                        if v is not None:
+                            return v
+                # left siblings
+                psib = parent.previous_siblings
+                for s in psib:
+                    if hasattr(s, "get_text"):
+                        v = _num_like(s.get_text(" ", strip=True))
+                        if v is not None:
+                            return v
+            # climb up one level (e.g. td/th in same tr)
+            row = parent.parent if parent else None
+            if row:
+                txt = row.get_text(" ", strip=True)
+                # find the first number not part of the label
+                nums = re.findall(r"[-\d٠-٩\.,%]+", txt)
+                for cand in nums[::-1]:  # prefer right side
+                    v = _num_like(cand)
+                    if v is not None:
+                        return v
+        except Exception:
+            continue
+    return None
+
+async def _guess_argaam_url(client: httpx.AsyncClient, code: str) -> Optional[str]:
+    for tpl in ARGAAM_CANDIDATES:
+        url = tpl.format(code=quote(code))
+        html = await _fetch_html(client, url, retries=1)
+        if html and len(html) > 2000:
+            return url
+    return None
+
+def _parse_argaam_snapshot(html: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # name
+    name = None
+    try:
+        h1 = soup.find("h1")
+        if h1:
+            name = h1.get_text(" ", strip=True)
+    except Exception:
+        pass
+
+    # Labels (English & Arabic variants)
+    labels = {
+        "marketCap": ["Market Cap", "القيمة السوقية"],
+        "sharesOutstanding": ["Shares Outstanding", "الأسهم القائمة", "الاسهم القائمة"],
+        "eps": ["EPS (TTM)", "ربحية السهم (TTM)", "ربحية السهم"],
+        "pe": ["P/E (TTM)", "مكرر الربحية"],
+        "beta": ["Beta", "بيتا"],
+        "dividendYield": ["Dividend Yield", "عائد التوزيع"],
+        "volume": ["Volume", "الكمية", "حجم التداول"],
+        "dayHigh": ["High", "أعلى"],
+        "dayLow": ["Low", "أدنى"],
+        "price": ["Last", "السعر", "Last Trade", "آخر صفقة", "آخر سعر"],
+    }
+
+    out: Dict[str, Any] = {"name": name, "sector": None, "industry": None}
+
+    for k, labs in labels.items():
+        out[k] = _extract_after_label(soup, labs)
+
+    # Some pages keep live price in data attributes
+    if out.get("price") is None:
+        live = soup.select_one("[data-last], [data-last-price]")
+        if live:
+            cand = live.get("data-last") or live.get("data-last-price")
+            out["price"] = _num_like(cand)
+
+    return out
+
+async def _fetch_argaam_company(client: httpx.AsyncClient, code: str, url_override: Optional[str] = None, ttl: int = 600) -> Dict[str, Any]:
+    cache_key = f"argaam::{code}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    url = url_override
+    if not url:
+        url = await _guess_argaam_url(client, code)
+    if not url:
+        _cache_put(cache_key, {}, 120)
+        return {}
+
+    html = await _fetch_html(client, url, retries=2)
+    if not html:
+        _cache_put(cache_key, {}, 120)
+        return {}
+
+    data = _parse_argaam_snapshot(html)
+    _cache_put(cache_key, data, ttl)
+    return data
+
+def _norm_tasi_code(s: str) -> str:
+    """
+    Extract 4-digit Tadawul code from inputs like '1120', '1120.SR', 'TADAWUL:1120'.
+    """
+    m = re.search(r"(\d{4})", s or "")
+    return m.group(1) if m else (s or "").upper()
+
+# -------------------------------------------------------------------
+# ARGAAM QUOTES — POST /v33/argaam/quotes
+# body: { "tickers": ["1120","2010",...], "urls": {"1120": "https://..." }, "cache_ttl": 600 }
+# returns: { "data": { "1120": {...}, "2010": {...} } }
+# -------------------------------------------------------------------
+@app.post("/v33/argaam/quotes")
+async def argaam_quotes(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tickers: List[str] = [ _norm_tasi_code(str(s)) for s in (body.get("tickers") or []) if str(s).strip() ]
+    url_map: Dict[str, str] = { _norm_tasi_code(k): v for k, v in (body.get("urls") or {}).items() }
+    cache_ttl = int(body.get("cache_ttl") or 600)
+
+    if not tickers:
+        return {"data": {}}
+
+    out: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    try:
+        async with httpx.AsyncClient() as client:
+            tasks, meta = [], []
+            for code in tickers:
+                key = f"argaam::{code}"
+                cached = _cache_get(key)
+                if cached is not None:
+                    out[code] = {
+                        "name": cached.get("name"),
+                        "sector": cached.get("sector"),
+                        "industry": cached.get("industry"),
+                        "price": cached.get("price"),
+                        "dayHigh": cached.get("dayHigh"),
+                        "dayLow": cached.get("dayLow"),
+                        "volume": cached.get("volume"),
+                        "marketCap": cached.get("marketCap"),
+                        "sharesOutstanding": cached.get("sharesOutstanding"),
+                        "dividendYield": cached.get("dividendYield"),
+                        "eps": cached.get("eps"),
+                        "pe": cached.get("pe"),
+                        "beta": cached.get("beta"),
+                    }
+                    continue
+                tasks.append(_fetch_argaam_company(client, code, url_override=url_map.get(code), ttl=cache_ttl))
+                meta.append(code)
+
+            if tasks:
+                results = await gather_all(tasks)
+                for code, data in zip(meta, results):
+                    out[code] = {
+                        "name": data.get("name"),
+                        "sector": data.get("sector"),
+                        "industry": data.get("industry"),
+                        "price": data.get("price"),
+                        "dayHigh": data.get("dayHigh"),
+                        "dayLow": data.get("dayLow"),
+                        "volume": data.get("volume"),
+                        "marketCap": data.get("marketCap"),
+                        "sharesOutstanding": data.get("sharesOutstanding"),
+                        "dividendYield": data.get("dividendYield"),
+                        "eps": data.get("eps"),
+                        "pe": data.get("pe"),
+                        "beta": data.get("beta"),
+                    }
+    except Exception as e:
+        errors.append(f"internal error: {e}")
+
+    resp = {"data": out}
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
