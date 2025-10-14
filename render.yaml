@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: tadawul-fast
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: APP_TOKEN
+        generateValue: false
+        value: REPLACE_WITH_A_LONG_RANDOM_TOKEN
+      - key: USER_AGENT
+        value: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36
