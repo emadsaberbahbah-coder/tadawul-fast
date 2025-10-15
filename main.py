@@ -23,12 +23,12 @@ except Exception:
 SERVICE_NAME = "tadawul-fast"
 VERSION = "v41"
 
-# Read tokens from environment (do NOT hard-code secrets in source!)
+# Auth tokens (read from environment; do NOT hard-code secrets in source)
 FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
-APP_TOKEN = os.getenv("APP_TOKEN", "").strip()  # kept for backward-compat
+APP_TOKEN = os.getenv("APP_TOKEN", "").strip()  # backward-compat
 REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
 
-# Optional: base URL and deploy hook (protected endpoint below)
+# Optional base URL and Render deploy hook (protected endpoint below)
 FASTAPI_BASE = os.getenv("FASTAPI_BASE", "").strip()
 RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", "").strip()
 
@@ -159,9 +159,7 @@ async def _gather(tasks):
 # Auth
 # =============================================================================
 def _check_auth(request: Request) -> None:
-    """
-    Enforce Bearer auth only if a token is configured via FASTAPI_TOKEN or APP_TOKEN.
-    """
+    """Enforce Bearer auth only if a token is configured."""
     if not REQUIRE_AUTH:
         return
     auth = request.headers.get("Authorization", "")
@@ -192,10 +190,10 @@ def _to_yahoo_symbol(sym: str) -> str:
 # =============================================================================
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
-# Open CORS; restrict to your origin if needed
+# Open CORS; restrict to your origin if desired
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # replace with [FASTAPI_BASE] to lock down
+    allow_origins=["*"],  # change to [FASTAPI_BASE] to restrict
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -221,7 +219,7 @@ def root():
             "/v33/fund/{code} (GET)",
             "/v33/argaam/quotes (POST)",
             "/v41/argaam/quotes (POST, GET)",
-            "/v41/deploy (POST, protected; uses RENDER_DEPLOY_HOOK)",
+            "/v41/deploy (POST; protected)",
         ],
         "auth_required": REQUIRE_AUTH,
     }
@@ -377,7 +375,7 @@ async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]
 
 async def _charts_response(
     symbols_in: List[str], p1: int, p2: int, cache_ttl: int
-) -> Dict[str, Any]]:
+) -> Dict[str, Any]:
     if not symbols_in or not p1 or not p2:
         return {"data": {}}
 
@@ -749,15 +747,15 @@ async def argaam_quotes_legacy(request: Request):
 
     if to_fetch:
         import asyncio
-        tasks = []
-        for code, url in to_fetch:
-            async def _fetch_one(c=code, u=url):
-                o = await _guess_argaam_url(c) if not u else u
-                html = await _fetch_html(o, retries=2) if o else None
-                data = _parse_argaam_snapshot(html) if html else {}
-                _cache_put(f"argaam::{c}", data, cache_ttl)
-                return c, data
-            tasks.append(_fetch_one())
+
+        async def _fetch_one(code: str, override: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+            url = override or (await _guess_argaam_url(code))
+            html = await _fetch_html(url, retries=2) if url else None
+            data = _parse_argaam_snapshot(html) if html else {}
+            _cache_put(f"argaam::{code}", data, cache_ttl)
+            return code, data
+
+        tasks = [_fetch_one(code, url) for code, url in to_fetch]
         results = await asyncio.gather(*tasks, return_exceptions=False)
         for code, data in results:
             out[code] = {
@@ -830,6 +828,7 @@ async def argaam_quotes(request: Request):
 
     if to_fetch:
         import asyncio
+
         async def _fetch_one(code: str, override: Optional[str]) -> Tuple[str, Dict[str, Any]]:
             url = override or (await _guess_argaam_url(code))
             html = await _fetch_html(url, retries=2) if url else None
@@ -865,16 +864,14 @@ async def argaam_quotes_get(
     tickers: Optional[str] = None,  # comma-separated "1120,2010"
     cache_ttl: int = 600,
 ):
-    """
-    GET convenience wrapper:
-      /v41/argaam/quotes?tickers=1120,2010&cache_ttl=600
-    """
+    """GET wrapper: /v41/argaam/quotes?tickers=1120,2010&cache_ttl=600"""
     _check_auth(request)
     if not tickers:
         raise HTTPException(status_code=400, detail="tickers query param is required")
 
     tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
     body = {"tickers": tickers_list, "cache_ttl": cache_ttl}
+    # emulate POST body for reuse
     request._body = body  # type: ignore
     return await argaam_quotes(request)
 
@@ -886,15 +883,15 @@ async def argaam_quotes_get(
 async def trigger_deploy(request: Request):
     """
     Protected endpoint to trigger Render deploy via RENDER_DEPLOY_HOOK.
-    Requires valid Bearer token. Does nothing if hook is not configured.
+    Requires valid Bearer token. No-op if hook not configured.
     """
     _check_auth(request)
     hook = RENDER_DEPLOY_HOOK
     if not hook:
         return {"ok": False, "error": "RENDER_DEPLOY_HOOK is not set"}
     try:
-        client = get_client()
-        r = await client.post(hook, timeout=20.0)
+        # Use GET to be compatible with Render's deploy hooks
+        r = await get_client().get(hook, timeout=20.0)
         return {"ok": r.status_code in (200, 201, 202), "status": r.status_code}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"deploy hook error: {e}")
