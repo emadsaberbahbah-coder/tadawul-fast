@@ -17,7 +17,7 @@ except Exception:
     BeautifulSoup = None  # type: ignore
 
 # ---------------------------------------------------------------------------
-# Router (v41 path so it doesn't duplicate the legacy v33 path in main.py)
+# Router (v41 path so it won't clash with legacy v33 route in main.py)
 # ---------------------------------------------------------------------------
 router = APIRouter(prefix="/v41/argaam", tags=["argaam"])
 
@@ -56,7 +56,7 @@ def _cache_put(key: str, data: Any, ttl_sec: int = 600) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared async HTTP client
+# Shared async HTTP client (closed by close_argaam_http_client)
 # ---------------------------------------------------------------------------
 _CLIENT: Optional[httpx.AsyncClient] = None
 
@@ -64,11 +64,16 @@ _CLIENT: Optional[httpx.AsyncClient] = None
 def _client() -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0),
-            headers=HEADERS,
-        )
+        _CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(15.0), headers=HEADERS)
     return _CLIENT
+
+
+async def close_argaam_http_client() -> None:
+    """Allow main.py to gracefully close this module's HTTP client."""
+    global _CLIENT
+    if _CLIENT is not None:
+        await _CLIENT.aclose()
+        _CLIENT = None
 
 
 # ---------------------------------------------------------------------------
@@ -100,13 +105,12 @@ def _num_like(s: Optional[str]) -> Optional[float]:
     # Arabic-Indic digits → Latin
     t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
 
-    # Remove thousands separators (commas/spaces)
+    # Remove thousands separators (commas become spaces for flexible matching)
     t = t.replace(",", " ").strip()
 
-    # Try flexible pattern: number + optional suffix or %
+    # Flexible pattern: number + optional suffix or %
     m = re.search(r"(-?\d+(?:\s?\d{3})*(?:\.\d+)?)(\s*[%kKmMbBtT]n?)?", t)
     if not m:
-        # last resort: plain float
         try:
             return float(t.replace(" ", ""))
         except Exception:
@@ -139,20 +143,20 @@ def _extract_after_label(soup: "BeautifulSoup", labels: List[str]) -> Optional[f
         try:
             parent = node.parent
             if parent:
-                # Check forward siblings
+                # Forward siblings
                 for s in parent.next_siblings:
                     if hasattr(s, "get_text"):
                         v = _num_like(s.get_text(" ", strip=True))
                         if v is not None:
                             return v
-                # Check backward siblings
+                # Backward siblings
                 for s in parent.previous_siblings:
                     if hasattr(s, "get_text"):
                         v = _num_like(s.get_text(" ", strip=True))
                         if v is not None:
                             return v
 
-            # Broader row scan (e.g., table rows)
+            # Scan the whole row (e.g., table rows)
             row = parent.parent if parent else None
             if row:
                 txt = row.get_text(" ", strip=True)
@@ -180,7 +184,7 @@ def _parse_argaam_snapshot(html: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Labels we try to read (English + Arabic)
+    # Labels we try to read (English + Arabic). Arabic strings are site labels.
     labels = {
         "marketCap": ["Market Cap", "القيمة السوقية"],
         "sharesOutstanding": ["Shares Outstanding", "الأسهم القائمة", "الاسهم القائمة"],
