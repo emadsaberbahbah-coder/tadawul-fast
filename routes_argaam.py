@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 # BeautifulSoup is optional; if it's missing, the endpoint will return a clear error
@@ -21,16 +21,39 @@ except Exception:
 # ---------------------------------------------------------------------------
 router = APIRouter(prefix="/v41/argaam", tags=["argaam"])
 
+# ---------------------------------------------------------------------------
+# Config (env-driven)
+# ---------------------------------------------------------------------------
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
-)
+).strip()
+
+FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
+APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
+REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
+
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Pragma": "no-cache",
     "Cache-Control": "no-cache",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+# ---------------------------------------------------------------------------
+# Auth helper (same semantics as in main.py)
+# ---------------------------------------------------------------------------
+def _check_auth(request: Request) -> None:
+    if not REQUIRE_AUTH:
+        return
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = auth.split(" ", 1)[1].strip()
+    allowed = {t for t in (FASTAPI_TOKEN, APP_TOKEN) if t}
+    if token not in allowed:
+        raise HTTPException(status_code=403, detail="invalid token")
 
 # ---------------------------------------------------------------------------
 # Simple in-memory TTL cache: key -> (expires_epoch, data)
@@ -54,7 +77,6 @@ def _cache_put(key: str, data: Any, ttl_sec: int = 600) -> None:
         return
     _CACHE[key] = (time.time() + ttl_sec, data)
 
-
 # ---------------------------------------------------------------------------
 # Shared async HTTP client (closed by close_argaam_http_client)
 # ---------------------------------------------------------------------------
@@ -74,7 +96,6 @@ async def close_argaam_http_client() -> None:
     if _CLIENT is not None:
         await _CLIENT.aclose()
         _CLIENT = None
-
 
 # ---------------------------------------------------------------------------
 # Helpers: normalization & parsing
@@ -254,7 +275,6 @@ async def _fetch_company(code: str, url_override: Optional[str] = None, ttl: int
         _cache_put(key, {}, ttl_sec=120)
         return {}
 
-
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -263,12 +283,13 @@ class ArgaamReq(BaseModel):
     urls: Optional[Dict[str, str]] = None  # optional per-ticker override URL map
     cache_ttl: int = 600                   # seconds
 
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @router.post("/quotes")
-async def argaam_quotes(req: ArgaamReq):
+async def argaam_quotes(req: ArgaamReq, request: Request):
+    _check_auth(request)
+
     if not req.tickers:
         raise HTTPException(status_code=400, detail="tickers array is required")
 
@@ -279,26 +300,72 @@ async def argaam_quotes(req: ArgaamReq):
         )
 
     out: Dict[str, Any] = {}
+
+    # Serve cached first; fetch the rest concurrently
+    to_fetch: List[tuple[str, Optional[str]]] = []
     for raw in req.tickers:
         code = _norm_tasi_code(raw or "")
-        url = (req.urls or {}).get(code)
-        info = await _fetch_company(code, url_override=url, ttl=req.cache_ttl)
+        cached = _cache_get(f"argaam::{code}")
+        if cached is not None:
+            out[code] = {
+                "name": cached.get("name"),
+                "sector": cached.get("sector"),
+                "industry": cached.get("industry"),
+                "price": cached.get("price"),
+                "dayHigh": cached.get("dayHigh"),
+                "dayLow": cached.get("dayLow"),
+                "volume": cached.get("volume"),
+                "marketCap": cached.get("marketCap"),
+                "sharesOutstanding": cached.get("sharesOutstanding"),
+                "dividendYield": cached.get("dividendYield"),
+                "eps": cached.get("eps"),
+                "pe": cached.get("pe"),
+                "beta": cached.get("beta"),
+            }
+        else:
+            to_fetch.append((code, (req.urls or {}).get(code)))
 
-        # Normalize output field names
-        out[code] = {
-            "name": info.get("name"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-            "price": info.get("price"),
-            "dayHigh": info.get("dayHigh"),
-            "dayLow": info.get("dayLow"),
-            "volume": info.get("volume"),
-            "marketCap": info.get("marketCap"),
-            "sharesOutstanding": info.get("sharesOutstanding"),
-            "dividendYield": info.get("dividendYield"),
-            "eps": info.get("eps"),
-            "pe": info.get("pe"),
-            "beta": info.get("beta"),
-        }
+    if to_fetch:
+        import asyncio
+        tasks = [
+            _fetch_company(code, url_override=url, ttl=req.cache_ttl) for code, url in to_fetch
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        for (code, _), data in zip(to_fetch, results):
+            out[code] = {
+                "name": data.get("name"),
+                "sector": data.get("sector"),
+                "industry": data.get("industry"),
+                "price": data.get("price"),
+                "dayHigh": data.get("dayHigh"),
+                "dayLow": data.get("dayLow"),
+                "volume": data.get("volume"),
+                "marketCap": data.get("marketCap"),
+                "sharesOutstanding": data.get("sharesOutstanding"),
+                "dividendYield": data.get("dividendYield"),
+                "eps": data.get("eps"),
+                "pe": data.get("pe"),
+                "beta": data.get("beta"),
+            }
 
     return {"data": out}
+
+
+@router.get("/quotes")
+async def argaam_quotes_get(
+    request: Request,
+    tickers: Optional[str] = None,          # comma-separated, e.g., "1120,2010"
+    cache_ttl: int = 600,
+):
+    """
+    GET convenience wrapper:
+      /v41/argaam/quotes?tickers=1120,2010&cache_ttl=600
+    """
+    _check_auth(request)
+
+    if not tickers:
+        raise HTTPException(status_code=400, detail="tickers query param is required")
+
+    tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
+    payload = ArgaamReq(tickers=tickers_list, urls=None, cache_ttl=cache_ttl)
+    return await argaam_quotes(payload, request)
