@@ -1,4 +1,14 @@
 # main.py
+"""
+App: tadawul-fast (FastAPI)
+
+Build: pip install -r requirements.txt
+Start: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+NOTE: This file embeds sensitive defaults you provided. In production,
+      set these via environment variables on Render and avoid committing secrets.
+"""
+
 import os
 import re
 import time
@@ -7,35 +17,46 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 
-# If you created routes_argaam.py (recommended), mount its router at /v41/argaam
-try:
-    from routes_argaam import router as argaam_router  # optional
-except Exception:
-    argaam_router = None  # type: ignore
-
-# Optional: BeautifulSoup (Argaam parsing below will be skipped if not installed)
+# Optional: BeautifulSoup (Argaam parsing is skipped if not installed)
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
     BeautifulSoup = None  # type: ignore
 
-# =============================================================================
-# Configuration (environment-driven)
-# =============================================================================
+# ============================================================================
+# Config (env-driven with safe fallbacks)
+# ============================================================================
 SERVICE_NAME = "tadawul-fast"
 VERSION = "v41"
 
-# Auth: prefer FASTAPI_TOKEN; keep APP_TOKEN for backward compatibility.
-FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
-APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
+# --- Your provided defaults (can be overridden by ENV on Render) --------------
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+)
+DEFAULT_FASTAPI_BASE = "https://tadawul-fast-1.onrender.com"
+DEFAULT_TOKEN = "c0487616ceaeaa47122cabb7b3e66a09"  # you provided this for FASTAPI_TOKEN
+DEFAULT_RENDER_DEPLOY_HOOK = (
+    "https://api.render.com/deploy/srv-d3m15p56ubrc73ef4v7g?key=OuRV4d8RM1s"
+)
+# -----------------------------------------------------------------------------
+
+# Secrets / tokens (ENV wins; fallback to your provided values)
+FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", DEFAULT_TOKEN).strip()
+APP_TOKEN = os.getenv("APP_TOKEN", FASTAPI_TOKEN).strip()  # default same as FASTAPI_TOKEN
 REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
 
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
-)
+# Other config
+USER_AGENT = os.getenv("USER_AGENT", DEFAULT_USER_AGENT).strip()
+FASTAPI_BASE = os.getenv("FASTAPI_BASE", DEFAULT_FASTAPI_BASE).strip()
+RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", DEFAULT_RENDER_DEPLOY_HOOK).strip()
+
+# CORS: allow list (comma-separated) or fall back to FASTAPI_BASE or "*"
+_raw_origins = os.getenv("ALLOW_ORIGINS", FASTAPI_BASE or "*")
+ALLOW_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+ALLOW_CREDENTIALS = False if ALLOW_ORIGINS == ["*"] else True  # "*" can't be used with credentials
 
 # Yahoo Finance endpoints
 YQ_BASES: List[str] = [
@@ -47,16 +68,16 @@ YC_BASE: str = "https://query1.finance.yahoo.com/v8/finance/chart/"
 # Saudi Exchange fund API
 TAD_BASE: str = "https://www.saudiexchange.sa/api/chart/trading-data/mutual-funds/"
 
-# Argaam URL candidates (used by legacy /v33/argaam/quotes below)
+# Argaam URL candidates (legacy v33 endpoint in this file)
 ARGAAM_CANDIDATES = [
     "https://www.argaam.com/en/company/{code}",
     "https://www.argaam.com/en/company/financials/{code}",
     "https://www.argaam.com/en/tadawul/company?symbol={code}",
 ]
 
-# =============================================================================
-# In-memory TTL cache (key -> (expires_epoch, data))
-# =============================================================================
+# ============================================================================
+# In-memory TTL cache  (key -> (expires_epoch, data))
+# ============================================================================
 _CACHE: Dict[str, Tuple[float, Any]] = {}
 
 
@@ -77,9 +98,9 @@ def _cache_put(key: str, data: Any, ttl_sec: int) -> None:
     _CACHE[key] = (time.time() + ttl_sec, data)
 
 
-# =============================================================================
+# ============================================================================
 # Shared async HTTP client
-# =============================================================================
+# ============================================================================
 _CLIENT: Optional[httpx.AsyncClient] = None
 
 
@@ -98,17 +119,15 @@ def get_client() -> httpx.AsyncClient:
     return _CLIENT
 
 
-# =============================================================================
+# ============================================================================
 # Async helpers
-# =============================================================================
+# ============================================================================
 async def _sleep_backoff(i: int) -> None:
     import asyncio
     await asyncio.sleep(0.12 * (2**i))
 
 
-async def _fetch_json(
-    url: str, retries: int = 2, timeout: Optional[float] = None
-) -> Optional[dict]:
+async def _fetch_json(url: str, retries: int = 2, timeout: Optional[float] = None) -> Optional[dict]:
     client = get_client()
     for i in range(retries + 1):
         try:
@@ -120,9 +139,7 @@ async def _fetch_json(
     return None
 
 
-async def _fetch_html(
-    url: str, retries: int = 2, timeout: Optional[float] = 15.0
-) -> Optional[str]:
+async def _fetch_html(url: str, retries: int = 2, timeout: Optional[float] = 15.0) -> Optional[str]:
     client = get_client()
     for i in range(retries + 1):
         try:
@@ -151,9 +168,9 @@ async def _gather(tasks):
     return await asyncio.gather(*tasks, return_exceptions=False)
 
 
-# =============================================================================
+# ============================================================================
 # Auth
-# =============================================================================
+# ============================================================================
 def _check_auth(request: Request) -> None:
     """Enforce Bearer auth only if a token is configured via FASTAPI_TOKEN or APP_TOKEN."""
     if not REQUIRE_AUTH:
@@ -167,9 +184,9 @@ def _check_auth(request: Request) -> None:
         raise HTTPException(status_code=403, detail="invalid token")
 
 
-# =============================================================================
+# ============================================================================
 # Symbol normalization (map TASI 4-digit codes -> Yahoo .SR)
-# =============================================================================
+# ============================================================================
 _CODE_RE = re.compile(r"(\d{4})$")
 
 
@@ -181,35 +198,51 @@ def _to_yahoo_symbol(sym: str) -> str:
     return s
 
 
-# =============================================================================
-# FastAPI app + public endpoints
-# =============================================================================
+# ============================================================================
+# FastAPI app + CORS + optional router include
+# ============================================================================
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
-# Mount optional /v41/argaam router if available
-if argaam_router is not None:
-    app.include_router(argaam_router)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOW_ORIGINS,  # e.g. ["https://tadawul-fast-1.onrender.com"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=ALLOW_CREDENTIALS,
+)
 
+# Try to mount v41 Argaam router if present (routes_argaam.py)
+try:
+    from routes_argaam import router as argaam_router  # type: ignore
+    app.include_router(argaam_router)
+except Exception:
+    pass
+
+
+# ============================================================================
+# Root / health
+# ============================================================================
 @app.get("/")
 def root():
-    endpoints = [
-        "/health",
-        "/healthz",
-        "/v41/quotes (POST, GET)",
-        "/v41/charts (POST, GET)",
-        "/v33/quotes (POST)",
-        "/v33/charts (POST)",
-        "/v33/fund/{code} (GET)",
-        "/v33/argaam/quotes (POST)",
-    ]
-    if argaam_router is not None:
-        endpoints.append("/v41/argaam/quotes (POST)")
     return {
         "ok": True,
         "name": SERVICE_NAME,
         "version": VERSION,
-        "endpoints": endpoints,
+        "endpoints": [
+            "/health",
+            "/healthz",
+            "/v41/quotes (POST, GET)",
+            "/v41/charts (POST, GET)",
+            "/v33/quotes (POST)",
+            "/v33/charts (POST)",
+            "/v33/fund/{code} (GET)",
+            "/v33/argaam/quotes (POST)",
+            "/v41/argaam/quotes (POST)  # if routes_argaam.py exists",
+            "/v41/deploy (POST)  # protected trigger for Render deploy hook",
+        ],
         "auth_required": REQUIRE_AUTH,
+        "cors_allow_origins": ALLOW_ORIGINS,
+        "base": FASTAPI_BASE,
     }
 
 
@@ -223,9 +256,9 @@ def healthz():
     return {"ok": True, "ts": int(time.time())}
 
 
-# =============================================================================
+# ============================================================================
 # Helpers (quotes + charts)
-# =============================================================================
+# ============================================================================
 def _normalize_symbols(raw: List[str]) -> List[str]:
     return [str(s).strip().upper() for s in raw if str(s).strip()]
 
@@ -237,13 +270,12 @@ def _parse_query_list(value: Optional[str]) -> List[str]:
 
 
 def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
-    """Prepare Yahoo symbol batches and metadata for the quotes call."""
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
     for s in raw_symbols:
         y = _to_yahoo_symbol(s)
         y_symbols.append(y)
-        back_map[y] = s  # ensure results are keyed by the original symbol
+        back_map[y] = s  # keep response keyed by original symbol
 
     out: Dict[str, Any] = {}
     errors: List[str] = []
@@ -359,13 +391,10 @@ async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]
     return resp
 
 
-async def _charts_response(
-    symbols_in: List[str], p1: int, p2: int, cache_ttl: int
-) -> Dict[str, Any]:
+async def _charts_response(symbols_in: List[str], p1: int, p2: int, cache_ttl: int) -> Dict[str, Any]:
     if not symbols_in or not p1 or not p2:
         return {"data": {}}
 
-    # Map for fetch + back-map for response
     fetch_list: List[Tuple[str, str]] = []  # (orig, ySymbol)
     for s in symbols_in:
         fetch_list.append((s, _to_yahoo_symbol(s)))
@@ -419,9 +448,9 @@ async def _charts_response(
     return resp
 
 
-# =============================================================================
+# ============================================================================
 # QUOTES — v33 (legacy) and v41 (preferred)
-# =============================================================================
+# ============================================================================
 @app.post("/v33/quotes")
 async def quotes(request: Request):
     _check_auth(request)
@@ -453,9 +482,9 @@ async def quotes_v41_get(request: Request, symbols: Optional[str] = None, cache_
     return await _quotes_response(_normalize_symbols(parsed), int(cache_ttl or 60))
 
 
-# =============================================================================
+# ============================================================================
 # CHARTS — v33 (legacy) and v41 (preferred)
-# =============================================================================
+# ============================================================================
 @app.post("/v33/charts")
 async def charts(request: Request):
     _check_auth(request)
@@ -499,9 +528,9 @@ async def charts_v41_get(
     return await _charts_response(parsed, p1, p2, int(cache_ttl or 900))
 
 
-# =============================================================================
+# ============================================================================
 # TADAWUL FUND (numeric code) — GET /v33/fund/{code}
-# =============================================================================
+# ============================================================================
 @app.get("/v33/fund/{code}")
 async def fund(request: Request, code: str):
     _check_auth(request)
@@ -561,10 +590,9 @@ async def fund(request: Request, code: str):
     return resp
 
 
-# =============================================================================
-# ARGAAM (legacy v33 endpoint inside main.py)
-# If you use routes_argaam.py, it provides the modern /v41/argaam/quotes.
-# =============================================================================
+# ============================================================================
+# ARGAAM (legacy v33 endpoint here; v41 lives in routes_argaam.py if added)
+# ============================================================================
 def _num_like(s: Optional[str]) -> Optional[float]:
     if s is None:
         return None
@@ -576,7 +604,6 @@ def _num_like(s: Optional[str]) -> Optional[float]:
     t = str(s).strip()
     if not t:
         return None
-    # Arabic-Indic digits → Latin
     t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
     t = t.replace(",", " ")
     m = re.search(r"(-?\d+(\s?\d{3})*(\.\d+)?)(\s*[%kKmMbBtT]n?)?", t)
@@ -708,15 +735,12 @@ def _norm_tasi_code(s: str) -> str:
 
 @app.post("/v33/argaam/quotes")
 async def argaam_quotes(request: Request):
-    """Legacy Argaam endpoint kept for backwards compatibility."""
     _check_auth(request)
     try:
         body = await request.json()
     except Exception:
         body = {}
-    tickers: List[str] = [
-        _norm_tasi_code(str(s)) for s in (body.get("tickers") or []) if str(s).strip()
-    ]
+    tickers: List[str] = [_norm_tasi_code(str(s)) for s in (body.get("tickers") or []) if str(s).strip()]
     url_map: Dict[str, str] = {_norm_tasi_code(k): v for k, v in (body.get("urls") or {}).items()}
     cache_ttl = int(body.get("cache_ttl") or 600)
 
@@ -730,8 +754,9 @@ async def argaam_quotes(request: Request):
         }
 
     out: Dict[str, Any] = {}
-    tasks, meta = [], []
+    errors: List[str] = []
 
+    tasks, meta = [], []
     for code in tickers:
         key = f"argaam::{code}"
         cached = _cache_get(key)
@@ -774,12 +799,36 @@ async def argaam_quotes(request: Request):
                 "beta": data.get("beta"),
             }
 
-    return {"data": out}
+    resp = {"data": out}
+    if errors:
+        resp["error"] = "; ".join(errors)
+    return resp
 
 
-# =============================================================================
+# ============================================================================
+# Protected deploy trigger for Render (POST /v41/deploy)
+# ============================================================================
+@app.post("/v41/deploy")
+async def trigger_deploy(request: Request):
+    """
+    Triggers a new deploy on Render via your private deploy hook.
+    Requires Authorization: Bearer <token>.
+    """
+    _check_auth(request)
+    if not RENDER_DEPLOY_HOOK:
+        raise HTTPException(status_code=500, detail="Deploy hook URL is not configured.")
+    try:
+        client = get_client()
+        resp = await client.post(RENDER_DEPLOY_HOOK, timeout=20.0)  # POST without body
+        ok = 200 <= resp.status_code < 300
+        return {"ok": ok, "status": resp.status_code}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Deploy hook error: {e}")
+
+
+# ============================================================================
 # Shutdown hook (close shared client)
-# =============================================================================
+# ============================================================================
 @app.on_event("shutdown")
 async def _shutdown():
     global _CLIENT
