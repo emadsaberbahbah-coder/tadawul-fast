@@ -8,7 +8,13 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 
-# Optional: BeautifulSoup (Argaam parsing will be skipped if not installed)
+# If you created routes_argaam.py (recommended), mount its router at /v41/argaam
+try:
+    from routes_argaam import router as argaam_router  # optional
+except Exception:
+    argaam_router = None  # type: ignore
+
+# Optional: BeautifulSoup (Argaam parsing below will be skipped if not installed)
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
@@ -41,7 +47,7 @@ YC_BASE: str = "https://query1.finance.yahoo.com/v8/finance/chart/"
 # Saudi Exchange fund API
 TAD_BASE: str = "https://www.saudiexchange.sa/api/chart/trading-data/mutual-funds/"
 
-# Argaam URL candidates
+# Argaam URL candidates (used by legacy /v33/argaam/quotes below)
 ARGAAM_CANDIDATES = [
     "https://www.argaam.com/en/company/{code}",
     "https://www.argaam.com/en/company/financials/{code}",
@@ -49,8 +55,7 @@ ARGAAM_CANDIDATES = [
 ]
 
 # =============================================================================
-# In-memory TTL cache
-# key -> (expires_epoch, data)
+# In-memory TTL cache (key -> (expires_epoch, data))
 # =============================================================================
 _CACHE: Dict[str, Tuple[float, Any]] = {}
 
@@ -150,9 +155,7 @@ async def _gather(tasks):
 # Auth
 # =============================================================================
 def _check_auth(request: Request) -> None:
-    """
-    Enforce Bearer auth only if a token is configured via FASTAPI_TOKEN or APP_TOKEN.
-    """
+    """Enforce Bearer auth only if a token is configured via FASTAPI_TOKEN or APP_TOKEN."""
     if not REQUIRE_AUTH:
         return
     auth = request.headers.get("Authorization", "")
@@ -183,23 +186,29 @@ def _to_yahoo_symbol(sym: str) -> str:
 # =============================================================================
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
+# Mount optional /v41/argaam router if available
+if argaam_router is not None:
+    app.include_router(argaam_router)
 
 @app.get("/")
 def root():
+    endpoints = [
+        "/health",
+        "/healthz",
+        "/v41/quotes (POST, GET)",
+        "/v41/charts (POST, GET)",
+        "/v33/quotes (POST)",
+        "/v33/charts (POST)",
+        "/v33/fund/{code} (GET)",
+        "/v33/argaam/quotes (POST)",
+    ]
+    if argaam_router is not None:
+        endpoints.append("/v41/argaam/quotes (POST)")
     return {
         "ok": True,
         "name": SERVICE_NAME,
         "version": VERSION,
-        "endpoints": [
-            "/health",
-            "/healthz",
-            "/v41/quotes (POST, GET)",
-            "/v41/charts (POST, GET)",
-            "/v33/quotes (POST)",
-            "/v33/charts (POST)",
-            "/v33/fund/{code} (GET)",
-            "/v33/argaam/quotes (POST)",
-        ],
+        "endpoints": endpoints,
         "auth_required": REQUIRE_AUTH,
     }
 
@@ -228,9 +237,7 @@ def _parse_query_list(value: Optional[str]) -> List[str]:
 
 
 def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
-    """
-    Prepares Yahoo symbol batches and metadata for the quotes call.
-    """
+    """Prepare Yahoo symbol batches and metadata for the quotes call."""
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
     for s in raw_symbols:
@@ -555,10 +562,8 @@ async def fund(request: Request, code: str):
 
 
 # =============================================================================
-# ARGAAM (optional; requires beautifulsoup4)
-# Notes:
-# - Code & comments are English-only.
-# - Arabic strings below are part of site labels we need to parse; they are intentional.
+# ARGAAM (legacy v33 endpoint inside main.py)
+# If you use routes_argaam.py, it provides the modern /v41/argaam/quotes.
 # =============================================================================
 def _num_like(s: Optional[str]) -> Optional[float]:
     if s is None:
@@ -703,6 +708,7 @@ def _norm_tasi_code(s: str) -> str:
 
 @app.post("/v33/argaam/quotes")
 async def argaam_quotes(request: Request):
+    """Legacy Argaam endpoint kept for backwards compatibility."""
     _check_auth(request)
     try:
         body = await request.json()
@@ -724,9 +730,8 @@ async def argaam_quotes(request: Request):
         }
 
     out: Dict[str, Any] = {}
-    errors: List[str] = []
-
     tasks, meta = [], []
+
     for code in tickers:
         key = f"argaam::{code}"
         cached = _cache_get(key)
@@ -769,10 +774,7 @@ async def argaam_quotes(request: Request):
                 "beta": data.get("beta"),
             }
 
-    resp = {"data": out}
-    if errors:
-        resp["error"] = "; ".join(errors)
-    return resp
+    return {"data": out}
 
 
 # =============================================================================
