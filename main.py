@@ -18,7 +18,7 @@ except Exception:
 # Config (env-driven)
 # =============================================================================
 SERVICE_NAME = "tadawul-fast"
-VERSION = "v33"
+VERSION = "v41"
 
 # Auth: prefer FASTAPI_TOKEN; keep APP_TOKEN for backward-compat.
 FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
@@ -189,6 +189,8 @@ def root():
         "endpoints": [
             "/health",
             "/healthz",
+            "/v41/quotes (POST, GET)",
+            "/v41/charts (POST, GET)",
             "/v33/quotes (POST)",
             "/v33/charts (POST)",
             "/v33/fund/{code} (GET)",
@@ -214,22 +216,15 @@ def healthz():
 # - Maps 4-digit TASI to "<code>.SR" for Yahoo.
 # - Returns data keyed by the ORIGINAL symbols you send.
 # =============================================================================
-@app.post("/v33/quotes")
-async def quotes(request: Request):
-    _check_auth(request)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    symbols: List[str] = [str(s).strip().upper() for s in (body.get("symbols") or []) if str(s).strip()]
-    cache_ttl = int(body.get("cache_ttl") or 60)
-    if not symbols:
-        return {"data": {}}
+def _normalize_symbols(raw: List[str]) -> List[str]:
+    return [str(s).strip().upper() for s in raw if str(s).strip()]
 
+
+def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
     # Build Yahoo symbols + back-map to original keys
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
-    for s in symbols:
+    for s in raw_symbols:
         y = _to_yahoo_symbol(s)
         y_symbols.append(y)
         back_map[y] = s  # ensure results are keyed by original
@@ -251,6 +246,25 @@ async def quotes(request: Request):
         url = base + ",".join(quote(s) for s in batch)
         tasks.append(_fetch_json(url))
         metas.append((key, batch))
+
+    return {
+        "y_symbols": y_symbols,
+        "back_map": back_map,
+        "tasks": tasks,
+        "metas": metas,
+        "out": out,
+        "errors": errors,
+        "cache_ttl": cache_ttl,
+    }
+
+
+async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
+    tasks = payload["tasks"]
+    metas = payload["metas"]
+    out = payload["out"]
+    errors = payload["errors"]
+    back_map = payload["back_map"]
+    cache_ttl = payload["cache_ttl"]
 
     results = await _gather(tasks) if tasks else []
 
@@ -317,10 +331,58 @@ async def quotes(request: Request):
         _cache_put(key, pack, cache_ttl)
         out.update(pack)
 
+    return out
+
+
+async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
+    if not symbols:
+        return {"data": {}}
+
+    payload = _build_quote_payload(symbols, cache_ttl)
+    out = await _resolve_quotes(payload)
+
     resp = {"data": out}
+    errors = payload["errors"]
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
+
+
+def _parse_query_list(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+@app.post("/v33/quotes")
+async def quotes(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols = _normalize_symbols(body.get("symbols") or [])
+    cache_ttl = int(body.get("cache_ttl") or 60)
+    return await _quotes_response(symbols, cache_ttl)
+
+
+@app.post("/v41/quotes")
+async def quotes_v41(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols = _normalize_symbols(body.get("symbols") or [])
+    cache_ttl = int(body.get("cache_ttl") or 60)
+    return await _quotes_response(symbols, cache_ttl)
+
+
+@app.get("/v41/quotes")
+async def quotes_v41_get(request: Request, symbols: Optional[str] = None, cache_ttl: int = 60):
+    _check_auth(request)
+    parsed = _parse_query_list(symbols)
+    return await _quotes_response(_normalize_symbols(parsed), int(cache_ttl or 60))
 
 
 # =============================================================================
@@ -329,17 +391,9 @@ async def quotes(request: Request):
 # - Maps 4-digit TASI to "<code>.SR" for Yahoo.
 # - Returns history keyed by the ORIGINAL symbols.
 # =============================================================================
-@app.post("/v33/charts")
-async def charts(request: Request):
-    _check_auth(request)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    symbols_in: List[str] = [str(s).strip().upper() for s in (body.get("symbols") or []) if str(s).strip()]
-    p1 = int(body.get("period1") or 0)
-    p2 = int(body.get("period2") or 0)
-    cache_ttl = int(body.get("cache_ttl") or 900)
+async def _charts_response(
+    symbols_in: List[str], p1: int, p2: int, cache_ttl: int
+) -> Dict[str, Any]:
     if not symbols_in or not p1 or not p2:
         return {"data": {}}
 
@@ -396,6 +450,49 @@ async def charts(request: Request):
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
+
+
+@app.post("/v33/charts")
+async def charts(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols_in = _normalize_symbols(body.get("symbols") or [])
+    p1 = int(body.get("period1") or 0)
+    p2 = int(body.get("period2") or 0)
+    cache_ttl = int(body.get("cache_ttl") or 900)
+    return await _charts_response(symbols_in, p1, p2, cache_ttl)
+
+
+@app.post("/v41/charts")
+async def charts_v41(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols_in = _normalize_symbols(body.get("symbols") or [])
+    p1 = int(body.get("period1") or 0)
+    p2 = int(body.get("period2") or 0)
+    cache_ttl = int(body.get("cache_ttl") or 900)
+    return await _charts_response(symbols_in, p1, p2, cache_ttl)
+
+
+@app.get("/v41/charts")
+async def charts_v41_get(
+    request: Request,
+    symbols: Optional[str] = None,
+    period1: Optional[int] = None,
+    period2: Optional[int] = None,
+    cache_ttl: int = 900,
+):
+    _check_auth(request)
+    parsed = _normalize_symbols(_parse_query_list(symbols))
+    p1 = int(period1 or 0)
+    p2 = int(period2 or 0)
+    return await _charts_response(parsed, p1, p2, int(cache_ttl or 900))
 
 
 # =============================================================================
