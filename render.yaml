@@ -12,8 +12,8 @@ services:
       - key: FASTAPI_TOKEN
         value: REPLACE_WITH_A_LONG_RANDOM_TOKEN
       - key: APP_TOKEN
-        value: REPLACE_WITH_THE_SAME_TOKEN  # keep same as FASTAPI_TOKEN
+        value: REPLACE_WITH_THE_SAME_TOKEN   # must match FASTAPI_TOKEN
       - key: USER_AGENT
         value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
-
-
+      - key: PYTHON_VERSION
+        value: "3.12.6"
