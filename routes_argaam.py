@@ -1,97 +1,189 @@
 # routes_argaam.py
+from __future__ import annotations
+
+import os
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import re, time, math
-import requests
-from bs4 import BeautifulSoup
 
-router = APIRouter(prefix="/v33/argaam", tags=["argaam"])
+# BeautifulSoup is optional; if it's missing, the endpoint will return a clear error
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None  # type: ignore
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36"
-HEADERS = {"User-Agent": USER_AGENT, "Pragma": "no-cache", "Cache-Control": "no-cache"}
+# ---------------------------------------------------------------------------
+# Router (v41 path so it doesn't duplicate the legacy v33 path in main.py)
+# ---------------------------------------------------------------------------
+router = APIRouter(prefix="/v41/argaam", tags=["argaam"])
 
-# Simple in-memory TTL cache
-_CACHE = {}  # key -> (expires_ts, data)
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+)
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Pragma": "no-cache",
+    "Cache-Control": "no-cache",
+}
+
+# ---------------------------------------------------------------------------
+# Simple in-memory TTL cache: key -> (expires_epoch, data)
+# ---------------------------------------------------------------------------
+_CACHE: Dict[str, Tuple[float, Any]] = {}
 
 
-class ArgaamReq(BaseModel):
-    tickers: list[str]
-    urls: dict[str, str] | None = None  # optional per-ticker override
-
-
-def _ttl_get(key):
-    now = time.time()
+def _cache_get(key: str) -> Optional[Any]:
     ent = _CACHE.get(key)
-    if not ent: return None
+    if not ent:
+        return None
     exp, data = ent
-    if now > exp:
+    if exp < time.time():
         _CACHE.pop(key, None)
         return None
     return data
 
 
-def _ttl_put(key, data, ttl=600):
-    _CACHE[key] = (time.time() + ttl, data)
+def _cache_put(key: str, data: Any, ttl_sec: int = 600) -> None:
+    if ttl_sec <= 0:
+        return
+    _CACHE[key] = (time.time() + ttl_sec, data)
 
 
-def _num(x):
-    if x is None: return None
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).strip().replace(",", "")
-    # handle Arabic digits
-    ar_map = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-    s = s.translate(ar_map)
-    # handle percentages
-    if s.endswith("%"):
-        try: return float(s[:-1]) / 100.0
-        except: return None
-    # handle common suffixes
-    m = re.match(r"^(-?\d+(\.\d+)?)([MBTK]|B|bn|m|k)?$", s, flags=re.I)
-    if m:
-        val = float(m.group(1))
-        suf = (m.group(3) or "").lower()
-        mult = {"k":1e3, "m":1e6, "b":1e9, "bn":1e9, "t":1e12}.get(suf, 1.0)
-        return val * mult
-    try: return float(s)
-    except: return None
+# ---------------------------------------------------------------------------
+# Shared async HTTP client
+# ---------------------------------------------------------------------------
+_CLIENT: Optional[httpx.AsyncClient] = None
 
 
-def _extract_text_after_label(soup, labels):
-    # try English & Arabic labels
-    joined = "|".join([re.escape(lbl) for lbl in labels])
-    # Find label anywhere and get the nearest number-like text in the same row/box
-    for el in soup.find_all(text=re.compile(joined, flags=re.I)):
-        # look rightwards / parent row cells
+def _client() -> httpx.AsyncClient:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            headers=HEADERS,
+        )
+    return _CLIENT
+
+
+# ---------------------------------------------------------------------------
+# Helpers: normalization & parsing
+# ---------------------------------------------------------------------------
+_CODE_RE = re.compile(r"(\d{4})")
+
+
+def _norm_tasi_code(s: str) -> str:
+    """Extract 4-digit TASI code from strings like '1120' or '1120.SR'."""
+    m = _CODE_RE.search(s or "")
+    return m.group(1) if m else (s or "").upper()
+
+
+def _num_like(s: Optional[str]) -> Optional[float]:
+    """Parse numbers from messy text (handles Arabic digits, %, and k/m/b/bn/t)."""
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
         try:
-            parent = el.find_parent()
-            if not parent: continue
-            # check siblings
-            sibs = list(parent.next_siblings)
-            for s in sibs:
-                if hasattr(s, "get_text"):
-                    txt = s.get_text(" ", strip=True)
-                    # first numeric-ish token
-                    mt = re.search(r"[-\d٠-٩\.,%]+", txt)
-                    if mt:
-                        return mt.group(0)
-        except:
-            pass
+            return float(s)
+        except Exception:
+            return None
+
+    t = str(s).strip()
+    if not t:
+        return None
+
+    # Arabic-Indic digits → Latin
+    t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+
+    # Remove thousands separators (commas/spaces)
+    t = t.replace(",", " ").strip()
+
+    # Try flexible pattern: number + optional suffix or %
+    m = re.search(r"(-?\d+(?:\s?\d{3})*(?:\.\d+)?)(\s*[%kKmMbBtT]n?)?", t)
+    if not m:
+        # last resort: plain float
+        try:
+            return float(t.replace(" ", ""))
+        except Exception:
+            return None
+
+    core = m.group(1).replace(" ", "")
+    suf = (m.group(2) or "").strip().lower()
+
+    try:
+        val = float(core)
+    except Exception:
+        return None
+
+    if suf == "%":
+        return val / 100.0
+
+    mult = {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9, "t": 1e12}
+    if suf in mult:
+        val *= mult[suf]
+    return val
+
+
+def _extract_after_label(soup: "BeautifulSoup", labels: List[str]) -> Optional[float]:
+    """Find a label (English or Arabic) and return the nearest numeric-like value."""
+    if not soup:
+        return None
+    pat = re.compile("|".join([re.escape(x) for x in labels]), flags=re.I)
+
+    for node in soup.find_all(string=pat):
+        try:
+            parent = node.parent
+            if parent:
+                # Check forward siblings
+                for s in parent.next_siblings:
+                    if hasattr(s, "get_text"):
+                        v = _num_like(s.get_text(" ", strip=True))
+                        if v is not None:
+                            return v
+                # Check backward siblings
+                for s in parent.previous_siblings:
+                    if hasattr(s, "get_text"):
+                        v = _num_like(s.get_text(" ", strip=True))
+                        if v is not None:
+                            return v
+
+            # Broader row scan (e.g., table rows)
+            row = parent.parent if parent else None
+            if row:
+                txt = row.get_text(" ", strip=True)
+                nums = re.findall(r"[-\d٠-٩\.,%]+", txt)
+                for cand in reversed(nums):
+                    v = _num_like(cand)
+                    if v is not None:
+                        return v
+        except Exception:
+            continue
     return None
 
 
-def _parse_company_snapshot(html):
+def _parse_argaam_snapshot(html: str) -> Dict[str, Any]:
+    if BeautifulSoup is None:
+        return {}
     soup = BeautifulSoup(html, "html.parser")
 
-    # Try to collect basic name/sector/industry if available
+    # Company name (best effort)
     name = None
-    h1 = soup.find("h1")
-    if h1:
-        name = h1.get_text(" ", strip=True)
+    try:
+        h1 = soup.find("h1")
+        if h1:
+            name = h1.get_text(" ", strip=True)
+    except Exception:
+        pass
 
-    # Common labels to try (English & Arabic)
+    # Labels we try to read (English + Arabic)
     labels = {
         "marketCap": ["Market Cap", "القيمة السوقية"],
-        "sharesOutstanding": ["Shares Outstanding", "الأسهم القائمة"],
+        "sharesOutstanding": ["Shares Outstanding", "الأسهم القائمة", "الاسهم القائمة"],
         "eps": ["EPS (TTM)", "ربحية السهم (TTM)", "ربحية السهم"],
         "pe": ["P/E (TTM)", "مكرر الربحية"],
         "beta": ["Beta", "بيتا"],
@@ -99,84 +191,96 @@ def _parse_company_snapshot(html):
         "volume": ["Volume", "الكمية", "حجم التداول"],
         "dayHigh": ["High", "أعلى"],
         "dayLow": ["Low", "أدنى"],
-        "price": ["Last", "السعر", "Last Trade", "آخر صفقة"]
+        "price": ["Last", "السعر", "Last Trade", "آخر صفقة", "آخر سعر"],
     }
 
-    out = {"name": name, "sector": None, "industry": None}
+    out: Dict[str, Any] = {"name": name, "sector": None, "industry": None}
+    for k, labs in labels.items():
+        out[k] = _extract_after_label(soup, labs)
 
-    # scrape by labels
-    for key, labs in labels.items():
-        vtxt = _extract_text_after_label(soup, labs)
-        if vtxt is not None:
-            out[key] = _num(vtxt)
-
-    # Fallback: sometimes live price sits in a special tag with data attributes
+    # Fallback: some pages expose live price in data attributes
     if out.get("price") is None:
         live = soup.select_one("[data-last], [data-last-price]")
         if live:
             cand = live.get("data-last") or live.get("data-last-price")
-            out["price"] = _num(cand)
+            out["price"] = _num_like(cand)
 
     return out
 
 
-def _guess_company_url(tasi_code: str) -> str | None:
-    # Heuristic (English pages). Adjust if your deployment is Arabic-only.
-    # We try a couple of common patterns:
+async def _guess_argaam_url(code: str) -> Optional[str]:
+    """Try a few URL patterns until one returns a plausible HTML page."""
     candidates = [
-        f"https://www.argaam.com/en/company/{tasi_code}",
-        f"https://www.argaam.com/en/company/financials/{tasi_code}",
-        f"https://www.argaam.com/en/tadawul/company?symbol={tasi_code}",
+        f"https://www.argaam.com/en/company/{code}",
+        f"https://www.argaam.com/en/company/financials/{code}",
+        f"https://www.argaam.com/en/tadawul/company?symbol={code}",
     ]
+    client = _client()
     for url in candidates:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            if r.status_code == 200 and len(r.text) > 2000:
+            r = await client.get(url)
+            if r.status_code == 200 and r.text and len(r.text) > 2000:
                 return url
-        except:
+        except Exception:
             pass
     return None
 
 
-def _fetch_company(tasi_code: str, url_override: str | None = None) -> dict:
-    # caching
-    cache_key = f"argaam:{tasi_code}"
-    cached = _ttl_get(cache_key)
+async def _fetch_company(code: str, url_override: Optional[str] = None, ttl: int = 600) -> Dict[str, Any]:
+    """Fetch and parse a single company's snapshot from Argaam (with caching)."""
+    key = f"argaam::{code}"
+    cached = _cache_get(key)
     if cached is not None:
         return cached
 
-    url = url_override or _guess_company_url(tasi_code)
+    url = url_override or (await _guess_argaam_url(code))
     if not url:
-        _ttl_put(cache_key, {}, ttl=120)
+        _cache_put(key, {}, ttl_sec=120)
         return {}
 
     try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
-            _ttl_put(cache_key, {}, ttl=120)
+        r = await _client().get(url)
+        if r.status_code != 200 or not r.text:
+            _cache_put(key, {}, ttl_sec=120)
             return {}
-        data = _parse_company_snapshot(res.text)
-        _ttl_put(cache_key, data, ttl=600)
+        data = _parse_argaam_snapshot(r.text)
+        _cache_put(key, data, ttl_sec=ttl)
         return data
-    except:
-        _ttl_put(cache_key, {}, ttl=120)
+    except Exception:
+        _cache_put(key, {}, ttl_sec=120)
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+class ArgaamReq(BaseModel):
+    tickers: List[str]
+    urls: Optional[Dict[str, str]] = None  # optional per-ticker override URL map
+    cache_ttl: int = 600                   # seconds
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @router.post("/quotes")
-def argaam_quotes(req: ArgaamReq):
+async def argaam_quotes(req: ArgaamReq):
     if not req.tickers:
-        raise HTTPException(status_code=400, detail="tickers array required")
+        raise HTTPException(status_code=400, detail="tickers array is required")
 
-    out = {}
+    if BeautifulSoup is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Argaam parser not available. Install 'beautifulsoup4' in your environment.",
+        )
+
+    out: Dict[str, Any] = {}
     for raw in req.tickers:
-        # Normalize 1120.SR -> 1120
-        m = re.search(r"(\d{4})", raw or "")
-        code = m.group(1) if m else (raw or "").upper()
+        code = _norm_tasi_code(raw or "")
         url = (req.urls or {}).get(code)
-        info = _fetch_company(code, url_override=url)
+        info = await _fetch_company(code, url_override=url, ttl=req.cache_ttl)
 
-        # normalize fields to the exact names your Apps Script expects
+        # Normalize output field names
         out[code] = {
             "name": info.get("name"),
             "sector": info.get("sector"),
@@ -190,7 +294,7 @@ def argaam_quotes(req: ArgaamReq):
             "dividendYield": info.get("dividendYield"),
             "eps": info.get("eps"),
             "pe": info.get("pe"),
-            "beta": info.get("beta")
+            "beta": info.get("beta"),
         }
 
-    return {"ok": True, "data": out}
+    return {"data": out}
