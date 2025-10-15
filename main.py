@@ -8,19 +8,19 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 
-# ---- Optional: BeautifulSoup (Argaam parsing will no-op if missing)
+# Optional: BeautifulSoup (Argaam parsing will be skipped if not installed)
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
     BeautifulSoup = None  # type: ignore
 
 # =============================================================================
-# Config (env-driven)
+# Configuration (environment-driven)
 # =============================================================================
 SERVICE_NAME = "tadawul-fast"
-VERSION = "v33"
+VERSION = "v41"
 
-# Auth: prefer FASTAPI_TOKEN; keep APP_TOKEN for backward-compat.
+# Auth: prefer FASTAPI_TOKEN; keep APP_TOKEN for backward compatibility.
 FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
@@ -31,14 +31,17 @@ USER_AGENT = os.getenv(
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
 )
 
+# Yahoo Finance endpoints
 YQ_BASES: List[str] = [
     "https://query1.finance.yahoo.com/v7/finance/quote?formatted=false&symbols=",
     "https://query2.finance.yahoo.com/v7/finance/quote?formatted=false&symbols=",
 ]
 YC_BASE: str = "https://query1.finance.yahoo.com/v8/finance/chart/"
+
+# Saudi Exchange fund API
 TAD_BASE: str = "https://www.saudiexchange.sa/api/chart/trading-data/mutual-funds/"
 
-# Argaam candidates
+# Argaam URL candidates
 ARGAAM_CANDIDATES = [
     "https://www.argaam.com/en/company/{code}",
     "https://www.argaam.com/en/company/financials/{code}",
@@ -47,8 +50,8 @@ ARGAAM_CANDIDATES = [
 
 # =============================================================================
 # In-memory TTL cache
-# =============================================================================
 # key -> (expires_epoch, data)
+# =============================================================================
 _CACHE: Dict[str, Tuple[float, Any]] = {}
 
 
@@ -70,7 +73,7 @@ def _cache_put(key: str, data: Any, ttl_sec: int) -> None:
 
 
 # =============================================================================
-# Async HTTP client (reused)
+# Shared async HTTP client
 # =============================================================================
 _CLIENT: Optional[httpx.AsyncClient] = None
 
@@ -91,11 +94,10 @@ def get_client() -> httpx.AsyncClient:
 
 
 # =============================================================================
-# Tiny async helpers
+# Async helpers
 # =============================================================================
 async def _sleep_backoff(i: int) -> None:
     import asyncio
-
     await asyncio.sleep(0.12 * (2**i))
 
 
@@ -139,7 +141,6 @@ async def _fetch_html(
 
 async def _gather(tasks):
     import asyncio
-
     if not tasks:
         return []
     return await asyncio.gather(*tasks, return_exceptions=False)
@@ -149,8 +150,11 @@ async def _gather(tasks):
 # Auth
 # =============================================================================
 def _check_auth(request: Request) -> None:
+    """
+    Enforce Bearer auth only if a token is configured via FASTAPI_TOKEN or APP_TOKEN.
+    """
     if not REQUIRE_AUTH:
-        return  # open instance if no token configured
+        return
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
@@ -189,6 +193,8 @@ def root():
         "endpoints": [
             "/health",
             "/healthz",
+            "/v41/quotes (POST, GET)",
+            "/v41/charts (POST, GET)",
             "/v33/quotes (POST)",
             "/v33/charts (POST)",
             "/v33/fund/{code} (GET)",
@@ -209,48 +215,64 @@ def healthz():
 
 
 # =============================================================================
-# QUOTES (Yahoo) — POST /v33/quotes
-# - Accepts symbols as sent by Apps Script.
-# - Maps 4-digit TASI to "<code>.SR" for Yahoo.
-# - Returns data keyed by the ORIGINAL symbols you send.
+# Helpers (quotes + charts)
 # =============================================================================
-@app.post("/v33/quotes")
-async def quotes(request: Request):
-    _check_auth(request)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    symbols: List[str] = [str(s).strip().upper() for s in (body.get("symbols") or []) if str(s).strip()]
-    cache_ttl = int(body.get("cache_ttl") or 60)
-    if not symbols:
-        return {"data": {}}
+def _normalize_symbols(raw: List[str]) -> List[str]:
+    return [str(s).strip().upper() for s in raw if str(s).strip()]
 
-    # Build Yahoo symbols + back-map to original keys
+
+def _parse_query_list(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
+    """
+    Prepares Yahoo symbol batches and metadata for the quotes call.
+    """
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
-    for s in symbols:
+    for s in raw_symbols:
         y = _to_yahoo_symbol(s)
         y_symbols.append(y)
-        back_map[y] = s  # ensure results are keyed by original
+        back_map[y] = s  # ensure results are keyed by the original symbol
 
     out: Dict[str, Any] = {}
     errors: List[str] = []
     chunk = 50
 
     tasks, metas = [], []
-    # Use caching per-batch of Yahoo symbols
     for i in range(0, len(y_symbols), chunk):
         batch = y_symbols[i : i + chunk]
         key = "yq::" + ",".join(batch)
         cached = _cache_get(key)
         if cached is not None:
-            out.update(cached)  # already keyed by original
+            out.update(cached)
             continue
         base = YQ_BASES[(i // chunk) % len(YQ_BASES)]
         url = base + ",".join(quote(s) for s in batch)
         tasks.append(_fetch_json(url))
         metas.append((key, batch))
+
+    return {
+        "y_symbols": y_symbols,
+        "back_map": back_map,
+        "tasks": tasks,
+        "metas": metas,
+        "out": out,
+        "errors": errors,
+        "cache_ttl": cache_ttl,
+    }
+
+
+async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
+    tasks = payload["tasks"]
+    metas = payload["metas"]
+    out = payload["out"]
+    errors = payload["errors"]
+    back_map = payload["back_map"]
+    cache_ttl = payload["cache_ttl"]
 
     results = await _gather(tasks) if tasks else []
 
@@ -261,7 +283,6 @@ async def quotes(request: Request):
 
         arr = (((res or {}).get("quoteResponse") or {}).get("result")) or []
         pack: Dict[str, Any] = {}
-        # Build pack keyed by ORIGINAL symbols
         for q in arr:
             ysym = str(q.get("symbol", "")).upper()
             orig = back_map.get(ysym, ysym)
@@ -313,33 +334,27 @@ async def quotes(request: Request):
                 "beta": q.get("beta"),
             }
 
-        # Cache the pack keyed by batch (already original-keyed)
         _cache_put(key, pack, cache_ttl)
         out.update(pack)
 
+    return out
+
+
+async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
+    if not symbols:
+        return {"data": {}}
+    payload = _build_quote_payload(symbols, cache_ttl)
+    out = await _resolve_quotes(payload)
     resp = {"data": out}
+    errors = payload["errors"]
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
 
 
-# =============================================================================
-# CHART (Yahoo) — POST /v33/charts
-# - Accepts symbols + period1/period2 (UNIX seconds).
-# - Maps 4-digit TASI to "<code>.SR" for Yahoo.
-# - Returns history keyed by the ORIGINAL symbols.
-# =============================================================================
-@app.post("/v33/charts")
-async def charts(request: Request):
-    _check_auth(request)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    symbols_in: List[str] = [str(s).strip().upper() for s in (body.get("symbols") or []) if str(s).strip()]
-    p1 = int(body.get("period1") or 0)
-    p2 = int(body.get("period2") or 0)
-    cache_ttl = int(body.get("cache_ttl") or 900)
+async def _charts_response(
+    symbols_in: List[str], p1: int, p2: int, cache_ttl: int
+) -> Dict[str, Any]:
     if not symbols_in or not p1 or not p2:
         return {"data": {}}
 
@@ -371,7 +386,6 @@ async def charts(request: Request):
             if result and result.get("timestamp"):
                 ts = result["timestamp"]
                 q = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
-                # shape each bar
                 for i in range(len(ts)):
                     c = (q.get("close") or [None])[i]
                     if c is None:
@@ -396,6 +410,86 @@ async def charts(request: Request):
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
+
+
+# =============================================================================
+# QUOTES — v33 (legacy) and v41 (preferred)
+# =============================================================================
+@app.post("/v33/quotes")
+async def quotes(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols = _normalize_symbols(body.get("symbols") or [])
+    cache_ttl = int(body.get("cache_ttl") or 60)
+    return await _quotes_response(symbols, cache_ttl)
+
+
+@app.post("/v41/quotes")
+async def quotes_v41(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols = _normalize_symbols(body.get("symbols") or [])
+    cache_ttl = int(body.get("cache_ttl") or 60)
+    return await _quotes_response(symbols, cache_ttl)
+
+
+@app.get("/v41/quotes")
+async def quotes_v41_get(request: Request, symbols: Optional[str] = None, cache_ttl: int = 60):
+    _check_auth(request)
+    parsed = _parse_query_list(symbols)
+    return await _quotes_response(_normalize_symbols(parsed), int(cache_ttl or 60))
+
+
+# =============================================================================
+# CHARTS — v33 (legacy) and v41 (preferred)
+# =============================================================================
+@app.post("/v33/charts")
+async def charts(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols_in = _normalize_symbols(body.get("symbols") or [])
+    p1 = int(body.get("period1") or 0)
+    p2 = int(body.get("period2") or 0)
+    cache_ttl = int(body.get("cache_ttl") or 900)
+    return await _charts_response(symbols_in, p1, p2, cache_ttl)
+
+
+@app.post("/v41/charts")
+async def charts_v41(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols_in = _normalize_symbols(body.get("symbols") or [])
+    p1 = int(body.get("period1") or 0)
+    p2 = int(body.get("period2") or 0)
+    cache_ttl = int(body.get("cache_ttl") or 900)
+    return await _charts_response(symbols_in, p1, p2, cache_ttl)
+
+
+@app.get("/v41/charts")
+async def charts_v41_get(
+    request: Request,
+    symbols: Optional[str] = None,
+    period1: Optional[int] = None,
+    period2: Optional[int] = None,
+    cache_ttl: int = 900,
+):
+    _check_auth(request)
+    parsed = _normalize_symbols(_parse_query_list(symbols))
+    p1 = int(period1 or 0)
+    p2 = int(period2 or 0)
+    return await _charts_response(parsed, p1, p2, int(cache_ttl or 900))
 
 
 # =============================================================================
@@ -461,7 +555,10 @@ async def fund(request: Request, code: str):
 
 
 # =============================================================================
-# A R G A A M  (optional; requires beautifulsoup4)
+# ARGAAM (optional; requires beautifulsoup4)
+# Notes:
+# - Code & comments are English-only.
+# - Arabic strings below are part of site labels we need to parse; they are intentional.
 # =============================================================================
 def _num_like(s: Optional[str]) -> Optional[float]:
     if s is None:
