@@ -10,19 +10,19 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-# BeautifulSoup is optional; if it's missing, the endpoint will return a clear error
+# BeautifulSoup is optional; endpoints will respond with a clear error if missing
 try:
     from bs4 import BeautifulSoup  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     BeautifulSoup = None  # type: ignore
 
 # ---------------------------------------------------------------------------
-# Router (v41 path so it won't clash with legacy v33 route in main.py)
+# Router (mounted under /v41/argaam by main.py)
 # ---------------------------------------------------------------------------
 router = APIRouter(prefix="/v41/argaam", tags=["argaam"])
 
 # ---------------------------------------------------------------------------
-# Config (env-driven)
+# Config (env-driven; mirrors main.py semantics)
 # ---------------------------------------------------------------------------
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -34,15 +34,25 @@ FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
 
-HEADERS = {
+BASE_HEADERS = {
     "User-Agent": USER_AGENT,
     "Pragma": "no-cache",
     "Cache-Control": "no-cache",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# URL candidates we try (English first, then Arabic)
+ARGAAM_CANDIDATES = [
+    "https://www.argaam.com/en/company/{code}",
+    "https://www.argaam.com/en/company/financials/{code}",
+    "https://www.argaam.com/en/tadawul/company?symbol={code}",
+    "https://www.argaam.com/ar/company/{code}",
+    "https://www.argaam.com/ar/company/financials/{code}",
+    "https://www.argaam.com/ar/tadawul/company?symbol={code}",
+]
+
 # ---------------------------------------------------------------------------
-# Auth helper (same semantics as in main.py)
+# Auth helper (same behavior as main.py)
 # ---------------------------------------------------------------------------
 def _check_auth(request: Request) -> None:
     if not REQUIRE_AUTH:
@@ -56,7 +66,7 @@ def _check_auth(request: Request) -> None:
         raise HTTPException(status_code=403, detail="invalid token")
 
 # ---------------------------------------------------------------------------
-# Simple in-memory TTL cache: key -> (expires_epoch, data)
+# In-memory TTL cache: key -> (expires_epoch, data)
 # ---------------------------------------------------------------------------
 _CACHE: Dict[str, Tuple[float, Any]] = {}
 
@@ -78,7 +88,7 @@ def _cache_put(key: str, data: Any, ttl_sec: int = 600) -> None:
     _CACHE[key] = (time.time() + ttl_sec, data)
 
 # ---------------------------------------------------------------------------
-# Shared async HTTP client (closed by close_argaam_http_client)
+# Shared async HTTP client (gracefully closed via close_argaam_http_client)
 # ---------------------------------------------------------------------------
 _CLIENT: Optional[httpx.AsyncClient] = None
 
@@ -86,16 +96,40 @@ _CLIENT: Optional[httpx.AsyncClient] = None
 def _client() -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(15.0), headers=HEADERS)
+        _CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            headers=BASE_HEADERS,
+        )
     return _CLIENT
 
 
 async def close_argaam_http_client() -> None:
-    """Allow main.py to gracefully close this module's HTTP client."""
+    """Called from main.py on shutdown to close this module's client."""
     global _CLIENT
     if _CLIENT is not None:
-        await _CLIENT.aclose()
-        _CLIENT = None
+        try:
+            await _CLIENT.aclose()
+        finally:
+            _CLIENT = None
+
+# ---------------------------------------------------------------------------
+# Async helpers
+# ---------------------------------------------------------------------------
+async def _sleep_backoff(i: int) -> None:
+    import asyncio
+    await asyncio.sleep(0.12 * (2 ** i))
+
+
+async def _fetch_html(url: str, retries: int = 2, timeout: float = 15.0) -> Optional[str]:
+    for i in range(retries + 1):
+        try:
+            r = await _client().get(url, timeout=timeout)
+            if r.status_code == 200 and r.text and len(r.text) > 1000:
+                return r.text
+        except Exception:
+            pass
+        await _sleep_backoff(i)
+    return None
 
 # ---------------------------------------------------------------------------
 # Helpers: normalization & parsing
@@ -110,7 +144,10 @@ def _norm_tasi_code(s: str) -> str:
 
 
 def _num_like(s: Optional[str]) -> Optional[float]:
-    """Parse numbers from messy text (handles Arabic digits, %, and k/m/b/bn/t)."""
+    """
+    Parse numbers from messy text (Arabic digits, %, and k/m/b/bn/t suffixes).
+    Returns float or None.
+    """
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -126,7 +163,7 @@ def _num_like(s: Optional[str]) -> Optional[float]:
     # Arabic-Indic digits → Latin
     t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
 
-    # Remove thousands separators (commas become spaces for flexible matching)
+    # Remove thousands separators (commas to spaces for flexible matching)
     t = t.replace(",", " ").strip()
 
     # Flexible pattern: number + optional suffix or %
@@ -155,7 +192,7 @@ def _num_like(s: Optional[str]) -> Optional[float]:
 
 
 def _extract_after_label(soup: "BeautifulSoup", labels: List[str]) -> Optional[float]:
-    """Find a label (English or Arabic) and return the nearest numeric-like value."""
+    """Find a label (English/Arabic) and return the nearest numeric-like value."""
     if not soup:
         return None
     pat = re.compile("|".join([re.escape(x) for x in labels]), flags=re.I)
@@ -205,7 +242,7 @@ def _parse_argaam_snapshot(html: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Labels we try to read (English + Arabic). Arabic strings are site labels.
+    # Labels we try to read (English + Arabic)
     labels = {
         "marketCap": ["Market Cap", "القيمة السوقية"],
         "sharesOutstanding": ["Shares Outstanding", "الأسهم القائمة", "الاسهم القائمة"],
@@ -234,24 +271,19 @@ def _parse_argaam_snapshot(html: str) -> Dict[str, Any]:
 
 
 async def _guess_argaam_url(code: str) -> Optional[str]:
-    """Try a few URL patterns until one returns a plausible HTML page."""
-    candidates = [
-        f"https://www.argaam.com/en/company/{code}",
-        f"https://www.argaam.com/en/company/financials/{code}",
-        f"https://www.argaam.com/en/tadawul/company?symbol={code}",
-    ]
-    client = _client()
-    for url in candidates:
-        try:
-            r = await client.get(url)
-            if r.status_code == 200 and r.text and len(r.text) > 2000:
-                return url
-        except Exception:
-            pass
+    """Try multiple URL patterns until one returns plausible HTML."""
+    from urllib.parse import quote
+    for tpl in ARGAAM_CANDIDATES:
+        url = tpl.format(code=quote(code))
+        html = await _fetch_html(url, retries=2, timeout=15.0)
+        if html and len(html) > 2000:
+            return url
     return None
 
 
-async def _fetch_company(code: str, url_override: Optional[str] = None, ttl: int = 600) -> Dict[str, Any]:
+async def _fetch_company(
+    code: str, url_override: Optional[str] = None, ttl: int = 600
+) -> Dict[str, Any]:
     """Fetch and parse a single company's snapshot from Argaam (with caching)."""
     key = f"argaam::{code}"
     cached = _cache_get(key)
@@ -263,17 +295,14 @@ async def _fetch_company(code: str, url_override: Optional[str] = None, ttl: int
         _cache_put(key, {}, ttl_sec=120)
         return {}
 
-    try:
-        r = await _client().get(url)
-        if r.status_code != 200 or not r.text:
-            _cache_put(key, {}, ttl_sec=120)
-            return {}
-        data = _parse_argaam_snapshot(r.text)
-        _cache_put(key, data, ttl_sec=ttl)
-        return data
-    except Exception:
+    html = await _fetch_html(url, retries=2, timeout=15.0)
+    if not html:
         _cache_put(key, {}, ttl_sec=120)
         return {}
+
+    data = _parse_argaam_snapshot(html) if html else {}
+    _cache_put(key, data, ttl_sec=ttl)
+    return data
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -288,6 +317,10 @@ class ArgaamReq(BaseModel):
 # ---------------------------------------------------------------------------
 @router.post("/quotes")
 async def argaam_quotes(req: ArgaamReq, request: Request):
+    """
+    POST: /v41/argaam/quotes
+    Body: { "tickers": ["1120","2010"], "urls": {"1120":"..."}, "cache_ttl": 600 }
+    """
     _check_auth(request)
 
     if not req.tickers:
@@ -354,11 +387,11 @@ async def argaam_quotes(req: ArgaamReq, request: Request):
 @router.get("/quotes")
 async def argaam_quotes_get(
     request: Request,
-    tickers: Optional[str] = None,          # comma-separated, e.g., "1120,2010"
+    tickers: Optional[str] = None,  # comma-separated, e.g., "1120,2010"
     cache_ttl: int = 600,
 ):
     """
-    GET convenience wrapper:
+    GET wrapper:
       /v41/argaam/quotes?tickers=1120,2010&cache_ttl=600
     """
     _check_auth(request)
