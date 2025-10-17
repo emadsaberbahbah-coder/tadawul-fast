@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # Optional: BeautifulSoup (Argaam parsing will be skipped if not installed)
@@ -23,12 +23,10 @@ except Exception:
 SERVICE_NAME = "tadawul-fast"
 VERSION = "v41"
 
-# Auth tokens (read from environment; do NOT hard-code secrets in source)
 FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()  # backward-compat
 REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
 
-# Optional base URL and Render deploy hook (protected endpoint below)
 FASTAPI_BASE = os.getenv("FASTAPI_BASE", "").strip()
 RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", "").strip()
 
@@ -185,30 +183,17 @@ def _to_yahoo_symbol(sym: str) -> str:
     return s
 
 
-def _is_likely_nomu(sym: str) -> bool:
-    """
-    Nomu codes are typically 95xx or 96xx. This helper is used
-    only for metadata or future conditional routing; the API still
-    attempts Yahoo unless the caller decides to skip.
-    """
-    s = (sym or "").strip().upper()
-    m = re.search(r"(\d{4})", s)
-    return bool(m and re.match(r"^(95|96)\d{2}$", m.group(1)))
-
-
 # =============================================================================
 # FastAPI app + CORS
 # =============================================================================
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
-# Open CORS; restrict to your origin if desired
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # change to [FASTAPI_BASE] to restrict
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =============================================================================
 # Meta / health
@@ -225,10 +210,9 @@ def root():
             "/healthz",
             "/v41/quotes (POST, GET)",
             "/v41/charts (POST, GET)",
-            "/v33/quotes (POST)",
-            "/v33/charts (POST)",
+            "/v33/quotes (POST) [legacy]",
+            "/v33/charts (POST) [legacy]",
             "/v33/fund/{code} (GET)",
-            "/v33/argaam/quotes (POST)",
             "/v41/argaam/quotes (POST, GET)",
             "/v41/deploy (POST; protected)",
         ],
@@ -241,23 +225,13 @@ def health():
     return {"ok": True, "ts": int(time.time())}
 
 
-@app.head("/health")
-def health_head():
-    return Response(status_code=200)
-
-
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": int(time.time())}
 
 
-@app.head("/healthz")
-def healthz_head():
-    return Response(status_code=200)
-
-
 # =============================================================================
-# Helpers (quotes + charts)
+# QUOTES helper
 # =============================================================================
 def _normalize_symbols(raw: List[str]) -> List[str]:
     return [str(s).strip().upper() for s in raw if str(s).strip()]
@@ -270,15 +244,12 @@ def _parse_query_list(value: Optional[str]) -> List[str]:
 
 
 def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
-    """
-    Prepares Yahoo symbol batches and metadata for the quotes call.
-    """
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
     for s in raw_symbols:
         y = _to_yahoo_symbol(s)
         y_symbols.append(y)
-        back_map[y] = s  # ensure results are keyed by the original symbol
+        back_map[y] = s  # map back to input symbol
 
     out: Dict[str, Any] = {}
     errors: List[str] = []
@@ -295,7 +266,7 @@ def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, An
         base = YQ_BASES[(i // chunk) % len(YQ_BASES)]
         url = base + ",".join(quote(s) for s in batch)
         tasks.append(_fetch_json(url))
-        metas.append((key, batch))
+        metas.append((key, batch, base))
 
     return {
         "y_symbols": y_symbols,
@@ -318,7 +289,7 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     results = await _gather(tasks) if tasks else []
 
-    for (key, batch), res in zip(metas, results):
+    for (key, batch, _base), res in zip(metas, results):
         if not res:
             errors.append(f"Yahoo quote fetch failed for {batch}")
             continue
@@ -341,13 +312,10 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
             mcap = q.get("marketCap")
             shares = q.get("sharesOutstanding")
             if mcap is None and price is not None and shares not in (None, 0):
-                try:
-                    mcap = float(price) * float(shares)  # type: ignore
-                except Exception:
-                    mcap = None
+                mcap = price * shares
             if shares is None and price not in (None, 0) and mcap is not None:
                 try:
-                    shares = float(mcap) / float(price)  # type: ignore
+                    shares = mcap / price
                 except Exception:
                     shares = None
 
@@ -356,7 +324,7 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                 rate = q.get("trailingAnnualDividendRate")
                 if rate is not None and price not in (None, 0):
                     try:
-                        dy = float(rate) / float(price)  # type: ignore
+                        dy = rate / price
                     except Exception:
                         dy = None
 
@@ -377,9 +345,6 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "eps": eps,
                 "pe": pe,
                 "beta": q.get("beta"),
-                # optional hints
-                "yahooSymbol": ysym,
-                "isNomuHint": _is_likely_nomu(orig),
             }
 
         _cache_put(key, pack, cache_ttl)
@@ -400,13 +365,15 @@ async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]
     return resp
 
 
+# =============================================================================
+# CHARTS helper
+# =============================================================================
 async def _charts_response(
     symbols_in: List[str], p1: int, p2: int, cache_ttl: int
 ) -> Dict[str, Any]:
     if not symbols_in or not p1 or not p2:
         return {"data": {}}
 
-    # Map for fetch + back-map for response
     fetch_list: List[Tuple[str, str]] = []  # (orig, ySymbol)
     for s in symbols_in:
         fetch_list.append((s, _to_yahoo_symbol(s)))
@@ -463,16 +430,6 @@ async def _charts_response(
 # =============================================================================
 # QUOTES — v33 (legacy) and v41 (preferred)
 # =============================================================================
-def _extract_symbols_from_body(body: Dict[str, Any]) -> List[str]:
-    # Accept either "symbols" or "tickers" (common across callers)
-    raw = body.get("symbols")
-    if not raw:
-        raw = body.get("tickers")
-    if isinstance(raw, list):
-        return _normalize_symbols(raw)
-    return []
-
-
 @app.post("/v33/quotes")
 async def quotes(request: Request):
     _check_auth(request)
@@ -480,7 +437,7 @@ async def quotes(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols = _extract_symbols_from_body(body)
+    symbols = _normalize_symbols(body.get("symbols") or [])
     cache_ttl = int(body.get("cache_ttl") or 60)
     return await _quotes_response(symbols, cache_ttl)
 
@@ -492,7 +449,7 @@ async def quotes_v41(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols = _extract_symbols_from_body(body)
+    symbols = _normalize_symbols(body.get("symbols") or [])
     cache_ttl = int(body.get("cache_ttl") or 60)
     return await _quotes_response(symbols, cache_ttl)
 
@@ -514,7 +471,7 @@ async def charts(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols_in = _extract_symbols_from_body(body)
+    symbols_in = _normalize_symbols(body.get("symbols") or [])
     p1 = int(body.get("period1") or 0)
     p2 = int(body.get("period2") or 0)
     cache_ttl = int(body.get("cache_ttl") or 900)
@@ -528,7 +485,7 @@ async def charts_v41(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols_in = _extract_symbols_from_body(body)
+    symbols_in = _normalize_symbols(body.get("symbols") or [])
     p1 = int(body.get("period1") or 0)
     p2 = int(body.get("period2") or 0)
     cache_ttl = int(body.get("cache_ttl") or 900)
@@ -628,7 +585,7 @@ def _num_like(s: Optional[str]) -> Optional[float]:
         return None
     # Arabic-Indic digits → Latin
     t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-    # normalize separators
+    # normalize thousands
     t = t.replace(",", " ")
     m = re.search(r"(-?\d+(\s?\d{3})*(\.\d+)?)(\s*[%kKmMbBtT]n?)?", t)
     if not m:
@@ -731,92 +688,9 @@ def _norm_tasi_code(s: str) -> str:
     return m.group(1) if m else (s or "").upper()
 
 
-@app.post("/v33/argaam/quotes")
-async def argaam_quotes_legacy(request: Request):
-    """
-    Legacy POST for Apps Script expecting v33.
-    Body: { "tickers": ["1120", "..."], "urls": { "1120": "..." }, "cache_ttl": 600 }
-    """
-    _check_auth(request)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    tickers: List[str] = [
-        _norm_tasi_code(str(s)) for s in (body.get("tickers") or []) if str(s).strip()
-    ]
-    url_map: Dict[str, str] = {_norm_tasi_code(k): v for k, v in (body.get("urls") or {}).items()}
-    cache_ttl = int(body.get("cache_ttl") or 600)
-
-    if not tickers:
-        return {"data": {}}
-
-    if BeautifulSoup is None:
-        return {
-            "data": {},
-            "error": "Argaam parser unavailable. Install beautifulsoup4 in your environment.",
-        }
-
-    out: Dict[str, Any] = {}
-    to_fetch: List[Tuple[str, Optional[str]]] = []
-    for code in tickers:
-        key = f"argaam::{code}"
-        cached = _cache_get(key)
-        if cached is not None:
-            out[code] = {
-                "name": cached.get("name"),
-                "sector": cached.get("sector"),
-                "industry": cached.get("industry"),
-                "price": cached.get("price"),
-                "dayHigh": cached.get("dayHigh"),
-                "dayLow": cached.get("dayLow"),
-                "volume": cached.get("volume"),
-                "marketCap": cached.get("marketCap"),
-                "sharesOutstanding": cached.get("sharesOutstanding"),
-                "dividendYield": cached.get("dividendYield"),
-                "eps": cached.get("eps"),
-                "pe": cached.get("pe"),
-                "beta": cached.get("beta"),
-            }
-        else:
-            to_fetch.append((code, url_map.get(code)))
-
-    if to_fetch:
-        import asyncio
-
-        async def _fetch_one(code: str, override: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-            url = override or (await _guess_argaam_url(code))
-            html = await _fetch_html(url, retries=2) if url else None
-            data = _parse_argaam_snapshot(html) if html else {}
-            _cache_put(f"argaam::{code}", data, cache_ttl)
-            return code, data
-
-        tasks = [_fetch_one(code, url) for code, url in to_fetch]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        for code, data in results:
-            out[code] = {
-                "name": data.get("name"),
-                "sector": data.get("sector"),
-                "industry": data.get("industry"),
-                "price": data.get("price"),
-                "dayHigh": data.get("dayHigh"),
-                "dayLow": data.get("dayLow"),
-                "volume": data.get("volume"),
-                "marketCap": data.get("marketCap"),
-                "sharesOutstanding": data.get("sharesOutstanding"),
-                "dividendYield": data.get("dividendYield"),
-                "eps": data.get("eps"),
-                "pe": data.get("pe"),
-                "beta": data.get("beta"),
-            }
-
-    return {"data": out}
-
-
 @app.post("/v41/argaam/quotes")
 async def argaam_quotes(request: Request):
     """
-    Preferred POST for v41.
     Body: { "tickers": ["1120","2010"], "urls": {"1120":"..."}, "cache_ttl": 600 }
     """
     _check_auth(request)
@@ -907,8 +781,7 @@ async def argaam_quotes_get(
 
     tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
     body = {"tickers": tickers_list, "cache_ttl": cache_ttl}
-    # emulate POST body for reuse
-    request._body = body  # type: ignore
+    request._body = body  # type: ignore (reuse POST logic)
     return await argaam_quotes(request)
 
 
