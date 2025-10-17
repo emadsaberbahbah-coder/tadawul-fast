@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # Optional: BeautifulSoup (Argaam parsing will be skipped if not installed)
@@ -185,6 +185,17 @@ def _to_yahoo_symbol(sym: str) -> str:
     return s
 
 
+def _is_likely_nomu(sym: str) -> bool:
+    """
+    Nomu codes are typically 95xx or 96xx. This helper is used
+    only for metadata or future conditional routing; the API still
+    attempts Yahoo unless the caller decides to skip.
+    """
+    s = (sym or "").strip().upper()
+    m = re.search(r"(\d{4})", s)
+    return bool(m and re.match(r"^(95|96)\d{2}$", m.group(1)))
+
+
 # =============================================================================
 # FastAPI app + CORS
 # =============================================================================
@@ -230,9 +241,19 @@ def health():
     return {"ok": True, "ts": int(time.time())}
 
 
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": int(time.time())}
+
+
+@app.head("/healthz")
+def healthz_head():
+    return Response(status_code=200)
 
 
 # =============================================================================
@@ -320,10 +341,13 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
             mcap = q.get("marketCap")
             shares = q.get("sharesOutstanding")
             if mcap is None and price is not None and shares not in (None, 0):
-                mcap = price * shares
+                try:
+                    mcap = float(price) * float(shares)  # type: ignore
+                except Exception:
+                    mcap = None
             if shares is None and price not in (None, 0) and mcap is not None:
                 try:
-                    shares = mcap / price
+                    shares = float(mcap) / float(price)  # type: ignore
                 except Exception:
                     shares = None
 
@@ -332,7 +356,7 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                 rate = q.get("trailingAnnualDividendRate")
                 if rate is not None and price not in (None, 0):
                     try:
-                        dy = rate / price
+                        dy = float(rate) / float(price)  # type: ignore
                     except Exception:
                         dy = None
 
@@ -353,6 +377,9 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "eps": eps,
                 "pe": pe,
                 "beta": q.get("beta"),
+                # optional hints
+                "yahooSymbol": ysym,
+                "isNomuHint": _is_likely_nomu(orig),
             }
 
         _cache_put(key, pack, cache_ttl)
@@ -436,6 +463,16 @@ async def _charts_response(
 # =============================================================================
 # QUOTES — v33 (legacy) and v41 (preferred)
 # =============================================================================
+def _extract_symbols_from_body(body: Dict[str, Any]) -> List[str]:
+    # Accept either "symbols" or "tickers" (common across callers)
+    raw = body.get("symbols")
+    if not raw:
+        raw = body.get("tickers")
+    if isinstance(raw, list):
+        return _normalize_symbols(raw)
+    return []
+
+
 @app.post("/v33/quotes")
 async def quotes(request: Request):
     _check_auth(request)
@@ -443,7 +480,7 @@ async def quotes(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols = _normalize_symbols(body.get("symbols") or [])
+    symbols = _extract_symbols_from_body(body)
     cache_ttl = int(body.get("cache_ttl") or 60)
     return await _quotes_response(symbols, cache_ttl)
 
@@ -455,7 +492,7 @@ async def quotes_v41(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols = _normalize_symbols(body.get("symbols") or [])
+    symbols = _extract_symbols_from_body(body)
     cache_ttl = int(body.get("cache_ttl") or 60)
     return await _quotes_response(symbols, cache_ttl)
 
@@ -477,7 +514,7 @@ async def charts(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols_in = _normalize_symbols(body.get("symbols") or [])
+    symbols_in = _extract_symbols_from_body(body)
     p1 = int(body.get("period1") or 0)
     p2 = int(body.get("period2") or 0)
     cache_ttl = int(body.get("cache_ttl") or 900)
@@ -491,7 +528,7 @@ async def charts_v41(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    symbols_in = _normalize_symbols(body.get("symbols") or [])
+    symbols_in = _extract_symbols_from_body(body)
     p1 = int(body.get("period1") or 0)
     p2 = int(body.get("period2") or 0)
     cache_ttl = int(body.get("cache_ttl") or 900)
@@ -577,7 +614,6 @@ async def fund(request: Request, code: str):
 
 # =============================================================================
 # A R G A A M  (optional; requires beautifulsoup4)
-#   - Code & comments are in English. Arabic strings below are site labels.
 # =============================================================================
 def _num_like(s: Optional[str]) -> Optional[float]:
     if s is None:
@@ -592,7 +628,7 @@ def _num_like(s: Optional[str]) -> Optional[float]:
         return None
     # Arabic-Indic digits → Latin
     t = t.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-    # normalize thousands
+    # normalize separators
     t = t.replace(",", " ")
     m = re.search(r"(-?\d+(\s?\d{3})*(\.\d+)?)(\s*[%kKmMbBtT]n?)?", t)
     if not m:
@@ -890,7 +926,6 @@ async def trigger_deploy(request: Request):
     if not hook:
         return {"ok": False, "error": "RENDER_DEPLOY_HOOK is not set"}
     try:
-        # Use GET to be compatible with Render's deploy hooks
         r = await get_client().get(hook, timeout=20.0)
         return {"ok": r.status_code in (200, 201, 202), "status": r.status_code}
     except Exception as e:
