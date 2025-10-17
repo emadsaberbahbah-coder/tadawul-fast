@@ -4,19 +4,48 @@ services:
     env: python
     plan: free
     region: oregon
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    runtime:
+      pythonVersion: 3.11
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --no-cache-dir -r requirements.txt
+    startCommand: |
+      uvicorn main:app --host 0.0.0.0 --port $PORT --workers ${UVICORN_WORKERS:-1}
     autoDeploy: true
     healthCheckPath: /health
+    healthCheckTimeout: 10
+    # Render will keep one instance on the Free plan; leave scaling implicit.
+    # instanceCount: 1
+
     envVars:
+      # === Auth ===
       - key: FASTAPI_TOKEN
-        fromSecret: fastapi-token               # create this secret in Render
+        fromSecret: fastapi-token          # create this secret in Render
       - key: APP_TOKEN
-        fromSecret: fastapi-token               # same token as FASTAPI_TOKEN
-      - key: USER_AGENT
-        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+        fromSecret: fastapi-token          # backward-compat; reuse same secret
+
+      # === Service metadata ===
       - key: FASTAPI_BASE
         value: "https://tadawul-fast-1.onrender.com"
-      # Optional: only if you want the /v41/deploy endpoint to work
+      - key: USER_AGENT
+        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+
+      # === Uvicorn tunables (optional) ===
+      - key: UVICORN_WORKERS
+        value: "1"                         # free instances have limited CPU/RAM
+
+      # === Optional: deploy hook for /v41/deploy endpoint ===
       - key: RENDER_DEPLOY_HOOK
-        fromSecret: render-deploy-hook
+        fromSecret: render-deploy-hook     # only if you want remote redeploys
+
+    # Enable previews on PRs (optional but handy)
+    previews:
+      generation: automatic
+
+    # Only trigger builds when relevant files change (optional)
+    buildFilter:
+      paths:
+        - requirements.txt
+        - main.py
+        - render.yaml
+        - Procfile
