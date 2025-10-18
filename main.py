@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 # ---- Optional: BeautifulSoup (Argaam parsing will no-op if missing)
 try:
@@ -17,8 +18,8 @@ except Exception:
 # =============================================================================
 # Config (env-driven)
 # =============================================================================
-SERVICE_NAME = "tadawul-fast"
-VERSION = "v41"
+SERVICE_NAME = os.getenv("SERVICE_NAME", "tadawul-fast")
+VERSION = os.getenv("API_VERSION", "v41")
 
 # Auth: prefer FASTAPI_TOKEN; keep APP_TOKEN for backward-compat.
 FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
@@ -31,11 +32,23 @@ USER_AGENT = os.getenv(
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
 )
 
+# Optional CORS origins (comma-separated). Leave empty to skip CORS.
+_CORS = os.getenv("CORS_ORIGINS", "").strip()
+CORS_ORIGINS = [o.strip() for o in _CORS.split(",") if o.strip()]
+
+# Yahoo Finance endpoints
 YQ_BASES: List[str] = [
+    # v7 quotes
     "https://query1.finance.yahoo.com/v7/finance/quote?formatted=false&symbols=",
     "https://query2.finance.yahoo.com/v7/finance/quote?formatted=false&symbols=",
 ]
-YC_BASE: str = "https://query1.finance.yahoo.com/v8/finance/chart/"
+YC_BASES: List[str] = [
+    # v8 charts (we rotate if one host misbehaves)
+    "https://query1.finance.yahoo.com/v8/finance/chart/",
+    "https://query2.finance.yahoo.com/v8/finance/chart/",
+]
+
+# Tadawul mutual funds API
 TAD_BASE: str = "https://www.saudiexchange.sa/api/chart/trading-data/mutual-funds/"
 
 # Argaam candidates
@@ -79,7 +92,7 @@ def get_client() -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None:
         _CLIENT = httpx.AsyncClient(
-            timeout=httpx.Timeout(12.0),
+            timeout=httpx.Timeout(connect=5.0, read=12.0, write=12.0),
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json, text/plain, */*",
@@ -96,16 +109,16 @@ def get_client() -> httpx.AsyncClient:
 async def _sleep_backoff(i: int) -> None:
     import asyncio
 
-    await asyncio.sleep(0.12 * (2**i))
+    await asyncio.sleep(min(0.12 * (2**i), 5.0))
 
 
 async def _fetch_json(
-    url: str, retries: int = 2, timeout: Optional[float] = None
+    url: str, retries: int = 2, timeout: Optional[float] = None, headers: Optional[Dict[str, str]] = None
 ) -> Optional[dict]:
     client = get_client()
     for i in range(retries + 1):
         try:
-            r = await client.get(url, timeout=timeout)
+            r = await client.get(url, timeout=timeout, headers=headers)
             r.raise_for_status()
             return r.json()
         except Exception:
@@ -164,13 +177,18 @@ def _check_auth(request: Request) -> None:
 # Symbol normalization (map TASI 4-digit codes -> Yahoo .SR)
 # =============================================================================
 _CODE_RE = re.compile(r"(\d{4})$")
+_TASI_SUFFIX_RE = re.compile(r"\.TASI$", flags=re.I)
 
 
 def _to_yahoo_symbol(sym: str) -> str:
     s = (sym or "").strip().upper()
+    # 4-digit code → .SR
     m = _CODE_RE.search(s)
     if m:
         return f"{m.group(1)}.SR"
+    # <code>.TASI → <code>.SR
+    if _TASI_SUFFIX_RE.search(s):
+        return _TASI_SUFFIX_RE.sub(".SR", s)
     return s
 
 
@@ -178,6 +196,17 @@ def _to_yahoo_symbol(sym: str) -> str:
 # FastAPI app + public endpoints
 # =============================================================================
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
+
+# Optional CORS (only if CORS_ORIGINS provided)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        max_age=3600,
+    )
 
 
 @app.get("/")
@@ -189,6 +218,7 @@ def root():
         "endpoints": [
             "/health",
             "/healthz",
+            "/version",
             "/v41/quotes (POST, GET)",
             "/v41/charts (POST, GET)",
             "/v33/quotes (POST)",
@@ -210,6 +240,11 @@ def healthz():
     return {"ok": True, "ts": int(time.time())}
 
 
+@app.get("/version")
+def version():
+    return {"service": SERVICE_NAME, "version": VERSION, "auth_required": REQUIRE_AUTH}
+
+
 # =============================================================================
 # QUOTES (Yahoo) — POST /v33/quotes
 # - Accepts symbols as sent by Apps Script.
@@ -217,7 +252,12 @@ def healthz():
 # - Returns data keyed by the ORIGINAL symbols you send.
 # =============================================================================
 def _normalize_symbols(raw: List[str]) -> List[str]:
-    return [str(s).strip().upper() for s in raw if str(s).strip()]
+    out: List[str] = []
+    for s in raw or []:
+        t = str(s).strip()
+        if t:
+            out.append(t.upper())
+    return out
 
 
 def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
@@ -406,13 +446,14 @@ async def _charts_response(
     errors: List[str] = []
 
     tasks, metas = [], []
-    for orig, ysym in fetch_list:
+    for i, (orig, ysym) in enumerate(fetch_list):
         key = f"yc::{ysym}::{p1}::{p2}"
         cached = _cache_get(key)
         if cached is not None:
             out[orig] = cached
             continue
-        url = f"{YC_BASE}{quote(ysym)}?period1={p1}&period2={p2}&interval=1d&events=history%7Cdiv"
+        base = YC_BASES[i % len(YC_BASES)]
+        url = f"{base}{quote(ysym)}?period1={p1}&period2={p2}&interval=1d&events=history%7Cdiv"
         tasks.append(_fetch_json(url))
         metas.append((key, orig))
 
