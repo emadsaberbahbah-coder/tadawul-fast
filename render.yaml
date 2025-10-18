@@ -1,16 +1,60 @@
+# render.yaml — Tadawul FastAPI bridge
+#
+# Notes:
+# 1) Create a secret named "app-token" in Render and paste your long random token there.
+#    Dashboard → Secrets → New Secret → key: app-token, value: <YOUR_LONG_RANDOM_TOKEN>
+# 2) You can tweak QUOTES_CACHE_TTL / CHARTS_CACHE_TTL to match Apps Script TTLs.
+# 3) Keep APP_TOKEN in secrets (do not inline in YAML).
+
+envVarGroups:
+  - name: tadawul-fast-env
+    envVars:
+      - key: USER_AGENT
+        value: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36
+      - key: APP_TOKEN
+        fromSecret: app-token
+      # Optional, but handy knobs:
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ALLOW_ORIGINS
+        # Comma-separated list. Add your script.google.com origin if you restrict CORS.
+        value: "*"
+      - key: QUOTES_CACHE_TTL
+        value: "60"      # seconds (matches Apps Script CONFIG.API.CACHE_DURATION_QUOTE_SEC)
+      - key: CHARTS_CACHE_TTL
+        value: "900"     # seconds (matches Apps Script CONFIG.API.CACHE_DURATION_HISTORY_SEC)
+      - key: YF_MAX_WORKERS
+        value: "8"       # tune if your server has more/less CPU
+      - key: ENABLE_GET_FALLBACK
+        value: "true"    # allow GET variants for /v41/quotes and /v41/charts
+      # - key: SENTRY_DSN      # (optional) add if you use Sentry
+      #   value: https://<public_key>@o<org>.ingest.sentry.io/<project>
+
 services:
   - type: web
     name: tadawul-fast-1
     env: python
     plan: free
     region: oregon
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    autoDeploy: true
-    healthCheckPath: /health
-    envVars:
-      - key: APP_TOKEN
-        value: REPLACE_WITH_A_LONG_RANDOM_TOKEN
-      - key: USER_AGENT
-        value: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36
+    envVarGroups:
+      - tadawul-fast-env
 
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+
+    startCommand: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port $PORT
+      --proxy-headers
+      --forwarded-allow-ips='*'
+
+    autoDeploy: true
+
+    # Health check
+    healthCheckPath: /health
+    # healthCheckTimeoutSeconds: 30   # (optional) uncomment if your cold start is slow
+
+    # Scaling: free plan runs a single instance; keep explicit for clarity
+    numInstances: 1
