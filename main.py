@@ -1,9 +1,10 @@
-# main.py
 from __future__ import annotations
 
 import os
 import re
 import time
+import random
+import json
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -38,10 +39,13 @@ USER_AGENT = os.getenv(
 
 # Yahoo Finance endpoints
 YQ_BASES: List[str] = [
-    "https://query1.finance.yahoo.com/v7/finance/quote?formatted=false&symbols=",
-    "https://query2.finance.yahoo.com/v7/finance/quote?formatted=false&symbols=",
+    "https://query1.finance.yahoo.com/v7/finance/quote?symbols=",
+    "https://query2.finance.yahoo.com/v7/finance/quote?symbols=",
 ]
-YC_BASE: str = "https://query1.finance.yahoo.com/v8/finance/chart/"
+YC_BASES: List[str] = [
+    "https://query1.finance.yahoo.com/v8/finance/chart/",
+    "https://query2.finance.yahoo.com/v8/finance/chart/",
+]
 
 # Saudi Exchange fund API
 TAD_BASE: str = "https://www.saudiexchange.sa/api/chart/trading-data/mutual-funds/"
@@ -55,6 +59,18 @@ ARGAAM_CANDIDATES = [
     "https://www.argaam.com/ar/company/financials/{code}",
     "https://www.argaam.com/ar/tadawul/company?symbol={code}",
 ]
+
+# Yahoo tuning knobs
+QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "20"))           # safer than 50/100
+YAHOO_MAX_URL_LEN = int(os.getenv("YAHOO_MAX_URL_LEN", "1800"))
+YAHOO_MAX_RETRY_401 = int(os.getenv("YAHOO_MAX_RETRY_401", "3"))
+YAHOO_MIN_BACKOFF_MS = int(os.getenv("YAHOO_MIN_BACKOFF_MS", "600"))
+YAHOO_MAX_BACKOFF_MS = int(os.getenv("YAHOO_MAX_BACKOFF_MS", "2200"))
+
+DEFAULT_QUOTE_TTL = int(os.getenv("CACHE_DURATION_QUOTE_SEC", "60"))
+DEFAULT_CHART_TTL = int(os.getenv("CACHE_DURATION_HISTORY_SEC", "900"))
+
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))
 
 # =============================================================================
 # In-memory TTL cache  (key -> (expires_epoch, data))
@@ -89,13 +105,14 @@ def get_client() -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None:
         _CLIENT = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0),
+            timeout=httpx.Timeout(REQUEST_TIMEOUT),
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json, text/plain, */*",
                 "Pragma": "no-cache",
                 "Cache-Control": "no-cache",
             },
+            follow_redirects=True,
         )
     return _CLIENT
 
@@ -103,54 +120,47 @@ def get_client() -> httpx.AsyncClient:
 # =============================================================================
 # Async helpers
 # =============================================================================
-async def _sleep_backoff(i: int) -> None:
+async def _sleep_ms(ms: int) -> None:
     import asyncio
-    await asyncio.sleep(0.12 * (2 ** i))
+    await asyncio.sleep(max(0, ms) / 1000.0)
 
 
-async def _fetch_json(
-    url: str, retries: int = 2, timeout: Optional[float] = None
-) -> Optional[dict]:
+def _backoff_ms(attempt: int) -> int:
+    # randomized backoff within configured bounds, grows slightly with attempt
+    base = min(YAHOO_MAX_BACKOFF_MS, YAHOO_MIN_BACKOFF_MS * (1 + attempt))
+    return random.randint(YAHOO_MIN_BACKOFF_MS, base)
+
+
+async def _yahoo_get_json(url: str, add_referer_first: bool = True) -> Optional[dict]:
+    """
+    Try with Referer header, then without. Return JSON or None.
+    """
     client = get_client()
-    for i in range(retries + 1):
-        try:
-            r = await client.get(url, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            await _sleep_backoff(i)
-    return None
+    headers_ref = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "Referer": "https://finance.yahoo.com",
+    }
+    headers_no_ref = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+    }
+    headers_list = [headers_ref, headers_no_ref] if add_referer_first else [headers_no_ref, headers_ref]
 
-
-async def _fetch_html(
-    url: str, retries: int = 2, timeout: Optional[float] = 15.0
-) -> Optional[str]:
-    client = get_client()
-    for i in range(retries + 1):
+    for headers in headers_list:
         try:
-            r = await client.get(
-                url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Pragma": "no-cache",
-                    "Cache-Control": "no-cache",
-                },
-                timeout=timeout,
-            )
-            if r.status_code == 200 and r.text and len(r.text) > 1000:
-                return r.text
+            r = await client.get(url, headers=headers)
+            if 200 <= r.status_code < 300:
+                return r.json()
         except Exception:
             pass
-        await _sleep_backoff(i)
     return None
-
-
-async def _gather(tasks):
-    import asyncio
-    if not tasks:
-        return []
-    return await asyncio.gather(*tasks, return_exceptions=False)
 
 
 # =============================================================================
@@ -180,6 +190,8 @@ def _to_yahoo_symbol(sym: str) -> str:
     m = _CODE_RE.search(s)
     if m:
         return f"{m.group(1)}.SR"
+    if s.endswith(".TASI"):
+        return s[:-5] + ".SR"
     return s
 
 
@@ -190,7 +202,7 @@ app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to [FASTAPI_BASE] to restrict
+    allow_origins=["*"],  # restrict if you like
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -243,6 +255,61 @@ def _parse_query_list(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def _shrink_to_url_limit(host_prefix: str, items: List[str]) -> List[str]:
+    """
+    Ensure host_prefix + ",".join(items) stays under YAHOO_MAX_URL_LEN by shrinking items.
+    """
+    if not items:
+        return items
+    joined = ",".join(items)
+    url = host_prefix + quote(joined, safe="")
+    if len(url) <= YAHOO_MAX_URL_LEN:
+        return items
+    # shrink
+    lo, hi = 1, len(items)
+    best = [items[0]]
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        joined = ",".join(items[:mid])
+        url = host_prefix + quote(joined, safe="")
+        if len(url) <= YAHOO_MAX_URL_LEN:
+            best = items[:mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+async def _fetch_quotes_batch(batch: List[str]) -> Dict[str, Any]:
+    """
+    Fetch one batch across hosts with referer toggling & backoff.
+    Returns map keyed by Yahoo symbols.
+    """
+    out: Dict[str, Any] = {}
+    attempts = 0
+    while attempts <= YAHOO_MAX_RETRY_401:
+        for host in YQ_BASES:
+            shrink = _shrink_to_url_limit(host, batch)
+            if not shrink:
+                return out
+            url = host + quote(",".join(shrink), safe="")
+            # try with referer then without
+            for add_ref in (True, False):
+                j = await _yahoo_get_json(url, add_referer_first=add_ref)
+                if j and isinstance(j, dict):
+                    lst = (j.get("quoteResponse", {}) or {}).get("result") or []
+                    for r in lst:
+                        s = str(r.get("symbol") or "").upper()
+                        if not s:
+                            continue
+                        out[s] = r
+                    return out
+        # backoff then retry whole batch
+        attempts += 1
+        await _sleep_ms(_backoff_ms(attempts))
+    return out
+
+
 def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
@@ -253,20 +320,19 @@ def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, An
 
     out: Dict[str, Any] = {}
     errors: List[str] = []
-    chunk = 50
 
-    tasks, metas = [], []
-    for i in range(0, len(y_symbols), chunk):
-        batch = y_symbols[i : i + chunk]
+    tasks: List[Tuple[str, List[str]]] = []  # (cache_key, batch)
+    metas: List[Tuple[str, List[str]]] = []
+
+    for i in range(0, len(y_symbols), QUOTE_BATCH_SIZE):
+        batch = y_symbols[i : i + QUOTE_BATCH_SIZE]
         key = "yq::" + ",".join(batch)
         cached = _cache_get(key)
         if cached is not None:
-            out.update(cached)
+            out.update(cached)  # cached pack already mapped by orig symbols
             continue
-        base = YQ_BASES[(i // chunk) % len(YQ_BASES)]
-        url = base + ",".join(quote(s) for s in batch)
-        tasks.append(_fetch_json(url))
-        metas.append((key, batch, base))
+        tasks.append((key, batch))
+        metas.append((key, batch))
 
     return {
         "y_symbols": y_symbols,
@@ -280,24 +346,20 @@ def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, An
 
 
 async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
-    tasks = payload["tasks"]
+    tasks: List[Tuple[str, List[str]]] = payload["tasks"]
     metas = payload["metas"]
     out = payload["out"]
     errors = payload["errors"]
     back_map = payload["back_map"]
     cache_ttl = payload["cache_ttl"]
 
-    results = await _gather(tasks) if tasks else []
-
-    for (key, batch, _base), res in zip(metas, results):
-        if not res:
-            errors.append(f"Yahoo quote fetch failed for {batch}")
-            continue
-
-        arr = (((res or {}).get("quoteResponse") or {}).get("result")) or []
+    # fetch batches sequentially (safer re: rate limits)
+    for key, batch in tasks:
+        raw_map = await _fetch_quotes_batch(batch)
         pack: Dict[str, Any] = {}
-        for q in arr:
-            ysym = str(q.get("symbol", "")).upper()
+        if not raw_map:
+            errors.append(f"Yahoo quote fetch failed for {batch}")
+        for ysym, q in raw_map.items():
             orig = back_map.get(ysym, ysym)
 
             price = q.get("regularMarketPrice")
@@ -319,7 +381,7 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     shares = None
 
-            dy = q.get("trailingAnnualDividendYield")
+            dy = q.get("dividendYield")
             if dy is None:
                 rate = q.get("trailingAnnualDividendRate")
                 if rate is not None and price not in (None, 0):
@@ -328,23 +390,40 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                     except Exception:
                         dy = None
 
+            # Minimal + extended fields (so Apps Script can read either)
             pack[orig] = {
+                "symbol": q.get("symbol"),
                 "price": price,
-                "chgPct": (q.get("regularMarketChangePercent") or 0) / 100
-                if q.get("regularMarketChangePercent") is not None
-                else None,
-                "name": q.get("longName") or q.get("shortName"),
-                "sector": q.get("sector"),
-                "industry": q.get("industry"),
-                "dayHigh": q.get("regularMarketDayHigh"),
-                "dayLow": q.get("regularMarketDayLow"),
-                "volume": q.get("regularMarketVolume"),
+                "regularMarketPrice": price,
+                "regularMarketDayHigh": q.get("regularMarketDayHigh"),
+                "regularMarketDayLow": q.get("regularMarketDayLow"),
+                "regularMarketVolume": q.get("regularMarketVolume"),
                 "marketCap": mcap,
                 "sharesOutstanding": shares,
                 "dividendYield": dy,
+                "lastDividendValue": q.get("lastDividendValue"),
+                "dividendDate": q.get("dividendDate"),
                 "eps": eps,
+                "epsTrailingTwelveMonths": eps,
                 "pe": pe,
+                "trailingPE": pe,
                 "beta": q.get("beta"),
+                "beta3Year": q.get("beta3Year"),
+                "beta5YearMonthly": q.get("beta5YearMonthly"),
+                "shortName": q.get("shortName"),
+                "longName": q.get("longName"),
+                "name": q.get("longName") or q.get("shortName"),
+                "sector": q.get("sector"),
+                "industry": q.get("industry"),
+                "industryDisp": q.get("industryDisp"),
+                "fiftyTwoWeekHigh": q.get("fiftyTwoWeekHigh"),
+                "fiftyTwoWeekLow": q.get("fiftyTwoWeekLow"),
+                "recommendationKey": q.get("recommendationKey"),
+                "recommendationMean": q.get("recommendationMean"),
+                "marketCapIntraDay": q.get("marketCapIntraDay"),
+                "dayHigh": q.get("regularMarketDayHigh"),
+                "dayLow": q.get("regularMarketDayLow"),
+                "volume": q.get("regularMarketVolume"),
             }
 
         _cache_put(key, pack, cache_ttl)
@@ -368,58 +447,70 @@ async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]
 # =============================================================================
 # CHARTS helper
 # =============================================================================
+async def _fetch_chart_one(yahoo_symbol: str, p1: int, p2: int) -> List[Dict[str, Any]]:
+    """
+    Try both hosts and both header modes with backoff.
+    """
+    params = f"?period1={p1}&period2={p2}&interval=1d&events=history&includeAdjustedClose=true"
+
+    attempts = 0
+    while attempts <= YAHOO_MAX_RETRY_401:
+        for base in YC_BASES:
+            url = f"{base}{quote(yahoo_symbol, safe='')}{params}"
+            # with referer then without
+            for add_ref in (True, False):
+                j = await _yahoo_get_json(url, add_ref)
+                try:
+                    result = (((j or {}).get("chart") or {}).get("result") or [None])[0]
+                    if not result:
+                        continue
+                    ts = result.get("timestamp") or []
+                    q = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+                    series: List[Dict[str, Any]] = []
+                    for i, t in enumerate(ts):
+                        series.append(
+                            {
+                                "date": int(t) * 1000,
+                                "timestamp": int(t),
+                                "close": (q.get("close") or [None])[i],
+                                "high": (q.get("high") or [None])[i],
+                                "low": (q.get("low") or [None])[i],
+                                "volume": (q.get("volume") or [None])[i],
+                            }
+                        )
+                    return series
+                except Exception:
+                    # try next header/host
+                    pass
+        attempts += 1
+        await _sleep_ms(_backoff_ms(attempts))
+    return []
+
+
 async def _charts_response(
     symbols_in: List[str], p1: int, p2: int, cache_ttl: int
 ) -> Dict[str, Any]:
     if not symbols_in or not p1 or not p2:
         return {"data": {}}
 
-    fetch_list: List[Tuple[str, str]] = []  # (orig, ySymbol)
-    for s in symbols_in:
-        fetch_list.append((s, _to_yahoo_symbol(s)))
-
     out: Dict[str, Any] = {}
     errors: List[str] = []
 
-    tasks, metas = [], []
-    for orig, ysym in fetch_list:
+    # sequential (safer under rate limits)
+    for s in symbols_in:
+        orig = s
+        ysym = _to_yahoo_symbol(s)
         key = f"yc::{ysym}::{p1}::{p2}"
         cached = _cache_get(key)
         if cached is not None:
             out[orig] = cached
             continue
-        url = f"{YC_BASE}{quote(ysym)}?period1={p1}&period2={p2}&interval=1d&events=history%7Cdiv"
-        tasks.append(_fetch_json(url))
-        metas.append((key, orig))
 
-    results = await _gather(tasks) if tasks else []
-
-    for (key, orig), j in zip(metas, results):
-        hist: List[Dict[str, Any]] = []
-        try:
-            result = (((j or {}).get("chart") or {}).get("result") or [None])[0]
-            if result and result.get("timestamp"):
-                ts = result["timestamp"]
-                q = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
-                for i in range(len(ts)):
-                    c = (q.get("close") or [None])[i]
-                    if c is None:
-                        continue
-                    bar = {
-                        "date": int(ts[i]) * 1000,
-                        "open": (q.get("open") or [None])[i],
-                        "high": (q.get("high") or [None])[i],
-                        "low": (q.get("low") or [None])[i],
-                        "close": c,
-                        "volume": (q.get("volume") or [None])[i],
-                    }
-                    hist.append(bar)
-        except Exception:
-            errors.append(f"Yahoo chart parse failed for {orig}")
-            hist = []
-
-        _cache_put(key, hist, cache_ttl)
-        out[orig] = hist
+        series = await _fetch_chart_one(ysym, p1, p2)
+        if not series:
+            errors.append(f"chart fetch failed for {orig}")
+        _cache_put(key, series, cache_ttl)
+        out[orig] = series
 
     resp = {"data": out}
     if errors:
@@ -438,7 +529,7 @@ async def quotes(request: Request):
     except Exception:
         body = {}
     symbols = _normalize_symbols(body.get("symbols") or [])
-    cache_ttl = int(body.get("cache_ttl") or 60)
+    cache_ttl = int(body.get("cache_ttl") or DEFAULT_QUOTE_TTL)
     return await _quotes_response(symbols, cache_ttl)
 
 
@@ -450,15 +541,15 @@ async def quotes_v41(request: Request):
     except Exception:
         body = {}
     symbols = _normalize_symbols(body.get("symbols") or [])
-    cache_ttl = int(body.get("cache_ttl") or 60)
+    cache_ttl = int(body.get("cache_ttl") or DEFAULT_QUOTE_TTL)
     return await _quotes_response(symbols, cache_ttl)
 
 
 @app.get("/v41/quotes")
-async def quotes_v41_get(request: Request, symbols: Optional[str] = None, cache_ttl: int = 60):
+async def quotes_v41_get(request: Request, symbols: Optional[str] = None, cache_ttl: int = DEFAULT_QUOTE_TTL):
     _check_auth(request)
     parsed = _parse_query_list(symbols)
-    return await _quotes_response(_normalize_symbols(parsed), int(cache_ttl or 60))
+    return await _quotes_response(_normalize_symbols(parsed), int(cache_ttl or DEFAULT_QUOTE_TTL))
 
 
 # =============================================================================
@@ -474,7 +565,7 @@ async def charts(request: Request):
     symbols_in = _normalize_symbols(body.get("symbols") or [])
     p1 = int(body.get("period1") or 0)
     p2 = int(body.get("period2") or 0)
-    cache_ttl = int(body.get("cache_ttl") or 900)
+    cache_ttl = int(body.get("cache_ttl") or DEFAULT_CHART_TTL)
     return await _charts_response(symbols_in, p1, p2, cache_ttl)
 
 
@@ -488,7 +579,7 @@ async def charts_v41(request: Request):
     symbols_in = _normalize_symbols(body.get("symbols") or [])
     p1 = int(body.get("period1") or 0)
     p2 = int(body.get("period2") or 0)
-    cache_ttl = int(body.get("cache_ttl") or 900)
+    cache_ttl = int(body.get("cache_ttl") or DEFAULT_CHART_TTL)
     return await _charts_response(symbols_in, p1, p2, cache_ttl)
 
 
@@ -498,13 +589,13 @@ async def charts_v41_get(
     symbols: Optional[str] = None,
     period1: Optional[int] = None,
     period2: Optional[int] = None,
-    cache_ttl: int = 900,
+    cache_ttl: int = DEFAULT_CHART_TTL,
 ):
     _check_auth(request)
     parsed = _normalize_symbols(_parse_query_list(symbols))
     p1 = int(period1 or 0)
     p2 = int(period2 or 0)
-    return await _charts_response(parsed, p1, p2, int(cache_ttl or 900))
+    return await _charts_response(parsed, p1, p2, int(cache_ttl or DEFAULT_CHART_TTL))
 
 
 # =============================================================================
@@ -522,7 +613,7 @@ async def fund(request: Request, code: str):
     rows: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    j = await _fetch_json(url)
+    j = await _yahoo_get_json(url, add_referer_first=False)  # simple GET
     if j is None:
         errors.append("fetch error")
 
@@ -781,7 +872,7 @@ async def argaam_quotes_get(
 
     tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
     body = {"tickers": tickers_list, "cache_ttl": cache_ttl}
-    request._body = body  # type: ignore (reuse POST logic)
+    request._body = body  # type: ignore
     return await argaam_quotes(request)
 
 
