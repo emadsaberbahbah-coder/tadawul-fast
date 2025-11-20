@@ -4,7 +4,6 @@ import os
 import re
 import time
 import random
-import json
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -18,19 +17,23 @@ try:
 except Exception:
     BeautifulSoup = None  # type: ignore
 
+
 # =============================================================================
-# Configuration (environment-driven)
+# Basic service metadata & env-driven configuration
 # =============================================================================
 SERVICE_NAME = "tadawul-fast"
 VERSION = "v41"
 
+# Auth tokens (either can be used)
 FASTAPI_TOKEN = os.getenv("FASTAPI_TOKEN", "").strip()
-APP_TOKEN = os.getenv("APP_TOKEN", "").strip()  # backward-compat
+APP_TOKEN = os.getenv("APP_TOKEN", "").strip()  # backward-compatible name
 REQUIRE_AUTH = bool(FASTAPI_TOKEN or APP_TOKEN)
 
+# Optional base URL / deploy hook (for informational & deploy endpoint)
 FASTAPI_BASE = os.getenv("FASTAPI_BASE", "").strip()
 RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", "").strip()
 
+# Default user agent for outbound HTTP
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,15 +64,17 @@ ARGAAM_CANDIDATES = [
 ]
 
 # Yahoo tuning knobs
-QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "20"))           # safer than 50/100
+QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "20"))  # safer than 50/100
 YAHOO_MAX_URL_LEN = int(os.getenv("YAHOO_MAX_URL_LEN", "1800"))
 YAHOO_MAX_RETRY_401 = int(os.getenv("YAHOO_MAX_RETRY_401", "3"))
 YAHOO_MIN_BACKOFF_MS = int(os.getenv("YAHOO_MIN_BACKOFF_MS", "600"))
 YAHOO_MAX_BACKOFF_MS = int(os.getenv("YAHOO_MAX_BACKOFF_MS", "2200"))
 
+# Cache TTLs
 DEFAULT_QUOTE_TTL = int(os.getenv("CACHE_DURATION_QUOTE_SEC", "60"))
 DEFAULT_CHART_TTL = int(os.getenv("CACHE_DURATION_HISTORY_SEC", "900"))
 
+# HTTP timeout
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))
 
 # =============================================================================
@@ -122,11 +127,14 @@ def get_client() -> httpx.AsyncClient:
 # =============================================================================
 async def _sleep_ms(ms: int) -> None:
     import asyncio
+
     await asyncio.sleep(max(0, ms) / 1000.0)
 
 
 def _backoff_ms(attempt: int) -> int:
-    # randomized backoff within configured bounds, grows slightly with attempt
+    """
+    Randomized backoff within configured bounds, grows slightly with attempt.
+    """
     base = min(YAHOO_MAX_BACKOFF_MS, YAHOO_MIN_BACKOFF_MS * (1 + attempt))
     return random.randint(YAHOO_MIN_BACKOFF_MS, base)
 
@@ -134,6 +142,7 @@ def _backoff_ms(attempt: int) -> int:
 async def _yahoo_get_json(url: str, add_referer_first: bool = True) -> Optional[dict]:
     """
     Try with Referer header, then without. Return JSON or None.
+    Used both for Yahoo and for simple JSON APIs (e.g., Tadawul fund).
     """
     client = get_client()
     headers_ref = {
@@ -159,7 +168,36 @@ async def _yahoo_get_json(url: str, add_referer_first: bool = True) -> Optional[
             if 200 <= r.status_code < 300:
                 return r.json()
         except Exception:
+            # try next header style
             pass
+    return None
+
+
+async def _fetch_html(url: str, retries: int = 2, timeout: float = 15.0) -> Optional[str]:
+    """
+    Simple HTML fetcher used by Argaam helpers.
+    Retries a few times with basic backoff.
+    """
+    if not url:
+        return None
+
+    client = get_client()
+    for attempt in range(retries + 1):
+        try:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+                timeout=timeout,
+            )
+            if 200 <= r.status_code < 300:
+                return r.text
+        except Exception:
+            # try again with backoff
+            if attempt < retries:
+                await _sleep_ms(_backoff_ms(attempt))
     return None
 
 
@@ -167,12 +205,17 @@ async def _yahoo_get_json(url: str, add_referer_first: bool = True) -> Optional[
 # Auth
 # =============================================================================
 def _check_auth(request: Request) -> None:
-    """Enforce Bearer auth only if a token is configured."""
+    """
+    Enforce Bearer auth only if a token is configured.
+    Accepts either FASTAPI_TOKEN or APP_TOKEN as the valid token.
+    """
     if not REQUIRE_AUTH:
         return
+
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
+
     token = auth.split(" ", 1)[1].strip()
     allowed = {t for t in (FASTAPI_TOKEN, APP_TOKEN) if t}
     if token not in allowed:
@@ -202,10 +245,11 @@ app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict if you like
+    allow_origins=["*"],  # can be restricted later if needed
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =============================================================================
 # Meta / health
@@ -265,7 +309,8 @@ def _shrink_to_url_limit(host_prefix: str, items: List[str]) -> List[str]:
     url = host_prefix + quote(joined, safe="")
     if len(url) <= YAHOO_MAX_URL_LEN:
         return items
-    # shrink
+
+    # shrink with binary search
     lo, hi = 1, len(items)
     best = [items[0]]
     while lo <= hi:
@@ -287,11 +332,13 @@ async def _fetch_quotes_batch(batch: List[str]) -> Dict[str, Any]:
     """
     out: Dict[str, Any] = {}
     attempts = 0
+
     while attempts <= YAHOO_MAX_RETRY_401:
         for host in YQ_BASES:
             shrink = _shrink_to_url_limit(host, batch)
             if not shrink:
                 return out
+
             url = host + quote(",".join(shrink), safe="")
             # try with referer then without
             for add_ref in (True, False):
@@ -304,15 +351,18 @@ async def _fetch_quotes_batch(batch: List[str]) -> Dict[str, Any]:
                             continue
                         out[s] = r
                     return out
+
         # backoff then retry whole batch
         attempts += 1
         await _sleep_ms(_backoff_ms(attempts))
+
     return out
 
 
 def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, Any]:
     y_symbols: List[str] = []
     back_map: Dict[str, str] = {}
+
     for s in raw_symbols:
         y = _to_yahoo_symbol(s)
         y_symbols.append(y)
@@ -320,12 +370,11 @@ def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, An
 
     out: Dict[str, Any] = {}
     errors: List[str] = []
-
     tasks: List[Tuple[str, List[str]]] = []  # (cache_key, batch)
     metas: List[Tuple[str, List[str]]] = []
 
     for i in range(0, len(y_symbols), QUOTE_BATCH_SIZE):
-        batch = y_symbols[i : i + QUOTE_BATCH_SIZE]
+        batch = y_symbols[i: i + QUOTE_BATCH_SIZE]
         key = "yq::" + ",".join(batch)
         cached = _cache_get(key)
         if cached is not None:
@@ -347,7 +396,7 @@ def _build_quote_payload(raw_symbols: List[str], cache_ttl: int) -> Dict[str, An
 
 async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
     tasks: List[Tuple[str, List[str]]] = payload["tasks"]
-    metas = payload["metas"]
+    metas = payload["metas"]  # noqa: F841 (kept for potential logging)
     out = payload["out"]
     errors = payload["errors"]
     back_map = payload["back_map"]
@@ -359,6 +408,7 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
         pack: Dict[str, Any] = {}
         if not raw_map:
             errors.append(f"Yahoo quote fetch failed for {batch}")
+
         for ysym, q in raw_map.items():
             orig = back_map.get(ysym, ysym)
 
@@ -390,7 +440,6 @@ async def _resolve_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                     except Exception:
                         dy = None
 
-            # Minimal + extended fields (so Apps Script can read either)
             pack[orig] = {
                 "symbol": q.get("symbol"),
                 "price": price,
@@ -437,7 +486,7 @@ async def _quotes_response(symbols: List[str], cache_ttl: int) -> Dict[str, Any]
         return {"data": {}}
     payload = _build_quote_payload(symbols, cache_ttl)
     out = await _resolve_quotes(payload)
-    resp = {"data": out}
+    resp: Dict[str, Any] = {"data": out}
     errors = payload["errors"]
     if errors:
         resp["error"] = "; ".join(errors)
@@ -459,7 +508,7 @@ async def _fetch_chart_one(yahoo_symbol: str, p1: int, p2: int) -> List[Dict[str
             url = f"{base}{quote(yahoo_symbol, safe='')}{params}"
             # with referer then without
             for add_ref in (True, False):
-                j = await _yahoo_get_json(url, add_ref)
+                j = await _yahoo_get_json(url, add_referer_first=add_ref)
                 try:
                     result = (((j or {}).get("chart") or {}).get("result") or [None])[0]
                     if not result:
@@ -512,7 +561,7 @@ async def _charts_response(
         _cache_put(key, series, cache_ttl)
         out[orig] = series
 
-    resp = {"data": out}
+    resp: Dict[str, Any] = {"data": out}
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
@@ -546,7 +595,11 @@ async def quotes_v41(request: Request):
 
 
 @app.get("/v41/quotes")
-async def quotes_v41_get(request: Request, symbols: Optional[str] = None, cache_ttl: int = DEFAULT_QUOTE_TTL):
+async def quotes_v41_get(
+    request: Request,
+    symbols: Optional[str] = None,
+    cache_ttl: int = DEFAULT_QUOTE_TTL,
+):
     _check_auth(request)
     parsed = _parse_query_list(symbols)
     return await _quotes_response(_normalize_symbols(parsed), int(cache_ttl or DEFAULT_QUOTE_TTL))
@@ -654,7 +707,7 @@ async def fund(request: Request, code: str):
         rows = []
 
     _cache_put(key, rows, 6 * 3600)
-    resp = {"data": rows}
+    resp: Dict[str, Any] = {"data": rows}
     if errors:
         resp["error"] = "; ".join(errors)
     return resp
@@ -872,6 +925,7 @@ async def argaam_quotes_get(
 
     tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
     body = {"tickers": tickers_list, "cache_ttl": cache_ttl}
+    # pass constructed body to the POST handler
     request._body = body  # type: ignore
     return await argaam_quotes(request)
 
