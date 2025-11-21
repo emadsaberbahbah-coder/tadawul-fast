@@ -6,37 +6,37 @@
 TZ=Asia/Riyadh
 ENVIRONMENT=production
 SERVICE_NAME=Stock Market Hub Sheet API
-SERVICE_VERSION=1.8.0
+SERVICE_VERSION=2.0.0
 APP_HOST=0.0.0.0
 APP_PORT=8101
 TRADING_INTERVAL_MINUTES=5
 
-# --- Data Provider Configuration (Choose ONE) ---
-# Options: YF (Yahoo Finance - Live), MOCK (Demo Data), ARGAAM (Argaam Scraping)
-DATA_PROVIDER=YF
+# --- Data Provider Configuration ---
+DATA_PROVIDER=MULTI_SOURCE  # Use all available data sources
+# DATA_PROVIDER=YF
 # DATA_PROVIDER=MOCK
 # DATA_PROVIDER=ARGAAM
 
 # --- Yahoo Finance API Settings ---
-YF_TIMEOUT=15
+YF_TIMEOUT=20
 YF_MAX_RETRIES=3
 YF_PERIOD=3mo
 YF_INTERVAL=1d
-YF_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+YF_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36
 
 # --- Argaam Integration Settings ---
 ARGAAM_TIMEOUT=30
 ARGAAM_MAX_RETRIES=3
 ARGAAM_CACHE_TTL=600
-ARGAAM_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+ARGAAM_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36
 
 # --- Authentication & Security ---
-APP_TOKEN=your_app_token_here_12345
-FASTAPI_TOKEN=your_fastapi_token_here_67890
+FASTAPI_TOKEN=c0487616ceaeaa47122cabb7b3e66a09
+APP_TOKEN=c0487616ceaeaa47122cabb7b3e66a09
 REQUIRE_AUTH=true
 ALLOWED_ORIGINS=*
-# Add these to your .env file or Render environment variables:
 
+# --- Financial Data API Keys ---
 # Alpha Vantage
 ALPHA_VANTAGE_API_KEY=Q0VIE9J6AXUCG99F
 
@@ -55,15 +55,11 @@ MARKETSTACK_API_KEY=657b972a96392c3cac405ccc48c36b0c
 # Financial Modeling Prep
 FMP_API_KEY=3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt
 
-# Google Apps Script Web App
+# Google Apps Script Integration
 GOOGLE_APPS_SCRIPT_URL=https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec
-
-# Your existing tokens
-FASTAPI_TOKEN=c0487616ceaeaa47122cabb7b3e66a09
-APP_TOKEN=c0487616ceaeaa47122cabb7b3e66a09
+GOOGLE_APPS_SCRIPT_BACKUP_URL=https://script.google.com/macros/s/AKfycbyI7a_xj7zvCa10CnzJP9wf8N1qPG3DYYb-LVkUCOEVEHjALzZq_Ox9YUJgbkzq86py6g/exec
 
 # --- Google Sheets Configuration ---
-# Primary Spreadsheet ID
 SHEETS_SPREADSHEET_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
 GOOGLE_SHEETS_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
 
@@ -78,13 +74,13 @@ SHEETS_HEADER_ROW=3
 SHEETS_DATA_START_ROW=4
 
 # --- Google Service Account Credentials ---
-# Windows Absolute Path
-SHEETS_JSON_CREDENTIALS_PATH=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
-GOOGLE_CREDENTIALS_FILE=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
+# Render Deployment Path (Linux)
+SHEETS_JSON_CREDENTIALS_PATH=./creds/google-service.json
+GOOGLE_CREDENTIALS_FILE=./creds/google-service.json
 
-# Alternative Linux/Mac Path (commented)
-# SHEETS_JSON_CREDENTIALS_PATH=./creds/google-service.json
-# GOOGLE_CREDENTIALS_FILE=./creds/google-service.json
+# Alternative Windows Path (commented)
+# SHEETS_JSON_CREDENTIALS_PATH=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
+# GOOGLE_CREDENTIALS_FILE=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
 
 # --- Cache & Performance Settings ---
 CACHE_PATH=./quote_cache.json
@@ -93,8 +89,9 @@ CACHE_AUTO_SAVE=true
 CACHE_BACKUP_RETENTION_DAYS=7
 
 # Request Rate Limiting
-RATE_LIMIT_REQUESTS_PER_MINUTE=60
+RATE_LIMIT_REQUESTS_PER_MINUTE=100
 RATE_LIMIT_MAX_SYMBOLS_PER_REQUEST=50
+RATE_LIMIT_API_CALLS_PER_MINUTE=200
 
 # --- Logging Configuration ---
 LOG_LEVEL=INFO
@@ -103,7 +100,7 @@ LOG_MAX_SIZE_MB=10
 LOG_BACKUP_COUNT=5
 
 # --- API Endpoint Configuration ---
-FASTAPI_BASE=
+FASTAPI_BASE=https://tadawul-fast-1.onrender.com
 API_PREFIX=/v1
 ENABLE_SWAGGER=true
 ENABLE_REDOC=true
@@ -114,6 +111,8 @@ ENABLE_GOOGLE_SHEETS=true
 ENABLE_AI_ANALYSIS=true
 ENABLE_MARKET_DASHBOARD=true
 ENABLE_SYMBOLS_READER=true
+ENABLE_MULTI_SOURCE_DATA=true
+ENABLE_GOOGLE_APPS_SCRIPT=true
 
 # --- Market Data Settings ---
 DEFAULT_MARKET=SAUDI
@@ -128,20 +127,37 @@ AI_MAX_TOKENS=1000
 AI_TEMPERATURE=0.7
 AI_ANALYSIS_TIMEOUT=30
 
-# --- External API Keys (Placeholders) ---
-# YAHOO_FINANCE_API_KEY=your_yahoo_finance_api_key
-# ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key
-# OPENAI_API_KEY=your_openai_api_key
+# --- External API Configuration ---
+ALPHA_VANTAGE_TIMEOUT=15
+FINNHUB_TIMEOUT=15
+TWELVEDATA_TIMEOUT=15
+MARKETSTACK_TIMEOUT=15
+FMP_TIMEOUT=15
+
+# --- Multi-Source Data Fusion ---
+DATA_SOURCE_PRIORITY=ALPHA_VANTAGE,FINNHUB,TWELVEDATA,MARKETSTACK,YF,ARGAAM
+PRICE_CONSENSUS_THRESHOLD=0.8
+MIN_DATA_SOURCES=2
 
 # --- Monitoring & Health Checks ---
 HEALTH_CHECK_INTERVAL=300
 METRICS_ENABLED=true
 ALERT_EMAIL=admin@example.com
+API_STATUS_CHECK_INTERVAL=3600
 
 # --- Backup & Recovery ---
 AUTO_BACKUP_ENABLED=true
 AUTO_BACKUP_INTERVAL_HOURS=24
 BACKUP_RETENTION_DAYS=30
+
+# --- Deployment URLs ---
+RENDER_DEPLOYMENT_URL=https://tadawul-fast-1.onrender.com
+BACKUP_DEPLOYMENT_URL=https://tadawul-fastap.onrender.com
+
+# --- Security & Rate Limits ---
+MAX_REQUEST_SIZE_MB=10
+ENABLE_RATE_LIMITING=true
+TRUSTED_PROXIES=*
 
 # =============================================================================
 # Development Settings (Override above in development)
@@ -152,3 +168,4 @@ BACKUP_RETENTION_DAYS=30
 # ENABLE_REDOC=true
 # CACHE_AUTO_SAVE=false
 # REQUIRE_AUTH=false
+# DATA_PROVIDER=MOCK
