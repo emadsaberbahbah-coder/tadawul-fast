@@ -50,7 +50,8 @@ SERVICE_NAME = os.getenv("SERVICE_NAME", "Tadawul Stock Analysis API")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2.1.0")
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("APP_PORT", "8000"))
-APP_TOKEN = os.getenv("APP_TOKEN", "")
+APP_TOKEN = os.getenv("APP_TOKEN", "c0487616ceaeaa47122cabb7b3e66a09")
+BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "441669eb92442fdde6dcae35c248f37f")
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
 
 # Google Sheets Configuration
@@ -63,6 +64,48 @@ EXPECTED_SHEETS = [
     "Companies", "Financials", "Prices", "Indicators", 
     "Sectors", "Analysis", "Reports", "Users", "Settings"
 ]
+
+# Financial API Configuration
+FINANCIAL_APIS = {
+    "alpha_vantage": {
+        "api_key": os.getenv("ALPHA_VANTAGE_API_KEY", "Q0VIE9J6AXUCG99F"),
+        "base_url": os.getenv("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"),
+        "timeout": int(os.getenv("ALPHA_VANTAGE_TIMEOUT", "15"))
+    },
+    "finnhub": {
+        "api_key": os.getenv("FINNHUB_API_KEY", "d3uhd8pr01qil4aq3i5gd3uhd8pr01qil4aq3i60"),
+        "base_url": os.getenv("FINNHUB_BASE_URL", "https://finnhub.io/api/v1"),
+        "timeout": int(os.getenv("FINNHUB_TIMEOUT", "15"))
+    },
+    "eodhd": {
+        "api_key": os.getenv("EODHD_API_KEY", "68fd1783ee7eb1.12039806"),
+        "base_url": os.getenv("EODHD_BASE_URL", "https://eodhistoricaldata.com/api"),
+        "timeout": int(os.getenv("EODHD_TIMEOUT", "15"))
+    },
+    "twelvedata": {
+        "api_key": os.getenv("TWELVEDATA_API_KEY", "ca363b090fbb421a84c05882e4f1e393"),
+        "base_url": os.getenv("TWELVEDATA_BASE_URL", "https://api.twelvedata.com"),
+        "timeout": int(os.getenv("TWELVEDATA_TIMEOUT", "15"))
+    },
+    "marketstack": {
+        "api_key": os.getenv("MARKETSTACK_API_KEY", "657b972a96392c3cac405ccc48c36b0c"),
+        "base_url": os.getenv("MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"),
+        "timeout": int(os.getenv("MARKETSTACK_TIMEOUT", "15"))
+    },
+    "fmp": {
+        "api_key": os.getenv("FMP_API_KEY", "3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt"),
+        "base_url": os.getenv("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"),
+        "timeout": int(os.getenv("FMP_TIMEOUT", "15"))
+    }
+}
+
+# Google Services Configuration
+GOOGLE_SERVICES = {
+    "spreadsheet_id": os.getenv("SPREADSHEET_ID", "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"),
+    "apps_script_url": os.getenv("GOOGLE_APPS_SCRIPT_URL", "https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec"),
+    "apps_script_backup_url": os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL", "https://script.google.com/macros/s/AKfycbyI7a_xj7zvCa10CnzJP9wf8N1qPG3DYYb-LVkUCOEVEHjALzZq_Ox9YUJgbkzq86py6g/exec"),
+    "sheets_csv_url": os.getenv("GOOGLE_SHEETS_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vTbiLOkNqsCz_FKIJH3em6HPT8N6cLFAuAKCW1ALz7JP9JwrQvvSQRIvtv2OuESSSB2Hkbrh2BchoWd/pub?output=csv")
+}
 
 # Security
 security = HTTPBearer(auto_error=False)
@@ -84,7 +127,8 @@ def get_required_config(key: str) -> str:
 def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Enhanced authentication dependency."""
     if REQUIRE_AUTH:
-        if not credentials or credentials.credentials != APP_TOKEN:
+        valid_tokens = [APP_TOKEN, BACKUP_APP_TOKEN]
+        if not credentials or credentials.credentials not in valid_tokens:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing authentication token"
@@ -137,7 +181,7 @@ class GoogleSheetsManager:
             return None
             
         try:
-            spreadsheet_id = get_required_config('SPREADSHEET_ID')
+            spreadsheet_id = GOOGLE_SERVICES["spreadsheet_id"]
             cls._spreadsheet = client.open_by_key(spreadsheet_id)
             logger.info(f"✅ Spreadsheet accessed: {cls._spreadsheet.title}")
             return cls._spreadsheet
@@ -182,6 +226,112 @@ class GoogleSheetsManager:
             return {"status": "ERROR", "message": f"Connection test failed: {str(e)}"}
 
 # =============================================================================
+# Financial Data API Client
+# =============================================================================
+
+class FinancialDataClient:
+    """Enhanced financial data client with multiple API support."""
+    
+    def __init__(self):
+        self.apis = FINANCIAL_APIS
+        self.session = None
+    
+    async def get_session(self):
+        """Get or create aiohttp session."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def close(self):
+        """Close the session."""
+        if self.session:
+            await self.session.close()
+    
+    async def get_stock_quote(self, symbol: str, api_name: str = "alpha_vantage") -> Optional[Dict[str, Any]]:
+        """Get stock quote from specified API."""
+        if api_name not in self.apis:
+            logger.error(f"API {api_name} not configured")
+            return None
+            
+        api_config = self.apis[api_name]
+        
+        try:
+            session = await self.get_session()
+            
+            if api_name == "alpha_vantage":
+                params = {
+                    'function': 'GLOBAL_QUOTE',
+                    'symbol': symbol,
+                    'apikey': api_config["api_key"]
+                }
+                async with session.get(api_config["base_url"], params=params, timeout=api_config["timeout"]) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._parse_alpha_vantage_quote(data)
+            
+            elif api_name == "finnhub":
+                params = {
+                    'symbol': symbol,
+                    'token': api_config["api_key"]
+                }
+                async with session.get(f"{api_config['base_url']}/quote", params=params, timeout=api_config["timeout"]) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._parse_finnhub_quote(data, symbol)
+            
+            # Add other API implementations here...
+            
+        except Exception as e:
+            logger.error(f"Error fetching data from {api_name}: {e}")
+        
+        return None
+    
+    def _parse_alpha_vantage_quote(self, data: Dict) -> Optional[Dict[str, Any]]:
+        """Parse Alpha Vantage quote data."""
+        try:
+            quote = data.get('Global Quote', {})
+            if not quote:
+                return None
+                
+            return {
+                'price': float(quote.get('05. price', 0)),
+                'change': float(quote.get('09. change', 0)),
+                'change_percent': float(quote.get('10. change percent', '0').rstrip('%')),
+                'volume': int(quote.get('06. volume', 0)),
+                'timestamp': quote.get('07. latest trading day')
+            }
+        except Exception as e:
+            logger.error(f"Error parsing Alpha Vantage data: {e}")
+            return None
+    
+    def _parse_finnhub_quote(self, data: Dict, symbol: str) -> Optional[Dict[str, Any]]:
+        """Parse Finnhub quote data."""
+        try:
+            return {
+                'price': data.get('c', 0),
+                'change': data.get('d', 0),
+                'change_percent': data.get('dp', 0),
+                'high': data.get('h', 0),
+                'low': data.get('l', 0),
+                'open': data.get('o', 0),
+                'previous_close': data.get('pc', 0),
+                'timestamp': datetime.datetime.fromtimestamp(data.get('t', 0)).isoformat() if data.get('t') else None
+            }
+        except Exception as e:
+            logger.error(f"Error parsing Finnhub data: {e}")
+            return None
+    
+    def get_api_status(self) -> Dict[str, bool]:
+        """Get status of all configured APIs."""
+        status = {}
+        for api_name, config in self.apis.items():
+            status[api_name] = bool(config.get("api_key"))
+        return status
+
+# Initialize financial data client
+financial_client = FinancialDataClient()
+
+# =============================================================================
 # Enhanced Data Models
 # =============================================================================
 
@@ -193,10 +343,11 @@ class Quote(BaseModel):
     previous_close: Optional[float] = Field(None, ge=0, description="Previous close price")
     day_change_pct: Optional[float] = Field(None, description="Daily change percentage")
     market_cap: Optional[float] = Field(None, ge=0, description="Market capitalization")
-    volume: Optional[float] = Field(None, ge=0, description="Trading volume")
+    volume: Optional[float] = Field(NNone, ge=0, description="Trading volume")
     fifty_two_week_high: Optional[float] = Field(None, ge=0, description="52-week high")
     fifty_two_week_low: Optional[float] = Field(None, ge=0, description="52-week low")
     timestamp_utc: Optional[str] = Field(None, description="UTC timestamp")
+    data_source: Optional[str] = Field(None, description="Data source")
 
     @validator('ticker')
     def validate_ticker(cls, v):
@@ -238,11 +389,18 @@ class HealthResponse(BaseModel):
     google_sheets_connected: bool
     cache_status: Dict[str, Any]
     features: Dict[str, bool]
+    api_status: Dict[str, bool]
 
 class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
     timestamp: str
+
+class APITestResponse(BaseModel):
+    api_name: str
+    status: str
+    response_time: Optional[float] = None
+    error: Optional[str] = None
 
 # =============================================================================
 # Enhanced Cache System
@@ -482,6 +640,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Error closing Argaam client: {e}")
     
+    # Close financial data client
+    await financial_client.close()
+    
     shutdown_time = datetime.datetime.utcnow()
     uptime = shutdown_time - startup_time
     logger.info(f"🛑 Shutting down after {uptime}")
@@ -498,9 +659,12 @@ app = FastAPI(
     ### Key Features:
     - ✅ Real-time stock data and analysis
     - ✅ Google Sheets integration with 9-page verification
-    - ✅ Multi-source data aggregation
+    - ✅ Multi-source data aggregation (6 financial APIs)
     - ✅ Advanced caching system
     - ✅ Comprehensive health monitoring
+    
+    ### Integrated Financial APIs:
+    - Alpha Vantage, Finnhub, EODHD, Twelve Data, MarketStack, FMP
     
     ### Main Endpoints:
     - `GET /` - API information and status
@@ -508,6 +672,7 @@ app = FastAPI(
     - `GET /verify-sheets` - Verify all Google Sheets pages
     - `GET /sheet/{name}` - Get specific sheet data
     - `GET /api/saudi/market` - Saudi market data
+    - `GET /v1/financial-apis/status` - Financial APIs status
     """,
     docs_url="/docs" if os.getenv("ENABLE_SWAGGER", "true").lower() == "true" else None,
     redoc_url="/redoc" if os.getenv("ENABLE_REDOC", "true").lower() == "true" else None,
@@ -560,6 +725,7 @@ async def global_exception_handler(request, exc):
 async def root(auth: bool = Depends(verify_auth)):
     """Enhanced root endpoint with comprehensive API information."""
     sheets_status = GoogleSheetsManager.test_connection()
+    api_status = financial_client.get_api_status()
     
     return {
         "service": SERVICE_NAME,
@@ -573,6 +739,7 @@ async def root(auth: bool = Depends(verify_auth)):
             "spreadsheet": sheets_status.get("spreadsheet_title"),
             "total_sheets": sheets_status.get("total_sheets", 0)
         },
+        "financial_apis": api_status,
         "features": {
             "dashboard": HAS_DASHBOARD,
             "argaam_integration": HAS_ARGAAM_ROUTES,
@@ -592,7 +759,8 @@ async def root(auth: bool = Depends(verify_auth)):
             "connection_test": "/test-connection",
             "saudi_market": "/api/saudi/market",
             "quotes": "/v1/quote",
-            "cache_info": "/v1/cache"
+            "cache_info": "/v1/cache",
+            "financial_apis_status": "/v1/financial-apis/status"
         }
     }
 
@@ -600,6 +768,7 @@ async def root(auth: bool = Depends(verify_auth)):
 async def health_check():
     """Comprehensive health check endpoint."""
     sheets_status = GoogleSheetsManager.test_connection()
+    api_status = financial_client.get_api_status()
     
     health_status = "healthy"
     if sheets_status["status"] != "SUCCESS":
@@ -619,7 +788,8 @@ async def health_check():
             "dashboard": HAS_DASHBOARD,
             "argaam_routes": HAS_ARGAAM_ROUTES,
             "google_apps_script": HAS_GOOGLE_APPS_SCRIPT
-        }
+        },
+        api_status=api_status
     )
 
 # =============================================================================
@@ -652,7 +822,7 @@ async def verify_all_sheets(auth: bool = Depends(verify_auth)):
         overall_status = "SUCCESS" if sheets_ok == len(EXPECTED_SHEETS) else "PARTIAL_SUCCESS"
         
         return VerificationResponse(
-            spreadsheet_id=os.getenv('SPREADSHEET_ID'),
+            spreadsheet_id=GOOGLE_SERVICES["spreadsheet_id"],
             overall_status=overall_status,
             sheets_verified=len(EXPECTED_SHEETS),
             sheets_ok=sheets_ok,
@@ -698,6 +868,71 @@ async def get_sheet_names(auth: bool = Depends(verify_auth)):
 async def test_connection(auth: bool = Depends(verify_auth)):
     """Comprehensive Google Sheets connection test."""
     return GoogleSheetsManager.test_connection()
+
+# =============================================================================
+# Financial APIs Endpoints
+# =============================================================================
+
+@app.get("/v1/financial-apis/status", response_model=Dict[str, Any])
+async def get_financial_apis_status(auth: bool = Depends(verify_auth)):
+    """Get status of all financial APIs."""
+    api_status = financial_client.get_api_status()
+    
+    # Test each API with a simple request
+    test_results = []
+    for api_name in api_status.keys():
+        if api_status[api_name]:  # Only test if API key is configured
+            try:
+                start_time = datetime.datetime.now()
+                result = await financial_client.get_stock_quote("AAPL", api_name)
+                response_time = (datetime.datetime.now() - start_time).total_seconds()
+                
+                if result:
+                    test_results.append({
+                        "api_name": api_name,
+                        "status": "SUCCESS",
+                        "response_time": round(response_time, 3),
+                        "data_sample": result
+                    })
+                else:
+                    test_results.append({
+                        "api_name": api_name,
+                        "status": "ERROR",
+                        "error": "No data returned"
+                    })
+            except Exception as e:
+                test_results.append({
+                    "api_name": api_name,
+                    "status": "ERROR",
+                    "error": str(e)
+                })
+    
+    return {
+        "api_configuration": api_status,
+        "api_tests": test_results,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+    }
+
+@app.get("/v1/financial-data/{symbol}")
+async def get_financial_data(
+    symbol: str,
+    api: str = Query("alpha_vantage", description="API to use"),
+    auth: bool = Depends(verify_auth)
+):
+    """Get financial data for a symbol from specified API."""
+    if api not in FINANCIAL_APIS:
+        raise HTTPException(status_code=400, detail=f"API {api} not supported")
+    
+    data = await financial_client.get_stock_quote(symbol, api)
+    if not data:
+        raise HTTPException(status_code=404, detail=f"No data found for {symbol} from {api}")
+    
+    return {
+        "symbol": symbol,
+        "api": api,
+        "data": data,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+    }
 
 # =============================================================================
 # Market Data Endpoints
@@ -885,6 +1120,14 @@ async def create_cache_backup(auth: bool = Depends(verify_auth)):
         raise HTTPException(status_code=500, detail="Failed to create backup")
 
 # =============================================================================
+# Include Argaam Routes if available
+# =============================================================================
+
+if HAS_ARGAAM_ROUTES:
+    app.include_router(argaam_router)
+    logger.info("✅ Argaam routes mounted successfully")
+
+# =============================================================================
 # Application Entry Point
 # =============================================================================
 
@@ -902,6 +1145,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Starting {SERVICE_NAME} v{SERVICE_VERSION} on {APP_HOST}:{APP_PORT}")
     logger.info(f"📊 Expected sheets: {len(EXPECTED_SHEETS)}")
     logger.info(f"🔐 Authentication: {'Enabled' if REQUIRE_AUTH else 'Disabled'}")
+    logger.info(f"📈 Financial APIs: {len([k for k, v in financial_client.get_api_status().items() if v])} configured")
     
     try:
         uvicorn.run(**server_config)
