@@ -742,9 +742,12 @@ def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
     # Fallback to direct sheet read
     if HAS_GSHEETS:
         logger.info("Falling back to direct Google Sheets read")
-        fallback = _build_symbols_payload_from_sheet(limit, only_included=True)
-        if fallback.get("count", 0) > 0:
-            return fallback
+        try:
+            fallback = _build_symbols_payload_from_sheet(limit, only_included=True)
+            if fallback.get("count", 0) > 0:
+                return fallback
+        except Exception as e:
+            logger.warning(f"Google Sheets fallback failed: {e}")
 
     # Final fallback - return empty but valid response
     logger.warning("Both symbols_reader and Google Sheets failed, returning empty response")
@@ -752,7 +755,7 @@ def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
         "data": [],
         "count": 0,
         "source": "fallback",
-        "error": "No symbols available"
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
     }
 
 
@@ -899,14 +902,16 @@ async def api_saudi_symbols(
             payload["data"] = data[:limit]
             payload["count"] = len(payload["data"])
         return payload
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Failed to read symbols: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read symbols: {e}"
-        )
+        # Return empty response instead of error
+        return {
+            "data": [],
+            "count": 0,
+            "source": "error_fallback", 
+            "error": str(e),
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+        }
 
 
 @app.get("/api/saudi/market", response_model=Dict[str, Any])
@@ -947,14 +952,10 @@ async def api_saudi_market(
             merged.append(out)
 
         return {"count": len(merged), "data": merged}
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Failed to build market view: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to build market view: {e}"
-        )
+        # Return empty market data instead of error
+        return {"count": 0, "data": []}
 
 
 # -----------------------------------------------------------------------------
