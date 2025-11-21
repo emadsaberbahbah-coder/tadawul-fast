@@ -5,47 +5,136 @@ services:
     plan: free
     region: oregon
     runtime:
-      pythonVersion: 3.11
+      pythonVersion: "3.11.8"
     buildCommand: |
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
+      python -c "import sys; print(f'Python {sys.version}')"
     startCommand: |
-      uvicorn main:app --host 0.0.0.0 --port $PORT --workers ${UVICORN_WORKERS:-1}
+      uvicorn main:app --host 0.0.0.0 --port $PORT --workers ${UVICORN_WORKERS:-1} --proxy-headers --forwarded-allow-ips="*" --log-level info
     autoDeploy: true
     healthCheckPath: /health
-    healthCheckTimeout: 10
-    # Render will keep one instance on the Free plan; leave scaling implicit.
-    # instanceCount: 1
+    healthCheckTimeout: 30
+    healthCheckInterval: 60
 
     envVars:
-      # === Auth ===
-      - key: FASTAPI_TOKEN
-        fromSecret: fastapi-token          # create this secret in Render
-      - key: APP_TOKEN
-        fromSecret: fastapi-token          # backward-compat; reuse same secret
+      # === Core Service Configuration ===
+      - key: SERVICE_NAME
+        value: "Tadawul FastAPI Service"
+      - key: SERVICE_VERSION
+        value: "2.0.0"
+      - key: ENVIRONMENT
+        value: "production"
 
-      # === Service metadata ===
+      # === Authentication & Security ===
+      - key: FASTAPI_TOKEN
+        fromSecret: fastapi-token
+      - key: APP_TOKEN
+        fromSecret: fastapi-token
+
+      # === Service Metadata & URLs ===
       - key: FASTAPI_BASE
         value: "https://tadawul-fast-1.onrender.com"
       - key: USER_AGENT
         value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 
-      # === Uvicorn tunables (optional) ===
+      # === Performance & Scaling ===
       - key: UVICORN_WORKERS
-        value: "1"                         # free instances have limited CPU/RAM
+        value: "1"
+      - key: UVICORN_LOG_LEVEL
+        value: "info"
+      - key: PYTHONUNBUFFERED
+        value: "true"
 
-      # === Optional: deploy hook for /v41/deploy endpoint ===
-      - key: RENDER_DEPLOY_HOOK
-        fromSecret: render-deploy-hook     # only if you want remote redeploys
+      # === Cache & Storage ===
+      - key: CACHE_PATH
+        value: "./quote_cache.json"
+      - key: CACHE_BACKUP_DIR
+        value: "./cache_backups"
 
-    # Enable previews on PRs (optional but handy)
+      # === Data Provider Configuration ===
+      - key: DATA_PROVIDER
+        value: "YF"
+      - key: YF_TIMEOUT
+        value: "20"
+      - key: YF_MAX_RETRIES
+        value: "3"
+      - key: YF_PERIOD
+        value: "3mo"
+      - key: YF_INTERVAL
+        value: "1d"
+
+      # === Google Sheets Integration ===
+      - key: SHEETS_SPREADSHEET_ID
+        value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
+      - key: GOOGLE_SHEETS_ID
+        value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
+      - key: SHEETS_SYMBOLS_TAB
+        value: "Market_Leaders"
+      - key: SHEETS_TAB_SYMBOLS
+        value: "Market_Leaders"
+      - key: SHEETS_HEADER_ROW
+        value: "3"
+
+      # === Argaam Integration ===
+      - key: ARGAAM_TIMEOUT
+        value: "30"
+      - key: ARGAAM_MAX_RETRIES
+        value: "3"
+      - key: ARGAAM_CACHE_TTL
+        value: "600"
+
+      # === Timezone & Market Hours ===
+      - key: TZ
+        value: "Asia/Riyadh"
+      - key: TRADING_INTERVAL_MINUTES
+        value: "5"
+
+    # === Secrets (Set these in Render Dashboard) ===
+    secrets:
+      - key: FASTAPI_TOKEN
+        fromSecret: fastapi-token
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        fromSecret: google-credentials-json
+
+    # === Preview Environments ===
     previews:
-      generation: automatic
+      enabled: true
+      plan: free
+      autodeploy: true
 
-    # Only trigger builds when relevant files change (optional)
+    # === Build Filter ===
     buildFilter:
       paths:
-        - requirements.txt
-        - main.py
-        - render.yaml
-        - Procfile
+        - "*.py"
+        - "requirements.txt"
+        - "render.yaml"
+        - "Procfile"
+        - "*.json"
+
+    # === Disk Configuration ===
+    disk:
+      name: cache-data
+      mountPath: /opt/render/cache
+      sizeGB: 1
+
+    # === Headers for Security ===
+    headers:
+      - path: "/*"
+        name: "X-Frame-Options"
+        value: "DENY"
+      - path: "/*"
+        name: "X-Content-Type-Options"
+        value: "nosniff"
+      - path: "/*"
+        name: "Referrer-Policy"
+        value: "strict-origin-when-cross-origin"
+
+    # === Health Check Configuration ===
+    healthCheck:
+      path: /health
+      initialDelay: 30
+      period: 60
+      timeout: 10
+      successThreshold: 1
+      failureThreshold: 3
