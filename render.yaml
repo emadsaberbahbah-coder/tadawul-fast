@@ -15,28 +15,41 @@ services:
     # Enhanced Build Configuration
     # =========================================================================
     buildCommand: |
-      echo "🚀 Building Tadawul Stock Analysis API v2.1.0..."
+      echo "🚀 Building Tadawul Stock Analysis API v2.2.0..."
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
-      echo "✅ Dependencies installed successfully"
+      
+      # Create necessary directories
+      mkdir -p logs cache_backups static templates
+      echo "✅ Directories created successfully"
+      
+      # Validate installation
       python -c "
       import sys
       print(f'🐍 Python {sys.version}')
       try:
-          import fastapi, uvicorn, gspread, pandas
+          import fastapi, uvicorn, gspread, pandas, yfinance, requests, aiohttp, jwt, sqlalchemy, celery
           print(f'✅ FastAPI {fastapi.__version__}')
           print(f'✅ Uvicorn {uvicorn.__version__}')
           print(f'✅ gspread {gspread.__version__}')
           print(f'✅ pandas {pandas.__version__}')
+          print(f'✅ yfinance {yfinance.__version__}')
+          print(f'✅ requests {requests.__version__}')
+          print(f'✅ aiohttp {aiohttp.__version__}')
+          print('✅ All dependencies installed successfully')
       except ImportError as e:
           print(f'❌ Import error: {e}')
+          sys.exit(1)
       "
+      echo "✅ Build completed successfully"
     
     # =========================================================================
     # Enhanced Start Command
     # =========================================================================
     startCommand: |
-      echo "🔧 Starting Tadawul API with ${UVICORN_WORKERS:-1} worker(s) on port $PORT"
+      echo "🔧 Starting Tadawul API v2.2.0 with ${UVICORN_WORKERS:-1} worker(s) on port $PORT"
+      echo "📊 Environment: ${ENVIRONMENT:-production}"
+      echo "🔗 Service URL: ${FASTAPI_BASE:-https://tadawul-fast-1.onrender.com}"
       uvicorn main:app \
         --host 0.0.0.0 \
         --port $PORT \
@@ -53,7 +66,7 @@ services:
     # =========================================================================
     # Enhanced Health Check Configuration
     # =========================================================================
-    healthCheckPath: /health
+    healthCheckPath: /api/v1/health
     healthCheckTimeout: 30
     healthCheckInterval: 60
     initialDelay: 45
@@ -66,7 +79,9 @@ services:
       - key: SERVICE_NAME
         value: "Tadawul Stock Analysis API"
       - key: SERVICE_VERSION
-        value: "2.1.0"
+        value: "2.2.0"
+      - key: API_VERSION
+        value: "v1"
       - key: ENVIRONMENT
         value: "production"
       - key: APP_HOST
@@ -85,6 +100,8 @@ services:
         value: "/docs"
       - key: REDOC_URL
         value: "/redoc"
+      - key: OPENAPI_URL
+        value: "/openapi.json"
 
       # === Authentication & Security ===
       - key: REQUIRE_AUTH
@@ -270,6 +287,10 @@ services:
         value: "true"
       - key: ENABLE_SHEET_VERIFICATION
         value: "true"
+      - key: ENABLE_VERSION_MANAGEMENT
+        value: "true"
+      - key: ENABLE_SYSTEM_UPDATES
+        value: "true"
 
       # === Market Data Settings ===
       - key: DEFAULT_MARKET
@@ -393,6 +414,20 @@ services:
       - key: MAX_ERROR_REPORTS_PER_HOUR
         value: "10"
 
+      # === Version Management & Updates ===
+      - key: UPDATE_CHECK_INTERVAL
+        value: "3600"
+      - key: AUTO_UPDATE_ENABLED
+        value: "false"
+      - key: UPDATE_BACKUP_ENABLED
+        value: "true"
+      - key: UPDATE_NOTIFICATION_ENABLED
+        value: "true"
+      - key: UPDATE_RETRY_ATTEMPTS
+        value: "3"
+      - key: UPDATE_RETRY_DELAY
+        value: "30"
+
     # =========================================================================
     # Secrets Configuration (Set in Render Dashboard)
     # =========================================================================
@@ -405,6 +440,10 @@ services:
         fromSecret: alert-email
       - key: SMTP_PASSWORD
         fromSecret: smtp-password
+      - key: UPDATE_WEBHOOK_URL
+        fromSecret: update-webhook-url
+      - key: BACKUP_WEBHOOK_URL
+        fromSecret: backup-webhook-url
 
     # =========================================================================
     # Enhanced Previews Configuration
@@ -491,7 +530,7 @@ services:
     # Advanced Health Check Configuration
     # =========================================================================
     healthCheck:
-      path: /health
+      path: /api/v1/health
       initialDelay: 45
       period: 60
       timeout: 25
@@ -510,19 +549,6 @@ services:
       targetMemoryPercent: 70
       targetCPUPercent: 70
 
-    # =========================================================================
-    # Deployment Hooks (Future Enhancement)
-    # =========================================================================
-    # deployHooks:
-    #   - name: Run Migrations
-    #     command: |
-    #       echo "Running database migrations..."
-    #       python -m alembic upgrade head
-    #   - name: Cache Warmup
-    #     command: |
-    #       echo "Warming up cache..."
-    #       curl -s https://${RENDER_SERVICE_NAME}.onrender.com/health > /dev/null
-
 # =============================================================================
 # Database Service (Future Enhancement)
 # =============================================================================
@@ -533,16 +559,38 @@ services:
 #     user: tadawul_user
 
 # =============================================================================
-# Cron Jobs (Future Enhancement)
+# Cron Jobs for Automated Updates and Maintenance
 # =============================================================================
-# jobs:
-#   - name: daily-backup
-#     plan: free
-#     schedule: "0 2 * * *"  # 2 AM daily
-#     command: |
-#       curl -X POST https://${RENDER_SERVICE_NAME}.onrender.com/v1/cache/backup
-#   - name: health-check
-#     plan: free
-#     schedule: "*/15 * * * *"  # Every 15 minutes
-#     command: |
-#       curl -f https://${RENDER_SERVICE_NAME}.onrender.com/health || exit 1
+jobs:
+  - name: system-update-check
+    plan: free
+    schedule: "0 */6 * * *"  # Every 6 hours
+    command: |
+      echo "🔍 Checking for system updates..."
+      curl -X POST "https://${RENDER_SERVICE_NAME}.onrender.com/api/v1/system/check-updates" \
+        -H "Content-Type: application/json" \
+        -d '{"auto_apply": false}'
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+
+  - name: cache-backup
+    plan: free
+    schedule: "0 2 * * *"  # 2 AM daily
+    command: |
+      echo "💾 Running cache backup..."
+      curl -X POST "https://${RENDER_SERVICE_NAME}.onrender.com/api/v1/system/backup" \
+        -H "Content-Type: application/json"
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+
+  - name: health-monitoring
+    plan: free
+    schedule: "*/15 * * * *"  # Every 15 minutes
+    command: |
+      echo "🏥 Running health monitoring..."
+      curl -f "https://${RENDER_SERVICE_NAME}.onrender.com/api/v1/health/detailed" || exit 1
+    envVars:
+      - key: ENVIRONMENT
+        value: production
