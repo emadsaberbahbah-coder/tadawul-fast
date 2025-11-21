@@ -1,0 +1,128 @@
+# =============================================================================
+# Stock Market Hub Sheet API - Environment Configuration
+# =============================================================================
+
+# --- Application Runtime Configuration ---
+TZ=Asia/Riyadh
+ENVIRONMENT=production
+SERVICE_NAME=Stock Market Hub Sheet API
+SERVICE_VERSION=1.8.0
+APP_HOST=0.0.0.0
+APP_PORT=8101
+TRADING_INTERVAL_MINUTES=5
+
+# --- Data Provider Configuration (Choose ONE) ---
+# Options: YF (Yahoo Finance - Live), MOCK (Demo Data), ARGAAM (Argaam Scraping)
+DATA_PROVIDER=YF
+# DATA_PROVIDER=MOCK
+# DATA_PROVIDER=ARGAAM
+
+# --- Yahoo Finance API Settings ---
+YF_TIMEOUT=15
+YF_MAX_RETRIES=3
+YF_PERIOD=3mo
+YF_INTERVAL=1d
+YF_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+
+# --- Argaam Integration Settings ---
+ARGAAM_TIMEOUT=30
+ARGAAM_MAX_RETRIES=3
+ARGAAM_CACHE_TTL=600
+ARGAAM_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+
+# --- Authentication & Security ---
+APP_TOKEN=your_app_token_here_12345
+FASTAPI_TOKEN=your_fastapi_token_here_67890
+REQUIRE_AUTH=true
+ALLOWED_ORIGINS=*
+
+# --- Google Sheets Configuration ---
+# Primary Spreadsheet ID
+SHEETS_SPREADSHEET_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
+GOOGLE_SHEETS_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
+
+# Tab/Worksheet Names
+SHEETS_SYMBOLS_TAB=Market_Leaders
+SHEETS_TAB_SYMBOLS=Market_Leaders
+SHEETS_DASHBOARD_TAB=Dashboard
+SHEETS_ANALYSIS_TAB=AI_Analysis
+
+# Header Configuration
+SHEETS_HEADER_ROW=3
+SHEETS_DATA_START_ROW=4
+
+# --- Google Service Account Credentials ---
+# Windows Absolute Path
+SHEETS_JSON_CREDENTIALS_PATH=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
+GOOGLE_CREDENTIALS_FILE=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
+
+# Alternative Linux/Mac Path (commented)
+# SHEETS_JSON_CREDENTIALS_PATH=./creds/google-service.json
+# GOOGLE_CREDENTIALS_FILE=./creds/google-service.json
+
+# --- Cache & Performance Settings ---
+CACHE_PATH=./quote_cache.json
+CACHE_BACKUP_DIR=./cache_backups
+CACHE_AUTO_SAVE=true
+CACHE_BACKUP_RETENTION_DAYS=7
+
+# Request Rate Limiting
+RATE_LIMIT_REQUESTS_PER_MINUTE=60
+RATE_LIMIT_MAX_SYMBOLS_PER_REQUEST=50
+
+# --- Logging Configuration ---
+LOG_LEVEL=INFO
+LOG_FILE=./logs/application.log
+LOG_MAX_SIZE_MB=10
+LOG_BACKUP_COUNT=5
+
+# --- API Endpoint Configuration ---
+FASTAPI_BASE=
+API_PREFIX=/v1
+ENABLE_SWAGGER=true
+ENABLE_REDOC=true
+
+# --- Feature Flags ---
+ENABLE_ARGAAM_INTEGRATION=true
+ENABLE_GOOGLE_SHEETS=true
+ENABLE_AI_ANALYSIS=true
+ENABLE_MARKET_DASHBOARD=true
+ENABLE_SYMBOLS_READER=true
+
+# --- Market Data Settings ---
+DEFAULT_MARKET=SAUDI
+DEFAULT_CURRENCY=SAR
+MARKET_OPEN_TIME=10:00
+MARKET_CLOSE_TIME=15:00
+MARKET_TIMEZONE=Asia/Riyadh
+
+# --- AI Analysis Configuration ---
+AI_MODEL_NAME=gpt-3.5-turbo
+AI_MAX_TOKENS=1000
+AI_TEMPERATURE=0.7
+AI_ANALYSIS_TIMEOUT=30
+
+# --- External API Keys (Placeholders) ---
+# YAHOO_FINANCE_API_KEY=your_yahoo_finance_api_key
+# ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key
+# OPENAI_API_KEY=your_openai_api_key
+
+# --- Monitoring & Health Checks ---
+HEALTH_CHECK_INTERVAL=300
+METRICS_ENABLED=true
+ALERT_EMAIL=admin@example.com
+
+# --- Backup & Recovery ---
+AUTO_BACKUP_ENABLED=true
+AUTO_BACKUP_INTERVAL_HOURS=24
+BACKUP_RETENTION_DAYS=30
+
+# =============================================================================
+# Development Settings (Override above in development)
+# =============================================================================
+# ENVIRONMENT=development
+# LOG_LEVEL=DEBUG
+# ENABLE_SWAGGER=true
+# ENABLE_REDOC=true
+# CACHE_AUTO_SAVE=false
+# REQUIRE_AUTH=false
