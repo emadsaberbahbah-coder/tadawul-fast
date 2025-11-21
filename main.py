@@ -5,15 +5,22 @@ import json
 import os
 import socket
 import logging
+import asyncio
+import aiohttp
 from contextlib import closing, asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from advanced_analysis import analyzer
+import gspread
+import pandas as pd
+import numpy as np
+from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
+import uvicorn
+import httpx
 
 # -----------------------------------------------------------------------------
 # Configure logging
@@ -33,8 +40,8 @@ load_dotenv(dotenv_path=BASE_DIR / ".env")
 # -----------------------------------------------------------------------------
 # Service-level configuration with validation
 # -----------------------------------------------------------------------------
-SERVICE_NAME = os.getenv("SERVICE_NAME", "Stock Market Hub Sheet API").strip()
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.8.0").strip()
+SERVICE_NAME = os.getenv("SERVICE_NAME", "Tadawul Stock Analysis API").strip()
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2.0.0").strip()
 FASTAPI_BASE = os.getenv("FASTAPI_BASE", "").strip()
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 USER_AGENT = os.getenv(
@@ -42,26 +49,31 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 ).strip()
 
+# Google Sheets configuration
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Expected sheet names for verification
+EXPECTED_SHEETS = [
+    "Companies",
+    "Financials", 
+    "Prices",
+    "Indicators",
+    "Sectors",
+    "Analysis",
+    "Reports",
+    "Users",
+    "Settings"
+]
+
 # Configuration with validation
 try:
     SHEETS_HEADER_ROW = max(1, int(os.getenv("SHEETS_HEADER_ROW", "3")))
 except ValueError:
     SHEETS_HEADER_ROW = 3
     logger.warning(f"Invalid SHEETS_HEADER_ROW, using default: {SHEETS_HEADER_ROW}")
-
-# -----------------------------------------------------------------------------
-# Argaam Integration Import
-# -----------------------------------------------------------------------------
-try:
-    from routes_argaam import router as argaam_router, close_argaam_http_client
-    HAS_ARGAAM_ROUTES = True
-    logger.info("Argaam routes loaded successfully")
-except ImportError as e:
-    HAS_ARGAAM_ROUTES = False
-    logger.warning(f"Argaam routes not available: {e}")
-    # Create dummy functions
-    async def close_argaam_http_client():
-        pass
 
 # -----------------------------------------------------------------------------
 # Optional imports with better error handling
@@ -78,24 +90,26 @@ except ImportError as e:
 except Exception as e:
     logger.error(f"Error loading AdvancedMarketDashboard: {e}")
 
-# Local modules with error handling
+# Import optional modules with error handling
 try:
-    import symbols_reader as sr
-    HAS_SYMBOLS_READER = True
-    logger.info("symbols_reader loaded successfully")
+    from advanced_analysis import analyzer
+    HAS_ADVANCED_ANALYSIS = True
+    logger.info("Advanced analysis module loaded successfully")
 except ImportError as e:
-    logger.error(f"Failed to import symbols_reader: {e}")
-    HAS_SYMBOLS_READER = False
-    # Create a dummy module to avoid crashes
-    class DummySymbolsReader:
-        @staticmethod
-        def fetch_symbols(limit):
-            return {"data": [], "count": 0, "error": "symbols_reader not available"}
-    sr = DummySymbolsReader()
+    HAS_ADVANCED_ANALYSIS = False
+    logger.warning(f"Advanced analysis module not available: {e}")
 
-# -----------------------------------------------------------------------------
-# Google Apps Script Client Import
-# -----------------------------------------------------------------------------
+try:
+    from routes_argaam import router as argaam_router, close_argaam_http_client
+    HAS_ARGAAM_ROUTES = True
+    logger.info("Argaam routes loaded successfully")
+except ImportError as e:
+    HAS_ARGAAM_ROUTES = False
+    logger.warning(f"Argaam routes not available: {e}")
+    # Create dummy functions
+    async def close_argaam_http_client():
+        pass
+
 try:
     from google_apps_script_client import google_apps_script_client
     HAS_GOOGLE_APPS_SCRIPT = True
@@ -115,18 +129,19 @@ except ImportError as e:
             })()
     google_apps_script_client = DummyGoogleAppsScriptClient()
 
-# -----------------------------------------------------------------------------
-# Google Sheets imports with error handling
-# -----------------------------------------------------------------------------
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    HAS_GSHEETS = True
-except ImportError:
-    gspread = None
-    Credentials = None
-    HAS_GSHEETS = False
-    logger.warning("gspread or google-auth not available")
+    import symbols_reader as sr
+    HAS_SYMBOLS_READER = True
+    logger.info("symbols_reader loaded successfully")
+except ImportError as e:
+    logger.error(f"Failed to import symbols_reader: {e}")
+    HAS_SYMBOLS_READER = False
+    # Create a dummy module to avoid crashes
+    class DummySymbolsReader:
+        @staticmethod
+        def fetch_symbols(limit):
+            return {"data": [], "count": 0, "error": "symbols_reader not available"}
+    sr = DummySymbolsReader()
 
 # -----------------------------------------------------------------------------
 # Enhanced Pydantic Models with Validation
@@ -156,26 +171,21 @@ class Quote(BaseModel):
             raise ValueError('Change percentage out of reasonable bounds')
         return v
 
-
 class QuoteUpdatePayload(BaseModel):
     data: List[Quote] = Field(..., description="List of quotes to update")
-
 
 class QuoteResponse(BaseModel):
     data: List[Quote] = Field(..., description="List of quotes")
 
-
 class AnalysisRequest(BaseModel):
     ticker: str = Field(..., description="Stock ticker to analyze")
     fundamentals: Dict[str, Any] = Field(default_factory=dict, description="Fundamental data")
-
 
 class AnalysisResponse(BaseModel):
     ticker: str = Field(..., description="Analyzed ticker")
     score: float = Field(..., ge=0, le=100, description="Analysis score 0-100")
     summary: str = Field(..., description="Analysis summary")
     confidence: float = Field(..., ge=0, le=1, description="Confidence level")
-
 
 class HealthResponse(BaseModel):
     status: str = Field(..., description="Service status")
@@ -185,13 +195,34 @@ class HealthResponse(BaseModel):
     has_dashboard: bool = Field(..., description="Dashboard module available")
     has_gsheets: bool = Field(..., description="Google Sheets available")
     has_argaam_routes: bool = Field(..., description="Argaam routes available")
+    google_sheets_connected: bool = Field(..., description="Google Sheets connection status")
 
+# Google Sheets Verification Models
+class SheetVerificationResult(BaseModel):
+    sheet_name: str
+    status: str
+    row_count: int
+    column_count: int
+    headers: List[str]
+    sample_data: List[Dict]
+    error: Optional[str] = None
+
+class VerificationResponse(BaseModel):
+    spreadsheet_id: str
+    overall_status: str
+    sheets_verified: int
+    sheets_ok: int
+    details: List[SheetVerificationResult]
+
+class SheetDataResponse(BaseModel):
+    sheet_name: str
+    total_records: int
+    data: List[Dict]
 
 class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(None, description="Error details")
     timestamp: str = Field(..., description="Error timestamp")
-
 
 # -----------------------------------------------------------------------------
 # Cache + persistence with enhanced error handling
@@ -205,11 +236,9 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 # In-memory cache: {"TICKER": {quote_dict}}
 QUOTE_CACHE: Dict[str, Dict[str, Any]] = {}
 
-
 class CacheError(Exception):
     """Custom exception for cache operations"""
     pass
-
 
 def _items_to_mapping(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Convert list of quote dicts to ticker mapping."""
@@ -220,7 +249,6 @@ def _items_to_mapping(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             if ticker:
                 out[ticker] = q
     return out
-
 
 def _is_ticker_mapping(obj: Any) -> bool:
     """Return True if obj is a proper ticker mapping."""
@@ -234,7 +262,6 @@ def _is_ticker_mapping(obj: Any) -> bool:
         if v.get("ticker") and v["ticker"].upper() != k.upper():
             return False
     return True
-
 
 def _normalize_cache_shape(obj: Any) -> Tuple[Dict[str, Dict[str, Any]], bool]:
     """
@@ -255,7 +282,6 @@ def _normalize_cache_shape(obj: Any) -> Tuple[Dict[str, Dict[str, Any]], bool]:
         logger.error(f"Error normalizing cache shape: {e}")
         return {}, False
 
-
 def _save_cache_canonical() -> int:
     """Persist QUOTE_CACHE to disk with error handling."""
     try:
@@ -269,7 +295,6 @@ def _save_cache_canonical() -> int:
     except Exception as e:
         logger.error(f"Failed to save cache: {e}")
         raise CacheError(f"Failed to save cache: {e}")
-
 
 def _backup_cache() -> str:
     """Create timestamped backup with error handling."""
@@ -289,7 +314,6 @@ def _backup_cache() -> str:
     except Exception as e:
         logger.error(f"Backup failed: {e}")
         raise CacheError(f"Backup failed: {e}")
-
 
 def _list_backups() -> List[Dict[str, Any]]:
     """List backup files with error handling."""
@@ -319,7 +343,6 @@ def _list_backups() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error listing backups: {e}")
         return []
-
 
 def _restore_backup(name: str) -> Dict[str, Any]:
     """Restore from backup with enhanced security and error handling."""
@@ -362,7 +385,6 @@ def _restore_backup(name: str) -> Dict[str, Any]:
         logger.error(f"Restore failed: {e}")
         raise
 
-
 def _quote_from_cache(obj: Dict[str, Any]) -> Quote:
     """Create Quote object from cache data with type safety."""
     return Quote(
@@ -378,7 +400,6 @@ def _quote_from_cache(obj: Dict[str, Any]) -> Quote:
         fifty_two_week_low=obj.get("fifty_two_week_low"),
         timestamp_utc=obj.get("timestamp_utc"),
     )
-
 
 def _empty_quote(sym: str) -> Quote:
     """Create empty quote for missing ticker."""
@@ -396,13 +417,118 @@ def _empty_quote(sym: str) -> Quote:
         timestamp_utc=datetime.datetime.utcnow().isoformat() + "Z",
     )
 
+# -----------------------------------------------------------------------------
+# Google Sheets Integration Functions
+# -----------------------------------------------------------------------------
+def get_google_sheets_client():
+    """Initialize and return Google Sheets client"""
+    try:
+        # For Render deployment, use environment variables
+        creds_json = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
+        
+        if not creds_json:
+            # Try to read from service account file (for local development)
+            try:
+                with open('service_account.json', 'r') as f:
+                    creds_dict = json.load(f)
+            except FileNotFoundError:
+                raise ValueError("GOOGLE_SHEETS_CREDENTIALS environment variable not set and service_account.json not found")
+        else:
+            # Convert string to dict
+            creds_dict = json.loads(creds_json)
+        
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        logger.info("Google Sheets client initialized successfully")
+        return client
+    except Exception as e:
+        logger.error(f"Error initializing Google Sheets client: {e}")
+        return None
+
+def get_spreadsheet():
+    """Get the spreadsheet object"""
+    try:
+        client = get_google_sheets_client()
+        if not client:
+            return None
+        
+        SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
+        if not SPREADSHEET_ID:
+            raise ValueError("SPREADSHEET_ID environment variable not set")
+        
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        logger.info(f"Spreadsheet accessed successfully: {spreadsheet.title}")
+        return spreadsheet
+    except Exception as e:
+        logger.error(f"Error accessing spreadsheet: {e}")
+        return None
+
+def verify_sheet_structure(sheet, sheet_name: str) -> SheetVerificationResult:
+    """Verify the structure and content of a specific sheet"""
+    try:
+        worksheet = sheet.worksheet(sheet_name)
+        
+        # Get all data
+        all_data = worksheet.get_all_records()
+        headers = worksheet.row_values(1) if worksheet.row_values(1) else []
+        
+        # Basic info
+        row_count = len(all_data) + 1  # +1 for header
+        col_count = len(headers)
+        
+        # Sample data preview (first 3 rows)
+        sample_data = all_data[:3] if len(all_data) > 3 else all_data
+        
+        return SheetVerificationResult(
+            sheet_name=sheet_name,
+            status="OK",
+            row_count=row_count,
+            column_count=col_count,
+            headers=headers,
+            sample_data=sample_data
+        )
+        
+    except gspread.WorksheetNotFound:
+        return SheetVerificationResult(
+            sheet_name=sheet_name,
+            status="NOT_FOUND",
+            row_count=0,
+            column_count=0,
+            headers=[],
+            sample_data=[],
+            error=f"Worksheet '{sheet_name}' not found"
+        )
+    except Exception as e:
+        return SheetVerificationResult(
+            sheet_name=sheet_name,
+            status="ERROR",
+            row_count=0,
+            column_count=0,
+            headers=[],
+            sample_data=[],
+            error=str(e)
+        )
+
+def get_sheet_data(sheet, sheet_name: str, limit: int = 10) -> SheetDataResponse:
+    """Get data from a specific sheet"""
+    try:
+        worksheet = sheet.worksheet(sheet_name)
+        data = worksheet.get_all_records()
+        
+        return SheetDataResponse(
+            sheet_name=sheet_name,
+            total_records=len(data),
+            data=data[:limit]
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading sheet {sheet_name}: {str(e)}")
 
 # -----------------------------------------------------------------------------
-# Enhanced Lifespan Management with Argaam Integration
+# Enhanced Lifespan Management
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Enhanced lifespan with Argaam integration."""
+    """Enhanced lifespan with all integrations."""
     # Startup
     startup_time = datetime.datetime.utcnow()
     logger.info(f"Starting {SERVICE_NAME} v{SERVICE_VERSION}")
@@ -439,7 +565,6 @@ async def lifespan(app: FastAPI):
     uptime = shutdown_time - startup_time
     logger.info(f"Shutting down after {uptime}")
 
-
 # -----------------------------------------------------------------------------
 # FastAPI App Configuration
 # -----------------------------------------------------------------------------
@@ -447,7 +572,7 @@ app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
     description=(
-        "Enhanced Stock Market API with Argaam integration and improved error handling.\n\n"
+        "Enhanced Stock Market API with Google Sheets integration, Argaam data, and comprehensive analysis.\n\n"
         "Main endpoints:\n"
         "  • GET  /                                 -> Service info and status\n"
         "  • GET  /health                           -> Health check with diagnostics\n"
@@ -458,10 +583,10 @@ app = FastAPI(
         "  • GET  /v1/quote?tickers=A,B             -> Get quotes from cache\n"
         "  • GET  /v1/cache                         -> Cache inspection\n"
         "  • GET  /v41/argaam/quotes                -> Argaam-style quotes\n"
-        "  • POST /v41/argaam/quotes                -> Argaam quotes with POST\n"
-        "  • GET  /v1/multi-source/{symbol}         -> Multi-source analysis\n"
-        "  • GET  /v1/google-apps-script/symbols    -> Google Apps Script data\n"
-        "  • GET  /v1/apis/status                   -> API status check\n"
+        "  • GET  /verify-sheets                    -> Verify all 9 Google Sheets\n"
+        "  • GET  /sheet/{sheet_name}               -> Get specific sheet data\n"
+        "  • GET  /sheet-names                      -> List all available sheets\n"
+        "  • GET  /test-connection                  -> Test Google Sheets connection\n"
     ),
     lifespan=lifespan,
     responses={
@@ -520,7 +645,6 @@ async def global_exception_handler(request, exc):
         ).dict()
     )
 
-
 # -----------------------------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------------------------
@@ -533,7 +657,6 @@ def _truthy(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in ("true", "1", "yes", "y", "on")
 
-
 def _require_dashboard() -> AdvancedMarketDashboard:
     """Check if dashboard is available."""
     if not HAS_DASHBOARD:
@@ -543,49 +666,31 @@ def _require_dashboard() -> AdvancedMarketDashboard:
         )
     return AdvancedMarketDashboard()
 
-
 def _get_sheets_client():
     """Get Google Sheets client with error handling."""
-    if not HAS_GSHEETS:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Sheets client not available"
-        )
-    
-    creds_path = os.getenv("SHEETS_JSON_CREDENTIALS_PATH", "./creds/google-service.json")
-    if not os.path.exists(creds_path):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Missing Google Sheets credentials: {creds_path}"
-        )
-    
-    try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-        return gspread.authorize(creds)
-    except Exception as e:
-        logger.error(f"Google Sheets auth failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Google Sheets authentication failed: {e}"
-        )
-
+    return get_google_sheets_client()
 
 # -----------------------------------------------------------------------------
 # Google Sheets Integration
 # -----------------------------------------------------------------------------
 def _read_symbols_sheet_rows() -> Tuple[str, str, List[Dict[str, Any]]]:
     """Read symbols from Google Sheets with enhanced error handling."""
-    sheet_id = os.getenv("SHEETS_SPREADSHEET_ID")
+    sheet_id = os.getenv("SPREADSHEET_ID") or os.getenv("SHEETS_SPREADSHEET_ID")
     tab = os.getenv("SHEETS_TAB_SYMBOLS", "symbols_master")
     
     if not sheet_id:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="SHEETS_SPREADSHEET_ID environment variable not set"
+            detail="SPREADSHEET_ID environment variable not set"
         )
 
     gc = _get_sheets_client()
+    if not gc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Sheets client not available"
+        )
+        
     try:
         sh = gc.open_by_key(sheet_id)
         ws = sh.worksheet(tab)
@@ -629,7 +734,6 @@ def _read_symbols_sheet_rows() -> Tuple[str, str, List[Dict[str, Any]]]:
         rows.append(row_dict)
 
     return sh.title, tab, rows
-
 
 def _build_symbols_payload_from_sheet(limit: int, only_included: bool = True) -> Dict[str, Any]:
     """Build symbols payload from Google Sheets."""
@@ -730,7 +834,6 @@ def _safe_fetch_symbols_via_sr(limit: int) -> Optional[Dict[str, Any]]:
         logger.warning(f"symbols_reader.fetch_symbols failed: {e}")
         return None
 
-
 def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
     """Unified symbol loader with fallback."""
     # Try symbols_reader first
@@ -740,7 +843,8 @@ def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
         return sr_payload
 
     # Fallback to direct sheet read
-    if HAS_GSHEETS:
+    client = get_google_sheets_client()
+    if client:
         logger.info("Falling back to direct Google Sheets read")
         try:
             fallback = _build_symbols_payload_from_sheet(limit, only_included=True)
@@ -758,13 +862,36 @@ def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
     }
 
+# -----------------------------------------------------------------------------
+# Background Tasks
+# -----------------------------------------------------------------------------
+async def periodic_health_check():
+    """Background task to periodically check sheet health"""
+    while True:
+        try:
+            sheet = get_spreadsheet()
+            if sheet:
+                worksheets = sheet.worksheets()
+                logger.info(f"Periodic health check: {len(worksheets)} sheets available")
+        except Exception as e:
+            logger.error(f"Periodic health check failed: {e}")
+        
+        await asyncio.sleep(300)  # Check every 5 minutes
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on startup"""
+    asyncio.create_task(periodic_health_check())
+    logger.info("Tadawul FastAPI application started")
 
 # -----------------------------------------------------------------------------
-# Root & Health Endpoints
+# API Routes - Combined from both scripts
 # -----------------------------------------------------------------------------
+
+# Root & Health Endpoints
 @app.get("/", response_model=Dict[str, Any])
 async def root() -> Dict[str, Any]:
-    """Enhanced root endpoint with comprehensive info including Argaam."""
+    """Enhanced root endpoint with comprehensive info."""
     return {
         "ok": True,
         "service": SERVICE_NAME,
@@ -777,10 +904,11 @@ async def root() -> Dict[str, Any]:
         },
         "capabilities": {
             "has_dashboard": HAS_DASHBOARD,
-            "has_gsheets": HAS_GSHEETS,
+            "has_gsheets": get_google_sheets_client() is not None,
             "has_symbols_reader": HAS_SYMBOLS_READER,
-            "has_argaam_routes": HAS_ARGAAM_ROUTES,  # Added Argaam capability
+            "has_argaam_routes": HAS_ARGAAM_ROUTES,
             "has_google_apps_script": HAS_GOOGLE_APPS_SCRIPT,
+            "has_advanced_analysis": HAS_ADVANCED_ANALYSIS,
         },
         "cache": {
             "count_cached": len(QUOTE_CACHE),
@@ -799,9 +927,35 @@ async def root() -> Dict[str, Any]:
             "multi_source_analysis": "/v1/multi-source/{symbol}",
             "google_apps_script": "/v1/google-apps-script/symbols",
             "apis_status": "/v1/apis/status",
+            "verify_sheets": "/verify-sheets",
+            "get_sheet": "/sheet/{sheet_name}",
+            "sheet_names": "/sheet-names",
+            "test_connection": "/test-connection",
         },
     }
 
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Comprehensive health check endpoint."""
+    shape_ok = _is_ticker_mapping(QUOTE_CACHE)
+    
+    # Additional health checks
+    health_status = "healthy"
+    if not shape_ok and QUOTE_CACHE:
+        health_status = "degraded"
+    elif not get_google_sheets_client():
+        health_status = "degraded"
+    
+    return HealthResponse(
+        status=health_status,
+        time_utc=datetime.datetime.utcnow().isoformat() + "Z",
+        count_cached=len(QUOTE_CACHE),
+        cache_file_exists=CACHE_PATH.exists(),
+        has_dashboard=HAS_DASHBOARD,
+        has_gsheets=get_google_sheets_client() is not None,
+        has_argaam_routes=HAS_ARGAAM_ROUTES,
+        google_sheets_connected=get_google_sheets_client() is not None,
+    )
 
 @app.get("/v1/ping", response_model=Dict[str, Any])
 async def ping() -> Dict[str, Any]:
@@ -813,82 +967,114 @@ async def ping() -> Dict[str, Any]:
         "version": SERVICE_VERSION,
         "capabilities": {
             "has_dashboard": HAS_DASHBOARD,
-            "has_gsheets": HAS_GSHEETS,
+            "has_gsheets": get_google_sheets_client() is not None,
             "has_argaam_routes": HAS_ARGAAM_ROUTES,
             "has_google_apps_script": HAS_GOOGLE_APPS_SCRIPT,
             "cache_count": len(QUOTE_CACHE),
         }
     }
 
-
-@app.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    """Comprehensive health check endpoint."""
-    shape_ok = _is_ticker_mapping(QUOTE_CACHE)
-    
-    # Additional health checks
-    health_status = "healthy"
-    if not shape_ok and QUOTE_CACHE:
-        health_status = "degraded"
-    elif not HAS_GSHEETS:
-        health_status = "degraded"
-    
-    return HealthResponse(
-        status=health_status,
-        time_utc=datetime.datetime.utcnow().isoformat() + "Z",
-        count_cached=len(QUOTE_CACHE),
-        cache_file_exists=CACHE_PATH.exists(),
-        has_dashboard=HAS_DASHBOARD,
-        has_gsheets=HAS_GSHEETS,
-        has_argaam_routes=HAS_ARGAAM_ROUTES,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Admin Endpoints
-# -----------------------------------------------------------------------------
-@app.post("/diagnostics", response_model=Dict[str, Any])
-async def run_diagnostics() -> Dict[str, Any]:
-    """Run SAFE diagnostics."""
-    dash = _require_dashboard()
+# Google Sheets Verification Endpoints
+@app.get("/verify-sheets", response_model=VerificationResponse)
+async def verify_all_sheets():
+    """Verify all 9 sheets in the Google Spreadsheet"""
     try:
-        dash.run_safe_diagnostics()
-        return {
-            "status": "ok",
-            "message": "Diagnostics executed successfully",
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-    except Exception as e:
-        logger.error(f"Diagnostics failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Diagnostics failed: {e}"
+        sheet = get_spreadsheet()
+        if not sheet:
+            raise HTTPException(status_code=500, detail="Failed to access Google Spreadsheet")
+        
+        SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
+        results = []
+        
+        for sheet_name in EXPECTED_SHEETS:
+            result = verify_sheet_structure(sheet, sheet_name)
+            results.append(result)
+        
+        # Overall status
+        sheets_ok = sum(1 for result in results if result.status == "OK")
+        overall_status = "SUCCESS" if sheets_ok == len(EXPECTED_SHEETS) else "PARTIAL_SUCCESS"
+        
+        return VerificationResponse(
+            spreadsheet_id=SPREADSHEET_ID,
+            overall_status=overall_status,
+            sheets_verified=len(EXPECTED_SHEETS),
+            sheets_ok=sheets_ok,
+            details=results
         )
+        
+    except Exception as e:
+        logger.error(f"Error verifying sheets: {e}")
+        raise HTTPException(status_code=500, detail=f"Error verifying sheets: {str(e)}")
 
-
-@app.post("/format/all-headers", response_model=Dict[str, Any])
-async def format_all_headers() -> Dict[str, Any]:
-    """Format headers for all sheets."""
-    dash = _require_dashboard()
+@app.get("/sheet/{sheet_name}", response_model=SheetDataResponse)
+async def get_sheet_data_endpoint(
+    sheet_name: str, 
+    limit: int = Query(10, ge=1, le=1000, description="Number of records to return")
+):
+    """Get data from a specific sheet"""
     try:
-        dash.run_market_leaders_header_format()
-        dash.run_other_sheets_header_format()
-        return {
-            "status": "ok",
-            "message": "Header formatting completed for all configured sheets",
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        }
+        sheet = get_spreadsheet()
+        if not sheet:
+            raise HTTPException(status_code=500, detail="Failed to access Google Spreadsheet")
+        
+        return get_sheet_data(sheet, sheet_name, limit)
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Header formatting failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Header formatting failed: {e}"
-        )
+        logger.error(f"Error reading sheet {sheet_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error reading sheet {sheet_name}: {str(e)}")
 
+@app.get("/sheet-names", response_model=Dict)
+async def get_sheet_names():
+    """Get all available sheet names in the spreadsheet"""
+    try:
+        sheet = get_spreadsheet()
+        if not sheet:
+            raise HTTPException(status_code=500, detail="Failed to access Google Spreadsheet")
+        
+        worksheets = sheet.worksheets()
+        sheet_names = [ws.title for ws in worksheets]
+        
+        return {
+            "spreadsheet_title": sheet.title,
+            "available_sheets": sheet_names,
+            "expected_sheets": EXPECTED_SHEETS,
+            "missing_sheets": list(set(EXPECTED_SHEETS) - set(sheet_names)),
+            "extra_sheets": list(set(sheet_names) - set(EXPECTED_SHEETS))
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting sheet names: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting sheet names: {str(e)}")
 
-# -----------------------------------------------------------------------------
-# Saudi Symbols & Market Endpoints - FIXED VERSIONS
-# -----------------------------------------------------------------------------
+@app.get("/test-connection", response_model=Dict)
+async def test_connection():
+    """Test Google Sheets connection and basic functionality"""
+    try:
+        client = get_google_sheets_client()
+        if not client:
+            return {"status": "ERROR", "message": "Failed to initialize Google Sheets client"}
+        
+        sheet = get_spreadsheet()
+        if not sheet:
+            return {"status": "ERROR", "message": "Failed to access spreadsheet"}
+        
+        # Test by getting sheet names
+        worksheets = sheet.worksheets()
+        
+        return {
+            "status": "SUCCESS",
+            "message": "Google Sheets connection successful",
+            "spreadsheet_title": sheet.title,
+            "total_sheets": len(worksheets),
+            "sheets": [ws.title for ws in worksheets]
+        }
+        
+    except Exception as e:
+        return {"status": "ERROR", "message": f"Connection test failed: {str(e)}"}
+
+# Saudi Symbols & Market Endpoints
 @app.get("/api/saudi/symbols", response_model=Dict[str, Any])
 async def api_saudi_symbols(
     limit: int = Query(20, ge=1, le=500, description="Max rows to read")
@@ -912,7 +1098,6 @@ async def api_saudi_symbols(
             "error": str(e),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
         }
-
 
 @app.get("/api/saudi/market", response_model=Dict[str, Any])
 async def api_saudi_market(
@@ -957,10 +1142,7 @@ async def api_saudi_market(
         # Return empty market data instead of error
         return {"count": 0, "data": []}
 
-
-# -----------------------------------------------------------------------------
 # Quote Management Endpoints
-# -----------------------------------------------------------------------------
 @app.post("/v1/quote/update", response_model=Dict[str, Any])
 async def update_quotes(
     payload: QuoteUpdatePayload,
@@ -1003,7 +1185,6 @@ async def update_quotes(
     logger.info(f"Quote update: {updated_count} updated, {len(errors)} errors")
     return response
 
-
 @app.get("/v1/quote", response_model=QuoteResponse)
 async def get_quote(
     tickers: str = Query(..., description="Comma-separated tickers")
@@ -1025,105 +1206,7 @@ async def get_quote(
     
     return QuoteResponse(data=out_list)
 
-
-# -----------------------------------------------------------------------------
-# Argaam-style Quotes Endpoint (Legacy - now use /v41/argaam/quotes)
-# -----------------------------------------------------------------------------
-@app.get("/v41/argaam/quotes", response_model=Dict[str, Any])
-async def legacy_argaam_quotes(
-    tickers: str = Query(..., description="Comma-separated tickers")
-) -> Dict[str, Any]:
-    """Legacy Argaam-style quotes endpoint - now handled by routes_argaam."""
-    # This endpoint is maintained for backward compatibility
-    # The actual implementation is now in routes_argaam.py
-    raw_symbols = [t.strip() for t in tickers.split(",") if t.strip()]
-    if not raw_symbols:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No tickers provided"
-        )
-    
-    items: List[Dict[str, Any]] = []
-    
-    for raw in raw_symbols:
-        sym_upper = raw.upper()
-        
-        # Try multiple cache key variants
-        candidates = [sym_upper]
-        if not sym_upper.endswith(".SR"):
-            candidates.append(sym_upper + ".SR")
-        if sym_upper.endswith(".SR"):
-            candidates.append(sym_upper.replace(".SR", ""))
-        
-        q: Dict[str, Any] = {}
-        for key in candidates:
-            if key in QUOTE_CACHE:
-                q = QUOTE_CACHE[key]
-                break
-        
-        # Calculate derived fields
-        last_price = q.get("price")
-        prev_close = q.get("previous_close")
-        change_value = None
-        change_percent = q.get("day_change_pct")
-        
-        if last_price is not None and prev_close is not None:
-            try:
-                change_value = float(last_price) - float(prev_close)
-                if change_percent is None and prev_close != 0:
-                    change_percent = (change_value / float(prev_close)) * 100
-            except (ValueError, TypeError):
-                pass
-        
-        item = {
-            "ticker": sym_upper,
-            "company": q.get("company"),
-            "sector": None,
-            "trading_market": "TADAWUL" if any(c.endswith('.SR') or c.isdigit() for c in candidates) else None,
-            "last_price": last_price,
-            "day_high": None,
-            "day_low": None,
-            "previous_close": prev_close,
-            "change_value": change_value,
-            "change_percent": change_percent,
-            "volume": q.get("volume"),
-            "value_traded": None,
-            "market_cap": q.get("market_cap"),
-            "pe_ttm": None,
-            "pb": None,
-            "dividend_yield": None,
-            "eps_ttm": None,
-            "roe": None,
-            "trend_direction": None,
-            "support_level": None,
-            "resistance_level": None,
-            "momentum_score": None,
-            "volatility_est": None,
-            "expected_roi_1m": None,
-            "expected_roi_3m": None,
-            "expected_roi_12m": None,
-            "risk_level": None,
-            "confidence_score": None,
-            "data_quality": None,
-            "composite_score": None,
-            "analysis_source": "QUOTE_CACHE" if q else "EMPTY",
-            "external_analysis_url": None,
-            "timestamp_utc": q.get("timestamp_utc"),
-        }
-        items.append(item)
-    
-    return {
-        "ok": True,
-        "source": "quote_cache",
-        "count": len(items),
-        "items": items,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-    }
-
-
-# -----------------------------------------------------------------------------
 # Cache Management Endpoints
-# -----------------------------------------------------------------------------
 @app.get("/v1/cache", response_model=Dict[str, Any])
 async def cache_view(
     limit: Optional[int] = Query(None, ge=1, le=500, description="Limit results")
@@ -1145,7 +1228,6 @@ async def cache_view(
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
-
 @app.post("/v1/cache/save", response_model=Dict[str, Any])
 async def cache_save() -> Dict[str, Any]:
     """Save cache to disk."""
@@ -1163,166 +1245,7 @@ async def cache_save() -> Dict[str, Any]:
             detail=str(e)
         )
 
-
-@app.post("/v1/cache/load", response_model=Dict[str, Any])
-async def cache_load(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Load cache from disk or request body."""
-    try:
-        if body is None:
-            if not CACHE_PATH.exists():
-                return {
-                    "status": "no_file", 
-                    "path": str(CACHE_PATH),
-                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                }
-            raw = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-        else:
-            raw = body
-
-        mapping, repaired = _normalize_cache_shape(raw)
-        QUOTE_CACHE.clear()
-        QUOTE_CACHE.update(mapping)
-
-        return {
-            "status": "loaded",
-            "count": len(QUOTE_CACHE),
-            "tickers": list(QUOTE_CACHE.keys()),
-            "repaired_from_old_format": repaired,
-            "path": str(CACHE_PATH),
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-    except Exception as e:
-        logger.error(f"Cache load failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load cache: {e}"
-        )
-
-
-@app.post("/v1/cache/backup", response_model=Dict[str, Any])
-async def cache_backup() -> Dict[str, Any]:
-    """Create cache backup."""
-    try:
-        path = _backup_cache()
-        return {
-            "status": "saved",
-            "path": path,
-            "count": len(QUOTE_CACHE),
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-    except CacheError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-
-
-@app.get("/v1/cache/backups", response_model=Dict[str, Any])
-async def cache_backups() -> Dict[str, Any]:
-    """List cache backups."""
-    bks = _list_backups()
-    return {
-        "count": len(bks),
-        "backups": bks,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-    }
-
-
-@app.post("/v1/cache/restore", response_model=Dict[str, Any])
-async def cache_restore(
-    name: str = Query(..., description="Backup filename")
-) -> Dict[str, Any]:
-    """Restore cache from backup."""
-    try:
-        result = _restore_backup(name)
-        result["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
-        return result
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Backup not found: {name}"
-        )
-    except Exception as e:
-        logger.error(f"Cache restore failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Restore failed: {e}"
-        )
-
-
-@app.post("/v1/cache/clear", response_model=Dict[str, Any])
-async def cache_clear(
-    delete_file: bool = Query(False, description="Delete cache file")
-) -> Dict[str, Any]:
-    """Clear cache with option to delete file."""
-    count_before = len(QUOTE_CACHE)
-    QUOTE_CACHE.clear()
-    
-    deleted_file = False
-    if delete_file and CACHE_PATH.exists():
-        try:
-            CACHE_PATH.unlink()
-            deleted_file = True
-        except Exception as e:
-            logger.error(f"Failed to delete cache file: {e}")
-
-    return {
-        "status": "cleared",
-        "cleared_count": count_before,
-        "deleted_file": deleted_file,
-        "count_cached": len(QUOTE_CACHE),
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-    }
-
-
-# -----------------------------------------------------------------------------
-# Additional Endpoints
-# -----------------------------------------------------------------------------
-@app.get("/api/sheets/symbols", response_model=Dict[str, Any])
-async def api_sheets_symbols(
-    include_all: bool = Query(False, description="Include all symbols")
-) -> Dict[str, Any]:
-    """Direct view of symbols sheet."""
-    if not HAS_GSHEETS:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Sheets not available"
-        )
-        
-    try:
-        sheet_title, tab, rows = _read_symbols_sheet_rows()
-        
-        if include_all:
-            data = rows
-        else:
-            data = [
-                row for row in rows 
-                if _truthy(
-                    row.get("include_in_ranking") or 
-                    row.get("Include in Ranking") or 
-                    row.get("Include in Ranking_2")
-                )
-            ]
-
-        return {
-            "ok": True,
-            "spreadsheet_id": os.getenv("SHEETS_SPREADSHEET_ID"),
-            "tab": tab,
-            "header_row": SHEETS_HEADER_ROW,
-            "count": len(data),
-            "data": data,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Sheet symbols endpoint failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read sheet symbols: {e}"
-        )
-
-
+# Additional Endpoints from original script
 @app.post("/v1/analyze", response_model=AnalysisResponse)
 async def analyze_stock(req: AnalysisRequest) -> AnalysisResponse:
     """Enhanced AI analysis endpoint."""
@@ -1365,13 +1288,16 @@ async def analyze_stock(req: AnalysisRequest) -> AnalysisResponse:
             detail=f"Analysis failed: {e}"
         )
 
-
-# -----------------------------------------------------------------------------
 # New Multi-Source Analysis and Google Apps Script Endpoints
-# -----------------------------------------------------------------------------
 @app.get("/v1/multi-source/{symbol}")
 async def get_multi_source_analysis(symbol: str):
     """Get analysis from all available data sources."""
+    if not HAS_ADVANCED_ANALYSIS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Advanced analysis module not available"
+        )
+    
     try:
         analysis = analyzer.get_multi_source_analysis(symbol)
         return analysis
@@ -1379,10 +1305,15 @@ async def get_multi_source_analysis(symbol: str):
         logger.error(f"Multi-source analysis failed for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
-
 @app.get("/v1/google-apps-script/symbols")
 async def get_google_apps_script_data(symbol: str = None):
     """Get data from Google Apps Script."""
+    if not HAS_GOOGLE_APPS_SCRIPT:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Apps Script client not available"
+        )
+    
     result = google_apps_script_client.get_symbols_data(symbol)
     
     if result.success:
@@ -1397,25 +1328,34 @@ async def get_google_apps_script_data(symbol: str = None):
             detail=f"Google Apps Script error: {result.error}"
         )
 
-
 @app.get("/v1/apis/status")
 async def get_apis_status():
     """Check status of all configured APIs."""
-    test_symbol = "7201.SR"  # Test with a Saudi symbol
-    
-    status = {
-        "alpha_vantage": bool(analyzer.apis['alpha_vantage']),
-        "finnhub": bool(analyzer.apis['finnhub']),
-        "eodhd": bool(analyzer.apis['eodhd']),
-        "twelvedata": bool(analyzer.apis['twelvedata']),
-        "marketstack": bool(analyzer.apis['marketstack']),
-        "fmp": bool(analyzer.apis['fmp']),
-        "google_apps_script": bool(os.getenv('GOOGLE_APPS_SCRIPT_URL')),
+    status_info = {
+        "google_sheets": get_google_sheets_client() is not None,
+        "google_apps_script": HAS_GOOGLE_APPS_SCRIPT,
+        "argaam_routes": HAS_ARGAAM_ROUTES,
+        "advanced_analysis": HAS_ADVANCED_ANALYSIS,
+        "symbols_reader": HAS_SYMBOLS_READER,
+        "dashboard": HAS_DASHBOARD,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
     }
     
-    return status
-
+    # Add API status from advanced analysis if available
+    if HAS_ADVANCED_ANALYSIS:
+        try:
+            status_info.update({
+                "alpha_vantage": bool(analyzer.apis.get('alpha_vantage')),
+                "finnhub": bool(analyzer.apis.get('finnhub')),
+                "eodhd": bool(analyzer.apis.get('eodhd')),
+                "twelvedata": bool(analyzer.apis.get('twelvedata')),
+                "marketstack": bool(analyzer.apis.get('marketstack')),
+                "fmp": bool(analyzer.apis.get('fmp')),
+            })
+        except Exception as e:
+            logger.warning(f"Could not get advanced API status: {e}")
+    
+    return status_info
 
 # -----------------------------------------------------------------------------
 # Server Runner with Enhanced Port Finding
@@ -1434,10 +1374,7 @@ def find_free_port(start_port: int = 8101, max_attempts: int = 50) -> int:
         sock.bind(('0.0.0.0', 0))
         return sock.getsockname()[1]
 
-
 if __name__ == "__main__":
-    import uvicorn
-    
     # Enhanced configuration
     host = os.getenv("APP_HOST", "0.0.0.0")
     
