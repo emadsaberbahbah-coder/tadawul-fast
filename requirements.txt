@@ -1,8 +1,9 @@
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-httpx==0.27.0
-beautifulsoup4==4.12.3
-pydantic>=2.9,<3
-
-# Optional (recommended) performance extras — FastAPI will auto-use if present
-orjson>=3.10,<4
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.0
+pydantic==2.8.2
+python-dotenv==1.0.1
+yfinance==0.2.54
+certifi==2024.8.30
+pandas>=1.5.0
+numpy>=1.21.0
