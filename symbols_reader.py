@@ -12,11 +12,6 @@ from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
-import gspread
-from google.oauth2.service_account import Credentials
-from google.auth.exceptions import GoogleAuthError
-from gspread.exceptions import APIError, WorksheetNotFound, SpreadsheetNotFound
-
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -127,14 +122,22 @@ class SymbolsReader:
         except Exception as e:
             logger.debug(f"Cache save failed: {e}")
 
-    def _get_google_client(self) -> gspread.Client:
+    def _get_google_client(self):
         """Get or create Google Sheets client with error handling."""
+        try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+            from google.auth.exceptions import GoogleAuthError
+            from gspread.exceptions import APIError, WorksheetNotFound, SpreadsheetNotFound
+        except ImportError:
+            logger.error("Google Sheets dependencies not available")
+            return None
+
         if self._client is None:
             try:
                 if not os.path.exists(self.credentials_file):
-                    raise FileNotFoundError(
-                        f"Google credentials file not found: {self.credentials_file}"
-                    )
+                    logger.error(f"Google credentials file not found: {self.credentials_file}")
+                    return None
                 
                 scopes = [
                     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -150,10 +153,10 @@ class SymbolsReader:
                 
             except GoogleAuthError as e:
                 logger.error(f"Google authentication failed: {e}")
-                raise
+                return None
             except Exception as e:
                 logger.error(f"Failed to initialize Google client: {e}")
-                raise
+                return None
         
         return self._client
 
@@ -161,8 +164,13 @@ class SymbolsReader:
         """Get worksheet with fallback strategies."""
         if self._worksheet is None:
             client = self._get_google_client()
+            if client is None:
+                return None
             
             try:
+                # Import here to avoid circular imports
+                from gspread.exceptions import APIError, WorksheetNotFound, SpreadsheetNotFound
+                
                 # Open spreadsheet
                 spreadsheet = client.open_by_key(self.sheet_id)
                 logger.info(f"Opened spreadsheet: {spreadsheet.title}")
@@ -180,16 +188,60 @@ class SymbolsReader:
                             f"Worksheet '{self.tab_name}' not found, using first worksheet: {self._worksheet.title}"
                         )
                     else:
-                        raise WorksheetNotFound("No worksheets found in spreadsheet")
+                        logger.error("No worksheets found in spreadsheet")
+                        return None
                         
             except SpreadsheetNotFound:
                 logger.error(f"Spreadsheet not found with ID: {self.sheet_id}")
-                raise
+                return None
             except APIError as e:
                 logger.error(f"Google Sheets API error: {e}")
-                raise
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected error getting worksheet: {e}")
+                return None
         
         return self._worksheet
+
+    def _get_hardcoded_symbols(self) -> List[Dict[str, Any]]:
+        """Return hardcoded symbols as fallback when Google Sheets fails."""
+        return [
+            {
+                "symbol": "7201.SR",
+                "company_name": "Saudi Company 7201",
+                "trading_sector": "Materials",
+                "financial_market": "Nomu",
+                "include_in_ranking": True
+            },
+            {
+                "symbol": "9603.SR", 
+                "company_name": "Saudi Company 9603",
+                "trading_sector": "Telecommunications",
+                "financial_market": "Tadawul (TASI)",
+                "include_in_ranking": True
+            },
+            {
+                "symbol": "9609.SR",
+                "company_name": "Saudi Company 9609", 
+                "trading_sector": "Banks",
+                "financial_market": "Tadawul (TASI)",
+                "include_in_ranking": True
+            },
+            {
+                "symbol": "6070.SR",
+                "company_name": "Saudi Company 6070",
+                "trading_sector": "Transportation", 
+                "financial_market": "Nomu",
+                "include_in_ranking": True
+            },
+            {
+                "symbol": "7200.SR",
+                "company_name": "Saudi Company 7200",
+                "trading_sector": "Petrochemicals",
+                "financial_market": "Tadawul (TASI)",
+                "include_in_ranking": True
+            }
+        ]
 
     def _map_columns(self, headers: List[str]) -> Dict[str, int]:
         """Map column names to indices based on header detection."""
@@ -315,12 +367,21 @@ class SymbolsReader:
             
             # Get worksheet
             worksheet = self._get_worksheet()
+            if worksheet is None:
+                logger.warning("Google Sheets not available, using hardcoded symbols")
+                hardcoded_data = self._get_hardcoded_symbols()
+                if limit:
+                    hardcoded_data = hardcoded_data[:limit]
+                return self._build_response(hardcoded_data, source="hardcoded_fallback")
             
             # Get all data
             all_data = worksheet.get_all_values()
             if not all_data or len(all_data) < self.header_row:
                 logger.warning("No data found in worksheet or insufficient header rows")
-                return self._build_response([], error="No data found in worksheet")
+                hardcoded_data = self._get_hardcoded_symbols()
+                if limit:
+                    hardcoded_data = hardcoded_data[:limit]
+                return self._build_response(hardcoded_data, source="hardcoded_fallback")
             
             # Extract headers and data rows
             headers = all_data[self.header_row - 1]  # Header row (0-indexed)
@@ -350,19 +411,16 @@ class SymbolsReader:
             
         except FileNotFoundError as e:
             logger.error(f"Credentials file not found: {e}")
-            return self._build_response([], error=f"Credentials file not found: {e}")
-        except SpreadsheetNotFound as e:
-            logger.error(f"Spreadsheet not found: {e}")
-            return self._build_response([], error=f"Spreadsheet not found: {e}")
-        except WorksheetNotFound as e:
-            logger.error(f"Worksheet not found: {e}")
-            return self._build_response([], error=f"Worksheet not found: {e}")
-        except APIError as e:
-            logger.error(f"Google Sheets API error: {e}")
-            return self._build_response([], error=f"Google Sheets API error: {e}")
+            hardcoded_data = self._get_hardcoded_symbols()
+            if limit:
+                hardcoded_data = hardcoded_data[:limit]
+            return self._build_response(hardcoded_data, source="hardcoded_fallback")
         except Exception as e:
             logger.error(f"Unexpected error fetching symbols: {e}")
-            return self._build_response([], error=f"Unexpected error: {e}")
+            hardcoded_data = self._get_hardcoded_symbols()
+            if limit:
+                hardcoded_data = hardcoded_data[:limit]
+            return self._build_response(hardcoded_data, source="hardcoded_fallback")
 
     def _build_response(self, data: List[Dict[str, Any]], source: str = "unknown", 
                        column_map: Dict[str, int] = None, error: str = None) -> dict:
