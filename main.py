@@ -731,24 +731,29 @@ def _safe_fetch_symbols_via_sr(limit: int) -> Optional[Dict[str, Any]]:
         return None
 
 
-
 def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
     """Unified symbol loader with fallback."""
     # Try symbols_reader first
     sr_payload = _safe_fetch_symbols_via_sr(limit)
-    if sr_payload and sr_payload.get("data"):
+    if sr_payload is not None:  # Changed this condition
+        logger.info(f"Using symbols_reader data with {len(sr_payload.get('data', []))} symbols")
         return sr_payload
 
     # Fallback to direct sheet read
     if HAS_GSHEETS:
+        logger.info("Falling back to direct Google Sheets read")
         fallback = _build_symbols_payload_from_sheet(limit, only_included=True)
         if fallback.get("count", 0) > 0:
             return fallback
 
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="No symbols available from symbols_reader or Google Sheets"
-    )
+    # Final fallback - return empty but valid response
+    logger.warning("Both symbols_reader and Google Sheets failed, returning empty response")
+    return {
+        "data": [],
+        "count": 0,
+        "source": "fallback",
+        "error": "No symbols available"
+    }
 
 
 # -----------------------------------------------------------------------------
