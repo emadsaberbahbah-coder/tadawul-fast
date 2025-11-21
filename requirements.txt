@@ -61,8 +61,3 @@ redis==5.0.7
 # === Data Validation & Serialization ===
 marshmallow==3.21.1
 marshmallow-dataclass==8.6.2
-
-# === Optional: Advanced Features ===
-# ta-lib==0.4.28  # Technical analysis library
-# plotly==5.21.0   # Charts and visualization
-# seaborn==0.13.2  # Statistical data visualization
