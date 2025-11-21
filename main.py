@@ -1383,3 +1383,49 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Server failed to start: {e}")
         raise
+from google_apps_script_client import google_apps_script_client
+
+@app.get("/v1/multi-source/{symbol}")
+async def get_multi_source_analysis(symbol: str):
+    """Get analysis from all available data sources."""
+    try:
+        analysis = analyzer.get_multi_source_analysis(symbol)
+        return analysis
+    except Exception as e:
+        logger.error(f"Multi-source analysis failed for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+
+@app.get("/v1/google-apps-script/symbols")
+async def get_google_apps_script_data(symbol: str = None):
+    """Get data from Google Apps Script."""
+    result = google_apps_script_client.get_symbols_data(symbol)
+    
+    if result.success:
+        return {
+            "ok": True,
+            "data": result.data,
+            "execution_time": result.execution_time
+        }
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google Apps Script error: {result.error}"
+        )
+
+@app.get("/v1/apis/status")
+async def get_apis_status():
+    """Check status of all configured APIs."""
+    test_symbol = "7201.SR"  # Test with a Saudi symbol
+    
+    status = {
+        "alpha_vantage": bool(analyzer.apis['alpha_vantage']),
+        "finnhub": bool(analyzer.apis['finnhub']),
+        "eodhd": bool(analyzer.apis['eodhd']),
+        "twelvedata": bool(analyzer.apis['twelvedata']),
+        "marketstack": bool(analyzer.apis['marketstack']),
+        "fmp": bool(analyzer.apis['fmp']),
+        "google_apps_script": bool(os.getenv('GOOGLE_APPS_SCRIPT_URL')),
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+    
+    return status
