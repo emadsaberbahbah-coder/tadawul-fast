@@ -94,6 +94,28 @@ except ImportError as e:
     sr = DummySymbolsReader()
 
 # -----------------------------------------------------------------------------
+# Google Apps Script Client Import
+# -----------------------------------------------------------------------------
+try:
+    from google_apps_script_client import google_apps_script_client
+    HAS_GOOGLE_APPS_SCRIPT = True
+    logger.info("Google Apps Script client loaded successfully")
+except ImportError as e:
+    HAS_GOOGLE_APPS_SCRIPT = False
+    logger.warning(f"Google Apps Script client not available: {e}")
+    # Create dummy client
+    class DummyGoogleAppsScriptClient:
+        @staticmethod
+        def get_symbols_data(symbol=None):
+            return type('obj', (object,), {
+                'success': False,
+                'data': None,
+                'error': 'Google Apps Script client not available',
+                'execution_time': 0
+            })()
+    google_apps_script_client = DummyGoogleAppsScriptClient()
+
+# -----------------------------------------------------------------------------
 # Google Sheets imports with error handling
 # -----------------------------------------------------------------------------
 try:
@@ -437,6 +459,9 @@ app = FastAPI(
         "  • GET  /v1/cache                         -> Cache inspection\n"
         "  • GET  /v41/argaam/quotes                -> Argaam-style quotes\n"
         "  • POST /v41/argaam/quotes                -> Argaam quotes with POST\n"
+        "  • GET  /v1/multi-source/{symbol}         -> Multi-source analysis\n"
+        "  • GET  /v1/google-apps-script/symbols    -> Google Apps Script data\n"
+        "  • GET  /v1/apis/status                   -> API status check\n"
     ),
     lifespan=lifespan,
     responses={
@@ -740,6 +765,7 @@ async def root() -> Dict[str, Any]:
             "has_gsheets": HAS_GSHEETS,
             "has_symbols_reader": HAS_SYMBOLS_READER,
             "has_argaam_routes": HAS_ARGAAM_ROUTES,  # Added Argaam capability
+            "has_google_apps_script": HAS_GOOGLE_APPS_SCRIPT,
         },
         "cache": {
             "count_cached": len(QUOTE_CACHE),
@@ -755,6 +781,9 @@ async def root() -> Dict[str, Any]:
             "argaam_quotes": "/v41/argaam/quotes",
             "argaam_health": "/v41/argaam/health",
             "cache_view": "/v1/cache",
+            "multi_source_analysis": "/v1/multi-source/{symbol}",
+            "google_apps_script": "/v1/google-apps-script/symbols",
+            "apis_status": "/v1/apis/status",
         },
     }
 
@@ -771,6 +800,7 @@ async def ping() -> Dict[str, Any]:
             "has_dashboard": HAS_DASHBOARD,
             "has_gsheets": HAS_GSHEETS,
             "has_argaam_routes": HAS_ARGAAM_ROUTES,
+            "has_google_apps_script": HAS_GOOGLE_APPS_SCRIPT,
             "cache_count": len(QUOTE_CACHE),
         }
     }
@@ -1324,6 +1354,57 @@ async def analyze_stock(req: AnalysisRequest) -> AnalysisResponse:
 
 
 # -----------------------------------------------------------------------------
+# New Multi-Source Analysis and Google Apps Script Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/v1/multi-source/{symbol}")
+async def get_multi_source_analysis(symbol: str):
+    """Get analysis from all available data sources."""
+    try:
+        analysis = analyzer.get_multi_source_analysis(symbol)
+        return analysis
+    except Exception as e:
+        logger.error(f"Multi-source analysis failed for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+
+
+@app.get("/v1/google-apps-script/symbols")
+async def get_google_apps_script_data(symbol: str = None):
+    """Get data from Google Apps Script."""
+    result = google_apps_script_client.get_symbols_data(symbol)
+    
+    if result.success:
+        return {
+            "ok": True,
+            "data": result.data,
+            "execution_time": result.execution_time
+        }
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google Apps Script error: {result.error}"
+        )
+
+
+@app.get("/v1/apis/status")
+async def get_apis_status():
+    """Check status of all configured APIs."""
+    test_symbol = "7201.SR"  # Test with a Saudi symbol
+    
+    status = {
+        "alpha_vantage": bool(analyzer.apis['alpha_vantage']),
+        "finnhub": bool(analyzer.apis['finnhub']),
+        "eodhd": bool(analyzer.apis['eodhd']),
+        "twelvedata": bool(analyzer.apis['twelvedata']),
+        "marketstack": bool(analyzer.apis['marketstack']),
+        "fmp": bool(analyzer.apis['fmp']),
+        "google_apps_script": bool(os.getenv('GOOGLE_APPS_SCRIPT_URL')),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+    }
+    
+    return status
+
+
+# -----------------------------------------------------------------------------
 # Server Runner with Enhanced Port Finding
 # -----------------------------------------------------------------------------
 def find_free_port(start_port: int = 8101, max_attempts: int = 50) -> int:
@@ -1383,49 +1464,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Server failed to start: {e}")
         raise
-from google_apps_script_client import google_apps_script_client
-
-@app.get("/v1/multi-source/{symbol}")
-async def get_multi_source_analysis(symbol: str):
-    """Get analysis from all available data sources."""
-    try:
-        analysis = analyzer.get_multi_source_analysis(symbol)
-        return analysis
-    except Exception as e:
-        logger.error(f"Multi-source analysis failed for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
-
-@app.get("/v1/google-apps-script/symbols")
-async def get_google_apps_script_data(symbol: str = None):
-    """Get data from Google Apps Script."""
-    result = google_apps_script_client.get_symbols_data(symbol)
-    
-    if result.success:
-        return {
-            "ok": True,
-            "data": result.data,
-            "execution_time": result.execution_time
-        }
-    else:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Google Apps Script error: {result.error}"
-        )
-
-@app.get("/v1/apis/status")
-async def get_apis_status():
-    """Check status of all configured APIs."""
-    test_symbol = "7201.SR"  # Test with a Saudi symbol
-    
-    status = {
-        "alpha_vantage": bool(analyzer.apis['alpha_vantage']),
-        "finnhub": bool(analyzer.apis['finnhub']),
-        "eodhd": bool(analyzer.apis['eodhd']),
-        "twelvedata": bool(analyzer.apis['twelvedata']),
-        "marketstack": bool(analyzer.apis['marketstack']),
-        "fmp": bool(analyzer.apis['fmp']),
-        "google_apps_script": bool(os.getenv('GOOGLE_APPS_SCRIPT_URL')),
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-    
-    return status
