@@ -700,29 +700,36 @@ def _build_symbols_payload_from_sheet(limit: int, only_included: bool = True) ->
         },
     }
 
-
 def _safe_fetch_symbols_via_sr(limit: int) -> Optional[Dict[str, Any]]:
     """Safely fetch symbols using symbols_reader."""
     if not HAS_SYMBOLS_READER:
+        logger.warning("HAS_SYMBOLS_READER is False")
         return None
         
     try:
         payload = sr.fetch_symbols(limit)
+        logger.info(f"symbols_reader response: {payload}")
+        
         if not isinstance(payload, dict):
+            logger.warning("symbols_reader returned non-dict response")
             return None
             
         data = payload.get("data")
-        if not data or not isinstance(data, list):
+        if data is None or not isinstance(data, list):
+            logger.warning(f"symbols_reader returned invalid data: {data}")
             return None
 
+        # Always return the payload even if data is empty
         # Fix count if needed
         if isinstance(payload.get("count"), int) and payload["count"] <= 0:
             payload["count"] = len(data)
             
+        logger.info(f"symbols_reader returning {len(data)} symbols")
         return payload
     except Exception as e:
         logger.warning(f"symbols_reader.fetch_symbols failed: {e}")
         return None
+
 
 
 def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
