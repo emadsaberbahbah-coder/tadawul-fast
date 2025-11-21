@@ -109,14 +109,14 @@ class AIRecommendation:
 
 class AdvancedTradingAnalyzer:
     def __init__(self):
-        # API Keys from environment variables only (no hardcoded keys)
+        # API Keys from environment variables with actual keys
         self.apis = {
-            'alpha_vantage': os.getenv('ALPHA_VANTAGE_API_KEY', ''),
-            'finnhub': os.getenv('FINNHUB_API_KEY', ''),
-            'eodhd': os.getenv('EODHD_API_KEY', ''),
-            'twelvedata': os.getenv('TWELVEDATA_API_KEY', ''),
-            'marketstack': os.getenv('MARKETSTACK_API_KEY', ''),
-            'fmp': os.getenv('FMP_API_KEY', '')
+            'alpha_vantage': os.getenv('ALPHA_VANTAGE_API_KEY', 'Q0VIE9J6AXUCG99F'),
+            'finnhub': os.getenv('FINNHUB_API_KEY', 'd3uhd8pr01qil4aq3i5gd3uhd8pr01qil4aq3i60'),
+            'eodhd': os.getenv('EODHD_API_KEY', '68fd1783ee7eb1.12039806'),
+            'twelvedata': os.getenv('TWELVEDATA_API_KEY', 'ca363b090fbb421a84c05882e4f1e393'),
+            'marketstack': os.getenv('MARKETSTACK_API_KEY', '657b972a96392c3cac405ccc48c36b0c'),
+            'fmp': os.getenv('FMP_API_KEY', '3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt')
         }
         
         self.base_urls = {
@@ -127,6 +127,12 @@ class AdvancedTradingAnalyzer:
             'marketstack': 'http://api.marketstack.com/v1',
             'fmp': 'https://financialmodelingprep.com/api/v3'
         }
+
+        # Google Apps Script integration
+        self.google_apps_script_url = os.getenv(
+            'GOOGLE_APPS_SCRIPT_URL',
+            'https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec'
+        )
 
         # Cache configuration
         self.cache_dir = Path("./analysis_cache")
@@ -193,7 +199,8 @@ class AdvancedTradingAnalyzer:
             self._get_price_alpha_vantage,
             self._get_price_finnhub,
             self._get_price_twelvedata,
-            self._get_price_marketstack
+            self._get_price_marketstack,
+            self._get_price_fmp
         ]
         
         for source in sources:
@@ -223,7 +230,7 @@ class AdvancedTradingAnalyzer:
         
         try:
             session = self.session or requests.Session()
-            response = session.get(self.base_urls['alpha_vantage'], params=params, timeout=10)
+            response = session.get(self.base_urls['alpha_vantage'], params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -260,7 +267,7 @@ class AdvancedTradingAnalyzer:
         
         try:
             session = self.session or requests.Session()
-            response = session.get(url, params=params, timeout=10)
+            response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -296,7 +303,7 @@ class AdvancedTradingAnalyzer:
         
         try:
             session = self.session or requests.Session()
-            response = session.get(url, params=params, timeout=10)
+            response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -304,7 +311,7 @@ class AdvancedTradingAnalyzer:
                 # Get additional quote data
                 quote_url = f"{self.base_urls['twelvedata']}/quote"
                 quote_params = {'symbol': symbol, 'apikey': self.apis['twelvedata']}
-                quote_response = session.get(quote_url, params=quote_params, timeout=10)
+                quote_response = session.get(quote_url, params=quote_params, timeout=15)
                 quote_data = quote_response.json()
                 
                 return PriceData(
@@ -338,7 +345,7 @@ class AdvancedTradingAnalyzer:
         
         try:
             session = self.session or requests.Session()
-            response = session.get(url, params=params, timeout=10)
+            response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -352,7 +359,7 @@ class AdvancedTradingAnalyzer:
                     high=float(quote.get('high', 0)),
                     low=float(quote.get('low', 0)),
                     open=float(quote.get('open', 0)),
-                    previous_close=float(quote.get('close', 0)),  # Marketstack doesn't provide previous close directly
+                    previous_close=float(quote.get('close', 0)),
                     volume=int(quote.get('volume', 0)),
                     timestamp=quote.get('date', datetime.utcnow().isoformat()),
                     source='marketstack'
@@ -361,6 +368,143 @@ class AdvancedTradingAnalyzer:
             logger.warning(f"Marketstack API error for {symbol}: {e}")
             
         return None
+
+    def _get_price_fmp(self, symbol: str) -> Optional[PriceData]:
+        """Financial Modeling Prep price data."""
+        if not self.apis['fmp']:
+            return None
+
+        url = f"{self.base_urls['fmp']}/quote/{symbol}"
+        params = {
+            'apikey': self.apis['fmp']
+        }
+        
+        try:
+            session = self.session or requests.Session()
+            response = session.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data and len(data) > 0:
+                quote = data[0]
+                return PriceData(
+                    symbol=symbol,
+                    price=float(quote.get('price', 0)),
+                    change=float(quote.get('change', 0)),
+                    change_percent=float(quote.get('changesPercentage', 0)),
+                    high=float(quote.get('dayHigh', 0)),
+                    low=float(quote.get('dayLow', 0)),
+                    open=float(quote.get('open', 0)),
+                    previous_close=float(quote.get('previousClose', 0)),
+                    volume=int(quote.get('volume', 0)),
+                    timestamp=datetime.utcnow().isoformat(),
+                    source='fmp'
+                )
+        except Exception as e:
+            logger.warning(f"FMP API error for {symbol}: {e}")
+            
+        return None
+
+    def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
+        """Get comprehensive analysis from all available data sources."""
+        results = {
+            'symbol': symbol,
+            'sources': {},
+            'consolidated': {},
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+        
+        # Alpha Vantage
+        try:
+            alpha_data = self._get_price_alpha_vantage(symbol)
+            if alpha_data:
+                results['sources']['alpha_vantage'] = alpha_data.__dict__
+        except Exception as e:
+            logger.warning(f"Alpha Vantage failed for {symbol}: {e}")
+        
+        # Finnhub
+        try:
+            finnhub_data = self._get_price_finnhub(symbol)
+            if finnhub_data:
+                results['sources']['finnhub'] = finnhub_data.__dict__
+        except Exception as e:
+            logger.warning(f"Finnhub failed for {symbol}: {e}")
+        
+        # Twelve Data
+        try:
+            twelve_data = self._get_price_twelvedata(symbol)
+            if twelve_data:
+                results['sources']['twelvedata'] = twelve_data.__dict__
+        except Exception as e:
+            logger.warning(f"Twelve Data failed for {symbol}: {e}")
+        
+        # MarketStack
+        try:
+            marketstack_data = self._get_price_marketstack(symbol)
+            if marketstack_data:
+                results['sources']['marketstack'] = marketstack_data.__dict__
+        except Exception as e:
+            logger.warning(f"MarketStack failed for {symbol}: {e}")
+        
+        # FMP
+        try:
+            fmp_data = self._get_price_fmp(symbol)
+            if fmp_data:
+                results['sources']['fmp'] = fmp_data.__dict__
+        except Exception as e:
+            logger.warning(f"FMP failed for {symbol}: {e}")
+        
+        # Google Apps Script
+        try:
+            apps_script_data = self._get_google_apps_script_data(symbol)
+            if apps_script_data:
+                results['sources']['google_apps_script'] = apps_script_data
+        except Exception as e:
+            logger.warning(f"Google Apps Script failed for {symbol}: {e}")
+        
+        # Consolidate results
+        results['consolidated'] = self._consolidate_multi_source_data(results['sources'])
+        
+        return results
+
+    def _get_google_apps_script_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get data from Google Apps Script."""
+        try:
+            params = {'symbol': symbol.upper()}
+            response = requests.get(self.google_apps_script_url, params=params, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.warning(f"Google Apps Script error for {symbol}: {e}")
+            return None
+
+    def _consolidate_multi_source_data(self, sources: Dict[str, Any]) -> Dict[str, Any]:
+        """Consolidate data from multiple sources."""
+        prices = []
+        volumes = []
+        changes = []
+        
+        for source_name, data in sources.items():
+            if data and data.get('price'):
+                prices.append(data['price'])
+            if data and data.get('volume'):
+                volumes.append(data['volume'])
+            if data and data.get('change'):
+                changes.append(data['change'])
+        
+        consolidated = {
+            'price_avg': sum(prices) / len(prices) if prices else None,
+            'price_min': min(prices) if prices else None,
+            'price_max': max(prices) if prices else None,
+            'price_std': np.std(prices) if len(prices) > 1 else 0,
+            'volume_avg': sum(volumes) / len(volumes) if volumes else None,
+            'change_avg': sum(changes) / len(changes) if changes else None,
+            'sources_count': len(sources),
+            'confidence': min(1.0, len(sources) * 0.2),
+            'data_quality': 'HIGH' if len(sources) >= 3 else 'MEDIUM' if len(sources) >= 2 else 'LOW'
+        }
+        
+        return consolidated
 
     def calculate_technical_indicators(self, symbol: str, period: str = '3mo') -> TechnicalIndicators:
         """Calculate advanced technical indicators with caching."""
@@ -389,8 +533,48 @@ class AdvancedTradingAnalyzer:
 
     def _get_historical_data(self, symbol: str, period: str) -> pd.DataFrame:
         """Get historical price data for technical analysis."""
-        # This would integrate with historical data APIs
-        # For now, generate realistic sample data
+        # Use Alpha Vantage for historical data
+        try:
+            if self.apis['alpha_vantage']:
+                url = self.base_urls['alpha_vantage']
+                params = {
+                    'function': 'TIME_SERIES_DAILY',
+                    'symbol': symbol,
+                    'apikey': self.apis['alpha_vantage'],
+                    'outputsize': 'compact'
+                }
+                response = requests.get(url, params=params, timeout=15)
+                data = response.json()
+                
+                if 'Time Series (Daily)' in data:
+                    time_series = data['Time Series (Daily)']
+                    dates = []
+                    opens = []
+                    highs = []
+                    lows = []
+                    closes = []
+                    volumes = []
+                    
+                    for date, values in list(time_series.items())[:90]:  # Last 90 days
+                        dates.append(pd.to_datetime(date))
+                        opens.append(float(values['1. open']))
+                        highs.append(float(values['2. high']))
+                        lows.append(float(values['3. low']))
+                        closes.append(float(values['4. close']))
+                        volumes.append(int(values['5. volume']))
+                    
+                    return pd.DataFrame({
+                        'date': dates,
+                        'open': opens,
+                        'high': highs,
+                        'low': lows,
+                        'close': closes,
+                        'volume': volumes
+                    }).set_index('date')
+        except Exception as e:
+            logger.warning(f"Historical data API failed, using sample data: {e}")
+        
+        # Fallback to sample data
         dates = pd.date_range(end=datetime.now(), periods=90, freq='D')
         base_price = np.random.uniform(40, 60)
         
@@ -417,7 +601,7 @@ class AdvancedTradingAnalyzer:
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
-        rsi = 100 - (100 / (1 + rs)).iloc[-1]
+        rsi = 100 - (100 / (1 + rs)).iloc[-1] if not rs.isna().iloc[-1] else 50
         
         # MACD
         exp1 = close_prices.ewm(span=12).mean()
@@ -450,7 +634,7 @@ class AdvancedTradingAnalyzer:
             trend_direction = "Neutral"
             
         volatility = close_prices.pct_change().std() * np.sqrt(252)
-        momentum_score = ((close_prices.iloc[-1] / close_prices.iloc[-20]) - 1) * 100
+        momentum_score = ((close_prices.iloc[-1] / close_prices.iloc[-20]) - 1) * 100 if len(close_prices) >= 20 else 0
         
         return TechnicalIndicators(
             rsi=float(rsi),
@@ -526,9 +710,12 @@ class AdvancedTradingAnalyzer:
 
     def _get_fundamental_data_combined(self, symbol: str) -> FundamentalData:
         """Combine data from multiple fundamental data sources."""
-        # This would integrate with FMP, EODHD, etc.
-        # For now, generate realistic sample data
+        # Try FMP API first
+        fmp_data = self._get_fundamentals_fmp(symbol)
+        if fmp_data:
+            return fmp_data
         
+        # Fallback to sample data
         return FundamentalData(
             market_cap=float(np.random.uniform(1e9, 50e9)),
             pe_ratio=float(np.random.uniform(8, 25)),
@@ -546,6 +733,41 @@ class AdvancedTradingAnalyzer:
             quick_ratio=float(np.random.uniform(0.8, 2.8)),
             peg_ratio=float(np.random.uniform(0.5, 3.0))
         )
+
+    def _get_fundamentals_fmp(self, symbol: str) -> Optional[FundamentalData]:
+        """Get fundamental data from Financial Modeling Prep."""
+        if not self.apis['fmp']:
+            return None
+
+        try:
+            url = f"{self.base_urls['fmp']}/profile/{symbol}"
+            params = {'apikey': self.apis['fmp']}
+            response = requests.get(url, params=params, timeout=15)
+            data = response.json()
+            
+            if data and len(data) > 0:
+                profile = data[0]
+                return FundamentalData(
+                    market_cap=float(profile.get('mktCap', 0)),
+                    pe_ratio=float(profile.get('priceToEarnings', 0)),
+                    pb_ratio=float(profile.get('priceToBook', 0)),
+                    dividend_yield=float(profile.get('lastDiv', 0)) / 100.0,
+                    eps=float(profile.get('eps', 0)),
+                    roe=float(profile.get('roe', 0)) / 100.0,
+                    debt_to_equity=float(profile.get('debtToEquity', 0)),
+                    revenue_growth=float(profile.get('revenueGrowth', 0)),
+                    profit_margin=float(profile.get('profitMargin', 0)) / 100.0,
+                    sector_rank=1,
+                    free_cash_flow=float(profile.get('freeCashFlow', 0)),
+                    operating_margin=float(profile.get('operatingMargins', 0)) / 100.0,
+                    current_ratio=float(profile.get('currentRatio', 0)),
+                    quick_ratio=float(profile.get('quickRatio', 0)),
+                    peg_ratio=float(profile.get('pegRatio', 0))
+                )
+        except Exception as e:
+            logger.warning(f"FMP fundamentals failed for {symbol}: {e}")
+        
+        return None
 
     def _generate_fallback_fundamental_data(self) -> FundamentalData:
         """Generate fallback fundamental data when analysis fails."""
@@ -921,79 +1143,3 @@ class AdvancedTradingAnalyzer:
 
 # Global analyzer instance with context manager support
 analyzer = AdvancedTradingAnalyzer()
-def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
-    """Get comprehensive analysis from all available data sources."""
-    results = {
-        'symbol': symbol,
-        'sources': {},
-        'consolidated': {},
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
-    }
-    
-    # Alpha Vantage
-    try:
-        alpha_data = self._get_price_alpha_vantage(symbol)
-        if alpha_data:
-            results['sources']['alpha_vantage'] = alpha_data
-    except Exception as e:
-        logger.warning(f"Alpha Vantage failed for {symbol}: {e}")
-    
-    # Finnhub
-    try:
-        finnhub_data = self._get_price_finnhub(symbol)
-        if finnhub_data:
-            results['sources']['finnhub'] = finnhub_data
-    except Exception as e:
-        logger.warning(f"Finnhub failed for {symbol}: {e}")
-    
-    # Twelve Data
-    try:
-        twelve_data = self._get_price_twelvedata(symbol)
-        if twelve_data:
-            results['sources']['twelvedata'] = twelve_data
-    except Exception as e:
-        logger.warning(f"Twelve Data failed for {symbol}: {e}")
-    
-    # MarketStack
-    try:
-        marketstack_data = self._get_price_marketstack(symbol)
-        if marketstack_data:
-            results['sources']['marketstack'] = marketstack_data
-    except Exception as e:
-        logger.warning(f"MarketStack failed for {symbol}: {e}")
-    
-    # Google Apps Script
-    try:
-        from google_apps_script_client import google_apps_script_client
-        apps_script_data = google_apps_script_client.get_symbols_data(symbol)
-        if apps_script_data.success:
-            results['sources']['google_apps_script'] = apps_script_data.data
-    except Exception as e:
-        logger.warning(f"Google Apps Script failed for {symbol}: {e}")
-    
-    # Consolidate results
-    results['consolidated'] = self._consolidate_multi_source_data(results['sources'])
-    
-    return results
-
-def _consolidate_multi_source_data(self, sources: Dict[str, Any]) -> Dict[str, Any]:
-    """Consolidate data from multiple sources."""
-    prices = []
-    volumes = []
-    
-    for source_name, data in sources.items():
-        if data and data.get('price'):
-            prices.append(data['price'])
-        if data and data.get('volume'):
-            volumes.append(data['volume'])
-    
-    consolidated = {
-        'price_avg': sum(prices) / len(prices) if prices else None,
-        'price_min': min(prices) if prices else None,
-        'price_max': max(prices) if prices else None,
-        'volume_avg': sum(volumes) / len(volumes) if volumes else None,
-        'sources_count': len(sources),
-        'confidence': min(1.0, len(sources) * 0.2)  # Higher confidence with more sources
-    }
-    
-    return consolidated
