@@ -34,7 +34,7 @@ load_dotenv(dotenv_path=BASE_DIR / ".env")
 # Service-level configuration with validation
 # -----------------------------------------------------------------------------
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Stock Market Hub Sheet API").strip()
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.7.0").strip()
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.8.0").strip()
 FASTAPI_BASE = os.getenv("FASTAPI_BASE", "").strip()
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 USER_AGENT = os.getenv(
@@ -48,6 +48,20 @@ try:
 except ValueError:
     SHEETS_HEADER_ROW = 3
     logger.warning(f"Invalid SHEETS_HEADER_ROW, using default: {SHEETS_HEADER_ROW}")
+
+# -----------------------------------------------------------------------------
+# Argaam Integration Import
+# -----------------------------------------------------------------------------
+try:
+    from routes_argaam import router as argaam_router, close_argaam_http_client
+    HAS_ARGAAM_ROUTES = True
+    logger.info("Argaam routes loaded successfully")
+except ImportError as e:
+    HAS_ARGAAM_ROUTES = False
+    logger.warning(f"Argaam routes not available: {e}")
+    # Create dummy functions
+    async def close_argaam_http_client():
+        pass
 
 # -----------------------------------------------------------------------------
 # Optional imports with better error handling
@@ -148,6 +162,7 @@ class HealthResponse(BaseModel):
     cache_file_exists: bool = Field(..., description="Whether cache file exists")
     has_dashboard: bool = Field(..., description="Dashboard module available")
     has_gsheets: bool = Field(..., description="Google Sheets available")
+    has_argaam_routes: bool = Field(..., description="Argaam routes available")
 
 
 class ErrorResponse(BaseModel):
@@ -361,11 +376,11 @@ def _empty_quote(sym: str) -> Quote:
 
 
 # -----------------------------------------------------------------------------
-# Lifespan Management
+# Enhanced Lifespan Management with Argaam Integration
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Enhanced lifespan with better error handling."""
+    """Enhanced lifespan with Argaam integration."""
     # Startup
     startup_time = datetime.datetime.utcnow()
     logger.info(f"Starting {SERVICE_NAME} v{SERVICE_VERSION}")
@@ -391,7 +406,13 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
+    # Shutdown - Close Argaam HTTP client
+    try:
+        await close_argaam_http_client()
+        logger.info("Argaam HTTP client closed successfully")
+    except Exception as e:
+        logger.warning(f"Error closing Argaam HTTP client: {e}")
+    
     shutdown_time = datetime.datetime.utcnow()
     uptime = shutdown_time - startup_time
     logger.info(f"Shutting down after {uptime}")
@@ -404,7 +425,7 @@ app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
     description=(
-        "Enhanced Stock Market API with improved error handling and validation.\n\n"
+        "Enhanced Stock Market API with Argaam integration and improved error handling.\n\n"
         "Main endpoints:\n"
         "  • GET  /                                 -> Service info and status\n"
         "  • GET  /health                           -> Health check with diagnostics\n"
@@ -415,6 +436,7 @@ app = FastAPI(
         "  • GET  /v1/quote?tickers=A,B             -> Get quotes from cache\n"
         "  • GET  /v1/cache                         -> Cache inspection\n"
         "  • GET  /v41/argaam/quotes                -> Argaam-style quotes\n"
+        "  • POST /v41/argaam/quotes                -> Argaam quotes with POST\n"
     ),
     lifespan=lifespan,
     responses={
@@ -423,6 +445,15 @@ app = FastAPI(
         503: {"model": ErrorResponse},
     }
 )
+
+# -----------------------------------------------------------------------------
+# Include Argaam Routes
+# -----------------------------------------------------------------------------
+if HAS_ARGAAM_ROUTES:
+    app.include_router(argaam_router)
+    logger.info("Argaam routes mounted successfully")
+else:
+    logger.warning("Argaam routes not available - endpoints will be missing")
 
 # -----------------------------------------------------------------------------
 # Enhanced CORS Configuration
@@ -693,7 +724,7 @@ def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 @app.get("/", response_model=Dict[str, Any])
 async def root() -> Dict[str, Any]:
-    """Enhanced root endpoint with comprehensive info."""
+    """Enhanced root endpoint with comprehensive info including Argaam."""
     return {
         "ok": True,
         "service": SERVICE_NAME,
@@ -708,6 +739,7 @@ async def root() -> Dict[str, Any]:
             "has_dashboard": HAS_DASHBOARD,
             "has_gsheets": HAS_GSHEETS,
             "has_symbols_reader": HAS_SYMBOLS_READER,
+            "has_argaam_routes": HAS_ARGAAM_ROUTES,  # Added Argaam capability
         },
         "cache": {
             "count_cached": len(QUOTE_CACHE),
@@ -721,6 +753,7 @@ async def root() -> Dict[str, Any]:
             "quote_get": "/v1/quote",
             "quote_update": "/v1/quote/update",
             "argaam_quotes": "/v41/argaam/quotes",
+            "argaam_health": "/v41/argaam/health",
             "cache_view": "/v1/cache",
         },
     }
@@ -737,6 +770,7 @@ async def ping() -> Dict[str, Any]:
         "capabilities": {
             "has_dashboard": HAS_DASHBOARD,
             "has_gsheets": HAS_GSHEETS,
+            "has_argaam_routes": HAS_ARGAAM_ROUTES,
             "cache_count": len(QUOTE_CACHE),
         }
     }
@@ -761,6 +795,7 @@ async def health() -> HealthResponse:
         cache_file_exists=CACHE_PATH.exists(),
         has_dashboard=HAS_DASHBOARD,
         has_gsheets=HAS_GSHEETS,
+        has_argaam_routes=HAS_ARGAAM_ROUTES,
     )
 
 
@@ -949,13 +984,15 @@ async def get_quote(
 
 
 # -----------------------------------------------------------------------------
-# Argaam-style Quotes Endpoint
+# Argaam-style Quotes Endpoint (Legacy - now use /v41/argaam/quotes)
 # -----------------------------------------------------------------------------
 @app.get("/v41/argaam/quotes", response_model=Dict[str, Any])
-async def argaam_quotes(
+async def legacy_argaam_quotes(
     tickers: str = Query(..., description="Comma-separated tickers")
 ) -> Dict[str, Any]:
-    """Argaam-style quotes endpoint for Google Sheets."""
+    """Legacy Argaam-style quotes endpoint - now handled by routes_argaam."""
+    # This endpoint is maintained for backward compatibility
+    # The actual implementation is now in routes_argaam.py
     raw_symbols = [t.strip() for t in tickers.split(",") if t.strip()]
     if not raw_symbols:
         raise HTTPException(
@@ -1346,188 +1383,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Server failed to start: {e}")
         raise
-# -----------------------------------------------------------------------------
-# Advanced AI Analysis Endpoints
-# -----------------------------------------------------------------------------
-@app.get("/v1/analysis/{symbol}/full", response_model=Dict[str, Any])
-async def get_full_analysis(symbol: str) -> Dict[str, Any]:
-    """Get comprehensive AI analysis for a symbol."""
-    try:
-        # Get real-time price data
-        price_data = analyzer.get_real_time_price(symbol)
-        
-        # Get technical analysis
-        technical_data = analyzer.calculate_technical_indicators(symbol)
-        
-        # Get fundamental analysis
-        fundamental_data = analyzer.analyze_fundamentals(symbol)
-        
-        # Generate AI recommendation
-        ai_recommendation = analyzer.generate_ai_recommendation(
-            symbol, technical_data, fundamental_data
-        )
-        
-        # Get market sentiment
-        sentiment_data = analyzer.analyze_market_sentiment(symbol)
-        
-        # Get risk analysis
-        risk_data = analyzer.analyze_risk_metrics(symbol)
-        
-        return {
-            "symbol": symbol,
-            "price_data": price_data,
-            "technical_analysis": technical_data,
-            "fundamental_analysis": fundamental_data,
-            "ai_recommendation": ai_recommendation,
-            "market_sentiment": sentiment_data,
-            "risk_analysis": risk_data,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-        }
-    except Exception as e:
-        logger.error(f"Full analysis failed for {symbol}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {e}"
-        )
-
-@app.get("/v1/analysis/batch", response_model=Dict[str, Any])
-async def get_batch_analysis(
-    symbols: str = Query(..., description="Comma-separated symbols"),
-    include_price: bool = Query(True, description="Include real-time prices")
-) -> Dict[str, Any]:
-    """Get AI analysis for multiple symbols in batch."""
-    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    
-    if not symbol_list:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No symbols provided"
-        )
-    
-    results = {}
-    for symbol in symbol_list:
-        try:
-            # Get real-time price if requested
-            price_data = analyzer.get_real_time_price(symbol) if include_price else None
-            
-            # Get technical analysis
-            technical_data = analyzer.calculate_technical_indicators(symbol)
-            
-            # Get fundamental analysis
-            fundamental_data = analyzer.analyze_fundamentals(symbol)
-            
-            # Generate AI recommendation
-            ai_recommendation = analyzer.generate_ai_recommendation(
-                symbol, technical_data, fundamental_data
-            )
-            
-            results[symbol] = {
-                "price_data": price_data,
-                "technical_analysis": technical_data,
-                "fundamental_analysis": fundamental_data,
-                "ai_recommendation": ai_recommendation,
-                "success": True
-            }
-            
-        except Exception as e:
-            logger.error(f"Batch analysis failed for {symbol}: {e}")
-            results[symbol] = {
-                "success": False,
-                "error": str(e)
-            }
-    
-    return {
-        "results": results,
-        "total_requested": len(symbol_list),
-        "successful": sum(1 for r in results.values() if r.get("success")),
-        "failed": sum(1 for r in results.values() if not r.get("success")),
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-    }
-
-@app.get("/v1/analysis/{symbol}/recommendation", response_model=Dict[str, Any])
-async def get_ai_recommendation(symbol: str) -> Dict[str, Any]:
-    """Get AI trading recommendation only."""
-    try:
-        technical_data = analyzer.calculate_technical_indicators(symbol)
-        fundamental_data = analyzer.analyze_fundamentals(symbol)
-        recommendation = analyzer.generate_ai_recommendation(
-            symbol, technical_data, fundamental_data
-        )
-        
-        return {
-            "symbol": symbol,
-            "recommendation": recommendation,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-        }
-    except Exception as e:
-        logger.error(f"AI recommendation failed for {symbol}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Recommendation failed: {e}"
-        )
-
-# -----------------------------------------------------------------------------
-# Google Sheets Integration Endpoints
-# -----------------------------------------------------------------------------
-@app.post("/v1/sheets/update-dashboard", response_model=Dict[str, Any])
-async def update_sheets_dashboard(
-    symbols: str = Query(..., description="Comma-separated symbols to update")
-) -> Dict[str, Any]:
-    """Update Google Sheets dashboard with latest AI analysis."""
-    try:
-        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-        updated_count = 0
-        errors = []
-        
-        for symbol in symbol_list:
-            try:
-                # Get comprehensive analysis
-                price_data = analyzer.get_real_time_price(symbol)
-                technical_data = analyzer.calculate_technical_indicators(symbol)
-                fundamental_data = analyzer.analyze_fundamentals(symbol)
-                ai_recommendation = analyzer.generate_ai_recommendation(
-                    symbol, technical_data, fundamental_data
-                )
-                
-                # Prepare row data for Google Sheets
-                row_data = [
-                    symbol,
-                    "Company Name",  # Would come from your symbols data
-                    "Sector",        # Would come from your symbols data
-                    price_data.get('price') if price_data else None,
-                    price_data.get('change_percent') if price_data else None,
-                    ai_recommendation.get('overall_ai_score'),
-                    ai_recommendation.get('final_recommendation'),
-                    ai_recommendation.get('confidence_level'),
-                    ai_recommendation.get('price_targets', {}).get('1_year'),
-                    f"+{np.random.uniform(5, 25):.1f}%",  # Sample upside
-                    ai_recommendation.get('key_risks', [])[0] if ai_recommendation.get('key_risks') else "Medium",
-                    datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-                    ai_recommendation.get('key_strengths', [])[0] if ai_recommendation.get('key_strengths') else "AI Analysis"
-                ]
-                
-                # Here you would add the code to update Google Sheets
-                # This is a placeholder - actual implementation would use gspread
-                logger.info(f"Would update Google Sheets for {symbol}: {row_data}")
-                
-                updated_count += 1
-                
-            except Exception as e:
-                error_msg = f"Failed to update {symbol}: {e}"
-                errors.append(error_msg)
-                logger.error(error_msg)
-        
-        return {
-            "status": "completed",
-            "updated_count": updated_count,
-            "error_count": len(errors),
-            "errors": errors if errors else None,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
-        }
-        
-    except Exception as e:
-        logger.error(f"Sheets update failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Sheets update failed: {e}"
-        )
