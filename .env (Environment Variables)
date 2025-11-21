@@ -1,0 +1,24 @@
+# --- runtime ---
+TZ=Asia/Riyadh
+TRADING_INTERVAL_MINUTES=5
+
+# --- data provider (choose ONE: YF for live, MOCK for demo) ---
+DATA_PROVIDER=YF
+#DATA_PROVIDER=MOCK
+
+YF_TIMEOUT=15
+YF_MAX_RETRIES=2
+YF_PERIOD=3mo
+YF_INTERVAL=1d
+
+# --- google sheets (IDs) ---
+SHEETS_SPREADSHEET_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
+GOOGLE_SHEETS_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
+
+# --- google sheets (tab names) ---
+SHEETS_SYMBOLS_TAB=Market_Leaders
+SHEETS_TAB_SYMBOLS=Market_Leaders
+
+# --- google creds path (Windows absolute) ---
+SHEETS_JSON_CREDENTIALS_PATH=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
+GOOGLE_CREDENTIALS_FILE=C:\Users\emadb\OneDrive\Desktop\saudi_trading_system\creds\google-service.json
