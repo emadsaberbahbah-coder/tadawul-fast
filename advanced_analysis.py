@@ -921,3 +921,79 @@ class AdvancedTradingAnalyzer:
 
 # Global analyzer instance with context manager support
 analyzer = AdvancedTradingAnalyzer()
+def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
+    """Get comprehensive analysis from all available data sources."""
+    results = {
+        'symbol': symbol,
+        'sources': {},
+        'consolidated': {},
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    }
+    
+    # Alpha Vantage
+    try:
+        alpha_data = self._get_price_alpha_vantage(symbol)
+        if alpha_data:
+            results['sources']['alpha_vantage'] = alpha_data
+    except Exception as e:
+        logger.warning(f"Alpha Vantage failed for {symbol}: {e}")
+    
+    # Finnhub
+    try:
+        finnhub_data = self._get_price_finnhub(symbol)
+        if finnhub_data:
+            results['sources']['finnhub'] = finnhub_data
+    except Exception as e:
+        logger.warning(f"Finnhub failed for {symbol}: {e}")
+    
+    # Twelve Data
+    try:
+        twelve_data = self._get_price_twelvedata(symbol)
+        if twelve_data:
+            results['sources']['twelvedata'] = twelve_data
+    except Exception as e:
+        logger.warning(f"Twelve Data failed for {symbol}: {e}")
+    
+    # MarketStack
+    try:
+        marketstack_data = self._get_price_marketstack(symbol)
+        if marketstack_data:
+            results['sources']['marketstack'] = marketstack_data
+    except Exception as e:
+        logger.warning(f"MarketStack failed for {symbol}: {e}")
+    
+    # Google Apps Script
+    try:
+        from google_apps_script_client import google_apps_script_client
+        apps_script_data = google_apps_script_client.get_symbols_data(symbol)
+        if apps_script_data.success:
+            results['sources']['google_apps_script'] = apps_script_data.data
+    except Exception as e:
+        logger.warning(f"Google Apps Script failed for {symbol}: {e}")
+    
+    # Consolidate results
+    results['consolidated'] = self._consolidate_multi_source_data(results['sources'])
+    
+    return results
+
+def _consolidate_multi_source_data(self, sources: Dict[str, Any]) -> Dict[str, Any]:
+    """Consolidate data from multiple sources."""
+    prices = []
+    volumes = []
+    
+    for source_name, data in sources.items():
+        if data and data.get('price'):
+            prices.append(data['price'])
+        if data and data.get('volume'):
+            volumes.append(data['volume'])
+    
+    consolidated = {
+        'price_avg': sum(prices) / len(prices) if prices else None,
+        'price_min': min(prices) if prices else None,
+        'price_max': max(prices) if prices else None,
+        'volume_avg': sum(volumes) / len(volumes) if volumes else None,
+        'sources_count': len(sources),
+        'confidence': min(1.0, len(sources) * 0.2)  # Higher confidence with more sources
+    }
+    
+    return consolidated
