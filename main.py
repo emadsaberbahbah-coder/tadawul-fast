@@ -735,7 +735,7 @@ def _fetch_symbol_payload(limit: int) -> Dict[str, Any]:
     """Unified symbol loader with fallback."""
     # Try symbols_reader first
     sr_payload = _safe_fetch_symbols_via_sr(limit)
-    if sr_payload is not None:  # Changed this condition
+    if sr_payload is not None:  # Accept even empty data
         logger.info(f"Using symbols_reader data with {len(sr_payload.get('data', []))} symbols")
         return sr_payload
 
@@ -887,7 +887,7 @@ async def format_all_headers() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Saudi Symbols & Market Endpoints
+# Saudi Symbols & Market Endpoints - FIXED VERSIONS
 # -----------------------------------------------------------------------------
 @app.get("/api/saudi/symbols", response_model=Dict[str, Any])
 async def api_saudi_symbols(
