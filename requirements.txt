@@ -1,10 +1,68 @@
+# === Core Data Science & Analysis ===
 pandas==2.2.2
 numpy==1.26.4
 scikit-learn==1.5.0
+
+# === Web Framework & API ===
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
 pydantic==2.8.2
-python-dotenv==1.0.1
+python-multipart==0.0.9
+
+# === Data Collection & Financial APIs ===
 yfinance==0.2.54
+requests==2.32.3
+httpx==0.28.1
+aiohttp==3.9.5
+
+# === Web Scraping & HTML Parsing ===
+beautifulsoup4==4.12.3
+lxml==5.2.2
+html5lib==1.1
+
+# === Google Services Integration ===
+gspread==5.12.4
+google-auth==2.28.2
+google-api-python-client==2.132.0
+google-auth-httplib2==0.1.1
+google-auth-oauthlib==1.1.0
+
+# === Environment & Configuration ===
+python-dotenv==1.0.1
+pyyaml==6.0.1
+
+# === Security & SSL ===
 certifi==2024.8.30
-pandas>=1.5.0
-numpy>=1.21.0
-beautifulsoup4>=4.12.0
+cryptography==42.0.8
+pyopenssl==24.1.0
+
+# === Async & Performance ===
+aiofiles==23.2.1
+asyncio-throttle==1.0.2
+uvloop==0.19.0
+
+# === Date/Time Handling ===
+python-dateutil==2.9.0.post0
+pytz==2024.1
+
+# === Logging & Monitoring ===
+structlog==24.2.0
+colorlog==6.8.2
+
+# === Utilities ===
+click==8.1.7
+typing-extensions==4.12.2
+pathlib2==2.3.7.post1
+
+# === Caching & Performance ===
+cachetools==5.3.3
+redis==5.0.7
+
+# === Data Validation & Serialization ===
+marshmallow==3.21.1
+marshmallow-dataclass==8.6.2
+
+# === Optional: Advanced Features ===
+# ta-lib==0.4.28  # Technical analysis library
+# plotly==5.21.0   # Charts and visualization
+# seaborn==0.13.2  # Statistical data visualization
