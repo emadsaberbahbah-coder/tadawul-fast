@@ -35,6 +35,32 @@ APP_TOKEN=your_app_token_here_12345
 FASTAPI_TOKEN=your_fastapi_token_here_67890
 REQUIRE_AUTH=true
 ALLOWED_ORIGINS=*
+# Add these to your .env file or Render environment variables:
+
+# Alpha Vantage
+ALPHA_VANTAGE_API_KEY=Q0VIE9J6AXUCG99F
+
+# Finnhub
+FINNHUB_API_KEY=d3uhd8pr01qil4aq3i5gd3uhd8pr01qil4aq3i60
+
+# EOD Historical Data
+EODHD_API_KEY=68fd1783ee7eb1.12039806
+
+# Twelve Data
+TWELVEDATA_API_KEY=ca363b090fbb421a84c05882e4f1e393
+
+# MarketStack
+MARKETSTACK_API_KEY=657b972a96392c3cac405ccc48c36b0c
+
+# Financial Modeling Prep
+FMP_API_KEY=3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt
+
+# Google Apps Script Web App
+GOOGLE_APPS_SCRIPT_URL=https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec
+
+# Your existing tokens
+FASTAPI_TOKEN=c0487616ceaeaa47122cabb7b3e66a09
+APP_TOKEN=c0487616ceaeaa47122cabb7b3e66a09
 
 # --- Google Sheets Configuration ---
 # Primary Spreadsheet ID
