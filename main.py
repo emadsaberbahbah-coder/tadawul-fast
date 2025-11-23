@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import aiohttp
 import gspread
-import numpy as np
-import pandas as pd
+import numpy as np  # currently unused, but kept for future analytics
+import pandas as pd  # currently unused, but kept for future analytics
 from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks,
@@ -150,7 +150,7 @@ EXPECTED_SHEETS = [
 ]
 
 # Financial APIs (read from env)
-FINANCIAL_APIS = {
+FINANCIAL_APIS: Dict[str, Dict[str, Any]] = {
     "alpha_vantage": {
         "api_key": config.alpha_vantage_api_key,
         "base_url": os.getenv(
@@ -177,19 +177,15 @@ FINANCIAL_APIS = {
     },
     "marketstack": {
         "api_key": config.marketstack_api_key,
-        "base_url": os.getenv("MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"),
+        "base_url": os.getenv(
+            "MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"
+        ),
         "timeout": int(os.getenv("MARKETSTACK_TIMEOUT", "15")),
     },
     "fmp": {
         "api_key": config.fmp_api_key,
         "base_url": os.getenv(
-    "fmp": {
-        "api_key": config.fmp_api_key,
-        "base_url": os.getenv(
             "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
-        ),
-        "timeout": int(os.getenv("FMP_TIMEOUT", "15")),
-    },
         ),
         "timeout": int(os.getenv("FMP_TIMEOUT", "15")),
     },
@@ -815,7 +811,9 @@ async def validate_configuration():
 
     api_status = financial_client.get_api_status()
     if not any(api_status.values()):
-        errors.append("No financial APIs configured. At least one API key is recommended.")
+        errors.append(
+            "No financial APIs configured. At least one API key is recommended."
+        )
 
     if errors:
         logger.error("Configuration validation failed:")
@@ -847,10 +845,14 @@ def safe_import(module_name: str, attr: Optional[str] = None):
         return None
 
 
-AdvancedMarketDashboard = safe_import("advanced_market_dashboard", "AdvancedMarketDashboard")
+AdvancedMarketDashboard = safe_import(
+    "advanced_market_dashboard", "AdvancedMarketDashboard"
+)
 argaam_router = safe_import("routes_argaam", "router")
 close_argaam_http_client = safe_import("routes_argaam", "close_argaam_http_client")
-google_apps_script_client = safe_import("google_apps_script_client", "google_apps_script_client")
+google_apps_script_client = safe_import(
+    "google_apps_script_client", "google_apps_script_client"
+)
 sr = safe_import("symbols_reader")
 analyzer = safe_import("advanced_analysis", "analyzer")
 
@@ -874,7 +876,9 @@ async def lifespan(app: FastAPI):
     if sheets_status.get("status") == "SUCCESS":
         logger.info("✅ Google Sheets connection verified")
     else:
-        logger.warning(f"⚠️ Google Sheets connection issue: {sheets_status.get('message')}")
+        logger.warning(
+            f"⚠️ Google Sheets connection issue: {sheets_status.get('message')}"
+        )
     expired = cache.cleanup_expired()
     if expired:
         logger.info(f"🧹 Cleaned {expired} expired cache entries on startup")
@@ -1022,7 +1026,9 @@ async def verify_all_sheets(request: Request, auth: bool = Depends(verify_auth))
         results.append(r)
         logger.info(f"Verified {name}: {r.status}")
     sheets_ok = sum(1 for r in results if r.status == "OK")
-    overall_status = "SUCCESS" if sheets_ok == len(EXPECTED_SHEETS) else "PARTIAL_SUCCESS"
+    overall_status = (
+        "SUCCESS" if sheets_ok == len(EXPECTED_SHEETS) else "PARTIAL_SUCCESS"
+    )
     return VerificationResponse(
         spreadsheet_id=GOOGLE_SERVICES["spreadsheet_id"],
         overall_status=overall_status,
@@ -1161,7 +1167,9 @@ async def get_saudi_symbols(
         symbols: List[Dict[str, Any]] = []
         for row in sheet_data.data:
             ticker = row.get("Ticker") or row.get("ticker")
-            company = row.get("Company Name") or row.get("Company") or row.get("company")
+            company = (
+                row.get("Company Name") or row.get("Company") or row.get("company")
+            )
             sector = row.get("Sector")
             trading_market = row.get("Trading Market") or row.get("Market")
             if ticker:
@@ -1344,8 +1352,12 @@ def _quote_to_v41_dict(q: Quote) -> Dict[str, Any]:
 @rate_limit("60/minute")
 async def v41_get_quotes(
     request: Request,
-    symbols: str = Query(..., description="Comma-separated tickers (e.g. 1120.SR,7010.SR)"),
-    cache_ttl: int = Query(60, ge=0, description="Cache TTL in seconds (ignored for now)"),
+    symbols: str = Query(
+        ..., description="Comma-separated tickers (e.g. 1120.SR,7010.SR)"
+    ),
+    cache_ttl: int = Query(
+        60, ge=0, description="Cache TTL in seconds (ignored for now)"
+    ),
     auth: bool = Depends(verify_auth),
 ):
     """
@@ -1484,7 +1496,9 @@ if __name__ == "__main__":
         f"🚀 Starting {config.service_name} v{config.service_version} on "
         f"{config.app_host}:{config.app_port}"
     )
-    logger.info(f"🔐 Authentication: {'Enabled' if config.require_auth else 'Disabled'}")
+    logger.info(
+        f"🔐 Authentication: {'Enabled' if config.require_auth else 'Disabled'}"
+    )
     logger.info(
         f"⚡ Rate Limiting: {'Enabled' if config.enable_rate_limiting else 'Disabled'} "
         f"({config.max_requests_per_minute}/minute)"
