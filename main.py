@@ -15,13 +15,17 @@ import pandas as pd
 import numpy as np
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, BaseSettings
 import uvicorn
 import httpx
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import secrets
 
 # =============================================================================
 # Enhanced Configuration & Logging
@@ -43,16 +47,90 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 # =============================================================================
-# Configuration Constants
+# Enhanced Configuration Management with Pydantic
 # =============================================================================
 
-SERVICE_NAME = os.getenv("SERVICE_NAME", "Tadawul Stock Analysis API")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "2.1.0")
-APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT", "8000"))
-APP_TOKEN = os.getenv("APP_TOKEN", "c0487616ceaeaa47122cabb7b3e66a09")
-BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "441669eb92442fdde6dcae35c248f37f")
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
+class AppConfig(BaseSettings):
+    """Enhanced configuration management with validation"""
+    
+    # Service Configuration
+    service_name: str = "Tadawul Stock Analysis API"
+    service_version: str = "2.2.0"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8000
+    environment: str = "production"
+    
+    # Security
+    require_auth: bool = True
+    app_token: str = Field(..., env="APP_TOKEN")
+    backup_app_token: str = Field(..., env="BACKUP_APP_TOKEN")
+    enable_rate_limiting: bool = True
+    max_requests_per_minute: int = 60
+    cors_origins: List[str] = ["http://localhost:3000", "https://yourdomain.com"]
+    
+    # Logging
+    log_enable_file: bool = True
+    log_level: str = "INFO"
+    
+    # Google Sheets
+    spreadsheet_id: str = Field(..., env="SPREADSHEET_ID")
+    google_sheets_credentials: str = Field(..., env="GOOGLE_SHEETS_CREDENTIALS")
+    google_apps_script_url: str = Field(..., env="GOOGLE_APPS_SCRIPT_URL")
+    
+    # API Keys - All from environment variables
+    alpha_vantage_api_key: Optional[str] = None
+    finnhub_api_key: Optional[str] = None
+    eodhd_api_key: Optional[str] = None
+    twelvedata_api_key: Optional[str] = None
+    marketstack_api_key: Optional[str] = None
+    fmp_api_key: Optional[str] = None
+    
+    # Feature Flags
+    enable_swagger: bool = True
+    enable_redoc: bool = True
+    enable_file_logging: bool = True
+    
+    @validator("spreadsheet_id")
+    def validate_spreadsheet_id(cls, v):
+        if not v or len(v) < 10:
+            raise ValueError("Invalid Spreadsheet ID")
+        return v
+    
+    @validator("app_token", "backup_app_token")
+    def validate_tokens(cls, v):
+        if not v or len(v) < 10:
+            raise ValueError("Authentication tokens must be secure")
+        return v
+    
+    @validator("environment")
+    def validate_environment(cls, v):
+        if v not in ["development", "staging", "production"]:
+            raise ValueError("Environment must be development, staging, or production")
+        return v
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+        validate_assignment = True
+
+# Initialize configuration
+try:
+    config = AppConfig()
+    logger.info("✅ Configuration loaded successfully")
+except Exception as e:
+    logger.error(f"❌ Configuration validation failed: {e}")
+    raise
+
+# =============================================================================
+# Enhanced Security Configuration
+# =============================================================================
+
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+rate_limit_storage = {}
+
+# Security
+security = HTTPBearer(auto_error=False)
 
 # Google Sheets Configuration
 SCOPES = [
@@ -65,35 +143,35 @@ EXPECTED_SHEETS = [
     "Sectors", "Analysis", "Reports", "Users", "Settings"
 ]
 
-# Financial API Configuration
+# Financial API Configuration (All from environment)
 FINANCIAL_APIS = {
     "alpha_vantage": {
-        "api_key": os.getenv("ALPHA_VANTAGE_API_KEY", "Q0VIE9J6AXUCG99F"),
+        "api_key": config.alpha_vantage_api_key,
         "base_url": os.getenv("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"),
         "timeout": int(os.getenv("ALPHA_VANTAGE_TIMEOUT", "15"))
     },
     "finnhub": {
-        "api_key": os.getenv("FINNHUB_API_KEY", "d3uhd8pr01qil4aq3i5gd3uhd8pr01qil4aq3i60"),
+        "api_key": config.finnhub_api_key,
         "base_url": os.getenv("FINNHUB_BASE_URL", "https://finnhub.io/api/v1"),
         "timeout": int(os.getenv("FINNHUB_TIMEOUT", "15"))
     },
     "eodhd": {
-        "api_key": os.getenv("EODHD_API_KEY", "68fd1783ee7eb1.12039806"),
+        "api_key": config.eodhd_api_key,
         "base_url": os.getenv("EODHD_BASE_URL", "https://eodhistoricaldata.com/api"),
         "timeout": int(os.getenv("EODHD_TIMEOUT", "15"))
     },
     "twelvedata": {
-        "api_key": os.getenv("TWELVEDATA_API_KEY", "ca363b090fbb421a84c05882e4f1e393"),
+        "api_key": config.twelvedata_api_key,
         "base_url": os.getenv("TWELVEDATA_BASE_URL", "https://api.twelvedata.com"),
         "timeout": int(os.getenv("TWELVEDATA_TIMEOUT", "15"))
     },
     "marketstack": {
-        "api_key": os.getenv("MARKETSTACK_API_KEY", "657b972a96392c3cac405ccc48c36b0c"),
+        "api_key": config.marketstack_api_key,
         "base_url": os.getenv("MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"),
         "timeout": int(os.getenv("MARKETSTACK_TIMEOUT", "15"))
     },
     "fmp": {
-        "api_key": os.getenv("FMP_API_KEY", "3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt"),
+        "api_key": config.fmp_api_key,
         "base_url": os.getenv("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"),
         "timeout": int(os.getenv("FMP_TIMEOUT", "15"))
     }
@@ -101,14 +179,35 @@ FINANCIAL_APIS = {
 
 # Google Services Configuration
 GOOGLE_SERVICES = {
-    "spreadsheet_id": os.getenv("SPREADSHEET_ID", "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"),
-    "apps_script_url": os.getenv("GOOGLE_APPS_SCRIPT_URL", "https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec"),
-    "apps_script_backup_url": os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL", "https://script.google.com/macros/s/AKfycbyI7a_xj7zvCa10CnzJP9wf8N1qPG3DYYb-LVkUCOEVEHjALzZq_Ox9YUJgbkzq86py6g/exec"),
-    "sheets_csv_url": os.getenv("GOOGLE_SHEETS_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vTbiLOkNqsCz_FKIJH3em6HPT8N6cLFAuAKCW1ALz7JP9JwrQvvSQRIvtv2OuESSSB2Hkbrh2BchoWd/pub?output=csv")
+    "spreadsheet_id": config.spreadsheet_id,
+    "apps_script_url": config.google_apps_script_url,
+    "apps_script_backup_url": os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL", ""),
+    "sheets_csv_url": os.getenv("GOOGLE_SHEETS_CSV_URL", "")
 }
 
-# Security
-security = HTTPBearer(auto_error=False)
+# =============================================================================
+# Custom Exceptions for Enhanced Error Handling
+# =============================================================================
+
+class FinancialAPIError(Exception):
+    """Base exception for financial API errors"""
+    pass
+
+class GoogleSheetsError(Exception):
+    """Google Sheets specific errors"""
+    pass
+
+class CacheError(Exception):
+    """Cache related errors"""
+    pass
+
+class ConfigurationError(Exception):
+    """Configuration validation errors"""
+    pass
+
+class SecurityError(Exception):
+    """Security related errors"""
+    pass
 
 # =============================================================================
 # Enhanced Dependency Management
@@ -118,21 +217,28 @@ def get_required_config(key: str) -> str:
     """Get required environment variable or raise error."""
     value = os.getenv(key)
     if not value:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Required environment variable {key} is not set"
-        )
+        raise ConfigurationError(f"Required environment variable {key} is not set")
     return value
 
 def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    """Enhanced authentication dependency."""
-    if REQUIRE_AUTH:
-        valid_tokens = [APP_TOKEN, BACKUP_APP_TOKEN]
-        if not credentials or credentials.credentials not in valid_tokens:
+    """Enhanced authentication dependency with security logging."""
+    if config.require_auth:
+        valid_tokens = [config.app_token, config.backup_app_token]
+        if not credentials:
+            logger.warning("Authentication attempted without credentials")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or missing authentication token"
+                detail="Missing authentication token"
             )
+        
+        if credentials.credentials not in valid_tokens:
+            logger.warning(f"Invalid token attempt: {credentials.credentials[:8]}...")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token"
+            )
+        
+        logger.info(f"Successful authentication with token: {credentials.credentials[:8]}...")
     return True
 
 # =============================================================================
@@ -152,10 +258,10 @@ class GoogleSheetsManager:
             return cls._client
             
         try:
-            creds_json = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
+            creds_json = config.google_sheets_credentials
             if not creds_json:
                 logger.error("GOOGLE_SHEETS_CREDENTIALS environment variable not set")
-                return None
+                raise GoogleSheetsError("Google Sheets credentials not configured")
             
             creds_dict = json.loads(creds_json)
             creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
@@ -165,10 +271,10 @@ class GoogleSheetsManager:
             
         except json.JSONDecodeError as e:
             logger.error(f"❌ Invalid JSON in GOOGLE_SHEETS_CREDENTIALS: {e}")
+            raise GoogleSheetsError(f"Invalid credentials format: {e}")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Google Sheets client: {e}")
-            
-        return None
+            raise GoogleSheetsError(f"Connection failed: {e}")
 
     @classmethod
     def get_spreadsheet(cls) -> Optional[gspread.Spreadsheet]:
@@ -187,7 +293,7 @@ class GoogleSheetsManager:
             return cls._spreadsheet
         except Exception as e:
             logger.error(f"❌ Failed to access spreadsheet: {e}")
-            return None
+            raise GoogleSheetsError(f"Spreadsheet access failed: {e}")
 
     @classmethod
     def test_connection(cls) -> Dict[str, Any]:
@@ -226,26 +332,56 @@ class GoogleSheetsManager:
             return {"status": "ERROR", "message": f"Connection test failed: {str(e)}"}
 
 # =============================================================================
-# Financial Data API Client
+# Enhanced Financial Data Client with Retry Logic
 # =============================================================================
 
 class FinancialDataClient:
-    """Enhanced financial data client with multiple API support."""
+    """Enhanced financial data client with multiple API support and retry logic."""
     
     def __init__(self):
         self.apis = FINANCIAL_APIS
         self.session = None
+        self.rate_limits = {}
     
     async def get_session(self):
-        """Get or create aiohttp session."""
+        """Get or create aiohttp session with connection pooling."""
         if self.session is None:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30)
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
+            self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self.session
     
     async def close(self):
         """Close the session."""
         if self.session:
             await self.session.close()
+            self.session = None
+    
+    async def get_stock_quote_with_retry(
+        self, 
+        symbol: str, 
+        api_name: str = "alpha_vantage",
+        max_retries: int = 3
+    ) -> Optional[Dict[str, Any]]:
+        """Get stock quote with exponential backoff retry logic."""
+        for attempt in range(max_retries):
+            try:
+                result = await self.get_stock_quote(symbol, api_name)
+                if result:
+                    logger.info(f"✅ Successfully fetched {symbol} from {api_name} (attempt {attempt + 1})")
+                    return result
+                else:
+                    logger.warning(f"⚠️ No data returned for {symbol} from {api_name} (attempt {attempt + 1})")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Attempt {attempt + 1} failed for {api_name}: {e}")
+                if attempt == max_retries - 1:
+                    logger.error(f"❌ All {max_retries} attempts failed for {api_name}: {e}")
+                else:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    await asyncio.sleep(wait_time)
+        
+        return None
     
     async def get_stock_quote(self, symbol: str, api_name: str = "alpha_vantage") -> Optional[Dict[str, Any]]:
         """Get stock quote from specified API."""
@@ -254,6 +390,11 @@ class FinancialDataClient:
             return None
             
         api_config = self.apis[api_name]
+        
+        # Check if API key is available
+        if not api_config.get("api_key"):
+            logger.warning(f"API key not configured for {api_name}")
+            return None
         
         try:
             session = await self.get_session()
@@ -268,6 +409,8 @@ class FinancialDataClient:
                     if response.status == 200:
                         data = await response.json()
                         return self._parse_alpha_vantage_quote(data)
+                    else:
+                        logger.error(f"Alpha Vantage API returned status {response.status}")
             
             elif api_name == "finnhub":
                 params = {
@@ -278,9 +421,22 @@ class FinancialDataClient:
                     if response.status == 200:
                         data = await response.json()
                         return self._parse_finnhub_quote(data, symbol)
+                    else:
+                        logger.error(f"Finnhub API returned status {response.status}")
             
             # Add other API implementations here...
+            elif api_name == "twelvedata":
+                params = {
+                    'symbol': symbol,
+                    'apikey': api_config["api_key"]
+                }
+                async with session.get(f"{api_config['base_url']}/quote", params=params, timeout=api_config["timeout"]) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._parse_twelvedata_quote(data)
             
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout while fetching data from {api_name}")
         except Exception as e:
             logger.error(f"Error fetching data from {api_name}: {e}")
         
@@ -298,7 +454,8 @@ class FinancialDataClient:
                 'change': float(quote.get('09. change', 0)),
                 'change_percent': float(quote.get('10. change percent', '0').rstrip('%')),
                 'volume': int(quote.get('06. volume', 0)),
-                'timestamp': quote.get('07. latest trading day')
+                'timestamp': quote.get('07. latest trading day'),
+                'data_source': 'alpha_vantage'
             }
         except Exception as e:
             logger.error(f"Error parsing Alpha Vantage data: {e}")
@@ -315,10 +472,29 @@ class FinancialDataClient:
                 'low': data.get('l', 0),
                 'open': data.get('o', 0),
                 'previous_close': data.get('pc', 0),
-                'timestamp': datetime.datetime.fromtimestamp(data.get('t', 0)).isoformat() if data.get('t') else None
+                'timestamp': datetime.datetime.fromtimestamp(data.get('t', 0)).isoformat() if data.get('t') else None,
+                'data_source': 'finnhub'
             }
         except Exception as e:
             logger.error(f"Error parsing Finnhub data: {e}")
+            return None
+    
+    def _parse_twelvedata_quote(self, data: Dict) -> Optional[Dict[str, Any]]:
+        """Parse Twelve Data quote data."""
+        try:
+            return {
+                'price': float(data.get('close', 0)),
+                'change': float(data.get('change', 0)),
+                'change_percent': float(data.get('percent_change', 0)),
+                'high': float(data.get('high', 0)),
+                'low': float(data.get('low', 0)),
+                'open': float(data.get('open', 0)),
+                'volume': int(data.get('volume', 0)),
+                'timestamp': data.get('datetime'),
+                'data_source': 'twelvedata'
+            }
+        except Exception as e:
+            logger.error(f"Error parsing Twelve Data: {e}")
             return None
     
     def get_api_status(self) -> Dict[str, bool]:
@@ -343,7 +519,7 @@ class Quote(BaseModel):
     previous_close: Optional[float] = Field(None, ge=0, description="Previous close price")
     day_change_pct: Optional[float] = Field(None, description="Daily change percentage")
     market_cap: Optional[float] = Field(None, ge=0, description="Market capitalization")
-    volume: Optional[float] = Field(NNone, ge=0, description="Trading volume")
+    volume: Optional[float] = Field(None, ge=0, description="Trading volume")  # FIXED: Changed NNone to None
     fifty_two_week_high: Optional[float] = Field(None, ge=0, description="52-week high")
     fifty_two_week_low: Optional[float] = Field(None, ge=0, description="52-week low")
     timestamp_utc: Optional[str] = Field(None, description="UTC timestamp")
@@ -403,17 +579,18 @@ class APITestResponse(BaseModel):
     error: Optional[str] = None
 
 # =============================================================================
-# Enhanced Cache System
+# Enhanced Cache System with TTL
 # =============================================================================
 
-class EnhancedCache:
-    """Enhanced cache system with backup and recovery."""
+class TTLCache:
+    """Enhanced cache system with TTL and backup/recovery."""
     
-    def __init__(self):
+    def __init__(self, ttl_minutes: int = 30):
         self.cache_path = BASE_DIR / "quote_cache.json"
         self.backup_dir = BASE_DIR / "cache_backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.data: Dict[str, Dict[str, Any]] = {}
+        self.ttl = ttl_minutes * 60  # Convert to seconds
         self.load_cache()
     
     def load_cache(self) -> bool:
@@ -426,15 +603,23 @@ class EnhancedCache:
             with open(self.cache_path, 'r', encoding='utf-8') as f:
                 raw_data = json.load(f)
             
-            # Normalize cache format
+            # Normalize cache format and filter expired items
+            current_time = datetime.datetime.now().timestamp()
+            valid_data = {}
+            
             if isinstance(raw_data, dict) and 'data' in raw_data:
                 for item in raw_data['data']:
                     if isinstance(item, dict) and 'ticker' in item:
-                        self.data[item['ticker']] = item
+                        # Check if cache item is still valid
+                        if self._is_valid(item, current_time):
+                            valid_data[item['ticker']] = item
             elif isinstance(raw_data, dict):
-                self.data = raw_data
-                
-            logger.info(f"✅ Cache loaded with {len(self.data)} items")
+                for ticker, item in raw_data.items():
+                    if self._is_valid(item, current_time):
+                        valid_data[ticker] = item
+                        
+            self.data = valid_data
+            logger.info(f"✅ Cache loaded with {len(self.data)} valid items")
             return True
             
         except Exception as e:
@@ -442,13 +627,28 @@ class EnhancedCache:
             self.data = {}
             return False
     
+    def _is_valid(self, cache_item: Dict, current_time: float = None) -> bool:
+        """Check if cache item is still valid based on TTL."""
+        if current_time is None:
+            current_time = datetime.datetime.now().timestamp()
+        
+        cache_timestamp = cache_item.get('_cache_timestamp', 0)
+        return (current_time - cache_timestamp) < self.ttl
+    
     def save_cache(self) -> bool:
         """Save cache to disk with atomic write."""
         try:
+            # Add timestamp to cache items
+            timestamped_data = {}
+            current_time = datetime.datetime.now().timestamp()
+            
+            for ticker, item in self.data.items():
+                timestamped_data[ticker] = {**item, '_cache_timestamp': current_time}
+            
             # Atomic write using temporary file
             temp_path = self.cache_path.with_suffix('.tmp')
             with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump({"data": list(self.data.values())}, f, indent=2, ensure_ascii=False)
+                json.dump({"data": list(timestamped_data.values())}, f, indent=2, ensure_ascii=False)
             
             # Replace original file
             temp_path.replace(self.cache_path)
@@ -479,10 +679,18 @@ class EnhancedCache:
             return None
     
     def get_quote(self, ticker: str) -> Optional[Quote]:
-        """Get quote from cache."""
+        """Get quote from cache if valid."""
         ticker = ticker.upper()
         if ticker in self.data:
-            return Quote(**self.data[ticker])
+            cached_data = self.data[ticker]
+            if self._is_valid(cached_data):
+                # Remove internal fields before returning
+                clean_data = {k: v for k, v in cached_data.items() if not k.startswith('_')}
+                return Quote(**clean_data)
+            else:
+                # Remove expired cache
+                del self.data[ticker]
+                self.save_cache()
         return None
     
     def update_quotes(self, quotes: List[Quote]) -> Tuple[int, List[str]]:
@@ -501,9 +709,28 @@ class EnhancedCache:
             self.save_cache()
             
         return updated, errors
+    
+    def cleanup_expired(self) -> int:
+        """Remove expired cache entries and return count removed."""
+        initial_count = len(self.data)
+        current_time = datetime.datetime.now().timestamp()
+        
+        expired_keys = [
+            ticker for ticker, item in self.data.items()
+            if not self._is_valid(item, current_time)
+        ]
+        
+        for key in expired_keys:
+            del self.data[key]
+        
+        if expired_keys:
+            self.save_cache()
+            logger.info(f"🧹 Cleaned up {len(expired_keys)} expired cache entries")
+        
+        return len(expired_keys)
 
-# Initialize cache
-cache = EnhancedCache()
+# Initialize cache with 30-minute TTL
+cache = TTLCache(ttl_minutes=30)
 
 # =============================================================================
 # Enhanced Sheet Operations
@@ -580,6 +807,42 @@ def get_sheet_data(sheet_name: str, limit: int = 10) -> SheetDataResponse:
         raise HTTPException(status_code=500, detail=f"Error reading sheet: {str(e)}")
 
 # =============================================================================
+# Configuration Validation
+# =============================================================================
+
+async def validate_configuration():
+    """Validate all required configuration on startup."""
+    errors = []
+    
+    # Check required environment variables
+    required_vars = ["SPREADSHEET_ID", "GOOGLE_SHEETS_CREDENTIALS", "APP_TOKEN"]
+    for var in required_vars:
+        if not os.getenv(var):
+            errors.append(f"Missing required environment variable: {var}")
+    
+    # Validate Google Sheets connection
+    try:
+        sheets_status = GoogleSheetsManager.test_connection()
+        if sheets_status["status"] != "SUCCESS":
+            errors.append(f"Google Sheets connection failed: {sheets_status.get('message')}")
+    except Exception as e:
+        errors.append(f"Google Sheets validation error: {e}")
+    
+    # Validate at least one financial API is configured
+    api_status = financial_client.get_api_status()
+    configured_apis = [api for api, configured in api_status.items() if configured]
+    if not configured_apis:
+        errors.append("No financial APIs configured. At least one API key is required.")
+    
+    if errors:
+        logger.error("Configuration validation failed:")
+        for error in errors:
+            logger.error(f"  - {error}")
+        raise ConfigurationError("Application configuration invalid")
+    
+    logger.info("✅ All configuration validations passed")
+
+# =============================================================================
 # Optional Module Imports with Enhanced Error Handling
 # =============================================================================
 
@@ -613,7 +876,7 @@ HAS_SYMBOLS_READER = sr is not None
 HAS_ADVANCED_ANALYSIS = analyzer is not None
 
 # =============================================================================
-# FastAPI Application Setup
+# FastAPI Application Setup with Enhanced Security
 # =============================================================================
 
 @asynccontextmanager
@@ -621,7 +884,10 @@ async def lifespan(app: FastAPI):
     """Enhanced application lifespan management."""
     # Startup
     startup_time = datetime.datetime.utcnow()
-    logger.info(f"🚀 Starting {SERVICE_NAME} v{SERVICE_VERSION}")
+    logger.info(f"🚀 Starting {config.service_name} v{config.service_version}")
+    
+    # Validate configuration
+    await validate_configuration()
     
     # Test critical connections
     sheets_status = GoogleSheetsManager.test_connection()
@@ -629,6 +895,11 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Google Sheets connection verified")
     else:
         logger.warning(f"⚠️ Google Sheets connection issue: {sheets_status.get('message')}")
+    
+    # Cleanup expired cache entries on startup
+    expired_count = cache.cleanup_expired()
+    if expired_count > 0:
+        logger.info(f"🧹 Cleaned {expired_count} expired cache entries on startup")
     
     yield
     
@@ -649,8 +920,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title=SERVICE_NAME,
-    version=SERVICE_VERSION,
+    title=config.service_name,
+    version=config.service_version,
     description="""
     ## Tadawul Stock Analysis API 📈
     
@@ -660,8 +931,9 @@ app = FastAPI(
     - ✅ Real-time stock data and analysis
     - ✅ Google Sheets integration with 9-page verification
     - ✅ Multi-source data aggregation (6 financial APIs)
-    - ✅ Advanced caching system
+    - ✅ Enhanced caching with TTL
     - ✅ Comprehensive health monitoring
+    - ✅ Rate limiting and security hardening
     
     ### Integrated Financial APIs:
     - Alpha Vantage, Finnhub, EODHD, Twelve Data, MarketStack, FMP
@@ -674,15 +946,19 @@ app = FastAPI(
     - `GET /api/saudi/market` - Saudi market data
     - `GET /v1/financial-apis/status` - Financial APIs status
     """,
-    docs_url="/docs" if os.getenv("ENABLE_SWAGGER", "true").lower() == "true" else None,
-    redoc_url="/redoc" if os.getenv("ENABLE_REDOC", "true").lower() == "true" else None,
+    docs_url="/docs" if config.enable_swagger else None,
+    redoc_url="/redoc" if config.enable_redoc else None,
     lifespan=lifespan
 )
+
+# Add rate limiting middleware
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -704,6 +980,32 @@ async def http_exception_handler(request, exc):
         ).dict()
     )
 
+@app.exception_handler(FinancialAPIError)
+async def financial_api_exception_handler(request, exc):
+    """Financial API exception handler."""
+    logger.error(f"Financial API Error: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content=ErrorResponse(
+            error="Financial service temporarily unavailable",
+            detail=str(exc) if config.environment == "development" else None,
+            timestamp=datetime.datetime.utcnow().isoformat() + "Z"
+        ).dict()
+    )
+
+@app.exception_handler(GoogleSheetsError)
+async def google_sheets_exception_handler(request, exc):
+    """Google Sheets exception handler."""
+    logger.error(f"Google Sheets Error: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content=ErrorResponse(
+            error="Google Sheets service unavailable",
+            detail=str(exc) if config.environment == "development" else None,
+            timestamp=datetime.datetime.utcnow().isoformat() + "Z"
+        ).dict()
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Global exception handler for unhandled errors."""
@@ -712,28 +1014,30 @@ async def global_exception_handler(request, exc):
         status_code=500,
         content=ErrorResponse(
             error="Internal server error",
-            detail=str(exc) if os.getenv("ENVIRONMENT") == "development" else None,
+            detail=str(exc) if config.environment == "development" else None,
             timestamp=datetime.datetime.utcnow().isoformat() + "Z"
         ).dict()
     )
 
 # =============================================================================
-# Core API Endpoints
+# Core API Endpoints with Rate Limiting
 # =============================================================================
 
 @app.get("/", response_model=Dict[str, Any])
-async def root(auth: bool = Depends(verify_auth)):
+@limiter.limit(f"{config.max_requests_per_minute}/minute")
+async def root(request: Request, auth: bool = Depends(verify_auth)):
     """Enhanced root endpoint with comprehensive API information."""
     sheets_status = GoogleSheetsManager.test_connection()
     api_status = financial_client.get_api_status()
     
     return {
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
+        "service": config.service_name,
+        "version": config.service_version,
         "status": "operational",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "environment": os.getenv("ENVIRONMENT", "production"),
-        "authentication_required": REQUIRE_AUTH,
+        "environment": config.environment,
+        "authentication_required": config.require_auth,
+        "rate_limiting": config.enable_rate_limiting,
         "google_sheets": {
             "connected": sheets_status["status"] == "SUCCESS",
             "spreadsheet": sheets_status.get("spreadsheet_title"),
@@ -749,7 +1053,8 @@ async def root(auth: bool = Depends(verify_auth)):
         },
         "cache": {
             "items": len(cache.data),
-            "file_exists": cache.cache_path.exists()
+            "file_exists": cache.cache_path.exists(),
+            "ttl_minutes": cache.ttl // 60
         },
         "endpoints": {
             "health": "/health",
@@ -765,7 +1070,8 @@ async def root(auth: bool = Depends(verify_auth)):
     }
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
+@limiter.limit("30/minute")
+async def health_check(request: Request):
     """Comprehensive health check endpoint."""
     sheets_status = GoogleSheetsManager.test_connection()
     api_status = financial_client.get_api_status()
@@ -777,12 +1083,13 @@ async def health_check():
     return HealthResponse(
         status=health_status,
         time_utc=datetime.datetime.utcnow().isoformat() + "Z",
-        version=SERVICE_VERSION,
+        version=config.service_version,
         google_sheets_connected=sheets_status["status"] == "SUCCESS",
         cache_status={
             "items": len(cache.data),
             "file_exists": cache.cache_path.exists(),
-            "last_updated": cache.cache_path.stat().st_mtime if cache.cache_path.exists() else None
+            "last_updated": cache.cache_path.stat().st_mtime if cache.cache_path.exists() else None,
+            "ttl_minutes": cache.ttl // 60
         },
         features={
             "dashboard": HAS_DASHBOARD,
@@ -797,7 +1104,8 @@ async def health_check():
 # =============================================================================
 
 @app.get("/verify-sheets", response_model=VerificationResponse)
-async def verify_all_sheets(auth: bool = Depends(verify_auth)):
+@limiter.limit("10/minute")
+async def verify_all_sheets(request: Request, auth: bool = Depends(verify_auth)):
     """
     Verify all 9 Google Sheets pages with comprehensive status reporting.
     
@@ -834,7 +1142,9 @@ async def verify_all_sheets(auth: bool = Depends(verify_auth)):
         raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
 
 @app.get("/sheet/{sheet_name}", response_model=SheetDataResponse)
+@limiter.limit("30/minute")
 async def get_sheet_data(
+    request: Request,
     sheet_name: str,
     limit: int = Query(10, ge=1, le=1000, description="Number of records to return"),
     auth: bool = Depends(verify_auth)
@@ -843,7 +1153,8 @@ async def get_sheet_data(
     return get_sheet_data(sheet_name, limit)
 
 @app.get("/sheet-names", response_model=Dict[str, Any])
-async def get_sheet_names(auth: bool = Depends(verify_auth)):
+@limiter.limit("20/minute")
+async def get_sheet_names(request: Request, auth: bool = Depends(verify_auth)):
     """Get all available sheet names with comparison to expected sheets."""
     try:
         spreadsheet = GoogleSheetsManager.get_spreadsheet()
@@ -865,7 +1176,8 @@ async def get_sheet_names(auth: bool = Depends(verify_auth)):
         raise HTTPException(status_code=500, detail=f"Error getting sheet names: {str(e)}")
 
 @app.get("/test-connection", response_model=Dict[str, Any])
-async def test_connection(auth: bool = Depends(verify_auth)):
+@limiter.limit("10/minute")
+async def test_connection(request: Request, auth: bool = Depends(verify_auth)):
     """Comprehensive Google Sheets connection test."""
     return GoogleSheetsManager.test_connection()
 
@@ -874,7 +1186,8 @@ async def test_connection(auth: bool = Depends(verify_auth)):
 # =============================================================================
 
 @app.get("/v1/financial-apis/status", response_model=Dict[str, Any])
-async def get_financial_apis_status(auth: bool = Depends(verify_auth)):
+@limiter.limit("15/minute")
+async def get_financial_apis_status(request: Request, auth: bool = Depends(verify_auth)):
     """Get status of all financial APIs."""
     api_status = financial_client.get_api_status()
     
@@ -884,7 +1197,7 @@ async def get_financial_apis_status(auth: bool = Depends(verify_auth)):
         if api_status[api_name]:  # Only test if API key is configured
             try:
                 start_time = datetime.datetime.now()
-                result = await financial_client.get_stock_quote("AAPL", api_name)
+                result = await financial_client.get_stock_quote_with_retry("AAPL", api_name)
                 response_time = (datetime.datetime.now() - start_time).total_seconds()
                 
                 if result:
@@ -892,13 +1205,13 @@ async def get_financial_apis_status(auth: bool = Depends(verify_auth)):
                         "api_name": api_name,
                         "status": "SUCCESS",
                         "response_time": round(response_time, 3),
-                        "data_sample": result
+                        "data_sample": {k: v for k, v in result.items() if k != 'data_source'}
                     })
                 else:
                     test_results.append({
                         "api_name": api_name,
                         "status": "ERROR",
-                        "error": "No data returned"
+                        "error": "No data returned after retries"
                     })
             except Exception as e:
                 test_results.append({
@@ -914,7 +1227,9 @@ async def get_financial_apis_status(auth: bool = Depends(verify_auth)):
     }
 
 @app.get("/v1/financial-data/{symbol}")
+@limiter.limit("30/minute")
 async def get_financial_data(
+    request: Request,
     symbol: str,
     api: str = Query("alpha_vantage", description="API to use"),
     auth: bool = Depends(verify_auth)
@@ -923,7 +1238,7 @@ async def get_financial_data(
     if api not in FINANCIAL_APIS:
         raise HTTPException(status_code=400, detail=f"API {api} not supported")
     
-    data = await financial_client.get_stock_quote(symbol, api)
+    data = await financial_client.get_stock_quote_with_retry(symbol, api)
     if not data:
         raise HTTPException(status_code=404, detail=f"No data found for {symbol} from {api}")
     
@@ -939,7 +1254,9 @@ async def get_financial_data(
 # =============================================================================
 
 @app.get("/api/saudi/symbols", response_model=Dict[str, Any])
+@limiter.limit("30/minute")
 async def get_saudi_symbols(
+    request: Request,
     limit: int = Query(20, ge=1, le=500),
     auth: bool = Depends(verify_auth)
 ):
@@ -989,7 +1306,9 @@ async def get_saudi_symbols(
         }
 
 @app.get("/api/saudi/market", response_model=Dict[str, Any])
+@limiter.limit("30/minute")
 async def get_saudi_market(
+    request: Request,
     limit: int = Query(20, ge=1, le=500),
     auth: bool = Depends(verify_auth)
 ):
@@ -1031,7 +1350,9 @@ async def get_saudi_market(
 # =============================================================================
 
 @app.get("/v1/quote", response_model=QuoteResponse)
+@limiter.limit("60/minute")
 async def get_quotes(
+    request: Request,
     tickers: str = Query(..., description="Comma-separated ticker symbols"),
     auth: bool = Depends(verify_auth)
 ):
@@ -1055,7 +1376,9 @@ async def get_quotes(
     return QuoteResponse(data=quotes)
 
 @app.post("/v1/quote/update", response_model=Dict[str, Any])
+@limiter.limit("30/minute")
 async def update_quotes(
+    request: Request,
     payload: QuoteUpdatePayload,
     autosave: bool = Query(True),
     auth: bool = Depends(verify_auth)
@@ -1076,7 +1399,9 @@ async def update_quotes(
     return response
 
 @app.get("/v1/cache", response_model=Dict[str, Any])
+@limiter.limit("20/minute")
 async def get_cache_info(
+    request: Request,
     limit: int = Query(50, ge=1, le=1000),
     auth: bool = Depends(verify_auth)
 ):
@@ -1089,7 +1414,8 @@ async def get_cache_info(
         "sample_data": items,
         "cache_file": str(cache.cache_path),
         "file_exists": cache.cache_path.exists(),
-        "file_size": cache.cache_path.stat().st_size if cache.cache_path.exists() else 0
+        "file_size": cache.cache_path.stat().st_size if cache.cache_path.exists() else 0,
+        "ttl_minutes": cache.ttl // 60
     }
 
 # =============================================================================
@@ -1097,17 +1423,19 @@ async def get_cache_info(
 # =============================================================================
 
 @app.get("/v1/ping", response_model=Dict[str, Any])
-async def ping():
+@limiter.limit("120/minute")
+async def ping(request: Request):
     """Simple ping endpoint for service availability."""
     return {
         "status": "ok",
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
+        "service": config.service_name,
+        "version": config.service_version,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
     }
 
 @app.post("/v1/cache/backup", response_model=Dict[str, Any])
-async def create_cache_backup(auth: bool = Depends(verify_auth)):
+@limiter.limit("5/minute")
+async def create_cache_backup(request: Request, auth: bool = Depends(verify_auth)):
     """Create a backup of the current cache."""
     backup_path = cache.create_backup()
     if backup_path:
@@ -1118,6 +1446,17 @@ async def create_cache_backup(auth: bool = Depends(verify_auth)):
         }
     else:
         raise HTTPException(status_code=500, detail="Failed to create backup")
+
+@app.post("/v1/cache/cleanup", response_model=Dict[str, Any])
+@limiter.limit("5/minute")
+async def cleanup_cache(request: Request, auth: bool = Depends(verify_auth)):
+    """Clean up expired cache entries."""
+    expired_count = cache.cleanup_expired()
+    return {
+        "status": "success",
+        "expired_removed": expired_count,
+        "remaining_items": len(cache.data)
+    }
 
 # =============================================================================
 # Include Argaam Routes if available
@@ -1135,17 +1474,19 @@ if __name__ == "__main__":
     # Enhanced server configuration
     server_config = {
         "app": "main:app",
-        "host": APP_HOST,
-        "port": APP_PORT,
+        "host": config.app_host,
+        "port": config.app_port,
         "log_level": "info",
         "access_log": True,
-        "reload": os.getenv("ENVIRONMENT") == "development"
+        "reload": config.environment == "development"
     }
     
-    logger.info(f"🚀 Starting {SERVICE_NAME} v{SERVICE_VERSION} on {APP_HOST}:{APP_PORT}")
+    logger.info(f"🚀 Starting {config.service_name} v{config.service_version} on {config.app_host}:{config.app_port}")
     logger.info(f"📊 Expected sheets: {len(EXPECTED_SHEETS)}")
-    logger.info(f"🔐 Authentication: {'Enabled' if REQUIRE_AUTH else 'Disabled'}")
+    logger.info(f"🔐 Authentication: {'Enabled' if config.require_auth else 'Disabled'}")
+    logger.info(f"⚡ Rate Limiting: {'Enabled' if config.enable_rate_limiting else 'Disabled'}")
     logger.info(f"📈 Financial APIs: {len([k for k, v in financial_client.get_api_status().items() if v])} configured")
+    logger.info(f"🌍 Environment: {config.environment}")
     
     try:
         uvicorn.run(**server_config)
