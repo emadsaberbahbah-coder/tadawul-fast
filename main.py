@@ -7,7 +7,7 @@ import logging
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import aiohttp
 import gspread
@@ -183,7 +183,8 @@ FINANCIAL_APIS = {
     "fmp": {
         "api_key": config.fmp_api_key,
         "base_url": os.getenv(
-            "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+            "FMP_BASE_URL", "https://financialm
+odelingprep.com/api/v3"
         ),
         "timeout": int(os.getenv("FMP_TIMEOUT", "15")),
     },
@@ -204,14 +205,12 @@ limiter = Limiter(key_func=get_remote_address)
 
 def rate_limit(rule: str):
     """Wrapper to optionally disable rate limiting from config."""
-
     if not config.enable_rate_limiting:
         # no-op decorator
         def _decorator(fn):
             return fn
 
         return _decorator
-
     return limiter.limit(rule)
 
 
@@ -677,7 +676,12 @@ class TTLCache:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             path = self.backup_dir / f"quote_cache_{ts}.json"
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"data": list(self.data.values())}, f, indent=2, ensure_ascii=False)
+                json.dump(
+                    {"data": list(self.data.values())},
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
             logger.info(f"✅ Backup created: {path}")
             return str(path)
         except Exception as e:
@@ -944,7 +948,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 @app.get("/", response_model=Dict[str, Any])
-@rate_limit(lambda: f"{config.max_requests_per_minute}/minute")
+@rate_limit(f"{config.max_requests_per_minute}/minute")
 async def root(request: Request, auth: bool = Depends(verify_auth)):
     sheets_status = GoogleSheetsManager.test_connection()
     api_status = financial_client.get_api_status()
@@ -1211,7 +1215,7 @@ async def get_saudi_market(
 
 
 # =============================================================================
-# Quotes & cache endpoints
+# Quotes & cache endpoints  (v1)
 # =============================================================================
 
 
@@ -1311,6 +1315,140 @@ async def ping(request: Request):
         "service": config.service_name,
         "version": config.service_version,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# =============================================================================
+# v4.1 Compatibility endpoints (/v41/quotes, /v41/charts)
+# =============================================================================
+
+
+def _quote_to_v41_dict(q: Quote) -> Dict[str, Any]:
+    return {
+        "ticker": q.ticker,
+        "price": q.price,
+        "previous_close": q.previous_close,
+        "day_change_pct": q.day_change_pct,
+        "currency": q.currency,
+        "timestamp_utc": q.timestamp_utc,
+        "data_source": q.data_source,
+    }
+
+
+@app.get("/v41/quotes")
+@rate_limit("60/minute")
+async def v41_get_quotes(
+    request: Request,
+    symbols: str = Query(..., description="Comma-separated tickers (e.g. 1120.SR,7010.SR)"),
+    cache_ttl: int = Query(60, ge=0, description="Cache TTL in seconds (ignored for now)"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Compatibility endpoint for existing Apps Script calls:
+
+    GET /v41/quotes?symbols=1120.SR&cache_ttl=60
+    """
+    tickers = [t.strip().upper() for t in symbols.split(",") if t.strip()]
+    if not tickers:
+        raise HTTPException(status_code=400, detail="No symbols provided")
+
+    data: List[Dict[str, Any]] = []
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+
+    for sym in tickers:
+        q = cache.get_quote(sym)
+        if q:
+            data.append(_quote_to_v41_dict(q))
+        else:
+            # Return minimal structure if not cached yet
+            data.append(
+                {
+                    "ticker": sym,
+                    "price": None,
+                    "previous_close": None,
+                    "day_change_pct": None,
+                    "currency": None,
+                    "timestamp_utc": now_ts,
+                    "data_source": "cache_miss",
+                }
+            )
+
+    return {
+        "ok": True,
+        "symbols": tickers,
+        "count": len(tickers),
+        "timestamp_utc": now_ts,
+        "data": data,
+        # extra alias to be safe
+        "quotes": data,
+    }
+
+
+@app.post("/v41/quotes")
+@rate_limit("30/minute")
+async def v41_post_quotes(
+    request: Request,
+    payload: QuoteUpdatePayload,
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Compatibility endpoint for posting quotes to cache:
+
+    POST /v41/quotes
+    Body: { "data": [ {ticker, price, ...}, ... ] }
+    """
+    updated, errors = cache.update_quotes(payload.data)
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+    return {
+        "ok": True,
+        "updated": updated,
+        "errors": errors or [],
+        "total_cached": len(cache.data),
+        "timestamp_utc": now_ts,
+    }
+
+
+@app.get("/v41/charts")
+@rate_limit("30/minute")
+async def v41_get_charts(
+    request: Request,
+    symbol: str = Query(..., description="Ticker symbol"),
+    period: str = Query("1mo", description="Period (e.g. 1d, 5d, 1mo, 3mo)"),
+    interval: str = Query("1d", description="Interval (e.g. 1m, 5m, 1d)"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Stub endpoint for charts. Returns an empty series but ok=true
+    so that existing clients don't break.
+    """
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "period": period,
+        "interval": interval,
+        "timestamp_utc": now_ts,
+        "points": [],  # future: you can implement real OHLCV series here
+        "message": "Chart data not implemented yet",
+    }
+
+
+@app.post("/v41/charts")
+@rate_limit("10/minute")
+async def v41_post_charts(
+    request: Request,
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Stub POST for /v41/charts – accepts any body and returns ok=true.
+    """
+    body = await request.json()
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+    return {
+        "ok": True,
+        "received": body,
+        "timestamp_utc": now_ts,
+        "message": "Chart POST endpoint is a stub (no processing implemented).",
     }
 
 
