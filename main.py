@@ -183,8 +183,13 @@ FINANCIAL_APIS = {
     "fmp": {
         "api_key": config.fmp_api_key,
         "base_url": os.getenv(
-            "FMP_BASE_URL", "https://financialm
-odelingprep.com/api/v3"
+    "fmp": {
+        "api_key": config.fmp_api_key,
+        "base_url": os.getenv(
+            "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+        ),
+        "timeout": int(os.getenv("FMP_TIMEOUT", "15")),
+    },
         ),
         "timeout": int(os.getenv("FMP_TIMEOUT", "15")),
     },
