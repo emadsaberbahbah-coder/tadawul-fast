@@ -88,7 +88,7 @@ services:
 
       # === FastAPI Configuration ===
       - key: FASTAPI_BASE
-        value: "https://tadawul-fast-1.onrender.com"
+        value: "https://tadawul-fastap.onrender.com"
       - key: ENABLE_SWAGGER
         value: "true"
       - key: ENABLE_REDOC
