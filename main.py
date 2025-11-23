@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from google.oauth2.service_account import Credentials
-from pydantic import BaseModel, BaseSettings, Field, validator
+from pydantic import BaseModel, Field, validator from pydantic_settings import BaseSettings
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
