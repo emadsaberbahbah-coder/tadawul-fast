@@ -87,8 +87,11 @@ class AppConfig(BaseSettings):
 
     # Google Sheets
     spreadsheet_id: str = Field(..., env="SPREADSHEET_ID")
-    # NEW: use the same env var as google_sheets_service
-    google_service_account_json: str = Field(..., env="GOOGLE_SERVICE_ACCOUNT_JSON")
+    # OPTIONAL now: allows app to start even if secret is not present
+    google_service_account_json: Optional[str] = Field(
+        default=None,
+        env="GOOGLE_SERVICE_ACCOUNT_JSON",
+    )
     google_apps_script_url: str = Field(..., env="GOOGLE_APPS_SCRIPT_URL")
     google_apps_script_backup_url: Optional[str] = Field(
         None, env="GOOGLE_APPS_SCRIPT_BACKUP_URL"
@@ -795,9 +798,18 @@ def fetch_sheet_data(sheet_name: str, limit: int = 10) -> SheetDataResponse:
 async def validate_configuration():
     errors: List[str] = []
 
-    for var in ["SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON"]:
+    # Hard-required env vars
+    required_env = ["SPREADSHEET_ID"]
+    for var in required_env:
         if not os.getenv(var):
             errors.append(f"Missing required environment variable: {var}")
+
+    # GOOGLE_SERVICE_ACCOUNT_JSON is important but not fatal in production
+    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        logger.warning(
+            "GOOGLE_SERVICE_ACCOUNT_JSON not configured. "
+            "Google Sheets operations will fail until this is set."
+        )
 
     try:
         sheets_status = GoogleSheetsManager.test_connection()
