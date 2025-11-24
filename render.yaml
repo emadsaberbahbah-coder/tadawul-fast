@@ -88,7 +88,7 @@ services:
 
       # === FastAPI Configuration ===
       - key: FASTAPI_BASE
-        value: "https://tadawul-fastap.onrender.com"
+        value: "https://tadawul-fast-1.onrender.com"
       - key: ENABLE_SWAGGER
         value: "true"
       - key: ENABLE_REDOC
@@ -102,7 +102,7 @@ services:
 
       # === Authentication & Security ===
       - key: REQUIRE_AUTH
-        value: "true"        # <-- turned ON to use APP_TOKEN
+        value: "true"        # Auth ON – use APP_TOKEN / BACKUP_APP_TOKEN
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: SECRET_KEY
@@ -132,7 +132,7 @@ services:
       - key: CACHE_BACKUP_RETENTION_DAYS
         value: "7"
       - key: CACHE_DEFAULT_TTL
-        value: "300"
+        value: "300"   # 5 minutes
 
       # === Data Provider Configuration ===
       - key: DATA_PROVIDER
@@ -151,8 +151,9 @@ services:
         value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
       - key: GOOGLE_SHEETS_ID
         value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
+      # NOTE: GOOGLE_SERVICE_ACCOUNT_JSON will come from the secrets section
 
-      # === Sheet Names Configuration (kept for future use) ===
+      # === Sheet Names Configuration (legacy, kept for future use) ===
       - key: SHEETS_SYMBOLS_TAB
         value: "Market_Leaders"
       - key: SHEETS_TAB_SYMBOLS
@@ -284,10 +285,13 @@ services:
         fromSecret: tadawul-app-token
       - key: BACKUP_APP_TOKEN
         fromSecret: tadawul-backup-token
-      - key: GOOGLE_SHEETS_CREDENTIALS
+
+      # 🔴 IMPORTANT: This must match main.py + google_sheets_service
+      # It will expose env var GOOGLE_SERVICE_ACCOUNT_JSON
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
         fromSecret: google-sheets-credentials-json
 
-      # Financial APIs – create these secrets in Render dashboard
+      # Financial APIs – create these secrets in Render dashboard (optional)
       - key: ALPHA_VANTAGE_API_KEY
         fromSecret: alpha-vantage-api-key
       - key: FINNHUB_API_KEY
