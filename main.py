@@ -5,12 +5,10 @@ import logging
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import gspread
-import numpy as np
-import pandas as pd
 from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks,
@@ -31,6 +29,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 import uvicorn
+
+# Import the new Google Sheets service (10-page structure)
+from google_sheets_service import google_sheets_service
 
 # =============================================================================
 # Basic setup
@@ -86,13 +87,14 @@ class AppConfig(BaseSettings):
 
     # Google Sheets
     spreadsheet_id: str = Field(..., env="SPREADSHEET_ID")
-    google_sheets_credentials: str = Field(..., env="GOOGLE_SHEETS_CREDENTIALS")
+    # NEW: use the same env var as google_sheets_service
+    google_service_account_json: str = Field(..., env="GOOGLE_SERVICE_ACCOUNT_JSON")
     google_apps_script_url: str = Field(..., env="GOOGLE_APPS_SCRIPT_URL")
     google_apps_script_backup_url: Optional[str] = Field(
         None, env="GOOGLE_APPS_SCRIPT_BACKUP_URL"
     )
 
-    # Financial APIs
+    # Financial APIs (optional; ok if empty)
     alpha_vantage_api_key: Optional[str] = Field(None, env="ALPHA_VANTAGE_API_KEY")
     finnhub_api_key: Optional[str] = Field(None, env="FINNHUB_API_KEY")
     eodhd_api_key: Optional[str] = Field(None, env="EODHD_API_KEY")
@@ -135,20 +137,20 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Your 9-page Ultimate Investment Dashboard sheet names
+# Your 10-page Ultimate Investment Dashboard (9 physical tabs, 10th conceptual)
 EXPECTED_SHEETS = [
-    "Market_Leaders",
-    "global_markets",
-    "my_portfolio",
-    "mutual_funds",
-    "commodities_fx",
-    "insights_analysis",
-    "economic_calendar",
-    "Portfolio_Reports",
-    "Investment_Advisor",
+    "KSA Tadawul Market",
+    "Global Market Stock",
+    "Mutual Fund",
+    "My Portfolio Investment",
+    "Commodities & FX",
+    "Advanced Analysis & Advice",
+    "Economic Calendar",
+    "Investment Income Statement YTD",
+    "Investment Advisor Assumptions",
 ]
 
-# Financial APIs (read from env)
+# Financial APIs (read from env; all optional)
 FINANCIAL_APIS = {
     "alpha_vantage": {
         "api_key": config.alpha_vantage_api_key,
@@ -281,7 +283,7 @@ def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
 
 
 # =============================================================================
-# Google Sheets Manager
+# Google Sheets Manager (for generic tests / verify endpoints)
 # =============================================================================
 
 
@@ -295,17 +297,17 @@ class GoogleSheetsManager:
             return cls._client
 
         try:
-            creds_json = config.google_sheets_credentials
+            creds_json = config.google_service_account_json
             if not creds_json:
-                raise GoogleSheetsError("GOOGLE_SHEETS_CREDENTIALS not configured")
+                raise GoogleSheetsError("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
 
             creds_dict = json.loads(creds_json)
             creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
             cls._client = gspread.authorize(creds)
-            logger.info("✅ Google Sheets client initialized successfully")
+            logger.info("✅ Google Sheets client initialized successfully (GoogleSheetsManager)")
             return cls._client
         except json.JSONDecodeError as e:
-            logger.error(f"❌ Invalid GOOGLE_SHEETS_CREDENTIALS JSON: {e}")
+            logger.error(f"❌ Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
             raise GoogleSheetsError(f"Invalid credentials format: {e}")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Google Sheets client: {e}")
@@ -793,7 +795,7 @@ def fetch_sheet_data(sheet_name: str, limit: int = 10) -> SheetDataResponse:
 async def validate_configuration():
     errors: List[str] = []
 
-    for var in ["SPREADSHEET_ID", "GOOGLE_SHEETS_CREDENTIALS"]:
+    for var in ["SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON"]:
         if not os.getenv(var):
             errors.append(f"Missing required environment variable: {var}")
 
@@ -806,15 +808,15 @@ async def validate_configuration():
     except Exception as e:
         errors.append(f"Google Sheets validation error: {e}")
 
+    # Financial APIs are optional now – only log a warning if none configured
     api_status = financial_client.get_api_status()
     if not any(api_status.values()):
-        errors.append("No financial APIs configured. At least one API key is recommended.")
+        logger.warning("No financial APIs configured. Only cache + Google Sheets will be used.")
 
     if errors:
         logger.error("Configuration validation failed:")
         for e in errors:
             logger.error("  - " + e)
-        # Do not raise in production: continue but log
         if config.environment != "production":
             raise ConfigurationError("Application configuration invalid")
     else:
@@ -889,10 +891,11 @@ app = FastAPI(
     description="""
     Tadawul Stock Analysis API 📈
 
-    - Google Sheets integration (9 pages)
-    - Multi-source financial data
-    - Cache with TTL
-    - Health & diagnostics
+    - Ultimate Investment Dashboard (10 logical pages, 9 tabs in Google Sheets)
+    - Google Sheets integration as the primary data source
+    - Optional multi-source financial data
+    - Local quote cache with TTL
+    - Health & diagnostics endpoints
     """,
     docs_url="/docs" if config.enable_swagger else None,
     redoc_url="/redoc" if config.enable_redoc else None,
@@ -969,6 +972,7 @@ async def root(request: Request, auth: bool = Depends(verify_auth)):
             "file_exists": cache.cache_path.exists(),
             "ttl_minutes": cache.ttl // 60,
         },
+        "expected_sheets": EXPECTED_SHEETS,
     }
 
 
@@ -1001,7 +1005,7 @@ async def health_check(request: Request):
 
 
 # =============================================================================
-# Sheets endpoints
+# Sheets endpoints (generic)
 # =============================================================================
 
 
@@ -1061,7 +1065,7 @@ async def test_connection(request: Request, auth: bool = Depends(verify_auth)):
 
 
 # =============================================================================
-# Financial APIs status & data
+# Financial APIs status & data (optional)
 # =============================================================================
 
 
@@ -1127,7 +1131,7 @@ async def get_financial_data(
 
 
 # =============================================================================
-# Market data endpoints (KSA)
+# Market data endpoints (KSA) – now aligned with KSA Tadawul sheet
 # =============================================================================
 
 
@@ -1140,37 +1144,38 @@ async def get_saudi_symbols(
 ):
     """
     Get Saudi symbols.
+
     Primary: symbols_reader.fetch_symbols()
-    Fallback: read from Market_Leaders (Ticker, Company Name, Sector, Trading Market)
+    Fallback: read from "KSA Tadawul Market" sheet via google_sheets_service
+              (Ticker, Company Name, Sector, Trading Market).
     """
     try:
+        # Primary: if a custom symbols_reader is available
         if HAS_SYMBOLS_READER and hasattr(sr, "fetch_symbols"):
             payload = sr.fetch_symbols(limit)
             if payload and isinstance(payload, dict):
                 return payload
 
-        # Fallback – from Market_Leaders sheet
-        sheet_data = fetch_sheet_data("Market_Leaders", limit=1000)
+        # Fallback – use the new KSA Tadawul Market reader
+        ksa_rows = google_sheets_service.read_ksa_tadawul_market()
         symbols: List[Dict[str, Any]] = []
-        for row in sheet_data.data:
-            ticker = row.get("Ticker") or row.get("ticker")
-            company = row.get("Company Name") or row.get("Company") or row.get("company")
-            sector = row.get("Sector")
-            trading_market = row.get("Trading Market") or row.get("Market")
-            if ticker:
-                symbols.append(
-                    {
-                        "symbol": str(ticker).strip(),
-                        "company_name": company,
-                        "sector": sector,
-                        "trading_market": trading_market,
-                    }
-                )
+        for row in ksa_rows:
+            ticker = row.get("ticker")
+            if not ticker:
+                continue
+            symbols.append(
+                {
+                    "symbol": ticker,
+                    "company_name": row.get("company_name"),
+                    "sector": row.get("sector"),
+                    "trading_market": row.get("trading_market"),
+                }
+            )
 
         return {
             "data": symbols[:limit],
             "count": min(len(symbols), limit),
-            "source": "google_sheets_Market_Leaders",
+            "source": "google_sheets_KSA_Tadawul_Market",
         }
     except Exception as e:
         logger.error(f"Failed to fetch KSA symbols: {e}")
