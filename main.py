@@ -87,10 +87,9 @@ class AppConfig(BaseSettings):
 
     # Google Sheets
     spreadsheet_id: str = Field(..., env="SPREADSHEET_ID")
-    # OPTIONAL now: allows app to start even if secret is not present
+    # OPTIONAL on Render: if empty, we skip direct gspread validation
     google_service_account_json: Optional[str] = Field(
-        default=None,
-        env="GOOGLE_SERVICE_ACCOUNT_JSON",
+        None, env="GOOGLE_SERVICE_ACCOUNT_JSON"
     )
     google_apps_script_url: str = Field(..., env="GOOGLE_APPS_SCRIPT_URL")
     google_apps_script_backup_url: Optional[str] = Field(
@@ -302,6 +301,10 @@ class GoogleSheetsManager:
         try:
             creds_json = config.google_service_account_json
             if not creds_json:
+                logger.warning(
+                    "GOOGLE_SERVICE_ACCOUNT_JSON not configured. "
+                    "GoogleSheetsManager is disabled (use Apps Script service instead)."
+                )
                 raise GoogleSheetsError("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
 
             creds_dict = json.loads(creds_json)
@@ -309,6 +312,10 @@ class GoogleSheetsManager:
             cls._client = gspread.authorize(creds)
             logger.info("✅ Google Sheets client initialized successfully (GoogleSheetsManager)")
             return cls._client
+
+        except GoogleSheetsError:
+            # Already logged as warning above
+            raise
         except json.JSONDecodeError as e:
             logger.error(f"❌ Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
             raise GoogleSheetsError(f"Invalid credentials format: {e}")
@@ -798,37 +805,47 @@ def fetch_sheet_data(sheet_name: str, limit: int = 10) -> SheetDataResponse:
 async def validate_configuration():
     errors: List[str] = []
 
-    # Hard-required env vars
+    # 1) Hard-required env vars (for Render + Apps Script mode)
     required_env = ["SPREADSHEET_ID"]
     for var in required_env:
         if not os.getenv(var):
             errors.append(f"Missing required environment variable: {var}")
 
-    # GOOGLE_SERVICE_ACCOUNT_JSON is important but not fatal in production
-    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+    # 2) Service account JSON is OPTIONAL on Render
+    has_sa_json = bool(config.google_service_account_json)
+
+    if not has_sa_json:
+        # We are in "Apps Script only" mode
         logger.warning(
             "GOOGLE_SERVICE_ACCOUNT_JSON not configured. "
-            "Google Sheets operations will fail until this is set."
+            "Skipping direct Google Sheets (gspread) validation. "
+            "Endpoints using GoogleSheetsManager will NOT work until this is set."
         )
+    else:
+        # Only if JSON is present do we try to validate direct Sheets access
+        try:
+            sheets_status = GoogleSheetsManager.test_connection()
+            if sheets_status.get("status") != "SUCCESS":
+                errors.append(
+                    f"Google Sheets connection failed: {sheets_status.get('message')}"
+                )
+        except Exception as e:
+            errors.append(f"Google Sheets validation error: {e}")
 
-    try:
-        sheets_status = GoogleSheetsManager.test_connection()
-        if sheets_status.get("status") != "SUCCESS":
-            errors.append(
-                f"Google Sheets connection failed: {sheets_status.get('message')}"
-            )
-    except Exception as e:
-        errors.append(f"Google Sheets validation error: {e}")
-
-    # Financial APIs are optional now – only log a warning if none configured
+    # 3) Financial APIs are optional – just warn if none configured
     api_status = financial_client.get_api_status()
     if not any(api_status.values()):
-        logger.warning("No financial APIs configured. Only cache + Google Sheets will be used.")
+        logger.warning(
+            "No financial APIs configured. Only cache + Google Sheets/Apps Script will be used."
+        )
 
+    # 4) Final decision
     if errors:
         logger.error("Configuration validation failed:")
         for e in errors:
             logger.error("  - " + e)
+
+        # In non-production (local dev), be strict and fail fast.
         if config.environment != "production":
             raise ConfigurationError("Application configuration invalid")
     else:
@@ -876,16 +893,30 @@ HAS_ADVANCED_ANALYSIS = analyzer is not None
 async def lifespan(app: FastAPI):
     startup_time = datetime.datetime.utcnow()
     logger.info(f"🚀 Starting {config.service_name} v{config.service_version}")
+
     await validate_configuration()
-    sheets_status = GoogleSheetsManager.test_connection()
-    if sheets_status.get("status") == "SUCCESS":
-        logger.info("✅ Google Sheets connection verified")
+
+    has_sa_json = bool(config.google_service_account_json)
+    if has_sa_json:
+        sheets_status = GoogleSheetsManager.test_connection()
+        if sheets_status.get("status") == "SUCCESS":
+            logger.info("✅ Google Sheets connection verified (direct gspread)")
+        else:
+            logger.warning(
+                f"⚠️ Google Sheets connection issue (direct gspread): {sheets_status.get('message')}"
+            )
     else:
-        logger.warning(f"⚠️ Google Sheets connection issue: {sheets_status.get('message')}")
+        logger.info(
+            "ℹ️ Skipping direct Google Sheets verification on startup "
+            "(GOOGLE_SERVICE_ACCOUNT_JSON not set; using Apps Script / other bridges)."
+        )
+
     expired = cache.cleanup_expired()
     if expired:
         logger.info(f"🧹 Cleaned {expired} expired cache entries on startup")
+
     yield
+
     try:
         if HAS_ARGAAM_ROUTES and close_argaam_http_client:
             await close_argaam_http_client()
@@ -963,8 +994,23 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/", response_model=Dict[str, Any])
 @rate_limit(f"{config.max_requests_per_minute}/minute")
 async def root(request: Request, auth: bool = Depends(verify_auth)):
-    sheets_status = GoogleSheetsManager.test_connection()
+    has_sa_json = bool(config.google_service_account_json)
+    if has_sa_json:
+        sheets_status = GoogleSheetsManager.test_connection()
+        connected = sheets_status.get("status") == "SUCCESS"
+        spreadsheet_title = sheets_status.get("spreadsheet_title")
+        total_sheets = sheets_status.get("total_sheets", 0)
+    else:
+        sheets_status = {
+            "status": "DISABLED",
+            "message": "GOOGLE_SERVICE_ACCOUNT_JSON not configured; direct gspread is disabled.",
+        }
+        connected = False
+        spreadsheet_title = None
+        total_sheets = 0
+
     api_status = financial_client.get_api_status()
+
     return {
         "service": config.service_name,
         "version": config.service_version,
@@ -974,9 +1020,11 @@ async def root(request: Request, auth: bool = Depends(verify_auth)):
         "authentication_required": config.require_auth,
         "rate_limiting": config.enable_rate_limiting,
         "google_sheets": {
-            "connected": sheets_status.get("status") == "SUCCESS",
-            "spreadsheet": sheets_status.get("spreadsheet_title"),
-            "total_sheets": sheets_status.get("total_sheets", 0),
+            "connected": connected,
+            "mode": "direct_gspread" if has_sa_json else "apps_script_or_external_only",
+            "spreadsheet": spreadsheet_title,
+            "total_sheets": total_sheets,
+            "raw_status": sheets_status,
         },
         "financial_apis": api_status,
         "cache": {
@@ -991,14 +1039,26 @@ async def root(request: Request, auth: bool = Depends(verify_auth)):
 @app.get("/health", response_model=HealthResponse)
 @rate_limit("30/minute")
 async def health_check(request: Request):
-    sheets_status = GoogleSheetsManager.test_connection()
+    has_sa_json = bool(config.google_service_account_json)
+    if has_sa_json:
+        sheets_status = GoogleSheetsManager.test_connection()
+        google_connected = sheets_status.get("status") == "SUCCESS"
+        health_status = "healthy" if google_connected else "degraded"
+    else:
+        # Treat as healthy from server perspective, but Sheets direct is disabled
+        sheets_status = {
+            "status": "DISABLED",
+            "message": "GOOGLE_SERVICE_ACCOUNT_JSON not configured; direct gspread is disabled.",
+        }
+        google_connected = False
+        health_status = "healthy"
+
     api_status = financial_client.get_api_status()
-    health_status = "healthy" if sheets_status.get("status") == "SUCCESS" else "degraded"
     return HealthResponse(
         status=health_status,
         time_utc=datetime.datetime.utcnow().isoformat() + "Z",
         version=config.service_version,
-        google_sheets_connected=sheets_status.get("status") == "SUCCESS",
+        google_sheets_connected=google_connected,
         cache_status={
             "items": len(cache.data),
             "file_exists": cache.cache_path.exists(),
@@ -1024,6 +1084,15 @@ async def health_check(request: Request):
 @app.get("/verify-sheets", response_model=VerificationResponse)
 @rate_limit("10/minute")
 async def verify_all_sheets(request: Request, auth: bool = Depends(verify_auth)):
+    if not config.google_service_account_json:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "GOOGLE_SERVICE_ACCOUNT_JSON not configured; "
+                "direct Sheets verification is disabled."
+            ),
+        )
+
     spreadsheet = GoogleSheetsManager.get_spreadsheet()
     results: List[SheetVerificationResult] = []
     for name in EXPECTED_SHEETS:
@@ -1049,12 +1118,29 @@ async def read_sheet_data(
     limit: int = Query(10, ge=1, le=1000),
     auth: bool = Depends(verify_auth),
 ):
+    if not config.google_service_account_json:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "GOOGLE_SERVICE_ACCOUNT_JSON not configured; "
+                "direct sheet access via gspread is disabled."
+            ),
+        )
     return fetch_sheet_data(sheet_name, limit)
 
 
 @app.get("/sheet-names", response_model=Dict[str, Any])
 @rate_limit("20/minute")
 async def get_sheet_names(request: Request, auth: bool = Depends(verify_auth)):
+    if not config.google_service_account_json:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "GOOGLE_SERVICE_ACCOUNT_JSON not configured; "
+                "direct sheet access via gspread is disabled."
+            ),
+        )
+
     try:
         spreadsheet = GoogleSheetsManager.get_spreadsheet()
         worksheets = spreadsheet.worksheets()
@@ -1073,6 +1159,11 @@ async def get_sheet_names(request: Request, auth: bool = Depends(verify_auth)):
 @app.get("/test-connection", response_model=Dict[str, Any])
 @rate_limit("10/minute")
 async def test_connection(request: Request, auth: bool = Depends(verify_auth)):
+    if not config.google_service_account_json:
+        return {
+            "status": "DISABLED",
+            "message": "GOOGLE_SERVICE_ACCOUNT_JSON not configured; direct gspread is disabled.",
+        }
     return GoogleSheetsManager.test_connection()
 
 
