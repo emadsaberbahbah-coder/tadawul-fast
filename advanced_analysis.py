@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import os
-import asyncio
-import aiohttp
 import requests
 import pandas as pd
 import numpy as np
@@ -13,16 +11,21 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
-import httpx
 from pathlib import Path
 
-# Configure logging
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Enums & Data Models
+# =============================================================================
+
 
 class AnalysisTimeframe(Enum):
     SHORT_TERM = "short_term"
-    MEDIUM_TERM = "medium_term" 
+    MEDIUM_TERM = "medium_term"
     LONG_TERM = "long_term"
+
 
 class Recommendation(Enum):
     STRONG_BUY = "STRONG_BUY"
@@ -30,6 +33,7 @@ class Recommendation(Enum):
     HOLD = "HOLD"
     SELL = "SELL"
     STRONG_SELL = "STRONG_SELL"
+
 
 @dataclass
 class PriceData:
@@ -44,6 +48,7 @@ class PriceData:
     previous_close: float
     timestamp: str
     source: str
+
 
 @dataclass
 class TechnicalIndicators:
@@ -70,6 +75,7 @@ class TechnicalIndicators:
     adx: float
     atr: float
 
+
 @dataclass
 class FundamentalData:
     market_cap: float
@@ -87,6 +93,7 @@ class FundamentalData:
     current_ratio: float
     quick_ratio: float
     peg_ratio: float
+
 
 @dataclass
 class AIRecommendation:
@@ -107,41 +114,81 @@ class AIRecommendation:
     price_targets: Dict[str, float]
     timestamp: str
 
+
+# =============================================================================
+# Core Analyzer
+# =============================================================================
+
+
 class AdvancedTradingAnalyzer:
+    """
+    Multi-source analysis engine.
+
+    NOTE:
+    - All API keys MUST be passed via environment variables.
+    - If no keys are configured, the analyzer will fall back to synthetic/sample
+      data where possible (for technicals & fundamentals).
+    """
+
     def __init__(self):
-        # API Keys from environment variables with actual keys
-        self.apis = {
-            'alpha_vantage': os.getenv('ALPHA_VANTAGE_API_KEY', 'Q0VIE9J6AXUCG99F'),
-            'finnhub': os.getenv('FINNHUB_API_KEY', 'd3uhd8pr01qil4aq3i5gd3uhd8pr01qil4aq3i60'),
-            'eodhd': os.getenv('EODHD_API_KEY', '68fd1783ee7eb1.12039806'),
-            'twelvedata': os.getenv('TWELVEDATA_API_KEY', 'ca363b090fbb421a84c05882e4f1e393'),
-            'marketstack': os.getenv('MARKETSTACK_API_KEY', '657b972a96392c3cac405ccc48c36b0c'),
-            'fmp': os.getenv('FMP_API_KEY', '3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt')
+        # API Keys from environment variables ONLY (no hard-coded defaults)
+        self.apis: Dict[str, Optional[str]] = {
+            "alpha_vantage": os.getenv("ALPHA_VANTAGE_API_KEY"),
+            "finnhub": os.getenv("FINNHUB_API_KEY"),
+            "eodhd": os.getenv("EODHD_API_KEY"),
+            "twelvedata": os.getenv("TWELVEDATA_API_KEY"),
+            "marketstack": os.getenv("MARKETSTACK_API_KEY"),
+            "fmp": os.getenv("FMP_API_KEY"),
         }
-        
+
+        configured = [k for k, v in self.apis.items() if v]
+        if not configured:
+            logger.warning(
+                "AdvancedTradingAnalyzer initialized WITHOUT any external API keys. "
+                "Live data will be very limited and fallbacks will be used."
+            )
+        else:
+            logger.info(
+                "AdvancedTradingAnalyzer initialized. APIs configured: %s",
+                ", ".join(configured),
+            )
+
+        # Base URLs (can be overridden by env if needed)
         self.base_urls = {
-            'alpha_vantage': 'https://www.alphavantage.co/query',
-            'finnhub': 'https://finnhub.io/api/v1',
-            'eodhd': 'https://eodhistoricaldata.com/api',
-            'twelvedata': 'https://api.twelvedata.com',
-            'marketstack': 'http://api.marketstack.com/v1',
-            'fmp': 'https://financialmodelingprep.com/api/v3'
+            "alpha_vantage": os.getenv(
+                "ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"
+            ),
+            "finnhub": os.getenv(
+                "FINNHUB_BASE_URL", "https://finnhub.io/api/v1"
+            ),
+            "eodhd": os.getenv(
+                "EODHD_BASE_URL", "https://eodhistoricaldata.com/api"
+            ),
+            "twelvedata": os.getenv(
+                "TWELVEDATA_BASE_URL", "https://api.twelvedata.com"
+            ),
+            "marketstack": os.getenv(
+                "MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"
+            ),
+            "fmp": os.getenv(
+                "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+            ),
         }
 
-        # Google Apps Script integration
-        self.google_apps_script_url = os.getenv(
-            'GOOGLE_APPS_SCRIPT_URL',
-            'https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec'
-        )
+        # Google Apps Script integration (optional)
+        self.google_apps_script_url = os.getenv("GOOGLE_APPS_SCRIPT_URL") or ""
 
-        # Cache configuration
+        # Cache configuration (local JSON files)
         self.cache_dir = Path("./analysis_cache")
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_ttl = timedelta(minutes=15)
 
-        # Session management
-        self.session = None
-        self.async_session = None
+        # Sync requests session
+        self.session: Optional[requests.Session] = None
+
+    # -------------------------------------------------------------------------
+    # Context manager (optional)
+    # -------------------------------------------------------------------------
 
     def __enter__(self):
         self.session = requests.Session()
@@ -150,519 +197,525 @@ class AdvancedTradingAnalyzer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             self.session.close()
+            self.session = None
 
-    async def __aenter__(self):
-        self.async_session = aiohttp.ClientSession()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.async_session:
-            await self.async_session.close()
+    # -------------------------------------------------------------------------
+    # Cache helpers
+    # -------------------------------------------------------------------------
 
     def _get_cache_key(self, symbol: str, data_type: str) -> str:
-        """Generate cache key for symbol and data type."""
         return f"{symbol}_{data_type}.json"
 
     def _load_from_cache(self, symbol: str, data_type: str) -> Optional[Any]:
-        """Load data from cache if valid."""
         try:
             cache_file = self.cache_dir / self._get_cache_key(symbol, data_type)
             if cache_file.exists():
                 data = json.loads(cache_file.read_text(encoding="utf-8"))
-                cache_time = datetime.fromisoformat(data.get('timestamp', '2000-01-01'))
+                cache_time = datetime.fromisoformat(data.get("timestamp", "2000-01-01"))
                 if datetime.now() - cache_time < self.cache_ttl:
-                    return data['data']
+                    return data.get("data")
         except Exception as e:
-            logger.debug(f"Cache load failed for {symbol}_{data_type}: {e}")
+            logger.debug("Cache load failed for %s_%s: %s", symbol, data_type, e)
         return None
 
-    def _save_to_cache(self, symbol: str, data_type: str, data: Any):
-        """Save data to cache."""
+    def _save_to_cache(self, symbol: str, data_type: str, data: Any) -> None:
         try:
             cache_file = self.cache_dir / self._get_cache_key(symbol, data_type)
-            cache_data = {
-                'timestamp': datetime.now().isoformat(),
-                'data': data
-            }
+            cache_data = {"timestamp": datetime.now().isoformat(), "data": data}
             cache_file.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
         except Exception as e:
-            logger.debug(f"Cache save failed for {symbol}_{data_type}: {e}")
+            logger.debug("Cache save failed for %s_%s: %s", symbol, data_type, e)
+
+    # -------------------------------------------------------------------------
+    # Realtime price (multi-source, with fallback & cache)
+    # -------------------------------------------------------------------------
 
     def get_real_time_price(self, symbol: str) -> Optional[PriceData]:
         """Get real-time price from multiple sources with fallback and caching."""
-        # Check cache first
-        cached = self._load_from_cache(symbol, 'price')
-        if cached:
-            return PriceData(**cached)
+        symbol = symbol.upper().strip()
 
+        # 1) Cache
+        cached = self._load_from_cache(symbol, "price")
+        if cached:
+            try:
+                return PriceData(**cached)
+            except Exception:
+                logger.debug("Invalid cached price structure for %s, ignoring.", symbol)
+
+        # 2) Online sources
         sources = [
             self._get_price_alpha_vantage,
             self._get_price_finnhub,
             self._get_price_twelvedata,
             self._get_price_marketstack,
-            self._get_price_fmp
+            self._get_price_fmp,
         ]
-        
+
         for source in sources:
             try:
                 result = source(symbol)
                 if result and result.price > 0:
-                    # Cache the successful result
-                    self._save_to_cache(symbol, 'price', result.__dict__)
+                    self._save_to_cache(symbol, "price", result.__dict__)
                     return result
             except Exception as e:
-                logger.warning(f"Price source {source.__name__} failed for {symbol}: {e}")
-                continue
-        
-        logger.error(f"All price sources failed for {symbol}")
+                logger.warning(
+                    "Price source %s failed for %s: %s",
+                    source.__name__,
+                    symbol,
+                    e,
+                )
+
+        logger.error("All price sources failed for %s", symbol)
         return None
 
     def _get_price_alpha_vantage(self, symbol: str) -> Optional[PriceData]:
-        """Alpha Vantage price data with enhanced error handling."""
-        if not self.apis['alpha_vantage']:
+        if not self.apis["alpha_vantage"]:
             return None
 
         params = {
-            'function': 'GLOBAL_QUOTE',
-            'symbol': symbol,
-            'apikey': self.apis['alpha_vantage']
+            "function": "GLOBAL_QUOTE",
+            "symbol": symbol,
+            "apikey": self.apis["alpha_vantage"],
         }
-        
+
         try:
             session = self.session or requests.Session()
-            response = session.get(self.base_urls['alpha_vantage'], params=params, timeout=15)
+            response = session.get(
+                self.base_urls["alpha_vantage"], params=params, timeout=15
+            )
             response.raise_for_status()
             data = response.json()
-            
-            if 'Global Quote' in data and data['Global Quote']:
-                quote = data['Global Quote']
-                return PriceData(
-                    symbol=symbol,
-                    price=float(quote.get('05. price', 0)),
-                    change=float(quote.get('09. change', 0)),
-                    change_percent=float(quote.get('10. change percent', '0').rstrip('%')),
-                    volume=int(quote.get('06. volume', 0)),
-                    high=float(quote.get('03. high', 0)),
-                    low=float(quote.get('04. low', 0)),
-                    open=float(quote.get('02. open', 0)),
-                    previous_close=float(quote.get('08. previous close', 0)),
-                    timestamp=datetime.utcnow().isoformat(),
-                    source='alpha_vantage'
-                )
+
+            quote = data.get("Global Quote") or {}
+            if not quote:
+                return None
+
+            return PriceData(
+                symbol=symbol,
+                price=float(quote.get("05. price", 0) or 0),
+                change=float(quote.get("09. change", 0) or 0),
+                change_percent=float(
+                    str(quote.get("10. change percent", "0")).rstrip("%") or 0
+                ),
+                volume=int(quote.get("06. volume", 0) or 0),
+                high=float(quote.get("03. high", 0) or 0),
+                low=float(quote.get("04. low", 0) or 0),
+                open=float(quote.get("02. open", 0) or 0),
+                previous_close=float(quote.get("08. previous close", 0) or 0),
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                source="alpha_vantage",
+            )
         except Exception as e:
-            logger.warning(f"Alpha Vantage API error for {symbol}: {e}")
-            
-        return None
+            logger.warning("Alpha Vantage API error for %s: %s", symbol, e)
+            return None
 
     def _get_price_finnhub(self, symbol: str) -> Optional[PriceData]:
-        """Finnhub price data with enhanced error handling."""
-        if not self.apis['finnhub']:
+        if not self.apis["finnhub"]:
             return None
 
         url = f"{self.base_urls['finnhub']}/quote"
-        params = {
-            'symbol': symbol,
-            'token': self.apis['finnhub']
-        }
-        
+        params = {"symbol": symbol, "token": self.apis["finnhub"]}
+
         try:
             session = self.session or requests.Session()
             response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
-            
-            if data.get('c', 0) > 0:
-                return PriceData(
-                    symbol=symbol,
-                    price=data['c'],
-                    change=data.get('d', 0),
-                    change_percent=data.get('dp', 0),
-                    high=data.get('h', 0),
-                    low=data.get('l', 0),
-                    open=data.get('o', 0),
-                    previous_close=data.get('pc', 0),
-                    volume=data.get('v', 0),
-                    timestamp=datetime.utcnow().isoformat(),
-                    source='finnhub'
-                )
-        except Exception as e:
-            logger.warning(f"Finnhub API error for {symbol}: {e}")
-            
-        return None
 
-    def _get_price_twelvedata(self, symbol: str) -> Optional[PriceData]:
-        """Twelve Data price data with enhanced error handling."""
-        if not self.apis['twelvedata']:
+            if not data or data.get("c", 0) <= 0:
+                return None
+
+            return PriceData(
+                symbol=symbol,
+                price=float(data.get("c", 0) or 0),
+                change=float(data.get("d", 0) or 0),
+                change_percent=float(data.get("dp", 0) or 0),
+                high=float(data.get("h", 0) or 0),
+                low=float(data.get("l", 0) or 0),
+                open=float(data.get("o", 0) or 0),
+                previous_close=float(data.get("pc", 0) or 0),
+                volume=int(data.get("v", 0) or 0),
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                source="finnhub",
+            )
+        except Exception as e:
+            logger.warning("Finnhub API error for %s: %s", symbol, e)
             return None
 
-        url = f"{self.base_urls['twelvedata']}/price"
-        params = {
-            'symbol': symbol,
-            'apikey': self.apis['twelvedata']
-        }
-        
+    def _get_price_twelvedata(self, symbol: str) -> Optional[PriceData]:
+        if not self.apis["twelvedata"]:
+            return None
+
+        base = self.base_urls["twelvedata"]
+        params = {"symbol": symbol, "apikey": self.apis["twelvedata"]}
+
         try:
             session = self.session or requests.Session()
-            response = session.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            if data.get('price'):
-                # Get additional quote data
-                quote_url = f"{self.base_urls['twelvedata']}/quote"
-                quote_params = {'symbol': symbol, 'apikey': self.apis['twelvedata']}
-                quote_response = session.get(quote_url, params=quote_params, timeout=15)
-                quote_data = quote_response.json()
-                
-                return PriceData(
-                    symbol=symbol,
-                    price=float(data['price']),
-                    change=float(quote_data.get('change', 0)),
-                    change_percent=float(quote_data.get('percent_change', '0').rstrip('%')),
-                    high=float(quote_data.get('high', 0)),
-                    low=float(quote_data.get('low', 0)),
-                    open=float(quote_data.get('open', 0)),
-                    previous_close=float(quote_data.get('previous_close', 0)),
-                    volume=int(quote_data.get('volume', 0)),
-                    timestamp=datetime.utcnow().isoformat(),
-                    source='twelvedata'
-                )
+
+            # Simple quote endpoint (avoid double-calls if not needed)
+            quote_url = f"{base}/quote"
+            resp = session.get(quote_url, params=params, timeout=15)
+            resp.raise_for_status()
+            quote_data = resp.json()
+
+            if not quote_data or not quote_data.get("close"):
+                return None
+
+            return PriceData(
+                symbol=symbol,
+                price=float(quote_data.get("close", 0) or 0),
+                change=float(quote_data.get("change", 0) or 0),
+                change_percent=float(
+                    quote_data.get("percent_change", 0) or 0
+                ),
+                high=float(quote_data.get("high", 0) or 0),
+                low=float(quote_data.get("low", 0) or 0),
+                open=float(quote_data.get("open", 0) or 0),
+                previous_close=float(quote_data.get("previous_close", 0) or 0),
+                volume=int(quote_data.get("volume", 0) or 0),
+                timestamp=quote_data.get("datetime")
+                or datetime.utcnow().isoformat() + "Z",
+                source="twelvedata",
+            )
         except Exception as e:
-            logger.warning(f"Twelve Data API error for {symbol}: {e}")
-            
-        return None
+            logger.warning("Twelve Data API error for %s: %s", symbol, e)
+            return None
 
     def _get_price_marketstack(self, symbol: str) -> Optional[PriceData]:
-        """Marketstack price data with enhanced error handling."""
-        if not self.apis['marketstack']:
+        if not self.apis["marketstack"]:
             return None
 
         url = f"{self.base_urls['marketstack']}/eod/latest"
-        params = {
-            'symbols': symbol,
-            'access_key': self.apis['marketstack']
-        }
-        
+        params = {"symbols": symbol, "access_key": self.apis["marketstack"]}
+
         try:
             session = self.session or requests.Session()
             response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
-            
-            if data.get('data') and len(data['data']) > 0:
-                quote = data['data'][0]
-                return PriceData(
-                    symbol=symbol,
-                    price=float(quote.get('close', 0)),
-                    change=float(quote.get('close', 0)) - float(quote.get('open', 0)),
-                    change_percent=((float(quote.get('close', 0)) - float(quote.get('open', 0))) / float(quote.get('open', 1))) * 100,
-                    high=float(quote.get('high', 0)),
-                    low=float(quote.get('low', 0)),
-                    open=float(quote.get('open', 0)),
-                    previous_close=float(quote.get('close', 0)),
-                    volume=int(quote.get('volume', 0)),
-                    timestamp=quote.get('date', datetime.utcnow().isoformat()),
-                    source='marketstack'
-                )
+
+            rows = data.get("data") or []
+            if not rows:
+                return None
+            quote = rows[0]
+
+            close_price = float(quote.get("close", 0) or 0)
+            open_price = float(quote.get("open", close_price) or close_price)
+            if open_price == 0:
+                open_price = close_price
+
+            change = close_price - open_price
+            change_pct = (change / open_price * 100) if open_price else 0.0
+
+            return PriceData(
+                symbol=symbol,
+                price=close_price,
+                change=change,
+                change_percent=change_pct,
+                high=float(quote.get("high", 0) or 0),
+                low=float(quote.get("low", 0) or 0),
+                open=open_price,
+                previous_close=close_price,
+                volume=int(quote.get("volume", 0) or 0),
+                timestamp=quote.get("date") or datetime.utcnow().isoformat() + "Z",
+                source="marketstack",
+            )
         except Exception as e:
-            logger.warning(f"Marketstack API error for {symbol}: {e}")
-            
-        return None
+            logger.warning("Marketstack API error for %s: %s", symbol, e)
+            return None
 
     def _get_price_fmp(self, symbol: str) -> Optional[PriceData]:
-        """Financial Modeling Prep price data."""
-        if not self.apis['fmp']:
+        if not self.apis["fmp"]:
             return None
 
         url = f"{self.base_urls['fmp']}/quote/{symbol}"
-        params = {
-            'apikey': self.apis['fmp']
-        }
-        
+        params = {"apikey": self.apis["fmp"]}
+
         try:
             session = self.session or requests.Session()
             response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
-            
-            if data and len(data) > 0:
-                quote = data[0]
-                return PriceData(
-                    symbol=symbol,
-                    price=float(quote.get('price', 0)),
-                    change=float(quote.get('change', 0)),
-                    change_percent=float(quote.get('changesPercentage', 0)),
-                    high=float(quote.get('dayHigh', 0)),
-                    low=float(quote.get('dayLow', 0)),
-                    open=float(quote.get('open', 0)),
-                    previous_close=float(quote.get('previousClose', 0)),
-                    volume=int(quote.get('volume', 0)),
-                    timestamp=datetime.utcnow().isoformat(),
-                    source='fmp'
-                )
+
+            if not data:
+                return None
+            quote = data[0]
+
+            return PriceData(
+                symbol=symbol,
+                price=float(quote.get("price", 0) or 0),
+                change=float(quote.get("change", 0) or 0),
+                change_percent=float(quote.get("changesPercentage", 0) or 0),
+                high=float(quote.get("dayHigh", 0) or 0),
+                low=float(quote.get("dayLow", 0) or 0),
+                open=float(quote.get("open", 0) or 0),
+                previous_close=float(quote.get("previousClose", 0) or 0),
+                volume=int(quote.get("volume", 0) or 0),
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                source="fmp",
+            )
         except Exception as e:
-            logger.warning(f"FMP API error for {symbol}: {e}")
-            
-        return None
+            logger.warning("FMP API error for %s: %s", symbol, e)
+            return None
+
+    # -------------------------------------------------------------------------
+    # Multi-source consolidation
+    # -------------------------------------------------------------------------
 
     def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
-        """Get comprehensive analysis from all available data sources."""
-        results = {
-            'symbol': symbol,
-            'sources': {},
-            'consolidated': {},
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        symbol = symbol.upper().strip()
+
+        results: Dict[str, Any] = {
+            "symbol": symbol,
+            "sources": {},
+            "consolidated": {},
+            "timestamp": datetime.utcnow().isoformat() + "Z",
         }
-        
-        # Alpha Vantage
-        try:
-            alpha_data = self._get_price_alpha_vantage(symbol)
-            if alpha_data:
-                results['sources']['alpha_vantage'] = alpha_data.__dict__
-        except Exception as e:
-            logger.warning(f"Alpha Vantage failed for {symbol}: {e}")
-        
-        # Finnhub
-        try:
-            finnhub_data = self._get_price_finnhub(symbol)
-            if finnhub_data:
-                results['sources']['finnhub'] = finnhub_data.__dict__
-        except Exception as e:
-            logger.warning(f"Finnhub failed for {symbol}: {e}")
-        
-        # Twelve Data
-        try:
-            twelve_data = self._get_price_twelvedata(symbol)
-            if twelve_data:
-                results['sources']['twelvedata'] = twelve_data.__dict__
-        except Exception as e:
-            logger.warning(f"Twelve Data failed for {symbol}: {e}")
-        
-        # MarketStack
-        try:
-            marketstack_data = self._get_price_marketstack(symbol)
-            if marketstack_data:
-                results['sources']['marketstack'] = marketstack_data.__dict__
-        except Exception as e:
-            logger.warning(f"MarketStack failed for {symbol}: {e}")
-        
-        # FMP
-        try:
-            fmp_data = self._get_price_fmp(symbol)
-            if fmp_data:
-                results['sources']['fmp'] = fmp_data.__dict__
-        except Exception as e:
-            logger.warning(f"FMP failed for {symbol}: {e}")
-        
-        # Google Apps Script
+
+        # Price-oriented sources
+        for name, fn in [
+            ("alpha_vantage", self._get_price_alpha_vantage),
+            ("finnhub", self._get_price_finnhub),
+            ("twelvedata", self._get_price_twelvedata),
+            ("marketstack", self._get_price_marketstack),
+            ("fmp", self._get_price_fmp),
+        ]:
+            try:
+                data = fn(symbol)
+                if data:
+                    results["sources"][name] = data.__dict__
+            except Exception as e:
+                logger.warning("%s failed for %s: %s", name, symbol, e)
+
+        # Optional Google Apps Script enrichment
         try:
             apps_script_data = self._get_google_apps_script_data(symbol)
             if apps_script_data:
-                results['sources']['google_apps_script'] = apps_script_data
+                results["sources"]["google_apps_script"] = apps_script_data
         except Exception as e:
-            logger.warning(f"Google Apps Script failed for {symbol}: {e}")
-        
-        # Consolidate results
-        results['consolidated'] = self._consolidate_multi_source_data(results['sources'])
-        
+            logger.warning("Google Apps Script failed for %s: %s", symbol, e)
+
+        # Consolidate
+        results["consolidated"] = self._consolidate_multi_source_data(
+            results["sources"]
+        )
         return results
 
     def _get_google_apps_script_data(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get data from Google Apps Script."""
+        if not self.google_apps_script_url:
+            return None
         try:
-            params = {'symbol': symbol.upper()}
-            response = requests.get(self.google_apps_script_url, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
+            params = {"symbol": symbol.upper()}
+            resp = requests.get(self.google_apps_script_url, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
         except Exception as e:
-            logger.warning(f"Google Apps Script error for {symbol}: {e}")
+            logger.warning("Google Apps Script error for %s: %s", symbol, e)
             return None
 
     def _consolidate_multi_source_data(self, sources: Dict[str, Any]) -> Dict[str, Any]:
-        """Consolidate data from multiple sources."""
-        prices = []
-        volumes = []
-        changes = []
-        
-        for source_name, data in sources.items():
-            if data and data.get('price'):
-                prices.append(data['price'])
-            if data and data.get('volume'):
-                volumes.append(data['volume'])
-            if data and data.get('change'):
-                changes.append(data['change'])
-        
+        prices: List[float] = []
+        volumes: List[float] = []
+        changes: List[float] = []
+
+        for data in sources.values():
+            if not isinstance(data, dict):
+                continue
+            if data.get("price") is not None:
+                prices.append(float(data["price"]))
+            if data.get("volume") is not None:
+                volumes.append(float(data["volume"]))
+            if data.get("change") is not None:
+                changes.append(float(data["change"]))
+
         consolidated = {
-            'price_avg': sum(prices) / len(prices) if prices else None,
-            'price_min': min(prices) if prices else None,
-            'price_max': max(prices) if prices else None,
-            'price_std': np.std(prices) if len(prices) > 1 else 0,
-            'volume_avg': sum(volumes) / len(volumes) if volumes else None,
-            'change_avg': sum(changes) / len(changes) if changes else None,
-            'sources_count': len(sources),
-            'confidence': min(1.0, len(sources) * 0.2),
-            'data_quality': 'HIGH' if len(sources) >= 3 else 'MEDIUM' if len(sources) >= 2 else 'LOW'
+            "price_avg": sum(prices) / len(prices) if prices else None,
+            "price_min": min(prices) if prices else None,
+            "price_max": max(prices) if prices else None,
+            "price_std": float(np.std(prices)) if len(prices) > 1 else 0.0,
+            "volume_avg": sum(volumes) / len(volumes) if volumes else None,
+            "change_avg": sum(changes) / len(changes) if changes else None,
+            "sources_count": len(sources),
+            "confidence": min(1.0, len(sources) * 0.2),
+            "data_quality": (
+                "HIGH"
+                if len(sources) >= 3
+                else "MEDIUM"
+                if len(sources) >= 2
+                else "LOW"
+            ),
         }
-        
         return consolidated
 
-    def calculate_technical_indicators(self, symbol: str, period: str = '3mo') -> TechnicalIndicators:
-        """Calculate advanced technical indicators with caching."""
-        # Check cache first
-        cached = self._load_from_cache(symbol, f'technical_{period}')
+    # -------------------------------------------------------------------------
+    # Technical indicators
+    # -------------------------------------------------------------------------
+
+    def calculate_technical_indicators(
+        self, symbol: str, period: str = "3mo"
+    ) -> TechnicalIndicators:
+        symbol = symbol.upper().strip()
+
+        cached = self._load_from_cache(symbol, f"technical_{period}")
         if cached:
-            return TechnicalIndicators(**cached)
+            try:
+                return TechnicalIndicators(**cached)
+            except Exception:
+                logger.debug("Invalid cached technicals for %s, ignoring.", symbol)
 
         try:
-            # Get historical data for calculations
-            historical_data = self._get_historical_data(symbol, period)
-            if historical_data.empty:
+            df = self._get_historical_data(symbol, period)
+            if df.empty:
                 return self._generate_fallback_technical_indicators()
 
-            # Calculate indicators
-            indicators = self._calculate_advanced_indicators(historical_data)
-            
-            # Cache the results
-            self._save_to_cache(symbol, f'technical_{period}', indicators.__dict__)
-            
+            indicators = self._calculate_advanced_indicators(df)
+            self._save_to_cache(symbol, f"technical_{period}", indicators.__dict__)
             return indicators
-            
         except Exception as e:
-            logger.error(f"Technical indicators calculation failed for {symbol}: {e}")
+            logger.error("Technical indicators calculation failed for %s: %s", symbol, e)
             return self._generate_fallback_technical_indicators()
 
     def _get_historical_data(self, symbol: str, period: str) -> pd.DataFrame:
-        """Get historical price data for technical analysis."""
-        # Use Alpha Vantage for historical data
+        # Use Alpha Vantage daily if configured
         try:
-            if self.apis['alpha_vantage']:
-                url = self.base_urls['alpha_vantage']
+            if self.apis["alpha_vantage"]:
+                url = self.base_urls["alpha_vantage"]
                 params = {
-                    'function': 'TIME_SERIES_DAILY',
-                    'symbol': symbol,
-                    'apikey': self.apis['alpha_vantage'],
-                    'outputsize': 'compact'
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": symbol,
+                    "apikey": self.apis["alpha_vantage"],
+                    "outputsize": "compact",
                 }
-                response = requests.get(url, params=params, timeout=15)
-                data = response.json()
-                
-                if 'Time Series (Daily)' in data:
-                    time_series = data['Time Series (Daily)']
-                    dates = []
-                    opens = []
-                    highs = []
-                    lows = []
-                    closes = []
-                    volumes = []
-                    
-                    for date, values in list(time_series.items())[:90]:  # Last 90 days
+                resp = requests.get(url, params=params, timeout=15)
+                data = resp.json()
+
+                ts = data.get("Time Series (Daily)") or {}
+                if ts:
+                    dates, opens, highs, lows, closes, volumes = [], [], [], [], [], []
+                    for date, values in list(ts.items())[:90]:
                         dates.append(pd.to_datetime(date))
-                        opens.append(float(values['1. open']))
-                        highs.append(float(values['2. high']))
-                        lows.append(float(values['3. low']))
-                        closes.append(float(values['4. close']))
-                        volumes.append(int(values['5. volume']))
-                    
-                    return pd.DataFrame({
-                        'date': dates,
-                        'open': opens,
-                        'high': highs,
-                        'low': lows,
-                        'close': closes,
-                        'volume': volumes
-                    }).set_index('date')
+                        opens.append(float(values["1. open"]))
+                        highs.append(float(values["2. high"]))
+                        lows.append(float(values["3. low"]))
+                        closes.append(float(values["4. close"]))
+                        volumes.append(int(values["5. volume"]))
+
+                    df = pd.DataFrame(
+                        {
+                            "date": dates,
+                            "open": opens,
+                            "high": highs,
+                            "low": lows,
+                            "close": closes,
+                            "volume": volumes,
+                        }
+                    )
+                    return df.set_index("date")
         except Exception as e:
-            logger.warning(f"Historical data API failed, using sample data: {e}")
-        
-        # Fallback to sample data
-        dates = pd.date_range(end=datetime.now(), periods=90, freq='D')
-        base_price = np.random.uniform(40, 60)
-        
+            logger.warning("Historical data API failed for %s: %s", symbol, e)
+
+        # Fallback: synthetic data
+        dates = pd.date_range(end=datetime.now(), periods=90, freq="D")
+        base_price = float(np.random.uniform(40, 60))
+
         data = {
-            'date': dates,
-            'open': base_price + np.random.uniform(-2, 2, 90),
-            'high': base_price + np.random.uniform(0, 3, 90),
-            'low': base_price + np.random.uniform(-3, 0, 90),
-            'close': base_price + np.random.uniform(-1.5, 1.5, 90),
-            'volume': np.random.randint(1000000, 5000000, 90)
+            "date": dates,
+            "open": base_price + np.random.uniform(-2, 2, 90),
+            "high": base_price + np.random.uniform(0, 3, 90),
+            "low": base_price + np.random.uniform(-3, 0, 90),
+            "close": base_price + np.random.uniform(-1.5, 1.5, 90),
+            "volume": np.random.randint(1_000_000, 5_000_000, 90),
         }
-        
-        return pd.DataFrame(data).set_index('date')
+        return pd.DataFrame(data).set_index("date")
 
     def _calculate_advanced_indicators(self, df: pd.DataFrame) -> TechnicalIndicators:
-        """Calculate comprehensive technical indicators."""
-        close_prices = df['close']
-        high_prices = df['high']
-        low_prices = df['low']
-        volumes = df['volume']
-        
+        close_prices = df["close"]
+        high_prices = df["high"]
+        low_prices = df["low"]
+        volumes = df["volume"]
+
         # RSI
         delta = close_prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
-        rsi = 100 - (100 / (1 + rs)).iloc[-1] if not rs.isna().iloc[-1] else 50
-        
+        rsi = (
+            float(100 - (100 / (1 + rs)).iloc[-1])
+            if not rs.isna().iloc[-1]
+            else 50.0
+        )
+
         # MACD
-        exp1 = close_prices.ewm(span=12).mean()
-        exp2 = close_prices.ewm(span=26).mean()
+        exp1 = close_prices.ewm(span=12, adjust=False).mean()
+        exp2 = close_prices.ewm(span=26, adjust=False).mean()
         macd = exp1 - exp2
-        macd_signal = macd.ewm(span=9).mean()
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
         macd_histogram = macd - macd_signal
-        
+
         # Moving Averages
-        ma_20 = close_prices.rolling(20).mean().iloc[-1]
-        ma_50 = close_prices.rolling(50).mean().iloc[-1]
-        ma_200 = close_prices.rolling(200).mean().iloc[-1] if len(close_prices) >= 200 else ma_50
-        
+        ma_20 = float(close_prices.rolling(20).mean().iloc[-1])
+        ma_50 = float(close_prices.rolling(50).mean().iloc[-1])
+        ma_200 = (
+            float(close_prices.rolling(200).mean().iloc[-1])
+            if len(close_prices) >= 200
+            else ma_50
+        )
+
         # Bollinger Bands
-        bb_upper = ma_20 + (2 * close_prices.rolling(20).std()).iloc[-1]
-        bb_lower = ma_20 - (2 * close_prices.rolling(20).std()).iloc[-1]
-        bb_position = (close_prices.iloc[-1] - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
-        
-        # Additional indicators
-        volume_trend = volumes.pct_change(5).mean()
-        support_level = low_prices.rolling(20).min().iloc[-1]
-        resistance_level = high_prices.rolling(20).max().iloc[-1]
-        
-        # Determine trend direction
+        std_20 = float(close_prices.rolling(20).std().iloc[-1])
+        bb_upper = ma_20 + 2 * std_20
+        bb_lower = ma_20 - 2 * std_20
+        if bb_upper != bb_lower:
+            bb_position = (close_prices.iloc[-1] - bb_lower) / (bb_upper - bb_lower)
+        else:
+            bb_position = 0.5
+
+        volume_trend = float(volumes.pct_change(5).mean())
+        support_level = float(low_prices.rolling(20).min().iloc[-1])
+        resistance_level = float(high_prices.rolling(20).max().iloc[-1])
+
+        # Trend direction
         if ma_20 > ma_50 > ma_200:
             trend_direction = "Bullish"
         elif ma_20 < ma_50 < ma_200:
             trend_direction = "Bearish"
         else:
             trend_direction = "Neutral"
-            
-        volatility = close_prices.pct_change().std() * np.sqrt(252)
-        momentum_score = ((close_prices.iloc[-1] / close_prices.iloc[-20]) - 1) * 100 if len(close_prices) >= 20 else 0
-        
+
+        volatility = float(close_prices.pct_change().std() * np.sqrt(252))
+        if len(close_prices) >= 20:
+            momentum_score = float(
+                (close_prices.iloc[-1] / close_prices.iloc[-20] - 1) * 100
+            )
+        else:
+            momentum_score = 0.0
+
         return TechnicalIndicators(
-            rsi=float(rsi),
+            rsi=rsi,
             macd=float(macd.iloc[-1]),
             macd_signal=float(macd_signal.iloc[-1]),
             macd_histogram=float(macd_histogram.iloc[-1]),
-            moving_avg_20=float(ma_20),
-            moving_avg_50=float(ma_50),
-            moving_avg_200=float(ma_200),
+            moving_avg_20=ma_20,
+            moving_avg_50=ma_50,
+            moving_avg_200=ma_200,
             bollinger_upper=float(bb_upper),
             bollinger_lower=float(bb_lower),
             bollinger_position=float(bb_position),
-            volume_trend=float(volume_trend),
-            support_level=float(support_level),
-            resistance_level=float(resistance_level),
+            volume_trend=volume_trend,
+            support_level=support_level,
+            resistance_level=resistance_level,
             trend_direction=trend_direction,
-            volatility=float(volatility),
-            momentum_score=float(momentum_score),
+            volatility=volatility,
+            momentum_score=momentum_score,
             williams_r=float(np.random.uniform(-100, 0)),
             stoch_k=float(np.random.uniform(0, 100)),
             stoch_d=float(np.random.uniform(0, 100)),
             cci=float(np.random.uniform(-200, 200)),
             adx=float(np.random.uniform(0, 60)),
-            atr=float(np.random.uniform(1, 5))
+            atr=float(np.random.uniform(1, 5)),
         )
 
     def _generate_fallback_technical_indicators(self) -> TechnicalIndicators:
-        """Generate fallback technical indicators when calculation fails."""
         return TechnicalIndicators(
             rsi=float(np.random.uniform(30, 70)),
             macd=float(np.random.uniform(-2, 2)),
@@ -677,7 +730,9 @@ class AdvancedTradingAnalyzer:
             volume_trend=float(np.random.uniform(-0.1, 0.1)),
             support_level=float(np.random.uniform(35, 45)),
             resistance_level=float(np.random.uniform(55, 65)),
-            trend_direction=np.random.choice(['Bullish', 'Bearish', 'Neutral']),
+            trend_direction=str(
+                np.random.choice(["Bullish", "Bearish", "Neutral"])
+            ),
             volatility=float(np.random.uniform(0.1, 0.4)),
             momentum_score=float(np.random.uniform(0, 100)),
             williams_r=float(np.random.uniform(-100, 0)),
@@ -685,37 +740,37 @@ class AdvancedTradingAnalyzer:
             stoch_d=float(np.random.uniform(0, 100)),
             cci=float(np.random.uniform(-200, 200)),
             adx=float(np.random.uniform(0, 60)),
-            atr=float(np.random.uniform(1, 5))
+            atr=float(np.random.uniform(1, 5)),
         )
 
+    # -------------------------------------------------------------------------
+    # Fundamentals
+    # -------------------------------------------------------------------------
+
     def analyze_fundamentals(self, symbol: str) -> FundamentalData:
-        """Analyze company fundamentals from multiple sources with caching."""
-        # Check cache first
-        cached = self._load_from_cache(symbol, 'fundamentals')
+        symbol = symbol.upper().strip()
+
+        cached = self._load_from_cache(symbol, "fundamentals")
         if cached:
-            return FundamentalData(**cached)
+            try:
+                return FundamentalData(**cached)
+            except Exception:
+                logger.debug("Invalid cached fundamentals for %s, ignoring.", symbol)
 
         try:
-            # Try multiple fundamental data sources
             fundamental_data = self._get_fundamental_data_combined(symbol)
-            
-            # Cache the results
-            self._save_to_cache(symbol, 'fundamentals', fundamental_data.__dict__)
-            
+            self._save_to_cache(symbol, "fundamentals", fundamental_data.__dict__)
             return fundamental_data
-            
         except Exception as e:
-            logger.error(f"Fundamental analysis failed for {symbol}: {e}")
+            logger.error("Fundamental analysis failed for %s: %s", symbol, e)
             return self._generate_fallback_fundamental_data()
 
     def _get_fundamental_data_combined(self, symbol: str) -> FundamentalData:
-        """Combine data from multiple fundamental data sources."""
-        # Try FMP API first
         fmp_data = self._get_fundamentals_fmp(symbol)
         if fmp_data:
             return fmp_data
-        
-        # Fallback to sample data
+
+        # Fallback synthetic fundamentals
         return FundamentalData(
             market_cap=float(np.random.uniform(1e9, 50e9)),
             pe_ratio=float(np.random.uniform(8, 25)),
@@ -731,46 +786,48 @@ class AdvancedTradingAnalyzer:
             operating_margin=float(np.random.uniform(0.08, 0.35)),
             current_ratio=float(np.random.uniform(1.2, 3.5)),
             quick_ratio=float(np.random.uniform(0.8, 2.8)),
-            peg_ratio=float(np.random.uniform(0.5, 3.0))
+            peg_ratio=float(np.random.uniform(0.5, 3.0)),
         )
 
     def _get_fundamentals_fmp(self, symbol: str) -> Optional[FundamentalData]:
-        """Get fundamental data from Financial Modeling Prep."""
-        if not self.apis['fmp']:
+        if not self.apis["fmp"]:
             return None
 
         try:
             url = f"{self.base_urls['fmp']}/profile/{symbol}"
-            params = {'apikey': self.apis['fmp']}
-            response = requests.get(url, params=params, timeout=15)
-            data = response.json()
-            
-            if data and len(data) > 0:
-                profile = data[0]
-                return FundamentalData(
-                    market_cap=float(profile.get('mktCap', 0)),
-                    pe_ratio=float(profile.get('priceToEarnings', 0)),
-                    pb_ratio=float(profile.get('priceToBook', 0)),
-                    dividend_yield=float(profile.get('lastDiv', 0)) / 100.0,
-                    eps=float(profile.get('eps', 0)),
-                    roe=float(profile.get('roe', 0)) / 100.0,
-                    debt_to_equity=float(profile.get('debtToEquity', 0)),
-                    revenue_growth=float(profile.get('revenueGrowth', 0)),
-                    profit_margin=float(profile.get('profitMargin', 0)) / 100.0,
-                    sector_rank=1,
-                    free_cash_flow=float(profile.get('freeCashFlow', 0)),
-                    operating_margin=float(profile.get('operatingMargins', 0)) / 100.0,
-                    current_ratio=float(profile.get('currentRatio', 0)),
-                    quick_ratio=float(profile.get('quickRatio', 0)),
-                    peg_ratio=float(profile.get('pegRatio', 0))
+            params = {"apikey": self.apis["fmp"]}
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+
+            if not data:
+                return None
+            profile = data[0]
+
+            return FundamentalData(
+                market_cap=float(profile.get("mktCap", 0) or 0),
+                pe_ratio=float(profile.get("priceToEarnings", 0) or 0),
+                pb_ratio=float(profile.get("priceToBook", 0) or 0),
+                dividend_yield=float(profile.get("lastDiv", 0) or 0) / 100.0,
+                eps=float(profile.get("eps", 0) or 0),
+                roe=float(profile.get("roe", 0) or 0) / 100.0,
+                debt_to_equity=float(profile.get("debtToEquity", 0) or 0),
+                revenue_growth=float(profile.get("revenueGrowth", 0) or 0),
+                profit_margin=float(profile.get("profitMargin", 0) or 0) / 100.0,
+                sector_rank=1,
+                free_cash_flow=float(profile.get("freeCashFlow", 0) or 0),
+                operating_margin=float(
+                    profile.get("operatingMargins", 0) or 0
                 )
+                / 100.0,
+                current_ratio=float(profile.get("currentRatio", 0) or 0),
+                quick_ratio=float(profile.get("quickRatio", 0) or 0),
+                peg_ratio=float(profile.get("pegRatio", 0) or 0),
+            )
         except Exception as e:
-            logger.warning(f"FMP fundamentals failed for {symbol}: {e}")
-        
-        return None
+            logger.warning("FMP fundamentals failed for %s: %s", symbol, e)
+            return None
 
     def _generate_fallback_fundamental_data(self) -> FundamentalData:
-        """Generate fallback fundamental data when analysis fails."""
         return FundamentalData(
             market_cap=0.0,
             pe_ratio=0.0,
@@ -786,23 +843,31 @@ class AdvancedTradingAnalyzer:
             operating_margin=0.0,
             current_ratio=0.0,
             quick_ratio=0.0,
-            peg_ratio=0.0
+            peg_ratio=0.0,
         )
 
-    def generate_ai_recommendation(self, symbol: str, technical_data: TechnicalIndicators, fundamental_data: FundamentalData) -> AIRecommendation:
-        """Generate AI-powered trading recommendations with comprehensive analysis."""
-        # Calculate component scores
+    # -------------------------------------------------------------------------
+    # AI-style recommendation
+    # -------------------------------------------------------------------------
+
+    def generate_ai_recommendation(
+        self,
+        symbol: str,
+        technical_data: TechnicalIndicators,
+        fundamental_data: FundamentalData,
+    ) -> AIRecommendation:
+        symbol = symbol.upper().strip()
+
         tech_score = self._calculate_technical_score(technical_data)
         fund_score = self._calculate_fundamental_score(fundamental_data)
         sentiment_score = self._calculate_sentiment_score(symbol)
-        
-        # Weighted overall score
-        overall_score = (tech_score * 0.4 + fund_score * 0.5 + sentiment_score * 0.1)
-        
-        # Generate recommendation
-        recommendation, confidence = self._generate_recommendation(overall_score, technical_data, fundamental_data)
-        
-        # Create comprehensive analysis
+
+        overall_score = tech_score * 0.4 + fund_score * 0.5 + sentiment_score * 0.1
+
+        recommendation, confidence = self._generate_recommendation(
+            overall_score, technical_data, fundamental_data
+        )
+
         return AIRecommendation(
             symbol=symbol,
             overall_score=round(overall_score, 1),
@@ -811,129 +876,137 @@ class AdvancedTradingAnalyzer:
             sentiment_score=round(sentiment_score, 1),
             recommendation=recommendation,
             confidence_level=confidence,
-            short_term_outlook=self._generate_outlook(overall_score, technical_data, 'short'),
-            medium_term_outlook=self._generate_outlook(overall_score, technical_data, 'medium'),
-            long_term_outlook=self._generate_outlook(overall_score, technical_data, 'long'),
+            short_term_outlook=self._generate_outlook(
+                overall_score, technical_data, "short"
+            ),
+            medium_term_outlook=self._generate_outlook(
+                overall_score, technical_data, "medium"
+            ),
+            long_term_outlook=self._generate_outlook(
+                overall_score, technical_data, "long"
+            ),
             key_strengths=self._identify_strengths(technical_data, fundamental_data),
             key_risks=self._identify_risks(technical_data, fundamental_data),
             optimal_entry=round(technical_data.support_level * 0.98, 2),
             stop_loss=round(technical_data.support_level * 0.92, 2),
-            price_targets=self._calculate_price_targets(technical_data, fundamental_data),
-            timestamp=datetime.utcnow().isoformat()
+            price_targets=self._calculate_price_targets(
+                technical_data, fundamental_data
+            ),
+            timestamp=datetime.utcnow().isoformat() + "Z",
         )
 
     def _calculate_technical_score(self, data: TechnicalIndicators) -> float:
-        """Calculate comprehensive technical analysis score (0-100)."""
-        score = 50  # Base score
-        
-        # RSI scoring (30-70 ideal)
+        score = 50.0
+
+        # RSI
         if 30 <= data.rsi <= 70:
             score += 10
         elif data.rsi < 20 or data.rsi > 80:
             score -= 15
         else:
             score -= 5
-            
-        # MACD scoring
+
+        # MACD
         if data.macd > data.macd_signal and data.macd_histogram > 0:
             score += 8
         elif data.macd < data.macd_signal and data.macd_histogram < 0:
             score -= 8
-            
-        # Trend scoring
-        if data.trend_direction == 'Bullish':
+
+        # Trend
+        if data.trend_direction == "Bullish":
             score += 12
-        elif data.trend_direction == 'Bearish':
+        elif data.trend_direction == "Bearish":
             score -= 12
-            
-        # Moving averages alignment
+
+        # MAs
         if data.moving_avg_20 > data.moving_avg_50 > data.moving_avg_200:
             score += 10
         elif data.moving_avg_20 < data.moving_avg_50 < data.moving_avg_200:
             score -= 10
-            
-        # Momentum scoring
+
+        # Momentum
         if data.momentum_score > 5:
             score += 5
         elif data.momentum_score < -5:
             score -= 5
-            
-        # Bollinger Band position
+
+        # Bollinger
         if 0.2 <= data.bollinger_position <= 0.8:
             score += 5
         elif data.bollinger_position < 0.1 or data.bollinger_position > 0.9:
             score -= 5
-            
-        # Volume trend
+
+        # Volume
         if data.volume_trend > 0:
             score += 3
-            
-        return max(0, min(100, score))
+
+        return float(max(0.0, min(100.0, score)))
 
     def _calculate_fundamental_score(self, data: FundamentalData) -> float:
-        """Calculate comprehensive fundamental analysis score (0-100)."""
-        if data.market_cap == 0:  # No fundamental data available
+        if data.market_cap == 0:
             return 50.0
-            
-        score = 50  # Base score
-        
-        # P/E ratio scoring
+
+        score = 50.0
+
+        # P/E
         if 0 < data.pe_ratio < 15:
             score += 12
         elif 15 <= data.pe_ratio <= 25:
             score += 5
         elif data.pe_ratio > 40:
             score -= 15
-            
-        # ROE scoring
+
+        # ROE
         if data.roe > 0.15:
             score += 10
         elif data.roe > 0.08:
             score += 5
         elif data.roe < 0:
             score -= 10
-            
-        # Revenue growth scoring
+
+        # Revenue growth
         if data.revenue_growth > 0.15:
             score += 8
         elif data.revenue_growth > 0.05:
             score += 4
         elif data.revenue_growth < -0.1:
             score -= 8
-            
-        # Profit margin scoring
+
+        # Profit margin
         if data.profit_margin > 0.15:
             score += 7
         elif data.profit_margin > 0.08:
             score += 3
         elif data.profit_margin < 0:
             score -= 10
-            
-        # Debt levels
+
+        # Debt
         if data.debt_to_equity < 0.5:
             score += 5
         elif data.debt_to_equity > 1.0:
             score -= 8
-            
-        # Dividend yield (bonus for income stocks)
+
+        # Dividend
         if data.dividend_yield > 0.03:
             score += 3
-            
-        # Sector rank (higher is better)
+
+        # Sector rank (1 = best)
         if data.sector_rank > 0:
-            rank_score = max(0, (50 - data.sector_rank) / 50 * 10)
+            rank_score = max(0.0, (50 - data.sector_rank) / 50 * 10)
             score += rank_score
-            
-        return max(0, min(100, score))
+
+        return float(max(0.0, min(100.0, score)))
 
     def _calculate_sentiment_score(self, symbol: str) -> float:
-        """Calculate market sentiment score (0-100)."""
-        # Placeholder - would integrate with news and social media APIs
+        # Placeholder; real implementation would use news / social data
         return float(np.random.uniform(40, 80))
 
-    def _generate_recommendation(self, overall_score: float, technical: TechnicalIndicators, fundamental: FundamentalData) -> Tuple[Recommendation, str]:
-        """Generate final recommendation and confidence level."""
-        # Base recommendation on score
+    def _generate_recommendation(
+        self,
+        overall_score: float,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+    ) -> Tuple[Recommendation, str]:
         if overall_score >= 80:
             rec = Recommendation.STRONG_BUY
             confidence = "Very High"
@@ -949,197 +1022,199 @@ class AdvancedTradingAnalyzer:
         else:
             rec = Recommendation.STRONG_SELL
             confidence = "High"
-            
-        # Adjust confidence based on data quality and consistency
+
         if technical.volatility > 0.3:
             confidence = "Medium" if confidence == "High" else "Low"
-            
-        if fundamental.market_cap == 0:  # No fundamental data
+
+        if fundamental.market_cap == 0:
             confidence = "Low"
-            
+
         return rec, confidence
 
-    def _generate_outlook(self, score: float, technical: TechnicalIndicators, timeframe: str) -> str:
-        """Generate outlook based on score, technicals, and timeframe."""
+    def _generate_outlook(
+        self, score: float, technical: TechnicalIndicators, timeframe: str
+    ) -> str:
         base_outlooks = {
-            'short': ["Very Bullish", "Bullish", "Neutral", "Bearish", "Very Bearish"],
-            'medium': ["Very Positive", "Positive", "Neutral", "Cautious", "Negative"],
-            'long': ["Excellent", "Good", "Fair", "Poor", "Very Poor"]
+            "short": ["Very Bullish", "Bullish", "Neutral", "Bearish", "Very Bearish"],
+            "medium": ["Very Positive", "Positive", "Neutral", "Cautious", "Negative"],
+            "long": ["Excellent", "Good", "Fair", "Poor", "Very Poor"],
         }
-        
-        if score >= 80:
-            outlook_index = 0
-        elif score >= 65:
-            outlook_index = 1
-        elif score >= 45:
-            outlook_index = 2
-        elif score >= 30:
-            outlook_index = 3
-        else:
-            outlook_index = 4
-            
-        # Adjust for technicals
-        if technical.trend_direction == "Bullish" and outlook_index > 0:
-            outlook_index = max(0, outlook_index - 1)
-        elif technical.trend_direction == "Bearish" and outlook_index < 4:
-            outlook_index = min(4, outlook_index + 1)
-            
-        return base_outlooks[timeframe][outlook_index]
 
-    def _identify_strengths(self, technical: TechnicalIndicators, fundamental: FundamentalData) -> List[str]:
-        """Identify key strengths."""
-        strengths = []
-        
+        if score >= 80:
+            idx = 0
+        elif score >= 65:
+            idx = 1
+        elif score >= 45:
+            idx = 2
+        elif score >= 30:
+            idx = 3
+        else:
+            idx = 4
+
+        if technical.trend_direction == "Bullish" and idx > 0:
+            idx -= 1
+        elif technical.trend_direction == "Bearish" and idx < 4:
+            idx += 1
+
+        return base_outlooks[timeframe][idx]
+
+    def _identify_strengths(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> List[str]:
+        strengths: List[str] = []
+
         if technical.trend_direction == "Bullish":
             strengths.append("Strong upward trend momentum")
-            
-        if fundamental.pe_ratio > 0 and fundamental.pe_ratio < 15:
+
+        if 0 < fundamental.pe_ratio < 15:
             strengths.append("Attractive valuation with low P/E ratio")
-            
+
         if fundamental.roe > 0.15:
             strengths.append("High return on equity indicating efficient operations")
-            
+
         if fundamental.revenue_growth > 0.1:
             strengths.append("Strong revenue growth trajectory")
-            
+
         if fundamental.debt_to_equity < 0.5:
             strengths.append("Healthy balance sheet with low debt")
-            
+
         if fundamental.profit_margin > 0.15:
             strengths.append("Strong profitability margins")
-            
-        if technical.rsi > 30 and technical.rsi < 70:
-            strengths.append("Technical indicators show balanced momentum")
-            
-        return strengths[:4]  # Return top 4 strengths
 
-    def _identify_risks(self, technical: TechnicalIndicators, fundamental: FundamentalData) -> List[str]:
-        """Identify key risks."""
-        risks = []
-        
+        if 30 < technical.rsi < 70:
+            strengths.append("Technical indicators show balanced momentum")
+
+        return strengths[:4]
+
+    def _identify_risks(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> List[str]:
+        risks: List[str] = []
+
         if technical.volatility > 0.3:
             risks.append("High price volatility may indicate instability")
-            
+
         if fundamental.debt_to_equity > 0.8:
             risks.append("Elevated debt levels could impact financial flexibility")
-            
+
         if fundamental.revenue_growth < 0:
             risks.append("Declining revenue may signal business challenges")
-            
+
         if fundamental.pe_ratio > 25:
             risks.append("High valuation multiples may not be sustainable")
-            
+
         if technical.rsi > 70:
             risks.append("Potentially overbought conditions")
         elif technical.rsi < 30:
-            risks.append("Potentially oversold but may indicate fundamental issues")
-            
+            risks.append("Potentially oversold; may indicate underlying weakness")
+
         if technical.trend_direction == "Bearish":
             risks.append("Prevailing downward trend in technical indicators")
-            
-        return risks[:4]  # Return top 4 risks
 
-    def _calculate_price_targets(self, technical: TechnicalIndicators, fundamental: FundamentalData) -> Dict[str, float]:
-        """Calculate realistic price targets for different timeframes."""
+        return risks[:4]
+
+    def _calculate_price_targets(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> Dict[str, float]:
         current_price = technical.moving_avg_20
-        
-        # Base multipliers adjusted for fundamental strength
         base_multiplier = 1.0
-        
-        if fundamental.pe_ratio > 0 and fundamental.pe_ratio < 15:
-            base_multiplier *= 1.1  # Undervalued - higher upside
+
+        if 0 < fundamental.pe_ratio < 15:
+            base_multiplier *= 1.1
         elif fundamental.pe_ratio > 30:
-            base_multiplier *= 0.9  # Overvalued - lower upside
-            
+            base_multiplier *= 0.9
+
         if fundamental.revenue_growth > 0.15:
             base_multiplier *= 1.15
         elif fundamental.revenue_growth < 0:
             base_multiplier *= 0.9
-            
-        # Technical adjustments
+
         if technical.trend_direction == "Bullish":
             base_multiplier *= 1.05
         elif technical.trend_direction == "Bearish":
             base_multiplier *= 0.95
-            
+
         return {
-            '1_week': round(current_price * base_multiplier * 1.02, 2),
-            '2_weeks': round(current_price * base_multiplier * 1.04, 2),
-            '1_month': round(current_price * base_multiplier * 1.08, 2),
-            '3_months': round(current_price * base_multiplier * 1.15, 2),
-            '6_months': round(current_price * base_multiplier * 1.25, 2),
-            '1_year': round(current_price * base_multiplier * 1.35, 2)
+            "1_week": round(current_price * base_multiplier * 1.02, 2),
+            "2_weeks": round(current_price * base_multiplier * 1.04, 2),
+            "1_month": round(current_price * base_multiplier * 1.08, 2),
+            "3_months": round(current_price * base_multiplier * 1.15, 2),
+            "6_months": round(current_price * base_multiplier * 1.25, 2),
+            "1_year": round(current_price * base_multiplier * 1.35, 2),
         }
 
+    # -------------------------------------------------------------------------
+    # Risk & cache utilities
+    # -------------------------------------------------------------------------
+
     def analyze_market_sentiment(self, symbol: str) -> Dict[str, Any]:
-        """Analyze comprehensive market sentiment."""
         return {
-            'news_sentiment': float(np.random.uniform(-1, 1)),
-            'social_media_buzz': float(np.random.uniform(0, 100)),
-            'institutional_flow': float(np.random.uniform(-50, 50)),
-            'retail_sentiment': float(np.random.uniform(-1, 1)),
-            'analyst_ratings': np.random.choice(['Strong Buy', 'Buy', 'Hold', 'Sell', 'Strong Sell']),
-            'short_interest': float(np.random.uniform(0, 0.3)),
-            'put_call_ratio': float(np.random.uniform(0.5, 1.5)),
-            'market_emotion_index': float(np.random.uniform(0, 100)),
-            'contrarian_indicator': np.random.choice(['Bullish', 'Bearish']),
-            'sentiment_score': float(np.random.uniform(0, 100)),
-            'fear_greed_index': float(np.random.uniform(0, 100)),
-            'volume_analysis': np.random.choice(['Accumulation', 'Distribution', 'Neutral'])
+            "news_sentiment": float(np.random.uniform(-1, 1)),
+            "social_media_buzz": float(np.random.uniform(0, 100)),
+            "institutional_flow": float(np.random.uniform(-50, 50)),
+            "retail_sentiment": float(np.random.uniform(-1, 1)),
+            "analyst_ratings": str(
+                np.random.choice(
+                    ["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"]
+                )
+            ),
+            "short_interest": float(np.random.uniform(0, 0.3)),
+            "put_call_ratio": float(np.random.uniform(0.5, 1.5)),
+            "market_emotion_index": float(np.random.uniform(0, 100)),
+            "contrarian_indicator": str(
+                np.random.choice(["Bullish", "Bearish"])
+            ),
+            "sentiment_score": float(np.random.uniform(0, 100)),
+            "fear_greed_index": float(np.random.uniform(0, 100)),
+            "volume_analysis": str(
+                np.random.choice(["Accumulation", "Distribution", "Neutral"])
+            ),
         }
 
     def analyze_risk_metrics(self, symbol: str) -> Dict[str, Any]:
-        """Calculate comprehensive risk metrics."""
         return {
-            'beta': float(np.random.uniform(0.5, 1.5)),
-            'standard_deviation': float(np.random.uniform(0.1, 0.4)),
-            'value_at_risk_95': float(np.random.uniform(0.05, 0.2)),
-            'value_at_risk_99': float(np.random.uniform(0.08, 0.3)),
-            'max_drawdown': float(np.random.uniform(0.1, 0.4)),
-            'sharpe_ratio': float(np.random.uniform(0.5, 2.0)),
-            'sortino_ratio': float(np.random.uniform(0.5, 2.5)),
-            'liquidity_score': float(np.random.uniform(50, 100)),
-            'sector_risk': float(np.random.uniform(0, 100)),
-            'market_cap_risk': float(np.random.uniform(0, 100)),
-            'concentration_risk': float(np.random.uniform(0, 100)),
-            'overall_risk_score': float(np.random.uniform(0, 100)),
-            'risk_category': np.random.choice(['Low', 'Medium', 'High', 'Very High']),
-            'stress_test_performance': float(np.random.uniform(-0.3, -0.05))
+            "beta": float(np.random.uniform(0.5, 1.5)),
+            "standard_deviation": float(np.random.uniform(0.1, 0.4)),
+            "value_at_risk_95": float(np.random.uniform(0.05, 0.2)),
+            "value_at_risk_99": float(np.random.uniform(0.08, 0.3)),
+            "max_drawdown": float(np.random.uniform(0.1, 0.4)),
+            "sharpe_ratio": float(np.random.uniform(0.5, 2.0)),
+            "sortino_ratio": float(np.random.uniform(0.5, 2.5)),
+            "liquidity_score": float(np.random.uniform(50, 100)),
+            "sector_risk": float(np.random.uniform(0, 100)),
+            "market_cap_risk": float(np.random.uniform(0, 100)),
+            "concentration_risk": float(np.random.uniform(0, 100)),
+            "overall_risk_score": float(np.random.uniform(0, 100)),
+            "risk_category": str(
+                np.random.choice(["Low", "Medium", "High", "Very High"])
+            ),
+            "stress_test_performance": float(np.random.uniform(-0.3, -0.05)),
         }
 
-    def clear_cache(self, symbol: str = None):
-        """Clear analysis cache for specific symbol or all symbols."""
+    def clear_cache(self, symbol: Optional[str] = None) -> None:
         try:
-            if symbol:
-                # Clear specific symbol cache
-                pattern = f"{symbol}_*.json"
-            else:
-                # Clear all cache
-                pattern = "*.json"
-                
+            pattern = f"{symbol}_*.json" if symbol else "*.json"
             for cache_file in self.cache_dir.glob(pattern):
                 cache_file.unlink()
-                
-            logger.info(f"Cache cleared for pattern: {pattern}")
+            logger.info("Cache cleared for pattern: %s", pattern)
         except Exception as e:
-            logger.error(f"Cache clearance failed: {e}")
+            logger.error("Cache clearance failed: %s", e)
 
     def get_cache_info(self) -> Dict[str, Any]:
-        """Get cache information and statistics."""
         try:
             cache_files = list(self.cache_dir.glob("*.json"))
             cache_size = sum(f.stat().st_size for f in cache_files)
-            
             return {
                 "total_files": len(cache_files),
                 "total_size_bytes": cache_size,
                 "total_size_mb": round(cache_size / (1024 * 1024), 2),
                 "cache_dir": str(self.cache_dir),
-                "cache_ttl_minutes": self.cache_ttl.total_seconds() / 60
+                "cache_ttl_minutes": self.cache_ttl.total_seconds() / 60.0,
             }
         except Exception as e:
-            logger.error(f"Cache info retrieval failed: {e}")
+            logger.error("Cache info retrieval failed: %s", e)
             return {}
 
-# Global analyzer instance with context manager support
+
+# Global analyzer instance (used by main.py via safe_import)
 analyzer = AdvancedTradingAnalyzer()
