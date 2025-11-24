@@ -9,7 +9,7 @@ services:
     plan: free
     region: oregon
     runtime:
-      pythonVersion: "3.11.8"
+      pythonVersion: "3.11.9"
     
     # =========================================================================
     # Build Configuration
@@ -151,9 +151,9 @@ services:
         value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
       - key: GOOGLE_SHEETS_ID
         value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
-      # NOTE: GOOGLE_SERVICE_ACCOUNT_JSON will come from the secrets section
+      # NOTE: GOOGLE_SERVICE_ACCOUNT_JSON comes from secrets below
 
-      # === Sheet Names Configuration (legacy, kept for future use) ===
+      # === Sheet Names Configuration (legacy / reference) ===
       - key: SHEETS_SYMBOLS_TAB
         value: "Market_Leaders"
       - key: SHEETS_TAB_SYMBOLS
@@ -286,12 +286,12 @@ services:
       - key: BACKUP_APP_TOKEN
         fromSecret: tadawul-backup-token
 
-      # 🔴 IMPORTANT: This must match main.py + google_sheets_service
-      # It will expose env var GOOGLE_SERVICE_ACCOUNT_JSON
+      # 🔴 IMPORTANT: This must match main.py AppConfig field `google_service_account_json`
+      # It exposes env var GOOGLE_SERVICE_ACCOUNT_JSON
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         fromSecret: google-sheets-credentials-json
 
-      # Financial APIs – create these secrets in Render dashboard (optional)
+      # Financial APIs – optional (only if you plan to use them)
       - key: ALPHA_VANTAGE_API_KEY
         fromSecret: alpha-vantage-api-key
       - key: FINNHUB_API_KEY
@@ -360,7 +360,7 @@ services:
       targetCPUPercent: 70
 
 # =============================================================================
-# Cron Jobs – OPTIONAL (you can leave as-is or comment out if endpoints don't exist)
+# Cron Jobs – OPTIONAL
 # =============================================================================
 jobs:
   - name: health-monitoring
