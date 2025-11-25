@@ -162,6 +162,7 @@ try:
 except Exception as e:
     logger.error(f"❌ Configuration validation failed: {e}")
     raise
+
 # =============================================================================
 # Constants / Security / Rate limiting
 # =============================================================================
@@ -814,36 +815,65 @@ ttl_seconds = int(os.getenv("CACHE_DEFAULT_TTL", "1800"))
 cache = TTLCache(ttl_minutes=max(1, ttl_seconds // 60))
 
 # =============================================================================
-# FastAPI app & lifespan
+# Startup validation - SECURE VERSION
 # =============================================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    startup_time = datetime.datetime.utcnow()
-    logger.info(f"🚀 Starting {config.service_name} v{config.service_version}")
-
-    # Validate configuration
+async def validate_configuration():
     errors: List[str] = []
+
+    # Required env vars
     required_env = ["SPREADSHEET_ID"]
     for var in required_env:
         if not os.getenv(var):
             errors.append(f"Missing required environment variable: {var}")
 
-    has_sa_json = bool(config.google_service_account_json)
-    if not has_sa_json:
-        logger.warning("GOOGLE_SERVICE_ACCOUNT_JSON not configured. Using Apps Script only mode.")
+    # Check Google Sheets credentials using the secure method
+    has_secure_creds = bool(config.google_sheets_credentials)
+    has_legacy_creds = bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+    
+    if has_secure_creds:
+        logger.info("🔐 Using secure GOOGLE_SHEETS_CREDENTIALS for Google Sheets")
+    elif has_legacy_creds:
+        logger.warning("⚠️ Using legacy GOOGLE_SERVICE_ACCOUNT_JSON - please migrate to GOOGLE_SHEETS_CREDENTIALS")
     else:
+        logger.warning(
+            "No Google Sheets credentials configured. "
+            "Running in Apps Script only mode. "
+            "Direct Sheets endpoints will be disabled."
+        )
+
+    # Test direct Sheets connection if credentials are available
+    if has_secure_creds or has_legacy_creds:
         try:
             sheets_status = GoogleSheetsManager.test_connection()
-            if sheets_status.get("status") != "SUCCESS":
+            if sheets_status.get("status") == "SUCCESS":
+                logger.info("✅ Google Sheets direct connection verified")
+                
+                # Log detailed sheet status
+                found_count = len(sheets_status.get("expected_sheets_found", []))
+                total_expected = len(EXPECTED_SHEETS)
+                missing_sheets = sheets_status.get("expected_sheets_missing", [])
+                
+                logger.info(f"📊 Sheets Status: {found_count}/{total_expected} expected sheets found")
+                
+                if missing_sheets:
+                    logger.warning(f"⚠️ Missing expected sheets: {missing_sheets}")
+                else:
+                    logger.info("✅ All expected sheets found")
+                    
+            elif sheets_status.get("status") == "DISABLED":
+                logger.warning(f"ℹ️ Google Sheets: {sheets_status.get('message')}")
+            else:
                 errors.append(f"Google Sheets connection failed: {sheets_status.get('message')}")
         except Exception as e:
             errors.append(f"Google Sheets validation error: {e}")
 
+    # Financial APIs are optional - just warn if none configured
     api_status = financial_client.get_api_status()
     if not any(api_status.values()):
         logger.warning("No financial APIs configured. Only cache + Google Sheets/Apps Script will be used.")
 
+    # Final decision
     if errors:
         logger.error("Configuration validation failed:")
         for e in errors:
@@ -853,8 +883,25 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("✅ All configuration validations passed")
 
+# =============================================================================
+# FastAPI app & lifespan
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    startup_time = datetime.datetime.utcnow()
+    logger.info(f"🚀 Starting {config.service_name} v{config.service_version}")
+
+    await validate_configuration()
+
+    # Clean up expired cache entries on startup
+    expired = cache.cleanup_expired()
+    if expired:
+        logger.info(f"🧹 Cleaned {expired} expired cache entries on startup")
+
     yield
 
+    # Cleanup on shutdown
     try:
         await financial_client.close()
     except Exception as e:
@@ -1041,7 +1088,7 @@ async def verify_all_sheets(request: Request, auth: bool = Depends(verify_auth))
     if not config.google_service_account_json:
         raise HTTPException(
             status_code=400,
-            detail="GOOGLE_SERVICE_ACCOUNT_JSON not configured; direct Sheets verification is disabled.",
+            detail="GOOGLE_SHEETS_CREDENTIALS not configured; direct Sheets verification is disabled.",
         )
 
     try:
@@ -1096,7 +1143,7 @@ async def read_sheet_data(
     if not config.google_service_account_json:
         raise HTTPException(
             status_code=400,
-            detail="GOOGLE_SERVICE_ACCOUNT_JSON not configured; direct sheet access is disabled.",
+            detail="GOOGLE_SHEETS_CREDENTIALS not configured; direct sheet access is disabled.",
         )
 
     try:
@@ -1111,8 +1158,40 @@ async def read_sheet_data(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading sheet: {e}")
 
-# Add other protected endpoints here...
-# All endpoints below this line should have `auth: bool = Depends(verify_auth)` parameter
+@app.get("/sheet-names", response_model=Dict[str, Any])
+@rate_limit("20/minute")
+async def get_sheet_names(request: Request, auth: bool = Depends(verify_auth)):
+    """Protected endpoint - requires authentication"""
+    if not config.google_service_account_json:
+        raise HTTPException(
+            status_code=400,
+            detail="GOOGLE_SHEETS_CREDENTIALS not configured; direct sheet access via gspread is disabled.",
+        )
+
+    try:
+        spreadsheet = GoogleSheetsManager.get_spreadsheet()
+        worksheets = spreadsheet.worksheets()
+        available = [ws.title for ws in worksheets]
+        return {
+            "spreadsheet_title": spreadsheet.title,
+            "available_sheets": available,
+            "expected_sheets": EXPECTED_SHEETS,
+            "missing_sheets": list(set(EXPECTED_SHEETS) - set(available)),
+            "extra_sheets": list(set(available) - set(EXPECTED_SHEETS)),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting sheet names: {e}")
+
+@app.get("/test-connection", response_model=Dict[str, Any])
+@rate_limit("10/minute")
+async def test_connection(request: Request, auth: bool = Depends(verify_auth)):
+    """Protected endpoint - requires authentication"""
+    if not config.google_service_account_json:
+        return {
+            "status": "DISABLED",
+            "message": "GOOGLE_SHEETS_CREDENTIALS not configured; direct gspread is disabled.",
+        }
+    return GoogleSheetsManager.test_connection()
 
 @app.get("/v1/quote", response_model=QuoteResponse)
 @rate_limit("60/minute")
@@ -1154,6 +1233,47 @@ async def update_quotes(
         "errors": errors or None,
         "total_cached": len(cache.data),
         "autosaved": autosave,
+    }
+
+@app.get("/v1/cache", response_model=Dict[str, Any])
+@rate_limit("20/minute")
+async def get_cache_info(
+    request: Request,
+    limit: int = Query(50, ge=1, le=1000),
+    auth: bool = Depends(verify_auth),
+):
+    """Protected endpoint - requires authentication"""
+    items = list(cache.data.values())[:limit]
+    return {
+        "total_items": len(cache.data),
+        "sample_size": len(items),
+        "sample_data": items,
+        "cache_file": str(cache.cache_path),
+        "file_exists": cache.cache_path.exists(),
+        "file_size": cache.cache_path.stat().st_size
+        if cache.cache_path.exists()
+        else 0,
+        "ttl_minutes": cache.ttl // 60,
+    }
+
+@app.post("/v1/cache/backup", response_model=Dict[str, Any])
+@rate_limit("5/minute")
+async def create_cache_backup(request: Request, auth: bool = Depends(verify_auth)):
+    """Protected endpoint - requires authentication"""
+    path = cache.create_backup()
+    if not path:
+        raise HTTPException(status_code=500, detail="Failed to create backup")
+    return {"status": "success", "backup_path": path, "item_count": len(cache.data)}
+
+@app.post("/v1/cache/cleanup", response_model=Dict[str, Any])
+@rate_limit("5/minute")
+async def cleanup_cache(request: Request, auth: bool = Depends(verify_auth)):
+    """Protected endpoint - requires authentication"""
+    expired = cache.cleanup_expired()
+    return {
+        "status": "success",
+        "expired_removed": expired,
+        "remaining_items": len(cache.data),
     }
 
 # =============================================================================
@@ -1224,6 +1344,196 @@ async def v41_post_quotes(
         "errors": errors or [],
         "total_cached": len(cache.data),
         "timestamp_utc": now_ts,
+    }
+
+@app.get("/v41/charts")
+@rate_limit("30/minute")
+async def v41_get_charts(
+    request: Request,
+    symbol: str = Query(..., description="Ticker symbol"),
+    period: str = Query("1mo", description="Period (e.g. 1d, 5d, 1mo, 3mo)"),
+    interval: str = Query("1d", description="Interval (e.g. 1m, 5m, 1d)"),
+    auth: bool = Depends(verify_auth),
+):
+    """Protected endpoint - requires authentication"""
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "period": period,
+        "interval": interval,
+        "timestamp_utc": now_ts,
+        "points": [],
+        "message": "Chart data not implemented yet",
+    }
+
+@app.post("/v41/charts")
+@rate_limit("10/minute")
+async def v41_post_charts(
+    request: Request,
+    auth: bool = Depends(verify_auth),
+):
+    """Protected endpoint - requires authentication"""
+    body = await request.json()
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+    return {
+        "ok": True,
+        "received": body,
+        "timestamp_utc": now_ts,
+        "message": "Chart POST endpoint is a stub (no processing implemented).",
+    }
+
+# =============================================================================
+# Market data endpoints (KSA)
+# =============================================================================
+
+@app.get("/api/saudi/symbols", response_model=Dict[str, Any])
+@rate_limit("30/minute")
+async def get_saudi_symbols(
+    request: Request,
+    limit: int = Query(20, ge=1, le=500),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Get Saudi symbols.
+
+    Primary: symbols_reader.fetch_symbols()
+    Fallback: read from "KSA Tadawul Market" sheet via google_sheets_service
+              (Ticker, Company Name, Sector, Trading Market).
+    """
+    try:
+        # Primary: if a custom symbols_reader is available
+        try:
+            from symbols_reader import fetch_symbols as sr_fetch_symbols
+            payload = sr_fetch_symbols(limit)
+            if payload and isinstance(payload, dict):
+                return payload
+        except ImportError:
+            pass
+
+        # Fallback – use the new KSA Tadawul Market reader
+        ksa_rows = google_sheets_service.read_ksa_tadawul_market()
+        symbols: List[Dict[str, Any]] = []
+        for row in ksa_rows:
+            ticker = row.get("ticker")
+            if not ticker:
+                continue
+            symbols.append(
+                {
+                    "symbol": ticker,
+                    "company_name": row.get("company_name"),
+                    "sector": row.get("sector"),
+                    "trading_market": row.get("trading_market"),
+                }
+            )
+
+        return {
+            "data": symbols[:limit],
+            "count": min(len(symbols), limit),
+            "source": "google_sheets_KSA_Tadawul_Market",
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch KSA symbols: {e}")
+        return {"data": [], "count": 0, "error": str(e), "source": "error"}
+
+@app.get("/api/saudi/market", response_model=Dict[str, Any])
+@rate_limit("30/minute")
+async def get_saudi_market(
+    request: Request,
+    limit: int = Query(20, ge=1, le=500),
+    auth: bool = Depends(verify_auth),
+):
+    """Protected endpoint - requires authentication"""
+    symbols_payload = await get_saudi_symbols(request, limit=limit, auth=auth)
+    symbols = symbols_payload.get("data", [])
+    market_data: List[Dict[str, Any]] = []
+
+    for sym in symbols:
+        symbol = sym.get("symbol")
+        if not symbol:
+            continue
+        q = cache.get_quote(symbol)
+        market_data.append(
+            {
+                **sym,
+                "price": q.price if q else None,
+                "change_percent": q.day_change_pct if q else None,
+                "volume": q.volume if q else None,
+                "market_cap": q.market_cap if q else None,
+                "last_updated": q.timestamp_utc if q else None,
+            }
+        )
+
+    return {
+        "count": len(market_data),
+        "data": market_data,
+        "source": symbols_payload.get("source", "unknown"),
+        "cache_hits": sum(1 for item in market_data if item.get("price") is not None),
+    }
+
+# =============================================================================
+# Financial APIs status & data
+# =============================================================================
+
+@app.get("/v1/financial-apis/status", response_model=Dict[str, Any])
+@rate_limit("15/minute")
+async def get_financial_apis_status(request: Request, auth: bool = Depends(verify_auth)):
+    """Protected endpoint - requires authentication"""
+    api_status = financial_client.get_api_status()
+    tests: List[Dict[str, Any]] = []
+    for api_name, configured in api_status.items():
+        if not configured:
+            continue
+        try:
+            start = datetime.datetime.now()
+            data = await financial_client.get_stock_quote_with_retry("AAPL", api_name)
+            elapsed = (datetime.datetime.now() - start).total_seconds()
+            if data:
+                tests.append(
+                    {
+                        "api_name": api_name,
+                        "status": "SUCCESS",
+                        "response_time": round(elapsed, 3),
+                    }
+                )
+            else:
+                tests.append(
+                    {
+                        "api_name": api_name,
+                        "status": "ERROR",
+                        "error": "No data returned after retries",
+                    }
+                )
+        except Exception as e:
+            tests.append({"api_name": api_name, "status": "ERROR", "error": str(e)})
+
+    return {
+        "api_configuration": api_status,
+        "api_tests": tests,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+@app.get("/v1/financial-data/{symbol}")
+@rate_limit("30/minute")
+async def get_financial_data(
+    request: Request,
+    symbol: str,
+    api: str = Query("alpha_vantage"),
+    auth: bool = Depends(verify_auth),
+):
+    """Protected endpoint - requires authentication"""
+    if api not in FINANCIAL_APIS:
+        raise HTTPException(status_code=400, detail=f"API {api} not supported")
+    data = await financial_client.get_stock_quote_with_retry(symbol, api)
+    if not data:
+        raise HTTPException(
+            status_code=404, detail=f"No data found for {symbol} from {api}"
+        )
+    return {
+        "symbol": symbol,
+        "api": api,
+        "data": data,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
 # =============================================================================
