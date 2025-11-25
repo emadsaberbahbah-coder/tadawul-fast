@@ -55,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Configuration
+# Configuration - SECURE VERSION
 # =============================================================================
 
 class AppConfig(BaseSettings):
@@ -83,9 +83,27 @@ class AppConfig(BaseSettings):
     enable_swagger: bool = Field(True, env="ENABLE_SWAGGER")
     enable_redoc: bool = Field(True, env="ENABLE_REDOC")
 
-    # Google Sheets
+    # Google Sheets - SECURE VERSION
     spreadsheet_id: str = Field(..., env="SPREADSHEET_ID")
-    google_service_account_json: Optional[str] = Field(None, env="GOOGLE_SERVICE_ACCOUNT_JSON")
+    
+    # NEW: Use GOOGLE_SHEETS_CREDENTIALS for JSON (more secure naming)
+    google_sheets_credentials: Optional[str] = Field(None, env="GOOGLE_SHEETS_CREDENTIALS")
+    
+    # Keep backward compatibility - property that checks both
+    @property
+    def google_service_account_json(self) -> Optional[str]:
+        # First try the new secure environment variable
+        if self.google_sheets_credentials:
+            return self.google_sheets_credentials
+        
+        # Fallback to old variable for backward compatibility
+        old_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if old_json:
+            logger.warning("⚠️ Using deprecated GOOGLE_SERVICE_ACCOUNT_JSON - please migrate to GOOGLE_SHEETS_CREDENTIALS")
+            return old_json
+        
+        return None
+    
     google_apps_script_url: str = Field(..., env="GOOGLE_APPS_SCRIPT_URL")
     google_apps_script_backup_url: Optional[str] = Field(None, env="GOOGLE_APPS_SCRIPT_BACKUP_URL")
 
@@ -114,13 +132,36 @@ class AppConfig(BaseSettings):
             raise ValueError("Environment must be development, staging, or production")
         return v
 
+    @validator("google_sheets_credentials")
+    def validate_google_credentials(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        
+        # Validate JSON format if provided
+        try:
+            json.loads(v)
+            logger.info("✅ Google Sheets credentials JSON format is valid")
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Invalid JSON in GOOGLE_SHEETS_CREDENTIALS: {e}")
+            raise ValueError(f"Invalid JSON format in Google Sheets credentials: {e}")
+        
+        return v
+
 try:
     config = AppConfig()
-    logger.info("✅ Configuration loaded successfully")
+    
+    # Log which Google Sheets credential method is being used
+    if config.google_sheets_credentials:
+        logger.info("✅ Configuration loaded with secure GOOGLE_SHEETS_CREDENTIALS")
+    elif os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        logger.warning("⚠️ Using legacy GOOGLE_SERVICE_ACCOUNT_JSON - consider migrating to GOOGLE_SHEETS_CREDENTIALS")
+        logger.info("✅ Configuration loaded with legacy Google Sheets credentials")
+    else:
+        logger.info("✅ Configuration loaded - Google Sheets using Apps Script mode")
+        
 except Exception as e:
     logger.error(f"❌ Configuration validation failed: {e}")
     raise
-
 # =============================================================================
 # Constants / Security / Rate limiting
 # =============================================================================
