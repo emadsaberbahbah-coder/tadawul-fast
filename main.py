@@ -305,12 +305,13 @@ def public_endpoint():
     return True
 
 # =============================================================================
-# Google Sheets Manager
+# Google Sheets Manager - SECURE VERSION
 # =============================================================================
 
 class GoogleSheetsManager:
     _client: Optional[gspread.Client] = None
     _spreadsheet: Optional[gspread.Spreadsheet] = None
+    _credentials_checked: bool = False
 
     @classmethod
     def get_client(cls) -> gspread.Client:
@@ -318,25 +319,46 @@ class GoogleSheetsManager:
             return cls._client
 
         try:
+            # Use the secure property that checks both environment variables
             creds_json = config.google_service_account_json
+            
             if not creds_json:
-                logger.warning(
-                    "GOOGLE_SERVICE_ACCOUNT_JSON not configured. "
-                    "GoogleSheetsManager is disabled."
-                )
-                raise GoogleSheetsError("GOOGLE_SERVICE_ACCOUNT_JSON not configured")
+                if not cls._credentials_checked:
+                    logger.warning(
+                        "GOOGLE_SHEETS_CREDENTIALS not configured. "
+                        "GoogleSheetsManager is disabled (using Apps Script mode)."
+                    )
+                    cls._credentials_checked = True
+                raise GoogleSheetsError("Google Sheets credentials not configured")
 
-            creds_dict = json.loads(creds_json)
+            # Validate and parse JSON
+            try:
+                creds_dict = json.loads(creds_json)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Invalid JSON in Google Sheets credentials: {e}")
+                raise GoogleSheetsError(f"Invalid credentials JSON format: {e}")
+
+            # Validate required fields in service account JSON
+            required_fields = ["type", "project_id", "private_key_id", "private_key", "client_email"]
+            missing_fields = [field for field in required_fields if field not in creds_dict]
+            if missing_fields:
+                logger.error(f"❌ Missing required fields in Google Sheets credentials: {missing_fields}")
+                raise GoogleSheetsError(f"Missing required fields: {missing_fields}")
+
+            # Create credentials and client
             creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
             cls._client = gspread.authorize(creds)
-            logger.info("✅ Google Sheets client initialized successfully")
+            
+            # Log which credential source was used
+            if config.google_sheets_credentials:
+                logger.info("✅ Google Sheets client initialized with secure GOOGLE_SHEETS_CREDENTIALS")
+            else:
+                logger.info("✅ Google Sheets client initialized with legacy GOOGLE_SERVICE_ACCOUNT_JSON")
+                
             return cls._client
 
         except GoogleSheetsError:
             raise
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
-            raise GoogleSheetsError(f"Invalid credentials format: {e}")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Google Sheets client: {e}")
             raise GoogleSheetsError(f"Connection failed: {e}")
@@ -350,41 +372,115 @@ class GoogleSheetsManager:
         try:
             spreadsheet_id = GOOGLE_SERVICES["spreadsheet_id"]
             cls._spreadsheet = client.open_by_key(spreadsheet_id)
-            logger.info(f"✅ Spreadsheet accessed: {cls._spreadsheet.title}")
+            
+            # Verify we can access the spreadsheet
+            title = cls._spreadsheet.title
+            worksheets = cls._spreadsheet.worksheets()
+            
+            logger.info(f"✅ Spreadsheet accessed: '{title}' with {len(worksheets)} worksheets")
             return cls._spreadsheet
+            
+        except gspread.SpreadsheetNotFound:
+            logger.error(f"❌ Spreadsheet not found with ID: {GOOGLE_SERVICES['spreadsheet_id']}")
+            raise GoogleSheetsError(f"Spreadsheet not found. Check SPREADSHEET_ID environment variable.")
         except Exception as e:
             logger.error(f"❌ Failed to access spreadsheet: {e}")
             raise GoogleSheetsError(f"Spreadsheet access failed: {e}")
 
     @classmethod
     def test_connection(cls) -> Dict[str, Any]:
+        """
+        Test the Google Sheets connection and return detailed status
+        """
         try:
+            # Check if credentials are configured
+            if not config.google_service_account_json:
+                return {
+                    "status": "DISABLED", 
+                    "message": "Google Sheets credentials not configured. Using Apps Script mode.",
+                    "spreadsheet_id": GOOGLE_SERVICES["spreadsheet_id"]
+                }
+
             spreadsheet = cls.get_spreadsheet()
             worksheets = spreadsheet.worksheets()
             sheet_info = []
-
+            
+            # Check expected sheets
+            expected_sheets_found = []
+            expected_sheets_missing = []
+            
             for ws in worksheets:
                 try:
                     record_count = len(ws.get_all_records())
-                    sheet_info.append(
-                        {
-                            "name": ws.title,
-                            "row_count": ws.row_count,
-                            "col_count": ws.col_count,
-                            "record_count": record_count,
-                        }
-                    )
+                    sheet_status = "OK"
+                    
+                    # Check if this is one of our expected sheets
+                    if ws.title in EXPECTED_SHEETS:
+                        expected_sheets_found.append(ws.title)
+                    
+                    sheet_info.append({
+                        "name": ws.title,
+                        "status": sheet_status,
+                        "row_count": ws.row_count,
+                        "col_count": ws.col_count,
+                        "record_count": record_count,
+                    })
                 except Exception as e:
-                    sheet_info.append({"name": ws.title, "error": str(e)})
+                    sheet_info.append({
+                        "name": ws.title, 
+                        "status": "ERROR",
+                        "error": str(e)
+                    })
 
-            return {
+            # Check for missing expected sheets
+            expected_sheets_missing = [sheet for sheet in EXPECTED_SHEETS if sheet not in expected_sheets_found]
+            
+            connection_status = {
                 "status": "SUCCESS",
                 "spreadsheet_title": spreadsheet.title,
+                "spreadsheet_id": GOOGLE_SERVICES["spreadsheet_id"],
                 "total_sheets": len(worksheets),
+                "expected_sheets_found": expected_sheets_found,
+                "expected_sheets_missing": expected_sheets_missing,
                 "sheets": sheet_info,
+                "credential_source": "GOOGLE_SHEETS_CREDENTIALS" if config.google_sheets_credentials else "GOOGLE_SERVICE_ACCOUNT_JSON"
             }
+            
+            # Log summary
+            logger.info(f"✅ Google Sheets connection successful: '{spreadsheet.title}'")
+            logger.info(f"   Found {len(expected_sheets_found)}/{len(EXPECTED_SHEETS)} expected sheets")
+            if expected_sheets_missing:
+                logger.warning(f"   Missing sheets: {expected_sheets_missing}")
+                
+            return connection_status
+            
+        except GoogleSheetsError as e:
+            error_status = {
+                "status": "ERROR", 
+                "message": str(e),
+                "spreadsheet_id": GOOGLE_SERVICES["spreadsheet_id"],
+                "credential_source": "GOOGLE_SHEETS_CREDENTIALS" if config.google_sheets_credentials else "GOOGLE_SERVICE_ACCOUNT_JSON"
+            }
+            logger.error(f"❌ Google Sheets connection test failed: {e}")
+            return error_status
         except Exception as e:
-            return {"status": "ERROR", "message": f"Connection test failed: {e}"}
+            error_status = {
+                "status": "ERROR",
+                "message": f"Unexpected error: {e}",
+                "spreadsheet_id": GOOGLE_SERVICES["spreadsheet_id"]
+            }
+            logger.error(f"❌ Unexpected error in Google Sheets connection test: {e}")
+            return error_status
+
+    @classmethod
+    def reset_connection(cls):
+        """
+        Reset the connection (useful for testing or re-authentication)
+        """
+        cls._client = None
+        cls._spreadsheet = None
+        cls._credentials_checked = False
+        logger.info("🔄 Google Sheets connection reset")
 
 # =============================================================================
 # Financial data client
