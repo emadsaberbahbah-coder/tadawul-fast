@@ -1982,7 +1982,32 @@ async def get_saudi_market(
     except Exception as e:
         logger.error(f"Failed to fetch Saudi market data: {e}")
         raise HTTPException(status_code=500, detail=f"Market data fetch failed: {e}")
+# Add to your main.py routes
+@app.get("/api/symbols/status")
+@rate_limit("10/minute")
+async def get_symbols_status(request: Request, auth: bool = Depends(verify_auth)):
+    """Get symbols reader status"""
+    try:
+        from symbols_reader import symbols_reader
+        if symbols_reader:
+            return symbols_reader.get_status()
+        return {"status": "symbols_reader_not_available"}
+    except Exception as e:
+        logger.error(f"Symbols status error: {e}")
+        return {"status": "error", "error": str(e)}
 
+@app.post("/api/symbols/cache/clear")
+@rate_limit("5/minute")
+async def clear_symbols_cache(request: Request, auth: bool = Depends(verify_auth)):
+    """Clear symbols cache"""
+    try:
+        from symbols_reader import symbols_reader
+        if symbols_reader:
+            return symbols_reader.clear_cache()
+        return {"status": "symbols_reader_not_available"}
+    except Exception as e:
+        logger.error(f"Cache clear error: {e}")
+        return {"status": "error", "error": str(e)}
 # =============================================================================
 # Financial APIs Status & Data Endpoints
 # =============================================================================
