@@ -1,83 +1,194 @@
 # =============================================================================
-# FastAPI Application Configuration (LOCAL DEV)
+# Tadawul Fast Bridge - Enhanced Environment Configuration
+# Version: 2.4.0 | Environment: Production
 # =============================================================================
 
-SERVICE_NAME=Tadawul Stock Analysis API
-SERVICE_VERSION=2.2.0
+# =============================================================================
+# APPLICATION CORE SETTINGS
+# =============================================================================
+
+# Application Identity
+SERVICE_NAME="Tadawul Fast Bridge"
+SERVICE_VERSION="2.4.0"
+ENVIRONMENT=production
+DEBUG=false
+
+# Server Configuration
 APP_HOST=0.0.0.0
 APP_PORT=8000
-ENVIRONMENT=production
+WEB_CONCURRENCY=2
 
-# Security & Authentication
-APP_TOKEN=changeme_local_only
-BACKUP_APP_TOKEN=changeme_local_only
+# =============================================================================
+# SECURITY & AUTHENTICATION
+# =============================================================================
+
+# Authentication (CHANGE THESE IN PRODUCTION)
+APP_TOKEN=changeme_production_secure_token_here
+BACKUP_APP_TOKEN=changeme_production_backup_token_here
 REQUIRE_AUTH=true
+
+# Rate Limiting
 ENABLE_RATE_LIMITING=true
-RATE_LIMIT_REQUESTS_PER_MINUTE=60
+RATE_LIMIT_REQUESTS_PER_MINUTE=120
+RATE_LIMIT_BURST=20
 
-# CORS (optional – will default to ["*"] if not set)
-CORS_ORIGINS=["http://localhost:3000","https://tadawul-fast-1.onrender.com"]
+# CORS Configuration
+CORS_ORIGINS=["http://localhost:3000","https://tadawul-fast-1.onrender.com","https://your-production-domain.com"]
 
-# Logging
+# =============================================================================
+# LOGGING & MONITORING
+# =============================================================================
+
+# Logging Configuration
 LOG_ENABLE_FILE=true
 LOG_LEVEL=INFO
+LOG_FORMAT=detailed
+LOG_RETENTION_DAYS=30
+
+# API Documentation
 ENABLE_SWAGGER=true
 ENABLE_REDOC=true
 
 # =============================================================================
-# Google Services Configuration
-# (names MATCH your Render environment)
+# GOOGLE SERVICES CONFIGURATION
 # =============================================================================
 
-SPREADSHEET_ID=your_local_sheet_id
-GOOGLE_APPS_SCRIPT_URL=your_local_apps_script_url
-GOOGLE_APPS_SCRIPT_BACKUP_URL=your_local_backup_url
+# Google Sheets Configuration
+SPREADSHEET_ID=your_production_spreadsheet_id_here
 
-# Same key name as Render:
-GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"...","private_key_id":"...","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n","client_email":"...","client_id":"...","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/....iam.gserviceaccount.com","universe_domain":"googleapis.com"}
+# Google Apps Script URLs
+GOOGLE_APPS_SCRIPT_URL=your_production_apps_script_url_here
+GOOGLE_APPS_SCRIPT_BACKUP_URL=your_production_backup_script_url_here
 
-# =============================================================================
-# Financial API Configuration
-# (all names MATCH your Render variables)
-# =============================================================================
-
-ALPHA_VANTAGE_API_KEY=your_local_alpha_key
-EODHD_API_KEY=your_local_eod_key
-FINNHUB_API_KEY=your_local_finnhub_key
-FMP_API_KEY=your_local_fmp_key
-MARKETSTACK_API_KEY=your_local_marketstack_key
-TWELVEDATA_API_KEY=your_local_twelvedata_key
-
-# Optional base URLs & timeouts (code already has defaults)
-# ALPHA_VANTAGE_BASE_URL=https://www.alphavantage.co/query
-# FINNHUB_BASE_URL=https://finnhub.io/api/v1
-# EODHD_BASE_URL=https://eodhistoricaldata.com/api
-# TWELVEDATA_BASE_URL=https://api.twelvedata.com
-# MARKETSTACK_BASE_URL=http://api.marketstack.com/v1
-# FMP_BASE_URL=https://financialmodelingprep.com/api/v3
-# ALPHA_VANTAGE_TIMEOUT=15
-# FINNHUB_TIMEOUT=15
-# EODHD_TIMEOUT=15
-# TWELVEDATA_TIMEOUT=15
-# MARKETSTACK_TIMEOUT=15
-# FMP_TIMEOUT=15
+# Service Account Credentials (JSON format)
+GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"your-project-id","private_key_id":"your-private-key-id","private_key":"-----BEGIN PRIVATE KEY-----\nYOUR_PRIVATE_KEY_HERE\n-----END PRIVATE KEY-----\n","client_email":"your-service-account@your-project.iam.gserviceaccount.com","client_id":"your-client-id","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/your-service-account@your-project.iam.gserviceaccount.com","universe_domain":"googleapis.com"}
 
 # =============================================================================
-# HTTP Client & Cache
+# FINANCIAL API CONFIGURATION
 # =============================================================================
 
-USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36
+# Alpha Vantage
+ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here
+ALPHA_VANTAGE_BASE_URL=https://www.alphavantage.co/query
+ALPHA_VANTAGE_TIMEOUT=15
+
+# Finnhub
+FINNHUB_API_KEY=your_finnhub_api_key_here
+FINNHUB_BASE_URL=https://finnhub.io/api/v1
+FINNHUB_TIMEOUT=15
+
+# EOD Historical Data
+EODHD_API_KEY=your_eodhd_api_key_here
+EODHD_BASE_URL=https://eodhistoricaldata.com/api
+EODHD_TIMEOUT=15
+
+# Twelve Data
+TWELVEDATA_API_KEY=your_twelvedata_api_key_here
+TWELVEDATA_BASE_URL=https://api.twelvedata.com
+TWELVEDATA_TIMEOUT=15
+
+# Marketstack
+MARKETSTACK_API_KEY=your_marketstack_api_key_here
+MARKETSTACK_BASE_URL=http://api.marketstack.com/v1
+MARKETSTACK_TIMEOUT=15
+
+# Financial Modeling Prep
+FMP_API_KEY=your_fmp_api_key_here
+FMP_BASE_URL=https://financialmodelingprep.com/api/v3
+FMP_TIMEOUT=15
+
+# =============================================================================
+# CACHE CONFIGURATION
+# =============================================================================
+
+# Cache Settings
+CACHE_DEFAULT_TTL=1800
+CACHE_MAX_SIZE=50000
+CACHE_BACKUP_ENABLED=true
+CACHE_CLEANUP_INTERVAL=300
+
+# =============================================================================
+# PERFORMANCE & RELIABILITY
+# =============================================================================
+
+# HTTP Client Configuration
 REQUEST_TIMEOUT=30
 MAX_RETRIES=3
-RETRY_BACKOFF=2
+RETRY_BACKOFF=2.0
+USER_AGENT=TadawulFastBridge/2.4.0
 
-# main.py reads CACHE_DEFAULT_TTL (seconds)
-CACHE_DEFAULT_TTL=1800
+# Connection Settings
+HTTP_MAX_CONNECTIONS=100
+HTTP_MAX_KEEPALIVE=20
+CONNECTION_POOL_SIZE=100
 
 # =============================================================================
-# External Service URLs (optional for reference)
+# BACKGROUND SERVICES
 # =============================================================================
 
+# Health Monitoring
+HEALTH_CHECK_INTERVAL=30
+HEALTH_MONITOR_TIMEOUT=10
+
+# Cache Management
+CACHE_WORKER_INTERVAL=60
+CACHE_WARMUP_ENABLED=true
+
+# Backup Services
+BACKUP_INTERVAL=86400
+BACKUP_RETENTION_DAYS=7
+
+# =============================================================================
+# TADAWUL-SPECIFIC SETTINGS
+# =============================================================================
+
+# Market Data Configuration
+TADAWUL_MARKET_ENABLED=true
+TADAWUL_REFRESH_INTERVAL=60
+TADAWUL_MAX_SYMBOLS=200
+
+# Popular Saudi Symbols
+SAUDI_SYMBOLS=["7201.SR", "1211.SR", "2222.SR", "2380.SR", "4030.SR", "4200.SR"]
+
+# =============================================================================
+# EXTERNAL SERVICE INTEGRATIONS
+# =============================================================================
+
+# API Base URLs
 FASTAPI_BASE_URL=https://tadawul-fast-1.onrender.com
 ARGAAM_BASE_URL=https://www.argaam.com
 TADAWUL_BASE_URL=https://www.saudiexchange.sa
+
+# =============================================================================
+# OPTIONAL ENHANCEMENTS (Uncomment to use)
+# =============================================================================
+
+# Monitoring (Optional)
+# METRICS_ENABLED=true
+# METRICS_PORT=9090
+
+# Notifications (Optional)
+# SLACK_WEBHOOK_URL=your_slack_webhook_here
+# EMAIL_NOTIFICATIONS=false
+
+# Advanced Features (Optional)
+# FEATURE_REALTIME_UPDATES=false
+# FEATURE_ADVANCED_ANALYTICS=false
+
+# Security Headers (Optional)
+# SECURITY_HEADERS_ENABLED=true
+# CSP_ENABLED=true
+
+# =============================================================================
+# DEVELOPMENT OVERRIDES (Comment out in production)
+# =============================================================================
+
+# For development environment, use these overrides:
+# ENVIRONMENT=development
+# DEBUG=true
+# LOG_LEVEL=DEBUG
+# ENABLE_RATE_LIMITING=false
+# REQUIRE_AUTH=false
+# WEB_CONCURRENCY=1
+# CACHE_DEFAULT_TTL=300
+# CORS_ORIGINS=["http://localhost:3000","http://localhost:8080","http://localhost:5173"]
