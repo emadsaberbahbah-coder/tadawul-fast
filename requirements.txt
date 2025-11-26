@@ -1,13 +1,15 @@
 # =============================================================================
 # Tadawul Stock Analysis API - Requirements
-# Fully aligned with Backend v2.2.0, Google Sheets, Apps Script, Argaam
+# Enhanced Version v2.3.0 - Full Stability & Monitoring
+# Backend v2.2.0 + Google Sheets + Apps Script + Argaam + Resilience
 # =============================================================================
 
 # -------------------------------
-# Core Framework
+# Core Framework & ASGI Server
 # -------------------------------
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
+python-multipart==0.0.6
 
 # -------------------------------
 # Data Models & Validation
@@ -16,17 +18,20 @@ pydantic==2.5.0
 pydantic-settings==2.0.3
 
 # -------------------------------
-# Google Sheets Integration
+# Google Services Integration
 # -------------------------------
 gspread==5.12.0
 google-auth==2.23.4
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
+google-api-python-client==2.108.0
 
 # -------------------------------
-# Google Apps Script Integration
+# HTTP Clients & API Integration
 # -------------------------------
-requests==2.32.3   # latest stable with security fixes
+requests==2.32.3
+httpx==0.25.2
+aiohttp==3.9.1
 httplib2==0.22.0
 
 # -------------------------------
@@ -34,33 +39,74 @@ httplib2==0.22.0
 # -------------------------------
 pandas==2.1.3
 numpy==1.25.2
+openpyxl==3.1.2
 
 # -------------------------------
-# Async HTTP Clients (for multi-source data)
-# -------------------------------
-aiohttp==3.9.1
-httpx==0.25.2
-
-# -------------------------------
-# Web Scraping (Argaam integration)
+# Web Scraping & Data Extraction
 # -------------------------------
 beautifulsoup4==4.12.2
 lxml==4.9.3
+selenium==4.15.2
+webdriver-manager==4.0.1
 
 # -------------------------------
-# Environment Configuration
+# Error Handling & Resilience
+# -------------------------------
+tenacity==8.2.3
+backoff==2.2.1
+retrying==1.3.4
+
+# -------------------------------
+# Monitoring & Logging
+# -------------------------------
+structlog==23.2.0
+prometheus-client==0.19.0
+loguru==0.7.2
+
+# -------------------------------
+# Environment & Configuration
 # -------------------------------
 python-dotenv==1.0.0
+pyyaml==6.0.1
 
 # -------------------------------
-# API Rate Limiting
+# API Rate Limiting & Security
 # -------------------------------
 slowapi==0.1.9
 limits==3.6.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
 
 # -------------------------------
-# Optional Utilities (recommended)
+# Performance & Utilities
 # -------------------------------
-orjson==3.9.15         # ultra-fast JSON for FastAPI
-python-dateutil==2.8.2 # safer date parsing
-cachetools==5.3.1      # in-memory TTL caching (better than dict)
+orjson==3.9.15
+python-dateutil==2.8.2
+cachetools==5.3.1
+pytz==2023.3
+tzdata==2023.4
+
+# -------------------------------
+# Security & SSL Enhancements
+# -------------------------------
+certifi==2023.11.17
+urllib3==2.1.0
+cryptography==41.0.8
+
+# -------------------------------
+# Type Support & Development
+# -------------------------------
+pandas-stubs==2.1.4.230918
+types-requests==2.31.0.10
+
+# -------------------------------
+# Async Task Queue (Future Ready)
+# -------------------------------
+celery==5.3.4
+redis==5.0.1
+
+# -------------------------------
+# Data Validation & Sanitization
+# -------------------------------
+jsonschema==4.20.0
+email-validator==2.1.0
