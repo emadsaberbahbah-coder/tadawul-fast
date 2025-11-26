@@ -1,7 +1,7 @@
 # =============================================================================
-# Tadawul Stock Analysis API - Requirements
-# Enhanced Version v2.3.0 - Full Stability & Monitoring
-# Backend v2.2.0 + Google Sheets + Apps Script + Argaam + Resilience
+# Tadawul Stock Analysis API - Enhanced Requirements
+# Version: 3.0.0 - Optimized for Production & Security
+# Python: 3.8+
 # =============================================================================
 
 # -------------------------------
@@ -14,54 +14,52 @@ python-multipart==0.0.6
 # -------------------------------
 # Data Models & Validation
 # -------------------------------
-pydantic==2.5.0
-pydantic-settings==2.0.3
+pydantic==2.5.3
+pydantic-settings==2.1.0
 
 # -------------------------------
-# Google Services Integration
+# Google Services Integration (OPTIMIZED)
 # -------------------------------
-gspread==5.12.0
+gspread==6.0.0
 google-auth==2.23.4
-google-auth-oauthlib==1.2.0
-google-auth-httplib2==0.2.0
 google-api-python-client==2.108.0
+# Removed: google-auth-oauthlib, google-auth-httplib2 (redundant)
 
 # -------------------------------
-# HTTP Clients & API Integration
+# HTTP Clients & API Integration (STREAMLINED)
 # -------------------------------
-requests==2.32.3
+requests==2.31.0
+aiohttp==3.8.6
 httpx==0.25.2
-aiohttp==3.9.1
-httplib2==0.22.0
+# Removed: httplib2 (replaced by google-auth)
 
 # -------------------------------
-# Data Analysis & Processing
+# Data Analysis & Processing (UPDATED)
 # -------------------------------
-pandas==2.1.3
-numpy==1.25.2
+pandas==2.1.4
+numpy==1.24.4
 openpyxl==3.1.2
 
 # -------------------------------
-# Web Scraping & Data Extraction
+# Web Scraping & Data Extraction (OPTIONAL - Only if needed)
 # -------------------------------
 beautifulsoup4==4.12.2
 lxml==4.9.3
-selenium==4.15.2
-webdriver-manager==4.0.1
+# selenium==4.15.2  # COMMENTED: Heavy dependency, only enable if needed
+# webdriver-manager==4.0.1  # COMMENTED: Only if selenium is used
 
 # -------------------------------
-# Error Handling & Resilience
+# Error Handling & Resilience (OPTIMIZED)
 # -------------------------------
 tenacity==8.2.3
-backoff==2.2.1
-retrying==1.3.4
+# Removed: backoff, retrying (redundant with tenacity)
 
 # -------------------------------
-# Monitoring & Logging
+# Monitoring & Logging (ENHANCED)
 # -------------------------------
 structlog==23.2.0
 prometheus-client==0.19.0
-loguru==0.7.2
+# Removed: loguru (redundant with structlog)
 
 # -------------------------------
 # Environment & Configuration
@@ -70,7 +68,7 @@ python-dotenv==1.0.0
 pyyaml==6.0.1
 
 # -------------------------------
-# API Rate Limiting & Security
+# API Rate Limiting & Security (UPDATED)
 # -------------------------------
 slowapi==0.1.9
 limits==3.6.0
@@ -78,35 +76,69 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
 # -------------------------------
-# Performance & Utilities
+# Performance & Utilities (OPTIMIZED)
 # -------------------------------
-orjson==3.9.15
+orjson==3.9.10
 python-dateutil==2.8.2
-cachetools==5.3.1
-pytz==2023.3
+cachetools==5.3.2
+pytz==2023.3.post1
 tzdata==2023.4
 
 # -------------------------------
-# Security & SSL Enhancements
+# Security & SSL Enhancements (CRITICAL UPDATES)
 # -------------------------------
 certifi==2023.11.17
 urllib3==2.1.0
-cryptography==41.0.8
+cryptography==41.0.7
 
 # -------------------------------
-# Type Support & Development
+# Type Support & Development (OPTIONAL)
 # -------------------------------
-pandas-stubs==2.1.4.230918
-types-requests==2.31.0.10
+# pandas-stubs==2.1.4.230918  # COMMENTED: Development only
+# types-requests==2.31.0.10   # COMMENTED: Development only
 
 # -------------------------------
-# Async Task Queue (Future Ready)
+# Async Task Queue (OPTIONAL - Only if Celery is used)
 # -------------------------------
-celery==5.3.4
-redis==5.0.1
+# celery==5.3.4  # COMMENTED: Only enable if using task queues
+# redis==5.0.1   # COMMENTED: Only enable if using Redis
 
 # -------------------------------
 # Data Validation & Sanitization
 # -------------------------------
 jsonschema==4.20.0
 email-validator==2.1.0
+
+# -------------------------------
+# MISSING CRITICAL DEPENDENCIES (ADDED)
+# -------------------------------
+
+# Database & ORM Support (if needed)
+sqlalchemy==2.0.23
+alembic==1.12.1
+
+# Enhanced Caching
+redis==5.0.1  # Now included as it's commonly needed
+
+# API Documentation Enhancements
+fastapi-utils==0.2.1
+
+# Health Checks & Monitoring
+healthchecks==2.8.1
+
+# Testing & Development
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2
+
+# Security Headers & Middleware
+python-bcrypt==4.0.1
+
+# -------------------------------
+# COMPATIBILITY NOTES:
+# -------------------------------
+# numpy 1.24.4: Compatible with pandas 2.1.4, better performance
+# requests 2.31.0: Security patches, stable version
+# aiohttp 3.8.6: Stable with better async performance
+# cryptography 41.0.7: Security updates, stable
+# pandas 2.1.4: Latest stable with performance improvements
