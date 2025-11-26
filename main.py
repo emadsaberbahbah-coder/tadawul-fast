@@ -2096,7 +2096,40 @@ async def get_financial_data(
         "data": data,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
+# =============================================================================
+# Google Apps Script Client Monitoring
+# =============================================================================
 
+@app.get("/api/google-apps-script/status")
+@rate_limit("10/minute")
+async def get_google_apps_script_status(request: Request, auth: bool = Depends(verify_auth)):
+    """Get Google Apps Script client status"""
+    try:
+        from google_apps_script_client import google_apps_script_client
+        if google_apps_script_client:
+            success, diagnostics = google_apps_script_client.test_connection()
+            return {
+                "status": "connected" if success else "disconnected",
+                "diagnostics": diagnostics,
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+            }
+        return {"status": "client_not_available"}
+    except Exception as e:
+        logger.error(f"Google Apps Script status error: {e}")
+        return {"status": "error", "error": str(e)}
+
+@app.get("/api/google-apps-script/stats")
+@rate_limit("5/minute")
+async def get_google_apps_script_stats(request: Request, auth: bool = Depends(verify_auth)):
+    """Get Google Apps Script client statistics"""
+    try:
+        from google_apps_script_client import google_apps_script_client
+        if google_apps_script_client:
+            return google_apps_script_client.get_statistics()
+        return {"status": "client_not_available"}
+    except Exception as e:
+        logger.error(f"Google Apps Script stats error: {e}")
+        return {"status": "error", "error": str(e)}
 # =============================================================================
 # Optional Routes Mounting
 # =============================================================================
