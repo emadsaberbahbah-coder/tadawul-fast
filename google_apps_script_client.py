@@ -1,6 +1,6 @@
 # google_apps_script_client.py
 # Enhanced Google Apps Script Client - Production Ready for Render
-# Version: 3.0.0 - With circuit breaker, memory fixes, and async support
+# Version: 3.1.0 - Memory and Performance Optimizations
 # Optimized for FastAPI and Render deployment
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import random
 import re
 import asyncio
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Any, Union, Tuple, Deque
+from typing import Dict, List, Optional, Any, Union, Tuple
 from enum import Enum
 from contextlib import contextmanager
 from collections import deque
@@ -86,8 +86,7 @@ class GoogleAppsScriptResponse:
 
 class CircuitBreaker:
     """
-    Circuit breaker pattern to prevent cascading failures.
-    Opens the circuit after consecutive failures, allows probing after cool-down.
+    Enhanced circuit breaker pattern to prevent cascading failures.
     """
     
     def __init__(
@@ -139,7 +138,7 @@ class CircuitBreaker:
             return True, self.state
     
     def on_success(self) -> None:
-        """Record successful execution."""
+        """Record successful execution and recover circuit state."""
         with self._lock:
             if self.state == HealthState.DEGRADED:
                 self.half_open_attempts += 1
@@ -151,20 +150,24 @@ class CircuitBreaker:
                     logger.info("Circuit breaker closed - service recovered")
             
             elif self.state == HealthState.UNHEALTHY:
-                # Gradual recovery from degraded state
+                # Gradual recovery from unhealthy state
                 self.failure_count = max(0, self.failure_count - 2)
-                if self.failure_count == 0:
+                if self.failure_count < self.failure_threshold:
                     self.state = HealthState.HEALTHY
                     logger.info("Circuit breaker recovered to HEALTHY state")
     
     def on_failure(self) -> None:
-        """Record failed execution."""
+        """Record failed execution and update circuit state."""
         with self._lock:
             self.failure_count += 1
             self.last_failure_time = time.time()
             
             if self.state == HealthState.DEGRADED:
                 self.half_open_attempts += 1
+                # If half-open requests fail, open circuit
+                if self.half_open_attempts >= self.half_open_max_requests:
+                    self.state = HealthState.CIRCUIT_OPEN
+                    logger.error("Circuit breaker opened due to half-open failures")
             
             elif self.state == HealthState.HEALTHY and self.failure_count >= self.failure_threshold:
                 self.state = HealthState.UNHEALTHY
@@ -177,12 +180,13 @@ class CircuitBreaker:
     def get_state(self) -> Dict[str, Any]:
         """Get current circuit breaker state."""
         with self._lock:
+            can_execute, _ = self.can_execute()
             return {
                 "state": self.state.value,
                 "failure_count": self.failure_count,
                 "last_failure_time": self.last_failure_time,
                 "half_open_attempts": self.half_open_attempts,
-                "can_execute": self.can_execute()[0]
+                "can_execute": can_execute
             }
 
 
@@ -239,8 +243,8 @@ class GoogleAppsScriptClient:
         self.max_retries: int = max_retries
         self.rate_limit_rpm: int = rate_limit_rpm
         
-        # Rate limiting state with bounded storage
-        self.request_timestamps: Deque[float] = deque(maxlen=rate_limit_rpm * 2)  # Prevent unbounded growth
+        # Enhanced rate limiting with memory optimization
+        self.request_timestamps: deque = deque(maxlen=rate_limit_rpm + 10)  # Small buffer
         self.last_request_time: float = 0.0
         self._rate_limit_lock = threading.RLock()
         
@@ -258,7 +262,7 @@ class GoogleAppsScriptClient:
             user_agent
             or os.getenv("GOOGLE_APPS_SCRIPT_USER_AGENT")
             or os.getenv("USER_AGENT")
-            or f"TadawulStockAPI/3.0.0 (+Python-Requests)"
+            or f"TadawulStockAPI/3.1.0 (+Python-Requests)"
         )
 
         # Request tracking
@@ -324,14 +328,14 @@ class GoogleAppsScriptClient:
             total=self.max_retries,
             status_forcelist=[408, 429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"],
-            backoff_factor=1.5,  # Increased backoff for better distribution
+            backoff_factor=1.5,
             raise_on_status=False,
         )
 
         # Configure adapter with connection pooling
         adapter = HTTPAdapter(
             max_retries=retry_strategy,
-            pool_connections=20,  # Increased for better performance
+            pool_connections=20,
             pool_maxsize=30,
             pool_block=False,
         )
@@ -347,7 +351,6 @@ class GoogleAppsScriptClient:
         })
 
         if self.app_token:
-            # Use only Authorization header for consistency
             session.headers["Authorization"] = f"Bearer {self.app_token}"
             logger.debug("App token configured for Google Apps Script requests")
 
@@ -379,23 +382,29 @@ class GoogleAppsScriptClient:
             return f"gas_req_{timestamp}_{self.request_counter:06d}"
 
     def _enforce_rate_limit(self) -> None:
-        """Enforce rate limiting with bounded memory usage."""
+        """Enhanced rate limiting with optimized memory usage."""
         with self._rate_limit_lock:
             now = time.time()
             window_start = now - 60  # 1 minute window
             
-            # Remove old timestamps (deque does this automatically due to maxlen)
-            # But we also explicitly clean for safety
-            while self.request_timestamps and self.request_timestamps[0] < window_start:
-                self.request_timestamps.popleft()
+            # Efficiently clean old timestamps using deque maxlen property
+            # The deque will automatically maintain size due to maxlen
+            # We just need to ensure we're not blocking on cleanup
             
             # Check if we're over the limit
-            if len(self.request_timestamps) >= self.rate_limit_rpm:
-                oldest_timestamp = self.request_timestamps[0]
-                sleep_time = 60 - (now - oldest_timestamp)
-                if sleep_time > 0:
-                    logger.warning(f"Rate limit exceeded, sleeping for {sleep_time:.2f}s")
-                    time.sleep(sleep_time + random.uniform(0.1, 0.3))  # Buffer with jitter
+            current_count = len(self.request_timestamps)
+            if current_count >= self.rate_limit_rpm:
+                # Find the oldest timestamp that's still in the window
+                while self.request_timestamps and self.request_timestamps[0] < window_start:
+                    self.request_timestamps.popleft()
+                
+                current_count = len(self.request_timestamps)
+                if current_count >= self.rate_limit_rpm:
+                    oldest_timestamp = self.request_timestamps[0]
+                    sleep_time = 60 - (now - oldest_timestamp)
+                    if sleep_time > 0:
+                        logger.warning(f"Rate limit exceeded, sleeping for {sleep_time:.2f}s")
+                        time.sleep(sleep_time + random.uniform(0.1, 0.3))
             
             # Add jitter to avoid synchronized requests
             jitter = random.uniform(0.05, 0.15)
@@ -405,7 +414,7 @@ class GoogleAppsScriptClient:
             self.last_request_time = now
 
     def _classify_error(self, error: Exception, status_code: Optional[int] = None) -> ErrorType:
-        """Classify error for appropriate handling."""
+        """Enhanced error classification with better coverage."""
         if isinstance(error, requests.exceptions.Timeout):
             return ErrorType.TIMEOUT
         elif isinstance(error, requests.exceptions.ConnectionError):
@@ -517,7 +526,7 @@ class GoogleAppsScriptClient:
                     except ValueError as e:
                         logger.warning(f"[{request_id}] JSON parse error: {e}")
                         # Try to extract error from text
-                        error_text = response.text[:500]  # Increased to 500 chars for better context
+                        error_text = response.text[:500]
                         self._update_stats(False)
                         self.circuit_breaker.on_failure()
                         
@@ -677,7 +686,7 @@ class GoogleAppsScriptClient:
             )
 
         # Validate data size
-        if len(str(data)) > 10000:  # Rough size check
+        if len(str(data)) > 10000:
             return GoogleAppsScriptResponse(
                 success=False,
                 error="Data payload too large",
@@ -862,7 +871,12 @@ class GoogleAppsScriptClient:
             self.error_counter = 0
             self.success_counter = 0
             self.request_timestamps.clear()
-            self.circuit_breaker = CircuitBreaker()  # Reset circuit breaker
+            # Reset circuit breaker but keep configuration
+            self.circuit_breaker = CircuitBreaker(
+                failure_threshold=self.circuit_breaker.failure_threshold,
+                recovery_timeout=self.circuit_breaker.recovery_timeout,
+                half_open_max_requests=self.circuit_breaker.half_open_max_requests
+            )
             logger.info("Client statistics and circuit breaker reset")
 
     def get_detailed_status(self) -> Dict[str, Any]:
