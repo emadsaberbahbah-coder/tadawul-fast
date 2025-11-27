@@ -1,7 +1,7 @@
 # =============================================================================
-# Tadawul Stock Analysis API - Production Ready
+# Tadawul Stock Analysis API - Production Ready for Render
 # Python: 3.11.9
-# Optimized for Render Deployment
+# Last Updated: 2024
 # =============================================================================
 
 # -------------------------------
@@ -120,3 +120,4 @@ idna==3.6
 asgiref==3.7.2
 sniffio==1.3.0
 anyio==3.7.1
+starlette==0.27.0
