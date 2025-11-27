@@ -2,87 +2,519 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Tadawul Stock Analysis API</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tadawul Fast Bridge - Saudi Market Data API</title>
+  <meta name="description" content="Real-time Saudi stock market data API with Google Sheets integration. Fast, reliable, and secure.">
   <style>
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a;
-      color: #e5e7eb;
+    :root {
+      --primary: #38bdf8;
+      --primary-dark: #0ea5e9;
+      --secondary: #22c55e;
+      --background: #0f172a;
+      --card-bg: #020617;
+      --border: #1e293b;
+      --text-primary: #e5e7eb;
+      --text-secondary: #cbd5f5;
+      --text-muted: #9ca3af;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --error: #ef4444;
+    }
+
+    * {
       margin: 0;
       padding: 0;
-      display: flex;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--background);
+      color: var(--text-primary);
+      line-height: 1.6;
       min-height: 100vh;
+      display: flex;
       align-items: center;
       justify-content: center;
+      padding: 20px;
     }
-    .card {
-      background: #020617;
-      border-radius: 12px;
-      padding: 24px 28px;
-      box-shadow: 0 15px 40px rgba(0, 0, 0, 0.6);
-      max-width: 480px;
+
+    .container {
+      max-width: 1200px;
       width: 100%;
-      border: 1px solid #1e293b;
+      display: grid;
+      grid-template-columns: 1fr 400px;
+      gap: 30px;
+      align-items: start;
     }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 1.4rem;
-      color: #38bdf8;
+
+    .main-content {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
     }
-    p {
-      margin: 4px 0 12px;
-      font-size: 0.95rem;
-      color: #cbd5f5;
+
+    .card {
+      background: var(--card-bg);
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+      border: 1px solid var(--border);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
+
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.6);
+    }
+
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: between;
+      margin-bottom: 20px;
+    }
+
     .badge {
-      display: inline-block;
-      padding: 2px 8px;
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 12px;
       border-radius: 999px;
-      font-size: 0.7rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      background: #22c55e1a;
-      color: #22c55e;
-      margin-bottom: 10px;
-    }
-    ul {
-      margin: 0;
-      padding-left: 18px;
-      font-size: 0.9rem;
-      color: #9ca3af;
-    }
-    a {
-      color: #38bdf8;
-      text-decoration: none;
-    }
-    a:hover {
-      text-decoration: underline;
-    }
-    .footer {
-      margin-top: 14px;
       font-size: 0.75rem;
-      color: #6b7280;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--success);
+      gap: 6px;
+    }
+
+    .badge::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 2s infinite;
+    }
+
+    .badge.warning {
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--warning);
+    }
+
+    .badge.error {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--error);
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 12px;
+      line-height: 1.2;
+    }
+
+    .subtitle {
+      font-size: 1.1rem;
+      color: var(--text-secondary);
+      margin-bottom: 24px;
+    }
+
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin: 24px 0;
+    }
+
+    .feature {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      background: rgba(30, 41, 59, 0.5);
+      border-radius: 12px;
+      border-left: 3px solid var(--primary);
+    }
+
+    .feature-icon {
+      width: 24px;
+      height: 24px;
+      background: var(--primary);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.875rem;
+      font-weight: bold;
+    }
+
+    .endpoints {
+      margin: 24px 0;
+    }
+
+    .endpoint {
+      display: flex;
+      align-items: center;
+      justify-content: between;
+      padding: 12px 16px;
+      background: rgba(30, 41, 59, 0.3);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      transition: background 0.2s ease;
+    }
+
+    .endpoint:hover {
+      background: rgba(30, 41, 59, 0.5);
+    }
+
+    .endpoint-method {
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-right: 12px;
+      min-width: 60px;
+      text-align: center;
+    }
+
+    .method-get {
+      background: rgba(34, 197, 94, 0.2);
+      color: var(--success);
+    }
+
+    .method-post {
+      background: rgba(59, 130, 246, 0.2);
+      color: #3b82f6;
+    }
+
+    .endpoint-path {
+      font-family: 'Courier New', monospace;
+      color: var(--text-primary);
+      flex: 1;
+    }
+
+    .endpoint-desc {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+    }
+
+    .status-card {
+      text-align: center;
+    }
+
+    .status-icon {
+      width: 80px;
+      height: 80px;
+      margin: 0 auto 20px;
+      background: rgba(34, 197, 94, 0.1);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2rem;
+    }
+
+    .status-metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 20px 0;
+    }
+
+    .metric {
+      text-align: center;
+      padding: 16px;
+      background: rgba(30, 41, 59, 0.3);
+      border-radius: 8px;
+    }
+
+    .metric-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 4px;
+    }
+
+    .metric-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .footer {
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 0.875rem;
+    }
+
+    .tech-stack {
+      display: flex;
+      gap: 12px;
+      margin-top: 16px;
+      flex-wrap: wrap;
+    }
+
+    .tech-tag {
+      padding: 4px 8px;
+      background: rgba(30, 41, 59, 0.5);
+      border-radius: 4px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    @media (max-width: 768px) {
+      .container {
+        grid-template-columns: 1fr;
+        gap: 20px;
+      }
+      
+      h1 {
+        font-size: 2rem;
+      }
+      
+      .features {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="card">
-    <span class="badge">API Server Online</span>
-    <h1>Tadawul Stock Analysis API</h1>
-    <p>
-      Backend for the Ultimate Investment Dashboard (Google Sheets + FastAPI).
-    </p>
-    <p>Useful endpoints:</p>
-    <ul>
-      <li><code>/docs</code> – Interactive Swagger UI</li>
-      <li><code>/redoc</code> – API reference (ReDoc)</li>
-      <li><code>/</code> or <code>/health</code> – Basic health check (JSON)</li>
-    </ul>
-    <p class="footer">
-      Data source: Google Sheets + internal ranking engine. This page is static and
-      only confirms that the service is running.
-    </p>
+  <div class="container">
+    <div class="main-content">
+      <div class="card">
+        <div class="header">
+          <div class="badge" id="statusBadge">
+            <span id="statusText">Checking Status...</span>
+          </div>
+        </div>
+        
+        <h1>Tadawul Fast Bridge</h1>
+        <div class="subtitle">
+          Real-time Saudi stock market data API with Google Sheets integration. 
+          Fast, reliable, and secure financial data bridge.
+        </div>
+
+        <div class="features">
+          <div class="feature">
+            <div class="feature-icon">📈</div>
+            <div>
+              <strong>Real-time Data</strong>
+              <div style="font-size: 0.875rem; color: var(--text-muted);">Live market quotes</div>
+            </div>
+          </div>
+          <div class="feature">
+            <div class="feature-icon">📊</div>
+            <div>
+              <strong>Sheets Integration</strong>
+              <div style="font-size: 0.875rem; color: var(--text-muted);">Google Sheets sync</div>
+            </div>
+          </div>
+          <div class="feature">
+            <div class="feature-icon">💾</div>
+            <div>
+              <strong>Smart Caching</strong>
+              <div style="font-size: 0.875rem; color: var(--text-muted);">Performance optimized</div>
+            </div>
+          </div>
+          <div class="feature">
+            <div class="feature-icon">🔐</div>
+            <div>
+              <strong>Secure API</strong>
+              <div style="font-size: 0.875rem; color: var(--text-muted);">Authentication & rate limits</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="endpoints">
+          <h3 style="margin-bottom: 16px; color: var(--text-secondary);">API Endpoints</h3>
+          <div class="endpoint">
+            <span class="endpoint-method method-get">GET</span>
+            <span class="endpoint-path">/docs</span>
+            <span class="endpoint-desc">Interactive Swagger UI</span>
+          </div>
+          <div class="endpoint">
+            <span class="endpoint-method method-get">GET</span>
+            <span class="endpoint-path">/redoc</span>
+            <span class="endpoint-desc">API Reference (ReDoc)</span>
+          </div>
+          <div class="endpoint">
+            <span class="endpoint-method method-get">GET</span>
+            <span class="endpoint-path">/health</span>
+            <span class="endpoint-desc">System health status</span>
+          </div>
+          <div class="endpoint">
+            <span class="endpoint-method method-get">GET</span>
+            <span class="endpoint-path">/v1/quote?tickers=7201.SR,1211.SR</span>
+            <span class="endpoint-desc">Stock quotes</span>
+          </div>
+          <div class="endpoint">
+            <span class="endpoint-method method-get">GET</span>
+            <span class="endpoint-path">/v1/tadawul/market?limit=50</span>
+            <span class="endpoint-desc">Saudi market data</span>
+          </div>
+        </div>
+
+        <div class="footer">
+          <div style="margin-bottom: 12px;">
+            Data sources: Google Sheets + Multiple financial APIs + Internal ranking engine
+          </div>
+          <div class="tech-stack">
+            <span class="tech-tag">FastAPI</span>
+            <span class="tech-tag">Python</span>
+            <span class="tech-tag">Google Sheets</span>
+            <span class="tech-tag">Redis Cache</span>
+            <span class="tech-tag">JWT Auth</span>
+            <span class="tech-tag">Rate Limiting</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card status-card">
+      <div class="status-icon">🚀</div>
+      <h3 style="margin-bottom: 8px;">System Status</h3>
+      <div style="color: var(--text-muted); margin-bottom: 24px; font-size: 0.875rem;">
+        Real-time service monitoring
+      </div>
+      
+      <div class="status-metrics">
+        <div class="metric">
+          <div class="metric-value" id="responseTime">--</div>
+          <div class="metric-label">Response Time</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="uptime">--</div>
+          <div class="metric-label">Uptime</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="cacheSize">--</div>
+          <div class="metric-label">Cache Size</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="requests">--</div>
+          <div class="metric-label">Requests</div>
+        </div>
+      </div>
+
+      <div style="margin-top: 20px; padding: 16px; background: rgba(30, 41, 59, 0.3); border-radius: 8px;">
+        <div style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 8px;">Version Info</div>
+        <div style="font-family: 'Courier New', monospace; font-size: 0.875rem;">
+          <div>Tadawul Fast Bridge <span id="version">v2.4.0</span></div>
+          <div>Environment: <span id="environment">production</span></div>
+        </div>
+      </div>
+    </div>
   </div>
+
+  <script>
+    // Health check and status monitoring
+    async function checkHealth() {
+      try {
+        const startTime = performance.now();
+        const response = await fetch('/health');
+        const endTime = performance.now();
+        
+        if (response.ok) {
+          const data = await response.json();
+          updateStatus('success', 'API Server Online', data);
+          updateMetrics(data, Math.round(endTime - startTime));
+        } else {
+          updateStatus('warning', 'API Degraded', null);
+        }
+      } catch (error) {
+        updateStatus('error', 'API Offline', null);
+        console.error('Health check failed:', error);
+      }
+    }
+
+    function updateStatus(status, text, data) {
+      const badge = document.getElementById('statusBadge');
+      const statusText = document.getElementById('statusText');
+      
+      badge.className = 'badge';
+      badge.classList.add(status);
+      statusText.textContent = text;
+      
+      if (data) {
+        document.getElementById('version').textContent = data.version || 'v2.4.0';
+        document.getElementById('environment').textContent = data.environment || 'production';
+      }
+    }
+
+    function updateMetrics(data, responseTime) {
+      // Update response time
+      document.getElementById('responseTime').textContent = `${responseTime}ms`;
+      
+      // Update other metrics
+      if (data && data.performance) {
+        document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
+        document.getElementById('requests').textContent = formatNumber(data.performance.total_requests);
+        
+        if (data.cache_status) {
+          document.getElementById('cacheSize').textContent = formatNumber(data.cache_status.valid_items);
+        }
+      }
+    }
+
+    function formatUptime(seconds) {
+      if (!seconds) return '--';
+      
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      
+      if (days > 0) {
+        return `${days}d ${hours}h`;
+      } else if (hours > 0) {
+        return `${hours}h`;
+      } else {
+        return '<1h';
+      }
+    }
+
+    function formatNumber(num) {
+      if (!num) return '0';
+      
+      if (num >= 1000000) {
+        return (num / 1000000).toFixed(1) + 'M';
+      } else if (num >= 1000) {
+        return (num / 1000).toFixed(1) + 'K';
+      }
+      return num.toString();
+    }
+
+    // Initial health check
+    checkHealth();
+    
+    // Refresh health status every 30 seconds
+    setInterval(checkHealth, 30000);
+    
+    // Add some interactive effects
+    document.addEventListener('DOMContentLoaded', function() {
+      const cards = document.querySelectorAll('.card');
+      cards.forEach((card, index) => {
+        card.style.opacity = '0';
+        card.style.transform = 'translateY(20px)';
+        
+        setTimeout(() => {
+          card.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
+          card.style.opacity = '1';
+          card.style.transform = 'translateY(0)';
+        }, index * 100);
+      });
+    });
+  </script>
 </body>
 </html>
