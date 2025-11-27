@@ -1,10 +1,12 @@
 # =============================================================================
-# Tadawul Stock Analysis API - Render Deployment Configuration
+# =============================================================================
+# Tadawul Fast Bridge - Enhanced Render Deployment Configuration
+# Version: 3.1.0 | Python: 3.11.9 | Environment: Production
 # =============================================================================
 
 services:
   - type: web
-    name: tadawul-fast-1
+    name: tadawul-fast-bridge
     env: python
     plan: free
     region: oregon
@@ -12,73 +14,123 @@ services:
       pythonVersion: "3.11.9"
     
     # =========================================================================
-    # Build Configuration
+    # Enhanced Build Configuration
     # =========================================================================
     buildCommand: |
-      echo "🚀 Building Tadawul Stock Analysis API v2.2.0..."
+      echo "🚀 Building Tadawul Fast Bridge v3.1.0..."
+      echo "🐍 Python 3.11.9 | FastAPI | Production"
+      
+      # Upgrade pip and install dependencies
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
       
       # Create necessary directories
-      mkdir -p logs cache_backups static templates
-      echo "✅ Directories created successfully"
+      mkdir -p logs cache_backups scripts static
+      echo "✅ Project structure created"
       
-      # Minimal dependency validation
+      # Enhanced dependency validation
       python -c "
-      import sys
+      import sys, platform
       print(f'🐍 Python {sys.version}')
-      try:
-          import fastapi, uvicorn, gspread, pandas, aiohttp, httpx
-          print(f'✅ FastAPI {fastapi.__version__}')
-          print(f'✅ Uvicorn {uvicorn.__version__}')
-          print(f'✅ gspread {gspread.__version__}')
-          print(f'✅ pandas {pandas.__version__}')
-          print('✅ Core dependencies installed successfully')
-      except ImportError as e:
-          print(f'❌ Import error: {e}')
+      print(f'💻 Platform: {platform.system()} {platform.release()}')
+      
+      required_packages = [
+          'fastapi', 'uvicorn', 'gspread', 'google.auth', 
+          'pandas', 'aiohttp', 'pydantic', 'pydantic_settings'
+      ]
+      
+      missing = []
+      for package in required_packages:
+          try:
+              __import__(package.replace('-', '_'))
+              version = getattr(__import__(package), '__version__', 'unknown')
+              print(f'✅ {package}: {version}')
+          except ImportError as e:
+              missing.append(package)
+              print(f'❌ {package}: MISSING - {e}')
+      
+      if missing:
+          print(f'🚨 Missing packages: {missing}')
           sys.exit(1)
+      else:
+          print('✅ All core dependencies verified')
       "
+      
+      # Create startup script for health monitoring
+      cat > scripts/startup_check.py << 'EOF'
+      #!/usr/bin/env python3
+      """
+      Startup Health Check for Tadawul Fast Bridge
+      """
+      import os
+      import sys
+      
+      def check_environment():
+          required_vars = ['SPREADSHEET_ID', 'GOOGLE_APPS_SCRIPT_URL']
+          missing = [var for var in required_vars if not os.getenv(var)]
+          
+          if missing:
+              print(f"❌ Missing required environment variables: {missing}")
+              return False
+          
+          print("✅ Environment variables check passed")
+          return True
+      
+      if __name__ == "__main__":
+          success = check_environment()
+          sys.exit(0 if success else 1)
+      EOF
+      
+      python scripts/startup_check.py
       echo "✅ Build completed successfully"
-    
+
     # =========================================================================
-    # Start Command
+    # Enhanced Start Command
     # =========================================================================
     startCommand: |
-      echo "🔧 Starting Tadawul API v2.2.0 with ${UVICORN_WORKERS:-1} worker(s) on port $PORT"
-      echo "📊 Environment: ${ENVIRONMENT:-production}"
-      echo "🔗 Service URL: ${FASTAPI_BASE:-https://tadawul-fast-1.onrender.com}"
+      echo "🔧 Starting Tadawul Fast Bridge v3.1.0"
+      echo "🌍 Environment: ${ENVIRONMENT:-production}"
+      echo "👥 Workers: ${WEB_CONCURRENCY:-2}"
+      echo "🔗 Port: $PORT"
+      echo "📊 Log Level: ${LOG_LEVEL:-info}"
+      
+      # Run startup checks
+      python scripts/startup_check.py
+      
+      # Start the application with enhanced configuration
       uvicorn main:app \
         --host 0.0.0.0 \
         --port $PORT \
-        --workers ${UVICORN_WORKERS:-1} \
+        --workers ${WEB_CONCURRENCY:-2} \
         --proxy-headers \
         --forwarded-allow-ips="*" \
-        --log-level ${UVICORN_LOG_LEVEL:-info} \
+        --log-level ${LOG_LEVEL:-info} \
         --access-log \
+        --loop asyncio \
         --timeout-keep-alive 60 \
-        --timeout-graceful-shutdown 30
-    
+        --timeout-graceful-shutdown 30 \
+        --header x-powered-by:"TadawulFastBridge/3.1.0" \
+        --header x-server:"FastAPI-Uvicorn"
+
     autoDeploy: true
     
     # =========================================================================
-    # Simple Health Check (Render top-level)
+    # Enhanced Health Check Configuration
     # =========================================================================
     healthCheckPath: /health
-    healthCheckTimeout: 30
+    healthCheckTimeout: 25
     healthCheckInterval: 60
-    initialDelay: 45
+    initialDelay: 30
 
     # =========================================================================
-    # Environment Variables
+    # Optimized Environment Variables
     # =========================================================================
     envVars:
-      # === Core Service Configuration ===
+      # === Core Application Configuration ===
       - key: SERVICE_NAME
-        value: "Tadawul Stock Analysis API"
+        value: "Tadawul Fast Bridge"
       - key: SERVICE_VERSION
-        value: "2.2.0"
-      - key: API_VERSION
-        value: "v1"
+        value: "3.1.0"
       - key: ENVIRONMENT
         value: "production"
       - key: APP_HOST
@@ -86,212 +138,109 @@ services:
       - key: APP_PORT
         value: "8000"
 
-      # === FastAPI Configuration ===
-      - key: FASTAPI_BASE
-        value: "https://tadawul-fast-1.onrender.com"
+      # === FastAPI & Server Configuration ===
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: LOG_LEVEL
+        value: "INFO"
       - key: ENABLE_SWAGGER
         value: "true"
       - key: ENABLE_REDOC
         value: "true"
-      - key: DOCS_URL
-        value: "/docs"
-      - key: REDOC_URL
-        value: "/redoc"
-      - key: OPENAPI_URL
-        value: "/openapi.json"
-
-      # === Authentication & Security ===
-      - key: REQUIRE_AUTH
-        value: "true"        # Auth ON – use APP_TOKEN / BACKUP_APP_TOKEN
-      - key: ALLOWED_ORIGINS
-        value: "*"
-      - key: SECRET_KEY
-        value: "tadawul-api-secret-key-change-in-production"
-      - key: ALGORITHM
-        value: "HS256"
-      - key: ACCESS_TOKEN_EXPIRE_MINUTES
-        value: "30"
-
-      # === Performance & Scaling ===
-      - key: UVICORN_WORKERS
-        value: "1"
-      - key: UVICORN_LOG_LEVEL
-        value: "info"
       - key: PYTHONUNBUFFERED
         value: "true"
-      - key: PYTHONPYCACHEPREFIX
-        value: "/tmp/pycache"
 
-      # === Cache & Storage Configuration ===
-      - key: CACHE_PATH
-        value: "./quote_cache.json"
-      - key: CACHE_BACKUP_DIR
-        value: "./cache_backups"
-      - key: CACHE_AUTO_SAVE
+      # === Security & Authentication ===
+      - key: REQUIRE_AUTH
         value: "true"
-      - key: CACHE_BACKUP_RETENTION_DAYS
-        value: "7"
-      - key: CACHE_DEFAULT_TTL
-        value: "300"   # 5 minutes
+      - key: ENABLE_RATE_LIMITING
+        value: "true"
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "120"
 
-      # === Data Provider Configuration ===
-      - key: DATA_PROVIDER
-        value: "MULTI_SOURCE"
-      - key: PRIMARY_DATA_SOURCE
-        value: "GOOGLE_SHEETS"
-      - key: SECONDARY_DATA_SOURCE
-        value: "ARGAAM"
-      - key: FALLBACK_DATA_SOURCE
-        value: "MOCK"
+      # === CORS Configuration ===
+      - key: CORS_ORIGINS
+        value: '["http://localhost:3000", "https://tadawul-fast-1.onrender.com", "https://your-app.com"]'
+
+      # === Cache Configuration ===
+      - key: CACHE_DEFAULT_TTL
+        value: "1800"
+      - key: CACHE_MAX_SIZE
+        value: "50000"
+      - key: CACHE_BACKUP_ENABLED
+        value: "true"
+      - key: CACHE_CLEANUP_INTERVAL
+        value: "300"
 
       # === Google Sheets Integration ===
       - key: SPREADSHEET_ID
         value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
-      - key: SHEETS_SPREADSHEET_ID
-        value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
-      - key: GOOGLE_SHEETS_ID
-        value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
-      # NOTE: GOOGLE_SERVICE_ACCOUNT_JSON comes from secrets below
-
-      # === Sheet Names Configuration (legacy / reference) ===
-      - key: SHEETS_SYMBOLS_TAB
-        value: "Market_Leaders"
-      - key: SHEETS_TAB_SYMBOLS
-        value: "Market_Leaders"
-      - key: SHEETS_DASHBOARD_TAB
-        value: "Dashboard"
-      - key: SHEETS_ANALYSIS_TAB
-        value: "AI_Analysis"
-      - key: SHEETS_PRICES_TAB
-        value: "Prices"
-      - key: SHEETS_FINANCIALS_TAB
-        value: "Financials"
-      - key: SHEETS_INDICATORS_TAB
-        value: "Indicators"
-      - key: SHEETS_SECTORS_TAB
-        value: "Sectors"
-      - key: SHEETS_REPORTS_TAB
-        value: "Reports"
-      - key: SHEETS_USERS_TAB
-        value: "Users"
-      - key: SHEETS_SETTINGS_TAB
-        value: "Settings"
-
-      # === Google Apps Script Integration ===
       - key: GOOGLE_APPS_SCRIPT_URL
         value: "https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec"
       - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
         value: "https://script.google.com/macros/s/AKfycbyI7a_xj7zvCa10CnzJP9wf8N1qPG3DYYb-LVkUCOEVEHjALzZq_Ox9YUJgbkzq86py6g/exec"
-      - key: GOOGLE_APPS_SCRIPT_TIMEOUT
-        value: "30"
 
-      # === Argaam Integration ===
-      - key: ARGAAM_TIMEOUT
+      # === Performance & HTTP Configuration ===
+      - key: HTTP_TIMEOUT
         value: "30"
-      - key: ARGAAM_MAX_RETRIES
+      - key: MAX_RETRIES
         value: "3"
-      - key: ARGAAM_CACHE_TTL
-        value: "600"
-      - key: ARGAAM_USER_AGENT
-        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      - key: ARGAAM_BASE_URL
-        value: "https://www.argaam.com"
+      - key: RETRY_DELAY
+        value: "1.0"
+      - key: CONNECTION_POOL_SIZE
+        value: "100"
+
+      # === Tadawul-Specific Settings ===
+      - key: TADAWUL_MARKET_ENABLED
+        value: "true"
+      - key: TADAWUL_REFRESH_INTERVAL
+        value: "60"
+      - key: TADAWUL_MAX_SYMBOLS
+        value: "200"
+      - key: TZ
+        value: "Asia/Riyadh"
+
+      # === Monitoring & Health ===
+      - key: HEALTH_CHECK_INTERVAL
+        value: "30"
+      - key: HEALTH_MONITOR_TIMEOUT
+        value: "10"
+      - key: ENABLE_HEALTH_MONITOR
+        value: "true"
 
       # === Feature Flags ===
-      - key: ENABLE_ARGAAM_INTEGRATION
+      - key: ENABLE_CACHE_WORKER
+        value: "true"
+      - key: ENABLE_BACKUP_SCHEDULER
         value: "true"
       - key: ENABLE_GOOGLE_SHEETS
         value: "true"
-      - key: ENABLE_AI_ANALYSIS
-        value: "true"
-      - key: ENABLE_MARKET_DASHBOARD
-        value: "true"
-      - key: ENABLE_SYMBOLS_READER
-        value: "true"
       - key: ENABLE_MULTI_SOURCE_DATA
         value: "true"
-      - key: ENABLE_GOOGLE_APPS_SCRIPT
-        value: "true"
-      - key: ENABLE_CACHE_MANAGEMENT
-        value: "true"
-      - key: ENABLE_HEALTH_CHECKS
-        value: "true"
-      - key: ENABLE_BACKGROUND_TASKS
-        value: "true"
-      - key: ENABLE_SHEET_VERIFICATION
-        value: "true"
-
-      # === Market Data Settings ===
-      - key: DEFAULT_MARKET
-        value: "SAUDI"
-      - key: DEFAULT_CURRENCY
-        value: "SAR"
-      - key: MARKET_OPEN_TIME
-        value: "10:00"
-      - key: MARKET_CLOSE_TIME
-        value: "15:00"
-      - key: MARKET_TIMEZONE
-        value: "Asia/Riyadh"
-      - key: MARKET_DAYS
-        value: "Sunday,Monday,Tuesday,Wednesday,Thursday"
-
-      # === Timezone & Scheduling ===
-      - key: TZ
-        value: "Asia/Riyadh"
-      - key: TRADING_INTERVAL_MINUTES
-        value: "5"
 
       # === Logging Configuration ===
-      - key: LOG_LEVEL
-        value: "INFO"
-      - key: LOG_FILE
-        value: "./logs/application.log"
-      - key: LOG_MAX_SIZE_MB
-        value: "10"
-      - key: LOG_BACKUP_COUNT
-        value: "5"
-      - key: LOG_FORMAT
-        value: "json"
-      - key: LOG_ENABLE_CONSOLE
-        value: "true"
       - key: LOG_ENABLE_FILE
         value: "false"
-
-      # === Request Rate Limiting ===
-      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
-        value: "100"
-      - key: RATE_LIMIT_ENABLED
-        value: "true"
-
-      # === Security & CORS ===
-      - key: ENABLE_RATE_LIMITING
-        value: "true"
-      - key: TRUSTED_PROXIES
-        value: "*"
-      - key: ENABLE_CORS
-        value: "true"
-      - key: CORS_ORIGINS
-        value: "*"
-      - key: ENABLE_HTTPS_REDIRECT
-        value: "true"
-      - key: TRUSTED_HOSTS
-        value: "*"
+      - key: LOG_FORMAT
+        value: "detailed"
+      - key: LOG_RETENTION_DAYS
+        value: "7"
 
     # =========================================================================
-    # Secrets (do NOT hard-code keys in this file)
+    # Secrets Management
     # =========================================================================
     secrets:
+      # Authentication Tokens
       - key: APP_TOKEN
         fromSecret: tadawul-app-token
       - key: BACKUP_APP_TOKEN
         fromSecret: tadawul-backup-token
 
-      # 🔴 IMPORTANT: This must match main.py AppConfig field `google_service_account_json`
-      # It exposes env var GOOGLE_SERVICE_ACCOUNT_JSON
-      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+      # Google Services - Use GOOGLE_SHEETS_CREDENTIALS to match our AppConfig
+      - key: GOOGLE_SHEETS_CREDENTIALS
         fromSecret: google-sheets-credentials-json
 
-      # Financial APIs – optional (only if you plan to use them)
+      # Optional Financial APIs
       - key: ALPHA_VANTAGE_API_KEY
         fromSecret: alpha-vantage-api-key
       - key: FINNHUB_API_KEY
@@ -306,11 +255,11 @@ services:
         fromSecret: fmp-api-key
 
     # =========================================================================
-    # Optional advanced health check (matches your /health endpoint)
+    # Enhanced Health Check Configuration
     # =========================================================================
     healthCheck:
       path: /health
-      initialDelay: 45
+      initialDelay: 30
       period: 60
       timeout: 25
       successThreshold: 1
@@ -318,17 +267,11 @@ services:
       headers:
         - name: User-Agent
           value: "Render-Health-Check/1.0"
+        - name: X-Health-Check
+          value: "true"
 
     # =========================================================================
-    # Disk Configuration for Cache Persistence
-    # =========================================================================
-    disk:
-      name: tadawul-cache-data
-      mountPath: /opt/render/cache
-      sizeGB: 1
-
-    # =========================================================================
-    # Basic Security Headers
+    # Security Headers
     # =========================================================================
     headers:
       - path: "/*"
@@ -343,15 +286,15 @@ services:
       - path: "/*"
         name: "X-XSS-Protection"
         value: "1; mode=block"
-      - path: "/*"
-        name: "Strict-Transport-Security"
-        value: "max-age=31536000; includeSubDomains"
       - path: "/health"
         name: "Cache-Control"
         value: "no-cache, no-store, must-revalidate"
+      - path: "/*"
+        name: "X-Powered-By"
+        value: "TadawulFastBridge/3.1.0"
 
     # =========================================================================
-    # Scaling (keep 1 instance on free plan)
+    # Scaling Configuration
     # =========================================================================
     scaling:
       minInstances: 1
@@ -360,15 +303,85 @@ services:
       targetCPUPercent: 70
 
 # =============================================================================
-# Cron Jobs – OPTIONAL
+# Background Worker Services
+# =============================================================================
+  - type: worker
+    name: tadawul-cache-worker
+    env: python
+    plan: free
+    region: oregon
+    runtime:
+      pythonVersion: "3.11.9"
+    
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    
+    startCommand: |
+      echo "🔧 Starting Cache Worker..."
+      python scripts/cache_manager.py --mode worker --cleanup-interval 300
+    
+    envVars:
+      - key: ENVIRONMENT
+        value: "production"
+      - key: LOG_LEVEL
+        value: "INFO"
+
+    secrets:
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        fromSecret: google-sheets-credentials-json
+
+# =============================================================================
+# Health Monitoring Worker
+# =============================================================================
+  - type: worker
+    name: tadawul-health-monitor
+    env: python
+    plan: free
+    region: oregon
+    runtime:
+      pythonVersion: "3.11.9"
+    
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    
+    startCommand: |
+      echo "🔧 Starting Health Monitor..."
+      python scripts/health_monitor.py \
+        --api-url https://tadawul-fast-bridge.onrender.com \
+        --interval 30 \
+        --timeout 10
+    
+    envVars:
+      - key: ENVIRONMENT
+        value: "production"
+      - key: LOG_LEVEL
+        value: "INFO"
+
+# =============================================================================
+# Cron Jobs for Maintenance
 # =============================================================================
 jobs:
   - name: health-monitoring
     plan: free
     schedule: "*/15 * * * *"
     command: |
-      echo "🏥 Running health monitoring..."
-      curl -f "https://${RENDER_SERVICE_NAME}.onrender.com/health" || exit 1
+      echo "🏥 Running scheduled health check..."
+      curl -f -H "X-Health-Check: true" \
+        "https://tadawul-fast-bridge.onrender.com/health" || exit 1
+    
     envVars:
       - key: ENVIRONMENT
         value: production
+
+  - name: cache-cleanup
+    plan: free
+    schedule: "0 2 * * *"  # Daily at 2 AM
+    command: |
+      echo "🧹 Running cache cleanup..."
+      curl -X POST -H "Authorization: Bearer $APP_TOKEN" \
+        "https://tadawul-fast-bridge.onrender.com/v1/cache/cleanup"
+    
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+    secrets:
+      - key: APP_TOKEN
+        fromSecret: tadawul-app-token
