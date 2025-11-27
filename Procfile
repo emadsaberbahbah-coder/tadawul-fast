@@ -1,52 +1,50 @@
 # =============================================================================
-# Stock Market Hub API - Enhanced Production Process File
-# Version: 2.4.0 | Environment: Production
+# Stock Market Hub API - Optimized Production Process File
+# Version: 3.1.0 | Environment: Production | Render Optimized
 # =============================================================================
 
-# --- Primary Web Process (Optimized for Production) ---
+# --- Primary Web Process (Render Optimized) ---
 web: uvicorn main:app \
   --host 0.0.0.0 \
   --port $PORT \
+  --workers ${WEB_CONCURRENCY:-2} \
+  --loop asyncio \
   --proxy-headers \
   --forwarded-allow-ips="*" \
-  --log-level info \
+  --log-level ${LOG_LEVEL:-info} \
   --access-log \
-  --loop asyncio \
-  --workers ${WEB_CONCURRENCY:-2} \
-  --timeout-keep-alive 5 \
-  --timeout-graceful-shutdown 10 \
-  --max-requests 1000 \
-  --max-requests-jitter 100 \
-  --header x-powered-by:StockMarketAPI/v2.4.0 \
-  --header x-server:FastAPI-Uvicorn
+  --timeout-keep-alive 60 \
+  --timeout-graceful-shutdown 30 \
+  --header x-powered-by:"TadawulFastBridge/3.1.0" \
+  --header x-server:"FastAPI-Uvicorn-Render"
 
-# --- Health Monitor Process (Recommended) ---
+# --- Health Monitor Process (Essential) ---
 health_monitor: python scripts/health_monitor.py \
-  --api-url http://localhost:$PORT \
-  --interval 30 \
-  --timeout 10 \
-  --retries 3
+  --api-url https://${RENDER_SERVICE_NAME}.onrender.com \
+  --interval 60 \
+  --timeout 15 \
+  --retries 2
 
-# --- Cache Management Worker (Recommended) ---
+# --- Cache Management Worker (Essential) ---
 cache_worker: python scripts/cache_manager.py \
   --mode worker \
   --cleanup-interval 300 \
-  --backup-interval 3600 \
-  --max-memory 512
+  --max-size-mb 100 \
+  --backup-enabled true
 
 # --- Backup Scheduler (Critical for Data Safety) ---
 backup_scheduler: python scripts/backup_manager.py \
   --mode scheduler \
-  --interval 86400 \
-  --retention 7 \
-  --storage local \
-  --max-size 100MB
+  --interval 3600 \
+  --retention 24 \
+  --max-backups 10
 
 # =============================================================================
 # ENVIRONMENT-SPECIFIC PROFILES
 # =============================================================================
 
 # --- Development Profile (Local Development) ---
+# Usage: heroku local dev
 dev: uvicorn main:app \
   --host 0.0.0.0 \
   --port $PORT \
@@ -58,153 +56,162 @@ dev: uvicorn main:app \
   --header x-environment:development
 
 # --- Staging Profile (Pre-Production) ---
+# Usage: heroku local staging
 staging: uvicorn main:app \
   --host 0.0.0.0 \
   --port $PORT \
-  --proxy-headers \
-  --forwarded-allow-ips="*" \
-  --log-level info \
-  --access-log \
-  --loop asyncio \
   --workers 2 \
+  --log-level info \
+  --loop asyncio \
   --header x-environment:staging
 
-# --- High-Performance Profile (High Traffic) ---
+# --- Single Worker Profile (Troubleshooting) ---
+# Usage: heroku local single
+single: uvicorn main:app \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --workers 1 \
+  --log-level debug \
+  --loop asyncio \
+  --header x-worker:single
+
+# =============================================================================
+# PERFORMANCE-OPTIMIZED PROFILES
+# =============================================================================
+
+# --- High-Performance Profile (4 workers) ---
+# Usage: heroku local highperf
 web_high_perf: uvicorn main:app \
   --host 0.0.0.0 \
   --port $PORT \
-  --proxy-headers \
-  --forwarded-allow-ips="*" \
+  --workers 4 \
   --log-level warning \
-  --access-log \
   --loop asyncio \
-  --workers ${WEB_CONCURRENCY:-4} \
-  --header server:StockMarketAPI-HP \
-  --header x-powered-by:FastAPI-Uvicorn-HighPerf
+  --max-requests 1000 \
+  --max-requests-jitter 100 \
+  --header x-profile:high-performance
 
-# --- Minimal Memory Profile (Resource Constrained) ---
+# --- Memory-Optimized Profile (Resource Constrained) ---
+# Usage: heroku local minimal
 web_minimal: uvicorn main:app \
   --host 0.0.0.0 \
   --port $PORT \
+  --workers 1 \
   --log-level warning \
   --loop asyncio \
-  --workers 1 \
-  --timeout-keep-alive 2 \
-  --max-requests 1000 \
-  --max-requests-jitter 100 \
-  --header x-profile:minimal-memory
+  --timeout-keep-alive 30 \
+  --header x-profile:memory-optimized
 
-# --- Readiness Check Profile (Load Balancer Health) ---
+# --- Readiness Check Profile (Health Checks) ---
+# Usage: heroku local readiness
 web_ready: uvicorn main:app \
   --host 0.0.0.0 \
   --port $PORT \
+  --workers 1 \
   --log-level error \
   --loop asyncio \
-  --workers 1 \
   --header x-purpose:readiness-check
-
-# =============================================================================
-# OPTIONAL BACKGROUND PROCESSES
-# =============================================================================
-
-# --- Data Sync Worker (Synchronizes external data) ---
-# data_sync: python scripts/data_sync_worker.py \
-#   --sheets-interval 600 \
-#   --quotes-interval 300 \
-#   --batch-size 50
-
-# --- Metrics Exporter (Prometheus metrics) ---
-# metrics: python scripts/metrics_exporter.py \
-#   --port 9090 \
-#   --endpoint /metrics \
-#   --interval 15
-
-# --- Email/Notification Worker (Optional) ---
-# notification_worker: python scripts/notification_worker.py \
-#   --queue notifications \
-#   --workers 2 \
-#   --retry-attempts 3
-
-# =============================================================================
-# SCHEDULED TASK PROCESSES
-# =============================================================================
-
-# --- Scheduled Tasks Scheduler (Optional) ---
-# scheduler: python scripts/scheduled_tasks.py \
-#   --config schedules.json \
-#   --log-level info \
-#   --max-concurrent 5
-
-# --- Cache Warmup Scheduler (Recommended for Production) ---
-cache_warmup: python scripts/cache_manager.py \
-  --mode warmup \
-  --symbols-file config/popular_symbols.json \
-  --concurrency 10 \
-  --interval 1800
 
 # =============================================================================
 # MAINTENANCE & ADMIN PROCESSES
 # =============================================================================
 
 # --- Maintenance Mode Process ---
+# Usage: heroku local maintenance
 maintenance: uvicorn maintenance:app \
   --host 0.0.0.0 \
   --port $PORT \
-  --log-level info \
   --workers 1 \
+  --log-level info \
   --header x-mode:maintenance
-
-# --- Admin/Management Interface (Optional) ---
-# admin: uvicorn admin_dashboard:app \
-#   --host 0.0.0.0 \
-#   --port 5000 \
-#   --log-level info \
-#   --workers 1
 
 # --- Database Maintenance (If using external DB) ---
 # db_maintenance: python scripts/db_maintenance.py \
 #   --vacuum-interval 86400 \
-#   --analyze-interval 43200 \
-#   --backup-interval 86400
+#   --analyze-interval 43200
 
 # =============================================================================
-# UTILITY & SUPPORT PROCESSES
+# SCHEDULED TASK PROCESSES
 # =============================================================================
 
-# --- Log Aggregator (Optional) ---
-# log_aggregator: python scripts/log_aggregator.py \
-#   --sources web,worker,cache \
-#   --output logs/aggregated \
-#   --rotation hourly \
-#   --retention 168
+# --- Cache Warmup Scheduler (Production Optimization) ---
+cache_warmup: python scripts/cache_manager.py \
+  --mode warmup \
+  --symbols-file config/popular_symbols.json \
+  --concurrency 5 \
+  --interval 1800
+
+# --- Data Refresh Scheduler (Keep data current) ---
+data_refresh: python scripts/data_refresh.py \
+  --interval 900 \
+  --batch-size 25 \
+  --priority high
+
+# =============================================================================
+# MONITORING & ANALYTICS PROCESSES
+# =============================================================================
 
 # --- Performance Monitor (Optional) ---
 # performance_monitor: python scripts/performance_monitor.py \
-#   --monitor-interval 30 \
-#   --metrics-port 9091 \
-#   --alert-threshold 95
+#   --interval 60 \
+#   --metrics-port 9090 \
+#   --alert-threshold 80
 
-# --- Security Scanner (Optional) ---
-# security_scanner: python scripts/security_scanner.py \
-#   --scan-interval 3600 \
-#   --report-file security_report.json \
-#   --max-failures 3
+# --- Log Aggregator (Optional) ---
+# log_aggregator: python scripts/log_aggregator.py \
+#   --sources web,cache,worker \
+#   --rotation hourly
 
 # =============================================================================
-# DEPRECATED PROCESSES (FOR REFERENCE)
+# RENDER-SPECIFIC OPTIMIZATIONS
 # =============================================================================
 
-# # --- Legacy Worker Process (Background Tasks) ---
-# # worker: python -c "from advanced_analysis import analyzer; analyzer.start_background_worker()"
+# --- Render Web Process (Primary for Render Deployment) ---
+# This is the default process that Render will use
+# Note: Render uses the 'web' process type by default
 
-# # --- Legacy Scheduler Process (Periodic Tasks) ---
-# # scheduler: python -c "from advanced_market_dashboard import scheduler; scheduler.start()"
+# --- Render Worker Process (Background Tasks) ---
+# worker: python scripts/background_worker.py \
+#   --queues high,medium,low \
+#   --concurrency 3
 
-# # --- Legacy Health Monitor Process ---
-# # health: python -c "from health_monitor import start_monitoring; start_monitoring()"
+# --- Render Cron Process (Scheduled Jobs) ---
+# cron_worker: python scripts/cron_worker.py \
+#   --schedule-file config/schedules.yaml \
+#   --log-level info
 
-# # --- Legacy Cache Warmup Process (Startup) ---
-# # cache_warmup: python -c "from cache_manager import warmup_cache; warmup_cache()"
+# =============================================================================
+# TROUBLESHOOTING & DEBUG PROFILES
+# =============================================================================
 
-# # --- Legacy Backup Process (Optional) ---
-# # backup: python -c "from backup_manager import start_backup_scheduler; start_backup_scheduler()"
+# --- Debug Profile (Detailed Logging) ---
+# Usage: heroku local debug
+debug: uvicorn main:app \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --workers 1 \
+  --log-level debug \
+  --loop asyncio \
+  --reload \
+  --reload-dir . \
+  --header x-mode:debug
+
+# --- Profile Mode (Performance Analysis) ---
+# Usage: heroku local profile
+profile: uvicorn main:app \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --workers 1 \
+  --log-level info \
+  --loop asyncio \
+  --header x-mode:profile
+
+# --- Test Mode (Integration Testing) ---
+# Usage: heroku local test
+test: uvicorn main:app \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --workers 1 \
+  --log-level warning \
+  --loop asyncio \
+  --header x-mode:test
