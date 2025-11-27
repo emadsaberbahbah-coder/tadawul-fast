@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version
+Tadawul Stock Analysis API - Enhanced Version 2.5.0
 Comprehensive financial data API with Google Sheets integration, caching, and multiple data sources.
 
 Features:
@@ -10,19 +10,22 @@ Features:
 - Comprehensive error handling and monitoring
 - Rate limiting and security features
 - Async/await for improved performance
+- Enhanced security and performance optimizations
 
-Version: 2.4.0
+Version: 2.5.0
 """
 
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote as url_quote
 
 import aiohttp
@@ -107,7 +110,7 @@ class AppConfig(BaseSettings):
     
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("2.4.0", env="SERVICE_VERSION")
+    service_version: str = Field("2.5.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -117,6 +120,7 @@ class AppConfig(BaseSettings):
     require_auth: bool = Field(True, env="REQUIRE_AUTH")
     app_token: Optional[str] = Field(None, env="APP_TOKEN")
     backup_app_token: Optional[str] = Field(None, env="BACKUP_APP_TOKEN")
+    token_hash_salt: str = Field(secrets.token_hex(32), env="TOKEN_HASH_SALT")
     
     # Rate Limiting
     enable_rate_limiting: bool = Field(True, env="ENABLE_RATE_LIMITING")
@@ -152,6 +156,10 @@ class AppConfig(BaseSettings):
     http_timeout: int = Field(30, env="HTTP_TIMEOUT")
     max_retries: int = Field(3, env="MAX_RETRIES")
     retry_delay: float = Field(1.0, env="RETRY_DELAY")
+
+    # Security Enhancements
+    enable_token_hashing: bool = Field(True, env="ENABLE_TOKEN_HASHING")
+    max_request_size: int = Field(10485760, env="MAX_REQUEST_SIZE")  # 10MB
 
     class Config:
         env_file = ".env"
@@ -205,6 +213,18 @@ class AppConfig(BaseSettings):
         if v < 60:
             raise ValueError("Cache TTL must be at least 60 seconds")
         return v
+
+    def hash_token(self, token: str) -> str:
+        """Hash token for secure storage and comparison"""
+        if not self.enable_token_hashing:
+            return token
+        return hashlib.sha256(f"{token}{self.token_hash_salt}".encode()).hexdigest()
+
+    def verify_token(self, token: str, stored_token: str) -> bool:
+        """Verify token against stored hash"""
+        if not self.enable_token_hashing:
+            return token == stored_token
+        return self.hash_token(token) == stored_token
 
 # Initialize configuration with enhanced error handling
 try:
@@ -286,8 +306,15 @@ def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
         logger.debug("Authentication disabled via configuration")
         return True
 
-    # Collect valid tokens
-    valid_tokens = [token for token in [config.app_token, config.backup_app_token] if token]
+    # Collect valid tokens (handle hashed tokens)
+    valid_tokens = []
+    for token in [config.app_token, config.backup_app_token]:
+        if token:
+            if config.enable_token_hashing:
+                # Store hashed version for comparison
+                valid_tokens.append(config.hash_token(token))
+            else:
+                valid_tokens.append(token)
     
     if not valid_tokens:
         logger.warning("REQUIRE_AUTH is True but no valid tokens configured. Allowing access.")
@@ -318,7 +345,9 @@ def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
             detail="Invalid authentication token",
         )
 
-    if token not in valid_tokens:
+    # Secure token verification
+    token_to_verify = config.hash_token(token) if config.enable_token_hashing else token
+    if token_to_verify not in valid_tokens:
         logger.warning(f"Invalid token attempt: {token[:8]}...")
         # Log additional security information
         raise HTTPException(
@@ -2900,10 +2929,10 @@ async def get_financial_apis_status(request: Request, auth: bool = Depends(verif
         "api_tests": test_results,
         "health_score": round(health_score * 100, 2),
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "recommendations": self._generate_api_recommendations(api_status, test_results),
+        "recommendations": _generate_api_recommendations(api_status, test_results),
     }
 
-def _generate_api_recommendations(self, api_status: Dict[str, Any], test_results: List[Dict[str, Any]]) -> List[str]:
+def _generate_api_recommendations(api_status: Dict[str, Any], test_results: List[Dict[str, Any]]) -> List[str]:
     """Generate API recommendations based on status and test results"""
     recommendations = []
     
