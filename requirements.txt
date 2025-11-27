@@ -1,7 +1,7 @@
 # =============================================================================
-# Tadawul Stock Analysis API - Enhanced Requirements
-# Version: 3.1.0 - Optimized for Python 3.11+ & Production
-# Python: 3.11+
+# Tadawul Stock Analysis API - Production Ready
+# Python: 3.11.9
+# Optimized for Render Deployment
 # =============================================================================
 
 # -------------------------------
@@ -18,39 +18,39 @@ pydantic==2.5.3
 pydantic-settings==2.1.0
 
 # -------------------------------
-# Google Services Integration (OPTIMIZED)
+# Google Services Integration
 # -------------------------------
 gspread==6.0.0
 google-auth==2.23.4
 google-api-python-client==2.108.0
 
 # -------------------------------
-# HTTP Clients & API Integration (STREAMLINED)
+# HTTP Clients & API Integration
 # -------------------------------
 requests==2.31.0
 aiohttp==3.8.6
 httpx==0.25.2
 
 # -------------------------------
-# Data Analysis & Processing (UPDATED)
+# Data Analysis & Processing
 # -------------------------------
 pandas==2.1.4
 numpy==1.24.4
 openpyxl==3.1.2
 
 # -------------------------------
-# Web Scraping & Data Extraction (OPTIONAL)
+# Web Scraping & Data Extraction
 # -------------------------------
 beautifulsoup4==4.12.2
 lxml==4.9.3
 
 # -------------------------------
-# Error Handling & Resilience (OPTIMIZED)
+# Error Handling & Resilience
 # -------------------------------
-tenacity==8.9.0  # Updated for Python 3.11 compatibility
+tenacity==8.2.3
 
 # -------------------------------
-# Monitoring & Logging (ENHANCED)
+# Monitoring & Logging
 # -------------------------------
 structlog==23.2.0
 prometheus-client==0.19.0
@@ -62,7 +62,7 @@ python-dotenv==1.0.0
 pyyaml==6.0.1
 
 # -------------------------------
-# API Rate Limiting & Security (UPDATED)
+# API Rate Limiting & Security
 # -------------------------------
 slowapi==0.1.9
 limits==3.6.0
@@ -70,7 +70,7 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
 # -------------------------------
-# Performance & Utilities (OPTIMIZED)
+# Performance & Utilities
 # -------------------------------
 orjson==3.9.10
 python-dateutil==2.8.2
@@ -79,7 +79,7 @@ pytz==2023.3.post1
 tzdata==2023.4
 
 # -------------------------------
-# Security & SSL Enhancements (CRITICAL UPDATES)
+# Security & SSL Enhancements
 # -------------------------------
 certifi==2023.11.17
 urllib3==2.1.0
@@ -108,21 +108,15 @@ redis==5.0.1
 fastapi-utils==0.2.1
 
 # -------------------------------
-# Testing & Development (OPTIONAL)
-# -------------------------------
-pytest==7.4.3
-pytest-asyncio==0.21.1
-
-# -------------------------------
-# System Monitoring (REPLACEMENT for healthchecks)
+# System Monitoring
 # -------------------------------
 psutil==5.9.6
 
 # -------------------------------
-# COMPATIBILITY NOTES:
+# Additional Dependencies for Stability
 # -------------------------------
-# - Removed healthchecks==2.8.1 (not compatible with Python 3.11)
-# - Updated tenacity to 8.9.0 for better Python 3.11 support
-# - Added psutil for system monitoring as healthchecks alternative
-# - All packages verified for Python 3.11+ compatibility
-# - Optimized for production deployment on Render.com
+charset-normalizer==3.3.2
+idna==3.6
+asgiref==3.7.2
+sniffio==1.3.0
+anyio==3.7.1
