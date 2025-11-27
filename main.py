@@ -11,21 +11,20 @@ Features:
 - Rate limiting and security features
 - Async/await for improved performance
 - Enhanced security and performance optimizations
+- Symbols reader integration for market data
 
 Version: 2.5.0
 """
 
 import asyncio
 import datetime
-import hashlib
 import json
 import logging
 import os
-import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote as url_quote
 
 import aiohttp
@@ -50,6 +49,18 @@ from pydantic_settings import BaseSettings
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+
+# =============================================================================
+# Import Symbols Reader
+# =============================================================================
+
+try:
+    from symbols_reader import SymbolsReader, fetch_symbols
+    SYMBOLS_READER_AVAILABLE = True
+    logger.info("✅ Symbols Reader imported successfully")
+except ImportError as e:
+    SYMBOLS_READER_AVAILABLE = False
+    logger.warning(f"❌ Symbols Reader not available: {e}")
 
 # =============================================================================
 # Configuration and Constants
@@ -120,7 +131,6 @@ class AppConfig(BaseSettings):
     require_auth: bool = Field(True, env="REQUIRE_AUTH")
     app_token: Optional[str] = Field(None, env="APP_TOKEN")
     backup_app_token: Optional[str] = Field(None, env="BACKUP_APP_TOKEN")
-    token_hash_salt: str = Field(secrets.token_hex(32), env="TOKEN_HASH_SALT")
     
     # Rate Limiting
     enable_rate_limiting: bool = Field(True, env="ENABLE_RATE_LIMITING")
@@ -157,9 +167,10 @@ class AppConfig(BaseSettings):
     max_retries: int = Field(3, env="MAX_RETRIES")
     retry_delay: float = Field(1.0, env="RETRY_DELAY")
 
-    # Security Enhancements
-    enable_token_hashing: bool = Field(True, env="ENABLE_TOKEN_HASHING")
-    max_request_size: int = Field(10485760, env="MAX_REQUEST_SIZE")  # 10MB
+    # Symbols Reader Configuration
+    symbols_cache_ttl: int = Field(1800, env="SYMBOLS_CACHE_TTL")  # 30 minutes
+    symbols_header_row: int = Field(2, env="SYMBOLS_HEADER_ROW")
+    symbols_tab_name: str = Field("Market_Leaders", env="SYMBOLS_TAB_NAME")
 
     class Config:
         env_file = ".env"
@@ -214,18 +225,6 @@ class AppConfig(BaseSettings):
             raise ValueError("Cache TTL must be at least 60 seconds")
         return v
 
-    def hash_token(self, token: str) -> str:
-        """Hash token for secure storage and comparison"""
-        if not self.enable_token_hashing:
-            return token
-        return hashlib.sha256(f"{token}{self.token_hash_salt}".encode()).hexdigest()
-
-    def verify_token(self, token: str, stored_token: str) -> bool:
-        """Verify token against stored hash"""
-        if not self.enable_token_hashing:
-            return token == stored_token
-        return self.hash_token(token) == stored_token
-
 # Initialize configuration with enhanced error handling
 try:
     config = AppConfig()
@@ -273,6 +272,10 @@ class RateLimitError(Exception):
     """Custom exception for rate limiting errors"""
     pass
 
+class SymbolsReaderError(Exception):
+    """Custom exception for symbols reader errors"""
+    pass
+
 # =============================================================================
 # Enhanced Security Setup
 # =============================================================================
@@ -306,15 +309,8 @@ def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
         logger.debug("Authentication disabled via configuration")
         return True
 
-    # Collect valid tokens (handle hashed tokens)
-    valid_tokens = []
-    for token in [config.app_token, config.backup_app_token]:
-        if token:
-            if config.enable_token_hashing:
-                # Store hashed version for comparison
-                valid_tokens.append(config.hash_token(token))
-            else:
-                valid_tokens.append(token)
+    # Collect valid tokens
+    valid_tokens = [token for token in [config.app_token, config.backup_app_token] if token]
     
     if not valid_tokens:
         logger.warning("REQUIRE_AUTH is True but no valid tokens configured. Allowing access.")
@@ -345,9 +341,7 @@ def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
             detail="Invalid authentication token",
         )
 
-    # Secure token verification
-    token_to_verify = config.hash_token(token) if config.enable_token_hashing else token
-    if token_to_verify not in valid_tokens:
+    if token not in valid_tokens:
         logger.warning(f"Invalid token attempt: {token[:8]}...")
         # Log additional security information
         raise HTTPException(
@@ -462,6 +456,24 @@ class Quote(BaseModel):
             raise ValueError("Value must be positive or None")
         return v
 
+class SymbolRecord(BaseModel):
+    """Symbol record model for market symbols"""
+    symbol: str = Field(..., description="Stock symbol/ticker")
+    company_name: str = Field(..., description="Company name")
+    trading_sector: str = Field(..., description="Trading sector/industry")
+    financial_market: str = Field(..., description="Financial market/exchange")
+    include_in_ranking: bool = Field(True, description="Include in rankings")
+    market_cap: Optional[float] = Field(None, description="Market capitalization")
+    last_updated: Optional[str] = Field(None, description="Last update timestamp")
+    data_source: str = Field("google_sheets", description="Data source")
+
+    @validator("symbol")
+    def validate_symbol(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("Symbol cannot be empty")
+        return v
+
 class QuoteUpdatePayload(BaseModel):
     """Payload for updating quotes with enhanced validation"""
     data: List[Quote] = Field(..., description="List of quotes to update")
@@ -484,6 +496,17 @@ class QuoteResponse(BaseModel):
     cache_hits: int = Field(0, description="Number of cache hits")
     cache_misses: int = Field(0, description="Number of cache misses")
     sources: List[str] = Field(default_factory=list, description="Data sources used")
+
+class SymbolsResponse(BaseModel):
+    """Standardized symbols response with metadata"""
+    ok: bool = Field(..., description="Success status")
+    source: str = Field(..., description="Data source")
+    count: int = Field(..., description="Number of symbols returned")
+    data: List[SymbolRecord] = Field(..., description="List of symbols")
+    timestamp_utc: str = Field(..., description="Response timestamp")
+    processing_time_seconds: float = Field(..., description="Processing time")
+    error: Optional[str] = Field(None, description="Error message if any")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
 
 class SheetVerificationResult(BaseModel):
     """Enhanced sheet verification result"""
@@ -525,6 +548,7 @@ class HealthResponse(BaseModel):
     features: Dict[str, bool] = Field(..., description="Available features")
     api_status: Dict[str, Any] = Field(..., description="Financial API status")
     performance: Dict[str, float] = Field(..., description="Performance metrics")
+    symbols_reader_status: Dict[str, Any] = Field(..., description="Symbols reader status")
 
 class ErrorResponse(BaseModel):
     """Enhanced error response"""
@@ -1694,6 +1718,150 @@ class FinancialDataClient:
 financial_client = FinancialDataClient()
 
 # =============================================================================
+# Symbols Reader Integration
+# =============================================================================
+
+class SymbolsReaderManager:
+    """
+    Manager for Symbols Reader integration with enhanced error handling
+    """
+    
+    def __init__(self):
+        self.reader = None
+        self.initialized = False
+        self.last_status = {}
+        self.metrics = {
+            "requests": 0,
+            "errors": 0,
+            "cache_hits": 0,
+            "successful_requests": 0,
+        }
+        
+    def initialize(self) -> bool:
+        """Initialize symbols reader with comprehensive error handling"""
+        if self.initialized and self.reader is not None:
+            return True
+            
+        if not SYMBOLS_READER_AVAILABLE:
+            logger.warning("Symbols Reader not available - skipping initialization")
+            return False
+            
+        try:
+            self.reader = SymbolsReader()
+            self.initialized = True
+            logger.info("✅ Symbols Reader initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Symbols Reader: {e}")
+            self.initialized = False
+            return False
+            
+    def get_status(self) -> Dict[str, Any]:
+        """Get symbols reader status with enhanced diagnostics"""
+        if not self.initialized or self.reader is None:
+            return {
+                "status": "not_initialized",
+                "available": SYMBOLS_READER_AVAILABLE,
+                "initialized": False,
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            
+        try:
+            status = self.reader.get_status()
+            cache_info = self.reader.get_cache_info()
+            
+            self.last_status = {
+                "status": "operational",
+                "available": True,
+                "initialized": True,
+                "reader_status": status,
+                "cache_info": cache_info,
+                "metrics": self.metrics,
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            return self.last_status
+        except Exception as e:
+            logger.error(f"Error getting symbols reader status: {e}")
+            return {
+                "status": "error",
+                "available": True,
+                "initialized": True,
+                "error": str(e),
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            
+    def fetch_symbols(self, limit: Optional[int] = None, use_cache: bool = True) -> Dict[str, Any]:
+        """Fetch symbols with enhanced error handling and metrics"""
+        self.metrics["requests"] += 1
+        
+        if not self.initialized or self.reader is None:
+            self.metrics["errors"] += 1
+            return {
+                "ok": False,
+                "source": "error",
+                "count": 0,
+                "data": [],
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "error": "Symbols Reader not initialized",
+                "processing_time_seconds": 0.0,
+            }
+            
+        try:
+            start_time = time.time()
+            result = self.reader.fetch_symbols(limit=limit, use_cache=use_cache)
+            processing_time = time.time() - start_time
+            
+            # Update metrics
+            if result.get("ok", False):
+                self.metrics["successful_requests"] += 1
+                if result.get("source") == "cache":
+                    self.metrics["cache_hits"] += 1
+            else:
+                self.metrics["errors"] += 1
+                
+            # Add processing time to result
+            result["processing_time_seconds"] = round(processing_time, 3)
+            
+            return result
+            
+        except Exception as e:
+            self.metrics["errors"] += 1
+            logger.error(f"Error fetching symbols: {e}")
+            return {
+                "ok": False,
+                "source": "error",
+                "count": 0,
+                "data": [],
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "error": f"Symbols fetch failed: {str(e)}",
+                "processing_time_seconds": 0.0,
+            }
+            
+    def clear_cache(self) -> Dict[str, Any]:
+        """Clear symbols cache with enhanced error handling"""
+        if not self.initialized or self.reader is None:
+            return {
+                "status": "error",
+                "error": "Symbols Reader not initialized",
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            
+        try:
+            result = self.reader.clear_cache()
+            logger.info("Symbols cache cleared successfully")
+            return result
+        except Exception as e:
+            logger.error(f"Error clearing symbols cache: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+
+# Initialize symbols reader manager
+symbols_reader_manager = SymbolsReaderManager()
+
+# =============================================================================
 # Enhanced Application Startup and Lifespan
 # =============================================================================
 
@@ -1782,6 +1950,13 @@ async def validate_configuration():
         logger.info(f"💾 Cache initialized: {cache_stats['valid_items']} valid items")
     except Exception as e:
         errors.append(f"Cache initialization failed: {e}")
+
+    # Symbols Reader validation
+    symbols_reader_initialized = symbols_reader_manager.initialize()
+    if symbols_reader_initialized:
+        logger.info("✅ Symbols Reader initialized successfully")
+    else:
+        warnings.append("Symbols Reader not available - symbol endpoints will be limited")
 
     # Report results
     if warnings:
@@ -1872,6 +2047,7 @@ app = FastAPI(
     * 🔐 Comprehensive security and rate limiting
     * 📱 Async/await for high performance
     * 🏥 Health monitoring and metrics
+    * 📋 Symbols reader for market data management
     
     ## Authentication
     
@@ -2016,6 +2192,9 @@ async def root(request: Request):
     # Get cache statistics
     cache_stats = cache.get_stats()
 
+    # Get symbols reader status
+    symbols_reader_status = symbols_reader_manager.get_status()
+
     # Calculate uptime
     uptime_seconds = time.time() - app_metrics["startup_time"]
 
@@ -2056,10 +2235,16 @@ async def root(request: Request):
             "ttl_minutes": cache_stats["ttl_minutes"],
             "hit_rate": cache_stats["performance"]["hit_rate"],
         },
+        "symbols_reader": {
+            "available": symbols_reader_status.get("available", False),
+            "initialized": symbols_reader_status.get("initialized", False),
+            "status": symbols_reader_status.get("status", "unknown"),
+        },
         "endpoints": {
             "health": "/health",
             "docs": "/docs" if config.enable_swagger else None,
             "quotes": "/v1/quote",
+            "symbols": "/v1/symbols",
             "sheets": "/sheet-names",
             "metrics": "/metrics",
             "cache_info": "/v1/cache",
@@ -2107,6 +2292,9 @@ async def health_check(request: Request):
     # Get cache statistics
     cache_stats = cache.get_stats()
 
+    # Get symbols reader status
+    symbols_reader_status = symbols_reader_manager.get_status()
+
     # Calculate performance metrics
     uptime_seconds = time.time() - app_metrics["startup_time"]
     success_rate = 0.0
@@ -2121,6 +2309,7 @@ async def health_check(request: Request):
         "direct_sheets_access": has_sheets_creds,
         "caching": True,
         "authentication": config.require_auth,
+        "symbols_reader": symbols_reader_status.get("available", False),
     }
 
     # Get financial client metrics
@@ -2145,6 +2334,7 @@ async def health_check(request: Request):
         },
         features=features,
         api_status=api_status,
+        symbols_reader_status=symbols_reader_status,
         performance={
             "total_requests": app_metrics["total_requests"],
             "success_rate": round(success_rate, 2),
@@ -2165,6 +2355,7 @@ async def get_metrics(request: Request, auth: bool = Depends(verify_auth)):
     financial_metrics = financial_client.get_metrics()
     sheets_metrics = GoogleSheetsManager.get_metrics()
     sheets_service_metrics = google_sheets_service.get_metrics()
+    symbols_reader_status = symbols_reader_manager.get_status()
 
     # Calculate rates
     success_rate = 0.0
@@ -2188,6 +2379,7 @@ async def get_metrics(request: Request, auth: bool = Depends(verify_auth)):
             "manager": sheets_metrics,
             "service": sheets_service_metrics,
         },
+        "symbols_reader": symbols_reader_status,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -2215,6 +2407,134 @@ async def ping(request: Request):
     app_metrics["successful_requests"] += 1
     
     return response
+
+# =============================================================================
+# Enhanced Symbols Reader Endpoints
+# =============================================================================
+
+@app.get("/v1/symbols", response_model=SymbolsResponse)
+@rate_limit("30/minute")
+async def get_symbols(
+    request: Request,
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of symbols to return"),
+    use_cache: bool = Query(True, description="Use cached symbols data"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Enhanced symbols endpoint with comprehensive market symbol data
+    """
+    result = symbols_reader_manager.fetch_symbols(limit=limit, use_cache=use_cache)
+    
+    # Convert data to SymbolRecord models for validation
+    symbol_records = []
+    for symbol_data in result.get("data", []):
+        try:
+            symbol_record = SymbolRecord(**symbol_data)
+            symbol_records.append(symbol_record)
+        except Exception as e:
+            logger.warning(f"Invalid symbol data skipped: {e}")
+            continue
+    
+    return SymbolsResponse(
+        ok=result.get("ok", False),
+        source=result.get("source", "unknown"),
+        count=len(symbol_records),
+        data=symbol_records,
+        timestamp=result.get("timestamp", datetime.datetime.utcnow().isoformat() + "Z"),
+        processing_time_seconds=result.get("processing_time_seconds", 0.0),
+        error=result.get("error"),
+        metadata=result.get("metadata"),
+    )
+
+@app.get("/v1/symbols/status", response_model=Dict[str, Any])
+@rate_limit("20/minute")
+async def get_symbols_status(request: Request, auth: bool = Depends(verify_auth)):
+    """
+    Get comprehensive symbols reader status and diagnostics
+    """
+    return symbols_reader_manager.get_status()
+
+@app.post("/v1/symbols/cache/clear", response_model=Dict[str, Any])
+@rate_limit("5/minute")
+async def clear_symbols_cache(request: Request, auth: bool = Depends(verify_auth)):
+    """
+    Clear symbols cache with enhanced error handling
+    """
+    result = symbols_reader_manager.clear_cache()
+    return result
+
+@app.get("/v1/symbols/search", response_model=SymbolsResponse)
+@rate_limit("40/minute")
+async def search_symbols(
+    request: Request,
+    query: str = Query(..., description="Search query for symbol or company name"),
+    sector: Optional[str] = Query(None, description="Filter by sector"),
+    market: Optional[str] = Query(None, description="Filter by financial market"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum results to return"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Enhanced symbol search with filtering capabilities
+    """
+    # Fetch all symbols
+    result = symbols_reader_manager.fetch_symbols(limit=None, use_cache=True)
+    
+    if not result.get("ok", False):
+        return SymbolsResponse(
+            ok=False,
+            source=result.get("source", "error"),
+            count=0,
+            data=[],
+            timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+            processing_time_seconds=0.0,
+            error=result.get("error", "Failed to fetch symbols"),
+        )
+    
+    # Filter symbols based on search criteria
+    query_lower = query.lower().strip()
+    filtered_symbols = []
+    
+    for symbol_data in result.get("data", []):
+        # Search in symbol and company name
+        symbol_match = query_lower in symbol_data.get("symbol", "").lower()
+        company_match = query_lower in symbol_data.get("company_name", "").lower()
+        
+        # Sector filter
+        sector_match = True
+        if sector:
+            sector_match = sector.lower() in symbol_data.get("trading_sector", "").lower()
+        
+        # Market filter
+        market_match = True
+        if market:
+            market_match = market.lower() in symbol_data.get("financial_market", "").lower()
+        
+        if (symbol_match or company_match) and sector_match and market_match:
+            try:
+                symbol_record = SymbolRecord(**symbol_data)
+                filtered_symbols.append(symbol_record)
+            except Exception as e:
+                logger.warning(f"Invalid symbol data in search: {e}")
+                continue
+        
+        # Limit results
+        if len(filtered_symbols) >= limit:
+            break
+    
+    return SymbolsResponse(
+        ok=True,
+        source=result.get("source", "search"),
+        count=len(filtered_symbols),
+        data=filtered_symbols,
+        timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+        processing_time_seconds=result.get("processing_time_seconds", 0.0),
+        metadata={
+            "search_query": query,
+            "sector_filter": sector,
+            "market_filter": market,
+            "total_matches": len(filtered_symbols),
+        },
+    )
 
 # =============================================================================
 # Enhanced Protected API Endpoints
@@ -3021,6 +3341,7 @@ def main():
     logger.info(f"⚡ Rate Limiting: {'Enabled' if config.enable_rate_limiting else 'Disabled'}")
     logger.info(f"📊 Google Sheets: {'Direct' if config.google_service_account_json else 'Apps Script'}")
     logger.info(f"💾 Cache: {len(cache.data)} items loaded")
+    logger.info(f"📋 Symbols Reader: {'Available' if SYMBOLS_READER_AVAILABLE else 'Not Available'}")
     logger.info(f"🔧 Debug Mode: {config.debug}")
     logger.info(f"🌐 Starting server on {args.host}:{args.port}")
     logger.info("=" * 70)
