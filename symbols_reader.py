@@ -1,6 +1,6 @@
 # symbols_reader.py
 # Enhanced Google Sheets symbol reader - Production Ready for Render
-# Version: 2.0.0 - Optimized for deployment
+# Version: 2.1.0 - Critical Fixes & Optimizations
 
 from __future__ import annotations
 
@@ -107,6 +107,9 @@ class SymbolsReader:
         # Column mapping with enhanced field detection
         self.column_mapping = self._initialize_column_mapping()
 
+        # Check for required dependencies
+        self._check_dependencies()
+
         logger.info(
             f"SymbolsReader initialized: "
             f"sheet_id={self.sheet_id[:8]}..., "
@@ -114,6 +117,18 @@ class SymbolsReader:
             f"cache_ttl={self.cache_ttl.total_seconds()}s, "
             f"cache_dir={self.cache_dir}"
         )
+
+    def _check_dependencies(self) -> None:
+        """Check for required dependencies and log appropriate messages."""
+        try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+            self._dependencies_available = True
+            logger.debug("Google Sheets dependencies available")
+        except ImportError as e:
+            self._dependencies_available = False
+            logger.warning(f"Google Sheets dependencies not available: {e}")
+            logger.info("SymbolsReader will operate in fallback mode only")
 
     def _get_spreadsheet_id(self) -> str:
         """Get spreadsheet ID with proper fallback hierarchy."""
@@ -222,21 +237,27 @@ class SymbolsReader:
         """Clean up old cache files to prevent disk space issues."""
         try:
             now = time.time()
-            # Only cleanup once per hour
+            # Only cleanup once per hour to reduce I/O
             if now - self._last_cache_cleanup < 3600:
                 return
 
             cache_files = list(self.cache_dir.glob("symbols_cache_*.json"))
+            deleted_count = 0
+            
             for cache_file in cache_files:
                 try:
-                    # Delete files older than 24 hours
-                    if now - cache_file.stat().st_mtime > 86400:
+                    # Delete files older than 24 hours, but keep current cache
+                    if (now - cache_file.stat().st_mtime > 86400 and 
+                        cache_file.name != self._get_cache_key()):
                         cache_file.unlink()
-                        logger.debug(f"Cleaned up old cache file: {cache_file}")
+                        deleted_count += 1
                 except Exception as e:
                     logger.debug(f"Could not delete cache file {cache_file}: {e}")
 
             self._last_cache_cleanup = now
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old cache files")
+                
         except Exception as e:
             logger.debug(f"Cache cleanup failed: {e}")
 
@@ -318,7 +339,7 @@ class SymbolsReader:
                 "sheet_id": self.sheet_id,
                 "tab_name": self.tab_name,
                 "data": data,
-                "version": "2.0.0",
+                "version": "2.1.0",
             }
 
             # Atomic write
@@ -340,15 +361,16 @@ class SymbolsReader:
         if self._client_initialized and self._client is not None:
             return self._client
 
-        try:
-            import gspread
-            from google.oauth2.service_account import Credentials
-        except ImportError as e:
-            logger.error(f"Google Sheets dependencies not available: {e}")
+        # Check if dependencies are available
+        if not self._dependencies_available:
+            logger.error("Google Sheets dependencies not available")
             self._client_initialized = True
             return None
 
         try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets.readonly",
                 "https://www.googleapis.com/auth/drive.readonly",
@@ -736,6 +758,11 @@ class SymbolsReader:
     def _fetch_from_google_sheets(self, limit: Optional[int]) -> Optional[List[Dict[str, Any]]]:
         """Enhanced Google Sheets data fetching."""
         try:
+            # Early return if dependencies not available
+            if not self._dependencies_available:
+                logger.warning("Google Sheets dependencies not available")
+                return None
+
             worksheet = self._get_worksheet()
             if not worksheet:
                 return None
@@ -795,6 +822,7 @@ class SymbolsReader:
                 "header_row": self.header_row,
                 "cache_used": source == "cache",
                 "last_successful_fetch": self._last_successful_fetch,
+                "dependencies_available": getattr(self, '_dependencies_available', False),
             },
         }
 
@@ -815,6 +843,7 @@ class SymbolsReader:
             "client_status": client_status,
             "worksheet_status": worksheet_status,
             "spreadsheet_id_configured": bool(self.sheet_id),
+            "dependencies_available": getattr(self, '_dependencies_available', False),
             "cache_info": cache_info,
             "last_successful_fetch": self._last_successful_fetch,
             "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -872,7 +901,7 @@ class SymbolsReader:
             return {"exists": False, "error": str(e)}
 
 
-# Global instance with error handling
+# Global instance with enhanced error handling
 try:
     symbols_reader = SymbolsReader()
     logger.info("Global SymbolsReader instance created successfully")
