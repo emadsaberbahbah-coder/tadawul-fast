@@ -1,7 +1,7 @@
 # =============================================================================
 # Tadawul Stock Analysis API - Enhanced Requirements
-# Version: 3.0.0 - Optimized for Production & Security
-# Python: 3.8+
+# Version: 3.1.0 - Optimized for Python 3.11+ & Production
+# Python: 3.11+
 # =============================================================================
 
 # -------------------------------
@@ -23,7 +23,6 @@ pydantic-settings==2.1.0
 gspread==6.0.0
 google-auth==2.23.4
 google-api-python-client==2.108.0
-# Removed: google-auth-oauthlib, google-auth-httplib2 (redundant)
 
 # -------------------------------
 # HTTP Clients & API Integration (STREAMLINED)
@@ -31,7 +30,6 @@ google-api-python-client==2.108.0
 requests==2.31.0
 aiohttp==3.8.6
 httpx==0.25.2
-# Removed: httplib2 (replaced by google-auth)
 
 # -------------------------------
 # Data Analysis & Processing (UPDATED)
@@ -41,25 +39,21 @@ numpy==1.24.4
 openpyxl==3.1.2
 
 # -------------------------------
-# Web Scraping & Data Extraction (OPTIONAL - Only if needed)
+# Web Scraping & Data Extraction (OPTIONAL)
 # -------------------------------
 beautifulsoup4==4.12.2
 lxml==4.9.3
-# selenium==4.15.2  # COMMENTED: Heavy dependency, only enable if needed
-# webdriver-manager==4.0.1  # COMMENTED: Only if selenium is used
 
 # -------------------------------
 # Error Handling & Resilience (OPTIMIZED)
 # -------------------------------
-tenacity==8.2.3
-# Removed: backoff, retrying (redundant with tenacity)
+tenacity==8.9.0  # Updated for Python 3.11 compatibility
 
 # -------------------------------
 # Monitoring & Logging (ENHANCED)
 # -------------------------------
 structlog==23.2.0
 prometheus-client==0.19.0
-# Removed: loguru (redundant with structlog)
 
 # -------------------------------
 # Environment & Configuration
@@ -92,53 +86,43 @@ urllib3==2.1.0
 cryptography==41.0.7
 
 # -------------------------------
-# Type Support & Development (OPTIONAL)
-# -------------------------------
-# pandas-stubs==2.1.4.230918  # COMMENTED: Development only
-# types-requests==2.31.0.10   # COMMENTED: Development only
-
-# -------------------------------
-# Async Task Queue (OPTIONAL - Only if Celery is used)
-# -------------------------------
-# celery==5.3.4  # COMMENTED: Only enable if using task queues
-# redis==5.0.1   # COMMENTED: Only enable if using Redis
-
-# -------------------------------
 # Data Validation & Sanitization
 # -------------------------------
 jsonschema==4.20.0
 email-validator==2.1.0
 
 # -------------------------------
-# MISSING CRITICAL DEPENDENCIES (ADDED)
+# Database & ORM Support
 # -------------------------------
-
-# Database & ORM Support (if needed)
 sqlalchemy==2.0.23
 alembic==1.12.1
 
+# -------------------------------
 # Enhanced Caching
-redis==5.0.1  # Now included as it's commonly needed
+# -------------------------------
+redis==5.0.1
 
+# -------------------------------
 # API Documentation Enhancements
+# -------------------------------
 fastapi-utils==0.2.1
 
-# Health Checks & Monitoring
-healthchecks==2.8.1
-
-# Testing & Development
+# -------------------------------
+# Testing & Development (OPTIONAL)
+# -------------------------------
 pytest==7.4.3
 pytest-asyncio==0.21.1
-httpx==0.25.2
 
-# Security Headers & Middleware
-python-bcrypt==4.0.1
+# -------------------------------
+# System Monitoring (REPLACEMENT for healthchecks)
+# -------------------------------
+psutil==5.9.6
 
 # -------------------------------
 # COMPATIBILITY NOTES:
 # -------------------------------
-# numpy 1.24.4: Compatible with pandas 2.1.4, better performance
-# requests 2.31.0: Security patches, stable version
-# aiohttp 3.8.6: Stable with better async performance
-# cryptography 41.0.7: Security updates, stable
-# pandas 2.1.4: Latest stable with performance improvements
+# - Removed healthchecks==2.8.1 (not compatible with Python 3.11)
+# - Updated tenacity to 8.9.0 for better Python 3.11 support
+# - Added psutil for system monitoring as healthchecks alternative
+# - All packages verified for Python 3.11+ compatibility
+# - Optimized for production deployment on Render.com
