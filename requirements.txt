@@ -18,10 +18,10 @@ pydantic==2.5.3
 pydantic-settings==2.1.0
 
 # -------------------------------
-# Google Services Integration
+# Google Services Integration - UPDATED FOR COMPATIBILITY
 # -------------------------------
-gspread==6.0.0
-google-auth==2.23.4
+gspread==5.12.4
+google-auth==2.23.3
 google-api-python-client==2.108.0
 
 # -------------------------------
@@ -86,10 +86,10 @@ urllib3==2.1.0
 cryptography==41.0.7
 
 # -------------------------------
-# Data Validation & Sanitization
+# Data Validation & Sanitization - UPDATED
 # -------------------------------
 jsonschema==4.20.0
-email-validator==2.1.0
+email-validator==2.1.1  # Fixed yanked version
 
 # -------------------------------
 # Database & ORM Support
