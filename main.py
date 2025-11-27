@@ -51,18 +51,6 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 # =============================================================================
-# Import Symbols Reader
-# =============================================================================
-
-try:
-    from symbols_reader import SymbolsReader, fetch_symbols
-    SYMBOLS_READER_AVAILABLE = True
-    logger.info("✅ Symbols Reader imported successfully")
-except ImportError as e:
-    SYMBOLS_READER_AVAILABLE = False
-    logger.warning(f"❌ Symbols Reader not available: {e}")
-
-# =============================================================================
 # Configuration and Constants
 # =============================================================================
 
@@ -70,7 +58,7 @@ except ImportError as e:
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
-# Enhanced logging configuration
+# Enhanced logging configuration - MUST BE BEFORE ANY LOGGER USAGE
 LOG_ENABLE_FILE = os.getenv("LOG_ENABLE_FILE", "false").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.getenv("LOG_FORMAT", "detailed")
@@ -93,6 +81,18 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Import Symbols Reader - NOW WITH PROPER LOGGER
+# =============================================================================
+
+try:
+    from symbols_reader import SymbolsReader, fetch_symbols
+    SYMBOLS_READER_AVAILABLE = True
+    logger.info("✅ Symbols Reader imported successfully")
+except ImportError as e:
+    SYMBOLS_READER_AVAILABLE = False
+    logger.warning(f"❌ Symbols Reader not available: {e}")
 
 # Constants
 SCOPES = [
