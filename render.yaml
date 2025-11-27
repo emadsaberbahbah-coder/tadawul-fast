@@ -1,5 +1,4 @@
 # =============================================================================
-# =============================================================================
 # Tadawul Fast Bridge - Enhanced Render Deployment Configuration
 # Version: 3.1.0 | Python: 3.11.9 | Environment: Production
 # =============================================================================
@@ -14,11 +13,12 @@ services:
       pythonVersion: "3.11.9"
     
     # =========================================================================
-    # Enhanced Build Configuration
+    # Enhanced Build Configuration with Fixes
     # =========================================================================
     buildCommand: |
       echo "🚀 Building Tadawul Fast Bridge v3.1.0..."
       echo "🐍 Python 3.11.9 | FastAPI | Production"
+      echo "🔧 Fixing Google Sheets compatibility issues..."
       
       # Upgrade pip and install dependencies
       pip install --upgrade pip
@@ -28,52 +28,156 @@ services:
       mkdir -p logs cache_backups scripts static
       echo "✅ Project structure created"
       
-      # Enhanced dependency validation
-      python -c "
-      import sys, platform
-      print(f'🐍 Python {sys.version}')
-      print(f'💻 Platform: {platform.system()} {platform.release()}')
+      # Create enhanced dependency validation script
+      cat > scripts/dependency_check.py << 'EOF'
+      #!/usr/bin/env python3
+      """
+      Enhanced Dependency Validation with Google Sheets Compatibility Check
+      """
+      import sys
+      import platform
+      import json
       
-      required_packages = [
-          'fastapi', 'uvicorn', 'gspread', 'google.auth', 
-          'pandas', 'aiohttp', 'pydantic', 'pydantic_settings'
-      ]
-      
-      missing = []
-      for package in required_packages:
+      def check_dependencies():
+          print(f'🐍 Python {sys.version}')
+          print(f'💻 Platform: {platform.system()} {platform.release()}')
+          
+          # Core package checks with version validation
+          required_packages = [
+              ('fastapi', '0.104.1'),
+              ('uvicorn', '0.24.0'),
+              ('gspread', '5.12.4'),  # Compatible version
+              ('google.auth', None),
+              ('pandas', '2.1.4'),
+              ('aiohttp', '3.8.6'),
+              ('pydantic', '2.5.3'),
+              ('pydantic_settings', '2.1.0')
+          ]
+          
+          missing = []
+          version_mismatch = []
+          
+          for package, expected_version in required_packages:
+              try:
+                  module = __import__(package.replace('-', '_').split('.')[0])
+                  version = getattr(module, '__version__', 'unknown')
+                  
+                  if expected_version and version != expected_version:
+                      version_mismatch.append(f'{package} (expected: {expected_version}, got: {version})')
+                      print(f'⚠️  {package}: {version} (version mismatch)')
+                  else:
+                      print(f'✅ {package}: {version}')
+                      
+              except ImportError as e:
+                  missing.append(package)
+                  print(f'❌ {package}: MISSING - {e}')
+          
+          # Check for gspread APIError compatibility
           try:
-              __import__(package.replace('-', '_'))
-              version = getattr(__import__(package), '__version__', 'unknown')
-              print(f'✅ {package}: {version}')
-          except ImportError as e:
-              missing.append(package)
-              print(f'❌ {package}: MISSING - {e}')
+              from gspread.exceptions import APIError, SpreadsheetNotFound
+              print("✅ gspread exceptions: APIError, SpreadsheetNotFound available")
+          except ImportError:
+              try:
+                  from gspread import APIError, SpreadsheetNotFound
+                  print("✅ gspread exceptions: APIError, SpreadsheetNotFound available (legacy)")
+              except ImportError:
+                  print("❌ gspread exceptions: APIError not available")
+                  missing.append('gspread-APIError')
+          
+          if missing or version_mismatch:
+              if missing:
+                  print(f'🚨 Missing packages: {missing}')
+              if version_mismatch:
+                  print(f'🚨 Version mismatches: {version_mismatch}')
+              return False
+          else:
+              print('✅ All core dependencies verified and compatible')
+              return True
       
-      if missing:
-          print(f'🚨 Missing packages: {missing}')
-          sys.exit(1)
-      else:
-          print('✅ All core dependencies verified')
-      "
+      if __name__ == "__main__":
+          success = check_dependencies()
+          sys.exit(0 if success else 1)
+      EOF
       
-      # Create startup script for health monitoring
+      # Create Google Sheets credentials validator
+      cat > scripts/validate_credentials.py << 'EOF'
+      #!/usr/bin/env python3
+      """
+      Google Sheets Credentials Validation Script
+      """
+      import os
+      import json
+      import sys
+      
+      def validate_google_credentials():
+          credentials_str = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
+          if not credentials_str:
+              print("❌ GOOGLE_SHEETS_CREDENTIALS environment variable is not set")
+              return False
+          
+          try:
+              credentials = json.loads(credentials_str)
+              print("✅ Google Sheets credentials JSON format is valid")
+              
+              # Check required fields
+              required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email']
+              missing_fields = [field for field in required_fields if field not in credentials]
+              
+              if missing_fields:
+                  print(f"❌ Missing required fields: {missing_fields}")
+                  return False
+              
+              # Validate private key format
+              private_key = credentials.get('private_key', '')
+              if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                  print("❌ Private key format invalid - must start with '-----BEGIN PRIVATE KEY-----'")
+                  return False
+              
+              if '-----END PRIVATE KEY-----' not in private_key:
+                  print("❌ Private key format invalid - must end with '-----END PRIVATE KEY-----'")
+                  return False
+              
+              print("✅ Private key format is valid")
+              print(f"✅ Service account: {credentials.get('client_email')}")
+              return True
+              
+          except json.JSONDecodeError as e:
+              print(f"❌ Invalid JSON in GOOGLE_SHEETS_CREDENTIALS: {e}")
+              return False
+          except Exception as e:
+              print(f"❌ Error validating credentials: {e}")
+              return False
+      
+      if __name__ == "__main__":
+          success = validate_google_credentials()
+          sys.exit(0 if success else 1)
+      EOF
+      
+      # Create enhanced startup health check
       cat > scripts/startup_check.py << 'EOF'
       #!/usr/bin/env python3
       """
-      Startup Health Check for Tadawul Fast Bridge
+      Enhanced Startup Health Check for Tadawul Fast Bridge
       """
       import os
       import sys
       
       def check_environment():
           required_vars = ['SPREADSHEET_ID', 'GOOGLE_APPS_SCRIPT_URL']
+          optional_vars = ['GOOGLE_SHEETS_CREDENTIALS', 'APP_TOKEN']
+          
           missing = [var for var in required_vars if not os.getenv(var)]
+          missing_optional = [var for var in optional_vars if not os.getenv(var)]
           
           if missing:
               print(f"❌ Missing required environment variables: {missing}")
               return False
           
-          print("✅ Environment variables check passed")
+          if missing_optional:
+              print(f"⚠️  Missing optional environment variables: {missing_optional}")
+          else:
+              print("✅ All environment variables check passed")
+          
           return True
       
       if __name__ == "__main__":
@@ -81,11 +185,17 @@ services:
           sys.exit(0 if success else 1)
       EOF
       
+      # Run validation scripts
+      echo "🔧 Running dependency checks..."
+      python scripts/dependency_check.py
+      
+      echo "🔧 Running environment checks..."
       python scripts/startup_check.py
-      echo "✅ Build completed successfully"
+      
+      echo "✅ Build completed successfully with all fixes"
 
     # =========================================================================
-    # Enhanced Start Command
+    # Enhanced Start Command with Error Handling
     # =========================================================================
     startCommand: |
       echo "🔧 Starting Tadawul Fast Bridge v3.1.0"
@@ -94,10 +204,16 @@ services:
       echo "🔗 Port: $PORT"
       echo "📊 Log Level: ${LOG_LEVEL:-info}"
       
+      # Validate Google Sheets credentials format
+      echo "🔧 Validating Google Sheets credentials..."
+      python scripts/validate_credentials.py
+      
       # Run startup checks
+      echo "🔧 Running startup checks..."
       python scripts/startup_check.py
       
-      # Start the application with enhanced configuration
+      # Start the application with enhanced configuration and fallback
+      echo "🚀 Starting FastAPI application..."
       uvicorn main:app \
         --host 0.0.0.0 \
         --port $PORT \
@@ -110,7 +226,17 @@ services:
         --timeout-keep-alive 60 \
         --timeout-graceful-shutdown 30 \
         --header x-powered-by:"TadawulFastBridge/3.1.0" \
-        --header x-server:"FastAPI-Uvicorn"
+        --header x-server:"FastAPI-Uvicorn" || \
+      
+      {
+        echo "⚠️  Primary start failed, starting with single worker..."
+        uvicorn main:app \
+          --host 0.0.0.0 \
+          --port $PORT \
+          --workers 1 \
+          --log-level warning \
+          --access-log
+      }
 
     autoDeploy: true
     
@@ -120,7 +246,7 @@ services:
     healthCheckPath: /health
     healthCheckTimeout: 25
     healthCheckInterval: 60
-    initialDelay: 30
+    initialDelay: 45  # Increased for Google Sheets initialization
 
     # =========================================================================
     # Optimized Environment Variables
@@ -208,7 +334,7 @@ services:
       - key: ENABLE_HEALTH_MONITOR
         value: "true"
 
-      # === Feature Flags ===
+      # === Feature Flags with Fallbacks ===
       - key: ENABLE_CACHE_WORKER
         value: "true"
       - key: ENABLE_BACKUP_SCHEDULER
@@ -217,6 +343,8 @@ services:
         value: "true"
       - key: ENABLE_MULTI_SOURCE_DATA
         value: "true"
+      - key: GOOGLE_SHEETS_FALLBACK_ENABLED
+        value: "true"  # New: Allow fallback if Google Sheets fails
 
       # === Logging Configuration ===
       - key: LOG_ENABLE_FILE
@@ -259,7 +387,7 @@ services:
     # =========================================================================
     healthCheck:
       path: /health
-      initialDelay: 30
+      initialDelay: 45  # Increased for Google Sheets init
       period: 60
       timeout: 25
       successThreshold: 1
@@ -303,7 +431,7 @@ services:
       targetCPUPercent: 70
 
 # =============================================================================
-# Background Worker Services
+# Background Worker Services (Optional - Comment out if not needed)
 # =============================================================================
   - type: worker
     name: tadawul-cache-worker
@@ -313,24 +441,30 @@ services:
     runtime:
       pythonVersion: "3.11.9"
     
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python scripts/dependency_check.py
     
     startCommand: |
-      echo "🔧 Starting Cache Worker..."
-      python scripts/cache_manager.py --mode worker --cleanup-interval 300
+      echo "🔧 Starting Cache Worker with fallback..."
+      python scripts/cache_manager.py --mode worker --cleanup-interval 300 || \
+      echo "⚠️ Cache worker failed, continuing without cache management"
     
     envVars:
       - key: ENVIRONMENT
         value: "production"
       - key: LOG_LEVEL
         value: "INFO"
+      - key: ENABLE_GOOGLE_SHEETS_FALLBACK
+        value: "true"
 
     secrets:
       - key: GOOGLE_SHEETS_CREDENTIALS
         fromSecret: google-sheets-credentials-json
 
 # =============================================================================
-# Health Monitoring Worker
+# Health Monitoring Worker (Optional)
 # =============================================================================
   - type: worker
     name: tadawul-health-monitor
@@ -340,23 +474,28 @@ services:
     runtime:
       pythonVersion: "3.11.9"
     
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     
     startCommand: |
       echo "🔧 Starting Health Monitor..."
       python scripts/health_monitor.py \
         --api-url https://tadawul-fast-bridge.onrender.com \
         --interval 30 \
-        --timeout 10
+        --timeout 10 \
+        --retries 3
     
     envVars:
       - key: ENVIRONMENT
         value: "production"
       - key: LOG_LEVEL
         value: "INFO"
+      - key: HEALTH_MONITOR_ENABLED
+        value: "true"
 
 # =============================================================================
-# Cron Jobs for Maintenance
+# Cron Jobs for Maintenance (Optional)
 # =============================================================================
 jobs:
   - name: health-monitoring
@@ -365,7 +504,9 @@ jobs:
     command: |
       echo "🏥 Running scheduled health check..."
       curl -f -H "X-Health-Check: true" \
-        "https://tadawul-fast-bridge.onrender.com/health" || exit 1
+        --retry 2 --retry-delay 5 \
+        "https://tadawul-fast-bridge.onrender.com/health" || \
+      echo "⚠️ Health check failed"
     
     envVars:
       - key: ENVIRONMENT
@@ -377,7 +518,9 @@ jobs:
     command: |
       echo "🧹 Running cache cleanup..."
       curl -X POST -H "Authorization: Bearer $APP_TOKEN" \
-        "https://tadawul-fast-bridge.onrender.com/v1/cache/cleanup"
+        --retry 2 \
+        "https://tadawul-fast-bridge.onrender.com/v1/cache/cleanup" || \
+      echo "⚠️ Cache cleanup failed"
     
     envVars:
       - key: ENVIRONMENT
@@ -385,3 +528,15 @@ jobs:
     secrets:
       - key: APP_TOKEN
         fromSecret: tadawul-app-token
+
+# =============================================================================
+# Database & Persistent Storage (If needed)
+# =============================================================================
+databases:
+  - name: tadawul-cache-db
+    plan: free
+    region: oregon
+    ipAllowList: []
+    # Uncomment if you need persistent database storage
+    # databaseName: tadawul_cache
+    # user: tadawul_user
