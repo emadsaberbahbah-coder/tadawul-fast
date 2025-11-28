@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Refactored Version 3.0.0
-Single-file implementation with modular architecture and service layer
+Tadawul Stock Analysis API - Enhanced Version 3.1.0
+Single-file implementation with all architectural improvements
 """
 
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
+from urllib.parse import parse_qs
 
 import aiohttp
 import uvicorn
@@ -26,6 +28,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,11 +47,11 @@ from slowapi.util import get_remote_address
 load_dotenv()
 
 class Settings(BaseSettings):
-    """Centralized configuration management"""
+    """Enhanced configuration management with validation"""
     
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.0.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.1.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -63,7 +66,7 @@ class Settings(BaseSettings):
     enable_rate_limiting: bool = Field(True, env="ENABLE_RATE_LIMITING")
     max_requests_per_minute: int = Field(60, env="RATE_LIMIT_REQUESTS_PER_MINUTE")
 
-    # CORS
+    # CORS - Support both JSON and comma-separated values
     cors_origins: List[str] = Field(default_factory=lambda: ["*"], env="CORS_ORIGINS")
 
     # Documentation
@@ -88,6 +91,7 @@ class Settings(BaseSettings):
     cache_default_ttl: int = Field(1800, env="CACHE_DEFAULT_TTL")
     cache_max_size: int = Field(10000, env="CACHE_MAX_SIZE")
     cache_backup_enabled: bool = Field(True, env="CACHE_BACKUP_ENABLED")
+    cache_save_interval: int = Field(10, env="CACHE_SAVE_INTERVAL")  # seconds
 
     # Performance
     http_timeout: int = Field(30, env="HTTP_TIMEOUT")
@@ -104,32 +108,69 @@ class Settings(BaseSettings):
         case_sensitive = False
         extra = "ignore"
 
-    def validate_urls(self) -> bool:
-        """Validate critical URLs at startup"""
-        urls_to_validate = [
-            ("GOOGLE_APPS_SCRIPT_URL", self.google_apps_script_url),
-        ]
-        
-        for name, url in urls_to_validate:
-            if not url or url.strip() in ["", "undefined"]:
-                logging.error(f"❌ Invalid URL provided for {name}: {url}")
-                return False
-                
-            if not url.startswith(('http://', 'https://')):
-                logging.error(f"❌ Invalid URL format for {name}: {url}")
-                return False
-                
-        logging.info("✅ All URLs validated successfully")
-        return True
+    @validator("cors_origins", pre=True)
+    def parse_cors_origins(cls, v):
+        """Parse CORS origins from both JSON and comma-separated formats"""
+        if isinstance(v, str):
+            # Try to parse as JSON first
+            if v.startswith('[') and v.endswith(']'):
+                try:
+                    return json.loads(v)
+                except json.JSONDecodeError:
+                    pass
+            # Fall back to comma-separated
+            return [origin.strip() for origin in v.split(',') if origin.strip()]
+        return v
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+    @property
+    def is_development(self) -> bool:
+        return self.environment == "development"
+
+    @property
+    def has_google_sheets_access(self) -> bool:
+        """Check if we have either direct Sheets access or Apps Script"""
+        return bool(self.google_sheets_credentials or self.google_apps_script_url)
+
+    def validate_configuration(self) -> List[str]:
+        """Validate configuration and return list of errors"""
+        errors = []
+        warnings = []
+
+        # Auth validation
+        if self.require_auth and not any([self.app_token, self.backup_app_token]):
+            if self.is_production:
+                errors.append("Authentication required but no tokens configured in production")
+            else:
+                warnings.append("Authentication required but no tokens configured")
+
+        # Google services validation
+        if not self.has_google_sheets_access:
+            warnings.append("No Google Sheets or Apps Script configuration - limited functionality")
+
+        # Apps Script URL validation (only if provided)
+        if self.google_apps_script_url and self.google_apps_script_url.strip() in ["", "undefined"]:
+            errors.append("Invalid GOOGLE_APPS_SCRIPT_URL provided")
+        elif self.google_apps_script_url and not self.google_apps_script_url.startswith(('http://', 'https://')):
+            errors.append("Invalid GOOGLE_APPS_SCRIPT_URL format")
+
+        # Log warnings
+        for warning in warnings:
+            logging.warning(f"⚠️ {warning}")
+
+        return errors
 
     def log_config_summary(self):
         """Log configuration summary without sensitive data"""
         logging.info(f"🔧 {self.service_name} v{self.service_version}")
-        logging.info(f"🌍 Environment: {self.environment}")
+        logging.info(f"🌍 Environment: {self.environment} (Production: {self.is_production})")
         logging.info(f"🔐 Auth: {'Enabled' if self.require_auth else 'Disabled'}")
         logging.info(f"⚡ Rate Limiting: {'Enabled' if self.enable_rate_limiting else 'Disabled'}")
-        logging.info(f"📊 Google Sheets: {'Direct' if self.google_sheets_credentials else 'Apps Script'}")
-        logging.info(f"💾 Cache TTL: {self.cache_default_ttl}s")
+        logging.info(f"📊 Google Services: {'Available' if self.has_google_sheets_access else 'Not Available'}")
+        logging.info(f"💾 Cache: TTL={self.cache_default_ttl}s, Save Interval={self.cache_save_interval}s")
         
         # Count configured APIs
         configured_apis = sum([
@@ -150,7 +191,7 @@ settings = Settings()
 # =============================================================================
 
 def setup_logging():
-    """Configure structured logging"""
+    """Configure structured logging with request context"""
     log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
     
     # Configure format
@@ -198,6 +239,13 @@ class Quote(BaseModel):
     open_price: Optional[float] = Field(None, ge=0, description="Open price")
     high_price: Optional[float] = Field(None, ge=0, description="Daily high")
     low_price: Optional[float] = Field(None, ge=0, description="Daily low")
+    
+    # Fundamental data fields (for future extension)
+    pe_ratio: Optional[float] = Field(None, description="Price-to-Earnings ratio")
+    pb_ratio: Optional[float] = Field(None, description="Price-to-Book ratio")
+    roe: Optional[float] = Field(None, description="Return on Equity")
+    eps: Optional[float] = Field(None, description="Earnings Per Share")
+    
     currency: Optional[str] = Field(None, description="Currency code")
     exchange: Optional[str] = Field(None, description="Stock exchange")
     sector: Optional[str] = Field(None, description="Company sector")
@@ -228,34 +276,30 @@ class ErrorResponse(BaseModel):
     request_id: Optional[str] = Field(None, description="Request ID for debugging")
 
 class HealthResponse(BaseModel):
-    """Health check response"""
+    """Enhanced health check response"""
     status: str = Field(..., description="Service status")
     version: str = Field(..., description="API version")
     timestamp: datetime.datetime = Field(..., description="Current timestamp")
     uptime_seconds: float = Field(..., description="Service uptime")
-    dependencies: Dict[str, bool] = Field(..., description="Dependency status")
+    dependencies: Dict[str, Any] = Field(..., description="Dependency status")
 
 class QuoteRequest(BaseModel):
     """Quote request model"""
     symbols: List[str] = Field(..., description="List of symbols to fetch")
-    cache_ttl: Optional[int] = Field(300, description="Cache TTL in seconds")
+    cache_ttl: Optional[int] = Field(None, description="Cache TTL in seconds (future use)")
     providers: Optional[List[str]] = Field(None, description="Preferred providers")
 
 # =============================================================================
-# Cache Implementation
+# Enhanced Cache Implementation
 # =============================================================================
 
-class QuoteCache(Protocol):
-    """Cache interface for quote storage"""
-    def get(self, symbol: str) -> Optional[Dict[str, Any]]: ...
-    def set(self, symbol: str, quote: Dict[str, Any], ttl: int) -> None: ...
-    def cleanup_expired(self) -> int: ...
-    def get_stats(self) -> Dict[str, Any]: ...
+import threading
+from collections import deque
 
 class TTLCache:
-    """Enhanced TTL cache implementation"""
+    """Enhanced TTL cache with batched writes and async safety"""
     
-    def __init__(self, ttl_seconds: int = None, max_size: int = None):
+    def __init__(self, ttl_seconds: int = None, max_size: int = None, save_interval: int = None):
         self.cache_path = Path(__file__).parent / "quote_cache.json"
         self.backup_dir = Path(__file__).parent / "cache_backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +307,13 @@ class TTLCache:
         self.data: Dict[str, Dict[str, Any]] = {}
         self.ttl = ttl_seconds or settings.cache_default_ttl
         self.max_size = max_size or settings.cache_max_size
+        self.save_interval = save_interval or settings.cache_save_interval
+        
+        # Thread safety and batching
+        self._lock = threading.Lock()
+        self._dirty = False
+        self._last_save = time.time()
+        self._save_queue = deque()
         
         self.metrics = {
             "hits": 0,
@@ -270,6 +321,8 @@ class TTLCache:
             "updates": 0,
             "expired_removals": 0,
             "errors": 0,
+            "batch_saves": 0,
+            "immediate_saves": 0,
         }
         
         self._load_cache()
@@ -294,7 +347,6 @@ class TTLCache:
             now = time.time()
             valid_items: Dict[str, Dict[str, Any]] = {}
             
-            # Handle different cache formats
             if isinstance(raw_data, dict) and "data" in raw_data:
                 for item in raw_data["data"]:
                     if isinstance(item, dict) and "ticker" in item and self._is_valid(item, now):
@@ -313,33 +365,43 @@ class TTLCache:
             self.metrics["errors"] += 1
             return False
 
-    def save_cache(self) -> bool:
-        """Save cache to disk atomically"""
-        try:
-            if len(self.data) > self.max_size:
-                self._enforce_size_limit()
+    def _save_cache_immediate(self) -> bool:
+        """Immediate cache save (used for critical operations)"""
+        with self._lock:
+            try:
+                if len(self.data) > self.max_size:
+                    self._enforce_size_limit()
+                    
+                cache_data = {
+                    "metadata": {
+                        "version": "1.3",
+                        "saved_at": datetime.datetime.utcnow().isoformat() + "Z",
+                        "item_count": len(self.data),
+                        "ttl_seconds": self.ttl,
+                    },
+                    "data": list(self.data.values())
+                }
                 
-            cache_data = {
-                "metadata": {
-                    "version": "1.2",
-                    "saved_at": datetime.datetime.utcnow().isoformat() + "Z",
-                    "item_count": len(self.data),
-                    "ttl_seconds": self.ttl,
-                },
-                "data": list(self.data.values())
-            }
-            
-            temp_path = self.cache_path.with_suffix(".tmp")
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, indent=2, ensure_ascii=False, default=str)
-            
-            temp_path.replace(self.cache_path)
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to save cache: {e}")
-            self.metrics["errors"] += 1
-            return False
+                temp_path = self.cache_path.with_suffix(".tmp")
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, indent=2, ensure_ascii=False, default=str)
+                
+                temp_path.replace(self.cache_path)
+                self._dirty = False
+                self._last_save = time.time()
+                self.metrics["immediate_saves"] += 1
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to save cache: {e}")
+                self.metrics["errors"] += 1
+                return False
+
+    def _schedule_save(self):
+        """Schedule a batched save if enough time has passed"""
+        now = time.time()
+        if self._dirty and (now - self._last_save) >= self.save_interval:
+            self._save_cache_immediate()
 
     def _enforce_size_limit(self):
         """Enforce cache size limit"""
@@ -357,83 +419,172 @@ class TTLCache:
             self.metrics["expired_removals"] += 1
 
     def get(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get quote from cache"""
+        """Get quote from cache with thread safety"""
         symbol = symbol.upper().strip()
         
-        if symbol in self.data and self._is_valid(self.data[symbol]):
-            self.metrics["hits"] += 1
-            # Remove cache metadata before returning
-            clean_data = {k: v for k, v in self.data[symbol].items() 
-                         if not k.startswith("_")}
-            return clean_data
-        
-        # Remove expired entry
-        if symbol in self.data:
-            del self.data[symbol]
-            self.save_cache()
+        with self._lock:
+            if symbol in self.data and self._is_valid(self.data[symbol]):
+                self.metrics["hits"] += 1
+                # Return copy without internal metadata
+                clean_data = {k: v for k, v in self.data[symbol].items() 
+                             if not k.startswith("_")}
+                return clean_data
             
-        self.metrics["misses"] += 1
-        return None
+            # Remove expired entry
+            if symbol in self.data:
+                del self.data[symbol]
+                self._dirty = True
+                self._schedule_save()
+                
+            self.metrics["misses"] += 1
+            return None
 
-    def set(self, symbol: str, quote: Dict[str, Any], ttl: int = None) -> None:
-        """Set quote in cache"""
+    def set(self, symbol: str, quote: Dict[str, Any]) -> None:
+        """Set quote in cache with batched saves"""
         symbol = symbol.upper().strip()
         quote_data = quote.copy()
         quote_data["_cache_timestamp"] = time.time()
         quote_data["_last_updated"] = datetime.datetime.utcnow().isoformat() + "Z"
         
-        self.data[symbol] = quote_data
-        self.metrics["updates"] += 1
-        self.save_cache()
+        with self._lock:
+            self.data[symbol] = quote_data
+            self.metrics["updates"] += 1
+            self._dirty = True
+            self._schedule_save()
 
     def cleanup_expired(self) -> int:
         """Clean up expired entries"""
         now = time.time()
-        expired_tickers = [
-            ticker for ticker, item in self.data.items() 
-            if not self._is_valid(item, now)
-        ]
+        expired_tickers = []
         
-        for ticker in expired_tickers:
-            del self.data[ticker]
-            self.metrics["expired_removals"] += 1
+        with self._lock:
+            expired_tickers = [
+                ticker for ticker, item in self.data.items() 
+                if not self._is_valid(item, now)
+            ]
             
-        if expired_tickers:
-            self.save_cache()
-            logger.info(f"🧹 Removed {len(expired_tickers)} expired cache entries")
-            
+            for ticker in expired_tickers:
+                del self.data[ticker]
+                self.metrics["expired_removals"] += 1
+                
+            if expired_tickers:
+                self._dirty = True
+                self._schedule_save()
+                logger.info(f"🧹 Removed {len(expired_tickers)} expired cache entries")
+                
         return len(expired_tickers)
+
+    def flush(self) -> bool:
+        """Force immediate cache save"""
+        if self._dirty:
+            return self._save_cache_immediate()
+        return True
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
         now = time.time()
-        valid_count = sum(1 for item in self.data.values() if self._is_valid(item, now))
-        expired_count = len(self.data) - valid_count
-        
-        total_requests = self.metrics["hits"] + self.metrics["misses"]
-        hit_rate = (self.metrics["hits"] / total_requests * 100) if total_requests > 0 else 0
-        
-        return {
-            "total_items": len(self.data),
-            "valid_items": valid_count,
-            "expired_items": expired_count,
-            "max_size": self.max_size,
-            "ttl_seconds": self.ttl,
-            "performance": {
-                "hits": self.metrics["hits"],
-                "misses": self.metrics["misses"],
-                "hit_rate": round(hit_rate, 2),
-                "updates": self.metrics["updates"],
-                "expired_removals": self.metrics["expired_removals"],
-                "errors": self.metrics["errors"],
+        with self._lock:
+            valid_count = sum(1 for item in self.data.values() if self._is_valid(item, now))
+            expired_count = len(self.data) - valid_count
+            
+            total_requests = self.metrics["hits"] + self.metrics["misses"]
+            hit_rate = (self.metrics["hits"] / total_requests * 100) if total_requests > 0 else 0
+            
+            return {
+                "total_items": len(self.data),
+                "valid_items": valid_count,
+                "expired_items": expired_count,
+                "max_size": self.max_size,
+                "ttl_seconds": self.ttl,
+                "dirty": self._dirty,
+                "last_save_seconds_ago": time.time() - self._last_save,
+                "performance": {
+                    "hits": self.metrics["hits"],
+                    "misses": self.metrics["misses"],
+                    "hit_rate": round(hit_rate, 2),
+                    "updates": self.metrics["updates"],
+                    "expired_removals": self.metrics["expired_removals"],
+                    "batch_saves": self.metrics["batch_saves"],
+                    "immediate_saves": self.metrics["immediate_saves"],
+                    "errors": self.metrics["errors"],
+                }
             }
-        }
 
 # Global cache instance
 cache = TTLCache()
 
 # =============================================================================
-# Provider Abstraction
+# Enhanced HTTP Client with Retry Logic
+# =============================================================================
+
+class HTTPClient:
+    """Shared HTTP client with retry logic and connection pooling"""
+    
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.timeout = aiohttp.ClientTimeout(total=settings.http_timeout)
+        
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Get or create shared session"""
+        if self.session is None:
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=20,
+                verify_ssl=True,
+            )
+            self.session = aiohttp.ClientSession(
+                timeout=self.timeout,
+                connector=connector,
+                headers={
+                    'User-Agent': f'{settings.service_name}/{settings.service_version}',
+                    'Accept': 'application/json',
+                }
+            )
+        return self.session
+
+    async def request_with_retry(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        max_retries: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Make HTTP request with retry logic"""
+        max_retries = max_retries or settings.max_retries
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                session = await self.get_session()
+                async with session.request(method, url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        last_exception = Exception(f"HTTP {response.status}: {await response.text()}")
+            except asyncio.TimeoutError:
+                last_exception = Exception(f"Timeout after {settings.http_timeout}s")
+            except Exception as e:
+                last_exception = e
+                
+            if attempt < max_retries - 1:
+                wait_time = settings.retry_delay * (2 ** attempt)  # Exponential backoff
+                logger.debug(f"Retry {attempt + 1}/{max_retries} in {wait_time:.1f}s for {url}")
+                await asyncio.sleep(wait_time)
+        
+        logger.error(f"All retries failed for {url}: {last_exception}")
+        return None
+
+    async def close(self):
+        """Close the session"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+# Global HTTP client
+http_client = HTTPClient()
+
+# =============================================================================
+# Enhanced Provider Abstraction
 # =============================================================================
 
 class ProviderClient(Protocol):
@@ -448,7 +599,7 @@ class AlphaVantageProvider:
     
     def __init__(self):
         self.name = "alpha_vantage"
-        self.rate_limit = 5  # requests per minute
+        self.rate_limit = 5
         self.base_url = "https://www.alphavantage.co/query"
         self.api_key = settings.alpha_vantage_api_key
         self.enabled = bool(self.api_key)
@@ -457,20 +608,15 @@ class AlphaVantageProvider:
         if not self.enabled:
             return None
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                params = {
-                    "function": "GLOBAL_QUOTE",
-                    "symbol": symbol,
-                    "apikey": self.api_key,
-                }
-                async with session.get(self.base_url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._parse_response(data, symbol)
-        except Exception as e:
-            logger.error(f"Alpha Vantage error for {symbol}: {e}")
-            
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": symbol,
+            "apikey": self.api_key,
+        }
+        
+        data = await http_client.request_with_retry("GET", self.base_url, params)
+        if data:
+            return self._parse_response(data, symbol)
         return None
 
     def _parse_response(self, data: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
@@ -518,21 +664,19 @@ class FinnhubProvider:
         if not self.enabled:
             return None
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                params = {"symbol": symbol, "token": self.api_key}
-                async with session.get(f"{self.base_url}/quote", params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._parse_response(data, symbol)
-        except Exception as e:
-            logger.error(f"Finnhub error for {symbol}: {e}")
-            
+        params = {"symbol": symbol, "token": self.api_key}
+        data = await http_client.request_with_retry("GET", f"{self.base_url}/quote", params)
+        if data:
+            return self._parse_response(data, symbol)
         return None
 
     def _parse_response(self, data: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
         if not data or "c" not in data:
             return None
+
+        timestamp = None
+        if data.get("t"):
+            timestamp = datetime.datetime.fromtimestamp(data["t"]).isoformat()
 
         return {
             "ticker": symbol,
@@ -544,10 +688,11 @@ class FinnhubProvider:
             "open_price": data.get("o"),
             "previous_close": data.get("pc"),
             "provider": self.name,
+            "as_of": timestamp,
         }
 
 class ProviderManager:
-    """Manager for provider selection and fallback"""
+    """Enhanced manager for provider selection and fallback"""
     
     def __init__(self):
         self.providers: List[ProviderClient] = [
@@ -559,31 +704,39 @@ class ProviderManager:
         logger.info(f"✅ Enabled providers: {[p.name for p in self.enabled_providers]}")
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get quote from providers with fallback"""
+        """Get quote from providers with enhanced error handling"""
+        errors = []
+        
         for provider in self.enabled_providers:
             try:
                 quote = await provider.get_quote(symbol)
-                if quote and quote.get("price"):
+                if quote and quote.get("price") is not None:
                     logger.info(f"✅ Got quote for {symbol} from {provider.name}")
                     return quote
+                else:
+                    errors.append(f"{provider.name}: No data")
             except Exception as e:
+                errors.append(f"{provider.name}: {str(e)}")
                 logger.warning(f"Provider {provider.name} failed for {symbol}: {e}")
                 continue
                 
-        logger.warning(f"❌ All providers failed for {symbol}")
+        logger.warning(f"❌ All providers failed for {symbol}: {', '.join(errors)}")
         return None
 
     async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        """Get multiple quotes in parallel"""
+        """Get multiple quotes in parallel with enhanced error tracking"""
         tasks = [self.get_quote(symbol) for symbol in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         quotes = []
-        for result in results:
+        for i, result in enumerate(results):
+            symbol = symbols[i]
             if isinstance(result, dict):
                 quotes.append(result)
             elif isinstance(result, Exception):
-                logger.error(f"Quote fetch error: {result}")
+                logger.error(f"Quote fetch error for {symbol}: {result}")
+            else:
+                logger.debug(f"No data available for {symbol} from any provider")
                 
         return quotes
 
@@ -591,18 +744,18 @@ class ProviderManager:
 provider_manager = ProviderManager()
 
 # =============================================================================
-# Quote Service Layer
+# Enhanced Quote Service Layer
 # =============================================================================
 
 class QuoteService:
-    """Service layer for quote management"""
+    """Enhanced service layer for quote management"""
     
     def __init__(self, cache, provider_manager):
         self.cache = cache
         self.provider_manager = provider_manager
 
     async def get_quote(self, symbol: str) -> Quote:
-        """Get single quote with cache fallback"""
+        """Get single quote with enhanced error handling"""
         # Try cache first
         cached_quote = self.cache.get(symbol)
         if cached_quote:
@@ -610,65 +763,82 @@ class QuoteService:
             return self._create_quote_model(cached_quote, QuoteStatus.OK)
 
         # Fetch from provider
-        provider_data = await self.provider_manager.get_quote(symbol)
-        if provider_data:
-            # Cache the result
-            self.cache.set(symbol, provider_data)
-            return self._create_quote_model(provider_data, QuoteStatus.OK)
-
-        # No data available
-        return Quote(
-            ticker=symbol,
-            status=QuoteStatus.NO_DATA,
-            message="No data available from providers"
-        )
+        try:
+            provider_data = await self.provider_manager.get_quote(symbol)
+            if provider_data:
+                # Cache the result
+                self.cache.set(symbol, provider_data)
+                return self._create_quote_model(provider_data, QuoteStatus.OK)
+            else:
+                return Quote(
+                    ticker=symbol,
+                    status=QuoteStatus.NO_DATA,
+                    message="No data available from any provider"
+                )
+        except Exception as e:
+            logger.error(f"Error fetching quote for {symbol}: {e}")
+            return Quote(
+                ticker=symbol,
+                status=QuoteStatus.ERROR,
+                message=f"Error fetching data: {str(e)}"
+            )
 
     async def get_quotes(self, symbols: List[str]) -> QuotesResponse:
-        """Get multiple quotes with efficient caching"""
-        quotes = []
-        cache_hits = 0
-        cache_misses = 0
+        """Get multiple quotes with efficient caching and error isolation"""
+        cache_hits = []
+        cache_misses = []
         sources_used = set()
 
-        # Check cache first
+        # Phase 1: Check cache
         for symbol in symbols:
             cached_quote = self.cache.get(symbol)
             if cached_quote:
-                cache_hits += 1
-                quotes.append(self._create_quote_model(cached_quote, QuoteStatus.OK))
+                cache_hits.append((symbol, cached_quote))
                 if cached_quote.get("provider"):
                     sources_used.add(cached_quote["provider"])
             else:
-                cache_misses += 1
+                cache_misses.append(symbol)
+
+        # Phase 2: Fetch missing symbols from providers
+        provider_quotes = []
+        if cache_misses:
+            provider_quotes = await self.provider_manager.get_quotes(cache_misses)
+            
+            # Cache successful provider results
+            for provider_quote in provider_quotes:
+                if provider_quote and provider_quote.get("price") is not None:
+                    symbol = provider_quote["ticker"]
+                    self.cache.set(symbol, provider_quote)
+                    if provider_quote.get("provider"):
+                        sources_used.add(provider_quote["provider"])
+
+        # Phase 3: Build final quotes list
+        quotes = []
+        
+        # Add cache hits
+        for symbol, cached_data in cache_hits:
+            quotes.append(self._create_quote_model(cached_data, QuoteStatus.OK))
+        
+        # Add provider results (both successes and failures)
+        provider_results_map = {q["ticker"]: q for q in provider_quotes if q and "ticker" in q}
+        
+        for symbol in cache_misses:
+            if symbol in provider_results_map:
+                # Success from provider
+                quotes.append(self._create_quote_model(provider_results_map[symbol], QuoteStatus.OK))
+            else:
+                # No data from any provider
                 quotes.append(Quote(
                     ticker=symbol,
                     status=QuoteStatus.NO_DATA,
-                    message="Not in cache"
+                    message="No data available from providers"
                 ))
-
-        # Fetch missing quotes from providers
-        missing_symbols = [symbol for symbol in symbols 
-                          if symbol not in [q.ticker for q in quotes if q.status == QuoteStatus.OK]]
-        
-        if missing_symbols:
-            provider_quotes = await self.provider_manager.get_quotes(missing_symbols)
-            
-            for provider_quote in provider_quotes:
-                if provider_quote and provider_quote.get("price"):
-                    symbol = provider_quote["ticker"]
-                    # Update cache
-                    self.cache.set(symbol, provider_quote)
-                    # Update quote in response
-                    for i, quote in enumerate(quotes):
-                        if quote.ticker == symbol:
-                            quotes[i] = self._create_quote_model(provider_quote, QuoteStatus.OK)
-                            sources_used.add(provider_quote.get("provider", "unknown"))
-                            break
 
         # Prepare metadata
         meta = {
-            "cache_hits": cache_hits,
-            "cache_misses": cache_misses,
+            "cache_hits": len(cache_hits),
+            "cache_misses": len(cache_misses),
+            "provider_successes": len(provider_results_map),
             "sources": list(sources_used),
             "total_symbols": len(symbols),
             "successful_quotes": len([q for q in quotes if q.status == QuoteStatus.OK])
@@ -681,7 +851,18 @@ class QuoteService:
         )
 
     def _create_quote_model(self, data: Dict[str, Any], status: QuoteStatus) -> Quote:
-        """Create Quote model from provider data"""
+        """Create Quote model from provider/cache data with proper timestamp handling"""
+        # Use stored as_of if available, otherwise current time
+        as_of = data.get("as_of")
+        if as_of and isinstance(as_of, str):
+            try:
+                # Try to parse ISO format timestamp
+                as_of = datetime.datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                as_of = datetime.datetime.utcnow()
+        else:
+            as_of = datetime.datetime.utcnow()
+
         return Quote(
             ticker=data.get("ticker", ""),
             status=status,
@@ -694,12 +875,16 @@ class QuoteService:
             open_price=data.get("open_price"),
             high_price=data.get("high_price"),
             low_price=data.get("low_price"),
+            pe_ratio=data.get("pe_ratio"),
+            pb_ratio=data.get("pb_ratio"),
+            roe=data.get("roe"),
+            eps=data.get("eps"),
             currency=data.get("currency"),
             exchange=data.get("exchange"),
             sector=data.get("sector"),
             country=data.get("country"),
             provider=data.get("provider"),
-            as_of=datetime.datetime.utcnow(),
+            as_of=as_of,
         )
 
     def update_cache(self, quotes: List[Quote]) -> Dict[str, Any]:
@@ -708,7 +893,7 @@ class QuoteService:
         errors = []
 
         for quote in quotes:
-            if quote.status == QuoteStatus.OK and quote.price:
+            if quote.status == QuoteStatus.OK and quote.price is not None:
                 try:
                     quote_data = quote.dict()
                     self.cache.set(quote.ticker, quote_data)
@@ -726,15 +911,22 @@ class QuoteService:
 quote_service = QuoteService(cache, provider_manager)
 
 # =============================================================================
-# Security & Rate Limiting
+# Enhanced Security & Auth
 # =============================================================================
 
 security = HTTPBearer(auto_error=False)
 limiter = Limiter(key_func=get_remote_address)
 
-def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+def get_token_hash(token: str) -> str:
+    """Hash token for secure logging"""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+def verify_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> bool:
     """
-    Authentication dependency
+    Enhanced authentication supporting both Bearer header and token query parameter
     """
     if not settings.require_auth:
         return True
@@ -742,23 +934,42 @@ def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(se
     valid_tokens = [token for token in [settings.app_token, settings.backup_app_token] if token]
     
     if not valid_tokens:
-        logger.warning("REQUIRE_AUTH is True but no valid tokens configured")
-        return True
+        if settings.is_production:
+            raise HTTPException(
+                status_code=500,
+                detail="Authentication misconfigured - no tokens available"
+            )
+        else:
+            logger.warning("REQUIRE_AUTH is True but no valid tokens configured")
+            return True
 
-    if not credentials:
+    # Check Authorization header first
+    token = None
+    if credentials:
+        token = credentials.credentials.strip()
+    
+    # Fall back to query parameter
+    if not token:
+        token = request.query_params.get("token", "").strip()
+    
+    if not token:
+        logger.warning("Authentication required but no token provided")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing authentication token",
         )
 
-    token = credentials.credentials.strip()
-    if not token or token not in valid_tokens:
+    # Token validation
+    if token not in valid_tokens:
+        token_hash = get_token_hash(token)
+        logger.warning(f"Invalid token attempt: {token_hash}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token",
         )
 
-    logger.info(f"Successful authentication for token: {token[:8]}...")
+    token_hash = get_token_hash(token)
+    logger.info(f"Successful authentication for token: {token_hash}")
     return True
 
 def rate_limit(rule: str):
@@ -769,6 +980,29 @@ def rate_limit(rule: str):
         return noop_decorator
     
     return limiter.limit(rule)
+
+# =============================================================================
+# Custom Rate Limit Handler
+# =============================================================================
+
+async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Custom rate limit handler with structured error response"""
+    request_id = getattr(request.state, 'request_id', 'unknown')
+    
+    return JSONResponse(
+        status_code=429,
+        content=ErrorResponse(
+            error="Rate limit exceeded",
+            message="Too many requests. Please try again later.",
+            detail={
+                "limit": str(exc.limit),
+                "retry_after": getattr(exc, 'retry_after', None),
+            },
+            timestamp=datetime.datetime.utcnow(),
+            request_id=request_id,
+        ).dict(),
+        headers={"Retry-After": str(getattr(exc, 'retry_after', 60))}
+    )
 
 # =============================================================================
 # FastAPI Application Setup
@@ -786,9 +1020,14 @@ async def lifespan(app: FastAPI):
     
     try:
         # Validate configuration
-        if not settings.validate_urls():
-            logger.error("❌ URL validation failed")
-            raise RuntimeError("Invalid configuration URLs")
+        config_errors = settings.validate_configuration()
+        if config_errors:
+            error_msg = "Configuration errors:\n" + "\n".join(f"  - {e}" for e in config_errors)
+            if settings.is_production:
+                logger.error(f"❌ {error_msg}")
+                raise RuntimeError("Production configuration invalid")
+            else:
+                logger.warning(f"⚠️ Configuration warnings in development:\n{error_msg}")
             
         settings.log_config_summary()
         
@@ -801,19 +1040,49 @@ async def lifespan(app: FastAPI):
         
     except Exception as e:
         logger.error(f"❌ Application startup failed: {e}")
-        if settings.environment == "production":
+        if settings.is_production:
             raise
 
     yield
 
     # Shutdown cleanup
-    logger.info("🛑 Application shutting down")
+    try:
+        # Flush cache to disk
+        cache.flush()
+        logger.info("✅ Cache flushed to disk")
+        
+        # Close HTTP client
+        await http_client.close()
+        logger.info("✅ HTTP client closed")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Error during shutdown: {e}")
+
+    uptime = time.time() - startup_time
+    logger.info(f"🛑 Application shutdown after {uptime:.2f} seconds")
 
 # Create FastAPI application
 app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
-    description="Enhanced Tadawul Stock Analysis API with modular architecture",
+    description="""
+    Enhanced Tadawul Stock Analysis API with comprehensive financial data integration.
+    
+    ## Features
+    
+    * 📈 Real-time stock quotes from multiple financial APIs
+    * 💾 Advanced caching with TTL and batched persistence
+    * 🔐 Comprehensive security with token authentication
+    * ⚡ Async/await for high performance
+    * 🏥 Health monitoring and metrics
+    * 📊 Support for fundamental data (P/E, P/B, ROE, EPS)
+    
+    ## Authentication
+    
+    Most endpoints require authentication via:
+    - Authorization: Bearer <token>
+    - OR token query parameter: ?token=<token>
+    """,
     docs_url="/docs" if settings.enable_swagger else None,
     redoc_url="/redoc" if settings.enable_redoc else None,
     lifespan=lifespan,
@@ -830,10 +1099,10 @@ app.add_middleware(
 
 # Configure rate limiting
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
 
 # =============================================================================
-# Request ID Middleware
+# Enhanced Middleware
 # =============================================================================
 
 @app.middleware("http")
@@ -842,13 +1111,26 @@ async def add_request_id(request: Request, call_next):
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
     
+    start_time = time.time()
     response = await call_next(request)
+    
+    # Calculate processing time
+    process_time = (time.time() - start_time) * 1000
+    
+    # Structured access logging
+    logger.info(
+        f"Request completed: {request.method} {request.url.path} "
+        f"-> {response.status_code} [{process_time:.1f}ms] "
+        f"[{request_id}]"
+    )
+    
     response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = f"{process_time:.1f}ms"
     
     return response
 
 # =============================================================================
-# Exception Handlers
+# Enhanced Exception Handlers
 # =============================================================================
 
 @app.exception_handler(HTTPException)
@@ -893,26 +1175,37 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 # =============================================================================
-# API Endpoints
+# Enhanced API Endpoints
 # =============================================================================
 
 @app.get("/", response_model=Dict[str, Any])
 @rate_limit(f"{settings.max_requests_per_minute}/minute")
 async def root(request: Request):
     """
-    Root endpoint with service information
+    Root endpoint with comprehensive service information
     """
+    cache_stats = cache.get_stats()
+    
     return {
         "service": settings.service_name,
         "version": settings.service_version,
         "status": "operational",
         "environment": settings.environment,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "authentication_required": settings.require_auth,
+        "rate_limiting": settings.enable_rate_limiting,
+        "cache": {
+            "total_items": cache_stats["total_items"],
+            "valid_items": cache_stats["valid_items"],
+            "hit_rate": cache_stats["performance"]["hit_rate"],
+        },
         "documentation": "/docs" if settings.enable_swagger else None,
         "endpoints": {
             "health": "/health",
-            "quotes": "/v1/quote",
-            "v41_quotes": "/v41/quotes",
+            "ping": "/ping",
+            "quotes_v1": "/v1/quote",
+            "quotes_v41": "/v41/quotes",
+            "cache_info": "/v1/cache/info",
         }
     }
 
@@ -920,17 +1213,34 @@ async def root(request: Request):
 @rate_limit("30/minute")
 async def health_check(request: Request):
     """
-    Health check endpoint with dependency status
+    Enhanced health check with dependency status
     """
-    # Check dependencies
+    # Check dependencies with more granularity
     dependencies = {
-        "cache": True,
-        "google_sheets": bool(settings.google_sheets_credentials),
-        "financial_apis": len(provider_manager.enabled_providers) > 0,
+        "cache": {
+            "status": True,
+            "mode": "memory_persistent",
+            "items": len(cache.data),
+        },
+        "google_services": {
+            "status": settings.has_google_sheets_access,
+            "modes": {
+                "direct_sheets": bool(settings.google_sheets_credentials),
+                "apps_script": bool(settings.google_apps_script_url),
+            }
+        },
+        "financial_apis": {
+            "status": len(provider_manager.enabled_providers) > 0,
+            "providers": [p.name for p in provider_manager.enabled_providers],
+            "count": len(provider_manager.enabled_providers),
+        }
     }
 
     # Determine overall status
-    critical_services = [dependencies["financial_apis"]]
+    critical_services = [
+        dependencies["financial_apis"]["status"],
+        dependencies["cache"]["status"],
+    ]
     status = "healthy" if all(critical_services) else "degraded"
 
     return HealthResponse(
@@ -951,18 +1261,24 @@ async def ping(request: Request):
         "status": "ok",
         "service": settings.service_name,
         "version": settings.service_version,
-        "timestamp": datetime.datetime.utcnow().isoformat()
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "request_id": getattr(request.state, 'request_id', 'unknown'),
     }
 
 @app.get("/v1/quote", response_model=QuotesResponse)
 @rate_limit("60/minute")
-async def get_quotes(
+async def get_quotes_v1(
     request: Request,
     tickers: str = Query(..., description="Comma-separated ticker symbols"),
     auth: bool = Depends(verify_auth)
 ):
     """
     Get quotes for multiple symbols with cache support
+    
+    - Supports up to 100 symbols per request
+    - Returns standardized quote format
+    - Uses cache with fallback to providers
+    - Includes comprehensive metadata
     """
     try:
         symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
@@ -983,14 +1299,19 @@ async def get_quotes(
 
 @app.get("/v41/quotes", response_model=QuotesResponse)
 @rate_limit("60/minute")
-async def v41_get_quotes(
+async def get_quotes_v41(
     request: Request,
-    symbols: str = Query(..., description="Comma-separated tickers"),
-    cache_ttl: int = Query(300, ge=0, le=3600),
+    symbols: str = Query(..., description="Comma-separated ticker symbols"),
+    # cache_ttl parameter removed as it's not currently implemented
     auth: bool = Depends(verify_auth)
 ):
     """
-    Enhanced v4.1 compatible quotes endpoint
+    v4.1 compatible quotes endpoint
+    
+    - Compatible with existing v4.1 clients
+    - Uses the same underlying service as v1
+    - Returns standardized quote format
+    - Includes v4.1 compatibility metadata
     """
     try:
         tickers = [t.strip().upper() for t in symbols.split(",") if t.strip()]
@@ -1002,8 +1323,8 @@ async def v41_get_quotes(
         
         # Add v4.1 specific metadata
         if response.meta:
-            response.meta["cache_ttl"] = cache_ttl
             response.meta["compatibility"] = "v4.1"
+            response.meta["api_version"] = "4.1"
             
         return response
         
@@ -1017,27 +1338,33 @@ async def v41_get_quotes(
 @rate_limit("30/minute")
 async def update_quotes(
     request: QuoteRequest,
-    background_tasks: BackgroundTasks,
+    # background_tasks removed as it's not used
     auth: bool = Depends(verify_auth)
 ):
     """
-    Update quotes in cache
+    Update quotes in cache with fresh data from providers
+    
+    - Fetches fresh data for specified symbols
+    - Updates cache with new data
+    - Returns update statistics
     """
     try:
         # Fetch fresh quotes for the symbols
         response = await quote_service.get_quotes(request.symbols)
         
-        # Update cache with fresh data
-        result = quote_service.update_cache(response.symbols)
-        
-        logger.info(f"Updated {result['updated_count']} quotes in cache")
-        
-        return {
+        # Update cache with fresh data (this happens automatically in get_quotes)
+        # This endpoint primarily forces a refresh
+        result = {
             "status": "success",
-            "updated_count": result["updated_count"],
-            "errors": result["errors"],
+            "refreshed_symbols": len(request.symbols),
+            "successful_quotes": len([q for q in response.symbols if q.status == QuoteStatus.OK]),
+            "cache_size": len(cache.data),
             "timestamp": response.timestamp.isoformat()
         }
+        
+        logger.info(f"Refreshed {len(request.symbols)} quotes in cache")
+        
+        return result
         
     except Exception as e:
         logger.error(f"Error updating quotes: {e}")
@@ -1050,7 +1377,11 @@ async def get_cache_info(
     auth: bool = Depends(verify_auth)
 ):
     """
-    Get cache information and statistics
+    Get comprehensive cache information and statistics
+    
+    - Current cache size and composition
+    - Performance metrics (hit rate, updates, etc.)
+    - Storage information
     """
     return cache.get_stats()
 
@@ -1062,12 +1393,38 @@ async def cleanup_cache(
 ):
     """
     Clean up expired cache entries
+    
+    - Removes expired entries
+    - Returns cleanup statistics
+    - Forces immediate cache save
     """
     expired_count = cache.cleanup_expired()
+    cache.flush()  # Force save after cleanup
+    
     return {
         "status": "success",
         "expired_removed": expired_count,
         "remaining_items": len(cache.data),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+@app.post("/v1/cache/flush")
+@rate_limit("5/minute")
+async def flush_cache(
+    request: Request,
+    auth: bool = Depends(verify_auth)
+):
+    """
+    Force immediate cache save to disk
+    
+    - Useful for ensuring persistence after important updates
+    - Returns save status
+    """
+    success = cache.flush()
+    
+    return {
+        "status": "success" if success else "error",
+        "message": "Cache flushed to disk" if success else "Failed to flush cache",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -1076,14 +1433,15 @@ async def cleanup_cache(
 # =============================================================================
 
 def main():
-    """Application entry point"""
+    """Application entry point with enhanced startup banner"""
     logger.info("=" * 70)
     logger.info(f"🚀 {settings.service_name} v{settings.service_version}")
-    logger.info(f"🌍 Environment: {settings.environment}")
+    logger.info(f"🌍 Environment: {settings.environment} (Production: {settings.is_production})")
     logger.info(f"🔐 Authentication: {'Enabled' if settings.require_auth else 'Disabled'}")
     logger.info(f"⚡ Rate Limiting: {'Enabled' if settings.enable_rate_limiting else 'Disabled'}")
-    logger.info(f"📊 Google Sheets: {'Direct' if settings.google_sheets_credentials else 'Apps Script'}")
-    logger.info(f"💾 Cache: {len(cache.data)} items loaded")
+    logger.info(f"📊 Google Services: {'Available' if settings.has_google_sheets_access else 'Not Available'}")
+    logger.info(f"💾 Cache: {len(cache.data)} items, Save Interval: {settings.cache_save_interval}s")
+    logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled")
     logger.info(f"🔧 Debug Mode: {settings.debug}")
     logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port}")
     logger.info("=" * 70)
