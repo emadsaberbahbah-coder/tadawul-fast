@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.1.0
-Single-file implementation with all architectural improvements
+Tadawul Stock Analysis API - Enhanced Version 3.1.1
+Production-ready with all architectural improvements and optimizations
 """
 
 import asyncio
@@ -9,26 +9,22 @@ import datetime
 import hashlib
 import json
 import logging
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
-from urllib.parse import parse_qs
 
 import aiohttp
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     HTTPException,
     Query,
     Request,
-    Response,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,7 +47,7 @@ class Settings(BaseSettings):
     
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.1.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.1.1", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -294,10 +290,9 @@ class QuoteRequest(BaseModel):
 # =============================================================================
 
 import threading
-from collections import deque
 
 class TTLCache:
-    """Enhanced TTL cache with batched writes and async safety"""
+    """Enhanced TTL cache with batched writes and thread safety"""
     
     def __init__(self, ttl_seconds: int = None, max_size: int = None, save_interval: int = None):
         self.cache_path = Path(__file__).parent / "quote_cache.json"
@@ -313,7 +308,6 @@ class TTLCache:
         self._lock = threading.Lock()
         self._dirty = False
         self._last_save = time.time()
-        self._save_queue = deque()
         
         self.metrics = {
             "hits": 0,
@@ -321,7 +315,6 @@ class TTLCache:
             "updates": 0,
             "expired_removals": 0,
             "errors": 0,
-            "batch_saves": 0,
             "immediate_saves": 0,
         }
         
@@ -480,6 +473,11 @@ class TTLCache:
             return self._save_cache_immediate()
         return True
 
+    def get_item_count(self) -> int:
+        """Get current item count with thread safety"""
+        with self._lock:
+            return len(self.data)
+
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
         now = time.time()
@@ -504,7 +502,6 @@ class TTLCache:
                     "hit_rate": round(hit_rate, 2),
                     "updates": self.metrics["updates"],
                     "expired_removals": self.metrics["expired_removals"],
-                    "batch_saves": self.metrics["batch_saves"],
                     "immediate_saves": self.metrics["immediate_saves"],
                     "errors": self.metrics["errors"],
                 }
@@ -560,7 +557,8 @@ class HTTPClient:
                     if response.status == 200:
                         return await response.json()
                     else:
-                        last_exception = Exception(f"HTTP {response.status}: {await response.text()}")
+                        error_text = await response.text()
+                        last_exception = Exception(f"HTTP {response.status}: {error_text}")
             except asyncio.TimeoutError:
                 last_exception = Exception(f"Timeout after {settings.http_timeout}s")
             except Exception as e:
@@ -904,7 +902,7 @@ class QuoteService:
         return {
             "updated_count": updated_count,
             "errors": errors,
-            "total_cached": len(self.cache.data)
+            "total_cached": cache.get_item_count()
         }
 
 # Global quote service instance
@@ -1146,8 +1144,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
-            error=exc.detail,
-            message=exc.detail,
+            error=str(exc.detail),  # Convert to string for safety
+            message=str(exc.detail),
             timestamp=datetime.datetime.utcnow(),
             request_id=request_id,
         ).dict(),
@@ -1216,11 +1214,13 @@ async def health_check(request: Request):
     Enhanced health check with dependency status
     """
     # Check dependencies with more granularity
+    cache_stats = cache.get_stats()
     dependencies = {
         "cache": {
             "status": True,
             "mode": "memory_persistent",
-            "items": len(cache.data),
+            "items": cache_stats["total_items"],
+            "hit_rate": cache_stats["performance"]["hit_rate"],
         },
         "google_services": {
             "status": settings.has_google_sheets_access,
@@ -1302,7 +1302,6 @@ async def get_quotes_v1(
 async def get_quotes_v41(
     request: Request,
     symbols: str = Query(..., description="Comma-separated ticker symbols"),
-    # cache_ttl parameter removed as it's not currently implemented
     auth: bool = Depends(verify_auth)
 ):
     """
@@ -1338,7 +1337,6 @@ async def get_quotes_v41(
 @rate_limit("30/minute")
 async def update_quotes(
     request: QuoteRequest,
-    # background_tasks removed as it's not used
     auth: bool = Depends(verify_auth)
 ):
     """
@@ -1352,13 +1350,12 @@ async def update_quotes(
         # Fetch fresh quotes for the symbols
         response = await quote_service.get_quotes(request.symbols)
         
-        # Update cache with fresh data (this happens automatically in get_quotes)
-        # This endpoint primarily forces a refresh
+        # Return refresh statistics
         result = {
             "status": "success",
             "refreshed_symbols": len(request.symbols),
             "successful_quotes": len([q for q in response.symbols if q.status == QuoteStatus.OK]),
-            "cache_size": len(cache.data),
+            "cache_size": cache.get_item_count(),
             "timestamp": response.timestamp.isoformat()
         }
         
@@ -1404,7 +1401,7 @@ async def cleanup_cache(
     return {
         "status": "success",
         "expired_removed": expired_count,
-        "remaining_items": len(cache.data),
+        "remaining_items": cache.get_item_count(),
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -1440,7 +1437,7 @@ def main():
     logger.info(f"🔐 Authentication: {'Enabled' if settings.require_auth else 'Disabled'}")
     logger.info(f"⚡ Rate Limiting: {'Enabled' if settings.enable_rate_limiting else 'Disabled'}")
     logger.info(f"📊 Google Services: {'Available' if settings.has_google_sheets_access else 'Not Available'}")
-    logger.info(f"💾 Cache: {len(cache.data)} items, Save Interval: {settings.cache_save_interval}s")
+    logger.info(f"💾 Cache: {cache.get_item_count()} items, Save Interval: {settings.cache_save_interval}s")
     logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled")
     logger.info(f"🔧 Debug Mode: {settings.debug}")
     logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port}")
