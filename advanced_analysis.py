@@ -1,5 +1,5 @@
 # advanced_analysis.py - Enhanced Multi-source AI Trading Analysis
-# Version: 3.0.1 - Production Ready for Render with Async Support
+# Version: 3.0.2 - Production Ready for Render with Async Support
 # Optimized for memory, performance, and reliability
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import logging
 import time
 import hashlib
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple, Union
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
 from pathlib import Path
@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 import threading
 from collections import deque
 
-import requests  # <-- needed for get_session_sync
+import requests  # needed for get_session_sync
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +87,14 @@ class PriceData:
             1.0 if self.price > 0 else 0.0,
             0.5 if self.volume > 0 else 0.0,
             0.5 if self.high >= self.low else 0.0,
-            0.5 if self.timestamp else 0.0
+            0.5 if self.timestamp else 0.0,
         ])
         self.confidence_score = min(1.0, completeness_score / 2.5)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary with enum handling."""
         result = asdict(self)
-        result['data_quality'] = self.data_quality.value
+        result["data_quality"] = self.data_quality.value
         return result
 
 
@@ -145,7 +145,7 @@ class TechnicalIndicators:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary with enum handling."""
         result = asdict(self)
-        result['data_quality'] = self.data_quality.value
+        result["data_quality"] = self.data_quality.value
         return result
 
 
@@ -185,7 +185,7 @@ class FundamentalData:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary with enum handling."""
         result = asdict(self)
-        result['data_quality'] = self.data_quality.value
+        result["data_quality"] = self.data_quality.value
         return result
 
 
@@ -215,7 +215,7 @@ class AIRecommendation:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary with enum handling."""
         result = asdict(self)
-        result['recommendation'] = self.recommendation.value
+        result["recommendation"] = self.recommendation.value
         return result
 
 
@@ -255,19 +255,33 @@ class AdvancedTradingAnalyzer:
 
         # Base URLs
         self.base_urls = {
-            "alpha_vantage": os.getenv("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"),
-            "finnhub": os.getenv("FINNHUB_BASE_URL", "https://finnhub.io/api/v1"),
-            "eodhd": os.getenv("EODHD_BASE_URL", "https://eodhistoricaldata.com/api"),
-            "twelvedata": os.getenv("TWELVEDATA_BASE_URL", "https://api.twelvedata.com"),
-            "marketstack": os.getenv("MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"),
-            "fmp": os.getenv("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"),
+            "alpha_vantage": os.getenv(
+                "ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"
+            ),
+            "finnhub": os.getenv(
+                "FINNHUB_BASE_URL", "https://finnhub.io/api/v1"
+            ),
+            "eodhd": os.getenv(
+                "EODHD_BASE_URL", "https://eodhistoricaldata.com/api"
+            ),
+            "twelvedata": os.getenv(
+                "TWELVEDATA_BASE_URL", "https://api.twelvedata.com"
+            ),
+            "marketstack": os.getenv(
+                "MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"
+            ),
+            "fmp": os.getenv(
+                "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+            ),
         }
 
         # Google Apps Script integration
         self.google_apps_script_url = os.getenv("GOOGLE_APPS_SCRIPT_URL")
 
         # Configuration with defaults
-        self.cache_ttl = timedelta(minutes=int(os.getenv("ANALYSIS_CACHE_TTL_MINUTES", "15")))
+        self.cache_ttl = timedelta(
+            minutes=int(os.getenv("ANALYSIS_CACHE_TTL_MINUTES", "15"))
+        )
         self.max_cache_size_mb = int(os.getenv("ANALYSIS_MAX_CACHE_SIZE_MB", "100"))
         self.rate_limit_rpm = int(os.getenv("ANALYSIS_RATE_LIMIT_RPM", "60"))
         self.max_retries = int(os.getenv("ANALYSIS_MAX_RETRIES", "3"))
@@ -296,7 +310,7 @@ class AdvancedTradingAnalyzer:
 
         configured_apis = [k for k, v in self.apis.items() if v]
         logger.info(
-            f"AdvancedTradingAnalyzer initialized. "
+            "AdvancedTradingAnalyzer initialized. "
             f"APIs: {configured_apis}, "
             f"Cache TTL: {self.cache_ttl.total_seconds()/60}min, "
             f"Rate Limit: {self.rate_limit_rpm}/min, "
@@ -308,7 +322,9 @@ class AdvancedTradingAnalyzer:
         if self.redis_url:
             try:
                 import redis
-                self.redis_client = redis.from_url(self.redis_url, decode_responses=True)
+                self.redis_client = redis.from_url(
+                    self.redis_url, decode_responses=True
+                )
                 logger.info("Redis cache initialized successfully")
             except ImportError:
                 logger.warning("Redis package not available, using file cache only")
@@ -320,7 +336,9 @@ class AdvancedTradingAnalyzer:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=30)
             connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
-            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, connector=connector
+            )
         return self._session
 
     def get_session_sync(self) -> requests.Session:
@@ -368,7 +386,9 @@ class AdvancedTradingAnalyzer:
                 cached = self.redis_client.get(cache_key)
                 if cached:
                     data = json.loads(cached)
-                    cache_time = datetime.fromisoformat(data.get("timestamp", "2000-01-01"))
+                    cache_time = datetime.fromisoformat(
+                        data.get("timestamp", "2000-01-01")
+                    )
                     if datetime.now() - cache_time < self.cache_ttl:
                         logger.debug(f"Cache hit (Redis): {symbol}_{data_type}")
                         return data.get("data")
@@ -380,7 +400,9 @@ class AdvancedTradingAnalyzer:
             cache_file = self.cache_dir / f"{cache_key}.json"
             if cache_file.exists():
                 data = json.loads(cache_file.read_text(encoding="utf-8"))
-                cache_time = datetime.fromisoformat(data.get("timestamp", "2000-01-01"))
+                cache_time = datetime.fromisoformat(
+                    data.get("timestamp", "2000-01-01")
+                )
                 if datetime.now() - cache_time < self.cache_ttl:
                     logger.debug(f"Cache hit (file): {symbol}_{data_type}")
                     return data.get("data")
@@ -465,29 +487,32 @@ class AdvancedTradingAnalyzer:
     # -------------------------------------------------------------------------
 
     async def _enforce_rate_limit(self):
-        """Enforce rate limiting with async support."""
-        with self._rate_limit_lock:
-            now = time.time()
-            window_start = now - 60  # 1 minute window
+        """Enforce rate limiting with async support (no await inside lock)."""
+        while True:
+            with self._rate_limit_lock:
+                now = time.time()
+                window_start = now - 60  # 1 minute window
 
-            # Clean old timestamps
-            while self.request_timestamps and self.request_timestamps[0] < window_start:
-                self.request_timestamps.popleft()
+                # Clean old timestamps
+                while (
+                    self.request_timestamps
+                    and self.request_timestamps[0] < window_start
+                ):
+                    self.request_timestamps.popleft()
 
-            # Check rate limit
-            if len(self.request_timestamps) >= self.rate_limit_rpm:
-                sleep_time = 60 - (now - self.request_timestamps[0])
-                if sleep_time > 0:
-                    logger.warning(
-                        f"Rate limit exceeded, sleeping for {sleep_time:.2f}s"
-                    )
-                    # release lock while sleeping
-                    self.request_timestamps.append(now)  # optimistic stamp
-                    # sleep outside lock
-                    await asyncio.sleep(sleep_time + 0.1)
+                if len(self.request_timestamps) < self.rate_limit_rpm:
+                    # We can proceed now
+                    self.request_timestamps.append(now)
                     return
 
-            self.request_timestamps.append(now)
+                # Need to wait before issuing new request
+                oldest = self.request_timestamps[0]
+                sleep_time = 60 - (now - oldest)
+
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time + 0.05)
+            else:
+                await asyncio.sleep(0)
 
     async def _make_async_request(
         self,
@@ -1074,7 +1099,7 @@ class AdvancedTradingAnalyzer:
                 stoch_k=self._calculate_stochastic(
                     high_prices, low_prices, close_prices
                 ),
-                stoch_d=0.0,  # Would need full calculation
+                stoch_d=0.0,  # placeholder for full calc
                 cci=self._calculate_cci(high_prices, low_prices, close_prices),
                 adx=float(np.random.uniform(0, 60)),  # Simplified
                 atr=self._calculate_atr(high_prices, low_prices, close_prices),
