@@ -1,7 +1,7 @@
 # google_sheets_service.py
 # =============================================================================
 # Google Sheets Service - Ultimate Investment Dashboard (10 Pages)
-# Version: 2.0.0 - Enhanced for Production with Render Optimizations
+# Version: 2.0.1 - Enhanced for Production with Render Optimizations
 # =============================================================================
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import logging
 import time
 import hashlib
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 import threading
 
@@ -27,6 +27,11 @@ except ImportError as e:
     logger.error(f"Required dependencies not available: {e}")
     gspread = None
     Credentials = None
+    # Provide fallbacks so later "except GoogleAuthError / APIError" won't crash
+    GoogleAuthError = Exception
+    APIError = Exception
+    SpreadsheetNotFound = Exception
+    WorksheetNotFound = Exception
     DEPENDENCIES_AVAILABLE = False
 
 try:
@@ -79,9 +84,18 @@ if PYDANTIC_AVAILABLE:
 else:
     # Fallback classes if Pydantic is not available
     class StockData:
-        def __init__(self, symbol: str, company_name: str, price: float, change: float, 
-                     change_percent: float, volume: int, market_cap: Optional[float] = None,
-                     sector: Optional[str] = None, timestamp: datetime = None):
+        def __init__(
+            self,
+            symbol: str,
+            company_name: str,
+            price: float,
+            change: float,
+            change_percent: float,
+            volume: int,
+            market_cap: Optional[float] = None,
+            sector: Optional[str] = None,
+            timestamp: datetime = None,
+        ):
             self.symbol = symbol
             self.company_name = company_name
             self.price = price
@@ -93,10 +107,16 @@ else:
             self.timestamp = timestamp or datetime.now()
 
     class FinancialData:
-        def __init__(self, symbol: str, revenue: Optional[float] = None, 
-                     net_income: Optional[float] = None, eps: Optional[float] = None,
-                     pe_ratio: Optional[float] = None, dividend_yield: Optional[float] = None,
-                     timestamp: datetime = None):
+        def __init__(
+            self,
+            symbol: str,
+            revenue: Optional[float] = None,
+            net_income: Optional[float] = None,
+            eps: Optional[float] = None,
+            pe_ratio: Optional[float] = None,
+            dividend_yield: Optional[float] = None,
+            timestamp: datetime = None,
+        ):
             self.symbol = symbol
             self.revenue = revenue
             self.net_income = net_income
@@ -106,9 +126,15 @@ else:
             self.timestamp = timestamp or datetime.now()
 
     class TechnicalIndicator:
-        def __init__(self, symbol: str, rsi: Optional[float] = None, macd: Optional[float] = None,
-                     moving_avg_50: Optional[float] = None, moving_avg_200: Optional[float] = None,
-                     timestamp: datetime = None):
+        def __init__(
+            self,
+            symbol: str,
+            rsi: Optional[float] = None,
+            macd: Optional[float] = None,
+            moving_avg_50: Optional[float] = None,
+            moving_avg_200: Optional[float] = None,
+            timestamp: datetime = None,
+        ):
             self.symbol = symbol
             self.rsi = rsi
             self.macd = macd
@@ -117,8 +143,13 @@ else:
             self.timestamp = timestamp or datetime.now()
 
     class SheetUpdate:
-        def __init__(self, sheet_name: str, range: str, values: List[List[Any]], 
-                     timestamp: datetime = None):
+        def __init__(
+            self,
+            sheet_name: str,
+            range: str,
+            values: List[List[Any]],
+            timestamp: datetime = None,
+        ):
             self.sheet_name = sheet_name
             self.range = range
             self.values = values
@@ -131,7 +162,7 @@ else:
 
 class GoogleSheetsService:
     """
-    Ultimate Investment Dashboard – 10-page Google Sheets integration.
+    Ultimate Investment Dashboard – Google Sheets integration.
     Production-ready with enhanced error handling, caching, and performance optimizations.
 
     ENVIRONMENT VARIABLES (Render Compatible):
@@ -143,7 +174,7 @@ class GoogleSheetsService:
 
     MAIN TABS / PAGES:
       1) "KSA Tadawul Market"
-      2) "Global Market Stock" 
+      2) "Global Market Stock"
       3) "Mutual Fund"
       4) "My Portfolio Investment"
       5) "Commodities & FX"
@@ -169,44 +200,47 @@ class GoogleSheetsService:
         if not DEPENDENCIES_AVAILABLE:
             logger.error("Google Sheets dependencies not available - service will operate in fallback mode")
 
-        self.client: Optional[gspread.Client] = None
-        self.spreadsheet: Optional[gspread.Spreadsheet] = None
-        self.worksheets: Dict[str, gspread.Worksheet] = {}
+        self.client: Optional["gspread.Client"] = None
+        self.spreadsheet: Optional["gspread.Spreadsheet"] = None
+        self.worksheets: Dict[str, "gspread.Worksheet"] = {}
         self.initialized: bool = False
         self.initialization_attempted: bool = False
-        
+
         # Enhanced configuration
         self.spreadsheet_id: Optional[str] = spreadsheet_id or self._get_spreadsheet_id()
         self.request_timeout: int = self._get_request_timeout()
-        
+
         # Cache configuration
         self.cache_dir = self._setup_cache_directory()
         self.cache_ttl = self._get_cache_ttl()
         self._cache_lock = threading.RLock()
         self._last_cache_cleanup: float = 0.0
-        
+
         # Request management
         self.last_request_time: float = 0.0
         self.min_request_interval: float = 1.0  # Rate limiting
         self._request_lock = threading.Lock()
-        
+
         # Statistics
         self.request_count: int = 0
         self.error_count: int = 0
         self.success_count: int = 0
-        
+
         logger.info(f"GoogleSheetsService initialized (spreadsheet_id: {self._mask_id(self.spreadsheet_id)})")
 
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
     def _get_spreadsheet_id(self) -> Optional[str]:
         """Get spreadsheet ID with multiple fallback options."""
         env_vars = ["SPREADSHEET_ID", "GOOGLE_SHEETS_ID", "SHEETS_SPREADSHEET_ID"]
-        
+
         for env_var in env_vars:
             value = os.getenv(env_var)
             if value and value.strip():
                 logger.info(f"Using spreadsheet ID from {env_var}")
                 return value.strip()
-        
+
         logger.warning("No spreadsheet ID configured - service will not initialize")
         return None
 
@@ -231,13 +265,13 @@ class GoogleSheetsService:
     def _setup_cache_directory(self) -> Path:
         """Setup cache directory with Render compatibility."""
         cache_base = os.getenv("SHEETS_CACHE_DIR", "/tmp/sheets_cache")
-        
+
         # Prefer /tmp on Render for ephemeral storage
         if os.path.exists("/tmp") and os.access("/tmp", os.W_OK):
             cache_dir = Path("/tmp/sheets_cache")
         else:
             cache_dir = Path(cache_base)
-        
+
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Cache directory: {cache_dir}")
@@ -246,6 +280,9 @@ class GoogleSheetsService:
             logger.warning(f"Could not create cache directory {cache_dir}: {e}")
             return Path("./sheets_cache")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
     def _mask_id(self, value: Optional[str]) -> str:
         """Mask sensitive IDs for logging."""
         if not value:
@@ -257,11 +294,11 @@ class GoogleSheetsService:
         with self._request_lock:
             now = time.time()
             elapsed = now - self.last_request_time
-            
+
             if elapsed < self.min_request_interval:
                 sleep_time = self.min_request_interval - elapsed
                 time.sleep(sleep_time)
-            
+
             self.last_request_time = time.time()
 
     def _get_cache_key(self, sheet_key: str) -> str:
@@ -272,67 +309,71 @@ class GoogleSheetsService:
 
     def _load_from_cache(self, sheet_key: str) -> Optional[List[Dict[str, Any]]]:
         """Load data from cache with validation."""
-        try:
-            cache_file = self.cache_dir / self._get_cache_key(sheet_key)
-            
-            if not cache_file.exists():
+        with self._cache_lock:
+            try:
+                cache_file = self.cache_dir / self._get_cache_key(sheet_key)
+
+                if not cache_file.exists():
+                    return None
+
+                # Check file size (avoid loading huge files)
+                if cache_file.stat().st_size > 5 * 1024 * 1024:  # 5MB limit
+                    logger.warning(f"Cache file too large, ignoring: {cache_file}")
+                    cache_file.unlink(missing_ok=True)
+                    return None
+
+                raw_data = cache_file.read_text(encoding="utf-8")
+                payload = json.loads(raw_data)
+
+                # Validate cache structure
+                if not isinstance(payload, dict) or "timestamp" not in payload or "data" not in payload:
+                    logger.warning("Invalid cache structure, ignoring")
+                    cache_file.unlink(missing_ok=True)
+                    return None
+
+                # Check TTL
+                cache_time = datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
+                if (datetime.now().replace(tzinfo=cache_time.tzinfo) - cache_time).total_seconds() > self.cache_ttl:
+                    return None
+
+                data = payload.get("data", [])
+                if not isinstance(data, list):
+                    return None
+
+                logger.debug(f"Cache hit for {sheet_key}: {len(data)} records")
+                return data
+
+            except Exception as e:
+                logger.debug(f"Cache load failed for {sheet_key}: {e}")
                 return None
-
-            # Check file size (avoid loading huge files)
-            if cache_file.stat().st_size > 5 * 1024 * 1024:  # 5MB limit
-                logger.warning(f"Cache file too large, ignoring: {cache_file}")
-                cache_file.unlink()
-                return None
-
-            raw_data = cache_file.read_text(encoding='utf-8')
-            payload = json.loads(raw_data)
-
-            # Validate cache structure
-            if not isinstance(payload, dict) or 'timestamp' not in payload or 'data' not in payload:
-                logger.warning("Invalid cache structure, ignoring")
-                cache_file.unlink()
-                return None
-
-            # Check TTL
-            cache_time = datetime.fromisoformat(payload['timestamp'].replace('Z', '+00:00'))
-            if (datetime.now().replace(tzinfo=cache_time.tzinfo) - cache_time).total_seconds() > self.cache_ttl:
-                return None
-
-            data = payload.get('data', [])
-            if not isinstance(data, list):
-                return None
-
-            logger.debug(f"Cache hit for {sheet_key}: {len(data)} records")
-            return data
-
-        except Exception as e:
-            logger.debug(f"Cache load failed for {sheet_key}: {e}")
-            return None
 
     def _save_to_cache(self, sheet_key: str, data: List[Dict[str, Any]]) -> bool:
         """Save data to cache with atomic write."""
-        try:
-            cache_file = self.cache_dir / self._get_cache_key(sheet_key)
-            temp_file = cache_file.with_suffix('.tmp')
+        with self._cache_lock:
+            try:
+                self._cleanup_old_cache()
 
-            payload = {
-                'timestamp': datetime.now().isoformat(),
-                'sheet_key': sheet_key,
-                'spreadsheet_id': self.spreadsheet_id,
-                'data': data,
-                'version': '2.0.0'
-            }
+                cache_file = self.cache_dir / self._get_cache_key(sheet_key)
+                temp_file = cache_file.with_suffix(".tmp")
 
-            # Atomic write
-            temp_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
-            temp_file.replace(cache_file)
+                payload = {
+                    "timestamp": datetime.now().isoformat(),
+                    "sheet_key": sheet_key,
+                    "spreadsheet_id": self.spreadsheet_id,
+                    "data": data,
+                    "version": "2.0.1",
+                }
 
-            logger.debug(f"Saved {len(data)} records to cache for {sheet_key}")
-            return True
+                # Atomic write
+                temp_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+                temp_file.replace(cache_file)
 
-        except Exception as e:
-            logger.debug(f"Cache save failed for {sheet_key}: {e}")
-            return False
+                logger.debug(f"Saved {len(data)} records to cache for {sheet_key}")
+                return True
+
+            except Exception as e:
+                logger.debug(f"Cache save failed for {sheet_key}: {e}")
+                return False
 
     def _cleanup_old_cache(self) -> None:
         """Clean up old cache files."""
@@ -349,7 +390,7 @@ class GoogleSheetsService:
                 try:
                     # Delete files older than 24 hours
                     if now - cache_file.stat().st_mtime > 86400:
-                        cache_file.unlink()
+                        cache_file.unlink(missing_ok=True)
                         deleted_count += 1
                 except Exception as e:
                     logger.debug(f"Could not delete cache file {cache_file}: {e}")
@@ -361,9 +402,9 @@ class GoogleSheetsService:
         except Exception as e:
             logger.debug(f"Cache cleanup failed: {e}")
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Enhanced Initialization
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def initialize(self, credentials_json: Optional[str] = None, max_retries: int = 3) -> bool:
         """
         Enhanced initialization with retry logic and better error handling.
@@ -388,12 +429,12 @@ class GoogleSheetsService:
         for attempt in range(max_retries):
             try:
                 self._throttle_requests()
-                
+
                 if credentials_json is None:
                     # Try multiple environment variable options
-                    credentials_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-                    if not credentials_json:
-                        credentials_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+                    credentials_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv(
+                        "GOOGLE_SERVICE_ACCOUNT_JSON"
+                    )
 
                 if not credentials_json:
                     logger.error("No Google Sheets credentials available")
@@ -420,15 +461,17 @@ class GoogleSheetsService:
                 credentials = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
                 self.client = gspread.authorize(credentials)
 
-                # Open spreadsheet with timeout
+                # Open spreadsheet
                 self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
                 self._cache_worksheets()
 
                 self.initialized = True
                 self.initialization_attempted = True
                 self.success_count += 1
-                
-                logger.info(f"✅ Google Sheets service initialized successfully (spreadsheet: {self.spreadsheet.title})")
+
+                logger.info(
+                    f"✅ Google Sheets service initialized successfully (spreadsheet: {self.spreadsheet.title})"
+                )
                 return True
 
             except SpreadsheetNotFound:
@@ -466,10 +509,10 @@ class GoogleSheetsService:
         except Exception as e:
             logger.error(f"❌ Failed to cache worksheets: {e}")
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Enhanced Worksheet Access
-    # -------------------------------------------------------------------------
-    def get_worksheet(self, sheet_name: str, use_cache: bool = True) -> Optional[gspread.Worksheet]:
+    # ------------------------------------------------------------------
+    def get_worksheet(self, sheet_name: str, use_cache: bool = True) -> Optional["gspread.Worksheet"]:
         """Enhanced worksheet access with caching and error handling."""
         if not self.initialized:
             if not self.initialize():
@@ -499,7 +542,7 @@ class GoogleSheetsService:
             logger.error(f"❌ Unexpected error accessing worksheet '{sheet_name}': {e}")
             return None
 
-    def get_sheet_by_key(self, key: str, use_cache: bool = True) -> Optional[gspread.Worksheet]:
+    def get_sheet_by_key(self, key: str, use_cache: bool = True) -> Optional["gspread.Worksheet"]:
         """Get worksheet using logical key from SHEET_NAMES."""
         sheet_name = self.SHEET_NAMES.get(key)
         if not sheet_name:
@@ -507,18 +550,22 @@ class GoogleSheetsService:
             return None
         return self.get_worksheet(sheet_name, use_cache=use_cache)
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Enhanced Data Reading Methods with Caching
-    # -------------------------------------------------------------------------
-    def read_ksa_tadawul_market(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    # ------------------------------------------------------------------
+    def read_ksa_tadawul_market(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced KSA Tadawul Market data reading with caching."""
+        sheet_key = "KSA_TADAWUL"
+
         if use_cache:
-            cached_data = self._load_from_cache("KSA_TADAWUL")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("KSA_TADAWUL")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -533,10 +580,19 @@ class GoogleSheetsService:
 
                 entry = {
                     "ticker": ticker,
-                    "custom_tag": str(row.get("Custom Tag", "")).strip(),
-                    "company_name": str(row.get("Company Name", "")).strip(),
+                    "custom_tag": str(
+                        row.get("Custom Tag")
+                        or row.get("Custom Tag / Watchlist")
+                        or row.get("Watchlist")
+                        or ""
+                    ).strip(),
+                    "company_name": str(
+                        row.get("Company Name") or row.get("Instrument Name") or ""
+                    ).strip(),
                     "sector": str(row.get("Sector", "")).strip(),
-                    "trading_market": str(row.get("Trading Market", "")).strip(),
+                    "trading_market": str(
+                        row.get("Trading Market") or row.get("Market") or ""
+                    ).strip(),
                     "last_price": self._safe_float(row.get("Last Price")),
                     "day_high": self._safe_float(row.get("Day High")),
                     "day_low": self._safe_float(row.get("Day Low")),
@@ -565,9 +621,12 @@ class GoogleSheetsService:
                     "composite_score": self._safe_float(row.get("Composite Score")),
                     "rank": self._safe_int(row.get("Rank")),
                     "recommendation": str(row.get("Recommendation", "")).strip(),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"📈 Read {len(results)} KSA Tadawul rows")
             self.request_count += 1
@@ -575,7 +634,7 @@ class GoogleSheetsService:
 
             # Cache the results
             if use_cache and results:
-                self._save_to_cache("KSA_TADAWUL", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -584,15 +643,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_global_market_stock(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_global_market_stock(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Global Market Stock data reading with caching."""
+        sheet_key = "GLOBAL_MARKET"
+
         if use_cache:
-            cached_data = self._load_from_cache("GLOBAL_MARKET")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("GLOBAL_MARKET")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -607,8 +670,12 @@ class GoogleSheetsService:
 
                 entry = {
                     "ticker": ticker,
-                    "custom_tag": str(row.get("Custom Tag", "")).strip(),
-                    "company_name": str(row.get("Company Name", "")).strip(),
+                    "custom_tag": str(
+                        row.get("Custom Tag") or row.get("Custom Tag / Watchlist") or ""
+                    ).strip(),
+                    "company_name": str(
+                        row.get("Company Name") or row.get("Instrument Name") or ""
+                    ).strip(),
                     "country": str(row.get("Country", "")).strip(),
                     "sector": str(row.get("Sector", "")).strip(),
                     "currency": str(row.get("Currency", "")).strip(),
@@ -645,16 +712,19 @@ class GoogleSheetsService:
                     "composite_score": self._safe_float(row.get("Composite Score")),
                     "rank": self._safe_int(row.get("Rank")),
                     "recommendation": str(row.get("Recommendation", "")).strip(),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"🌍 Read {len(results)} Global Market rows")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("GLOBAL_MARKET", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -663,16 +733,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    # Additional read methods with similar enhancements...
-    def read_mutual_funds(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_mutual_funds(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Mutual Funds data reading with caching."""
+        sheet_key = "MUTUAL_FUND"
+
         if use_cache:
-            cached_data = self._load_from_cache("MUTUAL_FUND")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("MUTUAL_FUND")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -681,7 +754,7 @@ class GoogleSheetsService:
             results: List[Dict[str, Any]] = []
 
             for row in rows:
-                name = str(row.get("Fund Name", "")).strip()
+                name = str(row.get("Fund Name") or row.get("Name") or "").strip()
                 if not name:
                     continue
 
@@ -700,16 +773,19 @@ class GoogleSheetsService:
                     "risk_level": str(row.get("Risk Level", "")).strip(),
                     "manager_comments": str(row.get("Manager Comments", "")).strip(),
                     "recommendation": str(row.get("Recommendation", "")).strip(),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"💼 Read {len(results)} mutual funds")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("MUTUAL_FUND", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -718,15 +794,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_my_portfolio_investment(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_my_portfolio_investment(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Portfolio data reading with caching."""
+        sheet_key = "MY_PORTFOLIO"
+
         if use_cache:
-            cached_data = self._load_from_cache("MY_PORTFOLIO")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("MY_PORTFOLIO")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -741,29 +821,52 @@ class GoogleSheetsService:
 
                 entry = {
                     "ticker": ticker,
-                    "quantity": self._safe_float(row.get("Quantity")),
-                    "buy_price": self._safe_float(row.get("Buy Price")),
-                    "today_price": self._safe_float(row.get("Today's Price")),
-                    "cost_value": self._safe_float(row.get("Cost Value")),
-                    "market_value": self._safe_float(row.get("Market Value")),
-                    "unrealized_pl": self._safe_float(row.get("Unrealized P/L")),
-                    "realized_pl": self._safe_float(row.get("Realized P/L")),
-                    "total_return_pct": self._safe_float(row.get("Total Return %")),
-                    "weight_pct": self._safe_float(row.get("Weight % of Portfolio")),
+                    "quantity": self._safe_float(
+                        row.get("Quantity") or row.get("Total Quantity (Original)")
+                    ),
+                    "buy_price": self._safe_float(
+                        row.get("Buy Price") or row.get("Average Cost per Unit")
+                    ),
+                    "today_price": self._safe_float(
+                        row.get("Today's Price") or row.get("Current Price")
+                    ),
+                    "cost_value": self._safe_float(
+                        row.get("Cost Value") or row.get("Total Invested Capital")
+                    ),
+                    "market_value": self._safe_float(
+                        row.get("Market Value") or row.get("Current Market Value")
+                    ),
+                    "unrealized_pl": self._safe_float(
+                        row.get("Unrealized P/L") or row.get("Unrealized Profit / Loss (Current)")
+                    ),
+                    "realized_pl": self._safe_float(
+                        row.get("Realized P/L") or row.get("Realized Profit / Loss (All Time)")
+                    ),
+                    "total_return_pct": self._safe_float(
+                        row.get("Total Return %") or row.get("ROI Since Inception (%)")
+                    ),
+                    "weight_pct": self._safe_float(
+                        row.get("Weight % of Portfolio")
+                    ),
                     "risk_level": str(row.get("Risk Level", "")).strip(),
                     "confidence_score": self._safe_float(row.get("Confidence Score")),
                     "target_price": self._safe_float(row.get("Target Price")),
-                    "investment_horizon_days": self._safe_int(row.get("Investment Horizon (Days)")),
-                    "timestamp": datetime.now().isoformat()
+                    "investment_horizon_days": self._safe_int(
+                        row.get("Investment Horizon (Days)") or row.get("Holding Period (Days)")
+                    ),
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"📊 Read {len(results)} portfolio positions")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("MY_PORTFOLIO", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -772,15 +875,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_commodities_fx(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_commodities_fx(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Commodities & FX data reading with caching."""
+        sheet_key = "COMMODITIES_FX"
+
         if use_cache:
-            cached_data = self._load_from_cache("COMMODITIES_FX")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("COMMODITIES_FX")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -806,16 +913,19 @@ class GoogleSheetsService:
                     "forecast_roi_3m": self._safe_float(row.get("Forecast ROI 3M")),
                     "economic_sensitivity": str(row.get("Economic Sensitivity", "")).strip(),
                     "recommendation": str(row.get("Recommendation", "")).strip(),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"💱 Read {len(results)} Commodities/FX rows")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("COMMODITIES_FX", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -824,15 +934,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_economic_calendar(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_economic_calendar(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Economic Calendar data reading with caching."""
+        sheet_key = "ECONOMIC_CALENDAR"
+
         if use_cache:
-            cached_data = self._load_from_cache("ECONOMIC_CALENDAR")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("ECONOMIC_CALENDAR")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -854,16 +968,19 @@ class GoogleSheetsService:
                     "previous": str(row.get("Previous", "")).strip(),
                     "impact_level": str(row.get("Impact Level", "")).strip(),
                     "market_relevance": str(row.get("Market Relevance", "")).strip(),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"📅 Read {len(results)} Economic Calendar events")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("ECONOMIC_CALENDAR", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -872,15 +989,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_investment_income_statement_ytd(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_investment_income_statement_ytd(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Income Statement data reading with caching."""
+        sheet_key = "INCOME_STATEMENT"
+
         if use_cache:
-            cached_data = self._load_from_cache("INCOME_STATEMENT")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("INCOME_STATEMENT")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -904,16 +1025,19 @@ class GoogleSheetsService:
                     "total_return": self._safe_float(row.get("Total Return")),
                     "roi_pct": self._safe_float(row.get("ROI %")),
                     "ytd_vs_last_year": self._safe_float(row.get("YTD vs Last Year %")),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"📘 Read {len(results)} Investment Income Statement rows")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("INCOME_STATEMENT", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -922,15 +1046,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_investment_advisor_assumptions(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_investment_advisor_assumptions(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Investment Advisor data reading with caching."""
+        sheet_key = "INVESTMENT_ADVISOR"
+
         if use_cache:
-            cached_data = self._load_from_cache("INVESTMENT_ADVISOR")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("INVESTMENT_ADVISOR")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -953,16 +1081,19 @@ class GoogleSheetsService:
                     "preferred_sectors": str(row.get("Preferred Sectors", "")).strip(),
                     "excluded_sectors": str(row.get("Excluded Sectors", "")).strip(),
                     "market_preference": str(row.get("Market Preference", "")).strip(),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
                 }
                 results.append(entry)
+
+                if limit and len(results) >= limit:
+                    break
 
             logger.info(f"🎯 Read {len(results)} Investment Advisor scenarios")
             self.request_count += 1
             self.success_count += 1
 
             if use_cache and results:
-                self._save_to_cache("INVESTMENT_ADVISOR", results)
+                self._save_to_cache(sheet_key, results)
 
             return results
 
@@ -971,15 +1102,19 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    def read_advanced_analysis_advice(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+    def read_advanced_analysis_advice(
+        self, use_cache: bool = True, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """Enhanced Advanced Analysis data reading with caching."""
+        sheet_key = "ADVANCED_ANALYSIS"
+
         if use_cache:
-            cached_data = self._load_from_cache("ADVANCED_ANALYSIS")
+            cached_data = self._load_from_cache(sheet_key)
             if cached_data is not None:
-                return cached_data
+                return cached_data[:limit] if limit else cached_data
 
         try:
-            ws = self.get_sheet_by_key("ADVANCED_ANALYSIS")
+            ws = self.get_sheet_by_key(sheet_key)
             if not ws:
                 return []
 
@@ -990,11 +1125,15 @@ class GoogleSheetsService:
             self.success_count += 1
 
             # Add timestamp to each row
+            now_iso = datetime.now().isoformat()
             for row in rows:
-                row['timestamp'] = datetime.now().isoformat()
+                row["timestamp"] = now_iso
+
+            if limit:
+                rows = rows[:limit]
 
             if use_cache and rows:
-                self._save_to_cache("ADVANCED_ANALYSIS", rows)
+                self._save_to_cache(sheet_key, rows)
 
             return rows
 
@@ -1003,9 +1142,9 @@ class GoogleSheetsService:
             self.error_count += 1
             return []
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Enhanced Utility Methods
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _safe_float(self, value) -> Optional[float]:
         """Enhanced safe float conversion with Arabic numeral support."""
         if value is None or value == "":
@@ -1015,7 +1154,7 @@ class GoogleSheetsService:
                 # Remove common formatting and Arabic numerals
                 value = value.replace(",", "").replace('"', "").strip()
                 # Convert Arabic numerals to Western
-                arabic_to_english = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+                arabic_to_english = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
                 value = value.translate(arabic_to_english)
             return float(value)
         except (ValueError, TypeError):
@@ -1028,15 +1167,15 @@ class GoogleSheetsService:
         try:
             if isinstance(value, str):
                 value = value.replace(",", "").replace('"', "").strip()
-                arabic_to_english = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+                arabic_to_english = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
                 value = value.translate(arabic_to_english)
             return int(float(value))
         except (ValueError, TypeError):
             return 0
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Enhanced Management Methods
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def get_sheet_info(self) -> Dict[str, Any]:
         """Enhanced spreadsheet metadata with health status."""
         try:
@@ -1053,15 +1192,17 @@ class GoogleSheetsService:
                 "sheets": [],
                 "last_updated": datetime.now().isoformat(),
                 "service_stats": self.get_statistics(),
-                "health_status": "healthy" if self.initialized else "unhealthy"
+                "health_status": "healthy" if self.initialized else "unhealthy",
             }
 
             for name, ws in self.worksheets.items():
-                info["sheets"].append({
-                    "name": name,
-                    "row_count": ws.row_count,
-                    "col_count": ws.col_count,
-                })
+                info["sheets"].append(
+                    {
+                        "name": name,
+                        "row_count": ws.row_count,
+                        "col_count": ws.col_count,
+                    }
+                )
 
             return info
 
@@ -1073,7 +1214,7 @@ class GoogleSheetsService:
         """Get service usage statistics."""
         total_requests = self.request_count
         success_rate = (self.success_count / total_requests * 100) if total_requests > 0 else 0
-        
+
         return {
             "total_requests": total_requests,
             "successful_requests": self.success_count,
@@ -1082,7 +1223,7 @@ class GoogleSheetsService:
             "initialized": self.initialized,
             "worksheets_cached": len(self.worksheets),
             "cache_ttl_seconds": self.cache_ttl,
-            "request_timeout": self.request_timeout
+            "request_timeout": self.request_timeout,
         }
 
     def clear_cache(self, sheet_key: Optional[str] = None) -> Dict[str, Any]:
@@ -1091,7 +1232,7 @@ class GoogleSheetsService:
             if sheet_key:
                 cache_file = self.cache_dir / self._get_cache_key(sheet_key)
                 if cache_file.exists():
-                    cache_file.unlink()
+                    cache_file.unlink(missing_ok=True)
                     return {"status": "cleared", "sheet_key": sheet_key}
                 return {"status": "not_found", "sheet_key": sheet_key}
             else:
@@ -1099,7 +1240,7 @@ class GoogleSheetsService:
                 cache_files = list(self.cache_dir.glob("sheets_cache_*.json"))
                 deleted_count = 0
                 for cache_file in cache_files:
-                    cache_file.unlink()
+                    cache_file.unlink(missing_ok=True)
                     deleted_count += 1
                 return {"status": "cleared", "deleted_count": deleted_count}
         except Exception as e:
@@ -1108,12 +1249,12 @@ class GoogleSheetsService:
 
     def health_check(self) -> Dict[str, Any]:
         """Comprehensive health check."""
-        health_status = {
+        health_status: Dict[str, Any] = {
             "service_initialized": self.initialized,
             "dependencies_available": DEPENDENCIES_AVAILABLE,
             "spreadsheet_id_configured": bool(self.spreadsheet_id),
             "worksheets_accessible": False,
-            "last_checked": datetime.now().isoformat()
+            "last_checked": datetime.now().isoformat(),
         }
 
         if self.initialized and self.spreadsheet:
@@ -1156,7 +1297,7 @@ class GoogleSheetsService:
     def close(self) -> None:
         """Cleanup resources."""
         try:
-            if hasattr(self, 'client') and self.client:
+            if getattr(self, "client", None):
                 # gspread client doesn't have explicit close, but we can clear caches
                 self.worksheets.clear()
                 logger.info("Google Sheets service resources cleaned up")
@@ -1177,69 +1318,73 @@ except Exception as e:
 
 
 # Convenience functions for backward compatibility
-def get_ksa_tadawul_data(use_cache: bool = True) -> List[Dict[str, Any]]:
+def get_ksa_tadawul_data(use_cache: bool = True, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Convenience function for KSA Tadawul data."""
     if google_sheets_service is None:
         logger.error("GoogleSheetsService not available")
         return []
-    return google_sheets_service.read_ksa_tadawul_market(use_cache=use_cache)
+    return google_sheets_service.read_ksa_tadawul_market(use_cache=use_cache, limit=limit)
 
 
-def get_global_market_data(use_cache: bool = True) -> List[Dict[str, Any]]:
+def get_global_market_data(use_cache: bool = True, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Convenience function for Global Market data."""
     if google_sheets_service is None:
         logger.error("GoogleSheetsService not available")
         return []
-    return google_sheets_service.read_global_market_stock(use_cache=use_cache)
+    return google_sheets_service.read_global_market_stock(use_cache=use_cache, limit=limit)
 
 
-def health_check() -> Dict[str, Any]:
+def health_check_global() -> Dict[str, Any]:
     """Convenience function for health checks."""
     if google_sheets_service is None:
         return {
             "service_initialized": False,
-            "error": "GoogleSheetsService not initialized"
+            "error": "GoogleSheetsService not initialized",
         }
     return google_sheets_service.health_check()
 
 
 if __name__ == "__main__":
     # Enhanced test functionality
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
     service = GoogleSheetsService()
-    
+
     try:
-        # Test health check
-        print("=== Health Check ===")
-        health = service.health_check()
-        print(f"Health: {health}")
-        
+        # Test health check BEFORE init (should show not initialized)
+        print("=== Health Check (pre-init) ===")
+        print(service.health_check())
+
         # Test initialization
         print("\n=== Initialization ===")
         if service.initialize():
             print("✅ Service initialized successfully")
-            
+
             # Test sheet info
             print("\n=== Sheet Info ===")
             info = service.get_sheet_info()
             print(f"Spreadsheet: {info.get('spreadsheet_title', 'Unknown')}")
             print(f"Sheets: {[s['name'] for s in info.get('sheets', [])]}")
-            
+
             # Test data reading
-            print("\n=== Test Data Reading ===")
+            print("\n=== Test Data Reading (KSA Tadawul, 2 rows) ===")
             ksa_data = service.read_ksa_tadawul_market(limit=2)
-            print(f"KSA Data Samples: {len(ksa_data)}")
-            
+            print(f"Rows fetched: {len(ksa_data)}")
+            if ksa_data:
+                print("Sample row:", ksa_data[0])
+
             # Test statistics
             print("\n=== Statistics ===")
             stats = service.get_statistics()
             for key, value in stats.items():
                 print(f"{key}: {value}")
-                
+
         else:
             print("❌ Service initialization failed")
-            
+
     except Exception as e:
         print(f"❌ Test failed: {e}")
     finally:
