@@ -71,7 +71,7 @@
     .header {
       display: flex;
       align-items: flex-start;
-      justify-content: between;
+      justify-content: space-between;
       margin-bottom: 20px;
     }
 
@@ -96,6 +96,11 @@
       border-radius: 50%;
       background: currentColor;
       animation: pulse 2s infinite;
+    }
+
+    .badge.success {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--success);
     }
 
     .badge.warning {
@@ -160,12 +165,13 @@
     .endpoint {
       display: flex;
       align-items: center;
-      justify-content: between;
+      justify-content: space-between;
       padding: 12px 16px;
       background: rgba(30, 41, 59, 0.3);
       border-radius: 8px;
       margin-bottom: 8px;
       transition: background 0.2s ease;
+      gap: 12px;
     }
 
     .endpoint:hover {
@@ -196,11 +202,15 @@
       font-family: 'Courier New', monospace;
       color: var(--text-primary);
       flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .endpoint-desc {
       color: var(--text-muted);
       font-size: 0.875rem;
+      white-space: nowrap;
     }
 
     .status-card {
@@ -280,13 +290,21 @@
         grid-template-columns: 1fr;
         gap: 20px;
       }
-      
+
       h1 {
         font-size: 2rem;
       }
-      
+
       .features {
         grid-template-columns: 1fr;
+      }
+
+      .endpoint-path {
+        max-width: 100%;
+      }
+
+      .endpoint-desc {
+        display: none;
       }
     }
   </style>
@@ -300,10 +318,10 @@
             <span id="statusText">Checking Status...</span>
           </div>
         </div>
-        
+
         <h1>Tadawul Fast Bridge</h1>
         <div class="subtitle">
-          Real-time Saudi stock market data API with Google Sheets integration. 
+          Real-time Saudi stock market data API with Google Sheets integration.
           Fast, reliable, and secure financial data bridge.
         </div>
 
@@ -358,12 +376,17 @@
           <div class="endpoint">
             <span class="endpoint-method method-get">GET</span>
             <span class="endpoint-path">/v1/quote?tickers=7201.SR,1211.SR</span>
-            <span class="endpoint-desc">Stock quotes</span>
+            <span class="endpoint-desc">Stock quotes (multi-source)</span>
           </div>
           <div class="endpoint">
             <span class="endpoint-method method-get">GET</span>
             <span class="endpoint-path">/v1/tadawul/market?limit=50</span>
-            <span class="endpoint-desc">Saudi market data</span>
+            <span class="endpoint-desc">Saudi market data snapshot</span>
+          </div>
+          <div class="endpoint">
+            <span class="endpoint-method method-post">POST</span>
+            <span class="endpoint-path">/v1/argaam/quotes</span>
+            <span class="endpoint-desc">Fundamentals via Argaam</span>
           </div>
         </div>
 
@@ -373,7 +396,7 @@
           </div>
           <div class="tech-stack">
             <span class="tech-tag">FastAPI</span>
-            <span class="tech-tag">Python</span>
+            <span class="tech-tag">Python 3.11</span>
             <span class="tech-tag">Google Sheets</span>
             <span class="tech-tag">Redis Cache</span>
             <span class="tech-tag">JWT Auth</span>
@@ -389,7 +412,7 @@
       <div style="color: var(--text-muted); margin-bottom: 24px; font-size: 0.875rem;">
         Real-time service monitoring
       </div>
-      
+
       <div class="status-metrics">
         <div class="metric">
           <div class="metric-value" id="responseTime">--</div>
@@ -412,7 +435,7 @@
       <div style="margin-top: 20px; padding: 16px; background: rgba(30, 41, 59, 0.3); border-radius: 8px;">
         <div style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 8px;">Version Info</div>
         <div style="font-family: 'Courier New', monospace; font-size: 0.875rem;">
-          <div>Tadawul Fast Bridge <span id="version">v2.4.0</span></div>
+          <div>Tadawul Fast Bridge <span id="version">v3.1.0</span></div>
           <div>Environment: <span id="environment">production</span></div>
         </div>
       </div>
@@ -426,7 +449,7 @@
         const startTime = performance.now();
         const response = await fetch('/health');
         const endTime = performance.now();
-        
+
         if (response.ok) {
           const data = await response.json();
           updateStatus('success', 'API Server Online', data);
@@ -443,38 +466,54 @@
     function updateStatus(status, text, data) {
       const badge = document.getElementById('statusBadge');
       const statusText = document.getElementById('statusText');
-      
+
       badge.className = 'badge';
       badge.classList.add(status);
       statusText.textContent = text;
-      
+
       if (data) {
-        document.getElementById('version').textContent = data.version || 'v2.4.0';
+        document.getElementById('version').textContent = data.version || 'v3.1.0';
         document.getElementById('environment').textContent = data.environment || 'production';
       }
     }
 
     function updateMetrics(data, responseTime) {
-      // Update response time
       document.getElementById('responseTime').textContent = `${responseTime}ms`;
-      
-      // Update other metrics
-      if (data && data.performance) {
-        document.getElementById('uptime').textContent = formatUptime(data.uptime_seconds);
-        document.getElementById('requests').textContent = formatNumber(data.performance.total_requests);
-        
-        if (data.cache_status) {
-          document.getElementById('cacheSize').textContent = formatNumber(data.cache_status.valid_items);
-        }
+
+      if (!data) return;
+
+      // Uptime: support uptime_seconds or uptime
+      const uptimeSeconds = data.uptime_seconds || data.uptime || 0;
+      document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
+
+      // Requests: prefer data.performance.total_requests, else derive from cache_status.performance
+      let totalRequests = 0;
+      if (data.performance && typeof data.performance.total_requests === 'number') {
+        totalRequests = data.performance.total_requests;
+      } else if (data.cache_status && data.cache_status.performance) {
+        const p = data.cache_status.performance;
+        const hits = typeof p.hits === 'number' ? p.hits : 0;
+        const misses = typeof p.misses === 'number' ? p.misses : 0;
+        totalRequests = hits + misses;
+      }
+      document.getElementById('requests').textContent = formatNumber(totalRequests);
+
+      // Cache size: valid_items or total_items
+      if (data.cache_status) {
+        const cs = data.cache_status;
+        const cacheItems = (typeof cs.valid_items === 'number' && cs.valid_items > 0)
+          ? cs.valid_items
+          : (cs.total_items || 0);
+        document.getElementById('cacheSize').textContent = formatNumber(cacheItems);
       }
     }
 
     function formatUptime(seconds) {
       if (!seconds) return '--';
-      
+
       const days = Math.floor(seconds / 86400);
       const hours = Math.floor((seconds % 86400) / 3600);
-      
+
       if (days > 0) {
         return `${days}d ${hours}h`;
       } else if (hours > 0) {
@@ -486,7 +525,7 @@
 
     function formatNumber(num) {
       if (!num) return '0';
-      
+
       if (num >= 1000000) {
         return (num / 1000000).toFixed(1) + 'M';
       } else if (num >= 1000) {
@@ -497,17 +536,17 @@
 
     // Initial health check
     checkHealth();
-    
+
     // Refresh health status every 30 seconds
     setInterval(checkHealth, 30000);
-    
+
     // Add some interactive effects
     document.addEventListener('DOMContentLoaded', function() {
       const cards = document.querySelectorAll('.card');
       cards.forEach((card, index) => {
         card.style.opacity = '0';
         card.style.transform = 'translateY(20px)';
-        
+
         setTimeout(() => {
           card.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
           card.style.opacity = '1';
