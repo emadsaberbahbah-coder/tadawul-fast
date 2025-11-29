@@ -742,6 +742,21 @@ class ProviderManager:
 provider_manager = ProviderManager()
 
 # =============================================================================
+# Tadawul Helper
+# =============================================================================
+
+def is_tadawul_symbol(symbol: str) -> bool:
+    """
+    Basic Tadawul symbol detector.
+
+    Tadawul tickers in this project are expected to end with '.SR',
+    e.g. '2222.SR', '1120.SR', etc.
+    """
+    if not symbol:
+        return False
+    return symbol.strip().upper().endswith(".SR")
+
+# =============================================================================
 # Enhanced Quote Service Layer
 # =============================================================================
 
@@ -754,41 +769,84 @@ class QuoteService:
 
     async def get_quote(self, symbol: str) -> Quote:
         """Get single quote with enhanced error handling"""
-        # Try cache first
-        cached_quote = self.cache.get(symbol)
+        # Normalize symbol
+        symbol_norm = symbol.strip().upper()
+
+        # Handle Tadawul upfront – providers on current plan don't support .SR
+        if is_tadawul_symbol(symbol_norm):
+            logger.info(f"Tadawul symbol detected with no enabled providers: {symbol_norm}")
+            return Quote(
+                ticker=symbol_norm,
+                status=QuoteStatus.NO_DATA,
+                currency="SAR",
+                exchange="TADAWUL",
+                message=(
+                    "Tadawul (.SR) market data is not enabled on the current data provider plan. "
+                    "Global / US symbols (e.g. AAPL, MSFT) are supported."
+                ),
+            )
+
+        # Try cache first for non-Tadawul
+        cached_quote = self.cache.get(symbol_norm)
         if cached_quote:
-            logger.debug(f"Cache hit for {symbol}")
+            logger.debug(f"Cache hit for {symbol_norm}")
             return self._create_quote_model(cached_quote, QuoteStatus.OK)
 
         # Fetch from provider
         try:
-            provider_data = await self.provider_manager.get_quote(symbol)
+            provider_data = await self.provider_manager.get_quote(symbol_norm)
             if provider_data:
                 # Cache the result
-                self.cache.set(symbol, provider_data)
+                self.cache.set(symbol_norm, provider_data)
                 return self._create_quote_model(provider_data, QuoteStatus.OK)
             else:
                 return Quote(
-                    ticker=symbol,
+                    ticker=symbol_norm,
                     status=QuoteStatus.NO_DATA,
                     message="No data available from any provider"
                 )
         except Exception as e:
-            logger.error(f"Error fetching quote for {symbol}: {e}")
+            logger.error(f"Error fetching quote for {symbol_norm}: {e}")
             return Quote(
-                ticker=symbol,
+                ticker=symbol_norm,
                 status=QuoteStatus.ERROR,
                 message=f"Error fetching data: {str(e)}"
             )
 
     async def get_quotes(self, symbols: List[str]) -> QuotesResponse:
         """Get multiple quotes with efficient caching and error isolation"""
-        cache_hits = []
-        cache_misses = []
+        cache_hits: List[Tuple[str, Dict[str, Any]]] = []
+        cache_misses: List[str] = []
         sources_used = set()
 
-        # Phase 1: Check cache
-        for symbol in symbols:
+        # Separate Tadawul and non-Tadawul symbols
+        original_symbols = symbols
+        tadawul_quotes: List[Quote] = []
+        normal_symbols: List[str] = []
+
+        for raw_symbol in original_symbols:
+            sym = raw_symbol.strip().upper()
+            if not sym:
+                continue
+            if is_tadawul_symbol(sym):
+                logger.info(f"Tadawul symbol detected with no enabled providers: {sym}")
+                tadawul_quotes.append(
+                    Quote(
+                        ticker=sym,
+                        status=QuoteStatus.NO_DATA,
+                        currency="SAR",
+                        exchange="TADAWUL",
+                        message=(
+                            "Tadawul (.SR) market data is not enabled on the current data provider "
+                            "plan. Global / US symbols (e.g. AAPL, MSFT) are supported."
+                        ),
+                    )
+                )
+            else:
+                normal_symbols.append(sym)
+
+        # Phase 1: Check cache for non-Tadawul symbols
+        for symbol in normal_symbols:
             cached_quote = self.cache.get(symbol)
             if cached_quote:
                 cache_hits.append((symbol, cached_quote))
@@ -798,7 +856,7 @@ class QuoteService:
                 cache_misses.append(symbol)
 
         # Phase 2: Fetch missing symbols from providers
-        provider_quotes = []
+        provider_quotes: List[Dict[str, Any]] = []
         if cache_misses:
             provider_quotes = await self.provider_manager.get_quotes(cache_misses)
             
@@ -810,8 +868,8 @@ class QuoteService:
                     if provider_quote.get("provider"):
                         sources_used.add(provider_quote["provider"])
 
-        # Phase 3: Build final quotes list
-        quotes = []
+        # Phase 3: Build final quotes list for non-Tadawul symbols
+        quotes: List[Quote] = []
         
         # Add cache hits
         for symbol, cached_data in cache_hits:
@@ -832,19 +890,22 @@ class QuoteService:
                     message="No data available from providers"
                 ))
 
+        # Combine Tadawul + non-Tadawul quotes
+        all_quotes = quotes + tadawul_quotes
+
         # Prepare metadata
         meta = {
             "cache_hits": len(cache_hits),
             "cache_misses": len(cache_misses),
             "provider_successes": len(provider_results_map),
             "sources": list(sources_used),
-            "total_symbols": len(symbols),
-            "successful_quotes": len([q for q in quotes if q.status == QuoteStatus.OK])
+            "total_symbols": len(original_symbols),
+            "successful_quotes": len([q for q in all_quotes if q.status == QuoteStatus.OK])
         }
 
         return QuotesResponse(
             timestamp=datetime.datetime.utcnow(),
-            symbols=quotes,
+            symbols=all_quotes,
             meta=meta
         )
 
