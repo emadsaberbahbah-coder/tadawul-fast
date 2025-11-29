@@ -1,5 +1,5 @@
 # advanced_analysis.py - Enhanced Multi-source AI Trading Analysis
-# Version: 3.0.0 - Production Ready for Render with Async Support
+# Version: 3.0.1 - Production Ready for Render with Async Support
 # Optimized for memory, performance, and reliability
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import threading
 from collections import deque
+
+import requests  # <-- needed for get_session_sync
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +70,18 @@ class PriceData:
     confidence_score: float = 0.0
 
     def __post_init__(self):
-        """Validate price data and calculate confidence."""
+        """Validate price data, normalize enums, and calculate confidence."""
+        # Normalize DataQuality if loaded from cache as string
+        if isinstance(self.data_quality, str):
+            try:
+                self.data_quality = DataQuality(self.data_quality)
+            except ValueError:
+                self.data_quality = DataQuality.MEDIUM
+
         self.symbol = self.symbol.upper().strip()
         if self.price <= 0:
             raise ValueError("Price must be positive")
-        
+
         # Calculate confidence based on data completeness
         completeness_score = sum([
             1.0 if self.price > 0 else 0.0,
@@ -118,10 +127,17 @@ class TechnicalIndicators:
     calculation_timestamp: str = None
 
     def __post_init__(self):
-        """Set calculation timestamp and validate indicators."""
+        """Set calculation timestamp, normalize enums, and validate indicators."""
+        # Normalize DataQuality if loaded from cache as string
+        if isinstance(self.data_quality, str):
+            try:
+                self.data_quality = DataQuality(self.data_quality)
+            except ValueError:
+                self.data_quality = DataQuality.MEDIUM
+
         if not self.calculation_timestamp:
             self.calculation_timestamp = datetime.utcnow().isoformat() + "Z"
-        
+
         # Validate RSI range
         if not (0 <= self.rsi <= 100):
             logger.warning(f"RSI out of expected range: {self.rsi}")
@@ -155,7 +171,14 @@ class FundamentalData:
     last_updated: str = None
 
     def __post_init__(self):
-        """Set last updated timestamp."""
+        """Set last updated timestamp and normalize enums."""
+        # Normalize DataQuality if loaded from cache as string
+        if isinstance(self.data_quality, str):
+            try:
+                self.data_quality = DataQuality(self.data_quality)
+            except ValueError:
+                self.data_quality = DataQuality.MEDIUM
+
         if not self.last_updated:
             self.last_updated = datetime.utcnow().isoformat() + "Z"
 
@@ -207,7 +230,6 @@ class AdvancedTradingAnalyzer:
     Features:
     - Async HTTP requests for better performance
     - Memory-efficient data processing
-    - Circuit breaker pattern for API failures
     - Enhanced caching with multiple backends
     - Rate limiting and request throttling
     - Comprehensive error handling and fallbacks
@@ -257,7 +279,7 @@ class AdvancedTradingAnalyzer:
         # Cache configuration
         self.cache_dir = Path("./analysis_cache")
         self.cache_dir.mkdir(exist_ok=True)
-        
+
         # Redis support for distributed caching
         self.redis_url = os.getenv("REDIS_URL")
         self.redis_client = None
@@ -277,7 +299,8 @@ class AdvancedTradingAnalyzer:
             f"AdvancedTradingAnalyzer initialized. "
             f"APIs: {configured_apis}, "
             f"Cache TTL: {self.cache_ttl.total_seconds()/60}min, "
-            f"Rate Limit: {self.rate_limit_rpm}/min"
+            f"Rate Limit: {self.rate_limit_rpm}/min, "
+            f"Max Retries: {self.max_retries}"
         )
 
     def _init_redis(self):
@@ -307,12 +330,12 @@ class AdvancedTradingAnalyzer:
             # Configure retry strategy
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
-            
+
             retry_strategy = Retry(
                 total=3,
                 status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "POST"],
-                backoff_factor=1
+                allowed_methods=frozenset(["GET", "POST"]),
+                backoff_factor=1,
             )
             adapter = HTTPAdapter(max_retries=retry_strategy)
             self._session_sync.mount("http://", adapter)
@@ -338,7 +361,7 @@ class AdvancedTradingAnalyzer:
     async def _load_from_cache(self, symbol: str, data_type: str) -> Optional[Any]:
         """Load from cache with Redis fallback."""
         cache_key = self._get_cache_key(symbol, data_type)
-        
+
         # Try Redis first
         if self.redis_client:
             try:
@@ -373,7 +396,7 @@ class AdvancedTradingAnalyzer:
             "timestamp": datetime.now().isoformat(),
             "symbol": symbol,
             "data_type": data_type,
-            "data": data
+            "data": data,
         }
 
         # Try Redis first
@@ -382,7 +405,7 @@ class AdvancedTradingAnalyzer:
                 self.redis_client.setex(
                     cache_key,
                     int(self.cache_ttl.total_seconds()),
-                    json.dumps(cache_data, default=str)
+                    json.dumps(cache_data, default=str),
                 )
                 return
             except Exception as e:
@@ -394,8 +417,10 @@ class AdvancedTradingAnalyzer:
             # Check cache size before writing
             if self._get_cache_size_mb() > self.max_cache_size_mb:
                 self._cleanup_old_cache_files()
-            
-            cache_file.write_text(json.dumps(cache_data, indent=2, default=str), encoding="utf-8")
+
+            cache_file.write_text(
+                json.dumps(cache_data, indent=2, default=str), encoding="utf-8"
+            )
         except Exception as e:
             logger.debug(f"File cache write failed: {e}")
 
@@ -413,23 +438,25 @@ class AdvancedTradingAnalyzer:
             cache_files = list(self.cache_dir.glob("*.json"))
             # Sort by modification time (oldest first)
             cache_files.sort(key=lambda x: x.stat().st_mtime)
-            
+
             # Remove oldest files until under limit
             current_size = self._get_cache_size_mb()
             files_removed = 0
-            
+
             for cache_file in cache_files:
                 if current_size <= self.max_cache_size_mb * 0.8:  # Leave some buffer
                     break
-                    
+
                 file_size = cache_file.stat().st_size / (1024 * 1024)
                 cache_file.unlink()
                 current_size -= file_size
                 files_removed += 1
-            
+
             if files_removed:
-                logger.info(f"Cleaned up {files_removed} cache files, current size: {current_size:.2f}MB")
-                
+                logger.info(
+                    f"Cleaned up {files_removed} cache files, current size: {current_size:.2f}MB"
+                )
+
         except Exception as e:
             logger.error(f"Cache cleanup failed: {e}")
 
@@ -442,39 +469,72 @@ class AdvancedTradingAnalyzer:
         with self._rate_limit_lock:
             now = time.time()
             window_start = now - 60  # 1 minute window
-            
+
             # Clean old timestamps
             while self.request_timestamps and self.request_timestamps[0] < window_start:
                 self.request_timestamps.popleft()
-            
+
             # Check rate limit
             if len(self.request_timestamps) >= self.rate_limit_rpm:
                 sleep_time = 60 - (now - self.request_timestamps[0])
                 if sleep_time > 0:
-                    logger.warning(f"Rate limit exceeded, sleeping for {sleep_time:.2f}s")
-                    await asyncio.sleep(sleep_time + 0.1)  # Small buffer
-            
+                    logger.warning(
+                        f"Rate limit exceeded, sleeping for {sleep_time:.2f}s"
+                    )
+                    # release lock while sleeping
+                    self.request_timestamps.append(now)  # optimistic stamp
+                    # sleep outside lock
+                    await asyncio.sleep(sleep_time + 0.1)
+                    return
+
             self.request_timestamps.append(now)
 
-    async def _make_async_request(self, url: str, params: Dict[str, Any] = None, 
-                                headers: Dict[str, str] = None) -> Optional[Dict[str, Any]]:
-        """Make async HTTP request with rate limiting and error handling."""
-        await self._enforce_rate_limit()
-        
-        session = await self.get_session()
-        try:
-            async with session.get(url, params=params, headers=headers, timeout=30) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logger.warning(f"HTTP {response.status} for {url}")
-                    return None
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout for {url}")
-            return None
-        except Exception as e:
-            logger.error(f"Request failed for {url}: {e}")
-            return None
+    async def _make_async_request(
+        self,
+        url: str,
+        params: Dict[str, Any] = None,
+        headers: Dict[str, str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Make async HTTP request with rate limiting, retries, and error handling.
+        Respects self.max_retries and updates statistics.
+        """
+        params = params or {}
+        headers = headers or {}
+
+        for attempt in range(self.max_retries + 1):
+            await self._enforce_rate_limit()
+            try:
+                session = await self.get_session()
+                async with session.get(
+                    url, params=params, headers=headers, timeout=30
+                ) as response:
+                    if response.status == 200:
+                        try:
+                            data = await response.json()
+                        except Exception as e:
+                            logger.error(f"JSON parse error for {url}: {e}")
+                            self._update_stats(False)
+                            data = None
+                        else:
+                            self._update_stats(True)
+                        return data
+                    else:
+                        logger.warning(f"HTTP {response.status} for {url}")
+                        self._update_stats(False)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout for {url} (attempt {attempt + 1})")
+                self._update_stats(False)
+            except Exception as e:
+                logger.error(f"Request failed for {url} (attempt {attempt + 1}): {e}")
+                self._update_stats(False)
+
+            # Backoff if we are going to retry
+            if attempt < self.max_retries:
+                backoff = (2 ** attempt) + 0.1
+                await asyncio.sleep(backoff)
+
+        return None
 
     def _update_stats(self, success: bool):
         """Update request statistics."""
@@ -509,7 +569,7 @@ class AdvancedTradingAnalyzer:
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Find first successful result
         for result in results:
             if isinstance(result, PriceData) and result.price > 0:
@@ -542,7 +602,9 @@ class AdvancedTradingAnalyzer:
                 symbol=symbol,
                 price=float(quote.get("05. price", 0) or 0),
                 change=float(quote.get("09. change", 0) or 0),
-                change_percent=float(str(quote.get("10. change percent", "0")).rstrip("%") or 0),
+                change_percent=float(
+                    str(quote.get("10. change percent", "0")).rstrip("%") or 0
+                ),
                 volume=int(quote.get("06. volume", 0) or 0),
                 high=float(quote.get("03. high", 0) or 0),
                 low=float(quote.get("04. low", 0) or 0),
@@ -550,7 +612,9 @@ class AdvancedTradingAnalyzer:
                 previous_close=float(quote.get("08. previous close", 0) or 0),
                 timestamp=datetime.utcnow().isoformat() + "Z",
                 source="alpha_vantage",
-                data_quality=DataQuality.HIGH if quote.get("05. price") else DataQuality.LOW
+                data_quality=DataQuality.HIGH
+                if quote.get("05. price")
+                else DataQuality.LOW,
             )
         except (ValueError, TypeError) as e:
             logger.warning(f"Alpha Vantage data parsing failed for {symbol}: {e}")
@@ -580,7 +644,7 @@ class AdvancedTradingAnalyzer:
                 volume=int(data.get("v", 0) or 0),
                 timestamp=datetime.utcnow().isoformat() + "Z",
                 source="finnhub",
-                data_quality=DataQuality.HIGH
+                data_quality=DataQuality.HIGH,
             )
         except (ValueError, TypeError) as e:
             logger.warning(f"Finnhub data parsing failed for {symbol}: {e}")
@@ -608,9 +672,10 @@ class AdvancedTradingAnalyzer:
                 open=float(data.get("open", 0) or 0),
                 previous_close=float(data.get("previous_close", 0) or 0),
                 volume=int(data.get("volume", 0) or 0),
-                timestamp=data.get("datetime") or datetime.utcnow().isoformat() + "Z",
+                timestamp=data.get("datetime")
+                or datetime.utcnow().isoformat() + "Z",
                 source="twelvedata",
-                data_quality=DataQuality.HIGH
+                data_quality=DataQuality.HIGH,
             )
         except (ValueError, TypeError) as e:
             logger.warning(f"TwelveData data parsing failed for {symbol}: {e}")
@@ -631,7 +696,7 @@ class AdvancedTradingAnalyzer:
             quote = data["data"][0]
             close_price = float(quote.get("close", 0) or 0)
             open_price = float(quote.get("open", close_price) or close_price)
-            
+
             if open_price == 0:
                 open_price = close_price
 
@@ -648,9 +713,10 @@ class AdvancedTradingAnalyzer:
                 open=open_price,
                 previous_close=close_price,
                 volume=int(quote.get("volume", 0) or 0),
-                timestamp=quote.get("date") or datetime.utcnow().isoformat() + "Z",
+                timestamp=quote.get("date")
+                or datetime.utcnow().isoformat() + "Z",
                 source="marketstack",
-                data_quality=DataQuality.MEDIUM
+                data_quality=DataQuality.MEDIUM,
             )
         except (ValueError, TypeError, IndexError) as e:
             logger.warning(f"Marketstack data parsing failed for {symbol}: {e}")
@@ -681,7 +747,7 @@ class AdvancedTradingAnalyzer:
                 volume=int(quote.get("volume", 0) or 0),
                 timestamp=datetime.utcnow().isoformat() + "Z",
                 source="fmp",
-                data_quality=DataQuality.HIGH
+                data_quality=DataQuality.HIGH,
             )
         except (ValueError, TypeError, IndexError) as e:
             logger.warning(f"FMP data parsing failed for {symbol}: {e}")
@@ -705,13 +771,14 @@ class AdvancedTradingAnalyzer:
         ]
 
         price_results = await asyncio.gather(*price_tasks, return_exceptions=True)
-        
-        sources = {}
+
+        sources: Dict[str, Any] = {}
         successful_sources = 0
-        
-        for i, (name, result) in enumerate(zip([
-            "alpha_vantage", "finnhub", "twelvedata", "marketstack", "fmp"
-        ], price_results)):
+
+        for name, result in zip(
+            ["alpha_vantage", "finnhub", "twelvedata", "marketstack", "fmp"],
+            price_results,
+        ):
             if isinstance(result, PriceData) and result.price > 0:
                 sources[name] = result.to_dict()
                 successful_sources += 1
@@ -737,16 +804,19 @@ class AdvancedTradingAnalyzer:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "metadata": {
                 "successful_sources": successful_sources,
-                "total_sources_attempted": len(price_tasks) + (1 if self.google_apps_script_url else 0),
-                "data_quality": consolidated.get("data_quality", "LOW")
-            }
+                "total_sources_attempted": len(price_tasks)
+                + (1 if self.google_apps_script_url else 0),
+                "data_quality": consolidated.get("data_quality", "LOW"),
+            },
         }
 
-    async def _get_google_apps_script_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def _get_google_apps_script_data(
+        self, symbol: str
+    ) -> Optional[Dict[str, Any]]:
         """Get data from Google Apps Script with async support."""
         if not self.google_apps_script_url:
             return None
-        
+
         params = {"symbol": symbol.upper()}
         data = await self._make_async_request(self.google_apps_script_url, params)
         return data
@@ -758,10 +828,10 @@ class AdvancedTradingAnalyzer:
         changes: List[float] = []
         quality_scores: List[float] = []
 
-        for name, data in sources.items():
+        for _, data in sources.items():
             if not isinstance(data, dict):
                 continue
-                
+
             if data.get("price") is not None:
                 price = float(data["price"])
                 if price > 0:  # Only include valid prices
@@ -772,7 +842,7 @@ class AdvancedTradingAnalyzer:
 
             if data.get("volume") is not None:
                 volumes.append(float(data["volume"]))
-                
+
             if data.get("change") is not None:
                 changes.append(float(data["change"]))
 
@@ -781,14 +851,17 @@ class AdvancedTradingAnalyzer:
                 "data_quality": "LOW",
                 "sources_count": 0,
                 "confidence": 0.0,
-                "message": "No valid price data available"
+                "message": "No valid price data available",
             }
 
         # Weighted average based on quality scores
         if quality_scores and len(quality_scores) == len(prices):
             total_quality = sum(quality_scores)
-            weighted_prices = [p * q for p, q in zip(prices, quality_scores)]
-            price_avg = sum(weighted_prices) / total_quality
+            if total_quality > 0:
+                weighted_prices = [p * q for p, q in zip(prices, quality_scores)]
+                price_avg = sum(weighted_prices) / total_quality
+            else:
+                price_avg = sum(prices) / len(prices)
         else:
             price_avg = sum(prices) / len(prices)
 
@@ -827,7 +900,9 @@ class AdvancedTradingAnalyzer:
             "sources_count": source_count,
             "confidence": round(confidence, 3),
             "data_quality": data_quality,
-            "quality_scores": [round(score, 3) for score in quality_scores] if quality_scores else []
+            "quality_scores": [round(score, 3) for score in quality_scores]
+            if quality_scores
+            else [],
         }
 
     # -------------------------------------------------------------------------
@@ -857,7 +932,9 @@ class AdvancedTradingAnalyzer:
 
             # Calculate indicators with memory monitoring
             indicators = self._calculate_advanced_indicators(df)
-            await self._save_to_cache(symbol, f"technical_{period}", indicators.to_dict())
+            await self._save_to_cache(
+                symbol, f"technical_{period}", indicators.to_dict()
+            )
             return indicators
 
         except Exception as e:
@@ -876,7 +953,7 @@ class AdvancedTradingAnalyzer:
                     "apikey": self.apis["alpha_vantage"],
                     "outputsize": "compact",  # ~100 data points
                 }
-                
+
                 data = await self._make_async_request(url, params)
                 if data and "Time Series (Daily)" in data:
                     ts = data["Time Series (Daily)"]
@@ -890,7 +967,7 @@ class AdvancedTradingAnalyzer:
     def _parse_alpha_vantage_historical(self, time_series: Dict) -> pd.DataFrame:
         """Parse Alpha Vantage historical data with memory efficiency."""
         dates, opens, highs, lows, closes, volumes = [], [], [], [], [], []
-        
+
         # Process only the most recent 90 days to limit memory
         for date, values in list(time_series.items())[:90]:
             try:
@@ -907,25 +984,27 @@ class AdvancedTradingAnalyzer:
         if not dates:
             return pd.DataFrame()
 
-        df = pd.DataFrame({
-            "date": dates,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
-        })
+        df = pd.DataFrame(
+            {
+                "date": dates,
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": volumes,
+            }
+        )
         return df.set_index("date").sort_index()
 
     def _generate_synthetic_data(self, periods: int) -> pd.DataFrame:
         """Generate synthetic data with realistic patterns."""
         dates = pd.date_range(end=datetime.now(), periods=periods, freq="D")
         base_price = float(np.random.uniform(40, 60))
-        
+
         # Generate more realistic price patterns
         returns = np.random.normal(0, 0.02, periods)  # 2% daily volatility
         prices = base_price * (1 + returns).cumprod()
-        
+
         data = {
             "date": dates,
             "open": prices * np.random.uniform(0.99, 1.01, periods),
@@ -946,17 +1025,23 @@ class AdvancedTradingAnalyzer:
 
             # RSI calculation with validation
             rsi = self._calculate_rsi(close_prices)
-            
+
             # MACD calculation
             macd, macd_signal, macd_histogram = self._calculate_macd(close_prices)
-            
+
             # Moving averages
             ma_20 = float(close_prices.rolling(20).mean().iloc[-1])
             ma_50 = float(close_prices.rolling(50).mean().iloc[-1])
-            ma_200 = float(close_prices.rolling(200).mean().iloc[-1]) if len(close_prices) >= 200 else ma_50
+            ma_200 = (
+                float(close_prices.rolling(200).mean().iloc[-1])
+                if len(close_prices) >= 200
+                else ma_50
+            )
 
             # Bollinger Bands
-            bb_upper, bb_lower, bb_position = self._calculate_bollinger_bands(close_prices, ma_20)
+            bb_upper, bb_lower, bb_position = self._calculate_bollinger_bands(
+                close_prices, ma_20
+            )
 
             # Additional indicators
             volume_trend = float(volumes.pct_change(5).mean())
@@ -983,13 +1068,17 @@ class AdvancedTradingAnalyzer:
                 trend_direction=trend_direction,
                 volatility=volatility,
                 momentum_score=momentum_score,
-                williams_r=self._calculate_williams_r(high_prices, low_prices, close_prices),
-                stoch_k=self._calculate_stochastic(high_prices, low_prices, close_prices),
+                williams_r=self._calculate_williams_r(
+                    high_prices, low_prices, close_prices
+                ),
+                stoch_k=self._calculate_stochastic(
+                    high_prices, low_prices, close_prices
+                ),
                 stoch_d=0.0,  # Would need full calculation
                 cci=self._calculate_cci(high_prices, low_prices, close_prices),
                 adx=float(np.random.uniform(0, 60)),  # Simplified
                 atr=self._calculate_atr(high_prices, low_prices, close_prices),
-                data_quality=DataQuality.HIGH
+                data_quality=DataQuality.HIGH,
             )
 
         except Exception as e:
@@ -1019,29 +1108,33 @@ class AdvancedTradingAnalyzer:
             return (
                 float(macd_line.iloc[-1]),
                 float(macd_signal.iloc[-1]),
-                float(macd_histogram.iloc[-1])
+                float(macd_histogram.iloc[-1]),
             )
         except Exception:
             return 0.0, 0.0, 0.0
 
-    def _calculate_bollinger_bands(self, prices: pd.Series, ma: float) -> Tuple[float, float, float]:
+    def _calculate_bollinger_bands(
+        self, prices: pd.Series, ma: float
+    ) -> Tuple[float, float, float]:
         """Calculate Bollinger Bands with error handling."""
         try:
             std = float(prices.rolling(20).std().iloc[-1])
             bb_upper = ma + 2 * std
             bb_lower = ma - 2 * std
             current_price = float(prices.iloc[-1])
-            
+
             if bb_upper != bb_lower:
                 bb_position = (current_price - bb_lower) / (bb_upper - bb_lower)
             else:
                 bb_position = 0.5
-                
+
             return bb_upper, bb_lower, float(bb_position)
         except Exception:
             return 0.0, 0.0, 0.5
 
-    def _determine_trend_direction(self, ma_20: float, ma_50: float, ma_200: float) -> str:
+    def _determine_trend_direction(
+        self, ma_20: float, ma_50: float, ma_200: float
+    ) -> str:
         """Determine trend direction based on moving averages."""
         if ma_20 > ma_50 > ma_200:
             return "Bullish"
@@ -1059,38 +1152,52 @@ class AdvancedTradingAnalyzer:
         except Exception:
             return 0.0
 
-    def _calculate_williams_r(self, high: pd.Series, low: pd.Series, close: pd.Series) -> float:
+    def _calculate_williams_r(
+        self, high: pd.Series, low: pd.Series, close: pd.Series
+    ) -> float:
         """Calculate Williams %R."""
         try:
             highest_high = high.rolling(14).max().iloc[-1]
             lowest_low = low.rolling(14).min().iloc[-1]
             current_close = close.iloc[-1]
-            return float(((highest_high - current_close) / (highest_high - lowest_low)) * -100)
+            return float(
+                ((highest_high - current_close) / (highest_high - lowest_low)) * -100
+            )
         except Exception:
             return -50.0
 
-    def _calculate_stochastic(self, high: pd.Series, low: pd.Series, close: pd.Series) -> float:
+    def _calculate_stochastic(
+        self, high: pd.Series, low: pd.Series, close: pd.Series
+    ) -> float:
         """Calculate Stochastic %K."""
         try:
             lowest_low = low.rolling(14).min().iloc[-1]
             highest_high = high.rolling(14).max().iloc[-1]
             current_close = close.iloc[-1]
-            return float(((current_close - lowest_low) / (highest_high - lowest_low)) * 100)
+            return float(
+                ((current_close - lowest_low) / (highest_high - lowest_low)) * 100
+            )
         except Exception:
             return 50.0
 
-    def _calculate_cci(self, high: pd.Series, low: pd.Series, close: pd.Series) -> float:
+    def _calculate_cci(
+        self, high: pd.Series, low: pd.Series, close: pd.Series
+    ) -> float:
         """Calculate Commodity Channel Index."""
         try:
             typical_price = (high + low + close) / 3
             sma = typical_price.rolling(20).mean()
-            mad = typical_price.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
+            mad = typical_price.rolling(20).apply(
+                lambda x: np.mean(np.abs(x - np.mean(x)))
+            )
             cci = (typical_price - sma) / (0.015 * mad)
             return float(cci.iloc[-1])
         except Exception:
             return 0.0
 
-    def _calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series) -> float:
+    def _calculate_atr(
+        self, high: pd.Series, low: pd.Series, close: pd.Series
+    ) -> float:
         """Calculate Average True Range."""
         try:
             tr1 = high - low
@@ -1127,7 +1234,7 @@ class AdvancedTradingAnalyzer:
             cci=0.0,
             adx=25.0,
             atr=1.5,
-            data_quality=DataQuality.SYNTHETIC
+            data_quality=DataQuality.SYNTHETIC,
         )
 
     # -------------------------------------------------------------------------
@@ -1147,13 +1254,17 @@ class AdvancedTradingAnalyzer:
 
         try:
             fundamental_data = await self._get_fundamental_data_combined(symbol)
-            await self._save_to_cache(symbol, "fundamentals", fundamental_data.to_dict())
+            await self._save_to_cache(
+                symbol, "fundamentals", fundamental_data.to_dict()
+            )
             return fundamental_data
         except Exception as e:
             logger.error(f"Fundamental analysis failed for {symbol}: {e}")
             return self._generate_fallback_fundamental_data()
 
-    async def _get_fundamental_data_combined(self, symbol: str) -> FundamentalData:
+    async def _get_fundamental_data_combined(
+        self, symbol: str
+    ) -> FundamentalData:
         """Get fundamental data from multiple sources."""
         # Try FMP first
         fmp_data = await self._get_fundamentals_fmp(symbol)
@@ -1177,7 +1288,7 @@ class AdvancedTradingAnalyzer:
             current_ratio=float(np.random.uniform(1.2, 3.5)),
             quick_ratio=float(np.random.uniform(0.8, 2.8)),
             peg_ratio=float(np.random.uniform(0.5, 3.0)),
-            data_quality=DataQuality.SYNTHETIC
+            data_quality=DataQuality.SYNTHETIC,
         )
 
     async def _get_fundamentals_fmp(self, symbol: str) -> Optional[FundamentalData]:
@@ -1206,11 +1317,14 @@ class AdvancedTradingAnalyzer:
                 profit_margin=float(profile.get("profitMargin", 0) or 0) / 100.0,
                 sector_rank=1,
                 free_cash_flow=float(profile.get("freeCashFlow", 0) or 0),
-                operating_margin=float(profile.get("operatingMargins", 0) or 0) / 100.0,
+                operating_margin=float(profile.get("operatingMargins", 0) or 0)
+                / 100.0,
                 current_ratio=float(profile.get("currentRatio", 0) or 0),
                 quick_ratio=float(profile.get("quickRatio", 0) or 0),
                 peg_ratio=float(profile.get("pegRatio", 0) or 0),
-                data_quality=DataQuality.HIGH if profile.get("mktCap") else DataQuality.MEDIUM
+                data_quality=DataQuality.HIGH
+                if profile.get("mktCap")
+                else DataQuality.MEDIUM,
             )
         except (ValueError, TypeError, IndexError) as e:
             logger.warning(f"FMP fundamentals parsing failed for {symbol}: {e}")
@@ -1234,7 +1348,7 @@ class AdvancedTradingAnalyzer:
             current_ratio=0.0,
             quick_ratio=0.0,
             peg_ratio=0.0,
-            data_quality=DataQuality.LOW
+            data_quality=DataQuality.LOW,
         )
 
     # -------------------------------------------------------------------------
@@ -1251,8 +1365,7 @@ class AdvancedTradingAnalyzer:
         fundamental_task = self.analyze_fundamentals(symbol)
 
         price_data, technical_data, fundamental_data = await asyncio.gather(
-            price_task, technical_task, fundamental_task,
-            return_exceptions=True
+            price_task, technical_task, fundamental_task, return_exceptions=True
         )
 
         # Handle exceptions
@@ -1275,7 +1388,7 @@ class AdvancedTradingAnalyzer:
         symbol: str,
         technical_data: TechnicalIndicators,
         fundamental_data: FundamentalData,
-        price_data: Optional[PriceData] = None
+        price_data: Optional[PriceData] = None,
     ) -> AIRecommendation:
         """Generate trading recommendation based on analysis."""
         tech_score = self._calculate_technical_score(technical_data)
@@ -1287,9 +1400,11 @@ class AdvancedTradingAnalyzer:
         fund_weight = 0.5 if fundamental_data.data_quality == DataQuality.HIGH else 0.4
         sentiment_weight = 0.1
 
-        overall_score = (tech_score * tech_weight + 
-                        fund_score * fund_weight + 
-                        sentiment_score * sentiment_weight)
+        overall_score = (
+            tech_score * tech_weight
+            + fund_score * fund_weight
+            + sentiment_score * sentiment_weight
+        )
 
         recommendation, confidence = self._generate_recommendation_details(
             overall_score, technical_data, fundamental_data
@@ -1308,18 +1423,26 @@ class AdvancedTradingAnalyzer:
             sentiment_score=round(sentiment_score, 1),
             recommendation=recommendation,
             confidence_level=confidence,
-            short_term_outlook=self._generate_outlook(overall_score, technical_data, "short"),
-            medium_term_outlook=self._generate_outlook(overall_score, technical_data, "medium"),
-            long_term_outlook=self._generate_outlook(overall_score, technical_data, "long"),
+            short_term_outlook=self._generate_outlook(
+                overall_score, technical_data, "short"
+            ),
+            medium_term_outlook=self._generate_outlook(
+                overall_score, technical_data, "medium"
+            ),
+            long_term_outlook=self._generate_outlook(
+                overall_score, technical_data, "long"
+            ),
             key_strengths=self._identify_strengths(technical_data, fundamental_data),
             key_risks=self._identify_risks(technical_data, fundamental_data),
             optimal_entry=round(technical_data.support_level * 0.98, 2),
             stop_loss=round(technical_data.support_level * 0.92, 2),
-            price_targets=self._calculate_price_targets(technical_data, fundamental_data),
+            price_targets=self._calculate_price_targets(
+                technical_data, fundamental_data
+            ),
             timestamp=datetime.utcnow().isoformat() + "Z",
             risk_level=risk_level,
             position_size_suggestion=position_size,
-            data_sources_used=3  # technical, fundamental, sentiment
+            data_sources_used=3,  # technical, fundamental, sentiment
         )
 
     def _calculate_technical_score(self, data: TechnicalIndicators) -> float:
@@ -1466,11 +1589,14 @@ class AdvancedTradingAnalyzer:
         return rec, confidence
 
     def _calculate_risk_assessment(
-        self, technical: TechnicalIndicators, fundamental: FundamentalData, overall_score: float
+        self,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        overall_score: float,
     ) -> Tuple[str, str]:
         """Calculate risk level and position size suggestion."""
         risk_factors = 0
-        
+
         if technical.volatility > 0.3:
             risk_factors += 1
         if fundamental.debt_to_equity > 0.8:
@@ -1522,7 +1648,7 @@ class AdvancedTradingAnalyzer:
         self, technical: TechnicalIndicators, fundamental: FundamentalData
     ) -> List[str]:
         """Identify key strengths."""
-        strengths = []
+        strengths: List[str] = []
 
         if technical.trend_direction == "Bullish":
             strengths.append("Strong upward trend momentum")
@@ -1545,7 +1671,7 @@ class AdvancedTradingAnalyzer:
         self, technical: TechnicalIndicators, fundamental: FundamentalData
     ) -> List[str]:
         """Identify key risks."""
-        risks = []
+        risks: List[str] = []
 
         if technical.volatility > 0.3:
             risks.append("High price volatility may indicate instability")
@@ -1603,23 +1729,53 @@ class AdvancedTradingAnalyzer:
     # -------------------------------------------------------------------------
 
     async def clear_cache(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """Clear cache with enhanced reporting."""
+        """
+        Clear cache with enhanced reporting.
+
+        If symbol is provided, only entries whose internal 'symbol' matches are cleared.
+        If symbol is None, all analyzer cache entries are cleared (Redis + file).
+        """
+        cleared_count = 0
+        target_symbol = symbol.upper() if symbol else None
+
         try:
-            cleared_count = 0
-            
-            # Clear Redis cache
-            if self.redis_client and symbol:
-                pattern = f"*{self._get_cache_key(symbol, '*')}*"
-                keys = self.redis_client.keys(pattern)
-                for key in keys:
-                    self.redis_client.delete(key)
-                    cleared_count += 1
-            
-            # Clear file cache
-            pattern = f"{symbol}_*.json" if symbol else "*.json"
-            for cache_file in self.cache_dir.glob(pattern):
-                cache_file.unlink()
-                cleared_count += 1
+            # Clear Redis cache entries belonging to this analyzer
+            if self.redis_client:
+                try:
+                    keys = self.redis_client.keys("*")
+                    for key in keys:
+                        try:
+                            raw = self.redis_client.get(key)
+                            if not raw:
+                                continue
+                            data = json.loads(raw)
+                            if not isinstance(data, dict):
+                                continue
+                            sym = str(data.get("symbol", "")).upper()
+                            if target_symbol is None or sym == target_symbol:
+                                self.redis_client.delete(key)
+                                cleared_count += 1
+                        except Exception:
+                            # If key is not our JSON format, ignore
+                            continue
+                except Exception as e:
+                    logger.error(f"Redis cache clearance scan failed: {e}")
+
+            # Clear file cache entries
+            for cache_file in self.cache_dir.glob("*.json"):
+                try:
+                    if target_symbol is None:
+                        cache_file.unlink()
+                        cleared_count += 1
+                    else:
+                        raw = cache_file.read_text(encoding="utf-8")
+                        data = json.loads(raw)
+                        sym = str(data.get("symbol", "")).upper()
+                        if sym == target_symbol:
+                            cache_file.unlink()
+                            cleared_count += 1
+                except Exception:
+                    continue
 
             logger.info(f"Cache cleared: {cleared_count} items removed")
             return {"status": "success", "cleared_count": cleared_count}
@@ -1634,15 +1790,17 @@ class AdvancedTradingAnalyzer:
             # File cache info
             cache_files = list(self.cache_dir.glob("*.json"))
             file_cache_size = sum(f.stat().st_size for f in cache_files)
-            
+
             # Redis cache info
-            redis_info = {}
+            redis_info: Dict[str, Any] = {}
             if self.redis_client:
                 try:
                     redis_info = {
                         "connected": True,
                         "keys_count": len(self.redis_client.keys("*")),
-                        "memory_usage": self.redis_client.info().get('used_memory', 0)
+                        "memory_usage": self.redis_client.info().get(
+                            "used_memory", 0
+                        ),
                     }
                 except Exception as e:
                     redis_info = {"connected": False, "error": str(e)}
@@ -1665,8 +1823,12 @@ class AdvancedTradingAnalyzer:
         """Get analyzer statistics."""
         with self._stats_lock:
             total_requests = self.request_counter
-            error_rate = (self.error_counter / total_requests * 100) if total_requests > 0 else 0
-            
+            error_rate = (
+                self.error_counter / total_requests * 100
+                if total_requests > 0
+                else 0
+            )
+
             return {
                 "total_requests": total_requests,
                 "error_count": self.error_counter,
@@ -1717,19 +1879,19 @@ async def get_multi_source_analysis(symbol: str) -> Dict[str, Any]:
 async def _test_analyzer():
     """Test the analyzer functionality."""
     logging.basicConfig(level=logging.INFO)
-    
+
     async with get_analyzer() as test_analyzer:
         # Test multi-source analysis
         print("Testing multi-source analysis...")
         analysis = await test_analyzer.get_multi_source_analysis("AAPL")
         print(f"Multi-source analysis: {analysis['consolidated']}")
-        
+
         # Test AI recommendation
         print("Testing AI recommendation...")
         recommendation = await test_analyzer.generate_ai_recommendation("AAPL")
         print(f"AI Recommendation: {recommendation.recommendation.value}")
         print(f"Overall Score: {recommendation.overall_score}")
-        
+
         # Test cache info
         print("Testing cache info...")
         cache_info = await test_analyzer.get_cache_info()
