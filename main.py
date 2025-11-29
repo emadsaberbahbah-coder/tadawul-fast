@@ -96,10 +96,10 @@ class Settings(BaseSettings):
     cache_backup_enabled: bool = Field(True, env="CACHE_BACKUP_ENABLED")
     cache_save_interval: int = Field(10, env="CACHE_SAVE_INTERVAL")  # seconds
 
-    # Performance
-    http_timeout: int = Field(30, env="HTTP_TIMEOUT")
-    max_retries: int = Field(3, env="MAX_RETRIES")
-    retry_delay: float = Field(1.0, env="RETRY_DELAY")
+    # Performance (more conservative defaults)
+    http_timeout: int = Field(10, env="HTTP_TIMEOUT")      # was 30
+    max_retries: int = Field(2, env="MAX_RETRIES")         # was 3
+    retry_delay: float = Field(0.7, env="RETRY_DELAY")     # was 1.0
 
     # Logging
     log_level: str = Field("INFO", env="LOG_LEVEL")
@@ -1378,6 +1378,7 @@ async def get_quotes_v1(
     - Returns standardized quote format
     - Uses cache with fallback to providers
     - Includes comprehensive metadata
+    - Enforces an overall timeout for upstream providers
     """
     try:
         symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
@@ -1388,7 +1389,40 @@ async def get_quotes_v1(
         if len(symbols) > 100:
             raise HTTPException(status_code=400, detail="Too many tickers (max 100)")
 
-        return await quote_service.get_quotes(symbols)
+        OVERALL_TIMEOUT_SECONDS = 12.0
+
+        try:
+            response = await asyncio.wait_for(
+                quote_service.get_quotes(symbols),
+                timeout=OVERALL_TIMEOUT_SECONDS,
+            )
+            return response
+
+        except asyncio.TimeoutError:
+            # Build a graceful timeout response instead of hanging
+            now = datetime.datetime.utcnow()
+            quotes = [
+                Quote(
+                    ticker=sym,
+                    status=QuoteStatus.ERROR,
+                    message=(
+                        "Timeout while contacting data providers. "
+                        "Please try again; if this persists, reduce the number of symbols."
+                    ),
+                )
+                for sym in symbols
+            ]
+
+            return QuotesResponse(
+                timestamp=now,
+                symbols=quotes,
+                meta={
+                    "timeout": True,
+                    "timeout_seconds": OVERALL_TIMEOUT_SECONDS,
+                    "total_symbols": len(symbols),
+                    "successful_quotes": 0,
+                },
+            )
         
     except HTTPException:
         raise
@@ -1410,6 +1444,7 @@ async def get_quotes_v41(
     - Uses the same underlying service as v1
     - Returns standardized quote format
     - Includes v4.1 compatibility metadata
+    - Enforces an overall timeout for upstream providers
     """
     try:
         tickers = [t.strip().upper() for t in symbols.split(",") if t.strip()]
@@ -1417,12 +1452,43 @@ async def get_quotes_v41(
         if not tickers:
             raise HTTPException(status_code=400, detail="No symbols provided")
 
-        response = await quote_service.get_quotes(tickers)
+        OVERALL_TIMEOUT_SECONDS = 12.0
+
+        try:
+            response = await asyncio.wait_for(
+                quote_service.get_quotes(tickers),
+                timeout=OVERALL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            now = datetime.datetime.utcnow()
+            quotes = [
+                Quote(
+                    ticker=sym,
+                    status=QuoteStatus.ERROR,
+                    message=(
+                        "Timeout while contacting data providers. "
+                        "Please try again; if this persists, reduce the number of symbols."
+                    ),
+                )
+                for sym in tickers
+            ]
+
+            response = QuotesResponse(
+                timestamp=now,
+                symbols=quotes,
+                meta={
+                    "timeout": True,
+                    "timeout_seconds": OVERALL_TIMEOUT_SECONDS,
+                    "total_symbols": len(tickers),
+                    "successful_quotes": 0,
+                },
+            )
         
         # Add v4.1 specific metadata
-        if response.meta:
-            response.meta["compatibility"] = "v4.1"
-            response.meta["api_version"] = "4.1"
+        if response.meta is None:
+            response.meta = {}
+        response.meta["compatibility"] = "v4.1"
+        response.meta["api_version"] = "4.1"
             
         return response
         
