@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.1.1
+Tadawul Stock Analysis API - Enhanced Version 3.2.0
 Production-ready with all architectural improvements and optimizations
 """
 
@@ -36,6 +36,13 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+# --- Advanced AI Trading Analysis integration ---
+from advanced_analysis import (
+    analyzer,                    # Global AdvancedTradingAnalyzer instance
+    generate_ai_recommendation,  # async convenience function
+    get_multi_source_analysis,   # async convenience function
+)
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -47,7 +54,7 @@ class Settings(BaseSettings):
     
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.1.1", env="SERVICE_VERSION")
+    service_version: str = Field("3.2.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -1113,6 +1120,14 @@ async def lifespan(app: FastAPI):
         # Close HTTP client
         await http_client.close()
         logger.info("✅ HTTP client closed")
+
+        # Close analysis engine sessions
+        if analyzer is not None:
+            try:
+                await analyzer.close()
+                logger.info("✅ Advanced analysis engine closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing analysis engine: {e}")
         
     except Exception as e:
         logger.warning(f"⚠️ Error during shutdown: {e}")
@@ -1125,11 +1140,13 @@ app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
     description="""
-    Enhanced Tadawul Stock Analysis API with comprehensive financial data integration.
-    
+    Enhanced Tadawul Stock Analysis API with comprehensive financial data integration
+    and AI-powered trading analysis.
+
     ## Features
     
     * 📈 Real-time stock quotes from multiple financial APIs
+    * 🤖 Advanced multi-source AI analysis & recommendations
     * 💾 Advanced caching with TTL and batched persistence
     * 🔐 Comprehensive security with token authentication
     * ⚡ Async/await for high performance
@@ -1265,6 +1282,8 @@ async def root(request: Request):
             "quotes_v1": "/v1/quote",
             "quotes_v41": "/v41/quotes",
             "cache_info": "/v1/cache/info",
+            "analysis_multi_source": "/v1/analysis/multi-source",
+            "analysis_recommendation": "/v1/analysis/recommendation",
         }
     }
 
@@ -1274,8 +1293,22 @@ async def health_check(request: Request):
     """
     Enhanced health check with dependency status
     """
-    # Check dependencies with more granularity
+    # Cache status
     cache_stats = cache.get_stats()
+
+    # Analysis engine cache info (best-effort)
+    analysis_cache_info: Optional[Dict[str, Any]] = None
+    analysis_status = False
+
+    if analyzer is not None:
+        try:
+            analysis_cache_info = await analyzer.get_cache_info()
+            analysis_status = True
+        except Exception as e:
+            logger.warning(f"⚠️ Analysis engine cache info failed: {e}")
+            analysis_cache_info = {"error": str(e)}
+            analysis_status = False
+
     dependencies = {
         "cache": {
             "status": True,
@@ -1294,6 +1327,11 @@ async def health_check(request: Request):
             "status": len(provider_manager.enabled_providers) > 0,
             "providers": [p.name for p in provider_manager.enabled_providers],
             "count": len(provider_manager.enabled_providers),
+        },
+        "analysis_engine": {
+            "status": analysis_status,
+            "available": analyzer is not None,
+            "cache": analysis_cache_info,
         }
     }
 
@@ -1487,6 +1525,119 @@ async def flush_cache(
     }
 
 # =============================================================================
+# New: Advanced Analysis Endpoints
+# =============================================================================
+
+@app.get("/v1/analysis/multi-source", response_model=Dict[str, Any])
+@rate_limit("30/minute")
+async def analysis_multi_source(
+    request: Request,
+    symbol: str = Query(..., description="Single ticker symbol for multi-source analysis"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Multi-source analysis endpoint.
+
+    - Aggregates real-time prices from all configured APIs
+    - Includes consolidation metrics (avg, std, dispersion, confidence)
+    - Optionally pulls extra data from Google Apps Script if configured
+    """
+    if analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis engine is not available on this instance"
+        )
+
+    try:
+        result = await get_multi_source_analysis(symbol)
+        return result
+    except Exception as e:
+        logger.error(f"Error in multi-source analysis for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/v1/analysis/recommendation", response_model=Dict[str, Any])
+@rate_limit("20/minute")
+async def analysis_recommendation(
+    request: Request,
+    symbol: str = Query(..., description="Single ticker symbol for AI trading recommendation"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    AI trading recommendation endpoint.
+
+    - Combines technical indicators, fundamentals, and sentiment
+    - Returns overall score, sub-scores and risk assessment
+    - Provides suggested entry, stop-loss, and price targets
+    """
+    if analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis engine is not available on this instance"
+        )
+
+    try:
+        rec = await generate_ai_recommendation(symbol)
+        # rec is an AIRecommendation dataclass; convert to dict for JSON response
+        return rec.to_dict()
+    except Exception as e:
+        logger.error(f"Error generating AI recommendation for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/v1/analysis/cache/info", response_model=Dict[str, Any])
+@rate_limit("10/minute")
+async def analysis_cache_info(
+    request: Request,
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Get cache information for the analysis engine.
+
+    - File cache + optional Redis info
+    - TTL and size configuration
+    """
+    if analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis engine is not available on this instance"
+        )
+
+    try:
+        info = await analyzer.get_cache_info()
+        return info
+    except Exception as e:
+        logger.error(f"Error getting analysis cache info: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/v1/analysis/cache/clear", response_model=Dict[str, Any])
+@rate_limit("5/minute")
+async def analysis_cache_clear(
+    request: Request,
+    symbol: Optional[str] = Query(
+        None,
+        description="Optional single symbol to clear; if omitted, clears all analysis cache entries",
+    ),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Clear analysis engine cache.
+
+    - If `symbol` is provided, clears only entries related to that symbol
+    - If not provided, clears all analyzer cache entries (Redis + file)
+    """
+    if analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis engine is not available on this instance"
+        )
+
+    try:
+        result = await analyzer.clear_cache(symbol)
+        return result
+    except Exception as e:
+        logger.error(f"Error clearing analysis cache: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# =============================================================================
 # Application Entry Point
 # =============================================================================
 
@@ -1500,6 +1651,7 @@ def main():
     logger.info(f"📊 Google Services: {'Available' if settings.has_google_sheets_access else 'Not Available'}")
     logger.info(f"💾 Cache: {cache.get_item_count()} items, Save Interval: {settings.cache_save_interval}s")
     logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled")
+    logger.info(f"🤖 Analysis Engine: {'Available' if analyzer is not None else 'Not Available'}")
     logger.info(f"🔧 Debug Mode: {settings.debug}")
     logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port}")
     logger.info("=" * 70)
