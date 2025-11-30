@@ -1729,6 +1729,72 @@ def main():
         reload=settings.environment == "development",
         log_level="info"
     )
+# =============================================================================
+# DEBUG / SAFE TEST ENDPOINTS (NO EXTERNAL APIS)
+# =============================================================================
+
+from fastapi import HTTPException
+
+@app.get("/debug/simple-quote")
+async def debug_simple_quote(
+    tickers: str = Query(..., description="Comma-separated tickers for debug only"),
+):
+    """
+    VERY SIMPLE: returns fake prices for testing the API pipeline.
+    No external providers. This should ALWAYS respond quickly.
+    """
+    symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No tickers provided")
+
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+
+    data = []
+    for i, sym in enumerate(symbols, start=1):
+        data.append({
+            "ticker": sym,
+            "price": 100 + i,              # fake price
+            "currency": "SAR",
+            "source": "debug_stub",
+            "ts": now_ts,
+        })
+
+    return {
+        "status": "ok",
+        "count": len(data),
+        "timestamp": now_ts,
+        "data": data,
+    }
+
+
+@app.get("/debug/saudi-market")
+async def debug_saudi_market(limit: int = Query(5, ge=1, le=50)):
+    """
+    Simple stub market snapshot. No external API calls.
+    """
+    now_ts = datetime.datetime.utcnow().isoformat() + "Z"
+
+    sample = []
+    base_symbols = ["1120.SR", "2010.SR", "2020.SR", "7200.SR", "2222.SR"]
+    names = ["Riyad Bank", "SABIC", "Maaden", "Arabian Internet", "Aramco"]
+
+    for i in range(min(limit, len(base_symbols))):
+        sample.append({
+            "ticker": base_symbols[i],
+            "name": names[i],
+            "last_price": 100 + i * 2,
+            "change_pct": 0.5 * (i - 2),
+            "volume": 1_000_000 + i * 100_000,
+            "sector": "DEBUG",
+            "ts": now_ts,
+        })
+
+    return {
+        "status": "ok",
+        "count": len(sample),
+        "timestamp": now_ts,
+        "data": sample,
+    }
 
 if __name__ == "__main__":
     main()
