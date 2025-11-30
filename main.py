@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.2.0
+Tadawul Stock Analysis API - Enhanced Version 3.3.0
 Production-ready with all architectural improvements and optimizations
 """
 
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.2.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.3.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     # Google Services
     spreadsheet_id: str = Field(..., env="SPREADSHEET_ID")
     google_sheets_credentials: Optional[str] = Field(None, env="GOOGLE_SHEETS_CREDENTIALS")
-    google_apps_script_url: str = Field(..., env="GOOGLE_APPS_SCRIPT_URL")
+    google_apps_script_url: Optional[str] = Field(None, env="GOOGLE_APPS_SCRIPT_URL")
     google_apps_script_backup_url: Optional[str] = Field(None, env="GOOGLE_APPS_SCRIPT_BACKUP_URL")
 
     # Financial APIs
@@ -151,9 +151,9 @@ class Settings(BaseSettings):
         return bool(self.google_sheets_credentials or self.google_apps_script_url)
 
     def validate_configuration(self) -> List[str]:
-        """Validate configuration and return list of errors"""
-        errors = []
-        warnings = []
+        """Validate configuration and return list of errors (warnings are logged separately)"""
+        errors: List[str] = []
+        warnings: List[str] = []
 
         # Auth validation
         if self.require_auth and not any([self.app_token, self.backup_app_token]):
@@ -166,11 +166,13 @@ class Settings(BaseSettings):
         if not self.has_google_sheets_access:
             warnings.append("No Google Sheets or Apps Script configuration - limited functionality")
 
-        # Apps Script URL validation (only if provided)
-        if self.google_apps_script_url and self.google_apps_script_url.strip() in ["", "undefined"]:
-            errors.append("Invalid GOOGLE_APPS_SCRIPT_URL provided")
-        elif self.google_apps_script_url and not self.google_apps_script_url.startswith(("http://", "https://")):
-            errors.append("Invalid GOOGLE_APPS_SCRIPT_URL format")
+        # Apps Script URL validation (soft – never blocks startup)
+        if self.google_apps_script_url:
+            url = self.google_apps_script_url.strip()
+            if url in ["", "undefined"]:
+                warnings.append("GOOGLE_APPS_SCRIPT_URL looks invalid ('undefined' or empty)")
+            elif not url.startswith(("http://", "https://")):
+                warnings.append("GOOGLE_APPS_SCRIPT_URL has unexpected format (should start with http/https)")
 
         # Log warnings
         for warning in warnings:
@@ -1902,14 +1904,15 @@ def main():
     logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled")
     logger.info(f"🤖 Analysis Engine: {'Available' if analyzer is not None else 'Not Available'}")
     logger.info(f"🔧 Debug Mode: {settings.debug}")
-    logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port}")
+    logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port} (reload=False)")
     logger.info("=" * 70)
 
+    # IMPORTANT: reload=False to avoid reload loops / hanging
     uvicorn.run(
         "main:app",
         host=settings.app_host,
         port=settings.app_port,
-        reload=settings.environment == "development",
+        reload=False,
         log_level="info",
     )
 
