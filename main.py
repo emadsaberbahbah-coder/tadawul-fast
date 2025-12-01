@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.3.0
-Production-ready with all architectural improvements and optimizations
+Tadawul Stock Analysis API - Enhanced Version 3.4.0
+Production-ready with hybrid FMP + EODHD providers and fundamentals service
 """
 
 import asyncio
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.3.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.4.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -94,13 +94,20 @@ class Settings(BaseSettings):
     google_apps_script_url: Optional[str] = Field(None, env="GOOGLE_APPS_SCRIPT_URL")
     google_apps_script_backup_url: Optional[str] = Field(None, env="GOOGLE_APPS_SCRIPT_BACKUP_URL")
 
-    # Financial APIs
+    # Financial APIs (hybrid stack)
     alpha_vantage_api_key: Optional[str] = Field(None, env="ALPHA_VANTAGE_API_KEY")
     finnhub_api_key: Optional[str] = Field(None, env="FINNHUB_API_KEY")
+
     eodhd_api_key: Optional[str] = Field(None, env="EODHD_API_KEY")
-    twelvedata_api_key: Optional[str] = Field(None, env="TWELVEDATA_API_KEY")
-    marketstack_api_key: Optional[str] = Field(None, env="MARKETSTACK_API_KEY")
+    eodhd_base_url: str = Field("https://eodhistoricaldata.com/api", env="EODHD_BASE_URL")
+
     fmp_api_key: Optional[str] = Field(None, env="FMP_API_KEY")
+    fmp_base_url: str = Field("https://financialmodelingprep.com/api/v3", env="FMP_BASE_URL")
+
+    # Optional future providers (Yahoo / Argaam / Google Finance proxies)
+    yahoo_finance_proxy_url: Optional[str] = Field(None, env="YAHOO_FINANCE_PROXY_URL")
+    argaam_base_url: Optional[str] = Field(None, env="ARGAAM_BASE_URL")
+    argaam_api_key: Optional[str] = Field(None, env="ARGAAM_API_KEY")
 
     # Cache
     cache_default_ttl: int = Field(1800, env="CACHE_DEFAULT_TTL")
@@ -195,8 +202,6 @@ class Settings(BaseSettings):
                 bool(self.alpha_vantage_api_key),
                 bool(self.finnhub_api_key),
                 bool(self.eodhd_api_key),
-                bool(self.twelvedata_api_key),
-                bool(self.marketstack_api_key),
                 bool(self.fmp_api_key),
             ]
         )
@@ -617,7 +622,7 @@ class HTTPClient:
 http_client = HTTPClient()
 
 # =============================================================================
-# Enhanced Provider Abstraction
+# Enhanced Provider Abstraction (Quotes)
 # =============================================================================
 
 
@@ -632,7 +637,7 @@ class ProviderClient(Protocol):
 
 
 class AlphaVantageProvider:
-    """Alpha Vantage provider implementation"""
+    """Alpha Vantage provider implementation (fallback)"""
 
     def __init__(self):
         self.name = "alpha_vantage"
@@ -677,13 +682,13 @@ class AlphaVantageProvider:
 
     def _safe_float(self, value: Any) -> Optional[float]:
         try:
-            return float(value) if value else None
+            return float(value) if value is not None and value != "" else None
         except (ValueError, TypeError):
             return None
 
     def _safe_int(self, value: Any) -> Optional[int]:
         try:
-            return int(float(value)) if value else None
+            return int(float(value)) if value is not None and value != "" else None
         except (ValueError, TypeError):
             return None
 
@@ -714,7 +719,10 @@ class FinnhubProvider:
 
         timestamp = None
         if data.get("t"):
-            timestamp = datetime.datetime.fromtimestamp(data["t"]).isoformat()
+            try:
+                timestamp = datetime.datetime.fromtimestamp(data["t"]).isoformat()
+            except Exception:
+                timestamp = None
 
         return {
             "ticker": symbol,
@@ -730,16 +738,86 @@ class FinnhubProvider:
         }
 
 
+class FMPProvider:
+    """
+    Financial Modeling Prep provider implementation.
+
+    Primary quote source for global stocks & funds, with richer fields
+    (price, previousClose, marketCap, eps, pe, etc.).
+    """
+
+    def __init__(self):
+        self.name = "fmp"
+        self.rate_limit = 60
+        self.base_url = settings.fmp_base_url.rstrip("/")
+        self.api_key = settings.fmp_api_key
+        self.enabled = bool(self.api_key)
+
+    async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+
+        # FMP quote endpoint returns a list; we take the first item
+        url = f"{self.base_url}/quote/{symbol}"
+        params = {"apikey": self.api_key}
+
+        data = await http_client.request_with_retry("GET", url, params)
+        if not data:
+            return None
+
+        item: Optional[Dict[str, Any]] = None
+        if isinstance(data, list) and data:
+            item = data[0]
+        elif isinstance(data, dict):
+            item = data
+
+        if not item:
+            return None
+
+        return self._parse_quote(item, symbol)
+
+    def _parse_quote(self, item: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
+        price = self._safe_float(item.get("price"))
+        if price is None:
+            return None
+
+        return {
+            "ticker": symbol,
+            "price": price,
+            "previous_close": self._safe_float(item.get("previousClose")),
+            "change_value": self._safe_float(item.get("change")),
+            "change_percent": self._safe_float(item.get("changesPercentage")),
+            "volume": self._safe_float(item.get("volume")),
+            "open_price": self._safe_float(item.get("open")),
+            "high_price": self._safe_float(item.get("dayHigh")),
+            "low_price": self._safe_float(item.get("dayLow")),
+            "market_cap": self._safe_float(item.get("marketCap")),
+            "eps": self._safe_float(item.get("eps")),
+            "pe_ratio": self._safe_float(item.get("pe")),
+            "currency": item.get("currency") or item.get("currencyCode"),
+            "exchange": item.get("exchange") or item.get("exchangeShortName"),
+            "provider": self.name,
+        }
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        try:
+            return float(value) if value is not None and value != "" else None
+        except (ValueError, TypeError):
+            return None
+
+
 class ProviderManager:
     """Enhanced manager for provider selection and fallback"""
 
     def __init__(self):
+        # Order matters: FMP (primary), Finnhub, Alpha Vantage (fallbacks)
         self.providers: List[ProviderClient] = [
-            AlphaVantageProvider(),
+            FMPProvider(),
             FinnhubProvider(),
+            AlphaVantageProvider(),
         ]
 
-        self.enabled_providers = [p for p in self.providers if p.enabled]
+        self.enabled_providers = [p for p in self.providers if getattr(p, "enabled", True)]
         logger.info(f"✅ Enabled providers: {[p.name for p in self.enabled_providers]}")
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -1018,6 +1096,167 @@ class QuoteService:
 quote_service = QuoteService(cache, provider_manager)
 
 # =============================================================================
+# Fundamentals Service (Hybrid EODHD + FMP)
+# =============================================================================
+
+
+class FundamentalsService:
+    """
+    Hybrid fundamentals lookup:
+    - For .SR symbols: returns NO_DATA and explains limitation (needs Argaam / static metadata).
+    - For global symbols:
+        1) Try EODHD fundamentals
+        2) Fall back to FMP profile
+    """
+
+    async def get_fundamentals(self, symbol: str) -> Dict[str, Any]:
+        symbol_norm = symbol.strip().upper()
+
+        base: Dict[str, Any] = {
+            "ticker": symbol_norm,
+            "status": "NO_DATA",
+            "provider": None,
+            "data": {},
+            "message": None,
+        }
+
+        # Tadawul: currently no licensed fundamentals provider wired in
+        if is_tadawul_symbol(symbol_norm):
+            base["message"] = (
+                "Fundamentals for Tadawul (.SR) symbols are not available from the current "
+                "providers. Use static metadata or connect an Argaam/Tadawul-capable API."
+            )
+            return base
+
+        # 1) EODHD fundamentals
+        if settings.eodhd_api_key:
+            try:
+                eod_data = await self._get_eod_fundamentals(symbol_norm)
+                if eod_data:
+                    base["status"] = "OK"
+                    base["provider"] = "eodhd"
+                    base["data"] = eod_data
+                    base["message"] = "Fundamentals from EOD Historical Data"
+                    return base
+            except Exception as e:
+                logger.warning(f"EODHD fundamentals failed for {symbol_norm}: {e}")
+
+        # 2) FMP profile as fallback
+        if settings.fmp_api_key:
+            try:
+                fmp_data = await self._get_fmp_fundamentals(symbol_norm)
+                if fmp_data:
+                    base["status"] = "OK"
+                    base["provider"] = "fmp"
+                    base["data"] = fmp_data
+                    base["message"] = "Fundamentals from Financial Modeling Prep"
+                    return base
+            except Exception as e:
+                logger.warning(f"FMP fundamentals failed for {symbol_norm}: {e}")
+
+        base["message"] = "No fundamentals available from configured providers"
+        return base
+
+    async def _get_eod_fundamentals(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Map EODHD fundamentals into a flat structure that matches your 57-column logic
+        as much as possible (sector, industry, EPS, P/E, P/B, ROE, ROA, D/E, etc.).
+        """
+        url = f"{settings.eodhd_base_url}/fundamentals/{symbol}"
+        params = {
+            "api_token": settings.eodhd_api_key,
+            "fmt": "json",
+        }
+        raw = await http_client.request_with_retry("GET", url, params)
+        if not raw or not isinstance(raw, dict):
+            return None
+
+        general = raw.get("General") or {}
+        highlights = raw.get("Highlights") or {}
+        valuation = raw.get("Valuation") or {}
+        shares = raw.get("SharesStats") or {}
+        growth = raw.get("Growth") or {}
+
+        result: Dict[str, Any] = {
+            "company_name": general.get("Name"),
+            "sector": general.get("Sector"),
+            "sub_sector": general.get("Industry"),
+            "currency": general.get("CurrencyCode") or general.get("Currency"),
+            "market": general.get("Exchange") or general.get("ExchangeShortName"),
+            "isin": general.get("ISIN"),
+            "shares_outstanding": shares.get("SharesOutstanding"),
+            "shares_float": shares.get("SharesFloat"),
+            "market_cap": highlights.get("MarketCapitalization") or valuation.get("MarketCapitalization"),
+            "eps": highlights.get("EarningsShare"),
+            "pe_ratio": highlights.get("PERatio"),
+            "peg_ratio": highlights.get("PEGRatio"),
+            "dividend_yield": highlights.get("DividendYield"),
+            "dividend_payout_ratio": highlights.get("DividendPayoutRatio"),
+            "roe": highlights.get("ReturnOnEquityTTM"),
+            "roa": highlights.get("ReturnOnAssetsTTM"),
+            "debt_to_equity": highlights.get("DebtEquityRatio") or valuation.get("DebtToEquity"),
+            "current_ratio": highlights.get("CurrentRatio"),
+            "quick_ratio": highlights.get("QuickRatio"),
+            "price_to_sales": valuation.get("PriceSalesTTM"),
+            "price_to_book": valuation.get("PriceBookMRQ"),
+            "ev_to_ebitda": valuation.get("EVToEBITDA"),
+            "price_to_cash_flow": valuation.get("PriceCashFlowTTM"),
+            # Basic growth / margin placeholders if present
+            "revenue_growth": growth.get("RevenueYoY"),
+            "net_income_growth": growth.get("NetIncomeYoY"),
+        }
+
+        return result
+
+    async def _get_fmp_fundamentals(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Use FMP profile endpoint as a lighter fundamentals backup:
+        sector, industry, currency, marketCap, beta, etc.
+        """
+        url = f"{settings.fmp_base_url.rstrip('/')}/profile/{symbol}"
+        params = {"apikey": settings.fmp_api_key}
+
+        data = await http_client.request_with_retry("GET", url, params)
+        if not data:
+            return None
+
+        item: Optional[Dict[str, Any]] = None
+        if isinstance(data, list) and data:
+            item = data[0]
+        elif isinstance(data, dict):
+            item = data
+
+        if not item:
+            return None
+
+        def sfloat(v: Any) -> Optional[float]:
+            try:
+                return float(v) if v is not None and v != "" else None
+            except (TypeError, ValueError):
+                return None
+
+        result: Dict[str, Any] = {
+            "company_name": item.get("companyName") or item.get("name"),
+            "sector": item.get("sector"),
+            "sub_sector": item.get("industry"),
+            "currency": item.get("currency") or item.get("currencyCode"),
+            "market": item.get("exchangeShortName") or item.get("exchange"),
+            "isin": item.get("isin"),
+            "shares_outstanding": sfloat(item.get("sharesOutstanding")),
+            "market_cap": sfloat(item.get("mktCap")),
+            "eps": sfloat(item.get("eps")),
+            "pe_ratio": sfloat(item.get("pe")),
+            # These may or may not be present depending on FMP plan:
+            "dividend_yield": sfloat(item.get("lastDiv")),
+        }
+
+        return result
+
+
+# Global fundamentals service instance
+fundamentals_service = FundamentalsService()
+
+# =============================================================================
 # Enhanced Security & Auth
 # =============================================================================
 
@@ -1199,12 +1438,13 @@ app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
     description="""
-    Enhanced Tadawul Stock Analysis API with comprehensive financial data integration
-    and AI-powered trading analysis.
+    Enhanced Tadawul Stock Analysis API with hybrid FMP + EODHD data providers,
+    comprehensive financial data integration and AI-powered trading analysis.
 
     ## Features
 
-    * 📈 Real-time stock quotes from multiple financial APIs
+    * 📈 Real-time stock quotes from multiple financial APIs (FMP, Finnhub, Alpha Vantage)
+    * 📊 Fundamentals endpoint (EODHD + FMP hybrid)
     * 🤖 Advanced multi-source AI analysis & recommendations
     * 💾 Advanced caching with TTL and batched persistence
     * 🔐 Comprehensive security with token authentication
@@ -1347,6 +1587,7 @@ async def root(request: Request):
             "ping": "/ping",
             "quotes_v1": "/v1/quote",
             "quotes_v41": "/v41/quotes",
+            "fundamentals": "/v1/fundamentals",
             "cache_info": "/v1/cache/info",
             "analysis_multi_source": "/v1/analysis/multi-source",
             "analysis_recommendation": "/v1/analysis/recommendation",
@@ -1669,6 +1910,33 @@ async def flush_cache(
 
 
 # =============================================================================
+# Fundamentals Endpoint (NEW)
+# =============================================================================
+
+
+@app.get("/v1/fundamentals", response_model=Dict[str, Any])
+@rate_limit("30/minute")
+async def get_fundamentals_v1(
+    request: Request,
+    symbol: str = Query(..., description="Ticker symbol for fundamentals lookup"),
+    auth: bool = Depends(verify_auth),
+):
+    """
+    Hybrid fundamentals endpoint (EODHD + FMP).
+
+    - For global tickers: tries EODHD first, then FMP.
+    - For Tadawul (.SR): returns NO_DATA and a clear explanation that
+      KSA fundamentals require a Tadawul/Argaam source or static metadata.
+    """
+    try:
+        result = await fundamentals_service.get_fundamentals(symbol)
+        return result
+    except Exception as e:
+        logger.error(f"Error in fundamentals lookup for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# =============================================================================
 # New: Advanced Analysis Endpoints
 # =============================================================================
 
@@ -1901,7 +2169,7 @@ def main():
     logger.info(f"⚡ Rate Limiting: {'Enabled' if settings.enable_rate_limiting else 'Disabled'}")
     logger.info(f"📊 Google Services: {'Available' if settings.has_google_sheets_access else 'Not Available'}")
     logger.info(f"💾 Cache: {cache.get_item_count()} items, Save Interval: {settings.cache_save_interval}s")
-    logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled")
+    logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled -> {[p.name for p in provider_manager.enabled_providers]}")
     logger.info(f"🤖 Analysis Engine: {'Available' if analyzer is not None else 'Not Available'}")
     logger.info(f"🔧 Debug Mode: {settings.debug}")
     logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port} (reload=False)")
