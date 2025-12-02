@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.4.1
-Production-ready with hybrid FMP + EODHD providers and fundamentals service
+Tadawul Stock Analysis API - Enhanced Version 3.5.0
+Production-ready with EODHD + FMP hybrid providers and fundamentals service
 """
 
 import asyncio
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.4.1", env="SERVICE_VERSION")
+    service_version: str = Field("3.5.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -755,8 +755,8 @@ class FMPProvider:
     """
     Financial Modeling Prep provider implementation.
 
-    Primary quote source for global stocks & funds, with richer fields
-    (price, previousClose, marketCap, eps, pe, etc.).
+    Primary quote source for global stocks & funds (backup after EODHD),
+    with richer fields (price, previousClose, marketCap, eps, pe, etc.).
     """
 
     def __init__(self):
@@ -818,15 +818,109 @@ class FMPProvider:
             return None
 
 
+class EODHDProvider:
+    """
+    EODHD provider implementation.
+
+    Primary real-time source for global stocks & funds.
+    Uses /real-time/{symbol}, mapping e.g. "AAPL" -> "AAPL.US" by default.
+    """
+
+    def __init__(self):
+        self.name = "eodhd"
+        self.rate_limit = 60
+        self.base_url = settings.eodhd_base_url.rstrip("/")
+        self.api_key = settings.eodhd_api_key
+        self.enabled = bool(self.api_key)
+
+    def _map_symbol_for_eod(self, symbol: str) -> str:
+        """
+        Map user symbol to EODHD symbol:
+
+        - If the symbol already has an exchange suffix (e.g. "AAPL.US", "MSFT.XNAS"),
+          use as-is.
+        - Otherwise, assume US market and append ".US".
+        """
+        sym = symbol.strip().upper()
+        if "." in sym:
+            return sym
+        return f"{sym}.US"
+
+    async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+
+        eod_symbol = self._map_symbol_for_eod(symbol)
+        url = f"{self.base_url}/real-time/{eod_symbol}"
+        params = {
+            "api_token": self.api_key,
+            "fmt": "json",
+        }
+
+        data = await http_client.request_with_retry("GET", url, params)
+        if not data or not isinstance(data, dict):
+            return None
+
+        return self._parse_real_time(data, symbol)
+
+    def _parse_real_time(self, data: Dict[str, Any], original_symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse EODHD real-time response.
+
+        Typical payload fields:
+        - code, timestamp, open, high, low, close, volume,
+          previousClose, change, change_p, etc.
+        """
+        close = self._safe_float(data.get("close"))
+        if close is None:
+            return None
+
+        ts = data.get("timestamp")
+        as_of = None
+        if ts is not None:
+            try:
+                as_of = datetime.datetime.fromtimestamp(float(ts)).isoformat() + "Z"
+            except Exception:
+                as_of = None
+
+        return {
+            "ticker": original_symbol.strip().upper(),
+            "price": close,
+            "previous_close": self._safe_float(data.get("previousClose")),
+            "change_value": self._safe_float(data.get("change")),
+            "change_percent": self._safe_float(data.get("change_p")),
+            "volume": self._safe_float(data.get("volume")),
+            "open_price": self._safe_float(data.get("open")),
+            "high_price": self._safe_float(data.get("high")),
+            "low_price": self._safe_float(data.get("low")),
+            "currency": data.get("currency"),  # may be None
+            "exchange": data.get("exchange_short_name") or data.get("exchange"),
+            "provider": self.name,
+            "as_of": as_of,
+        }
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        try:
+            return float(value) if value is not None and value != "" else None
+        except (TypeError, ValueError):
+            return None
+
+
 class ProviderManager:
     """Enhanced manager for provider selection and fallback"""
 
     def __init__(self):
-        # Order matters: FMP (primary), Finnhub, Alpha Vantage (fallbacks)
+        # Order matters: EODHD (primary), FMP, Finnhub, Alpha Vantage (fallbacks)
+        eodhd_provider = EODHDProvider()
+        fmp_provider = FMPProvider()
+        finnhub_provider = FinnhubProvider()
+        alpha_vantage_provider = AlphaVantageProvider()
+
         self.providers: List[ProviderClient] = [
-            FMPProvider(),
-            FinnhubProvider(),
-            AlphaVantageProvider(),
+            eodhd_provider,
+            fmp_provider,
+            finnhub_provider,
+            alpha_vantage_provider,
         ]
 
         self.enabled_providers = [p for p in self.providers if getattr(p, "enabled", True)]
@@ -906,17 +1000,17 @@ class QuoteService:
         """Get single quote with enhanced error handling"""
         symbol_norm = symbol.strip().upper()
 
-        # Handle Tadawul upfront – providers on current plan don't support .SR
+        # Tadawul currently not wired to any provider in this API
         if is_tadawul_symbol(symbol_norm):
-            logger.info(f"Tadawul symbol detected with no enabled providers: {symbol_norm}")
+            logger.info(f"Tadawul symbol detected but no Tadawul provider is configured: {symbol_norm}")
             return Quote(
                 ticker=symbol_norm,
                 status=QuoteStatus.NO_DATA,
                 currency="SAR",
                 exchange="TADAWUL",
                 message=(
-                    "Tadawul (.SR) market data is not enabled on the current data provider plan. "
-                    "Global / US symbols (e.g. AAPL, MSFT) are supported."
+                    "Market data for Tadawul (.SR) symbols is not yet configured in this API. "
+                    "Global / US symbols (e.g. AAPL, MSFT) via EODHD/FMP are supported."
                 ),
             )
 
@@ -963,7 +1057,7 @@ class QuoteService:
             if not sym:
                 continue
             if is_tadawul_symbol(sym):
-                logger.info(f"Tadawul symbol detected with no enabled providers: {sym}")
+                logger.info(f"Tadawul symbol detected but no Tadawul provider is configured: {sym}")
                 tadawul_quotes.append(
                     Quote(
                         ticker=sym,
@@ -971,8 +1065,8 @@ class QuoteService:
                         currency="SAR",
                         exchange="TADAWUL",
                         message=(
-                            "Tadawul (.SR) market data is not enabled on the current data provider "
-                            "plan. Global / US symbols (e.g. AAPL, MSFT) are supported."
+                            "Market data for Tadawul (.SR) symbols is not yet configured in this API. "
+                            "Global / US symbols (e.g. AAPL, MSFT) via EODHD/FMP are supported."
                         ),
                     )
                 )
@@ -997,7 +1091,7 @@ class QuoteService:
             # Cache successful provider results
             for provider_quote in provider_quotes:
                 if provider_quote and provider_quote.get("price") is not None:
-                    symbol = provider_quote["ticker"]
+                    symbol = provider_quote["ticker"].strip().upper()
                     self.cache.set(symbol, provider_quote)
                     if provider_quote.get("provider"):
                         sources_used.add(provider_quote["provider"])
@@ -1010,15 +1104,18 @@ class QuoteService:
             quotes.append(self._create_quote_model(cached_data, QuoteStatus.OK))
 
         # Add provider results (both successes and failures)
-        provider_results_map = {q["ticker"]: q for q in provider_quotes if q and "ticker" in q}
+        provider_results_map = {
+            q["ticker"].strip().upper(): q for q in provider_quotes if q and "ticker" in q
+        }
 
         for symbol in cache_misses:
-            if symbol in provider_results_map:
-                quotes.append(self._create_quote_model(provider_results_map[symbol], QuoteStatus.OK))
+            key = symbol.strip().upper()
+            if key in provider_results_map:
+                quotes.append(self._create_quote_model(provider_results_map[key], QuoteStatus.OK))
             else:
                 quotes.append(
                     Quote(
-                        ticker=symbol,
+                        ticker=key,
                         status=QuoteStatus.NO_DATA,
                         message="No data available from providers",
                     )
@@ -1055,7 +1152,7 @@ class QuoteService:
             as_of = datetime.datetime.utcnow()
 
         return Quote(
-            ticker=data.get("ticker", ""),
+            ticker=data.get("ticker", "").strip().upper(),
             status=status,
             price=data.get("price"),
             previous_close=data.get("previous_close"),
@@ -1169,7 +1266,7 @@ class FundamentalsService:
         Map EODHD fundamentals into a flat structure that matches your 57-column logic
         as much as possible (sector, industry, EPS, P/E, P/B, ROE, ROA, D/E, etc.).
         """
-        url = f"{settings.eodhd_base_url}/fundamentals/{symbol}"
+        url = f"{settings.eodhd_base_url.rstrip('/')}/fundamentals/{symbol}"
         params = {
             "api_token": settings.eodhd_api_key,
             "fmt": "json",
@@ -1439,12 +1536,12 @@ app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
     description="""
-    Enhanced Tadawul Stock Analysis API with hybrid FMP + EODHD data providers,
+    Enhanced Tadawul Stock Analysis API with EODHD + FMP data providers,
     comprehensive financial data integration and AI-powered trading analysis.
 
     ## Features
 
-    * 📈 Real-time stock quotes from multiple financial APIs (FMP, Finnhub, Alpha Vantage)
+    * 📈 Real-time stock quotes from multiple financial APIs (EODHD, FMP, Finnhub, Alpha Vantage)
     * 📊 Fundamentals endpoint (EODHD + FMP hybrid)
     * 🤖 Advanced multi-source AI analysis & recommendations
     * 💾 Advanced caching with TTL and batched persistence
@@ -1681,7 +1778,7 @@ async def get_quotes_v1(
 
     - Supports up to 100 symbols per request
     - Returns standardized quote format
-    - Uses cache with fallback to providers
+    - Uses cache with fallback to providers (EODHD -> FMP -> Finnhub -> Alpha Vantage)
     - Includes comprehensive metadata
     - Enforces an overall timeout for upstream providers
     """
@@ -2096,7 +2193,7 @@ async def saudi_market_official(
     - Always fast and safe for testing Google Sheets + Apps Script
 
     FUTURE:
-    - Can be wired to real Tadawul/Argaam provider when available.
+    - Can be wired to real Tadawul/Argaam/EODHD provider when available.
     """
     try:
         data = await debug_saudi_market(limit=limit)
