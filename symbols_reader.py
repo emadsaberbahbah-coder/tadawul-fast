@@ -1,6 +1,6 @@
 # symbols_reader.py
 # Enhanced Google Sheets symbol reader - Production Ready for Render
-# Version: 3.1.1 - Aligned with main.py / Render architecture
+# Version: 3.2.0 - Aligned with main.py / Render architecture and caching conventions
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SymbolRecord:
     """
-    Enhanced data class for symbol records with validation and serialization.
+    Data class for symbol records with validation and serialization.
     Represents a single row from the Market_Leaders (or similar) sheet.
     """
     symbol: str
@@ -89,7 +89,7 @@ class SymbolsReader:
             self.header_row: int = int(os.getenv("SHEETS_HEADER_ROW", "2"))
         except (ValueError, TypeError):
             self.header_row = 2
-            logger.warning(f"Invalid SHEETS_HEADER_ROW, using default: {self.header_row}")
+            logger.warning("Invalid SHEETS_HEADER_ROW, using default: %s", self.header_row)
 
         # Cache configuration optimized for Render
         self.cache_dir = self._setup_cache_directory()
@@ -115,9 +115,10 @@ class SymbolsReader:
         self._dependencies_available: bool = False
         self._check_dependencies()
 
+        short_id = (self.sheet_id[:8] + "...") if self.sheet_id else "None"
         logger.info(
             "SymbolsReader initialized: sheet_id=%s, tab_name=%s, cache_ttl=%ss, cache_dir=%s",
-            (self.sheet_id[:8] + "...") if self.sheet_id else "None",
+            short_id,
             self.tab_name,
             self.cache_ttl.total_seconds(),
             self.cache_dir,
@@ -133,10 +134,10 @@ class SymbolsReader:
             from google.oauth2.service_account import Credentials  # noqa: F401
 
             self._dependencies_available = True
-            logger.debug("Google Sheets dependencies available")
+            logger.debug("Google Sheets dependencies available for SymbolsReader")
         except ImportError as e:
             self._dependencies_available = False
-            logger.warning(f"Google Sheets dependencies not available: {e}")
+            logger.warning("Google Sheets dependencies not available for SymbolsReader: %s", e)
             logger.info("SymbolsReader will operate in fallback mode (hardcoded symbols)")
 
     def _get_spreadsheet_id(self) -> str:
@@ -156,10 +157,10 @@ class SymbolsReader:
         for env_var in env_vars:
             value = os.getenv(env_var)
             if value and value.strip():
-                logger.info(f"Using spreadsheet ID from {env_var}")
+                logger.info("SymbolsReader using spreadsheet ID from %s", env_var)
                 return value.strip()
 
-        logger.warning("No spreadsheet ID configured - symbols_reader will use hardcoded fallback only")
+        logger.warning("No spreadsheet ID configured - SymbolsReader will use hardcoded fallback only")
         return ""
 
     def _setup_cache_directory(self) -> Path:
@@ -174,39 +175,44 @@ class SymbolsReader:
 
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Symbols cache directory: {cache_dir}")
+            logger.info("Symbols cache directory: %s", cache_dir)
             return cache_dir
         except Exception as e:
-            logger.warning(f"Could not create cache directory {cache_dir}: {e}")
+            logger.warning("Could not create cache directory %s: %s", cache_dir, e)
             # Fallback to current directory
-            return Path("./symbols_cache")
+            fallback_dir = Path("./symbols_cache")
+            try:
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return fallback_dir
 
     def _get_cache_ttl(self) -> timedelta:
         """
         Get cache TTL with sensible defaults.
 
         Priority:
-        1) SYMBOLS_CACHE_TTL
-        2) CACHE_DEFAULT_TTL (shared with main.py)
+        1) SYMBOLS_CACHE_TTL or SYMBOLS_CACHE_TTL_SECONDS
+        2) CACHE_DEFAULT_TTL or CACHE_DEFAULT_TTL_SECONDS (shared with other services)
         3) 1800 seconds (30 minutes)
         """
         # Try dedicated symbols TTL first
-        ttl_env = os.getenv("SYMBOLS_CACHE_TTL")
+        ttl_env = os.getenv("SYMBOLS_CACHE_TTL") or os.getenv("SYMBOLS_CACHE_TTL_SECONDS")
         if ttl_env:
             try:
                 ttl_seconds = int(ttl_env)
                 return timedelta(seconds=max(300, ttl_seconds))
             except (ValueError, TypeError):
-                logger.warning("Invalid SYMBOLS_CACHE_TTL value, falling back")
+                logger.warning("Invalid SYMBOLS_CACHE_TTL value (%s), falling back", ttl_env)
 
         # Fallback to global cache TTL if available
-        global_ttl_env = os.getenv("CACHE_DEFAULT_TTL")
+        global_ttl_env = os.getenv("CACHE_DEFAULT_TTL") or os.getenv("CACHE_DEFAULT_TTL_SECONDS")
         if global_ttl_env:
             try:
                 ttl_seconds = int(global_ttl_env)
                 return timedelta(seconds=max(300, ttl_seconds))
             except (ValueError, TypeError):
-                logger.warning("Invalid CACHE_DEFAULT_TTL for symbols, using default 30 minutes")
+                logger.warning("Invalid CACHE_DEFAULT_TTL for SymbolsReader, using default 30 minutes")
 
         # Final default
         return timedelta(seconds=1800)
@@ -214,12 +220,30 @@ class SymbolsReader:
     def _initialize_column_mapping(self) -> Dict[str, List[str]]:
         """Initialize comprehensive column mapping (English + Arabic variants)."""
         return {
-            "symbol": ["Symbol", "Ticker", "Ticker Symbol", "Code", "رمز", "الرمز"],
-            "company_name": ["Company Name", "Company", "Name", "Security Name", "اسم الشركة", "الشركة"],
-            "trading_sector": ["Sector", "Trading Sector", "Industry", "Industry Sector", "القطاع", "قطاع التداول"],
-            "financial_market": ["Market", "Financial Market", "Exchange", "Trading Market", "السوق", "السوق المالية"],
-            "include_in_ranking": ["Include", "Include in Ranking", "Active", "Enabled", "مشمول", "مشمول في التصنيف"],
-            "market_cap": ["Market Cap", "Market Capitalization", "Capitalization", "القيمة السوقية", "رأس المال السوقي"],
+            "symbol": [
+                "Symbol", "Ticker", "Ticker Symbol", "Code",
+                "رمز", "الرمز"
+            ],
+            "company_name": [
+                "Company Name", "Company", "Name", "Security Name",
+                "اسم الشركة", "الشركة"
+            ],
+            "trading_sector": [
+                "Sector", "Trading Sector", "Industry", "Industry Sector",
+                "القطاع", "قطاع التداول"
+            ],
+            "financial_market": [
+                "Market", "Financial Market", "Exchange", "Trading Market",
+                "السوق", "السوق المالية"
+            ],
+            "include_in_ranking": [
+                "Include", "Include in Ranking", "Active", "Enabled",
+                "مشمول", "مشمول في التصنيف"
+            ],
+            "market_cap": [
+                "Market Cap", "Market Capitalization", "Capitalization",
+                "القيمة السوقية", "رأس المال السوقي"
+            ],
         }
 
     # -------------------------------------------------------------------------
@@ -233,8 +257,8 @@ class SymbolsReader:
         if elapsed < self.min_request_interval:
             sleep_time = self.min_request_interval - elapsed
             # Small jitter (0–100ms) to avoid synchronized bursts
-            sleep_time += (time.time() % 0.1)
-            time.sleep(sleep_time)
+            jitter = (time.time() % 0.1)
+            time.sleep(sleep_time + jitter)
 
         self.last_request_time = time.time()
 
@@ -250,7 +274,7 @@ class SymbolsReader:
                 last_exception = e
                 logger.warning(
                     "Attempt %d/%d failed for %s: %s",
-                    attempt + 1, self.max_retries, operation_name, e
+                    attempt + 1, self.max_retries, operation_name, e,
                 )
 
                 if attempt < self.max_retries - 1:
@@ -295,10 +319,10 @@ class SymbolsReader:
 
             self._last_cache_cleanup = now
             if deleted_count > 0:
-                logger.info("Cleaned up %d old cache files", deleted_count)
+                logger.info("Cleaned up %d old symbols cache files", deleted_count)
 
         except Exception as e:
-            logger.debug("Cache cleanup failed: %s", e)
+            logger.debug("Symbols cache cleanup failed: %s", e)
 
     def _get_cache_size_mb(self) -> float:
         """Calculate current cache directory size in MB."""
@@ -322,7 +346,7 @@ class SymbolsReader:
             # Check cache file size (avoid loading huge files)
             file_size = cache_file.stat().st_size
             if file_size > 10 * 1024 * 1024:  # 10MB limit
-                logger.warning("Cache file too large (%d bytes), ignoring", file_size)
+                logger.warning("Symbols cache file too large (%d bytes), deleting", file_size)
                 cache_file.unlink(missing_ok=True)
                 return None
 
@@ -330,32 +354,33 @@ class SymbolsReader:
             payload = json.loads(raw_data)
 
             if not isinstance(payload, dict) or "timestamp" not in payload or "data" not in payload:
-                logger.warning("Invalid cache structure, ignoring")
+                logger.warning("Invalid symbols cache structure, deleting")
                 cache_file.unlink(missing_ok=True)
                 return None
 
             cache_time = datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
-            if datetime.now().replace(tzinfo=cache_time.tzinfo) - cache_time > self.cache_ttl:
-                logger.debug("Symbols cache expired")
+            age = datetime.now().replace(tzinfo=cache_time.tzinfo) - cache_time
+            if age > self.cache_ttl:
+                logger.debug("Symbols cache expired (age: %.1fs)", age.total_seconds())
                 return None
 
             data = payload.get("data", [])
             if not isinstance(data, list):
-                logger.warning("Invalid cache data format")
+                logger.warning("Invalid symbols cache data format")
                 return None
 
             logger.info("Loaded %d symbols from cache", len(data))
             return data
 
         except json.JSONDecodeError as e:
-            logger.warning("Corrupted cache file: %s", e)
+            logger.warning("Corrupted symbols cache file: %s", e)
             try:
                 cache_file.unlink(missing_ok=True)
             except Exception:
                 pass
             return None
         except Exception as e:
-            logger.debug("Cache load failed: %s", e)
+            logger.debug("Symbols cache load failed: %s", e)
             return None
 
     def _save_to_cache(self, data: List[Dict[str, Any]]) -> bool:
@@ -363,7 +388,11 @@ class SymbolsReader:
         try:
             current_size = self._get_cache_size_mb()
             if current_size > self.max_cache_size_mb:
-                logger.warning("Cache size (%.1fMB) exceeds limit, cleaning up", current_size)
+                logger.warning(
+                    "Symbols cache size (%.1fMB) exceeds limit (%.1fMB), cleaning up",
+                    current_size,
+                    self.max_cache_size_mb,
+                )
                 self._cleanup_old_cache_files()
 
             cache_file = self.cache_dir / self._get_cache_key()
@@ -374,7 +403,7 @@ class SymbolsReader:
                 "sheet_id": self.sheet_id,
                 "tab_name": self.tab_name,
                 "data": data,
-                "version": "3.1.1",
+                "version": "3.2.0",
             }
 
             temp_file.write_text(
@@ -387,7 +416,7 @@ class SymbolsReader:
             return True
 
         except Exception as e:
-            logger.warning("Cache save failed: %s", e)
+            logger.warning("Symbols cache save failed: %s", e)
             return False
 
     # -------------------------------------------------------------------------
@@ -399,7 +428,7 @@ class SymbolsReader:
             return self._client
 
         if not self._dependencies_available:
-            logger.error("Google Sheets dependencies not available")
+            logger.error("Google Sheets dependencies not available for SymbolsReader")
             self._client_initialized = True
             return None
 
@@ -416,18 +445,18 @@ class SymbolsReader:
             legacy_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
             if creds_json:
-                logger.info("Initializing Google client from GOOGLE_SHEETS_CREDENTIALS")
+                logger.info("Initializing SymbolsReader Google client from GOOGLE_SHEETS_CREDENTIALS")
                 creds_dict = json.loads(creds_json)
             elif legacy_json:
                 logger.warning(
-                    "Using legacy GOOGLE_SERVICE_ACCOUNT_JSON - "
-                    "please migrate to GOOGLE_SHEETS_CREDENTIALS"
+                    "SymbolsReader using legacy GOOGLE_SERVICE_ACCOUNT_JSON - "
+                    "please migrate to GOOGLE_SHEETS_CREDENTIALS",
                 )
                 creds_dict = json.loads(legacy_json)
             else:
                 cred_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
                 if cred_file and os.path.exists(cred_file):
-                    logger.info("Initializing Google client from file: %s", cred_file)
+                    logger.info("Initializing SymbolsReader Google client from file: %s", cred_file)
                     with open(cred_file, "r", encoding="utf-8") as f:
                         creds_dict = json.load(f)
                 else:
@@ -438,7 +467,7 @@ class SymbolsReader:
             required_fields = ["type", "project_id", "private_key_id", "private_key", "client_email"]
             missing_fields = [field for field in required_fields if field not in creds_dict]
             if missing_fields:
-                logger.error("Missing required credential fields: %s", missing_fields)
+                logger.error("SymbolsReader missing required credential fields: %s", missing_fields)
                 self._client_initialized = True
                 return None
 
@@ -450,11 +479,11 @@ class SymbolsReader:
             return self._client
 
         except json.JSONDecodeError as e:
-            logger.error("Invalid JSON in Google credentials: %s", e)
+            logger.error("Invalid JSON in SymbolsReader Google credentials: %s", e)
             self._client_initialized = True
             return None
         except Exception as e:
-            logger.error("Failed to initialize Google Sheets client: %s", e)
+            logger.error("Failed to initialize SymbolsReader Google Sheets client: %s", e)
             self._client_initialized = True
             return None
 
@@ -479,7 +508,7 @@ class SymbolsReader:
                 return client.open_by_key(self.sheet_id)
 
             spreadsheet = self._retry_operation(open_spreadsheet, "open_spreadsheet")
-            logger.info("Opened spreadsheet for symbols: %s", spreadsheet.title)
+            logger.info("Opened spreadsheet for SymbolsReader: %s", spreadsheet.title)
 
             def get_worksheet():
                 self._throttle_requests()
@@ -492,14 +521,20 @@ class SymbolsReader:
                 )
                 logger.info("Using worksheet for symbols: %s", self.tab_name)
             except WorksheetNotFound:
-                logger.warning("Worksheet '%s' not found, trying first sheet", self.tab_name)
+                logger.warning(
+                    "Worksheet '%s' not found for SymbolsReader, trying first sheet",
+                    self.tab_name,
+                )
 
                 def get_first_worksheet():
                     self._throttle_requests()
                     worksheets = spreadsheet.worksheets()
                     return worksheets[0] if worksheets else None
 
-                self._worksheet = self._retry_operation(get_first_worksheet, "get_first_worksheet")
+                self._worksheet = self._retry_operation(
+                    get_first_worksheet,
+                    "get_first_worksheet",
+                )
                 if self._worksheet:
                     logger.info("Using first worksheet for symbols: %s", self._worksheet.title)
                 else:
@@ -560,7 +595,12 @@ class SymbolsReader:
             if best_match is not None and best_score > 40.0:
                 column_map[field] = best_match
                 used_indices.add(best_match)
-                logger.debug("Mapped field '%s' -> column %d (score: %.1f)", field, best_match, best_score)
+                logger.debug(
+                    "Mapped field '%s' -> column %d (score: %.1f)",
+                    field,
+                    best_match,
+                    best_score,
+                )
 
         # Ensure we have at least symbol mapping
         if "symbol" not in column_map and headers:
@@ -680,7 +720,7 @@ class SymbolsReader:
                 "trading_sector": "Energy",
                 "financial_market": "Tadawul (TASI)",
                 "include_in_ranking": True,
-                "market_cap": 2000000000000,
+                "market_cap": 2_000_000_000_000,
                 "data_source": "hardcoded_fallback",
                 "last_updated": base_ts,
             },
@@ -690,7 +730,7 @@ class SymbolsReader:
                 "trading_sector": "Banks",
                 "financial_market": "Tadawul (TASI)",
                 "include_in_ranking": True,
-                "market_cap": 150000000000,
+                "market_cap": 150_000_000_000,
                 "data_source": "hardcoded_fallback",
                 "last_updated": base_ts,
             },
@@ -700,7 +740,7 @@ class SymbolsReader:
                 "trading_sector": "Banks",
                 "financial_market": "Tadawul (TASI)",
                 "include_in_ranking": True,
-                "market_cap": 45000000000,
+                "market_cap": 45_000_000_000,
                 "data_source": "hardcoded_fallback",
                 "last_updated": base_ts,
             },
@@ -710,7 +750,7 @@ class SymbolsReader:
                 "trading_sector": "Petrochemicals",
                 "financial_market": "Tadawul (TASI)",
                 "include_in_ranking": True,
-                "market_cap": 300000000000,
+                "market_cap": 300_000_000_000,
                 "data_source": "hardcoded_fallback",
                 "last_updated": base_ts,
             },
@@ -720,7 +760,7 @@ class SymbolsReader:
                 "trading_sector": "Transportation",
                 "financial_market": "Tadawul (TASI)",
                 "include_in_ranking": True,
-                "market_cap": 25000000000,
+                "market_cap": 25_000_000_000,
                 "data_source": "hardcoded_fallback",
                 "last_updated": base_ts,
             },
@@ -729,7 +769,11 @@ class SymbolsReader:
     # -------------------------------------------------------------------------
     # Public API methods
     # -------------------------------------------------------------------------
-    def fetch_symbols(self, limit: Optional[int] = None, use_cache: bool = True) -> dict:
+    def fetch_symbols(
+        self,
+        limit: Optional[int] = None,
+        use_cache: bool = True,
+    ) -> dict:
         """
         Fetch symbols with full fallback chain.
 
@@ -767,7 +811,7 @@ class SymbolsReader:
                     source="google_sheets",
                     processing_time=time.time() - start_time,
                 )
-                logger.info("Google Sheets fetch successful: %d symbols", len(symbols_data))
+                logger.info("Google Sheets fetch successful for symbols: %d symbols", len(symbols_data))
                 return response
 
             # Hardcoded fallback
@@ -781,11 +825,11 @@ class SymbolsReader:
                 processing_time=time.time() - start_time,
                 error="All data sources failed, using fallback symbols",
             )
-            logger.warning("Using fallback symbols: %d symbols", len(hardcoded_data))
+            logger.warning("Using fallback symbols for SymbolsReader: %d symbols", len(hardcoded_data))
             return response
 
         except Exception as e:
-            logger.error("Unexpected error in fetch_symbols: %s", e)
+            logger.error("Unexpected error in SymbolsReader.fetch_symbols: %s", e)
             hardcoded_data = self._get_hardcoded_symbols()
             if limit:
                 hardcoded_data = hardcoded_data[:limit]
@@ -803,7 +847,7 @@ class SymbolsReader:
         """
         try:
             if not self._dependencies_available:
-                logger.warning("Google Sheets dependencies not available for symbols")
+                logger.warning("Google Sheets dependencies not available for SymbolsReader")
                 return None
 
             worksheet = self._get_worksheet()
@@ -817,7 +861,7 @@ class SymbolsReader:
             all_values = self._retry_operation(fetch_data, "get_all_values")
 
             if not all_values or len(all_values) < self.header_row:
-                logger.warning("Insufficient data in worksheet for symbols")
+                logger.warning("Insufficient data in symbols worksheet")
                 return None
 
             headers = all_values[self.header_row - 1]
@@ -852,10 +896,11 @@ class SymbolsReader:
         error: Optional[str] = None,
     ) -> dict:
         """Build standardized response with enhanced metadata."""
+        worksheet_title = getattr(self._worksheet, "title", "Unknown") if self._worksheet else "Unknown"
         response = {
             "ok": error is None,
             "source": source,
-            "sheet_title": getattr(self._worksheet, "title", "Unknown") if self._worksheet else "Unknown",
+            "sheet_title": worksheet_title,
             "worksheet": self.tab_name,
             "count": len(data),
             "data": data,
@@ -879,11 +924,18 @@ class SymbolsReader:
     def get_status(self) -> dict:
         """Get comprehensive status of the symbols reader."""
         cache_info = self.get_cache_info()
+
         client_status = "initialized" if self._client_initialized else "uninitialized"
         worksheet_status = "available" if self._worksheet else "unavailable"
 
+        # Overall status flag
+        if not self.sheet_id or not self._dependencies_available:
+            overall_status = "degraded"
+        else:
+            overall_status = "operational"
+
         return {
-            "status": "operational",
+            "status": overall_status,
             "client_status": client_status,
             "worksheet_status": worksheet_status,
             "spreadsheet_id_configured": bool(self.sheet_id),
@@ -939,11 +991,24 @@ class SymbolsReader:
                 "last_updated": ts,
                 "cache_file": str(cache_file),
                 "file_size_bytes": cache_file.stat().st_size,
-                "cache_version": payload.get("version", "3.1.1"),
+                "cache_version": payload.get("version", "3.2.0"),
             }
         except Exception as e:
             logger.debug("Failed to read symbols cache info: %s", e)
             return {"exists": False, "error": str(e)}
+
+    # Convenience: get just the list of tickers for ranking engine or advisor
+    def get_symbol_list(
+        self,
+        use_cache: bool = True,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """
+        Return a flat list of ticker symbols (e.g., for ranking engine / advisor).
+        Always respects include_in_ranking.
+        """
+        result = self.fetch_symbols(limit=limit, use_cache=use_cache)
+        return [row["symbol"] for row in result.get("data", []) if "symbol" in row]
 
 
 # Global instance for main.py / routes to use
@@ -955,12 +1020,13 @@ except Exception as e:
     symbols_reader = None
 
 
-def fetch_symbols(limit: Optional[int] = None) -> dict:
+def fetch_symbols(limit: Optional[int] = None, use_cache: bool = True) -> dict:
     """
     Backward-compatible function for integration from main.py / routes.
 
     Args:
         limit: Maximum number of symbols to return.
+        use_cache: Whether to use cache (default True).
 
     Returns:
         Standardized symbols response (ok/source/data/count/metadata).
@@ -976,7 +1042,7 @@ def fetch_symbols(limit: Optional[int] = None) -> dict:
             "error": "SymbolsReader not initialized",
         }
 
-    return symbols_reader.fetch_symbols(limit=limit)
+    return symbols_reader.fetch_symbols(limit=limit, use_cache=use_cache)
 
 
 # Simple CLI test (local execution only)
