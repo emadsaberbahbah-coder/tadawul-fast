@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.4.0
+Tadawul Stock Analysis API - Enhanced Version 3.4.1
 Production-ready with hybrid FMP + EODHD providers and fundamentals service
 """
 
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.4.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.4.1", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -78,7 +78,6 @@ class Settings(BaseSettings):
 
     # Rate Limiting
     enable_rate_limiting: bool = Field(True, env="ENABLE_RATE_LIMITING")
-    # align with env.example: MAX_REQUESTS_PER_MINUTE
     max_requests_per_minute: int = Field(60, env="MAX_REQUESTS_PER_MINUTE")
 
     # CORS - Support both JSON and comma-separated values
@@ -116,9 +115,12 @@ class Settings(BaseSettings):
     cache_save_interval: int = Field(10, env="CACHE_SAVE_INTERVAL")  # seconds
 
     # Performance (more conservative defaults)
-    http_timeout: int = Field(10, env="HTTP_TIMEOUT")      # was 30
-    max_retries: int = Field(2, env="MAX_RETRIES")         # was 3
-    retry_delay: float = Field(0.7, env="RETRY_DELAY")     # was 1.0
+    http_timeout: int = Field(10, env="HTTP_TIMEOUT")
+    max_retries: int = Field(2, env="MAX_RETRIES")
+    retry_delay: float = Field(0.7, env="RETRY_DELAY")
+
+    # Analysis / AI features
+    advanced_analysis_enabled: bool = Field(True, env="ADVANCED_ANALYSIS_ENABLED")
 
     # Logging
     log_level: str = Field("INFO", env="LOG_LEVEL")
@@ -181,6 +183,13 @@ class Settings(BaseSettings):
             elif not url.startswith(("http://", "https://")):
                 warnings.append("GOOGLE_APPS_SCRIPT_URL has unexpected format (should start with http/https)")
 
+        # Analysis engine vs configuration
+        if self.advanced_analysis_enabled and analyzer is None:
+            warnings.append(
+                "ADVANCED_ANALYSIS_ENABLED is True but analysis engine is not available "
+                "(advanced_analysis import failed or not deployed)."
+            )
+
         # Log warnings
         for warning in warnings:
             logging.warning(f"⚠️ {warning}")
@@ -206,6 +215,10 @@ class Settings(BaseSettings):
             ]
         )
         logging.info(f"📈 Financial APIs: {configured_apis} configured")
+        logging.info(
+            f"🤖 Analysis Engine Enabled (config): {self.advanced_analysis_enabled} | "
+            f"Available (import): {analyzer is not None}"
+        )
 
 
 # Initialize settings
@@ -441,7 +454,7 @@ class TTLCache:
             self._save_cache_immediate()
 
     def _enforce_size_limit(self):
-        """Enforce cache size limit"""
+        """Enforce cache size limit (lock must already be held by caller)"""
         if len(self.data) <= self.max_size:
             return
 
@@ -757,7 +770,6 @@ class FMPProvider:
         if not self.enabled:
             return None
 
-        # FMP quote endpoint returns a list; we take the first item
         url = f"{self.base_url}/quote/{symbol}"
         params = {"apikey": self.api_key}
 
@@ -892,7 +904,6 @@ class QuoteService:
 
     async def get_quote(self, symbol: str) -> Quote:
         """Get single quote with enhanced error handling"""
-        # Normalize symbol
         symbol_norm = symbol.strip().upper()
 
         # Handle Tadawul upfront – providers on current plan don't support .SR
@@ -1003,10 +1014,8 @@ class QuoteService:
 
         for symbol in cache_misses:
             if symbol in provider_results_map:
-                # Success from provider
                 quotes.append(self._create_quote_model(provider_results_map[symbol], QuoteStatus.OK))
             else:
-                # No data from any provider
                 quotes.append(
                     Quote(
                         ticker=symbol,
@@ -1036,11 +1045,9 @@ class QuoteService:
 
     def _create_quote_model(self, data: Dict[str, Any], status: QuoteStatus) -> Quote:
         """Create Quote model from provider/cache data with proper timestamp handling"""
-        # Use stored as_of if available, otherwise current time
         as_of = data.get("as_of")
         if as_of and isinstance(as_of, str):
             try:
-                # Try to parse ISO format timestamp
                 as_of = datetime.datetime.fromisoformat(as_of.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 as_of = datetime.datetime.utcnow()
@@ -1201,7 +1208,6 @@ class FundamentalsService:
             "price_to_book": valuation.get("PriceBookMRQ"),
             "ev_to_ebitda": valuation.get("EVToEBITDA"),
             "price_to_cash_flow": valuation.get("PriceCashFlowTTM"),
-            # Basic growth / margin placeholders if present
             "revenue_growth": growth.get("RevenueYoY"),
             "net_income_growth": growth.get("NetIncomeYoY"),
         }
@@ -1246,7 +1252,6 @@ class FundamentalsService:
             "market_cap": sfloat(item.get("mktCap")),
             "eps": sfloat(item.get("eps")),
             "pe_ratio": sfloat(item.get("pe")),
-            # These may or may not be present depending on FMP plan:
             "dividend_yield": sfloat(item.get("lastDiv")),
         }
 
@@ -1346,6 +1351,7 @@ def rate_limit(rule: str):
 # Custom Rate Limit Handler
 # =============================================================================
 
+
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
     """Custom rate limit handler with structured error response"""
     request_id = getattr(request.state, "request_id", "unknown")
@@ -1370,7 +1376,6 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # FastAPI Application Setup
 # =============================================================================
 
-# Application start time for uptime calculation
 APP_START_TIME = time.time()
 
 
@@ -1410,15 +1415,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown cleanup
     try:
-        # Flush cache to disk
         cache.flush()
         logger.info("✅ Cache flushed to disk")
 
-        # Close HTTP client
         await http_client.close()
         logger.info("✅ HTTP client closed")
 
-        # Close analysis engine sessions
         if analyzer is not None:
             try:
                 await analyzer.close()
@@ -1433,7 +1435,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"🛑 Application shutdown after {uptime:.2f} seconds")
 
 
-# Create FastAPI application
 app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
@@ -1464,7 +1465,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -1473,12 +1474,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure rate limiting
+# Rate limit handler
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
 
 # =============================================================================
-# Enhanced Middleware
+# Middleware
 # =============================================================================
 
 
@@ -1490,11 +1491,8 @@ async def add_request_id(request: Request, call_next):
 
     start_time = time.time()
     response = await call_next(request)
-
-    # Calculate processing time
     process_time = (time.time() - start_time) * 1000
 
-    # Structured access logging
     logger.info(
         f"Request completed: {request.method} {request.url.path} "
         f"-> {response.status_code} [{process_time:.1f}ms] "
@@ -1508,7 +1506,7 @@ async def add_request_id(request: Request, call_next):
 
 
 # =============================================================================
-# Enhanced Exception Handlers
+# Exception Handlers
 # =============================================================================
 
 
@@ -1525,7 +1523,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
-            error=str(exc.detail),  # Convert to string for safety
+            error=str(exc.detail),
             message=str(exc.detail),
             timestamp=datetime.datetime.utcnow(),
             request_id=request_id,
@@ -1556,16 +1554,14 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # =============================================================================
-# Enhanced API Endpoints
+# Core API Endpoints
 # =============================================================================
 
 
 @app.get("/", response_model=Dict[str, Any])
 @rate_limit(f"{settings.max_requests_per_minute}/minute")
 async def root(request: Request):
-    """
-    Root endpoint with comprehensive service information
-    """
+    """Root endpoint with comprehensive service information"""
     cache_stats = cache.get_stats()
 
     return {
@@ -1591,6 +1587,8 @@ async def root(request: Request):
             "cache_info": "/v1/cache/info",
             "analysis_multi_source": "/v1/analysis/multi-source",
             "analysis_recommendation": "/v1/analysis/recommendation",
+            "analysis_cache_info": "/v1/analysis/cache/info",
+            "analysis_cache_clear": "/v1/analysis/cache/clear",
             "saudi_market": "/api/saudi/market",
             "debug_simple_quote": "/debug/simple-quote",
             "debug_saudi_market": "/debug/saudi-market",
@@ -1601,17 +1599,13 @@ async def root(request: Request):
 @app.get("/health", response_model=HealthResponse)
 @rate_limit("30/minute")
 async def health_check(request: Request):
-    """
-    Enhanced health check with dependency status
-    """
-    # Cache status
+    """Enhanced health check with dependency status"""
     cache_stats = cache.get_stats()
 
-    # Analysis engine cache info (best-effort)
     analysis_cache_info: Optional[Dict[str, Any]] = None
     analysis_status = False
 
-    if analyzer is not None:
+    if analyzer is not None and settings.advanced_analysis_enabled:
         try:
             analysis_cache_info = await analyzer.get_cache_info()
             analysis_status = True
@@ -1642,11 +1636,11 @@ async def health_check(request: Request):
         "analysis_engine": {
             "status": analysis_status,
             "available": analyzer is not None,
+            "enabled": settings.advanced_analysis_enabled,
             "cache": analysis_cache_info,
         },
     }
 
-    # Determine overall status
     critical_services = [
         dependencies["financial_apis"]["status"],
         dependencies["cache"]["status"],
@@ -1665,9 +1659,7 @@ async def health_check(request: Request):
 @app.get("/ping")
 @rate_limit("120/minute")
 async def ping(request: Request):
-    """
-    Simple ping endpoint for connectivity testing
-    """
+    """Simple ping endpoint for connectivity testing"""
     return {
         "status": "ok",
         "service": settings.service_name,
@@ -1712,7 +1704,6 @@ async def get_quotes_v1(
             return response
 
         except asyncio.TimeoutError:
-            # Build a graceful timeout response instead of hanging
             now = datetime.datetime.utcnow()
             quotes = [
                 Quote(
@@ -1798,7 +1789,6 @@ async def get_quotes_v41(
                 },
             )
 
-        # Add v4.1 specific metadata
         if response.meta is None:
             response.meta = {}
         response.meta["compatibility"] = "v4.1"
@@ -1821,16 +1811,10 @@ async def update_quotes(
 ):
     """
     Update quotes in cache with fresh data from providers
-
-    - Fetches fresh data for specified symbols
-    - Updates cache with new data
-    - Returns update statistics
     """
     try:
-        # Fetch fresh quotes for the symbols
         response = await quote_service.get_quotes(request.symbols)
 
-        # Return refresh statistics
         result = {
             "status": "success",
             "refreshed_symbols": len(request.symbols),
@@ -1854,13 +1838,7 @@ async def get_cache_info(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Get comprehensive cache information and statistics
-
-    - Current cache size and composition
-    - Performance metrics (hit rate, updates, etc.)
-    - Storage information
-    """
+    """Get comprehensive cache information and statistics"""
     return cache.get_stats()
 
 
@@ -1870,15 +1848,9 @@ async def cleanup_cache(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Clean up expired cache entries
-
-    - Removes expired entries
-    - Returns cleanup statistics
-    - Forces immediate cache save
-    """
+    """Clean up expired cache entries"""
     expired_count = cache.cleanup_expired()
-    cache.flush()  # Force save after cleanup
+    cache.flush()
 
     return {
         "status": "success",
@@ -1894,12 +1866,7 @@ async def flush_cache(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Force immediate cache save to disk
-
-    - Useful for ensuring persistence after important updates
-    - Returns save status
-    """
+    """Force immediate cache save to disk"""
     success = cache.flush()
 
     return {
@@ -1910,7 +1877,7 @@ async def flush_cache(
 
 
 # =============================================================================
-# Fundamentals Endpoint (NEW)
+# Fundamentals Endpoint
 # =============================================================================
 
 
@@ -1923,10 +1890,6 @@ async def get_fundamentals_v1(
 ):
     """
     Hybrid fundamentals endpoint (EODHD + FMP).
-
-    - For global tickers: tries EODHD first, then FMP.
-    - For Tadawul (.SR): returns NO_DATA and a clear explanation that
-      KSA fundamentals require a Tadawul/Argaam source or static metadata.
     """
     try:
         result = await fundamentals_service.get_fundamentals(symbol)
@@ -1937,7 +1900,26 @@ async def get_fundamentals_v1(
 
 
 # =============================================================================
-# New: Advanced Analysis Endpoints
+# Analysis Feature Flag Helper
+# =============================================================================
+
+
+def ensure_analysis_enabled():
+    """Central check for analysis config + availability"""
+    if not settings.advanced_analysis_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis engine is disabled by configuration (ADVANCED_ANALYSIS_ENABLED=false)",
+        )
+    if analyzer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis engine is not available on this instance",
+        )
+
+
+# =============================================================================
+# Advanced Analysis Endpoints
 # =============================================================================
 
 
@@ -1950,16 +1932,8 @@ async def analysis_multi_source(
 ):
     """
     Multi-source analysis endpoint.
-
-    - Aggregates real-time prices from all configured APIs
-    - Includes consolidation metrics (avg, std, dispersion, confidence)
-    - Optionally pulls extra data from Google Apps Script if configured
     """
-    if analyzer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Analysis engine is not available on this instance",
-        )
+    ensure_analysis_enabled()
 
     try:
         result = await get_multi_source_analysis(symbol)
@@ -1978,20 +1952,11 @@ async def analysis_recommendation(
 ):
     """
     AI trading recommendation endpoint.
-
-    - Combines technical indicators, fundamentals, and sentiment
-    - Returns overall score, sub-scores and risk assessment
-    - Provides suggested entry, stop-loss, and price targets
     """
-    if analyzer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Analysis engine is not available on this instance",
-        )
+    ensure_analysis_enabled()
 
     try:
         rec = await generate_ai_recommendation(symbol)
-        # rec is an AIRecommendation dataclass; convert to dict for JSON response
         return rec.to_dict()
     except Exception as e:
         logger.error(f"Error generating AI recommendation for {symbol}: {e}")
@@ -2006,15 +1971,8 @@ async def analysis_cache_info(
 ):
     """
     Get cache information for the analysis engine.
-
-    - File cache + optional Redis info
-    - TTL and size configuration
     """
-    if analyzer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Analysis engine is not available on this instance",
-        )
+    ensure_analysis_enabled()
 
     try:
         info = await analyzer.get_cache_info()
@@ -2036,15 +1994,8 @@ async def analysis_cache_clear(
 ):
     """
     Clear analysis engine cache.
-
-    - If `symbol` is provided, clears only entries related to that symbol
-    - If not provided, clears all analyzer cache entries (Redis + file)
     """
-    if analyzer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Analysis engine is not available on this instance",
-        )
+    ensure_analysis_enabled()
 
     try:
         result = await analyzer.clear_cache(symbol)
@@ -2078,7 +2029,7 @@ async def debug_simple_quote(
         data.append(
             {
                 "ticker": sym,
-                "price": 100 + i,  # fake price
+                "price": 100 + i,
                 "currency": "SAR",
                 "source": "debug_stub",
                 "ts": now_ts,
@@ -2169,18 +2120,24 @@ def main():
     logger.info(f"⚡ Rate Limiting: {'Enabled' if settings.enable_rate_limiting else 'Disabled'}")
     logger.info(f"📊 Google Services: {'Available' if settings.has_google_sheets_access else 'Not Available'}")
     logger.info(f"💾 Cache: {cache.get_item_count()} items, Save Interval: {settings.cache_save_interval}s")
-    logger.info(f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled -> {[p.name for p in provider_manager.enabled_providers]}")
-    logger.info(f"🤖 Analysis Engine: {'Available' if analyzer is not None else 'Not Available'}")
+    logger.info(
+        f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled "
+        f"-> {[p.name for p in provider_manager.enabled_providers]}"
+    )
+    logger.info(
+        f"🤖 Analysis Engine: "
+        f"{'Available' if analyzer is not None else 'Not Available'} | "
+        f"Enabled (config): {settings.advanced_analysis_enabled}"
+    )
     logger.info(f"🔧 Debug Mode: {settings.debug}")
     logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port} (reload=False)")
     logger.info("=" * 70)
 
-    # IMPORTANT: reload=False to avoid reload loops / hanging
     uvicorn.run(
         "main:app",
         host=settings.app_host,
         port=settings.app_port,
-        reload=False,
+        reload=False,  # important: avoid reload loops on Render
         log_level="info",
     )
 
