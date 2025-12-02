@@ -1,6 +1,6 @@
 # advanced_analysis.py - Enhanced Multi-source AI Trading Analysis
-# Version: 3.0.2 - Production Ready for Render with Async Support
-# Optimized for memory, performance, and reliability
+# Version: 3.1.0 - Production Ready for Render with Async Support
+# Optimized for memory, performance, reliability, and Render environment
 
 from __future__ import annotations
 
@@ -71,7 +71,6 @@ class PriceData:
 
     def __post_init__(self):
         """Validate price data, normalize enums, and calculate confidence."""
-        # Normalize DataQuality if loaded from cache as string
         if isinstance(self.data_quality, str):
             try:
                 self.data_quality = DataQuality(self.data_quality)
@@ -79,20 +78,22 @@ class PriceData:
                 self.data_quality = DataQuality.MEDIUM
 
         self.symbol = self.symbol.upper().strip()
-        if self.price <= 0:
+
+        if self.price is None or self.price <= 0:
             raise ValueError("Price must be positive")
 
-        # Calculate confidence based on data completeness
+        if not self.timestamp:
+            self.timestamp = datetime.utcnow().isoformat() + "Z"
+
         completeness_score = sum([
-            1.0 if self.price > 0 else 0.0,
-            0.5 if self.volume > 0 else 0.0,
-            0.5 if self.high >= self.low else 0.0,
+            1.0 if self.price and self.price > 0 else 0.0,
+            0.5 if self.volume and self.volume > 0 else 0.0,
+            0.5 if self.high is not None and self.low is not None and self.high >= self.low else 0.0,
             0.5 if self.timestamp else 0.0,
         ])
-        self.confidence_score = min(1.0, completeness_score / 2.5)
+        self.confidence_score = float(min(1.0, completeness_score / 2.5))
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary with enum handling."""
         result = asdict(self)
         result["data_quality"] = self.data_quality.value
         return result
@@ -124,11 +125,9 @@ class TechnicalIndicators:
     adx: float
     atr: float
     data_quality: DataQuality = DataQuality.MEDIUM
-    calculation_timestamp: str = None
+    calculation_timestamp: Optional[str] = None
 
     def __post_init__(self):
-        """Set calculation timestamp, normalize enums, and validate indicators."""
-        # Normalize DataQuality if loaded from cache as string
         if isinstance(self.data_quality, str):
             try:
                 self.data_quality = DataQuality(self.data_quality)
@@ -138,12 +137,11 @@ class TechnicalIndicators:
         if not self.calculation_timestamp:
             self.calculation_timestamp = datetime.utcnow().isoformat() + "Z"
 
-        # Validate RSI range
+        # Basic validation
         if not (0 <= self.rsi <= 100):
             logger.warning(f"RSI out of expected range: {self.rsi}")
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary with enum handling."""
         result = asdict(self)
         result["data_quality"] = self.data_quality.value
         return result
@@ -168,11 +166,9 @@ class FundamentalData:
     quick_ratio: float
     peg_ratio: float
     data_quality: DataQuality = DataQuality.MEDIUM
-    last_updated: str = None
+    last_updated: Optional[str] = None
 
     def __post_init__(self):
-        """Set last updated timestamp and normalize enums."""
-        # Normalize DataQuality if loaded from cache as string
         if isinstance(self.data_quality, str):
             try:
                 self.data_quality = DataQuality(self.data_quality)
@@ -183,7 +179,6 @@ class FundamentalData:
             self.last_updated = datetime.utcnow().isoformat() + "Z"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary with enum handling."""
         result = asdict(self)
         result["data_quality"] = self.data_quality.value
         return result
@@ -213,7 +208,6 @@ class AIRecommendation:
     data_sources_used: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary with enum handling."""
         result = asdict(self)
         result["recommendation"] = self.recommendation.value
         return result
@@ -240,9 +234,10 @@ class AdvancedTradingAnalyzer:
         ANALYSIS_RATE_LIMIT_RPM - Requests per minute (default: 60)
         ANALYSIS_MAX_RETRIES - Maximum retry attempts (default: 3)
         REDIS_URL - Redis URL for distributed caching (optional)
+        GOOGLE_APPS_SCRIPT_URL - Optional Apps Script endpoint for sheet-enriched data
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # API configuration
         self.apis: Dict[str, Optional[str]] = {
             "alpha_vantage": os.getenv("ALPHA_VANTAGE_API_KEY"),
@@ -254,48 +249,35 @@ class AdvancedTradingAnalyzer:
         }
 
         # Base URLs
-        self.base_urls = {
-            "alpha_vantage": os.getenv(
-                "ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"
-            ),
-            "finnhub": os.getenv(
-                "FINNHUB_BASE_URL", "https://finnhub.io/api/v1"
-            ),
-            "eodhd": os.getenv(
-                "EODHD_BASE_URL", "https://eodhistoricaldata.com/api"
-            ),
-            "twelvedata": os.getenv(
-                "TWELVEDATA_BASE_URL", "https://api.twelvedata.com"
-            ),
-            "marketstack": os.getenv(
-                "MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"
-            ),
-            "fmp": os.getenv(
-                "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
-            ),
+        self.base_urls: Dict[str, str] = {
+            "alpha_vantage": os.getenv("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co/query"),
+            "finnhub": os.getenv("FINNHUB_BASE_URL", "https://finnhub.io/api/v1"),
+            "eodhd": os.getenv("EODHD_BASE_URL", "https://eodhistoricaldata.com/api"),
+            "twelvedata": os.getenv("TWELVEDATA_BASE_URL", "https://api.twelvedata.com"),
+            "marketstack": os.getenv("MARKETSTACK_BASE_URL", "http://api.marketstack.com/v1"),
+            "fmp": os.getenv("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"),
         }
 
         # Google Apps Script integration
-        self.google_apps_script_url = os.getenv("GOOGLE_APPS_SCRIPT_URL")
+        self.google_apps_script_url: Optional[str] = os.getenv("GOOGLE_APPS_SCRIPT_URL")
 
         # Configuration with defaults
-        self.cache_ttl = timedelta(
+        self.cache_ttl: timedelta = timedelta(
             minutes=int(os.getenv("ANALYSIS_CACHE_TTL_MINUTES", "15"))
         )
-        self.max_cache_size_mb = int(os.getenv("ANALYSIS_MAX_CACHE_SIZE_MB", "100"))
-        self.rate_limit_rpm = int(os.getenv("ANALYSIS_RATE_LIMIT_RPM", "60"))
-        self.max_retries = int(os.getenv("ANALYSIS_MAX_RETRIES", "3"))
+        self.max_cache_size_mb: int = int(os.getenv("ANALYSIS_MAX_CACHE_SIZE_MB", "100"))
+        self.rate_limit_rpm: int = int(os.getenv("ANALYSIS_RATE_LIMIT_RPM", "60"))
+        self.max_retries: int = int(os.getenv("ANALYSIS_MAX_RETRIES", "3"))
 
         # Rate limiting state
         self.request_timestamps: deque = deque(maxlen=self.rate_limit_rpm * 2)
         self._rate_limit_lock = threading.RLock()
 
-        # Cache configuration
-        self.cache_dir = Path("./analysis_cache")
-        self.cache_dir.mkdir(exist_ok=True)
+        # Cache directory (Render-friendly)
+        self.cache_dir: Path = self._init_cache_dir()
 
         # Redis support for distributed caching
-        self.redis_url = os.getenv("REDIS_URL")
+        self.redis_url: Optional[str] = os.getenv("REDIS_URL")
         self.redis_client = None
         self._init_redis()
 
@@ -304,48 +286,79 @@ class AdvancedTradingAnalyzer:
         self._session_sync: Optional[requests.Session] = None
 
         # Statistics
-        self.request_counter = 0
-        self.error_counter = 0
+        self.request_counter: int = 0
+        self.error_counter: int = 0
         self._stats_lock = threading.RLock()
 
         configured_apis = [k for k, v in self.apis.items() if v]
         logger.info(
             "AdvancedTradingAnalyzer initialized. "
-            f"APIs: {configured_apis}, "
-            f"Cache TTL: {self.cache_ttl.total_seconds()/60}min, "
+            f"APIs configured: {configured_apis}, "
+            f"Cache TTL: {self.cache_ttl.total_seconds()/60:.1f} min, "
             f"Rate Limit: {self.rate_limit_rpm}/min, "
             f"Max Retries: {self.max_retries}"
         )
 
-    def _init_redis(self):
+    # -------------------------------------------------------------------------
+    # Initialization helpers
+    # -------------------------------------------------------------------------
+
+    def _init_cache_dir(self) -> Path:
+        """Initialize cache directory, preferring /tmp on Render."""
+        preferred_tmp = Path("/tmp/analysis_cache")
+        try:
+            if preferred_tmp.parent.exists() and os.access(preferred_tmp.parent, os.W_OK):
+                preferred_tmp.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Analysis cache directory: {preferred_tmp}")
+                return preferred_tmp
+        except Exception as e:
+            logger.warning(f"Could not create /tmp cache dir, falling back: {e}")
+
+        fallback = Path("./analysis_cache")
+        try:
+            fallback.mkdir(exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create analysis_cache directory: {e}")
+        logger.info(f"Analysis cache directory (fallback): {fallback}")
+        return fallback
+
+    def _init_redis(self) -> None:
         """Initialize Redis client if available."""
-        if self.redis_url:
+        if not self.redis_url:
+            return
+
+        try:
+            import redis  # type: ignore
+            self.redis_client = redis.from_url(self.redis_url, decode_responses=True)
+            # Simple ping to validate connection
             try:
-                import redis
-                self.redis_client = redis.from_url(
-                    self.redis_url, decode_responses=True
-                )
+                self.redis_client.ping()
                 logger.info("Redis cache initialized successfully")
-            except ImportError:
-                logger.warning("Redis package not available, using file cache only")
-            except Exception as e:
-                logger.warning(f"Redis initialization failed: {e}, using file cache")
+            except Exception as ping_err:
+                logger.warning(f"Redis ping failed: {ping_err}, disabling Redis cache")
+                self.redis_client = None
+        except ImportError:
+            logger.warning("Redis package not available, using file cache only")
+        except Exception as e:
+            logger.warning(f"Redis initialization failed: {e}, using file cache only")
+            self.redis_client = None
+
+    # -------------------------------------------------------------------------
+    # Session handling
+    # -------------------------------------------------------------------------
 
     async def get_session(self) -> aiohttp.ClientSession:
         """Get or create async session."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=30)
             connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
-            self._session = aiohttp.ClientSession(
-                timeout=timeout, connector=connector
-            )
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     def get_session_sync(self) -> requests.Session:
         """Get or create sync session."""
         if self._session_sync is None:
             self._session_sync = requests.Session()
-            # Configure retry strategy
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
 
@@ -360,68 +373,80 @@ class AdvancedTradingAnalyzer:
             self._session_sync.mount("https://", adapter)
         return self._session_sync
 
-    async def close(self):
+    async def close(self) -> None:
         """Close sessions."""
-        if self._session:
-            await self._session.close()
-        if self._session_sync:
-            self._session_sync.close()
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+        except Exception as e:
+            logger.debug(f"Error closing aiohttp session: {e}")
+
+        try:
+            if self._session_sync:
+                self._session_sync.close()
+        except Exception as e:
+            logger.debug(f"Error closing sync session: {e}")
 
     # -------------------------------------------------------------------------
     # Enhanced Cache Management
     # -------------------------------------------------------------------------
 
     def _get_cache_key(self, symbol: str, data_type: str) -> str:
-        """Generate cache key with versioning."""
-        key_string = f"v3_{symbol}_{data_type}"
+        key_string = f"v3_{symbol.upper().strip()}_{data_type}"
         return hashlib.md5(key_string.encode()).hexdigest()
 
     async def _load_from_cache(self, symbol: str, data_type: str) -> Optional[Any]:
-        """Load from cache with Redis fallback."""
+        """Load from cache with Redis preference and TTL check."""
         cache_key = self._get_cache_key(symbol, data_type)
 
-        # Try Redis first
+        # Redis first (if enabled)
         if self.redis_client:
             try:
                 cached = self.redis_client.get(cache_key)
                 if cached:
                     data = json.loads(cached)
-                    cache_time = datetime.fromisoformat(
-                        data.get("timestamp", "2000-01-01")
-                    )
+                    ts_str = data.get("timestamp")
+                    if not ts_str:
+                        return None
+                    cache_time = datetime.fromisoformat(ts_str)
                     if datetime.now() - cache_time < self.cache_ttl:
                         logger.debug(f"Cache hit (Redis): {symbol}_{data_type}")
                         return data.get("data")
             except Exception as e:
                 logger.debug(f"Redis cache read failed: {e}")
 
-        # Fallback to file cache
+        # File cache
         try:
             cache_file = self.cache_dir / f"{cache_key}.json"
-            if cache_file.exists():
-                data = json.loads(cache_file.read_text(encoding="utf-8"))
-                cache_time = datetime.fromisoformat(
-                    data.get("timestamp", "2000-01-01")
-                )
-                if datetime.now() - cache_time < self.cache_ttl:
-                    logger.debug(f"Cache hit (file): {symbol}_{data_type}")
-                    return data.get("data")
+            if not cache_file.exists():
+                return None
+
+            raw = cache_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            ts_str = data.get("timestamp")
+            if not ts_str:
+                return None
+            cache_time = datetime.fromisoformat(ts_str)
+            if datetime.now() - cache_time >= self.cache_ttl:
+                return None
+
+            logger.debug(f"Cache hit (file): {symbol}_{data_type}")
+            return data.get("data")
         except Exception as e:
             logger.debug(f"File cache read failed: {e}")
-
-        return None
+            return None
 
     async def _save_to_cache(self, symbol: str, data_type: str, data: Any) -> None:
-        """Save to cache with Redis preference."""
+        """Save to cache with Redis preference and file fallback."""
         cache_key = self._get_cache_key(symbol, data_type)
         cache_data = {
             "timestamp": datetime.now().isoformat(),
-            "symbol": symbol,
+            "symbol": symbol.upper().strip(),
             "data_type": data_type,
             "data": data,
         }
 
-        # Try Redis first
+        # Redis
         if self.redis_client:
             try:
                 self.redis_client.setex(
@@ -433,52 +458,49 @@ class AdvancedTradingAnalyzer:
             except Exception as e:
                 logger.debug(f"Redis cache write failed: {e}")
 
-        # Fallback to file cache
+        # File cache
         try:
             cache_file = self.cache_dir / f"{cache_key}.json"
-            # Check cache size before writing
             if self._get_cache_size_mb() > self.max_cache_size_mb:
                 self._cleanup_old_cache_files()
 
             cache_file.write_text(
-                json.dumps(cache_data, indent=2, default=str), encoding="utf-8"
+                json.dumps(cache_data, indent=2, default=str),
+                encoding="utf-8",
             )
         except Exception as e:
             logger.debug(f"File cache write failed: {e}")
 
     def _get_cache_size_mb(self) -> float:
-        """Get current cache directory size in MB."""
         try:
             total_size = sum(f.stat().st_size for f in self.cache_dir.glob("*.json"))
             return total_size / (1024 * 1024)
         except Exception:
             return 0.0
 
-    def _cleanup_old_cache_files(self):
-        """Clean up old cache files to free space."""
+    def _cleanup_old_cache_files(self) -> None:
+        """Clean up old cache files if size exceeds limit."""
         try:
             cache_files = list(self.cache_dir.glob("*.json"))
-            # Sort by modification time (oldest first)
             cache_files.sort(key=lambda x: x.stat().st_mtime)
 
-            # Remove oldest files until under limit
             current_size = self._get_cache_size_mb()
             files_removed = 0
 
             for cache_file in cache_files:
-                if current_size <= self.max_cache_size_mb * 0.8:  # Leave some buffer
+                if current_size <= self.max_cache_size_mb * 0.8:
                     break
 
-                file_size = cache_file.stat().st_size / (1024 * 1024)
-                cache_file.unlink()
-                current_size -= file_size
+                size_mb = cache_file.stat().st_size / (1024 * 1024)
+                cache_file.unlink(missing_ok=True)
+                current_size -= size_mb
                 files_removed += 1
 
             if files_removed:
                 logger.info(
-                    f"Cleaned up {files_removed} cache files, current size: {current_size:.2f}MB"
+                    f"Cleaned up {files_removed} cache files, "
+                    f"current size: {current_size:.2f} MB"
                 )
-
         except Exception as e:
             logger.error(f"Cache cleanup failed: {e}")
 
@@ -486,26 +508,20 @@ class AdvancedTradingAnalyzer:
     # Rate Limiting and Error Handling
     # -------------------------------------------------------------------------
 
-    async def _enforce_rate_limit(self):
-        """Enforce rate limiting with async support (no await inside lock)."""
+    async def _enforce_rate_limit(self) -> None:
+        """Enforce per-minute rate limiting with async sleep."""
         while True:
             with self._rate_limit_lock:
                 now = time.time()
-                window_start = now - 60  # 1 minute window
+                window_start = now - 60  # 60-second window
 
-                # Clean old timestamps
-                while (
-                    self.request_timestamps
-                    and self.request_timestamps[0] < window_start
-                ):
+                while self.request_timestamps and self.request_timestamps[0] < window_start:
                     self.request_timestamps.popleft()
 
                 if len(self.request_timestamps) < self.rate_limit_rpm:
-                    # We can proceed now
                     self.request_timestamps.append(now)
                     return
 
-                # Need to wait before issuing new request
                 oldest = self.request_timestamps[0]
                 sleep_time = 60 - (now - oldest)
 
@@ -517,26 +533,28 @@ class AdvancedTradingAnalyzer:
     async def _make_async_request(
         self,
         url: str,
-        params: Dict[str, Any] = None,
-        headers: Dict[str, str] = None,
-    ) -> Optional[Dict[str, Any]]:
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[Any]:
         """
         Make async HTTP request with rate limiting, retries, and error handling.
-        Respects self.max_retries and updates statistics.
+        Tries to parse JSON but falls back gracefully.
         """
         params = params or {}
         headers = headers or {}
 
         for attempt in range(self.max_retries + 1):
             await self._enforce_rate_limit()
+
             try:
                 session = await self.get_session()
-                async with session.get(
-                    url, params=params, headers=headers, timeout=30
-                ) as response:
-                    if response.status == 200:
+                async with session.get(url, params=params, headers=headers) as response:
+                    status = response.status
+                    text = await response.text()
+
+                    if status == 200:
                         try:
-                            data = await response.json()
+                            data = await response.json(content_type=None)
                         except Exception as e:
                             logger.error(f"JSON parse error for {url}: {e}")
                             self._update_stats(False)
@@ -545,8 +563,9 @@ class AdvancedTradingAnalyzer:
                             self._update_stats(True)
                         return data
                     else:
-                        logger.warning(f"HTTP {response.status} for {url}")
+                        logger.warning(f"HTTP {status} for {url} :: {text[:200]}")
                         self._update_stats(False)
+
             except asyncio.TimeoutError:
                 logger.error(f"Timeout for {url} (attempt {attempt + 1})")
                 self._update_stats(False)
@@ -554,15 +573,13 @@ class AdvancedTradingAnalyzer:
                 logger.error(f"Request failed for {url} (attempt {attempt + 1}): {e}")
                 self._update_stats(False)
 
-            # Backoff if we are going to retry
             if attempt < self.max_retries:
                 backoff = (2 ** attempt) + 0.1
                 await asyncio.sleep(backoff)
 
         return None
 
-    def _update_stats(self, success: bool):
-        """Update request statistics."""
+    def _update_stats(self, success: bool) -> None:
         with self._stats_lock:
             self.request_counter += 1
             if not success:
@@ -576,7 +593,6 @@ class AdvancedTradingAnalyzer:
         """Get real-time price from multiple sources with async support."""
         symbol = symbol.upper().strip()
 
-        # Try cache first
         cached = await self._load_from_cache(symbol, "price")
         if cached:
             try:
@@ -584,7 +600,6 @@ class AdvancedTradingAnalyzer:
             except Exception as e:
                 logger.debug(f"Invalid cached price for {symbol}: {e}")
 
-        # Try all sources concurrently
         tasks = [
             self._get_price_alpha_vantage(symbol),
             self._get_price_finnhub(symbol),
@@ -595,17 +610,18 @@ class AdvancedTradingAnalyzer:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Find first successful result
         for result in results:
             if isinstance(result, PriceData) and result.price > 0:
                 await self._save_to_cache(symbol, "price", result.to_dict())
                 return result
+            elif isinstance(result, Exception):
+                logger.debug(f"Price source error: {result}")
 
         logger.error(f"All price sources failed for {symbol}")
         return None
 
     async def _get_price_alpha_vantage(self, symbol: str) -> Optional[PriceData]:
-        if not self.apis["alpha_vantage"]:
+        if not self.apis.get("alpha_vantage"):
             return None
 
         params = {
@@ -613,7 +629,6 @@ class AdvancedTradingAnalyzer:
             "symbol": symbol,
             "apikey": self.apis["alpha_vantage"],
         }
-
         data = await self._make_async_request(self.base_urls["alpha_vantage"], params)
         if not data:
             return None
@@ -627,9 +642,7 @@ class AdvancedTradingAnalyzer:
                 symbol=symbol,
                 price=float(quote.get("05. price", 0) or 0),
                 change=float(quote.get("09. change", 0) or 0),
-                change_percent=float(
-                    str(quote.get("10. change percent", "0")).rstrip("%") or 0
-                ),
+                change_percent=float(str(quote.get("10. change percent", "0")).rstrip("%") or 0),
                 volume=int(quote.get("06. volume", 0) or 0),
                 high=float(quote.get("03. high", 0) or 0),
                 low=float(quote.get("04. low", 0) or 0),
@@ -637,21 +650,18 @@ class AdvancedTradingAnalyzer:
                 previous_close=float(quote.get("08. previous close", 0) or 0),
                 timestamp=datetime.utcnow().isoformat() + "Z",
                 source="alpha_vantage",
-                data_quality=DataQuality.HIGH
-                if quote.get("05. price")
-                else DataQuality.LOW,
+                data_quality=DataQuality.HIGH if quote.get("05. price") else DataQuality.LOW,
             )
         except (ValueError, TypeError) as e:
             logger.warning(f"Alpha Vantage data parsing failed for {symbol}: {e}")
             return None
 
     async def _get_price_finnhub(self, symbol: str) -> Optional[PriceData]:
-        if not self.apis["finnhub"]:
+        if not self.apis.get("finnhub"):
             return None
 
         url = f"{self.base_urls['finnhub']}/quote"
         params = {"symbol": symbol, "token": self.apis["finnhub"]}
-
         data = await self._make_async_request(url, params)
         if not data or data.get("c", 0) <= 0:
             return None
@@ -676,12 +686,11 @@ class AdvancedTradingAnalyzer:
             return None
 
     async def _get_price_twelvedata(self, symbol: str) -> Optional[PriceData]:
-        if not self.apis["twelvedata"]:
+        if not self.apis.get("twelvedata"):
             return None
 
         url = f"{self.base_urls['twelvedata']}/quote"
         params = {"symbol": symbol, "apikey": self.apis["twelvedata"]}
-
         data = await self._make_async_request(url, params)
         if not data or not data.get("close"):
             return None
@@ -697,8 +706,7 @@ class AdvancedTradingAnalyzer:
                 open=float(data.get("open", 0) or 0),
                 previous_close=float(data.get("previous_close", 0) or 0),
                 volume=int(data.get("volume", 0) or 0),
-                timestamp=data.get("datetime")
-                or datetime.utcnow().isoformat() + "Z",
+                timestamp=data.get("datetime") or datetime.utcnow().isoformat() + "Z",
                 source="twelvedata",
                 data_quality=DataQuality.HIGH,
             )
@@ -707,12 +715,11 @@ class AdvancedTradingAnalyzer:
             return None
 
     async def _get_price_marketstack(self, symbol: str) -> Optional[PriceData]:
-        if not self.apis["marketstack"]:
+        if not self.apis.get("marketstack"):
             return None
 
         url = f"{self.base_urls['marketstack']}/eod/latest"
         params = {"symbols": symbol, "access_key": self.apis["marketstack"]}
-
         data = await self._make_async_request(url, params)
         if not data or not data.get("data"):
             return None
@@ -721,7 +728,6 @@ class AdvancedTradingAnalyzer:
             quote = data["data"][0]
             close_price = float(quote.get("close", 0) or 0)
             open_price = float(quote.get("open", close_price) or close_price)
-
             if open_price == 0:
                 open_price = close_price
 
@@ -738,8 +744,7 @@ class AdvancedTradingAnalyzer:
                 open=open_price,
                 previous_close=close_price,
                 volume=int(quote.get("volume", 0) or 0),
-                timestamp=quote.get("date")
-                or datetime.utcnow().isoformat() + "Z",
+                timestamp=quote.get("date") or datetime.utcnow().isoformat() + "Z",
                 source="marketstack",
                 data_quality=DataQuality.MEDIUM,
             )
@@ -748,12 +753,11 @@ class AdvancedTradingAnalyzer:
             return None
 
     async def _get_price_fmp(self, symbol: str) -> Optional[PriceData]:
-        if not self.apis["fmp"]:
+        if not self.apis.get("fmp"):
             return None
 
         url = f"{self.base_urls['fmp']}/quote/{symbol}"
         params = {"apikey": self.apis["fmp"]}
-
         data = await self._make_async_request(url, params)
         if not data:
             return None
@@ -783,10 +787,9 @@ class AdvancedTradingAnalyzer:
     # -------------------------------------------------------------------------
 
     async def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
-        """Enhanced multi-source analysis with async data collection."""
+        """Multi-source analysis including Apps Script enrichment if configured."""
         symbol = symbol.upper().strip()
 
-        # Get price data from all sources concurrently
         price_tasks = [
             self._get_price_alpha_vantage(symbol),
             self._get_price_finnhub(symbol),
@@ -810,7 +813,6 @@ class AdvancedTradingAnalyzer:
             elif isinstance(result, Exception):
                 logger.debug(f"Price source {name} failed: {result}")
 
-        # Get additional data from Google Apps Script if available
         if self.google_apps_script_url:
             try:
                 apps_script_data = await self._get_google_apps_script_data(symbol)
@@ -835,16 +837,15 @@ class AdvancedTradingAnalyzer:
             },
         }
 
-    async def _get_google_apps_script_data(
-        self, symbol: str
-    ) -> Optional[Dict[str, Any]]:
+    async def _get_google_apps_script_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get data from Google Apps Script with async support."""
         if not self.google_apps_script_url:
             return None
-
         params = {"symbol": symbol.upper()}
         data = await self._make_async_request(self.google_apps_script_url, params)
-        return data
+        if isinstance(data, dict):
+            return data
+        return None
 
     def _consolidate_multi_source_data(self, sources: Dict[str, Any]) -> Dict[str, Any]:
         """Consolidate data from multiple sources with enhanced metrics."""
@@ -858,18 +859,25 @@ class AdvancedTradingAnalyzer:
                 continue
 
             if data.get("price") is not None:
-                price = float(data["price"])
-                if price > 0:  # Only include valid prices
+                try:
+                    price = float(data["price"])
+                except Exception:
+                    price = 0
+                if price > 0:
                     prices.append(price)
-                    # Calculate quality score for this source
-                    quality_score = data.get("confidence_score", 0.5)
-                    quality_scores.append(quality_score)
+                    quality_scores.append(float(data.get("confidence_score", 0.5)))
 
             if data.get("volume") is not None:
-                volumes.append(float(data["volume"]))
+                try:
+                    volumes.append(float(data["volume"]))
+                except Exception:
+                    pass
 
             if data.get("change") is not None:
-                changes.append(float(data["change"]))
+                try:
+                    changes.append(float(data["change"]))
+                except Exception:
+                    pass
 
         if not prices:
             return {
@@ -879,7 +887,6 @@ class AdvancedTradingAnalyzer:
                 "message": "No valid price data available",
             }
 
-        # Weighted average based on quality scores
         if quality_scores and len(quality_scores) == len(prices):
             total_quality = sum(quality_scores)
             if total_quality > 0:
@@ -890,7 +897,6 @@ class AdvancedTradingAnalyzer:
         else:
             price_avg = sum(prices) / len(prices)
 
-        # Determine overall data quality
         source_count = len(prices)
         if source_count >= 3:
             data_quality = "HIGH"
@@ -902,15 +908,13 @@ class AdvancedTradingAnalyzer:
             data_quality = "LOW"
             confidence = 0.3
 
-        # Calculate price dispersion
         price_std = float(np.std(prices)) if len(prices) > 1 else 0.0
         price_range = (max(prices) - min(prices)) if prices else 0.0
-        dispersion_ratio = price_std / price_avg if price_avg > 0 else 0.0
+        dispersion_ratio = (price_std / price_avg) if price_avg > 0 else 0.0
 
-        # Adjust confidence based on dispersion
-        if dispersion_ratio > 0.1:  # More than 10% dispersion
+        if dispersion_ratio > 0.1:
             confidence *= 0.8
-        if dispersion_ratio > 0.2:  # More than 20% dispersion
+        if dispersion_ratio > 0.2:
             confidence *= 0.6
 
         return {
@@ -925,9 +929,7 @@ class AdvancedTradingAnalyzer:
             "sources_count": source_count,
             "confidence": round(confidence, 3),
             "data_quality": data_quality,
-            "quality_scores": [round(score, 3) for score in quality_scores]
-            if quality_scores
-            else [],
+            "quality_scores": [round(s, 3) for s in quality_scores] if quality_scores else [],
         }
 
     # -------------------------------------------------------------------------
@@ -940,7 +942,6 @@ class AdvancedTradingAnalyzer:
         """Calculate technical indicators with memory-efficient data processing."""
         symbol = symbol.upper().strip()
 
-        # Try cache first
         cached = await self._load_from_cache(symbol, f"technical_{period}")
         if cached:
             try:
@@ -949,52 +950,57 @@ class AdvancedTradingAnalyzer:
                 logger.debug(f"Invalid cached technicals for {symbol}: {e}")
 
         try:
-            # Get historical data with memory limits
             df = await self._get_historical_data(symbol, period)
-            if df.empty or len(df) < 20:  # Minimum data points
+            if df.empty or len(df) < 20:
                 logger.warning(f"Insufficient data for technical analysis of {symbol}")
                 return self._generate_fallback_technical_indicators()
 
-            # Calculate indicators with memory monitoring
             indicators = self._calculate_advanced_indicators(df)
-            await self._save_to_cache(
-                symbol, f"technical_{period}", indicators.to_dict()
-            )
+            await self._save_to_cache(symbol, f"technical_{period}", indicators.to_dict())
             return indicators
-
         except Exception as e:
             logger.error(f"Technical indicators calculation failed for {symbol}: {e}")
             return self._generate_fallback_technical_indicators()
 
     async def _get_historical_data(self, symbol: str, period: str) -> pd.DataFrame:
-        """Get historical data with memory-efficient chunking."""
-        # Try Alpha Vantage first
+        """
+        Get historical data with memory-efficient chunking.
+        period can be '1mo', '3mo', '6mo', '1y', 'max' (approximate by days).
+        """
+        # Decide how many days based on period (approximate)
+        period_map = {
+            "1mo": 30,
+            "3mo": 90,
+            "6mo": 180,
+            "1y": 252,
+            "max": 365,
+        }
+        max_days = period_map.get(period, 90)
+
         try:
-            if self.apis["alpha_vantage"]:
+            if self.apis.get("alpha_vantage"):
                 url = self.base_urls["alpha_vantage"]
                 params = {
                     "function": "TIME_SERIES_DAILY",
                     "symbol": symbol,
                     "apikey": self.apis["alpha_vantage"],
-                    "outputsize": "compact",  # ~100 data points
+                    "outputsize": "compact",
                 }
-
                 data = await self._make_async_request(url, params)
                 if data and "Time Series (Daily)" in data:
                     ts = data["Time Series (Daily)"]
-                    return self._parse_alpha_vantage_historical(ts)
+                    return self._parse_alpha_vantage_historical(ts, max_days)
         except Exception as e:
             logger.debug(f"Alpha Vantage historical data failed for {symbol}: {e}")
 
-        # Fallback to synthetic data with limited size
-        return self._generate_synthetic_data(90)  # 90 days max
+        # Fallback to synthetic data
+        return self._generate_synthetic_data(max_days)
 
-    def _parse_alpha_vantage_historical(self, time_series: Dict) -> pd.DataFrame:
+    def _parse_alpha_vantage_historical(self, time_series: Dict, max_days: int) -> pd.DataFrame:
         """Parse Alpha Vantage historical data with memory efficiency."""
         dates, opens, highs, lows, closes, volumes = [], [], [], [], [], []
 
-        # Process only the most recent 90 days to limit memory
-        for date, values in list(time_series.items())[:90]:
+        for date, values in list(time_series.items())[:max_days]:
             try:
                 dates.append(pd.to_datetime(date))
                 opens.append(float(values["1. open"]))
@@ -1010,14 +1016,7 @@ class AdvancedTradingAnalyzer:
             return pd.DataFrame()
 
         df = pd.DataFrame(
-            {
-                "date": dates,
-                "open": opens,
-                "high": highs,
-                "low": lows,
-                "close": closes,
-                "volume": volumes,
-            }
+            {"date": dates, "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes}
         )
         return df.set_index("date").sort_index()
 
@@ -1025,9 +1024,7 @@ class AdvancedTradingAnalyzer:
         """Generate synthetic data with realistic patterns."""
         dates = pd.date_range(end=datetime.now(), periods=periods, freq="D")
         base_price = float(np.random.uniform(40, 60))
-
-        # Generate more realistic price patterns
-        returns = np.random.normal(0, 0.02, periods)  # 2% daily volatility
+        returns = np.random.normal(0, 0.02, periods)
         prices = base_price * (1 + returns).cumprod()
 
         data = {
@@ -1048,27 +1045,15 @@ class AdvancedTradingAnalyzer:
             low_prices = df["low"].astype(float)
             volumes = df["volume"].astype(float)
 
-            # RSI calculation with validation
             rsi = self._calculate_rsi(close_prices)
-
-            # MACD calculation
             macd, macd_signal, macd_histogram = self._calculate_macd(close_prices)
 
-            # Moving averages
             ma_20 = float(close_prices.rolling(20).mean().iloc[-1])
             ma_50 = float(close_prices.rolling(50).mean().iloc[-1])
-            ma_200 = (
-                float(close_prices.rolling(200).mean().iloc[-1])
-                if len(close_prices) >= 200
-                else ma_50
-            )
+            ma_200 = float(close_prices.rolling(min(200, len(close_prices))).mean().iloc[-1])
 
-            # Bollinger Bands
-            bb_upper, bb_lower, bb_position = self._calculate_bollinger_bands(
-                close_prices, ma_20
-            )
+            bb_upper, bb_lower, bb_position = self._calculate_bollinger_bands(close_prices, ma_20)
 
-            # Additional indicators
             volume_trend = float(volumes.pct_change(5).mean())
             support_level = float(low_prices.rolling(20).min().iloc[-1])
             resistance_level = float(high_prices.rolling(20).max().iloc[-1])
@@ -1093,25 +1078,19 @@ class AdvancedTradingAnalyzer:
                 trend_direction=trend_direction,
                 volatility=volatility,
                 momentum_score=momentum_score,
-                williams_r=self._calculate_williams_r(
-                    high_prices, low_prices, close_prices
-                ),
-                stoch_k=self._calculate_stochastic(
-                    high_prices, low_prices, close_prices
-                ),
-                stoch_d=0.0,  # placeholder for full calc
+                williams_r=self._calculate_williams_r(high_prices, low_prices, close_prices),
+                stoch_k=self._calculate_stochastic(high_prices, low_prices, close_prices),
+                stoch_d=0.0,
                 cci=self._calculate_cci(high_prices, low_prices, close_prices),
-                adx=float(np.random.uniform(0, 60)),  # Simplified
+                adx=float(np.random.uniform(0, 60)),
                 atr=self._calculate_atr(high_prices, low_prices, close_prices),
                 data_quality=DataQuality.HIGH,
             )
-
         except Exception as e:
             logger.error(f"Indicator calculation error: {e}")
             return self._generate_fallback_technical_indicators()
 
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
-        """Calculate RSI with error handling."""
         try:
             delta = prices.diff()
             gain = delta.where(delta > 0, 0).rolling(window=period).mean()
@@ -1123,7 +1102,6 @@ class AdvancedTradingAnalyzer:
             return 50.0
 
     def _calculate_macd(self, prices: pd.Series) -> Tuple[float, float, float]:
-        """Calculate MACD with error handling."""
         try:
             exp1 = prices.ewm(span=12, adjust=False).mean()
             exp2 = prices.ewm(span=26, adjust=False).mean()
@@ -1141,7 +1119,6 @@ class AdvancedTradingAnalyzer:
     def _calculate_bollinger_bands(
         self, prices: pd.Series, ma: float
     ) -> Tuple[float, float, float]:
-        """Calculate Bollinger Bands with error handling."""
         try:
             std = float(prices.rolling(20).std().iloc[-1])
             bb_upper = ma + 2 * std
@@ -1157,19 +1134,14 @@ class AdvancedTradingAnalyzer:
         except Exception:
             return 0.0, 0.0, 0.5
 
-    def _determine_trend_direction(
-        self, ma_20: float, ma_50: float, ma_200: float
-    ) -> str:
-        """Determine trend direction based on moving averages."""
+    def _determine_trend_direction(self, ma_20: float, ma_50: float, ma_200: float) -> str:
         if ma_20 > ma_50 > ma_200:
             return "Bullish"
         elif ma_20 < ma_50 < ma_200:
             return "Bearish"
-        else:
-            return "Neutral"
+        return "Neutral"
 
     def _calculate_momentum(self, prices: pd.Series) -> float:
-        """Calculate price momentum."""
         try:
             if len(prices) >= 20:
                 return float((prices.iloc[-1] / prices.iloc[-20] - 1) * 100)
@@ -1180,35 +1152,28 @@ class AdvancedTradingAnalyzer:
     def _calculate_williams_r(
         self, high: pd.Series, low: pd.Series, close: pd.Series
     ) -> float:
-        """Calculate Williams %R."""
         try:
             highest_high = high.rolling(14).max().iloc[-1]
             lowest_low = low.rolling(14).min().iloc[-1]
             current_close = close.iloc[-1]
-            return float(
-                ((highest_high - current_close) / (highest_high - lowest_low)) * -100
-            )
+            return float(((highest_high - current_close) / (highest_high - lowest_low)) * -100)
         except Exception:
             return -50.0
 
     def _calculate_stochastic(
         self, high: pd.Series, low: pd.Series, close: pd.Series
     ) -> float:
-        """Calculate Stochastic %K."""
         try:
             lowest_low = low.rolling(14).min().iloc[-1]
             highest_high = high.rolling(14).max().iloc[-1]
             current_close = close.iloc[-1]
-            return float(
-                ((current_close - lowest_low) / (highest_high - lowest_low)) * 100
-            )
+            return float(((current_close - lowest_low) / (highest_high - lowest_low)) * 100)
         except Exception:
             return 50.0
 
     def _calculate_cci(
         self, high: pd.Series, low: pd.Series, close: pd.Series
     ) -> float:
-        """Calculate Commodity Channel Index."""
         try:
             typical_price = (high + low + close) / 3
             sma = typical_price.rolling(20).mean()
@@ -1223,11 +1188,10 @@ class AdvancedTradingAnalyzer:
     def _calculate_atr(
         self, high: pd.Series, low: pd.Series, close: pd.Series
     ) -> float:
-        """Calculate Average True Range."""
         try:
             tr1 = high - low
-            tr2 = abs(high - close.shift())
-            tr3 = abs(low - close.shift())
+            tr2 = (high - close.shift()).abs()
+            tr3 = (low - close.shift()).abs()
             true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             atr = true_range.rolling(14).mean()
             return float(atr.iloc[-1])
@@ -1235,7 +1199,6 @@ class AdvancedTradingAnalyzer:
             return 1.0
 
     def _generate_fallback_technical_indicators(self) -> TechnicalIndicators:
-        """Generate fallback technical indicators with synthetic data quality."""
         return TechnicalIndicators(
             rsi=50.0,
             macd=0.0,
@@ -1267,7 +1230,6 @@ class AdvancedTradingAnalyzer:
     # -------------------------------------------------------------------------
 
     async def analyze_fundamentals(self, symbol: str) -> FundamentalData:
-        """Analyze fundamentals with async data fetching."""
         symbol = symbol.upper().strip()
 
         cached = await self._load_from_cache(symbol, "fundamentals")
@@ -1279,24 +1241,18 @@ class AdvancedTradingAnalyzer:
 
         try:
             fundamental_data = await self._get_fundamental_data_combined(symbol)
-            await self._save_to_cache(
-                symbol, "fundamentals", fundamental_data.to_dict()
-            )
+            await self._save_to_cache(symbol, "fundamentals", fundamental_data.to_dict())
             return fundamental_data
         except Exception as e:
             logger.error(f"Fundamental analysis failed for {symbol}: {e}")
             return self._generate_fallback_fundamental_data()
 
-    async def _get_fundamental_data_combined(
-        self, symbol: str
-    ) -> FundamentalData:
-        """Get fundamental data from multiple sources."""
-        # Try FMP first
+    async def _get_fundamental_data_combined(self, symbol: str) -> FundamentalData:
         fmp_data = await self._get_fundamentals_fmp(symbol)
         if fmp_data and fmp_data.market_cap > 0:
             return fmp_data
 
-        # Fallback to synthetic data with realistic values
+        # Synthetic fallback
         return FundamentalData(
             market_cap=float(np.random.uniform(1e9, 50e9)),
             pe_ratio=float(np.random.uniform(8, 25)),
@@ -1317,13 +1273,11 @@ class AdvancedTradingAnalyzer:
         )
 
     async def _get_fundamentals_fmp(self, symbol: str) -> Optional[FundamentalData]:
-        """Get fundamentals from Financial Modeling Prep."""
-        if not self.apis["fmp"]:
+        if not self.apis.get("fmp"):
             return None
 
         url = f"{self.base_urls['fmp']}/profile/{symbol}"
         params = {"apikey": self.apis["fmp"]}
-
         data = await self._make_async_request(url, params)
         if not data:
             return None
@@ -1334,6 +1288,7 @@ class AdvancedTradingAnalyzer:
                 market_cap=float(profile.get("mktCap", 0) or 0),
                 pe_ratio=float(profile.get("priceToEarnings", 0) or 0),
                 pb_ratio=float(profile.get("priceToBook", 0) or 0),
+                # Note: lastDiv is dividend amount, not strict yield. Keep as-is for backward compatibility.
                 dividend_yield=float(profile.get("lastDiv", 0) or 0) / 100.0,
                 eps=float(profile.get("eps", 0) or 0),
                 roe=float(profile.get("roe", 0) or 0) / 100.0,
@@ -1342,21 +1297,17 @@ class AdvancedTradingAnalyzer:
                 profit_margin=float(profile.get("profitMargin", 0) or 0) / 100.0,
                 sector_rank=1,
                 free_cash_flow=float(profile.get("freeCashFlow", 0) or 0),
-                operating_margin=float(profile.get("operatingMargins", 0) or 0)
-                / 100.0,
+                operating_margin=float(profile.get("operatingMargins", 0) or 0) / 100.0,
                 current_ratio=float(profile.get("currentRatio", 0) or 0),
                 quick_ratio=float(profile.get("quickRatio", 0) or 0),
                 peg_ratio=float(profile.get("pegRatio", 0) or 0),
-                data_quality=DataQuality.HIGH
-                if profile.get("mktCap")
-                else DataQuality.MEDIUM,
+                data_quality=DataQuality.HIGH if profile.get("mktCap") else DataQuality.MEDIUM,
             )
         except (ValueError, TypeError, IndexError) as e:
             logger.warning(f"FMP fundamentals parsing failed for {symbol}: {e}")
             return None
 
     def _generate_fallback_fundamental_data(self) -> FundamentalData:
-        """Generate fallback fundamental data."""
         return FundamentalData(
             market_cap=0.0,
             pe_ratio=0.0,
@@ -1381,10 +1332,8 @@ class AdvancedTradingAnalyzer:
     # -------------------------------------------------------------------------
 
     async def generate_ai_recommendation(self, symbol: str) -> AIRecommendation:
-        """Generate AI recommendation with async data collection."""
         symbol = symbol.upper().strip()
 
-        # Get all data concurrently
         price_task = self.get_real_time_price(symbol)
         technical_task = self.calculate_technical_indicators(symbol)
         fundamental_task = self.analyze_fundamentals(symbol)
@@ -1393,7 +1342,6 @@ class AdvancedTradingAnalyzer:
             price_task, technical_task, fundamental_task, return_exceptions=True
         )
 
-        # Handle exceptions
         if isinstance(price_data, Exception):
             logger.error(f"Price data failed for {symbol}: {price_data}")
             price_data = None
@@ -1404,9 +1352,7 @@ class AdvancedTradingAnalyzer:
             logger.error(f"Fundamental data failed for {symbol}: {fundamental_data}")
             fundamental_data = self._generate_fallback_fundamental_data()
 
-        return self._generate_recommendation(
-            symbol, technical_data, fundamental_data, price_data
-        )
+        return self._generate_recommendation(symbol, technical_data, fundamental_data, price_data)
 
     def _generate_recommendation(
         self,
@@ -1415,12 +1361,10 @@ class AdvancedTradingAnalyzer:
         fundamental_data: FundamentalData,
         price_data: Optional[PriceData] = None,
     ) -> AIRecommendation:
-        """Generate trading recommendation based on analysis."""
         tech_score = self._calculate_technical_score(technical_data)
         fund_score = self._calculate_fundamental_score(fundamental_data)
         sentiment_score = self._calculate_sentiment_score(symbol)
 
-        # Weight scores based on data quality
         tech_weight = 0.4 if technical_data.data_quality == DataQuality.HIGH else 0.3
         fund_weight = 0.5 if fundamental_data.data_quality == DataQuality.HIGH else 0.4
         sentiment_weight = 0.1
@@ -1435,10 +1379,12 @@ class AdvancedTradingAnalyzer:
             overall_score, technical_data, fundamental_data
         )
 
-        # Calculate position size based on risk
         risk_level, position_size = self._calculate_risk_assessment(
             technical_data, fundamental_data, overall_score
         )
+
+        optimal_entry = technical_data.support_level * 0.98 if technical_data.support_level else 0.0
+        stop_loss = technical_data.support_level * 0.92 if technical_data.support_level else 0.0
 
         return AIRecommendation(
             symbol=symbol,
@@ -1448,33 +1394,23 @@ class AdvancedTradingAnalyzer:
             sentiment_score=round(sentiment_score, 1),
             recommendation=recommendation,
             confidence_level=confidence,
-            short_term_outlook=self._generate_outlook(
-                overall_score, technical_data, "short"
-            ),
-            medium_term_outlook=self._generate_outlook(
-                overall_score, technical_data, "medium"
-            ),
-            long_term_outlook=self._generate_outlook(
-                overall_score, technical_data, "long"
-            ),
+            short_term_outlook=self._generate_outlook(overall_score, technical_data, "short"),
+            medium_term_outlook=self._generate_outlook(overall_score, technical_data, "medium"),
+            long_term_outlook=self._generate_outlook(overall_score, technical_data, "long"),
             key_strengths=self._identify_strengths(technical_data, fundamental_data),
             key_risks=self._identify_risks(technical_data, fundamental_data),
-            optimal_entry=round(technical_data.support_level * 0.98, 2),
-            stop_loss=round(technical_data.support_level * 0.92, 2),
-            price_targets=self._calculate_price_targets(
-                technical_data, fundamental_data
-            ),
+            optimal_entry=round(optimal_entry, 2),
+            stop_loss=round(stop_loss, 2),
+            price_targets=self._calculate_price_targets(technical_data, fundamental_data),
             timestamp=datetime.utcnow().isoformat() + "Z",
             risk_level=risk_level,
             position_size_suggestion=position_size,
-            data_sources_used=3,  # technical, fundamental, sentiment
+            data_sources_used=3,
         )
 
     def _calculate_technical_score(self, data: TechnicalIndicators) -> float:
-        """Calculate technical analysis score with enhanced logic."""
         score = 50.0
 
-        # RSI scoring (30-70 is ideal)
         if 30 <= data.rsi <= 70:
             score += 10
         elif 20 <= data.rsi < 30 or 70 < data.rsi <= 80:
@@ -1482,37 +1418,31 @@ class AdvancedTradingAnalyzer:
         else:
             score -= 15
 
-        # MACD scoring
         if data.macd > data.macd_signal and data.macd_histogram > 0:
             score += 8
         elif data.macd < data.macd_signal and data.macd_histogram < 0:
             score -= 8
 
-        # Trend scoring
         if data.trend_direction == "Bullish":
             score += 12
         elif data.trend_direction == "Bearish":
             score -= 12
 
-        # Moving average alignment
         if data.moving_avg_20 > data.moving_avg_50 > data.moving_avg_200:
             score += 10
         elif data.moving_avg_20 < data.moving_avg_50 < data.moving_avg_200:
             score -= 10
 
-        # Momentum scoring
         if data.momentum_score > 5:
             score += 5
         elif data.momentum_score < -5:
             score -= 5
 
-        # Bollinger Band position
         if 0.2 <= data.bollinger_position <= 0.8:
             score += 5
         elif data.bollinger_position < 0.1 or data.bollinger_position > 0.9:
             score -= 5
 
-        # Volume trend
         if data.volume_trend > 0.05:
             score += 3
         elif data.volume_trend < -0.05:
@@ -1521,13 +1451,11 @@ class AdvancedTradingAnalyzer:
         return max(0.0, min(100.0, score))
 
     def _calculate_fundamental_score(self, data: FundamentalData) -> float:
-        """Calculate fundamental analysis score."""
         if data.market_cap == 0:
             return 50.0
 
         score = 50.0
 
-        # P/E ratio scoring
         if 0 < data.pe_ratio < 15:
             score += 12
         elif 15 <= data.pe_ratio <= 25:
@@ -1535,7 +1463,6 @@ class AdvancedTradingAnalyzer:
         elif data.pe_ratio > 40:
             score -= 15
 
-        # ROE scoring
         if data.roe > 0.15:
             score += 10
         elif data.roe > 0.08:
@@ -1543,7 +1470,6 @@ class AdvancedTradingAnalyzer:
         elif data.roe < 0:
             score -= 10
 
-        # Revenue growth scoring
         if data.revenue_growth > 0.15:
             score += 8
         elif data.revenue_growth > 0.05:
@@ -1551,7 +1477,6 @@ class AdvancedTradingAnalyzer:
         elif data.revenue_growth < -0.1:
             score -= 8
 
-        # Profit margin scoring
         if data.profit_margin > 0.15:
             score += 7
         elif data.profit_margin > 0.08:
@@ -1559,17 +1484,14 @@ class AdvancedTradingAnalyzer:
         elif data.profit_margin < 0:
             score -= 10
 
-        # Debt-to-equity scoring
         if data.debt_to_equity < 0.5:
             score += 5
         elif data.debt_to_equity > 1.0:
             score -= 8
 
-        # Dividend yield scoring
         if data.dividend_yield > 0.03:
             score += 3
 
-        # Sector rank scoring (1 is best)
         if data.sector_rank > 0:
             rank_score = max(0.0, (50 - data.sector_rank) / 50 * 10)
             score += rank_score
@@ -1577,9 +1499,8 @@ class AdvancedTradingAnalyzer:
         return max(0.0, min(100.0, score))
 
     def _calculate_sentiment_score(self, symbol: str) -> float:
-        """Calculate market sentiment score (placeholder for real implementation)."""
-        # In a real implementation, this would use news API, social media data, etc.
-        return 60.0  # Neutral default
+        # Placeholder for real sentiment data
+        return 60.0
 
     def _generate_recommendation_details(
         self,
@@ -1587,7 +1508,6 @@ class AdvancedTradingAnalyzer:
         technical: TechnicalIndicators,
         fundamental: FundamentalData,
     ) -> Tuple[Recommendation, str]:
-        """Generate recommendation and confidence level."""
         if overall_score >= 80:
             rec = Recommendation.STRONG_BUY
             confidence = "Very High"
@@ -1604,7 +1524,6 @@ class AdvancedTradingAnalyzer:
             rec = Recommendation.STRONG_SELL
             confidence = "High"
 
-        # Adjust confidence based on data quality and volatility
         if technical.volatility > 0.3:
             confidence = "Medium" if confidence == "High" else "Low"
 
@@ -1619,7 +1538,6 @@ class AdvancedTradingAnalyzer:
         fundamental: FundamentalData,
         overall_score: float,
     ) -> Tuple[str, str]:
-        """Calculate risk level and position size suggestion."""
         risk_factors = 0
 
         if technical.volatility > 0.3:
@@ -1643,7 +1561,6 @@ class AdvancedTradingAnalyzer:
     def _generate_outlook(
         self, score: float, technical: TechnicalIndicators, timeframe: str
     ) -> str:
-        """Generate outlook based on score and technicals."""
         base_outlooks = {
             "short": ["Very Bullish", "Bullish", "Neutral", "Bearish", "Very Bearish"],
             "medium": ["Very Positive", "Positive", "Neutral", "Cautious", "Negative"],
@@ -1661,7 +1578,6 @@ class AdvancedTradingAnalyzer:
         else:
             idx = 4
 
-        # Adjust based on trend
         if technical.trend_direction == "Bullish" and idx > 0:
             idx = max(0, idx - 1)
         elif technical.trend_direction == "Bearish" and idx < 4:
@@ -1672,7 +1588,6 @@ class AdvancedTradingAnalyzer:
     def _identify_strengths(
         self, technical: TechnicalIndicators, fundamental: FundamentalData
     ) -> List[str]:
-        """Identify key strengths."""
         strengths: List[str] = []
 
         if technical.trend_direction == "Bullish":
@@ -1695,7 +1610,6 @@ class AdvancedTradingAnalyzer:
     def _identify_risks(
         self, technical: TechnicalIndicators, fundamental: FundamentalData
     ) -> List[str]:
-        """Identify key risks."""
         risks: List[str] = []
 
         if technical.volatility > 0.3:
@@ -1718,11 +1632,9 @@ class AdvancedTradingAnalyzer:
     def _calculate_price_targets(
         self, technical: TechnicalIndicators, fundamental: FundamentalData
     ) -> Dict[str, float]:
-        """Calculate price targets based on technicals and fundamentals."""
-        current_price = technical.moving_avg_20
+        current_price = technical.moving_avg_20 or 0.0
         base_multiplier = 1.0
 
-        # Fundamental adjustments
         if 0 < fundamental.pe_ratio < 15:
             base_multiplier *= 1.1
         elif fundamental.pe_ratio > 30:
@@ -1733,13 +1645,11 @@ class AdvancedTradingAnalyzer:
         elif fundamental.revenue_growth < 0:
             base_multiplier *= 0.9
 
-        # Technical adjustments
         if technical.trend_direction == "Bullish":
             base_multiplier *= 1.05
         elif technical.trend_direction == "Bearish":
             base_multiplier *= 0.95
 
-        # Time-based targets
         return {
             "1_week": round(current_price * base_multiplier * 1.02, 2),
             "2_weeks": round(current_price * base_multiplier * 1.04, 2),
@@ -1764,7 +1674,6 @@ class AdvancedTradingAnalyzer:
         target_symbol = symbol.upper() if symbol else None
 
         try:
-            # Clear Redis cache entries belonging to this analyzer
             if self.redis_client:
                 try:
                     keys = self.redis_client.keys("*")
@@ -1781,30 +1690,27 @@ class AdvancedTradingAnalyzer:
                                 self.redis_client.delete(key)
                                 cleared_count += 1
                         except Exception:
-                            # If key is not our JSON format, ignore
                             continue
                 except Exception as e:
                     logger.error(f"Redis cache clearance scan failed: {e}")
 
-            # Clear file cache entries
             for cache_file in self.cache_dir.glob("*.json"):
                 try:
                     if target_symbol is None:
-                        cache_file.unlink()
+                        cache_file.unlink(missing_ok=True)
                         cleared_count += 1
                     else:
                         raw = cache_file.read_text(encoding="utf-8")
                         data = json.loads(raw)
                         sym = str(data.get("symbol", "")).upper()
                         if sym == target_symbol:
-                            cache_file.unlink()
+                            cache_file.unlink(missing_ok=True)
                             cleared_count += 1
                 except Exception:
                     continue
 
             logger.info(f"Cache cleared: {cleared_count} items removed")
             return {"status": "success", "cleared_count": cleared_count}
-
         except Exception as e:
             logger.error(f"Cache clearance failed: {e}")
             return {"status": "error", "error": str(e)}
@@ -1812,20 +1718,16 @@ class AdvancedTradingAnalyzer:
     async def get_cache_info(self) -> Dict[str, Any]:
         """Get comprehensive cache information."""
         try:
-            # File cache info
             cache_files = list(self.cache_dir.glob("*.json"))
             file_cache_size = sum(f.stat().st_size for f in cache_files)
 
-            # Redis cache info
             redis_info: Dict[str, Any] = {}
             if self.redis_client:
                 try:
                     redis_info = {
                         "connected": True,
                         "keys_count": len(self.redis_client.keys("*")),
-                        "memory_usage": self.redis_client.info().get(
-                            "used_memory", 0
-                        ),
+                        "memory_usage": self.redis_client.info().get("used_memory", 0),
                     }
                 except Exception as e:
                     redis_info = {"connected": False, "error": str(e)}
@@ -1845,15 +1747,11 @@ class AdvancedTradingAnalyzer:
             return {"error": str(e)}
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Get analyzer statistics."""
         with self._stats_lock:
             total_requests = self.request_counter
             error_rate = (
-                self.error_counter / total_requests * 100
-                if total_requests > 0
-                else 0
+                self.error_counter / total_requests * 100 if total_requests > 0 else 0
             )
-
             return {
                 "total_requests": total_requests,
                 "error_count": self.error_counter,
@@ -1865,7 +1763,7 @@ class AdvancedTradingAnalyzer:
             }
 
 
-# Global analyzer instance with async support
+# Global analyzer instance
 try:
     analyzer = AdvancedTradingAnalyzer()
     logger.info("Global AdvancedTradingAnalyzer instance created successfully")
@@ -1874,7 +1772,6 @@ except Exception as e:
     analyzer = None
 
 
-# Async context manager support
 @asynccontextmanager
 async def get_analyzer():
     """Async context manager for analyzer."""
@@ -1887,38 +1784,31 @@ async def get_analyzer():
 
 # Convenience functions for backward compatibility
 async def generate_ai_recommendation(symbol: str) -> AIRecommendation:
-    """Convenience function for AI recommendations."""
     if analyzer is None:
         raise RuntimeError("Analyzer not initialized")
     return await analyzer.generate_ai_recommendation(symbol)
 
 
 async def get_multi_source_analysis(symbol: str) -> Dict[str, Any]:
-    """Convenience function for multi-source analysis."""
     if analyzer is None:
         raise RuntimeError("Analyzer not initialized")
     return await analyzer.get_multi_source_analysis(symbol)
 
 
-# Test function
+# Simple self-test (for local debugging)
 async def _test_analyzer():
-    """Test the analyzer functionality."""
     logging.basicConfig(level=logging.INFO)
-
     async with get_analyzer() as test_analyzer:
-        # Test multi-source analysis
         print("Testing multi-source analysis...")
         analysis = await test_analyzer.get_multi_source_analysis("AAPL")
-        print(f"Multi-source analysis: {analysis['consolidated']}")
+        print(f"Multi-source analysis (consolidated): {analysis.get('consolidated')}")
 
-        # Test AI recommendation
-        print("Testing AI recommendation...")
+        print("\nTesting AI recommendation...")
         recommendation = await test_analyzer.generate_ai_recommendation("AAPL")
         print(f"AI Recommendation: {recommendation.recommendation.value}")
         print(f"Overall Score: {recommendation.overall_score}")
 
-        # Test cache info
-        print("Testing cache info...")
+        print("\nTesting cache info...")
         cache_info = await test_analyzer.get_cache_info()
         print(f"Cache info: {cache_info}")
 
