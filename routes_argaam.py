@@ -1,7 +1,7 @@
 # =============================================================================
-# Argaam Integration Routes - Ultimate Investment Dashboard (v3.1.1)
+# Argaam Integration Routes - Ultimate Investment Dashboard (v3.2.0)
 # Enhanced with Resilience, Monitoring & Advanced Error Handling
-# Fixed for Google Sheets compatibility and Render deployment
+# Aligned with main.py / symbols_reader.py caching & config patterns
 # =============================================================================
 from __future__ import annotations
 
@@ -10,20 +10,22 @@ import os
 import re
 import time
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
+from pydantic.functional_validators import field_validator  # pydantic v2 style
 import cachetools
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# -----------------------------------------------------------------------------
-# Enhanced Logging Setup
-# -----------------------------------------------------------------------------
-logger = logging.getLogger("argaam_routes")
+# -------------------------------------------------------------------------
+# Logging
+# -------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
@@ -33,9 +35,9 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Optional Parser (BeautifulSoup) with Enhanced Fallback Strategy
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 HAS_BS = False
 BeautifulSoup = None
 HTML_PARSERS = ["lxml", "html.parser", "html5lib"]
@@ -43,20 +45,21 @@ HTML_PARSERS = ["lxml", "html.parser", "html5lib"]
 try:
     from bs4 import BeautifulSoup  # type: ignore
     HAS_BS = True
-    logger.info("✅ BeautifulSoup available - enhanced parsing enabled")
+    logger.info("✅ BeautifulSoup available - enhanced parsing enabled for Argaam")
 except ImportError as e:
-    logger.warning(f"⚠️ BeautifulSoup not available: {e}. Basic parsing only.")
+    logger.warning("⚠️ BeautifulSoup not available for Argaam routes: %s. Basic parsing only.", e)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Router
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 router = APIRouter(prefix="/v1/argaam", tags=["Argaam"])
 
-# -----------------------------------------------------------------------------
-# Enhanced Configuration with Validation
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------------
 class ArgaamConfig:
     def __init__(self) -> None:
+        # User agent
         self.USER_AGENT = os.getenv(
             "ARGAAM_USER_AGENT",
             (
@@ -66,14 +69,35 @@ class ArgaamConfig:
             ),
         ).strip()
 
+        # Tokens & security flags (aligned with main.py style)
         self.APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
         self.BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "").strip()
+        # If REQUIRE_AUTH not set, default true for production safety
         self.REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
 
+        # Base Argaam URL
         self.BASE_URL = os.getenv("ARGAAM_BASE_URL", "https://www.argaam.com")
+
+        # Timeouts & retry / cache config
         self.TIMEOUT = int(os.getenv("ARGAAM_TIMEOUT", "30"))
         self.MAX_RETRIES = int(os.getenv("ARGAAM_MAX_RETRIES", "3"))
-        self.CACHE_TTL = int(os.getenv("ARGAAM_CACHE_TTL", "600"))
+
+        # Cache TTL resolution:
+        # 1) ARGAAM_CACHE_TTL / ARGAAM_CACHE_TTL_SECONDS
+        # 2) CACHE_DEFAULT_TTL / CACHE_DEFAULT_TTL_SECONDS
+        # 3) default 600s
+        ttl_env = (
+            os.getenv("ARGAAM_CACHE_TTL")
+            or os.getenv("ARGAAM_CACHE_TTL_SECONDS")
+            or os.getenv("CACHE_DEFAULT_TTL")
+            or os.getenv("CACHE_DEFAULT_TTL_SECONDS")
+        )
+        try:
+            ttl_val = int(ttl_env) if ttl_env is not None else 600
+        except (TypeError, ValueError):
+            ttl_val = 600
+        self.CACHE_TTL = max(60, ttl_val)
+
         self.CACHE_MAXSIZE = int(os.getenv("ARGAAM_CACHE_MAXSIZE", "1000"))
         self.RATE_LIMIT_DELAY = float(os.getenv("ARGAAM_RATE_LIMIT_DELAY", "0.15"))
 
@@ -94,29 +118,30 @@ class ArgaamConfig:
     def validate_config(self) -> None:
         """Validate critical configuration parameters."""
         if self.REQUIRE_AUTH and not (self.APP_TOKEN or self.BACKUP_APP_TOKEN):
-            logger.warning("⚠️ Authentication required but no tokens configured")
+            logger.warning("⚠️ Argaam: Authentication required but no tokens configured (APP_TOKEN/BACKUP_APP_TOKEN)")
 
         if self.TIMEOUT < 5:
-            logger.warning("⚠️ Timeout too low, increasing to minimum 5 seconds")
+            logger.warning("⚠️ Argaam: Timeout too low (%ss), increasing to minimum 5 seconds", self.TIMEOUT)
             self.TIMEOUT = 5
 
         if self.MAX_RETRIES > 5:
-            logger.warning("⚠️ Max retries too high, capping at 5")
+            logger.warning("⚠️ Argaam: Max retries too high (%s), capping at 5", self.MAX_RETRIES)
             self.MAX_RETRIES = 5
 
         logger.info(
-            "✅ ArgaamConfig loaded: timeout=%ss, retries=%s, cache_ttl=%ss",
+            "✅ ArgaamConfig loaded: timeout=%ss, retries=%s, cache_ttl=%ss, require_auth=%s",
             self.TIMEOUT,
             self.MAX_RETRIES,
             self.CACHE_TTL,
+            self.REQUIRE_AUTH,
         )
 
 
 config = ArgaamConfig()
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Enhanced TTL Cache with LRU Eviction
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 class TTLCache:
     def __init__(self, maxsize: int = 1000, ttl: int = 600) -> None:
         self._cache = cachetools.TTLCache(maxsize=maxsize, ttl=ttl)
@@ -141,7 +166,7 @@ class TTLCache:
             if len(self._cache) < old_size:
                 self._evictions += 1
         except Exception as e:
-            logger.warning(f"⚠️ Cache set failed for key {key}: {e}")
+            logger.warning("⚠️ Argaam cache set failed for key %s: %s", key, e)
 
     def clear(self) -> None:
         self._cache.clear()
@@ -163,12 +188,11 @@ class TTLCache:
         }
 
 
-# Initialize enhanced cache
 _CACHE = TTLCache(maxsize=config.CACHE_MAXSIZE, ttl=config.CACHE_TTL)
 
-# -----------------------------------------------------------------------------
-# Enhanced Async HTTP Client with Connection Pooling
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Async HTTP Client with Connection Pooling
+# -------------------------------------------------------------------------
 class ArgaamHTTPClient:
     def __init__(self) -> None:
         self._client: Optional[httpx.AsyncClient] = None
@@ -205,7 +229,7 @@ class ArgaamHTTPClient:
                 await self._client.aclose()
                 logger.info("✅ Closed Argaam HTTP client")
             except Exception as e:
-                logger.warning(f"⚠️ Error closing HTTP client: {e}")
+                logger.warning("⚠️ Error closing Argaam HTTP client: %s", e)
             finally:
                 self._client = None
 
@@ -215,17 +239,23 @@ class ArgaamHTTPClient:
 
 http_client = ArgaamHTTPClient()
 
-# -----------------------------------------------------------------------------
-# Enhanced Authentication with Rate Limiting
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Authentication with basic rate limiting (per IP)
+# -------------------------------------------------------------------------
+@dataclass
+class FailedAttempt:
+    count: int
+    first_ts: float
+
+
 class AuthManager:
     def __init__(self) -> None:
-        self._failed_attempts: Dict[str, List[float]] = {}
+        self._failed_attempts: Dict[str, FailedAttempt] = {}
         self._max_failed_attempts = 5
         self._lockout_duration = 300  # 5 minutes
 
     def _get_client_ip(self, request: Request) -> str:
-        """Extract client IP from request."""
+        """Extract client IP from request (Render / proxy aware)."""
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
             return forwarded.split(",")[0].strip()
@@ -233,30 +263,34 @@ class AuthManager:
 
     def _is_ip_locked(self, ip: str) -> bool:
         """Check if IP is temporarily locked due to failed attempts."""
-        if ip in self._failed_attempts:
-            failures, first_failure = self._failed_attempts[ip]
-            if failures >= self._max_failed_attempts:
-                lockout_time = first_failure + self._lockout_duration
-                if time.time() < lockout_time:
-                    return True
-                else:
-                    # Reset after lockout period
-                    del self._failed_attempts[ip]
+        attempt = self._failed_attempts.get(ip)
+        if not attempt:
+            return False
+
+        if attempt.count >= self._max_failed_attempts:
+            lockout_time = attempt.first_ts + self._lockout_duration
+            if time.time() < lockout_time:
+                return True
+            # lockout expired → reset
+            del self._failed_attempts[ip]
         return False
 
     def _record_failed_attempt(self, ip: str) -> None:
         """Record failed authentication attempt."""
         now = time.time()
-        if ip not in self._failed_attempts:
-            self._failed_attempts[ip] = [1, now]
+        attempt = self._failed_attempts.get(ip)
+        if not attempt:
+            self._failed_attempts[ip] = FailedAttempt(count=1, first_ts=now)
         else:
-            self._failed_attempts[ip][0] += 1
-            # Reset if last failure was long ago
-            if now - self._failed_attempts[ip][1] > 3600:  # 1 hour
-                self._failed_attempts[ip] = [1, now]
+            # Reset window if last failure long ago (> 1 hour)
+            if now - attempt.first_ts > 3600:
+                self._failed_attempts[ip] = FailedAttempt(count=1, first_ts=now)
+            else:
+                attempt.count += 1
+                self._failed_attempts[ip] = attempt
 
     def validate_auth(self, request: Request) -> None:
-        """Enhanced authentication validation."""
+        """Authentication validation using APP_TOKEN/BACKUP_APP_TOKEN."""
         if not config.REQUIRE_AUTH:
             return
 
@@ -264,10 +298,10 @@ class AuthManager:
 
         # Check IP lockout
         if self._is_ip_locked(client_ip):
-            logger.warning(f"🚫 IP {client_ip} temporarily locked due to failed attempts")
+            logger.warning("🚫 IP %s temporarily locked due to failed attempts", client_ip)
             raise HTTPException(
                 status_code=429,
-                detail="Too many failed attempts. Please try again later.",
+                detail="Too many failed authentication attempts. Please try again later.",
             )
 
         # Extract and validate token
@@ -281,21 +315,21 @@ class AuthManager:
 
         if token not in allowed_tokens:
             self._record_failed_attempt(client_ip)
-            logger.warning(f"🚫 Invalid token attempt from IP {client_ip}")
+            logger.warning("🚫 Invalid token attempt from IP %s", client_ip)
             raise HTTPException(status_code=403, detail="Invalid or expired token")
 
         # Reset failed attempts on successful auth
         if client_ip in self._failed_attempts:
             del self._failed_attempts[client_ip]
 
-        logger.debug(f"✅ Authentication successful for IP {client_ip}")
+        logger.debug("✅ Argaam auth successful for IP %s", client_ip)
 
 
 auth_manager = AuthManager()
 
-# -----------------------------------------------------------------------------
-# Enhanced Ticker Normalization
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Ticker Normalization
+# -------------------------------------------------------------------------
 class TickerNormalizer:
     def __init__(self) -> None:
         self._code_re = re.compile(r"(\d{1,4})")
@@ -325,25 +359,25 @@ class TickerNormalizer:
         # Check for common aliases
         if code.lower() in self._common_aliases:
             normalized = self._common_aliases[code.lower()]
-            logger.debug(f"🔤 Normalized alias {code} -> {normalized}")
+            logger.debug("🔤 Normalized alias %s -> %s", code, normalized)
             return normalized
 
         # Extract numeric part
         match = self._code_re.search(code)
         if match:
             normalized = match.group(1).zfill(4)  # Pad with leading zeros
-            logger.debug(f"🔤 Normalized {code} -> {normalized}")
+            logger.debug("🔤 Normalized %s -> %s", code, normalized)
             return normalized
 
-        logger.warning(f"⚠️ Could not normalize ticker: {code}")
+        logger.warning("⚠️ Could not normalize ticker: %s", code)
         return code
 
 
 ticker_normalizer = TickerNormalizer()
 
-# -----------------------------------------------------------------------------
-# Enhanced HTML Fetcher with Retry Logic
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# HTML Fetcher with Retry Logic
+# -------------------------------------------------------------------------
 class HTMLFetcher:
     def __init__(self) -> None:
         self._session_semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
@@ -360,7 +394,7 @@ class HTMLFetcher:
             http_client.increment_request_count()
 
             try:
-                logger.info(f"🌐 Fetching URL: {url}")
+                logger.info("🌐 Argaam: Fetching URL: %s", url)
                 start_time = time.time()
                 response = await client.get(url)
                 response_time = time.time() - start_time
@@ -371,44 +405,48 @@ class HTMLFetcher:
 
                     if content_length > 1000:  # Basic content validation
                         logger.info(
-                            "✅ Successfully fetched %d bytes from %s in %.2fs",
+                            "✅ Argaam: Fetched %d bytes from %s in %.2fs",
                             content_length,
                             url,
                             response_time,
                         )
                         return content
                     else:
-                        logger.warning("⚠️ Content too short from %s: %d bytes", url, content_length)
+                        logger.warning(
+                            "⚠️ Argaam: Content too short from %s: %d bytes",
+                            url,
+                            content_length,
+                        )
                         return None
                 elif response.status_code == 404:
-                    logger.info("❌ URL not found: %s", url)
+                    logger.info("❌ Argaam: URL not found: %s", url)
                     return None
                 elif response.status_code == 403:
-                    logger.warning("🚫 Access forbidden: %s", url)
+                    logger.warning("🚫 Argaam: Access forbidden: %s", url)
                     raise httpx.HTTPStatusError(
                         "403 Forbidden", request=response.request, response=response
                     )
                 elif response.status_code == 429:
-                    logger.warning("🚫 Rate limited: %s", url)
+                    logger.warning("🚫 Argaam: Rate limited: %s", url)
                     await asyncio.sleep(5)  # Longer delay for rate limits
                     raise httpx.HTTPStatusError(
                         "429 Rate Limited", request=response.request, response=response
                     )
                 else:
-                    logger.warning("⚠️ HTTP %s from %s", response.status_code, url)
+                    logger.warning("⚠️ Argaam: HTTP %s from %s", response.status_code, url)
                     response.raise_for_status()
 
             except httpx.TimeoutException:
-                logger.error("⏰ Timeout fetching %s", url)
+                logger.error("⏰ Argaam: Timeout fetching %s", url)
                 raise
             except httpx.HTTPError as e:
-                logger.error("🌐 HTTP error fetching %s: %s", url, e)
+                logger.error("🌐 Argaam: HTTP error fetching %s: %s", url, e)
                 raise
             except Exception as e:
-                logger.error("💥 Unexpected error fetching %s: %s", url, e)
+                logger.error("💥 Argaam: Unexpected error fetching %s: %s", url, e)
                 return None
             finally:
-                # Rate limiting
+                # Soft rate limiting between requests
                 await asyncio.sleep(config.RATE_LIMIT_DELAY)
 
         return None
@@ -416,9 +454,9 @@ class HTMLFetcher:
 
 html_fetcher = HTMLFetcher()
 
-# -----------------------------------------------------------------------------
-# Enhanced Data Parser with Multiple Strategies
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Data Parser
+# -------------------------------------------------------------------------
 class DataParser:
     def __init__(self) -> None:
         self._number_pattern = re.compile(r"-?\d+[,٠-٩]*(?:\.\d+)?\s*[%kKmMbBtT]?")
@@ -460,7 +498,6 @@ class DataParser:
             "٪": 0.01,
         }
 
-        # Match numbers with optional multipliers
         match = re.match(r"(-?\d+(?:\.\d+)?)([kKmMbBtT%٪]?)", text)
         if match:
             value = float(match.group(1))
@@ -480,7 +517,6 @@ class DataParser:
         if not labels:
             return None
 
-        # Strategy 1: Direct text search
         pattern = re.compile("|".join(re.escape(label) for label in labels), re.IGNORECASE)
 
         for element in soup.find_all(string=pattern):
@@ -499,10 +535,10 @@ class DataParser:
                         for num_str in numbers:
                             value = self.normalize_number(num_str)
                             if value is not None:
-                                logger.debug("📊 Found %s: %s in '%s'", field_name, value, text)
+                                logger.debug("📊 Argaam: Found %s: %s in '%s'", field_name, value, text)
                                 return value
             except Exception as e:
-                logger.debug("🔍 Error extracting %s: %s", field_name, e)
+                logger.debug("🔍 Argaam: Error extracting %s: %s", field_name, e)
                 continue
 
         return None
@@ -529,7 +565,7 @@ class DataParser:
 
         if not HAS_BS or not html:
             result["dataQuality"] = "none"
-            logger.warning("⚠️ No HTML or BeautifulSoup - returning empty data")
+            logger.warning("⚠️ Argaam: No HTML or BeautifulSoup - returning empty data snapshot")
             return result
 
         try:
@@ -537,14 +573,14 @@ class DataParser:
             for parser in HTML_PARSERS:
                 try:
                     soup = BeautifulSoup(html, parser)  # type: ignore
-                    logger.debug("✅ Successfully parsed HTML with %s", parser)
+                    logger.debug("✅ Argaam: Successfully parsed HTML with %s", parser)
                     break
                 except Exception as e:
-                    logger.debug("⚠️ Parser %s failed: %s", parser, e)
+                    logger.debug("⚠️ Argaam: Parser %s failed: %s", parser, e)
                     continue
 
             if not soup:
-                logger.warning("❌ No HTML parser succeeded")
+                logger.warning("❌ Argaam: No HTML parser succeeded")
                 return result
 
             # Extract company name
@@ -553,7 +589,7 @@ class DataParser:
                 element = soup.select_one(selector)
                 if element:
                     result["name"] = element.get_text(" ", strip=True)
-                    logger.debug("🏢 Found company name: %s", result["name"])
+                    logger.debug("🏢 Argaam: Found company name: %s", result["name"])
                     break
 
             # Extract financial fields
@@ -573,13 +609,13 @@ class DataParser:
                 result["dataQuality"] = "low"
 
             logger.info(
-                "📈 Parsed %d data points with %s quality",
+                "📈 Argaam: Parsed %d data points with %s quality",
                 data_points_found,
                 result["dataQuality"],
             )
 
         except Exception as e:
-            logger.error("💥 Error parsing HTML: %s", e)
+            logger.error("💥 Argaam: Error parsing HTML: %s", e)
             result["dataQuality"] = "error"
 
         return result
@@ -587,9 +623,9 @@ class DataParser:
 
 data_parser = DataParser()
 
-# -----------------------------------------------------------------------------
-# Enhanced URL Discovery with Pattern Learning
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# URL Discoverer
+# -------------------------------------------------------------------------
 class URLDiscoverer:
     def __init__(self) -> None:
         self._url_templates = [
@@ -613,37 +649,37 @@ class URLDiscoverer:
         if code_pattern in self._successful_patterns:
             template = self._successful_patterns[code_pattern]
             url = template.format(base=config.BASE_URL, code=quote(code))
-            logger.debug("🔄 Trying cached pattern for %s: %s", code, template)
+            logger.debug("🔄 Argaam: Trying cached pattern for %s: %s", code, template)
             content = await html_fetcher.fetch(url)
             if content and len(content) > 2000:
-                logger.info("✅ Found URL using cached pattern: %s", url)
+                logger.info("✅ Argaam: Found URL using cached pattern: %s", url)
                 return url
 
         for template in self._url_templates:
             url = template.format(base=config.BASE_URL, code=quote(code))
-            logger.debug("🔄 Trying template for %s: %s", code, template)
+            logger.debug("🔄 Argaam: Trying template for %s: %s", code, template)
             content = await html_fetcher.fetch(url)
 
             if content and len(content) > 2000:
                 self._successful_patterns[code_pattern] = template
-                logger.info("✅ Discovered URL for %s: %s", code, url)
+                logger.info("✅ Argaam: Discovered URL for %s: %s", code, url)
                 return url
 
-        logger.warning("❌ No valid URL discovered for %s", code)
+        logger.warning("❌ Argaam: No valid URL discovered for %s", code)
         return None
 
 
 url_discoverer = URLDiscoverer()
 
-# -----------------------------------------------------------------------------
-# Enhanced Data Fetcher with Cache Integration
-# -----------------------------------------------------------------------------
-async def fetch_company_data(code: str, ttl: int = None) -> Dict[str, Any]:
+# -------------------------------------------------------------------------
+# Data Fetcher with Cache Integration
+# -------------------------------------------------------------------------
+async def fetch_company_data(code: str, ttl: Optional[int] = None) -> Dict[str, Any]:
     """
     Enhanced company data fetching with cache integration.
 
     NOTE: TTL parameter is accepted for future extension; current cache TTL
-    is controlled globally by ARGAAM_CACHE_TTL.
+    is controlled globally by ARGAAM_CACHE_TTL / CACHE_DEFAULT_TTL.
     """
     if ttl is None:
         ttl = config.CACHE_TTL
@@ -653,10 +689,10 @@ async def fetch_company_data(code: str, ttl: int = None) -> Dict[str, Any]:
     # Cache first
     cached_data = _CACHE.get(cache_key)
     if cached_data:
-        logger.info("💾 Cache hit for %s", code)
+        logger.info("💾 Argaam: Cache hit for %s", code)
         return cached_data
 
-    logger.info("🔄 Cache miss for %s, fetching fresh data", code)
+    logger.info("🔄 Argaam: Cache miss for %s, fetching fresh data", code)
 
     # Discover and fetch data
     url = await url_discoverer.discover_company_url(code)
@@ -674,18 +710,19 @@ async def fetch_company_data(code: str, ttl: int = None) -> Dict[str, Any]:
     result = data_parser.parse_company_snapshot(html)
     _CACHE.set(cache_key, result)
 
-    logger.info("✅ Successfully fetched and cached data for %s", code)
+    logger.info("✅ Argaam: Successfully fetched and cached data for %s", code)
     return result
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Pydantic Models
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 class ArgaamRequest(BaseModel):
     tickers: List[str] = Field(..., min_items=1, max_items=50)
     cache_ttl: int = Field(default=config.CACHE_TTL, ge=60, le=3600)
-    priority: str = Field(default="normal", regex="^(low|normal|high)$")
+    priority: str = Field(default="normal", pattern="^(low|normal|high)$")
 
-    @validator("tickers")
+    @field_validator("tickers")
+    @classmethod
     def validate_tickers(cls, v: List[str]) -> List[str]:
         if len(v) > 50:
             raise ValueError("Maximum 50 tickers allowed per request")
@@ -719,9 +756,9 @@ class HealthResponse(BaseModel):
     uptime: float
     requests_served: int
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Background Tasks & Monitoring
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 class PerformanceMonitor:
     def __init__(self) -> None:
         self.start_time = time.time()
@@ -737,9 +774,7 @@ class PerformanceMonitor:
     def get_stats(self) -> Dict[str, Any]:
         uptime = time.time() - self.start_time
         error_rate = self.errors_count / max(self.requests_served, 1)
-        requests_per_hour = (
-            self.requests_served / (uptime / 3600) if uptime > 0 else 0
-        )
+        requests_per_hour = self.requests_served / (uptime / 3600) if uptime > 0 else 0
 
         return {
             "uptime": round(uptime, 2),
@@ -759,19 +794,19 @@ async def background_cache_cleanup() -> None:
         await asyncio.sleep(300)  # Every 5 minutes
         cache_info = _CACHE.info()
         stats = performance_monitor.get_stats()
-        logger.info("📊 Performance Stats - Cache: %s, Requests: %s", cache_info, stats)
+        logger.info("📊 Argaam Performance Stats - Cache: %s, Requests: %s", cache_info, stats)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Lifecycle Hooks
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 @router.on_event("startup")
 async def startup_event() -> None:
     """Initialize background tasks on startup."""
     try:
         asyncio.create_task(background_cache_cleanup())
-        logger.info("🚀 Argaam routes started with enhanced features (v3.1.1)")
+        logger.info("🚀 Argaam routes started with enhanced features (v3.2.0)")
     except Exception as e:
-        logger.error("💥 Failed to start background cache cleanup task: %s", e)
+        logger.error("💥 Argaam: Failed to start background cache cleanup task: %s", e)
 
 
 @router.on_event("shutdown")
@@ -780,9 +815,9 @@ async def shutdown_event() -> None:
     await http_client._close_client()
     logger.info("🛑 Argaam routes shutdown complete")
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Routes
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 @router.get("/health", response_model=HealthResponse)
 async def health_check(request: Request) -> Dict[str, Any]:
     """Enhanced health check endpoint."""
@@ -810,13 +845,13 @@ async def get_quotes(
     performance_monitor.record_request()
 
     if not HAS_BS:
-        logger.warning("⚠️ BeautifulSoup not available - limited functionality")
+        logger.warning("⚠️ Argaam: BeautifulSoup not available - limited functionality")
 
     # Normalize tickers
     normalized_tickers = [ticker_normalizer.normalize(t) for t in request.tickers]
     unique_tickers = list(dict.fromkeys(normalized_tickers))
 
-    logger.info("📥 Processing %d unique tickers: %s", len(unique_tickers), unique_tickers)
+    logger.info("📥 Argaam: Processing %d unique tickers: %s", len(unique_tickers), unique_tickers)
 
     tasks: List[asyncio.Task] = []
     for code in unique_tickers:
@@ -825,12 +860,13 @@ async def get_quotes(
 
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("✅ Successfully gathered data for %d tickers", len(tasks))
+        logger.info("✅ Argaam: Successfully gathered data for %d tickers", len(tasks))
     except Exception as e:
-        logger.error("💥 Error gathering company data: %s", e)
+        logger.error("💥 Argaam: Error gathering company data: %s", e)
         performance_monitor.record_error()
         raise HTTPException(
-            status_code=500, detail="Internal server error during data gathering"
+            status_code=500,
+            detail="Internal server error during Argaam data gathering",
         )
 
     processed_results: Dict[str, Any] = {}
@@ -839,7 +875,7 @@ async def get_quotes(
 
     for code, result in zip(unique_tickers, results):
         if isinstance(result, Exception):
-            logger.error("❌ Error fetching data for %s: %s", code, result)
+            logger.error("❌ Argaam: Error fetching data for %s: %s", code, result)
             processed_results[code] = {
                 "error": f"Data fetch failed: {str(result)}",
                 "lastUpdated": datetime.utcnow().isoformat(),
@@ -854,6 +890,7 @@ async def get_quotes(
                 error_count += 1
 
     response_data = {
+        "ok": True,
         "data": processed_results,
         "metadata": {
             "requested": len(request.tickers),
@@ -867,7 +904,7 @@ async def get_quotes(
         },
     }
 
-    logger.info("📤 Returning data: %d successful, %d errors", successful_count, error_count)
+    logger.info("📤 Argaam: Returning data: %d successful, %d errors", successful_count, error_count)
     return response_data
 
 
@@ -883,11 +920,17 @@ async def get_quotes_endpoint(
     Example:
       /v1/argaam/quotes?tickers=2222,1120,2010
     """
+    if request is None:
+        # Should not happen under FastAPI, but keep defensive
+        raise HTTPException(status_code=500, detail="Request context missing")
+
+    auth_manager.validate_auth(request)
     ticker_list = [t.strip() for t in tickers.split(",") if t.strip()]
     if not ticker_list:
         raise HTTPException(status_code=400, detail="No tickers provided")
 
     argaam_request = ArgaamRequest(tickers=ticker_list, cache_ttl=cache_ttl)
+    # We create a dummy BackgroundTasks instance for compatibility
     return await get_quotes(argaam_request, request, BackgroundTasks())
 
 
@@ -896,7 +939,7 @@ async def get_cache_info(request: Request) -> Dict[str, Any]:
     """Enhanced cache information endpoint."""
     auth_manager.validate_auth(request)
     cache_info = _CACHE.info()
-    logger.info("📊 Cache info requested: %s", cache_info)
+    logger.info("📊 Argaam: Cache info requested: %s", cache_info)
     return cache_info
 
 
@@ -906,7 +949,7 @@ async def clear_cache(request: Request) -> Dict[str, Any]:
     auth_manager.validate_auth(request)
     previous_info = _CACHE.info()
     _CACHE.clear()
-    logger.info("🗑️ Cache cleared successfully")
+    logger.info("🗑️ Argaam: Cache cleared successfully")
     return {
         "cleared": True,
         "previous": previous_info,
@@ -937,7 +980,7 @@ async def get_stats(request: Request) -> Dict[str, Any]:
     """Get performance statistics."""
     auth_manager.validate_auth(request)
     stats = performance_monitor.get_stats()
-    logger.info("📈 Stats requested: %s", stats)
+    logger.info("📈 Argaam: Stats requested: %s", stats)
     return stats
 
 
@@ -945,8 +988,9 @@ async def get_stats(request: Request) -> Dict[str, Any]:
 async def root() -> Dict[str, Any]:
     """Root endpoint with API information."""
     return {
+        "ok": True,
         "message": "Argaam Integration API",
-        "version": "3.1.1",
+        "version": "3.2.0",
         "status": "operational",
         "base_url": config.BASE_URL,
         "endpoints": {
