@@ -1,7 +1,7 @@
 # =============================================================================
 # Tadawul Fast Bridge - Production Requirements
-# Version: 3.1.1
-# Python: 3.11.9
+# Version: 3.2.0
+# Python: 3.11.x
 # Target: Render (Web Service)
 # =============================================================================
 
@@ -20,7 +20,7 @@ pydantic-settings==2.1.0
 
 # -------------------------------
 # Google Services Integration
-# (used by google_sheets_service, google_apps_script_client)
+# (used by symbols_reader, google_sheets_service, google_apps_script_client)
 # -------------------------------
 gspread==5.12.4
 google-auth==2.23.3
@@ -28,7 +28,7 @@ google-api-python-client==2.108.0
 
 # -------------------------------
 # HTTP Clients & API Integration
-# (used by main.py HTTPClient + other helpers)
+# (used by main.py HTTPClient, routes_argaam, other helpers)
 # -------------------------------
 requests==2.31.0
 aiohttp==3.8.6
@@ -44,19 +44,20 @@ openpyxl==3.1.2
 
 # -------------------------------
 # Web Scraping & Data Extraction
-# (for Argaam/Tadawul HTML parsing if needed)
+# (for Argaam / HTML parsing, numeric extraction)
 # -------------------------------
 beautifulsoup4==4.12.2
 lxml==4.9.3
+html5lib==1.1
 
 # -------------------------------
 # Error Handling & Resilience
+# (retries, backoff for Argaam / external APIs)
 # -------------------------------
 tenacity==8.2.3
 
 # -------------------------------
 # Monitoring & Logging
-# (structlog optional but kept for compatibility)
 # -------------------------------
 structlog==23.2.0
 prometheus-client==0.19.0
@@ -101,15 +102,13 @@ email-validator==2.1.1
 # -------------------------------
 # Database & ORM Support (OPTIONAL / FUTURE)
 # - Not used by main.py, kept in case other modules rely on it.
-#   Once we confirm it's unused, these two can be safely removed.
 # -------------------------------
 sqlalchemy==2.0.23
 alembic==1.12.1
 
 # -------------------------------
 # Enhanced Caching (OPTIONAL / FUTURE)
-# - Current cache in main.py is file-based TTLCache.
-#   Keep redis for future distributed cache if needed.
+# - Current cache is file/TTL-based; redis kept for possible future use.
 # -------------------------------
 redis==5.0.1
 
