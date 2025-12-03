@@ -13,7 +13,8 @@ ENRICHED QUOTE ROUTES – v1.0
     * sources[] (which providers were used)
 
 NOTE:
-- Adjust prefix "/v1" or auth logic to match your existing project.
+- We keep token-based access similar to your existing /v1/quote endpoint.
+- You can later swap validate_api_token() with your real auth dependency.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from core.data_engine import get_enriched_quote, UnifiedQuote
 
-# If you already have a shared auth dependency, import it instead:
+# If you already have a common auth dependency, later you can do:
 # from core.security import get_current_api_user  # example
 
 router = APIRouter(
@@ -31,7 +32,9 @@ router = APIRouter(
 )
 
 
-def validate_api_token(token: str = Query(..., description="API access token")) -> str:
+def validate_api_token(
+    token: str = Query(..., description="API access token")
+) -> str:
     """
     SIMPLE TOKEN VALIDATION PLACEHOLDER.
 
@@ -40,8 +43,9 @@ def validate_api_token(token: str = Query(..., description="API access token")) 
         * a dependency like get_current_user
         * or a token verification function.
 
-    For now:
-    - Accepts any non-empty token string, but keeps the interface consistent.
+    CURRENT BEHAVIOR:
+    - Accepts any non-empty token string.
+    - Keeps the same query parameter pattern: ?token=YOUR_TOKEN
     """
     if not token or not token.strip():
         raise HTTPException(
@@ -55,7 +59,7 @@ def validate_api_token(token: str = Query(..., description="API access token")) 
     "/enriched-quote",
     response_model=UnifiedQuote,
     summary="Get enriched quote with data quality & opportunity score",
-    response_description="Unified quote with merged providers and analysis.",
+    response_description="Unified quote with merged providers and basic analysis.",
 )
 async def enriched_quote_endpoint(
     symbol: str = Query(..., description="Ticker symbol, e.g. 1120.SR or MSFT"),
@@ -64,7 +68,7 @@ async def enriched_quote_endpoint(
     """
     Get a fully-enriched quote for a single symbol.
 
-    QUERY PARAMS:
+    QUERY PARAMETERS:
     - symbol: ticker, e.g. 1120.SR, 2222.SR, MSFT, AAPL
     - token:  your API token (placeholder validation for now)
 
@@ -75,11 +79,13 @@ async def enriched_quote_endpoint(
     try:
         quote = await get_enriched_quote(symbol)
     except ValueError as exc:
+        # For example: empty symbol
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
     except Exception as exc:  # noqa: BLE001
+        # Generic guard – in production, log the exception with structlog
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error generating enriched quote: {exc}",
