@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.5.1
+Tadawul Stock Analysis API - Enhanced Version 3.5.2
 Production-ready with hybrid EODHD providers and fundamentals service
 """
 
@@ -36,6 +36,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
+
 from routes_argaam import router as argaam_router
 
 # --- Advanced AI Trading Analysis integration (safe import) ---
@@ -67,7 +68,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.5.1", env="SERVICE_VERSION")
+    service_version: str = Field("3.5.2", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -1521,31 +1522,9 @@ app = FastAPI(
     redoc_url="/redoc" if settings.enable_redoc else None,
     lifespan=lifespan,
 )
-app = FastAPI(
-    title=settings.service_name,
-    version=settings.service_version,
-    description="""
-    Enhanced Tadawul Stock Analysis API with EODHD-based data providers,
-    comprehensive financial data integration and AI-powered trading analysis.
 
-    ## Features
-    ...
-    """,
-    docs_url="/docs" if settings.enable_swagger else None,
-    redoc_url="/redoc" if settings.enable_redoc else None,
-    lifespan=lifespan,
-)
-
-app.include_router(argaam_router)  # <-- ADD THIS LINE HERE
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
+# Argaam integration routes (prefix is already /v1/argaam inside the router)
+app.include_router(argaam_router)
 
 # CORS
 app.add_middleware(
@@ -1680,6 +1659,7 @@ async def root(request: Request):
             "saudi_market": "/api/saudi/market",
             "debug_simple_quote": "/debug/simple-quote",
             "debug_saudi_market": "/debug/saudi-market",
+            "argaam_root": "/v1/argaam/",
         },
         "example_curl": example_curl,
     }
