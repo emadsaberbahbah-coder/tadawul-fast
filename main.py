@@ -36,6 +36,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
+from routes_argaam import router as argaam_router
 
 # --- Advanced AI Trading Analysis integration (safe import) ---
 try:
