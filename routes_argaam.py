@@ -1,9 +1,10 @@
 # =============================================================================
-# Argaam Integration Routes - Ultimate Investment Dashboard (v3.2.0)
+# Argaam Integration Routes - Ultimate Investment Dashboard (v3.3.0)
 # Tadawul Fast Bridge / Stock Market Hub
 #
 # - Async httpx client with connection pooling
-# - Strong auth compatible with APP_TOKEN / BACKUP_APP_TOKEN + REQUIRE_AUTH
+# - Auth compatible with APP_TOKEN / BACKUP_APP_TOKEN + REQUIRE_AUTH
+#   (Bearer, raw Authorization, or ?token= supported)
 # - TTL cache (LRU) for scraped data
 # - BeautifulSoup-based HTML parsing with Arabic + English numeric handling
 # - Consistent logging & metadata for Render deployment
@@ -36,7 +37,7 @@ if not logger.handlers:
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)
 
 # -----------------------------------------------------------------------------
 # Optional BeautifulSoup parser
@@ -127,6 +128,10 @@ config = ArgaamConfig()
 # TTL Cache (LRU)
 # -----------------------------------------------------------------------------
 class TTLCache:
+    """
+    Lightweight wrapper around cachetools.TTLCache with stats.
+    """
+
     def __init__(self, maxsize: int = 1000, ttl: int = 600) -> None:
         self._cache = cachetools.TTLCache(maxsize=maxsize, ttl=ttl)
         self._hits = 0
@@ -143,11 +148,19 @@ class TTLCache:
             return None
 
     def set(self, key: str, value: Any) -> None:
+        """
+        Set key and estimate evictions:
+        - If cache is full and key is new, TTLCache will evict 1 LRU item.
+        """
         try:
+            existed = key in self._cache
             old_size = len(self._cache)
+            at_capacity = old_size >= self._cache.maxsize
+
             self._cache[key] = value
-            # TTLCache evicts on insert when full
-            if len(self._cache) < old_size:
+
+            if at_capacity and not existed and len(self._cache) == self._cache.maxsize:
+                # We replaced some older entry
                 self._evictions += 1
         except Exception as e:
             logger.warning(f"⚠️ Argaam cache set failed for key={key}: {e}")
@@ -226,6 +239,17 @@ http_client = ArgaamHTTPClient()
 # Authentication manager – consistent token logic
 # -----------------------------------------------------------------------------
 class AuthManager:
+    """
+    Auth aligned to main.py style:
+
+    Accepts any of:
+      - Authorization: Bearer <token>
+      - Authorization: <token>
+      - ?token=<token>
+
+    Uses APP_TOKEN / BACKUP_APP_TOKEN and REQUIRE_AUTH from env.
+    """
+
     def __init__(self) -> None:
         # Dict[ip] = [failures_count, first_failure_timestamp]
         self._failed_attempts: Dict[str, List[float]] = {}
@@ -262,6 +286,29 @@ class AuthManager:
             else:
                 self._failed_attempts[ip] = [failures + 1, first_failure]
 
+    def _extract_token(self, request: Request) -> Optional[str]:
+        """
+        Extract token from:
+          1) Authorization: Bearer <token>
+          2) Authorization: <token>
+          3) ?token=<token>
+        """
+        # Query param
+        token = request.query_params.get("token")
+        if token:
+            return token.strip()
+
+        # Authorization header
+        auth_header = request.headers.get("Authorization", "").strip()
+        if not auth_header:
+            return None
+
+        if auth_header.lower().startswith("bearer "):
+            return auth_header.split(" ", 1)[1].strip()
+
+        # Raw token header (no Bearer prefix)
+        return auth_header
+
     def validate_auth(self, request: Request) -> None:
         if not config.REQUIRE_AUTH:
             return
@@ -276,21 +323,18 @@ class AuthManager:
                 detail="Too many failed attempts. Please try again later.",
             )
 
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            self._record_failed_attempt(client_ip)
-            raise HTTPException(status_code=401, detail="Missing Bearer token")
-
-        token = auth_header.split(" ", 1)[1].strip()
         allowed_tokens = {t for t in (config.APP_TOKEN, config.BACKUP_APP_TOKEN) if t}
-
         if not allowed_tokens:
-            # Even if REQUIRE_AUTH, gracefully message missing server config
             logger.error("🚨 No APP_TOKEN / BACKUP_APP_TOKEN configured on server")
             raise HTTPException(
                 status_code=500,
                 detail="Server authentication configuration is missing tokens",
             )
+
+        token = self._extract_token(request)
+        if not token:
+            self._record_failed_attempt(client_ip)
+            raise HTTPException(status_code=401, detail="Missing authentication token")
 
         if token not in allowed_tokens:
             self._record_failed_attempt(client_ip)
@@ -715,7 +759,7 @@ class ArgaamQuoteResponse(BaseModel):
     error: Optional[str] = None
 
 
-class HealthResponse(BaseModel):
+class ArgaamHealthResponse(BaseModel):
     status: str
     bs4_available: bool
     cache: Dict[str, Any]
@@ -770,7 +814,7 @@ async def background_cache_cleanup() -> None:
 async def startup_event() -> None:
     try:
         asyncio.create_task(background_cache_cleanup())
-        logger.info("🚀 Argaam routes started (v3.2.0)")
+        logger.info("🚀 Argaam routes started (v3.3.0)")
     except Exception as e:
         logger.error("💥 Failed to start Argaam background task: %s", e)
 
@@ -783,7 +827,7 @@ async def shutdown_event() -> None:
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-@router.get("/health", response_model=HealthResponse)
+@router.get("/health", response_model=ArgaamHealthResponse)
 async def health_check(request: Request) -> Dict[str, Any]:
     """Health check (secured if REQUIRE_AUTH=true)."""
     auth_manager.validate_auth(request)
@@ -804,7 +848,13 @@ async def get_quotes(
     http_request: Request,
     background_tasks: BackgroundTasks,
 ) -> Dict[str, Any]:
-    """POST endpoint for Argaam quotes – main entry for backend integrations."""
+    """
+    POST endpoint for Argaam quotes – main entry for backend integrations.
+
+    - Secured by APP_TOKEN / BACKUP_APP_TOKEN if REQUIRE_AUTH=true
+    - Normalizes tickers (e.g., "2222.SR", "Aramco", "2222") to 4-digit codes
+    - Uses HTML scraping + BeautifulSoup for basic snapshot fundamentals
+    """
     auth_manager.validate_auth(http_request)
     performance_monitor.record_request()
 
@@ -878,10 +928,9 @@ async def get_quotes_endpoint(
     GET convenience endpoint for quotes (wrapper around POST /quotes).
 
     Example:
-        /v1/argaam/quotes?tickers=2222,1120,2010
+        /v1/argaam/quotes?tickers=2222,1120,2010&token=YOUR_APP_TOKEN
     """
     if request is None:
-        # Should not happen in normal FastAPI usage, but be defensive
         raise HTTPException(status_code=500, detail="Request context not available")
 
     ticker_list = [t.strip() for t in tickers.split(",") if t.strip()]
@@ -917,7 +966,13 @@ async def clear_cache(request: Request) -> Dict[str, Any]:
 
 @router.get("/test/{ticker}")
 async def test_ticker(ticker: str, request: Request) -> Dict[str, Any]:
-    """Debug endpoint to test a single ticker end-to-end."""
+    """
+    Debug endpoint to test a single ticker end-to-end.
+
+    - Normalizes ticker
+    - Fetches + parses Argaam snapshot
+    - Returns raw snapshot + metadata
+    """
     auth_manager.validate_auth(request)
     normalized = ticker_normalizer.normalize(ticker)
     data = await fetch_company_data(normalized)
@@ -946,7 +1001,7 @@ async def root() -> Dict[str, Any]:
     """Root meta endpoint for Argaam integration."""
     return {
         "message": "Argaam Integration API",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "status": "operational",
         "base_url": config.BASE_URL,
         "endpoints": {
