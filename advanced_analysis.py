@@ -1,5 +1,5 @@
 # advanced_analysis.py - Enhanced Multi-source AI Trading Analysis
-# Version: 3.1.0 - Production Ready for Render with Async Support
+# Version: 3.2.0 - Production Ready for Render with Async Support
 # Optimized for memory, performance, reliability, and Render environment
 
 from __future__ import annotations
@@ -395,6 +395,20 @@ class AdvancedTradingAnalyzer:
         key_string = f"v3_{symbol.upper().strip()}_{data_type}"
         return hashlib.md5(key_string.encode()).hexdigest()
 
+    def _parse_cache_timestamp(self, ts_str: Optional[str]) -> Optional[datetime]:
+        """Parse ISO timestamp safely, handling common 'Z' suffix."""
+        if not ts_str:
+            return None
+        try:
+            ts = ts_str.strip()
+            # normalize Zulu time to ISO8601 without 'Z'
+            if ts.endswith("Z"):
+                ts = ts[:-1]
+            return datetime.fromisoformat(ts)
+        except Exception:
+            logger.debug(f"Invalid cache timestamp format: {ts_str}")
+            return None
+
     async def _load_from_cache(self, symbol: str, data_type: str) -> Optional[Any]:
         """Load from cache with Redis preference and TTL check."""
         cache_key = self._get_cache_key(symbol, data_type)
@@ -406,10 +420,10 @@ class AdvancedTradingAnalyzer:
                 if cached:
                     data = json.loads(cached)
                     ts_str = data.get("timestamp")
-                    if not ts_str:
+                    cache_time = self._parse_cache_timestamp(ts_str)
+                    if cache_time is None:
                         return None
-                    cache_time = datetime.fromisoformat(ts_str)
-                    if datetime.now() - cache_time < self.cache_ttl:
+                    if datetime.utcnow() - cache_time < self.cache_ttl:
                         logger.debug(f"Cache hit (Redis): {symbol}_{data_type}")
                         return data.get("data")
             except Exception as e:
@@ -424,10 +438,10 @@ class AdvancedTradingAnalyzer:
             raw = cache_file.read_text(encoding="utf-8")
             data = json.loads(raw)
             ts_str = data.get("timestamp")
-            if not ts_str:
+            cache_time = self._parse_cache_timestamp(ts_str)
+            if cache_time is None:
                 return None
-            cache_time = datetime.fromisoformat(ts_str)
-            if datetime.now() - cache_time >= self.cache_ttl:
+            if datetime.utcnow() - cache_time >= self.cache_ttl:
                 return None
 
             logger.debug(f"Cache hit (file): {symbol}_{data_type}")
@@ -440,7 +454,7 @@ class AdvancedTradingAnalyzer:
         """Save to cache with Redis preference and file fallback."""
         cache_key = self._get_cache_key(symbol, data_type)
         cache_data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol.upper().strip(),
             "data_type": data_type,
             "data": data,
@@ -994,6 +1008,7 @@ class AdvancedTradingAnalyzer:
             logger.debug(f"Alpha Vantage historical data failed for {symbol}: {e}")
 
         # Fallback to synthetic data
+        logger.debug(f"Using synthetic historical data for {symbol}")
         return self._generate_synthetic_data(max_days)
 
     def _parse_alpha_vantage_historical(self, time_series: Dict, max_days: int) -> pd.DataFrame:
