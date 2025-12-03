@@ -36,8 +36,10 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
+
 from routes_argaam import router as argaam_router
 from routes.enriched_quote import router as enriched_quote_router  # NEW ✅
+from routes.ai_analysis import router as ai_analysis_router        # NEW ✅ AI router
 
 # --- Advanced AI Trading Analysis integration (safe import) ---
 try:
@@ -659,7 +661,7 @@ class AlphaVantageProvider:
         self.name = "alpha_vantage"
         self.rate_limit = 5
         self.base_url = "https://www.alphavantage.co/query"
-        self.api_key = settings.alpha_vantage_api_key
+               self.api_key = settings.alpha_vantage_api_key
         self.enabled = bool(self.api_key)
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -1527,7 +1529,8 @@ app = FastAPI(
 
 # Attach routers
 app.include_router(argaam_router)
-app.include_router(enriched_quote_router)  # NEW ✅
+app.include_router(enriched_quote_router)   # NEW ✅
+app.include_router(ai_analysis_router)      # NEW ✅ AI endpoints under /v1/ai/*
 
 # CORS
 app.add_middleware(
@@ -1656,10 +1659,16 @@ async def root(request: Request):
             "fundamentals": "/v1/fundamentals",
             "enriched_quote": "/v1/enriched-quote",  # NEW ✅
             "cache_info": "/v1/cache/info",
+            # Existing analysis endpoints
             "analysis_multi_source": "/v1/analysis/multi-source",
             "analysis_recommendation": "/v1/analysis/recommendation",
             "analysis_cache_info": "/v1/analysis/cache/info",
             "analysis_cache_clear": "/v1/analysis/cache/clear",
+            # NEW AI router endpoints (under /v1/ai/*)
+            "ai_recommendation": "/v1/ai/recommendation",
+            "ai_multi_source": "/v1/ai/multi-source",
+            "ai_cache_info": "/v1/ai/cache/info",
+            "ai_cache_clear": "/v1/ai/cache/clear",
             "saudi_market": "/api/saudi/market",
             "debug_simple_quote": "/debug/simple-quote",
             "debug_saudi_market": "/debug/saudi-market",
