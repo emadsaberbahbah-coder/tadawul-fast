@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.5.0
-Production-ready with hybrid EODHD + FMP providers and fundamentals service
+Tadawul Stock Analysis API - Enhanced Version 3.5.1
+Production-ready with hybrid EODHD providers and fundamentals service
 """
 
 import asyncio
@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.5.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.5.1", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -754,10 +754,12 @@ class FinnhubProvider:
 
 class FMPProvider:
     """
-    Financial Modeling Prep provider implementation.
+    Financial Modeling Prep provider implementation (quotes DISABLED).
 
-    Primary quote source for global stocks & funds, with richer fields
-    (price, previousClose, marketCap, eps, pe, etc.).
+    NOTE:
+    - FMP /quote endpoint is now LEGACY and returns 403 for your plan.
+    - To avoid noisy errors & slow retries, this provider is DISABLED for quotes.
+    - FMP is still used in FundamentalsService via /profile as a fallback source.
     """
 
     def __init__(self):
@@ -765,58 +767,22 @@ class FMPProvider:
         self.rate_limit = 60
         self.base_url = settings.fmp_base_url.rstrip("/")
         self.api_key = settings.fmp_api_key
-        self.enabled = bool(self.api_key)
+
+        # IMPORTANT:
+        # Quotes are disabled because /quote is deprecated for non-legacy users.
+        self.enabled = False
+        if self.api_key:
+            logger.info(
+                "FMP quote provider is DISABLED (legacy /quote endpoint). "
+                "FMP is still used for fundamentals via /profile when needed."
+            )
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if not self.enabled:
-            return None
-
-        url = f"{self.base_url}/quote/{symbol}"
-        params = {"apikey": self.api_key}
-
-        data = await http_client.request_with_retry("GET", url, params)
-        if not data:
-            return None
-
-        item: Optional[Dict[str, Any]] = None
-        if isinstance(data, list) and data:
-            item = data[0]
-        elif isinstance(data, dict):
-            item = data
-
-        if not item:
-            return None
-
-        return self._parse_quote(item, symbol)
-
-    def _parse_quote(self, item: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
-        price = self._safe_float(item.get("price"))
-        if price is None:
-            return None
-
-        return {
-            "ticker": symbol,
-            "price": price,
-            "previous_close": self._safe_float(item.get("previousClose")),
-            "change_value": self._safe_float(item.get("change")),
-            "change_percent": self._safe_float(item.get("changesPercentage")),
-            "volume": self._safe_float(item.get("volume")),
-            "open_price": self._safe_float(item.get("open")),
-            "high_price": self._safe_float(item.get("dayHigh")),
-            "low_price": self._safe_float(item.get("dayLow")),
-            "market_cap": self._safe_float(item.get("marketCap")),
-            "eps": self._safe_float(item.get("eps")),
-            "pe_ratio": self._safe_float(item.get("pe")),
-            "currency": item.get("currency") or item.get("currencyCode"),
-            "exchange": item.get("exchange") or item.get("exchangeShortName"),
-            "provider": self.name,
-        }
-
-    def _safe_float(self, value: Any) -> Optional[float]:
-        try:
-            return float(value) if value is not None and value != "" else None
-        except (ValueError, TypeError):
-            return None
+        """
+        Quotes from FMP are disabled to avoid HTTP 403 (Legacy Endpoint) noise.
+        Always returns None so ProviderManager will skip it.
+        """
+        return None
 
 
 class EODHDProvider:
@@ -828,7 +794,7 @@ class EODHDProvider:
 
     def __init__(self):
         self.name = "eodhd"
-        self.rate_limit = 1000  # logical high default; actual depends on your plan
+        self.rate_limit = 1000  # per day depends on your plan; logical high default
         self.base_url = settings.eodhd_base_url.rstrip("/")
         self.api_key = settings.eodhd_api_key
         self.enabled = bool(self.api_key)
@@ -908,19 +874,19 @@ class ProviderManager:
 
     def __init__(self):
         # Order matters:
-        # 1) EODHD (primary if configured – upgraded plan)
-        # 2) FMP
+        # 1) EODHD (primary if configured – you just upgraded)
+        # 2) FMP (quotes disabled – used ONLY in fundamentals layer)
         # 3) Finnhub
         # 4) Alpha Vantage
         self.providers: List[ProviderClient] = [
             EODHDProvider(),
-            FMPProvider(),
+            FMPProvider(),      # kept in list, but enabled=False so skipped for quotes
             FinnhubProvider(),
             AlphaVantageProvider(),
         ]
 
         self.enabled_providers = [p for p in self.providers if getattr(p, "enabled", True)]
-        logger.info(f"✅ Enabled providers: {[p.name for p in self.enabled_providers]}")
+        logger.info(f"✅ Enabled providers for quotes: {[p.name for p in self.enabled_providers]}")
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get quote from providers with enhanced error handling"""
@@ -996,18 +962,17 @@ class QuoteService:
         """Get single quote with enhanced error handling"""
         symbol_norm = symbol.strip().upper()
 
-        # Handle Tadawul upfront – not served via /v1/quote
+        # Handle Tadawul upfront – providers on current plan don't support .SR
         if is_tadawul_symbol(symbol_norm):
-            logger.info(f"Tadawul symbol detected (served via /api/saudi/market, not /v1/quote): {symbol_norm}")
+            logger.info(f"Tadawul symbol detected with no enabled providers: {symbol_norm}")
             return Quote(
                 ticker=symbol_norm,
                 status=QuoteStatus.NO_DATA,
                 currency="SAR",
                 exchange="TADAWUL",
                 message=(
-                    "Tadawul (.SR) symbols are not served via /v1/quote. "
-                    "Use /api/saudi/market for Saudi market snapshots, "
-                    "and keep /v1/quote for global symbols (AAPL, MSFT, AMZN, etc.)."
+                    "Tadawul (.SR) market data is not enabled on the current data provider plan. "
+                    "Global / US symbols (e.g. AAPL, MSFT) are supported."
                 ),
             )
 
@@ -1054,7 +1019,7 @@ class QuoteService:
             if not sym:
                 continue
             if is_tadawul_symbol(sym):
-                logger.info(f"Tadawul symbol detected (served via /api/saudi/market, not /v1/quote): {sym}")
+                logger.info(f"Tadawul symbol detected with no enabled providers: {sym}")
                 tadawul_quotes.append(
                     Quote(
                         ticker=sym,
@@ -1062,9 +1027,8 @@ class QuoteService:
                         currency="SAR",
                         exchange="TADAWUL",
                         message=(
-                            "Tadawul (.SR) symbols are not served via /v1/quote. "
-                            "Use /api/saudi/market for Saudi market snapshots, "
-                            "and keep /v1/quote for global symbols (AAPL, MSFT, AMZN, etc.)."
+                            "Tadawul (.SR) market data is not enabled on the current data provider "
+                            "plan. Global / US symbols (e.g. AAPL, MSFT) are supported."
                         ),
                     )
                 )
@@ -1223,8 +1187,7 @@ class FundamentalsService:
         if is_tadawul_symbol(symbol_norm):
             base["message"] = (
                 "Fundamentals for Tadawul (.SR) symbols are not available from the current "
-                "providers. Use static metadata or connect an Argaam/Tadawul-capable API. "
-                "Price/market snapshots are available via /api/saudi/market."
+                "providers. Use static metadata or connect an Argaam/Tadawul-capable API."
             )
             return base
 
@@ -1532,12 +1495,12 @@ app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
     description="""
-    Enhanced Tadawul Stock Analysis API with hybrid EODHD + FMP data providers,
+    Enhanced Tadawul Stock Analysis API with EODHD-based data providers,
     comprehensive financial data integration and AI-powered trading analysis.
 
     ## Features
 
-    * 📈 Real-time stock quotes from multiple financial APIs (EODHD, FMP, Finnhub, Alpha Vantage)
+    * 📈 Real-time stock quotes from multiple financial APIs (EODHD, Finnhub, Alpha Vantage)
     * 📊 Fundamentals endpoint (EODHD + FMP hybrid)
     * 🤖 Advanced multi-source AI analysis & recommendations
     * 💾 Advanced caching with TTL and batched persistence
@@ -1691,7 +1654,6 @@ async def root(request: Request):
             "saudi_market": "/api/saudi/market",
             "debug_simple_quote": "/debug/simple-quote",
             "debug_saudi_market": "/debug/saudi-market",
-            "debug_providers": "/debug/providers",
         },
         "example_curl": example_curl,
     }
@@ -2177,20 +2139,6 @@ async def debug_saudi_market(limit: int = Query(5, ge=1, le=50)):
         "count": len(sample),
         "timestamp": now_ts,
         "data": sample,
-    }
-
-
-@app.get("/debug/providers", response_model=Dict[str, Any])
-async def debug_providers():
-    """
-    Show which data providers are enabled and basic info.
-    """
-    return {
-        "enabled_providers": [p.name for p in provider_manager.enabled_providers],
-        "eodhd_enabled": bool(settings.eodhd_api_key),
-        "fmp_enabled": bool(settings.fmp_api_key),
-        "finnhub_enabled": bool(settings.finnhub_api_key),
-        "alpha_vantage_enabled": bool(settings.alpha_vantage_api_key),
     }
 
 
