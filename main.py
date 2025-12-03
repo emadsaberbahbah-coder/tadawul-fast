@@ -828,7 +828,7 @@ class EODHDProvider:
 
     def __init__(self):
         self.name = "eodhd"
-        self.rate_limit = 1000  # per day depends on your plan; logical high default
+        self.rate_limit = 1000  # logical high default; actual depends on your plan
         self.base_url = settings.eodhd_base_url.rstrip("/")
         self.api_key = settings.eodhd_api_key
         self.enabled = bool(self.api_key)
@@ -908,7 +908,7 @@ class ProviderManager:
 
     def __init__(self):
         # Order matters:
-        # 1) EODHD (primary if configured – you just upgraded)
+        # 1) EODHD (primary if configured – upgraded plan)
         # 2) FMP
         # 3) Finnhub
         # 4) Alpha Vantage
@@ -996,17 +996,18 @@ class QuoteService:
         """Get single quote with enhanced error handling"""
         symbol_norm = symbol.strip().upper()
 
-        # Handle Tadawul upfront – providers on current plan don't support .SR
+        # Handle Tadawul upfront – not served via /v1/quote
         if is_tadawul_symbol(symbol_norm):
-            logger.info(f"Tadawul symbol detected with no enabled providers: {symbol_norm}")
+            logger.info(f"Tadawul symbol detected (served via /api/saudi/market, not /v1/quote): {symbol_norm}")
             return Quote(
                 ticker=symbol_norm,
                 status=QuoteStatus.NO_DATA,
                 currency="SAR",
                 exchange="TADAWUL",
                 message=(
-                    "Tadawul (.SR) market data is not enabled on the current data provider plan. "
-                    "Global / US symbols (e.g. AAPL, MSFT) are supported."
+                    "Tadawul (.SR) symbols are not served via /v1/quote. "
+                    "Use /api/saudi/market for Saudi market snapshots, "
+                    "and keep /v1/quote for global symbols (AAPL, MSFT, AMZN, etc.)."
                 ),
             )
 
@@ -1053,7 +1054,7 @@ class QuoteService:
             if not sym:
                 continue
             if is_tadawul_symbol(sym):
-                logger.info(f"Tadawul symbol detected with no enabled providers: {sym}")
+                logger.info(f"Tadawul symbol detected (served via /api/saudi/market, not /v1/quote): {sym}")
                 tadawul_quotes.append(
                     Quote(
                         ticker=sym,
@@ -1061,8 +1062,9 @@ class QuoteService:
                         currency="SAR",
                         exchange="TADAWUL",
                         message=(
-                            "Tadawul (.SR) market data is not enabled on the current data provider "
-                            "plan. Global / US symbols (e.g. AAPL, MSFT) are supported."
+                            "Tadawul (.SR) symbols are not served via /v1/quote. "
+                            "Use /api/saudi/market for Saudi market snapshots, "
+                            "and keep /v1/quote for global symbols (AAPL, MSFT, AMZN, etc.)."
                         ),
                     )
                 )
@@ -1221,7 +1223,8 @@ class FundamentalsService:
         if is_tadawul_symbol(symbol_norm):
             base["message"] = (
                 "Fundamentals for Tadawul (.SR) symbols are not available from the current "
-                "providers. Use static metadata or connect an Argaam/Tadawul-capable API."
+                "providers. Use static metadata or connect an Argaam/Tadawul-capable API. "
+                "Price/market snapshots are available via /api/saudi/market."
             )
             return base
 
@@ -1688,6 +1691,7 @@ async def root(request: Request):
             "saudi_market": "/api/saudi/market",
             "debug_simple_quote": "/debug/simple-quote",
             "debug_saudi_market": "/debug/saudi-market",
+            "debug_providers": "/debug/providers",
         },
         "example_curl": example_curl,
     }
@@ -2173,6 +2177,20 @@ async def debug_saudi_market(limit: int = Query(5, ge=1, le=50)):
         "count": len(sample),
         "timestamp": now_ts,
         "data": sample,
+    }
+
+
+@app.get("/debug/providers", response_model=Dict[str, Any])
+async def debug_providers():
+    """
+    Show which data providers are enabled and basic info.
+    """
+    return {
+        "enabled_providers": [p.name for p in provider_manager.enabled_providers],
+        "eodhd_enabled": bool(settings.eodhd_api_key),
+        "fmp_enabled": bool(settings.fmp_api_key),
+        "finnhub_enabled": bool(settings.finnhub_api_key),
+        "alpha_vantage_enabled": bool(settings.alpha_vantage_api_key),
     }
 
 
