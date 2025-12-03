@@ -1,5 +1,5 @@
 # =============================================================================
-# Argaam Integration Routes - Ultimate Investment Dashboard (v3.3.0)
+# Argaam Integration Routes - Ultimate Investment Dashboard (v3.3.1)
 # Tadawul Fast Bridge / Stock Market Hub
 #
 # - Async httpx client with connection pooling
@@ -16,7 +16,7 @@ import os
 import re
 import time
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 from urllib.parse import quote
 from datetime import datetime
 
@@ -731,7 +731,8 @@ async def fetch_company_data(code: str, ttl: Optional[int] = None) -> Dict[str, 
 class ArgaamRequest(BaseModel):
     tickers: List[str] = Field(..., min_items=1, max_items=50)
     cache_ttl: int = Field(default=config.CACHE_TTL, ge=60, le=3600)
-    priority: str = Field(default="normal", regex="^(low|normal|high)$")
+    # Pydantic v2: avoid `regex` argument; use Literal to constrain values
+    priority: Literal["low", "normal", "high"] = Field(default="normal")
 
     @validator("tickers")
     def validate_tickers(cls, v: List[str]) -> List[str]:
@@ -814,7 +815,7 @@ async def background_cache_cleanup() -> None:
 async def startup_event() -> None:
     try:
         asyncio.create_task(background_cache_cleanup())
-        logger.info("🚀 Argaam routes started (v3.3.0)")
+        logger.info("🚀 Argaam routes started (v3.3.1)")
     except Exception as e:
         logger.error("💥 Failed to start Argaam background task: %s", e)
 
@@ -1001,7 +1002,7 @@ async def root() -> Dict[str, Any]:
     """Root meta endpoint for Argaam integration."""
     return {
         "message": "Argaam Integration API",
-        "version": "3.3.0",
+        "version": "3.3.1",
         "status": "operational",
         "base_url": config.BASE_URL,
         "endpoints": {
