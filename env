@@ -26,7 +26,7 @@ BACKUP_APP_TOKEN=your_backup_secure_app_token_here
 REQUIRE_AUTH=true
 
 ENABLE_RATE_LIMITING=true
-RATE_LIMIT_REQUESTS_PER_MINUTE=60    # matches /v1/quote and /v41/quotes limit
+RATE_LIMIT_REQUESTS_PER_MINUTE=60    # matches analysis rate limit
 
 # CORS Configuration
 CORS_ORIGINS=["http://localhost:3000","https://tadawul-fast-1.onrender.com","https://your-production-domain.com"]
@@ -50,7 +50,7 @@ ENABLE_REDOC=true
 # Google Sheets (MANDATORY for your project)
 SPREADSHEET_ID=your_production_spreadsheet_id_here
 
-# Apps Script URLs (used by google_apps_script_client.py)
+# Apps Script URLs (used by google_apps_script_client.py AND advanced_analysis.py)
 GOOGLE_APPS_SCRIPT_URL=your_production_apps_script_url_here
 GOOGLE_APPS_SCRIPT_BACKUP_URL=your_production_backup_script_url_here
 
@@ -58,26 +58,41 @@ GOOGLE_APPS_SCRIPT_BACKUP_URL=your_production_backup_script_url_here
 # NOTE: keep this exactly as one line (Render secret)
 GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"your-project-id","private_key_id":"your-private-key-id","private_key":"-----BEGIN PRIVATE KEY-----\nYOUR_PRIVATE_KEY_HERE\n-----END PRIVATE KEY-----\n","client_email":"your-service-account@your-project.iam.gserviceaccount.com","client_id":"your-client-id","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/your-service-account@your-project.iam.gserviceaccount.com","universe_domain":"googleapis.com"}
 
+# Optional explicit config for GoogleSheetsService
+SHEETS_REQUEST_TIMEOUT=30          # seconds (min 10s)
+SHEETS_CACHE_TTL=1800              # seconds (30 minutes)
+SHEETS_CACHE_DIR=/tmp/sheets_cache
+
 # =============================================================================
 # FINANCIAL API CONFIGURATION (ACTIVE PROVIDERS)
 # =============================================================================
 
 # ---- Alpha Vantage ----
 ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here
+ALPHA_VANTAGE_BASE_URL=https://www.alphavantage.co/query
 
 # ---- Finnhub ----
 FINNHUB_API_KEY=your_finnhub_api_key_here
+FINNHUB_BASE_URL=https://finnhub.io/api/v1
 
-# The following providers are currently NOT used by main.py v3.1.1.
-# You can leave them empty or commented. They are here only for future expansion.
+# ---- EODHD ----
+EODHD_API_KEY=your_eodhd_api_key_here
+EODHD_BASE_URL=https://eodhistoricaldata.com/api
 
-# EODHD_API_KEY=your_eodhd_api_key_here
-# TWELVEDATA_API_KEY=your_twelvedata_api_key_here
-# MARKETSTACK_API_KEY=your_marketstack_api_key_here
-# FMP_API_KEY=your_fmp_api_key_here
+# ---- TwelveData ----
+TWELVEDATA_API_KEY=your_twelvedata_api_key_here
+TWELVEDATA_BASE_URL=https://api.twelvedata.com
+
+# ---- Marketstack ----
+MARKETSTACK_API_KEY=your_marketstack_api_key_here
+MARKETSTACK_BASE_URL=http://api.marketstack.com/v1
+
+# ---- Financial Modeling Prep (FMP) ----
+FMP_API_KEY=your_fmp_api_key_here
+FMP_BASE_URL=https://financialmodelingprep.com/api/v3
 
 # =============================================================================
-# CACHE CONFIGURATION
+# CACHE CONFIGURATION (Core HTTP / main.py)
 # =============================================================================
 
 CACHE_DEFAULT_TTL=1800          # seconds (30 minutes)
@@ -87,6 +102,18 @@ CACHE_SAVE_INTERVAL=10          # seconds -> used by TTLCache.save_interval
 
 # (optional / documentation only)
 CACHE_CLEANUP_INTERVAL=300
+
+# =============================================================================
+# ADVANCED ANALYZER CACHE & RATE LIMIT (advanced_analysis.py)
+# =============================================================================
+
+ANALYSIS_CACHE_TTL_MINUTES=30    # matches 1800s above
+ANALYSIS_MAX_CACHE_SIZE_MB=100
+ANALYSIS_RATE_LIMIT_RPM=60       # keep in sync with RATE_LIMIT_REQUESTS_PER_MINUTE
+ANALYSIS_MAX_RETRIES=3
+
+# Optional: Redis for distributed cache (leave empty if not used)
+# REDIS_URL=redis://:password@host:6379/0
 
 # =============================================================================
 # PERFORMANCE & RELIABILITY
