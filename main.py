@@ -37,6 +37,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 from routes_argaam import router as argaam_router
+from routes.enriched_quote import router as enriched_quote_router  # NEW ✅
 
 # --- Advanced AI Trading Analysis integration (safe import) ---
 try:
@@ -1504,6 +1505,7 @@ app = FastAPI(
     * 📈 Real-time stock quotes from multiple financial APIs (EODHD, Finnhub, Alpha Vantage)
     * 📊 Fundamentals endpoint (EODHD + FMP hybrid)
     * 🤖 Advanced multi-source AI analysis & recommendations
+    * 🧠 Enriched quote endpoint with data quality & opportunity scoring
     * 💾 Advanced caching with TTL and batched persistence
     * 🔐 Comprehensive security with token authentication
     * ⚡ Async/await for high performance
@@ -1523,8 +1525,9 @@ app = FastAPI(
     default_response_class=ORJSONResponse,  # faster JSON serialization
 )
 
-# Attach Argaam router
+# Attach routers
 app.include_router(argaam_router)
+app.include_router(enriched_quote_router)  # NEW ✅
 
 # CORS
 app.add_middleware(
@@ -1651,6 +1654,7 @@ async def root(request: Request):
             "quotes_v1": "/v1/quote",
             "quotes_v41": "/v41/quotes",
             "fundamentals": "/v1/fundamentals",
+            "enriched_quote": "/v1/enriched-quote",  # NEW ✅
             "cache_info": "/v1/cache/info",
             "analysis_multi_source": "/v1/analysis/multi-source",
             "analysis_recommendation": "/v1/analysis/recommendation",
