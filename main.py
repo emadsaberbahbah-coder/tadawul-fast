@@ -1521,6 +1521,31 @@ app = FastAPI(
     redoc_url="/redoc" if settings.enable_redoc else None,
     lifespan=lifespan,
 )
+app = FastAPI(
+    title=settings.service_name,
+    version=settings.service_version,
+    description="""
+    Enhanced Tadawul Stock Analysis API with EODHD-based data providers,
+    comprehensive financial data integration and AI-powered trading analysis.
+
+    ## Features
+    ...
+    """,
+    docs_url="/docs" if settings.enable_swagger else None,
+    redoc_url="/redoc" if settings.enable_redoc else None,
+    lifespan=lifespan,
+)
+
+app.include_router(argaam_router)  # <-- ADD THIS LINE HERE
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # CORS
 app.add_middleware(
