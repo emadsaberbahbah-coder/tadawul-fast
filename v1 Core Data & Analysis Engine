@@ -1,0 +1,471 @@
+"""
+Core Data & Analysis Engine - v1.0
+Author: Emad Bahbah (with GPT-5.1 Thinking)
+
+GOAL:
+- Avoid missing data as much as possible by merging multiple providers.
+- Standardize structure for quotes & fundamentals.
+- Provide basic analysis signals to improve your dashboards.
+
+HOW TO USE (example):
+    from core.data_engine import get_enriched_quote
+
+    result = await get_enriched_quote("MSFT")
+    print(result.model_dump())
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+from datetime import datetime, timezone
+from typing import Dict, Optional, List, Literal
+
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# 1) UNIFIED MODELS
+# ---------------------------------------------------------------------------
+
+DataQualityLevel = Literal["EXCELLENT", "GOOD", "FAIR", "POOR", "MISSING"]
+MarketRegion = Literal["KSA", "GLOBAL", "UNKNOWN"]
+
+
+class QuoteSourceInfo(BaseModel):
+    provider: str
+    timestamp: datetime
+    fields: List[str] = Field(default_factory=list)
+
+
+class UnifiedQuote(BaseModel):
+    """
+    This is the master structure that your FastAPI endpoints should return.
+    Everything from all APIs is normalized into this model.
+    """
+
+    symbol: str
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+    market_region: MarketRegion = "UNKNOWN"
+
+    # Price snapshot
+    price: Optional[float] = None
+    prev_close: Optional[float] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    volume: Optional[float] = None
+
+    # Simple derived fields
+    change: Optional[float] = None
+    change_pct: Optional[float] = None
+    fifty_two_week_high: Optional[float] = None
+    fifty_two_week_low: Optional[float] = None
+
+    # Fundamentals (partial – extend later)
+    market_cap: Optional[float] = None
+    eps_ttm: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    pb: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+    debt_to_equity: Optional[float] = None
+    profit_margin: Optional[float] = None
+    operating_margin: Optional[float] = None
+    revenue_growth_yoy: Optional[float] = None
+    net_income_growth_yoy: Optional[float] = None
+
+    # Meta
+    last_updated_utc: Optional[datetime] = None
+    data_quality: DataQualityLevel = "MISSING"
+    data_gaps: List[str] = Field(default_factory=list)
+    sources: List[QuoteSourceInfo] = Field(default_factory=list)
+
+    # Analysis
+    opportunity_score: Optional[float] = None
+    risk_flag: Optional[str] = None
+    notes: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# 2) PROVIDER ADAPTERS (STUBS)
+#    Plug your real API calls here
+# ---------------------------------------------------------------------------
+
+async def fetch_from_eodhd(symbol: str) -> Dict:
+    """
+    TODO: Replace with real EODHD call.
+    Return a *normalized* dict with keys matching UnifiedQuote fields.
+
+    This version is a MOCK to let you start wiring the pipeline.
+    """
+    # Example: for MSFT return some fake but realistic data
+    if symbol.upper() == "MSFT":
+        now = datetime.now(timezone.utc)
+        return {
+            "symbol": "MSFT",
+            "name": "Microsoft Corporation",
+            "exchange": "NASDAQ",
+            "currency": "USD",
+            "price": 420.0,
+            "prev_close": 415.0,
+            "open": 416.0,
+            "high": 421.5,
+            "low": 414.2,
+            "volume": 18000000,
+            "fifty_two_week_high": 430.0,
+            "fifty_two_week_low": 310.0,
+            "market_cap": 3.1e12,
+            "eps_ttm": 11.9,
+            "pe_ttm": 35.3,
+            "pb": 12.0,
+            "dividend_yield": 0.007,  # 0.7%
+            "roe": 0.38,
+            "roa": 0.18,
+            "debt_to_equity": 0.55,
+            "profit_margin": 0.35,
+            "operating_margin": 0.42,
+            "revenue_growth_yoy": 0.13,
+            "net_income_growth_yoy": 0.16,
+            "last_updated_utc": now,
+            "__source__": QuoteSourceInfo(
+                provider="EODHD",
+                timestamp=now,
+                fields=[
+                    "price", "prev_close", "open", "high", "low",
+                    "volume", "market_cap", "eps_ttm", "pe_ttm",
+                    "pb", "roe", "profit_margin", "revenue_growth_yoy",
+                    "net_income_growth_yoy"
+                ]
+            ),
+        }
+
+    # Default: return empty dict (no data)
+    return {}
+
+
+async def fetch_from_fmp(symbol: str) -> Dict:
+    """
+    TODO: Replace with real FinancialModelingPrep API adaptor.
+    For now, just return {} (no data).
+    """
+    return {}
+
+
+async def fetch_from_tadawul_bridge(symbol: str) -> Dict:
+    """
+    TODO: Call your own 'tadawul-fast-bridge' API for KSA symbols.
+    This will be very useful for .SR tickers.
+    """
+    return {}
+
+
+# Register providers in order of priority
+PROVIDERS = [
+    ("EODHD", fetch_from_eodhd),
+    ("FMP", fetch_from_fmp),
+    ("TADAWUL_BRIDGE", fetch_from_tadawul_bridge),
+    # later: add DeepSeek-enriched fundamentals, etc.
+]
+
+
+# ---------------------------------------------------------------------------
+# 3) MERGING & DATA COMPLETENESS LOGIC
+# ---------------------------------------------------------------------------
+
+def _merge_dicts(primary: Dict, secondary: Dict) -> Dict:
+    """
+    Fill missing keys in 'primary' using values from 'secondary'.
+    Does NOT override non-empty primary values.
+    """
+    merged = dict(primary)
+    for k, v in secondary.items():
+        if k.startswith("__"):  # internal meta handled separately
+            continue
+        if merged.get(k) is None and v is not None:
+            merged[k] = v
+    return merged
+
+
+def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
+    sym = symbol.upper()
+    if sym.endswith(".SR") or (exchange and exchange.upper() in {"TADAWUL", "NOMU"}):
+        return "KSA"
+    if exchange and exchange.upper() in {"NASDAQ", "NYSE", "AMEX", "LSE", "XETRA"}:
+        return "GLOBAL"
+    return "UNKNOWN"
+
+
+def _calculate_change_fields(data: Dict) -> None:
+    price = data.get("price")
+    prev_close = data.get("prev_close")
+    if price is not None and prev_close is not None and prev_close != 0:
+        data["change"] = price - prev_close
+        data["change_pct"] = (price - prev_close) / prev_close * 100.0
+
+
+def _assess_data_quality(data: Dict) -> (DataQualityLevel, List[str]):
+    """
+    Simple scoring based on how many key fields are present.
+    You can tune this logic later.
+    """
+    required_price_fields = ["price", "prev_close", "volume"]
+    important_fundamentals = ["market_cap", "eps_ttm", "pe_ttm", "pb"]
+
+    missing: List[str] = []
+
+    for f in required_price_fields:
+        if data.get(f) is None:
+            missing.append(f)
+
+    for f in important_fundamentals:
+        if data.get(f) is None:
+            missing.append(f)
+
+    total_fields = len(required_price_fields) + len(important_fundamentals)
+    missing_count = len(missing)
+    coverage = 1.0 - (missing_count / float(total_fields))
+
+    if missing_count == total_fields:
+        return "MISSING", missing
+
+    if coverage > 0.80:
+        return "EXCELLENT", missing
+    if coverage > 0.60:
+        return "GOOD", missing
+    if coverage > 0.40:
+        return "FAIR", missing
+    return "POOR", missing
+
+
+# ---------------------------------------------------------------------------
+# 4) ANALYSIS LAYER (BASIC v1)
+# ---------------------------------------------------------------------------
+
+def _compute_opportunity_score(data: Dict) -> Optional[float]:
+    """
+    A very simple score combining:
+    - Valuation (PE vs ROE)
+    - Profitability (profit_margin)
+    - Growth (revenue_growth_yoy, net_income_growth_yoy)
+
+    Returns a score roughly between 0 and 100.
+    """
+    pe = data.get("pe_ttm")
+    roe = data.get("roe")
+    pm = data.get("profit_margin")
+    rev_g = data.get("revenue_growth_yoy")
+    ni_g = data.get("net_income_growth_yoy")
+
+    # If we have almost nothing, skip
+    if all(v is None for v in [pe, roe, pm, rev_g, ni_g]):
+        return None
+
+    score = 50.0  # neutral base
+
+    # Valuation vs profitability
+    if pe is not None and roe is not None and pe > 0:
+        pe_roe_ratio = pe / max(roe * 100.0, 0.1)  # roe as %
+        if pe_roe_ratio < 0.5:
+            score += 15
+        elif pe_roe_ratio < 1.0:
+            score += 8
+        elif pe_roe_ratio > 2.0:
+            score -= 10
+
+    # Profit margin
+    if pm is not None:
+        pm_pct = pm * 100.0
+        if pm_pct > 25:
+            score += 10
+        elif pm_pct > 15:
+            score += 5
+        elif pm_pct < 5:
+            score -= 5
+
+    # Growth
+    growth_scores = []
+    for g in (rev_g, ni_g):
+        if g is None:
+            continue
+        g_pct = g * 100.0
+        if g_pct > 20:
+            growth_scores.append(10)
+        elif g_pct > 10:
+            growth_scores.append(6)
+        elif g_pct > 0:
+            growth_scores.append(3)
+        elif g_pct < -5:
+            growth_scores.append(-5)
+
+    if growth_scores:
+        score += sum(growth_scores) / len(growth_scores)
+
+    # Clip to 0–100
+    return max(0.0, min(100.0, score))
+
+
+def _derive_risk_flag(data: Dict, opportunity_score: Optional[float]) -> Optional[str]:
+    if opportunity_score is None:
+        return None
+
+    pe = data.get("pe_ttm")
+    debt_equity = data.get("debt_to_equity")
+    rev_g = data.get("revenue_growth_yoy")
+
+    # Simple logic: good score but high debt => "LEVERAGED OPPORTUNITY"
+    if opportunity_score >= 70:
+        if debt_equity is not None and debt_equity > 1.5:
+            return "LEVERAGED OPPORTUNITY"
+        if rev_g is not None and rev_g < 0:
+            return "TURNAROUND PLAY"
+        return "STRONG OPPORTUNITY"
+
+    if opportunity_score <= 35:
+        if pe is not None and pe > 40:
+            return "OVERVALUED / SPECULATIVE"
+        if rev_g is not None and rev_g < 0:
+            return "DECLINING BUSINESS"
+        return "WEAK OPPORTUNITY"
+
+    return "NEUTRAL"
+
+
+def _build_notes(data: Dict, opportunity_score: Optional[float], risk_flag: Optional[str]) -> Optional[str]:
+    pieces: List[str] = []
+    if risk_flag:
+        pieces.append(f"Risk flag: {risk_flag}.")
+    if opportunity_score is not None:
+        pieces.append(f"Composite opportunity score: {opportunity_score:.1f}/100.")
+
+    pe = data.get("pe_ttm")
+    roe = data.get("roe")
+    pm = data.get("profit_margin")
+    rev_g = data.get("revenue_growth_yoy")
+    ni_g = data.get("net_income_growth_yoy")
+
+    if pe is not None:
+        pieces.append(f"P/E (TTM): {pe:.1f}.")
+    if roe is not None:
+        pieces.append(f"ROE: {roe * 100:.1f}%.")
+    if pm is not None:
+        pieces.append(f"Profit margin: {pm * 100:.1f}%.")
+    if rev_g is not None:
+        pieces.append(f"Revenue YoY growth: {rev_g * 100:.1f}%.")
+    if ni_g is not None:
+        pieces.append(f"Net income YoY growth: {ni_g * 100:.1f}%.")
+
+    return " ".join(pieces) if pieces else None
+
+
+# ---------------------------------------------------------------------------
+# 5) PUBLIC ENTRYPOINT
+# ---------------------------------------------------------------------------
+
+async def get_enriched_quote(symbol: str) -> UnifiedQuote:
+    """
+    High-level API:
+    - Calls all providers in parallel.
+    - Merges their data to reduce missing fields.
+    - Computes quality, gaps, and basic opportunity analysis.
+    """
+
+    symbol = symbol.strip()
+    if not symbol:
+        raise ValueError("Symbol cannot be empty.")
+
+    # 1) Call all providers concurrently
+    tasks = {
+        name: asyncio.create_task(func(symbol))
+        for name, func in PROVIDERS
+    }
+
+    raw_results: Dict[str, Dict] = {}
+    sources: List[QuoteSourceInfo] = []
+
+    for name, task in tasks.items():
+        try:
+            data = await task
+        except Exception as exc:  # noqa: BLE001
+            # In production: log exception
+            continue
+
+        if not data:
+            continue
+
+        raw_results[name] = data
+
+        # Extract QuoteSourceInfo if provided inside data
+        src = data.get("__source__")
+        if isinstance(src, QuoteSourceInfo):
+            sources.append(src)
+        else:
+            # Fallback
+            sources.append(
+                QuoteSourceInfo(
+                    provider=name,
+                    timestamp=datetime.now(timezone.utc),
+                    fields=[k for k in data.keys() if not k.startswith("__")],
+                )
+            )
+
+    # 2) If all providers returned nothing, return empty object
+    if not raw_results:
+        return UnifiedQuote(
+            symbol=symbol,
+            data_quality="MISSING",
+            data_gaps=[
+                "No data from any provider (EODHD/FMP/TADAWUL_BRIDGE)."
+            ],
+            last_updated_utc=datetime.now(timezone.utc),
+        )
+
+    # 3) Merge data; first provider in list acts as base
+    merged: Dict = {}
+    for provider_name, _func in PROVIDERS:
+        provider_data = raw_results.get(provider_name)
+        if not provider_data:
+            continue
+        if not merged:
+            merged = {k: v for k, v in provider_data.items() if not k.startswith("__")}
+        else:
+            merged = _merge_dicts(merged, provider_data)
+
+    # 4) Derived fields & quality
+    _calculate_change_fields(merged)
+
+    # Infer region
+    merged["market_region"] = _infer_market_region(
+        merged.get("symbol") or symbol,
+        merged.get("exchange"),
+    )
+
+    # Last updated
+    if merged.get("last_updated_utc") is None:
+        merged["last_updated_utc"] = datetime.now(timezone.utc)
+
+    # Data quality
+    dq, gaps = _assess_data_quality(merged)
+
+    # 5) Analysis
+    opp_score = _compute_opportunity_score(merged)
+    risk_flag = _derive_risk_flag(merged, opp_score)
+    notes = _build_notes(merged, opp_score, risk_flag)
+
+    # 6) Build UnifiedQuote
+    quote = UnifiedQuote(
+        **{
+            **merged,
+            "symbol": merged.get("symbol") or symbol,
+            "data_quality": dq,
+            "data_gaps": gaps,
+            "opportunity_score": opp_score,
+            "risk_flag": risk_flag,
+            "notes": notes,
+            "sources": sources,
+        }
+    )
+
+    return quote
