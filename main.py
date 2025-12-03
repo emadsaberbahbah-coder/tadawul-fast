@@ -602,7 +602,7 @@ class HTTPClient:
         url: str,
         params: Optional[Dict[str, Any]] = None,
         max_retries: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[Any]:
         """Make HTTP request with retry logic"""
         max_retries = max_retries or settings.max_retries
         last_exception = None
@@ -661,7 +661,7 @@ class AlphaVantageProvider:
         self.name = "alpha_vantage"
         self.rate_limit = 5
         self.base_url = "https://www.alphavantage.co/query"
-               self.api_key = settings.alpha_vantage_api_key
+        self.api_key = settings.alpha_vantage_api_key
         self.enabled = bool(self.api_key)
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
