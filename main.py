@@ -28,7 +28,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, ORJSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, validator
 from pydantic_settings import BaseSettings
@@ -36,7 +36,6 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
-
 from routes_argaam import router as argaam_router
 
 # --- Advanced AI Trading Analysis integration (safe import) ---
@@ -1521,9 +1520,10 @@ app = FastAPI(
     docs_url="/docs" if settings.enable_swagger else None,
     redoc_url="/redoc" if settings.enable_redoc else None,
     lifespan=lifespan,
+    default_response_class=ORJSONResponse,  # faster JSON serialization
 )
 
-# Argaam integration routes (prefix is already /v1/argaam inside the router)
+# Attach Argaam router
 app.include_router(argaam_router)
 
 # CORS
@@ -1659,7 +1659,6 @@ async def root(request: Request):
             "saudi_market": "/api/saudi/market",
             "debug_simple_quote": "/debug/simple-quote",
             "debug_saudi_market": "/debug/saudi-market",
-            "argaam_root": "/v1/argaam/",
         },
         "example_curl": example_curl,
     }
