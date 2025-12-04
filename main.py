@@ -1310,7 +1310,6 @@ def get_token_hash(token: str) -> str:
     """Hash token for logging without revealing it."""
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
-
 def verify_auth(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -1319,19 +1318,21 @@ def verify_auth(
     Authentication supporting:
     - Authorization: Bearer <token>
     - Authorization: <token>
-    - X-APP-TOKEN: <token>
-    - ?token=<token>
+    - X-APP-TOKEN / X_APP_TOKEN headers (for legacy clients / Sheets)
+    - ?token=<token> query parameter
     """
     if not settings.require_auth:
         return True
 
+    # All configured valid tokens
     valid_tokens = [t for t in [settings.app_token, settings.backup_app_token] if t]
 
+    # If nothing configured at all → configuration error (500)
     if not valid_tokens:
         if settings.is_production:
             raise HTTPException(
                 status_code=500,
-                detail="Authentication misconfigured - no tokens available",
+                detail="Authentication misconfigured - no APP_TOKEN/BACKUP_APP_TOKEN configured",
             )
         else:
             logger.warning("REQUIRE_AUTH=True but no tokens configured (DEV) -> allowing access")
@@ -1339,26 +1340,28 @@ def verify_auth(
 
     token: Optional[str] = None
 
-    # 1) Bearer token (Authorization: Bearer <token>)
+    # 1) Standard Bearer token: Authorization: Bearer <token>
     if credentials:
         token = credentials.credentials.strip()
 
-    # 2) X-APP-TOKEN header (for PowerShell / Sheets / JS)
-    if not token:
-        header_token = request.headers.get("X-APP-TOKEN", "").strip()
-        if header_token:
-            token = header_token
-
-    # 3) token query parameter (?token=...)
+    # 2) token query parameter: ?token=<token>
     if not token:
         token = request.query_params.get("token", "").strip()
 
-    # 4) Raw Authorization header (no 'Bearer ')
+    # 3) Legacy header: X-APP-TOKEN / X_APP_TOKEN (for PowerShell / Sheets)
+    if not token:
+        token = (
+            request.headers.get("X-APP-TOKEN", "").strip()
+            or request.headers.get("X_APP_TOKEN", "").strip()
+        )
+
+    # 4) Raw Authorization header (no "Bearer ")
     if not token:
         raw = request.headers.get("Authorization", "").strip()
         if raw and not raw.lower().startswith("bearer "):
             token = raw
 
+    # Still nothing → 401
     if not token:
         logger.warning("Authentication required but no token provided")
         raise HTTPException(
@@ -1366,6 +1369,7 @@ def verify_auth(
             detail="Missing authentication token",
         )
 
+    # Invalid token
     if token not in valid_tokens:
         token_hash = get_token_hash(token)
         logger.warning(f"Invalid token attempt: {token_hash}")
@@ -1377,6 +1381,7 @@ def verify_auth(
     token_hash = get_token_hash(token)
     logger.info(f"Successful authentication (hash={token_hash})")
     return True
+
 
 
 def rate_limit(rule: str):
