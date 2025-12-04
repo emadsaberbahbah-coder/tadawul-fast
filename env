@@ -1,193 +1,110 @@
 # =============================================================================
-# Tadawul Fast Bridge - Enhanced Environment Configuration
-# Version: 3.1.1 | Environment: Production
+# Tadawul Stock Analysis API - Environment Configuration
+# Version: 3.7.0 | Environment: Production
+# WARNING: DO NOT COMMIT SECRETS TO VERSION CONTROL
 # =============================================================================
 
 # =============================================================================
 # APPLICATION CORE SETTINGS
 # =============================================================================
 
-SERVICE_NAME="Tadawul Fast Bridge"
-SERVICE_VERSION="3.1.1"
+SERVICE_NAME="Tadawul Stock Analysis API"
+SERVICE_VERSION="3.7.0"
 ENVIRONMENT=production
 DEBUG=false
 
 APP_HOST=0.0.0.0
 APP_PORT=8000
-WEB_CONCURRENCY=2
 
 # =============================================================================
-# SECURITY & AUTHENTICATION
+# SECURITY & AUTHENTICATION (SET AS SECRETS IN RENDER)
 # =============================================================================
 
-# IMPORTANT: change these to strong random values in Render
-APP_TOKEN=your_main_secure_app_token_here
-BACKUP_APP_TOKEN=your_backup_secure_app_token_here
+# Set these in Render dashboard as SECRET environment variables
+APP_TOKEN=e1a5b2f8-3c9d-4a7b-82f1-5b3c6d9e8f2a
+BACKUP_APP_TOKEN=f7c3d9a1-4b8e-5c2f-93b6-1a4e5d7c8f9b
+TFB_APP_TOKEN=5e5ac1a4-08bf-4602-9a67-7ae781c4923c
 REQUIRE_AUTH=true
 
 ENABLE_RATE_LIMITING=true
-RATE_LIMIT_REQUESTS_PER_MINUTE=60    # matches analysis rate limit
+MAX_REQUESTS_PER_MINUTE=60
+CORS_ORIGINS=["*"]
 
-# CORS Configuration
-CORS_ORIGINS=["http://localhost:3000","https://tadawul-fast-1.onrender.com","https://your-production-domain.com"]
+# =============================================================================
+# PROVIDER CONFIGURATION
+# =============================================================================
+
+ENABLED_PROVIDERS=alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp
+PRIMARY_PROVIDER=tadawul_fast_bridge
+
+# =============================================================================
+# TADAWUL FAST BRIDGE CONFIGURATION
+# =============================================================================
+
+BACKEND_BASE_URL=https://tadawul-fast-bridge.onrender.com
+FASTAPI_BASE=https://tadawul-fast-bridge.onrender.com
+BASE_URL=https://investment-api.onrender.com
 
 # =============================================================================
 # LOGGING & MONITORING
 # =============================================================================
 
-LOG_ENABLE_FILE=true
+LOG_ENABLE_FILE=false
 LOG_LEVEL=INFO
 LOG_FORMAT=detailed
-LOG_RETENTION_DAYS=30         # not used by code but OK as documentation
 
 ENABLE_SWAGGER=true
 ENABLE_REDOC=true
 
 # =============================================================================
-# GOOGLE SERVICES CONFIGURATION
+# GOOGLE SERVICES CONFIGURATION (SET AS SECRETS IN RENDER)
 # =============================================================================
 
-# Google Sheets (MANDATORY for your project)
-SPREADSHEET_ID=your_production_spreadsheet_id_here
+# Set in Render as plain environment variable
+SPREADSHEET_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
 
-# Apps Script URLs (used by google_apps_script_client.py AND advanced_analysis.py)
-GOOGLE_APPS_SCRIPT_URL=your_production_apps_script_url_here
-GOOGLE_APPS_SCRIPT_BACKUP_URL=your_production_backup_script_url_here
+# Set in Render as plain environment variables
+GOOGLE_APPS_SCRIPT_URL=https://script.google.com/macros/s/AKfycbxfJX64vG7AYsTXtmk_v53CxRCc9zqD8kbGR7j4YcEfARH6Tm9KUXrRxZKseMvp_Mzq/exec
+GOOGLE_APPS_SCRIPT_BACKUP_URL=https://script.google.com/macros/s/AKfycbzIjUOJwzVWQdPpK84g7rEEeKDTFBHfkE_Xcq4qdJrt5Yr4lFxN2acZLiYqapuxmeb-/exec
 
-# Service Account Credentials (JSON as single line)
-# NOTE: keep this exactly as one line (Render secret)
-GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"your-project-id","private_key_id":"your-private-key-id","private_key":"-----BEGIN PRIVATE KEY-----\nYOUR_PRIVATE_KEY_HERE\n-----END PRIVATE KEY-----\n","client_email":"your-service-account@your-project.iam.gserviceaccount.com","client_id":"your-client-id","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/your-service-account@your-project.iam.gserviceaccount.com","universe_domain":"googleapis.com"}
-
-# Optional explicit config for GoogleSheetsService
-SHEETS_REQUEST_TIMEOUT=30          # seconds (min 10s)
-SHEETS_CACHE_TTL=1800              # seconds (30 minutes)
-SHEETS_CACHE_DIR=/tmp/sheets_cache
+# SET THIS ONLY IN RENDER DASHBOARD AS A SECRET ENVIRONMENT VARIABLE
+# GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"gen-lang-client-0885310113","private_key_id":"NEW_KEY_ID_HERE","private_key":"-----BEGIN PRIVATE KEY-----\nNEW_PRIVATE_KEY_HERE\n-----END PRIVATE KEY-----\n","client_email":"sheets-data-access@gen-lang-client-0885310113.iam.gserviceaccount.com","client_id":"117620606731724560109","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/sheets-data-access%40gen-lang-client-0885310113.iam.gserviceaccount.com","universe_domain":"googleapis.com"}
 
 # =============================================================================
-# FINANCIAL API CONFIGURATION (ACTIVE PROVIDERS)
+# FINANCIAL API CONFIGURATION (SET AS SECRETS IN RENDER)
 # =============================================================================
 
-# ---- Alpha Vantage ----
-ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here
-ALPHA_VANTAGE_BASE_URL=https://www.alphavantage.co/query
+# Set these in Render dashboard as SECRET environment variables
+ALPHA_VANTAGE_API_KEY=GGGPQXDT8EUZQKC5
+FINNHUB_API_KEY=d4kv6u9r01qt7v17fougd4kv6u9r01qt7v17fov0
+EODHD_API_KEY=68fd1783ee7eb1.12039806
+FMP_API_KEY=3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt
+MARKETSTACK_API_KEY=657b972a96392c3cac405ccc48c36b0c
+TWELVEDATA_API_KEY=ca363b090fbb421a84c05882e4f1e393
 
-# ---- Finnhub ----
-FINNHUB_API_KEY=your_finnhub_api_key_here
-FINNHUB_BASE_URL=https://finnhub.io/api/v1
-
-# ---- EODHD ----
-EODHD_API_KEY=your_eodhd_api_key_here
-EODHD_BASE_URL=https://eodhistoricaldata.com/api
-
-# ---- TwelveData ----
-TWELVEDATA_API_KEY=your_twelvedata_api_key_here
-TWELVEDATA_BASE_URL=https://api.twelvedata.com
-
-# ---- Marketstack ----
-MARKETSTACK_API_KEY=your_marketstack_api_key_here
-MARKETSTACK_BASE_URL=http://api.marketstack.com/v1
-
-# ---- Financial Modeling Prep (FMP) ----
-FMP_API_KEY=your_fmp_api_key_here
+EODHD_BASE_URL=https://eodhd.com/api
 FMP_BASE_URL=https://financialmodelingprep.com/api/v3
 
 # =============================================================================
-# CACHE CONFIGURATION (Core HTTP / main.py)
+# CACHE & PERFORMANCE CONFIGURATION
 # =============================================================================
 
-CACHE_DEFAULT_TTL=1800          # seconds (30 minutes)
+CACHE_DEFAULT_TTL=1800
 CACHE_MAX_SIZE=10000
 CACHE_BACKUP_ENABLED=true
-CACHE_SAVE_INTERVAL=10          # seconds -> used by TTLCache.save_interval
+CACHE_SAVE_INTERVAL=10
 
-# (optional / documentation only)
-CACHE_CLEANUP_INTERVAL=300
+HTTP_TIMEOUT=30
+MAX_RETRIES=3
+RETRY_DELAY=1.0
 
-# =============================================================================
-# ADVANCED ANALYZER CACHE & RATE LIMIT (advanced_analysis.py)
-# =============================================================================
-
-ANALYSIS_CACHE_TTL_MINUTES=30    # matches 1800s above
-ANALYSIS_MAX_CACHE_SIZE_MB=100
-ANALYSIS_RATE_LIMIT_RPM=60       # keep in sync with RATE_LIMIT_REQUESTS_PER_MINUTE
-ANALYSIS_MAX_RETRIES=3
-
-# Optional: Redis for distributed cache (leave empty if not used)
-# REDIS_URL=redis://:password@host:6379/0
-
-# =============================================================================
-# PERFORMANCE & RELIABILITY
-# =============================================================================
-
-# These names MUST match Settings in main.py
-HTTP_TIMEOUT=30                 # used by HTTPClient (aiohttp total timeout)
-MAX_RETRIES=3                   # used by HTTPClient.request_with_retry
-RETRY_DELAY=1.0                 # base for exponential backoff (1s,2s,4s,...)
-
-USER_AGENT="TadawulFastBridge/3.1.1"
-
-HTTP_MAX_CONNECTIONS=100        # not directly used but kept as documentation
-HTTP_MAX_KEEPALIVE=20
-CONNECTION_POOL_SIZE=100
-
-# =============================================================================
-# BACKGROUND SERVICES (mostly for future/notes)
-# =============================================================================
-
-HEALTH_CHECK_INTERVAL=30
-HEALTH_MONITOR_TIMEOUT=10
-
-CACHE_WORKER_INTERVAL=60
-CACHE_WARMUP_ENABLED=true
-
-BACKUP_INTERVAL=86400
-BACKUP_RETENTION_DAYS=7
+ADVANCED_ANALYSIS_ENABLED=true
 
 # =============================================================================
 # TADAWUL-SPECIFIC SETTINGS
 # =============================================================================
 
-# NOTE: main.py v3.1.1 does NOT yet auto-refresh Tadawul in background.
-# It only detects .SR symbols and returns a clear NO_DATA message.
 TADAWUL_MARKET_ENABLED=true
 TADAWUL_REFRESH_INTERVAL=60
 TADAWUL_MAX_SYMBOLS=200
-
 SAUDI_SYMBOLS=["7201.SR", "1211.SR", "2222.SR", "2380.SR", "4030.SR", "4200.SR"]
-
-# =============================================================================
-# EXTERNAL SERVICE INTEGRATIONS
-# =============================================================================
-
-FASTAPI_BASE_URL=https://tadawul-fast-1.onrender.com
-ARGAAM_BASE_URL=https://www.argaam.com
-TADAWUL_BASE_URL=https://www.saudiexchange.sa
-
-# =============================================================================
-# OPTIONAL ENHANCEMENTS (Uncomment to use)
-# =============================================================================
-
-# METRICS_ENABLED=true
-# METRICS_PORT=9090
-
-# SLACK_WEBHOOK_URL=your_slack_webhook_here
-# EMAIL_NOTIFICATIONS=false
-
-# FEATURE_REALTIME_UPDATES=false
-# FEATURE_ADVANCED_ANALYTICS=false
-
-# SECURITY_HEADERS_ENABLED=true
-# CSP_ENABLED=true
-
-# =============================================================================
-# DEVELOPMENT OVERRIDES (Comment out in production)
-# =============================================================================
-
-# ENVIRONMENT=development
-# DEBUG=true
-# LOG_LEVEL=DEBUG
-# ENABLE_RATE_LIMITING=false
-# REQUIRE_AUTH=false
-# WEB_CONCURRENCY=1
-# CACHE_DEFAULT_TTL=300
-# CORS_ORIGINS=["http://localhost:3000","http://localhost:8080","http://localhost:5173"]
