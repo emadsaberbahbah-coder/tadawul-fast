@@ -1,6 +1,6 @@
 # =============================================================================
 # Tadawul Fast Bridge - Render Deployment Configuration
-# Version: 3.1.1 | Python: 3.11.9 | Environment: Production
+# Version: 3.2.0 | Python: 3.11.9 | Environment: Production
 # =============================================================================
 
 services:
@@ -16,8 +16,9 @@ services:
     # Build Configuration
     # =========================================================================
     buildCommand: |
-      echo "🚀 Building Tadawul Fast Bridge v3.1.1..."
+      echo "🚀 Building Tadawul Fast Bridge v3.2.0..."
       echo "🐍 Python 3.11.9 | FastAPI | Production"
+      echo "📊 Adding enhanced counting and monitoring features..."
 
       # Upgrade pip and install dependencies
       pip install --upgrade pip
@@ -55,8 +56,11 @@ services:
 
           missing = []
           version_mismatch = []
+          total_packages = len(required_packages)
+          checked_count = 0
 
           for package, expected_version in required_packages:
+              checked_count += 1
               try:
                   module = __import__(package.replace('-', '_').split('.')[0])
                   version = getattr(module, '__version__', 'unknown')
@@ -83,6 +87,13 @@ services:
           if version_mismatch:
               print(f'🚨 Version mismatches: {version_mismatch}')
 
+          print(f'📊 Dependency check summary:')
+          print(f'   Total packages: {total_packages}')
+          print(f'   Checked: {checked_count}')
+          print(f'   Missing: {len(missing)}')
+          print(f'   Version mismatches: {len(version_mismatch)}')
+          print(f'   Success rate: {((total_packages - len(missing)) / total_packages * 100):.1f}%')
+
           return not missing
 
       if __name__ == "__main__":
@@ -97,7 +108,7 @@ services:
       cat > scripts/validate_credentials.py << 'EOF'
       #!/usr/bin/env python3
       """
-      Google Sheets Credentials Validation Script
+      Google Sheets Credentials Validation Script with Counting
       """
       import os
       import json
@@ -105,33 +116,71 @@ services:
 
       def validate_google_credentials():
           credentials_str = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
+          validation_stats = {
+              'checks_passed': 0,
+              'checks_failed': 0,
+              'total_checks': 6
+          }
+
           if not credentials_str:
               print("⚠️ GOOGLE_SHEETS_CREDENTIALS environment variable is not set")
+              print("📊 Credential check: 0/6 passed")
               return True  # Do not block startup if you want to use Apps Script only
 
           try:
               credentials = json.loads(credentials_str)
+              validation_stats['checks_passed'] += 1
               print("✅ Google Sheets credentials JSON format is valid")
 
               required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email']
               missing_fields = [field for field in required_fields if field not in credentials]
 
-              if missing_fields:
+              if not missing_fields:
+                  validation_stats['checks_passed'] += 1
+                  print(f"✅ All required fields present")
+              else:
+                  validation_stats['checks_failed'] += 1
                   print(f"❌ Missing required fields: {missing_fields}")
-                  return False
 
+              # Check private key format
               private_key = credentials.get('private_key', '')
-              if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+              if private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                  validation_stats['checks_passed'] += 1
+                  print("✅ Private key starts correctly")
+              else:
+                  validation_stats['checks_failed'] += 1
                   print("❌ Private key format invalid - must start with '-----BEGIN PRIVATE KEY-----'")
-                  return False
 
-              if '-----END PRIVATE KEY-----' not in private_key:
+              if '-----END PRIVATE KEY-----' in private_key:
+                  validation_stats['checks_passed'] += 1
+                  print("✅ Private key ends correctly")
+              else:
+                  validation_stats['checks_failed'] += 1
                   print("❌ Private key format invalid - must end with '-----END PRIVATE KEY-----'")
-                  return False
 
-              print("✅ Private key format is valid")
-              print(f"✅ Service account: {credentials.get('client_email')}")
-              return True
+              # Check client email format
+              client_email = credentials.get('client_email', '')
+              if client_email and '@' in client_email and '.iam.gserviceaccount.com' in client_email:
+                  validation_stats['checks_passed'] += 1
+                  print(f"✅ Service account email format valid: {client_email}")
+              else:
+                  validation_stats['checks_failed'] += 1
+                  print(f"⚠️  Service account email may be invalid: {client_email}")
+
+              # Check for token URI
+              if credentials.get('token_uri'):
+                  validation_stats['checks_passed'] += 1
+                  print("✅ Token URI present")
+              else:
+                  print("ℹ️  Token URI not specified (optional)")
+
+              print(f"📊 Credential validation summary:")
+              print(f"   Total checks: {validation_stats['total_checks']}")
+              print(f"   Passed: {validation_stats['checks_passed']}")
+              print(f"   Failed: {validation_stats['checks_failed']}")
+              print(f"   Success rate: {(validation_stats['checks_passed'] / validation_stats['total_checks'] * 100):.1f}%")
+
+              return validation_stats['checks_failed'] == 0
 
           except json.JSONDecodeError as e:
               print(f"❌ Invalid JSON in GOOGLE_SHEETS_CREDENTIALS: {e}")
@@ -146,32 +195,83 @@ services:
       EOF
 
       # -----------------------------------------------------------------------
-      # startup_check.py – validate required environment variables
+      # startup_check.py – validate required environment variables with counting
       # -----------------------------------------------------------------------
       cat > scripts/startup_check.py << 'EOF'
       #!/usr/bin/env python3
       """
-      Startup Environment Check for Tadawul Fast Bridge
+      Startup Environment Check for Tadawul Fast Bridge with Enhanced Counting
       """
       import os
       import sys
 
       def check_environment():
-          required_vars = ['SPREADSHEET_ID', 'GOOGLE_APPS_SCRIPT_URL']
-          optional_vars = ['GOOGLE_SHEETS_CREDENTIALS', 'APP_TOKEN']
+          required_vars = [
+              'SPREADSHEET_ID',
+              'GOOGLE_APPS_SCRIPT_URL'
+          ]
+          
+          optional_vars = [
+              'GOOGLE_SHEETS_CREDENTIALS',
+              'APP_TOKEN',
+              'ALPHA_VANTAGE_API_KEY',
+              'FINNHUB_API_KEY',
+              'EODHD_API_KEY',
+              'TWELVEDATA_API_KEY',
+              'MARKETSTACK_API_KEY',
+              'FMP_API_KEY'
+          ]
 
-          missing = [var for var in required_vars if not os.getenv(var)]
-          missing_optional = [var for var in optional_vars if not os.getenv(var)]
+          print("🔍 Starting environment variable scan...")
+          
+          # Count and check required variables
+          missing_required = []
+          present_required = []
+          
+          for var in required_vars:
+              if os.getenv(var):
+                  present_required.append(var)
+                  print(f"✅ Required: {var} = Present")
+              else:
+                  missing_required.append(var)
+                  print(f"❌ Required: {var} = MISSING")
 
-          if missing:
-              print(f"❌ Missing required environment variables: {missing}")
+          # Count and check optional variables
+          missing_optional = []
+          present_optional = []
+          
+          for var in optional_vars:
+              if os.getenv(var):
+                  present_optional.append(var)
+                  print(f"✅ Optional: {var} = Present")
+              else:
+                  missing_optional.append(var)
+                  print(f"⚠️  Optional: {var} = Not set")
+
+          # Summary statistics
+          total_vars = len(required_vars) + len(optional_vars)
+          present_vars = len(present_required) + len(present_optional)
+          
+          print(f"\n📊 Environment Variable Summary:")
+          print(f"   Total variables checked: {total_vars}")
+          print(f"   Required variables: {len(required_vars)}")
+          print(f"   - Present: {len(present_required)}")
+          print(f"   - Missing: {len(missing_required)}")
+          print(f"   Optional variables: {len(optional_vars)}")
+          print(f"   - Present: {len(present_optional)}")
+          print(f"   - Missing: {len(missing_optional)}")
+          print(f"   Overall completion: {(present_vars / total_vars * 100):.1f}%")
+
+          if missing_required:
+              print(f"\n🚨 CRITICAL: Missing required environment variables: {missing_required}")
+              print("   These must be set for the application to function properly.")
               return False
 
-          if missing_optional:
-              print(f"⚠️ Missing optional environment variables: {missing_optional}")
-          else:
-              print("✅ All required and optional environment variables present")
+          if len(missing_optional) > 0:
+              print(f"\n⚠️  WARNING: {len(missing_optional)} optional variables not set")
+              print("   Some features may be limited. Consider setting these for full functionality.")
 
+          print("\n✅ Environment check completed successfully")
           return True
 
       if __name__ == "__main__":
@@ -179,33 +279,139 @@ services:
           sys.exit(0 if success else 1)
       EOF
 
-      chmod +x scripts/dependency_check.py scripts/startup_check.py scripts/validate_credentials.py
+      # -----------------------------------------------------------------------
+      # performance_counter.py – monitor and count performance metrics
+      # -----------------------------------------------------------------------
+      cat > scripts/performance_counter.py << 'EOF'
+      #!/usr/bin/env python3
+      """
+      Performance Counter for Tadawul Fast Bridge
+      Tracks and counts various application metrics
+      """
+      import os
+      import time
+      import psutil
+      import sys
 
-      echo "🔧 Running dependency checks..."
+      def count_performance_metrics():
+          print("📊 Performance Metrics Counter")
+          print("=" * 40)
+          
+          metrics = {
+              'start_time': time.time(),
+              'checks_performed': 0,
+              'checks_passed': 0,
+              'checks_failed': 0
+          }
+
+          # CPU Count
+          try:
+              cpu_count = psutil.cpu_count()
+              logical_cpu_count = psutil.cpu_count(logical=True)
+              metrics['checks_performed'] += 1
+              metrics['checks_passed'] += 1
+              print(f"✅ CPU Cores: {cpu_count} physical, {logical_cpu_count} logical")
+          except Exception as e:
+              metrics['checks_performed'] += 1
+              metrics['checks_failed'] += 1
+              print(f"❌ CPU check failed: {e}")
+
+          # Memory Count
+          try:
+              memory = psutil.virtual_memory()
+              metrics['checks_performed'] += 1
+              metrics['checks_passed'] += 1
+              print(f"✅ Memory: {memory.available / (1024**3):.2f} GB available of {memory.total / (1024**3):.2f} GB total")
+          except Exception as e:
+              metrics['checks_performed'] += 1
+              metrics['checks_failed'] += 1
+              print(f"❌ Memory check failed: {e}")
+
+          # Disk Space Count
+          try:
+              disk = psutil.disk_usage('/')
+              metrics['checks_performed'] += 1
+              metrics['checks_passed'] += 1
+              print(f"✅ Disk: {disk.free / (1024**3):.2f} GB free of {disk.total / (1024**3):.2f} GB total")
+          except Exception as e:
+              metrics['checks_performed'] += 1
+              metrics['checks_failed'] += 1
+              print(f"❌ Disk check failed: {e}")
+
+          # Process Count
+          try:
+              process_count = len(psutil.pids())
+              metrics['checks_performed'] += 1
+              metrics['checks_passed'] += 1
+              print(f"✅ Running processes: {process_count}")
+          except Exception as e:
+              metrics['checks_performed'] += 1
+              metrics['checks_failed'] += 1
+              print(f"❌ Process count failed: {e}")
+
+          # Environment Variables Count
+          try:
+              env_vars_count = len(os.environ)
+              metrics['checks_performed'] += 1
+              metrics['checks_passed'] += 1
+              print(f"✅ Environment variables: {env_vars_count}")
+          except Exception as e:
+              metrics['checks_performed'] += 1
+              metrics['checks_failed'] += 1
+              print(f"❌ Environment count failed: {e}")
+
+          # Calculate elapsed time
+          metrics['elapsed_time'] = time.time() - metrics['start_time']
+          
+          print(f"\n📊 Performance Counter Summary:")
+          print(f"   Total checks performed: {metrics['checks_performed']}")
+          print(f"   Checks passed: {metrics['checks_passed']}")
+          print(f"   Checks failed: {metrics['checks_failed']}")
+          print(f"   Success rate: {(metrics['checks_passed'] / metrics['checks_performed'] * 100):.1f}%")
+          print(f"   Total execution time: {metrics['elapsed_time']:.3f} seconds")
+
+          return metrics['checks_failed'] == 0
+
+      if __name__ == "__main__":
+          success = count_performance_metrics()
+          sys.exit(0 if success else 1)
+      EOF
+
+      chmod +x scripts/dependency_check.py scripts/startup_check.py scripts/validate_credentials.py scripts/performance_counter.py
+
+      echo "🔧 Running dependency checks with counting..."
       python scripts/dependency_check.py
 
-      echo "🔧 Running startup checks..."
+      echo "🔧 Running startup checks with counting..."
       python scripts/startup_check.py
 
-      echo "✅ Build completed successfully"
+      echo "🔧 Running performance counter..."
+      python scripts/performance_counter.py
+
+      echo "✅ Build completed successfully with enhanced counting features"
 
     # =========================================================================
     # Start Command
     # =========================================================================
     startCommand: |
-      echo "🔧 Starting Tadawul Fast Bridge v3.1.1"
+      echo "🔧 Starting Tadawul Fast Bridge v3.2.0"
       echo "🌍 Environment: ${ENVIRONMENT:-production}"
       echo "👥 Workers: ${WEB_CONCURRENCY:-2}"
       echo "🔗 Port: $PORT"
       echo "📊 Log Level: ${LOG_LEVEL:-info}"
 
-      echo "🔧 Validating Google Sheets credentials..."
+      echo "🔧 Validating Google Sheets credentials with counting..."
       python scripts/validate_credentials.py || echo "⚠️ Credentials validation failed (continuing)"
 
-      echo "🔧 Running startup checks..."
+      echo "🔧 Running startup checks with counting..."
       python scripts/startup_check.py || echo "⚠️ Startup checks reported issues (continuing)"
 
+      echo "🔧 Initializing performance counter..."
+      python scripts/performance_counter.py || echo "⚠️ Performance counter failed (continuing)"
+
       echo "🚀 Starting FastAPI application..."
+      echo "📈 Application metrics will be counted and logged..."
+      
       uvicorn main:app \
         --host 0.0.0.0 \
         --port $PORT \
@@ -217,8 +423,9 @@ services:
         --loop asyncio \
         --timeout-keep-alive 60 \
         --timeout-graceful-shutdown 30 \
-        --header x-powered-by:"TadawulFastBridge/3.1.1" \
-        --header x-server:"FastAPI-Uvicorn" || \
+        --header x-powered-by:"TadawulFastBridge/3.2.0" \
+        --header x-server:"FastAPI-Uvicorn" \
+        --header x-metrics:"counting-enabled" || \
       {
         echo "⚠️ Primary start failed, starting with single worker..."
         uvicorn main:app \
@@ -226,13 +433,14 @@ services:
           --port $PORT \
           --workers 1 \
           --log-level warning \
-          --access-log
+          --access-log \
+          --header x-metrics:"counting-fallback"
       }
 
     autoDeploy: true
 
     # =========================================================================
-    # Health Check (Render native)
+    # Health Check (Render native) - Enhanced with counting
     # =========================================================================
     healthCheck:
       path: /health
@@ -246,16 +454,18 @@ services:
           value: "Render-Health-Check/1.0"
         - name: X-Health-Check
           value: "true"
+        - name: X-Metrics-Count
+          value: "enabled"
 
     # =========================================================================
-    # Environment Variables (non-secret)
+    # Environment Variables (non-secret) - Updated for counting
     # =========================================================================
     envVars:
       # Core Application Configuration
       - key: SERVICE_NAME
         value: "Tadawul Fast Bridge"
       - key: SERVICE_VERSION
-        value: "3.1.1"
+        value: "3.2.0"
       - key: ENVIRONMENT
         value: "production"
       - key: DEBUG
@@ -333,6 +543,20 @@ services:
       - key: LOG_ENABLE_FILE
         value: "false"
 
+      # Counting & Metrics Configuration
+      - key: ENABLE_METRICS_COUNTING
+        value: "true"
+      - key: METRICS_INTERVAL_SECONDS
+        value: "300"
+      - key: COUNT_API_REQUESTS
+        value: "true"
+      - key: COUNT_CACHE_HITS
+        value: "true"
+      - key: COUNT_ERRORS
+        value: "true"
+      - key: MAX_METRICS_HISTORY
+        value: "1000"
+
     # =========================================================================
     # Secrets (managed in Render dashboard)
     # =========================================================================
@@ -362,7 +586,7 @@ services:
         fromSecret: fmp-api-key
 
     # =========================================================================
-    # Security Headers
+    # Security Headers - Updated for metrics
     # =========================================================================
     headers:
       - path: "/*"
@@ -382,13 +606,21 @@ services:
         value: "no-cache, no-store, must-revalidate"
       - path: "/*"
         name: "X-Powered-By"
-        value: "TadawulFastBridge/3.1.1"
+        value: "TadawulFastBridge/3.2.0"
+      - path: "/*"
+        name: "X-Metrics-Enabled"
+        value: "true"
 
     # =========================================================================
-    # Scaling Configuration (free plan: single instance)
+    # Scaling Configuration (free plan: single instance) - Added metrics
     # =========================================================================
     scaling:
       minInstances: 1
       maxInstances: 1
       targetMemoryPercent: 70
       targetCPUPercent: 70
+      metrics:
+        - type: cpu
+          target: 70
+        - type: memory
+          target: 70
