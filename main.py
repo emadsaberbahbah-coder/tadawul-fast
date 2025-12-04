@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.6.0
+Tadawul Stock Analysis API - Enhanced Version 3.6.1
 Production-ready with:
 - Hybrid EODHD providers and fundamentals service
 - Advanced multi-source AI Trading Analysis (advanced_analysis.py)
@@ -73,7 +73,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.6.0", env="SERVICE_VERSION")
+    service_version: str = Field("3.6.1", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -1087,6 +1087,7 @@ class QuoteService:
             "sources": list(sources_used),
             "total_symbols": len(symbols),
             "successful_quotes": len([q for q in all_quotes if q.status == QuoteStatus.OK]),
+            "all_no_data": all(q.status != QuoteStatus.OK for q in all_quotes),
         }
 
         return QuotesResponse(
@@ -1318,6 +1319,7 @@ def verify_auth(
     Authentication supporting:
     - Authorization: Bearer <token>
     - Authorization: <token>
+    - X-APP-TOKEN: <token>
     - ?token=<token>
     """
     if not settings.require_auth:
@@ -1335,17 +1337,23 @@ def verify_auth(
             logger.warning("REQUIRE_AUTH=True but no tokens configured (DEV) -> allowing access")
             return True
 
-    token = None
+    token: Optional[str] = None
 
-    # 1) Bearer token
+    # 1) Bearer token (Authorization: Bearer <token>)
     if credentials:
         token = credentials.credentials.strip()
 
-    # 2) token query parameter
+    # 2) X-APP-TOKEN header (for PowerShell / Sheets / JS)
+    if not token:
+        header_token = request.headers.get("X-APP-TOKEN", "").strip()
+        if header_token:
+            token = header_token
+
+    # 3) token query parameter (?token=...)
     if not token:
         token = request.query_params.get("token", "").strip()
 
-    # 3) Raw Authorization header (no 'Bearer ')
+    # 4) Raw Authorization header (no 'Bearer ')
     if not token:
         raw = request.headers.get("Authorization", "").strip()
         if raw and not raw.lower().startswith("bearer "):
@@ -1509,7 +1517,7 @@ app.add_middleware(
 # SlowAPI
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
-# ✅ FIX: no kwargs here – SlowAPIMiddleware reads app.state.limiter internally
+# SlowAPIMiddleware reads app.state.limiter internally
 app.add_middleware(SlowAPIMiddleware)
 
 # =============================================================================
@@ -1642,7 +1650,10 @@ async def root(request: Request):
 @app.get("/health", response_model=HealthResponse)
 @rate_limit("30/minute")
 async def health_check(request: Request):
-    """Health check with dependency diagnostics."""
+    """
+    Health check with dependency diagnostics.
+    NOTE: does NOT require auth, so it's easy to test from PowerShell/Sheets.
+    """
     cache_stats = cache.get_stats()
 
     analysis_cache_info: Optional[Dict[str, Any]] = None
