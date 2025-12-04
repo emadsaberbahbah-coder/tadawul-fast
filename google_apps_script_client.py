@@ -1,32 +1,28 @@
-# google_apps_script_client.py
-# Enhanced Google Apps Script Client - Production Ready for Render
-# Version: 3.1.1 - Memory, Performance & Stability Optimizations
-# Optimized for FastAPI and Render deployment
+"""
+google_apps_script_client.py
+Enhanced Async Google Apps Script Client for Tadawul Fast Bridge
+Version: 3.7.0 - Fully async with aiohttp, aligned with main.py
+"""
 
-from __future__ import annotations
-
-import os
+import asyncio
 import logging
 import time
 import random
 import re
-import asyncio
-from dataclasses import dataclass, asdict
+import json
 from typing import Dict, List, Optional, Any, Union, Tuple
 from enum import Enum
-from contextlib import contextmanager
-from collections import deque
-import threading
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import aiohttp
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Compatibility alias for JSONDecodeError (older requests versions)
-JSONDecodeError = getattr(requests.exceptions, "JSONDecodeError", ValueError)
-
+# ======================================================================
+# Data Models
+# ======================================================================
 
 class RequestAction(str, Enum):
     """Standardized actions for Google Apps Script requests."""
@@ -36,10 +32,11 @@ class RequestAction(str, Enum):
     LIST = "list"
     BATCH = "batch"
     HEALTH = "health"
+    REFRESH = "refresh"
 
 
 class ErrorType(str, Enum):
-    """Classification of error types for better handling."""
+    """Classification of error types."""
     NETWORK = "network_error"
     TIMEOUT = "timeout_error"
     AUTH = "authentication_error"
@@ -53,18 +50,16 @@ class ErrorType(str, Enum):
 
 
 class HealthState(str, Enum):
-    """System health states for circuit breaker pattern."""
+    """Health states for circuit breaker."""
     HEALTHY = "healthy"
-    DEGRADED = "degraded"      # used as HALF-OPEN
+    DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
     CIRCUIT_OPEN = "circuit_open"
 
 
 @dataclass
 class GoogleAppsScriptResponse:
-    """
-    Enhanced response wrapper for Google Apps Script calls with detailed diagnostics.
-    """
+    """Enhanced response wrapper with diagnostics."""
     success: bool
     data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
@@ -75,6 +70,7 @@ class GoogleAppsScriptResponse:
     request_id: Optional[str] = None
     timestamp: Optional[str] = None
     health_state: Optional[HealthState] = None
+    source_url: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -83,15 +79,16 @@ class GoogleAppsScriptResponse:
             result["error_type"] = self.error_type.value
         if self.health_state:
             result["health_state"] = self.health_state.value
-        # Remove None values for cleaner output
         return {k: v for k, v in result.items() if v is not None}
 
 
-class CircuitBreaker:
-    """
-    Enhanced circuit breaker pattern to prevent cascading failures.
-    """
+# ======================================================================
+# Async Circuit Breaker
+# ======================================================================
 
+class AsyncCircuitBreaker:
+    """Async circuit breaker pattern to prevent cascading failures."""
+    
     def __init__(
         self,
         failure_threshold: int = 5,
@@ -101,29 +98,23 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.half_open_max_requests = half_open_max_requests
-
+        
         self.state = HealthState.HEALTHY
         self.failure_count = 0
         self.last_failure_time: Optional[float] = None
         self.half_open_attempts = 0
-        self._lock = threading.RLock()
-
+        self._lock = asyncio.Lock()
+        
         logger.info(
-            f"CircuitBreaker initialized: threshold={failure_threshold}, "
+            f"AsyncCircuitBreaker initialized: threshold={failure_threshold}, "
             f"recovery_timeout={recovery_timeout}s"
         )
-
-    def can_execute(self) -> Tuple[bool, Optional[HealthState]]:
-        """
-        Check if request can be executed based on current circuit state.
-        Returns (can_execute, current_state).
-
-        NOTE: This method may transition CIRCUIT_OPEN → DEGRADED (half-open)
-        when recovery_timeout has elapsed.
-        """
-        with self._lock:
+    
+    async def can_execute(self) -> Tuple[bool, HealthState]:
+        """Check if request can be executed based on current circuit state."""
+        async with self._lock:
             now = time.time()
-
+            
             if self.state == HealthState.CIRCUIT_OPEN:
                 if self.last_failure_time and (now - self.last_failure_time) > self.recovery_timeout:
                     # Transition to half-open state
@@ -132,7 +123,7 @@ class CircuitBreaker:
                     logger.info("Circuit breaker transitioning to HALF-OPEN (DEGRADED) state")
                     return True, self.state
                 return False, self.state
-
+            
             elif self.state == HealthState.DEGRADED:
                 if self.half_open_attempts >= self.half_open_max_requests:
                     self.state = HealthState.CIRCUIT_OPEN
@@ -140,13 +131,13 @@ class CircuitBreaker:
                     logger.warning("Circuit breaker re-opened due to half-open failures")
                     return False, self.state
                 return True, self.state
-
+            
             # HEALTHY or UNHEALTHY states still allow execution
             return True, self.state
-
-    def on_success(self) -> None:
+    
+    async def on_success(self) -> None:
         """Record successful execution and recover circuit state."""
-        with self._lock:
+        async with self._lock:
             if self.state == HealthState.DEGRADED:
                 self.half_open_attempts += 1
                 # If we have enough successful attempts in half-open, close the circuit
@@ -155,54 +146,46 @@ class CircuitBreaker:
                     self.failure_count = 0
                     self.half_open_attempts = 0
                     logger.info("Circuit breaker closed - service recovered")
-
+            
             elif self.state == HealthState.UNHEALTHY:
                 # Gradual recovery from unhealthy state
                 self.failure_count = max(0, self.failure_count - 2)
                 if self.failure_count < self.failure_threshold:
                     self.state = HealthState.HEALTHY
                     logger.info("Circuit breaker recovered to HEALTHY state")
-
-    def on_failure(self) -> None:
+    
+    async def on_failure(self) -> None:
         """Record failed execution and update circuit state."""
-        with self._lock:
+        async with self._lock:
             self.failure_count += 1
             self.last_failure_time = time.time()
-
+            
             if self.state == HealthState.DEGRADED:
                 self.half_open_attempts += 1
                 # If half-open requests fail, open circuit
                 if self.half_open_attempts >= self.half_open_max_requests:
                     self.state = HealthState.CIRCUIT_OPEN
                     logger.error("Circuit breaker opened due to half-open failures")
-
+            
             elif self.state == HealthState.HEALTHY and self.failure_count >= self.failure_threshold:
                 self.state = HealthState.UNHEALTHY
                 logger.warning(f"Circuit breaker degraded due to {self.failure_count} consecutive failures")
-
+            
             elif self.state == HealthState.UNHEALTHY and self.failure_count >= self.failure_threshold * 2:
                 self.state = HealthState.CIRCUIT_OPEN
                 logger.error(f"Circuit breaker opened due to {self.failure_count} consecutive failures")
-
-    def get_state(self) -> Dict[str, Any]:
-        """
-        Get current circuit breaker state.
-
-        IMPORTANT: This method is read-only and does NOT change the circuit
-        state (unlike can_execute()).
-        """
-        with self._lock:
+    
+    async def get_state(self) -> Dict[str, Any]:
+        """Get current circuit breaker state."""
+        async with self._lock:
             now = time.time()
             can_execute = True
-
+            
             if self.state == HealthState.CIRCUIT_OPEN:
-                # While circuit is open we report can_execute=False;
-                # transition back to half-open happens only via can_execute()
                 can_execute = False
             elif self.state == HealthState.DEGRADED:
-                # Half-open: limited number of trial requests allowed
                 can_execute = self.half_open_attempts < self.half_open_max_requests
-
+            
             return {
                 "state": self.state.value,
                 "failure_count": self.failure_count,
@@ -214,39 +197,27 @@ class CircuitBreaker:
             }
 
 
+# ======================================================================
+# Enhanced Async Google Apps Script Client
+# ======================================================================
+
 class GoogleAppsScriptClient:
     """
-    Enhanced HTTP client for interacting with Google Apps Script endpoints.
-
-    Features:
-    - Circuit breaker pattern for failure prevention
-    - Retry mechanism with exponential backoff
-    - Rate limiting and request throttling
-    - Comprehensive error handling and classification
-    - Connection pooling with optimized settings
-    - Request/response logging for debugging
-    - Health checks and graceful degradation
-    - Async-compatible operation
-    - Memory-efficient timestamp tracking
-
-    Environment Variables:
-        GOOGLE_APPS_SCRIPT_URL (required) - Base URL for the Apps Script
-        GOOGLE_APPS_SCRIPT_BACKUP_URL (optional) - Fallback URL
-        GOOGLE_APPS_SCRIPT_APP_TOKEN (optional) - Authentication token
-        GOOGLE_APPS_SCRIPT_TIMEOUT (optional) - Request timeout in seconds
-        GOOGLE_APPS_SCRIPT_MAX_RETRIES (optional) - Maximum retry attempts
-        GOOGLE_APPS_SCRIPT_RATE_LIMIT_RPM (optional) - Rate limit (requests per minute)
-        GOOGLE_APPS_SCRIPT_CIRCUIT_BREAKER_THRESHOLD (optional) - Failure threshold for circuit breaker
+    Async HTTP client for Google Apps Script endpoints.
+    Uses aiohttp for async operations, aligned with main.py configuration.
+    
+    Environment Variables (from main.py Settings):
+        GOOGLE_APPS_SCRIPT_URL (required)
+        GOOGLE_APPS_SCRIPT_BACKUP_URL (optional)
+        APP_TOKEN (for authentication)
+        TFB_APP_TOKEN (alternative authentication)
+        HTTP_TIMEOUT (from settings, default: 30)
+        MAX_RETRIES (from settings, default: 3)
     """
-
-    # Google Apps Script URL pattern for validation
-    GAS_URL_PATTERN = re.compile(
-        r"^https://script\.google\.com/macros/s/[A-Za-z0-9_-]+/exec$"
-    )
-
-    # Default Apps Script URL (should be replaced with actual URL)
-    DEFAULT_GAS_URL = "https://script.google.com/macros/s/AKfycbw.../exec"
-
+    
+    # Google Apps Script URL pattern
+    GAS_URL_PATTERN = re.compile(r"^https://script\.google\.com/macros/s/[A-Za-z0-9_-]+/exec$")
+    
     def __init__(
         self,
         base_url: Optional[str] = None,
@@ -258,154 +229,68 @@ class GoogleAppsScriptClient:
         app_token: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> None:
-        # URLs configuration with validation
-        self.base_url: str = self._get_and_validate_url(base_url, "GOOGLE_APPS_SCRIPT_URL")
-        self.backup_url: Optional[str] = self._get_and_validate_url(
-            backup_url, "GOOGLE_APPS_SCRIPT_BACKUP_URL", required=False
-        )
-
-        # Request configuration
-        self.timeout: int = self._get_timeout_config(timeout)
-        self.max_retries: int = max_retries
-        self.rate_limit_rpm: int = rate_limit_rpm
-
-        # Enhanced rate limiting with memory optimization
-        self.request_timestamps: deque = deque(maxlen=rate_limit_rpm + 10)  # Small buffer
-        self.last_request_time: float = 0.0
-        self._rate_limit_lock = threading.RLock()
-
-        # Circuit breaker for failure prevention
-        self.circuit_breaker = CircuitBreaker(
+        import os
+        
+        # URLs from environment or parameters
+        self.base_url = base_url or os.getenv("GOOGLE_APPS_SCRIPT_URL", "")
+        self.backup_url = backup_url or os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL", "")
+        
+        # Validate URLs
+        if not self.base_url:
+            raise ValueError("GOOGLE_APPS_SCRIPT_URL is required")
+        if not self._validate_gas_url(self.base_url):
+            logger.warning(f"Base URL may not be valid Google Apps Script URL: {self._mask_url(self.base_url)}")
+        if self.backup_url and not self._validate_gas_url(self.backup_url):
+            logger.warning(f"Backup URL may not be valid: {self._mask_url(self.backup_url)}")
+        
+        # Configuration from main.py settings
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.rate_limit_rpm = rate_limit_rpm
+        
+        # Rate limiting tracking
+        self.request_timestamps: List[float] = []
+        self._rate_limit_lock = asyncio.Lock()
+        
+        # Circuit breaker
+        self.circuit_breaker = AsyncCircuitBreaker(
             failure_threshold=circuit_breaker_threshold,
-            recovery_timeout=60,  # 1 minute recovery
+            recovery_timeout=60,
             half_open_max_requests=2,
         )
-
-        # Security / identity
-        self.app_token: Optional[str] = (
-            app_token
-            or os.getenv("GOOGLE_APPS_SCRIPT_APP_TOKEN")
-            or os.getenv("APP_TOKEN")
-        )
-
-        self.user_agent: str = (
-            user_agent
-            or os.getenv("GOOGLE_APPS_SCRIPT_USER_AGENT")
-            or os.getenv("USER_AGENT")
-            or "TadawulStockAPI/3.1.1 (+Python-Requests)"
-        )
-
-        # Request tracking
-        self.request_counter: int = 0
-        self.error_counter: int = 0
-        self.success_counter: int = 0
-        self._stats_lock = threading.RLock()
-
-        # Initialize session with enhanced configuration
-        self.session = self._create_session()
-
+        
+        # Authentication - use APP_TOKEN or TFB_APP_TOKEN from main.py
+        self.app_token = app_token or os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN")
+        
+        # User agent matching main.py
+        self.user_agent = user_agent or os.getenv("USER_AGENT", "TadawulStockAPI/3.7.0")
+        
+        # Statistics
+        self.request_counter = 0
+        self.error_counter = 0
+        self.success_counter = 0
+        self._stats_lock = asyncio.Lock()
+        
+        # HTTP session (will be created on demand)
+        self._session: Optional[aiohttp.ClientSession] = None
+        
         logger.info(
-            "GoogleAppsScriptClient initialized: "
+            f"GoogleAppsScriptClient initialized: "
             f"base_url={self._mask_url(self.base_url)}, "
-            f"backup_url={self._mask_url(self.backup_url) if self.backup_url else 'None'}, "
-            f"timeout={self.timeout}s, max_retries={self.max_retries}, "
-            f"rate_limit={self.rate_limit_rpm}/min, "
-            f"circuit_breaker_threshold={circuit_breaker_threshold}"
+            f"timeout={self.timeout}s, max_retries={self.max_retries}"
         )
-
-    # ------------------------------------------------------------------
-    # Internal helpers – configuration & setup
-    # ------------------------------------------------------------------
-    def _get_and_validate_url(
-        self, provided_url: Optional[str], env_var: str, required: bool = True
-    ) -> str:
-        """Get and validate Google Apps Script URL."""
-        url = provided_url or os.getenv(env_var)
-
-        if required and not url:
-            logger.warning(f"{env_var} not configured, using default")
-            url = self.DEFAULT_GAS_URL
-
-        if url:
-            url = url.strip()
-            if not self._validate_gas_url(url):
-                logger.warning(
-                    f"URL for {env_var} does not match Google Apps Script pattern: "
-                    f"{self._mask_url(url)}"
-                )
-            return url
-
-        if required:
-            raise ValueError(f"Required configuration missing: {env_var}")
-
-        return ""
-
+    
     def _validate_gas_url(self, url: str) -> bool:
         """Validate that URL matches Google Apps Script pattern."""
         return bool(self.GAS_URL_PATTERN.match(url))
-
-    def _get_timeout_config(self, default_timeout: int) -> int:
-        """Get timeout configuration from environment with validation."""
-        try:
-            env_timeout = os.getenv("GOOGLE_APPS_SCRIPT_TIMEOUT")
-            if env_timeout:
-                timeout_val = max(5, int(env_timeout))  # Minimum 5 seconds
-                logger.info(f"Using configured timeout: {timeout_val}s")
-                return timeout_val
-        except (ValueError, TypeError) as e:
-            logger.warning(
-                f"Invalid GOOGLE_APPS_SCRIPT_TIMEOUT: {e}, using default: {default_timeout}s"
-            )
-
-        return max(5, default_timeout)
-
-    def _create_session(self) -> requests.Session:
-        """Create configured requests session with retry strategy and connection pooling."""
-        session = requests.Session()
-
-        # Configure retry strategy
-        retry_strategy = Retry(
-            total=self.max_retries,
-            status_forcelist=[408, 429, 500, 502, 503, 504],
-            allowed_methods=frozenset(["GET", "POST"]),
-            backoff_factor=1.5,
-            raise_on_status=False,
-        )
-
-        # Configure adapter with connection pooling
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=20,
-            pool_maxsize=30,
-            pool_block=False,
-        )
-
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-
-        # Set default headers
-        session.headers.update(
-            {
-                "User-Agent": self.user_agent,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-        )
-
-        if self.app_token:
-            session.headers["Authorization"] = f"Bearer {self.app_token}"
-            logger.debug("App token configured for Google Apps Script requests")
-
-        return session
-
-    def _mask_url(self, url: Optional[str]) -> str:
+    
+    def _mask_url(self, url: str) -> str:
         """Mask URL for secure logging."""
-        if not url or "/" not in url:
+        if not url:
             return "***"
-
+        
         try:
             from urllib.parse import urlparse
-
             parsed = urlparse(url)
             if parsed.hostname and "google.com" in parsed.hostname:
                 path_parts = parsed.path.split("/")
@@ -414,52 +299,64 @@ class GoogleAppsScriptClient:
                     return f"https://script.google.com/macros/s/{script_id[:8]}.../exec"
         except Exception:
             pass
-
+        
         return "https://script.google.com/macros/s/.../exec"
-
-    def _generate_request_id(self) -> str:
-        """Generate unique request ID for tracing."""
-        with self._stats_lock:
-            self.request_counter += 1
-            timestamp = int(time.time() * 1000)
-            return f"gas_req_{timestamp}_{self.request_counter:06d}"
-
-    def _enforce_rate_limit(self) -> None:
-        """Enhanced rate limiting with optimized memory usage."""
-        with self._rate_limit_lock:
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session with proper configuration."""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=20,
+                ssl=True,
+            )
+            
+            headers = {
+                "User-Agent": self.user_agent,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            
+            if self.app_token:
+                headers["Authorization"] = f"Bearer {self.app_token}"
+            
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers=headers,
+            )
+        
+        return self._session
+    
+    async def _enforce_rate_limit(self) -> None:
+        """Async rate limiting with sliding window."""
+        async with self._rate_limit_lock:
             now = time.time()
             window_start = now - 60  # 1 minute window
-
-            # Drop timestamps older than 60 seconds
-            while self.request_timestamps and self.request_timestamps[0] < window_start:
-                self.request_timestamps.popleft()
-
-            current_count = len(self.request_timestamps)
-            if current_count >= self.rate_limit_rpm:
+            
+            # Remove old timestamps
+            self.request_timestamps = [ts for ts in self.request_timestamps if ts > window_start]
+            
+            # Check if we're at limit
+            if len(self.request_timestamps) >= self.rate_limit_rpm:
                 oldest_timestamp = self.request_timestamps[0]
                 sleep_time = 60 - (now - oldest_timestamp)
                 if sleep_time > 0:
-                    logger.warning(
-                        f"Rate limit exceeded, sleeping for {sleep_time:.2f}s"
-                    )
-                    time.sleep(sleep_time + random.uniform(0.1, 0.3))
-
-            # Add jitter to avoid synchronized requests
-            jitter = random.uniform(0.05, 0.15)
-            time.sleep(jitter)
-
+                    logger.warning(f"Rate limit exceeded, sleeping for {sleep_time:.2f}s")
+                    await asyncio.sleep(sleep_time + random.uniform(0.1, 0.3))
+            
+            # Add jitter and record this request
+            await asyncio.sleep(random.uniform(0.05, 0.15))
             self.request_timestamps.append(time.time())
-            self.last_request_time = self.request_timestamps[-1]
-
-    def _classify_error(
-        self, error: Exception, status_code: Optional[int] = None
-    ) -> ErrorType:
-        """Enhanced error classification with better coverage."""
-        if isinstance(error, requests.exceptions.Timeout):
+    
+    def _classify_error(self, error: Exception, status_code: Optional[int] = None) -> ErrorType:
+        """Enhanced error classification."""
+        if isinstance(error, asyncio.TimeoutError):
             return ErrorType.TIMEOUT
-        elif isinstance(error, requests.exceptions.ConnectionError):
+        elif isinstance(error, aiohttp.ClientConnectionError):
             return ErrorType.NETWORK
-        elif isinstance(error, requests.exceptions.HTTPError):
+        elif isinstance(error, aiohttp.ClientResponseError):
             if status_code == 429:
                 return ErrorType.RATE_LIMIT
             elif status_code in [401, 403]:
@@ -468,40 +365,26 @@ class GoogleAppsScriptClient:
                 return ErrorType.SERVER
             elif status_code and 400 <= status_code < 500:
                 return ErrorType.CLIENT
-        elif isinstance(error, (JSONDecodeError, ValueError)):
+        elif isinstance(error, json.JSONDecodeError):
             return ErrorType.PARSING
-
+        
         return ErrorType.UNKNOWN
-
-    def _update_stats(self, success: bool) -> None:
+    
+    async def _update_stats(self, success: bool) -> None:
         """Update success/error statistics."""
-        with self._stats_lock:
+        async with self._stats_lock:
             if success:
                 self.success_counter += 1
             else:
                 self.error_counter += 1
-
-    @contextmanager
-    def _request_context(self, request_id: str, action: str, url: str):
-        """Context manager for request logging and timing."""
-        start_time = time.perf_counter()
-        logger.debug(
-            f"[{request_id}] Starting {action} request to {self._mask_url(url)}"
-        )
-
-        try:
-            yield
-            execution_time = time.perf_counter() - start_time
-            logger.debug(f"[{request_id}] Request completed in {execution_time:.3f}s")
-
-        except Exception as e:
-            execution_time = time.perf_counter() - start_time
-            logger.error(
-                f"[{request_id}] Request failed after {execution_time:.3f}s: {e}"
-            )
-            raise
-
-    def _make_request(
+    
+    def _generate_request_id(self) -> str:
+        """Generate unique request ID for tracing."""
+        self.request_counter += 1
+        timestamp = int(time.time() * 1000)
+        return f"gas_async_{timestamp}_{self.request_counter:06d}"
+    
+    async def _make_request(
         self,
         method: str,
         url: str,
@@ -510,105 +393,117 @@ class GoogleAppsScriptClient:
         action: str = "unknown",
     ) -> GoogleAppsScriptResponse:
         """
-        Internal method to make HTTP requests with comprehensive error handling and circuit breaker.
+        Internal method to make async HTTP requests with comprehensive error handling.
         """
         # Check circuit breaker first
-        can_execute, _ = self.circuit_breaker.can_execute()
+        can_execute, circuit_state = await self.circuit_breaker.can_execute()
         if not can_execute:
-            state_now = self.circuit_breaker.state
-            logger.warning(
-                f"Request blocked by circuit breaker (state: {state_now.value})"
-            )
+            logger.warning(f"Request blocked by circuit breaker (state: {circuit_state.value})")
             return GoogleAppsScriptResponse(
                 success=False,
-                error=f"Service temporarily unavailable (circuit {state_now.value})",
+                error=f"Service temporarily unavailable (circuit {circuit_state.value})",
                 error_type=ErrorType.CIRCUIT_BREAKER,
-                health_state=state_now,
+                health_state=circuit_state,
                 request_id=self._generate_request_id(),
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source_url=self._mask_url(url),
             )
-
+        
         request_id = self._generate_request_id()
         retries = 0
         last_exception: Optional[Exception] = None
         last_status_code: Optional[int] = None
-
+        
         # Try primary and backup URLs
         urls_to_try = [url]
         if self.backup_url and url == self.base_url:
             urls_to_try.append(self.backup_url)
-
+        
         for current_url in urls_to_try:
             for attempt in range(self.max_retries + 1):
                 try:
-                    self._enforce_rate_limit()
+                    await self._enforce_rate_limit()
                     attempt_start = time.perf_counter()
-
-                    with self._request_context(request_id, action, current_url):
-                        if method.upper() == "GET":
-                            response = self.session.get(
-                                current_url,
-                                params=params,
-                                timeout=self.timeout,
-                            )
-                        else:  # POST
-                            response = self.session.post(
-                                current_url,
-                                json=json_data,
-                                timeout=self.timeout,
-                            )
-
-                    last_status_code = response.status_code
-
-                    # Log response for debugging
+                    
+                    session = await self._get_session()
+                    
+                    logger.debug(f"[{request_id}] Starting {action} to {self._mask_url(current_url)}")
+                    
+                    if method.upper() == "GET":
+                        async with session.get(current_url, params=params) as response:
+                            last_status_code = response.status
+                            response_text = await response.text()
+                    else:  # POST
+                        async with session.post(current_url, json=json_data) as response:
+                            last_status_code = response.status
+                            response_text = await response.text()
+                    
+                    execution_time = time.perf_counter() - attempt_start
+                    
                     logger.debug(
                         f"[{request_id}] Response: status={last_status_code}, "
-                        f"size={len(response.content)} bytes, url={self._mask_url(current_url)}"
+                        f"time={execution_time:.3f}s, size={len(response_text)} bytes"
                     )
-
-                    response.raise_for_status()
-
-                    # Parse JSON response
-                    try:
-                        data = response.json()
-                    except ValueError as e:
-                        execution_time = time.perf_counter() - attempt_start
-                        logger.warning(f"[{request_id}] JSON parse error: {e}")
-                        # Try to extract error from text
-                        error_text = response.text[:500]
-                        self._update_stats(False)
-                        self.circuit_breaker.on_failure()
-
+                    
+                    # Check HTTP status
+                    if last_status_code != 200:
+                        error_msg = f"HTTP {last_status_code}: {response_text[:200]}"
+                        logger.warning(f"[{request_id}] HTTP error: {error_msg}")
+                        
+                        await self._update_stats(False)
+                        await self.circuit_breaker.on_failure()
+                        
                         return GoogleAppsScriptResponse(
                             success=False,
-                            error=f"Invalid JSON response: {error_text}",
+                            error=error_msg,
+                            error_type=self._classify_error(
+                                aiohttp.ClientResponseError(None, None, status=last_status_code),
+                                last_status_code
+                            ),
+                            status_code=last_status_code,
+                            retries=retries,
+                            request_id=request_id,
+                            execution_time=execution_time,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            health_state=circuit_state,
+                            source_url=self._mask_url(current_url),
+                        )
+                    
+                    # Parse JSON response
+                    try:
+                        data = json.loads(response_text)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[{request_id}] JSON parse error: {e}, response: {response_text[:500]}")
+                        
+                        await self._update_stats(False)
+                        await self.circuit_breaker.on_failure()
+                        
+                        return GoogleAppsScriptResponse(
+                            success=False,
+                            error=f"Invalid JSON response: {response_text[:200]}",
                             error_type=ErrorType.PARSING,
                             status_code=last_status_code,
                             retries=retries,
                             request_id=request_id,
                             execution_time=execution_time,
-                            timestamp=time.strftime(
-                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                            ),
-                            health_state=self.circuit_breaker.state,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            health_state=circuit_state,
+                            source_url=self._mask_url(current_url),
                         )
-
-                    # Check for success flag in response (Apps Script payload convention)
+                    
+                    # Check for success flag in response
                     success = data.get("success", True)
                     error_msg = data.get("error") or data.get("message")
-                    execution_time = time.perf_counter() - attempt_start
-
+                    
                     # Update statistics and circuit breaker
-                    self._update_stats(success)
+                    await self._update_stats(success)
                     if success:
-                        self.circuit_breaker.on_success()
+                        await self.circuit_breaker.on_success()
                         logger.debug(f"[{request_id}] Request successful")
                     else:
-                        self.circuit_breaker.on_failure()
-                        logger.warning(
-                            f"[{request_id}] Apps Script reported error: {error_msg}"
-                        )
-
+                        await self.circuit_breaker.on_failure()
+                        logger.warning(f"[{request_id}] Apps Script reported error: {error_msg}")
+                    
                     return GoogleAppsScriptResponse(
                         success=success,
                         data=data if success else None,
@@ -618,49 +513,44 @@ class GoogleAppsScriptClient:
                         status_code=last_status_code,
                         retries=retries,
                         request_id=request_id,
-                        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        health_state=self.circuit_breaker.state,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        health_state=circuit_state,
+                        source_url=self._mask_url(current_url),
                     )
-
-                except requests.exceptions.RequestException as e:
+                    
+                except Exception as e:
                     last_exception = e
                     retries = attempt
-                    last_status_code = getattr(
-                        getattr(e, "response", None), "status_code", None
-                    )
                     error_type = self._classify_error(e, last_status_code)
-
+                    
                     logger.warning(
                         f"[{request_id}] Attempt {attempt + 1}/{self.max_retries + 1} "
                         f"failed ({error_type.value}): {e}, "
                         f"url={self._mask_url(current_url)}"
                     )
-
+                    
                     # Don't retry on client errors (except 429)
                     if error_type == ErrorType.CLIENT and last_status_code != 429:
                         break
-
+                    
                     if attempt < self.max_retries:
                         # Exponential backoff with jitter
-                        sleep_time = (2**attempt) + random.uniform(0.1, 0.5)
-                        logger.debug(
-                            f"[{request_id}] Retrying in {sleep_time:.2f}s..."
-                        )
-                        time.sleep(sleep_time)
+                        sleep_time = (2 ** attempt) + random.uniform(0.1, 0.5)
+                        logger.debug(f"[{request_id}] Retrying in {sleep_time:.2f}s...")
+                        await asyncio.sleep(sleep_time)
                     else:
-                        logger.error(
-                            f"[{request_id}] All retries exhausted for {self._mask_url(current_url)}"
-                        )
-
+                        logger.error(f"[{request_id}] All retries exhausted")
+        
         # All attempts failed
-        self._update_stats(False)
-        self.circuit_breaker.on_failure()
+        await self._update_stats(False)
+        await self.circuit_breaker.on_failure()
+        
         error_type = (
             self._classify_error(last_exception, last_status_code)
             if last_exception
             else ErrorType.UNKNOWN
         )
-
+        
         return GoogleAppsScriptResponse(
             success=False,
             error=(
@@ -672,27 +562,29 @@ class GoogleAppsScriptClient:
             status_code=last_status_code,
             retries=retries,
             request_id=request_id,
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            health_state=self.circuit_breaker.state,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            health_state=circuit_state,
+            source_url=self._mask_url(url),
         )
-
-    # ------------------------------------------------------------------
-    # Public API Methods (Synchronous)
-    # ------------------------------------------------------------------
-    def get_symbols_data(
+    
+    # ==================================================================
+    # Public Async API Methods
+    # ==================================================================
+    
+    async def get_symbols_data(
         self,
         symbol: Optional[Union[str, List[str]]] = None,
         action: str = "get",
         include_metadata: bool = False,
     ) -> GoogleAppsScriptResponse:
         """
-        Enhanced symbols data retrieval with comprehensive error handling.
-
+        Async symbols data retrieval.
+        
         Args:
             symbol: Single symbol string or list of symbols
             action: Action type for the Apps Script
-            include_metadata: Whether to include additional metadata in request
-
+            include_metadata: Whether to include additional metadata
+        
         Returns:
             GoogleAppsScriptResponse with results
         """
@@ -702,47 +594,48 @@ class GoogleAppsScriptClient:
                 success=False,
                 error="Too many symbols (maximum 100 per request)",
                 error_type=ErrorType.VALIDATION,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
-
+        
         params: Dict[str, Any] = {"action": action}
-
+        
         if symbol:
             if isinstance(symbol, (list, tuple)):
                 params["symbol"] = ",".join(str(s).upper().strip() for s in symbol)
             else:
                 params["symbol"] = str(symbol).upper().strip()
-
+        
         if include_metadata:
             params["metadata"] = "true"
             params["source"] = "tadawul_api_v3"
-
+        
         logger.info(
-            "Fetching symbols data: "
+            f"Fetching symbols data: "
             f"symbol={symbol if isinstance(symbol, str) else f'list({len(symbol)})' if symbol else 'None'}, "
-            f"action={action}, include_metadata={include_metadata}"
+            f"action={action}"
         )
-
-        return self._make_request(
+        
+        return await self._make_request(
             method="GET",
             url=self.base_url,
             params=params,
             action=f"get_symbols_{action}",
         )
-
-    def update_symbol_data(
+    
+    async def update_symbol_data(
         self,
         symbol: str,
         data: Dict[str, Any],
         action: str = "update",
     ) -> GoogleAppsScriptResponse:
         """
-        Enhanced symbol data update with validation.
-
+        Async symbol data update.
+        
         Args:
             symbol: Stock symbol to update
             data: Dictionary of data to update
             action: Action type for the Apps Script
-
+        
         Returns:
             GoogleAppsScriptResponse with update results
         """
@@ -751,45 +644,47 @@ class GoogleAppsScriptClient:
                 success=False,
                 error="Symbol cannot be empty",
                 error_type=ErrorType.VALIDATION,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
-
+        
         # Validate data size
-        if len(str(data)) > 10000:
+        if len(json.dumps(data)) > 10000:
             return GoogleAppsScriptResponse(
                 success=False,
                 error="Data payload too large",
                 error_type=ErrorType.VALIDATION,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
-
+        
         payload = {
             "action": action,
             "symbol": symbol.upper().strip(),
             "data": data,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "tadawul_api_v3",
         }
-
+        
         logger.info(f"Updating symbol data: {symbol}, data_keys={list(data.keys())}")
-
-        return self._make_request(
+        
+        return await self._make_request(
             method="POST",
             url=self.base_url,
             json_data=payload,
             action=f"update_symbol_{action}",
         )
-
-    def batch_update_symbols(
+    
+    async def batch_update_symbols(
         self,
         updates: List[Dict[str, Any]],
         action: str = "batch_update",
     ) -> GoogleAppsScriptResponse:
         """
-        Batch update multiple symbols in a single request.
-
+        Async batch update multiple symbols.
+        
         Args:
-            updates: List of update objects, each containing 'symbol' and 'data'
+            updates: List of update objects
             action: Action type for the Apps Script
-
+        
         Returns:
             GoogleAppsScriptResponse with batch results
         """
@@ -798,83 +693,85 @@ class GoogleAppsScriptClient:
                 success=False,
                 error="Empty updates list",
                 error_type=ErrorType.VALIDATION,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
-
+        
         if len(updates) > 50:
             return GoogleAppsScriptResponse(
                 success=False,
                 error="Too many updates (maximum 50 per batch)",
                 error_type=ErrorType.VALIDATION,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
-
+        
         payload = {
             "action": action,
             "updates": updates,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "tadawul_api_v3",
             "count": len(updates),
         }
-
+        
         logger.info(f"Batch updating {len(updates)} symbols")
-
-        return self._make_request(
+        
+        return await self._make_request(
             method="POST",
             url=self.base_url,
             json_data=payload,
             action="batch_update_symbols",
         )
-
-    def health_check(self, detailed: bool = False) -> GoogleAppsScriptResponse:
+    
+    async def health_check(self, detailed: bool = False) -> GoogleAppsScriptResponse:
         """
-        Enhanced health check with detailed diagnostics.
-
+        Async health check with detailed diagnostics.
+        
         Args:
             detailed: Whether to include detailed system information
-
+        
         Returns:
             GoogleAppsScriptResponse with health status
         """
         params: Dict[str, Any] = {"action": "health", "ping": "1"}
         if detailed:
             params["detailed"] = "true"
-
-        logger.debug("Performing health check")
-
-        response = self._make_request(
+        
+        logger.debug("Performing async health check")
+        
+        response = await self._make_request(
             method="GET",
             url=self.base_url,
             params=params,
             action="health_check",
         )
-
-        # Add client statistics and circuit breaker state to health response
+        
+        # Add client statistics and circuit breaker state
         if response.data is None:
             response.data = {}
-
-        response.data["client_stats"] = self.get_statistics()
-        response.data["circuit_breaker"] = self.circuit_breaker.get_state()
-
+        
+        response.data["client_stats"] = await self.get_statistics()
+        response.data["circuit_breaker"] = await self.circuit_breaker.get_state()
+        
         return response
-
-    def test_connection(self) -> Tuple[bool, Dict[str, Any]]:
+    
+    async def test_connection(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        Simple connection test that returns basic information.
-
+        Simple async connection test.
+        
         Returns:
             Tuple of (success, diagnostics_dict)
         """
-        response = self.health_check()
-
+        response = await self.health_check()
+        
         diagnostics: Dict[str, Any] = {
             "base_url_accessible": response.success,
             "backup_url_configured": bool(self.backup_url),
             "timeout_configured": self.timeout,
             "app_token_configured": bool(self.app_token),
-            "client_stats": self.get_statistics(),
-            "circuit_breaker": self.circuit_breaker.get_state(),
+            "client_stats": await self.get_statistics(),
+            "circuit_breaker": await self.circuit_breaker.get_state(),
             "last_health_check": response.timestamp,
         }
-
+        
         if not response.success:
             diagnostics["error"] = response.error
             diagnostics["error_type"] = (
@@ -883,201 +780,212 @@ class GoogleAppsScriptClient:
             diagnostics["health_state"] = (
                 response.health_state.value if response.health_state else "unknown"
             )
-
+        
         return response.success, diagnostics
-
-    # ------------------------------------------------------------------
-    # Async-Compatible Methods
-    # ------------------------------------------------------------------
-    async def get_symbols_data_async(
-        self,
-        symbol: Optional[Union[str, List[str]]] = None,
-        action: str = "get",
-        include_metadata: bool = False,
-    ) -> GoogleAppsScriptResponse:
-        """
-        Async-compatible version of get_symbols_data.
-        Uses thread pool to avoid blocking the event loop.
-        """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self.get_symbols_data, symbol, action, include_metadata
-        )
-
-    async def health_check_async(
-        self, detailed: bool = False
-    ) -> GoogleAppsScriptResponse:
-        """
-        Async-compatible version of health_check.
-        """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.health_check, detailed)
-
-    # ------------------------------------------------------------------
+    
+    # ==================================================================
     # Monitoring and Statistics
-    # ------------------------------------------------------------------
-    def get_statistics(self) -> Dict[str, Any]:
+    # ==================================================================
+    
+    async def get_statistics(self) -> Dict[str, Any]:
         """Get client usage statistics and health metrics."""
-        with self._stats_lock:
+        async with self._stats_lock:
             total_requests = self.success_counter + self.error_counter
             success_rate = (
                 self.success_counter / total_requests * 100
                 if total_requests > 0
                 else 0
             )
-
+            
+            # Get current rate limit window usage
+            now = time.time()
+            window_start = now - 60
+            current_window = len([ts for ts in self.request_timestamps if ts > window_start])
+            
+            circuit_state = await self.circuit_breaker.get_state()
+            
             return {
                 "total_requests": total_requests,
                 "successful_requests": self.success_counter,
                 "failed_requests": self.error_counter,
                 "success_rate_percent": round(success_rate, 2),
                 "rate_limit_rpm": self.rate_limit_rpm,
-                "current_window_requests": len(self.request_timestamps),
+                "current_window_requests": current_window,
                 "max_retries": self.max_retries,
                 "timeout_seconds": self.timeout,
-                "circuit_breaker_state": self.circuit_breaker.get_state(),
+                "circuit_breaker_state": circuit_state,
+                "base_url": self._mask_url(self.base_url),
+                "backup_url": self._mask_url(self.backup_url) if self.backup_url else None,
             }
-
-    def reset_statistics(self) -> None:
+    
+    async def reset_statistics(self) -> None:
         """Reset client statistics counters."""
-        with self._stats_lock:
+        async with self._stats_lock:
             self.request_counter = 0
             self.error_counter = 0
             self.success_counter = 0
             self.request_timestamps.clear()
+            
             # Reset circuit breaker but keep configuration
-            self.circuit_breaker = CircuitBreaker(
+            self.circuit_breaker = AsyncCircuitBreaker(
                 failure_threshold=self.circuit_breaker.failure_threshold,
                 recovery_timeout=self.circuit_breaker.recovery_timeout,
                 half_open_max_requests=self.circuit_breaker.half_open_max_requests,
             )
+            
             logger.info("Client statistics and circuit breaker reset")
-
-    def get_detailed_status(self) -> Dict[str, Any]:
-        """Get detailed status including configuration and health."""
-        stats = self.get_statistics()
-        config = {
-            "base_url": self._mask_url(self.base_url),
-            "backup_url": self._mask_url(self.backup_url) if self.backup_url else None,
-            "timeout": self.timeout,
-            "max_retries": self.max_retries,
-            "rate_limit_rpm": self.rate_limit_rpm,
-            "app_token_configured": bool(self.app_token),
-            "user_agent": self.user_agent,
-        }
-
-        return {
-            "configuration": config,
-            "statistics": stats,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-
-    def close(self) -> None:
+    
+    async def close(self) -> None:
         """Close the session and cleanup resources."""
-        if hasattr(self, "session"):
-            self.session.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
             logger.info("Google Apps Script client session closed")
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.close()
 
 
-# Global instance with enhanced error handling
-try:
-    # Get circuit breaker threshold from environment
-    circuit_breaker_threshold = int(
-        os.getenv("GOOGLE_APPS_SCRIPT_CIRCUIT_BREAKER_THRESHOLD", "5")
-    )
+# ======================================================================
+# Global Async Instance
+# ======================================================================
 
-    google_apps_script_client = GoogleAppsScriptClient(
-        circuit_breaker_threshold=circuit_breaker_threshold
-    )
-    logger.info("Global GoogleAppsScriptClient instance created successfully")
-except Exception as e:
-    logger.error(f"Failed to create global GoogleAppsScriptClient: {e}")
-    google_apps_script_client = None
+# Create global async instance
+google_apps_script_client: Optional[GoogleAppsScriptClient] = None
 
-
-# Convenience functions for backward compatibility and async usage
-def get_symbols_data(
-    symbol: Optional[Union[str, List[str]]] = None,
-) -> GoogleAppsScriptResponse:
-    """Convenience function for simple symbol data retrieval."""
+async def get_google_apps_script_client() -> GoogleAppsScriptClient:
+    """Get or create global Google Apps Script client instance."""
+    global google_apps_script_client
+    
     if google_apps_script_client is None:
-        return GoogleAppsScriptResponse(
-            success=False,
-            error="Google Apps Script client not initialized",
-            error_type=ErrorType.CLIENT,
+        import os
+        
+        # Get configuration from environment (aligned with main.py)
+        base_url = os.getenv("GOOGLE_APPS_SCRIPT_URL")
+        backup_url = os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL")
+        timeout = int(os.getenv("HTTP_TIMEOUT", "30"))
+        max_retries = int(os.getenv("MAX_RETRIES", "3"))
+        app_token = os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN")
+        
+        if not base_url:
+            raise ValueError("GOOGLE_APPS_SCRIPT_URL environment variable is required")
+        
+        google_apps_script_client = GoogleAppsScriptClient(
+            base_url=base_url,
+            backup_url=backup_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            rate_limit_rpm=60,
+            circuit_breaker_threshold=5,
+            app_token=app_token,
+            user_agent="TadawulStockAPI/3.7.0",
         )
-    return google_apps_script_client.get_symbols_data(symbol)
+        
+        logger.info("Global GoogleAppsScriptClient instance created successfully")
+    
+    return google_apps_script_client
 
+
+async def close_google_apps_script_client() -> None:
+    """Close global Google Apps Script client."""
+    global google_apps_script_client
+    if google_apps_script_client:
+        await google_apps_script_client.close()
+        google_apps_script_client = None
+        logger.info("Global GoogleAppsScriptClient closed")
+
+
+# ======================================================================
+# Convenience Async Functions
+# ======================================================================
 
 async def get_symbols_data_async(
     symbol: Optional[Union[str, List[str]]] = None,
+    action: str = "get",
+    include_metadata: bool = False,
 ) -> GoogleAppsScriptResponse:
     """Async convenience function for symbol data retrieval."""
-    if google_apps_script_client is None:
-        return GoogleAppsScriptResponse(
-            success=False,
-            error="Google Apps Script client not initialized",
-            error_type=ErrorType.CLIENT,
-        )
-    return await google_apps_script_client.get_symbols_data_async(symbol)
+    client = await get_google_apps_script_client()
+    return await client.get_symbols_data(symbol, action, include_metadata)
 
 
-def health_check() -> GoogleAppsScriptResponse:
-    """Convenience function for health checks."""
-    if google_apps_script_client is None:
-        return GoogleAppsScriptResponse(
-            success=False,
-            error="Google Apps Script client not initialized",
-            error_type=ErrorType.CLIENT,
-        )
-    return google_apps_script_client.health_check()
+async def update_symbol_data_async(
+    symbol: str,
+    data: Dict[str, Any],
+    action: str = "update",
+) -> GoogleAppsScriptResponse:
+    """Async convenience function for symbol data update."""
+    client = await get_google_apps_script_client()
+    return await client.update_symbol_data(symbol, data, action)
 
 
-async def health_check_async() -> GoogleAppsScriptResponse:
+async def health_check_async(detailed: bool = False) -> GoogleAppsScriptResponse:
     """Async convenience function for health checks."""
-    if google_apps_script_client is None:
-        return GoogleAppsScriptResponse(
-            success=False,
-            error="Google Apps Script client not initialized",
-            error_type=ErrorType.CLIENT,
-        )
-    return await google_apps_script_client.health_check_async()
+    client = await get_google_apps_script_client()
+    return await client.health_check(detailed)
 
 
-if __name__ == "__main__":
-    # Enhanced test functionality
+# ======================================================================
+# Test Function
+# ======================================================================
+
+async def test_client():
+    """Test the async Google Apps Script client."""
+    import sys
+    
+    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    client = GoogleAppsScriptClient()
-
+    
     try:
+        client = await get_google_apps_script_client()
+        
+        print("=== Testing Google Apps Script Client (Async) ===")
+        print(f"Base URL: {client._mask_url(client.base_url)}")
+        print(f"Timeout: {client.timeout}s")
+        print(f"Max Retries: {client.max_retries}")
+        
         # Test health check
-        print("=== Health Check ===")
-        health_response = client.health_check()
-        print(f"Health Check: {health_response.success}")
+        print("\n=== Health Check ===")
+        health_response = await client.health_check()
+        print(f"Success: {health_response.success}")
+        print(f"Status Code: {health_response.status_code}")
+        print(f"Execution Time: {health_response.execution_time:.3f}s")
+        
         if health_response.data:
-            print(f"Data: {health_response.data}")
-
+            print(f"Response Keys: {list(health_response.data.keys())}")
+        
         # Test statistics
         print("\n=== Statistics ===")
-        stats = client.get_statistics()
+        stats = await client.get_statistics()
         for key, value in stats.items():
             print(f"{key}: {value}")
-
-        # Test detailed status
-        print("\n=== Detailed Status ===")
-        status = client.get_detailed_status()
-        print(f"Configuration: {status['configuration']}")
-        print(f"Statistics: {status['statistics']}")
-
-        # Test circuit breaker state
+        
+        # Test circuit breaker
         print("\n=== Circuit Breaker ===")
-        cb_state = client.circuit_breaker.get_state()
-        print(f"Circuit Breaker: {cb_state}")
-
+        cb_state = await client.circuit_breaker.get_state()
+        print(f"State: {cb_state['state']}")
+        print(f"Can Execute: {cb_state['can_execute']}")
+        print(f"Failure Count: {cb_state['failure_count']}")
+        
+        print("\n=== Test Completed Successfully ===")
+        
+    except Exception as e:
+        print(f"\n!!! Test Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
     finally:
-        client.close()
-        print("\n=== Client Closed ===")
+        await close_google_apps_script_client()
+
+
+if __name__ == "__main__":
+    # Run test if executed directly
+    asyncio.run(test_client())
