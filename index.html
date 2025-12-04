@@ -3,90 +3,281 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tadawul Fast Bridge - Saudi Market Data API</title>
-  <meta name="description" content="Real-time Saudi stock market data API with Google Sheets integration. Fast, reliable, and secure.">
+  <title>Tadawul Fast Bridge v4.0 - Saudi Market Data API Dashboard</title>
+  <meta name="description" content="Enhanced real-time Saudi stock market data API with Google Sheets integration. Comprehensive dashboard with monitoring and analytics.">
+  <meta name="keywords" content="Tadawul, Saudi Arabia, Stock Market, API, Google Sheets, Financial Data, Dashboard">
+  
+  <!-- Open Graph / Social Media Meta Tags -->
+  <meta property="og:title" content="Tadawul Fast Bridge v4.0">
+  <meta property="og:description" content="Real-time Saudi stock market data API dashboard">
+  <meta property="og:type" content="website">
+  
+  <!-- Favicon -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📊</text></svg>">
+  
   <style>
+    /* CSS Variables with Enhanced Color Scheme */
     :root {
-      --primary: #38bdf8;
-      --primary-dark: #0ea5e9;
-      --secondary: #22c55e;
-      --background: #0f172a;
-      --card-bg: #020617;
-      --border: #1e293b;
-      --text-primary: #e5e7eb;
-      --text-secondary: #cbd5f5;
-      --text-muted: #9ca3af;
-      --success: #22c55e;
+      /* Primary Colors */
+      --primary-50: #eff6ff;
+      --primary-100: #dbeafe;
+      --primary-200: #bfdbfe;
+      --primary-300: #93c5fd;
+      --primary-400: #60a5fa;
+      --primary-500: #3b82f6;
+      --primary-600: #2563eb;
+      --primary-700: #1d4ed8;
+      --primary-800: #1e40af;
+      --primary-900: #1e3a8a;
+      
+      /* Secondary Colors */
+      --secondary-50: #f0fdf4;
+      --secondary-100: #dcfce7;
+      --secondary-200: #bbf7d0;
+      --secondary-300: #86efac;
+      --secondary-400: #4ade80;
+      --secondary-500: #22c55e;
+      --secondary-600: #16a34a;
+      --secondary-700: #15803d;
+      --secondary-800: #166534;
+      --secondary-900: #14532d;
+      
+      /* Neutral Colors */
+      --neutral-50: #f8fafc;
+      --neutral-100: #f1f5f9;
+      --neutral-200: #e2e8f0;
+      --neutral-300: #cbd5e1;
+      --neutral-400: #94a3b8;
+      --neutral-500: #64748b;
+      --neutral-600: #475569;
+      --neutral-700: #334155;
+      --neutral-800: #1e293b;
+      --neutral-900: #0f172a;
+      --neutral-950: #020617;
+      
+      /* Semantic Colors */
+      --success: var(--secondary-500);
       --warning: #f59e0b;
       --error: #ef4444;
+      --info: var(--primary-500);
+      
+      /* Background & Surface */
+      --background: var(--neutral-950);
+      --surface-1: var(--neutral-900);
+      --surface-2: var(--neutral-800);
+      --surface-3: var(--neutral-700);
+      
+      /* Text Colors */
+      --text-primary: var(--neutral-100);
+      --text-secondary: var(--neutral-300);
+      --text-tertiary: var(--neutral-400);
+      --text-muted: var(--neutral-500);
+      
+      /* Border Colors */
+      --border-light: var(--neutral-700);
+      --border-medium: var(--neutral-600);
+      --border-dark: var(--neutral-500);
+      
+      /* Shadow System */
+      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+      --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+      --shadow-2xl: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+      
+      /* Spacing */
+      --space-1: 0.25rem;
+      --space-2: 0.5rem;
+      --space-3: 0.75rem;
+      --space-4: 1rem;
+      --space-5: 1.25rem;
+      --space-6: 1.5rem;
+      --space-8: 2rem;
+      --space-10: 2.5rem;
+      --space-12: 3rem;
+      --space-16: 4rem;
+      
+      /* Typography */
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      --font-mono: 'SF Mono', Monaco, 'Cascadia Mono', 'Segoe UI Mono', 'Roboto Mono', 'Ubuntu Mono', monospace;
+      --font-heading: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      
+      /* Border Radius */
+      --radius-sm: 0.25rem;
+      --radius-md: 0.5rem;
+      --radius-lg: 0.75rem;
+      --radius-xl: 1rem;
+      --radius-2xl: 1.5rem;
+      --radius-full: 9999px;
+      
+      /* Transitions */
+      --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+      --transition-normal: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+      --transition-slow: 500ms cubic-bezier(0.4, 0, 0.2, 1);
     }
 
+    /* Reset & Base Styles */
     * {
       margin: 0;
       padding: 0;
       box-sizing: border-box;
     }
 
+    html {
+      font-size: 16px;
+      scroll-behavior: smooth;
+    }
+
     body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: var(--font-sans);
       background: var(--background);
       color: var(--text-primary);
       line-height: 1.6;
       min-height: 100vh;
       display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
+      flex-direction: column;
+      padding: 0;
     }
 
+    /* Container System */
     .container {
-      max-width: 1200px;
       width: 100%;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 0 var(--space-4);
+    }
+
+    @media (min-width: 640px) {
+      .container {
+        padding: 0 var(--space-6);
+      }
+    }
+
+    @media (min-width: 1024px) {
+      .container {
+        padding: 0 var(--space-8);
+      }
+    }
+
+    /* Typography */
+    h1, h2, h3, h4, h5, h6 {
+      font-family: var(--font-heading);
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: var(--space-4);
+    }
+
+    h1 {
+      font-size: 3rem;
+      font-weight: 800;
+      letter-spacing: -0.025em;
+    }
+
+    h2 {
+      font-size: 2.25rem;
+      letter-spacing: -0.025em;
+    }
+
+    h3 {
+      font-size: 1.875rem;
+    }
+
+    h4 {
+      font-size: 1.5rem;
+    }
+
+    p {
+      margin-bottom: var(--space-4);
+    }
+
+    /* Layout Components */
+    .dashboard {
       display: grid;
-      grid-template-columns: 1fr 400px;
-      gap: 30px;
-      align-items: start;
+      grid-template-columns: 1fr;
+      gap: var(--space-6);
+      padding: var(--space-6) 0;
+    }
+
+    @media (min-width: 1024px) {
+      .dashboard {
+        grid-template-columns: 2fr 1fr;
+        gap: var(--space-8);
+      }
     }
 
     .main-content {
       display: flex;
       flex-direction: column;
-      gap: 24px;
+      gap: var(--space-6);
     }
 
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-6);
+    }
+
+    /* Cards */
     .card {
-      background: var(--card-bg);
-      border-radius: 16px;
-      padding: 32px;
-      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
-      border: 1px solid var(--border);
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
+      background: var(--surface-1);
+      border: 1px solid var(--border-light);
+      border-radius: var(--radius-xl);
+      padding: var(--space-6);
+      box-shadow: var(--shadow-xl);
+      transition: all var(--transition-normal);
     }
 
     .card:hover {
       transform: translateY(-2px);
-      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.6);
+      box-shadow: var(--shadow-2xl);
+      border-color: var(--primary-600);
     }
 
-    .header {
+    .card-header {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      margin-bottom: 20px;
+      margin-bottom: var(--space-4);
+      padding-bottom: var(--space-4);
+      border-bottom: 1px solid var(--border-light);
     }
 
+    .card-title {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .card-icon {
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: var(--radius-md);
+      background: var(--primary-500);
+      color: white;
+      font-size: 0.875rem;
+    }
+
+    .card-content {
+      margin-top: var(--space-4);
+    }
+
+    /* Badges */
     .badge {
       display: inline-flex;
       align-items: center;
-      padding: 6px 12px;
-      border-radius: 999px;
+      padding: var(--space-1) var(--space-3);
+      border-radius: var(--radius-full);
       font-size: 0.75rem;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.05em;
-      background: rgba(34, 197, 94, 0.15);
-      color: var(--success);
-      gap: 6px;
+      gap: var(--space-2);
     }
 
     .badge::before {
@@ -98,462 +289,1195 @@
       animation: pulse 2s infinite;
     }
 
-    .badge.success {
+    .badge-success {
       background: rgba(34, 197, 94, 0.15);
       color: var(--success);
+      border: 1px solid rgba(34, 197, 94, 0.3);
     }
 
-    .badge.warning {
+    .badge-warning {
       background: rgba(245, 158, 11, 0.15);
       color: var(--warning);
+      border: 1px solid rgba(245, 158, 11, 0.3);
     }
 
-    .badge.error {
+    .badge-error {
       background: rgba(239, 68, 68, 0.15);
       color: var(--error);
+      border: 1px solid rgba(239, 68, 68, 0.3);
     }
 
-    h1 {
-      font-size: 2.5rem;
-      font-weight: 700;
-      background: linear-gradient(135deg, var(--primary), var(--secondary));
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      margin-bottom: 12px;
-      line-height: 1.2;
+    .badge-info {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--info);
+      border: 1px solid rgba(59, 130, 246, 0.3);
     }
 
-    .subtitle {
-      font-size: 1.1rem;
-      color: var(--text-secondary);
-      margin-bottom: 24px;
+    .badge-neutral {
+      background: rgba(100, 116, 139, 0.15);
+      color: var(--text-tertiary);
+      border: 1px solid rgba(100, 116, 139, 0.3);
     }
 
-    .features {
+    /* Status Display */
+    .status-display {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 16px;
-      margin: 24px 0;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: var(--space-4);
+      margin: var(--space-4) 0;
     }
 
-    .feature {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 16px;
-      background: rgba(30, 41, 59, 0.5);
-      border-radius: 12px;
-      border-left: 3px solid var(--primary);
-    }
-
-    .feature-icon {
-      width: 24px;
-      height: 24px;
-      background: var(--primary);
-      border-radius: 6px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.875rem;
-      font-weight: bold;
-    }
-
-    .endpoints {
-      margin: 24px 0;
-    }
-
-    .endpoint {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 12px 16px;
-      background: rgba(30, 41, 59, 0.3);
-      border-radius: 8px;
-      margin-bottom: 8px;
-      transition: background 0.2s ease;
-      gap: 12px;
-    }
-
-    .endpoint:hover {
-      background: rgba(30, 41, 59, 0.5);
-    }
-
-    .endpoint-method {
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      margin-right: 12px;
-      min-width: 60px;
+    .status-item {
+      background: var(--surface-2);
+      border-radius: var(--radius-lg);
+      padding: var(--space-4);
       text-align: center;
+      border: 1px solid var(--border-light);
     }
 
-    .method-get {
-      background: rgba(34, 197, 94, 0.2);
-      color: var(--success);
-    }
-
-    .method-post {
-      background: rgba(59, 130, 246, 0.2);
-      color: #3b82f6;
-    }
-
-    .endpoint-path {
-      font-family: 'Courier New', monospace;
-      color: var(--text-primary);
-      flex: 1;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .endpoint-desc {
-      color: var(--text-muted);
-      font-size: 0.875rem;
-      white-space: nowrap;
-    }
-
-    .status-card {
-      text-align: center;
-    }
-
-    .status-icon {
-      width: 80px;
-      height: 80px;
-      margin: 0 auto 20px;
-      background: rgba(34, 197, 94, 0.1);
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 2rem;
-    }
-
-    .status-metrics {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin: 20px 0;
-    }
-
-    .metric {
-      text-align: center;
-      padding: 16px;
-      background: rgba(30, 41, 59, 0.3);
-      border-radius: 8px;
-    }
-
-    .metric-value {
-      font-size: 1.5rem;
+    .status-value {
+      font-size: 1.875rem;
       font-weight: 700;
-      color: var(--primary);
-      margin-bottom: 4px;
+      margin-bottom: var(--space-1);
+      font-feature-settings: "tnum";
+      font-variant-numeric: tabular-nums;
     }
 
-    .metric-label {
+    .status-label {
       font-size: 0.75rem;
-      color: var(--text-muted);
+      color: var(--text-tertiary);
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
 
-    .footer {
-      margin-top: 24px;
-      padding-top: 20px;
-      border-top: 1px solid var(--border);
-      color: var(--text-muted);
+    .status-delta {
+      font-size: 0.75rem;
+      margin-top: var(--space-1);
+    }
+
+    .status-delta.positive {
+      color: var(--success);
+    }
+
+    .status-delta.negative {
+      color: var(--error);
+    }
+
+    /* Service Status */
+    .service-status {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--space-3);
+      margin-top: var(--space-4);
+    }
+
+    .service-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: var(--space-3);
+      background: var(--surface-2);
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border-light);
+    }
+
+    .service-info {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+    }
+
+    .service-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: var(--radius-lg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--surface-3);
+      color: var(--text-primary);
+    }
+
+    .service-name {
+      font-weight: 500;
+    }
+
+    .service-desc {
+      font-size: 0.75rem;
+      color: var(--text-tertiary);
+    }
+
+    /* API Endpoints */
+    .endpoints-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-2);
+      margin-top: var(--space-4);
+    }
+
+    @media (min-width: 768px) {
+      .endpoints-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    .endpoint-item {
+      background: var(--surface-2);
+      border-radius: var(--radius-lg);
+      padding: var(--space-3);
+      border: 1px solid var(--border-light);
+      transition: all var(--transition-fast);
+    }
+
+    .endpoint-item:hover {
+      background: var(--surface-3);
+      border-color: var(--primary-500);
+    }
+
+    .endpoint-header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      margin-bottom: var(--space-2);
+    }
+
+    .endpoint-method {
+      padding: var(--space-1) var(--space-2);
+      border-radius: var(--radius-sm);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      min-width: 64px;
+      text-align: center;
+    }
+
+    .method-get {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--success);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+
+    .method-post {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--info);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+
+    .method-put {
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--warning);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .method-delete {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--error);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+
+    .endpoint-path {
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .endpoint-desc {
+      font-size: 0.875rem;
+      color: var(--text-tertiary);
+      line-height: 1.4;
+    }
+
+    /* Metrics Charts */
+    .metrics-chart {
+      background: var(--surface-2);
+      border-radius: var(--radius-lg);
+      padding: var(--space-4);
+      margin-top: var(--space-4);
+    }
+
+    .chart-placeholder {
+      height: 150px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--surface-3);
+      border-radius: var(--radius-md);
+      color: var(--text-tertiary);
       font-size: 0.875rem;
     }
 
-    .tech-stack {
+    /* Navigation */
+    .nav-header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: rgba(2, 6, 23, 0.8);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border-light);
+      padding: var(--space-4) 0;
+    }
+
+    .nav-container {
       display: flex;
-      gap: 12px;
-      margin-top: 16px;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      text-decoration: none;
+    }
+
+    .brand-logo {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, var(--primary-500), var(--secondary-500));
+      border-radius: var(--radius-lg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: bold;
+    }
+
+    .brand-text {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .nav-links {
+      display: flex;
+      gap: var(--space-4);
+      align-items: center;
+    }
+
+    .nav-link {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      padding: var(--space-2) var(--space-3);
+      border-radius: var(--radius-md);
+      transition: all var(--transition-fast);
+    }
+
+    .nav-link:hover {
+      color: var(--text-primary);
+      background: var(--surface-2);
+    }
+
+    /* Footer */
+    .footer {
+      margin-top: auto;
+      background: var(--surface-1);
+      border-top: 1px solid var(--border-light);
+      padding: var(--space-6) 0;
+    }
+
+    .footer-content {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-6);
+    }
+
+    @media (min-width: 768px) {
+      .footer-content {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+
+    .footer-section h4 {
+      font-size: 1rem;
+      margin-bottom: var(--space-3);
+      color: var(--text-primary);
+    }
+
+    .footer-links {
+      list-style: none;
+    }
+
+    .footer-links li {
+      margin-bottom: var(--space-2);
+    }
+
+    .footer-links a {
+      color: var(--text-tertiary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      transition: color var(--transition-fast);
+    }
+
+    .footer-links a:hover {
+      color: var(--text-primary);
+    }
+
+    .tech-tags {
+      display: flex;
       flex-wrap: wrap;
+      gap: var(--space-2);
+      margin-top: var(--space-3);
     }
 
     .tech-tag {
-      padding: 4px 8px;
-      background: rgba(30, 41, 59, 0.5);
-      border-radius: 4px;
+      padding: var(--space-1) var(--space-2);
+      background: var(--surface-3);
+      border-radius: var(--radius-md);
       font-size: 0.75rem;
-      color: var(--text-muted);
+      color: var(--text-tertiary);
     }
 
+    /* Animations */
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.5; }
     }
 
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes slideIn {
+      from { transform: translateX(-10px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* Utility Classes */
+    .animate-fade-in {
+      animation: fadeIn 0.5s ease-out;
+    }
+
+    .animate-slide-in {
+      animation: slideIn 0.3s ease-out;
+    }
+
+    .gradient-text {
+      background: linear-gradient(135deg, var(--primary-500), var(--secondary-500));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .text-gradient {
+      background: linear-gradient(135deg, var(--primary-500), var(--secondary-500));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .glass-effect {
+      background: rgba(30, 41, 59, 0.7);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    /* Responsive Adjustments */
     @media (max-width: 768px) {
-      .container {
-        grid-template-columns: 1fr;
-        gap: 20px;
-      }
-
       h1 {
-        font-size: 2rem;
+        font-size: 2.25rem;
       }
-
-      .features {
-        grid-template-columns: 1fr;
+      
+      h2 {
+        font-size: 1.875rem;
       }
-
-      .endpoint-path {
-        max-width: 100%;
+      
+      .card {
+        padding: var(--space-4);
       }
-
-      .endpoint-desc {
+      
+      .dashboard {
+        padding: var(--space-4) 0;
+      }
+      
+      .nav-links {
         display: none;
       }
+    }
+
+    @media (max-width: 480px) {
+      h1 {
+        font-size: 1.875rem;
+      }
+      
+      .status-display {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--surface-2);
+      border-radius: var(--radius-full);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--neutral-600);
+      border-radius: var(--radius-full);
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--neutral-500);
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="main-content">
-      <div class="card">
-        <div class="header">
-          <div class="badge" id="statusBadge">
-            <span id="statusText">Checking Status...</span>
+  <!-- Navigation Header -->
+  <header class="nav-header">
+    <nav class="container nav-container">
+      <a href="#" class="nav-brand">
+        <div class="brand-logo">T</div>
+        <span class="brand-text">Tadawul Fast Bridge</span>
+      </a>
+      <div class="nav-links">
+        <a href="#api" class="nav-link">API Reference</a>
+        <a href="#status" class="nav-link">System Status</a>
+        <a href="#metrics" class="nav-link">Metrics</a>
+        <a href="#docs" class="nav-link">Documentation</a>
+      </div>
+    </nav>
+  </header>
+
+  <!-- Main Content -->
+  <main class="container">
+    <div class="dashboard">
+      <!-- Left Column - Main Content -->
+      <div class="main-content">
+        <!-- Hero Section -->
+        <div class="card animate-fade-in">
+          <div class="card-header">
+            <div class="card-title">
+              <div class="card-icon">🚀</div>
+              <h1>Tadawul Fast Bridge <span class="gradient-text">v4.0.0</span></h1>
+            </div>
+            <div class="badge badge-success" id="systemStatus">
+              <span id="statusText">Initializing...</span>
+            </div>
+          </div>
+          
+          <div class="card-content">
+            <p class="text-gradient" style="font-size: 1.125rem; font-weight: 500; margin-bottom: var(--space-4);">
+              Advanced real-time Saudi stock market data API with comprehensive monitoring and analytics.
+            </p>
+            
+            <div class="features-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-4); margin: var(--space-6) 0;">
+              <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
+                <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">📈</div>
+                <div style="font-weight: 600; margin-bottom: var(--space-1);">Real-time Market Data</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Live quotes, volumes, and market indicators</div>
+              </div>
+              
+              <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
+                <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">💾</div>
+                <div style="font-weight: 600; margin-bottom: var(--space-1);">Smart Caching</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Multi-layer cache with TTL management</div>
+              </div>
+              
+              <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
+                <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">🔄</div>
+                <div style="font-weight: 600; margin-bottom: var(--space-1);">Async Processing</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Full async/await architecture</div>
+              </div>
+              
+              <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
+                <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">📊</div>
+                <div style="font-weight: 600; margin-bottom: var(--space-1);">Data Validation</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Comprehensive quality assessment</div>
+              </div>
+            </div>
           </div>
         </div>
 
-        <h1>Tadawul Fast Bridge</h1>
-        <div class="subtitle">
-          Real-time Saudi stock market data API with Google Sheets integration.
-          Fast, reliable, and secure financial data bridge.
+        <!-- API Endpoints Section -->
+        <div class="card" id="api">
+          <div class="card-header">
+            <div class="card-title">
+              <div class="card-icon">🔌</div>
+              <h3>API Endpoints</h3>
+            </div>
+          </div>
+          
+          <div class="card-content">
+            <div class="endpoints-grid">
+              <!-- Health & Monitoring -->
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/health</span>
+                </div>
+                <div class="endpoint-desc">Comprehensive system health check with metrics</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/stats</span>
+                </div>
+                <div class="endpoint-desc">Detailed service statistics and performance</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/metrics</span>
+                </div>
+                <div class="endpoint-desc">Prometheus-compatible metrics endpoint</div>
+              </div>
+              
+              <!-- Market Data -->
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/market/ksa</span>
+                </div>
+                <div class="endpoint-desc">KSA Tadawul market data (Google Sheets)</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/market/tadawul</span>
+                </div>
+                <div class="endpoint-desc">Comprehensive Tadawul data snapshot</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/quote/:ticker</span>
+                </div>
+                <div class="endpoint-desc">Detailed quote for specific ticker</div>
+              </div>
+              
+              <!-- Google Apps Script Integration -->
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-post">POST</span>
+                  <span class="endpoint-path">/api/v1/gas/update</span>
+                </div>
+                <div class="endpoint-desc">Update data via Google Apps Script</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/gas/health</span>
+                </div>
+                <div class="endpoint-desc">Google Apps Script connection health</div>
+              </div>
+              
+              <!-- Cache Management -->
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-delete">DELETE</span>
+                  <span class="endpoint-path">/api/v1/cache/clear</span>
+                </div>
+                <div class="endpoint-desc">Clear all cache entries</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/api/v1/cache/stats</span>
+                </div>
+                <div class="endpoint-desc">Cache statistics and hit rates</div>
+              </div>
+              
+              <!-- Documentation -->
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/docs</span>
+                </div>
+                <div class="endpoint-desc">Interactive Swagger UI documentation</div>
+              </div>
+              
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/redoc</span>
+                </div>
+                <div class="endpoint-desc">ReDoc API documentation</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column - Sidebar -->
+      <div class="sidebar">
+        <!-- System Status Card -->
+        <div class="card" id="status">
+          <div class="card-header">
+            <div class="card-title">
+              <div class="card-icon">⚡</div>
+              <h3>System Status</h3>
+            </div>
+          </div>
+          
+          <div class="card-content">
+            <div class="status-display">
+              <div class="status-item">
+                <div class="status-value" id="responseTime">--</div>
+                <div class="status-label">Response Time</div>
+                <div class="status-delta" id="responseDelta">--</div>
+              </div>
+              
+              <div class="status-item">
+                <div class="status-value" id="uptime">--</div>
+                <div class="status-label">Uptime</div>
+                <div class="status-delta" id="uptimeDelta">--</div>
+              </div>
+              
+              <div class="status-item">
+                <div class="status-value" id="requests">--</div>
+                <div class="status-label">Requests</div>
+                <div class="status-delta" id="requestsDelta">--</div>
+              </div>
+              
+              <div class="status-item">
+                <div class="status-value" id="cacheHits">--</div>
+                <div class="status-label">Cache Hits</div>
+                <div class="status-delta" id="cacheDelta">--</div>
+              </div>
+            </div>
+            
+            <div class="service-status">
+              <div class="service-item">
+                <div class="service-info">
+                  <div class="service-icon">📊</div>
+                  <div>
+                    <div class="service-name">Google Sheets</div>
+                    <div class="service-desc">Market data source</div>
+                  </div>
+                </div>
+                <div class="badge badge-success" id="sheetsStatus">Checking</div>
+              </div>
+              
+              <div class="service-item">
+                <div class="service-info">
+                  <div class="service-icon">🔄</div>
+                  <div>
+                    <div class="service-name">Google Apps Script</div>
+                    <div class="service-desc">Data updates</div>
+                  </div>
+                </div>
+                <div class="badge badge-success" id="gasStatus">Checking</div>
+              </div>
+              
+              <div class="service-item">
+                <div class="service-info">
+                  <div class="service-icon">💾</div>
+                  <div>
+                    <div class="service-name">Cache</div>
+                    <div class="service-desc">Performance layer</div>
+                  </div>
+                </div>
+                <div class="badge badge-success" id="cacheStatus">Checking</div>
+              </div>
+              
+              <div class="service-item">
+                <div class="service-info">
+                  <div class="service-icon">⚡</div>
+                  <div>
+                    <div class="service-name">API Server</div>
+                    <div class="service-desc">FastAPI backend</div>
+                  </div>
+                </div>
+                <div class="badge badge-success" id="apiStatus">Checking</div>
+              </div>
+            </div>
+            
+            <div class="metrics-chart">
+              <div class="card-header">
+                <div class="card-title">
+                  <div class="card-icon">📈</div>
+                  <h4>Performance Trends</h4>
+                </div>
+              </div>
+              <div class="chart-placeholder">
+                Performance charts will appear here
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div class="features">
-          <div class="feature">
-            <div class="feature-icon">📈</div>
-            <div>
-              <strong>Real-time Data</strong>
-              <div style="font-size: 0.875rem; color: var(--text-muted);">Live market quotes</div>
+        <!-- Version & Environment Card -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <div class="card-icon">ℹ️</div>
+              <h3>Version Info</h3>
             </div>
           </div>
-          <div class="feature">
-            <div class="feature-icon">📊</div>
-            <div>
-              <strong>Sheets Integration</strong>
-              <div style="font-size: 0.875rem; color: var(--text-muted);">Google Sheets sync</div>
-            </div>
-          </div>
-          <div class="feature">
-            <div class="feature-icon">💾</div>
-            <div>
-              <strong>Smart Caching</strong>
-              <div style="font-size: 0.875rem; color: var(--text-muted);">Performance optimized</div>
-            </div>
-          </div>
-          <div class="feature">
-            <div class="feature-icon">🔐</div>
-            <div>
-              <strong>Secure API</strong>
-              <div style="font-size: 0.875rem; color: var(--text-muted);">Authentication & rate limits</div>
+          
+          <div class="card-content">
+            <div style="font-family: var(--font-mono);">
+              <div style="margin-bottom: var(--space-3);">
+                <div style="font-size: 0.75rem; color: var(--text-tertiary);">Version</div>
+                <div style="font-size: 1rem; font-weight: 600;" id="versionDisplay">Tadawul Fast Bridge v4.0.0</div>
+              </div>
+              
+              <div style="margin-bottom: var(--space-3);">
+                <div style="font-size: 0.75rem; color: var(--text-tertiary);">Environment</div>
+                <div style="font-size: 1rem; font-weight: 600;" id="environmentDisplay">production</div>
+              </div>
+              
+              <div style="margin-bottom: var(--space-3);">
+                <div style="font-size: 0.75rem; color: var(--text-tertiary);">Build Date</div>
+                <div style="font-size: 1rem; font-weight: 600;" id="buildDate">2024-01-15</div>
+              </div>
+              
+              <div style="margin-top: var(--space-4); padding-top: var(--space-4); border-top: 1px solid var(--border-light);">
+                <div style="font-size: 0.75rem; color: var(--text-tertiary);">System ID</div>
+                <div style="font-size: 0.875rem; font-family: var(--font-mono); word-break: break-all;" id="systemId">system-id-placeholder</div>
+              </div>
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  </main>
 
-        <div class="endpoints">
-          <h3 style="margin-bottom: 16px; color: var(--text-secondary);">API Endpoints</h3>
-          <div class="endpoint">
-            <span class="endpoint-method method-get">GET</span>
-            <span class="endpoint-path">/docs</span>
-            <span class="endpoint-desc">Interactive Swagger UI</span>
-          </div>
-          <div class="endpoint">
-            <span class="endpoint-method method-get">GET</span>
-            <span class="endpoint-path">/redoc</span>
-            <span class="endpoint-desc">API Reference (ReDoc)</span>
-          </div>
-          <div class="endpoint">
-            <span class="endpoint-method method-get">GET</span>
-            <span class="endpoint-path">/health</span>
-            <span class="endpoint-desc">System health status</span>
-          </div>
-          <div class="endpoint">
-            <span class="endpoint-method method-get">GET</span>
-            <span class="endpoint-path">/v1/quote?tickers=7201.SR,1211.SR</span>
-            <span class="endpoint-desc">Stock quotes (multi-source)</span>
-          </div>
-          <div class="endpoint">
-            <span class="endpoint-method method-get">GET</span>
-            <span class="endpoint-path">/v1/tadawul/market?limit=50</span>
-            <span class="endpoint-desc">Saudi market data snapshot</span>
-          </div>
-          <div class="endpoint">
-            <span class="endpoint-method method-post">POST</span>
-            <span class="endpoint-path">/v1/argaam/quotes</span>
-            <span class="endpoint-desc">Fundamentals via Argaam</span>
-          </div>
-        </div>
-
-        <div class="footer">
-          <div style="margin-bottom: 12px;">
-            Data sources: Google Sheets + Multiple financial APIs + Internal ranking engine
-          </div>
-          <div class="tech-stack">
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-content">
+        <div class="footer-section">
+          <h4>Tadawul Fast Bridge</h4>
+          <p style="font-size: 0.875rem; color: var(--text-tertiary);">
+            Advanced API for real-time Saudi stock market data with comprehensive monitoring and analytics.
+          </p>
+          <div class="tech-tags">
             <span class="tech-tag">FastAPI</span>
-            <span class="tech-tag">Python 3.11</span>
+            <span class="tech-tag">Python 3.11+</span>
             <span class="tech-tag">Google Sheets</span>
-            <span class="tech-tag">Redis Cache</span>
-            <span class="tech-tag">JWT Auth</span>
-            <span class="tech-tag">Rate Limiting</span>
+            <span class="tech-tag">Async/Await</span>
+            <span class="tech-tag">Redis</span>
+            <span class="tech-tag">Docker</span>
+            <span class="tech-tag">Monitoring</span>
+            <span class="tech-tag">Prometheus</span>
           </div>
         </div>
+        
+        <div class="footer-section">
+          <h4>Quick Links</h4>
+          <ul class="footer-links">
+            <li><a href="#api">API Reference</a></li>
+            <li><a href="#status">System Status</a></li>
+            <li><a href="#docs">Documentation</a></li>
+            <li><a href="#metrics">Metrics Dashboard</a></li>
+            <li><a href="#health">Health Checks</a></li>
+          </ul>
+        </div>
+        
+        <div class="footer-section">
+          <h4>Data Sources</h4>
+          <ul class="footer-links">
+            <li>Google Sheets Integration</li>
+            <li>Google Apps Script</li>
+            <li>Multiple Financial APIs</li>
+            <li>Internal Ranking Engine</li>
+            <li>Real-time Market Feeds</li>
+          </ul>
+        </div>
+      </div>
+      
+      <div style="margin-top: var(--space-8); padding-top: var(--space-4); border-top: 1px solid var(--border-light); text-align: center; color: var(--text-tertiary); font-size: 0.875rem;">
+        <p>© 2024 Tadawul Fast Bridge v4.0.0 • Built with modern async architecture</p>
+        <p style="margin-top: var(--space-2);">System Status: <span id="footerStatus">Initializing...</span></p>
       </div>
     </div>
-
-    <div class="card status-card">
-      <div class="status-icon">🚀</div>
-      <h3 style="margin-bottom: 8px;">System Status</h3>
-      <div style="color: var(--text-muted); margin-bottom: 24px; font-size: 0.875rem;">
-        Real-time service monitoring
-      </div>
-
-      <div class="status-metrics">
-        <div class="metric">
-          <div class="metric-value" id="responseTime">--</div>
-          <div class="metric-label">Response Time</div>
-        </div>
-        <div class="metric">
-          <div class="metric-value" id="uptime">--</div>
-          <div class="metric-label">Uptime</div>
-        </div>
-        <div class="metric">
-          <div class="metric-value" id="cacheSize">--</div>
-          <div class="metric-label">Cache Size</div>
-        </div>
-        <div class="metric">
-          <div class="metric-value" id="requests">--</div>
-          <div class="metric-label">Requests</div>
-        </div>
-      </div>
-
-      <div style="margin-top: 20px; padding: 16px; background: rgba(30, 41, 59, 0.3); border-radius: 8px;">
-        <div style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 8px;">Version Info</div>
-        <div style="font-family: 'Courier New', monospace; font-size: 0.875rem;">
-          <div>Tadawul Fast Bridge <span id="version">v3.1.0</span></div>
-          <div>Environment: <span id="environment">production</span></div>
-        </div>
-      </div>
-    </div>
-  </div>
+  </footer>
 
   <script>
-    // Health check and status monitoring
-    async function checkHealth() {
-      try {
-        const startTime = performance.now();
-        const response = await fetch('/health');
-        const endTime = performance.now();
-
-        if (response.ok) {
-          const data = await response.json();
-          updateStatus('success', 'API Server Online', data);
-          updateMetrics(data, Math.round(endTime - startTime));
-        } else {
-          updateStatus('warning', 'API Degraded', null);
+    // Enhanced Dashboard JavaScript
+    class DashboardMonitor {
+      constructor() {
+        this.config = {
+          healthCheckInterval: 30000, // 30 seconds
+          metricsInterval: 10000, // 10 seconds
+          apiBaseUrl: window.location.origin,
+          historySize: 60, // Store last 60 data points
+        };
+        
+        this.state = {
+          previousMetrics: null,
+          requestHistory: [],
+          lastUpdate: null,
+          isInitialized: false,
+          version: '4.0.0',
+        };
+        
+        this.cache = {
+          healthData: null,
+          statsData: null,
+          lastFetch: null,
+        };
+        
+        this.initialize();
+      }
+      
+      initialize() {
+        console.log('DashboardMonitor initialized');
+        
+        // Set initial version display
+        document.getElementById('versionDisplay').textContent = `Tadawul Fast Bridge v${this.state.version}`;
+        document.getElementById('buildDate').textContent = new Date().toISOString().split('T')[0];
+        document.getElementById('systemId').textContent = this.generateSystemId();
+        
+        // Initial checks
+        this.checkHealth();
+        this.fetchMetrics();
+        
+        // Set up periodic checks
+        setInterval(() => this.checkHealth(), this.config.healthCheckInterval);
+        setInterval(() => this.fetchMetrics(), this.config.metricsInterval);
+        
+        // Add event listeners for manual refresh
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'r' && e.ctrlKey) {
+            e.preventDefault();
+            this.refreshAll();
+          }
+        });
+        
+        this.state.isInitialized = true;
+      }
+      
+      generateSystemId() {
+        const timestamp = Date.now().toString(36);
+        const random = Math.random().toString(36).substr(2, 5);
+        return `tfb-${timestamp}-${random}`;
+      }
+      
+      async checkHealth() {
+        try {
+          const startTime = performance.now();
+          const response = await fetch(`${this.config.apiBaseUrl}/api/v1/health`);
+          const endTime = performance.now();
+          
+          if (response.ok) {
+            const data = await response.json();
+            this.cache.healthData = data;
+            this.cache.lastFetch = new Date();
+            this.updateHealthDisplay(data, Math.round(endTime - startTime));
+          } else {
+            this.handleHealthError();
+          }
+        } catch (error) {
+          console.error('Health check failed:', error);
+          this.handleHealthError();
         }
-      } catch (error) {
-        updateStatus('error', 'API Offline', null);
-        console.error('Health check failed:', error);
+      }
+      
+      async fetchMetrics() {
+        try {
+          const response = await fetch(`${this.config.apiBaseUrl}/api/v1/stats`);
+          
+          if (response.ok) {
+            const data = await response.json();
+            this.cache.statsData = data;
+            this.updateMetricsDisplay(data);
+          }
+        } catch (error) {
+          console.warn('Metrics fetch failed:', error);
+        }
+      }
+      
+      updateHealthDisplay(data, responseTime) {
+        // Update overall status
+        const statusElement = document.getElementById('systemStatus');
+        const statusTextElement = document.getElementById('statusText');
+        const footerStatusElement = document.getElementById('footerStatus');
+        
+        const isHealthy = data.status === 'healthy' || data.status === 'operational';
+        
+        statusElement.className = `badge ${isHealthy ? 'badge-success' : 'badge-error'}`;
+        statusTextElement.textContent = isHealthy ? 'Operational' : 'Degraded';
+        footerStatusElement.textContent = isHealthy ? 'All Systems Operational' : 'Degraded Performance';
+        
+        // Update response time
+        this.updateMetricElement('responseTime', responseTime, 'ms');
+        
+        // Update uptime
+        if (data.uptime_seconds) {
+          const uptimeText = this.formatUptime(data.uptime_seconds);
+          this.updateMetricElement('uptime', uptimeText);
+        }
+        
+        // Update environment
+        if (data.environment) {
+          document.getElementById('environmentDisplay').textContent = data.environment;
+        }
+        
+        // Update service statuses
+        this.updateServiceStatuses(data);
+        
+        // Store for delta calculations
+        if (this.state.previousMetrics) {
+          this.calculateDeltas(data);
+        }
+        
+        this.state.previousMetrics = data;
+        this.state.lastUpdate = new Date();
+        
+        // Trigger animations
+        this.triggerStatusAnimation(isHealthy);
+      }
+      
+      updateServiceStatuses(data) {
+        // Update individual service statuses
+        const services = {
+          'sheetsStatus': data.google_sheets_status || data.services?.google_sheets,
+          'gasStatus': data.google_apps_script_status || data.services?.google_apps_script,
+          'cacheStatus': data.cache_status?.status || data.services?.cache,
+          'apiStatus': data.api_status || data.status,
+        };
+        
+        Object.entries(services).forEach(([elementId, status]) => {
+          const element = document.getElementById(elementId);
+          if (element && status) {
+            const isHealthy = status === 'healthy' || status === 'operational' || status === 'connected';
+            element.className = `badge ${isHealthy ? 'badge-success' : 'badge-warning'}`;
+            element.textContent = isHealthy ? 'Connected' : 'Degraded';
+          }
+        });
+      }
+      
+      updateMetricsDisplay(data) {
+        // Update requests
+        if (data.performance?.total_requests !== undefined) {
+          this.updateMetricElement('requests', data.performance.total_requests);
+        }
+        
+        // Update cache hits
+        if (data.cache?.hits !== undefined) {
+          this.updateMetricElement('cacheHits', data.cache.hits);
+        }
+        
+        // Update cache hit rate if available
+        if (data.cache?.hit_rate !== undefined) {
+          const element = document.getElementById('cacheDelta');
+          if (element) {
+            element.textContent = `${data.cache.hit_rate}%`;
+            element.className = `status-delta ${data.cache.hit_rate >= 80 ? 'positive' : 'negative'}`;
+          }
+        }
+        
+        // Store in history for trends
+        if (this.state.requestHistory.length >= this.config.historySize) {
+          this.state.requestHistory.shift();
+        }
+        this.state.requestHistory.push({
+          timestamp: new Date(),
+          requests: data.performance?.total_requests || 0,
+          responseTime: data.performance?.avg_response_time_ms || 0,
+          cacheHits: data.cache?.hits || 0,
+        });
+      }
+      
+      updateMetricElement(elementId, value, suffix = '') {
+        const element = document.getElementById(elementId);
+        if (element) {
+          if (typeof value === 'number') {
+            element.textContent = this.formatNumber(value) + suffix;
+          } else {
+            element.textContent = value;
+          }
+        }
+      }
+      
+      calculateDeltas(currentData) {
+        const previous = this.state.previousMetrics;
+        
+        // Response time delta
+        const responseDeltaElement = document.getElementById('responseDelta');
+        if (responseDeltaElement && currentData.performance?.avg_response_time_ms && previous.performance?.avg_response_time_ms) {
+          const delta = currentData.performance.avg_response_time_ms - previous.performance.avg_response_time_ms;
+          responseDeltaElement.textContent = `${delta > 0 ? '+' : ''}${Math.round(delta)}ms`;
+          responseDeltaElement.className = `status-delta ${delta <= 0 ? 'positive' : 'negative'}`;
+        }
+        
+        // Requests delta
+        const requestsDeltaElement = document.getElementById('requestsDelta');
+        if (requestsDeltaElement && currentData.performance?.total_requests && previous.performance?.total_requests) {
+          const delta = currentData.performance.total_requests - previous.performance.total_requests;
+          requestsDeltaElement.textContent = `${delta > 0 ? '+' : ''}${this.formatNumber(delta)}`;
+          requestsDeltaElement.className = `status-delta ${delta > 0 ? 'positive' : 'negative'}`;
+        }
+      }
+      
+      handleHealthError() {
+        const statusElement = document.getElementById('systemStatus');
+        const statusTextElement = document.getElementById('statusText');
+        const footerStatusElement = document.getElementById('footerStatus');
+        
+        statusElement.className = 'badge badge-error';
+        statusTextElement.textContent = 'Offline';
+        footerStatusElement.textContent = 'System Unavailable';
+        
+        // Set default values for metrics
+        this.updateMetricElement('responseTime', '--');
+        this.updateMetricElement('uptime', '--');
+        this.updateMetricElement('requests', '--');
+        this.updateMetricElement('cacheHits', '--');
+        
+        // Update service statuses to error
+        ['sheetsStatus', 'gasStatus', 'cacheStatus', 'apiStatus'].forEach(id => {
+          const element = document.getElementById(id);
+          if (element) {
+            element.className = 'badge badge-error';
+            element.textContent = 'Offline';
+          }
+        });
+      }
+      
+      triggerStatusAnimation(isHealthy) {
+        const statusElement = document.getElementById('systemStatus');
+        statusElement.style.animation = 'none';
+        setTimeout(() => {
+          statusElement.style.animation = 'pulse 2s infinite';
+        }, 10);
+      }
+      
+      formatUptime(seconds) {
+        if (!seconds) return '--';
+        
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor((seconds % 86400) / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        
+        if (days > 0) {
+          return `${days}d ${hours}h`;
+        } else if (hours > 0) {
+          return `${hours}h ${minutes}m`;
+        } else {
+          return `${minutes}m`;
+        }
+      }
+      
+      formatNumber(num) {
+        if (typeof num !== 'number') return num;
+        
+        if (num >= 1000000) {
+          return (num / 1000000).toFixed(1) + 'M';
+        } else if (num >= 1000) {
+          return (num / 1000).toFixed(1) + 'K';
+        }
+        return num.toString();
+      }
+      
+      refreshAll() {
+        console.log('Manual refresh triggered');
+        this.checkHealth();
+        this.fetchMetrics();
+        
+        // Visual feedback
+        const refreshElements = document.querySelectorAll('.card');
+        refreshElements.forEach(element => {
+          element.style.transform = 'scale(0.98)';
+          setTimeout(() => {
+            element.style.transform = '';
+          }, 300);
+        });
+      }
+      
+      getHistoricalData() {
+        return this.state.requestHistory;
+      }
+      
+      exportMetrics() {
+        return {
+          current: this.cache.statsData,
+          history: this.state.requestHistory,
+          lastUpdate: this.state.lastUpdate,
+          version: this.state.version,
+        };
       }
     }
-
-    function updateStatus(status, text, data) {
-      const badge = document.getElementById('statusBadge');
-      const statusText = document.getElementById('statusText');
-
-      badge.className = 'badge';
-      badge.classList.add(status);
-      statusText.textContent = text;
-
-      if (data) {
-        document.getElementById('version').textContent = data.version || 'v3.1.0';
-        document.getElementById('environment').textContent = data.environment || 'production';
-      }
-    }
-
-    function updateMetrics(data, responseTime) {
-      document.getElementById('responseTime').textContent = `${responseTime}ms`;
-
-      if (!data) return;
-
-      // Uptime: support uptime_seconds or uptime
-      const uptimeSeconds = data.uptime_seconds || data.uptime || 0;
-      document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
-
-      // Requests: prefer data.performance.total_requests, else derive from cache_status.performance
-      let totalRequests = 0;
-      if (data.performance && typeof data.performance.total_requests === 'number') {
-        totalRequests = data.performance.total_requests;
-      } else if (data.cache_status && data.cache_status.performance) {
-        const p = data.cache_status.performance;
-        const hits = typeof p.hits === 'number' ? p.hits : 0;
-        const misses = typeof p.misses === 'number' ? p.misses : 0;
-        totalRequests = hits + misses;
-      }
-      document.getElementById('requests').textContent = formatNumber(totalRequests);
-
-      // Cache size: valid_items or total_items
-      if (data.cache_status) {
-        const cs = data.cache_status;
-        const cacheItems = (typeof cs.valid_items === 'number' && cs.valid_items > 0)
-          ? cs.valid_items
-          : (cs.total_items || 0);
-        document.getElementById('cacheSize').textContent = formatNumber(cacheItems);
-      }
-    }
-
-    function formatUptime(seconds) {
-      if (!seconds) return '--';
-
-      const days = Math.floor(seconds / 86400);
-      const hours = Math.floor((seconds % 86400) / 3600);
-
-      if (days > 0) {
-        return `${days}d ${hours}h`;
-      } else if (hours > 0) {
-        return `${hours}h`;
-      } else {
-        return '<1h';
-      }
-    }
-
-    function formatNumber(num) {
-      if (!num) return '0';
-
-      if (num >= 1000000) {
-        return (num / 1000000).toFixed(1) + 'M';
-      } else if (num >= 1000) {
-        return (num / 1000).toFixed(1) + 'K';
-      }
-      return num.toString();
-    }
-
-    // Initial health check
-    checkHealth();
-
-    // Refresh health status every 30 seconds
-    setInterval(checkHealth, 30000);
-
-    // Add some interactive effects
-    document.addEventListener('DOMContentLoaded', function() {
+    
+    // Initialize dashboard when DOM is loaded
+    document.addEventListener('DOMContentLoaded', () => {
+      // Create dashboard instance
+      window.dashboard = new DashboardMonitor();
+      
+      // Add animation effects to cards
       const cards = document.querySelectorAll('.card');
       cards.forEach((card, index) => {
         card.style.opacity = '0';
         card.style.transform = 'translateY(20px)';
-
+        
         setTimeout(() => {
           card.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
           card.style.opacity = '1';
           card.style.transform = 'translateY(0)';
         }, index * 100);
       });
+      
+      // Add endpoint click handlers
+      const endpointItems = document.querySelectorAll('.endpoint-item');
+      endpointItems.forEach(item => {
+        item.addEventListener('click', () => {
+          const path = item.querySelector('.endpoint-path').textContent;
+          const method = item.querySelector('.endpoint-method').textContent;
+          
+          // Visual feedback
+          item.style.transform = 'scale(0.98)';
+          setTimeout(() => {
+            item.style.transform = '';
+          }, 200);
+          
+          console.log(`Endpoint clicked: ${method} ${path}`);
+          
+          // In a real application, you might:
+          // 1. Copy the endpoint to clipboard
+          // 2. Open documentation for that endpoint
+          // 3. Make a test request
+        });
+      });
+      
+      // Add smooth scrolling for navigation
+      document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function (e) {
+          e.preventDefault();
+          const targetId = this.getAttribute('href');
+          if (targetId === '#') return;
+          
+          const targetElement = document.querySelector(targetId);
+          if (targetElement) {
+            window.scrollTo({
+              top: targetElement.offsetTop - 80,
+              behavior: 'smooth'
+            });
+          }
+        });
+      });
     });
+    
+    // Global helper functions
+    window.formatNumber = function(num) {
+      if (typeof num !== 'number') return num;
+      return num.toLocaleString('en-US');
+    };
+    
+    window.formatBytes = function(bytes, decimals = 2) {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024;
+      const dm = decimals < 0 ? 0 : decimals;
+      const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    };
   </script>
 </body>
 </html>
