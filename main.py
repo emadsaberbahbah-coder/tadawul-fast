@@ -486,7 +486,6 @@ class TTLCache:
         if len(self.data) <= self.max_size:
             return
 
-
         items_to_remove = len(self.data) - self.max_size
         sorted_items = sorted(self.data.items(), key=lambda x: x[1].get("_cache_timestamp", 0))
 
@@ -1467,7 +1466,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Error during shutdown: {e}")
 
-    uptime = time.time() - startup_time
+    uptime = time.time() - startup_time    # noqa: F841
     logger.info(f"🛑 Application shutdown after {uptime:.2f} seconds")
 
 
@@ -1510,7 +1509,8 @@ app.add_middleware(
 # SlowAPI
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
-app.add_middleware(SlowAPIMiddleware, limiter=limiter, key_func=get_remote_address)
+# ✅ FIX: no kwargs here – SlowAPIMiddleware reads app.state.limiter internally
+app.add_middleware(SlowAPIMiddleware)
 
 # =============================================================================
 # Middleware
@@ -1846,7 +1846,7 @@ async def get_quotes_v41(
 @app.post("/v1/quote/update")
 @rate_limit("30/minute")
 async def update_quotes(
-    request: Request,                     # ✅ added to satisfy SlowAPI
+    request: Request,                     # must include request for SlowAPI
     request_body: QuoteRequest,
     auth: bool = Depends(verify_auth),
 ):
