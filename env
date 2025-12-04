@@ -1,110 +1,630 @@
 # =============================================================================
-# Tadawul Stock Analysis API - Environment Configuration
-# Version: 3.7.0 | Environment: Production
-# WARNING: DO NOT COMMIT SECRETS TO VERSION CONTROL
+# Tadawul Stock Analysis API - Enhanced Environment Configuration
+# Version: 4.0.0 | Environment: Production-Ready
+# 
+# SECURITY WARNING: DO NOT COMMIT SECRETS TO VERSION CONTROL
+# Use Render/Heroku environment variables for sensitive data
 # =============================================================================
 
 # =============================================================================
 # APPLICATION CORE SETTINGS
 # =============================================================================
 
+# Basic Application
 SERVICE_NAME="Tadawul Stock Analysis API"
-SERVICE_VERSION="3.7.0"
-ENVIRONMENT=production
-DEBUG=false
+SERVICE_VERSION="4.0.0"
+SERVICE_DESCRIPTION="AI-powered stock analysis and trading recommendations"
+ENVIRONMENT="production"  # production, staging, development, testing
+DEBUG="false"
+LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
-APP_HOST=0.0.0.0
-APP_PORT=8000
+# Server Configuration
+APP_HOST="0.0.0.0"
+APP_PORT="8000"
+WEB_CONCURRENCY="4"  # Number of worker processes (2-4x CPU cores)
+MAX_CONCURRENCY="100"  # Maximum concurrent requests per worker
+MAX_REQUESTS="1000"  # Restart worker after N requests (memory management)
+WORKER_TIMEOUT="30"  # Worker timeout in seconds
+
+# API Versioning
+API_VERSION="v1"
+API_PREFIX="/api"
+OPENAPI_URL="/docs"
+REDOC_URL="/redoc"
 
 # =============================================================================
 # SECURITY & AUTHENTICATION (SET AS SECRETS IN RENDER)
 # =============================================================================
 
-# Set these in Render dashboard as SECRET environment variables
-APP_TOKEN=e1a5b2f8-3c9d-4a7b-82f1-5b3c6d9e8f2a
-BACKUP_APP_TOKEN=f7c3d9a1-4b8e-5c2f-93b6-1a4e5d7c8f9b
-TFB_APP_TOKEN=5e5ac1a4-08bf-4602-9a67-7ae781c4923c
-REQUIRE_AUTH=true
+# Authentication Tokens (Set as secrets in production)
+# API_TOKENS="token1:user,token2:premium,token3:admin"
+API_TOKENS=""
+BACKUP_TOKENS=""
+ADMIN_TOKENS=""
 
-ENABLE_RATE_LIMITING=true
-MAX_REQUESTS_PER_MINUTE=60
-CORS_ORIGINS=["*"]
+# Security Settings
+REQUIRE_AUTH="true"
+ENABLE_RATE_LIMITING="true"
+ENABLE_CORS="true"
+ENABLE_HTTPS_REDIRECT="true"
+
+# Rate Limiting
+RATE_LIMIT_ENABLED="true"
+MAX_REQUESTS_PER_MINUTE="120"
+MAX_REQUESTS_PER_HOUR="1000"
+MAX_REQUESTS_PER_DAY="5000"
+RATE_LIMIT_BY_IP="true"
+RATE_LIMIT_BY_TOKEN="true"
+
+# CORS Configuration
+CORS_ORIGINS="*"  # Comma-separated list or "*"
+CORS_METHODS="GET,POST,PUT,DELETE,OPTIONS"
+CORS_HEADERS="*"
+CORS_CREDENTIALS="true"
+CORS_MAX_AGE="600"
+
+# Security Headers
+ENABLE_SECURITY_HEADERS="true"
+HSTS_MAX_AGE="31536000"
+HSTS_INCLUDE_SUBDOMAINS="true"
+X_CONTENT_TYPE_OPTIONS="nosniff"
+X_FRAME_OPTIONS="DENY"
+X_XSS_PROTECTION="1; mode=block"
+
+# JWT Configuration (if using JWT)
+JWT_SECRET_KEY=""  # Set as secret
+JWT_ALGORITHM="HS256"
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES="30"
+JWT_REFRESH_TOKEN_EXPIRE_DAYS="7"
 
 # =============================================================================
-# PROVIDER CONFIGURATION
+# DATABASE & CACHE CONFIGURATION
 # =============================================================================
 
-ENABLED_PROVIDERS=alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp
-PRIMARY_PROVIDER=tadawul_fast_bridge
+# Redis Cache (for distributed caching)
+REDIS_ENABLED="true"
+REDIS_URL=""  # Set as secret: redis://:password@host:port/db
+REDIS_TTL="1800"  # Default cache TTL in seconds (30 minutes)
+REDIS_MAX_CONNECTIONS="20"
+REDIS_POOL_TIMEOUT="10"
+
+# PostgreSQL (if using database)
+DATABASE_ENABLED="false"
+DATABASE_URL=""  # Set as secret: postgresql://user:password@host:port/dbname
+DATABASE_POOL_SIZE="10"
+DATABASE_MAX_OVERFLOW="20"
+DATABASE_POOL_TIMEOUT="30"
+
+# In-Memory Cache
+MEMCACHE_ENABLED="true"
+MEMCACHE_MAX_SIZE="10000"
+MEMCACHE_DEFAULT_TTL="300"  # 5 minutes
+MEMCACHE_CLEANUP_INTERVAL="60"
+
+# Cache Configuration
+CACHE_BACKEND="redis"  # redis, memory, hybrid
+CACHE_PREFIX="tadawul_"
+CACHE_VERSION="v4"
+CACHE_COMPRESSION="true"
+CACHE_SERIALIZER="json"  # json, pickle, msgpack
+
+# =============================================================================
+# PROVIDER CONFIGURATION & API KEYS
+# =============================================================================
+
+# Enabled Data Providers
+ENABLED_PROVIDERS="alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp,polygon,tiingo,yfinance"
+PRIMARY_PROVIDER="tadawul_fast_bridge"
+FALLBACK_PROVIDERS="alpha_vantage,finnhub"
+PROVIDER_PRIORITY="tadawul_fast_bridge,alpha_vantage,finnhub,eodhd,marketstack"
+
+# Provider Rate Limits (requests per minute)
+ALPHA_VANTAGE_RPM="5"
+FINNHUB_RPM="60"
+EODHD_RPM="30"
+MARKETSTACK_RPM="30"
+TWELVEDATA_RPM="8"
+FMP_RPM="250"
+POLYGON_RPM="5"
+TIINGO_RPM="10"
+
+# Alpha Vantage
+ALPHA_VANTAGE_API_KEY=""  # Set as secret
+ALPHA_VANTAGE_BASE_URL="https://www.alphavantage.co/query"
+ALPHA_VANTAGE_PREMIUM="false"
+
+# Finnhub
+FINNHUB_API_KEY=""  # Set as secret
+FINNHUB_BASE_URL="https://finnhub.io/api/v1"
+
+# EODHD
+EODHD_API_KEY=""  # Set as secret
+EODHD_BASE_URL="https://eodhistoricaldata.com/api"
+
+# MarketStack
+MARKETSTACK_API_KEY=""  # Set as secret
+MARKETSTACK_BASE_URL="http://api.marketstack.com/v1"
+
+# Twelve Data
+TWELVEDATA_API_KEY=""  # Set as secret
+TWELVEDATA_BASE_URL="https://api.twelvedata.com"
+
+# Financial Modeling Prep
+FMP_API_KEY=""  # Set as secret
+FMP_BASE_URL="https://financialmodelingprep.com/api/v3"
+
+# Polygon.io
+POLYGON_API_KEY=""  # Set as secret
+POLYGON_BASE_URL="https://api.polygon.io/v2"
+
+# Tiingo
+TIINGO_API_KEY=""  # Set as secret
+TIINGO_BASE_URL="https://api.tiingo.com/tiingo"
+
+# Yahoo Finance (no API key required)
+YFINANCE_ENABLED="true"
+YFINANCE_TIMEOUT="10"
 
 # =============================================================================
 # TADAWUL FAST BRIDGE CONFIGURATION
 # =============================================================================
 
-BACKEND_BASE_URL=https://tadawul-fast-bridge.onrender.com
-FASTAPI_BASE=https://tadawul-fast-bridge.onrender.com
-BASE_URL=https://investment-api.onrender.com
+TADAWUL_FAST_BRIDGE_ENABLED="true"
+TADAWUL_FAST_BRIDGE_URL="https://tadawul-fast-bridge.onrender.com"
+TADAWUL_FAST_BRIDGE_TIMEOUT="15"
+TADAWUL_FAST_BRIDGE_RETRIES="3"
+TADAWUL_FAST_BRIDGE_CACHE_TTL="60"
+
+# Backup Services
+BACKUP_SERVICE_ENABLED="true"
+BACKUP_SERVICE_URL="https://backup-tadawul-service.onrender.com"
+ALTERNATE_BASE_URL="https://investment-api.onrender.com"
+
+# =============================================================================
+# GOOGLE SERVICES CONFIGURATION
+# =============================================================================
+
+# Google Sheets Integration
+GOOGLE_SHEETS_ENABLED="true"
+GOOGLE_SHEETS_SPREADSHEET_ID="19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
+GOOGLE_SHEETS_CREDENTIALS=""  # Set as secret JSON
+GOOGLE_SHEETS_CACHE_TTL="300"
+GOOGLE_SHEETS_RETRY_COUNT="3"
+
+# Google Apps Script
+GOOGLE_APPS_SCRIPT_ENABLED="true"
+GOOGLE_APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbxfJX64vG7AYsTXtmk_v53CxRCc9zqD8kbGR7j4YcEfARH6Tm9KUXrRxZKseMvp_Mzq/exec"
+GOOGLE_APPS_SCRIPT_BACKUP_URL="https://script.google.com/macros/s/AKfycbzIjUOJwzVWQdPpK84g7rEEeKDTFBHfkE_Xcq4qdJrt5Yr4lFxN2acZLiYqapuxmeb-/exec"
+GOOGLE_APPS_SCRIPT_TIMEOUT="10"
 
 # =============================================================================
 # LOGGING & MONITORING
 # =============================================================================
 
-LOG_ENABLE_FILE=false
-LOG_LEVEL=INFO
-LOG_FORMAT=detailed
+# Logging Configuration
+LOG_ENABLE_FILE="true"
+LOG_FILE_PATH="./logs/app.log"
+LOG_ROTATION="1 day"  # 1 day, 1 week, 200 MB
+LOG_RETENTION="30 days"
+LOG_FORMAT="json"  # json, detailed, simple
+LOG_LEVEL_API="INFO"
+LOG_LEVEL_DATABASE="WARNING"
+LOG_LEVEL_CACHE="INFO"
+LOG_LEVEL_PROVIDERS="INFO"
 
-ENABLE_SWAGGER=true
-ENABLE_REDOC=true
+# Monitoring & Metrics
+METRICS_ENABLED="true"
+METRICS_PORT="9090"
+METRICS_PATH="/metrics"
+PROMETHEUS_ENABLED="true"
+HEALTH_CHECK_ENABLED="true"
+HEALTH_CHECK_PATH="/health"
+HEALTH_CHECK_INTERVAL="30"
+
+# Performance Monitoring
+PERFORMANCE_MONITORING="true"
+SLOW_REQUEST_THRESHOLD="5.0"  # seconds
+ERROR_TRACKING_ENABLED="true"
+REQUEST_LOGGING_ENABLED="true"
+
+# Alerting
+ALERT_WEBHOOK_URL=""  # Set as secret
+ALERT_LEVEL="ERROR"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+ALERT_SLACK_WEBHOOK=""  # Set as secret
+ALERT_EMAIL=""  # Set as secret
 
 # =============================================================================
-# GOOGLE SERVICES CONFIGURATION (SET AS SECRETS IN RENDER)
+# AI & ADVANCED ANALYSIS CONFIGURATION
 # =============================================================================
 
-# Set in Render as plain environment variable
-SPREADSHEET_ID=19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw
+# AI Analysis Engine
+ADVANCED_ANALYSIS_ENABLED="true"
+AI_MODEL_VERSION="4.0.0"
+AI_CACHE_TTL="900"  # 15 minutes
+AI_MAX_CONCURRENT_ANALYSIS="5"
+AI_ANALYSIS_TIMEOUT="45"
+AI_QUOTE_TIMEOUT="15"
 
-# Set in Render as plain environment variables
-GOOGLE_APPS_SCRIPT_URL=https://script.google.com/macros/s/AKfycbxfJX64vG7AYsTXtmk_v53CxRCc9zqD8kbGR7j4YcEfARH6Tm9KUXrRxZKseMvp_Mzq/exec
-GOOGLE_APPS_SCRIPT_BACKUP_URL=https://script.google.com/macros/s/AKfycbzIjUOJwzVWQdPpK84g7rEEeKDTFBHfkE_Xcq4qdJrt5Yr4lFxN2acZLiYqapuxmeb-/exec
+# Machine Learning
+ML_ENABLED="true"
+ML_MODEL_PATH="./ml_models"
+ML_CACHE_ENABLED="true"
+ML_PREDICTION_CACHE_TTL="3600"
 
-# SET THIS ONLY IN RENDER DASHBOARD AS A SECRET ENVIRONMENT VARIABLE
-# GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"gen-lang-client-0885310113","private_key_id":"NEW_KEY_ID_HERE","private_key":"-----BEGIN PRIVATE KEY-----\nNEW_PRIVATE_KEY_HERE\n-----END PRIVATE KEY-----\n","client_email":"sheets-data-access@gen-lang-client-0885310113.iam.gserviceaccount.com","client_id":"117620606731724560109","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/sheets-data-access%40gen-lang-client-0885310113.iam.gserviceaccount.com","universe_domain":"googleapis.com"}
+# Sentiment Analysis
+SENTIMENT_ANALYSIS_ENABLED="true"
+SENTIMENT_API_KEY=""  # Set as secret
+SENTIMENT_CACHE_TTL="1800"
 
-# =============================================================================
-# FINANCIAL API CONFIGURATION (SET AS SECRETS IN RENDER)
-# =============================================================================
+# Technical Analysis
+TECHNICAL_ANALYSIS_ENABLED="true"
+TECHNICAL_INDICATORS="rsi,macd,bollinger,moving_averages,stochastic,williams_r,cci,adx,atr"
+TECHNICAL_CACHE_TTL="600"
 
-# Set these in Render dashboard as SECRET environment variables
-ALPHA_VANTAGE_API_KEY=GGGPQXDT8EUZQKC5
-FINNHUB_API_KEY=d4kv6u9r01qt7v17fougd4kv6u9r01qt7v17fov0
-EODHD_API_KEY=68fd1783ee7eb1.12039806
-FMP_API_KEY=3weEgekBXByxCzDGIbXgQ0hgWGZfVKyt
-MARKETSTACK_API_KEY=657b972a96392c3cac405ccc48c36b0c
-TWELVEDATA_API_KEY=ca363b090fbb421a84c05882e4f1e393
-
-EODHD_BASE_URL=https://eodhd.com/api
-FMP_BASE_URL=https://financialmodelingprep.com/api/v3
+# Fundamental Analysis
+FUNDAMENTAL_ANALYSIS_ENABLED="true"
+FUNDAMENTAL_CACHE_TTL="7200"  # 2 hours
 
 # =============================================================================
 # CACHE & PERFORMANCE CONFIGURATION
 # =============================================================================
 
-CACHE_DEFAULT_TTL=1800
-CACHE_MAX_SIZE=10000
-CACHE_BACKUP_ENABLED=true
-CACHE_SAVE_INTERVAL=10
+# Cache Settings
+CACHE_DEFAULT_TTL="1800"
+CACHE_MAX_SIZE_MB="200"
+CACHE_BACKUP_ENABLED="true"
+CACHE_SAVE_INTERVAL="10"
+CACHE_WARMUP_ENABLED="true"
+CACHE_WARMUP_SYMBOLS="7201.SR,1211.SR,2222.SR,2380.SR,4030.SR,4200.SR"
+CACHE_WARMUP_INTERVAL="300"
 
-HTTP_TIMEOUT=30
-MAX_RETRIES=3
-RETRY_DELAY=1.0
+# HTTP Configuration
+HTTP_TIMEOUT="30"
+HTTP_CONNECT_TIMEOUT="10"
+HTTP_READ_TIMEOUT="20"
+HTTP_WRITE_TIMEOUT="20"
+HTTP_MAX_RETRIES="3"
+HTTP_RETRY_DELAY="1.0"
+HTTP_RETRY_BACKOFF_FACTOR="2"
+HTTP_POOL_SIZE="100"
+HTTP_POOL_MAXSIZE="100"
 
-ADVANCED_ANALYSIS_ENABLED=true
+# Connection Pooling
+CONNECTION_POOL_ENABLED="true"
+CONNECTION_POOL_SIZE="10"
+CONNECTION_POOL_MAX_SIZE="20"
+CONNECTION_POOL_RECYCLE="3600"
+CONNECTION_POOL_TIMEOUT="30"
 
 # =============================================================================
 # TADAWUL-SPECIFIC SETTINGS
 # =============================================================================
 
-TADAWUL_MARKET_ENABLED=true
-TADAWUL_REFRESH_INTERVAL=60
-TADAWUL_MAX_SYMBOLS=200
-SAUDI_SYMBOLS=["7201.SR", "1211.SR", "2222.SR", "2380.SR", "4030.SR", "4200.SR"]
+# Market Configuration
+TADAWUL_MARKET_ENABLED="true"
+SAUDI_MARKET_ENABLED="true"
+GLOBAL_MARKET_ENABLED="true"
+
+# Data Refresh
+TADAWUL_REFRESH_INTERVAL="60"  # seconds
+GLOBAL_REFRESH_INTERVAL="300"  # seconds
+HISTORICAL_REFRESH_INTERVAL="86400"  # 24 hours
+
+# Symbols Configuration
+TADAWUL_MAX_SYMBOLS="500"
+GLOBAL_MAX_SYMBOLS="1000"
+POPULAR_SYMBOLS_LIMIT="50"
+
+# Saudi Market Symbols
+SAUDI_SYMBOLS="7201.SR,1211.SR,2222.SR,2380.SR,4030.SR,4200.SR,1120.SR,1150.SR,2010.SR,2020.SR,2030.SR,2050.SR,2060.SR,2080.SR,2090.SR,2100.SR,2110.SR,2120.SR,2140.SR,2150.SR,2160.SR,2170.SR,2180.SR,2190.SR,2200.SR,2210.SR,2220.SR,2230.SR,2240.SR,2250.SR,2260.SR,2270.SR,2280.SR,2290.SR,2300.SR,2310.SR,2320.SR,2330.SR,2340.SR,2350.SR,2360.SR,2370.SR,2380.SR,2390.SR,2400.SR,2410.SR,2420.SR,2430.SR,2440.SR,2450.SR"
+
+# Sector Configuration
+SAUDI_SECTORS="banking,petrochemicals,telecom,cement,retail,insurance,energy,real_estate"
+SECTOR_CACHE_TTL="3600"
+
+# =============================================================================
+# SCHEDULED TASKS & BACKGROUND WORKERS
+# =============================================================================
+
+# Background Workers
+WORKER_ENABLED="true"
+WORKER_CONCURRENCY="3"
+WORKER_MAX_TASKS="100"
+WORKER_TIMEOUT_TASKS="300"
+WORKER_RETRY_ATTEMPTS="3"
+
+# Scheduled Tasks
+SCHEDULER_ENABLED="true"
+CACHE_WARMUP_SCHEDULE="*/30 * * * *"  # Every 30 minutes
+DATA_REFRESH_SCHEDULE="*/15 * * * *"  # Every 15 minutes
+BACKUP_SCHEDULE="0 2 * * *"  # 2 AM daily
+CLEANUP_SCHEDULE="0 3 * * *"  # 3 AM daily
+
+# Data Processing
+BATCH_PROCESSING_ENABLED="true"
+BATCH_SIZE="50"
+BATCH_TIMEOUT="120"
+BATCH_CONCURRENCY="5"
+
+# =============================================================================
+# PERFORMANCE TUNING & OPTIMIZATION
+# =============================================================================
+
+# Memory Management
+MEMORY_LIMIT_MB="512"
+MEMORY_WARNING_THRESHOLD="80"  # Percentage
+MEMORY_CRITICAL_THRESHOLD="90"
+GC_COLLECTION_THRESHOLD="70"
+
+# CPU Optimization
+CPU_AFFINITY_ENABLED="false"
+THREAD_POOL_SIZE="10"
+THREAD_POOL_MAX_SIZE="20"
+
+# Database Optimization
+QUERY_CACHE_ENABLED="true"
+QUERY_CACHE_SIZE="100"
+QUERY_TIMEOUT="10"
+
+# Network Optimization
+TCP_KEEPALIVE="true"
+TCP_KEEPALIVE_IDLE="60"
+TCP_KEEPALIVE_INTERVAL="10"
+TCP_KEEPALIVE_COUNT="5"
+
+# =============================================================================
+# FEATURE FLAGS & EXPERIMENTAL FEATURES
+# =============================================================================
+
+# Feature Flags
+FEATURE_WEBSOCKET_ENABLED="true"
+FEATURE_BATCH_API_ENABLED="true"
+FEATURE_STREAMING_ENABLED="false"
+FEATURE_REALTIME_UPDATES="true"
+FEATURE_PUSH_NOTIFICATIONS="false"
+
+# Experimental Features
+EXPERIMENTAL_AI_PREDICTIONS="true"
+EXPERIMENTAL_SENTIMENT_ANALYSIS="true"
+EXPERIMENTAL_PORTFOLIO_OPTIMIZATION="true"
+EXPERIMENTAL_RISK_ASSESSMENT="true"
+
+# A/B Testing
+AB_TESTING_ENABLED="false"
+AB_TESTING_GROUPS="control,variant_a,variant_b"
+
+# =============================================================================
+# BACKUP & DISASTER RECOVERY
+# =============================================================================
+
+# Backup Configuration
+BACKUP_ENABLED="true"
+BACKUP_INTERVAL="3600"  # 1 hour
+BACKUP_RETENTION_DAYS="7"
+BACKUP_COMPRESSION="true"
+BACKUP_ENCRYPTION="false"
+
+# Disaster Recovery
+DR_ENABLED="true"
+DR_FAILOVER_URL=""  # Set as secret
+DR_HEARTBEAT_INTERVAL="30"
+DR_FAILOVER_THRESHOLD="3"
+
+# Data Persistence
+DATA_PERSISTENCE_ENABLED="true"
+DATA_PERSISTENCE_PATH="./data"
+DATA_PERSISTENCE_INTERVAL="300"
+
+# =============================================================================
+# COMPLIANCE & LEGAL
+# =============================================================================
+
+# Compliance Settings
+GDPR_COMPLIANT="true"
+DATA_RETENTION_DAYS="30"
+PRIVACY_POLICY_URL="https://example.com/privacy"
+TERMS_OF_SERVICE_URL="https://example.com/terms"
+
+# Rate Limit Headers
+RATE_LIMIT_HEADERS_ENABLED="true"
+RATE_LIMIT_HEADER_PREFIX="X-RateLimit"
+
+# =============================================================================
+# DEPLOYMENT & INFRASTRUCTURE
+# =============================================================================
+
+# Platform Configuration
+PLATFORM="render"  # render, heroku, aws, gcp, azure, docker
+REGION="us-east"  # us-east, eu-west, asia-southeast
+
+# Scaling Configuration
+AUTO_SCALING_ENABLED="false"
+MIN_INSTANCES="1"
+MAX_INSTANCES="3"
+SCALE_UP_THRESHOLD="80"  # CPU percentage
+SCALE_DOWN_THRESHOLD="30"
+
+# Load Balancer
+LOAD_BALANCER_ENABLED="false"
+LOAD_BALANCER_STICKY_SESSIONS="false"
+
+# DNS & Networking
+CDN_ENABLED="false"
+CDN_PROVIDER="cloudflare"
+SSL_ENABLED="true"
+SSL_CERT_PATH="./ssl"
+
+# =============================================================================
+# DEVELOPER & DEBUGGING TOOLS
+# =============================================================================
+
+# Development Tools
+SWAGGER_ENABLED="true"
+REDOC_ENABLED="true"
+API_EXPLORER_ENABLED="true"
+DEBUG_TOOLBAR_ENABLED="false"
+
+# Testing
+TEST_MODE="false"
+TEST_API_KEY="test_token_12345"
+MOCK_PROVIDERS_ENABLED="false"
+
+# Profiling
+PROFILING_ENABLED="false"
+PROFILING_PATH="./profiles"
+PROFILING_INTERVAL="60"
+
+# =============================================================================
+# ENVIRONMENT VALIDATION RULES
+# =============================================================================
+
+# Required Variables (must be set in production)
+REQUIRED_VARIABLES="APP_HOST,APP_PORT,ENVIRONMENT,LOG_LEVEL"
+
+# Validation Rules
+MIN_WORKERS="1"
+MAX_WORKERS="8"
+MIN_PORT="1024"
+MAX_PORT="65535"
+
+# =============================================================================
+# TEMPLATE FOR SECRETS (Copy to Render/Heroku dashboard)
+# =============================================================================
+
+# Copy these to your deployment platform as SECRET environment variables:
+
+# API_TOKENS=token1:user,token2:premium,token3:admin
+# BACKUP_TOKENS=backup1:user,backup2:admin
+# ADMIN_TOKENS=admin1:superadmin
+# JWT_SECRET_KEY=your-super-secret-jwt-key-here
+# REDIS_URL=redis://:password@host:port/db
+# DATABASE_URL=postgresql://user:password@host:port/dbname
+# ALPHA_VANTAGE_API_KEY=YOUR_ALPHA_VANTAGE_KEY
+# FINNHUB_API_KEY=YOUR_FINNHUB_KEY
+# EODHD_API_KEY=YOUR_EODHD_KEY
+# MARKETSTACK_API_KEY=YOUR_MARKETSTACK_KEY
+# TWELVEDATA_API_KEY=YOUR_TWELVEDATA_KEY
+# FMP_API_KEY=YOUR_FMP_KEY
+# POLYGON_API_KEY=YOUR_POLYGON_KEY
+# TIINGO_API_KEY=YOUR_TIINGO_KEY
+# GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"...","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n","client_email":"..."}
+# SENTIMENT_API_KEY=YOUR_SENTIMENT_KEY
+# ALERT_WEBHOOK_URL=https://hooks.slack.com/services/...
+# ALERT_SLACK_WEBHOOK=https://hooks.slack.com/services/...
+# ALERT_EMAIL=alerts@example.com
+# DR_FAILOVER_URL=https://backup-api.example.com
+
+# =============================================================================
+# ENVIRONMENT-SPECIFIC OVERRIDES
+# =============================================================================
+
+# Development Environment (override in development.env)
+if [ "$ENVIRONMENT" = "development" ]; then
+    DEBUG="true"
+    LOG_LEVEL="DEBUG"
+    CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
+    ENABLE_RATE_LIMITING="false"
+    CACHE_DEFAULT_TTL="60"
+    TEST_MODE="true"
+fi
+
+# Staging Environment (override in staging.env)
+if [ "$ENVIRONMENT" = "staging" ]; then
+    DEBUG="true"
+    LOG_LEVEL="INFO"
+    CORS_ORIGINS="https://staging.example.com"
+    MAX_REQUESTS_PER_MINUTE="30"
+    TEST_MODE="true"
+fi
+
+# Testing Environment (override in testing.env)
+if [ "$ENVIRONMENT" = "testing" ]; then
+    DEBUG="true"
+    LOG_LEVEL="DEBUG"
+    ENABLE_RATE_LIMITING="false"
+    CACHE_DEFAULT_TTL="10"
+    TEST_MODE="true"
+    MOCK_PROVIDERS_ENABLED="true"
+fi
+
+# =============================================================================
+# DEPLOYMENT NOTES
+# =============================================================================
+
+# Render.com Deployment:
+# 1. Set environment to "production"
+# 2. Add all secret variables in Render dashboard
+# 3. Set WEB_CONCURRENCY based on pricing tier
+# 4. Configure health check at /health
+# 5. Set up auto-deploy from GitHub
+
+# Heroku Deployment:
+# 1. Set config vars in Heroku dashboard
+# 2. Set web dyno scaling
+# 3. Add Redis add-on if needed
+# 4. Configure log drains
+
+# Docker Deployment:
+# 1. Build with: docker build -t tadawul-api .
+# 2. Run with: docker run -p 8000:8000 --env-file .env tadawul-api
+# 3. Use docker-compose for multi-container setup
+
+# Local Development:
+# 1. Copy .env.example to .env.local
+# 2. Set ENVIRONMENT=development
+# 3. Run: python main.py
+# 4. Access at: http://localhost:8000/docs
+
+# =============================================================================
+# PERFORMANCE TUNING GUIDE
+# =============================================================================
+
+# For 512MB memory:
+# WEB_CONCURRENCY=2
+# MAX_CONCURRENCY=50
+# REDIS_MAX_CONNECTIONS=10
+# WORKER_CONCURRENCY=2
+
+# For 1GB memory:
+# WEB_CONCURRENCY=4
+# MAX_CONCURRENCY=100
+# REDIS_MAX_CONNECTIONS=20
+# WORKER_CONCURRENCY=3
+
+# For 2GB+ memory:
+# WEB_CONCURRENCY=8
+# MAX_CONCURRENCY=200
+# REDIS_MAX_CONNECTIONS=30
+# WORKER_CONCURRENCY=5
+
+# =============================================================================
+# TROUBLESHOOTING
+# =============================================================================
+
+# Common Issues:
+# 1. Memory leaks: Set MAX_REQUESTS to restart workers periodically
+# 2. Rate limiting: Adjust MAX_REQUESTS_PER_MINUTE based on API quotas
+# 3. Timeout errors: Increase HTTP_TIMEOUT and RETRY settings
+# 4. Cache issues: Check Redis connection and TTL settings
+# 5. API key limits: Monitor provider rate limits and adjust RPM settings
+
+# Monitoring Endpoints:
+# - Health: /health
+# - Metrics: /metrics (Prometheus format)
+# - Cache Stats: /api/v1/cache/stats
+# - API Stats: /api/v1/stats
+# - Provider Status: /api/v1/providers/status
+
+# =============================================================================
+# VERSION HISTORY
+# =============================================================================
+
+# v4.0.0 - Enhanced production configuration with comprehensive settings
+# v3.7.0 - Previous version with basic configuration
+# v3.0.0 - Initial production release
+# v2.0.0 - Beta release with multiple providers
+# v1.0.0 - Initial release with Tadawul integration
+
+# =============================================================================
+# END OF ENVIRONMENT CONFIGURATION
+# =============================================================================
