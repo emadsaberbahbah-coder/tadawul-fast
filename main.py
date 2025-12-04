@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.5.3
-Production-ready with hybrid EODHD providers and fundamentals service
+Tadawul Stock Analysis API - Enhanced Version 3.6.0
+Production-ready with:
+- Hybrid EODHD providers and fundamentals service
+- Advanced multi-source AI Trading Analysis (advanced_analysis.py)
+- Hard timeouts to avoid endless loading in web/UI
 """
 
 import asyncio
@@ -38,10 +41,10 @@ from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 
 from routes_argaam import router as argaam_router
-from routes.enriched_quote import router as enriched_quote_router  # NEW ✅
-from routes.ai_analysis import router as ai_analysis_router        # NEW ✅ AI router
+from routes.enriched_quote import router as enriched_quote_router
+from routes.ai_analysis import router as ai_analysis_router
 
-# --- Advanced AI Trading Analysis integration (safe import) ---
+# --- Advanced AI Trading Analysis integration (safe import) -------------------
 try:
     from advanced_analysis import (
         analyzer,                    # Global AdvancedTradingAnalyzer instance
@@ -66,11 +69,11 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    """Enhanced configuration management with validation"""
+    """Enhanced configuration management with validation and safe defaults."""
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.5.3", env="SERVICE_VERSION")
+    service_version: str = Field("3.6.0", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -85,7 +88,7 @@ class Settings(BaseSettings):
     enable_rate_limiting: bool = Field(True, env="ENABLE_RATE_LIMITING")
     max_requests_per_minute: int = Field(60, env="MAX_REQUESTS_PER_MINUTE")
 
-    # CORS - Support both JSON and comma-separated values
+    # CORS - supports JSON string or comma-separated list
     cors_origins: List[str] = Field(default_factory=lambda: ["*"], env="CORS_ORIGINS")
 
     # Documentation
@@ -119,7 +122,7 @@ class Settings(BaseSettings):
     cache_backup_enabled: bool = Field(True, env="CACHE_BACKUP_ENABLED")
     cache_save_interval: int = Field(10, env="CACHE_SAVE_INTERVAL")  # seconds
 
-    # Performance (more conservative defaults)
+    # Performance (more conservative defaults to avoid endless waits)
     http_timeout: int = Field(10, env="HTTP_TIMEOUT")
     max_retries: int = Field(2, env="MAX_RETRIES")
     retry_delay: float = Field(0.7, env="RETRY_DELAY")
@@ -139,70 +142,75 @@ class Settings(BaseSettings):
 
     @validator("cors_origins", pre=True)
     def parse_cors_origins(cls, v):
-        """Parse CORS origins from both JSON and comma-separated formats"""
+        """Parse CORS origins from JSON string or comma-separated string."""
         if isinstance(v, str):
-            # Try to parse as JSON first
+            v = v.strip()
+            # Try JSON array first: '["https://a","https://b"]'
             if v.startswith("[") and v.endswith("]"):
                 try:
-                    return json.loads(v)
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(o).strip() for o in parsed if str(o).strip()]
                 except json.JSONDecodeError:
                     pass
-            # Fall back to comma-separated
+            # Fallback: comma-separated list
             return [origin.strip() for origin in v.split(",") if origin.strip()]
         return v
 
     @property
     def is_production(self) -> bool:
-        return self.environment == "production"
+        return self.environment.lower() == "production"
 
     @property
     def is_development(self) -> bool:
-        return self.environment == "development"
+        return self.environment.lower() == "development"
 
     @property
     def has_google_sheets_access(self) -> bool:
-        """Check if we have either direct Sheets access or Apps Script"""
+        """Check if we have either direct Sheets access or Apps Script."""
         return bool(self.google_sheets_credentials or self.google_apps_script_url)
 
     def validate_configuration(self) -> List[str]:
-        """Validate configuration and return list of errors (warnings are logged separately)"""
+        """
+        Validate configuration and return list of *errors*.
+        Warnings are logged but do not block startup (except in strict cases).
+        """
         errors: List[str] = []
         warnings: List[str] = []
 
         # Auth validation
         if self.require_auth and not any([self.app_token, self.backup_app_token]):
             if self.is_production:
-                errors.append("Authentication required but no tokens configured in production")
+                errors.append("Authentication required but no APP_TOKEN/BACKUP_APP_TOKEN configured.")
             else:
-                warnings.append("Authentication required but no tokens configured")
+                warnings.append("Authentication required but no tokens configured (dev).")
 
         # Google services validation
         if not self.has_google_sheets_access:
-            warnings.append("No Google Sheets or Apps Script configuration - limited functionality")
+            warnings.append("No Google Sheets or Apps Script configured - some features limited.")
 
-        # Apps Script URL validation (soft – never blocks startup)
+        # Apps Script URL sanity
         if self.google_apps_script_url:
             url = self.google_apps_script_url.strip()
             if url in ["", "undefined"]:
-                warnings.append("GOOGLE_APPS_SCRIPT_URL looks invalid ('undefined' or empty)")
+                warnings.append("GOOGLE_APPS_SCRIPT_URL looks invalid ('undefined' or empty).")
             elif not url.startswith(("http://", "https://")):
-                warnings.append("GOOGLE_APPS_SCRIPT_URL has unexpected format (should start with http/https)")
+                warnings.append("GOOGLE_APPS_SCRIPT_URL should start with http(s).")
 
-        # Analysis engine vs configuration
+        # Analysis engine availability vs config
         if self.advanced_analysis_enabled and analyzer is None:
             warnings.append(
-                "ADVANCED_ANALYSIS_ENABLED is True but analysis engine is not available "
-                "(advanced_analysis import failed or not deployed)."
+                "ADVANCED_ANALYSIS_ENABLED=True but advanced_analysis engine is not available "
+                "(import failed or not deployed)."
             )
 
-        # Log warnings
-        for warning in warnings:
-            logging.warning(f"⚠️ {warning}")
+        for w in warnings:
+            logging.warning(f"⚠️ {w}")
 
         return errors
 
     def log_config_summary(self):
-        """Log configuration summary without sensitive data"""
+        """Log configuration summary without sensitive values."""
         logging.info(f"🔧 {self.service_name} v{self.service_version}")
         logging.info(f"🌍 Environment: {self.environment} (Production: {self.is_production})")
         logging.info(f"🔐 Auth: {'Enabled' if self.require_auth else 'Disabled'}")
@@ -210,7 +218,6 @@ class Settings(BaseSettings):
         logging.info(f"📊 Google Services: {'Available' if self.has_google_sheets_access else 'Not Available'}")
         logging.info(f"💾 Cache: TTL={self.cache_default_ttl}s, Save Interval={self.cache_save_interval}s")
 
-        # Count configured APIs
         configured_apis = sum(
             [
                 bool(self.alpha_vantage_api_key),
@@ -219,7 +226,7 @@ class Settings(BaseSettings):
                 bool(self.fmp_api_key),
             ]
         )
-        logging.info(f"📈 Financial APIs: {configured_apis} configured")
+        logging.info(f"📈 Financial APIs configured: {configured_apis}")
         logging.info(
             f"🤖 Analysis Engine Enabled (config): {self.advanced_analysis_enabled} | "
             f"Available (import): {analyzer is not None}"
@@ -231,10 +238,10 @@ settings = Settings()
 
 # === Global timeouts (central control) =======================================
 
-# Overall timeout for quote endpoints (v1, v4.1)
+# Bounded quote timeout: prevents endless loading from frontend
 QUOTE_OVERALL_TIMEOUT_SECONDS = max(6.0, float(settings.http_timeout) + 2.0)
 
-# Overall timeout for analysis endpoints (multi-source & recommendation)
+# Bounded analysis timeout for AI endpoints
 ANALYSIS_OVERALL_TIMEOUT_SECONDS = max(8.0, float(settings.http_timeout) + 4.0)
 
 # =============================================================================
@@ -243,12 +250,14 @@ ANALYSIS_OVERALL_TIMEOUT_SECONDS = max(8.0, float(settings.http_timeout) + 4.0)
 
 
 def setup_logging():
-    """Configure structured logging with request context"""
+    """Configure structured logging with request context."""
     log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
 
-    # Configure format
     if settings.log_format == "detailed":
-        log_format = "%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
+        log_format = (
+            "%(asctime)s - %(name)s - %(levelname)s - "
+            "[%(filename)s:%(lineno)d] - %(message)s"
+        )
     else:
         log_format = "%(asctime)s - %(levelname)s - %(message)s"
 
@@ -263,7 +272,7 @@ def setup_logging():
         handlers=handlers,
     )
 
-    # Suppress noisy loggers
+    # Reduce noise from uvicorn access logs
     logging.getLogger("uvicorn.access").disabled = True
 
 
@@ -282,7 +291,7 @@ class QuoteStatus(str, Enum):
 
 
 class Quote(BaseModel):
-    """Unified quote model for all endpoints"""
+    """Unified quote model for all quote-related endpoints."""
 
     ticker: str = Field(..., description="Stock ticker symbol")
     status: QuoteStatus = Field(QuoteStatus.OK, description="Quote status")
@@ -296,7 +305,7 @@ class Quote(BaseModel):
     high_price: Optional[float] = Field(None, ge=0, description="Daily high")
     low_price: Optional[float] = Field(None, ge=0, description="Daily low")
 
-    # Fundamental data fields (for future extension)
+    # Fundamental data fields (optional, used if provider returns them)
     pe_ratio: Optional[float] = Field(None, description="Price-to-Earnings ratio")
     pb_ratio: Optional[float] = Field(None, description="Price-to-Book ratio")
     roe: Optional[float] = Field(None, description="Return on Equity")
@@ -306,9 +315,9 @@ class Quote(BaseModel):
     exchange: Optional[str] = Field(None, description="Stock exchange")
     sector: Optional[str] = Field(None, description="Company sector")
     country: Optional[str] = Field(None, description="Country code")
-    provider: Optional[str] = Field(None, description="Data provider")
+    provider: Optional[str] = Field(None, description="Data provider source name")
     as_of: Optional[datetime.datetime] = Field(None, description="Quote timestamp")
-    message: Optional[str] = Field(None, description="Status message")
+    message: Optional[str] = Field(None, description="Status or diagnostic message")
 
     @validator("ticker")
     def validate_ticker(cls, v: str) -> str:
@@ -319,7 +328,7 @@ class Quote(BaseModel):
 
 
 class QuotesResponse(BaseModel):
-    """Standardized quotes response"""
+    """Standardized quotes response with metadata."""
 
     timestamp: datetime.datetime = Field(..., description="Response timestamp")
     symbols: List[Quote] = Field(..., description="List of quotes")
@@ -327,7 +336,7 @@ class QuotesResponse(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Standardized error response"""
+    """Standardized error response."""
 
     error: str = Field(..., description="Error type")
     message: str = Field(..., description="Error message")
@@ -337,21 +346,21 @@ class ErrorResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Enhanced health check response"""
+    """Enhanced health check response."""
 
     status: str = Field(..., description="Service status")
     version: str = Field(..., description="API version")
     timestamp: datetime.datetime = Field(..., description="Current timestamp")
-    uptime_seconds: float = Field(..., description="Service uptime")
+    uptime_seconds: float = Field(..., description="Service uptime in seconds")
     dependencies: Dict[str, Any] = Field(..., description="Dependency status")
 
 
 class QuoteRequest(BaseModel):
-    """Quote request model"""
+    """Quote request model for POST refresh."""
 
-    symbols: List[str] = Field(..., description="List of symbols to fetch")
-    cache_ttl: Optional[int] = Field(None, description="Cache TTL in seconds (future use)")
-    providers: Optional[List[str]] = Field(None, description="Preferred providers")
+    symbols: List[str] = Field(..., description="List of symbols to fetch/refresh")
+    cache_ttl: Optional[int] = Field(None, description="Reserved for per-call TTL override")
+    providers: Optional[List[str]] = Field(None, description="Preferred providers (future use)")
 
 
 # =============================================================================
@@ -362,7 +371,13 @@ import threading
 
 
 class TTLCache:
-    """Enhanced TTL cache with batched writes and thread safety"""
+    """
+    Enhanced TTL cache with:
+    - Thread safety
+    - Batched disk writes
+    - Size enforcement
+    - Diagnostics (hit rate, errors, etc.)
+    """
 
     def __init__(self, ttl_seconds: int = None, max_size: int = None, save_interval: int = None):
         self.cache_path = Path(__file__).parent / "quote_cache.json"
@@ -374,7 +389,6 @@ class TTLCache:
         self.max_size = max_size or settings.cache_max_size
         self.save_interval = save_interval or settings.cache_save_interval
 
-        # Thread safety and batching
         self._lock = threading.Lock()
         self._dirty = False
         self._last_save = time.time()
@@ -391,17 +405,16 @@ class TTLCache:
         self._load_cache()
 
     def _is_valid(self, item: Dict[str, Any], now: Optional[float] = None) -> bool:
-        """Check if cache item is still valid"""
         if now is None:
             now = time.time()
-        timestamp = item.get("_cache_timestamp", 0)
-        return (now - timestamp) < self.ttl
+        ts = item.get("_cache_timestamp", 0)
+        return (now - ts) < self.ttl
 
     def _load_cache(self) -> bool:
-        """Load cache from disk"""
+        """Load cache from disk on startup; discard expired entries."""
         try:
             if not self.cache_path.exists():
-                logger.info("No cache file found, starting with empty cache")
+                logger.info("No existing quote_cache.json file; starting empty cache.")
                 return True
 
             with open(self.cache_path, "r", encoding="utf-8") as f:
@@ -410,6 +423,7 @@ class TTLCache:
             now = time.time()
             valid_items: Dict[str, Dict[str, Any]] = {}
 
+            # Support both old + new structures
             if isinstance(raw_data, dict) and "data" in raw_data:
                 for item in raw_data["data"]:
                     if isinstance(item, dict) and "ticker" in item and self._is_valid(item, now):
@@ -426,10 +440,11 @@ class TTLCache:
         except Exception as e:
             logger.error(f"❌ Failed to load cache: {e}")
             self.metrics["errors"] += 1
+            self.data = {}
             return False
 
     def _save_cache_immediate(self) -> bool:
-        """Immediate cache save (used for critical operations)"""
+        """Immediate save to disk; used by flush() and batched writes."""
         with self._lock:
             try:
                 if len(self.data) > self.max_size:
@@ -461,13 +476,13 @@ class TTLCache:
                 return False
 
     def _schedule_save(self):
-        """Schedule a batched save if enough time has passed"""
+        """Schedule batched save if threshold reached."""
         now = time.time()
         if self._dirty and (now - self._last_save) >= self.save_interval:
             self._save_cache_immediate()
 
     def _enforce_size_limit(self):
-        """Enforce cache size limit (lock must already be held by caller)"""
+        """Remove oldest items if cache size exceeds max_size."""
         if len(self.data) <= self.max_size:
             return
 
@@ -479,17 +494,16 @@ class TTLCache:
             self.metrics["expired_removals"] += 1
 
     def get(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get quote from cache with thread safety"""
+        """Get quote from cache; returns copy without internal metadata."""
         symbol = symbol.upper().strip()
 
         with self._lock:
             if symbol in self.data and self._is_valid(self.data[symbol]):
                 self.metrics["hits"] += 1
-                # Return copy without internal metadata
-                clean_data = {k: v for k, v in self.data[symbol].items() if not k.startswith("_")}
-                return clean_data
+                clean = {k: v for k, v in self.data[symbol].items() if not k.startswith("_")}
+                return clean
 
-            # Remove expired entry
+            # If present but expired -> remove
             if symbol in self.data:
                 del self.data[symbol]
                 self._dirty = True
@@ -499,7 +513,7 @@ class TTLCache:
             return None
 
     def set(self, symbol: str, quote: Dict[str, Any]) -> None:
-        """Set quote in cache with batched saves"""
+        """Insert or update a quote in cache."""
         symbol = symbol.upper().strip()
         quote_data = quote.copy()
         quote_data["_cache_timestamp"] = time.time()
@@ -512,44 +526,43 @@ class TTLCache:
             self._schedule_save()
 
     def cleanup_expired(self) -> int:
-        """Clean up expired entries"""
+        """Remove expired items; return count removed."""
         now = time.time()
-        expired_tickers = []
+        expired: List[str] = []
 
         with self._lock:
-            expired_tickers = [ticker for ticker, item in self.data.items() if not self._is_valid(item, now)]
+            expired = [t for t, item in self.data.items() if not self._is_valid(item, now)]
 
-            for ticker in expired_tickers:
-                del self.data[ticker]
+            for t in expired:
+                del self.data[t]
                 self.metrics["expired_removals"] += 1
 
-            if expired_tickers:
+            if expired:
                 self._dirty = True
                 self._schedule_save()
-                logger.info(f"🧹 Removed {len(expired_tickers)} expired cache entries")
+                logger.info(f"🧹 Removed {len(expired)} expired cache entries")
 
-        return len(expired_tickers)
+        return len(expired)
 
     def flush(self) -> bool:
-        """Force immediate cache save"""
+        """Force immediate save to disk if there are pending changes."""
         if self._dirty:
             return self._save_cache_immediate()
         return True
 
     def get_item_count(self) -> int:
-        """Get current item count with thread safety"""
         with self._lock:
             return len(self.data)
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
+        """Return diagnostic information about cache state/performance."""
         now = time.time()
         with self._lock:
             valid_count = sum(1 for item in self.data.values() if self._is_valid(item, now))
             expired_count = len(self.data) - valid_count
 
             total_requests = self.metrics["hits"] + self.metrics["misses"]
-            hit_rate = (self.metrics["hits"] / total_requests * 100) if total_requests > 0 else 0
+            hit_rate = (self.metrics["hits"] / total_requests * 100) if total_requests > 0 else 0.0
 
             return {
                 "total_items": len(self.data),
@@ -580,14 +593,13 @@ cache = TTLCache()
 
 
 class HTTPClient:
-    """Shared HTTP client with retry logic and connection pooling"""
+    """Shared aiohttp client with retry logic and connection pooling."""
 
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.timeout = aiohttp.ClientTimeout(total=settings.http_timeout)
 
     async def get_session(self) -> aiohttp.ClientSession:
-        """Get or create shared session"""
         if self.session is None:
             connector = aiohttp.TCPConnector(
                 limit=100,
@@ -611,9 +623,9 @@ class HTTPClient:
         params: Optional[Dict[str, Any]] = None,
         max_retries: Optional[int] = None,
     ) -> Optional[Any]:
-        """Make HTTP request with retry logic"""
+        """Make HTTP request with retry & exponential backoff."""
         max_retries = max_retries or settings.max_retries
-        last_exception = None
+        last_exception: Optional[Exception] = None
 
         for attempt in range(max_retries):
             try:
@@ -622,15 +634,15 @@ class HTTPClient:
                     if response.status == 200:
                         return await response.json()
                     else:
-                        error_text = await response.text()
-                        last_exception = Exception(f"HTTP {response.status}: {error_text}")
+                        text = await response.text()
+                        last_exception = Exception(f"HTTP {response.status}: {text[:200]}")
             except asyncio.TimeoutError:
                 last_exception = Exception(f"Timeout after {settings.http_timeout}s")
             except Exception as e:
                 last_exception = e
 
             if attempt < max_retries - 1:
-                wait_time = settings.retry_delay * (2 ** attempt)  # Exponential backoff
+                wait_time = settings.retry_delay * (2 ** attempt)
                 logger.debug(f"Retry {attempt + 1}/{max_retries} in {wait_time:.1f}s for {url}")
                 await asyncio.sleep(wait_time)
 
@@ -638,7 +650,6 @@ class HTTPClient:
         return None
 
     async def close(self):
-        """Close the session"""
         if self.session:
             await self.session.close()
             self.session = None
@@ -648,12 +659,12 @@ class HTTPClient:
 http_client = HTTPClient()
 
 # =============================================================================
-# Enhanced Provider Abstraction (Quotes)
+# Provider Abstractions (Quotes)
 # =============================================================================
 
 
 class ProviderClient(Protocol):
-    """Provider interface"""
+    """Provider interface for quote providers."""
 
     name: str
     rate_limit: int
@@ -663,7 +674,7 @@ class ProviderClient(Protocol):
 
 
 class AlphaVantageProvider:
-    """Alpha Vantage provider implementation (fallback)"""
+    """Alpha Vantage provider implementation (fallback)."""
 
     def __init__(self):
         self.name = "alpha_vantage"
@@ -688,7 +699,6 @@ class AlphaVantageProvider:
         return None
 
     def _parse_response(self, data: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
-        """Parse Alpha Vantage response"""
         quote_data = data.get("Global Quote", {})
         if not quote_data:
             return None
@@ -708,19 +718,19 @@ class AlphaVantageProvider:
 
     def _safe_float(self, value: Any) -> Optional[float]:
         try:
-            return float(value) if value is not None and value != "" else None
+            return float(value) if value not in (None, "") else None
         except (ValueError, TypeError):
             return None
 
     def _safe_int(self, value: Any) -> Optional[int]:
         try:
-            return int(float(value)) if value is not None and value != "" else None
+            return int(float(value)) if value not in (None, "") else None
         except (ValueError, TypeError):
             return None
 
 
 class FinnhubProvider:
-    """Finnhub provider implementation"""
+    """Finnhub provider implementation (global equities)."""
 
     def __init__(self):
         self.name = "finnhub"
@@ -766,12 +776,8 @@ class FinnhubProvider:
 
 class FMPProvider:
     """
-    Financial Modeling Prep provider implementation (quotes DISABLED).
-
-    NOTE:
-    - FMP /quote endpoint is now LEGACY and returns 403 for your plan.
-    - To avoid noisy errors & slow retries, this provider is DISABLED for quotes.
-    - FMP is still used in FundamentalsService via /profile when needed.
+    Financial Modeling Prep provider for quotes (DISABLED).
+    Kept only for clarity; fundamentals use /profile endpoint via FundamentalsService.
     """
 
     def __init__(self):
@@ -780,20 +786,15 @@ class FMPProvider:
         self.base_url = settings.fmp_base_url.rstrip("/")
         self.api_key = settings.fmp_api_key
 
-        # IMPORTANT:
-        # Quotes are disabled because /quote is deprecated for non-legacy users.
+        # Quotes disabled due to 403 "Legacy endpoint" issues on /quote
         self.enabled = False
         if self.api_key:
             logger.info(
                 "FMP quote provider is DISABLED (legacy /quote endpoint). "
-                "FMP is still used for fundamentals via /profile when needed."
+                "FMP remains active for fundamentals via /profile."
             )
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Quotes from FMP are disabled to avoid HTTP 403 (Legacy Endpoint) noise.
-        Always returns None so ProviderManager will skip it.
-        """
         return None
 
 
@@ -801,12 +802,12 @@ class EODHDProvider:
     """
     EOD Historical Data provider for real-time quotes.
 
-    Uses: /real-time/{symbol}?api_token=...&fmt=json
+    Endpoint: /real-time/{symbol}?api_token=...&fmt=json
     """
 
     def __init__(self):
         self.name = "eodhd"
-        self.rate_limit = 1000  # per day depends on your plan; logical high default
+        self.rate_limit = 1000  # logical default; real limit depends on plan
         self.base_url = settings.eodhd_base_url.rstrip("/")
         self.api_key = settings.eodhd_api_key
         self.enabled = bool(self.api_key)
@@ -828,12 +829,6 @@ class EODHDProvider:
         return self._parse_quote(data, symbol)
 
     def _parse_quote(self, item: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Map EODHD real-time fields to our unified quote schema.
-        Typical response includes:
-          - code, close, previousClose, change, change_p, volume,
-            open, high, low, timestamp, market_cap, etc.
-        """
         price = self._safe_float(
             item.get("close")
             or item.get("price")
@@ -854,20 +849,14 @@ class EODHDProvider:
         return {
             "ticker": symbol,
             "price": price,
-            "previous_close": self._safe_float(
-                item.get("previousClose") or item.get("previous_close")
-            ),
+            "previous_close": self._safe_float(item.get("previousClose") or item.get("previous_close")),
             "change_value": self._safe_float(item.get("change")),
-            "change_percent": self._safe_float(
-                item.get("change_p") or item.get("changePercent")
-            ),
+            "change_percent": self._safe_float(item.get("change_p") or item.get("changePercent")),
             "volume": self._safe_float(item.get("volume")),
             "open_price": self._safe_float(item.get("open")),
             "high_price": self._safe_float(item.get("high")),
             "low_price": self._safe_float(item.get("low")),
-            "market_cap": self._safe_float(
-                item.get("market_cap") or item.get("marketCap")
-            ),
+            "market_cap": self._safe_float(item.get("market_cap") or item.get("marketCap")),
             "currency": item.get("currency") or item.get("currencyCode"),
             "exchange": item.get("exchange_short_name") or item.get("exchange"),
             "provider": self.name,
@@ -876,23 +865,26 @@ class EODHDProvider:
 
     def _safe_float(self, value: Any) -> Optional[float]:
         try:
-            return float(value) if value is not None and value != "" else None
+            return float(value) if value not in (None, "") else None
         except (ValueError, TypeError):
             return None
 
 
 class ProviderManager:
-    """Enhanced manager for provider selection and fallback"""
+    """
+    Manager to orchestrate providers and implement fallback logic.
+    Provider order is important.
+    """
 
     def __init__(self):
-        # Order matters:
-        # 1) EODHD (primary if configured – you just upgraded)
-        # 2) FMP (quotes disabled – used ONLY in fundamentals layer)
+        # Order:
+        # 1) EODHD (primary for your upgraded plan)
+        # 2) FMP (disabled for quotes; fundamentals only)
         # 3) Finnhub
         # 4) Alpha Vantage
         self.providers: List[ProviderClient] = [
             EODHDProvider(),
-            FMPProvider(),      # kept in list, but enabled=False so skipped for quotes
+            FMPProvider(),   # remains in list but enabled=False so skipped
             FinnhubProvider(),
             AlphaVantageProvider(),
         ]
@@ -901,19 +893,19 @@ class ProviderManager:
         logger.info(f"✅ Enabled providers for quotes: {[p.name for p in self.enabled_providers]}")
 
     async def get_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get quote from providers with enhanced error handling"""
+        """Get quote from first provider that returns valid price."""
         errors = []
 
         for provider in self.enabled_providers:
             try:
                 quote = await provider.get_quote(symbol)
                 if quote and quote.get("price") is not None:
-                    logger.info(f"✅ Got quote for {symbol} from {provider.name}")
+                    logger.info(f"✅ Quote for {symbol} from {provider.name}")
                     return quote
                 else:
-                    errors.append(f"{provider.name}: No data")
+                    errors.append(f"{provider.name}: no data")
             except Exception as e:
-                errors.append(f"{provider.name}: {str(e)}")
+                errors.append(f"{provider.name}: {e}")
                 logger.warning(f"Provider {provider.name} failed for {symbol}: {e}")
                 continue
 
@@ -921,20 +913,18 @@ class ProviderManager:
         return None
 
     async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        """Get multiple quotes in parallel with enhanced error tracking"""
-        tasks = [self.get_quote(symbol) for symbol in symbols]
+        """Get multiple quotes in parallel with safe error handling."""
+        tasks = [self.get_quote(sym) for sym in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        quotes = []
-        for i, result in enumerate(results):
-            symbol = symbols[i]
-            if isinstance(result, dict):
-                quotes.append(result)
-            elif isinstance(result, Exception):
-                logger.error(f"Quote fetch error for {symbol}: {result}")
+        quotes: List[Dict[str, Any]] = []
+        for sym, res in zip(symbols, results):
+            if isinstance(res, dict):
+                quotes.append(res)
+            elif isinstance(res, Exception):
+                logger.error(f"Quote fetch error for {sym}: {res}")
             else:
-                logger.debug(f"No data available for {symbol} from any provider")
-
+                logger.debug(f"No data available for {sym}")
         return quotes
 
 
@@ -948,10 +938,7 @@ provider_manager = ProviderManager()
 
 def is_tadawul_symbol(symbol: str) -> bool:
     """
-    Basic Tadawul symbol detector.
-
-    Tadawul tickers in this project are expected to end with '.SR',
-    e.g. '2222.SR', '1120.SR', etc.
+    Basic Tadawul (.SR) detector.
     """
     if not symbol:
         return False
@@ -959,24 +946,23 @@ def is_tadawul_symbol(symbol: str) -> bool:
 
 
 # =============================================================================
-# Enhanced Quote Service Layer
+# Quote Service Layer
 # =============================================================================
 
 
 class QuoteService:
-    """Enhanced service layer for quote management"""
+    """Service layer orchestrating cache + provider manager."""
 
-    def __init__(self, cache, provider_manager):
+    def __init__(self, cache: TTLCache, provider_manager: ProviderManager):
         self.cache = cache
         self.provider_manager = provider_manager
 
     async def get_quote(self, symbol: str) -> Quote:
-        """Get single quote with enhanced error handling"""
         symbol_norm = symbol.strip().upper()
 
-        # Handle Tadawul upfront – providers on current plan don't support .SR
+        # Tadawul handling: current provider stack doesn't support .SR
         if is_tadawul_symbol(symbol_norm):
-            logger.info(f"Tadawul symbol detected with no enabled providers: {symbol_norm}")
+            logger.info(f"Tadawul symbol detected (no market data plan): {symbol_norm}")
             return Quote(
                 ticker=symbol_norm,
                 status=QuoteStatus.NO_DATA,
@@ -984,54 +970,56 @@ class QuoteService:
                 exchange="TADAWUL",
                 message=(
                     "Tadawul (.SR) market data is not enabled on the current data provider plan. "
-                    "Global / US symbols (e.g. AAPL, MSFT) are supported."
+                    "Global / US symbols (e.g. AAPL, MSFT, GOOGL, AMZN) are supported."
                 ),
             )
 
-        # Try cache first for non-Tadawul
-        cached_quote = self.cache.get(symbol_norm)
-        if cached_quote:
+        # Cache first
+        cached = self.cache.get(symbol_norm)
+        if cached:
             logger.debug(f"Cache hit for {symbol_norm}")
-            return self._create_quote_model(cached_quote, QuoteStatus.OK)
+            return self._create_quote_model(cached, QuoteStatus.OK)
 
-        # Fetch from provider
+        # Provider fallback
         try:
             provider_data = await self.provider_manager.get_quote(symbol_norm)
             if provider_data:
-                # Cache the result
                 self.cache.set(symbol_norm, provider_data)
                 return self._create_quote_model(provider_data, QuoteStatus.OK)
             else:
                 return Quote(
                     ticker=symbol_norm,
                     status=QuoteStatus.NO_DATA,
-                    message="No data available from any provider",
+                    message="No data available from providers",
                 )
         except Exception as e:
             logger.error(f"Error fetching quote for {symbol_norm}: {e}")
             return Quote(
                 ticker=symbol_norm,
                 status=QuoteStatus.ERROR,
-                message=f"Error fetching data: {str(e)}",
+                message=f"Error fetching data: {e}",
             )
 
     async def get_quotes(self, symbols: List[str]) -> QuotesResponse:
-        """Get multiple quotes with efficient caching and error isolation"""
+        """
+        Get multiple quotes with:
+        - Separate treatment for Tadawul vs global
+        - Cache hits recorded
+        - Single provider batch for misses
+        """
         cache_hits: List[Tuple[str, Dict[str, Any]]] = []
         cache_misses: List[str] = []
         sources_used = set()
 
-        # Separate Tadawul and non-Tadawul symbols
-        original_symbols = symbols
         tadawul_quotes: List[Quote] = []
         normal_symbols: List[str] = []
 
-        for raw_symbol in original_symbols:
-            sym = raw_symbol.strip().upper()
+        # 1) Split into Tadawul vs non-Tadawul
+        for raw in symbols:
+            sym = raw.strip().upper()
             if not sym:
                 continue
             if is_tadawul_symbol(sym):
-                logger.info(f"Tadawul symbol detected with no enabled providers: {sym}")
                 tadawul_quotes.append(
                     Quote(
                         ticker=sym,
@@ -1039,69 +1027,65 @@ class QuoteService:
                         currency="SAR",
                         exchange="TADAWUL",
                         message=(
-                            "Tadawul (.SR) market data is not enabled on the current data provider "
-                            "plan. Global / US symbols (e.g. AAPL, MSFT) are supported."
+                            "Tadawul (.SR) market data is not enabled on the current data provider plan. "
+                            "Global / US symbols (e.g. AAPL, MSFT, GOOGL, AMZN) are supported."
                         ),
                     )
                 )
             else:
                 normal_symbols.append(sym)
 
-        # Phase 1: Check cache for non-Tadawul symbols
-        for symbol in normal_symbols:
-            cached_quote = self.cache.get(symbol)
-            if cached_quote:
-                cache_hits.append((symbol, cached_quote))
-                if cached_quote.get("provider"):
-                    sources_used.add(cached_quote["provider"])
+        # 2) Cache check for global symbols
+        for sym in normal_symbols:
+            cached = self.cache.get(sym)
+            if cached:
+                cache_hits.append((sym, cached))
+                if cached.get("provider"):
+                    sources_used.add(cached["provider"])
             else:
-                cache_misses.append(symbol)
+                cache_misses.append(sym)
 
-        # Phase 2: Fetch missing symbols from providers
+        # 3) Provider calls for misses
         provider_quotes: List[Dict[str, Any]] = []
         if cache_misses:
             provider_quotes = await self.provider_manager.get_quotes(cache_misses)
+            for q in provider_quotes:
+                if q and q.get("price") is not None:
+                    s = q["ticker"]
+                    self.cache.set(s, q)
+                    if q.get("provider"):
+                        sources_used.add(q["provider"])
 
-            # Cache successful provider results
-            for provider_quote in provider_quotes:
-                if provider_quote and provider_quote.get("price") is not None:
-                    symbol = provider_quote["ticker"]
-                    self.cache.set(symbol, provider_quote)
-                    if provider_quote.get("provider"):
-                        sources_used.add(provider_quote["provider"])
-
-        # Phase 3: Build final quotes list for non-Tadawul symbols
+        # 4) Build final list for global symbols
         quotes: List[Quote] = []
 
-        # Add cache hits
-        for symbol, cached_data in cache_hits:
-            quotes.append(self._create_quote_model(cached_data, QuoteStatus.OK))
+        # Cache hits first
+        for sym, data in cache_hits:
+            quotes.append(self._create_quote_model(data, QuoteStatus.OK))
 
-        # Add provider results (both successes and failures)
-        provider_results_map = {q["ticker"]: q for q in provider_quotes if q and "ticker" in q}
-
-        for symbol in cache_misses:
-            if symbol in provider_results_map:
-                quotes.append(self._create_quote_model(provider_results_map[symbol], QuoteStatus.OK))
+        # Provider results
+        provider_map = {q["ticker"]: q for q in provider_quotes if q and "ticker" in q}
+        for sym in cache_misses:
+            if sym in provider_map:
+                quotes.append(self._create_quote_model(provider_map[sym], QuoteStatus.OK))
             else:
                 quotes.append(
                     Quote(
-                        ticker=symbol,
+                        ticker=sym,
                         status=QuoteStatus.NO_DATA,
                         message="No data available from providers",
                     )
                 )
 
-        # Combine Tadawul + non-Tadawul quotes
+        # 5) Combine with Tadawul pseudo-quotes
         all_quotes = quotes + tadawul_quotes
 
-        # Prepare metadata
         meta = {
             "cache_hits": len(cache_hits),
             "cache_misses": len(cache_misses),
-            "provider_successes": len(provider_results_map),
+            "provider_successes": len(provider_map),
             "sources": list(sources_used),
-            "total_symbols": len(original_symbols),
+            "total_symbols": len(symbols),
             "successful_quotes": len([q for q in all_quotes if q.status == QuoteStatus.OK]),
         }
 
@@ -1112,14 +1096,14 @@ class QuoteService:
         )
 
     def _create_quote_model(self, data: Dict[str, Any], status: QuoteStatus) -> Quote:
-        """Create Quote model from provider/cache data with proper timestamp handling"""
+        """Map provider/cache dict into Quote model, handling as_of timestamp safely."""
         as_of = data.get("as_of")
         if as_of and isinstance(as_of, str):
             try:
                 as_of = datetime.datetime.fromisoformat(as_of.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 as_of = datetime.datetime.utcnow()
-        else:
+        elif not isinstance(as_of, datetime.datetime):
             as_of = datetime.datetime.utcnow()
 
         return Quote(
@@ -1147,27 +1131,26 @@ class QuoteService:
         )
 
     def update_cache(self, quotes: List[Quote]) -> Dict[str, Any]:
-        """Update cache with new quotes"""
-        updated_count = 0
-        errors = []
+        """Update cache from Quote models (used by /v1/quote/update)."""
+        updated = 0
+        errors: List[str] = []
 
-        for quote in quotes:
-            if quote.status == QuoteStatus.OK and quote.price is not None:
+        for q in quotes:
+            if q.status == QuoteStatus.OK and q.price is not None:
                 try:
-                    quote_data = quote.dict()
-                    self.cache.set(quote.ticker, quote_data)
-                    updated_count += 1
+                    self.cache.set(q.ticker, q.dict())
+                    updated += 1
                 except Exception as e:
-                    errors.append(f"Failed to update {quote.ticker}: {e}")
+                    errors.append(f"Failed to update {q.ticker}: {e}")
 
         return {
-            "updated_count": updated_count,
+            "updated_count": updated,
             "errors": errors,
             "total_cached": cache.get_item_count(),
         }
 
 
-# Global quote service instance
+# Global quote service
 quote_service = QuoteService(cache, provider_manager)
 
 # =============================================================================
@@ -1177,11 +1160,9 @@ quote_service = QuoteService(cache, provider_manager)
 
 class FundamentalsService:
     """
-    Hybrid fundamentals lookup:
-    - For .SR symbols: returns NO_DATA and explains limitation (needs Argaam / static metadata).
-    - For global symbols:
-        1) Try EODHD fundamentals
-        2) Fall back to FMP profile
+    Fundamentals lookup:
+    - Tadawul (.SR): currently returns NO_DATA with explanation.
+    - Global: EODHD fundamentals, fallback to FMP profile.
     """
 
     async def get_fundamentals(self, symbol: str) -> Dict[str, Any]:
@@ -1195,7 +1176,6 @@ class FundamentalsService:
             "message": None,
         }
 
-        # Tadawul: currently no licensed fundamentals provider wired in
         if is_tadawul_symbol(symbol_norm):
             base["message"] = (
                 "Fundamentals for Tadawul (.SR) symbols are not available from the current "
@@ -1203,7 +1183,7 @@ class FundamentalsService:
             )
             return base
 
-        # 1) EODHD fundamentals
+        # 1) Try EODHD fundamentals
         if settings.eodhd_api_key:
             try:
                 eod_data = await self._get_eod_fundamentals(symbol_norm)
@@ -1216,7 +1196,7 @@ class FundamentalsService:
             except Exception as e:
                 logger.warning(f"EODHD fundamentals failed for {symbol_norm}: {e}")
 
-        # 2) FMP profile as fallback
+        # 2) FMP profile fallback
         if settings.fmp_api_key:
             try:
                 fmp_data = await self._get_fmp_fundamentals(symbol_norm)
@@ -1233,15 +1213,9 @@ class FundamentalsService:
         return base
 
     async def _get_eod_fundamentals(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Map EODHD fundamentals into a flat structure that matches your 57-column logic
-        as much as possible (sector, industry, EPS, P/E, P/B, ROE, ROA, D/E, etc.).
-        """
         url = f"{settings.eodhd_base_url}/fundamentals/{symbol}"
-        params = {
-            "api_token": settings.eodhd_api_key,
-            "fmt": "json",
-        }
+        params = {"api_token": settings.eodhd_api_key, "fmt": "json"}
+
         raw = await http_client.request_with_retry("GET", url, params)
         if not raw or not isinstance(raw, dict):
             return None
@@ -1279,14 +1253,9 @@ class FundamentalsService:
             "revenue_growth": growth.get("RevenueYoY"),
             "net_income_growth": growth.get("NetIncomeYoY"),
         }
-
         return result
 
     async def _get_fmp_fundamentals(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Use FMP profile endpoint as a lighter fundamentals backup:
-        sector, industry, currency, marketCap, beta, etc.
-        """
         url = f"{settings.fmp_base_url.rstrip('/')}/profile/{symbol}"
         params = {"apikey": settings.fmp_api_key}
 
@@ -1305,7 +1274,7 @@ class FundamentalsService:
 
         def sfloat(v: Any) -> Optional[float]:
             try:
-                return float(v) if v is not None and v != "" else None
+                return float(v) if v not in (None, "") else None
             except (TypeError, ValueError):
                 return None
 
@@ -1322,15 +1291,14 @@ class FundamentalsService:
             "pe_ratio": sfloat(item.get("pe")),
             "dividend_yield": sfloat(item.get("lastDiv")),
         }
-
         return result
 
 
-# Global fundamentals service instance
+# Global fundamentals service
 fundamentals_service = FundamentalsService()
 
 # =============================================================================
-# Enhanced Security & Auth
+# Security & Auth
 # =============================================================================
 
 security = HTTPBearer(auto_error=False)
@@ -1338,7 +1306,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 
 def get_token_hash(token: str) -> str:
-    """Hash token for secure logging"""
+    """Hash token for logging without revealing it."""
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
@@ -1347,15 +1315,15 @@ def verify_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> bool:
     """
-    Enhanced authentication supporting:
+    Authentication supporting:
     - Authorization: Bearer <token>
-    - Authorization: <token>      (raw header, e.g. from curl or Apps Script)
-    - ?token=<token>              (query parameter)
+    - Authorization: <token>
+    - ?token=<token>
     """
     if not settings.require_auth:
         return True
 
-    valid_tokens = [token for token in [settings.app_token, settings.backup_app_token] if token]
+    valid_tokens = [t for t in [settings.app_token, settings.backup_app_token] if t]
 
     if not valid_tokens:
         if settings.is_production:
@@ -1364,12 +1332,12 @@ def verify_auth(
                 detail="Authentication misconfigured - no tokens available",
             )
         else:
-            logger.warning("REQUIRE_AUTH is True but no valid tokens configured")
+            logger.warning("REQUIRE_AUTH=True but no tokens configured (DEV) -> allowing access")
             return True
 
     token = None
 
-    # 1) Bearer token (parsed by HTTPBearer)
+    # 1) Bearer token
     if credentials:
         token = credentials.credentials.strip()
 
@@ -1377,11 +1345,11 @@ def verify_auth(
     if not token:
         token = request.query_params.get("token", "").strip()
 
-    # 3) Raw Authorization header without 'Bearer '
+    # 3) Raw Authorization header (no 'Bearer ')
     if not token:
-        raw_header = request.headers.get("Authorization", "").strip()
-        if raw_header and not raw_header.lower().startswith("bearer "):
-            token = raw_header
+        raw = request.headers.get("Authorization", "").strip()
+        if raw and not raw.lower().startswith("bearer "):
+            token = raw
 
     if not token:
         logger.warning("Authentication required but no token provided")
@@ -1399,18 +1367,16 @@ def verify_auth(
         )
 
     token_hash = get_token_hash(token)
-    logger.info(f"Successful authentication for token: {token_hash}")
+    logger.info(f"Successful authentication (hash={token_hash})")
     return True
 
 
 def rate_limit(rule: str):
-    """Conditional rate limiting decorator"""
-
+    """Conditional rate limiting decorator wrapper."""
     if not settings.enable_rate_limiting:
-        def noop_decorator(fn):
+        def noop(fn):
             return fn
-
-        return noop_decorator
+        return noop
 
     return limiter.limit(rule)
 
@@ -1421,7 +1387,7 @@ def rate_limit(rule: str):
 
 
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    """Custom rate limit handler with structured error response"""
+    """Custom rate limit handler with structured JSON response."""
     request_id = getattr(request.state, "request_id", "unknown")
 
     return JSONResponse(
@@ -1450,27 +1416,28 @@ APP_START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Enhanced application lifespan management
+    Lifespan: validate configuration, warm cache, cleanly shutdown.
     """
     startup_time = time.time()
 
     try:
-        # Validate configuration
+        # 1) Validate config
         config_errors = settings.validate_configuration()
         if config_errors:
-            error_msg = "Configuration errors:\n" + "\n".join(f"  - {e}" for e in config_errors)
+            msg = "Configuration errors:\n" + "\n".join(f"- {e}" for e in config_errors)
             if settings.is_production:
-                logger.error(f"❌ {error_msg}")
+                logger.error(f"❌ {msg}")
                 raise RuntimeError("Production configuration invalid")
             else:
-                logger.warning(f"⚠️ Configuration warnings in development:\n{error_msg}")
+                logger.warning(f"⚠️ {msg}")
 
+        # 2) Log summary
         settings.log_config_summary()
 
-        # Initialize cache
+        # 3) Cleanup expired cache entries
         expired_count = cache.cleanup_expired()
         if expired_count:
-            logger.info(f"🧹 Cleaned {expired_count} expired cache entries")
+            logger.info(f"🧹 Cleaned {expired_count} expired cache entries on startup")
 
         logger.info("✅ Application startup completed successfully")
 
@@ -1479,12 +1446,13 @@ async def lifespan(app: FastAPI):
         if settings.is_production:
             raise
 
+    # Hand off to request handling
     yield
 
-    # Shutdown cleanup
+    # Shutdown logic
     try:
         cache.flush()
-        logger.info("✅ Cache flushed to disk")
+        logger.info("✅ Cache flushed to disk on shutdown")
 
         await http_client.close()
         logger.info("✅ HTTP client closed")
@@ -1495,7 +1463,6 @@ async def lifespan(app: FastAPI):
                 logger.info("✅ Advanced analysis engine closed")
             except Exception as e:
                 logger.warning(f"⚠️ Error closing analysis engine: {e}")
-
     except Exception as e:
         logger.warning(f"⚠️ Error during shutdown: {e}")
 
@@ -1507,38 +1474,28 @@ app = FastAPI(
     title=settings.service_name,
     version=settings.service_version,
     description="""
-    Enhanced Tadawul Stock Analysis API with EODHD-based data providers,
-    comprehensive financial data integration and AI-powered trading analysis.
+Enhanced Tadawul Stock Analysis API with EODHD-based data providers,
+fundamentals integration, and advanced AI-powered trading analysis.
 
-    ## Features
-
-    * 📈 Real-time stock quotes from multiple financial APIs (EODHD, Finnhub, Alpha Vantage)
-    * 📊 Fundamentals endpoint (EODHD + FMP hybrid)
-    * 🤖 Advanced multi-source AI analysis & recommendations
-    * 🧠 Enriched quote endpoint with data quality & opportunity scoring
-    * 💾 Advanced caching with TTL and batched persistence
-    * 🔐 Comprehensive security with token authentication
-    * ⚡ Async/await for high performance
-    * 🏥 Health monitoring and metrics
-    * 📊 Support for fundamental data (P/E, P/B, ROE, EPS)
-
-    ## Authentication
-
-    Most endpoints require authentication via:
-    - Authorization: Bearer <token>
-    - Authorization: <token>
-    - OR token query parameter: ?token=<token>
-    """,
+Key features:
+- 📈 Real-time global stock quotes (EODHD, Finnhub, Alpha Vantage)
+- 📊 Fundamentals endpoint (EODHD + FMP hybrid)
+- 🤖 Multi-source AI analysis & recommendations (advanced_analysis.py)
+- 🧠 Enriched quote endpoint with data quality & scoring
+- 💾 Persistent TTL cache with batched disk writes
+- 🔐 Token-based authentication
+- ⚡ Async/await architecture with hard request timeouts
+""",
     docs_url="/docs" if settings.enable_swagger else None,
     redoc_url="/redoc" if settings.enable_redoc else None,
     lifespan=lifespan,
-    default_response_class=ORJSONResponse,  # faster JSON serialization
+    default_response_class=ORJSONResponse,
 )
 
 # Attach routers
 app.include_router(argaam_router)
-app.include_router(enriched_quote_router)   # NEW ✅
-app.include_router(ai_analysis_router)      # NEW ✅ AI endpoints under /v1/ai/*
+app.include_router(enriched_quote_router)
+app.include_router(ai_analysis_router)
 
 # CORS
 app.add_middleware(
@@ -1549,7 +1506,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SlowAPI rate limit middleware
+# SlowAPI
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
 app.add_middleware(SlowAPIMiddleware)
@@ -1561,23 +1518,21 @@ app.add_middleware(SlowAPIMiddleware)
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
-    """Add request ID to all requests for correlation"""
+    """Attach request ID + simple timing for each request."""
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
 
-    start_time = time.time()
+    start = time.time()
     response = await call_next(request)
-    process_time = (time.time() - start_time) * 1000
+    duration_ms = (time.time() - start) * 1000
 
     logger.info(
-        f"Request completed: {request.method} {request.url.path} "
-        f"-> {response.status_code} [{process_time:.1f}ms] "
-        f"[{request_id}]"
+        f"{request.method} {request.url.path} -> {response.status_code} "
+        f"[{duration_ms:.1f}ms] [req_id={request_id}]"
     )
 
     response.headers["X-Request-ID"] = request_id
-    response.headers["X-Process-Time"] = f"{process_time:.1f}ms"
-
+    response.headers["X-Process-Time"] = f"{duration_ms:.1f}ms"
     return response
 
 
@@ -1588,12 +1543,11 @@ async def add_request_id(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Enhanced HTTP exception handler"""
     request_id = getattr(request.state, "request_id", "unknown")
 
     logger.warning(
-        f"HTTP {exc.status_code} for {request.method} {request.url.path} "
-        f"[{request_id}]: {exc.detail}"
+        f"HTTP {exc.status_code} {request.method} {request.url.path} "
+        f"[req_id={request_id}]: {exc.detail}"
     )
 
     return JSONResponse(
@@ -1609,12 +1563,11 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler"""
     request_id = getattr(request.state, "request_id", "unknown")
 
     logger.error(
-        f"Unhandled exception for {request.method} {request.url.path} "
-        f"[{request_id}]: {exc}",
+        f"Unhandled error {request.method} {request.url.path} "
+        f"[req_id={request_id}]: {exc}",
         exc_info=settings.debug,
     )
 
@@ -1637,7 +1590,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/", response_model=Dict[str, Any])
 @rate_limit(f"{settings.max_requests_per_minute}/minute")
 async def root(request: Request):
-    """Root endpoint with comprehensive service information"""
+    """Root endpoint: shows status, key endpoints, and basic cache metrics."""
     cache_stats = cache.get_stats()
 
     example_curl = (
@@ -1665,14 +1618,14 @@ async def root(request: Request):
             "quotes_v1": "/v1/quote",
             "quotes_v41": "/v41/quotes",
             "fundamentals": "/v1/fundamentals",
-            "enriched_quote": "/v1/enriched-quote",  # NEW ✅
+            "enriched_quote": "/v1/enriched-quote",
             "cache_info": "/v1/cache/info",
-            # Existing analysis endpoints
+            # Built-in analysis endpoints
             "analysis_multi_source": "/v1/analysis/multi-source",
             "analysis_recommendation": "/v1/analysis/recommendation",
             "analysis_cache_info": "/v1/analysis/cache/info",
             "analysis_cache_clear": "/v1/analysis/cache/clear",
-            # NEW AI router endpoints (under /v1/ai/*)
+            # AI router endpoints
             "ai_recommendation": "/v1/ai/recommendation",
             "ai_multi_source": "/v1/ai/multi-source",
             "ai_cache_info": "/v1/ai/cache/info",
@@ -1688,7 +1641,7 @@ async def root(request: Request):
 @app.get("/health", response_model=HealthResponse)
 @rate_limit("30/minute")
 async def health_check(request: Request):
-    """Enhanced health check with dependency status"""
+    """Health check with dependency diagnostics."""
     cache_stats = cache.get_stats()
 
     analysis_cache_info: Optional[Dict[str, Any]] = None
@@ -1730,11 +1683,13 @@ async def health_check(request: Request):
         },
     }
 
-    critical_services = [
-        dependencies["financial_apis"]["status"],
-        dependencies["cache"]["status"],
-    ]
-    health_status = "healthy" if all(critical_services) else "degraded"
+    critical_services_ok = all(
+        [
+            dependencies["cache"]["status"],
+            dependencies["financial_apis"]["status"],
+        ]
+    )
+    health_status = "healthy" if critical_services_ok else "degraded"
 
     return HealthResponse(
         status=health_status,
@@ -1748,7 +1703,7 @@ async def health_check(request: Request):
 @app.get("/ping")
 @rate_limit("120/minute")
 async def ping(request: Request):
-    """Simple ping endpoint for connectivity testing"""
+    """Simple connectivity check."""
     return {
         "status": "ok",
         "service": settings.service_name,
@@ -1766,16 +1721,10 @@ async def get_quotes_v1(
     auth: bool = Depends(verify_auth),
 ):
     """
-    Get quotes for multiple symbols with cache support
+    Get quotes for multiple symbols with cache + providers.
 
-    - Supports up to 100 symbols per request
-    - Returns standardized quote format
-    - Uses cache with fallback to providers (EODHD first)
-    - Includes comprehensive metadata
-    - Enforces an overall timeout for upstream providers
-
-    Example:
-      GET /v1/quote?tickers=AAPL,MSFT&token=YOUR_APP_TOKEN
+    - Up to 100 symbols per call.
+    - Hard overall timeout to avoid endless loading.
     """
     try:
         symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
@@ -1804,14 +1753,13 @@ async def get_quotes_v1(
                     ticker=sym,
                     status=QuoteStatus.ERROR,
                     message=(
-                        f"Timeout while contacting data providers. "
-                        f"Overall quote timeout={QUOTE_OVERALL_TIMEOUT_SECONDS}s. "
+                        f"Timeout while contacting data providers "
+                        f"(overall={QUOTE_OVERALL_TIMEOUT_SECONDS}s). "
                         "Try fewer symbols or retry later."
                     ),
                 )
                 for sym in symbols
             ]
-
             return QuotesResponse(
                 timestamp=now,
                 symbols=quotes,
@@ -1838,13 +1786,8 @@ async def get_quotes_v41(
     auth: bool = Depends(verify_auth),
 ):
     """
-    v4.1 compatible quotes endpoint
-
-    - Compatible with existing v4.1 clients
-    - Uses the same underlying service as v1
-    - Returns standardized quote format
-    - Includes v4.1 compatibility metadata
-    - Enforces an overall timeout for upstream providers
+    v4.1-compatible quotes endpoint; same logic as /v1/quote but
+    with explicit v4.1 metadata in response.
     """
     try:
         tickers = [t.strip().upper() for t in symbols.split(",") if t.strip()]
@@ -1868,14 +1811,13 @@ async def get_quotes_v41(
                     ticker=sym,
                     status=QuoteStatus.ERROR,
                     message=(
-                        f"Timeout while contacting data providers. "
-                        f"Overall quote timeout={QUOTE_OVERALL_TIMEOUT_SECONDS}s. "
+                        f"Timeout while contacting data providers "
+                        f"(overall={QUOTE_OVERALL_TIMEOUT_SECONDS}s). "
                         "Try fewer symbols or retry later."
                     ),
                 )
                 for sym in tickers
             ]
-
             response = QuotesResponse(
                 timestamp=now,
                 symbols=quotes,
@@ -1891,7 +1833,6 @@ async def get_quotes_v41(
             response.meta = {}
         response.meta["compatibility"] = "v4.1"
         response.meta["api_version"] = "4.1"
-
         return response
 
     except HTTPException:
@@ -1904,25 +1845,22 @@ async def get_quotes_v41(
 @app.post("/v1/quote/update")
 @rate_limit("30/minute")
 async def update_quotes(
-    request: QuoteRequest,
+    request_body: QuoteRequest,
     auth: bool = Depends(verify_auth),
 ):
     """
-    Update quotes in cache with fresh data from providers
+    Refresh quotes for given symbols (cache-aware).
     """
     try:
-        response = await quote_service.get_quotes(request.symbols)
-
+        response = await quote_service.get_quotes(request_body.symbols)
         result = {
             "status": "success",
-            "refreshed_symbols": len(request.symbols),
+            "refreshed_symbols": len(request_body.symbols),
             "successful_quotes": len([q for q in response.symbols if q.status == QuoteStatus.OK]),
             "cache_size": cache.get_item_count(),
             "timestamp": response.timestamp.isoformat(),
         }
-
-        logger.info(f"Refreshed {len(request.symbols)} quotes in cache")
-
+        logger.info(f"Refreshed {len(request_body.symbols)} quotes in cache")
         return result
 
     except Exception as e:
@@ -1936,7 +1874,7 @@ async def get_cache_info(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """Get comprehensive cache information and statistics"""
+    """Return detailed cache statistics."""
     return cache.get_stats()
 
 
@@ -1946,10 +1884,9 @@ async def cleanup_cache(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """Clean up expired cache entries"""
+    """Remove expired cache entries."""
     expired_count = cache.cleanup_expired()
     cache.flush()
-
     return {
         "status": "success",
         "expired_removed": expired_count,
@@ -1964,9 +1901,8 @@ async def flush_cache(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """Force immediate cache save to disk"""
+    """Force immediate cache save to disk."""
     success = cache.flush()
-
     return {
         "status": "success" if success else "error",
         "message": "Cache flushed to disk" if success else "Failed to flush cache",
@@ -1986,9 +1922,7 @@ async def get_fundamentals_v1(
     symbol: str = Query(..., description="Ticker symbol for fundamentals lookup"),
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Hybrid fundamentals endpoint (EODHD + FMP).
-    """
+    """Hybrid fundamentals endpoint (EODHD + FMP)."""
     try:
         result = await fundamentals_service.get_fundamentals(symbol)
         return result
@@ -2003,21 +1937,21 @@ async def get_fundamentals_v1(
 
 
 def ensure_analysis_enabled():
-    """Central check for analysis config + availability"""
+    """Central check for analysis config and availability."""
     if not settings.advanced_analysis_enabled:
         raise HTTPException(
             status_code=503,
-            detail="Analysis engine is disabled by configuration (ADVANCED_ANALYSIS_ENABLED=false)",
+            detail="Analysis engine disabled (ADVANCED_ANALYSIS_ENABLED=false).",
         )
     if analyzer is None:
         raise HTTPException(
             status_code=503,
-            detail="Analysis engine is not available on this instance",
+            detail="Analysis engine is not available on this instance.",
         )
 
 
 # =============================================================================
-# Advanced Analysis Endpoints
+# Advanced Analysis Endpoints (Using advanced_analysis.py)
 # =============================================================================
 
 
@@ -2028,9 +1962,7 @@ async def analysis_multi_source(
     symbol: str = Query(..., description="Single ticker symbol for multi-source analysis"),
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Multi-source analysis endpoint.
-    """
+    """Multi-source price analysis via advanced_analysis."""
     ensure_analysis_enabled()
 
     try:
@@ -2060,12 +1992,10 @@ async def analysis_multi_source(
 @rate_limit("20/minute")
 async def analysis_recommendation(
     request: Request,
-    symbol: str = Query(..., description="Single ticker symbol for AI trading recommendation"),
+    symbol: str = Query(..., description="Ticker symbol for AI trading recommendation"),
     auth: bool = Depends(verify_auth),
 ):
-    """
-    AI trading recommendation endpoint.
-    """
+    """AI trading recommendation via advanced_analysis."""
     ensure_analysis_enabled()
 
     try:
@@ -2073,7 +2003,6 @@ async def analysis_recommendation(
             generate_ai_recommendation(symbol),
             timeout=ANALYSIS_OVERALL_TIMEOUT_SECONDS,
         )
-        # rec may be a model object; keep backward compatibility
         return rec.to_dict() if hasattr(rec, "to_dict") else rec
     except asyncio.TimeoutError:
         logger.warning(
@@ -2098,9 +2027,7 @@ async def analysis_cache_info(
     request: Request,
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Get cache information for the analysis engine.
-    """
+    """Get cache information for the analysis engine."""
     ensure_analysis_enabled()
 
     try:
@@ -2117,13 +2044,11 @@ async def analysis_cache_clear(
     request: Request,
     symbol: Optional[str] = Query(
         None,
-        description="Optional single symbol to clear; if omitted, clears all analysis cache entries",
+        description="Optional symbol to clear from analysis cache; if omitted, clears all.",
     ),
     auth: bool = Depends(verify_auth),
 ):
-    """
-    Clear analysis engine cache.
-    """
+    """Clear analysis engine cache."""
     ensure_analysis_enabled()
 
     try:
@@ -2144,8 +2069,8 @@ async def debug_simple_quote(
     tickers: str = Query(..., description="Comma-separated tickers for debug only"),
 ):
     """
-    VERY SIMPLE: returns fake prices for testing the API pipeline.
-    No external providers. This should ALWAYS respond quickly.
+    Debug endpoint: returns fake prices quickly (no external calls).
+    Useful to verify Sheets/JS integration without hitting real APIs.
     """
     symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     if not symbols:
@@ -2176,14 +2101,14 @@ async def debug_simple_quote(
 @app.get("/debug/saudi-market")
 async def debug_saudi_market(limit: int = Query(5, ge=1, le=50)):
     """
-    Simple stub market snapshot. No external API calls.
+    Simple stubbed Saudi market snapshot (no external APIs).
     """
     now_ts = datetime.datetime.utcnow().isoformat() + "Z"
 
-    sample = []
     base_symbols = ["1120.SR", "2010.SR", "2020.SR", "7200.SR", "2222.SR"]
     names = ["Riyad Bank", "SABIC", "Maaden", "Arabian Internet", "Aramco"]
 
+    sample = []
     for i in range(min(limit, len(base_symbols))):
         sample.append(
             {
@@ -2206,7 +2131,7 @@ async def debug_saudi_market(limit: int = Query(5, ge=1, le=50)):
 
 
 # =============================================================================
-# OFFICIAL SAUDI MARKET ENDPOINT (CURRENTLY USING DEBUG STUB)
+# Official Saudi Market Endpoint (currently stubbed)
 # =============================================================================
 
 
@@ -2220,12 +2145,10 @@ async def saudi_market_official(
     """
     Official Saudi market endpoint.
 
-    CURRENT BEHAVIOR:
-    - Uses the debug_saudi_market stub (no external APIs)
-    - Always fast and safe for testing Google Sheets + Apps Script
-
+    CURRENT:
+      - Uses debug_saudi_market stub (no external APIs).
     FUTURE:
-    - Can be wired to real Tadawul/Argaam provider when available.
+      - Replace stub with Argaam/Tadawul provider integration.
     """
     try:
         data = await debug_saudi_market(limit=limit)
@@ -2241,7 +2164,7 @@ async def saudi_market_official(
 
 
 def main():
-    """Application entry point with enhanced startup banner"""
+    """Application entry point."""
     logger.info("=" * 70)
     logger.info(f"🚀 {settings.service_name} v{settings.service_version}")
     logger.info(f"🌍 Environment: {settings.environment} (Production: {settings.is_production})")
@@ -2250,8 +2173,8 @@ def main():
     logger.info(f"📊 Google Services: {'Available' if settings.has_google_sheets_access else 'Not Available'}")
     logger.info(f"💾 Cache: {cache.get_item_count()} items, Save Interval: {settings.cache_save_interval}s")
     logger.info(
-        f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled "
-        f"-> {[p.name for p in provider_manager.enabled_providers]}"
+        f"📈 Financial APIs: {len(provider_manager.enabled_providers)} enabled -> "
+        f"{[p.name for p in provider_manager.enabled_providers]}"
     )
     logger.info(
         f"🤖 Analysis Engine: "
@@ -2270,7 +2193,7 @@ def main():
         "main:app",
         host=settings.app_host,
         port=settings.app_port,
-        reload=False,  # important: avoid reload loops on Render
+        reload=False,  # important for Render to avoid multiple workers / reload loops
         log_level="info",
     )
 
