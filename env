@@ -1,630 +1,2259 @@
 # =============================================================================
-# Tadawul Stock Analysis API - Enhanced Environment Configuration
-# Version: 4.0.0 | Environment: Production-Ready
-# 
-# SECURITY WARNING: DO NOT COMMIT SECRETS TO VERSION CONTROL
-# Use Render/Heroku environment variables for sensitive data
+# Tadawul Stock Analysis API - Enhanced Production Server
+# Version: 4.0.0
+# Python: 3.11.x
+# Environment: Production
+# Author: Trading & Analytics Team
 # =============================================================================
 
-# =============================================================================
-# APPLICATION CORE SETTINGS
-# =============================================================================
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
+from contextlib import asynccontextmanager
+from pathlib import Path
+from enum import Enum
 
-# Basic Application
-SERVICE_NAME="Tadawul Stock Analysis API"
-SERVICE_VERSION="4.0.0"
-SERVICE_DESCRIPTION="AI-powered stock analysis and trading recommendations"
-ENVIRONMENT="production"  # production, staging, development, testing
-DEBUG="false"
-LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-
-# Server Configuration
-APP_HOST="0.0.0.0"
-APP_PORT="8000"
-WEB_CONCURRENCY="4"  # Number of worker processes (2-4x CPU cores)
-MAX_CONCURRENCY="100"  # Maximum concurrent requests per worker
-MAX_REQUESTS="1000"  # Restart worker after N requests (memory management)
-WORKER_TIMEOUT="30"  # Worker timeout in seconds
-
-# API Versioning
-API_VERSION="v1"
-API_PREFIX="/api"
-OPENAPI_URL="/docs"
-REDOC_URL="/redoc"
-
-# =============================================================================
-# SECURITY & AUTHENTICATION (SET AS SECRETS IN RENDER)
-# =============================================================================
-
-# Authentication Tokens (Set as secrets in production)
-# API_TOKENS="token1:user,token2:premium,token3:admin"
-API_TOKENS=""
-BACKUP_TOKENS=""
-ADMIN_TOKENS=""
-
-# Security Settings
-REQUIRE_AUTH="true"
-ENABLE_RATE_LIMITING="true"
-ENABLE_CORS="true"
-ENABLE_HTTPS_REDIRECT="true"
+# Core Framework
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, status, BackgroundTasks, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 
 # Rate Limiting
-RATE_LIMIT_ENABLED="true"
-MAX_REQUESTS_PER_MINUTE="120"
-MAX_REQUESTS_PER_HOUR="1000"
-MAX_REQUESTS_PER_DAY="5000"
-RATE_LIMIT_BY_IP="true"
-RATE_LIMIT_BY_TOKEN="true"
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-# CORS Configuration
-CORS_ORIGINS="*"  # Comma-separated list or "*"
-CORS_METHODS="GET,POST,PUT,DELETE,OPTIONS"
-CORS_HEADERS="*"
-CORS_CREDENTIALS="true"
-CORS_MAX_AGE="600"
+# Data Models & Configuration
+from pydantic import BaseModel, Field, validator, root_validator, ConfigDict
+from pydantic_settings import BaseSettings
+from pydantic.functional_validators import field_validator
 
-# Security Headers
-ENABLE_SECURITY_HEADERS="true"
-HSTS_MAX_AGE="31536000"
-HSTS_INCLUDE_SUBDOMAINS="true"
-X_CONTENT_TYPE_OPTIONS="nosniff"
-X_FRAME_OPTIONS="DENY"
-X_XSS_PROTECTION="1; mode=block"
-
-# JWT Configuration (if using JWT)
-JWT_SECRET_KEY=""  # Set as secret
-JWT_ALGORITHM="HS256"
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES="30"
-JWT_REFRESH_TOKEN_EXPIRE_DAYS="7"
-
-# =============================================================================
-# DATABASE & CACHE CONFIGURATION
-# =============================================================================
-
-# Redis Cache (for distributed caching)
-REDIS_ENABLED="true"
-REDIS_URL=""  # Set as secret: redis://:password@host:port/db
-REDIS_TTL="1800"  # Default cache TTL in seconds (30 minutes)
-REDIS_MAX_CONNECTIONS="20"
-REDIS_POOL_TIMEOUT="10"
-
-# PostgreSQL (if using database)
-DATABASE_ENABLED="false"
-DATABASE_URL=""  # Set as secret: postgresql://user:password@host:port/dbname
-DATABASE_POOL_SIZE="10"
-DATABASE_MAX_OVERFLOW="20"
-DATABASE_POOL_TIMEOUT="30"
-
-# In-Memory Cache
-MEMCACHE_ENABLED="true"
-MEMCACHE_MAX_SIZE="10000"
-MEMCACHE_DEFAULT_TTL="300"  # 5 minutes
-MEMCACHE_CLEANUP_INTERVAL="60"
-
-# Cache Configuration
-CACHE_BACKEND="redis"  # redis, memory, hybrid
-CACHE_PREFIX="tadawul_"
-CACHE_VERSION="v4"
-CACHE_COMPRESSION="true"
-CACHE_SERIALIZER="json"  # json, pickle, msgpack
-
-# =============================================================================
-# PROVIDER CONFIGURATION & API KEYS
-# =============================================================================
-
-# Enabled Data Providers
-ENABLED_PROVIDERS="alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp,polygon,tiingo,yfinance"
-PRIMARY_PROVIDER="tadawul_fast_bridge"
-FALLBACK_PROVIDERS="alpha_vantage,finnhub"
-PROVIDER_PRIORITY="tadawul_fast_bridge,alpha_vantage,finnhub,eodhd,marketstack"
-
-# Provider Rate Limits (requests per minute)
-ALPHA_VANTAGE_RPM="5"
-FINNHUB_RPM="60"
-EODHD_RPM="30"
-MARKETSTACK_RPM="30"
-TWELVEDATA_RPM="8"
-FMP_RPM="250"
-POLYGON_RPM="5"
-TIINGO_RPM="10"
-
-# Alpha Vantage
-ALPHA_VANTAGE_API_KEY=""  # Set as secret
-ALPHA_VANTAGE_BASE_URL="https://www.alphavantage.co/query"
-ALPHA_VANTAGE_PREMIUM="false"
-
-# Finnhub
-FINNHUB_API_KEY=""  # Set as secret
-FINNHUB_BASE_URL="https://finnhub.io/api/v1"
-
-# EODHD
-EODHD_API_KEY=""  # Set as secret
-EODHD_BASE_URL="https://eodhistoricaldata.com/api"
-
-# MarketStack
-MARKETSTACK_API_KEY=""  # Set as secret
-MARKETSTACK_BASE_URL="http://api.marketstack.com/v1"
-
-# Twelve Data
-TWELVEDATA_API_KEY=""  # Set as secret
-TWELVEDATA_BASE_URL="https://api.twelvedata.com"
-
-# Financial Modeling Prep
-FMP_API_KEY=""  # Set as secret
-FMP_BASE_URL="https://financialmodelingprep.com/api/v3"
-
-# Polygon.io
-POLYGON_API_KEY=""  # Set as secret
-POLYGON_BASE_URL="https://api.polygon.io/v2"
-
-# Tiingo
-TIINGO_API_KEY=""  # Set as secret
-TIINGO_BASE_URL="https://api.tiingo.com/tiingo"
-
-# Yahoo Finance (no API key required)
-YFINANCE_ENABLED="true"
-YFINANCE_TIMEOUT="10"
-
-# =============================================================================
-# TADAWUL FAST BRIDGE CONFIGURATION
-# =============================================================================
-
-TADAWUL_FAST_BRIDGE_ENABLED="true"
-TADAWUL_FAST_BRIDGE_URL="https://tadawul-fast-bridge.onrender.com"
-TADAWUL_FAST_BRIDGE_TIMEOUT="15"
-TADAWUL_FAST_BRIDGE_RETRIES="3"
-TADAWUL_FAST_BRIDGE_CACHE_TTL="60"
-
-# Backup Services
-BACKUP_SERVICE_ENABLED="true"
-BACKUP_SERVICE_URL="https://backup-tadawul-service.onrender.com"
-ALTERNATE_BASE_URL="https://investment-api.onrender.com"
-
-# =============================================================================
-# GOOGLE SERVICES CONFIGURATION
-# =============================================================================
-
-# Google Sheets Integration
-GOOGLE_SHEETS_ENABLED="true"
-GOOGLE_SHEETS_SPREADSHEET_ID="19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
-GOOGLE_SHEETS_CREDENTIALS=""  # Set as secret JSON
-GOOGLE_SHEETS_CACHE_TTL="300"
-GOOGLE_SHEETS_RETRY_COUNT="3"
-
-# Google Apps Script
-GOOGLE_APPS_SCRIPT_ENABLED="true"
-GOOGLE_APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbxfJX64vG7AYsTXtmk_v53CxRCc9zqD8kbGR7j4YcEfARH6Tm9KUXrRxZKseMvp_Mzq/exec"
-GOOGLE_APPS_SCRIPT_BACKUP_URL="https://script.google.com/macros/s/AKfycbzIjUOJwzVWQdPpK84g7rEEeKDTFBHfkE_Xcq4qdJrt5Yr4lFxN2acZLiYqapuxmeb-/exec"
-GOOGLE_APPS_SCRIPT_TIMEOUT="10"
-
-# =============================================================================
-# LOGGING & MONITORING
-# =============================================================================
-
-# Logging Configuration
-LOG_ENABLE_FILE="true"
-LOG_FILE_PATH="./logs/app.log"
-LOG_ROTATION="1 day"  # 1 day, 1 week, 200 MB
-LOG_RETENTION="30 days"
-LOG_FORMAT="json"  # json, detailed, simple
-LOG_LEVEL_API="INFO"
-LOG_LEVEL_DATABASE="WARNING"
-LOG_LEVEL_CACHE="INFO"
-LOG_LEVEL_PROVIDERS="INFO"
-
-# Monitoring & Metrics
-METRICS_ENABLED="true"
-METRICS_PORT="9090"
-METRICS_PATH="/metrics"
-PROMETHEUS_ENABLED="true"
-HEALTH_CHECK_ENABLED="true"
-HEALTH_CHECK_PATH="/health"
-HEALTH_CHECK_INTERVAL="30"
-
-# Performance Monitoring
-PERFORMANCE_MONITORING="true"
-SLOW_REQUEST_THRESHOLD="5.0"  # seconds
-ERROR_TRACKING_ENABLED="true"
-REQUEST_LOGGING_ENABLED="true"
-
-# Alerting
-ALERT_WEBHOOK_URL=""  # Set as secret
-ALERT_LEVEL="ERROR"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-ALERT_SLACK_WEBHOOK=""  # Set as secret
-ALERT_EMAIL=""  # Set as secret
-
-# =============================================================================
-# AI & ADVANCED ANALYSIS CONFIGURATION
-# =============================================================================
-
-# AI Analysis Engine
-ADVANCED_ANALYSIS_ENABLED="true"
-AI_MODEL_VERSION="4.0.0"
-AI_CACHE_TTL="900"  # 15 minutes
-AI_MAX_CONCURRENT_ANALYSIS="5"
-AI_ANALYSIS_TIMEOUT="45"
-AI_QUOTE_TIMEOUT="15"
-
-# Machine Learning
-ML_ENABLED="true"
-ML_MODEL_PATH="./ml_models"
-ML_CACHE_ENABLED="true"
-ML_PREDICTION_CACHE_TTL="3600"
-
-# Sentiment Analysis
-SENTIMENT_ANALYSIS_ENABLED="true"
-SENTIMENT_API_KEY=""  # Set as secret
-SENTIMENT_CACHE_TTL="1800"
-
-# Technical Analysis
-TECHNICAL_ANALYSIS_ENABLED="true"
-TECHNICAL_INDICATORS="rsi,macd,bollinger,moving_averages,stochastic,williams_r,cci,adx,atr"
-TECHNICAL_CACHE_TTL="600"
-
-# Fundamental Analysis
-FUNDAMENTAL_ANALYSIS_ENABLED="true"
-FUNDAMENTAL_CACHE_TTL="7200"  # 2 hours
-
-# =============================================================================
-# CACHE & PERFORMANCE CONFIGURATION
-# =============================================================================
-
-# Cache Settings
-CACHE_DEFAULT_TTL="1800"
-CACHE_MAX_SIZE_MB="200"
-CACHE_BACKUP_ENABLED="true"
-CACHE_SAVE_INTERVAL="10"
-CACHE_WARMUP_ENABLED="true"
-CACHE_WARMUP_SYMBOLS="7201.SR,1211.SR,2222.SR,2380.SR,4030.SR,4200.SR"
-CACHE_WARMUP_INTERVAL="300"
-
-# HTTP Configuration
-HTTP_TIMEOUT="30"
-HTTP_CONNECT_TIMEOUT="10"
-HTTP_READ_TIMEOUT="20"
-HTTP_WRITE_TIMEOUT="20"
-HTTP_MAX_RETRIES="3"
-HTTP_RETRY_DELAY="1.0"
-HTTP_RETRY_BACKOFF_FACTOR="2"
-HTTP_POOL_SIZE="100"
-HTTP_POOL_MAXSIZE="100"
-
-# Connection Pooling
-CONNECTION_POOL_ENABLED="true"
-CONNECTION_POOL_SIZE="10"
-CONNECTION_POOL_MAX_SIZE="20"
-CONNECTION_POOL_RECYCLE="3600"
-CONNECTION_POOL_TIMEOUT="30"
-
-# =============================================================================
-# TADAWUL-SPECIFIC SETTINGS
-# =============================================================================
-
-# Market Configuration
-TADAWUL_MARKET_ENABLED="true"
-SAUDI_MARKET_ENABLED="true"
-GLOBAL_MARKET_ENABLED="true"
-
-# Data Refresh
-TADAWUL_REFRESH_INTERVAL="60"  # seconds
-GLOBAL_REFRESH_INTERVAL="300"  # seconds
-HISTORICAL_REFRESH_INTERVAL="86400"  # 24 hours
-
-# Symbols Configuration
-TADAWUL_MAX_SYMBOLS="500"
-GLOBAL_MAX_SYMBOLS="1000"
-POPULAR_SYMBOLS_LIMIT="50"
-
-# Saudi Market Symbols
-SAUDI_SYMBOLS="7201.SR,1211.SR,2222.SR,2380.SR,4030.SR,4200.SR,1120.SR,1150.SR,2010.SR,2020.SR,2030.SR,2050.SR,2060.SR,2080.SR,2090.SR,2100.SR,2110.SR,2120.SR,2140.SR,2150.SR,2160.SR,2170.SR,2180.SR,2190.SR,2200.SR,2210.SR,2220.SR,2230.SR,2240.SR,2250.SR,2260.SR,2270.SR,2280.SR,2290.SR,2300.SR,2310.SR,2320.SR,2330.SR,2340.SR,2350.SR,2360.SR,2370.SR,2380.SR,2390.SR,2400.SR,2410.SR,2420.SR,2430.SR,2440.SR,2450.SR"
-
-# Sector Configuration
-SAUDI_SECTORS="banking,petrochemicals,telecom,cement,retail,insurance,energy,real_estate"
-SECTOR_CACHE_TTL="3600"
-
-# =============================================================================
-# SCHEDULED TASKS & BACKGROUND WORKERS
-# =============================================================================
-
-# Background Workers
-WORKER_ENABLED="true"
-WORKER_CONCURRENCY="3"
-WORKER_MAX_TASKS="100"
-WORKER_TIMEOUT_TASKS="300"
-WORKER_RETRY_ATTEMPTS="3"
-
-# Scheduled Tasks
-SCHEDULER_ENABLED="true"
-CACHE_WARMUP_SCHEDULE="*/30 * * * *"  # Every 30 minutes
-DATA_REFRESH_SCHEDULE="*/15 * * * *"  # Every 15 minutes
-BACKUP_SCHEDULE="0 2 * * *"  # 2 AM daily
-CLEANUP_SCHEDULE="0 3 * * *"  # 3 AM daily
+# HTTP Clients
+import httpx
+import aiohttp
+import requests
+from aiohttp import ClientTimeout, TCPConnector
+from httpx import AsyncClient, Limits, Timeout
 
 # Data Processing
-BATCH_PROCESSING_ENABLED="true"
-BATCH_SIZE="50"
-BATCH_TIMEOUT="120"
-BATCH_CONCURRENCY="5"
+import pandas as pd
+import numpy as np
+from pandas import DataFrame, Series
+import openpyxl
+from openpyxl import Workbook
+
+# Google Services
+import gspread
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# Web Scraping
+from bs4 import BeautifulSoup
+import lxml.html
+from lxml import etree
+import html5lib
+
+# Error Handling & Resilience
+from tenacity import (
+    retry, stop_after_attempt, wait_exponential, wait_random,
+    retry_if_exception_type, stop_after_delay, wait_fixed
+)
+
+# Monitoring & Logging
+import structlog
+from structlog import get_logger
+from structlog.stdlib import BoundLogger
+import prometheus_client
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, REGISTRY
+from prometheus_client.core import CollectorRegistry
+
+# Security
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import bcrypt
+import cryptography
+from cryptography.fernet import Fernet
+
+# Caching
+import redis
+from redis import Redis
+from redis.exceptions import RedisError
+import aioredis
+from cachetools import TTLCache, LRUCache, cached
+from cachetools.keys import hashkey
+
+# Database (Optional)
+from sqlalchemy import create_engine, text, select, update, delete, insert
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+import asyncpg
+
+# Utilities
+import orjson
+from dateutil import parser, relativedelta
+import pytz
+from pytz import timezone as pytz_timezone
+import tzdata
+import cachetools
+import email_validator
+from email_validator import validate_email
+import jsonschema
+from jsonschema import validate
+
+# AI & ML Libraries
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import joblib
+import pickle
+
+# System Monitoring
+import psutil
+import gc
+
+# WebSocket Support
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 # =============================================================================
-# PERFORMANCE TUNING & OPTIMIZATION
+# Environment Configuration & Settings
 # =============================================================================
 
-# Memory Management
-MEMORY_LIMIT_MB="512"
-MEMORY_WARNING_THRESHOLD="80"  # Percentage
-MEMORY_CRITICAL_THRESHOLD="90"
-GC_COLLECTION_THRESHOLD="70"
+class Environment(str, Enum):
+    """Environment types."""
+    DEVELOPMENT = "development"
+    STAGING = "staging"
+    PRODUCTION = "production"
+    TESTING = "testing"
 
-# CPU Optimization
-CPU_AFFINITY_ENABLED="false"
-THREAD_POOL_SIZE="10"
-THREAD_POOL_MAX_SIZE="20"
+class CacheBackend(str, Enum):
+    """Cache backend types."""
+    REDIS = "redis"
+    MEMORY = "memory"
+    HYBRID = "hybrid"
 
-# Database Optimization
-QUERY_CACHE_ENABLED="true"
-QUERY_CACHE_SIZE="100"
-QUERY_TIMEOUT="10"
+class Provider(str, Enum):
+    """Data provider types."""
+    TADAWUL_FAST_BRIDGE = "tadawul_fast_bridge"
+    ALPHA_VANTAGE = "alpha_vantage"
+    FINNHUB = "finnhub"
+    EODHD = "eodhd"
+    MARKETSTACK = "marketstack"
+    TWELVEDATA = "twelvedata"
+    FMP = "fmp"
+    POLYGON = "polygon"
+    TIINGO = "tiingo"
+    YFINANCE = "yfinance"
 
-# Network Optimization
-TCP_KEEPALIVE="true"
-TCP_KEEPALIVE_IDLE="60"
-TCP_KEEPALIVE_INTERVAL="10"
-TCP_KEEPALIVE_COUNT="5"
-
-# =============================================================================
-# FEATURE FLAGS & EXPERIMENTAL FEATURES
-# =============================================================================
-
-# Feature Flags
-FEATURE_WEBSOCKET_ENABLED="true"
-FEATURE_BATCH_API_ENABLED="true"
-FEATURE_STREAMING_ENABLED="false"
-FEATURE_REALTIME_UPDATES="true"
-FEATURE_PUSH_NOTIFICATIONS="false"
-
-# Experimental Features
-EXPERIMENTAL_AI_PREDICTIONS="true"
-EXPERIMENTAL_SENTIMENT_ANALYSIS="true"
-EXPERIMENTAL_PORTFOLIO_OPTIMIZATION="true"
-EXPERIMENTAL_RISK_ASSESSMENT="true"
-
-# A/B Testing
-AB_TESTING_ENABLED="false"
-AB_TESTING_GROUPS="control,variant_a,variant_b"
-
-# =============================================================================
-# BACKUP & DISASTER RECOVERY
-# =============================================================================
-
-# Backup Configuration
-BACKUP_ENABLED="true"
-BACKUP_INTERVAL="3600"  # 1 hour
-BACKUP_RETENTION_DAYS="7"
-BACKUP_COMPRESSION="true"
-BACKUP_ENCRYPTION="false"
-
-# Disaster Recovery
-DR_ENABLED="true"
-DR_FAILOVER_URL=""  # Set as secret
-DR_HEARTBEAT_INTERVAL="30"
-DR_FAILOVER_THRESHOLD="3"
-
-# Data Persistence
-DATA_PERSISTENCE_ENABLED="true"
-DATA_PERSISTENCE_PATH="./data"
-DATA_PERSISTENCE_INTERVAL="300"
-
-# =============================================================================
-# COMPLIANCE & LEGAL
-# =============================================================================
-
-# Compliance Settings
-GDPR_COMPLIANT="true"
-DATA_RETENTION_DAYS="30"
-PRIVACY_POLICY_URL="https://example.com/privacy"
-TERMS_OF_SERVICE_URL="https://example.com/terms"
-
-# Rate Limit Headers
-RATE_LIMIT_HEADERS_ENABLED="true"
-RATE_LIMIT_HEADER_PREFIX="X-RateLimit"
-
-# =============================================================================
-# DEPLOYMENT & INFRASTRUCTURE
-# =============================================================================
-
-# Platform Configuration
-PLATFORM="render"  # render, heroku, aws, gcp, azure, docker
-REGION="us-east"  # us-east, eu-west, asia-southeast
-
-# Scaling Configuration
-AUTO_SCALING_ENABLED="false"
-MIN_INSTANCES="1"
-MAX_INSTANCES="3"
-SCALE_UP_THRESHOLD="80"  # CPU percentage
-SCALE_DOWN_THRESHOLD="30"
-
-# Load Balancer
-LOAD_BALANCER_ENABLED="false"
-LOAD_BALANCER_STICKY_SESSIONS="false"
-
-# DNS & Networking
-CDN_ENABLED="false"
-CDN_PROVIDER="cloudflare"
-SSL_ENABLED="true"
-SSL_CERT_PATH="./ssl"
-
-# =============================================================================
-# DEVELOPER & DEBUGGING TOOLS
-# =============================================================================
-
-# Development Tools
-SWAGGER_ENABLED="true"
-REDOC_ENABLED="true"
-API_EXPLORER_ENABLED="true"
-DEBUG_TOOLBAR_ENABLED="false"
-
-# Testing
-TEST_MODE="false"
-TEST_API_KEY="test_token_12345"
-MOCK_PROVIDERS_ENABLED="false"
-
-# Profiling
-PROFILING_ENABLED="false"
-PROFILING_PATH="./profiles"
-PROFILING_INTERVAL="60"
-
-# =============================================================================
-# ENVIRONMENT VALIDATION RULES
-# =============================================================================
-
-# Required Variables (must be set in production)
-REQUIRED_VARIABLES="APP_HOST,APP_PORT,ENVIRONMENT,LOG_LEVEL"
-
-# Validation Rules
-MIN_WORKERS="1"
-MAX_WORKERS="8"
-MIN_PORT="1024"
-MAX_PORT="65535"
-
-# =============================================================================
-# TEMPLATE FOR SECRETS (Copy to Render/Heroku dashboard)
-# =============================================================================
-
-# Copy these to your deployment platform as SECRET environment variables:
-
-# API_TOKENS=token1:user,token2:premium,token3:admin
-# BACKUP_TOKENS=backup1:user,backup2:admin
-# ADMIN_TOKENS=admin1:superadmin
-# JWT_SECRET_KEY=your-super-secret-jwt-key-here
-# REDIS_URL=redis://:password@host:port/db
-# DATABASE_URL=postgresql://user:password@host:port/dbname
-# ALPHA_VANTAGE_API_KEY=YOUR_ALPHA_VANTAGE_KEY
-# FINNHUB_API_KEY=YOUR_FINNHUB_KEY
-# EODHD_API_KEY=YOUR_EODHD_KEY
-# MARKETSTACK_API_KEY=YOUR_MARKETSTACK_KEY
-# TWELVEDATA_API_KEY=YOUR_TWELVEDATA_KEY
-# FMP_API_KEY=YOUR_FMP_KEY
-# POLYGON_API_KEY=YOUR_POLYGON_KEY
-# TIINGO_API_KEY=YOUR_TIINGO_KEY
-# GOOGLE_SHEETS_CREDENTIALS={"type":"service_account","project_id":"...","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n","client_email":"..."}
-# SENTIMENT_API_KEY=YOUR_SENTIMENT_KEY
-# ALERT_WEBHOOK_URL=https://hooks.slack.com/services/...
-# ALERT_SLACK_WEBHOOK=https://hooks.slack.com/services/...
-# ALERT_EMAIL=alerts@example.com
-# DR_FAILOVER_URL=https://backup-api.example.com
-
-# =============================================================================
-# ENVIRONMENT-SPECIFIC OVERRIDES
-# =============================================================================
-
-# Development Environment (override in development.env)
-if [ "$ENVIRONMENT" = "development" ]; then
-    DEBUG="true"
-    LOG_LEVEL="DEBUG"
-    CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
-    ENABLE_RATE_LIMITING="false"
-    CACHE_DEFAULT_TTL="60"
-    TEST_MODE="true"
-fi
-
-# Staging Environment (override in staging.env)
-if [ "$ENVIRONMENT" = "staging" ]; then
-    DEBUG="true"
-    LOG_LEVEL="INFO"
-    CORS_ORIGINS="https://staging.example.com"
-    MAX_REQUESTS_PER_MINUTE="30"
-    TEST_MODE="true"
-fi
-
-# Testing Environment (override in testing.env)
-if [ "$ENVIRONMENT" = "testing" ]; then
-    DEBUG="true"
-    LOG_LEVEL="DEBUG"
-    ENABLE_RATE_LIMITING="false"
-    CACHE_DEFAULT_TTL="10"
-    TEST_MODE="true"
-    MOCK_PROVIDERS_ENABLED="true"
-fi
-
-# =============================================================================
-# DEPLOYMENT NOTES
-# =============================================================================
-
-# Render.com Deployment:
-# 1. Set environment to "production"
-# 2. Add all secret variables in Render dashboard
-# 3. Set WEB_CONCURRENCY based on pricing tier
-# 4. Configure health check at /health
-# 5. Set up auto-deploy from GitHub
-
-# Heroku Deployment:
-# 1. Set config vars in Heroku dashboard
-# 2. Set web dyno scaling
-# 3. Add Redis add-on if needed
-# 4. Configure log drains
-
-# Docker Deployment:
-# 1. Build with: docker build -t tadawul-api .
-# 2. Run with: docker run -p 8000:8000 --env-file .env tadawul-api
-# 3. Use docker-compose for multi-container setup
-
-# Local Development:
-# 1. Copy .env.example to .env.local
-# 2. Set ENVIRONMENT=development
-# 3. Run: python main.py
-# 4. Access at: http://localhost:8000/docs
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+    
+    # Application Core
+    service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
+    service_version: str = Field("4.0.0", env="SERVICE_VERSION")
+    environment: Environment = Field(Environment.PRODUCTION, env="ENVIRONMENT")
+    debug: bool = Field(False, env="DEBUG")
+    log_level: str = Field("INFO", env="LOG_LEVEL")
+    
+    # Server Configuration
+    app_host: str = Field("0.0.0.0", env="APP_HOST")
+    app_port: int = Field(8000, env="APP_PORT")
+    web_concurrency: int = Field(4, env="WEB_CONCURRENCY")
+    max_concurrency: int = Field(100, env="MAX_CONCURRENCY")
+    worker_timeout: int = Field(30, env="WORKER_TIMEOUT")
+    
+    # API Configuration
+    api_version: str = Field("v1", env="API_VERSION")
+    api_prefix: str = Field("/api", env="API_PREFIX")
+    openapi_url: str = Field("/docs", env="OPENAPI_URL")
+    redoc_url: str = Field("/redoc", env="REDOC_URL")
+    
+    # Security
+    api_tokens: str = Field("", env="API_TOKENS")
+    require_auth: bool = Field(True, env="REQUIRE_AUTH")
+    enable_rate_limiting: bool = Field(True, env="ENABLE_RATE_LIMITING")
+    enable_cors: bool = Field(True, env="ENABLE_CORS")
+    enable_https_redirect: bool = Field(True, env="ENABLE_HTTPS_REDIRECT")
+    
+    # Rate Limiting
+    max_requests_per_minute: int = Field(120, env="MAX_REQUESTS_PER_MINUTE")
+    max_requests_per_hour: int = Field(1000, env="MAX_REQUESTS_PER_HOUR")
+    max_requests_per_day: int = Field(5000, env="MAX_REQUESTS_PER_DAY")
+    rate_limit_by_ip: bool = Field(True, env="RATE_LIMIT_BY_IP")
+    rate_limit_by_token: bool = Field(True, env="RATE_LIMIT_BY_TOKEN")
+    
+    # CORS
+    cors_origins: str = Field("*", env="CORS_ORIGINS")
+    cors_methods: str = Field("GET,POST,PUT,DELETE,OPTIONS", env="CORS_METHODS")
+    cors_headers: str = Field("*", env="CORS_HEADERS")
+    cors_credentials: bool = Field(True, env="CORS_CREDENTIALS")
+    cors_max_age: int = Field(600, env="CORS_MAX_AGE")
+    
+    # JWT
+    jwt_secret_key: str = Field("", env="JWT_SECRET_KEY")
+    jwt_algorithm: str = Field("HS256", env="JWT_ALGORITHM")
+    jwt_access_token_expire_minutes: int = Field(30, env="JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
+    
+    # Redis
+    redis_enabled: bool = Field(True, env="REDIS_ENABLED")
+    redis_url: str = Field("", env="REDIS_URL")
+    redis_ttl: int = Field(1800, env="REDIS_TTL")
+    redis_max_connections: int = Field(20, env="REDIS_MAX_CONNECTIONS")
+    
+    # Database
+    database_enabled: bool = Field(False, env="DATABASE_ENABLED")
+    database_url: str = Field("", env="DATABASE_URL")
+    database_pool_size: int = Field(10, env="DATABASE_POOL_SIZE")
+    
+    # Cache
+    cache_backend: CacheBackend = Field(CacheBackend.REDIS, env="CACHE_BACKEND")
+    cache_prefix: str = Field("tadawul_", env="CACHE_PREFIX")
+    cache_default_ttl: int = Field(1800, env="CACHE_DEFAULT_TTL")
+    cache_max_size_mb: int = Field(200, env="CACHE_MAX_SIZE_MB")
+    
+    # Providers
+    enabled_providers: str = Field("alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp,polygon,tiingo,yfinance", env="ENABLED_PROVIDERS")
+    primary_provider: Provider = Field(Provider.TADAWUL_FAST_BRIDGE, env="PRIMARY_PROVIDER")
+    fallback_providers: str = Field("alpha_vantage,finnhub", env="FALLBACK_PROVIDERS")
+    
+    # Provider API Keys
+    alpha_vantage_api_key: str = Field("", env="ALPHA_VANTAGE_API_KEY")
+    finnhub_api_key: str = Field("", env="FINNHUB_API_KEY")
+    eodhd_api_key: str = Field("", env="EODHD_API_KEY")
+    marketstack_api_key: str = Field("", env="MARKETSTACK_API_KEY")
+    twelvedata_api_key: str = Field("", env="TWELVEDATA_API_KEY")
+    fmp_api_key: str = Field("", env="FMP_API_KEY")
+    polygon_api_key: str = Field("", env="POLYGON_API_KEY")
+    tiingo_api_key: str = Field("", env="TIINGO_API_KEY")
+    
+    # Provider Rate Limits (requests per minute)
+    alpha_vantage_rpm: int = Field(5, env="ALPHA_VANTAGE_RPM")
+    finnhub_rpm: int = Field(60, env="FINNHUB_RPM")
+    eodhd_rpm: int = Field(30, env="EODHD_RPM")
+    marketstack_rpm: int = Field(30, env="MARKETSTACK_RPM")
+    twelvedata_rpm: int = Field(8, env="TWELVEDATA_RPM")
+    fmp_rpm: int = Field(250, env="FMP_RPM")
+    polygon_rpm: int = Field(5, env="POLYGON_RPM")
+    tiingo_rpm: int = Field(10, env="TIINGO_RPM")
+    
+    # Tadawul Fast Bridge
+    tadawul_fast_bridge_enabled: bool = Field(True, env="TADAWUL_FAST_BRIDGE_ENABLED")
+    tadawul_fast_bridge_url: str = Field("https://tadawul-fast-bridge.onrender.com", env="TADAWUL_FAST_BRIDGE_URL")
+    tadawul_fast_bridge_timeout: int = Field(15, env="TADAWUL_FAST_BRIDGE_TIMEOUT")
+    tadawul_fast_bridge_retries: int = Field(3, env="TADAWUL_FAST_BRIDGE_RETRIES")
+    
+    # Google Services
+    google_sheets_enabled: bool = Field(True, env="GOOGLE_SHEETS_ENABLED")
+    google_sheets_spreadsheet_id: str = Field("19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw", env="GOOGLE_SHEETS_SPREADSHEET_ID")
+    google_sheets_credentials: str = Field("", env="GOOGLE_SHEETS_CREDENTIALS")
+    google_apps_script_url: str = Field("https://script.google.com/macros/s/AKfycbxfJX64vG7AYsTXtmk_v53CxRCc9zqD8kbGR7j4YcEfARH6Tm9KUXrRxZKseMvp_Mzq/exec", env="GOOGLE_APPS_SCRIPT_URL")
+    
+    # Logging
+    log_enable_file: bool = Field(True, env="LOG_ENABLE_FILE")
+    log_file_path: str = Field("./logs/app.log", env="LOG_FILE_PATH")
+    log_format: str = Field("json", env="LOG_FORMAT")
+    
+    # Monitoring
+    metrics_enabled: bool = Field(True, env="METRICS_ENABLED")
+    metrics_path: str = Field("/metrics", env="METRICS_PATH")
+    health_check_enabled: bool = Field(True, env="HEALTH_CHECK_ENABLED")
+    health_check_path: str = Field("/health", env="HEALTH_CHECK_PATH")
+    
+    # AI & Analysis
+    advanced_analysis_enabled: bool = Field(True, env="ADVANCED_ANALYSIS_ENABLED")
+    ai_model_version: str = Field("4.0.0", env="AI_MODEL_VERSION")
+    sentiment_analysis_enabled: bool = Field(True, env="SENTIMENT_ANALYSIS_ENABLED")
+    technical_analysis_enabled: bool = Field(True, env="TECHNICAL_ANALYSIS_ENABLED")
+    fundamental_analysis_enabled: bool = Field(True, env="FUNDAMENTAL_ANALYSIS_ENABLED")
+    
+    # Tadawul Specific
+    tadawul_market_enabled: bool = Field(True, env="TADAWUL_MARKET_ENABLED")
+    saudi_market_enabled: bool = Field(True, env="SAUDI_MARKET_ENABLED")
+    tadawul_refresh_interval: int = Field(60, env="TADAWUL_REFRESH_INTERVAL")
+    saudi_symbols: str = Field("7201.SR,1211.SR,2222.SR,2380.SR,4030.SR,4200.SR", env="SAUDI_SYMBOLS")
+    
+    # HTTP Configuration
+    http_timeout: int = Field(30, env="HTTP_TIMEOUT")
+    http_max_retries: int = Field(3, env="HTTP_MAX_RETRIES")
+    http_pool_size: int = Field(100, env="HTTP_POOL_SIZE")
+    
+    # Feature Flags
+    feature_websocket_enabled: bool = Field(True, env="FEATURE_WEBSOCKET_ENABLED")
+    feature_batch_api_enabled: bool = Field(True, env="FEATURE_BATCH_API_ENABLED")
+    
+    # Background Workers
+    worker_enabled: bool = Field(True, env="WORKER_ENABLED")
+    worker_concurrency: int = Field(3, env="WORKER_CONCURRENCY")
+    
+    # Performance
+    memory_limit_mb: int = Field(512, env="MEMORY_LIMIT_MB")
+    slow_request_threshold: float = Field(5.0, env="SLOW_REQUEST_THRESHOLD")
+    
+    # Backup & Recovery
+    backup_enabled: bool = Field(True, env="BACKUP_ENABLED")
+    backup_interval: int = Field(3600, env="BACKUP_INTERVAL")
+    
+    # Development
+    swagger_enabled: bool = Field(True, env="SWAGGER_ENABLED")
+    redoc_enabled: bool = Field(True, env="REDOC_ENABLED")
+    
+    # Validation
+    @field_validator('environment', mode='before')
+    @classmethod
+    def validate_environment(cls, v):
+        if isinstance(v, str):
+            v = v.lower()
+        return v
+    
+    @field_validator('log_level', mode='before')
+    @classmethod
+    def validate_log_level(cls, v):
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        if v.upper() not in valid_levels:
+            raise ValueError(f"Log level must be one of {valid_levels}")
+        return v.upper()
+    
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
+    )
 
 # =============================================================================
-# PERFORMANCE TUNING GUIDE
+# Logging Configuration
 # =============================================================================
 
-# For 512MB memory:
-# WEB_CONCURRENCY=2
-# MAX_CONCURRENCY=50
-# REDIS_MAX_CONNECTIONS=10
-# WORKER_CONCURRENCY=2
-
-# For 1GB memory:
-# WEB_CONCURRENCY=4
-# MAX_CONCURRENCY=100
-# REDIS_MAX_CONNECTIONS=20
-# WORKER_CONCURRENCY=3
-
-# For 2GB+ memory:
-# WEB_CONCURRENCY=8
-# MAX_CONCURRENCY=200
-# REDIS_MAX_CONNECTIONS=30
-# WORKER_CONCURRENCY=5
+def setup_structured_logging(settings: Settings):
+    """Configure structured logging based on environment."""
+    
+    # Create logs directory if it doesn't exist
+    if settings.log_enable_file:
+        log_dir = Path(settings.log_file_path).parent
+        log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Configure structlog processors
+    processors = [
+        structlog.stdlib.filter_by_level,
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+    
+    if settings.log_format == "json":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer())
+    
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+    
+    # Configure standard logging
+    logging.basicConfig(
+        format="%(message)s" if settings.log_format == "json" else "%(levelname)s - %(name)s - %(message)s",
+        level=getattr(logging, settings.log_level),
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(settings.log_file_path) if settings.log_enable_file else logging.NullHandler()
+        ]
+    )
+    
+    logger = structlog.get_logger(__name__)
+    logger.info("Logging configured", 
+                level=settings.log_level, 
+                format=settings.log_format,
+                environment=settings.environment.value)
+    
+    return logger
 
 # =============================================================================
-# TROUBLESHOOTING
+# Prometheus Metrics
 # =============================================================================
 
-# Common Issues:
-# 1. Memory leaks: Set MAX_REQUESTS to restart workers periodically
-# 2. Rate limiting: Adjust MAX_REQUESTS_PER_MINUTE based on API quotas
-# 3. Timeout errors: Increase HTTP_TIMEOUT and RETRY settings
-# 4. Cache issues: Check Redis connection and TTL settings
-# 5. API key limits: Monitor provider rate limits and adjust RPM settings
-
-# Monitoring Endpoints:
-# - Health: /health
-# - Metrics: /metrics (Prometheus format)
-# - Cache Stats: /api/v1/cache/stats
-# - API Stats: /api/v1/stats
-# - Provider Status: /api/v1/providers/status
+class Metrics:
+    """Prometheus metrics collector."""
+    
+    def __init__(self):
+        self.registry = CollectorRegistry()
+        
+        # HTTP Metrics
+        self.http_requests_total = Counter(
+            'http_requests_total',
+            'Total HTTP requests',
+            ['method', 'endpoint', 'status', 'client'],
+            registry=self.registry
+        )
+        
+        self.http_request_duration_seconds = Histogram(
+            'http_request_duration_seconds',
+            'HTTP request duration in seconds',
+            ['method', 'endpoint'],
+            buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+            registry=self.registry
+        )
+        
+        # Business Metrics
+        self.stock_queries_total = Counter(
+            'stock_queries_total',
+            'Total stock data queries',
+            ['symbol', 'provider', 'cache_status'],
+            registry=self.registry
+        )
+        
+        self.provider_requests_total = Counter(
+            'provider_requests_total',
+            'Total requests to external providers',
+            ['provider', 'status'],
+            registry=self.registry
+        )
+        
+        # Cache Metrics
+        self.cache_hits_total = Counter(
+            'cache_hits_total',
+            'Total cache hits',
+            ['cache_type'],
+            registry=self.registry
+        )
+        
+        self.cache_misses_total = Counter(
+            'cache_misses_total',
+            'Total cache misses',
+            ['cache_type'],
+            registry=self.registry
+        )
+        
+        # System Metrics
+        self.memory_usage_bytes = Gauge(
+            'memory_usage_bytes',
+            'Memory usage in bytes',
+            registry=self.registry
+        )
+        
+        self.cpu_usage_percent = Gauge(
+            'cpu_usage_percent',
+            'CPU usage percentage',
+            registry=self.registry
+        )
+        
+        # Error Metrics
+        self.api_errors_total = Counter(
+            'api_errors_total',
+            'Total API errors',
+            ['error_type', 'endpoint'],
+            registry=self.registry
+        )
+        
+        # Provider Rate Limit Metrics
+        self.provider_rate_limit_remaining = Gauge(
+            'provider_rate_limit_remaining',
+            'Remaining rate limit for providers',
+            ['provider'],
+            registry=self.registry
+        )
+        
+        # Initialize system metrics
+        self.update_system_metrics()
+    
+    def update_system_metrics(self):
+        """Update system metrics."""
+        process = psutil.Process()
+        self.memory_usage_bytes.set(process.memory_info().rss)
+        self.cpu_usage_percent.set(process.cpu_percent())
 
 # =============================================================================
-# VERSION HISTORY
+# Security & Authentication
 # =============================================================================
 
-# v4.0.0 - Enhanced production configuration with comprehensive settings
-# v3.7.0 - Previous version with basic configuration
-# v3.0.0 - Initial production release
-# v2.0.0 - Beta release with multiple providers
-# v1.0.0 - Initial release with Tadawul integration
+class SecurityManager:
+    """Security and authentication manager."""
+    
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.security = HTTPBearer(auto_error=False)
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        self.api_tokens = self._parse_api_tokens()
+        
+    def _parse_api_tokens(self) -> Dict[str, str]:
+        """Parse API tokens from environment variable."""
+        tokens = {}
+        if self.settings.api_tokens:
+            for token_entry in self.settings.api_tokens.split(','):
+                if ':' in token_entry:
+                    token, role = token_entry.split(':', 1)
+                    tokens[token.strip()] = role.strip()
+        return tokens
+    
+    def verify_api_token(self, token: str) -> Optional[str]:
+        """Verify API token and return role."""
+        return self.api_tokens.get(token)
+    
+    def create_access_token(self, data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+        """Create JWT access token."""
+        to_encode = data.copy()
+        if expires_delta:
+            expire = datetime.now(timezone.utc) + expires_delta
+        else:
+            expire = datetime.now(timezone.utc) + timedelta(minutes=self.settings.jwt_access_token_expire_minutes)
+        
+        to_encode.update({"exp": expire})
+        return jwt.encode(to_encode, self.settings.jwt_secret_key, algorithm=self.settings.jwt_algorithm)
+    
+    def verify_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Verify JWT token."""
+        try:
+            payload = jwt.decode(
+                token,
+                self.settings.jwt_secret_key,
+                algorithms=[self.settings.jwt_algorithm]
+            )
+            return payload
+        except JWTError:
+            return None
+    
+    def get_password_hash(self, password: str) -> str:
+        """Generate password hash."""
+        return self.pwd_context.hash(password)
+    
+    def verify_password(self, plain_password: str, hashed_password: str) -> bool:
+        """Verify password against hash."""
+        return self.pwd_context.verify(plain_password, hashed_password)
+    
+    def get_api_key_auth(self, api_key: str) -> Optional[str]:
+        """Authenticate using API key."""
+        return self.verify_api_token(api_key)
 
 # =============================================================================
-# END OF ENVIRONMENT CONFIGURATION
+# Cache Implementation
 # =============================================================================
+
+class CacheManager:
+    """Unified cache manager with multiple backends."""
+    
+    def __init__(self, settings: Settings, logger: BoundLogger):
+        self.settings = settings
+        self.logger = logger
+        self.redis_client = None
+        self.memory_cache = None
+        self.initialized = False
+        self._init_cache()
+    
+    def _init_cache(self):
+        """Initialize cache based on configuration."""
+        try:
+            if self.settings.cache_backend in [CacheBackend.REDIS, CacheBackend.HYBRID] and self.settings.redis_enabled:
+                if self.settings.redis_url:
+                    self.redis_client = redis.from_url(
+                        self.settings.redis_url,
+                        max_connections=self.settings.redis_max_connections,
+                        decode_responses=True
+                    )
+                    # Test connection
+                    self.redis_client.ping()
+                    self.logger.info("Redis cache initialized", url=self.settings.redis_url)
+                else:
+                    self.logger.warning("Redis URL not configured, falling back to memory cache")
+            
+            if self.settings.cache_backend in [CacheBackend.MEMORY, CacheBackend.HYBRID]:
+                maxsize = (self.settings.cache_max_size_mb * 1024 * 1024) // 1000  # Approximate item count
+                self.memory_cache = TTLCache(maxsize=maxsize, ttl=self.settings.cache_default_ttl)
+                self.logger.info("Memory cache initialized", maxsize=maxsize)
+            
+            self.initialized = True
+            
+        except Exception as e:
+            self.logger.error("Failed to initialize cache", error=str(e))
+            # Fallback to memory cache
+            self.memory_cache = TTLCache(maxsize=1000, ttl=self.settings.cache_default_ttl)
+            self.initialized = True
+    
+    def _build_key(self, key: str) -> str:
+        """Build cache key with prefix and version."""
+        return f"{self.settings.cache_prefix}{self.settings.service_version}:{key}"
+    
+    async def get(self, key: str) -> Optional[Any]:
+        """Get value from cache."""
+        if not self.initialized:
+            return None
+        
+        cache_key = self._build_key(key)
+        
+        try:
+            # Try memory cache first
+            if self.memory_cache:
+                value = self.memory_cache.get(cache_key)
+                if value is not None:
+                    return value
+            
+            # Try Redis
+            if self.redis_client:
+                value = self.redis_client.get(cache_key)
+                if value:
+                    # Deserialize JSON
+                    try:
+                        parsed = json.loads(value)
+                        # Store in memory cache for faster access
+                        if self.memory_cache:
+                            self.memory_cache[cache_key] = parsed
+                        return parsed
+                    except json.JSONDecodeError:
+                        return value
+            
+        except Exception as e:
+            self.logger.warning("Cache get error", key=key, error=str(e))
+        
+        return None
+    
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
+        """Set value in cache."""
+        if not self.initialized:
+            return False
+        
+        cache_key = self._build_key(key)
+        ttl = ttl or self.settings.cache_default_ttl
+        
+        try:
+            # Store in memory cache
+            if self.memory_cache:
+                self.memory_cache[cache_key] = value
+            
+            # Store in Redis
+            if self.redis_client:
+                # Serialize to JSON if possible
+                if isinstance(value, (dict, list, str, int, float, bool, type(None))):
+                    serialized = json.dumps(value)
+                else:
+                    serialized = str(value)
+                
+                self.redis_client.setex(cache_key, ttl, serialized)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.warning("Cache set error", key=key, error=str(e))
+            return False
+    
+    async def delete(self, key: str) -> bool:
+        """Delete value from cache."""
+        if not self.initialized:
+            return False
+        
+        cache_key = self._build_key(key)
+        
+        try:
+            # Delete from memory cache
+            if self.memory_cache and cache_key in self.memory_cache:
+                del self.memory_cache[cache_key]
+            
+            # Delete from Redis
+            if self.redis_client:
+                self.redis_client.delete(cache_key)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.warning("Cache delete error", key=key, error=str(e))
+            return False
+    
+    async def clear(self) -> bool:
+        """Clear all cache."""
+        try:
+            if self.memory_cache:
+                self.memory_cache.clear()
+            
+            if self.redis_client:
+                # Only delete keys with our prefix
+                pattern = f"{self.settings.cache_prefix}{self.settings.service_version}:*"
+                keys = self.redis_client.keys(pattern)
+                if keys:
+                    self.redis_client.delete(*keys)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error("Cache clear error", error=str(e))
+            return False
+    
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        stats = {
+            "backend": self.settings.cache_backend.value,
+            "initialized": self.initialized,
+            "memory_cache_size": len(self.memory_cache) if self.memory_cache else 0,
+        }
+        
+        if self.redis_client:
+            try:
+                redis_info = self.redis_client.info()
+                stats.update({
+                    "redis_connected": True,
+                    "redis_used_memory": redis_info.get('used_memory', 0),
+                    "redis_keys": redis_info.get('db0', {}).get('keys', 0),
+                })
+            except:
+                stats["redis_connected"] = False
+        
+        return stats
+
+# =============================================================================
+# HTTP Client with Rate Limiting
+# =============================================================================
+
+class RateLimiter:
+    """Provider rate limiter."""
+    
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.limits = {
+            Provider.ALPHA_VANTAGE: self.settings.alpha_vantage_rpm,
+            Provider.FINNHUB: self.settings.finnhub_rpm,
+            Provider.EODHD: self.settings.eodhd_rpm,
+            Provider.MARKETSTACK: self.settings.marketstack_rpm,
+            Provider.TWELVEDATA: self.settings.twelvedata_rpm,
+            Provider.FMP: self.settings.fmp_rpm,
+            Provider.POLYGON: self.settings.polygon_rpm,
+            Provider.TIINGO: self.settings.tiingo_rpm,
+        }
+        self.request_timestamps = {provider: [] for provider in self.limits.keys()}
+    
+    def can_make_request(self, provider: Provider) -> bool:
+        """Check if request can be made within rate limits."""
+        if provider not in self.limits:
+            return True
+        
+        limit = self.limits[provider]
+        timestamps = self.request_timestamps[provider]
+        now = time.time()
+        
+        # Remove timestamps older than 60 seconds
+        timestamps[:] = [ts for ts in timestamps if now - ts < 60]
+        
+        if len(timestamps) >= limit:
+            return False
+        
+        timestamps.append(now)
+        return True
+    
+    def get_wait_time(self, provider: Provider) -> float:
+        """Get wait time before next request can be made."""
+        if provider not in self.limits:
+            return 0.0
+        
+        timestamps = self.request_timestamps[provider]
+        now = time.time()
+        timestamps[:] = [ts for ts in timestamps if now - ts < 60]
+        
+        if len(timestamps) < self.limits[provider]:
+            return 0.0
+        
+        # Wait until oldest request is 60 seconds old
+        oldest = min(timestamps)
+        return max(0.0, 60 - (now - oldest))
+
+class ResilientHTTPClient:
+    """HTTP client with retry, timeout, and rate limiting."""
+    
+    def __init__(self, settings: Settings, rate_limiter: RateLimiter, logger: BoundLogger):
+        self.settings = settings
+        self.rate_limiter = rate_limiter
+        self.logger = logger
+        self.timeout = Timeout(
+            connect=self.settings.http_timeout,
+            read=self.settings.http_timeout,
+            write=self.settings.http_timeout,
+            pool=self.settings.http_timeout
+        )
+        self.limits = Limits(
+            max_connections=self.settings.http_pool_size,
+            max_keepalive_connections=self.settings.http_pool_size // 2
+        )
+        self.client = AsyncClient(
+            timeout=self.timeout,
+            limits=self.limits,
+            follow_redirects=True
+        )
+        
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.RequestError, asyncio.TimeoutError))
+    )
+    async def fetch_json(self, 
+                        url: str, 
+                        params: Optional[Dict[str, Any]] = None,
+                        headers: Optional[Dict[str, str]] = None,
+                        provider: Optional[Provider] = None) -> Dict[str, Any]:
+        """Fetch JSON data with retry logic and rate limiting."""
+        
+        # Apply rate limiting if provider specified
+        if provider:
+            if not self.rate_limiter.can_make_request(provider):
+                wait_time = self.rate_limiter.get_wait_time(provider)
+                if wait_time > 0:
+                    self.logger.debug("Rate limited, waiting", provider=provider, wait_time=wait_time)
+                    await asyncio.sleep(wait_time)
+        
+        start_time = time.time()
+        
+        try:
+            response = await self.client.get(
+                url,
+                params=params,
+                headers=headers or {},
+                timeout=self.settings.http_timeout
+            )
+            
+            response_time = time.time() - start_time
+            
+            if response.status_code == 200:
+                self.logger.debug("HTTP request successful", 
+                                url=url, 
+                                status=response.status_code,
+                                response_time=response_time)
+                return response.json()
+            else:
+                self.logger.warning("HTTP request failed", 
+                                  url=url, 
+                                  status=response.status_code,
+                                  response_text=response.text[:200])
+                response.raise_for_status()
+                
+        except httpx.RequestError as e:
+            self.logger.error("HTTP request error", url=url, error=str(e))
+            raise
+        except asyncio.TimeoutError:
+            self.logger.error("HTTP request timeout", url=url, timeout=self.settings.http_timeout)
+            raise
+    
+    async def post_json(self, 
+                       url: str, 
+                       data: Optional[Dict[str, Any]] = None,
+                       json_data: Optional[Dict[str, Any]] = None,
+                       headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """POST JSON data."""
+        start_time = time.time()
+        
+        try:
+            response = await self.client.post(
+                url,
+                data=data,
+                json=json_data,
+                headers=headers or {}
+            )
+            
+            response_time = time.time() - start_time
+            
+            if response.status_code in [200, 201]:
+                self.logger.debug("HTTP POST successful", 
+                                url=url, 
+                                status=response.status_code,
+                                response_time=response_time)
+                return response.json()
+            else:
+                self.logger.warning("HTTP POST failed", 
+                                  url=url, 
+                                  status=response.status_code)
+                response.raise_for_status()
+                
+        except httpx.RequestError as e:
+            self.logger.error("HTTP POST error", url=url, error=str(e))
+            raise
+    
+    async def close(self):
+        """Close HTTP client."""
+        await self.client.aclose()
+
+# =============================================================================
+# Data Models
+# =============================================================================
+
+class TimeSeries(BaseModel):
+    """Time series data model."""
+    timestamp: datetime
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    volume: Optional[int] = None
+    
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
+class StockData(BaseModel):
+    """Stock data model."""
+    symbol: str
+    name: Optional[str] = None
+    currency: Optional[str] = None
+    exchange: Optional[str] = None
+    last_price: Optional[float] = None
+    change: Optional[float] = None
+    change_percent: Optional[float] = None
+    volume: Optional[int] = None
+    market_cap: Optional[float] = None
+    pe_ratio: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    high_52_week: Optional[float] = None
+    low_52_week: Optional[float] = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
+class MarketSummary(BaseModel):
+    """Market summary model."""
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    total_market_cap: Optional[float] = None
+    total_volume: Optional[int] = None
+    advancers: Optional[int] = None
+    decliners: Optional[int] = None
+    unchanged: Optional[int] = None
+    market_index: Optional[float] = None
+    market_change: Optional[float] = None
+    market_change_percent: Optional[float] = None
+    
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
+class TechnicalIndicator(BaseModel):
+    """Technical indicator model."""
+    symbol: str
+    indicator: str
+    value: float
+    signal: str = Field(pattern="^(BUY|SELL|NEUTRAL|STRONG_BUY|STRONG_SELL)$")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    period: Optional[int] = None
+    upper_band: Optional[float] = None
+    lower_band: Optional[float] = None
+    
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
+class AnalysisResult(BaseModel):
+    """Analysis result model."""
+    symbol: str
+    analysis_type: str
+    score: float
+    confidence: float
+    recommendation: str
+    factors: Dict[str, Any]
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
+class BatchRequest(BaseModel):
+    """Batch request model."""
+    symbols: List[str] = Field(..., max_items=50)
+    metrics: List[str] = Field(default=["price", "volume", "change"])
+    providers: Optional[List[Provider]] = None
+
+class BatchResponse(BaseModel):
+    """Batch response model."""
+    request_id: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    results: Dict[str, Any]
+    failed_symbols: List[str] = []
+    processing_time: float
+    
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
+class HealthStatus(BaseModel):
+    """Health status model."""
+    status: str
+    version: str
+    timestamp: datetime
+    uptime: float
+    dependencies: Dict[str, str]
+    system: Dict[str, Any]
+
+# =============================================================================
+# Provider Services
+# =============================================================================
+
+class BaseProvider:
+    """Base provider class."""
+    
+    def __init__(self, name: Provider, api_key: str, base_url: str, http_client: ResilientHTTPClient, logger: BoundLogger):
+        self.name = name
+        self.api_key = api_key
+        self.base_url = base_url
+        self.http_client = http_client
+        self.logger = logger
+    
+    async def get_stock_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get stock data from provider."""
+        raise NotImplementedError
+    
+    async def get_historical_data(self, symbol: str, days: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """Get historical data from provider."""
+        raise NotImplementedError
+    
+    def is_available(self) -> bool:
+        """Check if provider is available (has API key)."""
+        return bool(self.api_key)
+
+class AlphaVantageProvider(BaseProvider):
+    """Alpha Vantage provider."""
+    
+    async def get_stock_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": symbol,
+                "apikey": self.api_key
+            }
+            
+            data = await self.http_client.fetch_json(
+                f"{self.base_url}",
+                params=params,
+                provider=Provider.ALPHA_VANTAGE
+            )
+            
+            if "Global Quote" in data:
+                quote = data["Global Quote"]
+                return {
+                    "symbol": symbol,
+                    "price": float(quote.get("05. price", 0)),
+                    "change": float(quote.get("09. change", 0)),
+                    "change_percent": float(quote.get("10. change percent", "0").replace("%", "")),
+                    "volume": int(quote.get("06. volume", 0)),
+                    "timestamp": datetime.now(timezone.utc)
+                }
+        except Exception as e:
+            self.logger.error("AlphaVantage error", symbol=symbol, error=str(e))
+        return None
+
+class FinnhubProvider(BaseProvider):
+    """Finnhub provider."""
+    
+    async def get_stock_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = await self.http_client.fetch_json(
+                f"{self.base_url}/quote",
+                params={"symbol": symbol, "token": self.api_key},
+                provider=Provider.FINNHUB
+            )
+            
+            if data:
+                return {
+                    "symbol": symbol,
+                    "price": data.get("c", 0),
+                    "change": data.get("d", 0),
+                    "change_percent": data.get("dp", 0),
+                    "high": data.get("h", 0),
+                    "low": data.get("l", 0),
+                    "open": data.get("o", 0),
+                    "previous_close": data.get("pc", 0),
+                    "timestamp": datetime.now(timezone.utc)
+                }
+        except Exception as e:
+            self.logger.error("Finnhub error", symbol=symbol, error=str(e))
+        return None
+
+class TadawulFastBridgeProvider(BaseProvider):
+    """Tadawul Fast Bridge provider."""
+    
+    async def get_stock_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            data = await self.http_client.fetch_json(
+                f"{self.base_url}/api/v1/symbols/{symbol}"
+            )
+            
+            if data:
+                return {
+                    "symbol": symbol,
+                    "price": data.get("last_price", 0),
+                    "change": data.get("change", 0),
+                    "change_percent": data.get("change_percent", 0),
+                    "volume": data.get("volume", 0),
+                    "name_ar": data.get("name_ar", ""),
+                    "name_en": data.get("name_en", ""),
+                    "sector": data.get("sector", ""),
+                    "market_cap": data.get("market_cap", 0),
+                    "timestamp": datetime.now(timezone.utc)
+                }
+        except Exception as e:
+            self.logger.error("Tadawul Fast Bridge error", symbol=symbol, error=str(e))
+        return None
+
+class ProviderManager:
+    """Manage multiple data providers with fallback logic."""
+    
+    def __init__(self, settings: Settings, http_client: ResilientHTTPClient, logger: BoundLogger):
+        self.settings = settings
+        self.http_client = http_client
+        self.logger = logger
+        self.providers: Dict[Provider, BaseProvider] = {}
+        self._init_providers()
+    
+    def _init_providers(self):
+        """Initialize all enabled providers."""
+        enabled_providers = [Provider(p.strip()) for p in self.settings.enabled_providers.split(",")]
+        
+        # Alpha Vantage
+        if Provider.ALPHA_VANTAGE in enabled_providers and self.settings.alpha_vantage_api_key:
+            self.providers[Provider.ALPHA_VANTAGE] = AlphaVantageProvider(
+                Provider.ALPHA_VANTAGE,
+                self.settings.alpha_vantage_api_key,
+                self.settings.alpha_vantage_base_url,
+                self.http_client,
+                self.logger
+            )
+        
+        # Finnhub
+        if Provider.FINNHUB in enabled_providers and self.settings.finnhub_api_key:
+            self.providers[Provider.FINNHUB] = FinnhubProvider(
+                Provider.FINNHUB,
+                self.settings.finnhub_api_key,
+                self.settings.finnhub_base_url,
+                self.http_client,
+                self.logger
+            )
+        
+        # Tadawul Fast Bridge
+        if self.settings.tadawul_fast_bridge_enabled:
+            self.providers[Provider.TADAWUL_FAST_BRIDGE] = TadawulFastBridgeProvider(
+                Provider.TADAWUL_FAST_BRIDGE,
+                "",
+                self.settings.tadawul_fast_bridge_url,
+                self.http_client,
+                self.logger
+            )
+        
+        self.logger.info("Providers initialized", 
+                        count=len(self.providers),
+                        providers=list(self.providers.keys()))
+    
+    async def get_stock_data(self, symbol: str, preferred_provider: Optional[Provider] = None) -> Optional[Dict[str, Any]]:
+        """Get stock data using provider fallback logic."""
+        
+        # Try preferred provider first
+        if preferred_provider and preferred_provider in self.providers:
+            data = await self.providers[preferred_provider].get_stock_data(symbol)
+            if data:
+                data["provider"] = preferred_provider.value
+                return data
+        
+        # Try primary provider
+        if self.settings.primary_provider in self.providers:
+            data = await self.providers[self.settings.primary_provider].get_stock_data(symbol)
+            if data:
+                data["provider"] = self.settings.primary_provider.value
+                return data
+        
+        # Try all providers in priority order
+        for provider_name in self.settings.provider_priority.split(","):
+            provider = Provider(provider_name.strip())
+            if provider in self.providers:
+                data = await self.providers[provider].get_stock_data(symbol)
+                if data:
+                    data["provider"] = provider.value
+                    return data
+        
+        # Try any available provider
+        for provider, service in self.providers.items():
+            data = await service.get_stock_data(symbol)
+            if data:
+                data["provider"] = provider.value
+                return data
+        
+        return None
+
+# =============================================================================
+# AI & Analysis Engine
+# =============================================================================
+
+class AnalysisEngine:
+    """AI-powered analysis engine."""
+    
+    def __init__(self, settings: Settings, logger: BoundLogger):
+        self.settings = settings
+        self.logger = logger
+        self.ml_models = {}
+        self.scalers = {}
+        
+        if self.settings.advanced_analysis_enabled:
+            self._load_models()
+    
+    def _load_models(self):
+        """Load ML models for analysis."""
+        try:
+            # Load pre-trained models if they exist
+            model_path = Path("./ml_models")
+            if model_path.exists():
+                for model_file in model_path.glob("*.joblib"):
+                    model_name = model_file.stem
+                    self.ml_models[model_name] = joblib.load(model_file)
+                    self.logger.info("ML model loaded", model=model_name)
+        except Exception as e:
+            self.logger.error("Failed to load ML models", error=str(e))
+    
+    def calculate_technical_indicators(self, prices: List[float], volumes: Optional[List[int]] = None) -> Dict[str, Any]:
+        """Calculate technical indicators from price data."""
+        if len(prices) < 20:
+            return {}
+        
+        try:
+            df = pd.DataFrame({"price": prices})
+            
+            # Moving Averages
+            df["sma_20"] = df["price"].rolling(window=20).mean()
+            df["sma_50"] = df["price"].rolling(window=50).mean()
+            df["ema_12"] = df["price"].ewm(span=12, adjust=False).mean()
+            df["ema_26"] = df["price"].ewm(span=26, adjust=False).mean()
+            
+            # RSI
+            delta = df["price"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df["rsi"] = 100 - (100 / (1 + rs))
+            
+            # MACD
+            df["macd"] = df["ema_12"] - df["ema_26"]
+            df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+            df["macd_histogram"] = df["macd"] - df["macd_signal"]
+            
+            # Bollinger Bands
+            df["bb_middle"] = df["price"].rolling(window=20).mean()
+            bb_std = df["price"].rolling(window=20).std()
+            df["bb_upper"] = df["bb_middle"] + (bb_std * 2)
+            df["bb_lower"] = df["bb_middle"] - (bb_std * 2)
+            
+            # Get latest values
+            latest = df.iloc[-1].to_dict()
+            
+            # Generate signals
+            signals = {
+                "rsi_signal": self._get_rsi_signal(latest.get("rsi", 50)),
+                "macd_signal": self._get_macd_signal(latest.get("macd", 0), latest.get("macd_signal", 0)),
+                "bb_signal": self._get_bb_signal(latest.get("price", 0), latest.get("bb_upper", 0), latest.get("bb_lower", 0))
+            }
+            
+            return {
+                "indicators": latest,
+                "signals": signals,
+                "timestamp": datetime.now(timezone.utc)
+            }
+            
+        except Exception as e:
+            self.logger.error("Technical indicator calculation error", error=str(e))
+            return {}
+    
+    def _get_rsi_signal(self, rsi: float) -> str:
+        """Generate RSI signal."""
+        if rsi > 70:
+            return "OVERBOUGHT"
+        elif rsi < 30:
+            return "OVERSOLD"
+        else:
+            return "NEUTRAL"
+    
+    def _get_macd_signal(self, macd: float, signal: float) -> str:
+        """Generate MACD signal."""
+        if macd > signal:
+            return "BULLISH"
+        elif macd < signal:
+            return "BEARISH"
+        else:
+            return "NEUTRAL"
+    
+    def _get_bb_signal(self, price: float, upper: float, lower: float) -> str:
+        """Generate Bollinger Bands signal."""
+        if price > upper:
+            return "OVERBOUGHT"
+        elif price < lower:
+            return "OVERSOLD"
+        else:
+            return "NEUTRAL"
+    
+    def analyze_sentiment(self, text: str) -> Dict[str, Any]:
+        """Analyze sentiment from text."""
+        # Simple sentiment analysis
+        # In production, use a proper NLP model
+        positive_words = ["bullish", "growth", "profit", "gain", "positive", "strong", "buy"]
+        negative_words = ["bearish", "loss", "decline", "negative", "weak", "sell"]
+        
+        text_lower = text.lower()
+        positive_score = sum(1 for word in positive_words if word in text_lower)
+        negative_score = sum(1 for word in negative_words if word in text_lower)
+        
+        total = positive_score + negative_score
+        if total > 0:
+            sentiment_score = (positive_score - negative_score) / total
+        else:
+            sentiment_score = 0
+        
+        return {
+            "score": sentiment_score,
+            "positive_words": positive_score,
+            "negative_words": negative_score,
+            "sentiment": "POSITIVE" if sentiment_score > 0.1 else "NEGATIVE" if sentiment_score < -0.1 else "NEUTRAL"
+        }
+    
+    def predict_price(self, historical_data: List[Dict[str, Any]], days_ahead: int = 7) -> Optional[List[float]]:
+        """Predict future prices using ML models."""
+        if not historical_data or len(historical_data) < 30:
+            return None
+        
+        try:
+            # Prepare features
+            prices = [d.get("close", 0) for d in historical_data]
+            
+            # Simple moving average prediction
+            # In production, use ARIMA, LSTM, or other time series models
+            df = pd.DataFrame({"price": prices})
+            
+            # Calculate moving averages
+            df["sma_7"] = df["price"].rolling(window=7).mean()
+            df["sma_14"] = df["price"].rolling(window=14).mean()
+            df["sma_30"] = df["price"].rolling(window=30).mean()
+            
+            # Simple prediction: extend the trend
+            last_sma_7 = df["sma_7"].iloc[-1]
+            trend = df["price"].iloc[-7:].pct_change().mean()
+            
+            predictions = []
+            for i in range(1, days_ahead + 1):
+                prediction = last_sma_7 * (1 + trend) ** i
+                predictions.append(float(prediction))
+            
+            return predictions
+            
+        except Exception as e:
+            self.logger.error("Price prediction error", error=str(e))
+            return None
+
+# =============================================================================
+# Google Sheets Service
+# =============================================================================
+
+class GoogleSheetsService:
+    """Google Sheets integration service."""
+    
+    def __init__(self, settings: Settings, logger: BoundLogger):
+        self.settings = settings
+        self.logger = logger
+        self.client = None
+        self.spreadsheet_id = settings.google_sheets_spreadsheet_id
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize Google Sheets client."""
+        if not self.settings.google_sheets_enabled or not self.settings.google_sheets_credentials:
+            self.logger.warning("Google Sheets disabled or credentials not configured")
+            return
+        
+        try:
+            creds_dict = json.loads(self.settings.google_sheets_credentials)
+            creds = Credentials.from_service_account_info(creds_dict)
+            self.client = gspread.authorize(creds)
+            self.logger.info("Google Sheets client initialized")
+        except Exception as e:
+            self.logger.error("Failed to initialize Google Sheets", error=str(e))
+            self.client = None
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((gspread.exceptions.APIError, HttpError))
+    )
+    async def update_stock_data(self, stock_data: List[Dict[str, Any]], sheet_name: str = "StockData"):
+        """Update Google Sheet with stock data."""
+        if not self.client:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Google Sheets service not available"
+            )
+        
+        try:
+            spreadsheet = self.client.open_by_key(self.spreadsheet_id)
+            
+            # Get or create worksheet
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=20)
+            
+            # Prepare data
+            headers = [
+                "Symbol", "Name", "Price", "Change", "Change %", "Volume", 
+                "Market Cap", "P/E Ratio", "Sector", "Provider", "Timestamp"
+            ]
+            
+            rows = [headers]
+            for data in stock_data:
+                row = [
+                    data.get("symbol", ""),
+                    data.get("name", ""),
+                    data.get("price", 0),
+                    data.get("change", 0),
+                    data.get("change_percent", 0),
+                    data.get("volume", 0),
+                    data.get("market_cap", 0),
+                    data.get("pe_ratio", 0),
+                    data.get("sector", ""),
+                    data.get("provider", ""),
+                    data.get("timestamp", datetime.now(timezone.utc)).isoformat()
+                ]
+                rows.append(row)
+            
+            # Clear and update worksheet
+            worksheet.clear()
+            worksheet.update(rows, value_input_option='USER_ENTERED')
+            
+            self.logger.info("Google Sheet updated", 
+                           spreadsheet=self.spreadsheet_id,
+                           sheet=sheet_name,
+                           rows=len(rows) - 1)
+            
+            return {
+                "status": "success",
+                "spreadsheet_id": self.spreadsheet_id,
+                "sheet_name": sheet_name,
+                "rows_updated": len(rows) - 1
+            }
+            
+        except Exception as e:
+            self.logger.error("Google Sheets update failed", error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to update Google Sheet: {str(e)}"
+            )
+    
+    async def export_to_excel(self, stock_data: List[Dict[str, Any]]) -> bytes:
+        """Export stock data to Excel format."""
+        try:
+            df = pd.DataFrame(stock_data)
+            
+            # Create Excel workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Stock Data"
+            
+            # Write headers
+            for col_idx, column in enumerate(df.columns, 1):
+                ws.cell(row=1, column=col_idx, value=column)
+            
+            # Write data
+            for row_idx, row in df.iterrows():
+                for col_idx, value in enumerate(row, 1):
+                    ws.cell(row=row_idx + 2, column=col_idx, value=value)
+            
+            # Save to bytes
+            from io import BytesIO
+            buffer = BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
+            
+            return buffer.getvalue()
+            
+        except Exception as e:
+            self.logger.error("Excel export failed", error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to export Excel: {str(e)}"
+            )
+
+# =============================================================================
+# WebSocket Manager
+# =============================================================================
+
+class WebSocketManager:
+    """WebSocket connection manager for real-time updates."""
+    
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self.subscriptions: Dict[str, List[WebSocket]] = {}
+    
+    async def connect(self, websocket: WebSocket):
+        """Connect WebSocket client."""
+        await websocket.accept()
+        self.active_connections.append(websocket)
+    
+    def disconnect(self, websocket: WebSocket):
+        """Disconnect WebSocket client."""
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        
+        # Remove from subscriptions
+        for symbol, connections in self.subscriptions.items():
+            if websocket in connections:
+                connections.remove(websocket)
+    
+    async def subscribe(self, websocket: WebSocket, symbol: str):
+        """Subscribe to symbol updates."""
+        if symbol not in self.subscriptions:
+            self.subscriptions[symbol] = []
+        
+        if websocket not in self.subscriptions[symbol]:
+            self.subscriptions[symbol].append(websocket)
+            await websocket.send_json({
+                "type": "subscription",
+                "symbol": symbol,
+                "status": "subscribed"
+            })
+    
+    async def unsubscribe(self, websocket: WebSocket, symbol: str):
+        """Unsubscribe from symbol updates."""
+        if symbol in self.subscriptions and websocket in self.subscriptions[symbol]:
+            self.subscriptions[symbol].remove(websocket)
+            await websocket.send_json({
+                "type": "subscription",
+                "symbol": symbol,
+                "status": "unsubscribed"
+            })
+    
+    async def broadcast_update(self, symbol: str, data: Dict[str, Any]):
+        """Broadcast update to all subscribers of a symbol."""
+        if symbol in self.subscriptions:
+            for connection in self.subscriptions[symbol]:
+                try:
+                    await connection.send_json({
+                        "type": "update",
+                        "symbol": symbol,
+                        "data": data,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                except:
+                    # Remove disconnected clients
+                    self.disconnect(connection)
+
+# =============================================================================
+# Background Workers & Scheduler
+# =============================================================================
+
+class BackgroundWorker:
+    """Background task worker."""
+    
+    def __init__(self, 
+                 settings: Settings,
+                 cache_manager: CacheManager,
+                 provider_manager: ProviderManager,
+                 logger: BoundLogger):
+        self.settings = settings
+        self.cache_manager = cache_manager
+        self.provider_manager = provider_manager
+        self.logger = logger
+        self.tasks = set()
+        self.running = False
+    
+    async def start(self):
+        """Start background worker."""
+        self.running = True
+        self.logger.info("Background worker started")
+        
+        # Start cache warmup task
+        if self.settings.cache_warmup_enabled:
+            asyncio.create_task(self.cache_warmup_loop())
+        
+        # Start data refresh task
+        asyncio.create_task(self.data_refresh_loop())
+    
+    async def stop(self):
+        """Stop background worker."""
+        self.running = False
+        # Cancel all tasks
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.logger.info("Background worker stopped")
+    
+    async def cache_warmup_loop(self):
+        """Periodically warm up cache with popular symbols."""
+        while self.running:
+            try:
+                symbols = self.settings.cache_warmup_symbols.split(",")
+                self.logger.info("Starting cache warmup", symbols_count=len(symbols))
+                
+                for symbol in symbols:
+                    try:
+                        data = await self.provider_manager.get_stock_data(symbol.strip())
+                        if data:
+                            cache_key = f"stock:{symbol.strip()}"
+                            await self.cache_manager.set(cache_key, data)
+                            self.logger.debug("Cache warmed up", symbol=symbol.strip())
+                    except Exception as e:
+                        self.logger.warning("Cache warmup failed for symbol", 
+                                          symbol=symbol.strip(), 
+                                          error=str(e))
+                
+                self.logger.info("Cache warmup completed")
+                
+            except Exception as e:
+                self.logger.error("Cache warmup loop error", error=str(e))
+            
+            # Wait for next interval
+            await asyncio.sleep(self.settings.cache_warmup_interval)
+    
+    async def data_refresh_loop(self):
+        """Periodically refresh market data."""
+        while self.running:
+            try:
+                # Refresh Saudi market symbols
+                if self.settings.saudi_market_enabled:
+                    symbols = self.settings.saudi_symbols.split(",")[:10]  # First 10 symbols
+                    
+                    for symbol in symbols:
+                        symbol = symbol.strip()
+                        try:
+                            data = await self.provider_manager.get_stock_data(symbol)
+                            if data:
+                                # Update cache
+                                cache_key = f"stock:{symbol}"
+                                await self.cache_manager.set(cache_key, data, ttl=300)
+                        except Exception as e:
+                            self.logger.warning("Data refresh failed", symbol=symbol, error=str(e))
+                
+                self.logger.debug("Data refresh completed")
+                
+            except Exception as e:
+                self.logger.error("Data refresh loop error", error=str(e))
+            
+            # Wait for next interval
+            await asyncio.sleep(self.settings.tadawul_refresh_interval)
+
+# =============================================================================
+# FastAPI Application Factory
+# =============================================================================
+
+class FastAPIApp:
+    """FastAPI application factory."""
+    
+    def __init__(self):
+        self.settings = Settings()
+        self.logger = setup_structured_logging(self.settings)
+        self.metrics = Metrics()
+        self.security_manager = SecurityManager(self.settings)
+        self.cache_manager = CacheManager(self.settings, self.logger)
+        self.rate_limiter = RateLimiter(self.settings)
+        self.http_client = ResilientHTTPClient(self.settings, self.rate_limiter, self.logger)
+        self.provider_manager = ProviderManager(self.settings, self.http_client, self.logger)
+        self.analysis_engine = AnalysisEngine(self.settings, self.logger)
+        self.sheets_service = GoogleSheetsService(self.settings, self.logger)
+        self.websocket_manager = WebSocketManager()
+        self.background_worker = BackgroundWorker(
+            self.settings, 
+            self.cache_manager,
+            self.provider_manager,
+            self.logger
+        )
+        
+        # Rate Limiter for FastAPI
+        self.limiter = Limiter(
+            key_func=get_remote_address,
+            default_limits=[f"{self.settings.max_requests_per_minute}/minute"]
+        )
+        
+        # Create FastAPI app
+        self.app = self._create_app()
+        
+        # Initialize services
+        self._init_services()
+    
+    def _create_app(self) -> FastAPI:
+        """Create and configure FastAPI application."""
+        
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # Startup
+            app.state.start_time = time.time()
+            app.state.settings = self.settings
+            app.state.logger = self.logger
+            app.state.metrics = self.metrics
+            app.state.cache_manager = self.cache_manager
+            app.state.provider_manager = self.provider_manager
+            app.state.analysis_engine = self.analysis_engine
+            app.state.sheets_service = self.sheets_service
+            app.state.websocket_manager = self.websocket_manager
+            
+            # Start background worker
+            if self.settings.worker_enabled:
+                await self.background_worker.start()
+            
+            self.logger.info(
+                "Application started",
+                name=self.settings.service_name,
+                version=self.settings.service_version,
+                environment=self.settings.environment.value,
+                host=self.settings.app_host,
+                port=self.settings.app_port
+            )
+            
+            yield
+            
+            # Shutdown
+            if self.settings.worker_enabled:
+                await self.background_worker.stop()
+            
+            await self.http_client.close()
+            
+            self.logger.info("Application shutdown complete")
+        
+        # Create FastAPI app
+        app = FastAPI(
+            title=self.settings.service_name,
+            version=self.settings.service_version,
+            description="AI-powered stock analysis and trading recommendations",
+            docs_url=self.settings.openapi_url if self.settings.swagger_enabled else None,
+            redoc_url=self.settings.redoc_url if self.settings.redoc_enabled else None,
+            openapi_url="/openapi.json" if self.settings.swagger_enabled else None,
+            lifespan=lifespan,
+            debug=self.settings.debug
+        )
+        
+        # Add rate limiting middleware
+        if self.settings.enable_rate_limiting:
+            app.state.limiter = self.limiter
+            app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+            app.add_middleware(SlowAPIMiddleware)
+        
+        # Add CORS middleware
+        if self.settings.enable_cors:
+            origins = self.settings.cors_origins.split(",") if self.settings.cors_origins != "*" else ["*"]
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_credentials=self.settings.cors_credentials,
+                allow_methods=self.settings.cors_methods.split(","),
+                allow_headers=self.settings.cors_headers.split(","),
+                max_age=self.settings.cors_max_age
+            )
+        
+        # Add GZip middleware
+        app.add_middleware(GZipMiddleware, minimum_size=1000)
+        
+        # Add custom middleware
+        @app.middleware("http")
+        async def add_process_time_header(request: Request, call_next):
+            start_time = time.time()
+            
+            # Log request
+            self.logger.info(
+                "Request started",
+                method=request.method,
+                url=str(request.url),
+                client_ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent")
+            )
+            
+            try:
+                response = await call_next(request)
+                process_time = time.time() - start_time
+                
+                # Add headers
+                response.headers["X-Process-Time"] = str(process_time)
+                response.headers["X-API-Version"] = self.settings.service_version
+                
+                # Log slow requests
+                if process_time > self.settings.slow_request_threshold:
+                    self.logger.warning(
+                        "Slow request",
+                        method=request.method,
+                        url=str(request.url),
+                        process_time=process_time,
+                        threshold=self.settings.slow_request_threshold
+                    )
+                
+                # Update metrics
+                self.metrics.http_requests_total.labels(
+                    method=request.method,
+                    endpoint=request.url.path,
+                    status=response.status_code,
+                    client=request.client.host if request.client else "unknown"
+                ).inc()
+                
+                self.metrics.http_request_duration_seconds.labels(
+                    method=request.method,
+                    endpoint=request.url.path
+                ).observe(process_time)
+                
+                return response
+                
+            except Exception as e:
+                process_time = time.time() - start_time
+                self.logger.error(
+                    "Request error",
+                    method=request.method,
+                    url=str(request.url),
+                    error=str(e),
+                    process_time=process_time,
+                    traceback=traceback.format_exc()
+                )
+                
+                self.metrics.api_errors_total.labels(
+                    error_type=type(e).__name__,
+                    endpoint=request.url.path
+                ).inc()
+                
+                raise
+        
+        return app
+    
+    def _init_services(self):
+        """Initialize application services and routes."""
+        
+        # Dependency for authentication
+        async def get_current_user(
+            credentials: Optional[HTTPAuthorizationCredentials] = Depends(self.security_manager.security)
+        ) -> Optional[Dict[str, Any]]:
+            if not self.settings.require_auth:
+                return {"user": "anonymous", "role": "guest"}
+            
+            if credentials:
+                # Try JWT token
+                payload = self.security_manager.verify_token(credentials.credentials)
+                if payload:
+                    return payload
+                
+                # Try API token
+                role = self.security_manager.get_api_key_auth(credentials.credentials)
+                if role:
+                    return {"user": "api_user", "role": role}
+            
+            if self.settings.environment == Environment.DEVELOPMENT:
+                return {"user": "developer", "role": "admin"}
+            
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Health check endpoint
+        @self.app.get(self.settings.health_check_path, response_model=HealthStatus, tags=["Monitoring"])
+        async def health_check():
+            """Health check endpoint."""
+            dependencies = {}
+            
+            # Check cache
+            if self.cache_manager.initialized:
+                dependencies["cache"] = "healthy"
+            else:
+                dependencies["cache"] = "unavailable"
+            
+            # Check providers
+            available_providers = []
+            for provider in self.provider_manager.providers.values():
+                if provider.is_available():
+                    available_providers.append(provider.name.value)
+            
+            dependencies["providers"] = f"{len(available_providers)} available"
+            
+            # System info
+            process = psutil.Process()
+            system_info = {
+                "memory_usage_mb": process.memory_info().rss / 1024 / 1024,
+                "cpu_percent": process.cpu_percent(),
+                "threads": process.num_threads(),
+                "uptime": time.time() - self.app.state.start_time
+            }
+            
+            return HealthStatus(
+                status="healthy",
+                version=self.settings.service_version,
+                timestamp=datetime.now(timezone.utc),
+                uptime=system_info["uptime"],
+                dependencies=dependencies,
+                system=system_info
+            )
+        
+        # Metrics endpoint
+        @self.app.get(self.settings.metrics_path, tags=["Monitoring"])
+        async def metrics():
+            """Prometheus metrics endpoint."""
+            if not self.settings.metrics_enabled:
+                raise HTTPException(status_code=404, detail="Metrics endpoint disabled")
+            
+            # Update system metrics
+            self.metrics.update_system_metrics()
+            
+            return Response(
+                content=generate_latest(self.metrics.registry),
+                media_type="text/plain"
+            )
+        
+        # Get stock data endpoint
+        @self.app.get(
+            f"{self.settings.api_prefix}/{self.settings.api_version}/stocks/{{symbol}}",
+            response_model=StockData,
+            tags=["Stocks"]
+        )
+        @self.limiter.limit(f"{self.settings.max_requests_per_minute}/minute")
+        async def get_stock(
+            request: Request,
+            symbol: str,
+            use_cache: bool = True,
+            provider: Optional[Provider] = None,
+            current_user: Dict = Depends(get_current_user)
+        ):
+            """Get stock data for a symbol."""
+            
+            # Check cache first
+            cache_key = f"stock:{symbol}"
+            if use_cache:
+                cached_data = await self.cache_manager.get(cache_key)
+                if cached_data:
+                    self.metrics.cache_hits_total.labels(cache_type="stock").inc()
+                    self.logger.debug("Cache hit", symbol=symbol)
+                    return StockData(**cached_data)
+                self.metrics.cache_misses_total.labels(cache_type="stock").inc()
+            
+            # Get from provider
+            data = await self.provider_manager.get_stock_data(symbol, provider)
+            
+            if not data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Stock data not found for symbol: {symbol}"
+                )
+            
+            # Update metrics
+            self.metrics.stock_queries_total.labels(
+                symbol=symbol,
+                provider=data.get("provider", "unknown"),
+                cache_status="miss"
+            ).inc()
+            
+            # Cache the result
+            await self.cache_manager.set(cache_key, data, ttl=300)
+            
+            return StockData(**data)
+        
+        # Get multiple stocks endpoint
+        @self.app.post(
+            f"{self.settings.api_prefix}/{self.settings.api_version}/stocks/batch",
+            response_model=BatchResponse,
+            tags=["Stocks"]
+        )
+        @self.limiter.limit("10/minute")
+        async def get_stocks_batch(
+            request: Request,
+            batch_request: BatchRequest,
+            current_user: Dict = Depends(get_current_user)
+        ):
+            """Get data for multiple stocks in batch."""
+            start_time = time.time()
+            request_id = f"batch_{int(time.time())}_{hash(str(batch_request.dict()))}"
+            
+            results = {}
+            failed_symbols = []
+            
+            # Process symbols in parallel
+            tasks = []
+            for symbol in batch_request.symbols:
+                task = asyncio.create_task(self.provider_manager.get_stock_data(symbol))
+                tasks.append((symbol, task))
+            
+            # Wait for all tasks
+            for symbol, task in tasks:
+                try:
+                    data = await task
+                    if data:
+                        results[symbol] = data
+                    else:
+                        failed_symbols.append(symbol)
+                except Exception as e:
+                    self.logger.warning("Batch processing failed for symbol", symbol=symbol, error=str(e))
+                    failed_symbols.append(symbol)
+            
+            processing_time = time.time() - start_time
+            
+            return BatchResponse(
+                request_id=request_id,
+                results=results,
+                failed_symbols=failed_symbols,
+                processing_time=processing_time
+            )
+        
+        # Technical analysis endpoint
+        @self.app.get(
+            f"{self.settings.api_prefix}/{self.settings.api_version}/analysis/technical/{{symbol}}",
+            response_model=TechnicalIndicator,
+            tags=["Analysis"]
+        )
+        @self.limiter.limit("30/minute")
+        async def get_technical_analysis(
+            request: Request,
+            symbol: str,
+            indicator: str = "RSI",
+            period: int = 14,
+            current_user: Dict = Depends(get_current_user)
+        ):
+            """Get technical analysis for a symbol."""
+            
+            if not self.settings.technical_analysis_enabled:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Technical analysis is disabled"
+                )
+            
+            # Get historical data (simulated)
+            # In production, fetch actual historical data
+            historical_prices = [100.0, 101.0, 102.0, 101.5, 103.0, 104.0, 103.5]
+            
+            indicators = self.analysis_engine.calculate_technical_indicators(historical_prices)
+            
+            if not indicators:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Technical analysis not available for {symbol}"
+                )
+            
+            # Get specific indicator
+            indicator_value = indicators["indicators"].get(indicator.lower(), 50.0)
+            signal = indicators["signals"].get(f"{indicator.lower()}_signal", "NEUTRAL")
+            
+            return TechnicalIndicator(
+                symbol=symbol,
+                indicator=indicator,
+                value=indicator_value,
+                signal=signal,
+                period=period
+            )
+        
+        # Export to Google Sheets endpoint
+        @self.app.post(
+            f"{self.settings.api_prefix}/{self.settings.api_version}/export/sheets",
+            tags=["Export"]
+        )
+        @self.limiter.limit("10/minute")
+        async def export_to_sheets(
+            request: Request,
+            symbols: List[str],
+            sheet_name: str = "StockData",
+            current_user: Dict = Depends(get_current_user)
+        ):
+            """Export stock data to Google Sheets."""
+            
+            if not self.settings.google_sheets_enabled:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Google Sheets export is disabled"
+                )
+            
+            # Get data for all symbols
+            stock_data = []
+            for symbol in symbols[:50]:  # Limit to 50 symbols
+                try:
+                    data = await self.provider_manager.get_stock_data(symbol)
+                    if data:
+                        stock_data.append(data)
+                except Exception as e:
+                    self.logger.warning("Failed to fetch data for export", symbol=symbol, error=str(e))
+            
+            if not stock_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No data available for export"
+                )
+            
+            # Update Google Sheet
+            result = await self.sheets_service.update_stock_data(stock_data, sheet_name)
+            
+            return {
+                "status": "success",
+                "exported_symbols": len(stock_data),
+                "details": result
+            }
+        
+        # WebSocket endpoint for real-time updates
+        @self.app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            """WebSocket endpoint for real-time stock updates."""
+            
+            if not self.settings.feature_websocket_enabled:
+                await websocket.close(code=1008, reason="WebSocket feature disabled")
+                return
+            
+            await self.websocket_manager.connect(websocket)
+            
+            try:
+                while True:
+                    # Receive message from client
+                    data = await websocket.receive_json()
+                    
+                    message_type = data.get("type")
+                    
+                    if message_type == "subscribe":
+                        symbol = data.get("symbol")
+                        if symbol:
+                            await self.websocket_manager.subscribe(websocket, symbol)
+                    
+                    elif message_type == "unsubscribe":
+                        symbol = data.get("symbol")
+                        if symbol:
+                            await self.websocket_manager.unsubscribe(websocket, symbol)
+                    
+                    elif message_type == "ping":
+                        await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
+                    
+            except Exception as e:
+                self.logger.error("WebSocket error", error=str(e))
+            finally:
+                self.websocket_manager.disconnect(websocket)
+        
+        # Cache statistics endpoint
+        @self.app.get(
+            f"{self.settings.api_prefix}/{self.settings.api_version}/cache/stats",
+            tags=["System"]
+        )
+        async def get_cache_stats(current_user: Dict = Depends(get_current_user)):
+            """Get cache statistics."""
+            stats = await self.cache_manager.get_stats()
+            return stats
+        
+        # System information endpoint
+        @self.app.get(
+            f"{self.settings.api_prefix}/{self.settings.api_version}/system/info",
+            tags=["System"]
+        )
+        async def get_system_info(current_user: Dict = Depends(get_current_user)):
+            """Get system information and metrics."""
+            process = psutil.Process()
+            
+            return {
+                "application": {
+                    "name": self.settings.service_name,
+                    "version": self.settings.service_version,
+                    "environment": self.settings.environment.value,
+                    "uptime": time.time() - self.app.state.start_time
+                },
+                "system": {
+                    "memory_usage_mb": process.memory_info().rss / 1024 / 1024,
+                    "memory_percent": process.memory_percent(),
+                    "cpu_percent": process.cpu_percent(),
+                    "threads": process.num_threads(),
+                    "connections": len(psutil.net_connections())
+                },
+                "providers": {
+                    "available": len([p for p in self.provider_manager.providers.values() if p.is_available()]),
+                    "total": len(self.provider_manager.providers)
+                },
+                "cache": await self.cache_manager.get_stats()
+            }
+        
+        # Error handlers
+        @self.app.exception_handler(HTTPException)
+        async def http_exception_handler(request: Request, exc: HTTPException):
+            """Handle HTTP exceptions."""
+            self.logger.warning(
+                "HTTP exception",
+                status_code=exc.status_code,
+                detail=exc.detail,
+                path=request.url.path,
+                client_ip=request.client.host if request.client else None
+            )
+            
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "error": True,
+                    "code": exc.status_code,
+                    "message": exc.detail,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "path": request.url.path
+                }
+            )
+        
+        @self.app.exception_handler(Exception)
+        async def general_exception_handler(request: Request, exc: Exception):
+            """Handle general exceptions."""
+            self.logger.error(
+                "Unhandled exception",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                path=request.url.path,
+                traceback=traceback.format_exc()
+            )
+            
+            self.metrics.api_errors_total.labels(
+                error_type="unhandled",
+                endpoint=request.url.path
+            ).inc()
+            
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "error": True,
+                    "code": 500,
+                    "message": "Internal server error",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "request_id": request.headers.get("X-Request-ID", "unknown")
+                }
+            )
+    
+    def run(self):
+        """Run the FastAPI application."""
+        import uvicorn
+        
+        uvicorn_config = {
+            "app": self.app,
+            "host": self.settings.app_host,
+            "port": self.settings.app_port,
+            "workers": self.settings.web_concurrency if self.settings.environment == Environment.PRODUCTION else 1,
+            "reload": self.settings.environment == Environment.DEVELOPMENT,
+            "log_level": self.settings.log_level.lower(),
+            "access_log": True,
+            "timeout_keep_alive": 5,
+            "limit_concurrency": self.settings.max_concurrency,
+            "backlog": 2048,
+        }
+        
+        if self.settings.environment == Environment.PRODUCTION:
+            uvicorn_config.update({
+                "proxy_headers": True,
+                "forwarded_allow_ips": "*",
+                "headers": [
+                    ("Server", f"{self.settings.service_name}/{self.settings.service_version}"),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("X-Frame-Options", "DENY"),
+                    ("X-XSS-Protection", "1; mode=block"),
+                ]
+            })
+        
+        self.logger.info("Starting Uvicorn server", **uvicorn_config)
+        
+        uvicorn.run(**uvicorn_config)
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+if __name__ == "__main__":
+    # Set environment variables for development if not set
+    if not os.getenv("ENVIRONMENT"):
+        os.environ["ENVIRONMENT"] = "development"
+        os.environ["DEBUG"] = "true"
+        os.environ["LOG_LEVEL"] = "DEBUG"
+        os.environ["ENABLE_RATE_LIMITING"] = "false"
+    
+    # Create and run the application
+    app_factory = FastAPIApp()
+    app_factory.run()
