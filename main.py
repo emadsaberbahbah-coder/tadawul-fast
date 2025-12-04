@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Stock Analysis API - Enhanced Version 3.5.2
+Tadawul Stock Analysis API - Enhanced Version 3.5.3
 Production-ready with hybrid EODHD providers and fundamentals service
 """
 
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
 
     # Service Configuration
     service_name: str = Field("Tadawul Stock Analysis API", env="SERVICE_NAME")
-    service_version: str = Field("3.5.2", env="SERVICE_VERSION")
+    service_version: str = Field("3.5.3", env="SERVICE_VERSION")
     app_host: str = Field("0.0.0.0", env="APP_HOST")
     app_port: int = Field(8000, env="APP_PORT")
     environment: str = Field("production", env="ENVIRONMENT")
@@ -228,6 +228,14 @@ class Settings(BaseSettings):
 
 # Initialize settings
 settings = Settings()
+
+# === Global timeouts (central control) =======================================
+
+# Overall timeout for quote endpoints (v1, v4.1)
+QUOTE_OVERALL_TIMEOUT_SECONDS = max(6.0, float(settings.http_timeout) + 2.0)
+
+# Overall timeout for analysis endpoints (multi-source & recommendation)
+ANALYSIS_OVERALL_TIMEOUT_SECONDS = max(8.0, float(settings.http_timeout) + 4.0)
 
 # =============================================================================
 # Logging Setup
@@ -763,7 +771,7 @@ class FMPProvider:
     NOTE:
     - FMP /quote endpoint is now LEGACY and returns 403 for your plan.
     - To avoid noisy errors & slow retries, this provider is DISABLED for quotes.
-    - FMP is still used in FundamentalsService via /profile as a fallback source.
+    - FMP is still used in FundamentalsService via /profile when needed.
     """
 
     def __init__(self):
@@ -1778,24 +1786,27 @@ async def get_quotes_v1(
         if len(symbols) > 100:
             raise HTTPException(status_code=400, detail="Too many tickers (max 100)")
 
-        OVERALL_TIMEOUT_SECONDS = 12.0
-
         try:
             response = await asyncio.wait_for(
                 quote_service.get_quotes(symbols),
-                timeout=OVERALL_TIMEOUT_SECONDS,
+                timeout=QUOTE_OVERALL_TIMEOUT_SECONDS,
             )
             return response
 
         except asyncio.TimeoutError:
             now = datetime.datetime.utcnow()
+            logger.warning(
+                f"Quote request timeout after {QUOTE_OVERALL_TIMEOUT_SECONDS}s "
+                f"for symbols={symbols}"
+            )
             quotes = [
                 Quote(
                     ticker=sym,
                     status=QuoteStatus.ERROR,
                     message=(
-                        "Timeout while contacting data providers. "
-                        "Please try again; if this persists, reduce the number of symbols."
+                        f"Timeout while contacting data providers. "
+                        f"Overall quote timeout={QUOTE_OVERALL_TIMEOUT_SECONDS}s. "
+                        "Try fewer symbols or retry later."
                     ),
                 )
                 for sym in symbols
@@ -1806,7 +1817,7 @@ async def get_quotes_v1(
                 symbols=quotes,
                 meta={
                     "timeout": True,
-                    "timeout_seconds": OVERALL_TIMEOUT_SECONDS,
+                    "timeout_seconds": QUOTE_OVERALL_TIMEOUT_SECONDS,
                     "total_symbols": len(symbols),
                     "successful_quotes": 0,
                 },
@@ -1841,22 +1852,25 @@ async def get_quotes_v41(
         if not tickers:
             raise HTTPException(status_code=400, detail="No symbols provided")
 
-        OVERALL_TIMEOUT_SECONDS = 12.0
-
         try:
             response = await asyncio.wait_for(
                 quote_service.get_quotes(tickers),
-                timeout=OVERALL_TIMEOUT_SECONDS,
+                timeout=QUOTE_OVERALL_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             now = datetime.datetime.utcnow()
+            logger.warning(
+                f"v4.1 quote request timeout after {QUOTE_OVERALL_TIMEOUT_SECONDS}s "
+                f"for symbols={tickers}"
+            )
             quotes = [
                 Quote(
                     ticker=sym,
                     status=QuoteStatus.ERROR,
                     message=(
-                        "Timeout while contacting data providers. "
-                        "Please try again; if this persists, reduce the number of symbols."
+                        f"Timeout while contacting data providers. "
+                        f"Overall quote timeout={QUOTE_OVERALL_TIMEOUT_SECONDS}s. "
+                        "Try fewer symbols or retry later."
                     ),
                 )
                 for sym in tickers
@@ -1867,7 +1881,7 @@ async def get_quotes_v41(
                 symbols=quotes,
                 meta={
                     "timeout": True,
-                    "timeout_seconds": OVERALL_TIMEOUT_SECONDS,
+                    "timeout_seconds": QUOTE_OVERALL_TIMEOUT_SECONDS,
                     "total_symbols": len(tickers),
                     "successful_quotes": 0,
                 },
@@ -2020,8 +2034,23 @@ async def analysis_multi_source(
     ensure_analysis_enabled()
 
     try:
-        result = await get_multi_source_analysis(symbol)
+        result = await asyncio.wait_for(
+            get_multi_source_analysis(symbol),
+            timeout=ANALYSIS_OVERALL_TIMEOUT_SECONDS,
+        )
         return result
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Analysis multi-source timeout after {ANALYSIS_OVERALL_TIMEOUT_SECONDS}s "
+            f"for symbol={symbol}"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Analysis timeout after {ANALYSIS_OVERALL_TIMEOUT_SECONDS}s. "
+                "Try again later."
+            ),
+        )
     except Exception as e:
         logger.error(f"Error in multi-source analysis for {symbol}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -2040,8 +2069,24 @@ async def analysis_recommendation(
     ensure_analysis_enabled()
 
     try:
-        rec = await generate_ai_recommendation(symbol)
-        return rec.to_dict()
+        rec = await asyncio.wait_for(
+            generate_ai_recommendation(symbol),
+            timeout=ANALYSIS_OVERALL_TIMEOUT_SECONDS,
+        )
+        # rec may be a model object; keep backward compatibility
+        return rec.to_dict() if hasattr(rec, "to_dict") else rec
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Analysis recommendation timeout after {ANALYSIS_OVERALL_TIMEOUT_SECONDS}s "
+            f"for symbol={symbol}"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Analysis timeout after {ANALYSIS_OVERALL_TIMEOUT_SECONDS}s. "
+                "Try again later."
+            ),
+        )
     except Exception as e:
         logger.error(f"Error generating AI recommendation for {symbol}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -2214,7 +2259,11 @@ def main():
         f"Enabled (config): {settings.advanced_analysis_enabled}"
     )
     logger.info(f"🔧 Debug Mode: {settings.debug}")
-    logger.info(f"🌐 Starting server on {settings.app_host}:{settings.app_port} (reload=False)")
+    logger.info(
+        f"🌐 Starting server on {settings.app_host}:{settings.app_port} "
+        f"(reload=False, quote_timeout={QUOTE_OVERALL_TIMEOUT_SECONDS}s, "
+        f"analysis_timeout={ANALYSIS_OVERALL_TIMEOUT_SECONDS}s)"
+    )
     logger.info("=" * 70)
 
     uvicorn.run(
