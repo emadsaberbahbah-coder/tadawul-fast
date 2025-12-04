@@ -1,5 +1,5 @@
 # advanced_analysis.py - Enhanced Multi-source AI Trading Analysis
-# Version: 3.2.0 - Production Ready for Render with Async Support
+# Version: 3.3.0 - Production Ready for Render with Async + Global Timeouts
 # Optimized for memory, performance, reliability, and Render environment
 
 from __future__ import annotations
@@ -227,14 +227,18 @@ class AdvancedTradingAnalyzer:
     - Enhanced caching with multiple backends
     - Rate limiting and request throttling
     - Comprehensive error handling and fallbacks
+    - Global operation timeouts so analysis never "hangs forever"
 
     Environment Variables:
-        ANALYSIS_CACHE_TTL_MINUTES - Cache TTL in minutes (default: 15)
-        ANALYSIS_MAX_CACHE_SIZE_MB - Maximum cache size (default: 100)
-        ANALYSIS_RATE_LIMIT_RPM - Requests per minute (default: 60)
-        ANALYSIS_MAX_RETRIES - Maximum retry attempts (default: 3)
-        REDIS_URL - Redis URL for distributed caching (optional)
-        GOOGLE_APPS_SCRIPT_URL - Optional Apps Script endpoint for sheet-enriched data
+        ANALYSIS_CACHE_TTL_MINUTES        - Cache TTL in minutes (default: 15)
+        ANALYSIS_MAX_CACHE_SIZE_MB        - Maximum cache size (default: 100)
+        ANALYSIS_RATE_LIMIT_RPM           - Requests per minute (default: 60)
+        ANALYSIS_MAX_RETRIES              - Maximum retry attempts (default: 3)
+        ANALYSIS_HTTP_TIMEOUT_SECONDS     - HTTP timeout per request (default: 15)
+        ANALYSIS_OPERATION_TIMEOUT_SECONDS- Max seconds for a full analysis op (default: 25)
+        ANALYSIS_QUOTE_TIMEOUT_SECONDS    - Max seconds to search quotes from providers (default: 15)
+        REDIS_URL                         - Redis URL for distributed caching (optional)
+        GOOGLE_APPS_SCRIPT_URL            - Optional Apps Script endpoint for sheet-enriched data
     """
 
     def __init__(self) -> None:
@@ -269,6 +273,15 @@ class AdvancedTradingAnalyzer:
         self.rate_limit_rpm: int = int(os.getenv("ANALYSIS_RATE_LIMIT_RPM", "60"))
         self.max_retries: int = int(os.getenv("ANALYSIS_MAX_RETRIES", "3"))
 
+        # Global operation timeouts
+        self.http_timeout_seconds: int = int(os.getenv("ANALYSIS_HTTP_TIMEOUT_SECONDS", "15"))
+        self.operation_timeout_seconds: int = int(
+            os.getenv("ANALYSIS_OPERATION_TIMEOUT_SECONDS", "25")
+        )
+        self.quote_timeout_seconds: int = int(
+            os.getenv("ANALYSIS_QUOTE_TIMEOUT_SECONDS", "15")
+        )
+
         # Rate limiting state
         self.request_timestamps: deque = deque(maxlen=self.rate_limit_rpm * 2)
         self._rate_limit_lock = threading.RLock()
@@ -296,7 +309,9 @@ class AdvancedTradingAnalyzer:
             f"APIs configured: {configured_apis}, "
             f"Cache TTL: {self.cache_ttl.total_seconds()/60:.1f} min, "
             f"Rate Limit: {self.rate_limit_rpm}/min, "
-            f"Max Retries: {self.max_retries}"
+            f"Max Retries: {self.max_retries}, "
+            f"HTTP Timeout: {self.http_timeout_seconds}s, "
+            f"Operation Timeout: {self.operation_timeout_seconds}s"
         )
 
     # -------------------------------------------------------------------------
@@ -350,7 +365,11 @@ class AdvancedTradingAnalyzer:
     async def get_session(self) -> aiohttp.ClientSession:
         """Get or create async session."""
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = aiohttp.ClientTimeout(
+                total=self.http_timeout_seconds,
+                connect=self.http_timeout_seconds,
+                sock_read=self.http_timeout_seconds,
+            )
             connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
             self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
@@ -401,7 +420,6 @@ class AdvancedTradingAnalyzer:
             return None
         try:
             ts = ts_str.strip()
-            # normalize Zulu time to ISO8601 without 'Z'
             if ts.endswith("Z"):
                 ts = ts[:-1]
             return datetime.fromisoformat(ts)
@@ -588,7 +606,7 @@ class AdvancedTradingAnalyzer:
                 self._update_stats(False)
 
             if attempt < self.max_retries:
-                backoff = (2 ** attempt) + 0.1
+                backoff = min(2 ** attempt, 3) + 0.1
                 await asyncio.sleep(backoff)
 
         return None
@@ -600,11 +618,15 @@ class AdvancedTradingAnalyzer:
                 self.error_counter += 1
 
     # -------------------------------------------------------------------------
-    # Enhanced Price Data Collection (Async)
+    # Enhanced Price Data Collection (Async + Timeout)
     # -------------------------------------------------------------------------
 
     async def get_real_time_price(self, symbol: str) -> Optional[PriceData]:
-        """Get real-time price from multiple sources with async support."""
+        """
+        Get real-time price from multiple sources with async support.
+
+        Now wrapped with ANALYSIS_QUOTE_TIMEOUT_SECONDS so it never hangs indefinitely.
+        """
         symbol = symbol.upper().strip()
 
         cached = await self._load_from_cache(symbol, "price")
@@ -614,24 +636,61 @@ class AdvancedTradingAnalyzer:
             except Exception as e:
                 logger.debug(f"Invalid cached price for {symbol}: {e}")
 
-        tasks = [
-            self._get_price_alpha_vantage(symbol),
-            self._get_price_finnhub(symbol),
-            self._get_price_twelvedata(symbol),
-            self._get_price_marketstack(symbol),
-            self._get_price_fmp(symbol),
-        ]
+        # Create tasks for all providers
+        provider_calls = {
+            "alpha_vantage": self._get_price_alpha_vantage,
+            "finnhub": self._get_price_finnhub,
+            "twelvedata": self._get_price_twelvedata,
+            "marketstack": self._get_price_marketstack,
+            "fmp": self._get_price_fmp,
+        }
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks: Dict[str, asyncio.Task] = {}
+        for name, func in provider_calls.items():
+            tasks[name] = asyncio.create_task(func(symbol))
 
-        for result in results:
+        # Wait up to quote_timeout_seconds for any providers to respond
+        try:
+            done, pending = await asyncio.wait(
+                tasks.values(),
+                timeout=self.quote_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except Exception as e:
+            logger.error(f"Error waiting for price tasks: {e}")
+            done, pending = set(), set(tasks.values())
+
+        # Cancel any remaining tasks to avoid background work
+        for p in pending:
+            p.cancel()
+
+        # Prefer the first valid PriceData result
+        for task in done:
+            try:
+                result = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception as e:
+                logger.debug(f"Price task error: {e}")
+                continue
+
             if isinstance(result, PriceData) and result.price > 0:
                 await self._save_to_cache(symbol, "price", result.to_dict())
                 return result
-            elif isinstance(result, Exception):
-                logger.debug(f"Price source error: {result}")
 
-        logger.error(f"All price sources failed for {symbol}")
+        # If FIRST_COMPLETED didn't find a valid price, check any still-running tasks
+        # (they may have finished between FIRST_COMPLETED and here)
+        for name, task in tasks.items():
+            if task.done() and not task.cancelled():
+                try:
+                    result = task.result()
+                except Exception:
+                    continue
+                if isinstance(result, PriceData) and result.price > 0:
+                    await self._save_to_cache(symbol, "price", result.to_dict())
+                    return result
+
+        logger.error(f"All price sources failed or timed out for {symbol}")
         return None
 
     async def _get_price_alpha_vantage(self, symbol: str) -> Optional[PriceData]:
@@ -797,44 +856,87 @@ class AdvancedTradingAnalyzer:
             return None
 
     # -------------------------------------------------------------------------
-    # Enhanced Multi-source Analysis (Async)
+    # Enhanced Multi-source Analysis (Async + Global Timeout)
     # -------------------------------------------------------------------------
 
     async def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
-        """Multi-source analysis including Apps Script enrichment if configured."""
+        """
+        Multi-source analysis including Apps Script enrichment if configured.
+
+        Wrapped with ANALYSIS_OPERATION_TIMEOUT_SECONDS to avoid endless waits.
+        Partial results are returned if timeout is hit.
+        """
         symbol = symbol.upper().strip()
+        start_time = time.monotonic()
 
-        price_tasks = [
-            self._get_price_alpha_vantage(symbol),
-            self._get_price_finnhub(symbol),
-            self._get_price_twelvedata(symbol),
-            self._get_price_marketstack(symbol),
-            self._get_price_fmp(symbol),
-        ]
+        # Prepare provider tasks
+        provider_funcs = {
+            "alpha_vantage": self._get_price_alpha_vantage,
+            "finnhub": self._get_price_finnhub,
+            "twelvedata": self._get_price_twelvedata,
+            "marketstack": self._get_price_marketstack,
+            "fmp": self._get_price_fmp,
+        }
 
-        price_results = await asyncio.gather(*price_tasks, return_exceptions=True)
+        tasks: Dict[str, asyncio.Task] = {
+            name: asyncio.create_task(func(symbol))
+            for name, func in provider_funcs.items()
+        }
+
+        # Time budget for provider calls
+        timeout = self.operation_timeout_seconds
+        try:
+            done, pending = await asyncio.wait(
+                tasks.values(), timeout=timeout, return_when=asyncio.ALL_COMPLETED
+            )
+        except Exception as e:
+            logger.error(f"Error waiting for multi-source tasks: {e}")
+            done, pending = set(), set(tasks.values())
+
+        # Cancel any leftover tasks
+        for p in pending:
+            p.cancel()
 
         sources: Dict[str, Any] = {}
         successful_sources = 0
 
-        for name, result in zip(
-            ["alpha_vantage", "finnhub", "twelvedata", "marketstack", "fmp"],
-            price_results,
-        ):
+        # Collect finished provider results
+        for name, task in tasks.items():
+            if not task.done() or task.cancelled():
+                continue
+            try:
+                result = task.result()
+            except Exception as e:
+                logger.debug(f"Price source {name} failed: {e}")
+                continue
+
             if isinstance(result, PriceData) and result.price > 0:
                 sources[name] = result.to_dict()
                 successful_sources += 1
-            elif isinstance(result, Exception):
-                logger.debug(f"Price source {name} failed: {result}")
 
-        if self.google_apps_script_url:
+        # If there's still some time left, try Google Apps Script enrichment
+        time_spent = time.monotonic() - start_time
+        remaining = self.operation_timeout_seconds - time_spent
+
+        if self.google_apps_script_url and remaining > 2:
             try:
-                apps_script_data = await self._get_google_apps_script_data(symbol)
-                if apps_script_data:
-                    sources["google_apps_script"] = apps_script_data
-                    successful_sources += 1
+                apps_task = asyncio.create_task(self._get_google_apps_script_data(symbol))
+                done_g, pending_g = await asyncio.wait(
+                    {apps_task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                for p in pending_g:
+                    p.cancel()
+                for t in done_g:
+                    try:
+                        apps_script_data = t.result()
+                    except Exception as e:
+                        logger.debug(f"Google Apps Script failed: {e}")
+                        apps_script_data = None
+                    if apps_script_data:
+                        sources["google_apps_script"] = apps_script_data
+                        successful_sources += 1
             except Exception as e:
-                logger.debug(f"Google Apps Script failed: {e}")
+                logger.debug(f"Google Apps Script enrichment error: {e}")
 
         consolidated = self._consolidate_multi_source_data(sources)
 
@@ -845,9 +947,11 @@ class AdvancedTradingAnalyzer:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "metadata": {
                 "successful_sources": successful_sources,
-                "total_sources_attempted": len(price_tasks)
+                "total_sources_attempted": len(provider_funcs)
                 + (1 if self.google_apps_script_url else 0),
                 "data_quality": consolidated.get("data_quality", "LOW"),
+                "operation_time_seconds": round(time.monotonic() - start_time, 3),
+                "timeout_seconds": self.operation_timeout_seconds,
             },
         }
 
@@ -981,7 +1085,6 @@ class AdvancedTradingAnalyzer:
         Get historical data with memory-efficient chunking.
         period can be '1mo', '3mo', '6mo', '1y', 'max' (approximate by days).
         """
-        # Decide how many days based on period (approximate)
         period_map = {
             "1mo": 30,
             "3mo": 90,
@@ -1343,31 +1446,82 @@ class AdvancedTradingAnalyzer:
         )
 
     # -------------------------------------------------------------------------
-    # Enhanced AI Recommendation Engine
+    # Enhanced AI Recommendation Engine (Global Timeout)
     # -------------------------------------------------------------------------
 
     async def generate_ai_recommendation(self, symbol: str) -> AIRecommendation:
+        """
+        Generate AI recommendation by combining price, technicals, and fundamentals.
+
+        Wrapped with ANALYSIS_OPERATION_TIMEOUT_SECONDS so it returns within a
+        predictable time budget using fallbacks if needed.
+        """
         symbol = symbol.upper().strip()
+        start_time = time.monotonic()
 
-        price_task = self.get_real_time_price(symbol)
-        technical_task = self.calculate_technical_indicators(symbol)
-        fundamental_task = self.analyze_fundamentals(symbol)
+        # Prepare tasks
+        tasks: Dict[str, asyncio.Task] = {
+            "price": asyncio.create_task(self.get_real_time_price(symbol)),
+            "technical": asyncio.create_task(self.calculate_technical_indicators(symbol)),
+            "fundamental": asyncio.create_task(self.analyze_fundamentals(symbol)),
+        }
 
-        price_data, technical_data, fundamental_data = await asyncio.gather(
-            price_task, technical_task, fundamental_task, return_exceptions=True
+        try:
+            done, pending = await asyncio.wait(
+                tasks.values(),
+                timeout=self.operation_timeout_seconds,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+        except Exception as e:
+            logger.error(f"Error waiting for AI recommendation tasks: {e}")
+            done, pending = set(), set(tasks.values())
+
+        # Cancel any pending
+        for p in pending:
+            p.cancel()
+
+        # Safely extract results with fallbacks
+        price_data: Optional[PriceData] = None
+        technical_data: TechnicalIndicators = self._generate_fallback_technical_indicators()
+        fundamental_data: FundamentalData = self._generate_fallback_fundamental_data()
+
+        # Price
+        if tasks["price"].done() and not tasks["price"].cancelled():
+            try:
+                result = tasks["price"].result()
+                if isinstance(result, PriceData):
+                    price_data = result
+            except Exception as e:
+                logger.error(f"Price data failed for {symbol}: {e}")
+
+        # Technical
+        if tasks["technical"].done() and not tasks["technical"].cancelled():
+            try:
+                result = tasks["technical"].result()
+                if isinstance(result, TechnicalIndicators):
+                    technical_data = result
+            except Exception as e:
+                logger.error(f"Technical data failed for {symbol}: {e}")
+
+        # Fundamental
+        if tasks["fundamental"].done() and not tasks["fundamental"].cancelled():
+            try:
+                result = tasks["fundamental"].result()
+                if isinstance(result, FundamentalData):
+                    fundamental_data = result
+            except Exception as e:
+                logger.error(f"Fundamental data failed for {symbol}: {e}")
+
+        recommendation = self._generate_recommendation(symbol, technical_data, fundamental_data, price_data)
+
+        # Just for debug/monitoring
+        logger.info(
+            f"AI recommendation for {symbol} completed in "
+            f"{round(time.monotonic() - start_time, 3)}s "
+            f"(timeout={self.operation_timeout_seconds}s)"
         )
 
-        if isinstance(price_data, Exception):
-            logger.error(f"Price data failed for {symbol}: {price_data}")
-            price_data = None
-        if isinstance(technical_data, Exception):
-            logger.error(f"Technical data failed for {symbol}: {technical_data}")
-            technical_data = self._generate_fallback_technical_indicators()
-        if isinstance(fundamental_data, Exception):
-            logger.error(f"Fundamental data failed for {symbol}: {fundamental_data}")
-            fundamental_data = self._generate_fallback_fundamental_data()
-
-        return self._generate_recommendation(symbol, technical_data, fundamental_data, price_data)
+        return recommendation
 
     def _generate_recommendation(
         self,
@@ -1775,6 +1929,8 @@ class AdvancedTradingAnalyzer:
                 "current_window_requests": len(self.request_timestamps),
                 "max_retries": self.max_retries,
                 "cache_ttl_minutes": self.cache_ttl.total_seconds() / 60.0,
+                "http_timeout_seconds": self.http_timeout_seconds,
+                "operation_timeout_seconds": self.operation_timeout_seconds,
             }
 
 
