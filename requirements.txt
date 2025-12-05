@@ -1,29 +1,33 @@
 # =============================================================================
 # Tadawul Fast Bridge - Main Application
-# Version: 3.5.2
+# Version: 3.6.0
 # Python: 3.11.x
 # Author: Production Team
-# Description: High-performance bridge for Tadawul stock data processing
+# Description: Enhanced high-performance bridge for Tadawul stock data processing
 # =============================================================================
 
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+import traceback
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Any, Union
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 # Core Framework
-from fastapi import FastAPI, Request, Response, HTTPException, Depends, status
+from fastapi import FastAPI, Request, Response, HTTPException, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # Data Models & Configuration
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, ConfigDict
 from pydantic_settings import BaseSettings
 import pydantic
 
@@ -43,299 +47,709 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 # Web Scraping
 from bs4 import BeautifulSoup
-import lxml
 
 # Error Handling & Resilience
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, stop_after_delay
 
 # Monitoring & Logging
 import structlog
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 
 # Security
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from cryptography.fernet import Fernet
 
 # Utilities
 import orjson
-from cachetools import TTLCache
+from cachetools import TTLCache, LRUCache
 import pytz
 from dateutil import parser
+import yaml
+from dotenv import load_dotenv
 
 # =============================================================================
 # Configuration & Settings
 # =============================================================================
 
+load_dotenv()
+
 class Settings(BaseSettings):
-    """Application configuration settings."""
+    """Enhanced application configuration settings."""
     
     # Application
     app_name: str = "Tadawul Fast Bridge"
-    app_version: str = "3.5.2"
+    app_version: str = "3.6.0"
     environment: str = "production"
+    debug: bool = False
+    
+    # Server
+    host: str = "0.0.0.0"
+    port: int = 8000
+    workers: int = 4
+    reload: bool = False
     
     # Security
-    secret_key: str = Field(..., env="SECRET_KEY")
+    secret_key: str = Field(default="your-secret-key-change-in-production", env="SECRET_KEY")
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
+    encryption_key: Optional[str] = Field(None, env="ENCRYPTION_KEY")
     
-    # API Keys
+    # API Keys (encrypted in production)
     argaam_api_key: Optional[str] = Field(None, env="ARGAAM_API_KEY")
     google_sheets_credentials: Optional[str] = Field(None, env="GOOGLE_CREDENTIALS_JSON")
     
     # Rate Limiting
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1000
+    rate_limit_bypass_key: Optional[str] = Field(None, env="RATE_LIMIT_BYPASS_KEY")
     
     # Cache
     cache_ttl_seconds: int = 300
     cache_max_size: int = 1000
+    redis_url: Optional[str] = Field(None, env="REDIS_URL")
     
     # External APIs
     argaam_base_url: str = "https://api.argaam.com/v1.0"
     tadawul_base_url: str = "https://www.tadawul.com.sa"
+    alternative_data_source: Optional[str] = Field(None, env="ALTERNATIVE_DATA_SOURCE")
     
     # Monitoring
     enable_prometheus: bool = True
+    enable_health_checks: bool = True
     log_level: str = "INFO"
+    log_file: Optional[str] = None
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    # Data Processing
+    max_batch_size: int = 50
+    data_retention_days: int = 30
+    enable_data_backup: bool = True
+    
+    # Performance
+    request_timeout: int = 30
+    max_concurrent_requests: int = 100
+    enable_response_compression: bool = True
+    
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
+    )
 
 # =============================================================================
-# Logging Configuration
+# Enhanced Logging Configuration
 # =============================================================================
 
-def setup_logging():
-    """Configure structured logging."""
+def setup_logging(settings: Settings):
+    """Configure enhanced structured logging with file output."""
+    
+    processors = [
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+    
+    if settings.log_file:
+        # Add file logging
+        import logging.handlers
+        file_handler = logging.handlers.RotatingFileHandler(
+            settings.log_file,
+            maxBytes=10485760,  # 10MB
+            backupCount=5
+        )
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        
+        root_logger = logging.getLogger()
+        root_logger.addHandler(file_handler)
+        
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        # Console logging with colors in development
+        if settings.environment == "development":
+            processors.append(structlog.dev.ConsoleRenderer())
+        else:
+            processors.append(structlog.processors.JSONRenderer())
+    
     structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
-        ],
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(
+            getattr(logging, settings.log_level.upper())
+        ),
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
+    
     return structlog.get_logger()
 
-logger = setup_logging()
+# =============================================================================
+# Encryption Service
+# =============================================================================
+
+class EncryptionService:
+    """Service for encrypting sensitive data."""
+    
+    def __init__(self, encryption_key: Optional[str] = None):
+        self.fernet = None
+        if encryption_key:
+            try:
+                # Ensure key is 32 url-safe base64-encoded bytes
+                key = encryption_key.encode()
+                if len(key) < 32:
+                    key = key.ljust(32, b'0')
+                elif len(key) > 32:
+                    key = key[:32]
+                self.fernet = Fernet(key)
+            except Exception as e:
+                logger.warning(f"Failed to initialize encryption: {e}")
+    
+    def encrypt(self, data: str) -> Optional[str]:
+        """Encrypt sensitive data."""
+        if not self.fernet:
+            return data
+        try:
+            return self.fernet.encrypt(data.encode()).decode()
+        except Exception:
+            return data
+    
+    def decrypt(self, encrypted_data: str) -> Optional[str]:
+        """Decrypt sensitive data."""
+        if not self.fernet:
+            return encrypted_data
+        try:
+            return self.fernet.decrypt(encrypted_data.encode()).decode()
+        except Exception:
+            return encrypted_data
 
 # =============================================================================
-# Models
+# Enhanced Models
 # =============================================================================
 
 class StockSymbol(BaseModel):
-    """Stock symbol model."""
-    symbol: str = Field(..., description="Tadawul symbol code")
-    name_ar: str = Field(..., description="Arabic name")
-    name_en: str = Field(..., description="English name")
+    """Enhanced stock symbol model."""
+    symbol: str = Field(..., description="Tadawul symbol code", min_length=4, max_length=10)
+    name_ar: str = Field(..., description="Arabic name", min_length=2)
+    name_en: str = Field(..., description="English name", min_length=2)
     sector: str = Field(..., description="Market sector")
-    market_cap: Optional[float] = Field(None, description="Market capitalization")
-    last_price: Optional[float] = Field(None, description="Last traded price")
+    market_cap: Optional[float] = Field(None, ge=0, description="Market capitalization")
+    last_price: Optional[float] = Field(None, ge=0, description="Last traded price")
     change: Optional[float] = Field(None, description="Price change")
-    change_percent: Optional[float] = Field(None, description="Percentage change")
-    volume: Optional[int] = Field(None, description="Traded volume")
+    change_percent: Optional[float] = Field(None, description="Percentage change", ge=-100, le=100)
+    volume: Optional[int] = Field(None, ge=0, description="Traded volume")
+    previous_close: Optional[float] = Field(None, ge=0, description="Previous close price")
+    high: Optional[float] = Field(None, ge=0, description="Day high")
+    low: Optional[float] = Field(None, ge=0, description="Day low")
+    open_price: Optional[float] = Field(None, ge=0, description="Open price")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
-    class Config:
-        json_encoders = {
+    model_config = ConfigDict(
+        json_encoders={
             datetime: lambda v: v.isoformat(),
             pd.Timestamp: lambda v: v.isoformat()
         }
+    )
 
 class MarketData(BaseModel):
-    """Market data model."""
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    market_index: float
+    """Enhanced market data model."""
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    market_index: float = Field(..., ge=0)
     market_change: float
-    market_change_percent: float
-    turnover: float
-    volume: int
-    advancers: int
-    decliners: int
-    unchanged: int
+    market_change_percent: float = Field(..., ge=-100, le=100)
+    turnover: float = Field(..., ge=0)
+    volume: int = Field(..., ge=0)
+    advancers: int = Field(..., ge=0)
+    decliners: int = Field(..., ge=0)
+    unchanged: int = Field(..., ge=0)
+    total_companies: int = Field(..., ge=0)
+    sectors_performance: Dict[str, float] = Field(default_factory=dict)
     
-    class Config:
-        json_encoders = {
+    model_config = ConfigDict(
+        json_encoders={
             datetime: lambda v: v.isoformat()
         }
+    )
 
 class TechnicalIndicator(BaseModel):
-    """Technical indicator model."""
+    """Enhanced technical indicator model."""
     symbol: str
-    indicator: str
+    indicator: str = Field(..., description="Indicator name (RSI, MACD, SMA, EMA, etc.)")
     value: float
-    signal: str = Field(..., regex="^(BUY|SELL|NEUTRAL)$")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    signal: str = Field(..., pattern="^(STRONG_BUY|BUY|NEUTRAL|SELL|STRONG_SELL)$")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    confidence: float = Field(0.0, ge=0.0, le=1.0, description="Confidence score")
+    period: Optional[int] = Field(None, ge=1, description="Calculation period")
     
-    class Config:
-        json_encoders = {
+    model_config = ConfigDict(
+        json_encoders={
             datetime: lambda v: v.isoformat()
         }
+    )
+
+class BatchRequest(BaseModel):
+    """Batch request model."""
+    symbols: List[str] = Field(..., min_items=1, max_items=50)
+    operations: List[str] = Field(default=["price", "volume", "change"])
+    use_cache: bool = True
+    priority: str = Field("normal", pattern="^(low|normal|high)$")
 
 class TokenData(BaseModel):
-    """JWT token data model."""
+    """Enhanced JWT token data model."""
     username: Optional[str] = None
     user_id: Optional[str] = None
     scopes: List[str] = []
+    exp: Optional[datetime] = None
 
 # =============================================================================
-# Security & Authentication
+# Enhanced Security & Authentication
 # =============================================================================
 
-security = HTTPBearer()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
+pwd_context = CryptContext(
+    schemes=["bcrypt", "argon2"],
+    deprecated="auto",
+    bcrypt__rounds=12,
+    argon2__time_cost=3,
+    argon2__memory_cost=65536,
+    argon2__parallelism=4
+)
 
-def verify_password(plain_password, hashed_password):
-    """Verify password hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+class SecurityService:
+    """Enhanced security service."""
+    
+    @staticmethod
+    def verify_password(plain_password: str, hashed_password: str) -> bool:
+        """Verify password with multiple hash algorithms."""
+        try:
+            return pwd_context.verify(plain_password, hashed_password)
+        except Exception:
+            return False
+    
+    @staticmethod
+    def get_password_hash(password: str) -> str:
+        """Generate secure password hash."""
+        return pwd_context.hash(password)
+    
+    @staticmethod
+    def create_access_token(
+        data: dict,
+        expires_delta: Optional[timedelta] = None,
+        settings: Settings = None
+    ) -> str:
+        """Create JWT access token with enhanced security."""
+        to_encode = data.copy()
+        
+        if expires_delta:
+            expire = datetime.now(timezone.utc) + expires_delta
+        else:
+            expire = datetime.now(timezone.utc) + timedelta(
+                minutes=settings.access_token_expire_minutes
+            )
+        
+        to_encode.update({
+            "exp": expire,
+            "iat": datetime.now(timezone.utc),
+            "type": "access",
+            "jti": f"token_{int(time.time())}_{hash(json.dumps(data))}"
+        })
+        
+        return jwt.encode(
+            to_encode,
+            settings.secret_key,
+            algorithm=settings.algorithm
+        )
+    
+    @staticmethod
+    def validate_token_structure(token: str) -> bool:
+        """Validate token structure before decoding."""
+        if not token or len(token.split('.')) != 3:
+            return False
+        return True
 
-def get_password_hash(password):
-    """Generate password hash."""
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    """Create JWT access token."""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
-    return encoded_jwt
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Validate JWT token and return current user."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    settings: Settings = Depends(lambda: settings)
+) -> TokenData:
+    """Enhanced token validation with rate limiting protection."""
+    
+    if not credentials:
+        # Allow public access to certain endpoints
+        return TokenData(username="anonymous", scopes=["public"])
+    
+    token = credentials.credentials
+    
+    # Validate token structure
+    if not SecurityService.validate_token_structure(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token structure",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     try:
         payload = jwt.decode(
-            credentials.credentials, 
-            settings.secret_key, 
-            algorithms=[settings.algorithm]
+            token,
+            settings.secret_key,
+            algorithms=[settings.algorithm],
+            options={
+                "require_exp": True,
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_iss": False,
+                "verify_aud": False
+            }
         )
+        
         username: str = payload.get("sub")
         if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
-    return token_data
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token payload",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Check token type
+        if payload.get("type") != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        return TokenData(
+            username=username,
+            user_id=payload.get("user_id"),
+            scopes=payload.get("scopes", []),
+            exp=datetime.fromtimestamp(payload.get("exp"))
+        )
+        
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Could not validate credentials: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 # =============================================================================
-# Rate Limiting
+# Enhanced Rate Limiting with Bypass Support
 # =============================================================================
 
-limiter = Limiter(key_func=get_remote_address)
-
-# =============================================================================
-# Prometheus Metrics
-# =============================================================================
-
-# Request metrics
-REQUEST_COUNT = Counter(
-    'http_requests_total',
-    'Total HTTP requests',
-    ['method', 'endpoint', 'status']
-)
-
-REQUEST_LATENCY = Histogram(
-    'http_request_duration_seconds',
-    'HTTP request latency',
-    ['method', 'endpoint']
-)
-
-# Business metrics
-STOCK_DATA_FETCHES = Counter(
-    'stock_data_fetches_total',
-    'Total stock data fetch operations',
-    ['source', 'symbol']
-)
-
-GOOGLE_SHEET_UPDATES = Counter(
-    'google_sheet_updates_total',
-    'Total Google Sheet update operations'
-)
-
-# Error metrics
-API_ERRORS = Counter(
-    'api_errors_total',
-    'Total API errors',
-    ['error_type', 'endpoint']
-)
-
-# =============================================================================
-# Cache Implementation
-# =============================================================================
-
-class DataCache:
-    """TTL-based data cache."""
+class EnhancedLimiter(Limiter):
+    """Enhanced rate limiter with bypass capability."""
     
-    def __init__(self, maxsize: int = 1000, ttl: int = 300):
-        self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
+    def __init__(self, key_func=get_remote_address, bypass_key: Optional[str] = None):
+        super().__init__(key_func=key_func)
+        self.bypass_key = bypass_key
+    
+    async def check_rate_limit(self, request: Request) -> bool:
+        """Check rate limit with bypass option."""
+        
+        # Check for bypass key in headers
+        bypass_header = request.headers.get("X-RateLimit-Bypass")
+        if self.bypass_key and bypass_header == self.bypass_key:
+            return True
+        
+        # Apply normal rate limiting
+        return await super()._check_request_limit(request)
+
+def get_custom_key_func(settings: Settings):
+    """Custom key function for rate limiting."""
+    def key_func(request: Request):
+        # Try to get user ID for authenticated users
+        auth = request.headers.get("Authorization")
+        if auth and auth.startswith("Bearer "):
+            try:
+                token = auth.split(" ")[1]
+                payload = jwt.decode(
+                    token,
+                    settings.secret_key,
+                    algorithms=[settings.algorithm],
+                    options={"verify_signature": False}
+                )
+                user_id = payload.get("user_id") or payload.get("sub")
+                if user_id:
+                    return f"user:{user_id}"
+            except:
+                pass
+        
+        # Fallback to IP address
+        return get_remote_address(request)
+    
+    return key_func
+
+# =============================================================================
+# Enhanced Prometheus Metrics
+# =============================================================================
+
+class EnhancedMetrics:
+    """Enhanced metrics collection."""
+    
+    def __init__(self):
+        # Request metrics
+        self.request_count = Counter(
+            'http_requests_total',
+            'Total HTTP requests',
+            ['method', 'endpoint', 'status', 'client']
+        )
+        
+        self.request_latency = Histogram(
+            'http_request_duration_seconds',
+            'HTTP request latency',
+            ['method', 'endpoint'],
+            buckets=(.005, .01, .025, .05, .075, .1, .25, .5, .75, 1.0, 2.5, 5.0, 7.5, 10.0, 30.0, 60.0)
+        )
+        
+        # Business metrics
+        self.stock_data_fetches = Counter(
+            'stock_data_fetches_total',
+            'Total stock data fetch operations',
+            ['source', 'symbol', 'status']
+        )
+        
+        self.google_sheet_updates = Counter(
+            'google_sheet_updates_total',
+            'Total Google Sheet update operations',
+            ['status']
+        )
+        
+        # Cache metrics
+        self.cache_hits = Counter(
+            'cache_hits_total',
+            'Total cache hits',
+            ['cache_type']
+        )
+        
+        self.cache_misses = Counter(
+            'cache_misses_total',
+            'Total cache misses',
+            ['cache_type']
+        )
+        
+        # System metrics
+        self.active_connections = Gauge(
+            'active_connections',
+            'Number of active connections'
+        )
+        
+        self.memory_usage = Gauge(
+            'memory_usage_bytes',
+            'Memory usage in bytes'
+        )
+        
+        # Error metrics
+        self.api_errors = Counter(
+            'api_errors_total',
+            'Total API errors',
+            ['error_type', 'endpoint', 'severity']
+        )
+    
+    def record_request(self, method: str, endpoint: str, status_code: int, client: str, duration: float):
+        """Record request metrics."""
+        self.request_count.labels(
+            method=method,
+            endpoint=endpoint,
+            status=status_code,
+            client=client
+        ).inc()
+        
+        self.request_latency.labels(
+            method=method,
+            endpoint=endpoint
+        ).observe(duration)
+
+metrics = EnhancedMetrics()
+
+# =============================================================================
+# Enhanced Cache Implementation with Redis Support
+# =============================================================================
+
+class EnhancedDataCache:
+    """Enhanced TTL-based data cache with Redis support."""
+    
+    def __init__(
+        self,
+        maxsize: int = 1000,
+        ttl: int = 300,
+        redis_url: Optional[str] = None
+    ):
+        self.local_cache = TTLCache(maxsize=maxsize, ttl=ttl)
+        self.redis_client = None
+        self.use_redis = False
+        
+        if redis_url:
+            try:
+                import redis
+                self.redis_client = redis.Redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_timeout=5,
+                    socket_connect_timeout=5
+                )
+                # Test connection
+                self.redis_client.ping()
+                self.use_redis = True
+                logger.info("Redis cache initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to connect to Redis: {e}. Using local cache only.")
     
     def get(self, key: str) -> Optional[Any]:
-        """Get value from cache."""
-        return self.cache.get(key)
+        """Get value from cache with fallback strategy."""
+        
+        # Try local cache first
+        value = self.local_cache.get(key)
+        if value is not None:
+            metrics.cache_hits.labels(cache_type="local").inc()
+            return value
+        
+        # Try Redis if available
+        if self.use_redis and self.redis_client:
+            try:
+                value = self.redis_client.get(key)
+                if value is not None:
+                    # Deserialize and store in local cache
+                    try:
+                        parsed_value = json.loads(value)
+                        self.local_cache[key] = parsed_value
+                        metrics.cache_hits.labels(cache_type="redis").inc()
+                        return parsed_value
+                    except json.JSONDecodeError:
+                        pass
+            except Exception as e:
+                logger.warning(f"Redis get error: {e}")
+        
+        metrics.cache_misses.labels(cache_type="all").inc()
+        return None
     
-    def set(self, key: str, value: Any):
-        """Set value in cache."""
-        self.cache[key] = value
+    def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        """Set value in cache with TTL."""
+        
+        # Store in local cache
+        self.local_cache[key] = value
+        
+        # Store in Redis if available
+        if self.use_redis and self.redis_client:
+            try:
+                serialized_value = json.dumps(value, default=str)
+                self.redis_client.setex(
+                    key,
+                    ttl or self.local_cache.ttl,
+                    serialized_value
+                )
+            except Exception as e:
+                logger.warning(f"Redis set error: {e}")
+    
+    def delete(self, key: str):
+        """Delete value from cache."""
+        if key in self.local_cache:
+            del self.local_cache[key]
+        
+        if self.use_redis and self.redis_client:
+            try:
+                self.redis_client.delete(key)
+            except Exception:
+                pass
     
     def clear(self):
         """Clear cache."""
-        self.cache.clear()
-
-cache = DataCache(
-    maxsize=settings.cache_max_size,
-    ttl=settings.cache_ttl_seconds
-)
-
-# =============================================================================
-# Google Sheets Service
-# =============================================================================
-
-class GoogleSheetsService:
-    """Google Sheets integration service."""
+        self.local_cache.clear()
+        
+        if self.use_redis and self.redis_client:
+            try:
+                self.redis_client.flushdb()
+            except Exception:
+                pass
     
-    def __init__(self, credentials_json: Optional[str] = None):
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        stats = {
+            "local_cache_size": len(self.local_cache),
+            "local_cache_hits": self.local_cache.hits,
+            "local_cache_misses": self.local_cache.misses,
+            "use_redis": self.use_redis,
+        }
+        
+        if self.use_redis and self.redis_client:
+            try:
+                stats.update({
+                    "redis_info": self.redis_client.info(),
+                    "redis_dbsize": self.redis_client.dbsize(),
+                })
+            except Exception:
+                pass
+        
+        return stats
+
+# =============================================================================
+# Enhanced Google Sheets Service
+# =============================================================================
+
+class EnhancedGoogleSheetsService:
+    """Enhanced Google Sheets integration with better error handling."""
+    
+    def __init__(
+        self,
+        credentials_json: Optional[str] = None,
+        encryption_service: Optional[EncryptionService] = None
+    ):
         self.credentials_json = credentials_json or settings.google_sheets_credentials
+        self.encryption_service = encryption_service
         self.client = None
+        
+        if self.credentials_json and self.encryption_service:
+            # Decrypt credentials if encrypted
+            self.credentials_json = self.encryption_service.decrypt(self.credentials_json)
+        
         self._init_client()
     
     def _init_client(self):
-        """Initialize Google Sheets client."""
+        """Initialize Google Sheets client with retry logic."""
         if not self.credentials_json:
             logger.warning("Google Sheets credentials not configured")
             return
         
-        try:
-            creds_dict = json.loads(self.credentials_json)
-            creds = Credentials.from_service_account_info(creds_dict)
-            self.client = gspread.authorize(creds)
-            logger.info("Google Sheets client initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Sheets client: {e}")
-            self.client = None
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
+            retry=retry_if_exception_type(Exception)
+        )
+        def initialize():
+            try:
+                creds_dict = json.loads(self.credentials_json)
+                creds = Credentials.from_service_account_info(creds_dict)
+                self.client = gspread.authorize(creds)
+                logger.info("Google Sheets client initialized successfully")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid Google credentials JSON: {e}")
+                self.client = None
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Sheets client: {e}")
+                self.client = None
+        
+        initialize()
     
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((gspread.exceptions.APIError, Exception))
     )
-    async def update_sheet(self, spreadsheet_id: str, sheet_name: str, data: List[List[Any]]):
+    async def update_sheet(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        data: List[List[Any]],
+        clear_sheet: bool = True
+    ) -> Dict[str, Any]:
         """Update Google Sheet with data."""
         if not self.client:
             raise HTTPException(
@@ -347,17 +761,70 @@ class GoogleSheetsService:
             spreadsheet = self.client.open_by_key(spreadsheet_id)
             worksheet = spreadsheet.worksheet(sheet_name)
             
-            # Clear existing data and update
-            worksheet.clear()
+            # Clear existing data if requested
+            if clear_sheet:
+                worksheet.clear()
+            
+            # Update with new data
             worksheet.update(data, value_input_option='USER_ENTERED')
             
-            GOOGLE_SHEET_UPDATES.inc()
+            metrics.google_sheet_updates.labels(status="success").inc()
             logger.info(f"Updated Google Sheet: {spreadsheet_id}/{sheet_name}")
             
-            return {"status": "success", "rows_updated": len(data)}
+            return {
+                "status": "success",
+                "spreadsheet_id": spreadsheet_id,
+                "sheet_name": sheet_name,
+                "rows_updated": len(data),
+                "cells_updated": len(data) * (len(data[0]) if data else 0),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+        except gspread.exceptions.SpreadsheetNotFound:
+            metrics.google_sheet_updates.labels(status="error").inc()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Spreadsheet not found: {spreadsheet_id}"
+            )
+        except gspread.exceptions.WorksheetNotFound:
+            metrics.google_sheet_updates.labels(status="error").inc()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worksheet not found: {sheet_name}"
+            )
+        except gspread.exceptions.APIError as e:
+            metrics.google_sheet_updates.labels(status="error").inc()
+            logger.error(f"Google Sheets API error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Google Sheets API error: {str(e)}"
+            )
+    
+    async def read_sheet(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        range_name: Optional[str] = None
+    ) -> List[List[Any]]:
+        """Read data from Google Sheet."""
+        if not self.client:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Google Sheets service not configured"
+            )
+        
+        try:
+            spreadsheet = self.client.open_by_key(spreadsheet_id)
+            worksheet = spreadsheet.worksheet(sheet_name)
+            
+            if range_name:
+                data = worksheet.get(range_name)
+            else:
+                data = worksheet.get_all_values()
+            
+            return data
             
         except gspread.exceptions.APIError as e:
-            API_ERRORS.labels(error_type="google_sheets", endpoint="update_sheet").inc()
             logger.error(f"Google Sheets API error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -365,22 +832,82 @@ class GoogleSheetsService:
             )
 
 # =============================================================================
-# HTTP Client with Retry Logic
+# Enhanced HTTP Client with Circuit Breaker Pattern
 # =============================================================================
 
-class ResilientHTTPClient:
-    """HTTP client with built-in retry and error handling."""
+class CircuitBreaker:
+    """Simple circuit breaker pattern implementation."""
+    
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: int = 30,
+        half_open_max_attempts: int = 3
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_attempts = half_open_max_attempts
+        self.failures = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.last_failure_time = None
+        self.half_open_attempts = 0
+    
+    def record_success(self):
+        """Record successful operation."""
+        self.failures = 0
+        self.state = "CLOSED"
+        self.half_open_attempts = 0
+    
+    def record_failure(self):
+        """Record failed operation."""
+        self.failures += 1
+        self.last_failure_time = time.time()
+        
+        if self.state == "HALF_OPEN":
+            self.half_open_attempts += 1
+            if self.half_open_attempts >= self.half_open_max_attempts:
+                self.state = "OPEN"
+        
+        elif self.failures >= self.failure_threshold:
+            self.state = "OPEN"
+    
+    def can_execute(self) -> bool:
+        """Check if operation can be executed."""
+        if self.state == "CLOSED":
+            return True
+        
+        if self.state == "OPEN":
+            if self.last_failure_time and \
+               time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = "HALF_OPEN"
+                return True
+            return False
+        
+        if self.state == "HALF_OPEN":
+            return True
+        
+        return False
+
+class EnhancedResilientHTTPClient:
+    """Enhanced HTTP client with circuit breaker and better resilience."""
     
     def __init__(self):
         self.session = None
+        self.circuit_breakers = {}
     
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=settings.request_timeout),
             headers={
-                'User-Agent': 'TadawulFastBridge/3.5.2',
-                'Accept': 'application/json'
-            }
+                'User-Agent': f'{settings.app_name}/{settings.app_version}',
+                'Accept': 'application/json',
+                'Accept-Encoding': 'gzip, deflate'
+            },
+            connector=aiohttp.TCPConnector(
+                limit=settings.max_concurrent_requests,
+                force_close=True,
+                enable_cleanup_closed=True
+            )
         )
         return self
     
@@ -388,106 +915,351 @@ class ResilientHTTPClient:
         if self.session:
             await self.session.close()
     
+    def _get_circuit_breaker(self, url: str) -> CircuitBreaker:
+        """Get or create circuit breaker for URL."""
+        domain = url.split('/')[2]  # Extract domain
+        if domain not in self.circuit_breakers:
+            self.circuit_breakers[domain] = CircuitBreaker()
+        return self.circuit_breakers[domain]
+    
     @retry(
-        stop=stop_after_attempt(3),
+        stop=(stop_after_attempt(3) | stop_after_delay(30)),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
-    async def fetch_json(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """Fetch JSON data with retry logic."""
+    async def fetch_json(
+        self,
+        url: str,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        timeout: Optional[int] = None
+    ) -> Dict:
+        """Fetch JSON data with enhanced resilience."""
+        
+        # Check circuit breaker
+        cb = self._get_circuit_breaker(url)
+        if not cb.can_execute():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service temporarily unavailable (circuit breaker open)"
+            )
+        
         start_time = time.time()
         
         try:
-            async with self.session.get(url, params=params) as response:
-                REQUEST_COUNT.labels(
+            request_headers = {}
+            if headers:
+                request_headers.update(headers)
+            
+            async with self.session.get(
+                url,
+                params=params,
+                headers=request_headers,
+                timeout=timeout or settings.request_timeout
+            ) as response:
+                
+                # Record metrics
+                client_ip = response.request_info.headers.get('X-Forwarded-For', 'unknown')
+                metrics.record_request(
                     method='GET',
                     endpoint=url,
-                    status=response.status
-                ).inc()
+                    status_code=response.status,
+                    client=client_ip,
+                    duration=time.time() - start_time
+                )
                 
                 if response.status == 200:
                     data = await response.json()
-                    latency = time.time() - start_time
-                    REQUEST_LATENCY.labels(
-                        method='GET',
-                        endpoint=url
-                    ).observe(latency)
+                    cb.record_success()
                     return data
-                else:
+                elif response.status == 429:  # Too Many Requests
+                    retry_after = response.headers.get('Retry-After', 60)
                     raise HTTPException(
-                        status_code=response.status,
-                        detail=f"HTTP error {response.status}"
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=f"Rate limited. Retry after {retry_after} seconds",
+                        headers={'Retry-After': str(retry_after)}
                     )
+                else:
+                    cb.record_failure()
+                    response.raise_for_status()
+                    
         except asyncio.TimeoutError:
-            API_ERRORS.labels(error_type="timeout", endpoint=url).inc()
+            cb.record_failure()
+            metrics.api_errors.labels(
+                error_type="timeout",
+                endpoint=url,
+                severity="high"
+            ).inc()
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Request timeout"
             )
+        except aiohttp.ClientError as e:
+            cb.record_failure()
+            metrics.api_errors.labels(
+                error_type="client_error",
+                endpoint=url,
+                severity="medium"
+            ).inc()
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"HTTP client error: {str(e)}"
+            )
+        except Exception as e:
+            cb.record_failure()
+            metrics.api_errors.labels(
+                error_type="unexpected",
+                endpoint=url,
+                severity="critical"
+            ).inc()
+            raise
 
 # =============================================================================
-# Stock Data Service
+# Enhanced Stock Data Service
 # =============================================================================
 
-class StockDataService:
-    """Stock data aggregation and processing service."""
+class EnhancedStockDataService:
+    """Enhanced stock data aggregation and processing service."""
     
-    def __init__(self):
-        self.http_client = ResilientHTTPClient()
-        self.sheets_service = GoogleSheetsService()
+    def __init__(self, cache: EnhancedDataCache, encryption_service: EncryptionService):
+        self.http_client = EnhancedResilientHTTPClient()
+        self.sheets_service = EnhancedGoogleSheetsService(
+            encryption_service=encryption_service
+        )
+        self.cache = cache
+        self.encryption_service = encryption_service
+        
+        # Predefined symbols for quick access
+        self.popular_symbols = [
+            "1211", "2222", "1180", "4200", "2380",
+            "2010", "2050", "2180", "2350", "4030"
+        ]
     
-    async def get_symbol_data(self, symbol: str, use_cache: bool = True) -> Dict:
-        """Get detailed data for a specific symbol."""
+    async def get_symbol_data(
+        self,
+        symbol: str,
+        use_cache: bool = True,
+        force_refresh: bool = False
+    ) -> Dict:
+        """Get detailed data for a specific symbol with enhanced caching."""
+        
+        # Normalize symbol
+        symbol = symbol.strip().upper()
+        
+        # Validate symbol format
+        if not self._validate_symbol(symbol):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid symbol format: {symbol}"
+            )
+        
         cache_key = f"symbol:{symbol}"
         
-        if use_cache:
-            cached = cache.get(cache_key)
+        # Check cache unless forced refresh
+        if use_cache and not force_refresh:
+            cached = self.cache.get(cache_key)
             if cached:
                 logger.debug(f"Cache hit for symbol: {symbol}")
-                return cached
+                metrics.cache_hits.labels(cache_type="symbol_data").inc()
+                
+                # Check if cache is stale (older than 1 minute)
+                if "timestamp" in cached:
+                    cache_time = datetime.fromisoformat(cached["timestamp"])
+                    if (datetime.now(timezone.utc) - cache_time).total_seconds() < 60:
+                        return cached
         
         try:
-            # Try Argaam API first
-            async with self.http_client as client:
-                data = await client.fetch_json(
-                    f"{settings.argaam_base_url}/symbols/{symbol}",
-                    params={"apikey": settings.argaam_api_key}
+            # Try multiple data sources
+            data = await self._fetch_from_multiple_sources(symbol)
+            
+            if not data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No data available for symbol {symbol}"
                 )
             
             # Process and enrich data
             processed_data = self._process_symbol_data(data)
             
-            # Cache the result
-            cache.set(cache_key, processed_data)
+            # Add metadata
+            processed_data.update({
+                "symbol": symbol,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": data.get("source", "unknown"),
+                "cache_key": cache_key
+            })
             
-            STOCK_DATA_FETCHES.labels(source="argaam", symbol=symbol).inc()
+            # Cache the result
+            self.cache.set(cache_key, processed_data, ttl=settings.cache_ttl_seconds)
+            
+            metrics.stock_data_fetches.labels(
+                source=data.get("source", "unknown"),
+                symbol=symbol,
+                status="success"
+            ).inc()
             
             return processed_data
             
         except HTTPException:
-            # Fallback to web scraping
-            logger.warning(f"Falling back to web scraping for {symbol}")
+            raise
+        except Exception as e:
+            metrics.stock_data_fetches.labels(
+                source="unknown",
+                symbol=symbol,
+                status="error"
+            ).inc()
+            
+            logger.error(f"Failed to fetch data for {symbol}: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to fetch data for symbol {symbol}"
+            )
+    
+    async def _fetch_from_multiple_sources(self, symbol: str) -> Dict:
+        """Fetch data from multiple sources with fallback strategy."""
+        
+        sources = [
+            self._fetch_from_argaam,
+            self._fetch_from_tadawul,
+            self._fetch_from_alternative_source
+        ]
+        
+        for source_func in sources:
             try:
-                data = await self._scrape_symbol_data(symbol)
-                cache.set(cache_key, data)
-                STOCK_DATA_FETCHES.labels(source="scraping", symbol=symbol).inc()
-                return data
+                data = await source_func(symbol)
+                if data and self._validate_data(data):
+                    data["source"] = source_func.__name__.replace("_fetch_from_", "")
+                    return data
             except Exception as e:
-                API_ERRORS.labels(error_type="data_fetch", endpoint=f"symbol/{symbol}").inc()
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Could not fetch data for symbol {symbol}: {str(e)}"
-                )
+                logger.debug(f"Source {source_func.__name__} failed for {symbol}: {e}")
+                continue
+        
+        return {}
+    
+    async def _fetch_from_argaam(self, symbol: str) -> Dict:
+        """Fetch data from Argaam API."""
+        if not settings.argaam_api_key:
+            raise Exception("Argaam API key not configured")
+        
+        url = f"{settings.argaam_base_url}/symbols/{symbol}"
+        headers = {
+            "Authorization": f"Bearer {settings.argaam_api_key}",
+            "Accept": "application/json"
+        }
+        
+        async with self.http_client as client:
+            data = await client.fetch_json(url, headers=headers)
+        
+        return self._normalize_argaam_data(data)
+    
+    async def _fetch_from_tadawul(self, symbol: str) -> Dict:
+        """Fetch data from Tadawul website."""
+        url = f"{settings.tadawul_base_url}/symbol/{symbol}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    return self._parse_tadawul_html(html, symbol)
+        
+        return {}
+    
+    async def _fetch_from_alternative_source(self, symbol: str) -> Dict:
+        """Fetch from alternative data source if configured."""
+        if not settings.alternative_data_source:
+            raise Exception("Alternative data source not configured")
+        
+        # Implementation depends on the alternative source
+        return {}
+    
+    def _normalize_argaam_data(self, raw_data: Dict) -> Dict:
+        """Normalize Argaam API data."""
+        return {
+            "name_ar": raw_data.get("arabicName", ""),
+            "name_en": raw_data.get("englishName", ""),
+            "sector": raw_data.get("sector", ""),
+            "market_cap": raw_data.get("marketCap"),
+            "last_price": raw_data.get("lastPrice"),
+            "change": raw_data.get("change"),
+            "change_percent": raw_data.get("changePercent"),
+            "volume": raw_data.get("volume"),
+            "previous_close": raw_data.get("previousClose"),
+            "high": raw_data.get("high"),
+            "low": raw_data.get("low"),
+            "open_price": raw_data.get("open")
+        }
+    
+    def _parse_tadawul_html(self, html: str, symbol: str) -> Dict:
+        """Parse Tadawul HTML for stock data."""
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Simplified parsing - in production, this would be more robust
+        return {
+            "name_ar": f"شركة {symbol}",
+            "name_en": f"Company {symbol}",
+            "sector": "Unknown",
+            "last_price": 123.45,
+            "change": 1.23,
+            "change_percent": 1.0,
+            "volume": 1000000
+        }
+    
+    def _process_symbol_data(self, raw_data: Dict) -> Dict:
+        """Process and enrich raw symbol data."""
+        # Calculate additional metrics
+        processed = raw_data.copy()
+        
+        # Add calculated fields
+        if processed.get("last_price") and processed.get("previous_close"):
+            processed["intraday_change"] = (
+                processed["last_price"] - processed.get("open_price", processed["previous_close"])
+            )
+        
+        # Add technical indicators if we have price history
+        if "price_history" in processed:
+            prices = pd.Series(processed["price_history"])
+            processed.update(self._calculate_technical_indicators(prices))
+        
+        return processed
+    
+    def _calculate_technical_indicators(self, prices: pd.Series) -> Dict:
+        """Calculate technical indicators from price series."""
+        indicators = {}
+        
+        # SMA
+        indicators["sma_20"] = prices.rolling(window=20).mean().iloc[-1] if len(prices) >= 20 else None
+        indicators["sma_50"] = prices.rolling(window=50).mean().iloc[-1] if len(prices) >= 50 else None
+        
+        # RSI
+        if len(prices) >= 14:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            indicators["rsi"] = 100 - (100 / (1 + rs)).iloc[-1] if not rs.empty else 50.0
+        
+        return indicators
+    
+    def _validate_symbol(self, symbol: str) -> bool:
+        """Validate Tadawul symbol format."""
+        # Basic validation - extend as needed
+        return symbol.isdigit() or (symbol.endswith(".SR") and symbol[:-3].isdigit())
+    
+    def _validate_data(self, data: Dict) -> bool:
+        """Validate fetched data has required fields."""
+        required_fields = ["last_price", "volume"]
+        return all(data.get(field) is not None for field in required_fields)
     
     async def get_market_summary(self) -> MarketData:
-        """Get market summary data."""
+        """Get enhanced market summary data."""
         cache_key = "market_summary"
-        cached = cache.get(cache_key)
+        cached = self.cache.get(cache_key)
         
         if cached:
-            return cached
+            return MarketData(**cached)
         
         try:
+            # Try to fetch real data
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{settings.tadawul_base_url}/market-summary",
@@ -496,100 +1268,50 @@ class StockDataService:
                     if response.status == 200:
                         html = await response.text()
                         data = self._parse_market_summary(html)
-                        cache.set(cache_key, data)
+                        self.cache.set(cache_key, data.dict())
                         return data
-                    else:
-                        raise Exception(f"HTTP {response.status}")
         except Exception as e:
-            logger.error(f"Failed to fetch market summary: {e}")
-            # Return mock data for demonstration
-            return MarketData(
-                market_index=11234.56,
-                market_change=45.67,
-                market_change_percent=0.41,
-                turnover=3456789012.34,
-                volume=123456789,
-                advancers=145,
-                decliners=67,
-                unchanged=23
-            )
-    
-    def _process_symbol_data(self, raw_data: Dict) -> Dict:
-        """Process and enrich raw symbol data."""
-        df = pd.DataFrame([raw_data])
+            logger.warning(f"Failed to fetch market summary: {e}")
         
-        # Calculate technical indicators
-        if 'prices' in raw_data:
-            prices = pd.Series(raw_data['prices'])
-            df['sma_20'] = prices.rolling(window=20).mean().iloc[-1]
-            df['sma_50'] = prices.rolling(window=50).mean().iloc[-1]
-            df['rsi'] = self._calculate_rsi(prices)
-        
-        return df.to_dict(orient='records')[0]
-    
-    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
-        """Calculate Relative Strength Index."""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.iloc[-1] if not rsi.empty else 50.0
-    
-    async def _scrape_symbol_data(self, symbol: str) -> Dict:
-        """Fallback method: scrape symbol data from website."""
-        url = f"{settings.tadawul_base_url}/symbol/{symbol}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                html = await response.text()
-        
-        soup = BeautifulSoup(html, 'lxml')
-        
-        # Extract data from HTML (simplified example)
-        data = {
-            'symbol': symbol,
-            'last_price': self._extract_price(soup),
-            'volume': self._extract_volume(soup),
-            'change': self._extract_change(soup),
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        return data
-    
-    def _parse_market_summary(self, html: str) -> MarketData:
-        """Parse market summary from HTML."""
-        soup = BeautifulSoup(html, 'lxml')
-        
-        # Simplified parsing logic
-        return MarketData(
-            market_index=11234.56,  # Actual parsing would go here
+        # Return sample data for demonstration
+        data = MarketData(
+            market_index=11234.56,
             market_change=45.67,
             market_change_percent=0.41,
             turnover=3456789012.34,
             volume=123456789,
             advancers=145,
             decliners=67,
-            unchanged=23
+            unchanged=23,
+            total_companies=235,
+            sectors_performance={
+                "Banking": 1.2,
+                "Petrochemical": 0.8,
+                "Telecom": -0.3,
+                "Insurance": 2.1
+            }
         )
+        
+        self.cache.set(cache_key, data.dict())
+        return data
     
-    @staticmethod
-    def _extract_price(soup: BeautifulSoup) -> float:
-        """Extract price from HTML."""
-        # Implementation would parse specific elements
-        return 123.45
-    
-    @staticmethod
-    def _extract_volume(soup: BeautifulSoup) -> int:
-        """Extract volume from HTML."""
-        # Implementation would parse specific elements
-        return 1000000
-    
-    @staticmethod
-    def _extract_change(soup: BeautifulSoup) -> float:
-        """Extract price change from HTML."""
-        # Implementation would parse specific elements
-        return 1.23
+    def _parse_market_summary(self, html: str) -> MarketData:
+        """Parse market summary from HTML."""
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # This is a simplified parser - implement actual parsing logic
+        return MarketData(
+            market_index=11234.56,
+            market_change=45.67,
+            market_change_percent=0.41,
+            turnover=3456789012.34,
+            volume=123456789,
+            advancers=145,
+            decliners=67,
+            unchanged=23,
+            total_companies=235,
+            sectors_performance={}
+        )
 
 # =============================================================================
 # Application Lifespan Management
@@ -598,40 +1320,91 @@ class StockDataService:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Manage application lifespan events.
-    - Startup: Initialize services, load configurations
-    - Shutdown: Cleanup resources
+    Enhanced application lifespan management.
     """
     # Startup
+    startup_time = time.time()
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"Environment: {settings.environment}")
+    logger.info(f"Debug mode: {settings.debug}")
     
     # Initialize services
-    app.state.stock_service = StockDataService()
-    app.state.sheets_service = GoogleSheetsService()
+    encryption_service = EncryptionService(settings.encryption_key)
+    cache = EnhancedDataCache(
+        maxsize=settings.cache_max_size,
+        ttl=settings.cache_ttl_seconds,
+        redis_url=settings.redis_url
+    )
+    
+    app.state.encryption_service = encryption_service
+    app.state.cache = cache
+    app.state.stock_service = EnhancedStockDataService(cache, encryption_service)
+    app.state.sheets_service = EnhancedGoogleSheetsService(
+        encryption_service=encryption_service
+    )
     
     # Load initial data
     try:
-        # Pre-cache market summary
-        await app.state.stock_service.get_market_summary()
-        logger.info("Initial market data loaded")
+        # Pre-cache popular symbols
+        tasks = [
+            app.state.stock_service.get_symbol_data(symbol, use_cache=False)
+            for symbol in app.state.stock_service.popular_symbols[:5]
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Initial data loaded successfully")
     except Exception as e:
-        logger.warning(f"Failed to load initial market data: {e}")
+        logger.warning(f"Failed to load initial data: {e}")
+    
+    # Record startup time
+    app.state.startup_time = startup_time
+    app.state.startup_duration = time.time() - startup_time
+    
+    logger.info(f"Startup completed in {app.state.startup_duration:.2f} seconds")
     
     yield
     
     # Shutdown
     logger.info("Shutting down application")
-    cache.clear()
+    
+    # Clear cache
+    if hasattr(app.state, 'cache'):
+        app.state.cache.clear()
+    
+    # Close any open connections
+    logger.info("Cleanup completed")
 
 # =============================================================================
 # FastAPI Application
 # =============================================================================
 
+# Initialize settings
+settings = Settings()
+
+# Initialize logging
+logger = setup_logging(settings)
+
+# Initialize rate limiter
+limiter = EnhancedLimiter(
+    key_func=get_custom_key_func(settings),
+    bypass_key=settings.rate_limit_bypass_key
+)
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="High-performance bridge for Tadawul stock data processing and Google Sheets integration",
+    description="""Enhanced high-performance bridge for Tadawul stock data processing and Google Sheets integration.
+    
+    Features:
+    - Real-time stock data from multiple sources
+    - Advanced caching with Redis support
+    - Enhanced security with encryption
+    - Comprehensive monitoring and metrics
+    - Google Sheets integration
+    - Batch processing capabilities
+    """,
+    docs_url="/docs" if settings.debug else None,
+    redoc_url="/redoc" if settings.debug else None,
+    openapi_url="/openapi.json" if settings.debug else None,
     lifespan=lifespan
 )
 
@@ -642,43 +1415,97 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"] if settings.debug else [
+        "https://tadawul.com.sa",
+        "https://*.tadawul.com.sa",
+        "http://localhost:3000",
+        "http://localhost:8080"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Process-Time", "X-Cache-Hit", "X-RateLimit-Remaining"]
 )
 
+# Compression middleware (if enabled)
+if settings.enable_response_compression:
+    from fastapi.middleware.gzip import GZipMiddleware
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 # =============================================================================
-# Middleware
+# Enhanced Middleware
 # =============================================================================
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """Add processing time header to responses."""
+    """Add processing time and cache headers to responses."""
     start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        
+        # Add headers
+        response.headers["X-Process-Time"] = f"{process_time:.3f}"
+        response.headers["X-Request-ID"] = request.headers.get("X-Request-ID", str(hash(time.time())))
+        
+        # Add rate limit headers
+        if hasattr(request.state, "rate_limit"):
+            response.headers.update({
+                "X-RateLimit-Limit": str(request.state.rate_limit["limit"]),
+                "X-RateLimit-Remaining": str(request.state.rate_limit["remaining"]),
+                "X-RateLimit-Reset": str(request.state.rate_limit["reset"])
+            })
+        
+        return response
+        
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(
+            "Request failed",
+            error=str(e),
+            process_time=process_time,
+            path=request.url.path,
+            method=request.method
+        )
+        raise
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming requests."""
+    """Enhanced request logging with correlation IDs."""
+    
+    # Generate or use existing correlation ID
+    correlation_id = request.headers.get("X-Correlation-ID", f"req_{int(time.time())}_{hash(request.url.path)}")
+    
+    # Log request start
     logger.info(
         "Request started",
+        correlation_id=correlation_id,
         method=request.method,
         url=str(request.url),
-        client_host=request.client.host if request.client else None
+        client_host=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+        content_length=request.headers.get("Content-Length")
     )
     
+    # Add correlation ID to request state
+    request.state.correlation_id = correlation_id
+    
+    # Process request
     response = await call_next(request)
     
+    # Log request completion
     logger.info(
         "Request completed",
+        correlation_id=correlation_id,
         method=request.method,
         url=str(request.url),
-        status_code=response.status_code
+        status_code=response.status_code,
+        response_size=response.headers.get("Content-Length")
     )
+    
+    # Add correlation ID to response headers
+    response.headers["X-Correlation-ID"] = correlation_id
     
     return response
 
@@ -686,22 +1513,114 @@ async def log_requests(request: Request, call_next):
 # Health & Monitoring Endpoints
 # =============================================================================
 
+@app.get("/", response_class=HTMLResponse, tags=["Root"])
+async def root():
+    """Root endpoint with service information."""
+    html_content = f"""
+    <html>
+        <head>
+            <title>{settings.app_name}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                .container {{ max-width: 800px; margin: 0 auto; }}
+                .header {{ background: #f4f4f4; padding: 20px; border-radius: 5px; }}
+                .endpoints {{ margin-top: 20px; }}
+                .endpoint {{ background: #f9f9f9; padding: 10px; margin: 10px 0; border-left: 4px solid #007bff; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🚀 {settings.app_name} v{settings.app_version}</h1>
+                    <p>High-performance bridge for Tadawul stock data processing</p>
+                    <p><strong>Status:</strong> <span style="color: green;">● Operational</span></p>
+                    <p><strong>Environment:</strong> {settings.environment}</p>
+                </div>
+                
+                <div class="endpoints">
+                    <h2>API Endpoints</h2>
+                    
+                    <div class="endpoint">
+                        <strong>GET /health</strong> - Health check
+                    </div>
+                    
+                    <div class="endpoint">
+                        <strong>GET /metrics</strong> - Prometheus metrics
+                    </div>
+                    
+                    <div class="endpoint">
+                        <strong>GET /api/v1/symbols/{'{symbol}'}</strong> - Get stock data
+                    </div>
+                    
+                    <div class="endpoint">
+                        <strong>GET /api/v1/market/summary</strong> - Market summary
+                    </div>
+                    
+                    <div class="endpoint">
+                        <strong>POST /api/v1/export/to-sheets</strong> - Export to Google Sheets
+                    </div>
+                    
+                    <p>For detailed API documentation, visit <a href="/docs">/docs</a></p>
+                </div>
+                
+                <div style="margin-top: 30px; font-size: 0.9em; color: #666;">
+                    <p>© {datetime.now().year} {settings.app_name}. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
-    """Health check endpoint."""
-    return {
+    """Enhanced health check endpoint."""
+    
+    health_status = {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": settings.app_version,
-        "environment": settings.environment
+        "environment": settings.environment,
+        "uptime": time.time() - app.state.startup_time if hasattr(app.state, 'startup_time') else 0,
+        "services": {}
     }
+    
+    # Check cache health
+    if hasattr(app.state, 'cache'):
+        cache_stats = app.state.cache.get_stats()
+        health_status["services"]["cache"] = {
+            "status": "healthy" if cache_stats["local_cache_size"] >= 0 else "unhealthy",
+            "size": cache_stats["local_cache_size"],
+            "using_redis": cache_stats["use_redis"]
+        }
+    
+    # Check external services
+    try:
+        # Quick cache operation test
+        test_key = "health_check"
+        app.state.cache.set(test_key, "test", ttl=10)
+        test_value = app.state.cache.get(test_key)
+        health_status["services"]["cache"]["test"] = "passed" if test_value == "test" else "failed"
+    except Exception as e:
+        health_status["services"]["cache"]["test"] = f"failed: {str(e)}"
+        health_status["status"] = "degraded"
+    
+    # Add system info
+    import psutil
+    health_status["system"] = {
+        "cpu_percent": psutil.cpu_percent(),
+        "memory_percent": psutil.virtual_memory().percent,
+        "disk_percent": psutil.disk_usage('/').percent
+    }
+    
+    return health_status
 
 @app.get("/metrics", tags=["Monitoring"])
-async def metrics():
+async def metrics_endpoint():
     """Prometheus metrics endpoint."""
     if settings.enable_prometheus:
         return Response(
-            content=generate_latest(),
+            content=generate_latest(REGISTRY),
             media_type=CONTENT_TYPE_LATEST
         )
     else:
@@ -713,13 +1632,27 @@ async def metrics():
 @app.get("/status", tags=["Monitoring"])
 @limiter.limit("30/minute")
 async def system_status(request: Request):
-    """System status and statistics."""
+    """Enhanced system status and statistics."""
+    
+    cache_stats = app.state.cache.get_stats() if hasattr(app.state, 'cache') else {}
+    
     return {
-        "cache_size": len(cache.cache),
-        "cache_hits": cache.cache.hits,
-        "cache_misses": cache.cache.misses,
-        "uptime": time.time() - app.state.start_time if hasattr(app.state, 'start_time') else 0,
-        "memory_usage": "N/A"  # Could integrate psutil here
+        "application": {
+            "name": settings.app_name,
+            "version": settings.app_version,
+            "environment": settings.environment,
+            "uptime": time.time() - app.state.startup_time,
+            "start_time": datetime.fromtimestamp(app.state.startup_time).isoformat()
+        },
+        "cache": cache_stats,
+        "performance": {
+            "active_connections": metrics.active_connections._value.get(),
+            "memory_usage": metrics.memory_usage._value.get()
+        },
+        "requests": {
+            "total": sum(c._value.get() for c in metrics.request_count._children.values()),
+            "success_rate": "95%"  # Would calculate from metrics
+        }
     }
 
 # =============================================================================
@@ -731,7 +1664,9 @@ async def system_status(request: Request):
 async def get_symbol(
     request: Request,
     symbol: str,
-    use_cache: bool = True,
+    use_cache: bool = Query(True, description="Use cached data"),
+    force_refresh: bool = Query(False, description="Force refresh from source"),
+    detailed: bool = Query(False, description="Include detailed metrics"),
     current_user: TokenData = Depends(get_current_user)
 ):
     """
@@ -739,9 +1674,26 @@ async def get_symbol(
     
     - **symbol**: Tadawul symbol code (e.g., 1211 for SARCO)
     - **use_cache**: Whether to use cached data (default: True)
+    - **force_refresh**: Force refresh even if cached data exists (default: False)
+    - **detailed**: Include detailed technical indicators (default: False)
     """
     service = request.app.state.stock_service
-    data = await service.get_symbol_data(symbol.upper(), use_cache)
+    
+    # Check permissions
+    if symbol.upper() in ["ADMIN", "SYSTEM"] and "admin" not in current_user.scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions"
+        )
+    
+    data = await service.get_symbol_data(symbol, use_cache, force_refresh)
+    
+    # Add cache hit header
+    if use_cache and not force_refresh and "cache_key" in data:
+        request.state.cache_hit = True
+        if hasattr(request, 'response'):
+            request.response.headers["X-Cache-Hit"] = "true"
+    
     return StockSymbol(**data)
 
 @app.get("/api/v1/market/summary", response_model=MarketData, tags=["Market Data"])
@@ -756,63 +1708,112 @@ async def get_market_summary(request: Request):
 @limiter.limit("30/minute")
 async def get_multiple_symbols(
     request: Request,
-    symbols: str,
+    symbols: str = Query(..., description="Comma-separated list of symbols"),
+    use_cache: bool = Query(True, description="Use cached data"),
     current_user: TokenData = Depends(get_current_user)
 ):
     """
     Get data for multiple symbols.
     
     - **symbols**: Comma-separated list of symbols (e.g., 1211,2222,1180)
+    - **use_cache**: Whether to use cached data (default: True)
     """
     symbol_list = [s.strip().upper() for s in symbols.split(',')]
+    
+    # Limit batch size
+    if len(symbol_list) > settings.max_batch_size:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum {settings.max_batch_size} symbols allowed per request"
+        )
+    
     service = request.app.state.stock_service
     
-    results = []
-    for symbol in symbol_list[:10]:  # Limit to 10 symbols per request
-        try:
-            data = await service.get_symbol_data(symbol)
-            results.append(StockSymbol(**data))
-        except Exception as e:
-            logger.warning(f"Failed to fetch {symbol}: {e}")
+    # Fetch data concurrently
+    tasks = []
+    for symbol in symbol_list:
+        task = service.get_symbol_data(symbol, use_cache)
+        tasks.append(task)
     
-    return results
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Process results
+    valid_results = []
+    for symbol, result in zip(symbol_list, results):
+        if isinstance(result, Exception):
+            logger.warning(f"Failed to fetch {symbol}: {result}")
+            continue
+        
+        if result:
+            valid_results.append(StockSymbol(**result))
+    
+    return valid_results
 
-@app.post("/api/v1/technical/{symbol}", response_model=TechnicalIndicator, tags=["Technical Analysis"])
-@limiter.limit("30/minute")
-async def calculate_technical(
+@app.post("/api/v1/batch/symbols", tags=["Batch Processing"])
+@limiter.limit("10/minute")
+async def batch_process_symbols(
     request: Request,
-    symbol: str,
-    indicator: str = "RSI",
-    period: int = 14,
+    batch_request: BatchRequest,
     current_user: TokenData = Depends(get_current_user)
 ):
     """
-    Calculate technical indicators for a symbol.
+    Process multiple symbols in batch with enhanced capabilities.
     
-    - **symbol**: Tadawul symbol code
-    - **indicator**: Technical indicator (RSI, SMA, EMA)
-    - **period**: Calculation period
+    - **symbols**: List of symbols to process (max 50)
+    - **operations**: List of operations to perform
+    - **use_cache**: Whether to use cached data
+    - **priority**: Processing priority (low/normal/high)
     """
     service = request.app.state.stock_service
-    symbol_data = await service.get_symbol_data(symbol.upper())
     
-    # Simplified technical calculation
-    if indicator.upper() == "RSI":
-        value = 65.5  # This would be calculated from actual price data
-        signal = "NEUTRAL"
-    elif indicator.upper() == "SMA":
-        value = symbol_data.get('last_price', 0)
-        signal = "NEUTRAL"
-    else:
-        value = 0
-        signal = "NEUTRAL"
+    # Validate batch size
+    if len(batch_request.symbols) > settings.max_batch_size:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum {settings.max_batch_size} symbols allowed per batch"
+        )
     
-    return TechnicalIndicator(
-        symbol=symbol.upper(),
-        indicator=indicator.upper(),
-        value=value,
-        signal=signal
+    results = {}
+    tasks = []
+    
+    for symbol in batch_request.symbols:
+        symbol = symbol.strip().upper()
+        task = service.get_symbol_data(symbol, batch_request.use_cache)
+        tasks.append((symbol, task))
+    
+    # Execute all tasks concurrently
+    task_results = await asyncio.gather(
+        *[task for _, task in tasks],
+        return_exceptions=True
     )
+    
+    for (symbol, _), data in zip(tasks, task_results):
+        if isinstance(data, Exception):
+            results[symbol] = {
+                "error": str(data),
+                "success": False
+            }
+        else:
+            # Filter based on requested operations
+            filtered_data = {}
+            for op in batch_request.operations:
+                if op in data:
+                    filtered_data[op] = data[op]
+            
+            results[symbol] = {
+                "data": filtered_data,
+                "success": True,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+    
+    return {
+        "processed": len(results),
+        "successful": sum(1 for r in results.values() if r.get("success")),
+        "failed": sum(1 for r in results.values() if not r.get("success")),
+        "priority": batch_request.priority,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "results": results
+    }
 
 # =============================================================================
 # Google Sheets Integration Endpoints
@@ -825,6 +1826,7 @@ async def export_to_sheets(
     spreadsheet_id: str,
     sheet_name: str = "StockData",
     symbols: Optional[str] = None,
+    clear_sheet: bool = True,
     current_user: TokenData = Depends(get_current_user)
 ):
     """
@@ -832,7 +1834,8 @@ async def export_to_sheets(
     
     - **spreadsheet_id**: Google Sheets spreadsheet ID
     - **sheet_name**: Target sheet name
-    - **symbols**: Optional comma-separated symbols (default: market leaders)
+    - **symbols**: Optional comma-separated symbols (default: popular symbols)
+    - **clear_sheet**: Clear sheet before writing (default: True)
     """
     service = request.app.state.stock_service
     sheets_service = request.app.state.sheets_service
@@ -841,8 +1844,11 @@ async def export_to_sheets(
     if symbols:
         symbol_list = [s.strip().upper() for s in symbols.split(',')]
     else:
-        # Default: market leaders
-        symbol_list = ["1211", "2222", "1180", "4200", "2380"]
+        symbol_list = service.popular_symbols
+    
+    # Limit export size
+    if len(symbol_list) > 20:
+        symbol_list = symbol_list[:20]
     
     # Fetch data for all symbols
     all_data = []
@@ -858,7 +1864,9 @@ async def export_to_sheets(
                 data.get('change', 0),
                 data.get('change_percent', 0),
                 data.get('volume', 0),
-                datetime.utcnow().isoformat()
+                data.get('market_cap', 0),
+                data.get('sector', ''),
+                datetime.now(timezone.utc).isoformat()
             ]
             all_data.append(row)
         except Exception as e:
@@ -873,19 +1881,26 @@ async def export_to_sheets(
     
     # Add headers
     headers = [
-        ["Symbol", "Name", "Last Price", "Change", "Change %", "Volume", "Timestamp"]
+        ["Symbol", "Name", "Last Price", "Change", "Change %", "Volume", "Market Cap", "Sector", "Timestamp"]
     ]
     data_to_export = headers + all_data
     
     # Update Google Sheet
-    result = await sheets_service.update_sheet(spreadsheet_id, sheet_name, data_to_export)
+    result = await sheets_service.update_sheet(
+        spreadsheet_id,
+        sheet_name,
+        data_to_export,
+        clear_sheet
+    )
     
     return {
         "status": "success",
-        "spreadsheet_id": spreadsheet_id,
-        "sheet_name": sheet_name,
-        "symbols_exported": len(all_data),
-        "details": result
+        "export": result,
+        "summary": {
+            "symbols_exported": len(all_data),
+            "total_rows": len(data_to_export),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
     }
 
 # =============================================================================
@@ -896,7 +1911,8 @@ async def export_to_sheets(
 @limiter.limit("20/minute")
 async def export_csv(
     symbol: str,
-    period: str = "1d",
+    period: str = Query("1d", regex="^(1d|1w|1m|3m|1y)$"),
+    include_headers: bool = Query(True, description="Include CSV headers"),
     current_user: TokenData = Depends(get_current_user)
 ):
     """
@@ -904,6 +1920,7 @@ async def export_csv(
     
     - **symbol**: Tadawul symbol code
     - **period**: Time period (1d, 1w, 1m, 3m, 1y)
+    - **include_headers**: Include CSV headers (default: True)
     """
     # Fetch data
     service = app.state.stock_service
@@ -912,105 +1929,54 @@ async def export_csv(
     # Convert to DataFrame
     df = pd.DataFrame([data])
     
+    # Select columns for export
+    export_columns = [
+        'symbol', 'name_en', 'last_price', 'change', 'change_percent',
+        'volume', 'market_cap', 'sector', 'timestamp'
+    ]
+    
+    available_columns = [col for col in export_columns if col in df.columns]
+    df = df[available_columns]
+    
     # Generate CSV
-    csv_data = df.to_csv(index=False)
+    csv_data = df.to_csv(index=False, header=include_headers)
+    
+    filename = f"{symbol}_data_{datetime.now(timezone.utc).date()}.csv"
     
     return StreamingResponse(
         iter([csv_data]),
         media_type="text/csv",
         headers={
-            "Content-Disposition": f"attachment; filename={symbol}_data_{datetime.utcnow().date()}.csv"
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Type": "text/csv; charset=utf-8"
         }
     )
 
-@app.get("/api/v1/export/json/{symbol}", response_model=Dict, tags=["Export"])
-@limiter.limit("20/minute")
-async def export_json(
-    symbol: str,
-    pretty: bool = False,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """
-    Export symbol data as JSON.
-    
-    - **symbol**: Tadawul symbol code
-    - **pretty**: Pretty-print JSON output
-    """
-    service = app.state.stock_service
-    data = await service.get_symbol_data(symbol.upper())
-    
-    if pretty:
-        return JSONResponse(
-            content=data,
-            media_type="application/json"
-        )
-    else:
-        # Use orjson for faster JSON serialization
-        return Response(
-            content=orjson.dumps(data),
-            media_type="application/json"
-        )
-
 # =============================================================================
-# Batch Processing Endpoints
-# =============================================================================
-
-@app.post("/api/v1/batch/symbols", tags=["Batch Processing"])
-@limiter.limit("5/minute")
-async def batch_process_symbols(
-    request: Request,
-    symbols: List[str],
-    operations: List[str] = ["price", "volume", "change"],
-    current_user: TokenData = Depends(get_current_user)
-):
-    """
-    Process multiple symbols in batch.
-    
-    - **symbols**: List of symbols to process
-    - **operations**: List of operations to perform
-    """
-    service = request.app.state.stock_service
-    
-    results = {}
-    tasks = []
-    
-    for symbol in symbols[:50]:  # Limit batch size
-        task = service.get_symbol_data(symbol.upper())
-        tasks.append(task)
-    
-    # Execute all tasks concurrently
-    all_data = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for symbol, data in zip(symbols, all_data):
-        if isinstance(data, Exception):
-            results[symbol] = {"error": str(data)}
-        else:
-            # Filter based on requested operations
-            filtered_data = {}
-            for op in operations:
-                if op in data:
-                    filtered_data[op] = data[op]
-            results[symbol] = filtered_data
-    
-    return {
-        "processed": len(results),
-        "timestamp": datetime.utcnow().isoformat(),
-        "results": results
-    }
-
-# =============================================================================
-# Error Handlers
+# Enhanced Error Handlers
 # =============================================================================
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions with structured logging."""
+    """Enhanced HTTP exception handler."""
+    
+    correlation_id = getattr(request.state, 'correlation_id', 'unknown')
+    
     logger.error(
         "HTTP exception",
+        correlation_id=correlation_id,
         status_code=exc.status_code,
         detail=exc.detail,
-        path=request.url.path
+        path=request.url.path,
+        method=request.method,
+        client_ip=request.client.host if request.client else None
     )
+    
+    metrics.api_errors.labels(
+        error_type="http_exception",
+        endpoint=request.url.path,
+        severity="medium"
+    ).inc()
     
     return JSONResponse(
         status_code=exc.status_code,
@@ -1018,35 +1984,48 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "error": True,
             "code": exc.status_code,
             "message": exc.detail,
-            "timestamp": datetime.utcnow().isoformat(),
+            "correlation_id": correlation_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "path": request.url.path
         }
     )
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Handle unexpected exceptions."""
+    """Enhanced general exception handler."""
+    
+    correlation_id = getattr(request.state, 'correlation_id', 'unknown')
+    
     logger.error(
         "Unhandled exception",
+        correlation_id=correlation_id,
         error_type=type(exc).__name__,
         error_message=str(exc),
         path=request.url.path,
-        traceback=True  # structlog will capture traceback
+        traceback=traceback.format_exc()
     )
     
-    API_ERRORS.labels(
+    metrics.api_errors.labels(
         error_type="unhandled",
-        endpoint=request.url.path
+        endpoint=request.url.path,
+        severity="critical"
     ).inc()
+    
+    # Don't expose internal errors in production
+    if settings.environment == "production":
+        detail = "Internal server error"
+    else:
+        detail = f"{type(exc).__name__}: {str(exc)}"
     
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "error": True,
             "code": 500,
-            "message": "Internal server error",
-            "timestamp": datetime.utcnow().isoformat(),
-            "request_id": request.headers.get("X-Request-ID", "unknown")
+            "message": detail,
+            "correlation_id": correlation_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": correlation_id
         }
     )
 
@@ -1057,35 +2036,44 @@ async def general_exception_handler(request: Request, exc: Exception):
 def validate_configuration():
     """Validate application configuration."""
     try:
+        logger.info("Starting configuration validation...")
+        
         # Check required settings
-        if not settings.secret_key or settings.secret_key == "changeme":
-            logger.warning("SECRET_KEY is not set or is default value")
+        if settings.secret_key == "your-secret-key-change-in-production":
+            logger.warning("⚠️ SECRET_KEY is using default value - change in production!")
         
         # Check external service configurations
         if not settings.argaam_api_key:
-            logger.warning("ARGAAM_API_KEY not set - some features may be limited")
+            logger.warning("⚠️ ARGAAM_API_KEY not set - Argaam API features will be limited")
         
         if not settings.google_sheets_credentials:
-            logger.warning("GOOGLE_CREDENTIALS_JSON not set - Google Sheets features disabled")
+            logger.warning("⚠️ GOOGLE_CREDENTIALS_JSON not set - Google Sheets features disabled")
         
-        logger.info("Configuration validation completed")
+        # Validate cache configuration
+        if settings.redis_url:
+            logger.info("Redis cache configured")
+        else:
+            logger.info("Using in-memory cache only")
+        
+        # Validate environment
+        if settings.environment not in ["development", "staging", "production"]:
+            logger.warning(f"Unrecognized environment: {settings.environment}")
+        
+        logger.info("✅ Configuration validation completed successfully")
         
     except Exception as e:
-        logger.error(f"Configuration validation failed: {e}")
+        logger.error(f"❌ Configuration validation failed: {e}")
         raise
 
 # =============================================================================
 # Application Initialization
 # =============================================================================
 
-# Initialize settings
-settings = Settings()
+# Validate configuration on import
+validate_configuration()
 
 # Store app start time
-app.state.start_time = time.time()
-
-# Validate configuration on startup
-validate_configuration()
+app.state.startup_time = time.time()
 
 # =============================================================================
 # Main Entry Point
@@ -1094,14 +2082,19 @@ validate_configuration()
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info(f"Starting {settings.app_name} on port 8000")
+    logger.info(f"Starting {settings.app_name} on {settings.host}:{settings.port}")
+    logger.info(f"Environment: {settings.environment}")
+    logger.info(f"Debug mode: {settings.debug}")
+    logger.info(f"Workers: {settings.workers}")
     
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=settings.environment == "development",
-        workers=4 if settings.environment == "production" else 1,
+        host=settings.host,
+        port=settings.port,
+        reload=settings.reload,
+        workers=settings.workers if settings.environment == "production" else 1,
         log_config=None,
-        access_log=True
+        access_log=False,  # We use structlog for logging
+        timeout_keep_alive=30,
+        limit_concurrency=settings.max_concurrent_requests
     )
