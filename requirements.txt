@@ -1,6 +1,8 @@
+#!/usr/bin/env python3
 """
 Tadawul Fast Bridge - Legacy Stock Microservice
-Version: 4.0.0
+Version: 4.1.0
+
 Description:
   Lightweight stock market data bridge with FastAPI
 
@@ -13,7 +15,13 @@ Key Features:
     - /health              → simple health (for Render)
     - /api/v1/health       → detailed status (used by index.html dashboard)
     - /api/v1/stats        → performance & cache metrics
+
+Notes:
+- This is a self-contained legacy microservice, separate from your main
+  tadawul-fast bridge. It is safe to run alone on Render or locally.
 """
+
+from __future__ import annotations
 
 import asyncio
 import csv
@@ -56,7 +64,7 @@ class Settings:
         self.VERSION: str = (
             os.getenv("SERVICE_VERSION")
             or os.getenv("APP_VERSION")
-            or "4.0.0"
+            or "4.1.0"
         )
 
         # External APIs
@@ -67,6 +75,9 @@ class Settings:
         self.TADAWUL_BASE_URL: str = os.getenv(
             "TADAWUL_BASE_URL", "https://www.tadawul.com.sa"
         )
+
+        # Optional security token (aligned with main service APP_TOKEN usage)
+        self.APP_TOKEN: str = os.getenv("APP_TOKEN", "")
 
         # Google Sheets credentials (JSON string)
         # Support multiple env names for compatibility
@@ -88,6 +99,9 @@ class Settings:
         # Environment / misc
         self.ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
 
+        # Logging
+        self.LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
 
 settings = Settings()
 
@@ -96,7 +110,7 @@ settings = Settings()
 # =============================================================================
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("tadawul-legacy")
@@ -107,7 +121,7 @@ logger = logging.getLogger("tadawul-legacy")
 
 
 class StockSymbol(BaseModel):
-    """Stock symbol model."""
+    """Unified stock symbol snapshot."""
 
     symbol: str
     name_ar: Optional[str] = None
@@ -125,7 +139,7 @@ class StockSymbol(BaseModel):
 
 
 class MarketData(BaseModel):
-    """Market data model."""
+    """Simple market summary model."""
 
     timestamp: str
     market_index: Optional[float] = None
@@ -152,7 +166,7 @@ class TokenData(BaseModel):
 limiter = Limiter(key_func=get_remote_address)
 
 # =============================================================================
-# In-memory TTL Cache with hit/miss stats (no external dependency)
+# In-memory TTL Cache with hit/miss stats
 # =============================================================================
 
 
@@ -549,8 +563,8 @@ async def add_process_time_header(request: Request, call_next):
 
     # Update app metrics
     try:
-        app.state.request_count += 1
-        app.state.total_response_time += process_time
+        request.app.state.request_count += 1
+        request.app.state.total_response_time += process_time
     except Exception:
         # If state not yet initialized, ignore
         pass
@@ -593,7 +607,7 @@ async def detailed_health(request: Request):
     """
     Detailed health endpoint.
 
-    This is what index.html DashboardMonitor expects:
+    Dashboard expects:
       - status
       - uptime_seconds
       - environment
@@ -648,7 +662,7 @@ async def stats(request: Request):
     """
     Stats endpoint used by dashboard for metrics.
 
-    Expected shape:
+    Returns:
       {
         "performance": { "total_requests": ..., "avg_response_time_ms": ... },
         "cache": { "hits": ..., "misses": ..., "hit_rate": ..., "size": ... }
@@ -698,7 +712,7 @@ async def get_multiple_symbols(
     symbols: str = Query(..., description="Comma-separated symbols (max 10)"),
     use_cache: bool = Query(True, description="Use cached data"),
 ):
-    """Get multiple symbols."""
+    """Get multiple symbols (simple batch endpoint)."""
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     symbol_list = symbol_list[:10]  # Safety cap
 
@@ -852,5 +866,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        log_level="info",
+        log_level=settings.LOG_LEVEL.lower(),
     )
