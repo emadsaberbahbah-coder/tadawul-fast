@@ -1090,6 +1090,9 @@ class QuoteService:
         self.google_sheets_service: Optional[AsyncGoogleSheetsService] = None
         self.google_apps_script_client: Optional[GoogleAppsScriptClient] = None
 
+        # New: direct gspread client for KSA_Tadawul sheet
+        self._gspread_client: Optional[gspread.Client] = None
+
         # Request tracking
         self.request_count = 0
         self.success_count = 0
@@ -1316,7 +1319,120 @@ class QuoteService:
         available_providers: Dict[str, Callable[[str], Any]] = {}
 
         is_tadawul = symbol.endswith(".SR") or "TADAWUL" in symbol.upper()
+    def _load_ksa_rows_sync(self) -> List[Dict[str, Any]]:
+        """
+        Synchronous loader for KSA_Tadawul using gspread.
 
+        - Uses SPREADSHEET_ID (your Google Sheet)
+        - Uses settings.tadawul_market_sheet (tab name, e.g. 'KSA_Tadawul')
+        - Treats row 5 as headers, row 6+ as data
+        """
+        if not settings.google_sheets_spreadsheet_id:
+            logger.warning("No SPREADSHEET_ID configured; cannot load KSA_Tadawul")
+            return []
+    async def _get_ksa_rows(self) -> List[Dict[str, Any]]:
+        """
+        Async wrapper around _load_ksa_rows_sync with caching.
+
+        Cache key: 'ksa_sheet_rows'
+        TTL: 30 seconds (can adjust later)
+        """
+        cache_key = "ksa_sheet_rows"
+        cached = await self.cache.get(cache_key)
+        if isinstance(cached, list) and cached:
+            return cached
+
+        loop = asyncio.get_event_loop()
+        rows = await loop.run_in_executor(None, self._load_ksa_rows_sync)
+
+        if rows:
+            await self.cache.set(cache_key, rows, ttl=30)
+
+        return rows
+
+        # Build credentials
+        creds = None
+        try:
+            if settings.google_sheets_credentials_json:
+                info = json.loads(settings.google_sheets_credentials_json)
+                creds = Credentials.from_service_account_info(
+                    info,
+                    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+                )
+            elif settings.google_sheets_credentials_path:
+                creds = Credentials.from_service_account_file(
+                    settings.google_sheets_credentials_path,
+                    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+                )
+        except Exception as e:
+            logger.error(f"Failed to build Google credentials for gspread: {e}")
+            return []
+
+        if not creds:
+            logger.warning("Google Sheets credentials not available for gspread")
+            return []
+
+        # Init gspread client once
+        if self._gspread_client is None:
+            self._gspread_client = gspread.authorize(creds)
+
+        # Open spreadsheet & worksheet
+        sh = self._gspread_client.open_by_key(settings.google_sheets_spreadsheet_id)
+        ws = sh.worksheet(settings.tadawul_market_sheet)
+
+        # Get all values
+        values = ws.get_all_values()
+        if len(values) <= 5:
+            logger.warning(
+                f"KSA sheet '{settings.tadawul_market_sheet}' has <=5 rows (len={len(values)})"
+            )
+            return []
+
+        # Row indices: 1-based in sheet
+        # Row 5 = headers index 4, Row 6 = first data index 5
+        header_row = values[4]
+        data_rows = values[5:]
+
+        # Build normalized header keys
+        keys: List[Optional[str]] = []
+        for h in header_row:
+            h = (h or "").strip()
+            if not h:
+                keys.append(None)
+                continue
+            key = (
+                h.lower()
+                .replace(" ", "_")
+                .replace("%", "pct")
+                .replace("/", "_")
+                .replace("(", "")
+                .replace(")", "")
+            )
+            keys.append(key)
+
+        records: List[Dict[str, Any]] = []
+        for row in data_rows:
+            # Skip fully empty rows
+            if not any(str(cell).strip() for cell in row):
+                continue
+
+            record: Dict[str, Any] = {}
+            for idx, cell in enumerate(row):
+                if idx >= len(keys):
+                    break
+                field = keys[idx]
+                if not field:
+                    continue
+                record[field] = cell
+            records.append(record)
+
+        logger.info(
+            f"Loaded {len(records)} KSA Tadawul rows via gspread "
+            f"from sheet '{settings.tadawul_market_sheet}'"
+        )
+        return records
+
+        
         # Google Sheets is valid for KSA (and optionally for others if you want)
         if self.google_sheets_service:
             available_providers["google_sheets"] = self._get_quote_from_sheets
@@ -1365,36 +1481,127 @@ class QuoteService:
 
     async def _get_quote_from_sheets(self, symbol: str) -> Optional[Quote]:
         """
-        Get quote from Google Sheets (KSA_Tadawul sheet).
+        Get quote from Google Sheets (KSA_Tadawul sheet) using gspread.
 
-        This version does NOT depend on a specific filter key name inside
-        google_sheets_service; instead it fetches a slice of the KSA sheet and
-        matches rows where either 'symbol' or 'ticker' equals the normalized symbol.
+        - Reads the sheet once (cached)
+        - Matches on Symbol or Ticker
+        - Maps common columns: Price, Previous Close, Volume, Market Cap, etc.
         """
-        if not self.google_sheets_service:
-            return None
-
         try:
-            # Normalize Tadawul symbol: ensure it ends with .SR only once
+            # Normalize Tadawul symbol
             if symbol.endswith(".SR"):
                 normalized_symbol = symbol.upper()
             else:
                 normalized_symbol = f"{symbol.upper()}.SR"
 
-            # Read a bounded number of KSA rows and filter in Python
-            market_data = await self.google_sheets_service.read_ksa_tadawul_market(
-                use_cache=True,
-                validate=True,
-                filters=None,
-                limit=500,           # enough for your watchlist / universe
-                as_dataframe=False,
-            )
-
-            if not market_data:
+            # Load all KSA rows (cached)
+            rows = await self._get_ksa_rows()
+            if not rows:
                 logger.warning(
-                    f"Google Sheets returned no KSA Tadawul rows when searching for {normalized_symbol}"
+                    f"gspread KSA loader returned 0 rows when searching for {normalized_symbol}"
                 )
                 return None
+
+            # Find matching row by symbol / ticker / code
+            match: Optional[Dict[str, Any]] = None
+            for row in rows:
+                sym = str(
+                    row.get("symbol")
+                    or row.get("ticker")
+                    or row.get("code")
+                    or ""
+                ).strip().upper()
+                if sym == normalized_symbol:
+                    match = row
+                    break
+
+            if not match:
+                logger.warning(
+                    f"KSA sheet '{settings.tadawul_market_sheet}' has {len(rows)} rows "
+                    f"but none match symbol {normalized_symbol}"
+                )
+                return None
+
+            # Map fields using normalized header keys
+            price = _to_float(match.get("price"))
+            prev_close = _to_float(
+                match.get("previous_close") or match.get("prev_close")
+            )
+            change_val = _to_float(match.get("change"))
+            change_pct = _to_float(
+                match.get("change_pct") or match.get("change_percent")
+            )
+            volume = _to_float(match.get("volume"))
+            mcap = _to_float(match.get("market_cap"))
+
+            quote = Quote(
+                ticker=normalized_symbol,
+                symbol=normalized_symbol,
+                exchange="TADAWUL",
+                currency=match.get("currency", "SAR"),
+                name=match.get("company_name"),
+                sector=match.get("sector"),
+                price=price,
+                previous_close=prev_close,
+                open=_to_float(match.get("open")),
+                high=_to_float(match.get("high")),
+                low=_to_float(match.get("low")),
+                volume=volume,
+                avg_volume=_to_float(
+                    match.get("average_volume_30d")
+                    or match.get("avg_volume_30d")
+                    or match.get("average_volume")
+                ),
+                change=change_val,
+                change_percent=change_pct,
+                market_cap=mcap,
+                shares_outstanding=_to_float(match.get("shares_outstanding")),
+                free_float=_to_float(match.get("free_float")),
+                pe_ratio=_to_float(
+                    match.get("p_e_ratio")
+                    or match.get("pe_ratio")
+                    or match.get("p_e")
+                ),
+                pb_ratio=_to_float(
+                    match.get("p_b_ratio")
+                    or match.get("pb_ratio")
+                    or match.get("p_b")
+                ),
+                dividend_yield=_to_float(match.get("dividend_yield")),
+                eps=_to_float(match.get("eps")),
+                roe=_to_float(match.get("roe")),
+                rsi=_to_float(match.get("rsi_14") or match.get("rsi")),
+                macd=_to_float(match.get("macd")),
+                moving_avg_20=_to_float(
+                    match.get("moving_avg_20d")
+                    or match.get("moving_avg_20")
+                    or match.get("ma_20d")
+                ),
+                moving_avg_50=_to_float(
+                    match.get("moving_avg_50d")
+                    or match.get("moving_avg_50")
+                    or match.get("ma_50d")
+                ),
+                volatility=_to_float(match.get("volatility")),
+                status=QuoteStatus.OK if price not in (None, 0) else QuoteStatus.NO_DATA,
+                quality=DataQuality.HIGH,
+                provider="google_sheets",
+                source=settings.tadawul_market_sheet,
+                raw_data=match,
+            )
+
+            if not quote.is_valid:
+                logger.warning(
+                    f"KSA row found for {normalized_symbol} via gspread but price is missing/zero"
+                )
+                return None
+
+            return quote
+
+        except Exception as e:
+            logger.error(f"Error getting quote from sheets via gspread for {symbol}: {e}")
+            return None
+
 
             # Match by 'symbol' or 'ticker' field (whichever mapping your service uses)
             matches = [
