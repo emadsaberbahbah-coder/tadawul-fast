@@ -1,33 +1,28 @@
 """
-Core Data & Analysis Engine - v2.0
+Core Data & Analysis Engine - v2.1 (Enhanced)
+=============================================
 Enhanced with multi-provider merging, intelligent caching, advanced analysis,
 and configurable data quality assessment.
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
-Key Improvements:
+Key Features:
 1. Asynchronous provider calls with timeout and retry mechanisms
-2. Intelligent caching with TTL and stale-while-revalidate
+2. Intelligent caching with TTL and stale-while-revalidate behavior
 3. Configurable data quality scoring with field weighting
 4. Advanced opportunity scoring with sector-aware analysis
-5. Event-driven architecture for data updates
-6. Built-in performance metrics and monitoring
-7. Enhanced KSA market support
+5. Event-driven architecture for data updates (via async tasks)
+6. Built-in performance metrics and monitoring-friendly stats
+7. Enhanced KSA market support via Tadawul Fast Bridge
 8. Data validation and sanitization
 
 Usage:
-    from core.data_engine_v2 import DataEngine
-    
+    from core_data_engine_v2 import DataEngine
+
     engine = DataEngine()
+    await engine.initialize()
     result = await engine.get_enriched_quote("MSFT")
     print(result.model_dump())
-    
-    # Or with custom configuration:
-    engine = DataEngine(
-        cache_ttl=300,
-        provider_timeout=10,
-        enable_advanced_analysis=True
-    )
 """
 
 from __future__ import annotations
@@ -36,14 +31,15 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
+import os
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
-from typing import Dict, Optional, List, Literal, Any, Set, Tuple, Callable, Awaitable
+from typing import Dict, Optional, List, Any, Tuple, Callable
+
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -54,12 +50,11 @@ from redis import asyncio as aioredis
 # 0) SETUP & CONFIGURATION
 # ---------------------------------------------------------------------------
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("core_data_engine_v2")
 
 # Constants
 DEFAULT_CACHE_TTL = 300  # 5 minutes
@@ -71,12 +66,14 @@ RETRY_DELAY = 1  # second
 # 1) ENHANCED ENUMS AND TYPES
 # ---------------------------------------------------------------------------
 
+
 class DataQualityLevel(str, Enum):
     EXCELLENT = "EXCELLENT"  # 90-100% coverage
-    GOOD = "GOOD"          # 75-89% coverage
-    FAIR = "FAIR"          # 50-74% coverage
-    POOR = "POOR"          # 25-49% coverage
-    MISSING = "MISSING"    # <25% coverage
+    GOOD = "GOOD"  # 75-89% coverage
+    FAIR = "FAIR"  # 50-74% coverage
+    POOR = "POOR"  # 25-49% coverage
+    MISSING = "MISSING"  # <25% coverage
+
 
 class MarketRegion(str, Enum):
     KSA = "KSA"
@@ -86,10 +83,12 @@ class MarketRegion(str, Enum):
     GLOBAL = "GLOBAL"
     UNKNOWN = "UNKNOWN"
 
+
 class ProviderPriority(int, Enum):
     PRIMARY = 1
     SECONDARY = 2
     FALLBACK = 3
+
 
 class AnalysisSignal(str, Enum):
     STRONG_BUY = "STRONG_BUY"
@@ -99,13 +98,16 @@ class AnalysisSignal(str, Enum):
     STRONG_SELL = "STRONG_SELL"
     UNKNOWN = "UNKNOWN"
 
+
 # ---------------------------------------------------------------------------
 # 2) CONFIGURATION MODELS
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ProviderConfig:
-    """Configuration for a data provider"""
+    """Configuration for a data provider."""
+
     name: str
     enabled: bool = True
     priority: ProviderPriority = ProviderPriority.SECONDARY
@@ -113,61 +115,72 @@ class ProviderConfig:
     max_retries: int = MAX_RETRIES
     cache_key_prefix: str = "provider"
     weight: float = 1.0  # Weight for weighted averaging
-    
+
+
 @dataclass
 class CacheConfig:
-    """Cache configuration"""
+    """Cache configuration."""
+
     enabled: bool = True
     ttl: int = DEFAULT_CACHE_TTL
     stale_while_revalidate: int = 60  # Serve stale data while refreshing
     redis_url: Optional[str] = None
-    
+
+
 @dataclass
 class AnalysisConfig:
-    """Analysis engine configuration"""
+    """Analysis engine configuration."""
+
     enable_advanced_analysis: bool = True
     enable_sector_comparison: bool = True
     enable_technical_signals: bool = False
-    opportunity_score_weights: Dict[str, float] = field(default_factory=lambda: {
-        "valuation": 0.3,
-        "profitability": 0.25,
-        "growth": 0.25,
-        "financial_health": 0.2
-    })
+    opportunity_score_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "valuation": 0.3,
+            "profitability": 0.25,
+            "growth": 0.25,
+            "financial_health": 0.2,
+        }
+    )
+
 
 # ---------------------------------------------------------------------------
 # 3) ENHANCED DATA MODELS
 # ---------------------------------------------------------------------------
 
+
 class QuoteSourceInfo(BaseModel):
-    """Enhanced source information with confidence scoring"""
+    """Enhanced source information with confidence scoring."""
+
     provider: str
     timestamp: datetime
     fields: List[str] = Field(default_factory=list)
     confidence: float = Field(1.0, ge=0.0, le=1.0)  # Provider confidence score
     latency_ms: Optional[float] = None
-    
+
     class Config:
-        json_encoders = {
-            datetime: lambda dt: dt.isoformat()
-        }
+        json_encoders = {datetime: lambda dt: dt.isoformat()}
+
 
 class FieldMetadata(BaseModel):
-    """Metadata for individual data fields"""
+    """Metadata for individual data fields."""
+
     value: Any
     source: str
     timestamp: datetime
     confidence: float = 1.0
     last_verified: Optional[datetime] = None
-    
-    @validator('confidence')
-    def validate_confidence(cls, v):
+
+    @validator("confidence")
+    def validate_confidence(cls, v: float) -> float:
         return max(0.0, min(1.0, v))
+
 
 class UnifiedQuote(BaseModel):
     """
-    Enhanced unified quote with metadata for each field
+    Enhanced unified quote with metadata for each field.
     """
+
     # Basic Identification
     symbol: str
     name: Optional[str] = None
@@ -176,7 +189,7 @@ class UnifiedQuote(BaseModel):
     market_region: MarketRegion = MarketRegion.UNKNOWN
     sector: Optional[str] = None
     industry: Optional[str] = None
-    
+
     # Price Data
     price: Optional[float] = None
     prev_close: Optional[float] = None
@@ -185,14 +198,14 @@ class UnifiedQuote(BaseModel):
     low: Optional[float] = None
     volume: Optional[int] = None
     avg_volume_30d: Optional[int] = None
-    
+
     # Derived Price Metrics
     change: Optional[float] = None
-    change_pct: Optional[float] = None
+    change_pct: Optional[float]] = None
     fifty_two_week_high: Optional[float] = None
     fifty_two_week_low: Optional[float] = None
     ytd_return: Optional[float] = None
-    
+
     # Valuation Metrics
     market_cap: Optional[float] = None
     enterprise_value: Optional[float] = None
@@ -206,7 +219,7 @@ class UnifiedQuote(BaseModel):
     ev_to_revenue: Optional[float] = None
     dividend_yield: Optional[float] = None
     dividend_payout_ratio: Optional[float] = None
-    
+
     # Profitability Metrics
     roe: Optional[float] = None
     roa: Optional[float] = None
@@ -215,14 +228,14 @@ class UnifiedQuote(BaseModel):
     operating_margin: Optional[float] = None
     profit_margin: Optional[float] = None
     ebitda_margin: Optional[float] = None
-    
+
     # Growth Metrics
     revenue_growth_yoy: Optional[float] = None
     revenue_growth_3y: Optional[float] = None
     eps_growth_yoy: Optional[float] = None
     eps_growth_3y: Optional[float] = None
     fcf_growth_yoy: Optional[float] = None
-    
+
     # Financial Health
     debt_to_equity: Optional[float] = None
     current_ratio: Optional[float] = None
@@ -230,605 +243,640 @@ class UnifiedQuote(BaseModel):
     interest_coverage: Optional[float] = None
     fcf_yield: Optional[float] = None
     net_debt_to_ebitda: Optional[float] = None
-    
+
     # Efficiency Metrics
     asset_turnover: Optional[float] = None
     inventory_turnover: Optional[float] = None
     receivables_turnover: Optional[float] = None
-    
+
     # Technical Indicators (if enabled)
     rsi_14: Optional[float] = None
     macd: Optional[float] = None
     bollinger_position: Optional[float] = None
-    
+
     # Meta Information
-    last_updated_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_updated_utc: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     data_quality: DataQualityLevel = DataQualityLevel.MISSING
     data_quality_score: float = Field(0.0, ge=0.0, le=1.0)
     data_gaps: List[str] = Field(default_factory=list)
     sources: List[QuoteSourceInfo] = Field(default_factory=list)
     field_metadata: Dict[str, FieldMetadata] = Field(default_factory=dict)
-    
+
     # Analysis Results
     opportunity_score: Optional[float] = Field(None, ge=0.0, le=100.0)
     risk_score: Optional[float] = Field(None, ge=0.0, le=100.0)
     value_score: Optional[float] = Field(None, ge=0.0, le=100.0)
     growth_score: Optional[float] = Field(None, ge=0.0, le=100.0)
     quality_score: Optional[float] = Field(None, ge=0.0, le=100.0)
-    
+
     # Signals
     primary_signal: AnalysisSignal = AnalysisSignal.UNKNOWN
     secondary_signals: List[AnalysisSignal] = Field(default_factory=list)
-    
+
     # Risk Assessment
     risk_flags: List[str] = Field(default_factory=list)
     warning_flags: List[str] = Field(default_factory=list)
-    
+
     # Enhanced Analysis
     sector_percentile: Dict[str, float] = Field(default_factory=dict)
     historical_consistency: Optional[float] = None
     analyst_consensus: Optional[str] = None
     target_price: Optional[float] = None
     upside_potential: Optional[float] = None
-    
+
     # Performance Metrics
     processing_time_ms: Optional[float] = None
     cache_status: Optional[str] = None
-    
+
     # Recommendations
     summary: Optional[str] = None
     key_strengths: List[str] = Field(default_factory=list)
     key_concerns: List[str] = Field(default_factory=list)
     recommendations: List[str] = Field(default_factory=list)
-    
+
     class Config:
         json_encoders = {
             datetime: lambda dt: dt.isoformat(),
-            Decimal: lambda d: float(d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            Decimal: lambda d: float(
+                d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            ),
         }
-    
-    @validator('price', 'prev_close', 'open', 'high', 'low')
-    def validate_price_positive(cls, v):
+
+    @validator("price", "prev_close", "open", "high", "low")
+    def validate_price_positive(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and v <= 0:
             raise ValueError(f"Price must be positive: {v}")
         return v
-    
+
     @root_validator
-    def calculate_derived_fields(cls, values):
-        """Calculate derived fields automatically"""
-        price = values.get('price')
-        prev_close = values.get('prev_close')
-        
+    def calculate_derived_fields(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate derived fields automatically."""
+        price = values.get("price")
+        prev_close = values.get("prev_close")
+
         # Calculate change and change percentage
-        if price is not None and prev_close is not None and prev_close > 0:
-            values['change'] = price - prev_close
-            values['change_pct'] = ((price - prev_close) / prev_close) * 100
-            
+        if (
+            price is not None
+            and prev_close is not None
+            and isinstance(prev_close, (int, float))
+            and prev_close > 0
+        ):
+            values["change"] = price - prev_close
+            values["change_pct"] = ((price - prev_close) / prev_close) * 100
+
         # Calculate upside potential if target price exists
-        target_price = values.get('target_price')
-        if target_price is not None and price is not None and price > 0:
-            values['upside_potential'] = ((target_price - price) / price) * 100
-            
+        target_price = values.get("target_price")
+        if (
+            target_price is not None
+            and price is not None
+            and isinstance(price, (int, float))
+            and price > 0
+        ):
+            values["upside_potential"] = ((target_price - price) / price) * 100
+
         return values
-    
+
     def get_field_sources(self) -> Dict[str, List[str]]:
-        """Get sources for each field"""
-        result = defaultdict(list)
+        """Get sources for each field."""
+        result: Dict[str, List[str]] = defaultdict(list)
         for field_name, metadata in self.field_metadata.items():
             result[field_name].append(metadata.source)
         return dict(result)
+
 
 # ---------------------------------------------------------------------------
 # 4) PROVIDER ABSTRACTION LAYER
 # ---------------------------------------------------------------------------
 
+
 class DataProvider(ABC):
-    """Abstract base class for data providers"""
-    
+    """Abstract base class for data providers."""
+
     def __init__(self, config: ProviderConfig):
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
-        self._stats = {
-            'calls': 0,
-            'errors': 0,
-            'avg_latency': 0.0,
-            'last_call': None
+        self._stats: Dict[str, Any] = {
+            "calls": 0,
+            "errors": 0,
+            "avg_latency": 0.0,
+            "last_call": None,
         }
-    
+
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.config.timeout)
         )
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
-    
+            self.session = None
+
     @abstractmethod
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch quote data for given symbol"""
-        pass
-    
+        """Fetch quote data for given symbol."""
+        ...
+
     @abstractmethod
     def normalize_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize provider-specific data to unified format"""
-        pass
-    
+        """Normalize provider-specific data to unified format."""
+        ...
+
     async def fetch_with_retry(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Fetch data with retry logic"""
+        """Fetch data with retry logic."""
         start_time = time.time()
-        
+
         for attempt in range(self.config.max_retries + 1):
             try:
                 if self.session is None:
+                    # Local temporary session (do NOT store in self.session)
                     async with aiohttp.ClientSession(
                         timeout=aiohttp.ClientTimeout(total=self.config.timeout)
                     ) as temp_session:
-                        self.session = temp_session
                         raw_data = await self.fetch_quote(symbol)
                 else:
                     raw_data = await self.fetch_quote(symbol)
-                
+
                 # Update statistics
-                latency = (time.time() - start_time) * 1000
-                self._stats['calls'] += 1
-                self._stats['avg_latency'] = (
-                    (self._stats['avg_latency'] * (self._stats['calls'] - 1) + latency) 
-                    / self._stats['calls']
+                latency = (time.time() - start_time) * 1000.0
+                self._stats["calls"] += 1
+                self._stats["avg_latency"] = (
+                    (self._stats["avg_latency"] * (self._stats["calls"] - 1) + latency)
+                    / self._stats["calls"]
                 )
-                self._stats['last_call'] = datetime.now(timezone.utc)
-                
+                self._stats["last_call"] = datetime.now(timezone.utc)
+
                 return self.normalize_data(raw_data)
-                
+
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout fetching {symbol} from {self.config.name} (attempt {attempt + 1})")
+                logger.warning(
+                    f"Timeout fetching {symbol} from {self.config.name} "
+                    f"(attempt {attempt + 1})"
+                )
                 if attempt < self.config.max_retries:
                     await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
             except Exception as e:
-                logger.error(f"Error fetching from {self.config.name}: {str(e)}")
-                self._stats['errors'] += 1
+                logger.error(f"Error fetching from {self.config.name}: {e}")
+                self._stats["errors"] += 1
                 if attempt < self.config.max_retries:
                     await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
-        
+
         return None
-    
+
     def get_stats(self) -> Dict[str, Any]:
-        """Get provider statistics"""
+        """Get provider statistics."""
         return self._stats.copy()
+
 
 # Concrete Provider Implementations
 
+
 class EODHDProvider(DataProvider):
-    """EODHD API provider"""
-    
-    def __init__(self, api_key: Optional[str] = None):
+    """EODHD API provider."""
+
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         config = ProviderConfig(
             name="EODHD",
             priority=ProviderPriority.PRIMARY,
-            weight=1.0
+            weight=1.0,
         )
         super().__init__(config)
-        self.api_key = api_key or "demo"  # In production, load from config
-    
+        self.api_key = api_key or os.getenv("EODHD_API_KEY", "demo")
+        self.base_url = base_url or os.getenv(
+            "EODHD_BASE_URL", "https://eodhistoricaldata.com/api"
+        )
+
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch data from EODHD API"""
-        # Real implementation would make actual API calls
-        # This is a stub for illustration
-        
-        # Example endpoints:
-        # /api/real-time/{symbol}?api_token={api_key}
-        # /api/fundamentals/{symbol}?api_token={api_key}
-        
-        url = f"https://eodhistoricaldata.com/api/real-time/{symbol}"
-        params = {
-            'api_token': self.api_key,
-            'fmt': 'json'
-        }
-        
+        """Fetch data from EODHD API."""
+        url = f"{self.base_url}/real-time/{symbol}"
+        params = {"api_token": self.api_key, "fmt": "json"}
+
+        if self.session is None:
+            raise RuntimeError("Session not initialized for EODHDProvider")
+
         async with self.session.get(url, params=params) as response:
             if response.status == 200:
                 return await response.json()
-            else:
-                response.raise_for_status()
-    
+            response.raise_for_status()
+
     def normalize_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize EODHD data to unified format"""
+        """Normalize EODHD data to unified format."""
         normalized = {
-            'symbol': raw_data.get('code', ''),
-            'name': raw_data.get('name'),
-            'exchange': raw_data.get('exchange'),
-            'currency': raw_data.get('currency'),
-            'price': raw_data.get('close'),
-            'prev_close': raw_data.get('previousClose'),
-            'open': raw_data.get('open'),
-            'high': raw_data.get('high'),
-            'low': raw_data.get('low'),
-            'volume': raw_data.get('volume'),
-            'market_cap': raw_data.get('marketCapitalization'),
-            'timestamp': datetime.now(timezone.utc)
+            "symbol": raw_data.get("code", ""),
+            "name": raw_data.get("name"),
+            "exchange": raw_data.get("exchange"),
+            "currency": raw_data.get("currency"),
+            "price": raw_data.get("close"),
+            "prev_close": raw_data.get("previousClose"),
+            "open": raw_data.get("open"),
+            "high": raw_data.get("high"),
+            "low": raw_data.get("low"),
+            "volume": raw_data.get("volume"),
+            "market_cap": raw_data.get("marketCapitalization"),
+            "timestamp": datetime.now(timezone.utc),
         }
-        
-        # Clean None values
+
         return {k: v for k, v in normalized.items() if v is not None}
 
+
 class FMPProvider(DataProvider):
-    """Financial Modeling Prep provider"""
-    
+    """Financial Modeling Prep provider (fundamentals & extra metrics)."""
+
     def __init__(self, api_key: Optional[str] = None):
         config = ProviderConfig(
             name="FMP",
             priority=ProviderPriority.SECONDARY,
-            weight=0.9
+            weight=0.9,
         )
         super().__init__(config)
-        self.api_key = api_key
-    
+        self.api_key = api_key or os.getenv("FMP_API_KEY")
+
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch data from FMP API"""
-        # Stub implementation
-        return {}
-    
-    def normalize_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize FMP data"""
+        """Fetch data from FMP API (stub / extend as needed)."""
+        # Real implementation can call:
+        #   https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={api_key}
+        #   https://financialmodelingprep.com/api/v3/key-metrics/{symbol}?apikey={api_key}
+        if not self.api_key:
+            return {}
+        # Placeholder empty dict for now
         return {}
 
+    def normalize_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize FMP data."""
+        if not raw_data:
+            return {}
+        # Implement mapping when FMP payload is known
+        return {}
+
+
 class TadawulBridgeProvider(DataProvider):
-    """Tadawul Bridge provider for KSA stocks"""
-    
-    def __init__(self, base_url: Optional[str] = None):
+    """Tadawul Fast Bridge provider for KSA stocks (.SR)."""
+
+    def __init__(self, base_url: Optional[str] = None, app_token: Optional[str] = None):
         config = ProviderConfig(
             name="TADAWUL_BRIDGE",
             priority=ProviderPriority.PRIMARY,
-            weight=1.0
+            weight=1.0,
         )
         super().__init__(config)
-        self.base_url = base_url or "http://localhost:8000"  # Your tadawul bridge URL
-    
+        # Prefer explicit TADAWUL_BRIDGE_BASE_URL, then FAST_BRIDGE_BASE_URL
+        self.base_url = (
+            base_url
+            or os.getenv("TADAWUL_BRIDGE_BASE_URL")
+            or os.getenv("FAST_BRIDGE_BASE_URL")
+            or "http://localhost:8000"
+        )
+        # Use APP_TOKEN header if available
+        self.app_token = app_token or os.getenv("APP_TOKEN")
+
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch data from Tadawul Bridge"""
-        if not symbol.endswith('.SR'):
+        """Fetch data from Tadawul Fast Bridge.
+
+        NOTE: Adjust endpoint to match your actual API contract.
+        Here we assume an endpoint like:
+
+            GET {base_url}/v1/quote?tickers=1180.SR
+
+        returning a JSON list or dict. You can adapt normalization accordingly.
+        """
+        if not symbol.upper().endswith(".SR"):
             return {}
-        
-        url = f"{self.base_url}/api/quote/{symbol}"
-        async with self.session.get(url) as response:
+
+        if self.session is None:
+            raise RuntimeError("Session not initialized for TadawulBridgeProvider")
+
+        url = f"{self.base_url}/v1/quote"
+        params = {"tickers": symbol}
+        headers = {}
+        if self.app_token:
+            headers["X-APP-TOKEN"] = self.app_token
+
+        async with self.session.get(url, params=params, headers=headers) as response:
             if response.status == 200:
-                return await response.json()
-            else:
-                response.raise_for_status()
-    
+                data = await response.json()
+                # If API returns list, take first element
+                if isinstance(data, list) and data:
+                    return data[0]
+                return data
+            response.raise_for_status()
+
     def normalize_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize Tadawul data"""
+        """Normalize Tadawul Fast Bridge data."""
+        if not raw_data:
+            return {}
+
         normalized = {
-            'symbol': raw_data.get('symbol'),
-            'name': raw_data.get('name_ar'),  # Arabic name
-            'name_en': raw_data.get('name_en'),  # English name
-            'exchange': 'TADAWUL',
-            'currency': 'SAR',
-            'price': raw_data.get('current_price'),
-            'prev_close': raw_data.get('previous_close'),
-            'open': raw_data.get('open_price'),
-            'high': raw_data.get('high_price'),
-            'low': raw_data.get('low_price'),
-            'volume': raw_data.get('volume'),
-            'market_cap': raw_data.get('market_cap'),
-            'market_region': MarketRegion.KSA,
-            'timestamp': datetime.now(timezone.utc)
+            "symbol": raw_data.get("symbol"),
+            "name": raw_data.get("name_ar") or raw_data.get("name_en"),
+            "exchange": raw_data.get("exchange") or "TADAWUL",
+            "currency": raw_data.get("currency") or "SAR",
+            "price": raw_data.get("current_price") or raw_data.get("price"),
+            "prev_close": raw_data.get("previous_close"),
+            "open": raw_data.get("open_price"),
+            "high": raw_data.get("high_price"),
+            "low": raw_data.get("low_price"),
+            "volume": raw_data.get("volume"),
+            "market_cap": raw_data.get("market_cap"),
+            "sector": raw_data.get("sector"),
+            "market_region": MarketRegion.KSA,
+            "timestamp": datetime.now(timezone.utc),
         }
-        
-        # Add KSA-specific fields
-        if 'sector' in raw_data:
-            normalized['sector'] = raw_data['sector']
-        
+
         return {k: v for k, v in normalized.items() if v is not None}
+
 
 # ---------------------------------------------------------------------------
 # 5) INTELLIGENT MERGING ENGINE
 # ---------------------------------------------------------------------------
 
+
 class DataMerger:
-    """Intelligent data merging engine"""
-    
+    """Intelligent data merging engine."""
+
     def __init__(self, field_weights: Optional[Dict[str, float]] = None):
         self.field_weights = field_weights or self._get_default_weights()
-    
+
     @staticmethod
     def _get_default_weights() -> Dict[str, float]:
-        """Get default field weights for merging"""
+        """Get default field weights for merging."""
         return {
             # Price data (highest priority)
-            'price': 1.0,
-            'prev_close': 0.9,
-            'open': 0.8,
-            'high': 0.8,
-            'low': 0.8,
-            'volume': 0.7,
-            
+            "price": 1.0,
+            "prev_close": 0.9,
+            "open": 0.8,
+            "high": 0.8,
+            "low": 0.8,
+            "volume": 0.7,
             # Fundamentals
-            'market_cap': 0.9,
-            'eps_ttm': 0.8,
-            'pe_ttm': 0.8,
-            'pb': 0.7,
-            
+            "market_cap": 0.9,
+            "eps_ttm": 0.8,
+            "pe_ttm": 0.8,
+            "pb": 0.7,
             # Company info
-            'name': 0.6,
-            'exchange': 0.5,
-            'currency': 0.5,
+            "name": 0.6,
+            "exchange": 0.5,
+            "currency": 0.5,
         }
-    
+
     def merge_provider_data(
         self,
         symbol: str,
-        provider_data: List[Tuple[str, Dict[str, Any], QuoteSourceInfo]]
+        provider_data: List[Tuple[str, Dict[str, Any], QuoteSourceInfo]],
     ) -> Dict[str, Any]:
         """
-        Merge data from multiple providers intelligently
-        
+        Merge data from multiple providers intelligently.
+
         Args:
             symbol: Stock symbol
             provider_data: List of (provider_name, data, source_info) tuples
-            
+
         Returns:
             Merged data dictionary
         """
         if not provider_data:
-            return {'symbol': symbol, 'data_quality': DataQualityLevel.MISSING}
-        
-        # Group data by field
-        field_values = defaultdict(list)
-        field_sources = defaultdict(list)
-        field_confidences = defaultdict(list)
-        field_timestamps = defaultdict(list)
-        
+            return {"symbol": symbol, "data_quality": DataQualityLevel.MISSING}
+
+        field_values: Dict[str, List[Any]] = defaultdict(list)
+        field_sources: Dict[str, List[str]] = defaultdict(list)
+        field_confidences: Dict[str, List[float]] = defaultdict(list)
+        field_timestamps: Dict[str, List[datetime]] = defaultdict(list)
+
         for provider_name, data, source_info in provider_data:
             for field, value in data.items():
-                if value is not None:
+                if value is not None and field != "timestamp":
                     field_values[field].append(value)
                     field_sources[field].append(provider_name)
                     field_confidences[field].append(source_info.confidence)
                     field_timestamps[field].append(source_info.timestamp)
-        
-        # Merge each field
-        merged = {'symbol': symbol}
-        metadata = {}
-        
+
+        merged: Dict[str, Any] = {"symbol": symbol}
+        metadata: Dict[str, FieldMetadata] = {}
+
         for field, values in field_values.items():
             if not values:
                 continue
-                
+
             # Choose merging strategy based on field type
-            if field in ['price', 'prev_close', 'open', 'high', 'low']:
-                # For prices, use weighted average based on confidence
+            if field in ["price", "prev_close", "open", "high", "low"]:
                 merged_value = self._weighted_average(
-                    values, 
-                    field_confidences[field]
+                    values, field_confidences[field]
                 )
-            elif field in ['volume', 'market_cap']:
-                # For these, use median to avoid outliers
+            elif field in ["volume", "market_cap"]:
                 merged_value = self._median(values)
-            elif field in ['name', 'exchange', 'currency', 'sector']:
-                # For text fields, use most frequent or highest confidence
+            elif field in ["name", "exchange", "currency", "sector"]:
                 merged_value = self._most_confident(
                     values, field_confidences[field]
                 )
             else:
-                # For other fields, use average
                 merged_value = self._weighted_average(
                     values, field_confidences[field]
                 )
-            
+
             merged[field] = merged_value
-            
-            # Store metadata
+
             latest_timestamp = max(field_timestamps[field])
-            avg_confidence = sum(field_confidences[field]) / len(field_confidences[field])
-            
+            avg_confidence = sum(field_confidences[field]) / max(
+                1, len(field_confidences[field])
+            )
+
             metadata[field] = FieldMetadata(
                 value=merged_value,
-                source=field_sources[field][0],  # Primary source
+                source=field_sources[field][0],
                 timestamp=latest_timestamp,
                 confidence=avg_confidence,
-                last_verified=latest_timestamp
+                last_verified=latest_timestamp,
             )
-        
-        # Infer market region
-        merged['market_region'] = self._infer_market_region(
-            merged.get('symbol') or symbol,
-            merged.get('exchange')
+
+        merged["market_region"] = self._infer_market_region(
+            merged.get("symbol") or symbol, merged.get("exchange")
         )
-        
-        # Add metadata
-        merged['field_metadata'] = metadata
-        
+        merged["field_metadata"] = metadata
+
         return merged
-    
+
     @staticmethod
     def _weighted_average(values: List[Any], weights: List[float]) -> float:
-        """Calculate weighted average"""
-        if not values:
+        """Calculate weighted average."""
+        numeric_values = [
+            float(v) for v in values if isinstance(v, (int, float))
+        ]
+        numeric_weights = [
+            w for v, w in zip(values, weights) if isinstance(v, (int, float))
+        ]
+        if not numeric_values:
             return 0.0
-        
-        weighted_sum = sum(v * w for v, w in zip(values, weights))
-        total_weight = sum(weights)
-        
-        return weighted_sum / total_weight if total_weight > 0 else sum(values) / len(values)
-    
+
+        weighted_sum = sum(v * w for v, w in zip(numeric_values, numeric_weights))
+        total_weight = sum(numeric_weights)
+        if total_weight <= 0:
+            return sum(numeric_values) / len(numeric_values)
+        return weighted_sum / total_weight
+
     @staticmethod
     def _median(values: List[Any]) -> float:
-        """Calculate median"""
-        sorted_values = sorted(values)
-        n = len(sorted_values)
-        
+        """Calculate median."""
+        numeric_values = sorted(
+            float(v) for v in values if isinstance(v, (int, float))
+        )
+        n = len(numeric_values)
+        if n == 0:
+            return 0.0
         if n % 2 == 1:
-            return sorted_values[n // 2]
-        else:
-            mid = n // 2
-            return (sorted_values[mid - 1] + sorted_values[mid]) / 2
-    
+            return numeric_values[n // 2]
+        mid = n // 2
+        return (numeric_values[mid - 1] + numeric_values[mid]) / 2
+
     @staticmethod
     def _most_confident(values: List[Any], confidences: List[float]) -> Any:
-        """Return value with highest confidence"""
+        """Return value with highest confidence."""
         if not values:
             return None
-        
         max_idx = confidences.index(max(confidences))
         return values[max_idx]
-    
+
     @staticmethod
     def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
-        """Infer market region from symbol and exchange"""
+        """Infer market region from symbol and exchange."""
         symbol_upper = symbol.upper()
-        
-        # KSA stocks
-        if symbol_upper.endswith('.SR') or (exchange and exchange.upper() == 'TADAWUL'):
+        exchange_upper = exchange.upper() if exchange else None
+
+        if symbol_upper.endswith(".SR") or exchange_upper == "TADAWUL":
             return MarketRegion.KSA
-        
-        # US stocks
-        us_exchanges = {'NASDAQ', 'NYSE', 'AMEX'}
-        if exchange and exchange.upper() in us_exchanges:
+
+        us_exchanges = {"NASDAQ", "NYSE", "AMEX"}
+        if exchange_upper in us_exchanges:
             return MarketRegion.US
-        
-        # European stocks
-        eu_exchanges = {'LSE', 'XETRA', 'EURONEXT', 'SIX'}
-        if exchange and exchange.upper() in eu_exchanges:
+
+        eu_exchanges = {"LSE", "XETRA", "EURONEXT", "SIX"}
+        if exchange_upper in eu_exchanges:
             return MarketRegion.EU
-        
-        # Asian stocks
-        asia_exchanges = {'TSE', 'HKEX', 'SSE', 'SZSE'}
-        if exchange and exchange.upper() in asia_exchanges:
+
+        asia_exchanges = {"TSE", "HKEX", "SSE", "SZSE"}
+        if exchange_upper in asia_exchanges:
             return MarketRegion.ASIA
-        
+
         return MarketRegion.UNKNOWN
+
 
 # ---------------------------------------------------------------------------
 # 6) ADVANCED ANALYSIS ENGINE
 # ---------------------------------------------------------------------------
 
+
 class AnalysisEngine:
-    """Advanced analysis engine with multiple scoring models"""
-    
+    """Advanced analysis engine with multiple scoring models."""
+
     def __init__(self, config: Optional[AnalysisConfig] = None):
         self.config = config or AnalysisConfig()
         self.sector_data = self._load_sector_data()
-    
+
     def _load_sector_data(self) -> Dict[str, Dict[str, float]]:
-        """Load sector benchmark data"""
+        """Load sector benchmark data."""
         # In production, load from database or API
         return {
             "Technology": {
                 "avg_pe": 25.0,
                 "avg_roe": 0.20,
                 "avg_profit_margin": 0.15,
-                "avg_revenue_growth": 0.12
+                "avg_revenue_growth": 0.12,
             },
             "Financial Services": {
                 "avg_pe": 12.0,
                 "avg_roe": 0.15,
                 "avg_profit_margin": 0.25,
-                "avg_revenue_growth": 0.08
+                "avg_revenue_growth": 0.08,
             },
             "Healthcare": {
                 "avg_pe": 22.0,
                 "avg_roe": 0.18,
                 "avg_profit_margin": 0.12,
-                "avg_revenue_growth": 0.10
+                "avg_revenue_growth": 0.10,
             },
-            # Add more sectors as needed
         }
-    
+
     def analyze_quote(self, quote_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Perform comprehensive analysis on quote data
-        
+        Perform comprehensive analysis on quote data.
+
         Returns:
-            Dictionary with analysis results
+            Dictionary with analysis results.
         """
-        analysis = {}
-        
-        # Calculate individual scores
-        analysis['value_score'] = self._calculate_value_score(quote_data)
-        analysis['growth_score'] = self._calculate_growth_score(quote_data)
-        analysis['quality_score'] = self._calculate_quality_score(quote_data)
-        analysis['risk_score'] = self._calculate_risk_score(quote_data)
-        
-        # Calculate composite opportunity score
-        analysis['opportunity_score'] = self._calculate_opportunity_score(
+        analysis: Dict[str, Any] = {}
+
+        analysis["value_score"] = self._calculate_value_score(quote_data)
+        analysis["growth_score"] = self._calculate_growth_score(quote_data)
+        analysis["quality_score"] = self._calculate_quality_score(quote_data)
+        analysis["risk_score"] = self._calculate_risk_score(quote_data)
+
+        analysis["opportunity_score"] = self._calculate_opportunity_score(
             analysis, quote_data
         )
-        
-        # Generate signals
-        analysis['primary_signal'] = self._generate_primary_signal(
-            analysis['opportunity_score'],
-            quote_data
+
+        analysis["primary_signal"] = self._generate_primary_signal(
+            analysis["opportunity_score"], quote_data
         )
-        
-        analysis['secondary_signals'] = self._generate_secondary_signals(
+        analysis["secondary_signals"] = self._generate_secondary_signals(
             analysis, quote_data
         )
-        
-        # Identify risk flags
-        analysis['risk_flags'] = self._identify_risk_flags(quote_data)
-        analysis['warning_flags'] = self._identify_warning_flags(quote_data)
-        
-        # Calculate sector percentiles
+
+        analysis["risk_flags"] = self._identify_risk_flags(quote_data)
+        analysis["warning_flags"] = self._identify_warning_flags(quote_data)
+
         if self.config.enable_sector_comparison:
-            analysis['sector_percentile'] = self._calculate_sector_percentiles(
+            analysis["sector_percentile"] = self._calculate_sector_percentiles(
                 quote_data
             )
-        
-        # Generate summary and recommendations
+
         analysis.update(self._generate_recommendations(analysis, quote_data))
-        
+
         return analysis
-    
+
     def _calculate_value_score(self, data: Dict[str, Any]) -> float:
-        """Calculate value investment score (0-100)"""
-        score = 50.0  # Neutral baseline
-        
-        # P/E ratio scoring
-        pe = data.get('pe_ttm')
-        if pe is not None:
+        """Calculate value investment score (0-100)."""
+        score = 50.0
+
+        pe = data.get("pe_ttm")
+        if isinstance(pe, (int, float)):
             if pe < 10:
                 score += 20
             elif pe < 15:
                 score += 10
-            elif pe > 30:
-                score -= 10
             elif pe > 50:
                 score -= 20
-        
-        # P/B ratio scoring
-        pb = data.get('pb')
-        if pb is not None:
+            elif pe > 30:
+                score -= 10
+
+        pb = data.get("pb")
+        if isinstance(pb, (int, float)):
             if pb < 1:
                 score += 15
             elif pb < 2:
                 score += 5
             elif pb > 5:
                 score -= 10
-        
-        # Dividend yield scoring
-        dividend_yield = data.get('dividend_yield')
-        if dividend_yield is not None:
-            if dividend_yield > 0.04:  # >4%
+
+        dividend_yield = data.get("dividend_yield")
+        if isinstance(dividend_yield, (int, float)):
+            if dividend_yield > 0.04:
                 score += 10
-            elif dividend_yield > 0.02:  # >2%
+            elif dividend_yield > 0.02:
                 score += 5
-        
-        # FCF yield scoring
-        fcf_yield = data.get('fcf_yield')
-        if fcf_yield is not None and fcf_yield > 0.05:  # >5%
+
+        fcf_yield = data.get("fcf_yield")
+        if isinstance(fcf_yield, (int, float)) and fcf_yield > 0.05:
             score += 10
-        
+
         return max(0.0, min(100.0, score))
-    
+
     def _calculate_growth_score(self, data: Dict[str, Any]) -> float:
-        """Calculate growth potential score (0-100)"""
+        """Calculate growth potential score (0-100)."""
         score = 50.0
-        
-        # Revenue growth
-        rev_growth = data.get('revenue_growth_yoy')
-        if rev_growth is not None:
+
+        rev_growth = data.get("revenue_growth_yoy")
+        if isinstance(rev_growth, (int, float)):
             rev_growth_pct = rev_growth * 100
             if rev_growth_pct > 20:
                 score += 20
@@ -836,10 +884,9 @@ class AnalysisEngine:
                 score += 10
             elif rev_growth_pct < 0:
                 score -= 10
-        
-        # EPS growth
-        eps_growth = data.get('eps_growth_yoy')
-        if eps_growth is not None:
+
+        eps_growth = data.get("eps_growth_yoy")
+        if isinstance(eps_growth, (int, float)):
             eps_growth_pct = eps_growth * 100
             if eps_growth_pct > 20:
                 score += 15
@@ -847,23 +894,25 @@ class AnalysisEngine:
                 score += 8
             elif eps_growth_pct < 0:
                 score -= 8
-        
-        # Forward P/E vs TTM P/E
-        pe_ttm = data.get('pe_ttm')
-        pe_forward = data.get('pe_forward')
-        if pe_ttm is not None and pe_forward is not None and pe_ttm > 0:
-            if pe_forward < pe_ttm * 0.9:  # Forward P/E is significantly lower
+
+        pe_ttm = data.get("pe_ttm")
+        pe_forward = data.get("pe_forward")
+        if (
+            isinstance(pe_ttm, (int, float))
+            and isinstance(pe_forward, (int, float))
+            and pe_ttm > 0
+        ):
+            if pe_forward < pe_ttm * 0.9:
                 score += 10
-        
+
         return max(0.0, min(100.0, score))
-    
+
     def _calculate_quality_score(self, data: Dict[str, Any]) -> float:
-        """Calculate business quality score (0-100)"""
+        """Calculate business quality score (0-100)."""
         score = 50.0
-        
-        # Profitability metrics
-        roe = data.get('roe')
-        if roe is not None:
+
+        roe = data.get("roe")
+        if isinstance(roe, (int, float)):
             roe_pct = roe * 100
             if roe_pct > 20:
                 score += 15
@@ -871,9 +920,9 @@ class AnalysisEngine:
                 score += 8
             elif roe_pct < 5:
                 score -= 10
-        
-        profit_margin = data.get('profit_margin')
-        if profit_margin is not None:
+
+        profit_margin = data.get("profit_margin")
+        if isinstance(profit_margin, (int, float)):
             margin_pct = profit_margin * 100
             if margin_pct > 20:
                 score += 10
@@ -881,330 +930,310 @@ class AnalysisEngine:
                 score += 5
             elif margin_pct < 5:
                 score -= 5
-        
-        # Financial health
-        debt_to_equity = data.get('debt_to_equity')
-        if debt_to_equity is not None:
+
+        debt_to_equity = data.get("debt_to_equity")
+        if isinstance(debt_to_equity, (int, float)):
             if debt_to_equity < 0.5:
                 score += 10
             elif debt_to_equity > 1.5:
                 score -= 10
-        
-        current_ratio = data.get('current_ratio')
-        if current_ratio is not None:
+
+        current_ratio = data.get("current_ratio")
+        if isinstance(current_ratio, (int, float)):
             if current_ratio > 2.0:
                 score += 5
             elif current_ratio < 1.0:
                 score -= 10
-        
+
         return max(0.0, min(100.0, score))
-    
+
     def _calculate_risk_score(self, data: Dict[str, Any]) -> float:
-        """Calculate risk score (0-100, lower is better)"""
-        score = 50.0  # Neutral baseline
-        
-        # Volatility indicators
-        beta = data.get('beta')  # Would need to add this field
-        if beta is not None:
+        """Calculate risk score (0-100, higher is more risky)."""
+        score = 50.0
+
+        beta = data.get("beta")
+        if isinstance(beta, (int, float)):
             if beta > 1.5:
-                score += 20  # Higher risk
+                score += 20
             elif beta < 0.8:
-                score -= 10  # Lower risk
-        
-        # Debt levels
-        debt_to_equity = data.get('debt_to_equity')
-        if debt_to_equity is not None:
+                score -= 10
+
+        debt_to_equity = data.get("debt_to_equity")
+        if isinstance(debt_to_equity, (int, float)):
             if debt_to_equity > 2.0:
                 score += 15
             elif debt_to_equity > 1.0:
                 score += 5
-        
-        # Profitability consistency
-        if data.get('revenue_growth_yoy') is not None and data.get('revenue_growth_yoy') < 0:
+
+        revenue_growth = data.get("revenue_growth_yoy")
+        if isinstance(revenue_growth, (int, float)) and revenue_growth < 0:
             score += 10
-        
-        if data.get('profit_margin') is not None and data.get('profit_margin') < 0.05:
+
+        profit_margin = data.get("profit_margin")
+        if isinstance(profit_margin, (int, float)) and profit_margin < 0.05:
             score += 5
-        
+
         return max(0.0, min(100.0, score))
-    
+
     def _calculate_opportunity_score(
-        self, 
-        individual_scores: Dict[str, float],
-        data: Dict[str, Any]
+        self, individual_scores: Dict[str, float], data: Dict[str, Any]
     ) -> float:
-        """Calculate composite opportunity score"""
+        """Calculate composite opportunity score."""
         weights = self.config.opportunity_score_weights
-        
-        # Weighted average of component scores
-        weighted_sum = 0
-        total_weight = 0
-        
+
+        weighted_sum = 0.0
+        total_weight = 0.0
+
         for score_name, weight in weights.items():
-            if score_name == 'valuation':
-                score = individual_scores.get('value_score', 50)
-            elif score_name == 'profitability':
-                score = individual_scores.get('quality_score', 50)
-            elif score_name == 'growth':
-                score = individual_scores.get('growth_score', 50)
-            elif score_name == 'financial_health':
-                score = 100 - individual_scores.get('risk_score', 50)  # Inverse of risk
+            if score_name == "valuation":
+                score = individual_scores.get("value_score", 50.0)
+            elif score_name == "profitability":
+                score = individual_scores.get("quality_score", 50.0)
+            elif score_name == "growth":
+                score = individual_scores.get("growth_score", 50.0)
+            elif score_name == "financial_health":
+                score = 100.0 - individual_scores.get("risk_score", 50.0)
             else:
                 continue
-                
+
             weighted_sum += score * weight
             total_weight += weight
-        
-        if total_weight > 0:
-            base_score = weighted_sum / total_weight
-        else:
-            base_score = 50.0
-        
-        # Apply sector adjustment
+
+        base_score = weighted_sum / total_weight if total_weight > 0 else 50.0
+
         if self.config.enable_sector_comparison:
             sector_adjustment = self._calculate_sector_adjustment(data)
             base_score += sector_adjustment
-        
+
         return max(0.0, min(100.0, base_score))
-    
+
     def _calculate_sector_adjustment(self, data: Dict[str, Any]) -> float:
-        """Adjust score based on sector performance"""
-        sector = data.get('sector')
+        """Adjust score based on sector performance."""
+        sector = data.get("sector")
         if not sector or sector not in self.sector_data:
             return 0.0
-        
+
         sector_benchmarks = self.sector_data[sector]
         adjustment = 0.0
-        
-        # Compare P/E to sector average
-        pe = data.get('pe_ttm')
-        sector_pe = sector_benchmarks.get('avg_pe')
-        if pe is not None and sector_pe is not None:
-            if pe < sector_pe * 0.8:  # Undervalued relative to sector
+
+        pe = data.get("pe_ttm")
+        sector_pe = sector_benchmarks.get("avg_pe")
+        if isinstance(pe, (int, float)) and isinstance(sector_pe, (int, float)):
+            if pe < sector_pe * 0.8:
                 adjustment += 5
-            elif pe > sector_pe * 1.2:  # Overvalued relative to sector
+            elif pe > sector_pe * 1.2:
                 adjustment -= 5
-        
-        # Compare ROE to sector average
-        roe = data.get('roe')
-        sector_roe = sector_benchmarks.get('avg_roe')
-        if roe is not None and sector_roe is not None:
-            if roe > sector_roe * 1.2:  # Better profitability
+
+        roe = data.get("roe")
+        sector_roe = sector_benchmarks.get("avg_roe")
+        if isinstance(roe, (int, float)) and isinstance(sector_roe, (int, float)):
+            if roe > sector_roe * 1.2:
                 adjustment += 5
-            elif roe < sector_roe * 0.8:  # Worse profitability
+            elif roe < sector_roe * 0.8:
                 adjustment -= 5
-        
+
         return adjustment
-    
+
     def _generate_primary_signal(
-        self, 
-        opportunity_score: float,
-        data: Dict[str, Any]
+        self, opportunity_score: float, data: Dict[str, Any]
     ) -> AnalysisSignal:
-        """Generate primary investment signal"""
+        """Generate primary investment signal."""
         if opportunity_score >= 80:
             return AnalysisSignal.STRONG_BUY
-        elif opportunity_score >= 65:
+        if opportunity_score >= 65:
             return AnalysisSignal.BUY
-        elif opportunity_score >= 40:
+        if opportunity_score >= 40:
             return AnalysisSignal.HOLD
-        elif opportunity_score >= 20:
+        if opportunity_score >= 20:
             return AnalysisSignal.SELL
-        else:
-            return AnalysisSignal.STRONG_SELL
-    
+        return AnalysisSignal.STRONG_SELL
+
     def _generate_secondary_signals(
-        self,
-        analysis: Dict[str, Any],
-        data: Dict[str, Any]
+        self, analysis: Dict[str, Any], data: Dict[str, Any]
     ) -> List[AnalysisSignal]:
-        """Generate secondary signals based on individual scores"""
-        signals = []
-        
-        # Value signal
-        if analysis.get('value_score', 50) >= 70:
+        """Generate secondary signals based on individual scores."""
+        signals: List[AnalysisSignal] = []
+
+        if analysis.get("value_score", 50.0) >= 70:
             signals.append(AnalysisSignal.BUY)
-        elif analysis.get('value_score', 50) <= 30:
+        elif analysis.get("value_score", 50.0) <= 30:
             signals.append(AnalysisSignal.SELL)
-        
-        # Growth signal
-        if analysis.get('growth_score', 50) >= 70:
+
+        if analysis.get("growth_score", 50.0) >= 70:
             signals.append(AnalysisSignal.BUY)
-        
-        # Quality signal
-        if analysis.get('quality_score', 50) >= 70:
+
+        if analysis.get("quality_score", 50.0) >= 70:
             signals.append(AnalysisSignal.BUY)
-        
-        return list(set(signals))  # Remove duplicates
-    
+
+        return list(set(signals))
+
     def _identify_risk_flags(self, data: Dict[str, Any]) -> List[str]:
-        """Identify critical risk flags"""
-        flags = []
-        
-        # High debt
-        debt_to_equity = data.get('debt_to_equity')
-        if debt_to_equity is not None and debt_to_equity > 2.0:
+        """Identify critical risk flags."""
+        flags: List[str] = []
+
+        debt_to_equity = data.get("debt_to_equity")
+        if isinstance(debt_to_equity, (int, float)) and debt_to_equity > 2.0:
             flags.append("HIGH_DEBT_LEVEL")
-        
-        # Negative profitability
-        profit_margin = data.get('profit_margin')
-        if profit_margin is not None and profit_margin < 0:
+
+        profit_margin = data.get("profit_margin")
+        if isinstance(profit_margin, (int, float)) and profit_margin < 0:
             flags.append("NEGATIVE_PROFITABILITY")
-        
-        # Declining revenue
-        revenue_growth = data.get('revenue_growth_yoy')
-        if revenue_growth is not None and revenue_growth < -0.1:  # >10% decline
+
+        revenue_growth = data.get("revenue_growth_yoy")
+        if isinstance(revenue_growth, (int, float)) and revenue_growth < -0.1:
             flags.append("REVENUE_DECLINE")
-        
-        # Low liquidity
-        current_ratio = data.get('current_ratio')
-        if current_ratio is not None and current_ratio < 1.0:
+
+        current_ratio = data.get("current_ratio")
+        if isinstance(current_ratio, (int, float)) and current_ratio < 1.0:
             flags.append("LIQUIDITY_CONCERN")
-        
+
         return flags
-    
+
     def _identify_warning_flags(self, data: Dict[str, Any]) -> List[str]:
-        """Identify warning flags (less severe than risk flags)"""
-        warnings = []
-        
-        # High valuation
-        pe = data.get('pe_ttm')
-        if pe is not None and pe > 40:
+        """Identify warning flags (less severe than risk flags)."""
+        warnings: List[str] = []
+
+        pe = data.get("pe_ttm")
+        if isinstance(pe, (int, float)) and pe > 40:
             warnings.append("HIGH_VALUATION")
-        
-        # Slowing growth
-        revenue_growth = data.get('revenue_growth_yoy')
-        if revenue_growth is not None and 0 > revenue_growth > -0.05:
+
+        revenue_growth = data.get("revenue_growth_yoy")
+        if isinstance(revenue_growth, (int, float)) and 0 > revenue_growth > -0.05:
             warnings.append("SLOWING_GROWTH")
-        
-        # Thin margin
-        profit_margin = data.get('profit_margin')
-        if profit_margin is not None and 0 < profit_margin < 0.05:
+
+        profit_margin = data.get("profit_margin")
+        if isinstance(profit_margin, (int, float)) and 0 < profit_margin < 0.05:
             warnings.append("THIN_MARGINS")
-        
+
         return warnings
-    
+
     def _calculate_sector_percentiles(self, data: Dict[str, Any]) -> Dict[str, float]:
-        """Calculate percentiles relative to sector"""
-        sector = data.get('sector')
+        """Calculate percentiles relative to sector benchmarks."""
+        sector = data.get("sector")
         if not sector or sector not in self.sector_data:
             return {}
-        
-        percentiles = {}
+
+        percentiles: Dict[str, float] = {}
         sector_data = self.sector_data[sector]
-        
-        # PE percentile
-        pe = data.get('pe_ttm')
-        if pe is not None:
-            sector_pe = sector_data.get('avg_pe', 20)
-            percentiles['pe'] = min(100, max(0, (pe / sector_pe) * 100))
-        
-        # ROE percentile
-        roe = data.get('roe')
-        if roe is not None:
-            sector_roe = sector_data.get('avg_roe', 0.15)
-            percentiles['roe'] = min(100, max(0, (roe / sector_roe) * 100))
-        
+
+        pe = data.get("pe_ttm")
+        if isinstance(pe, (int, float)):
+            sector_pe = sector_data.get("avg_pe", 20.0)
+            if sector_pe > 0:
+                percentiles["pe"] = min(100.0, max(0.0, (pe / sector_pe) * 100.0))
+
+        roe = data.get("roe")
+        if isinstance(roe, (int, float)):
+            sector_roe = sector_data.get("avg_roe", 0.15)
+            if sector_roe > 0:
+                percentiles["roe"] = min(100.0, max(0.0, (roe / sector_roe) * 100.0))
+
         return percentiles
-    
+
     def _generate_recommendations(
-        self,
-        analysis: Dict[str, Any],
-        data: Dict[str, Any]
+        self, analysis: Dict[str, Any], data: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Generate summary and recommendations"""
-        result = {
-            'summary': '',
-            'key_strengths': [],
-            'key_concerns': [],
-            'recommendations': []
+        """Generate summary and recommendations."""
+        result: Dict[str, Any] = {
+            "summary": "",
+            "key_strengths": [],
+            "key_concerns": [],
+            "recommendations": [],
         }
-        
-        opportunity_score = analysis.get('opportunity_score', 50)
-        
-        # Generate summary based on opportunity score
+
+        opportunity_score = analysis.get("opportunity_score", 50.0)
+
         if opportunity_score >= 75:
-            result['summary'] = "Strong investment opportunity with favorable valuation and growth prospects."
+            result["summary"] = (
+                "Strong investment opportunity with favorable valuation and "
+                "growth prospects."
+            )
         elif opportunity_score >= 60:
-            result['summary'] = "Good investment opportunity with balanced risk-reward profile."
+            result["summary"] = (
+                "Good investment opportunity with balanced risk-reward profile."
+            )
         elif opportunity_score >= 40:
-            result['summary'] = "Neutral outlook. Monitor for better entry point or improved fundamentals."
+            result["summary"] = (
+                "Neutral outlook. Monitor for better entry point or improved fundamentals."
+            )
         elif opportunity_score >= 25:
-            result['summary'] = "Caution advised. Multiple risk factors present."
+            result["summary"] = "Caution advised. Multiple risk factors present."
         else:
-            result['summary'] = "High risk profile. Consider avoiding or short-term trading only."
-        
-        # Identify strengths
-        if analysis.get('value_score', 50) >= 65:
-            result['key_strengths'].append("Attractive valuation metrics")
-        
-        if analysis.get('growth_score', 50) >= 65:
-            result['key_strengths'].append("Strong growth trajectory")
-        
-        if analysis.get('quality_score', 50) >= 65:
-            result['key_strengths'].append("High business quality and profitability")
-        
-        if analysis.get('risk_score', 50) <= 35:
-            result['key_strengths'].append("Strong financial health")
-        
-        # Identify concerns
-        risk_flags = analysis.get('risk_flags', [])
+            result["summary"] = (
+                "High risk profile. Consider avoiding or short-term trading only."
+            )
+
+        if analysis.get("value_score", 50.0) >= 65:
+            result["key_strengths"].append("Attractive valuation metrics")
+
+        if analysis.get("growth_score", 50.0) >= 65:
+            result["key_strengths"].append("Strong growth trajectory")
+
+        if analysis.get("quality_score", 50.0) >= 65:
+            result["key_strengths"].append("High business quality and profitability")
+
+        if analysis.get("risk_score", 50.0) <= 35:
+            result["key_strengths"].append("Strong financial health")
+
+        risk_flags = analysis.get("risk_flags", [])
         if risk_flags:
-            result['key_concerns'].extend(risk_flags)
-        
-        warning_flags = analysis.get('warning_flags', [])
+            result["key_concerns"].extend(risk_flags)
+
+        warning_flags = analysis.get("warning_flags", [])
         if warning_flags:
-            result['key_concerns'].extend(warning_flags)
-        
-        # Generate recommendations
+            result["key_concerns"].extend(warning_flags)
+
         if opportunity_score >= 70:
-            result['recommendations'].append("Consider accumulating position")
-            result['recommendations'].append("Monitor quarterly results")
+            result["recommendations"].append("Consider accumulating position")
+            result["recommendations"].append("Monitor quarterly results")
         elif opportunity_score >= 50:
-            result['recommendations'].append("Hold existing position")
-            result['recommendations'].append("Watch for pullbacks to add")
+            result["recommendations"].append("Hold existing position")
+            result["recommendations"].append("Watch for pullbacks to add")
         else:
-            result['recommendations'].append("Consider reducing exposure")
-            result['recommendations'].append("Set strict stop-loss if trading")
-        
-        # Add sector-specific recommendations
-        sector = data.get('sector')
+            result["recommendations"].append("Consider reducing exposure")
+            result["recommendations"].append("Set strict stop-loss if trading")
+
+        sector = data.get("sector")
         if sector:
-            result['recommendations'].append(f"Compare with {sector} sector peers")
-        
+            result["recommendations"].append(f"Compare with {sector} sector peers")
+
         return result
+
 
 # ---------------------------------------------------------------------------
 # 7) CACHE MANAGER
 # ---------------------------------------------------------------------------
 
+
 class CacheManager:
-    """Intelligent cache manager with Redis support"""
-    
+    """Intelligent cache manager with Redis support."""
+
     def __init__(self, config: CacheConfig):
         self.config = config
-        self.redis = None
-        self.local_cache = {}
-        self.local_cache_timestamps = {}
-        
+        self.redis: Optional[aioredis.Redis] = None
+        self.local_cache: Dict[str, Any] = {}
+        self.local_cache_timestamps: Dict[str, datetime] = {}
+
     async def initialize(self):
-        """Initialize cache connection"""
+        """Initialize cache connection."""
         if self.config.enabled and self.config.redis_url:
             try:
                 self.redis = await aioredis.from_url(
                     self.config.redis_url,
-                    decode_responses=True
+                    decode_responses=True,
                 )
-                logger.info("Redis cache initialized")
+                logger.info("Redis cache initialized for DataEngine")
             except Exception as e:
-                logger.warning(f"Failed to connect to Redis: {e}. Using local cache only.")
-    
+                logger.warning(
+                    f"Failed to connect to Redis: {e}. Using local in-memory cache only."
+                )
+
     async def get(self, key: str) -> Optional[Any]:
-        """Get value from cache"""
+        """Get value from cache."""
         if not self.config.enabled:
             return None
-        
-        # Try Redis first
+
+        # Redis first
         if self.redis:
             try:
                 cached = await self.redis.get(key)
@@ -1212,317 +1241,288 @@ class CacheManager:
                     return json.loads(cached)
             except Exception as e:
                 logger.warning(f"Redis get error: {e}")
-        
-        # Fallback to local cache
+
+        # Local cache
         if key in self.local_cache:
             timestamp = self.local_cache_timestamps.get(key)
-            if timestamp and (datetime.now(timezone.utc) - timestamp).seconds < self.config.ttl:
-                return self.local_cache[key]
-        
+            if timestamp:
+                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+                if age < self.config.ttl:
+                    return self.local_cache[key]
+
         return None
-    
+
     async def set(self, key: str, value: Any, ttl: Optional[int] = None):
-        """Set value in cache"""
+        """Set value in cache."""
         if not self.config.enabled:
             return
-        
+
         ttl = ttl or self.config.ttl
-        
-        # Store in Redis
+
         if self.redis:
             try:
                 await self.redis.setex(
-                    key,
-                    ttl,
-                    json.dumps(value, default=str)
+                    key, ttl, json.dumps(value, default=str)
                 )
             except Exception as e:
                 logger.warning(f"Redis set error: {e}")
-        
-        # Also store in local cache
+
         self.local_cache[key] = value
         self.local_cache_timestamps[key] = datetime.now(timezone.utc)
-    
+
     async def delete(self, key: str):
-        """Delete value from cache"""
+        """Delete value from cache."""
         if self.redis:
             try:
                 await self.redis.delete(key)
             except Exception:
                 pass
-        
-        if key in self.local_cache:
-            del self.local_cache[key]
-            del self.local_cache_timestamps[key]
-    
+
+        self.local_cache.pop(key, None)
+        self.local_cache_timestamps.pop(key, None)
+
     def generate_cache_key(self, symbol: str, data_type: str = "quote") -> str:
-        """Generate cache key for symbol"""
+        """Generate cache key for symbol."""
         key_data = f"{data_type}:{symbol.upper()}"
         return hashlib.md5(key_data.encode()).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # 8) MAIN DATA ENGINE
 # ---------------------------------------------------------------------------
 
+
 class DataEngine:
     """
-    Main data engine orchestrating providers, caching, merging, and analysis
+    Main data engine orchestrating providers, caching, merging, and analysis.
     """
-    
+
     def __init__(
         self,
         cache_config: Optional[CacheConfig] = None,
         analysis_config: Optional[AnalysisConfig] = None,
-        enable_providers: Optional[List[str]] = None
+        enable_providers: Optional[List[str]] = None,
     ):
-        self.cache_config = cache_config or CacheConfig()
-        self.analysis_config = analysis_config or AnalysisConfig()
-        
-        # Initialize components
+        self.cache_config = cache_config or CacheConfig(
+            ttl=int(os.getenv("ENGINE_CACHE_TTL", DEFAULT_CACHE_TTL)),
+            redis_url=os.getenv("REDIS_URL"),
+        )
+        self.analysis_config = analysis_config or AnalysisConfig(
+            enable_advanced_analysis=os.getenv(
+                "ENABLE_ADVANCED_ANALYSIS", "true"
+            ).lower()
+            in ("1", "true", "yes")
+        )
+
         self.cache_manager = CacheManager(self.cache_config)
         self.data_merger = DataMerger()
         self.analysis_engine = AnalysisEngine(self.analysis_config)
-        
-        # Initialize providers
-        self.providers = self._initialize_providers(enable_providers)
-        
-        # Statistics
-        self.stats = {
-            'total_requests': 0,
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'avg_processing_time': 0.0,
-            'errors': 0
+
+        self.providers: List[DataProvider] = self._initialize_providers(
+            enable_providers
+        )
+
+        self.stats: Dict[str, Any] = {
+            "total_requests": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "avg_processing_time": 0.0,
+            "errors": 0,
         }
-    
+
     def _initialize_providers(
-        self, 
-        enable_providers: Optional[List[str]] = None
+        self, enable_providers: Optional[List[str]] = None
     ) -> List[DataProvider]:
-        """Initialize data providers"""
-        providers = []
-        
-        provider_configs = {
-            'eodhd': EODHDProvider,
-            'fmp': FMPProvider,
-            'tadawul': TadawulBridgeProvider
+        """Initialize data providers, respecting ENABLED_PROVIDERS env."""
+        providers: List[DataProvider] = []
+
+        provider_classes: Dict[str, Callable[..., DataProvider]] = {
+            "eodhd": EODHDProvider,
+            "fmp": FMPProvider,
+            "tadawul": TadawulBridgeProvider,
         }
-        
-        enabled = enable_providers or list(provider_configs.keys())
-        
-        for provider_name in enabled:
-            if provider_name in provider_configs:
+
+        env_enabled = os.getenv("ENABLED_PROVIDERS")
+        if env_enabled and not enable_providers:
+            enable_providers = [p.strip().lower() for p in env_enabled.split(",")]
+
+        enabled_list = enable_providers or list(provider_classes.keys())
+
+        for key in enabled_list:
+            name = key.lower()
+            if name in provider_classes:
                 try:
-                    provider_class = provider_configs[provider_name]
+                    provider_class = provider_classes[name]
                     provider = provider_class()
                     providers.append(provider)
-                    logger.info(f"Initialized provider: {provider_name}")
+                    logger.info(f"Initialized provider: {name}")
                 except Exception as e:
-                    logger.error(f"Failed to initialize {provider_name}: {e}")
-        
+                    logger.error(f"Failed to initialize provider {name}: {e}")
+
         if not providers:
-            logger.warning("No providers initialized!")
-        
+            logger.warning("No data providers initialized for DataEngine")
+
         return providers
-    
+
     async def initialize(self):
-        """Initialize engine components"""
+        """Initialize engine components."""
         await self.cache_manager.initialize()
-        logger.info("Data Engine initialized")
-    
+        logger.info("DataEngine initialized")
+
     async def get_enriched_quote(
-        self, 
+        self,
         symbol: str,
         use_cache: bool = True,
-        force_refresh: bool = False
+        force_refresh: bool = False,
     ) -> UnifiedQuote:
         """
-        Main entry point: get enriched quote with analysis
-        
-        Args:
-            symbol: Stock symbol
-            use_cache: Whether to use cache
-            force_refresh: Force refresh even if cached
-            
-        Returns:
-            UnifiedQuote object with full analysis
+        Get enriched quote with analysis for a symbol.
         """
         start_time = time.time()
-        self.stats['total_requests'] += 1
-        
-        # Generate cache key
+        self.stats["total_requests"] += 1
+
         cache_key = self.cache_manager.generate_cache_key(symbol)
-        
-        # Try cache first
-        cached_result = None
+
+        cached_result: Optional[Dict[str, Any]] = None
         if use_cache and not force_refresh:
             cached_result = await self.cache_manager.get(cache_key)
             if cached_result:
-                self.stats['cache_hits'] += 1
+                self.stats["cache_hits"] += 1
                 logger.info(f"Cache hit for {symbol}")
-                
-                # Check if cache is stale but can be served while revalidating
+
                 cache_status = "HIT"
                 if self._is_cache_stale(cached_result):
                     cache_status = "STALE"
-                    # Trigger async refresh
                     asyncio.create_task(self._refresh_cache(symbol))
-                
-                cached_result['cache_status'] = cache_status
-                return UnifiedQuote(**cached_result)
-        
-        self.stats['cache_misses'] += 1
-        
+
+                cached_result["cache_status"] = cache_status
+                quote = UnifiedQuote(**cached_result)
+                processing_time = (time.time() - start_time) * 1000.0
+                quote.processing_time_ms = processing_time
+                return quote
+
+        self.stats["cache_misses"] += 1
+
         try:
-            # Fetch from providers
             provider_data = await self._fetch_from_providers(symbol)
-            
             if not provider_data:
-                logger.warning(f"No data available for {symbol}")
+                logger.warning(f"No provider data available for {symbol}")
                 return self._create_empty_quote(symbol)
-            
-            # Merge data
+
             merged_data = self.data_merger.merge_provider_data(symbol, provider_data)
-            
-            # Calculate data quality
+
             quality_info = self._assess_data_quality(merged_data)
             merged_data.update(quality_info)
-            
-            # Perform analysis
+
             if self.analysis_config.enable_advanced_analysis:
                 analysis_results = self.analysis_engine.analyze_quote(merged_data)
                 merged_data.update(analysis_results)
-            
-            # Build unified quote
+
+            merged_data["last_updated_utc"] = datetime.now(timezone.utc)
+
             quote = UnifiedQuote(**merged_data)
-            
-            # Add processing metrics
-            processing_time = (time.time() - start_time) * 1000
+
+            processing_time = (time.time() - start_time) * 1000.0
             quote.processing_time_ms = processing_time
             quote.cache_status = "MISS"
-            
-            # Update stats
+
             self._update_stats(processing_time)
-            
-            # Cache the result
+
             if use_cache:
                 await self.cache_manager.set(
-                    cache_key,
-                    quote.model_dump(),
-                    self.cache_config.ttl
+                    cache_key, quote.model_dump(), self.cache_config.ttl
                 )
-            
-            logger.info(f"Processed {symbol} in {processing_time:.2f}ms")
+
+            logger.info(f"Processed {symbol} in {processing_time:.2f} ms")
             return quote
-            
+
         except Exception as e:
-            self.stats['errors'] += 1
+            self.stats["errors"] += 1
             logger.error(f"Error processing {symbol}: {e}")
             raise
-    
+
     async def _fetch_from_providers(
-        self, 
-        symbol: str
+        self, symbol: str
     ) -> List[Tuple[str, Dict[str, Any], QuoteSourceInfo]]:
-        """Fetch data from all providers concurrently"""
-        tasks = []
-        
+        """Fetch data from all providers concurrently."""
+        tasks: List[asyncio.Task] = []
+
         for provider in self.providers:
             if not provider.config.enabled:
                 continue
-            
-            task = self._fetch_single_provider(provider, symbol)
-            tasks.append(task)
-        
+            tasks.append(self._fetch_single_provider(provider, symbol))
+
         if not tasks:
             return []
-        
-        # Execute all provider calls concurrently
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
-        provider_data = []
+
+        provider_data: List[Tuple[str, Dict[str, Any], QuoteSourceInfo]] = []
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(f"Provider error: {result}")
                 continue
-            
             if result:
                 provider_name, data, source_info = result
                 if data:
                     provider_data.append((provider_name, data, source_info))
-        
+
         return provider_data
-    
+
     async def _fetch_single_provider(
-        self,
-        provider: DataProvider,
-        symbol: str
+        self, provider: DataProvider, symbol: str
     ) -> Optional[Tuple[str, Dict[str, Any], QuoteSourceInfo]]:
-        """Fetch data from a single provider"""
+        """Fetch data from a single provider."""
         try:
             async with provider:
                 data = await provider.fetch_with_retry(symbol)
-                
                 if not data:
                     return None
-                
-                # Create source info
+
                 source_info = QuoteSourceInfo(
                     provider=provider.config.name,
                     timestamp=datetime.now(timezone.utc),
                     fields=list(data.keys()),
                     confidence=provider.config.weight,
-                    latency_ms=provider.get_stats().get('avg_latency')
+                    latency_ms=provider.get_stats().get("avg_latency"),
                 )
-                
+
                 return provider.config.name, data, source_info
-                
+
         except Exception as e:
             logger.error(f"Error fetching from {provider.config.name}: {e}")
             return None
-    
+
     def _assess_data_quality(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Assess data quality and identify gaps"""
-        # Define field categories and weights
+        """Assess data quality and identify gaps."""
         field_categories = {
-            'essential': ['price', 'prev_close', 'volume', 'market_cap'],
-            'important': ['open', 'high', 'low', 'pe_ttm', 'eps_ttm'],
-            'additional': ['roe', 'profit_margin', 'debt_to_equity', 'revenue_growth_yoy']
+            "essential": ["price", "prev_close", "volume", "market_cap"],
+            "important": ["open", "high", "low", "pe_ttm", "eps_ttm"],
+            "additional": ["roe", "profit_margin", "debt_to_equity", "revenue_growth_yoy"],
         }
-        
-        weights = {
-            'essential': 0.5,
-            'important': 0.3,
-            'additional': 0.2
-        }
-        
-        # Calculate coverage
+
+        weights = {"essential": 0.5, "important": 0.3, "additional": 0.2}
+
         total_score = 0.0
         max_score = 0.0
-        gaps = []
-        
+        gaps: List[str] = []
+
         for category, fields in field_categories.items():
             category_weight = weights[category]
             fields_present = 0
-            
+
             for field in fields:
                 if data.get(field) is not None:
                     fields_present += 1
                 else:
                     gaps.append(field)
-            
+
             category_score = (fields_present / len(fields)) * category_weight
             total_score += category_score
             max_score += category_weight
-        
-        # Calculate quality score (0-1)
-        if max_score > 0:
-            quality_score = total_score / max_score
-        else:
-            quality_score = 0.0
-        
-        # Determine quality level
+
+        quality_score = total_score / max_score if max_score > 0 else 0.0
+
         if quality_score >= 0.9:
             quality_level = DataQualityLevel.EXCELLENT
         elif quality_score >= 0.75:
@@ -1533,124 +1533,126 @@ class DataEngine:
             quality_level = DataQualityLevel.POOR
         else:
             quality_level = DataQualityLevel.MISSING
-        
+
         return {
-            'data_quality': quality_level,
-            'data_quality_score': quality_score,
-            'data_gaps': gaps
+            "data_quality": quality_level,
+            "data_quality_score": quality_score,
+            "data_gaps": gaps,
         }
-    
+
     def _create_empty_quote(self, symbol: str) -> UnifiedQuote:
-        """Create empty quote for missing data"""
+        """Create empty quote for missing data."""
         return UnifiedQuote(
             symbol=symbol,
             data_quality=DataQualityLevel.MISSING,
             data_quality_score=0.0,
             data_gaps=["No data from any provider"],
-            last_updated_utc=datetime.now(timezone.utc)
+            last_updated_utc=datetime.now(timezone.utc),
         )
-    
-    def _is_cache_stale(self, cached_data: Dict) -> bool:
-        """Check if cached data is stale"""
-        if 'last_updated_utc' not in cached_data:
+
+    def _is_cache_stale(self, cached_data: Dict[str, Any]) -> bool:
+        """Check if cached data is stale."""
+        last_updated_str = cached_data.get("last_updated_utc")
+        if not last_updated_str:
             return True
-        
+
         try:
-            last_updated = datetime.fromisoformat(cached_data['last_updated_utc'])
-            age = (datetime.now(timezone.utc) - last_updated).seconds
+            last_updated = datetime.fromisoformat(last_updated_str)
+            age = (datetime.now(timezone.utc) - last_updated).total_seconds()
             return age > self.cache_config.ttl
-        except:
+        except Exception:
             return True
-    
+
     async def _refresh_cache(self, symbol: str):
-        """Refresh cache in background"""
+        """Refresh cache in background (stale-while-revalidate)."""
         try:
-            await self.get_enriched_quote(symbol, use_cache=False)
-            logger.info(f"Background cache refresh for {symbol}")
+            await self.get_enriched_quote(symbol, use_cache=False, force_refresh=True)
+            logger.info(f"Background cache refresh completed for {symbol}")
         except Exception as e:
             logger.warning(f"Failed to refresh cache for {symbol}: {e}")
-    
+
     def _update_stats(self, processing_time: float):
-        """Update engine statistics"""
-        total_requests = self.stats['total_requests']
-        current_avg = self.stats['avg_processing_time']
-        
-        self.stats['avg_processing_time'] = (
-            (current_avg * (total_requests - 1) + processing_time) 
-            / total_requests
+        """Update engine statistics."""
+        total_requests = self.stats["total_requests"]
+        current_avg = self.stats["avg_processing_time"]
+        self.stats["avg_processing_time"] = (
+            (current_avg * (total_requests - 1) + processing_time) / total_requests
         )
-    
+
     def get_stats(self) -> Dict[str, Any]:
-        """Get engine statistics"""
+        """Get engine statistics (for monitoring / /metrics-style endpoints)."""
         stats = self.stats.copy()
-        
-        # Add provider stats
-        stats['providers'] = {}
+
+        stats["providers"] = {}
         for provider in self.providers:
-            stats['providers'][provider.config.name] = provider.get_stats()
-        
-        # Add cache stats
-        stats['cache_hit_rate'] = (
-            (self.stats['cache_hits'] / self.stats['total_requests'] * 100)
-            if self.stats['total_requests'] > 0 else 0
+            stats["providers"][provider.config.name] = provider.get_stats()
+
+        stats["cache_hit_rate"] = (
+            (self.stats["cache_hits"] / self.stats["total_requests"] * 100.0)
+            if self.stats["total_requests"] > 0
+            else 0.0
         )
-        
+
         return stats
-    
+
     async def close(self):
-        """Cleanup resources"""
+        """Cleanup resources."""
         for provider in self.providers:
-            if hasattr(provider, 'session') and provider.session:
-                await provider.session.close()
-        
+            if getattr(provider, "session", None):
+                try:
+                    await provider.session.close()
+                except Exception:
+                    pass
+
         if self.cache_manager.redis:
-            await self.cache_manager.redis.close()
-        
-        logger.info("Data Engine closed")
+            try:
+                await self.cache_manager.redis.close()
+            except Exception:
+                pass
+
+        logger.info("DataEngine closed")
+
 
 # ---------------------------------------------------------------------------
 # 9) SIMPLIFIED ENTRY POINT (for backward compatibility)
 # ---------------------------------------------------------------------------
 
+
 async def get_enriched_quote(
     symbol: str,
     cache_ttl: int = DEFAULT_CACHE_TTL,
-    enable_advanced_analysis: bool = True
+    enable_advanced_analysis: bool = True,
 ) -> UnifiedQuote:
     """
-    Simplified entry point for backward compatibility
-    
-    Args:
-        symbol: Stock symbol
-        cache_ttl: Cache TTL in seconds
-        enable_advanced_analysis: Enable advanced analysis
-    
-    Returns:
-        UnifiedQuote object
+    Simplified entry point for backward compatibility.
     """
     engine = DataEngine(
-        cache_config=CacheConfig(ttl=cache_ttl),
+        cache_config=CacheConfig(
+            ttl=cache_ttl, redis_url=os.getenv("REDIS_URL")
+        ),
         analysis_config=AnalysisConfig(
             enable_advanced_analysis=enable_advanced_analysis
-        )
+        ),
     )
-    
+
     await engine.initialize()
-    
+
     try:
         result = await engine.get_enriched_quote(symbol)
         return result
     finally:
         await engine.close()
 
+
 # ---------------------------------------------------------------------------
-# 10) EXAMPLE USAGE
+# 10) EXAMPLE USAGE (local testing only)
 # ---------------------------------------------------------------------------
 
+
 async def example_usage():
-    """Example usage of the enhanced data engine"""
-    
-    # Method 1: Simple usage (backward compatible)
+    """Example usage of the enhanced data engine."""
+
+    # Method 1: Simple usage
     print("=== Method 1: Simple Usage ===")
     result = await get_enriched_quote("MSFT")
     print(f"Symbol: {result.symbol}")
@@ -1658,49 +1660,45 @@ async def example_usage():
     print(f"Opportunity Score: {result.opportunity_score}")
     print(f"Primary Signal: {result.primary_signal}")
     print(f"Summary: {result.summary}")
-    
+
     # Method 2: Full engine usage
     print("\n=== Method 2: Full Engine Usage ===")
-    
-    # Create engine with custom configuration
+
     engine = DataEngine(
         cache_config=CacheConfig(
             enabled=True,
             ttl=300,
-            redis_url="redis://localhost:6379"  # Optional
+            redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
         ),
         analysis_config=AnalysisConfig(
             enable_advanced_analysis=True,
-            enable_sector_comparison=True
+            enable_sector_comparison=True,
         ),
-        enable_providers=["eodhd", "tadawul"]  # Only use these providers
+        enable_providers=["eodhd", "tadawul"],
     )
-    
+
     await engine.initialize()
-    
+
     try:
-        # Get quote for US stock
         us_stock = await engine.get_enriched_quote("AAPL")
         print(f"AAPL Analysis:")
         print(f"  Value Score: {us_stock.value_score}")
         print(f"  Growth Score: {us_stock.growth_score}")
         print(f"  Risk Flags: {', '.join(us_stock.risk_flags)}")
-        
-        # Get quote for KSA stock
+
         ksa_stock = await engine.get_enriched_quote("1180.SR")
         print(f"\n1180.SR Analysis:")
         print(f"  Market Region: {ksa_stock.market_region}")
         print(f"  Opportunity Score: {ksa_stock.opportunity_score}")
-        
-        # Get engine statistics
+
         stats = engine.get_stats()
         print(f"\nEngine Statistics:")
         print(f"  Total Requests: {stats['total_requests']}")
         print(f"  Cache Hit Rate: {stats['cache_hit_rate']:.1f}%")
-        
+
     finally:
         await engine.close()
 
+
 if __name__ == "__main__":
-    # Run example
     asyncio.run(example_usage())
