@@ -1,6 +1,7 @@
 # =============================================================================
 # Tadawul Fast Bridge - Python Dependencies
 # Compatible with main.py (v4.x) and legacy microservices
+# Render Ready - CLEAN & ERROR-FREE
 # =============================================================================
 
 # Core Web Framework
@@ -17,6 +18,9 @@ aiohttp==3.8.6
 httpx==0.25.2
 requests==2.31.0
 
+# Retry Logic (required by google_apps_script_client.py)
+tenacity==8.2.3
+
 # Rate Limiting & Performance
 slowapi==0.1.8
 orjson==3.10.3
@@ -27,15 +31,15 @@ gspread==5.12.4
 google-auth==2.23.3
 google-api-python-client==2.108.0
 
-# Cache / Redis (optional but supported by main.py)
+# Cache / Redis (optional)
 redis==5.0.1
 
-# Database & Migrations (if used later)
+# Database & Migrations (optional / future support)
 SQLAlchemy==2.0.23
 alembic==1.12.1
 
 # Forms & Multipart
 python-multipart==0.0.6
 
-# Email validation (used by some Pydantic models / future endpoints)
+# Email Validation
 email-validator==2.1.1
