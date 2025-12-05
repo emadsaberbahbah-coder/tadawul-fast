@@ -2274,558 +2274,12 @@ class EnhancedTradingAnalyzer:
             source="synthetic"
         )
     
-    # =========================================================================
-    # Enhanced Market Sentiment Analysis
-    # =========================================================================
-    
-    async def analyze_market_sentiment(self, symbol: str) -> MarketSentiment:
-        """Analyze market sentiment from multiple sources"""
-        symbol = symbol.upper().strip()
-        cache_key = self._get_cache_key(symbol, "sentiment_v2")
-        
-        cached = await self._load_from_cache(cache_key)
-        if cached:
-            return cached
-        
-        try:
-            # Collect sentiment from multiple sources
-            sentiment_sources = []
-            sentiment_scores = []
-            
-            # News sentiment
-            news_sentiment = await self._get_news_sentiment(symbol)
-            if news_sentiment is not None:
-                sentiment_sources.append("news")
-                sentiment_scores.append(news_sentiment)
-            
-            # Social media sentiment (placeholder)
-            social_sentiment = await self._get_social_sentiment(symbol)
-            if social_sentiment is not None:
-                sentiment_sources.append("social")
-                sentiment_scores.append(social_sentiment)
-            
-            # Analyst sentiment
-            analyst_sentiment = await self._get_analyst_sentiment(symbol)
-            if analyst_sentiment is not None:
-                sentiment_sources.append("analyst")
-                sentiment_scores.append(analyst_sentiment)
-            
-            # Options sentiment
-            options_sentiment = await self._get_options_sentiment(symbol)
-            if options_sentiment is not None:
-                sentiment_sources.append("options")
-                sentiment_scores.append(options_sentiment)
-            
-            # Calculate overall sentiment
-            if sentiment_scores:
-                overall_sentiment = np.mean(sentiment_scores)
-                confidence = min(1.0, len(sentiment_sources) / 4)
-            else:
-                overall_sentiment = 0.0
-                confidence = 0.0
-            
-            # Determine trend
-            sentiment_trend = "stable"
-            if overall_sentiment > 0.2:
-                sentiment_trend = "improving"
-            elif overall_sentiment < -0.2:
-                sentiment_trend = "deteriorating"
-            
-            sentiment = MarketSentiment(
-                symbol=symbol,
-                overall_sentiment=overall_sentiment,
-                news_sentiment=news_sentiment or 0.0,
-                social_sentiment=social_sentiment or 0.0,
-                analyst_sentiment=analyst_sentiment or 0.0,
-                options_sentiment=options_sentiment or 0.0,
-                short_interest_ratio=None,
-                put_call_ratio=None,
-                fear_greed_index=None,
-                sentiment_sources=sentiment_sources,
-                sentiment_trend=sentiment_trend,
-                confidence_score=confidence,
-                timestamp=datetime.utcnow().isoformat() + "Z"
-            )
-            
-            await self._save_to_cache(cache_key, sentiment)
-            return sentiment
-            
-        except Exception as e:
-            logger.error(f"Sentiment analysis failed for {symbol}: {e}")
-            return self._generate_fallback_sentiment(symbol)
-    
-    async def _get_news_sentiment(self, symbol: str) -> Optional[float]:
-        """Get news sentiment score"""
-        try:
-            if self.apis.get("news"):
-                # Use news API
-                url = f"{self.base_urls['news']}/everything"
-                params = {
-                    'q': symbol,
-                    'apiKey': self.apis["news"],
-                    'pageSize': 10,
-                    'sortBy': 'publishedAt'
-                }
-                
-                data = await self._make_async_request(url, params)
-                if data and 'articles' in data:
-                    # Simple sentiment analysis
-                    articles = data['articles']
-                    if articles:
-                        # Count positive/negative words
-                        positive_words = {'up', 'gain', 'rise', 'bullish', 'buy', 'strong', 'growth'}
-                        negative_words = {'down', 'loss', 'fall', 'bearish', 'sell', 'weak', 'decline'}
-                        
-                        scores = []
-                        for article in articles:
-                            title = article.get('title', '').lower()
-                            description = article.get('description', '').lower()
-                            text = f"{title} {description}"
-                            
-                            positive_count = sum(1 for word in positive_words if word in text)
-                            negative_count = sum(1 for word in negative_words if word in text)
-                            
-                            if positive_count + negative_count > 0:
-                                score = (positive_count - negative_count) / (positive_count + negative_count)
-                                scores.append(score)
-                        
-                        if scores:
-                            return float(np.mean(scores))
-            
-            return 0.0  # Neutral if no news
-            
-        except Exception as e:
-            logger.debug(f"News sentiment failed: {e}")
-            return None
-    
-    async def _get_social_sentiment(self, symbol: str) -> Optional[float]:
-        """Get social media sentiment (placeholder)"""
-        # In a real implementation, this would connect to social media APIs
-        # For now, return random sentiment
-        return np.random.uniform(-0.5, 0.5)
-    
-    async def _get_analyst_sentiment(self, symbol: str) -> Optional[float]:
-        """Get analyst sentiment"""
-        try:
-            if self.apis.get("fmp"):
-                url = f"{self.base_urls['fmp']}/analyst-stock-recommendations/{symbol}"
-                params = {"apikey": self.apis["fmp"]}
-                
-                data = await self._make_async_request(url, params)
-                if data and isinstance(data, list) and len(data) > 0:
-                    latest = data[0]
-                    
-                    # Convert analyst ratings to sentiment score
-                    rating_map = {
-                        'Strong Buy': 1.0,
-                        'Buy': 0.7,
-                        'Hold': 0.0,
-                        'Sell': -0.7,
-                        'Strong Sell': -1.0
-                    }
-                    
-                    rating = latest.get('rating', '').title()
-                    return rating_map.get(rating, 0.0)
-            
-            return 0.0
-            
-        except Exception as e:
-            logger.debug(f"Analyst sentiment failed: {e}")
-            return None
-    
-    async def _get_options_sentiment(self, symbol: str) -> Optional[float]:
-        """Get options market sentiment"""
-        # Placeholder - would require options data API
-        return np.random.uniform(-0.3, 0.3)
-    
-    def _generate_fallback_sentiment(self, symbol: str) -> MarketSentiment:
-        """Generate fallback sentiment data"""
-        return MarketSentiment(
-            symbol=symbol,
-            overall_sentiment=0.0,
-            news_sentiment=0.0,
-            social_sentiment=0.0,
-            analyst_sentiment=0.0,
-            options_sentiment=0.0,
-            short_interest_ratio=None,
-            put_call_ratio=None,
-            fear_greed_index=None,
-            sentiment_sources=["fallback"],
-            sentiment_trend="stable",
-            confidence_score=0.0,
-            timestamp=datetime.utcnow().isoformat() + "Z"
-        )
-    
-    # =========================================================================
-    # Enhanced AI Recommendation Engine
-    # =========================================================================
-    
-    async def generate_ai_recommendation(self, symbol: str, timeframe: str = "medium_term") -> AIRecommendation:
-        """Generate comprehensive AI recommendation"""
-        start_time = time.time()
-        symbol = symbol.upper().strip()
-        cache_key = self._get_cache_key(symbol, f"recommendation_v3_{timeframe}")
-        
-        # Try cache
-        cached = await self._load_from_cache(cache_key)
-        if cached:
-            cached.analysis_duration = time.time() - start_time
-            return cached
-        
-        try:
-            # Gather all data concurrently
-            tasks = {
-                'price': asyncio.create_task(self.get_real_time_price(symbol)),
-                'technical': asyncio.create_task(self.calculate_technical_indicators(symbol)),
-                'fundamental': asyncio.create_task(self.analyze_fundamentals(symbol)),
-                'sentiment': asyncio.create_task(self.analyze_market_sentiment(symbol)),
-            }
-            
-            # Execute with timeout
-            done, pending = await asyncio.wait(
-                tasks.values(),
-                timeout=self.analysis_timeout,
-                return_when=asyncio.ALL_COMPLETED
-            )
-            
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-            
-            # Get results
-            price_data = await self._safe_get_result(tasks['price'], PriceData)
-            technical_data = await self._safe_get_result(tasks['technical'], TechnicalIndicators)
-            fundamental_data = await self._safe_get_result(tasks['fundamental'], FundamentalData)
-            sentiment_data = await self._safe_get_result(tasks['sentiment'], MarketSentiment)
-            
-            # Generate recommendation
-            recommendation = await self._generate_comprehensive_recommendation(
-                symbol, price_data, technical_data, fundamental_data, sentiment_data, timeframe
-            )
-            
-            recommendation.analysis_duration = time.time() - start_time
-            
-            # Cache the result
-            await self._save_to_cache(cache_key, recommendation)
-            
-            return recommendation
-            
-        except Exception as e:
-            logger.error(f"AI recommendation generation failed for {symbol}: {e}")
-            return self._generate_fallback_recommendation(symbol, timeframe, time.time() - start_time)
-    
-    async def _safe_get_result(self, task: asyncio.Task, expected_type: type) -> Any:
-        """Safely get task result with fallback"""
-        try:
-            if task.done() and not task.cancelled():
-                result = task.result()
-                if isinstance(result, expected_type):
-                    return result
-        except Exception as e:
-            logger.debug(f"Task result error: {e}")
-        
-        # Return fallback based on type
-        if expected_type == PriceData:
-            return PriceData(
-                symbol="",
-                price=0.0,
-                change=0.0,
-                change_percent=0.0,
-                volume=0,
-                high=0.0,
-                low=0.0,
-                open=0.0,
-                previous_close=0.0,
-                timestamp=datetime.utcnow().isoformat() + "Z",
-                source="fallback",
-                data_quality=DataQuality.UNRELIABLE
-            )
-        elif expected_type == TechnicalIndicators:
-            return self._generate_fallback_technical_indicators()
-        elif expected_type == FundamentalData:
-            return self._generate_fallback_fundamental_data("")
-        elif expected_type == MarketSentiment:
-            return self._generate_fallback_sentiment("")
-        
-        return None
-    
-    async def _generate_comprehensive_recommendation(
-        self,
-        symbol: str,
-        price_data: PriceData,
-        technical_data: TechnicalIndicators,
-        fundamental_data: FundamentalData,
-        sentiment_data: MarketSentiment,
-        timeframe: str
-    ) -> AIRecommendation:
-        """Generate comprehensive recommendation"""
-        
-        # Calculate individual scores
-        technical_score = self._calculate_technical_score_enhanced(technical_data)
-        fundamental_score = self._calculate_fundamental_score_enhanced(fundamental_data)
-        sentiment_score = self._calculate_sentiment_score_enhanced(sentiment_data)
-        momentum_score = self._calculate_momentum_score(technical_data, price_data)
-        value_score = self._calculate_value_score(fundamental_data, price_data)
-        quality_score = self._calculate_quality_score(fundamental_data, technical_data)
-        
-        # Calculate overall score with dynamic weights
-        weights = self._get_score_weights(timeframe)
-        
-        overall_score = (
-            technical_score * weights['technical'] +
-            fundamental_score * weights['fundamental'] +
-            sentiment_score * weights['sentiment'] +
-            momentum_score * weights['momentum'] +
-            value_score * weights['value'] +
-            quality_score * weights['quality']
-        )
-        
-        # Risk-adjusted score
-        risk_adjusted_score = self._calculate_risk_adjusted_score(
-            overall_score, technical_data, fundamental_data
-        )
-        
-        # Generate recommendation details
-        recommendation, recommendation_strength = self._generate_recommendation_details(
-            overall_score, technical_data, fundamental_data, sentiment_data
-        )
-        
-        # Risk assessment
-        risk_level, risk_factors = self._assess_risk_enhanced(
-            technical_data, fundamental_data, sentiment_data
-        )
-        
-        # Position sizing
-        position_sizing = self._calculate_position_sizing(
-            symbol, overall_score, risk_level, fundamental_data
-        )
-        
-        # Trading levels
-        optimal_entry, take_profit, stop_loss = self._calculate_trading_levels(
-            price_data, technical_data, recommendation
-        )
-        
-        # Generate outlooks
-        outlooks = self._generate_outlooks(overall_score, technical_data, fundamental_data)
-        
-        # Explainable factors
-        explainable_factors = self._calculate_explainable_factors(
-            technical_score, fundamental_score, sentiment_score,
-            momentum_score, value_score, quality_score
-        )
-        
-        # Scenario analysis
-        scenario_analysis = self._generate_scenario_analysis(
-            price_data, technical_data, fundamental_data
-        )
-        
-        # Expected return and risk metrics
-        expected_return, expected_volatility = self._calculate_expected_metrics(
-            technical_data, fundamental_data
-        )
-        
-        sharpe_ratio = expected_return / expected_volatility if expected_volatility > 0 else 0
-        sortino_ratio = self._calculate_sortino_ratio(expected_return, expected_volatility)
-        
-        return AIRecommendation(
-            symbol=symbol,
-            overall_score=overall_score,
-            technical_score=technical_score,
-            fundamental_score=fundamental_score,
-            sentiment_score=sentiment_score,
-            risk_adjusted_score=risk_adjusted_score,
-            momentum_score=momentum_score,
-            value_score=value_score,
-            quality_score=quality_score,
-            recommendation=recommendation,
-            recommendation_strength=recommendation_strength,
-            confidence_level=self._determine_confidence(
-                technical_data.data_quality, fundamental_data.data_quality
-            ),
-            expected_return=expected_return,
-            expected_volatility=expected_volatility,
-            sharpe_ratio=sharpe_ratio,
-            sortino_ratio=sortino_ratio,
-            short_term_outlook=outlooks['short_term'],
-            medium_term_outlook=outlooks['medium_term'],
-            long_term_outlook=outlooks['long_term'],
-            swing_trade_outlook=outlooks['swing_trade'],
-            risk_level=risk_level,
-            risk_factors=risk_factors,
-            max_drawdown_estimate=self._estimate_max_drawdown(technical_data),
-            value_at_risk=self._calculate_var(technical_data, fundamental_data),
-            stop_loss_levels=stop_loss,
-            position_sizing=position_sizing,
-            optimal_entry=optimal_entry,
-            take_profit_levels=take_profit,
-            trailing_stop_percent=self._calculate_trailing_stop(technical_data),
-            key_strengths=self._identify_strengths_enhanced(technical_data, fundamental_data),
-            key_weaknesses=self._identify_weaknesses(technical_data, fundamental_data),
-            opportunities=self._identify_opportunities(technical_data, fundamental_data, sentiment_data),
-            threats=self._identify_threats(technical_data, fundamental_data, sentiment_data),
-            market_regime=technical_data.market_regime,
-            sector_outlook=self._assess_sector_outlook(fundamental_data),
-            competitive_position=self._assess_competitive_position(fundamental_data),
-            timestamp=datetime.utcnow().isoformat() + "Z",
-            data_sources_used=4,  # Price, Technical, Fundamental, Sentiment
-            analysis_duration=0.0,  # Will be set by caller
-            model_version=self.model_version,
-            explainable_factors=explainable_factors,
-            scenario_analysis=scenario_analysis
-        )
-    
-    def _calculate_technical_score_enhanced(self, technical: TechnicalIndicators) -> float:
-        """Enhanced technical score calculation"""
-        score = 50.0
-        
-        # RSI (15%)
-        if 30 <= technical.rsi <= 70:
-            score += 15
-        elif 20 <= technical.rsi < 30 or 70 < technical.rsi <= 80:
-            score += 5
-        else:
-            score -= 10
-        
-        # MACD (15%)
-        if technical.macd_histogram > 0 and technical.macd > technical.macd_signal:
-            score += 15
-        elif technical.macd_histogram < 0 and technical.macd < technical.macd_signal:
-            score -= 15
-        
-        # Trend (20%)
-        if technical.trend_direction == "Bullish":
-            score += technical.trend_strength * 0.2
-        elif technical.trend_direction == "Bearish":
-            score -= (100 - technical.trend_strength) * 0.2
-        
-        # Moving averages (15%)
-        if technical.moving_avg_20 > technical.moving_avg_50 > technical.moving_avg_200:
-            score += 15
-        elif technical.moving_avg_20 < technical.moving_avg_50 < technical.moving_avg_200:
-            score -= 15
-        
-        # Momentum (10%)
-        if technical.momentum_score > 5:
-            score += min(10, technical.momentum_score / 2)
-        elif technical.momentum_score < -5:
-            score -= min(10, abs(technical.momentum_score) / 2)
-        
-        # Bollinger Bands (10%)
-        if 0.2 <= technical.bollinger_position <= 0.8:
-            score += 10
-        elif technical.bollinger_position < 0.1 or technical.bollinger_position > 0.9:
-            score -= 10
-        
-        # Volume (5%)
-        if technical.volume_trend > 0.05:
-            score += 5
-        elif technical.volume_trend < -0.05:
-            score -= 5
-        
-        # ADX trend strength (10%)
-        if technical.adx > 25:
-            if technical.dmi_plus > technical.dmi_minus:
-                score += 10
-            else:
-                score -= 10
-        
-        return max(0.0, min(100.0, score))
-    
-    def _calculate_fundamental_score_enhanced(self, fundamental: FundamentalData) -> float:
-        """Enhanced fundamental score calculation"""
-        if fundamental.market_cap == 0:
-            return 50.0
-        
-        score = 50.0
-        
-        # Valuation (25%)
-        valuation_score = fundamental.get_valuation_score()
-        score += (valuation_score - 50) * 0.25
-        
-        # Profitability (25%)
-        if fundamental.roe > 0.15:
-            score += 12.5
-        elif fundamental.roe > 0.08:
-            score += 6.25
-        elif fundamental.roe < 0:
-            score -= 12.5
-        
-        if fundamental.net_margin > 0.15:
-            score += 12.5
-        elif fundamental.net_margin > 0.08:
-            score += 6.25
-        elif fundamental.net_margin < 0:
-            score -= 12.5
-        
-        # Growth (20%)
-        growth_score = fundamental.get_growth_score()
-        score += (growth_score - 50) * 0.20
-        
-        # Financial Health (15%)
-        if fundamental.debt_to_equity < 0.5:
-            score += 7.5
-        elif fundamental.debt_to_equity > 1.0:
-            score -= 7.5
-        
-        if fundamental.current_ratio > 1.5:
-            score += 7.5
-        elif fundamental.current_ratio < 1.0:
-            score -= 7.5
-        
-        # Efficiency (10%)
-        if fundamental.asset_turnover > 0.8:
-            score += 5
-        elif fundamental.asset_turnover < 0.3:
-            score -= 5
-        
-        if fundamental.receivables_turnover > 8:
-            score += 5
-        elif fundamental.receivables_turnover < 4:
-            score -= 5
-        
-        # Dividends (5%)
-        if fundamental.dividend_yield > 0.03:
-            score += 5
-        
-        return max(0.0, min(100.0, score))
-    
-    def _calculate_sentiment_score_enhanced(self, sentiment: MarketSentiment) -> float:
-        """Convert sentiment to score"""
-        # Convert from -1 to 1 scale to 0 to 100 scale
-        return 50 + (sentiment.overall_sentiment * 50)
-    
-    def _calculate_momentum_score(self, technical: TechnicalIndicators, price: PriceData) -> float:
-        """Calculate momentum score"""
-        score = 50.0
-        
-        # Price momentum
-        if price.change_percent > 5:
-            score += 15
-        elif price.change_percent > 2:
-            score += 10
-        elif price.change_percent < -5:
-            score -= 15
-        elif price.change_percent < -2:
-            score -= 10
-        
-        # Volume momentum
-        if technical.volume_ratio > 1.5:
-            score += 10
-        elif technical.volume_ratio < 0.7:
-            score -= 10
-        
-        # Technical momentum
-        if technical.momentum_score > 10:
-            score += 15
-        elif technical.momentum_score < -10:
-            score -= 15
-        
-        return max(0.0, min(100.0, score))
-    
-    def _calculate_value_score(self, fundamental: FundamentalData, price: PriceData) -> float:
+        def _calculate_value_score(
+        self, fundamental: FundamentalData, price: PriceData
+    ) -> float:
         """Calculate value score"""
         score = 50.0
-        
+
         if fundamental.pe_ratio > 0:
             if fundamental.pe_ratio < 12:
                 score += 20
@@ -2833,7 +2287,7 @@ class EnhancedTradingAnalyzer:
                 score += 10
             elif fundamental.pe_ratio > 30:
                 score -= 15
-        
+
         if fundamental.pb_ratio > 0:
             if fundamental.pb_ratio < 1.2:
                 score += 15
@@ -2841,226 +2295,244 @@ class EnhancedTradingAnalyzer:
                 score += 5
             elif fundamental.pb_ratio > 4:
                 score -= 10
-        
+
         if fundamental.dividend_yield > 0.04:
             score += 10
         elif fundamental.dividend_yield > 0.02:
             score += 5
-        
-        return max(0.0, min(100.0, score))
-    
-    def _calculate_quality_score(self, fundamental: FundamentalData, technical: TechnicalIndicators) -> float:
+
+        return float(max(0.0, min(100.0, score)))
+
+    def _calculate_quality_score(
+        self, fundamental: FundamentalData, technical: TechnicalIndicators
+    ) -> float:
         """Calculate quality score"""
         score = 50.0
-        
+
         # Financial quality
         if fundamental.roe > 0.15:
             score += 10
         elif fundamental.roe < 0.05:
             score -= 10
-        
+
         if fundamental.net_margin > 0.1:
             score += 10
         elif fundamental.net_margin < 0.02:
             score -= 10
-        
+
         # Stability
         if technical.volatility < 0.2:
             score += 10
         elif technical.volatility > 0.4:
             score -= 10
-        
+
         # Consistency
         if fundamental.revenue_growth > 0 and fundamental.eps_growth > 0:
             score += 10
         elif fundamental.revenue_growth < 0 and fundamental.eps_growth < 0:
             score -= 10
-        
-        return max(0.0, min(100.0, score))
-    
+
+        return float(max(0.0, min(100.0, score)))
+
     def _get_score_weights(self, timeframe: str) -> Dict[str, float]:
         """Get score weights based on timeframe"""
-        weights_map = {
-            'intraday': {
-                'technical': 0.35,
-                'sentiment': 0.25,
-                'momentum': 0.25,
-                'fundamental': 0.05,
-                'value': 0.05,
-                'quality': 0.05
+        weights_map: Dict[str, Dict[str, float]] = {
+            "intraday": {
+                "technical": 0.35,
+                "sentiment": 0.25,
+                "momentum": 0.25,
+                "fundamental": 0.05,
+                "value": 0.05,
+                "quality": 0.05,
             },
-            'short_term': {
-                'technical': 0.30,
-                'sentiment': 0.20,
-                'momentum': 0.25,
-                'fundamental': 0.15,
-                'value': 0.05,
-                'quality': 0.05
+            "short_term": {
+                "technical": 0.30,
+                "sentiment": 0.20,
+                "momentum": 0.25,
+                "fundamental": 0.15,
+                "value": 0.05,
+                "quality": 0.05,
             },
-            'medium_term': {
-                'technical': 0.20,
-                'sentiment': 0.15,
-                'momentum': 0.20,
-                'fundamental': 0.25,
-                'value': 0.10,
-                'quality': 0.10
+            "medium_term": {
+                "technical": 0.20,
+                "sentiment": 0.15,
+                "momentum": 0.20,
+                "fundamental": 0.25,
+                "value": 0.10,
+                "quality": 0.10,
             },
-            'long_term': {
-                'technical': 0.10,
-                'sentiment': 0.10,
-                'momentum': 0.10,
-                'fundamental': 0.40,
-                'value': 0.15,
-                'quality': 0.15
-            }
+            "long_term": {
+                "technical": 0.10,
+                "sentiment": 0.10,
+                "momentum": 0.10,
+                "fundamental": 0.40,
+                "value": 0.15,
+                "quality": 0.15,
+            },
         }
-        
-        return weights_map.get(timeframe, weights_map['medium_term'])
-    
-    def _calculate_risk_adjusted_score(self, overall_score: float, 
-                                      technical: TechnicalIndicators,
-                                      fundamental: FundamentalData) -> float:
+
+        return weights_map.get(timeframe, weights_map["medium_term"])
+
+    def _calculate_risk_adjusted_score(
+        self,
+        overall_score: float,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+    ) -> float:
         """Calculate risk-adjusted score"""
-        # Reduce score based on risk factors
         risk_penalty = 0.0
-        
+
         if technical.volatility > 0.3:
             risk_penalty += 10
         if fundamental.debt_to_equity > 1.0:
             risk_penalty += 8
         if technical.rsi > 80 or technical.rsi < 20:
             risk_penalty += 5
-        
+
         risk_adjusted = overall_score - risk_penalty
-        
-        # Add bonus for low risk
+
+        # Bonus for low risk
         if technical.volatility < 0.15 and fundamental.debt_to_equity < 0.5:
             risk_adjusted += 5
-        
-        return max(0.0, min(100.0, risk_adjusted))
-    
-    def _generate_recommendation_details(self, overall_score: float,
-                                        technical: TechnicalIndicators,
-                                        fundamental: FundamentalData,
-                                        sentiment: MarketSentiment) -> Tuple[Recommendation, float]:
+
+        return float(max(0.0, min(100.0, risk_adjusted)))
+
+    def _generate_recommendation_details(
+        self,
+        overall_score: float,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> Tuple[Recommendation, float]:
         """Generate recommendation with strength"""
-        # Base recommendation
         if overall_score >= 80:
             rec = Recommendation.STRONG_BUY
-            strength = min(1.0, (overall_score - 80) / 20)
+            strength = min(1.0, (overall_score - 80) / 20.0)
         elif overall_score >= 70:
             rec = Recommendation.BUY
-            strength = min(1.0, (overall_score - 70) / 10)
+            strength = min(1.0, (overall_score - 70) / 10.0)
         elif overall_score >= 60:
             rec = Recommendation.ACCUMULATE
-            strength = min(1.0, (overall_score - 60) / 10)
+            strength = min(1.0, (overall_score - 60) / 10.0)
         elif overall_score >= 50:
             rec = Recommendation.HOLD
             strength = 0.5
         elif overall_score >= 40:
             rec = Recommendation.REDUCE
-            strength = min(1.0, (50 - overall_score) / 10)
+            strength = min(1.0, (50 - overall_score) / 10.0)
         elif overall_score >= 30:
             rec = Recommendation.SELL
-            strength = min(1.0, (40 - overall_score) / 10)
+            strength = min(1.0, (40 - overall_score) / 10.0)
         else:
             rec = Recommendation.STRONG_SELL
-            strength = min(1.0, (30 - overall_score) / 30)
-        
-        # Adjust based on additional factors
+            strength = min(1.0, (30 - overall_score) / 30.0)
+
+        # Adjust based on risk / data quality / sentiment
         if technical.volatility > 0.3:
             strength *= 0.8
-        
+
         if fundamental.data_quality == DataQuality.LOW:
             strength *= 0.7
-        
+
         if sentiment.overall_sentiment > 0.3:
-            if rec in [Recommendation.BUY, Recommendation.STRONG_BUY]:
+            if rec in (Recommendation.BUY, Recommendation.STRONG_BUY):
                 strength *= 1.1
             else:
                 strength *= 0.9
-        
-        return rec, max(0.1, min(1.0, strength))
-    
-    def _assess_risk_enhanced(self, technical: TechnicalIndicators,
-                             fundamental: FundamentalData,
-                             sentiment: MarketSentiment) -> Tuple[str, List[Dict[str, Any]]]:
+
+        return rec, float(max(0.1, min(1.0, strength)))
+
+    def _assess_risk_enhanced(
+        self,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
         """Enhanced risk assessment"""
-        risk_factors = []
+        risk_factors: List[Dict[str, Any]] = []
         risk_score = 0
-        
+
         # Volatility risk
         if technical.volatility > 0.3:
             risk_score += 2
-            risk_factors.append({
-                'factor': 'High Volatility',
-                'severity': 'high',
-                'description': f'Volatility of {technical.volatility:.1%} indicates high price swings'
-            })
+            risk_factors.append(
+                {
+                    "factor": "High Volatility",
+                    "severity": "high",
+                    "description": f"Volatility of {technical.volatility:.1%} indicates high price swings",
+                }
+            )
         elif technical.volatility > 0.2:
             risk_score += 1
-        
+
         # Debt risk
         if fundamental.debt_to_equity > 1.0:
             risk_score += 2
-            risk_factors.append({
-                'factor': 'High Debt',
-                'severity': 'high',
-                'description': f'Debt/Equity ratio of {fundamental.debt_to_equity:.2f} indicates high leverage'
-            })
+            risk_factors.append(
+                {
+                    "factor": "High Debt",
+                    "severity": "high",
+                    "description": f"Debt/Equity ratio of {fundamental.debt_to_equity:.2f} indicates high leverage",
+                }
+            )
         elif fundamental.debt_to_equity > 0.7:
             risk_score += 1
-        
+
         # Liquidity risk
         if fundamental.current_ratio < 1.0:
             risk_score += 2
-            risk_factors.append({
-                'factor': 'Low Liquidity',
-                'severity': 'high',
-                'description': f'Current ratio of {fundamental.current_ratio:.2f} indicates potential liquidity issues'
-            })
+            risk_factors.append(
+                {
+                    "factor": "Low Liquidity",
+                    "severity": "high",
+                    "description": f"Current ratio of {fundamental.current_ratio:.2f} indicates potential liquidity issues",
+                }
+            )
         elif fundamental.current_ratio < 1.5:
             risk_score += 1
-        
+
         # Sentiment risk
         if sentiment.overall_sentiment < -0.3:
             risk_score += 1
-            risk_factors.append({
-                'factor': 'Negative Sentiment',
-                'severity': 'medium',
-                'description': 'Market sentiment is significantly negative'
-            })
-        
+            risk_factors.append(
+                {
+                    "factor": "Negative Sentiment",
+                    "severity": "medium",
+                    "description": "Market sentiment is significantly negative",
+                }
+            )
+
         # Technical risk
         if technical.rsi > 80 or technical.rsi < 20:
             risk_score += 1
-            risk_factors.append({
-                'factor': 'Extreme RSI',
-                'severity': 'medium',
-                'description': f'RSI of {technical.rsi:.1f} indicates overbought/oversold conditions'
-            })
-        
-        # Determine risk level
+            risk_factors.append(
+                {
+                    "factor": "Extreme RSI",
+                    "severity": "medium",
+                    "description": f"RSI of {technical.rsi:.1f} indicates overbought/oversold conditions",
+                }
+            )
+
         if risk_score >= 4:
             risk_level = "HIGH"
         elif risk_score >= 2:
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
-        
+
         return risk_level, risk_factors
-    
-    def _calculate_position_sizing(self, symbol: str, overall_score: float,
-                                  risk_level: str, fundamental: FundamentalData) -> PortfolioAllocation:
+
+    def _calculate_position_sizing(
+        self,
+        symbol: str,
+        overall_score: float,
+        risk_level: str,
+        fundamental: FundamentalData,
+    ) -> PortfolioAllocation:
         """Calculate position sizing recommendations"""
-        
-        # Base allocation based on score and risk
-        base_allocation = {
-            "HIGH": 2.0,
-            "MEDIUM": 5.0,
-            "LOW": 10.0
-        }.get(risk_level, 5.0)
-        
+        base_allocation_map = {"HIGH": 2.0, "MEDIUM": 5.0, "LOW": 10.0}
+        base_allocation = base_allocation_map.get(risk_level, 5.0)
+
         # Adjust based on score
         if overall_score >= 80:
             base_allocation *= 1.5
@@ -3068,124 +2540,141 @@ class EnhancedTradingAnalyzer:
             base_allocation *= 1.2
         elif overall_score < 50:
             base_allocation *= 0.5
-        
+
         # Adjust for market cap
         if fundamental.market_cap < 1e9:  # Small cap
             base_allocation *= 0.7
         elif fundamental.market_cap > 50e9:  # Large cap
             base_allocation *= 1.2
-        
-        # Clamp allocation
-        recommended = max(1.0, min(15.0, base_allocation))
-        max_allocation = min(20.0, recommended * 1.5)
-        min_allocation = max(0.5, recommended * 0.5)
-        
+
+        recommended = float(max(1.0, min(15.0, base_allocation)))
+        max_allocation = float(min(20.0, recommended * 1.5))
+        min_allocation = float(max(0.5, recommended * 0.5))
+
+        risk_adjust_factor = 1 - {"HIGH": 0.5, "MEDIUM": 0.2, "LOW": 0.0}.get(
+            risk_level, 0.2
+        )
+
         return PortfolioAllocation(
             symbol=symbol,
             recommended_allocation=recommended,
             max_allocation=max_allocation,
             min_allocation=min_allocation,
-            allocation_reason=self._get_allocation_reason(recommended, risk_level, overall_score),
-            risk_adjusted_allocation=recommended * (1 - {"HIGH": 0.5, "MEDIUM": 0.2, "LOW": 0.0}.get(risk_level, 0.2)),
+            allocation_reason=self._get_allocation_reason(
+                recommended, risk_level, overall_score
+            ),
+            risk_adjusted_allocation=recommended * risk_adjust_factor,
             scenario_analysis={
-                'bull_case': recommended * 1.5,
-                'base_case': recommended,
-                'bear_case': recommended * 0.5
-            }
+                "bull_case": recommended * 1.5,
+                "base_case": recommended,
+                "bear_case": recommended * 0.5,
+            },
         )
-    
-    def _get_allocation_reason(self, allocation: float, risk_level: str, score: float) -> str:
+
+    def _get_allocation_reason(
+        self, allocation: float, risk_level: str, score: float
+    ) -> str:
         """Get allocation reason"""
-        reasons = []
-        
+        reasons: List[str] = []
+
         if allocation > 10:
             reasons.append("High conviction opportunity")
         elif allocation > 5:
             reasons.append("Strong fundamentals and technicals")
         else:
             reasons.append("Moderate opportunity with manageable risk")
-        
+
         if risk_level == "LOW":
             reasons.append("Low risk profile allows for larger position")
         elif risk_level == "HIGH":
             reasons.append("Higher risk requires smaller position size")
-        
+
         if score >= 80:
             reasons.append("Exceptional overall score")
         elif score >= 70:
             reasons.append("Strong overall score")
-        
+
         return "; ".join(reasons)
-    
-    def _calculate_trading_levels(self, price: PriceData, technical: TechnicalIndicators,
-                                 recommendation: Recommendation) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+
+    def _calculate_trading_levels(
+        self,
+        price: PriceData,
+        technical: TechnicalIndicators,
+        recommendation: Recommendation,
+    ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
         """Calculate trading levels"""
         current_price = price.price
-        
+
         # Optimal entry levels
-        if recommendation in [Recommendation.STRONG_BUY, Recommendation.BUY, Recommendation.ACCUMULATE]:
+        if recommendation in (
+            Recommendation.STRONG_BUY,
+            Recommendation.BUY,
+            Recommendation.ACCUMULATE,
+        ):
             # For buy recommendations, look for pullbacks
             optimal_entry = {
-                'aggressive': current_price * 0.98,
-                'moderate': current_price * 0.96,
-                'conservative': current_price * 0.94
+                "aggressive": current_price * 0.98,
+                "moderate": current_price * 0.96,
+                "conservative": current_price * 0.94,
             }
         else:
             # For sell/hold, current price is entry
             optimal_entry = {
-                'aggressive': current_price,
-                'moderate': current_price,
-                'conservative': current_price
+                "aggressive": current_price,
+                "moderate": current_price,
+                "conservative": current_price,
             }
-        
+
         # Take profit levels
-        if recommendation in [Recommendation.STRONG_BUY, Recommendation.BUY]:
+        if recommendation in (Recommendation.STRONG_BUY, Recommendation.BUY):
             take_profit = {
-                'target_1': current_price * 1.05,
-                'target_2': current_price * 1.10,
-                'target_3': current_price * 1.15
+                "target_1": current_price * 1.05,
+                "target_2": current_price * 1.10,
+                "target_3": current_price * 1.15,
             }
         elif recommendation == Recommendation.ACCUMULATE:
             take_profit = {
-                'target_1': current_price * 1.03,
-                'target_2': current_price * 1.06,
-                'target_3': current_price * 1.09
+                "target_1": current_price * 1.03,
+                "target_2": current_price * 1.06,
+                "target_3": current_price * 1.09,
             }
         else:
             take_profit = {
-                'target_1': current_price,
-                'target_2': current_price,
-                'target_3': current_price
+                "target_1": current_price,
+                "target_2": current_price,
+                "target_3": current_price,
             }
-        
+
         # Stop loss levels
         if technical.support_levels:
             initial_stop = technical.support_levels[0] * 0.97
         else:
             initial_stop = current_price * 0.92
-        
+
         stop_loss = {
-            'initial': initial_stop,
-            'trailing': current_price * 0.93,
-            'breakeven': current_price * 1.01
+            "initial": initial_stop,
+            "trailing": current_price * 0.93,
+            "breakeven": current_price * 1.01,
         }
-        
+
         return optimal_entry, take_profit, stop_loss
-    
-    def _generate_outlooks(self, overall_score: float, technical: TechnicalIndicators,
-                          fundamental: FundamentalData) -> Dict[str, str]:
+
+    def _generate_outlooks(
+        self, overall_score: float, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> Dict[str, str]:
         """Generate outlooks for different timeframes"""
-        
-        outlooks = {
-            'short_term': self._generate_short_term_outlook(overall_score, technical),
-            'medium_term': self._generate_medium_term_outlook(overall_score, fundamental),
-            'long_term': self._generate_long_term_outlook(overall_score, fundamental),
-            'swing_trade': self._generate_swing_trade_outlook(technical)
+        return {
+            "short_term": self._generate_short_term_outlook(overall_score, technical),
+            "medium_term": self._generate_medium_term_outlook(
+                overall_score, fundamental
+            ),
+            "long_term": self._generate_long_term_outlook(overall_score, fundamental),
+            "swing_trade": self._generate_swing_trade_outlook(technical),
         }
-        
-        return outlooks
-    
-    def _generate_short_term_outlook(self, score: float, technical: TechnicalIndicators) -> str:
+
+    def _generate_short_term_outlook(
+        self, score: float, technical: TechnicalIndicators
+    ) -> str:
         """Generate short-term outlook"""
         if score >= 70:
             if technical.trend_direction == "Bullish":
@@ -3200,8 +2689,10 @@ class EnhancedTradingAnalyzer:
             return "Cautious - Some negative factors emerging"
         else:
             return "Bearish - Multiple negative indicators"
-    
-    def _generate_medium_term_outlook(self, score: float, fundamental: FundamentalData) -> str:
+
+    def _generate_medium_term_outlook(
+        self, score: float, fundamental: FundamentalData
+    ) -> str:
         """Generate medium-term outlook"""
         if score >= 70:
             if fundamental.revenue_growth > 0.1:
@@ -3216,8 +2707,10 @@ class EnhancedTradingAnalyzer:
             return "Cautious - Fundamentals show some weakness"
         else:
             return "Negative - Structural issues present"
-    
-    def _generate_long_term_outlook(self, score: float, fundamental: FundamentalData) -> str:
+
+    def _generate_long_term_outlook(
+        self, score: float, fundamental: FundamentalData
+    ) -> str:
         """Generate long-term outlook"""
         if score >= 70:
             if fundamental.roe > 0.15 and fundamental.revenue_growth > 0.1:
@@ -3232,8 +2725,10 @@ class EnhancedTradingAnalyzer:
             return "Below Average - Long-term concerns"
         else:
             return "Poor - Significant long-term challenges"
-    
-    def _generate_swing_trade_outlook(self, technical: TechnicalIndicators) -> str:
+
+    def _generate_swing_trade_outlook(
+        self, technical: TechnicalIndicators
+    ) -> str:
         """Generate swing trade outlook"""
         if technical.trend_direction == "Bullish" and technical.adx > 25:
             return "Favorable - Strong trend with good momentum"
@@ -3245,88 +2740,116 @@ class EnhancedTradingAnalyzer:
             return "Caution - Downtrend but weak momentum"
         else:
             return "Neutral - Range-bound, look for breakout"
-    
-    def _calculate_explainable_factors(self, tech_score: float, fund_score: float,
-                                      sent_score: float, mom_score: float,
-                                      val_score: float, qual_score: float) -> Dict[str, float]:
+
+    def _calculate_explainable_factors(
+        self,
+        tech_score: float,
+        fund_score: float,
+        sent_score: float,
+        mom_score: float,
+        val_score: float,
+        qual_score: float,
+    ) -> Dict[str, float]:
         """Calculate explainable factors for transparency"""
         total = tech_score + fund_score + sent_score + mom_score + val_score + qual_score
-        
+
         if total > 0:
             return {
-                'technical_contribution': tech_score / total * 100,
-                'fundamental_contribution': fund_score / total * 100,
-                'sentiment_contribution': sent_score / total * 100,
-                'momentum_contribution': mom_score / total * 100,
-                'value_contribution': val_score / total * 100,
-                'quality_contribution': qual_score / total * 100
+                "technical_contribution": tech_score / total * 100.0,
+                "fundamental_contribution": fund_score / total * 100.0,
+                "sentiment_contribution": sent_score / total * 100.0,
+                "momentum_contribution": mom_score / total * 100.0,
+                "value_contribution": val_score / total * 100.0,
+                "quality_contribution": qual_score / total * 100.0,
             }
-        
-        return {key: 16.67 for key in ['technical', 'fundamental', 'sentiment', 'momentum', 'value', 'quality']}
-    
-    def _generate_scenario_analysis(self, price: PriceData, technical: TechnicalIndicators,
-                                   fundamental: FundamentalData) -> Dict[str, Dict[str, float]]:
+
+        # Fallback: equal contributions with consistent keys
+        return {
+            "technical_contribution": 16.67,
+            "fundamental_contribution": 16.67,
+            "sentiment_contribution": 16.67,
+            "momentum_contribution": 16.67,
+            "value_contribution": 16.67,
+            "quality_contribution": 16.67,
+        }
+
+    def _generate_scenario_analysis(
+        self, price: PriceData, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> Dict[str, Dict[str, Any]]:
         """Generate scenario analysis"""
         current_price = price.price
-        
+
         return {
-            'bull_case': {
-                'probability': 0.3,
-                'target_price': current_price * 1.25,
-                'timeframe': '6-12 months',
-                'catalysts': ['Strong earnings beat', 'Market leadership', 'Sector rotation']
+            "bull_case": {
+                "probability": 0.3,
+                "target_price": current_price * 1.25,
+                "timeframe": "6-12 months",
+                "catalysts": [
+                    "Strong earnings beat",
+                    "Market leadership",
+                    "Sector rotation",
+                ],
             },
-            'base_case': {
-                'probability': 0.5,
-                'target_price': current_price * 1.10,
-                'timeframe': '6-12 months',
-                'catalysts': ['Steady growth', 'Market average performance', 'Dividend stability']
+            "base_case": {
+                "probability": 0.5,
+                "target_price": current_price * 1.10,
+                "timeframe": "6-12 months",
+                "catalysts": [
+                    "Steady growth",
+                    "Market average performance",
+                    "Dividend stability",
+                ],
             },
-            'bear_case': {
-                'probability': 0.2,
-                'target_price': current_price * 0.85,
-                'timeframe': '6-12 months',
-                'catalysts': ['Earnings miss', 'Sector headwinds', 'Market correction']
-            }
+            "bear_case": {
+                "probability": 0.2,
+                "target_price": current_price * 0.85,
+                "timeframe": "6-12 months",
+                "catalysts": [
+                    "Earnings miss",
+                    "Sector headwinds",
+                    "Market correction",
+                ],
+            },
         }
-    
-    def _calculate_expected_metrics(self, technical: TechnicalIndicators,
-                                   fundamental: FundamentalData) -> Tuple[float, float]:
+
+    def _calculate_expected_metrics(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> Tuple[float, float]:
         """Calculate expected return and volatility"""
-        # Base expected return
         base_return = 0.08  # 8% market average
-        
+
         # Adjust for technicals
         if technical.trend_direction == "Bullish":
             base_return += 0.02
         elif technical.trend_direction == "Bearish":
             base_return -= 0.03
-        
+
         # Adjust for fundamentals
         if fundamental.roe > 0.15:
             base_return += 0.03
         elif fundamental.roe < 0.05:
             base_return -= 0.02
-        
+
         if fundamental.revenue_growth > 0.15:
             base_return += 0.02
-        
-        # Expected volatility
+
         expected_volatility = technical.volatility
-        
         return base_return, expected_volatility
-    
-    def _calculate_sortino_ratio(self, expected_return: float, volatility: float) -> float:
+
+    def _calculate_sortino_ratio(
+        self, expected_return: float, volatility: float
+    ) -> float:
         """Calculate Sortino ratio"""
-        # Simplified Sortino ratio
-        risk_free_rate = 0.02  # 2% risk-free rate
-        downside_deviation = volatility * 0.7  # Approximate downside deviation
-        
+        risk_free_rate = 0.02
+        downside_deviation = volatility * 0.7  # Approximate
+
         if downside_deviation > 0:
-            return (expected_return - risk_free_rate) / downside_deviation
+            return float((expected_return - risk_free_rate) / downside_deviation)
         return 0.0
-    
-    def _determine_confidence(self, tech_quality: DataQuality, fund_quality: DataQuality) -> str:
+
+    def _determine_confidence(
+        self, tech_quality: DataQuality, fund_quality: DataQuality
+    ) -> str:
         """Determine confidence level"""
         quality_scores = {
             DataQuality.EXCELLENT: 5,
@@ -3334,11 +2857,13 @@ class EnhancedTradingAnalyzer:
             DataQuality.MEDIUM: 3,
             DataQuality.LOW: 2,
             DataQuality.SYNTHETIC: 1,
-            DataQuality.UNRELIABLE: 0
+            DataQuality.UNRELIABLE: 0,
         }
-        
-        avg_score = (quality_scores.get(tech_quality, 0) + quality_scores.get(fund_quality, 0)) / 2
-        
+
+        avg_score = (
+            quality_scores.get(tech_quality, 0) + quality_scores.get(fund_quality, 0)
+        ) / 2.0
+
         if avg_score >= 4:
             return "Very High"
         elif avg_score >= 3:
@@ -3349,25 +2874,24 @@ class EnhancedTradingAnalyzer:
             return "Low"
         else:
             return "Very Low"
-    
+
     def _estimate_max_drawdown(self, technical: TechnicalIndicators) -> float:
         """Estimate maximum drawdown"""
-        # Simple estimation based on volatility
-        return min(0.30, technical.volatility * 1.5)
-    
-    def _calculate_var(self, technical: TechnicalIndicators, fundamental: FundamentalData) -> float:
+        return float(min(0.30, technical.volatility * 1.5))
+
+    def _calculate_var(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> float:
         """Calculate Value at Risk (95% confidence)"""
-        # Simplified VaR calculation
         base_var = technical.volatility * 1.645  # 95% confidence
-        
-        # Adjust for fundamentals
+
         if fundamental.debt_to_equity > 1.0:
             base_var *= 1.2
         if fundamental.current_ratio < 1.0:
             base_var *= 1.3
-        
-        return min(0.50, base_var)  # Cap at 50%
-    
+
+        return float(min(0.50, base_var))
+
     def _calculate_trailing_stop(self, technical: TechnicalIndicators) -> float:
         """Calculate trailing stop percentage"""
         if technical.volatility > 0.3:
@@ -3376,149 +2900,182 @@ class EnhancedTradingAnalyzer:
             return 10.0
         else:
             return 7.0
-    
-    def _identify_strengths_enhanced(self, technical: TechnicalIndicators,
-                                    fundamental: FundamentalData) -> List[str]:
+
+    def _identify_strengths_enhanced(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> List[str]:
         """Identify key strengths"""
-        strengths = []
-        
+        strengths: List[str] = []
+
         if technical.trend_direction == "Bullish":
             strengths.append("Strong upward trend momentum")
-        
+
         if 0 < fundamental.pe_ratio < 15:
             strengths.append("Attractive valuation with reasonable P/E ratio")
-        
+
         if fundamental.roe > 0.15:
             strengths.append("High return on equity indicating efficient operations")
-        
+
         if fundamental.revenue_growth > 0.1:
             strengths.append("Strong revenue growth trajectory")
-        
+
         if fundamental.debt_to_equity < 0.5:
             strengths.append("Healthy balance sheet with conservative debt levels")
-        
-        if fundamental.profit_margin > 0.15:
+
+        profit_margin = getattr(
+            fundamental, "profit_margin", fundamental.net_margin
+        )
+        if profit_margin > 0.15:
             strengths.append("Strong profitability margins")
-        
+
         if technical.adx > 25 and technical.dmi_plus > technical.dmi_minus:
             strengths.append("Strong trend with positive directional movement")
-        
+
         if technical.volume_trend > 0.05:
             strengths.append("Increasing volume supporting price movement")
-        
+
         if not strengths:
             strengths.append("Stable operations with moderate growth prospects")
-        
+
         return strengths[:5]
-    
-    def _identify_weaknesses(self, technical: TechnicalIndicators,
-                            fundamental: FundamentalData) -> List[str]:
+
+    def _identify_weaknesses(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> List[str]:
         """Identify key weaknesses"""
-        weaknesses = []
-        
+        weaknesses: List[str] = []
+
         if technical.volatility > 0.3:
             weaknesses.append("High price volatility indicating instability")
-        
+
         if fundamental.debt_to_equity > 1.0:
-            weaknesses.append("Elevated debt levels could impact financial flexibility")
-        
+            weaknesses.append(
+                "Elevated debt levels could impact financial flexibility"
+            )
+
         if fundamental.revenue_growth < 0:
             weaknesses.append("Declining revenue may signal business challenges")
-        
+
         if fundamental.pe_ratio > 30:
             weaknesses.append("High valuation multiples may not be sustainable")
-        
+
         if technical.rsi > 70:
             weaknesses.append("Potentially overbought conditions")
         elif technical.rsi < 30:
-            weaknesses.append("Potentially oversold; may indicate underlying weakness")
-        
+            weaknesses.append(
+                "Potentially oversold; may indicate underlying weakness"
+            )
+
         if technical.trend_direction == "Bearish":
             weaknesses.append("Prevailing downward trend in technical indicators")
-        
+
         if not weaknesses:
             weaknesses.append("Standard market risks apply")
-        
+
         return weaknesses[:4]
-    
-    def _identify_opportunities(self, technical: TechnicalIndicators,
-                               fundamental: FundamentalData,
-                               sentiment: MarketSentiment) -> List[str]:
+
+    def _identify_opportunities(
+        self,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> List[str]:
         """Identify opportunities"""
-        opportunities = []
-        
+        opportunities: List[str] = []
+
         if technical.rsi < 30:
             opportunities.append("Oversold conditions may present buying opportunity")
-        
-        if fundamental.pe_ratio < industry_pe:
+
+        industry_pe = getattr(fundamental, "industry_pe", None)
+        if (
+            industry_pe is not None
+            and industry_pe > 0
+            and fundamental.pe_ratio > 0
+            and fundamental.pe_ratio < industry_pe
+        ):
             opportunities.append("Trading below industry average P/E")
-        
+
         if sentiment.overall_sentiment > 0.3:
-            opportunities.append("Positive market sentiment could drive further gains")
-        
+            opportunities.append(
+                "Positive market sentiment could drive further gains"
+            )
+
         if technical.bollinger_position < 0.2:
-            opportunities.append("Trading near lower Bollinger Band, potential rebound")
-        
+            opportunities.append(
+                "Trading near lower Bollinger Band, potential rebound"
+            )
+
         if fundamental.dividend_yield > 0.04:
-            opportunities.append("Attractive dividend yield for income investors")
-        
+            opportunities.append(
+                "Attractive dividend yield for income-focused investors"
+            )
+
         if not opportunities:
             opportunities.append("Market efficiency limits obvious opportunities")
-        
+
         return opportunities[:3]
-    
-    def _identify_threats(self, technical: TechnicalIndicators,
-                         fundamental: FundamentalData,
-                         sentiment: MarketSentiment) -> List[str]:
+
+    def _identify_threats(
+        self,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> List[str]:
         """Identify threats"""
-        threats = []
-        
+        threats: List[str] = []
+
         if technical.volatility > 0.3:
             threats.append("Market volatility could lead to sharp price declines")
-        
+
         if sentiment.overall_sentiment < -0.3:
             threats.append("Negative sentiment could trigger sell-offs")
-        
+
         if fundamental.debt_to_equity > 1.5:
             threats.append("High leverage increases risk during downturns")
-        
+
         if technical.adx > 40 and technical.dmi_minus > technical.dmi_plus:
             threats.append("Strong bearish trend momentum")
-        
+
         if not threats:
             threats.append("General market and economic risks")
-        
+
         return threats[:3]
-    
+
     def _assess_sector_outlook(self, fundamental: FundamentalData) -> str:
         """Assess sector outlook"""
-        sector = fundamental.sector.lower()
-        
-        if sector in ['technology', 'healthcare']:
+        sector = (fundamental.sector or "").lower()
+
+        if sector in ["technology", "healthcare"]:
             return "Favorable - Growth sectors with strong long-term prospects"
-        elif sector in ['financials', 'consumer staples']:
+        elif sector in ["financials", "consumer staples"]:
             return "Stable - Defensive sectors with reliable performance"
-        elif sector in ['energy', 'materials']:
+        elif sector in ["energy", "materials"]:
             return "Cyclical - Dependent on economic cycles"
-        elif sector in ['utilities', 'real estate']:
+        elif sector in ["utilities", "real estate"]:
             return "Income-focused - Stable dividends but limited growth"
         else:
             return "Mixed - Varies by specific industry dynamics"
-    
+
     def _assess_competitive_position(self, fundamental: FundamentalData) -> str:
         """Assess competitive position"""
-        if fundamental.sector_rank <= 10:
+        rank = getattr(fundamental, "sector_rank", None)
+        if rank is None:
+            return "Unknown"
+
+        if rank <= 10:
             return "Leadership - Top tier in sector"
-        elif fundamental.sector_rank <= 25:
+        elif rank <= 25:
             return "Strong - Above average competitive position"
-        elif fundamental.sector_rank <= 50:
+        elif rank <= 50:
             return "Average - Mid-tier competitive position"
-        elif fundamental.sector_rank <= 75:
+        elif rank <= 75:
             return "Challenged - Below average competitive position"
         else:
             return "Weak - Bottom tier in sector"
-    
-    def _generate_fallback_recommendation(self, symbol: str, timeframe: str, duration: float) -> AIRecommendation:
+
+    def _generate_fallback_recommendation(
+        self, symbol: str, timeframe: str, duration: float
+    ) -> AIRecommendation:
         """Generate fallback recommendation"""
         return AIRecommendation(
             symbol=symbol,
@@ -3542,14 +3099,16 @@ class EnhancedTradingAnalyzer:
             long_term_outlook="Unknown - Analysis unavailable",
             swing_trade_outlook="Not recommended - Data issues",
             risk_level="MEDIUM",
-            risk_factors=[{
-                'factor': 'Data Unavailability',
-                'severity': 'high',
-                'description': 'Unable to collect sufficient data for proper analysis'
-            }],
+            risk_factors=[
+                {
+                    "factor": "Data Unavailability",
+                    "severity": "high",
+                    "description": "Unable to collect sufficient data for proper analysis",
+                }
+            ],
             max_drawdown_estimate=0.2,
             value_at_risk=0.15,
-            stop_loss_levels={'initial': 0.0, 'trailing': 0.0, 'breakeven': 0.0},
+            stop_loss_levels={"initial": 0.0, "trailing": 0.0, "breakeven": 0.0},
             position_sizing=PortfolioAllocation(
                 symbol=symbol,
                 recommended_allocation=0.0,
@@ -3557,10 +3116,14 @@ class EnhancedTradingAnalyzer:
                 min_allocation=0.0,
                 allocation_reason="Insufficient data for position sizing",
                 risk_adjusted_allocation=0.0,
-                scenario_analysis={}
+                scenario_analysis={},
             ),
-            optimal_entry={'aggressive': 0.0, 'moderate': 0.0, 'conservative': 0.0},
-            take_profit_levels={'target_1': 0.0, 'target_2': 0.0, 'target_3': 0.0},
+            optimal_entry={"aggressive": 0.0, "moderate": 0.0, "conservative": 0.0},
+            take_profit_levels={
+                "target_1": 0.0,
+                "target_2": 0.0,
+                "target_3": 0.0,
+            },
             trailing_stop_percent=0.0,
             key_strengths=["Insufficient data for analysis"],
             key_weaknesses=["Data collection failed"],
@@ -3574,62 +3137,74 @@ class EnhancedTradingAnalyzer:
             analysis_duration=duration,
             model_version=self.model_version,
             explainable_factors={},
-            scenario_analysis={}
+            scenario_analysis={},
         )
-    
+
     # =========================================================================
     # Enhanced Multi-source Analysis
     # =========================================================================
-    
+
     async def get_multi_source_analysis(self, symbol: str) -> Dict[str, Any]:
         """Enhanced multi-source analysis with comprehensive data"""
         start_time = time.time()
         symbol = symbol.upper().strip()
         cache_key = self._get_cache_key(symbol, "multisource_v2")
-        
-        # Try cache
+
         cached = await self._load_from_cache(cache_key)
         if cached:
-            cached['metadata']['cache_hit'] = True
+            cached["metadata"]["cache_hit"] = True
             return cached
-        
+
         try:
-            # Gather all data
             price_data = await self.get_real_time_price(symbol)
             technical_data = await self.calculate_technical_indicators(symbol)
             fundamental_data = await self.analyze_fundamentals(symbol)
             sentiment_data = await self.analyze_market_sentiment(symbol)
-            
-            # Combine data
+
             analysis = {
                 "symbol": symbol,
                 "price_data": price_data.to_dict() if price_data else None,
-                "technical_indicators": technical_data.to_dict() if technical_data else None,
-                "fundamental_data": fundamental_data.to_dict() if fundamental_data else None,
-                "market_sentiment": sentiment_data.to_dict() if sentiment_data else None,
+                "technical_indicators": (
+                    technical_data.to_dict() if technical_data else None
+                ),
+                "fundamental_data": (
+                    fundamental_data.to_dict() if fundamental_data else None
+                ),
+                "market_sentiment": (
+                    sentiment_data.to_dict() if sentiment_data else None
+                ),
                 "consolidated_analysis": self._consolidate_multi_source_data_enhanced(
                     price_data, technical_data, fundamental_data, sentiment_data
                 ),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "metadata": {
                     "data_sources_used": 4,
-                    "successful_sources": sum(1 for data in [price_data, technical_data, fundamental_data, sentiment_data] if data),
+                    "successful_sources": sum(
+                        1
+                        for data in [
+                            price_data,
+                            technical_data,
+                            fundamental_data,
+                            sentiment_data,
+                        ]
+                        if data
+                    ),
                     "analysis_duration": time.time() - start_time,
                     "cache_hit": False,
                     "data_quality": self._assess_overall_quality(
-                        price_data.data_quality if price_data else DataQuality.UNRELIABLE,
+                        price_data.data_quality
+                        if price_data
+                        else DataQuality.UNRELIABLE,
                         technical_data.data_quality,
                         fundamental_data.data_quality,
-                        DataQuality.MEDIUM
-                    ).value
-                }
+                        DataQuality.MEDIUM,
+                    ).value,
+                },
             }
-            
-            # Cache the result
+
             await self._save_to_cache(cache_key, analysis)
-            
             return analysis
-            
+
         except Exception as e:
             logger.error(f"Multi-source analysis failed for {symbol}: {e}")
             return {
@@ -3641,42 +3216,40 @@ class EnhancedTradingAnalyzer:
                     "successful_sources": 0,
                     "analysis_duration": time.time() - start_time,
                     "cache_hit": False,
-                    "data_quality": "UNRELIABLE"
-                }
+                    "data_quality": "UNRELIABLE",
+                },
             }
-    
-    def _consolidate_multi_source_data_enhanced(self, price_data: Optional[PriceData],
-                                               technical_data: TechnicalIndicators,
-                                               fundamental_data: FundamentalData,
-                                               sentiment_data: MarketSentiment) -> Dict[str, Any]:
+
+    def _consolidate_multi_source_data_enhanced(
+        self,
+        price_data: Optional[PriceData],
+        technical_data: TechnicalIndicators,
+        fundamental_data: FundamentalData,
+        sentiment_data: MarketSentiment,
+    ) -> Dict[str, Any]:
         """Enhanced data consolidation"""
         if not price_data:
             return {"error": "No price data available"}
-        
-        # Calculate consensus metrics
+
         consensus_price = price_data.price
         consensus_volume = price_data.volume
-        
-        # Calculate data quality score
+
         quality_scores = {
-            'price': self._data_quality_to_score(price_data.data_quality),
-            'technical': self._data_quality_to_score(technical_data.data_quality),
-            'fundamental': self._data_quality_to_score(fundamental_data.data_quality),
-            'sentiment': sentiment_data.confidence_score
+            "price": self._data_quality_to_score(price_data.data_quality),
+            "technical": self._data_quality_to_score(technical_data.data_quality),
+            "fundamental": self._data_quality_to_score(fundamental_data.data_quality),
+            "sentiment": float(sentiment_data.confidence_score),
         }
-        
-        avg_quality = np.mean(list(quality_scores.values()))
-        
-        # Calculate risk score
+
+        avg_quality = float(np.mean(list(quality_scores.values())))
+
         risk_score = self._calculate_risk_score_consolidated(
             technical_data, fundamental_data, sentiment_data
         )
-        
-        # Calculate opportunity score
         opportunity_score = self._calculate_opportunity_score(
             technical_data, fundamental_data, sentiment_data
         )
-        
+
         return {
             "consensus_price": consensus_price,
             "consensus_volume": consensus_volume,
@@ -3692,9 +3265,9 @@ class EnhancedTradingAnalyzer:
             ),
             "recommendation_summary": self._generate_recommendation_summary(
                 technical_data, fundamental_data
-            )
+            ),
         }
-    
+
     def _data_quality_to_score(self, quality: DataQuality) -> float:
         """Convert data quality to score"""
         quality_map = {
@@ -3703,10 +3276,10 @@ class EnhancedTradingAnalyzer:
             DataQuality.MEDIUM: 0.70,
             DataQuality.LOW: 0.50,
             DataQuality.SYNTHETIC: 0.30,
-            DataQuality.UNRELIABLE: 0.10
+            DataQuality.UNRELIABLE: 0.10,
         }
-        return quality_map.get(quality, 0.50)
-    
+        return float(quality_map.get(quality, 0.50))
+
     def _assess_overall_quality(self, *qualities: DataQuality) -> DataQuality:
         """Assess overall data quality"""
         quality_scores = {
@@ -3715,11 +3288,13 @@ class EnhancedTradingAnalyzer:
             DataQuality.MEDIUM: 3,
             DataQuality.LOW: 2,
             DataQuality.SYNTHETIC: 1,
-            DataQuality.UNRELIABLE: 0
+            DataQuality.UNRELIABLE: 0,
         }
-        
-        avg_score = np.mean([quality_scores.get(q, 0) for q in qualities])
-        
+
+        avg_score = float(
+            np.mean([quality_scores.get(q, 0) for q in qualities])
+        )
+
         if avg_score >= 4:
             return DataQuality.HIGH
         elif avg_score >= 3:
@@ -3730,72 +3305,78 @@ class EnhancedTradingAnalyzer:
             return DataQuality.SYNTHETIC
         else:
             return DataQuality.UNRELIABLE
-    
-    def _calculate_risk_score_consolidated(self, technical: TechnicalIndicators,
-                                          fundamental: FundamentalData,
-                                          sentiment: MarketSentiment) -> float:
+
+    def _calculate_risk_score_consolidated(
+        self,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> float:
         """Calculate consolidated risk score"""
-        risk_factors = []
-        
+        risk_factors: List[float] = []
+
         # Technical risk
         if technical.volatility > 0.3:
             risk_factors.append(0.3)
         elif technical.volatility > 0.2:
             risk_factors.append(0.2)
-        
+
         if technical.rsi > 80 or technical.rsi < 20:
             risk_factors.append(0.2)
-        
+
         # Fundamental risk
         if fundamental.debt_to_equity > 1.0:
             risk_factors.append(0.3)
         elif fundamental.debt_to_equity > 0.7:
             risk_factors.append(0.1)
-        
+
         if fundamental.current_ratio < 1.0:
             risk_factors.append(0.3)
         elif fundamental.current_ratio < 1.5:
             risk_factors.append(0.1)
-        
+
         # Sentiment risk
         if sentiment.overall_sentiment < -0.3:
             risk_factors.append(0.2)
-        
+
         if risk_factors:
-            return min(1.0, sum(risk_factors) / len(risk_factors))
-        return 0.1  # Low risk by default
-    
-    def _calculate_opportunity_score(self, technical: TechnicalIndicators,
-                                    fundamental: FundamentalData,
-                                    sentiment: MarketSentiment) -> float:
+            return float(min(1.0, sum(risk_factors) / len(risk_factors)))
+        return 0.1
+
+    def _calculate_opportunity_score(
+        self,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> float:
         """Calculate opportunity score"""
-        opportunity_factors = []
-        
+        opportunity_factors: List[float] = []
+
         # Technical opportunity
         if technical.trend_direction == "Bullish":
             opportunity_factors.append(0.3)
-        
+
         if technical.rsi < 30:
             opportunity_factors.append(0.2)
-        
+
         if technical.bollinger_position < 0.2:
             opportunity_factors.append(0.15)
-        
+
         # Fundamental opportunity
-        if fundamental.pe_ratio > 0 and fundamental.pe_ratio < 15:
+        if 0 < fundamental.pe_ratio < 15:
             opportunity_factors.append(0.2)
-        
+
         if fundamental.roe > 0.15:
             opportunity_factors.append(0.15)
-        
+
         # Sentiment opportunity
         if sentiment.overall_sentiment > 0.3:
             opportunity_factors.append(0.1)
-        
+
         if opportunity_factors:
-            return min(1.0, sum(opportunity_factors) / len(opportunity_factors))
-        return 0.3  # Neutral opportunity
-    
+            return float(min(1.0, sum(opportunity_factors) / len(opportunity_factors)))
+        return 0.3
+
     def _assess_valuation_status(self, fundamental: FundamentalData) -> str:
         """Assess valuation status"""
         if fundamental.pe_ratio <= 0:
@@ -3808,7 +3389,7 @@ class EnhancedTradingAnalyzer:
             return "Overvalued"
         else:
             return "Highly Overvalued"
-    
+
     def _assess_sentiment_status(self, sentiment: MarketSentiment) -> str:
         """Assess sentiment status"""
         if sentiment.overall_sentiment > 0.3:
@@ -3821,167 +3402,187 @@ class EnhancedTradingAnalyzer:
             return "Negative"
         else:
             return "Very Negative"
-    
-    def _generate_key_insights(self, price_data: PriceData, technical: TechnicalIndicators,
-                              fundamental: FundamentalData, sentiment: MarketSentiment) -> List[str]:
+
+    def _generate_key_insights(
+        self,
+        price_data: PriceData,
+        technical: TechnicalIndicators,
+        fundamental: FundamentalData,
+        sentiment: MarketSentiment,
+    ) -> List[str]:
         """Generate key insights"""
-        insights = []
-        
+        insights: List[str] = []
+
         # Price insights
         if price_data.change_percent > 5:
             insights.append(f"Strong price momentum: +{price_data.change_percent:.1f}%")
         elif price_data.change_percent < -5:
-            insights.append(f"Significant decline: {price_data.change_percent:.1f}%")
-        
+            insights.append(
+                f"Significant decline: {price_data.change_percent:.1f}%"
+            )
+
         # Technical insights
         if technical.rsi < 30:
             insights.append("Oversold conditions based on RSI")
         elif technical.rsi > 70:
             insights.append("Overbought conditions based on RSI")
-        
+
         if technical.trend_direction == "Bullish" and technical.adx > 25:
             insights.append("Strong bullish trend with good momentum")
-        
-        # Fundamental insights
-        if fundamental.pe_ratio < industry_pe * 0.8:
-            insights.append("Trading at discount to industry average")
-        elif fundamental.pe_ratio > industry_pe * 1.2:
-            insights.append("Trading at premium to industry average")
-        
+
+        # Fundamental vs industry P/E
+        industry_pe = getattr(fundamental, "industry_pe", None)
+        if (
+            industry_pe is not None
+            and industry_pe > 0
+            and fundamental.pe_ratio > 0
+        ):
+            if fundamental.pe_ratio < industry_pe * 0.8:
+                insights.append("Trading at discount to industry average")
+            elif fundamental.pe_ratio > industry_pe * 1.2:
+                insights.append("Trading at premium to industry average")
+
         if fundamental.roe > 0.2:
             insights.append("Exceptional return on equity")
-        
+
         # Sentiment insights
         if sentiment.overall_sentiment > 0.3:
             insights.append("Positive market sentiment supporting price")
-        
+
         if not insights:
             insights.append("Mixed signals across different analysis dimensions")
-        
+
         return insights[:5]
-    
-    def _generate_recommendation_summary(self, technical: TechnicalIndicators,
-                                        fundamental: FundamentalData) -> str:
+
+    def _generate_recommendation_summary(
+        self, technical: TechnicalIndicators, fundamental: FundamentalData
+    ) -> str:
         """Generate recommendation summary"""
         buy_signals = len(technical.get_buy_signals())
         sell_signals = len(technical.get_sell_signals())
-        
+
         if buy_signals > sell_signals + 2:
             return "Bullish - Multiple buy signals outweigh sell signals"
         elif sell_signals > buy_signals + 2:
             return "Bearish - Multiple sell signals outweigh buy signals"
-        elif fundamental.pe_ratio > 0 and fundamental.pe_ratio < 15:
+        elif 0 < fundamental.pe_ratio < 15:
             return "Value Opportunity - Attractive valuation with reasonable risk"
         elif fundamental.pe_ratio > 30:
             return "Caution - High valuation multiples present risk"
         else:
             return "Neutral - Balanced factors suggest holding position"
-    
+
     # =========================================================================
     # Enhanced Utility Methods
     # =========================================================================
-    
-    async def _make_async_request(self, url: str, params: Optional[Dict[str, Any]] = None,
-                                 headers: Optional[Dict[str, str]] = None) -> Optional[Any]:
+
+    async def _make_async_request(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[Any]:
         """Enhanced async HTTP request with better error handling"""
         params = params or {}
         headers = headers or {}
-        
+
         for attempt in range(3):  # Max 3 retries
+            start_time = time.time()
             try:
-                # Rate limiting
                 await self._enforce_rate_limit()
-                
+
                 session = await self.get_session()
                 async with session.get(url, params=params, headers=headers) as response:
-                    self.stats['requests'] += 1
-                    
+                    self.stats["requests"] += 1
+
                     if response.status == 200:
                         try:
-                            content_type = response.headers.get('Content-Type', '')
-                            if 'application/json' in content_type:
+                            content_type = response.headers.get("Content-Type", "")
+                            if "application/json" in content_type:
                                 data = await response.json()
                             else:
                                 text = await response.text()
                                 try:
                                     data = json.loads(text)
-                                except:
+                                except Exception:
                                     data = text
-                            
-                            # Update performance metrics
-                            response_time = response.request_info.response_start
-                            self.performance_metrics['response_times'].append(response_time)
-                            
+
+                            duration = time.time() - start_time
+                            self.performance_metrics.setdefault(
+                                "response_times", []
+                            ).append(duration)
+
                             return data
                         except Exception as e:
                             logger.warning(f"Response parsing failed: {e}")
-                            self.stats['errors'] += 1
+                            self.stats["errors"] += 1
                             return None
                     else:
                         logger.warning(f"HTTP {response.status} for {url}")
-                        self.stats['errors'] += 1
-                        
-                        if response.status == 429:  # Rate limited
-                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        self.stats["errors"] += 1
+
+                        if response.status == 429:
+                            await asyncio.sleep(2**attempt)
                             continue
-                        
+
                         return None
-                        
+
             except asyncio.TimeoutError:
                 logger.error(f"Timeout for {url} (attempt {attempt + 1})")
-                self.stats['errors'] += 1
+                self.stats["errors"] += 1
                 if attempt < 2:
                     await asyncio.sleep(1)
                 continue
-                
             except Exception as e:
                 logger.error(f"Request failed for {url} (attempt {attempt + 1}): {e}")
-                self.stats['errors'] += 1
+                self.stats["errors"] += 1
                 if attempt < 2:
                     await asyncio.sleep(1)
                 continue
-        
+
         return None
-    
+
     async def _enforce_rate_limit(self):
         """Enhanced rate limiting"""
         while True:
             with self._rate_lock:
                 now = time.time()
                 window_start = now - 60
-                
-                # Remove old timestamps
+
                 while self.request_timestamps and self.request_timestamps[0] < window_start:
                     self.request_timestamps.popleft()
-                
+
                 if len(self.request_timestamps) < self.rate_limit_rpm:
                     self.request_timestamps.append(now)
                     return
-                
+
                 oldest = self.request_timestamps[0]
                 sleep_time = 60 - (now - oldest)
-            
+
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time + 0.1)
-    
+
     async def clear_cache(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         """Enhanced cache clearing"""
         cleared_count = 0
-        
+
         try:
-            # Clear memory cache
+            # Memory cache
             if symbol:
-                keys_to_remove = [k for k in self.memory_cache.keys() if symbol.upper() in k]
+                symbol_upper = symbol.upper()
+                keys_to_remove = [
+                    k for k in self.memory_cache.keys() if symbol_upper in k
+                ]
                 for key in keys_to_remove:
-                    del self.memory_cache[key]
-                    del self.memory_cache_ttl[key]
-                    cleared_count += 1
+                    if self.memory_cache.pop(key, None) is not None:
+                        cleared_count += 1
+                    self.memory_cache_ttl.pop(key, None)
             else:
+                cleared_count += len(self.memory_cache)
                 self.memory_cache.clear()
                 self.memory_cache_ttl.clear()
-                cleared_count = len(self.memory_cache)
-            
-            # Clear Redis cache
+
+            # Redis cache
             if self.redis_client:
                 try:
                     if symbol:
@@ -3991,46 +3592,44 @@ class EnhancedTradingAnalyzer:
                             self.redis_client.delete(*keys)
                             cleared_count += len(keys)
                     else:
-                        # Clear all analyzer cache keys
                         keys = self.redis_client.keys("*v4_*")
                         if keys:
                             self.redis_client.delete(*keys)
                             cleared_count += len(keys)
                 except Exception as e:
                     logger.error(f"Redis cache clear failed: {e}")
-            
-            # Clear file cache
+
+            # File cache
             if symbol:
-                pattern = f"*{symbol.upper()}*"
+                pattern = symbol.upper()
                 cache_files = list(self.cache_dir.glob(f"*{pattern}*"))
             else:
                 cache_files = list(self.cache_dir.glob("*"))
-            
+
             for cache_file in cache_files:
                 try:
                     cache_file.unlink(missing_ok=True)
-                    # Also remove metadata file
-                    meta_file = cache_file.with_suffix('.json')
+                    meta_file = cache_file.with_suffix(".json")
                     meta_file.unlink(missing_ok=True)
                     cleared_count += 1
                 except Exception as e:
                     logger.debug(f"Failed to delete cache file {cache_file}: {e}")
-            
+
             logger.info(f"Cache cleared: {cleared_count} items removed")
             return {
                 "status": "success",
                 "cleared_count": cleared_count,
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "timestamp": datetime.utcnow().isoformat() + "Z",
             }
-            
+
         except Exception as e:
             logger.error(f"Cache clearance failed: {e}")
             return {
                 "status": "error",
                 "error": str(e),
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "timestamp": datetime.utcnow().isoformat() + "Z",
             }
-    
+
     async def get_cache_info(self) -> Dict[str, Any]:
         """Get enhanced cache information"""
         try:
@@ -4039,93 +3638,121 @@ class EnhancedTradingAnalyzer:
                 "entries": len(self.memory_cache),
                 "memory_usage_mb": sum(
                     len(pickle.dumps(v)) for v in self.memory_cache.values()
-                ) / (1024 * 1024)
+                )
+                / (1024 * 1024),
             }
-            
+
             # File cache stats
             cache_files = list(self.cache_dir.glob("*.pkl"))
             file_stats = {
                 "total_files": len(cache_files),
-                "total_size_mb": sum(f.stat().st_size for f in cache_files) / (1024 * 1024),
-                "oldest_file": min((f.stat().st_mtime for f in cache_files), default=None),
-                "newest_file": max((f.stat().st_mtime for f in cache_files), default=None)
+                "total_size_mb": sum(f.stat().st_size for f in cache_files)
+                / (1024 * 1024),
+                "oldest_file": min(
+                    (f.stat().st_mtime for f in cache_files), default=None
+                ),
+                "newest_file": max(
+                    (f.stat().st_mtime for f in cache_files), default=None
+                ),
             }
-            
+
             # Redis stats
-            redis_stats = {}
+            redis_stats: Dict[str, Any] = {}
             if self.redis_client:
                 try:
                     redis_stats = {
                         "connected": True,
                         "keys_count": len(self.redis_client.keys("*")),
-                        "memory_usage": self.redis_client.info().get("used_memory", 0)
+                        "memory_usage": self.redis_client.info().get(
+                            "used_memory", 0
+                        ),
                     }
                 except Exception as e:
                     redis_stats = {"connected": False, "error": str(e)}
-            
-            # Hit rate
-            total_accesses = self.stats['cache_hits'] + self.stats['cache_misses']
-            hit_rate = self.stats['cache_hits'] / total_accesses if total_accesses > 0 else 0
-            
+
+            total_accesses = (
+                self.stats["cache_hits"] + self.stats["cache_misses"]
+            )
+            hit_rate = (
+                self.stats["cache_hits"] / total_accesses
+                if total_accesses > 0
+                else 0.0
+            )
+
             return {
                 "memory_cache": memory_stats,
                 "file_cache": file_stats,
                 "redis_cache": redis_stats,
                 "performance": {
                     "hit_rate": hit_rate,
-                    "total_hits": self.stats['cache_hits'],
-                    "total_misses": self.stats['cache_misses'],
-                    "cache_ttl_minutes": self.cache_ttl.total_seconds() / 60
+                    "total_hits": self.stats["cache_hits"],
+                    "total_misses": self.stats["cache_misses"],
+                    "cache_ttl_minutes": self.cache_ttl.total_seconds() / 60.0,
                 },
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "timestamp": datetime.utcnow().isoformat() + "Z",
             }
-            
+
         except Exception as e:
             logger.error(f"Cache info retrieval failed: {e}")
             return {"error": str(e)}
-    
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get enhanced statistics"""
         with self._rate_lock:
-            total_requests = self.stats['requests']
-            error_rate = (self.stats['errors'] / total_requests * 100) if total_requests > 0 else 0
-            
-            # Calculate average response time
-            response_times = self.performance_metrics.get('response_times', [])
-            avg_response_time = np.mean(response_times) if response_times else 0
-            
-            # Calculate cache efficiency
-            total_cache_access = self.stats['cache_hits'] + self.stats['cache_misses']
-            cache_efficiency = (self.stats['cache_hits'] / total_cache_access * 100) if total_cache_access > 0 else 0
-            
-            uptime = time.time() - self.stats['start_time']
-            
+            total_requests = self.stats["requests"]
+            error_rate = (
+                self.stats["errors"] / total_requests * 100.0
+                if total_requests > 0
+                else 0.0
+            )
+
+            response_times = self.performance_metrics.get(
+                "response_times", []
+            )
+            avg_response_time = (
+                float(np.mean(response_times)) if response_times else 0.0
+            )
+
+            total_cache_access = (
+                self.stats["cache_hits"] + self.stats["cache_misses"]
+            )
+            cache_efficiency = (
+                self.stats["cache_hits"] / total_cache_access * 100.0
+                if total_cache_access > 0
+                else 0.0
+            )
+
+            uptime = time.time() - self.stats["start_time"]
+
             return {
                 "requests": {
                     "total": total_requests,
-                    "errors": self.stats['errors'],
+                    "errors": self.stats["errors"],
                     "error_rate_percent": round(error_rate, 2),
-                    "avg_response_time_ms": round(avg_response_time * 1000, 2)
+                    "avg_response_time_ms": round(
+                        avg_response_time * 1000.0, 2
+                    ),
                 },
                 "cache": {
-                    "hits": self.stats['cache_hits'],
-                    "misses": self.stats['cache_misses'],
-                    "efficiency_percent": round(cache_efficiency, 2)
+                    "hits": self.stats["cache_hits"],
+                    "misses": self.stats["cache_misses"],
+                    "efficiency_percent": round(cache_efficiency, 2),
                 },
                 "performance": {
                     "uptime_seconds": round(uptime, 2),
                     "current_rpm": len(self.request_timestamps),
-                    "max_rpm": self.rate_limit_rpm
+                    "max_rpm": self.rate_limit_rpm,
                 },
                 "configuration": {
                     "model_version": self.model_version,
                     "analysis_timeout": self.analysis_timeout,
-                    "cache_ttl_minutes": self.cache_ttl.total_seconds() / 60,
-                    "enable_ml": self.enable_ml
+                    "cache_ttl_minutes": self.cache_ttl.total_seconds()
+                    / 60.0,
+                    "enable_ml": self.enable_ml,
                 },
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "timestamp": datetime.utcnow().isoformat() + "Z",
             }
-    
+
     async def close(self):
         """Clean shutdown"""
         try:
@@ -4133,32 +3760,30 @@ class EnhancedTradingAnalyzer:
                 await self._session.close()
         except Exception as e:
             logger.debug(f"Error closing async session: {e}")
-        
+
         try:
             if self._session_sync:
                 self._session_sync.close()
         except Exception as e:
             logger.debug(f"Error closing sync session: {e}")
-        
-        # Save statistics
+
         self._save_statistics()
-    
+
     def _save_statistics(self):
         """Save statistics to file"""
         try:
             stats_file = self.cache_dir / "statistics.json"
             stats_data = {
                 "last_run": datetime.utcnow().isoformat() + "Z",
-                "total_requests": self.stats['requests'],
-                "total_errors": self.stats['errors'],
-                "cache_hits": self.stats['cache_hits'],
-                "cache_misses": self.stats['cache_misses'],
-                "uptime_seconds": time.time() - self.stats['start_time']
+                "total_requests": self.stats["requests"],
+                "total_errors": self.stats["errors"],
+                "cache_hits": self.stats["cache_hits"],
+                "cache_misses": self.stats["cache_misses"],
+                "uptime_seconds": time.time() - self.stats["start_time"],
             }
-            
-            with open(stats_file, 'w') as f:
+
+            with open(stats_file, "w") as f:
                 json.dump(stats_data, f, indent=2)
-                
         except Exception as e:
             logger.debug(f"Failed to save statistics: {e}")
 
@@ -4166,7 +3791,9 @@ class EnhancedTradingAnalyzer:
 # Global analyzer instance
 try:
     analyzer = EnhancedTradingAnalyzer()
-    logger.info(f"Global EnhancedTradingAnalyzer v{analyzer.model_version} created successfully")
+    logger.info(
+        f"Global EnhancedTradingAnalyzer v{analyzer.model_version} created successfully"
+    )
 except Exception as e:
     logger.error(f"Failed to create global EnhancedTradingAnalyzer: {e}")
     analyzer = None
@@ -4183,7 +3810,9 @@ async def get_analyzer():
 
 
 # Convenience functions
-async def generate_ai_recommendation(symbol: str, timeframe: str = "medium_term") -> AIRecommendation:
+async def generate_ai_recommendation(
+    symbol: str, timeframe: str = "medium_term"
+) -> AIRecommendation:
     if analyzer is None:
         raise RuntimeError("Analyzer not initialized")
     return await analyzer.generate_ai_recommendation(symbol, timeframe)
@@ -4199,56 +3828,75 @@ async def get_multi_source_analysis(symbol: str) -> Dict[str, Any]:
 async def _test_enhanced_analyzer():
     """Test the enhanced analyzer"""
     logging.basicConfig(level=logging.INFO)
-    
+
     print("=" * 60)
     print("Testing Enhanced Trading Analyzer v4.0.0")
     print("=" * 60)
-    
+
     async with get_analyzer() as test_analyzer:
-        # Test symbol (Saudi Aramco)
         test_symbol = "2222.SR"
-        
+
         print(f"\n1. Testing multi-source analysis for {test_symbol}...")
         start = time.time()
         analysis = await test_analyzer.get_multi_source_analysis(test_symbol)
         duration = time.time() - start
-        
-        if 'error' not in analysis:
+
+        if "error" not in analysis:
             print(f"   ✓ Analysis completed in {duration:.2f}s")
-            consolidated = analysis.get('consolidated_analysis', {})
-            print(f"   - Consensus Price: {consolidated.get('consensus_price', 'N/A')}")
-            print(f"   - Data Quality: {consolidated.get('data_quality_score', 'N/A'):.2f}")
-            print(f"   - Risk Score: {consolidated.get('risk_score', 'N/A'):.2f}")
-            print(f"   - Opportunity Score: {consolidated.get('opportunity_score', 'N/A'):.2f}")
+            consolidated = analysis.get("consolidated_analysis", {})
+            print(
+                f"   - Consensus Price: {consolidated.get('consensus_price', 'N/A')}"
+            )
+            print(
+                f"   - Data Quality: {consolidated.get('data_quality_score', 0):.2f}"
+            )
+            print(f"   - Risk Score: {consolidated.get('risk_score', 0):.2f}")
+            print(
+                f"   - Opportunity Score: {consolidated.get('opportunity_score', 0):.2f}"
+            )
         else:
             print(f"   ✗ Analysis failed: {analysis.get('error')}")
-        
+
         print(f"\n2. Testing AI recommendation for {test_symbol}...")
         start = time.time()
-        recommendation = await test_analyzer.generate_ai_recommendation(test_symbol)
+        recommendation = await test_analyzer.generate_ai_recommendation(
+            test_symbol
+        )
         duration = time.time() - start
-        
+
         print(f"   ✓ Recommendation generated in {duration:.2f}s")
         print(f"   - Recommendation: {recommendation.recommendation.value}")
         print(f"   - Overall Score: {recommendation.overall_score:.1f}")
         print(f"   - Risk Level: {recommendation.risk_level}")
         print(f"   - Confidence: {recommendation.confidence_level}")
-        print(f"   - Position Size: {recommendation.position_sizing.recommended_allocation:.1f}%")
-        
+        print(
+            f"   - Position Size: {recommendation.position_sizing.recommended_allocation:.1f}%"
+        )
+
         print(f"\n3. Testing cache info...")
         cache_info = await test_analyzer.get_cache_info()
         print(f"   ✓ Cache info retrieved")
-        print(f"   - Memory entries: {cache_info.get('memory_cache', {}).get('entries', 0)}")
-        print(f"   - File cache size: {cache_info.get('file_cache', {}).get('total_size_mb', 0):.2f} MB")
-        
+        print(
+            f"   - Memory entries: {cache_info.get('memory_cache', {}).get('entries', 0)}"
+        )
+        print(
+            f"   - File cache size: {cache_info.get('file_cache', {}).get('total_size_mb', 0):.2f} MB"
+        )
+
         print(f"\n4. Testing statistics...")
         stats = test_analyzer.get_statistics()
         print(f"   ✓ Statistics retrieved")
-        print(f"   - Total requests: {stats.get('requests', {}).get('total', 0)}")
-        print(f"   - Error rate: {stats.get('requests', {}).get('error_rate_percent', 0):.1f}%")
-        print(f"   - Cache efficiency: {stats.get('cache', {}).get('efficiency_percent', 0):.1f}%")
-        
-        print(f"\n" + "=" * 60)
+        print(
+            f"   - Total requests: {stats.get('requests', {}).get('total', 0)}"
+        )
+        print(
+            f"   - Error rate: {stats.get('requests', {}).get('error_rate_percent', 0):.1f}%"
+        )
+        print(
+            f"   - Cache efficiency: {stats.get('cache', {}).get('efficiency_percent', 0):.1f}%"
+        )
+
+        print("\n" + "=" * 60)
         print("Enhanced analyzer test completed successfully!")
         print("=" * 60)
 
