@@ -1,7 +1,7 @@
 # =============================================================================
 # Tadawul Fast Bridge - Python Dependencies
 # Compatible with main.py (v4.x) and all microservices
-# Render Ready - CLEAN & ERROR-FREE
+# FINAL FULL VERSION - Render Ready
 # =============================================================================
 
 # Core Web Framework
@@ -18,18 +18,24 @@ aiohttp==3.8.6
 httpx==0.25.2
 requests==2.31.0
 
-# File I/O (required by google_sheets_service.py)
+# File I/O
 aiofiles==23.2.1
 
-# Retry Logic (required by google_apps_script_client.py)
+# Retry Logic
 tenacity==8.2.3
 
-# Rate Limiting & Performance
-slowapi==0.1.8
+# Performance & Serialization
 orjson==3.10.3
 psutil==5.9.6
 
-# Google Services (Sheets & APIs)
+# Data Handling (required by google_sheets_service.py)
+pandas==2.1.3
+numpy==1.26.2
+
+# Rate Limiting
+slowapi==0.1.8
+
+# Google Services (Sheets & Apps Script)
 gspread==5.12.4
 google-auth==2.23.3
 google-api-python-client==2.108.0
