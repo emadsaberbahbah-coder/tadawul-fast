@@ -1760,6 +1760,52 @@ class QuoteService:
             "success_rate": success_rate,
             "providers": provider_details,
         }
+# add near the top with other imports
+import os
+import httpx
+
+# make sure you have something like this for settings OR env
+EODHD_BASE_URL = os.getenv("EODHD_BASE_URL", "https://eodhd.com/api")
+
+
+def verify_token_simple(token: str):
+    """Simple token check using APP_TOKEN / BACKUP_APP_TOKEN."""
+    app_token = os.getenv("APP_TOKEN")
+    backup_token = os.getenv("BACKUP_APP_TOKEN")
+    if not app_token and not backup_token:
+        # if you want to allow no auth in dev, you can relax this
+        raise HTTPException(status_code=500, detail="APP_TOKEN not configured")
+    if token not in {app_token, backup_token}:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@app.get("/debug/eodhd/{symbol}")
+async def debug_eodhd(
+    symbol: str,
+    token: str = Query(..., description="APP token, same as /v1/quote"),
+):
+    """
+    Direct EODHD test from inside the Fast Bridge container.
+    Example:
+      /debug/eodhd/AAPL.US?token=xxxx
+      /debug/eodhd/2222.SR?token=xxxx
+    """
+    verify_token_simple(token)
+
+    api_key = os.getenv("EODHD_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="EODHD_API_KEY is not set")
+
+    url = f"{EODHD_BASE_URL}/real-time/{symbol}?api_token={api_key}&fmt=json"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+
+    return {
+        "url": url,
+        "status_code": resp.status_code,
+        "body": resp.text,
+    }
 
 
 # =============================================================================
