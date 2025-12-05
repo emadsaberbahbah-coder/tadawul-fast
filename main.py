@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 import traceback
@@ -1090,16 +1091,31 @@ class QuoteService:
 
     async def initialize(self):
         """Initialize service dependencies."""
+        # --- GOOGLE SHEETS SERVICE ---
         try:
-            # Initialize Google Sheets service
+            # Ensure env vars are compatible with SheetsConfig.from_env()
+            # If Render only has GOOGLE_SHEETS_CREDENTIALS + SPREADSHEET_ID,
+            # we map them to what google_sheets_service expects.
+            if settings.google_sheets_credentials_json and not (
+                os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON") or os.getenv("GOOGLE_CREDENTIALS_PATH")
+            ):
+                os.environ["GOOGLE_SHEETS_CREDENTIALS_JSON"] = settings.google_sheets_credentials_json
+
+            if settings.google_sheets_spreadsheet_id and not os.getenv("SPREADSHEET_ID"):
+                os.environ["SPREADSHEET_ID"] = settings.google_sheets_spreadsheet_id
+
+            # Some older versions of google_sheets_service may still expect this:
+            if settings.google_sheets_spreadsheet_id and not os.getenv("KSA_TADAWUL_SHEET_ID"):
+                os.environ["KSA_TADAWUL_SHEET_ID"] = settings.google_sheets_spreadsheet_id
+
             sheets_config = SheetsConfig.from_env()
             self.google_sheets_service = await get_google_sheets_service(sheets_config)
             logger.info("Google Sheets service initialized")
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets service: {e}")
 
+        # --- GOOGLE APPS SCRIPT CLIENT ---
         try:
-            # Initialize Google Apps Script client
             self.google_apps_script_client = await get_google_apps_script_client()
             logger.info("Google Apps Script client initialized")
         except Exception as e:
