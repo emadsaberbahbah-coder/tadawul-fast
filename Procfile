@@ -1,14 +1,16 @@
 # =============================================================================
-# Tadawul Fast Bridge API - Enhanced Production Procfile
-# Version: 4.0.0 | Environment: Production-Ready
+# Tadawul Fast Bridge API - Procfile
+# Version: 3.6.0 | Environment: Production-Ready
 # =============================================================================
-# This Procfile defines process types for production deployment
-# Primary process: web (Render/Heroku)
-# Additional workers can be deployed as separate services
+# Notes:
+# - On Render, ONLY the "web:" process is used for the main service.
+# - Other process types (data_refresher, cache_manager, etc.) are OPTIONAL
+#   templates for Heroku / local / Docker Compose and are safe to keep as docs
+#   as long as you don't scale them.
 # =============================================================================
 
-# --- PRIMARY WEB PROCESS (Production) ---
-# Optimized for Render/Heroku deployment
+# --- PRIMARY WEB PROCESS (Production / Render) ---
+# Safe options for uvicorn==0.24.0 + uvicorn[standard]
 web: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -20,10 +22,9 @@ web: uvicorn main:app \
   --log-level ${LOG_LEVEL:-info} \
   --access-log \
   --timeout-keep-alive 65 \
-  --timeout-graceful-shutdown 30 \
   --limit-concurrency ${MAX_CONCURRENCY:-100} \
   --limit-max-requests ${MAX_REQUESTS:-1000} \
-  --header x-powered-by:"TadawulFastBridge/4.0.0" \
+  --header x-powered-by:"TadawulFastBridge/3.6.0" \
   --header x-server:"FastAPI-Uvicorn" \
   --header strict-transport-security:"max-age=31536000; includeSubDomains" \
   --header x-content-type-options:"nosniff" \
@@ -31,7 +32,9 @@ web: uvicorn main:app \
   --header permissions-policy:"interest-cohort=()" \
   --header referrer-policy:"strict-origin-when-cross-origin"
 
-# --- BACKGROUND WORKERS (Deploy as separate services) ---
+# =============================================================================
+# OPTIONAL WORKERS (only use if you actually implement these modules)
+# =============================================================================
 
 # Real-time Data Refresher Worker
 data_refresher: python -m workers.data_refresher \
@@ -76,7 +79,9 @@ scheduler: python -m workers.scheduler \
   --log-level info \
   --max-concurrent-tasks 5
 
-# --- MAINTENANCE WORKERS (Optional, scheduled) ---
+# =============================================================================
+# OPTIONAL MAINTENANCE WORKERS (only if DB / log modules exist)
+# =============================================================================
 
 # Database Maintenance Worker (if applicable)
 db_maintainer: python -m workers.db_maintainer \
@@ -94,9 +99,11 @@ log_manager: python -m workers.log_manager \
   --max-total-size 1024 \
   --log-level info
 
-# --- PERFORMANCE OPTIMIZATION PROFILES ---
+# =============================================================================
+# PERFORMANCE PROFILES (used manually, not by Render)
+# =============================================================================
 
-# High-Performance Profile (8 workers, aggressive timeouts)
+# High-Performance Profile (8 workers, more throughput)
 web_high_perf: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -109,7 +116,7 @@ web_high_perf: uvicorn main:app \
   --log-level warning \
   --header x-profile:high-performance
 
-# Memory-Optimized Profile (for resource-constrained environments)
+# Memory-Optimized Profile (for small instances)
 web_light: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -122,9 +129,11 @@ web_light: uvicorn main:app \
   --no-access-log \
   --header x-profile:memory-optimized
 
-# --- SPECIALIZED API ENDPOINTS ---
+# =============================================================================
+# SPECIALIZED API PROFILES (ONLY if these modules exist)
+# =============================================================================
 
-# Readiness/Liveness Check Endpoint Only
+# Readiness/Liveness Check-only Service
 web_health: uvicorn health:app \
   --host 0.0.0.0 \
   --port ${HEALTH_PORT:-8080} \
@@ -143,9 +152,11 @@ web_metrics: uvicorn metrics:app \
   --loop asyncio \
   --header x-service:metrics
 
-# --- ENVIRONMENT-SPECIFIC PROFILES ---
+# =============================================================================
+# ENVIRONMENT-SPECIFIC PROFILES
+# =============================================================================
 
-# Development Profile (for local development)
+# Local Development Profile
 dev: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -170,9 +181,11 @@ staging: uvicorn main:app \
   --access-log \
   --header x-environment:staging
 
-# --- TROUBLESHOOTING & DEBUG PROFILES ---
+# =============================================================================
+# TROUBLESHOOTING & DEBUG PROFILES
+# =============================================================================
 
-# Debug Profile (detailed logging)
+# Debug Profile (detailed logging + external YAML config)
 debug: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -184,7 +197,7 @@ debug: uvicorn main:app \
   --log-config logging_debug.yaml \
   --header x-mode:debug
 
-# Single Worker Profile (for debugging concurrency issues)
+# Single Worker Profile (for concurrency debugging)
 single: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -193,9 +206,10 @@ single: uvicorn main:app \
   --log-level debug \
   --header x-worker:single
 
-# --- MAINTENANCE MODE ---
+# =============================================================================
+# MAINTENANCE MODE (ONLY if maintenance:app is implemented)
+# =============================================================================
 
-# Maintenance Mode (simple static response)
 maintenance: uvicorn maintenance:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -205,7 +219,9 @@ maintenance: uvicorn maintenance:app \
   --header x-mode:maintenance \
   --header retry-after:3600
 
-# --- SPECIALIZED WORKFLOWS ---
+# =============================================================================
+# LOAD TEST / GATEWAY PROFILES (manual use only)
+# =============================================================================
 
 # Load Testing Profile
 load_test: uvicorn main:app \
@@ -219,7 +235,7 @@ load_test: uvicorn main:app \
   --limit-concurrency 1000 \
   --header x-mode:load-test
 
-# API Gateway Profile (reverse proxy scenarios)
+# API Gateway Profile (if used behind another proxy)
 gateway: uvicorn main:app \
   --host 0.0.0.0 \
   --port ${PORT:-8000} \
@@ -229,122 +245,3 @@ gateway: uvicorn main:app \
   --forwarded-allow-ips="*" \
   --log-level warning \
   --header x-role:api-gateway
-
-# =============================================================================
-# SUPPORTING CONFIGURATION FILES
-# =============================================================================
-
-# logging_debug.yaml (for debug profile)
-# logging:
-#   version: 1
-#   disable_existing_loggers: false
-#   formatters:
-#     detailed:
-#       format: '%(asctime)s %(name)-12s %(levelname)-8s %(message)s'
-#   handlers:
-#     console:
-#       class: logging.StreamHandler
-#       formatter: detailed
-#   loggers:
-#     uvicorn:
-#       level: DEBUG
-#     uvicorn.error:
-#       level: DEBUG
-#     uvicorn.access:
-#       level: INFO
-#       propagate: false
-
-# config/scheduled_tasks.yaml
-# tasks:
-#   - name: cache_warmup
-#     schedule: "*/30 * * * *"  # Every 30 minutes
-#     command: "python -m workers.cache_warmup"
-#     timeout: 300
-#   
-#   - name: data_refresh
-#     schedule: "*/15 * * * *"  # Every 15 minutes
-#     command: "python -m workers.data_refresh"
-#     timeout: 600
-#   
-#   - name: daily_report
-#     schedule: "0 8 * * *"  # 8:00 AM daily (Riyadh time)
-#     command: "python -m workers.generate_reports"
-#     timeout: 1800
-
-# =============================================================================
-# DEPLOYMENT NOTES
-# =============================================================================
-# 
-# RENDER.COM:
-# - Only the 'web:' process will be executed for the main web service
-# - For background workers, create separate "Worker" services
-# - Use environment variables in Render dashboard:
-#   * WEB_CONCURRENCY: 4 (adjust based on pricing tier)
-#   * LOG_LEVEL: info
-#   * MAX_CONCURRENCY: 100
-#   * MAX_REQUESTS: 1000 (for graceful worker recycling)
-# 
-# HEROKU:
-# - All process types can be scaled independently:
-#   * heroku ps:scale web=2 cache_manager=1 data_refresher=1
-#   * heroku ps:scale scheduler=1 monitor_worker=1
-# 
-# DOCKER COMPOSE:
-# - Map each process type to a separate service in docker-compose.yml
-# 
-# LOCAL DEVELOPMENT:
-# - Use 'dev' or 'debug' profiles
-# - Start workers individually if needed:
-#   * honcho start dev
-#   * honcho start -f Procfile.dev
-# 
-# MONITORING:
-# - Each worker exposes metrics on separate ports
-# - Use Prometheus/Grafana for monitoring
-# - Set up alerts for critical failures
-# 
-# =============================================================================
-# ENVIRONMENT VARIABLE REFERENCE
-# =============================================================================
-# 
-# Required:
-# PORT: Application port (automatically set by platform)
-# 
-# Recommended:
-# WEB_CONCURRENCY: Number of worker processes (default: 4)
-# LOG_LEVEL: Logging level (debug, info, warning, error, critical)
-# MAX_CONCURRENCY: Maximum concurrent requests per worker
-# MAX_REQUESTS: Restart worker after N requests (memory management)
-# REDIS_URL: Redis connection URL for caching
-# DATABASE_URL: Database connection URL
-# ALERT_WEBHOOK_URL: Webhook for sending alerts
-# 
-# Optional:
-# HEALTH_PORT: Port for health check service (default: 8080)
-# METRICS_PORT: Port for metrics service (default: 9090)
-# RENDER_SERVICE_NAME: For internal health checks
-# 
-# =============================================================================
-# SECURITY HEADERS EXPLANATION
-# =============================================================================
-# 
-# x-powered-by: Custom header (can be disabled in production)
-# x-server: Server identification
-# strict-transport-security: Enforce HTTPS
-# x-content-type-options: Prevent MIME type sniffing
-# x-frame-options: Prevent clickjacking
-# permissions-policy: Privacy-focused feature controls
-# referrer-policy: Control referrer information
-# 
-# =============================================================================
-# PERFORMANCE TUNING
-# =============================================================================
-# 
-# Optimal worker count: 2-4 x CPU cores
-# Keep-alive timeout: 30-65 seconds
-# Max concurrent requests: 50-200 per worker
-# Max requests per worker: 1000-2000 (prevents memory leaks)
-# Use uvloop for better async performance (Linux only)
-# Use httptools for faster HTTP parsing
-# 
-# =============================================================================
