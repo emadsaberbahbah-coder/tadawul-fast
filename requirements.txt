@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""
-Tadawul Fast Bridge - Legacy Stock Microservice
-Version: 4.1.2
-
-Description:
-  Lightweight stock market data bridge with FastAPI
-
-Key Features:
-- Simple Argaam/Tadawul integration (with mock fallback)
-- CSV export
-- Optional Google Sheets export (service account)
-- Basic in-memory TTL cache with hit/miss stats
-- Health & Stats endpoints aligned with v4 dashboard:
-    - /health              → simple health (for Render)
-    - /api/v1/health       → detailed status (used by index.html dashboard)
-    - /api/v1/stats        → performance & cache metrics
-"""
+# Tadawul Fast Bridge - Legacy Stock Microservice
+# Version: 4.1.3 (no triple-quoted strings)
+#
+# Description:
+#   Lightweight stock market data bridge with FastAPI
+#
+# Key Features:
+# - Simple Argaam/Tadawul integration (with mock fallback)
+# - CSV export
+# - Optional Google Sheets export (service account)
+# - Basic in-memory TTL cache with hit/miss stats
+# - Health & Stats endpoints aligned with v4 dashboard:
+#     - /health              -> simple health (for Render)
+#     - /api/v1/health       -> detailed status (used by index.html dashboard)
+#     - /api/v1/stats        -> performance & cache metrics
 
 from __future__ import annotations
 
@@ -48,8 +46,7 @@ from slowapi.util import get_remote_address
 
 
 class Settings:
-    """Application settings loaded from environment with sane defaults."""
-
+    # Application settings loaded from environment with sane defaults.
     def __init__(self) -> None:
         # Prefer SERVICE_NAME / SERVICE_VERSION (aligned with render.yaml)
         self.APP_NAME: str = (
@@ -60,7 +57,7 @@ class Settings:
         self.VERSION: str = (
             os.getenv("SERVICE_VERSION")
             or os.getenv("APP_VERSION")
-            or "4.1.2"
+            or "4.1.3"
         )
 
         # External APIs
@@ -72,11 +69,11 @@ class Settings:
             "TADAWUL_BASE_URL", "https://www.tadawul.com.sa"
         )
 
-        # Optional security token (kept for future)
+        # Optional security token (kept for future use)
         self.APP_TOKEN: str = os.getenv("APP_TOKEN", "")
 
-        # Google Sheets credentials (JSON string)
-        # Support multiple env names for compatibility
+        # Google Sheets credentials (JSON string).
+        # Support multiple env names for compatibility.
         self.GOOGLE_CREDENTIALS_JSON: str = (
             os.getenv("GOOGLE_SHEETS_CREDENTIALS")
             or os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
@@ -117,8 +114,7 @@ logger = logging.getLogger("tadawul-legacy")
 
 
 class StockSymbol(BaseModel):
-    """Unified stock symbol snapshot."""
-
+    # Unified stock symbol snapshot.
     symbol: str
     name_ar: Optional[str] = None
     name_en: Optional[str] = None
@@ -135,8 +131,7 @@ class StockSymbol(BaseModel):
 
 
 class MarketData(BaseModel):
-    """Simple market summary model."""
-
+    # Simple market summary model.
     timestamp: str
     market_index: Optional[float] = None
     market_change: Optional[float] = None
@@ -149,8 +144,7 @@ class MarketData(BaseModel):
 
 
 class TokenData(BaseModel):
-    """Placeholder JWT token data (not used in endpoints, kept for future)."""
-
+    # Placeholder JWT token data (not used in endpoints, kept for future).
     username: Optional[str] = None
     scopes: List[str] = Field(default_factory=list)
 
@@ -167,8 +161,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 
 class DataCache:
-    """Simple in-memory TTL cache with basic stats."""
-
+    # Simple in-memory TTL cache with basic stats.
     def __init__(self, maxsize: int = 1000, ttl: int = 300) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
         self.maxsize = maxsize
@@ -229,8 +222,7 @@ cache = DataCache(maxsize=settings.CACHE_MAXSIZE, ttl=settings.CACHE_TTL)
 
 
 class GoogleSheetsService:
-    """Google Sheets integration using gspread (sync, wrapped in executor for async)."""
-
+    # Google Sheets integration using gspread (sync, wrapped in executor for async).
     def __init__(self, credentials_json: Optional[str] = None):
         self.credentials_json = credentials_json or settings.GOOGLE_CREDENTIALS_JSON
         self.client: Optional[gspread.Client] = None
@@ -243,7 +235,7 @@ class GoogleSheetsService:
             )
 
     def _init_client(self) -> None:
-        """Initialize Google Sheets client."""
+        # Initialize Google Sheets client.
         try:
             creds_dict = json.loads(self.credentials_json)
             creds = Credentials.from_service_account_info(creds_dict)
@@ -259,7 +251,7 @@ class GoogleSheetsService:
         sheet_name: str,
         data: List[List[Any]],
     ) -> Dict[str, Any]:
-        """Synchronous part of sheet update (runs in executor)."""
+        # Synchronous part of sheet update (runs in executor).
         if not self.client:
             raise RuntimeError("Google Sheets client is not initialized")
 
@@ -283,7 +275,7 @@ class GoogleSheetsService:
         sheet_name: str,
         data: List[List[Any]],
     ) -> Dict[str, Any]:
-        """Async wrapper to update Google Sheet without blocking event loop."""
+        # Async wrapper to update Google Sheet without blocking event loop.
         if not self.client:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -314,8 +306,7 @@ class GoogleSheetsService:
 
 
 class HTTPClient:
-    """HTTP client with simple retry logic using aiohttp."""
-
+    # HTTP client with simple retry logic using aiohttp.
     def __init__(self) -> None:
         self.session: Optional[aiohttp.ClientSession] = None
 
@@ -332,7 +323,7 @@ class HTTPClient:
     async def fetch_json(
         self, url: str, params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Fetch JSON data from the given URL."""
+        # Fetch JSON data from the given URL.
         if self.session is None:
             raise RuntimeError("HTTPClient session is not initialized")
 
@@ -360,8 +351,7 @@ class HTTPClient:
 
 
 class StockDataService:
-    """Stock data service: Argaam + mock + basic Tadawul HTML summary."""
-
+    # Stock data service: Argaam + mock + basic Tadawul HTML summary.
     def __init__(self) -> None:
         self.http_client = HTTPClient()
         self.sheets_service = GoogleSheetsService()
@@ -369,7 +359,7 @@ class StockDataService:
     async def get_symbol_data(
         self, symbol: str, use_cache: bool = True
     ) -> Dict[str, Any]:
-        """Get symbol data from Argaam or mock fallback."""
+        # Get symbol data from Argaam or mock fallback.
         symbol = symbol.strip()
         if not symbol:
             raise HTTPException(
@@ -404,7 +394,7 @@ class StockDataService:
             return self._process_data(self._generate_mock_data(symbol), symbol)
 
     def _process_data(self, raw_data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-        """Normalize raw data into a unified structure."""
+        # Normalize raw data into a unified structure.
         return {
             "symbol": symbol,
             "name_ar": raw_data.get("arabicName", f"شركة {symbol}"),
@@ -419,7 +409,7 @@ class StockDataService:
         }
 
     def _generate_mock_data(self, symbol: str) -> Dict[str, Any]:
-        """Generate mock data for testing / fallback."""
+        # Generate mock data for testing / fallback.
         return {
             "arabicName": f"شركة {symbol}",
             "englishName": f"Company {symbol}",
@@ -432,7 +422,7 @@ class StockDataService:
         }
 
     async def get_market_summary(self) -> MarketData:
-        """Get market summary from Tadawul or fallback dummy data."""
+        # Get market summary from Tadawul or fallback dummy data.
         cache_key = "market_summary"
         cached = cache.get(cache_key)
         if cached:
@@ -474,15 +464,8 @@ class StockDataService:
         return MarketData(**data)
 
     def _parse_market_summary(self, html: str) -> Dict[str, Any]:
-        """
-        Parse market summary from Tadawul HTML.
-
-        NOTE: Currently returns dummy values. You can implement real parsing
-        with BeautifulSoup here if you want live HTML scraping.
-        """
-        # from bs4 import BeautifulSoup
-        # soup = BeautifulSoup(html, "html.parser")
-        # TODO: extract real values from soup
+        # Parse market summary from Tadawul HTML.
+        # Currently returns dummy values. Real parsing can be implemented later.
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "market_index": 11234.56,
@@ -503,7 +486,7 @@ class StockDataService:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager (startup/shutdown)."""
+    # Application lifespan manager (startup/shutdown).
     logger.info(f"Starting {settings.APP_NAME} v{settings.VERSION}")
 
     # Initialize services
@@ -558,7 +541,7 @@ app.state.limiter = limiter
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """Add process time header and update basic performance stats."""
+    # Add process time header and update basic performance stats.
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
@@ -582,7 +565,7 @@ async def add_process_time_header(request: Request, call_next):
 
 @app.get("/")
 async def root():
-    """Root endpoint."""
+    # Root endpoint.
     return {
         "service": settings.APP_NAME,
         "version": settings.VERSION,
@@ -594,11 +577,8 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """
-    Simple health check endpoint.
-
-    Used by Render native healthCheck (render.yaml -> path: /health)
-    """
+    # Simple health check endpoint.
+    # Used by Render native healthCheck (render.yaml -> path: /health)
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -607,17 +587,7 @@ async def health():
 
 @app.get("/api/v1/health")
 async def detailed_health(request: Request):
-    """
-    Detailed health endpoint.
-
-    Dashboard expects:
-      - status
-      - uptime_seconds
-      - environment
-      - cache_status
-      - performance
-      - services / google_sheets_status
-    """
+    # Detailed health endpoint.
     now = time.time()
     start_time = getattr(request.app.state, "start_time", now)
     uptime_seconds = int(now - start_time)
@@ -662,15 +632,7 @@ async def detailed_health(request: Request):
 
 @app.get("/api/v1/stats")
 async def stats(request: Request):
-    """
-    Stats endpoint used by dashboard for metrics.
-
-    Returns:
-      {
-        "performance": { "total_requests": ..., "avg_response_time_ms": ... },
-        "cache": { "hits": ..., "misses": ..., "hit_rate": ..., "size": ... }
-      }
-    """
+    # Stats endpoint used by dashboard for metrics.
     total_requests = getattr(request.app.state, "request_count", 0)
     total_resp_time = getattr(request.app.state, "total_response_time", 0.0)
     avg_response_ms = (
@@ -695,7 +657,7 @@ async def get_symbol(
     symbol: str,
     use_cache: bool = Query(True, description="Use cached data"),
 ):
-    """Get single symbol data."""
+    # Get single symbol data.
     service: StockDataService = request.app.state.stock_service
     data = await service.get_symbol_data(symbol, use_cache)
     return StockSymbol(**data)
@@ -703,7 +665,7 @@ async def get_symbol(
 
 @app.get("/api/v1/market/summary", response_model=MarketData)
 async def get_market_summary(request: Request):
-    """Get market summary."""
+    # Get market summary.
     service: StockDataService = request.app.state.stock_service
     data = await service.get_market_summary()
     return data
@@ -715,7 +677,7 @@ async def get_multiple_symbols(
     symbols: str = Query(..., description="Comma-separated symbols (max 10)"),
     use_cache: bool = Query(True, description="Use cached data"),
 ):
-    """Get multiple symbols (simple batch endpoint)."""
+    # Get multiple symbols (simple batch endpoint).
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     symbol_list = symbol_list[:10]  # Safety cap
 
@@ -739,7 +701,7 @@ async def export_to_sheets(
     sheet_name: str = "StockData",
     symbols: Optional[str] = None,
 ):
-    """Export simple symbol snapshot to Google Sheets."""
+    # Export simple symbol snapshot to Google Sheets.
     service: StockDataService = request.app.state.stock_service
 
     # Determine symbols
@@ -787,7 +749,7 @@ async def export_to_sheets(
 
 @app.get("/api/v1/export/csv/{symbol}")
 async def export_csv(symbol: str):
-    """Export a single symbol snapshot as CSV (no pandas dependency)."""
+    # Export a single symbol snapshot as CSV (no pandas dependency).
     service: StockDataService = app.state.stock_service
     data = await service.get_symbol_data(symbol, use_cache=True)
 
@@ -828,7 +790,7 @@ async def export_csv(symbol: str):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """HTTP exception handler."""
+    # HTTP exception handler.
     logger.error(f"HTTP error: {exc.status_code} - {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
@@ -843,7 +805,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """General exception handler."""
+    # General exception handler.
     logger.error(f"Unexpected error: {exc}")
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
