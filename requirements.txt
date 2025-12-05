@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Tadawul Fast Bridge - Legacy Stock Microservice
-Version: 4.1.0
+Version: 4.1.2
 
 Description:
   Lightweight stock market data bridge with FastAPI
@@ -15,10 +15,6 @@ Key Features:
     - /health              → simple health (for Render)
     - /api/v1/health       → detailed status (used by index.html dashboard)
     - /api/v1/stats        → performance & cache metrics
-
-Notes:
-- This is a self-contained legacy microservice, separate from your main
-  tadawul-fast bridge. It is safe to run alone on Render or locally.
 """
 
 from __future__ import annotations
@@ -64,7 +60,7 @@ class Settings:
         self.VERSION: str = (
             os.getenv("SERVICE_VERSION")
             or os.getenv("APP_VERSION")
-            or "4.1.0"
+            or "4.1.2"
         )
 
         # External APIs
@@ -76,7 +72,7 @@ class Settings:
             "TADAWUL_BASE_URL", "https://www.tadawul.com.sa"
         )
 
-        # Optional security token (aligned with main service APP_TOKEN usage)
+        # Optional security token (kept for future)
         self.APP_TOKEN: str = os.getenv("APP_TOKEN", "")
 
         # Google Sheets credentials (JSON string)
@@ -374,6 +370,13 @@ class StockDataService:
         self, symbol: str, use_cache: bool = True
     ) -> Dict[str, Any]:
         """Get symbol data from Argaam or mock fallback."""
+        symbol = symbol.strip()
+        if not symbol:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Symbol cannot be empty",
+            )
+
         cache_key = f"symbol:{symbol}"
 
         if use_cache:
