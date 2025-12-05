@@ -199,7 +199,8 @@ class AppSettings(BaseSettings):
     )
 
     # Tadawul Market Configuration
-    tadawul_market_sheet: str = Field("KSA_TADAWUL", description="Tadawul market sheet name")
+    # IMPORTANT: align with actual Google Sheet tab name: "KSA_Tadawul"
+    tadawul_market_sheet: str = Field("KSA_Tadawul", description="Tadawul market sheet name")
     tadawul_all_sheet: Optional[str] = Field(None, description="Tadawul all data sheet")
     market_data_sheet: Optional[str] = Field(None, description="Market data sheet")
     portfolio_sheet: Optional[str] = Field(None, description="Portfolio sheet")
@@ -1110,7 +1111,32 @@ class QuoteService:
 
             sheets_config = SheetsConfig.from_env()
             self.google_sheets_service = await get_google_sheets_service(sheets_config)
-            logger.info("Google Sheets service initialized")
+            logger.info(
+                f"Google Sheets service initialized for spreadsheet "
+                f"{settings.google_sheets_spreadsheet_id} / sheet '{settings.tadawul_market_sheet}'"
+            )
+
+            # Small probe to see if KSA_Tadawul has rows (for easier diagnostics)
+            try:
+                probe_rows = await self.google_sheets_service.read_ksa_tadawul_market(
+                    use_cache=False,
+                    validate=False,
+                    filters=None,
+                    limit=5,
+                    as_dataframe=False,
+                )
+                probe_count = len(probe_rows) if probe_rows else 0
+                sample_symbols = [
+                    (row.get("symbol") or row.get("ticker"))
+                    for row in (probe_rows or [])
+                ]
+                logger.info(
+                    f"KSA Tadawul initial probe: {probe_count} rows "
+                    f"(sample symbols: {sample_symbols})"
+                )
+            except Exception as probe_err:
+                logger.warning(f"Probe read_ksa_tadawul_market failed during init: {probe_err}")
+
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets service: {e}")
 
@@ -1263,20 +1289,39 @@ class QuoteService:
         return norm_symbol, quote, cache_hit, provider
 
     async def _get_quote_from_providers(self, symbol: str) -> Optional[Quote]:
-        """Get quote from available providers."""
+        """
+        Get quote from available providers.
+
+        Uses providers_enabled + provider_priority from settings,
+        and then filters by what is actually available for this symbol.
+        """
         providers_to_try: List[Tuple[str, Callable[[str], Any]]] = []
 
-        # Determine which providers to try based on symbol
-        if symbol.endswith(".SR") or "TADAWUL" in symbol:
-            # Tadawul symbols - try Google Sheets and Google Apps Script
-            if self.google_sheets_service:
-                providers_to_try.append(("google_sheets", self._get_quote_from_sheets))
-            if self.google_apps_script_client:
-                providers_to_try.append(("google_apps_script", self._get_quote_from_gas))
-        else:
-            # Non-Tadawul symbols - try Google Sheets first (if configured)
-            if self.google_sheets_service:
-                providers_to_try.append(("google_sheets", self._get_quote_from_sheets))
+        # Build available providers for this symbol
+        available_providers: Dict[str, Callable[[str], Any]] = {}
+
+        is_tadawul = symbol.endswith(".SR") or "TADAWUL" in symbol.upper()
+
+        # Google Sheets is valid for KSA (and optionally for others if you want)
+        if self.google_sheets_service:
+            available_providers["google_sheets"] = self._get_quote_from_sheets
+
+        # Google Apps Script is only meaningful for Tadawul in this design
+        if self.google_apps_script_client and is_tadawul:
+            available_providers["google_apps_script"] = self._get_quote_from_gas
+
+        # Build provider list from priority + enabled flags
+        for name in settings.provider_priority:
+            if name in settings.providers_enabled and name in available_providers:
+                providers_to_try.append((name, available_providers[name]))
+
+        # Fallback: if settings misconfigured and nothing selected, but something is available
+        if not providers_to_try and available_providers:
+            providers_to_try = list(available_providers.items())
+
+        if not providers_to_try:
+            logger.warning(f"No providers available for symbol {symbol} with current configuration")
+            return None
 
         # Try providers in order
         for provider_name, provider_func in providers_to_try:
@@ -1304,29 +1349,54 @@ class QuoteService:
         return None
 
     async def _get_quote_from_sheets(self, symbol: str) -> Optional[Quote]:
-        """Get quote from Google Sheets."""
+        """
+        Get quote from Google Sheets (KSA_Tadawul sheet).
+
+        This version does NOT depend on a specific filter key name inside
+        google_sheets_service; instead it fetches a slice of the KSA sheet and
+        matches rows where either 'symbol' or 'ticker' equals the normalized symbol.
+        """
         if not self.google_sheets_service:
             return None
 
         try:
             # Normalize Tadawul symbol: ensure it ends with .SR only once
             if symbol.endswith(".SR"):
-                normalized_symbol = symbol
+                normalized_symbol = symbol.upper()
             else:
-                normalized_symbol = f"{symbol}.SR"
+                normalized_symbol = f"{symbol.upper()}.SR"
 
-            # Get market data
+            # Read a bounded number of KSA rows and filter in Python
             market_data = await self.google_sheets_service.read_ksa_tadawul_market(
                 use_cache=True,
                 validate=True,
-                filters={"ticker": normalized_symbol},
-                limit=1,
+                filters=None,
+                limit=500,           # enough for your watchlist / universe
+                as_dataframe=False,
             )
 
             if not market_data:
+                logger.warning(
+                    f"Google Sheets returned no KSA Tadawul rows when searching for {normalized_symbol}"
+                )
                 return None
 
-            data = market_data[0]
+            # Match by 'symbol' or 'ticker' field (whichever mapping your service uses)
+            matches = [
+                row
+                for row in market_data
+                if str(row.get("symbol", "")).strip().upper() == normalized_symbol
+                or str(row.get("ticker", "")).strip().upper() == normalized_symbol
+            ]
+
+            if not matches:
+                logger.warning(
+                    f"KSA sheet '{settings.tadawul_market_sheet}' has {len(market_data)} rows "
+                    f"but none match symbol {normalized_symbol}"
+                )
+                return None
+
+            data = matches[0]
 
             # Convert to Quote model
             quote = Quote(
@@ -1358,12 +1428,19 @@ class QuoteService:
                 moving_avg_20=data.get("ma_20d"),
                 moving_avg_50=data.get("ma_50d"),
                 volatility=data.get("volatility"),
-                status=QuoteStatus.OK,
+                status=QuoteStatus.OK if data.get("last_price") not in (None, 0) else QuoteStatus.NO_DATA,
                 quality=DataQuality.HIGH,
                 provider="google_sheets",
-                source="KSA_TADAWUL",
+                source=settings.tadawul_market_sheet,
                 raw_data=data,
             )
+
+            # Only return if it passes minimal validity check (non-null price)
+            if not quote.is_valid:
+                logger.warning(
+                    f"KSA row found for {normalized_symbol} but price is missing or zero; treating as NO_DATA"
+                )
+                return None
 
             return quote
 
@@ -1379,9 +1456,9 @@ class QuoteService:
         try:
             # Normalize Tadawul symbol similarly
             if symbol.endswith(".SR"):
-                normalized_symbol = symbol
+                normalized_symbol = symbol.upper()
             else:
-                normalized_symbol = f"{symbol}.SR"
+                normalized_symbol = f"{symbol.upper()}.SR"
 
             response = await self.google_apps_script_client.get_symbols_data(
                 symbol=normalized_symbol,
@@ -1413,6 +1490,9 @@ class QuoteService:
                 source="google_apps_script",
                 raw_data=data,
             )
+
+            if not quote.is_valid:
+                return None
 
             return quote
 
@@ -1736,12 +1816,22 @@ async def health_check(request: Request):
 
     # Quote service health
     quote_stats = quote_service.get_stats()
+    if quote_stats["total_requests"] == 0:
+        quote_status = HealthStatus.DEGRADED
+        quote_message = "No quote requests processed yet"
+    else:
+        quote_status = (
+            HealthStatus.HEALTHY if quote_stats["success_rate"] > 0.5 else HealthStatus.DEGRADED
+        )
+        quote_message = None
+
     quote_health = ServiceHealth(
         service="quote_service",
-        status=HealthStatus.HEALTHY if quote_stats["success_rate"] > 0.5 else HealthStatus.DEGRADED,
+        status=quote_status,
         version=settings.app_version,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
         details=quote_stats,
+        message=quote_message,
     )
     services["quote_service"] = quote_health
 
@@ -1817,10 +1907,8 @@ async def get_quotes(
         # Get quotes
         response = await quote_service.get_quotes(symbols, use_cache=use_cache)
 
-        # Add request ID from context (if available)
-        request_id = request.headers.get("x-request-id")
-        if request_id:
-            response.request_id = request_id
+        # The monitoring middleware already attaches an X-Request-ID header to the response.
+        # We keep response.request_id as generated inside QuoteResponse.
 
         return response
 
