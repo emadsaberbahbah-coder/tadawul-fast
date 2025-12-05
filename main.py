@@ -379,6 +379,18 @@ settings = AppSettings()
 # Reconfigure logging with proper level
 logging.getLogger().setLevel(settings.get_log_level_numeric())
 
+def _to_float(value: Any) -> Optional[float]:
+    """Safely convert a value to float, returning None on failure."""
+    try:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if s in ("", "-", "NA", "N/A", "null", "None"):
+            return None
+        s = s.replace(",", "")
+        return float(s)
+    except Exception:
+        return None
 # =============================================================================
 # Enhanced Data Models
 # =============================================================================
