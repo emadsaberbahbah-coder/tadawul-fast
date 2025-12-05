@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Tadawul Fast Bridge - Legacy Stock Microservice
-# Version: 4.1.3 (no triple-quoted strings)
+# Version: 4.1.3 (no __future__ import, no top-level docstring)
 #
 # Description:
 #   Lightweight stock market data bridge with FastAPI
@@ -14,8 +14,6 @@
 #     - /health              -> simple health (Render healthcheck)
 #     - /api/v1/health       -> detailed status
 #     - /api/v1/stats        -> performance & cache metrics
-
-from __future__ import annotations
 
 import asyncio
 import csv
