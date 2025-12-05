@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tadawul Fast Bridge API v4.0.0 - Enhanced Production Server
+Tadawul Fast Bridge API v4.0.1 - Enhanced Production Server
 Production-ready with comprehensive monitoring, async architecture, and enhanced providers
 Aligned with google_apps_script_client.py and google_sheets_service.py patterns
 """
@@ -58,6 +58,11 @@ from google_sheets_service import (
     close_google_sheets_service,
 )
 
+# -----------------------------------------------------------------------------
+# Load .env for local development (Render uses env vars directly)
+# -----------------------------------------------------------------------------
+load_dotenv()
+
 # Configure enhanced logging
 logging.basicConfig(
     level=logging.INFO,
@@ -99,7 +104,7 @@ class AppSettings(BaseSettings):
 
     # Application Identity
     app_name: str = Field("Tadawul Fast Bridge", description="Application name")
-    app_version: str = Field("4.0.0", description="Application version")
+    app_version: str = Field("4.0.1", description="Application version")
     app_description: str = Field(
         "Real-time Saudi stock market data API with comprehensive monitoring",
         description="Application description",
@@ -248,7 +253,7 @@ class AppSettings(BaseSettings):
             if s == "*":
                 return ["*"]
             # Handle JSON-style lists, e.g. ["*"] or ["https://a","https://b"]
-            if (s.startswith("[") and s.endswith("]")):
+            if s.startswith("[") and s.endswith("]"):
                 try:
                     parsed = json.loads(s)
                     if isinstance(parsed, list):
@@ -320,7 +325,7 @@ class AppSettings(BaseSettings):
 
     def validate_configuration(self) -> List[str]:
         """Validate configuration and return list of issues."""
-        issues = []
+        issues: List[str] = []
 
         # Required configurations
         if not self.google_apps_script_url:
@@ -574,8 +579,8 @@ class ServiceHealth(BaseModel):
     uptime: Optional[float] = Field(None, description="Uptime in seconds")
     error_rate: Optional[float] = Field(None, description="Error rate")
 
-    # Dependencies
-    dependencies: Dict[str, "ServiceHealth"] = Field(default_factory=dict, description="Dependency health")
+    # Dependencies (simplified typing to avoid forward-ref issues)
+    dependencies: Dict[str, Any] = Field(default_factory=dict, description="Dependency health")
 
     # Additional Info
     details: Dict[str, Any] = Field(default_factory=dict, description="Additional details")
@@ -767,7 +772,7 @@ class EnhancedCache:
                 if value:
                     # Also store in memory cache for faster access
                     if self.strategy == CacheStrategy.HYBRID:
-                        await self._set_memory(key, value, settings.cache_ttl_default)
+                        await self._set_memory(key, json.loads(value), settings.cache_ttl_default)
 
                     self.stats.hits += 1
                     return json.loads(value)
@@ -1400,8 +1405,7 @@ class QuoteService:
             return None
 
     async def _get_cache_ttl_remaining(self, cache_key: str) -> Optional[int]:
-        """Get remaining TTL for cache key."""
-        # This is a simplified version - in production, you'd want to track TTL properly
+        """Get remaining TTL for cache key (simplified)."""
         return settings.cache_ttl_short
 
     def get_stats(self) -> Dict[str, Any]:
@@ -1410,12 +1414,15 @@ class QuoteService:
         success_rate = self.success_count / total_requests if total_requests > 0 else 0.0
 
         # Provider statistics
-        provider_details = {}
+        provider_details: Dict[str, Any] = {}
         for provider, stats in self.provider_stats.items():
             total = stats["requests"]
             if total > 0:
-                success_rate_provider = stats["success"] / total
-                avg_response_time = stats["response_time_sum"] / stats["success"] if stats["success"] > 0 else 0.0
+                success_rate_provider = stats["success"] / total if total > 0 else 0.0
+                avg_response_time = (
+                    stats["response_time_sum"] / stats["success"]
+                    if stats["success"] > 0 else 0.0
+                )
             else:
                 success_rate_provider = 0.0
                 avg_response_time = 0.0
@@ -1541,15 +1548,6 @@ async def monitoring_middleware(request: Request, call_next):
     # Store context
     request_contexts[request_id] = context
 
-    # Add request ID to headers (mutable underlying structure)
-    try:
-        request.headers.__dict__["_list"].append(
-            (b"x-request-id", request_id.encode())
-        )
-    except Exception:
-        # If this trick fails, we just skip injecting into request headers
-        pass
-
     # Process request
     try:
         response = await call_next(request)
@@ -1594,7 +1592,7 @@ async def verify_authentication(
         return True
 
     # Collect valid tokens
-    valid_tokens = []
+    valid_tokens: List[str] = []
     if settings.app_token:
         valid_tokens.append(settings.app_token)
     if settings.backup_app_token:
@@ -1611,9 +1609,9 @@ async def verify_authentication(
         return True
 
     # Check various token sources
-    token = None
+    token: Optional[str] = None
 
-    # 1. Authorization header
+    # 1. Authorization header (Bearer)
     if credentials:
         token = credentials.credentials.strip()
 
@@ -1624,10 +1622,10 @@ async def verify_authentication(
     # 3. Custom headers
     if not token:
         token = (
-            request.headers.get(settings.api_key_header, "").strip() or
-            request.headers.get("X-API-Key", "").strip() or
-            request.headers.get("X-TFB-Token", "").strip() or
-            request.headers.get("X-App-Token", "").strip()
+            request.headers.get(settings.api_key_header, "").strip()
+            or request.headers.get("X-API-Key", "").strip()
+            or request.headers.get("X-TFB-Token", "").strip()
+            or request.headers.get("X-App-Token", "").strip()
         )
 
     # 4. Raw Authorization (non-Bearer)
@@ -1684,7 +1682,7 @@ async def health_check(request: Request):
     sheets_health = ServiceHealth(
         service="google_sheets",
         status=HealthStatus.HEALTHY if quote_service.google_sheets_service else HealthStatus.UNHEALTHY,
-        version="4.0.0",
+        version=settings.app_version,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
         details={
             "configured": settings.has_google_sheets,
@@ -1697,7 +1695,7 @@ async def health_check(request: Request):
     gas_health = ServiceHealth(
         service="google_apps_script",
         status=HealthStatus.HEALTHY if quote_service.google_apps_script_client else HealthStatus.UNHEALTHY,
-        version="4.0.0",
+        version=settings.app_version,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
         details={
             "configured": settings.has_google_apps_script,
@@ -1708,10 +1706,13 @@ async def health_check(request: Request):
 
     # Cache health
     cache_stats = cache.get_stats()
+    cache_health_status = (
+        HealthStatus.HEALTHY if cache_stats is not None else HealthStatus.DEGRADED
+    )
     cache_health = ServiceHealth(
         service="cache",
-        status=HealthStatus.HEALTHY if cache_stats.valid_entries > 0 else HealthStatus.DEGRADED,
-        version="4.0.0",
+        status=cache_health_status,
+        version=settings.app_version,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
         details=cache_stats.dict(),
     )
@@ -1722,7 +1723,7 @@ async def health_check(request: Request):
     quote_health = ServiceHealth(
         service="quote_service",
         status=HealthStatus.HEALTHY if quote_stats["success_rate"] > 0.5 else HealthStatus.DEGRADED,
-        version="4.0.0",
+        version=settings.app_version,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
         details=quote_stats,
     )
@@ -1800,7 +1801,7 @@ async def get_quotes(
         # Get quotes
         response = await quote_service.get_quotes(symbols, use_cache=use_cache)
 
-        # Add request ID from context
+        # Add request ID from context (if available)
         request_id = request.headers.get("x-request-id")
         if request_id:
             response.request_id = request_id
@@ -2060,8 +2061,8 @@ async def get_request_history(
 ):
     """Get recent request history for monitoring."""
     try:
-        # Get active requests
-        active_requests = list(request_contexts.values())
+        # Currently we only track active in-memory requests
+        active_requests = list(request_contexts.values()) if include_active else []
 
         history = []
         for context in active_requests[:limit]:
@@ -2096,8 +2097,8 @@ async def get_status(request: Request):
     try:
         # Basic health check
         services_healthy = (
-            quote_service.google_sheets_service is not None and
-            quote_service.google_apps_script_client is not None
+            quote_service.google_sheets_service is not None
+            and quote_service.google_apps_script_client is not None
         )
 
         return {
