@@ -427,6 +427,7 @@
       padding: var(--space-3);
       border: 1px solid var(--border-light);
       transition: all var(--transition-fast);
+      cursor: pointer;
     }
 
     .endpoint-item:hover {
@@ -634,7 +635,7 @@
 
     /* Animations */
     @keyframes pulse {
-      0%, 100% { opacity: 1; }
+      0%, 100 { opacity: 1; }
       50% { opacity: 0.5; }
     }
 
@@ -742,7 +743,7 @@
         <a href="#api" class="nav-link">API Reference</a>
         <a href="#status" class="nav-link">System Status</a>
         <a href="#metrics" class="nav-link">Metrics</a>
-        <a href="#docs" class="nav-link">Documentation</a>
+        <a href="/docs" class="nav-link" target="_blank" rel="noopener">Documentation</a>
       </div>
     </nav>
   </header>
@@ -759,7 +760,7 @@
               <div class="card-icon">🚀</div>
               <h1>Tadawul Fast Bridge <span class="gradient-text">v4.0.0</span></h1>
             </div>
-            <div class="badge badge-success" id="systemStatus">
+            <div class="badge badge-neutral" id="systemStatus">
               <span id="statusText">Initializing...</span>
             </div>
           </div>
@@ -779,19 +780,19 @@
               <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
                 <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">💾</div>
                 <div style="font-weight: 600; margin-bottom: var(--space-1);">Smart Caching</div>
-                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Multi-layer cache with TTL management</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Redis + in-memory cache with TTL management</div>
               </div>
               
               <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
                 <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">🔄</div>
                 <div style="font-weight: 600; margin-bottom: var(--space-1);">Async Processing</div>
-                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Full async/await architecture</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Full async/await FastAPI architecture</div>
               </div>
               
               <div class="feature-card" style="padding: var(--space-4); background: var(--surface-2); border-radius: var(--radius-lg);">
                 <div style="font-size: 1.5rem; margin-bottom: var(--space-2);">📊</div>
                 <div style="font-weight: 600; margin-bottom: var(--space-1);">Data Validation</div>
-                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Comprehensive quality assessment</div>
+                <div style="font-size: 0.875rem; color: var(--text-tertiary);">Pydantic models & quality assessment</div>
               </div>
             </div>
           </div>
@@ -802,7 +803,7 @@
           <div class="card-header">
             <div class="card-title">
               <div class="card-icon">🔌</div>
-              <h3>API Endpoints</h3>
+              <h3>API Endpoints (v1)</h3>
             </div>
           </div>
           
@@ -812,93 +813,85 @@
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/health</span>
+                  <span class="endpoint-path">/health</span>
                 </div>
-                <div class="endpoint-desc">Comprehensive system health check with metrics</div>
+                <div class="endpoint-desc">Service health status, uptime, and basic dependencies.</div>
               </div>
               
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/stats</span>
+                  <span class="endpoint-path">/metrics</span>
                 </div>
-                <div class="endpoint-desc">Detailed service statistics and performance</div>
+                <div class="endpoint-desc">Prometheus-compatible metrics (for monitoring stacks).</div>
               </div>
               
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/metrics</span>
+                  <span class="endpoint-path">/api/v1/system/info</span>
                 </div>
-                <div class="endpoint-desc">Prometheus-compatible metrics endpoint</div>
+                <div class="endpoint-desc">Application + system info (CPU, memory, providers, cache).</div>
               </div>
-              
-              <!-- Market Data -->
+
+              <!-- Market Data / Stocks -->
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/market/ksa</span>
+                  <span class="endpoint-path">/api/v1/stocks/{symbol}</span>
                 </div>
-                <div class="endpoint-desc">KSA Tadawul market data (Google Sheets)</div>
+                <div class="endpoint-desc">Get stock snapshot (price, change, volume, caps, etc.).</div>
               </div>
               
-              <div class="endpoint-item animate-slide-in">
-                <div class="endpoint-header">
-                  <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/market/tadawul</span>
-                </div>
-                <div class="endpoint-desc">Comprehensive Tadawul data snapshot</div>
-              </div>
-              
-              <div class="endpoint-item animate-slide-in">
-                <div class="endpoint-header">
-                  <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/quote/:ticker</span>
-                </div>
-                <div class="endpoint-desc">Detailed quote for specific ticker</div>
-              </div>
-              
-              <!-- Google Apps Script Integration -->
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-post">POST</span>
-                  <span class="endpoint-path">/api/v1/gas/update</span>
+                  <span class="endpoint-path">/api/v1/stocks/batch</span>
                 </div>
-                <div class="endpoint-desc">Update data via Google Apps Script</div>
+                <div class="endpoint-desc">Batch stock lookup for up to 50 symbols in one request.</div>
               </div>
               
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
-                  <span class="endpoint-path">/api/v1/gas/health</span>
+                  <span class="endpoint-path">/api/v1/analysis/technical/{symbol}</span>
                 </div>
-                <div class="endpoint-desc">Google Apps Script connection health</div>
+                <div class="endpoint-desc">Sample technical indicators (RSI, MACD, MAs).</div>
               </div>
               
-              <!-- Cache Management -->
+              <!-- Google Sheets / Export -->
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
-                  <span class="endpoint-method method-delete">DELETE</span>
-                  <span class="endpoint-path">/api/v1/cache/clear</span>
+                  <span class="endpoint-method method-post">POST</span>
+                  <span class="endpoint-path">/api/v1/export/sheets</span>
                 </div>
-                <div class="endpoint-desc">Clear all cache entries</div>
+                <div class="endpoint-desc">Export a list of symbols into your configured Google Sheet.</div>
               </div>
-              
+
+              <!-- Cache & System -->
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
                   <span class="endpoint-path">/api/v1/cache/stats</span>
                 </div>
-                <div class="endpoint-desc">Cache statistics and hit rates</div>
+                <div class="endpoint-desc">Cache backend, memory usage, and Redis key statistics.</div>
               </div>
               
-              <!-- Documentation -->
+              <!-- WebSocket & Docs -->
+              <div class="endpoint-item animate-slide-in">
+                <div class="endpoint-header">
+                  <span class="endpoint-method method-get">GET</span>
+                  <span class="endpoint-path">/ws</span>
+                </div>
+                <div class="endpoint-desc">WebSocket endpoint for streaming real-time stock updates.</div>
+              </div>
+
               <div class="endpoint-item animate-slide-in">
                 <div class="endpoint-header">
                   <span class="endpoint-method method-get">GET</span>
                   <span class="endpoint-path">/docs</span>
                 </div>
-                <div class="endpoint-desc">Interactive Swagger UI documentation</div>
+                <div class="endpoint-desc">Interactive Swagger UI documentation (FastAPI).</div>
               </div>
               
               <div class="endpoint-item animate-slide-in">
@@ -906,7 +899,7 @@
                   <span class="endpoint-method method-get">GET</span>
                   <span class="endpoint-path">/redoc</span>
                 </div>
-                <div class="endpoint-desc">ReDoc API documentation</div>
+                <div class="endpoint-desc">ReDoc-based API documentation.</div>
               </div>
             </div>
           </div>
@@ -928,26 +921,26 @@
             <div class="status-display">
               <div class="status-item">
                 <div class="status-value" id="responseTime">--</div>
-                <div class="status-label">Response Time</div>
-                <div class="status-delta" id="responseDelta">--</div>
+                <div class="status-label">Health Latency</div>
+                <div class="status-delta" id="responseDelta">ms</div>
               </div>
               
               <div class="status-item">
                 <div class="status-value" id="uptime">--</div>
                 <div class="status-label">Uptime</div>
-                <div class="status-delta" id="uptimeDelta">--</div>
+                <div class="status-delta" id="uptimeDelta">since start</div>
               </div>
               
               <div class="status-item">
                 <div class="status-value" id="requests">--</div>
-                <div class="status-label">Requests</div>
-                <div class="status-delta" id="requestsDelta">--</div>
+                <div class="status-label">Requests* (info)</div>
+                <div class="status-delta" id="requestsDelta">N/A</div>
               </div>
               
               <div class="status-item">
                 <div class="status-value" id="cacheHits">--</div>
-                <div class="status-label">Cache Hits</div>
-                <div class="status-delta" id="cacheDelta">--</div>
+                <div class="status-label">Cache Backend</div>
+                <div class="status-delta" id="cacheDelta">N/A</div>
               </div>
             </div>
             
@@ -960,7 +953,7 @@
                     <div class="service-desc">Market data source</div>
                   </div>
                 </div>
-                <div class="badge badge-success" id="sheetsStatus">Checking</div>
+                <div class="badge badge-neutral" id="sheetsStatus">Unknown</div>
               </div>
               
               <div class="service-item">
@@ -968,10 +961,10 @@
                   <div class="service-icon">🔄</div>
                   <div>
                     <div class="service-name">Google Apps Script</div>
-                    <div class="service-desc">Data updates</div>
+                    <div class="service-desc">Sheet automation</div>
                   </div>
                 </div>
-                <div class="badge badge-success" id="gasStatus">Checking</div>
+                <div class="badge badge-neutral" id="gasStatus">Unknown</div>
               </div>
               
               <div class="service-item">
@@ -979,10 +972,10 @@
                   <div class="service-icon">💾</div>
                   <div>
                     <div class="service-name">Cache</div>
-                    <div class="service-desc">Performance layer</div>
+                    <div class="service-desc">Redis + in-memory</div>
                   </div>
                 </div>
-                <div class="badge badge-success" id="cacheStatus">Checking</div>
+                <div class="badge badge-neutral" id="cacheStatus">Checking</div>
               </div>
               
               <div class="service-item">
@@ -993,19 +986,19 @@
                     <div class="service-desc">FastAPI backend</div>
                   </div>
                 </div>
-                <div class="badge badge-success" id="apiStatus">Checking</div>
+                <div class="badge badge-neutral" id="apiStatus">Checking</div>
               </div>
             </div>
             
-            <div class="metrics-chart">
+            <div class="metrics-chart" id="metrics">
               <div class="card-header">
                 <div class="card-title">
                   <div class="card-icon">📈</div>
-                  <h4>Performance Trends</h4>
+                  <h4>Performance Snapshot</h4>
                 </div>
               </div>
               <div class="chart-placeholder">
-                Performance charts will appear here
+                Metrics summary will appear here (CPU, memory, connections).
               </div>
             </div>
           </div>
@@ -1029,7 +1022,7 @@
               
               <div style="margin-bottom: var(--space-3);">
                 <div style="font-size: 0.75rem; color: var(--text-tertiary);">Environment</div>
-                <div style="font-size: 1rem; font-weight: 600;" id="environmentDisplay">production</div>
+                <div style="font-size: 1rem; font-weight: 600;" id="environmentDisplay">unknown</div>
               </div>
               
               <div style="margin-bottom: var(--space-3);">
@@ -1074,9 +1067,9 @@
           <ul class="footer-links">
             <li><a href="#api">API Reference</a></li>
             <li><a href="#status">System Status</a></li>
-            <li><a href="#docs">Documentation</a></li>
-            <li><a href="#metrics">Metrics Dashboard</a></li>
-            <li><a href="#health">Health Checks</a></li>
+            <li><a href="#metrics">Metrics Snapshot</a></li>
+            <li><a href="/docs" target="_blank" rel="noopener">Swagger Docs</a></li>
+            <li><a href="/redoc" target="_blank" rel="noopener">ReDoc Docs</a></li>
           </ul>
         </div>
         
@@ -1084,8 +1077,8 @@
           <h4>Data Sources</h4>
           <ul class="footer-links">
             <li>Google Sheets Integration</li>
-            <li>Google Apps Script</li>
-            <li>Multiple Financial APIs</li>
+            <li>Multi-provider Market APIs</li>
+            <li>Tadawul Fast Bridge Provider</li>
             <li>Internal Ranking Engine</li>
             <li>Real-time Market Feeds</li>
           </ul>
@@ -1100,28 +1093,27 @@
   </footer>
 
   <script>
-    // Enhanced Dashboard JavaScript
+    // Enhanced Dashboard JavaScript aligned with FastAPI v4.0 backend
     class DashboardMonitor {
       constructor() {
         this.config = {
           healthCheckInterval: 30000, // 30 seconds
-          metricsInterval: 10000, // 10 seconds
+          systemInfoInterval: 20000,  // 20 seconds
           apiBaseUrl: window.location.origin,
-          historySize: 60, // Store last 60 data points
+          historySize: 60,
         };
         
         this.state = {
-          previousMetrics: null,
+          previousHealth: null,
           requestHistory: [],
           lastUpdate: null,
-          isInitialized: false,
           version: '4.0.0',
         };
         
         this.cache = {
           healthData: null,
-          statsData: null,
-          lastFetch: null,
+          systemInfo: null,
+          cacheStats: null,
         };
         
         this.initialize();
@@ -1130,28 +1122,30 @@
       initialize() {
         console.log('DashboardMonitor initialized');
         
-        // Set initial version display
+        // Set initial version / build info
         document.getElementById('versionDisplay').textContent = `Tadawul Fast Bridge v${this.state.version}`;
         document.getElementById('buildDate').textContent = new Date().toISOString().split('T')[0];
         document.getElementById('systemId').textContent = this.generateSystemId();
         
-        // Initial checks
+        // Initial calls
         this.checkHealth();
-        this.fetchMetrics();
+        this.fetchSystemInfo();
+        this.fetchCacheStats();
         
-        // Set up periodic checks
+        // Periodic checks
         setInterval(() => this.checkHealth(), this.config.healthCheckInterval);
-        setInterval(() => this.fetchMetrics(), this.config.metricsInterval);
+        setInterval(() => {
+          this.fetchSystemInfo();
+          this.fetchCacheStats();
+        }, this.config.systemInfoInterval);
         
-        // Add event listeners for manual refresh
+        // Manual refresh: Ctrl + R (inside app, without full browser reload)
         document.addEventListener('keydown', (e) => {
           if (e.key === 'r' && e.ctrlKey) {
             e.preventDefault();
             this.refreshAll();
           }
         });
-        
-        this.state.isInitialized = true;
       }
       
       generateSystemId() {
@@ -1161,159 +1155,202 @@
       }
       
       async checkHealth() {
+        const url = `${this.config.apiBaseUrl}/health`;
         try {
           const startTime = performance.now();
-          const response = await fetch(`${this.config.apiBaseUrl}/api/v1/health`);
+          const response = await fetch(url);
           const endTime = performance.now();
+          const latency = Math.round(endTime - startTime);
           
-          if (response.ok) {
-            const data = await response.json();
-            this.cache.healthData = data;
-            this.cache.lastFetch = new Date();
-            this.updateHealthDisplay(data, Math.round(endTime - startTime));
-          } else {
-            this.handleHealthError();
-          }
+          if (!response.ok) throw new Error(`Health ${response.status}`);
+          
+          const data = await response.json();
+          this.cache.healthData = data;
+          this.updateHealthDisplay(data, latency);
         } catch (error) {
           console.error('Health check failed:', error);
           this.handleHealthError();
         }
       }
       
-      async fetchMetrics() {
+      async fetchSystemInfo() {
+        const url = `${this.config.apiBaseUrl}/api/v1/system/info`;
         try {
-          const response = await fetch(`${this.config.apiBaseUrl}/api/v1/stats`);
+          const response = await fetch(url);
+          if (!response.ok) throw new Error(`System info ${response.status}`);
           
-          if (response.ok) {
-            const data = await response.json();
-            this.cache.statsData = data;
-            this.updateMetricsDisplay(data);
-          }
+          const data = await response.json();
+          this.cache.systemInfo = data;
+          this.updateSystemInfoDisplay(data);
         } catch (error) {
-          console.warn('Metrics fetch failed:', error);
+          console.warn('System info fetch failed:', error);
+        }
+      }
+      
+      async fetchCacheStats() {
+        const url = `${this.config.apiBaseUrl}/api/v1/cache/stats`;
+        try {
+          const response = await fetch(url);
+          if (!response.ok) throw new Error(`Cache stats ${response.status}`);
+          
+          const data = await response.json();
+          this.cache.cacheStats = data;
+          this.updateCacheDisplay(data);
+        } catch (error) {
+          console.warn('Cache stats fetch failed:', error);
         }
       }
       
       updateHealthDisplay(data, responseTime) {
-        // Update overall status
         const statusElement = document.getElementById('systemStatus');
         const statusTextElement = document.getElementById('statusText');
         const footerStatusElement = document.getElementById('footerStatus');
         
-        const isHealthy = data.status === 'healthy' || data.status === 'operational';
-        
+        const isHealthy = data.status === 'healthy';
         statusElement.className = `badge ${isHealthy ? 'badge-success' : 'badge-error'}`;
         statusTextElement.textContent = isHealthy ? 'Operational' : 'Degraded';
         footerStatusElement.textContent = isHealthy ? 'All Systems Operational' : 'Degraded Performance';
         
-        // Update response time
-        this.updateMetricElement('responseTime', responseTime, 'ms');
+        // Latency
+        this.updateMetricValue('responseTime', responseTime, 'ms');
+        const responseDeltaElement = document.getElementById('responseDelta');
+        responseDeltaElement.textContent = `${responseTime} ms`;
+        responseDeltaElement.className = 'status-delta positive';
         
-        // Update uptime
-        if (data.uptime_seconds) {
-          const uptimeText = this.formatUptime(data.uptime_seconds);
-          this.updateMetricElement('uptime', uptimeText);
+        // Uptime from health.system.uptime or health.uptime
+        const uptimeSeconds =
+          (data.system && typeof data.system.uptime === 'number') ? data.system.uptime :
+          (typeof data.uptime === 'number' ? data.uptime : null);
+        if (uptimeSeconds != null) {
+          const uptimeText = this.formatUptime(uptimeSeconds);
+          this.updateMetricValue('uptime', uptimeText, '');
         }
         
-        // Update environment
-        if (data.environment) {
-          document.getElementById('environmentDisplay').textContent = data.environment;
-        }
-        
-        // Update service statuses
+        // Service statuses from dependencies
         this.updateServiceStatuses(data);
         
-        // Store for delta calculations
-        if (this.state.previousMetrics) {
-          this.calculateDeltas(data);
-        }
-        
-        this.state.previousMetrics = data;
+        this.state.previousHealth = data;
         this.state.lastUpdate = new Date();
-        
-        // Trigger animations
-        this.triggerStatusAnimation(isHealthy);
+        this.triggerStatusAnimation();
       }
       
-      updateServiceStatuses(data) {
-        // Update individual service statuses
-        const services = {
-          'sheetsStatus': data.google_sheets_status || data.services?.google_sheets,
-          'gasStatus': data.google_apps_script_status || data.services?.google_apps_script,
-          'cacheStatus': data.cache_status?.status || data.services?.cache,
-          'apiStatus': data.api_status || data.status,
-        };
-        
-        Object.entries(services).forEach(([elementId, status]) => {
-          const element = document.getElementById(elementId);
-          if (element && status) {
-            const isHealthy = status === 'healthy' || status === 'operational' || status === 'connected';
-            element.className = `badge ${isHealthy ? 'badge-success' : 'badge-warning'}`;
-            element.textContent = isHealthy ? 'Connected' : 'Degraded';
+      updateSystemInfoDisplay(info) {
+        // Environment + version
+        if (info.application) {
+          if (info.application.environment) {
+            document.getElementById('environmentDisplay').textContent = info.application.environment;
           }
-        });
-      }
-      
-      updateMetricsDisplay(data) {
-        // Update requests
-        if (data.performance?.total_requests !== undefined) {
-          this.updateMetricElement('requests', data.performance.total_requests);
-        }
-        
-        // Update cache hits
-        if (data.cache?.hits !== undefined) {
-          this.updateMetricElement('cacheHits', data.cache.hits);
-        }
-        
-        // Update cache hit rate if available
-        if (data.cache?.hit_rate !== undefined) {
-          const element = document.getElementById('cacheDelta');
-          if (element) {
-            element.textContent = `${data.cache.hit_rate}%`;
-            element.className = `status-delta ${data.cache.hit_rate >= 80 ? 'positive' : 'negative'}`;
+          if (info.application.version) {
+            document.getElementById('versionDisplay').textContent =
+              `${info.application.name || 'Tadawul Fast Bridge'} v${info.application.version}`;
+          }
+          
+          // Uptime (fallback)
+          if (typeof info.application.uptime === 'number') {
+            const uptimeText = this.formatUptime(info.application.uptime);
+            this.updateMetricValue('uptime', uptimeText, '');
           }
         }
         
-        // Store in history for trends
-        if (this.state.requestHistory.length >= this.config.historySize) {
-          this.state.requestHistory.shift();
+        // Metrics snapshot in placeholder
+        const placeholder = document.querySelector('.chart-placeholder');
+        if (placeholder && info.system) {
+          const memMb = info.system.memory_usage_mb !== undefined
+            ? `${info.system.memory_usage_mb.toFixed(1)} MB`
+            : 'N/A';
+          const cpuPercent = info.system.cpu_percent !== undefined
+            ? `${info.system.cpu_percent.toFixed(1)}%`
+            : 'N/A';
+          const threads = info.system.threads !== undefined
+            ? info.system.threads
+            : 'N/A';
+          const connections = info.system.connections !== undefined
+            ? info.system.connections
+            : 'N/A';
+          
+          placeholder.textContent = `CPU ${cpuPercent} • Memory ${memMb} • Threads ${threads} • Connections ${connections}`;
         }
-        this.state.requestHistory.push({
-          timestamp: new Date(),
-          requests: data.performance?.total_requests || 0,
-          responseTime: data.performance?.avg_response_time_ms || 0,
-          cacheHits: data.cache?.hits || 0,
-        });
-      }
-      
-      updateMetricElement(elementId, value, suffix = '') {
-        const element = document.getElementById(elementId);
-        if (element) {
-          if (typeof value === 'number') {
-            element.textContent = this.formatNumber(value) + suffix;
-          } else {
-            element.textContent = value;
+        
+        // Providers info used as "Requests info"
+        if (info.providers) {
+          const value = `${info.providers.available}/${info.providers.total}`;
+          this.updateMetricValue('requests', value, '');
+          const delta = document.getElementById('requestsDelta');
+          if (delta) {
+            delta.textContent = 'Providers available';
+            delta.className = 'status-delta positive';
           }
         }
       }
       
-      calculateDeltas(currentData) {
-        const previous = this.state.previousMetrics;
+      updateCacheDisplay(stats) {
+        // Cache backend
+        if (stats && stats.backend) {
+          const backend = stats.backend;
+          this.updateMetricValue('cacheHits', backend.toUpperCase(), '');
+          
+          const cacheDelta = document.getElementById('cacheDelta');
+          if (cacheDelta) {
+            const memoryItems = stats.memory_cache_size || 0;
+            cacheDelta.textContent = `Memory items: ${memoryItems}`;
+            cacheDelta.className = 'status-delta positive';
+          }
+          
+          const cacheStatusEl = document.getElementById('cacheStatus');
+          if (cacheStatusEl) {
+            const redisConnected = stats.redis_connected === true;
+            if (backend === 'redis' && !redisConnected) {
+              cacheStatusEl.className = 'badge badge-warning';
+              cacheStatusEl.textContent = 'Memory Only';
+            } else {
+              cacheStatusEl.className = 'badge badge-success';
+              cacheStatusEl.textContent = backend === 'redis' ? 'Redis' : 'Memory';
+            }
+          }
+        }
+      }
+      
+      updateServiceStatuses(healthData) {
+        const deps = healthData.dependencies || {};
         
-        // Response time delta
-        const responseDeltaElement = document.getElementById('responseDelta');
-        if (responseDeltaElement && currentData.performance?.avg_response_time_ms && previous.performance?.avg_response_time_ms) {
-          const delta = currentData.performance.avg_response_time_ms - previous.performance.avg_response_time_ms;
-          responseDeltaElement.textContent = `${delta > 0 ? '+' : ''}${Math.round(delta)}ms`;
-          responseDeltaElement.className = `status-delta ${delta <= 0 ? 'positive' : 'negative'}`;
+        // Cache via dependencies if present
+        const cacheStatus = deps.cache || healthData.status;
+        const cacheStatusEl = document.getElementById('cacheStatus');
+        if (cacheStatusEl) {
+          const isOk = cacheStatus === 'healthy';
+          cacheStatusEl.className = `badge ${isOk ? 'badge-success' : 'badge-warning'}`;
+          cacheStatusEl.textContent = isOk ? 'Healthy' : 'Degraded';
         }
         
-        // Requests delta
-        const requestsDeltaElement = document.getElementById('requestsDelta');
-        if (requestsDeltaElement && currentData.performance?.total_requests && previous.performance?.total_requests) {
-          const delta = currentData.performance.total_requests - previous.performance.total_requests;
-          requestsDeltaElement.textContent = `${delta > 0 ? '+' : ''}${this.formatNumber(delta)}`;
-          requestsDeltaElement.className = `status-delta ${delta > 0 ? 'positive' : 'negative'}`;
+        // API server uses global status
+        const apiStatusEl = document.getElementById('apiStatus');
+        if (apiStatusEl) {
+          const isOk = healthData.status === 'healthy';
+          apiStatusEl.className = `badge ${isOk ? 'badge-success' : 'badge-error'}`;
+          apiStatusEl.textContent = isOk ? 'Running' : 'Issue';
+        }
+        
+        // Sheets & GAS – we don't have explicit flags in /health yet, so mark as Unknown/Configured
+        const sheetsStatusEl = document.getElementById('sheetsStatus');
+        if (sheetsStatusEl) {
+          sheetsStatusEl.className = 'badge badge-neutral';
+          sheetsStatusEl.textContent = 'Configured';
+        }
+        const gasStatusEl = document.getElementById('gasStatus');
+        if (gasStatusEl) {
+          gasStatusEl.className = 'badge badge-neutral';
+          gasStatusEl.textContent = 'Configured';
+        }
+      }
+      
+      updateMetricValue(elementId, value, suffix = '') {
+        const el = document.getElementById(elementId);
+        if (!el) return;
+        
+        if (typeof value === 'number') {
+          el.textContent = this.formatNumber(value) + suffix;
+        } else {
+          el.textContent = value + (suffix || '');
         }
       }
       
@@ -1322,28 +1359,27 @@
         const statusTextElement = document.getElementById('statusText');
         const footerStatusElement = document.getElementById('footerStatus');
         
-        statusElement.className = 'badge badge-error';
-        statusTextElement.textContent = 'Offline';
-        footerStatusElement.textContent = 'System Unavailable';
+        if (statusElement) statusElement.className = 'badge badge-error';
+        if (statusTextElement) statusTextElement.textContent = 'Offline';
+        if (footerStatusElement) footerStatusElement.textContent = 'System Unavailable';
         
-        // Set default values for metrics
-        this.updateMetricElement('responseTime', '--');
-        this.updateMetricElement('uptime', '--');
-        this.updateMetricElement('requests', '--');
-        this.updateMetricElement('cacheHits', '--');
+        ['responseTime', 'uptime', 'requests', 'cacheHits'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = '--';
+        });
         
-        // Update service statuses to error
         ['sheetsStatus', 'gasStatus', 'cacheStatus', 'apiStatus'].forEach(id => {
-          const element = document.getElementById(id);
-          if (element) {
-            element.className = 'badge badge-error';
-            element.textContent = 'Offline';
+          const el = document.getElementById(id);
+          if (el) {
+            el.className = 'badge badge-error';
+            el.textContent = 'Offline';
           }
         });
       }
       
-      triggerStatusAnimation(isHealthy) {
+      triggerStatusAnimation() {
         const statusElement = document.getElementById('systemStatus');
+        if (!statusElement) return;
         statusElement.style.animation = 'none';
         setTimeout(() => {
           statusElement.style.animation = 'pulse 2s infinite';
@@ -1351,55 +1387,43 @@
       }
       
       formatUptime(seconds) {
-        if (!seconds) return '--';
-        
+        if (!seconds && seconds !== 0) return '--';
         const days = Math.floor(seconds / 86400);
         const hours = Math.floor((seconds % 86400) / 3600);
         const minutes = Math.floor((seconds % 3600) / 60);
         
-        if (days > 0) {
-          return `${days}d ${hours}h`;
-        } else if (hours > 0) {
-          return `${hours}h ${minutes}m`;
-        } else {
-          return `${minutes}m`;
-        }
+        if (days > 0) return `${days}d ${hours}h`;
+        if (hours > 0) return `${hours}h ${minutes}m`;
+        return `${minutes}m`;
       }
       
       formatNumber(num) {
         if (typeof num !== 'number') return num;
-        
-        if (num >= 1000000) {
-          return (num / 1000000).toFixed(1) + 'M';
-        } else if (num >= 1000) {
-          return (num / 1000).toFixed(1) + 'K';
-        }
+        if (num >= 1_000_000) return (num / 1_000_000).toFixed(1) + 'M';
+        if (num >= 1_000) return (num / 1_000).toFixed(1) + 'K';
         return num.toString();
       }
       
       refreshAll() {
-        console.log('Manual refresh triggered');
+        console.log('Manual dashboard refresh (Ctrl+R) – API calls only.');
         this.checkHealth();
-        this.fetchMetrics();
+        this.fetchSystemInfo();
+        this.fetchCacheStats();
         
-        // Visual feedback
-        const refreshElements = document.querySelectorAll('.card');
-        refreshElements.forEach(element => {
-          element.style.transform = 'scale(0.98)';
+        const cards = document.querySelectorAll('.card');
+        cards.forEach(card => {
+          card.style.transform = 'scale(0.98)';
           setTimeout(() => {
-            element.style.transform = '';
-          }, 300);
+            card.style.transform = '';
+          }, 200);
         });
-      }
-      
-      getHistoricalData() {
-        return this.state.requestHistory;
       }
       
       exportMetrics() {
         return {
-          current: this.cache.statsData,
-          history: this.state.requestHistory,
+          health: this.cache.healthData,
+          system: this.cache.systemInfo,
+          cache: this.cache.cacheStats,
           lastUpdate: this.state.lastUpdate,
           version: this.state.version,
         };
@@ -1411,12 +1435,11 @@
       // Create dashboard instance
       window.dashboard = new DashboardMonitor();
       
-      // Add animation effects to cards
+      // Card entrance animation
       const cards = document.querySelectorAll('.card');
       cards.forEach((card, index) => {
         card.style.opacity = '0';
         card.style.transform = 'translateY(20px)';
-        
         setTimeout(() => {
           card.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
           card.style.opacity = '1';
@@ -1424,12 +1447,12 @@
         }, index * 100);
       });
       
-      // Add endpoint click handlers
+      // Endpoint tile click behaviour
       const endpointItems = document.querySelectorAll('.endpoint-item');
       endpointItems.forEach(item => {
         item.addEventListener('click', () => {
-          const path = item.querySelector('.endpoint-path').textContent;
-          const method = item.querySelector('.endpoint-method').textContent;
+          const path = item.querySelector('.endpoint-path').textContent.trim();
+          const method = item.querySelector('.endpoint-method').textContent.trim();
           
           // Visual feedback
           item.style.transform = 'scale(0.98)';
@@ -1437,23 +1460,22 @@
             item.style.transform = '';
           }, 200);
           
-          console.log(`Endpoint clicked: ${method} ${path}`);
+          // Copy to clipboard for quick testing
+          const fullUrl = `${window.location.origin}${path.replace(':symbol', '{symbol}')}`;
+          navigator.clipboard?.writeText(`${method} ${fullUrl}`).catch(() => {});
           
-          // In a real application, you might:
-          // 1. Copy the endpoint to clipboard
-          // 2. Open documentation for that endpoint
-          // 3. Make a test request
+          console.log(`Endpoint clicked: ${method} ${fullUrl}`);
         });
       });
       
-      // Add smooth scrolling for navigation
+      // Smooth scrolling for internal navigation
       document.querySelectorAll('a[href^="#"]').forEach(anchor => {
         anchor.addEventListener('click', function (e) {
+          const href = this.getAttribute('href');
+          if (!href || href === '#') return;
           e.preventDefault();
-          const targetId = this.getAttribute('href');
-          if (targetId === '#') return;
           
-          const targetElement = document.querySelector(targetId);
+          const targetElement = document.querySelector(href);
           if (targetElement) {
             window.scrollTo({
               top: targetElement.offsetTop - 80,
@@ -1464,7 +1486,7 @@
       });
     });
     
-    // Global helper functions
+    // Global helper functions (optional)
     window.formatNumber = function(num) {
       if (typeof num !== 'number') return num;
       return num.toLocaleString('en-US');
