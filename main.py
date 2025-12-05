@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple, Callable
 from collections import defaultdict
 
+import gspread
+from google.oauth2.service_account import Credentials
+
 import aiohttp
 import uvicorn
 from dotenv import load_dotenv
