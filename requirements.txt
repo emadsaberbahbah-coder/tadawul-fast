@@ -1,52 +1,42 @@
 """
 Tadawul Fast Bridge - Legacy Stock Microservice
-Version: 3.7.0
-Description: Lightweight stock market data bridge with FastAPI
-- Simple Argaam/Tadawul integration
+Version: 4.0.0
+Description:
+  Lightweight stock market data bridge with FastAPI
+
+Key Features:
+- Simple Argaam/Tadawul integration (with mock fallback)
 - CSV export
-- Optional Google Sheets export
+- Optional Google Sheets export (service account)
+- Basic in-memory TTL cache with hit/miss stats
+- Health & Stats endpoints aligned with v4 dashboard:
+    - /health              → simple health (for Render)
+    - /api/v1/health       → detailed status (used by index.html dashboard)
+    - /api/v1/stats        → performance & cache metrics
 """
 
 import asyncio
+import csv
+import io
 import json
-import time
 import logging
 import os
 import random
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-# FastAPI Core
-from fastapi import FastAPI, Request, HTTPException, Depends, Query, status
+import aiohttp
+import gspread
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.gzip import GZipMiddleware
-
-# Rate Limiting (not enforced per-route yet, but kept for future use)
+from fastapi.responses import JSONResponse, StreamingResponse
+from google.oauth2.service_account import Credentials
+from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-
-# Data Models
-from pydantic import BaseModel, Field
-
-# HTTP Clients
-import aiohttp
-
-# Data Processing
-import pandas as pd
-
-# Google Sheets
-import gspread
-from google.oauth2.service_account import Credentials
-
-# Security
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-
-# Cache
-from cachetools import TTLCache
 
 # =============================================================================
 # Settings / Configuration
@@ -57,34 +47,46 @@ class Settings:
     """Application settings loaded from environment with sane defaults."""
 
     def __init__(self) -> None:
-        self.APP_NAME: str = os.getenv("APP_NAME", "Tadawul Fast Bridge - Legacy")
-        self.VERSION: str = os.getenv("APP_VERSION", "3.7.0")
+        # Prefer SERVICE_NAME / SERVICE_VERSION (aligned with render.yaml)
+        self.APP_NAME: str = (
+            os.getenv("SERVICE_NAME")
+            or os.getenv("APP_NAME")
+            or "Tadawul Fast Bridge - Legacy"
+        )
+        self.VERSION: str = (
+            os.getenv("SERVICE_VERSION")
+            or os.getenv("APP_VERSION")
+            or "4.0.0"
+        )
 
         # External APIs
         self.ARGAAM_API_KEY: str = os.getenv("ARGAAM_API_KEY", "")
-        self.ARGAAM_BASE_URL: str = os.getenv("ARGAAM_BASE_URL", "https://api.argaam.com")
-        self.TADAWUL_BASE_URL: str = os.getenv("TADAWUL_BASE_URL", "https://www.tadawul.com.sa")
-
-        # Google Sheets credentials (JSON string)
-        # Prefer unified env name GOOGLE_SHEETS_CREDENTIALS_JSON, but keep backward compat
-        self.GOOGLE_CREDENTIALS_JSON: str = os.getenv(
-            "GOOGLE_SHEETS_CREDENTIALS_JSON",
-            os.getenv("GOOGLE_CREDENTIALS", ""),
+        self.ARGAAM_BASE_URL: str = os.getenv(
+            "ARGAAM_BASE_URL", "https://api.argaam.com"
+        )
+        self.TADAWUL_BASE_URL: str = os.getenv(
+            "TADAWUL_BASE_URL", "https://www.tadawul.com.sa"
         )
 
-        # Security
-        self.SECRET_KEY: str = os.getenv("SECRET_KEY", "change-this-secret-in-production")
-        self.ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
-        self.ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
-            os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+        # Google Sheets credentials (JSON string)
+        # Support multiple env names for compatibility
+        self.GOOGLE_CREDENTIALS_JSON: str = (
+            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+            or os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
+            or os.getenv("GOOGLE_CREDENTIALS", "")
         )
 
         # Cache
         self.CACHE_TTL: int = int(os.getenv("CACHE_TTL", "300"))
         self.CACHE_MAXSIZE: int = int(os.getenv("CACHE_MAXSIZE", "1000"))
 
-        # Rate Limiting
-        self.RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+        # Rate Limiting (placeholder)
+        self.RATE_LIMIT_PER_MINUTE: int = int(
+            os.getenv("RATE_LIMIT_PER_MINUTE", "60")
+        )
+
+        # Environment / misc
+        self.ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
 
 
 settings = Settings()
@@ -97,7 +99,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tadawul-legacy")
 
 # =============================================================================
 # Models
@@ -137,61 +139,10 @@ class MarketData(BaseModel):
 
 
 class TokenData(BaseModel):
-    """JWT token data."""
+    """Placeholder JWT token data (not used in endpoints, kept for future)."""
 
     username: Optional[str] = None
     scopes: List[str] = Field(default_factory=list)
-
-
-# =============================================================================
-# Authentication Helpers (currently not enforced on endpoints)
-# =============================================================================
-
-security = HTTPBearer()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    """Get password hash."""
-    return pwd_context.hash(password)
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create JWT token."""
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (
-        expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-
-
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> TokenData:
-    """Get current user from token (not yet used in endpoints)."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(
-            credentials.credentials,
-            settings.SECRET_KEY,
-            algorithms=[settings.ALGORITHM],
-        )
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        return TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
 
 
 # =============================================================================
@@ -201,24 +152,63 @@ async def get_current_user(
 limiter = Limiter(key_func=get_remote_address)
 
 # =============================================================================
-# Cache
+# In-memory TTL Cache with hit/miss stats (no external dependency)
 # =============================================================================
 
 
 class DataCache:
-    """Simple TTL cache wrapper."""
+    """Simple in-memory TTL cache with basic stats."""
 
-    def __init__(self, maxsize: int = 1000, ttl: int = 300):
-        self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
+    def __init__(self, maxsize: int = 1000, ttl: int = 300) -> None:
+        self._store: Dict[str, Tuple[float, Any]] = {}
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.hits = 0
+        self.misses = 0
 
     def get(self, key: str) -> Optional[Any]:
-        return self.cache.get(key)
+        now = time.time()
+        item = self._store.get(key)
+        if not item:
+            self.misses += 1
+            return None
+
+        expires_at, value = item
+        if expires_at < now:
+            # expired
+            self.misses += 1
+            self._store.pop(key, None)
+            return None
+
+        self.hits += 1
+        return value
 
     def set(self, key: str, value: Any) -> None:
-        self.cache[key] = value
+        if len(self._store) >= self.maxsize:
+            # Simple eviction: remove the first key
+            try:
+                first_key = next(iter(self._store.keys()))
+                self._store.pop(first_key, None)
+            except StopIteration:
+                pass
+        self._store[key] = (time.time() + self.ttl, value)
 
     def clear(self) -> None:
-        self.cache.clear()
+        self._store.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def stats(self) -> Dict[str, Any]:
+        total = self.hits + self.misses
+        hit_rate = (self.hits * 100.0 / total) if total > 0 else 0.0
+        return {
+            "size": len(self._store),
+            "ttl": self.ttl,
+            "maxsize": self.maxsize,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(hit_rate, 1),
+        }
 
 
 cache = DataCache(maxsize=settings.CACHE_MAXSIZE, ttl=settings.CACHE_TTL)
@@ -234,10 +224,13 @@ class GoogleSheetsService:
     def __init__(self, credentials_json: Optional[str] = None):
         self.credentials_json = credentials_json or settings.GOOGLE_CREDENTIALS_JSON
         self.client: Optional[gspread.Client] = None
+
         if self.credentials_json:
             self._init_client()
         else:
-            logger.warning("Google Sheets credentials not configured; export will be disabled.")
+            logger.warning(
+                "Google Sheets credentials not configured; export to Sheets will be disabled."
+            )
 
     def _init_client(self) -> None:
         """Initialize Google Sheets client."""
@@ -264,7 +257,11 @@ class GoogleSheetsService:
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=len(data) + 10, cols=len(data[0]) + 5)
+            worksheet = spreadsheet.add_worksheet(
+                title=sheet_name,
+                rows=len(data) + 10,
+                cols=len(data[0]) + 5,
+            )
 
         worksheet.clear()
         worksheet.update(data, value_input_option="USER_ENTERED")
@@ -309,20 +306,22 @@ class GoogleSheetsService:
 class HTTPClient:
     """HTTP client with simple retry logic using aiohttp."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.session: Optional[aiohttp.ClientSession] = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "HTTPClient":
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
         )
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         if self.session:
             await self.session.close()
 
-    async def fetch_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def fetch_json(
+        self, url: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Fetch JSON data from the given URL."""
         if self.session is None:
             raise RuntimeError("HTTPClient session is not initialized")
@@ -357,13 +356,15 @@ class StockDataService:
         self.http_client = HTTPClient()
         self.sheets_service = GoogleSheetsService()
 
-    async def get_symbol_data(self, symbol: str, use_cache: bool = True) -> Dict[str, Any]:
+    async def get_symbol_data(
+        self, symbol: str, use_cache: bool = True
+    ) -> Dict[str, Any]:
         """Get symbol data from Argaam or mock fallback."""
         cache_key = f"symbol:{symbol}"
 
         if use_cache:
             cached = cache.get(cache_key)
-            if cached:
+            if cached is not None:
                 logger.debug(f"Cache hit for {symbol}")
                 return cached
 
@@ -421,16 +422,24 @@ class StockDataService:
             return MarketData(**cached)
 
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(f"{settings.TADAWUL_BASE_URL}/market-summary") as response:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                async with session.get(
+                    f"{settings.TADAWUL_BASE_URL}/market-summary"
+                ) as response:
                     if response.status == 200:
                         html = await response.text()
                         data = self._parse_market_summary(html)
                         cache.set(cache_key, data)
                         return MarketData(**data)
-                    logger.warning(f"Tadawul summary HTTP {response.status}, using fallback")
+                    logger.warning(
+                        f"Tadawul summary HTTP {response.status}, using fallback"
+                    )
         except Exception as e:
-            logger.warning(f"Failed to fetch Tadawul market summary, using fallback: {e}")
+            logger.warning(
+                f"Failed to fetch Tadawul market summary, using fallback: {e}"
+            )
 
         # Fallback default data
         data = {
@@ -483,6 +492,11 @@ async def lifespan(app: FastAPI):
     # Initialize services
     app.state.stock_service = StockDataService()
 
+    # Metrics for /api/v1/health and /api/v1/stats
+    app.state.start_time = time.time()
+    app.state.request_count = 0
+    app.state.total_response_time = 0.0
+
     # Pre-cache market summary (non-blocking if it fails)
     try:
         await app.state.stock_service.get_market_summary()
@@ -500,14 +514,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description="Legacy Tadawul stock data bridge (simple Argaam/Tadawul service)",
+    description=(
+        "Legacy Tadawul stock data bridge "
+        "(simple Argaam/Tadawul service with CSV & Google Sheets export)"
+    ),
     lifespan=lifespan,
 )
 
 # Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # For legacy microservice; tighten if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -518,17 +535,26 @@ app.add_middleware(GZipMiddleware, minimum_size=1_000)
 app.state.limiter = limiter
 
 # =============================================================================
-# HTTP Middleware
+# HTTP Middleware (performance metrics)
 # =============================================================================
 
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """Add process time header for simple performance insight."""
+    """Add process time header and update basic performance stats."""
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
+
+    # Update app metrics
+    try:
+        app.state.request_count += 1
+        app.state.total_response_time += process_time
+    except Exception:
+        # If state not yet initialized, ignore
+        pass
+
     return response
 
 
@@ -544,15 +570,104 @@ async def root():
         "service": settings.APP_NAME,
         "version": settings.VERSION,
         "status": "running",
+        "environment": settings.ENVIRONMENT,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/health")
 async def health():
-    """Health check."""
+    """
+    Simple health check endpoint.
+
+    Used by Render native healthCheck (render.yaml -> path: /health)
+    """
     return {
         "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/v1/health")
+async def detailed_health(request: Request):
+    """
+    Detailed health endpoint.
+
+    This is what index.html DashboardMonitor expects:
+      - status
+      - uptime_seconds
+      - environment
+      - cache_status
+      - performance
+      - services / google_sheets_status
+    """
+    now = time.time()
+    start_time = getattr(request.app.state, "start_time", now)
+    uptime_seconds = int(now - start_time)
+
+    service: StockDataService = request.app.state.stock_service
+    sheets_status = (
+        "connected" if service.sheets_service.client is not None else "disabled"
+    )
+
+    cache_stats = cache.stats()
+
+    total_requests = getattr(request.app.state, "request_count", 0)
+    total_resp_time = getattr(request.app.state, "total_response_time", 0.0)
+    avg_response_ms = (
+        (total_resp_time / total_requests) * 1000.0
+        if total_requests > 0
+        else 0.0
+    )
+
+    return {
+        "status": "healthy",
+        "environment": settings.ENVIRONMENT,
+        "version": settings.VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds": uptime_seconds,
+        "api_status": "healthy",
+        "google_sheets_status": sheets_status,
+        "services": {
+            "google_sheets": sheets_status,
+            "cache": "enabled",
+        },
+        "cache_status": {
+            "status": "enabled",
+            **cache_stats,
+        },
+        "performance": {
+            "total_requests": total_requests,
+            "avg_response_time_ms": round(avg_response_ms, 2),
+        },
+    }
+
+
+@app.get("/api/v1/stats")
+async def stats(request: Request):
+    """
+    Stats endpoint used by dashboard for metrics.
+
+    Expected shape:
+      {
+        "performance": { "total_requests": ..., "avg_response_time_ms": ... },
+        "cache": { "hits": ..., "misses": ..., "hit_rate": ..., "size": ... }
+      }
+    """
+    total_requests = getattr(request.app.state, "request_count", 0)
+    total_resp_time = getattr(request.app.state, "total_response_time", 0.0)
+    avg_response_ms = (
+        (total_resp_time / total_requests) * 1000.0
+        if total_requests > 0
+        else 0.0
+    )
+
+    return {
+        "performance": {
+            "total_requests": total_requests,
+            "avg_response_time_ms": round(avg_response_ms, 2),
+        },
+        "cache": cache.stats(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -641,26 +756,46 @@ async def export_to_sheets(
         )
 
     # Headers
-    headers = [["Symbol", "Name", "Price", "Change", "Change%", "Volume", "Timestamp"]]
+    headers = [
+        ["Symbol", "Name", "Price", "Change", "Change%", "Volume", "Timestamp"]
+    ]
     data_to_export = headers + all_data
 
-    result = await service.sheets_service.update_sheet(spreadsheet_id, sheet_name, data_to_export)
+    result = await service.sheets_service.update_sheet(
+        spreadsheet_id, sheet_name, data_to_export
+    )
 
     return {"status": "success", "exported": len(all_data), "details": result}
 
 
 @app.get("/api/v1/export/csv/{symbol}")
 async def export_csv(symbol: str):
-    """Export a single symbol snapshot as CSV."""
+    """Export a single symbol snapshot as CSV (no pandas dependency)."""
     service: StockDataService = app.state.stock_service
     data = await service.get_symbol_data(symbol, use_cache=True)
 
-    df = pd.DataFrame([data])
+    # Order of columns
+    columns = [
+        "symbol",
+        "name_en",
+        "last_price",
+        "change",
+        "change_percent",
+        "volume",
+        "timestamp",
+    ]
 
-    columns = ["symbol", "name_en", "last_price", "change", "change_percent", "volume", "timestamp"]
-    df = df[[col for col in columns if col in df.columns]]
+    # Build CSV via standard library
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
 
-    csv_data = df.to_csv(index=False)
+    # Header
+    writer.writerow(columns)
+    # Row
+    writer.writerow([data.get(col, "") for col in columns])
+
+    csv_data = buffer.getvalue()
+    buffer.close()
 
     return StreamingResponse(
         iter([csv_data]),
@@ -705,13 +840,13 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 
 # =============================================================================
-# Run Application (local dev)
+# Run Application (local dev only)
 # =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("Starting legacy server on 0.0.0.0:8000")
+    logger.info("Starting legacy server on 0.0.0.0:8000 (dev mode)")
     uvicorn.run(
         app,
         host="0.0.0.0",
