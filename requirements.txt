@@ -10,9 +10,9 @@
 # - CSV export
 # - Optional Google Sheets export (service account)
 # - Basic in-memory TTL cache with hit/miss stats
-# - Health & Stats endpoints aligned with v4 dashboard:
-#     - /health              -> simple health (for Render)
-#     - /api/v1/health       -> detailed status (used by index.html dashboard)
+# - Health & Stats endpoints:
+#     - /health              -> simple health (Render healthcheck)
+#     - /api/v1/health       -> detailed status
 #     - /api/v1/stats        -> performance & cache metrics
 
 from __future__ import annotations
