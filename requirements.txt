@@ -1,12 +1,18 @@
 """
-Tadawul Fast Bridge - Production Ready
-Version: 3.6.0
-Description: Stock market data bridge with FastAPI
+Tadawul Fast Bridge - Legacy Stock Microservice
+Version: 3.7.0
+Description: Lightweight stock market data bridge with FastAPI
+- Simple Argaam/Tadawul integration
+- CSV export
+- Optional Google Sheets export
 """
 
 import asyncio
 import json
 import time
+import logging
+import os
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
@@ -18,7 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.gzip import GZipMiddleware
 
-# Rate Limiting
+# Rate Limiting (not enforced per-route yet, but kept for future use)
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -27,58 +33,59 @@ from pydantic import BaseModel, Field
 
 # HTTP Clients
 import aiohttp
-import requests
 
 # Data Processing
 import pandas as pd
-import numpy as np
 
 # Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Web Scraping
-from bs4 import BeautifulSoup
-
 # Security
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-# Utilities
+# Cache
 from cachetools import TTLCache
-import pytz
-
-# Logging
-import logging
 
 # =============================================================================
-# Configuration
+# Settings / Configuration
 # =============================================================================
+
 
 class Settings:
-    """Application settings"""
-    APP_NAME = "Tadawul Fast Bridge"
-    VERSION = "3.6.0"
-    
-    # API Keys (set in environment variables)
-    ARGAAM_API_KEY = ""
-    GOOGLE_CREDENTIALS = ""
-    
-    # Security
-    SECRET_KEY = "your-secret-key-change-in-production"
-    ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = 30
-    
-    # Cache
-    CACHE_TTL = 300
-    CACHE_MAXSIZE = 1000
-    
-    # Rate Limiting
-    RATE_LIMIT_PER_MINUTE = 60
-    
-    # External APIs
-    ARGAAM_BASE_URL = "https://api.argaam.com"
-    TADAWUL_BASE_URL = "https://www.tadawul.com.sa"
+    """Application settings loaded from environment with sane defaults."""
+
+    def __init__(self) -> None:
+        self.APP_NAME: str = os.getenv("APP_NAME", "Tadawul Fast Bridge - Legacy")
+        self.VERSION: str = os.getenv("APP_VERSION", "3.7.0")
+
+        # External APIs
+        self.ARGAAM_API_KEY: str = os.getenv("ARGAAM_API_KEY", "")
+        self.ARGAAM_BASE_URL: str = os.getenv("ARGAAM_BASE_URL", "https://api.argaam.com")
+        self.TADAWUL_BASE_URL: str = os.getenv("TADAWUL_BASE_URL", "https://www.tadawul.com.sa")
+
+        # Google Sheets credentials (JSON string)
+        # Prefer unified env name GOOGLE_SHEETS_CREDENTIALS_JSON, but keep backward compat
+        self.GOOGLE_CREDENTIALS_JSON: str = os.getenv(
+            "GOOGLE_SHEETS_CREDENTIALS_JSON",
+            os.getenv("GOOGLE_CREDENTIALS", ""),
+        )
+
+        # Security
+        self.SECRET_KEY: str = os.getenv("SECRET_KEY", "change-this-secret-in-production")
+        self.ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+        self.ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
+            os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+        )
+
+        # Cache
+        self.CACHE_TTL: int = int(os.getenv("CACHE_TTL", "300"))
+        self.CACHE_MAXSIZE: int = int(os.getenv("CACHE_MAXSIZE", "1000"))
+
+        # Rate Limiting
+        self.RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
 
 settings = Settings()
 
@@ -88,7 +95,7 @@ settings = Settings()
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -96,8 +103,10 @@ logger = logging.getLogger(__name__)
 # Models
 # =============================================================================
 
+
 class StockSymbol(BaseModel):
-    """Stock symbol model"""
+    """Stock symbol model."""
+
     symbol: str
     name_ar: Optional[str] = None
     name_en: Optional[str] = None
@@ -108,14 +117,14 @@ class StockSymbol(BaseModel):
     change_percent: Optional[float] = None
     volume: Optional[int] = None
     timestamp: Optional[str] = None
-    
+
     class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+        json_encoders = {datetime: lambda v: v.isoformat()}
+
 
 class MarketData(BaseModel):
-    """Market data model"""
+    """Market data model."""
+
     timestamp: str
     market_index: Optional[float] = None
     market_change: Optional[float] = None
@@ -126,38 +135,46 @@ class MarketData(BaseModel):
     decliners: Optional[int] = None
     unchanged: Optional[int] = None
 
+
 class TokenData(BaseModel):
-    """JWT token data"""
+    """JWT token data."""
+
     username: Optional[str] = None
-    scopes: List[str] = []
+    scopes: List[str] = Field(default_factory=list)
+
 
 # =============================================================================
-# Authentication
+# Authentication Helpers (currently not enforced on endpoints)
 # =============================================================================
 
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password"""
+    """Verify password."""
     return pwd_context.verify(plain_password, hashed_password)
 
+
 def get_password_hash(password: str) -> str:
-    """Get password hash"""
+    """Get password hash."""
     return pwd_context.hash(password)
 
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create JWT token"""
+    """Create JWT token."""
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> TokenData:
-    """Get current user from token"""
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> TokenData:
+    """Get current user from token (not yet used in endpoints)."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -167,7 +184,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         payload = jwt.decode(
             credentials.credentials,
             settings.SECRET_KEY,
-            algorithms=[settings.ALGORITHM]
+            algorithms=[settings.ALGORITHM],
         )
         username: str = payload.get("sub")
         if username is None:
@@ -176,8 +193,9 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except JWTError:
         raise credentials_exception
 
+
 # =============================================================================
-# Rate Limiting
+# Rate Limiting (placeholder, not applied per-route yet)
 # =============================================================================
 
 limiter = Limiter(key_func=get_remote_address)
@@ -186,19 +204,22 @@ limiter = Limiter(key_func=get_remote_address)
 # Cache
 # =============================================================================
 
+
 class DataCache:
-    """Simple TTL cache"""
+    """Simple TTL cache wrapper."""
+
     def __init__(self, maxsize: int = 1000, ttl: int = 300):
         self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
-    
+
     def get(self, key: str) -> Optional[Any]:
         return self.cache.get(key)
-    
-    def set(self, key: str, value: Any):
+
+    def set(self, key: str, value: Any) -> None:
         self.cache[key] = value
-    
-    def clear(self):
+
+    def clear(self) -> None:
         self.cache.clear()
+
 
 cache = DataCache(maxsize=settings.CACHE_MAXSIZE, ttl=settings.CACHE_TTL)
 
@@ -206,133 +227,166 @@ cache = DataCache(maxsize=settings.CACHE_MAXSIZE, ttl=settings.CACHE_TTL)
 # Google Sheets Service
 # =============================================================================
 
+
 class GoogleSheetsService:
-    """Google Sheets integration"""
-    
+    """Google Sheets integration using gspread (sync, wrapped in executor for async)."""
+
     def __init__(self, credentials_json: Optional[str] = None):
-        self.credentials_json = credentials_json or settings.GOOGLE_CREDENTIALS
-        self.client = None
+        self.credentials_json = credentials_json or settings.GOOGLE_CREDENTIALS_JSON
+        self.client: Optional[gspread.Client] = None
         if self.credentials_json:
             self._init_client()
-    
-    def _init_client(self):
-        """Initialize Google Sheets client"""
+        else:
+            logger.warning("Google Sheets credentials not configured; export will be disabled.")
+
+    def _init_client(self) -> None:
+        """Initialize Google Sheets client."""
         try:
             creds_dict = json.loads(self.credentials_json)
             creds = Credentials.from_service_account_info(creds_dict)
             self.client = gspread.authorize(creds)
-            logger.info("Google Sheets client initialized")
+            logger.info("Google Sheets client initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize Google Sheets: {e}")
-    
-    async def update_sheet(self, spreadsheet_id: str, sheet_name: str, data: List[List[Any]]) -> Dict:
-        """Update Google Sheet"""
+            logger.error(f"Failed to initialize Google Sheets client: {e}")
+            self.client = None
+
+    def _update_sheet_sync(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        data: List[List[Any]],
+    ) -> Dict[str, Any]:
+        """Synchronous part of sheet update (runs in executor)."""
+        if not self.client:
+            raise RuntimeError("Google Sheets client is not initialized")
+
+        spreadsheet = self.client.open_by_key(spreadsheet_id)
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=len(data) + 10, cols=len(data[0]) + 5)
+
+        worksheet.clear()
+        worksheet.update(data, value_input_option="USER_ENTERED")
+        return {"status": "success", "rows_updated": len(data)}
+
+    async def update_sheet(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        data: List[List[Any]],
+    ) -> Dict[str, Any]:
+        """Async wrapper to update Google Sheet without blocking event loop."""
         if not self.client:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Google Sheets not configured"
+                detail="Google Sheets not configured",
             )
-        
+
         try:
-            spreadsheet = self.client.open_by_key(spreadsheet_id)
-            worksheet = spreadsheet.worksheet(sheet_name)
-            worksheet.clear()
-            worksheet.update(data, value_input_option='USER_ENTERED')
-            
-            return {
-                "status": "success",
-                "rows_updated": len(data)
-            }
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                self._update_sheet_sync,
+                spreadsheet_id,
+                sheet_name,
+                data,
+            )
+            return result
         except Exception as e:
             logger.error(f"Google Sheets error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Google Sheets error: {str(e)}"
+                detail=f"Google Sheets error: {str(e)}",
             )
+
 
 # =============================================================================
 # HTTP Client
 # =============================================================================
 
+
 class HTTPClient:
-    """HTTP client with retry logic"""
-    
+    """HTTP client with simple retry logic using aiohttp."""
+
     def __init__(self):
-        self.session = None
-    
+        self.session: Optional[aiohttp.ClientSession] = None
+
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=30),
         )
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
-    
-    async def fetch_json(self, url: str, params: Optional[Dict] = None) -> Dict:
-        """Fetch JSON data"""
+
+    async def fetch_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Fetch JSON data from the given URL."""
+        if self.session is None:
+            raise RuntimeError("HTTPClient session is not initialized")
+
         try:
             async with self.session.get(url, params=params) as response:
                 if response.status == 200:
                     return await response.json()
-                else:
-                    raise HTTPException(
-                        status_code=response.status,
-                        detail=f"HTTP error {response.status}"
-                    )
+                raise HTTPException(
+                    status_code=response.status,
+                    detail=f"HTTP error {response.status}",
+                )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"HTTP request failed: {e}")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Request failed: {str(e)}"
+                detail=f"Request failed: {str(e)}",
             )
+
 
 # =============================================================================
 # Stock Data Service
 # =============================================================================
 
+
 class StockDataService:
-    """Stock data service"""
-    
-    def __init__(self):
+    """Stock data service: Argaam + mock + basic Tadawul HTML summary."""
+
+    def __init__(self) -> None:
         self.http_client = HTTPClient()
         self.sheets_service = GoogleSheetsService()
-    
-    async def get_symbol_data(self, symbol: str, use_cache: bool = True) -> Dict:
-        """Get symbol data"""
+
+    async def get_symbol_data(self, symbol: str, use_cache: bool = True) -> Dict[str, Any]:
+        """Get symbol data from Argaam or mock fallback."""
         cache_key = f"symbol:{symbol}"
-        
+
         if use_cache:
             cached = cache.get(cache_key)
             if cached:
                 logger.debug(f"Cache hit for {symbol}")
                 return cached
-        
+
         try:
-            # Try to fetch from Argaam
             if settings.ARGAAM_API_KEY:
                 async with self.http_client as client:
                     data = await client.fetch_json(
                         f"{settings.ARGAAM_BASE_URL}/v1.0/symbols/{symbol}",
-                        params={"apikey": settings.ARGAAM_API_KEY}
+                        params={"apikey": settings.ARGAAM_API_KEY},
                     )
             else:
-                # Fallback to mock data
                 data = self._generate_mock_data(symbol)
-            
+
             processed_data = self._process_data(data, symbol)
             cache.set(cache_key, processed_data)
-            
             return processed_data
-            
+
         except Exception as e:
-            logger.error(f"Failed to fetch {symbol}: {e}")
-            # Return mock data as fallback
-            return self._generate_mock_data(symbol)
-    
-    def _process_data(self, raw_data: Dict, symbol: str) -> Dict:
-        """Process raw data"""
+            logger.error(f"Failed to fetch {symbol}, using mock data: {e}")
+            return self._process_data(self._generate_mock_data(symbol), symbol)
+
+    def _process_data(self, raw_data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+        """Normalize raw data into a unified structure."""
         return {
             "symbol": symbol,
             "name_ar": raw_data.get("arabicName", f"شركة {symbol}"),
@@ -343,110 +397,114 @@ class StockDataService:
             "change": raw_data.get("change"),
             "change_percent": raw_data.get("changePercent"),
             "volume": raw_data.get("volume"),
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-    
-    def _generate_mock_data(self, symbol: str) -> Dict:
-        """Generate mock data for testing"""
-        import random
+
+    def _generate_mock_data(self, symbol: str) -> Dict[str, Any]:
+        """Generate mock data for testing / fallback."""
         return {
             "arabicName": f"شركة {symbol}",
             "englishName": f"Company {symbol}",
             "sector": random.choice(["البنوك", "البتروكيماويات", "الاتصالات"]),
-            "marketCap": random.uniform(10000000, 1000000000),
+            "marketCap": random.uniform(10_000_000, 1_000_000_000),
             "lastPrice": random.uniform(10, 500),
             "change": random.uniform(-10, 10),
             "changePercent": random.uniform(-5, 5),
-            "volume": random.randint(100000, 10000000)
+            "volume": random.randint(100_000, 10_000_000),
         }
-    
+
     async def get_market_summary(self) -> MarketData:
-        """Get market summary"""
+        """Get market summary from Tadawul or fallback dummy data."""
         cache_key = "market_summary"
         cached = cache.get(cache_key)
-        
         if cached:
             return MarketData(**cached)
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{settings.TADAWUL_BASE_URL}/market-summary",
-                    timeout=10
-                ) as response:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(f"{settings.TADAWUL_BASE_URL}/market-summary") as response:
                     if response.status == 200:
                         html = await response.text()
                         data = self._parse_market_summary(html)
                         cache.set(cache_key, data)
                         return MarketData(**data)
+                    logger.warning(f"Tadawul summary HTTP {response.status}, using fallback")
         except Exception as e:
-            logger.warning(f"Failed to fetch market summary: {e}")
-        
-        # Return default data
+            logger.warning(f"Failed to fetch Tadawul market summary, using fallback: {e}")
+
+        # Fallback default data
         data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "market_index": 11234.56,
             "market_change": 45.67,
             "market_change_percent": 0.41,
-            "turnover": 3456789012.34,
-            "volume": 123456789,
+            "turnover": 3_456_789_012.34,
+            "volume": 123_456_789,
             "advancers": 145,
             "decliners": 67,
-            "unchanged": 23
+            "unchanged": 23,
         }
         cache.set(cache_key, data)
         return MarketData(**data)
-    
-    def _parse_market_summary(self, html: str) -> Dict:
-        """Parse market summary from HTML"""
-        # Simplified parser - implement actual parsing as needed
+
+    def _parse_market_summary(self, html: str) -> Dict[str, Any]:
+        """
+        Parse market summary from Tadawul HTML.
+
+        NOTE: Currently returns dummy values. You can implement real parsing
+        with BeautifulSoup here if you want live HTML scraping.
+        """
+        # from bs4 import BeautifulSoup
+        # soup = BeautifulSoup(html, "html.parser")
+        # TODO: extract real values from soup
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "market_index": 11234.56,
             "market_change": 45.67,
             "market_change_percent": 0.41,
-            "turnover": 3456789012.34,
-            "volume": 123456789,
+            "turnover": 3_456_789_012.34,
+            "volume": 123_456_789,
             "advancers": 145,
             "decliners": 67,
-            "unchanged": 23
+            "unchanged": 23,
         }
 
+
 # =============================================================================
-# Application Setup
+# Application Setup (lifespan)
 # =============================================================================
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    # Startup
+    """Application lifespan manager (startup/shutdown)."""
     logger.info(f"Starting {settings.APP_NAME} v{settings.VERSION}")
-    
+
     # Initialize services
     app.state.stock_service = StockDataService()
-    
-    # Pre-cache market summary
+
+    # Pre-cache market summary (non-blocking if it fails)
     try:
         await app.state.stock_service.get_market_summary()
-        logger.info("Initial data loaded")
+        logger.info("Initial market summary pre-loaded")
     except Exception as e:
-        logger.warning(f"Failed to load initial data: {e}")
-    
+        logger.warning(f"Failed to pre-load initial data: {e}")
+
     yield
-    
+
     # Shutdown
-    logger.info("Shutting down")
+    logger.info("Shutting down legacy microservice")
     cache.clear()
 
-# Create FastAPI app
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description="Tadawul stock data bridge",
-    lifespan=lifespan
+    description="Legacy Tadawul stock data bridge (simple Argaam/Tadawul service)",
+    lifespan=lifespan,
 )
 
-# Add middleware
+# Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -454,106 +512,115 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1_000)
 
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-# Store limiter
+# Store limiter for potential future use
 app.state.limiter = limiter
 
 # =============================================================================
-# Middleware
+# HTTP Middleware
 # =============================================================================
+
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """Add process time header"""
+    """Add process time header for simple performance insight."""
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
+    response.headers["X-Process-Time"] = f"{process_time:.6f}"
     return response
+
 
 # =============================================================================
 # Endpoints
 # =============================================================================
 
+
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    """Root endpoint."""
     return {
         "service": settings.APP_NAME,
         "version": settings.VERSION,
         "status": "running",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
 
 @app.get("/health")
 async def health():
-    """Health check"""
+    """Health check."""
     return {
         "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
 
 @app.get("/api/v1/symbols/{symbol}", response_model=StockSymbol)
 async def get_symbol(
     request: Request,
     symbol: str,
-    use_cache: bool = Query(True, description="Use cached data")
+    use_cache: bool = Query(True, description="Use cached data"),
 ):
-    """Get symbol data"""
-    service = request.app.state.stock_service
+    """Get single symbol data."""
+    service: StockDataService = request.app.state.stock_service
     data = await service.get_symbol_data(symbol, use_cache)
     return StockSymbol(**data)
 
+
 @app.get("/api/v1/market/summary", response_model=MarketData)
 async def get_market_summary(request: Request):
-    """Get market summary"""
-    service = request.app.state.stock_service
+    """Get market summary."""
+    service: StockDataService = request.app.state.stock_service
     data = await service.get_market_summary()
     return data
+
 
 @app.get("/api/v1/symbols", response_model=List[StockSymbol])
 async def get_multiple_symbols(
     request: Request,
-    symbols: str = Query(..., description="Comma-separated symbols"),
-    use_cache: bool = Query(True, description="Use cached data")
+    symbols: str = Query(..., description="Comma-separated symbols (max 10)"),
+    use_cache: bool = Query(True, description="Use cached data"),
 ):
-    """Get multiple symbols"""
-    symbol_list = [s.strip() for s in symbols.split(",")]
-    service = request.app.state.stock_service
-    
-    results = []
-    for symbol in symbol_list[:10]:  # Limit to 10
+    """Get multiple symbols."""
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+    symbol_list = symbol_list[:10]  # Safety cap
+
+    service: StockDataService = request.app.state.stock_service
+
+    results: List[StockSymbol] = []
+    for symbol in symbol_list:
         try:
             data = await service.get_symbol_data(symbol, use_cache)
             results.append(StockSymbol(**data))
         except Exception as e:
             logger.warning(f"Failed to fetch {symbol}: {e}")
-    
+
     return results
+
 
 @app.post("/api/v1/export/to-sheets")
 async def export_to_sheets(
     request: Request,
     spreadsheet_id: str,
     sheet_name: str = "StockData",
-    symbols: Optional[str] = None
+    symbols: Optional[str] = None,
 ):
-    """Export to Google Sheets"""
-    service = request.app.state.stock_service
-    
-    # Get symbols to export
+    """Export simple symbol snapshot to Google Sheets."""
+    service: StockDataService = request.app.state.stock_service
+
+    # Determine symbols
     if symbols:
-        symbol_list = [s.strip() for s in symbols.split(",")]
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     else:
+        # Default sample symbols (can be changed)
         symbol_list = ["1211", "2222", "1180"]
-    
-    # Fetch data
-    all_data = []
+
+    all_data: List[List[Any]] = []
     for symbol in symbol_list:
         try:
-            data = await service.get_symbol_data(symbol)
+            data = await service.get_symbol_data(symbol, use_cache=True)
             row = [
                 data.get("symbol", ""),
                 data.get("name_en", ""),
@@ -561,62 +628,55 @@ async def export_to_sheets(
                 data.get("change", 0),
                 data.get("change_percent", 0),
                 data.get("volume", 0),
-                datetime.now(timezone.utc).isoformat()
+                data.get("timestamp", datetime.now(timezone.utc).isoformat()),
             ]
             all_data.append(row)
         except Exception as e:
-            logger.error(f"Failed to fetch {symbol}: {e}")
-    
+            logger.error(f"Failed to fetch {symbol} during export: {e}")
+
     if not all_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No data to export"
+            detail="No data to export",
         )
-    
-    # Add headers
+
+    # Headers
     headers = [["Symbol", "Name", "Price", "Change", "Change%", "Volume", "Timestamp"]]
     data_to_export = headers + all_data
-    
-    # Update sheet
+
     result = await service.sheets_service.update_sheet(spreadsheet_id, sheet_name, data_to_export)
-    
-    return {
-        "status": "success",
-        "exported": len(all_data),
-        "details": result
-    }
+
+    return {"status": "success", "exported": len(all_data), "details": result}
+
 
 @app.get("/api/v1/export/csv/{symbol}")
 async def export_csv(symbol: str):
-    """Export to CSV"""
-    service = app.state.stock_service
-    data = await service.get_symbol_data(symbol)
-    
-    # Create DataFrame
+    """Export a single symbol snapshot as CSV."""
+    service: StockDataService = app.state.stock_service
+    data = await service.get_symbol_data(symbol, use_cache=True)
+
     df = pd.DataFrame([data])
-    
-    # Select columns
+
     columns = ["symbol", "name_en", "last_price", "change", "change_percent", "volume", "timestamp"]
     df = df[[col for col in columns if col in df.columns]]
-    
-    # Generate CSV
+
     csv_data = df.to_csv(index=False)
-    
+
     return StreamingResponse(
         iter([csv_data]),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": f"attachment; filename={symbol}_data.csv"
-        }
+        headers={"Content-Disposition": f"attachment; filename={symbol}_data.csv"},
     )
+
 
 # =============================================================================
 # Error Handlers
 # =============================================================================
 
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """HTTP exception handler"""
+    """HTTP exception handler."""
     logger.error(f"HTTP error: {exc.status_code} - {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
@@ -624,13 +684,14 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "error": True,
             "code": exc.status_code,
             "message": exc.detail,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
     )
+
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """General exception handler"""
+    """General exception handler."""
     logger.error(f"Unexpected error: {exc}")
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -638,23 +699,23 @@ async def general_exception_handler(request: Request, exc: Exception):
             "error": True,
             "code": 500,
             "message": "Internal server error",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
+
 # =============================================================================
-# Run Application
+# Run Application (local dev)
 # =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    
-    logger.info(f"Starting server on 0.0.0.0:8000")
-    
+
+    logger.info("Starting legacy server on 0.0.0.0:8000")
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=8000,
         reload=True,
-        log_level="info"
+        log_level="info",
     )
