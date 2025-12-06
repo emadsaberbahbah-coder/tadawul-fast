@@ -1,18 +1,20 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – v1.3
+UNIFIED DATA & ANALYSIS ENGINE – v1.4
 Production-ready with real API integrations
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
-UPDATES v1.3:
+UPDATES v1.4:
 1. REAL API INTEGRATION: Connects to your FastAPI backend instead of mock data
-2. ALL CONFIGURED PROVIDERS: Uses ENABLED_PROVIDERS from environment
-3. PROPER AUTH: Uses APP_TOKEN / BACKUP_APP_TOKEN for authentication
-4. EODHD PRIMARY: Prioritizes EODHD for Saudi (.SR) symbols via paid subscription
-5. ERROR HANDLING: Comprehensive retry and fallback logic
-6. COMPATIBILITY: Adds properties expected by enriched_quote.py
-7. CLEAN API: Exposes UnifiedQuote, DataQualityScore, ProviderSource, get_enriched_quote, get_enriched_quotes
+2. PROVIDER ALIGNMENT: Matches current /v1/quote payload (quotes[], not symbols[])
+3. FLEXIBLE FIELD MAPPING: Handles multiple key variants (price/open/high/low etc.)
+4. PROPER AUTH: Uses APP_TOKEN / BACKUP_APP_TOKEN for authentication (query + header)
+5. EODHD PRIMARY: Prioritizes EODHD for Saudi (.SR) symbols via paid subscription
+6. ERROR HANDLING: Comprehensive retry and fallback logic
+7. COMPATIBILITY: Adds properties expected by enriched_quote.py
+8. CLEAN API: Exposes UnifiedQuote, DataQualityScore, ProviderSource,
+   get_enriched_quote, get_enriched_quotes
 """
 
 from __future__ import annotations
@@ -42,10 +44,17 @@ BACKEND_BASE_URL = os.getenv(
 )
 APP_TOKEN = os.getenv("APP_TOKEN", "")
 BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "")
-ENABLED_PROVIDERS = os.getenv(
+
+# Enabled providers (clean list, no empty strings)
+_enabled_raw = os.getenv(
     "ENABLED_PROVIDERS", "alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp"
-).split(",")
+)
+ENABLED_PROVIDERS: List[str] = [
+    p.strip() for p in _enabled_raw.split(",") if p.strip()
+]
+
 PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "eodhd")
+
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
@@ -177,7 +186,7 @@ class HTTPClient:
             cls._session = aiohttp.ClientSession(
                 timeout=timeout,
                 headers={
-                    "User-Agent": "TadawulDataEngine/1.3",
+                    "User-Agent": "TadawulDataEngine/1.4",
                     "Accept": "application/json",
                 },
             )
@@ -237,33 +246,59 @@ class HTTPClient:
 async def fetch_from_backend_api(symbol: str, endpoint: str = "quote") -> Dict[str, Any]:
     """
     Fetch data from your main FastAPI backend.
+
     Assumes there is `/v1/quote?tickers=...&token=...` that returns
-    a payload with `"symbols": [ { "ticker": "...", ... }, ... ]`.
+    a payload with `"quotes": [ { "ticker": "...", ... }, ... ]`.
+
+    This function is the main bridge between Tadawul Fast Bridge
+    and the unified data engine – if /v1/quote changes, update here.
     """
     if not BACKEND_BASE_URL or not APP_TOKEN:
-        logger.warning("Backend URL or APP_TOKEN not configured for fetch_from_backend_api")
+        logger.warning(
+            "Backend URL or APP_TOKEN not configured for fetch_from_backend_api"
+        )
         return {}
 
     url = f"{BACKEND_BASE_URL.rstrip('/')}/v1/{endpoint}"
-    params = {
-        "tickers": symbol,
-        "token": APP_TOKEN,
-    }
 
-    # Try with primary token
-    data = await HTTPClient.request_with_retry("GET", url, params)
-    # Fallback to backup token if available
-    if not data and BACKUP_APP_TOKEN:
-        params["token"] = BACKUP_APP_TOKEN
-        data = await HTTPClient.request_with_retry("GET", url, params)
+    def _build_params(token: str) -> Dict[str, Any]:
+        return {
+            "tickers": symbol,
+            "token": token,
+        }
 
-    if not data or "symbols" not in data:
+    # First try with primary APP_TOKEN
+    params = _build_params(APP_TOKEN)
+    headers = {"X-APP-TOKEN": APP_TOKEN} if APP_TOKEN else None
+    data = await HTTPClient.request_with_retry("GET", url, params, headers=headers)
+
+    # Fallback to BACKUP_APP_TOKEN if primary fails or response is invalid
+    if (not data or ("quotes" not in data and "symbols" not in data)) and BACKUP_APP_TOKEN:
+        params = _build_params(BACKUP_APP_TOKEN)
+        headers = {"X-APP-TOKEN": BACKUP_APP_TOKEN}
+        data = await HTTPClient.request_with_retry("GET", url, params, headers=headers)
+
+    if not data:
         return {}
 
-    for quote_data in data.get("symbols", []):
-        if quote_data.get("ticker", "").upper() == symbol.upper():
+    # Support both legacy "symbols" and current "quotes" keys
+    items = data.get("quotes") or data.get("symbols") or []
+
+    if not isinstance(items, list):
+        logger.warning(f"Unexpected quote payload format for {symbol}: {data}")
+        return {}
+
+    for quote_data in items:
+        ticker = (
+            quote_data.get("ticker")
+            or quote_data.get("symbol")
+            or ""
+        ).upper()
+        if ticker == symbol.upper():
             return _normalize_backend_quote(quote_data, symbol)
 
+    # If we reach here, nothing matched exactly
+    logger.debug(f"No matching ticker entry found for {symbol} in backend payload.")
     return {}
 
 
@@ -293,47 +328,101 @@ async def fetch_from_eodhd_direct(symbol: str) -> Dict[str, Any]:
 async def fetch_fundamentals_from_backend(symbol: str) -> Dict[str, Any]:
     """
     Fetch fundamentals data from backend /v1/fundamentals endpoint.
-    This is a secondary provider to enrich price snapshots with structural data.
+
+    Expected shape (example):
+    {
+      "status": "OK",
+      "data": {
+         "market_cap": ...,
+         "eps_ttm": ...,
+         "pe_ttm": ...,
+         ...
+      }
+    }
     """
     if not BACKEND_BASE_URL or not APP_TOKEN:
         logger.debug("Backend URL or APP_TOKEN not configured for fundamentals")
         return {}
 
     url = f"{BACKEND_BASE_URL.rstrip('/')}/v1/fundamentals"
-    params = {
-        "symbol": symbol,
-        "token": APP_TOKEN,
-    }
 
-    data = await HTTPClient.request_with_retry("GET", url, params)
+    def _build_params(token: str) -> Dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "token": token,
+        }
+
+    params = _build_params(APP_TOKEN)
+    headers = {"X-APP-TOKEN": APP_TOKEN} if APP_TOKEN else None
+    data = await HTTPClient.request_with_retry("GET", url, params, headers=headers)
+
+    if (not data or data.get("status") != "OK") and BACKUP_APP_TOKEN:
+        params = _build_params(BACKUP_APP_TOKEN)
+        headers = {"X-APP-TOKEN": BACKUP_APP_TOKEN}
+        data = await HTTPClient.request_with_retry("GET", url, params, headers=headers)
+
     if data and data.get("status") == "OK":
-        return data.get("data", {})
+        fundamentals = data.get("data") or {}
+        # These keys already use unified names in many backends; we can return as-is
+        return fundamentals
 
     return {}
 
 
+# ----------------------------------------------------------------------
+# NORMALIZATION HELPERS
+# ----------------------------------------------------------------------
+
+
 def _normalize_backend_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """Normalize backend API response to UnifiedQuote-compatible dict."""
+    """
+    Normalize backend API response to UnifiedQuote-compatible dict.
+
+    This function maps your /v1/quote JSON (quotes[]) to the UnifiedQuote fields.
+    It tries multiple key variants to avoid missing data.
+    """
     now = datetime.now(timezone.utc)
+
+    # Safe getters with fallbacks
+    def g(*keys: str) -> Any:
+        for k in keys:
+            if k in data and data[k] is not None:
+                return data[k]
+        return None
+
+    # 52-week fields – backend might use these kinds of names
+    fifty_two_high = g("52_week_high", "fifty_two_week_high", "week_52_high")
+    fifty_two_low = g("52_week_low", "fifty_two_week_low", "week_52_low")
 
     result: Dict[str, Any] = {
         "symbol": symbol,
-        "price": data.get("price"),
-        "prev_close": data.get("previous_close"),
-        "open": data.get("open_price"),
-        "high": data.get("high_price"),
-        "low": data.get("low_price"),
-        "volume": data.get("volume"),
-        "market_cap": data.get("market_cap"),
-        "currency": data.get("currency"),
-        "exchange": data.get("exchange"),
-        "pe_ttm": data.get("pe_ratio"),
-        "eps_ttm": data.get("eps"),
-        "pb": data.get("pb_ratio"),
-        "roe": data.get("roe"),
-        "last_updated_utc": data.get("as_of") or now,
+        "name": g("name", "company_name"),
+        "price": g("price", "last_price", "close"),
+        "prev_close": g("previous_close", "prev_close", "prior_close"),
+        "open": g("open", "open_price"),
+        "high": g("high", "high_price"),
+        "low": g("low", "low_price"),
+        "volume": g("volume", "vol"),
+        "market_cap": g("market_cap", "marketCapitalization"),
+        "currency": g("currency", "currency_code"),
+        "exchange": g("exchange", "exchange_short_name", "market"),
+        "fifty_two_week_high": fifty_two_high,
+        "fifty_two_week_low": fifty_two_low,
+        # Fundamentals – try multiple variants
+        "eps_ttm": g("eps_ttm", "eps"),
+        "pe_ttm": g("pe_ttm", "pe_ratio", "pe"),
+        "pb": g("pb", "pb_ratio", "price_to_book"),
+        "dividend_yield": g("dividend_yield", "div_yield"),
+        "roe": g("roe", "return_on_equity"),
+        "roa": g("roa", "return_on_assets"),
+        "debt_to_equity": g("debt_to_equity", "de_ratio"),
+        "profit_margin": g("profit_margin", "net_margin"),
+        "operating_margin": g("operating_margin", "op_margin"),
+        "revenue_growth_yoy": g("revenue_growth_yoy", "revenue_growth"),
+        "net_income_growth_yoy": g("net_income_growth_yoy", "net_income_growth"),
+        "last_updated_utc": g("as_of", "last_updated_utc") or now,
         "__source__": QuoteSourceInfo(
-            provider=data.get("provider", "backend_api"),
+            provider=g("provider") or "backend_api",
             timestamp=now,
             fields=[k for k in data.keys() if data.get(k) is not None],
         ),
@@ -355,17 +444,26 @@ def _normalize_eodhd_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         except (ValueError, TypeError):
             pass
 
+    def g(*keys: str) -> Any:
+        for k in keys:
+            if k in data and data[k] is not None:
+                return data[k]
+        return None
+
     result: Dict[str, Any] = {
         "symbol": symbol,
-        "price": data.get("close") or data.get("price"),
-        "prev_close": data.get("previousClose") or data.get("previous_close"),
-        "open": data.get("open"),
-        "high": data.get("high"),
-        "low": data.get("low"),
-        "volume": data.get("volume"),
-        "market_cap": data.get("market_cap") or data.get("marketCap"),
-        "currency": data.get("currency") or data.get("currencyCode"),
-        "exchange": data.get("exchange") or data.get("exchange_short_name"),
+        "name": g("name", "code"),
+        "price": g("close", "price"),
+        "prev_close": g("previousClose", "previous_close"),
+        "open": g("open"),
+        "high": g("high"),
+        "low": g("low"),
+        "volume": g("volume"),
+        "market_cap": g("market_cap", "marketCap"),
+        "currency": g("currency", "currencyCode"),
+        "exchange": g("exchange", "exchange_short_name"),
+        "fifty_two_week_high": g("fifty_two_week_high", "52_week_high"),
+        "fifty_two_week_low": g("fifty_two_week_low", "52_week_low"),
         "last_updated_utc": timestamp,
         "__source__": QuoteSourceInfo(
             provider="eodhd_direct",
@@ -384,13 +482,12 @@ def _normalize_eodhd_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
 PROVIDER_REGISTRY: List[Tuple[str, Any]] = []
 
-# Build provider list based on PRIMARY_PROVIDER and ENABLED_PROVIDERS
+# EODHD first for KSA when configured, then backend
 if PRIMARY_PROVIDER == "eodhd":
     PROVIDER_REGISTRY.append(("EODHD_DIRECT", fetch_from_eodhd_direct))
     PROVIDER_REGISTRY.append(("BACKEND_API", fetch_from_backend_api))
 elif "tadawul_fast_bridge" in ENABLED_PROVIDERS:
-    # If in future you add a dedicated tadawul_fast_bridge provider,
-    # you can redirect to a different adapter here.
+    # Future hook for a dedicated tadawul_fast_bridge adapter
     PROVIDER_REGISTRY.append(("BACKEND_API", fetch_from_backend_api))
 else:
     PROVIDER_REGISTRY.append(("BACKEND_API", fetch_from_backend_api))
@@ -438,6 +535,12 @@ def _calculate_change_fields(data: Dict[str, Any]) -> None:
 
 
 def _assess_data_quality(data: Dict[str, Any]) -> Tuple[DataQualityLevel, List[str]]:
+    """
+    Simple completeness scoring.
+
+    NOTE: This only measures what providers returned.
+    If providers return nulls (no fundamentals), quality will still be low.
+    """
     required_price_fields = ["price", "prev_close", "volume"]
     important_fundamentals = ["market_cap", "eps_ttm", "pe_ttm", "pb"]
 
@@ -640,7 +743,7 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     if symbol.endswith(".SR") and not raw_results:
         logger.warning(
             f"[DataEngine] No data for Saudi symbol {symbol}. "
-            f"Check EODHD subscription & /real-time endpoint."
+            f"Check EODHD subscription & /real-time endpoint, and /v1/quote config."
         )
         return UnifiedQuote(
             symbol=symbol,
@@ -649,7 +752,8 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
             data_quality="MISSING",
             data_gaps=["No data from EODHD / backend for Saudi symbol"],
             sources=[],
-            notes=f"Saudi symbol {symbol} likely requires active EODHD subscription.",
+            notes=f"Saudi symbol {symbol} likely requires active EODHD subscription "
+            f"and correct backend mapping.",
         )
 
     # 3) No data at all
@@ -764,7 +868,7 @@ async def test_engine() -> None:
     """Test the data engine with sample symbols."""
     test_symbols = ["AAPL", "MSFT", "2222.SR", "1180.SR"]
 
-    print("Testing Data Engine v1.3...")
+    print("Testing Data Engine v1.4...")
     print("=" * 60)
 
     for symbol in test_symbols:
@@ -773,7 +877,9 @@ async def test_engine() -> None:
             quote = await get_enriched_quote(symbol)
             print(f"  Status: {quote.data_quality}")
             print(f"  Price:  {quote.price}")
-            print(f"  Change: {quote.change_pct if quote.change_pct is not None else 'N/A'}")
+            print(
+                f"  Change: {quote.change_pct if quote.change_pct is not None else 'N/A'}"
+            )
             print(f"  Score:  {quote.opportunity_score}")
             print(f"  Sources: {[s.provider for s in quote.sources]}")
         except Exception as e:
