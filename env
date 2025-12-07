@@ -3,11 +3,12 @@ env.py
 ------------------------------------------------------------
 Centralized environment configuration for Tadawul Fast Bridge.
 
-- Loads all key config from environment variables (Render, .env, etc.)
+- Loads all key config from environment variables (Render, .env, env.local, etc.)
 - Provides:
-    • settings: Settings          -> main config object
+    • settings: Settings          -> main config object (Pydantic)
     • Convenience constants       -> APP_ENV, APP_TOKEN, ENABLED_PROVIDERS, etc.
-- Integrated with:
+
+Integrated with:
     • core.data_engine_v2 / core.data_engine
     • routes:
         - routes.enriched_quote
@@ -37,11 +38,14 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-# Optional: load from .env during local development (safe if python-dotenv absent)
+# Optional: load from .env and env.local during local development
 try:  # pragma: no cover - optional dependency
     from dotenv import load_dotenv
 
+    # Standard .env (if present)
     load_dotenv()
+    # Optional env.local (your local dev file – safe to ignore if missing)
+    load_dotenv("env.local")
 except Exception:
     pass
 
@@ -238,7 +242,6 @@ class Settings(BaseModel):
 
     # ------------------------------------------------------------------
     # 9-Page Dashboard – Sheet Name configuration
-    # (all can be overridden via env; these are just safe defaults)
     # ------------------------------------------------------------------
     ksa_sheet_name: str = Field(
         default=os.getenv("SHEET_KSA_TADAWUL", "KSA_Tadawul"),
@@ -490,6 +493,9 @@ SHEET_INSIGHTS_ANALYSIS: str = settings.insights_sheet_name
 SHEET_INVESTMENT_ADVISOR: str = settings.advisor_sheet_name
 SHEET_ECONOMIC_CALENDAR: str = settings.economic_calendar_sheet_name
 SHEET_INVESTMENT_INCOME: str = settings.income_statement_sheet_name
+
+# Also expose a dict for convenience (e.g. logging/UI)
+DASHBOARD_SHEET_NAMES: Dict[str, str] = settings.dashboard_sheet_names
 
 # Misc
 ENABLE_CORS_ALL_ORIGINS: bool = settings.enable_cors_all_origins
