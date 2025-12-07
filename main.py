@@ -54,74 +54,93 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 # ------------------------------------------------------------
-# Configuration import (env.py) with safe fallback to os.environ
+# Configuration import (env.py) with safe, non-crashing fallback
 # ------------------------------------------------------------
 
 try:
-    # Preferred path: use your dedicated env.py module
-    from env import (
-        APP_NAME,
-        APP_VERSION,
-        APP_TOKEN,
-        BACKUP_APP_TOKEN,
-        BACKEND_BASE_URL,
-        ENABLE_CORS_ALL_ORIGINS,
-        HAS_SECURE_TOKEN,
-        GOOGLE_SHEETS_CREDENTIALS_RAW,
-        GOOGLE_APPS_SCRIPT_BACKUP_URL,
-        settings,
-    )
+    import env as _env_mod  # type: ignore
 except Exception:  # pragma: no cover - defensive fallback
-    logging.warning(
-        "env.py not found or failed to import. "
-        "Falling back to environment variables directly."
-    )
+    _env_mod = None  # type: ignore
 
-    @dataclass
-    class _Settings:
-        app_env: str = os.getenv("APP_ENV", "production")
-        default_spreadsheet_id: Optional[str] = os.getenv(
-            "DEFAULT_SPREADSHEET_ID", None
-        )
 
-    settings = _Settings()
+@dataclass
+class _SettingsFallback:
+    app_env: str = os.getenv("APP_ENV", "production")
+    default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
 
-    APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
-    APP_VERSION: str = os.getenv("APP_VERSION", "4.0.0")
-    APP_TOKEN: str = os.getenv("APP_TOKEN", "")
-    BACKUP_APP_TOKEN: str = os.getenv("BACKUP_APP_TOKEN", "")
-    BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", "")
 
-    def _bool(name: str, default: bool = False) -> bool:
-        raw = os.getenv(name)
-        if raw is None:
+# Prefer settings from env.py, otherwise use fallback dataclass
+settings = getattr(_env_mod, "settings", _SettingsFallback())
+
+
+def _get_env_attr(name: str, default: str = "") -> str:
+    """
+    Helper to read config from env.py if available, otherwise from OS env vars.
+    """
+    if _env_mod is not None and hasattr(_env_mod, name):
+        value = getattr(_env_mod, name)
+        if isinstance(value, str):
+            return value
+        # For non-string, just cast to str if needed
+        try:
+            return str(value)
+        except Exception:
             return default
-        return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+    return os.getenv(name, default)
 
-    ENABLE_CORS_ALL_ORIGINS: bool = _bool("ENABLE_CORS_ALL_ORIGINS", True)
-    HAS_SECURE_TOKEN: bool = bool(APP_TOKEN or BACKUP_APP_TOKEN)
 
-    GOOGLE_SHEETS_CREDENTIALS_RAW: str = os.getenv(
-        "GOOGLE_SHEETS_CREDENTIALS", ""
-    )
-    GOOGLE_APPS_SCRIPT_BACKUP_URL: str = os.getenv(
-        "GOOGLE_APPS_SCRIPT_BACKUP_URL", ""
-    )
+def _get_bool(name: str, default: bool = False) -> bool:
+    """
+    Helper to read a boolean from env.py or environment variables.
+    """
+    if _env_mod is not None and hasattr(_env_mod, name):
+        val = getattr(_env_mod, name)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on", "y")
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+APP_NAME: str = _get_env_attr("APP_NAME", "tadawul-fast-bridge")
+APP_VERSION: str = _get_env_attr("APP_VERSION", "4.0.0")
+APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
+BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
+BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "")
+
+ENABLE_CORS_ALL_ORIGINS: bool = _get_bool("ENABLE_CORS_ALL_ORIGINS", True)
+
+# For /v1/status service flags
+GOOGLE_SHEETS_CREDENTIALS_RAW: str = getattr(
+    _env_mod, "GOOGLE_SHEETS_CREDENTIALS_RAW", os.getenv("GOOGLE_SHEETS_CREDENTIALS", "")
+)
+GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr("GOOGLE_APPS_SCRIPT_BACKUP_URL", "")
+
+# KSA / Argaam gateway visibility in /v1/status
+ARGAAM_GATEWAY_URL: str = _get_env_attr("ARGAAM_GATEWAY_URL", "")
+
+# HAS_SECURE_TOKEN: if env.py defines it, use that; otherwise derive from tokens
+HAS_SECURE_TOKEN: bool = getattr(
+    _env_mod, "HAS_SECURE_TOKEN", bool(APP_TOKEN or BACKUP_APP_TOKEN)
+)
 
 # ------------------------------------------------------------
 # Routers & legacy services
 # ------------------------------------------------------------
 
-# Routers:
-# - enriched_quote, ai_analysis, advanced_analysis live under routes/
-# - routes_argaam.py is at project root in your repo
-
-# Always import the core routers
+# Core routers:
+# - routes/enriched_quote.py
+# - routes/ai_analysis.py
 from routes import enriched_quote, ai_analysis  # type: ignore
 
-# advanced_analysis is optional – don't crash the app if it's missing
-try:  # pragma: no cover - importing optional router
+# advanced_analysis is optional – if not present, we only disable /v1/advanced*
+try:  # pragma: no cover - optional router import
     from routes import advanced_analysis  # type: ignore
+
     _ADVANCED_ANALYSIS_AVAILABLE = True
 except Exception as _advanced_exc:  # pragma: no cover - defensive
     logging.error(
@@ -132,8 +151,10 @@ except Exception as _advanced_exc:  # pragma: no cover - defensive
     advanced_analysis = None  # type: ignore
     _ADVANCED_ANALYSIS_AVAILABLE = False
 
+# KSA / Argaam gateway routes
 import routes_argaam  # type: ignore
 
+# Legacy service abstraction
 from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
 # ------------------------------------------------------------
@@ -154,7 +175,6 @@ START_TIME = time.time()
 # ------------------------------------------------------------
 
 try:
-    # Newer env.py version exposes this; if not, we fall back to None.
     DEFAULT_SPREADSHEET_ID: Optional[str] = getattr(
         settings, "default_spreadsheet_id", None
     )
@@ -189,7 +209,7 @@ async def require_app_token(
     If no APP_TOKEN/BACKUP_APP_TOKEN is configured, this is a no-op.
     """
     if not HAS_SECURE_TOKEN:
-        # No token configured -> do not enforce
+        # No token configured -> no enforcement (development mode)
         return None
 
     token: Optional[str] = None
@@ -198,7 +218,7 @@ async def require_app_token(
     if credentials and credentials.scheme.lower() == "bearer":
         token = (credentials.credentials or "").strip()
 
-    # 2) X-APP-TOKEN header
+    # 2) X-APP-TOKEN header (for Google Apps Script / PowerShell, etc.)
     if not token:
         header_token = request.headers.get("X-APP-TOKEN") or request.headers.get(
             "x-app-token"
@@ -253,7 +273,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Attach limiter
+# Attach rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -279,7 +299,6 @@ else:
 # Middleware: GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-
 # ------------------------------------------------------------
 # Include routers (protected by token if configured)
 # ------------------------------------------------------------
@@ -290,13 +309,13 @@ app.include_router(
     dependencies=[Depends(require_app_token)],
 )
 
-# AI-based analysis (narrative, scores, AI recommendations)
+# AI-based analysis (scores + recommendation)
 app.include_router(
     ai_analysis.router,
     dependencies=[Depends(require_app_token)],
 )
 
-# Advanced analysis / risk engine (extra KPIs, risk buckets, etc.)
+# Advanced analysis / risk engine (extra KPIs, risk buckets, etc.) – optional
 if _ADVANCED_ANALYSIS_AVAILABLE and advanced_analysis is not None:
     app.include_router(
         advanced_analysis.router,  # type: ignore[attr-defined]
@@ -313,7 +332,6 @@ app.include_router(
     routes_argaam.router,
     dependencies=[Depends(require_app_token)],
 )
-
 
 # ------------------------------------------------------------
 # Root / Health / Status
@@ -351,8 +369,9 @@ async def root() -> str:
           <li><code>/v1/argaam/health</code> (KSA / Argaam gateway)</li>
         </ul>
         <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
-          KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.
-          Global (non-.SR) tickers are handled via EODHD + FMP + Yahoo.
+          KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.<br/>
+          Global (non-.SR) tickers are handled via EODHD + FMP + Yahoo
+          through the unified data engine.
         </p>
       </body>
     </html>
@@ -379,7 +398,7 @@ async def basic_health() -> Dict[str, Any]:
 @app.get("/v1/status")
 async def status_endpoint(request: Request) -> Dict[str, Any]:
     """
-    Detailed status used by your PowerShell / integration tests.
+    Detailed status used by PowerShell / integration tests and Sheets hooks.
 
     Example:
         GET /v1/status
@@ -412,6 +431,17 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "has_default_spreadsheet": bool(DEFAULT_SPREADSHEET_ID),
     }
 
+    # For Apps Script / Google Sheets integration – single source of truth
+    sheet_endpoints = {
+        "enriched": "/v1/enriched/sheet-rows",
+        "ai_analysis": "/v1/analysis/sheet-rows",
+        "advanced_analysis": (
+            "/v1/advanced/sheet-rows" if _ADVANCED_ANALYSIS_AVAILABLE else None
+        ),
+        "legacy": "/v1/legacy/sheet-rows",
+        "ksa_argaam": "/v1/argaam/sheet-rows",
+    }
+
     return {
         "status": "operational",
         "version": APP_VERSION,
@@ -422,11 +452,17 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "services": services,
         "auth": auth,
         "sheets": sheets_meta,
+        "sheet_endpoints": sheet_endpoints,
         "advanced_analysis_enabled": _ADVANCED_ANALYSIS_AVAILABLE,
+        "ksa_argaam_gateway": {
+            "configured": bool(ARGAAM_GATEWAY_URL),
+            "gateway_url_prefix": (ARGAAM_GATEWAY_URL or "")[:80] or None,
+        },
         "notes": [
             "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
             "No direct EODHD calls are made for KSA inside this main application.",
             "Global (non-.SR) tickers use EODHD + FMP + Yahoo via core.data_engine / core.data_engine_v2.",
+            "Google Sheets 9-page dashboard should use the /sheet-rows endpoints listed in 'sheet_endpoints'.",
         ],
     }
 
@@ -460,7 +496,7 @@ async def legacy_quote_endpoint(
     _token: Optional[str] = Depends(require_app_token),
 ) -> JSONResponse:
     """
-    Legacy quote endpoint (used by your early PowerShell scripts).
+    Legacy quote endpoint (used by early PowerShell tests).
 
     Example:
         GET /v1/quote?tickers=AAPL
@@ -488,7 +524,7 @@ async def legacy_sheet_rows_endpoint(
 
     Used by:
         - Google Apps Script (UrlFetchApp)
-        - google_sheets_service (legacy layout for 9 pages if needed)
+        - google_sheets_service (legacy layout for any page if needed)
     """
     payload = await build_legacy_sheet_payload(body.tickers or [])
     return LegacyQuoteSheetResponse(
