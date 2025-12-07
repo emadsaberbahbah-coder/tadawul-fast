@@ -5,10 +5,10 @@ Enriched Quotes Router (v2.0+)
 
 - Uses core.data_engine_v2.DataEngine as the primary backend.
 - If not available, falls back to core.data_engine.DataEngine.
-- If neither exists, uses a safe stub engine so the API still runs.
+- If neither exists or does not expose DataEngine, uses a safe stub engine
+  so the API still runs and returns MISSING data instead of crashing.
 
-KSA (.SR) tickers and global tickers are handled by the engine.
-Provides:
+Exposes:
     • /v1/enriched/health
     • /v1/enriched/quote?symbol=...
     • /v1/enriched/quotes        (POST)
@@ -33,16 +33,18 @@ try:
     # Preferred: new engine
     from core.data_engine_v2 import DataEngine  # type: ignore
     logger.info("Using DataEngine from core.data_engine_v2")
-except ModuleNotFoundError:
+except Exception:
+    # Any failure here (module missing OR DataEngine missing) goes to fallback
     try:
         # Fallback: legacy engine
         from core.data_engine import DataEngine  # type: ignore
         logger.warning(
-            "core.data_engine_v2 not found; falling back to core.data_engine.DataEngine"
+            "core.data_engine_v2 not usable; falling back to core.data_engine.DataEngine"
         )
-    except ModuleNotFoundError:
+    except Exception:
+        # If this also fails (module missing or no DataEngine symbol), use stub
         logger.error(
-            "No data engine module found (core.data_engine_v2 / core.data_engine). "
+            "No usable DataEngine found in core.data_engine_v2 or core.data_engine. "
             "Using stub DataEngine with MISSING data responses."
         )
 
@@ -57,7 +59,7 @@ except ModuleNotFoundError:
                     "symbol": symbol,
                     "data_quality": "MISSING",
                     "error": (
-                        "Data engine module not found "
+                        "Data engine module or DataEngine class not found "
                         "(core.data_engine_v2 / core.data_engine)"
                     ),
                 }
@@ -70,7 +72,7 @@ except ModuleNotFoundError:
                         "symbol": s,
                         "data_quality": "MISSING",
                         "error": (
-                            "Data engine module not found "
+                            "Data engine module or DataEngine class not found "
                             "(core.data_engine_v2 / core.data_engine)"
                         ),
                     }
