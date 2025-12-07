@@ -81,7 +81,6 @@ def _get_env_attr(name: str, default: str = "") -> str:
         value = getattr(_env_mod, name)
         if isinstance(value, str):
             return value
-        # For non-string, just cast to str if needed
         try:
             return str(value)
         except Exception:
@@ -115,10 +114,17 @@ BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "")
 ENABLE_CORS_ALL_ORIGINS: bool = _get_bool("ENABLE_CORS_ALL_ORIGINS", True)
 
 # For /v1/status service flags
+# If env.py exposes GOOGLE_SHEETS_CREDENTIALS_RAW, use that;
+# otherwise fall back to the raw JSON string env var.
 GOOGLE_SHEETS_CREDENTIALS_RAW: str = getattr(
-    _env_mod, "GOOGLE_SHEETS_CREDENTIALS_RAW", os.getenv("GOOGLE_SHEETS_CREDENTIALS", "")
+    _env_mod,
+    "GOOGLE_SHEETS_CREDENTIALS_RAW",
+    os.getenv("GOOGLE_SHEETS_CREDENTIALS", ""),
 )
-GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr("GOOGLE_APPS_SCRIPT_BACKUP_URL", "")
+
+GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr(
+    "GOOGLE_APPS_SCRIPT_BACKUP_URL", ""
+)
 
 # KSA / Argaam gateway visibility in /v1/status
 ARGAAM_GATEWAY_URL: str = _get_env_attr("ARGAAM_GATEWAY_URL", "")
@@ -409,7 +415,11 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
 
     # Simple service flags (no heavy external calls here)
     services = {
-        "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW),
+        "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW)
+        or (
+            _env_mod is not None
+            and hasattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS")
+        ),
         "google_apps_script": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
         "cache": False,  # placeholder for future cache
     }
@@ -510,6 +520,7 @@ async def legacy_quote_endpoint(
 @app.post("/v1/legacy/sheet-rows", response_model=LegacyQuoteSheetResponse)
 @limiter.limit("60/minute")
 async def legacy_sheet_rows_endpoint(
+    request: Request,
     body: LegacyQuoteSheetRequest,
     _token: Optional[str] = Depends(require_app_token),
 ) -> LegacyQuoteSheetResponse:
