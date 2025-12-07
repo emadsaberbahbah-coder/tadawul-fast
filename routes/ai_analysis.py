@@ -1,23 +1,118 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.0)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.1)
 
-- Uses core.data_engine.get_enriched_quote(s) for live data
-- Computes Value / Quality / Momentum / Overall / Recommendation
-- Returns clean JSON + sheet-friendly rows
-- Designed to avoid 500 errors: on failure returns MISSING with error text
+- Preferred backend:
+    • core.data_engine_v2.DataEngine (class-based unified engine)
+
+- Fallback backend:
+    • core.data_engine (module-level async functions:
+        get_enriched_quote / get_enriched_quotes)
+
+- Last-resort:
+    • In-process stub engine that always returns MISSING data so that
+      the API and Google Sheets never crash.
+
+- Computes:
+    • Value / Quality / Momentum / Opportunity / Overall / Recommendation
+
+- Designed for:
+    • 9-page Google Sheets dashboard
+    • KSA-safe routing (KSA handled by the unified engine / Argaam,
+      no direct EODHD calls for .SR from here)
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from core.data_engine import UnifiedQuote, get_enriched_quote, get_enriched_quotes
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# ENGINE DETECTION & FALLBACKS
+# ----------------------------------------------------------------------
+
+_ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
+_engine: Any = None
+_data_engine_module: Any = None
+
+try:
+    # Preferred: new unified engine
+    from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
+
+    _engine = _V2DataEngine()
+    _ENGINE_MODE = "v2"
+    logger.info("ai_analysis: Using DataEngine from core.data_engine_v2")
+except Exception as e_v2:  # pragma: no cover - defensive
+    logger.exception(
+        "ai_analysis: Failed to import/use core.data_engine_v2.DataEngine: %s",
+        e_v2,
+    )
+    try:
+        # Fallback: legacy data engine module with async functions
+        from core import data_engine as _data_engine_module  # type: ignore
+
+        _ENGINE_MODE = "v1_module"
+        logger.warning(
+            "ai_analysis: Falling back to core.data_engine module-level API"
+        )
+    except Exception as e_v1:  # pragma: no cover - defensive
+        logger.exception(
+            "ai_analysis: Failed to import core.data_engine as fallback: %s",
+            e_v1,
+        )
+
+        class _StubEngine:
+            """
+            Safe stub engine when no real engine is available.
+
+            All responses have data_quality='MISSING', but the API
+            stays up and Google Sheets never see 500 errors.
+            """
+
+            async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
+                sym = (symbol or "").strip().upper()
+                return {
+                    "symbol": sym,
+                    "name": None,
+                    "market_region": "UNKNOWN",
+                    "price": None,
+                    "change_pct": None,
+                    "market_cap": None,
+                    "pe_ttm": None,
+                    "pb": None,
+                    "dividend_yield": None,
+                    "roe": None,
+                    "roa": None,
+                    "data_quality": "MISSING",
+                    "opportunity_score": None,
+                    "last_updated_utc": None,
+                    "sources": [],
+                    "notes": None,
+                    "error": (
+                        "Data engine modules (core.data_engine_v2/core.data_engine) "
+                        "are not available or failed to import."
+                    ),
+                }
+
+            async def get_enriched_quotes(
+                self, symbols: List[str]
+            ) -> List[Dict[str, Any]]:
+                out: List[Dict[str, Any]] = []
+                for s in symbols:
+                    out.append(await self.get_enriched_quote(s))
+                return out
+
+        _engine = _StubEngine()
+        _ENGINE_MODE = "stub"
+        logger.error("ai_analysis: Using stub DataEngine with MISSING data.")
+
 
 # ----------------------------------------------------------------------
 # ROUTER
@@ -79,8 +174,61 @@ class SheetAnalysisResponse(BaseModel):
 
 
 # ----------------------------------------------------------------------
-# INTERNAL HELPERS
+# INTERNAL HELPERS – ENGINE WRAPPERS
 # ----------------------------------------------------------------------
+
+
+async def _engine_get_quote(symbol: str) -> Any:
+    """
+    Unified wrapper for a single quote, hiding engine differences.
+    """
+    sym = (symbol or "").strip()
+    if not sym:
+        return None
+
+    if _ENGINE_MODE == "v2":
+        return await _engine.get_enriched_quote(sym)
+    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
+        return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
+    # Stub
+    return await _engine.get_enriched_quote(sym)
+
+
+async def _engine_get_quotes(symbols: List[str]) -> List[Any]:
+    """
+    Unified wrapper for multiple quotes.
+    """
+    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
+    if not clean:
+        return []
+
+    if _ENGINE_MODE == "v2":
+        return await _engine.get_enriched_quotes(clean)
+    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
+        return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+    # Stub
+    return await _engine.get_enriched_quotes(clean)
+
+
+def _qget(obj: Any, *names: str) -> Any:
+    """
+    Safely get a field from a UnifiedQuote-like object or dict.
+
+    Tries attributes first, then dict keys, returns None if not found.
+    """
+    if obj is None:
+        return None
+    for name in names:
+        if hasattr(obj, name):
+            try:
+                val = getattr(obj, name)
+                if val is not None:
+                    return val
+            except Exception:
+                continue
+        if isinstance(obj, dict) and name in obj and obj[name] is not None:
+            return obj[name]
+    return None
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -92,26 +240,26 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _compute_scores(q: UnifiedQuote) -> Dict[str, Optional[float]]:
+def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
     """
     Basic AI-like scoring layer. 0–100 scale for each score.
-
-    This is intentionally simple and deterministic so Google Sheets can rely on it.
+    Uses fields from the unified engine (v2 or v1).
     """
-    value_score: Optional[float] = None
-    quality_score: Optional[float] = None
-    momentum_score: Optional[float] = None
-
-    pe = _safe_float(q.pe_ttm)
-    pb = _safe_float(q.pb)
-    dy = _safe_float(q.dividend_yield)
-    roe = _safe_float(q.roe)
-    profit_margin = _safe_float(q.profit_margin)
-    change_pct = _safe_float(q.change_pct)
+    pe = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
+    pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
+    dy = _safe_float(_qget(quote, "dividend_yield", "dividend_yield_percent"))
+    roe = _safe_float(_qget(quote, "roe", "roe_percent"))
+    profit_margin = _safe_float(
+        _qget(quote, "profit_margin", "net_margin_percent", "profitMargins")
+    )
+    change_pct = _safe_float(
+        _qget(quote, "change_pct", "change_percent", "changePercent")
+    )
 
     # ------------------------
     # Value score (P/E, P/B, Dividend Yield)
     # ------------------------
+    value_score: Optional[float] = None
     vs = 50.0
     if pe is not None:
         if 0 < pe < 12:
@@ -135,6 +283,7 @@ def _compute_scores(q: UnifiedQuote) -> Dict[str, Optional[float]]:
     # ------------------------
     # Quality score (ROE, profit margin)
     # ------------------------
+    quality_score: Optional[float] = None
     qs = 50.0
     if roe is not None:
         if roe >= 0.20:
@@ -155,6 +304,7 @@ def _compute_scores(q: UnifiedQuote) -> Dict[str, Optional[float]]:
     # ------------------------
     # Momentum score (daily change %)
     # ------------------------
+    momentum_score: Optional[float] = None
     ms = 50.0
     if change_pct is not None:
         if change_pct > 0:
@@ -200,37 +350,103 @@ def _compute_overall_and_reco(
     return {"overall_score": overall, "recommendation": reco}
 
 
-def _quote_to_analysis(quote: UnifiedQuote) -> SingleAnalysisResponse:
+def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
+    """
+    Convert a UnifiedQuote-like object to SingleAnalysisResponse.
+
+    Works with:
+    - core.data_engine_v2.UnifiedQuote
+    - core.data_engine.UnifiedQuote
+    - dict payloads
+    """
+    if quote is None:
+        return SingleAnalysisResponse(
+            symbol="",
+            data_quality="MISSING",
+            error="No quote data returned from engine",
+        )
+
     base_scores = _compute_scores(quote)
+
+    opportunity_score = _safe_float(_qget(quote, "opportunity_score"))
     more = _compute_overall_and_reco(
-        opportunity_score=quote.opportunity_score,
+        opportunity_score=opportunity_score,
         value_score=base_scores["value_score"],
         quality_score=base_scores["quality_score"],
         momentum_score=base_scores["momentum_score"],
     )
 
+    symbol = str(_qget(quote, "symbol", "ticker") or "").upper()
+    name = _qget(quote, "name", "company_name", "longName", "shortName")
+    market_region = _qget(quote, "market_region")
+
+    price = _safe_float(_qget(quote, "price", "last_price"))
+    change_pct = _safe_float(
+        _qget(quote, "change_pct", "change_percent", "changePercent")
+    )
+    market_cap = _safe_float(_qget(quote, "market_cap", "marketCap"))
+    pe_ttm = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
+    pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
+    dividend_yield = _safe_float(
+        _qget(quote, "dividend_yield", "dividend_yield_percent")
+    )
+    roe = _safe_float(_qget(quote, "roe", "roe_percent"))
+    roa = _safe_float(_qget(quote, "roa", "roa_percent"))
+    data_quality = str(_qget(quote, "data_quality") or "MISSING")
+
+    last_updated_raw = _qget(quote, "last_updated_utc", "as_of_utc")
+    # Pydantic will parse this; it's fine if it's str or datetime
+    last_updated_utc: Optional[datetime]
+    if isinstance(last_updated_raw, datetime):
+        last_updated_utc = last_updated_raw
+    elif isinstance(last_updated_raw, str):
+        try:
+            last_updated_utc = datetime.fromisoformat(last_updated_raw)
+        except Exception:
+            last_updated_utc = None
+    else:
+        last_updated_utc = None
+
+    # Sources can be objects, dicts, or strings
+    raw_sources = _qget(quote, "sources") or []
+    sources: List[str] = []
+    try:
+        for s in raw_sources:
+            if hasattr(s, "provider"):
+                sources.append(str(getattr(s, "provider")))
+            elif isinstance(s, dict) and "provider" in s:
+                sources.append(str(s["provider"]))
+            else:
+                sources.append(str(s))
+    except Exception:
+        pass
+
+    notes = _qget(quote, "notes")
+    error = _qget(quote, "error")
+
     return SingleAnalysisResponse(
-        symbol=quote.symbol,
-        name=quote.name,
-        market_region=quote.market_region,
-        price=quote.price,
-        change_pct=quote.change_pct,
-        market_cap=quote.market_cap,
-        pe_ttm=quote.pe_ttm,
-        pb=quote.pb,
-        dividend_yield=quote.dividend_yield,
-        roe=quote.roe,
-        roa=quote.roa,
-        data_quality=quote.data_quality,
+        symbol=symbol,
+        name=name,
+        market_region=market_region,
+        price=price,
+        change_pct=change_pct,
+        market_cap=market_cap,
+        pe_ttm=pe_ttm,
+        pb=pb,
+        dividend_yield=dividend_yield,
+        roe=roe,
+        roa=roa,
+        data_quality=data_quality,
         value_score=base_scores["value_score"],
         quality_score=base_scores["quality_score"],
         momentum_score=base_scores["momentum_score"],
-        opportunity_score=quote.opportunity_score,
+        opportunity_score=opportunity_score,
         overall_score=more["overall_score"],
         recommendation=more["recommendation"],
-        last_updated_utc=quote.last_updated_utc,
-        sources=[src.provider for src in (quote.sources or [])],
-        notes=quote.notes,
+        last_updated_utc=last_updated_utc,
+        sources=sources,
+        notes=notes,
+        error=error,
     )
 
 
@@ -259,6 +475,15 @@ def _build_sheet_headers() -> List[str]:
     ]
 
 
+def _to_iso(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    try:
+        return dt.isoformat()
+    except Exception:
+        return None
+
+
 def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
     """
     Flatten one analysis result to a row (all primitives),
@@ -282,7 +507,7 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
         a.opportunity_score,
         a.overall_score,
         a.recommendation,
-        a.last_updated_utc.isoformat() if a.last_updated_utc else None,
+        _to_iso(a.last_updated_utc),
         ", ".join(a.sources) if a.sources else "",
     ]
 
@@ -300,34 +525,39 @@ async def analysis_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "ai_analysis",
-        "version": "2.0",
+        "version": "2.1",
+        "engine_mode": _ENGINE_MODE,
     }
 
 
 @router.get("/quote", response_model=SingleAnalysisResponse)
-async def analyze_single_quote(ticker: str = Query(..., alias="symbol")) -> SingleAnalysisResponse:
+async def analyze_single_quote(
+    ticker: str = Query(..., alias="symbol"),
+) -> SingleAnalysisResponse:
     """
     High-level AI/quant analysis for a single ticker.
     Designed to be consumed by Google Sheets / Apps Script.
 
     Example:
         GET /v1/analysis/quote?symbol=AAPL
+        GET /v1/analysis/quote?symbol=1120.SR
     """
     ticker = (ticker or "").strip()
     if not ticker:
         raise HTTPException(status_code=400, detail="Ticker is required")
 
     try:
-        quote = await get_enriched_quote(ticker)
+        quote = await _engine_get_quote(ticker)
         analysis = _quote_to_analysis(quote)
 
         # If we truly have no data from providers, mark an explicit error
-        if analysis.data_quality == "MISSING":
+        if analysis.data_quality == "MISSING" and not analysis.error:
             analysis.error = "No data available from providers"
         return analysis
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("Exception in analyze_single_quote for %s", ticker)
         # NEVER crash Google Sheets – always return a valid body
         return SingleAnalysisResponse(
             symbol=ticker.upper(),
@@ -351,8 +581,9 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
         raise HTTPException(status_code=400, detail="At least one ticker is required")
 
     try:
-        unified_quotes = await get_enriched_quotes(tickers)
+        unified_quotes = await _engine_get_quotes(tickers)
     except Exception as exc:
+        logger.exception("Batch analysis failed for tickers=%s", tickers)
         # Total failure – return placeholder rows for all tickers
         placeholder_results: List[SingleAnalysisResponse] = [
             SingleAnalysisResponse(
@@ -367,12 +598,14 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
     results: List[SingleAnalysisResponse] = []
     for t, q in zip(tickers, unified_quotes):
         try:
-            # Convert UnifiedQuote (even if MISSING) to analysis response
             analysis = _quote_to_analysis(q)
-            if analysis.data_quality == "MISSING":
+            if analysis.data_quality == "MISSING" and not analysis.error:
                 analysis.error = "No data available from providers"
             results.append(analysis)
         except Exception as exc:
+            logger.exception(
+                "Exception building analysis for %s in batch", t, exc_info=exc
+            )
             results.append(
                 SingleAnalysisResponse(
                     symbol=t.upper(),
@@ -396,6 +629,11 @@ async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse
         }
 
     Apps Script can simply setValues() using rows with the returned headers.
+
+    This is designed for:
+        - Insights_Analysis sheet
+        - Any scoring/AI layer on top of KSA_Tadawul, Global_Markets,
+          Mutual_Funds, Commodities_FX, and My_Portfolio pages.
     """
     batch = await analyze_batch_quotes(body)
     headers = _build_sheet_headers()
