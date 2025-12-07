@@ -1,29 +1,33 @@
-#!/usr/bin/env python3
 """
-Tadawul Fast Bridge - Core API v4.1.0
+main.py
+===========================================================
+Tadawul Fast Bridge - Main Application
+Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
 
-Clean, provider-driven version focused on:
-- /v1/status
-- /v1/quote
-- /debug/eodhd/{symbol}
-
-Key ideas:
-- Read ENABLED_PROVIDERS and PRIMARY_PROVIDER from env
-- Fully implement EODHD as a provider
-- Always record providers_used in /v1/quote
-- Support auth via ?token=... or Bearer token
+- FastAPI backend for:
+    • Enriched Quotes (v1/enriched)
+    • AI Analysis (v1/analysis)
+    • Advanced Analysis & Risk (v1/advanced)
+    • Legacy Quotes (v1/quote, v1/legacy/sheet-rows)
+- Integrated with:
+    • core.data_engine (multi-provider engine, KSA via Tadawul/Argaam)
+    • env.py (all config & tokens)
+    • Google Sheets / Apps Script flows (via other modules)
+- EODHD:
+    • This file NEVER calls EODHD directly.
+    • KSA (.SR) is handled by core.data_engine using non-EODHD providers.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -33,618 +37,378 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-
-logger = logging.getLogger("main")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+from env import (
+    APP_NAME,
+    APP_VERSION,
+    APP_TOKEN,
+    BACKUP_APP_TOKEN,
+    BACKEND_BASE_URL,
+    ENABLE_CORS_ALL_ORIGINS,
+    HAS_SECURE_TOKEN,
+    GOOGLE_SHEETS_CREDENTIALS_RAW,
+    GOOGLE_APPS_SCRIPT_BACKUP_URL,
+    settings,
 )
 
+from routes import enriched_quote, ai_analysis, advanced_analysis
+from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
-# -----------------------------------------------------------------------------
-# Settings
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
 
-class Settings(BaseSettings):
-    # Service info
-    service_name: str = Field("Tadawul Fast Bridge", alias="SERVICE_NAME")
-    service_version: str = Field("4.1.0", alias="SERVICE_VERSION")
-    environment: str = Field("production", alias="ENVIRONMENT")
-
-    # Auth
-    app_token: Optional[str] = Field(None, alias="APP_TOKEN")
-    backup_app_token: Optional[str] = Field(None, alias="BACKUP_APP_TOKEN")
-    require_auth: bool = Field(True, alias="REQUIRE_AUTH")
-
-    # Providers
-    enabled_providers_raw: str = Field(
-        "eodhd",
-        alias="ENABLED_PROVIDERS",
-        description="Comma-separated list: eodhd,finnhub,alpha_vantage,marketstack,twelvedata,fmp",
-    )
-    primary_provider: str = Field(
-        "eodhd",
-        alias="PRIMARY_PROVIDER",
-        description="Primary provider key, e.g. eodhd",
+logger = logging.getLogger("tadawul_fast_bridge")
+if not logger.handlers:
+    # Basic config if not configured by host
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # EODHD
-    eodhd_api_key: Optional[str] = Field(None, alias="EODHD_API_KEY")
-    eodhd_base_url: str = Field("https://eodhd.com/api", alias="EODHD_BASE_URL")
+START_TIME = time.time()
 
-    # HTTP
-    http_timeout: float = Field(10.0, alias="HTTP_TIMEOUT")
+# ------------------------------------------------------------
+# Rate limiting (SlowAPI) – light default
+# ------------------------------------------------------------
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+limiter = Limiter(key_func=get_remote_address, headers_enabled=True)
 
+# ------------------------------------------------------------
+# Auth – APP_TOKEN / BACKUP_APP_TOKEN
+# ------------------------------------------------------------
 
-settings = Settings()
-
-# Normalize enabled providers
-ENABLED_PROVIDERS: List[str] = [
-    p.strip().lower()
-    for p in settings.enabled_providers_raw.split(",")
-    if p.strip()
-]
-
-logger.info("Service Name: %s", settings.service_name)
-logger.info("Service Version: %s", settings.service_version)
-logger.info("Environment: %s", settings.environment)
-logger.info("Enabled providers: %s", ENABLED_PROVIDERS)
-logger.info("Primary provider: %s", settings.primary_provider)
+auth_scheme = HTTPBearer(auto_error=False)
 
 
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
-
-class Quote(BaseModel):
-    ticker: str
-    symbol: str
-    exchange: Optional[str] = None
-    currency: Optional[str] = None
-    name: Optional[str] = None
-    sector: Optional[str] = None
-
-    price: Optional[float] = None
-    previous_close: Optional[float] = None
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-
-    volume: Optional[int] = None
-    avg_volume: Optional[int] = None
-
-    change: Optional[float] = None
-    change_percent: Optional[float] = None
-
-    market_cap: Optional[float] = None
-    shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
-
-    pe_ratio: Optional[float] = None
-    pb_ratio: Optional[float] = None
-    ps_ratio: Optional[float] = None
-    ev_ebitda: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    eps: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
-    debt_equity: Optional[float] = None
-
-    rsi: Optional[float] = None
-    macd: Optional[float] = None
-    moving_avg_20: Optional[float] = None
-    moving_avg_50: Optional[float] = None
-    volatility: Optional[float] = None
-
-    status: str = "ok"
-    quality: str = "unknown"
-    provider: Optional[str] = None
-    source: Optional[str] = None
-
-    cached: bool = False
-    cache_ttl: Optional[int] = None
-
-    message: Optional[str] = None
-
-    last_updated: Optional[datetime] = None
-    timestamp: Optional[datetime] = None
-
-    raw_data: Optional[Dict[str, Any]] = None
-
-
-class QuoteResponse(BaseModel):
-    quotes: List[Quote]
-    timestamp: datetime
-    request_id: str
-    success_count: int
-    error_count: int
-    cache_hits: int
-    cache_misses: int
-    execution_time: float
-    providers_used: List[str]
-    status: str
-    message: Optional[str] = None
-
-
-class StatusResponse(BaseModel):
-    status: str
-    version: str
-    environment: str
-    timestamp: datetime
-    uptime_seconds: float
-    services: Dict[str, Any]
-
-
-# -----------------------------------------------------------------------------
-# Provider Interface + EODHD Implementation
-# -----------------------------------------------------------------------------
-
-class ProviderError(Exception):
-    pass
-
-
-class BaseProvider:
-    name: str
-
-    async def get_quote(self, symbol: str) -> Dict[str, Any]:
-        raise NotImplementedError
-
-
-class EodhdProvider(BaseProvider):
+async def require_app_token(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
+) -> Optional[str]:
     """
-    EODHD real-time provider using /real-time/{code}?api_token=...
+    Require a valid APP token *only if* a token is configured.
+
+    Accepts:
+      - Authorization: Bearer <token>
+      - X-APP-TOKEN: <token>
+      - ?token=<token>
+
+    If no APP_TOKEN/BACKUP_APP_TOKEN is configured, this is a no-op.
     """
+    if not HAS_SECURE_TOKEN:
+        # No token configured -> do not enforce
+        return None
 
-    def __init__(self, api_key: str, base_url: str, client: httpx.AsyncClient):
-        self.name = "eodhd"
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
-        self.client = client
+    token: Optional[str] = None
 
-    def _normalize_symbol(self, ticker: str) -> str:
-        """
-        EODHD needs an exchange suffix.
-        - If ticker already has '.', assume full code (e.g., 2222.SR, MSFT.US)
-        - If no '.', assume US stock and append '.US'
-        """
-        t = ticker.strip().upper()
-        if "." in t:
-            return t
-        # basic heuristic: treat as US
-        return f"{t}.US"
+    # 1) Authorization: Bearer
+    if credentials and credentials.scheme.lower() == "bearer":
+        token = (credentials.credentials or "").strip()
 
-    async def get_quote(self, ticker: str) -> Dict[str, Any]:
-        if not self.api_key:
-            raise ProviderError("EODHD_API_KEY is not configured")
-
-        code = self._normalize_symbol(ticker)
-        url = f"{self.base_url}/real-time/{code}"
-        params = {
-            "api_token": self.api_key,
-            "fmt": "json",
-        }
-
-        try:
-            resp = await self.client.get(url, params=params)
-        except Exception as exc:
-            raise ProviderError(f"EODHD request error: {exc}") from exc
-
-        if resp.status_code != 200:
-            raise ProviderError(f"EODHD HTTP {resp.status_code}: {resp.text}")
-
-        try:
-            data = resp.json()
-        except Exception as exc:
-            raise ProviderError(f"EODHD JSON parse error: {exc}") from exc
-
-        # EODHD real-time sample:
-        # {"code":"AAPL.US","timestamp":..., "open":..., "high":..., ...}
-        if not data or "code" not in data:
-            raise ProviderError(f"EODHD returned invalid payload: {data}")
-
-        return data
-
-
-# -----------------------------------------------------------------------------
-# QuoteService
-# -----------------------------------------------------------------------------
-
-class QuoteService:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        timeout = httpx.Timeout(settings.http_timeout)
-        self.http_client = httpx.AsyncClient(timeout=timeout)
-
-        # Build providers registry
-        self.providers: Dict[str, BaseProvider] = {}
-
-        if "eodhd" in ENABLED_PROVIDERS:
-            if not settings.eodhd_api_key:
-                logger.warning("EODHD enabled but EODHD_API_KEY is missing.")
-            else:
-                self.providers["eodhd"] = EodhdProvider(
-                    api_key=settings.eodhd_api_key,
-                    base_url=settings.eodhd_base_url,
-                    client=self.http_client,
-                )
-                logger.info("EODHD provider initialized")
-
-        # Stubs for other providers (you can implement later)
-        for stub_name in ["alpha_vantage", "finnhub", "marketstack", "twelvedata", "fmp"]:
-            if stub_name in ENABLED_PROVIDERS and stub_name not in self.providers:
-                logger.warning(
-                    "Provider '%s' is listed in ENABLED_PROVIDERS but not implemented yet.",
-                    stub_name,
-                )
-
-    async def close(self):
-        await self.http_client.aclose()
-
-    def _build_provider_order(self) -> List[str]:
-        """
-        Build provider order with PRIMARY_PROVIDER first, then the rest.
-        """
-        providers = [p for p in ENABLED_PROVIDERS if p in self.providers]
-        primary = self.settings.primary_provider.lower()
-
-        ordered: List[str] = []
-        if primary in providers:
-            ordered.append(primary)
-        for p in providers:
-            if p not in ordered:
-                ordered.append(p)
-        return ordered
-
-    def _infer_currency(self, ticker: str) -> str:
-        t = ticker.upper()
-        if t.endswith(".SR"):
-            return "SAR"
-        return "USD"
-
-    async def get_quote_for_symbol(self, ticker: str) -> Tuple[Quote, List[str]]:
-        """
-        Try providers in order, return Quote and list of providers tried.
-        """
-        start = time.perf_counter()
-        providers_tried: List[str] = []
-
-        base_quote = Quote(
-            ticker=ticker,
-            symbol=ticker,
-            currency=self._infer_currency(ticker),
-            status="error",
-            message="Failed to fetch quote",
-            last_updated=datetime.now(timezone.utc),
-            timestamp=datetime.now(timezone.utc),
+    # 2) X-APP-TOKEN header
+    if not token:
+        header_token = request.headers.get("X-APP-TOKEN") or request.headers.get(
+            "x-app-token"
         )
+        if header_token:
+            token = header_token.strip()
 
-        order = self._build_provider_order()
-        if not order:
-            base_quote.message = "No providers configured"
-            return base_quote, providers_tried
+    # 3) ?token= query param (for old tests)
+    if not token:
+        query_token = request.query_params.get("token")
+        if query_token:
+            token = query_token.strip()
 
-        for provider_name in order:
-            provider = self.providers.get(provider_name)
-            providers_tried.append(provider_name)
-
-            if provider is None:
-                continue
-
-            try:
-                raw = await provider.get_quote(ticker)
-            except ProviderError as exc:
-                logger.warning(
-                    "Provider %s failed for %s: %s", provider_name, ticker, exc
-                )
-                continue
-            except Exception as exc:
-                logger.error(
-                    "Unexpected error in provider %s for %s: %s",
-                    provider_name,
-                    ticker,
-                    exc,
-                )
-                continue
-
-            # Map EODHD payload
-            if provider_name == "eodhd":
-                quote = self._map_eodhd_quote(ticker, raw)
-                quote.provider = "eodhd"
-                quote.source = "eodhd-realtime"
-                quote.status = "ok"
-                quote.message = None
-                quote.raw_data = raw
-                quote.timestamp = datetime.now(timezone.utc)
-                return quote, providers_tried
-
-            # Fallback generic mapping if implemented later
-            quote = base_quote.copy()
-            quote.provider = provider_name
-            quote.raw_data = raw
-            quote.status = "ok"
-            quote.message = None
-            quote.timestamp = datetime.now(timezone.utc)
-            return quote, providers_tried
-
-        # None succeeded
-        duration = time.perf_counter() - start
-        logger.warning("All providers failed for %s in %.3fs", ticker, duration)
-        base_quote.timestamp = datetime.now(timezone.utc)
-        return base_quote, providers_tried
-
-    def _map_eodhd_quote(self, ticker: str, data: Dict[str, Any]) -> Quote:
-        """
-        Map EODHD real-time JSON to Quote model.
-        Example data:
-        {
-          "code":"AAPL.US",
-          "timestamp":1764958860,
-          "gmtoffset":0,
-          "open":280.54,
-          "high":281.14,
-          "low":278.05,
-          "close":278.97,
-          "volume":18388595,
-          "previousClose":280.7,
-          "change":-1.73,
-          "change_p":-0.6163
-        }
-        """
-        code = data.get("code", ticker)
-        price = data.get("close")
-        prev_close = data.get("previousClose")
-        change = data.get("change")
-        change_p = data.get("change_p")
-
-        dt = None
-        ts = data.get("timestamp")
-        if isinstance(ts, (int, float)):
-            try:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            except Exception:
-                dt = None
-
-        q = Quote(
-            ticker=ticker,
-            symbol=ticker,
-            exchange=None,  # you can improve this later if needed
-            currency=self._infer_currency(ticker),
-            name=None,
-            sector=None,
-            price=price,
-            previous_close=prev_close,
-            open=data.get("open"),
-            high=data.get("high"),
-            low=data.get("low"),
-            volume=data.get("volume"),
-            change=change,
-            change_percent=change_p,
-            status="ok",
-            quality="realtime",
-            last_updated=dt or datetime.now(timezone.utc),
-            timestamp=dt or datetime.now(timezone.utc),
-        )
-        return q
-
-
-# Global service
-quote_service = QuoteService(settings=settings)
-
-# -----------------------------------------------------------------------------
-# Auth helpers
-# -----------------------------------------------------------------------------
-
-def verify_token(request: Request, token_param: Optional[str]) -> None:
-    """
-    Check ?token=... OR Authorization: Bearer ...
-    Only enforces if REQUIRE_AUTH is True.
-    """
-    if not settings.require_auth:
-        return
-
-    valid_tokens = {t for t in [settings.app_token, settings.backup_app_token] if t}
-    if not valid_tokens:
-        logger.warning("require_auth=True but no APP_TOKEN/BACKUP_APP_TOKEN set")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication not configured",
-        )
-
-    # 1) Query param
-    if token_param and token_param in valid_tokens:
-        return
-
-    # 2) Header
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.lower().startswith("bearer "):
-        candidate = auth_header.split(" ", 1)[1].strip()
-        if candidate in valid_tokens:
-            return
+    if token and token in {APP_TOKEN, BACKUP_APP_TOKEN}:
+        return token
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or missing authentication token",
+        detail="Invalid or missing API token",
     )
 
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Lifespan (startup / shutdown)
+# ------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "🚀 Starting %s (env=%s, version=%s)",
+        APP_NAME,
+        settings.app_env,
+        APP_VERSION,
+    )
+    yield
+    uptime = time.time() - START_TIME
+    logger.info("🛑 Shutting down after %.1f seconds", uptime)
+
+
+# ------------------------------------------------------------
 # FastAPI app
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------
 
 app = FastAPI(
-    title=settings.service_name,
-    version=settings.service_version,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="Tadawul Fast Bridge – Unified KSA + Global data engine with Google Sheets integration.",
+    lifespan=lifespan,
 )
 
-# CORS (relaxed; you can tighten later)
-cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
-cors_origins = [o.strip() for o in cors_origins_raw.split(",")] if cors_origins_raw else ["*"]
+# Attach limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Middleware: CORS
+if ENABLE_CORS_ALL_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # You can adjust allowed origins if you want to restrict
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["https://docs.google.com", "https://script.google.com"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Middleware: GZip compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# ------------------------------------------------------------
+# Include routers (protected by token if configured)
+# ------------------------------------------------------------
+
+app.include_router(
+    enriched_quote.router,
+    dependencies=[Depends(require_app_token)],
+)
+app.include_router(
+    ai_analysis.router,
+    dependencies=[Depends(require_app_token)],
+)
+app.include_router(
+    advanced_analysis.router,
+    dependencies=[Depends(require_app_token)],
 )
 
 
-@app.on_event("startup")
-async def on_startup():
-    logger.info("🚀 Starting %s v%s", settings.service_name, settings.service_version)
-    logger.info("🌍 Environment: %s", settings.environment)
-    logger.info("🔐 Authentication: %s", "Enabled" if settings.require_auth else "Disabled")
-    logger.info("📈 Providers enabled: %s (primary: %s)", ENABLED_PROVIDERS, settings.primary_provider)
+# ------------------------------------------------------------
+# Root / Health / Status
+# ------------------------------------------------------------
 
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    await quote_service.close()
-    logger.info("🛑 Application shutdown complete.")
+@app.get("/", response_class=HTMLResponse)
+async def root() -> str:
+    """
+    Simple HTML landing page.
+    """
+    return f"""
+    <html>
+      <head><title>{APP_NAME}</title></head>
+      <body style="font-family:system-ui;background:#0b1020;color:#edf2f7;padding:20px;">
+        <h1>{APP_NAME}</h1>
+        <p>Environment: <strong>{settings.app_env}</strong></p>
+        <p>Version: <strong>{APP_VERSION}</strong></p>
+        <p>Base URL: <code>{BACKEND_BASE_URL}</code></p>
+        <p>
+          Try:
+          <ul>
+            <li><code>/health</code></li>
+            <li><code>/v1/status</code></li>
+            <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
+            <li><code>/v1/enriched/health</code>, <code>/v1/analysis/health</code>, <code>/v1/advanced/health</code></li>
+          </ul>
+        </p>
+      </body>
+    </html>
+    """
 
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-
-@app.get("/", include_in_schema=False)
-async def root():
-    return RedirectResponse(url="/docs")
-
-
-@app.get("/v1/status", response_model=StatusResponse)
-async def status_endpoint():
-    uptime_seconds = 0.0  # If you track start time, you can compute real uptime
+@app.get("/health")
+async def basic_health() -> Dict[str, Any]:
+    """
+    Very lightweight health endpoint (no external calls).
+    """
     now = datetime.now(timezone.utc)
-    services = {
-        "providers": {
-            "enabled": ENABLED_PROVIDERS,
-            "primary": settings.primary_provider,
-            "eodhd_configured": bool(settings.eodhd_api_key),
-        }
+    uptime_seconds = time.time() - START_TIME
+    return {
+        "status": "ok",
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "env": settings.app_env,
+        "time_utc": now.isoformat(),
+        "uptime_seconds": uptime_seconds,
     }
-    return StatusResponse(
-        status="operational",
-        version=settings.service_version,
-        environment=settings.environment,
-        timestamp=now,
-        uptime_seconds=uptime_seconds,
-        services=services,
-    )
 
 
-@app.get("/v1/quote", response_model=QuoteResponse)
-async def v1_quote(
-    request: Request,
-    tickers: str = Query(..., description="Comma-separated list of tickers, e.g. 2250.SR,AAPL"),
-    token: Optional[str] = Query(None, description="App token (alternative to Bearer header)"),
-):
+@app.get("/v1/status")
+async def status_endpoint(request: Request) -> Dict[str, Any]:
     """
-    Main quote endpoint used by Google Sheets / Apps Script.
+    More detailed status used by your PowerShell tests.
 
     Example:
-      /v1/quote?tickers=2250.SR,AAPL&token=...
+        GET /v1/status
+        GET /v1/status?token=...
     """
-    verify_token(request, token)
+    now = datetime.now(timezone.utc)
+    uptime_seconds = time.time() - START_TIME
 
-    symbols = [t.strip() for t in tickers.split(",") if t.strip()]
-    if not symbols:
-        raise HTTPException(status_code=400, detail="No tickers provided")
+    # Simple service flags (no heavy external calls here)
+    services = {
+        "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW),
+        "google_apps_script": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
+        "cache": False,  # placeholder for future Redis/Memory cache
+    }
 
-    start = time.perf_counter()
-    quotes: List[Quote] = []
-    providers_used_set: set[str] = set()
-    cache_hits = 0   # not implemented yet
-    cache_misses = 0 # not implemented yet
-
-    for sym in symbols:
-        quote, tried = await quote_service.get_quote_for_symbol(sym)
-        quotes.append(quote)
-        for p in tried:
-            providers_used_set.add(p)
-
-    success_count = sum(1 for q in quotes if q.status == "ok")
-    error_count = len(quotes) - success_count
-    duration = time.perf_counter() - start
-
-    overall_status = "ok" if success_count > 0 and error_count == 0 else "partial"
-    if success_count == 0:
-        overall_status = "error"
-
-    message = f"Retrieved {success_count} of {len(quotes)} quotes"
-
-    response = QuoteResponse(
-        quotes=quotes,
-        timestamp=datetime.now(timezone.utc),
-        request_id=os.urandom(16).hex(),
-        success_count=success_count,
-        error_count=error_count,
-        cache_hits=cache_hits,
-        cache_misses=cache_misses,
-        execution_time=duration,
-        providers_used=sorted(list(providers_used_set)),
-        status=overall_status,
-        message=message,
-    )
-    logger.info(
-        "v1/quote: %s -> %s (success=%d, error=%d, providers=%s, duration=%.3fs)",
-        tickers,
-        overall_status,
-        success_count,
-        error_count,
-        response.providers_used,
-        duration,
-    )
-    return response
-
-
-@app.get("/debug/eodhd/{symbol}")
-async def debug_eodhd(
-    request: Request,
-    symbol: str,
-    token: Optional[str] = Query(None, description="App token (alternative to Bearer header)"),
-):
-    """
-    Direct EODHD test from inside the Fast Bridge container.
-
-    Example:
-      /debug/eodhd/AAPL.US?token=xxxx
-      /debug/eodhd/2250.SR?token=xxxx
-    """
-    verify_token(request, token)
-
-    provider = quote_service.providers.get("eodhd")
-    if not provider or not isinstance(provider, EodhdProvider):
-        raise HTTPException(
-            status_code=500,
-            detail="EODHD provider is not configured (check ENABLED_PROVIDERS and EODHD_API_KEY)",
-        )
-
-    try:
-        raw = await provider.get_quote(symbol)
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Unexpected error in debug_eodhd for %s: %s", symbol, exc)
-        raise HTTPException(status_code=500, detail="Unexpected error in debug_eodhd")
+    # Whether tokens are configured
+    auth = {
+        "has_secure_token": HAS_SECURE_TOKEN,
+        "token_in_query": bool(request.query_params.get("token")),
+        "token_in_header": bool(
+            request.headers.get("Authorization")
+            or request.headers.get("X-APP-TOKEN")
+            or request.headers.get("x-app-token")
+        ),
+    }
 
     return {
-        "symbol": symbol,
-        "normalized_symbol": provider._normalize_symbol(symbol),
-        "base_url": settings.eodhd_base_url,
-        "status": "ok",
-        "raw": raw,
+        "status": "operational",
+        "version": APP_VERSION,
+        "environment": settings.app_env,
+        "uptime_seconds": uptime_seconds,
+        "timestamp": now.isoformat(),
+        "backend_base_url": BACKEND_BASE_URL,
+        "services": services,
+        "auth": auth,
+        "notes": [
+            "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
+            "No direct EODHD calls are made for KSA inside this main application.",
+        ],
     }
+
+
+# ------------------------------------------------------------
+# Legacy endpoints (v1/quote + v1/legacy/sheet-rows)
+# ------------------------------------------------------------
+
+
+class LegacyQuoteSheetRequest(BaseModel):
+    tickers: List[str] = Field(
+        default_factory=list,
+        description="List of symbols, e.g. ['1120.SR','1180.SR','AAPL']",
+    )
+
+
+class LegacyQuoteSheetResponse(BaseModel):
+    headers: List[str]
+    rows: List[List[Any]]
+    meta: Dict[str, Any]
+
+
+@app.get("/v1/quote")
+@limiter.limit("120/minute")
+async def legacy_quote_endpoint(
+    request: Request,
+    tickers: str = Query(
+        ...,
+        description="Comma-separated symbols, e.g. AAPL,MSFT,1120.SR",
+    ),
+    _token: Optional[str] = Depends(require_app_token),
+) -> JSONResponse:
+    """
+    Legacy quote endpoint (used by your early PowerShell scripts).
+
+    Example:
+        GET /v1/quote?tickers=AAPL
+        GET /v1/quote?tickers=AAPL,MSFT,1120.SR
+    """
+    symbols = [t.strip() for t in tickers.split(",") if t.strip()]
+    payload = await get_legacy_quotes(symbols)
+    return JSONResponse(content=payload)
+
+
+@app.post("/v1/legacy/sheet-rows", response_model=LegacyQuoteSheetResponse)
+@limiter.limit("60/minute")
+async def legacy_sheet_rows_endpoint(
+    body: LegacyQuoteSheetRequest,
+    _token: Optional[str] = Depends(require_app_token),
+) -> LegacyQuoteSheetResponse:
+    """
+    Google Sheets–friendly legacy data:
+
+        {
+          "headers": [...],
+          "rows": [[...], ...],
+          "meta": {...}
+        }
+
+    Can be used by:
+        - Google Apps Script (UrlFetchApp)
+        - google_sheets_service (if you want the legacy layout)
+    """
+    payload = await build_legacy_sheet_payload(body.tickers or [])
+    return LegacyQuoteSheetResponse(
+        headers=payload.get("headers", []),
+        rows=payload.get("rows", []),
+        meta=payload.get("meta", {}),
+    )
+
+
+# ------------------------------------------------------------
+# Global error handlers (optional but nice)
+# ------------------------------------------------------------
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """
+    Standardize HTTPException responses.
+    """
+    logger.warning(
+        "HTTPException (%s) at %s: %s",
+        exc.status_code,
+        request.url.path,
+        exc.detail,
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "status_code": exc.status_code,
+            "detail": exc.detail,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all for uncaught exceptions – ensures we do not leak stack traces
+    in production while still logging them server-side.
+    """
+    logger.exception("Unhandled exception at %s", request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": True,
+            "status_code": 500,
+            "detail": "Internal server error – see backend logs.",
+        },
+    )
