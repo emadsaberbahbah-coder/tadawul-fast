@@ -1,605 +1,387 @@
-# routes/ai_analysis.py
 """
-Enhanced AI & Multi-source Analysis Routes (v1.1)
-- Stronger validation & error handling
-- Safe Pydantic defaults (no mutable defaults)
-- Robust fallback when advanced_analysis is missing
-- Cleaner batch API with explicit response model
+routes/ai_analysis.py
+------------------------------------------------------------
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY
+
+- Uses core.data_engine.get_enriched_quote(s) for live data
+- Computes value / quality / momentum / overall scores
+- Returns clean JSON for API + sheet-friendly rows
+- Never throws 500 for normal data issues: returns MISSING rows
 """
 
-from typing import Optional, Any, Dict, List
-import logging
+from __future__ import annotations
+
 from datetime import datetime
-from enum import Enum
-import asyncio
-import time
+from typing import Any, Dict, List, Optional
 
-from fastapi import (
-    APIRouter,
-    HTTPException,
-    Query,
-    status,
-    Depends,
-    Request,
-)
-from pydantic import BaseModel, Field, validator
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+from core.data_engine import UnifiedQuote, get_enriched_quote, get_enriched_quotes
 
-# ---------------------------------------------------------------------------
-# Configuration & Constants
-# ---------------------------------------------------------------------------
-
-MAX_CONCURRENT_REQUESTS = 5
-ANALYSIS_TIMEOUT_SECONDS = 30
-CACHE_TTL_MINUTES = 15
-
-
-class AnalysisSource(Enum):
-    """Sources for multi-source analysis"""
-    GOOGLE_SHEETS = "google_sheets"
-    YAHOO_FINANCE = "yahoo_finance"
-    ARGAAM = "argaam"
-    ALPHA_VANTAGE = "alpha_vantage"
-    TADAWUL = "tadawul"
-
-
-class RecommendationType(Enum):
-    """Types of AI recommendations"""
-    STRONG_BUY = "strong_buy"
-    BUY = "buy"
-    HOLD = "hold"
-    SELL = "sell"
-    STRONG_SELL = "strong_sell"
-
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
-class AIRecommendation(BaseModel):
-    """Enhanced AI recommendation model"""
-    symbol: str
-    recommendation: RecommendationType
-    confidence_score: float = Field(..., ge=0.0, le=1.0)
-    price_target: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    reasoning: List[str] = Field(default_factory=list)
-    time_horizon: str = Field(
-        "short_term",
-        pattern=r"^(short_term|medium_term|long_term)$",
-    )
-    risk_level: str = Field(
-        "medium",
-        pattern=r"^(low|medium|high)$",
-    )
-    last_updated: datetime = Field(default_factory=datetime.now)
-    sources_used: List[AnalysisSource] = Field(default_factory=list)
-
-    @validator("confidence_score")
-    def validate_confidence(cls, v: float) -> float:
-        if 0 < v < 0.5:
-            logger.warning(f"Low confidence score: {v}")
-        return v
-
-
-class MultiSourceAnalysis(BaseModel):
-    """Enhanced multi-source analysis model"""
-    symbol: str
-    consensus_price: Optional[float] = None
-    price_range: Dict[str, float] = Field(default_factory=dict)  # e.g. {"min":..,"max":..,"avg":..}
-    source_breakdown: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
-    data_freshness: Dict[str, datetime] = Field(default_factory=dict)
-    data_quality_score: float = Field(..., ge=0.0, le=1.0)
-    discrepancies: List[Dict[str, Any]] = Field(default_factory=list)
-    recommendations_summary: Dict[str, int] = Field(default_factory=dict)
-    last_updated: datetime = Field(default_factory=datetime.now)
-
-
-class AnalysisRequest(BaseModel):
-    """Analysis request with validation (for future extension)"""
-    symbol: str = Field(..., min_length=1, max_length=10, pattern=r"^[A-Z0-9.]+$")
-    include_technical: bool = True
-    include_fundamental: bool = True
-    include_sentiment: bool = False
-    sources: List[AnalysisSource] = Field(
-        default_factory=lambda: [AnalysisSource.GOOGLE_SHEETS, AnalysisSource.ARGAAM]
-    )
-    force_refresh: bool = False
-
-    @validator("symbol")
-    def uppercase_symbol(cls, v: str) -> str:
-        return v.upper()
-
-
-class CacheClearRequest(BaseModel):
-    """Enhanced cache clearing with safety checks"""
-    symbol: Optional[str] = None
-    source: Optional[AnalysisSource] = None
-    confirm: bool = False  # Require confirmation for bulk clears
-    dry_run: bool = False  # Preview what would be cleared
-
-    @validator("symbol")
-    def validate_symbol_or_source(cls, v: Optional[str], values: Dict[str, Any]) -> Optional[str]:
-        # If neither symbol nor source is provided, require confirm=True (bulk clear)
-        if v is None and values.get("source") is None and not values.get("confirm"):
-            raise ValueError("Bulk cache clear requires confirmation (confirm=true)")
-        return v
-
-
-class CacheStats(BaseModel):
-    """Detailed cache statistics"""
-    total_entries: int
-    entries_by_source: Dict[str, int]
-    memory_usage_mb: float
-    hit_rate: float
-    oldest_entry: Optional[datetime]
-    newest_entry: Optional[datetime]
-    ttl_minutes: int
-
-
-class BatchRecommendationItem(BaseModel):
-    """
-    Item for batch recommendations:
-    - Either a full recommendation
-    - Or an error description for that symbol
-    """
-    symbol: str
-    recommendation: Optional[AIRecommendation] = None
-    error: Optional[str] = None
-    status_code: Optional[int] = None
-
-
-# ---------------------------------------------------------------------------
-# Enhanced Imports with Fallback
-# ---------------------------------------------------------------------------
-
-class MockAnalyzer:
-    """Mock analyzer for when real analyzer is unavailable"""
-
-    def __init__(self) -> None:
-        self.cache_stats = {
-            "total_entries": 0,
-            "entries_by_source": {},
-            "memory_usage_mb": 0.0,
-            "hit_rate": 0.0,
-            "oldest_entry": None,
-            "newest_entry": None,
-            "ttl_minutes": CACHE_TTL_MINUTES,
-        }
-
-    async def get_cache_info(self) -> Dict[str, Any]:
-        return self.cache_stats
-
-    async def clear_cache(self, symbol: Optional[str] = None, source: Optional[str] = None) -> Dict[str, Any]:
-        return {"status": "success", "cleared": 0, "dry_run": False}
-
-    async def get_supported_symbols(
-        self, exchange: Optional[str] = None, sector: Optional[str] = None
-    ) -> List[str]:
-        return []
-
-
-try:
-    from advanced_analysis import (
-        EnhancedAnalyzer,
-        generate_ai_recommendation as generate_ai_recommendation_fn,
-        get_multi_source_analysis as get_multi_source_analysis_fn,
-        get_analyzer_stats,  # not used yet but kept for future
-        validate_symbol,
-    )
-
-    analyzer = EnhancedAnalyzer()
-    ADVANCED_ANALYSIS_ENABLED = True
-    logger.info("✅ Advanced AI analysis engine loaded successfully")
-
-except ImportError as e:
-    logger.warning(f"⚠️ Advanced analysis module not available: {e}")
-    analyzer = MockAnalyzer()
-    ADVANCED_ANALYSIS_ENABLED = False
-
-    async def generate_ai_recommendation_fn(symbol: str, **kwargs: Any) -> Any:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="AI analysis engine is not available on this instance",
-        )
-
-    async def get_multi_source_analysis_fn(symbol: str, **kwargs: Any) -> Any:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Multi-source analysis is not available on this instance",
-        )
-
-    async def validate_symbol(symbol: str) -> bool:
-        # Simple fallback validation: basic format check
-        return bool(symbol and len(symbol) <= 12)
-
-
-# ---------------------------------------------------------------------------
-# Rate Limiting & Concurrency Control
-# ---------------------------------------------------------------------------
-
-class RateLimiter:
-    """Simple rate limiter for analysis endpoints"""
-
-    def __init__(self, max_requests: int = 5, time_window: int = 60) -> None:
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests: Dict[str, List[float]] = {}
-
-    async def check_limit(self, client_id: str) -> bool:
-        now = time.time()
-        if client_id not in self.requests:
-            self.requests[client_id] = []
-
-        # Clean old requests
-        self.requests[client_id] = [
-            req_time for req_time in self.requests[client_id]
-            if now - req_time < self.time_window
-        ]
-
-        if len(self.requests[client_id]) >= self.max_requests:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Rate limit exceeded. Max {self.max_requests} requests per minute.",
-            )
-
-        self.requests[client_id].append(now)
-        return True
-
-
-rate_limiter = RateLimiter(max_requests=10, time_window=60)
-
-
-async def get_client_id(request: Request) -> str:
-    """Extract client identifier for rate limiting"""
-    return request.client.host if request.client else "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Router Definition
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# ROUTER
+# ----------------------------------------------------------------------
 
 router = APIRouter(
     prefix="/v1/analysis",
-    tags=["AI Analysis"],
-    responses={
-        404: {"description": "Not found"},
-        429: {"description": "Rate limit exceeded"},
-        503: {"description": "Service unavailable"},
-    },
+    tags=["AI & Analysis"],
 )
 
+# ----------------------------------------------------------------------
+# MODELS
+# ----------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Internal helper functions
-# ---------------------------------------------------------------------------
 
-async def _build_ai_recommendation(
-    symbol: str,
-    include_reasoning: bool,
-    time_horizon: str,
-) -> AIRecommendation:
-    """
-    Core helper that:
-    - Validates symbol
-    - Calls advanced engine with timeout
-    - Normalizes return into AIRecommendation
-    """
-    # Validate format
-    if not await validate_symbol(symbol):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid symbol format: {symbol}. Use format like '2222.SR' or 'AAPL'",
-        )
+class SingleAnalysisResponse(BaseModel):
+    """One ticker full analysis – safe for Sheets consumption."""
 
-    if not ADVANCED_ANALYSIS_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="AI analysis engine is not available on this instance",
-        )
+    symbol: str
+    name: Optional[str] = None
+    market_region: Optional[str] = None
 
+    price: Optional[float] = None
+    change_pct: Optional[float] = None
+    market_cap: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    pb: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+
+    data_quality: str = "MISSING"
+
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
+    opportunity_score: Optional[float] = None
+    overall_score: Optional[float] = None
+    recommendation: Optional[str] = None
+
+    last_updated_utc: Optional[datetime] = None
+    sources: List[str] = Field(default_factory=list)
+
+    notes: Optional[str] = None
+    error: Optional[str] = None  # text error instead of 500
+
+
+class BatchAnalysisRequest(BaseModel):
+    tickers: List[str]
+
+
+class BatchAnalysisResponse(BaseModel):
+    results: List[SingleAnalysisResponse]
+
+
+class SheetAnalysisResponse(BaseModel):
+    headers: List[str]
+    rows: List[List[Any]]
+
+
+# ----------------------------------------------------------------------
+# INTERNAL HELPERS
+# ----------------------------------------------------------------------
+
+
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        raw_rec = await asyncio.wait_for(
-            generate_ai_recommendation_fn(
-                symbol=symbol,
-                include_reasoning=include_reasoning,
-                time_horizon=time_horizon,
-            ),
-            timeout=ANALYSIS_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"Analysis timeout for {symbol}")
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Analysis timeout. Please try again later.",
-        )
-
-    # Normalize into dict
-    if isinstance(raw_rec, AIRecommendation):
-        return raw_rec
-    if hasattr(raw_rec, "to_dict"):
-        data = raw_rec.to_dict()  # type: ignore[attr-defined]
-    elif isinstance(raw_rec, dict):
-        data = raw_rec
-    else:
-        data = raw_rec.__dict__
-
-    # Ensure symbol is present & uppercased
-    data.setdefault("symbol", symbol.upper())
-    return AIRecommendation(**data)
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@router.get("/recommendation", response_model=AIRecommendation)
-async def get_ai_recommendation(
-    symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. 2222.SR or AAPL"),
-    include_reasoning: bool = Query(True, description="Include detailed reasoning"),
-    time_horizon: str = Query("short_term", pattern=r"^(short_term|medium_term|long_term)$"),
-    request: Request = None,  # kept for future logging / client metadata
-    client_id: str = Depends(get_client_id),
-):
+def _compute_scores(q: UnifiedQuote) -> Dict[str, Optional[float]]:
     """
-    Get AI trading recommendation with enhanced features.
+    Basic AI-like scoring layer. 0–100 scale for each score.
 
-    Features:
-    - Rate limiting
-    - Symbol validation
-    - Timeout protection
-    - Detailed reasoning
-    - Multiple time horizons
+    This is intentionally simple and deterministic so Google Sheets can rely on it.
     """
-    await rate_limiter.check_limit(client_id)
-    return await _build_ai_recommendation(symbol=symbol, include_reasoning=include_reasoning, time_horizon=time_horizon)
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
 
+    pe = _safe_float(q.pe_ttm)
+    pb = _safe_float(q.pb)
+    dy = _safe_float(q.dividend_yield)
+    roe = _safe_float(q.roe)
+    profit_margin = _safe_float(q.profit_margin)
+    change_pct = _safe_float(q.change_pct)
 
-@router.post("/batch-recommendations", response_model=List[BatchRecommendationItem])
-async def get_batch_recommendations(
-    symbols: List[str] = Query(..., description="List of ticker symbols"),
-    request: Request = None,
-    client_id: str = Depends(get_client_id),
-):
-    """
-    Get AI recommendations for multiple symbols in batch.
+    # ------------------------
+    # Value score (P/E, P/B, Div Yield)
+    # ------------------------
+    vs = 50.0
+    if pe is not None:
+        if 0 < pe < 12:
+            vs += 20
+        elif 12 <= pe <= 20:
+            vs += 10
+        elif pe > 35:
+            vs -= 15
+    if pb is not None:
+        if 0 < pb < 1:
+            vs += 10
+        elif pb > 4:
+            vs -= 10
+    if dy is not None:
+        if 0.02 <= dy <= 0.06:
+            vs += 10
+        elif dy > 0.08:
+            vs -= 5
+    value_score = max(0.0, min(100.0, vs))
 
-    Limits:
-    - Max 10 symbols per request
-    - Rate limited per client (per endpoint call)
-    - Internally limited concurrency
-    """
-    if len(symbols) > 10:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum 10 symbols per batch request",
-        )
+    # ------------------------
+    # Quality score (ROE, profit margin)
+    # ------------------------
+    qs = 50.0
+    if roe is not None:
+        if roe >= 0.20:
+            qs += 25
+        elif 0.10 <= roe < 0.20:
+            qs += 10
+        elif roe < 0.0:
+            qs -= 15
+    if profit_margin is not None:
+        if profit_margin >= 0.20:
+            qs += 20
+        elif 0.10 <= profit_margin < 0.20:
+            qs += 10
+        elif profit_margin < 0.0:
+            qs -= 10
+    quality_score = max(0.0, min(100.0, qs))
 
-    await rate_limiter.check_limit(client_id)
+    # ------------------------
+    # Momentum score (daily change %)
+    # ------------------------
+    ms = 50.0
+    if change_pct is not None:
+        if change_pct > 0:
+            ms += min(change_pct, 10) * 2  # cap upside contribution
+        elif change_pct < 0:
+            ms += max(change_pct, -10) * 2  # penalties for deep red
+    momentum_score = max(0.0, min(100.0, ms))
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    results: List[BatchRecommendationItem] = []
-
-    async def process_symbol(sym: str) -> BatchRecommendationItem:
-        async with semaphore:
-            try:
-                rec = await _build_ai_recommendation(
-                    symbol=sym,
-                    include_reasoning=True,
-                    time_horizon="short_term",
-                )
-                return BatchRecommendationItem(symbol=sym, recommendation=rec)
-            except HTTPException as e:
-                return BatchRecommendationItem(
-                    symbol=sym,
-                    error=str(e.detail),
-                    status_code=e.status_code,
-                )
-            except Exception as e:
-                logger.error(f"Batch recommendation failed for {sym}: {e}", exc_info=True)
-                return BatchRecommendationItem(
-                    symbol=sym,
-                    error=f"Unexpected error: {str(e)[:100]}",
-                    status_code=500,
-                )
-
-    tasks = [process_symbol(sym) for sym in symbols]
-    results = await asyncio.gather(*tasks)
-    return list(results)
-
-
-@router.get("/multi-source", response_model=MultiSourceAnalysis)
-async def get_multi_source_analysis(
-    symbol: str = Query(..., min_length=1, description="Ticker symbol"),
-    sources: List[AnalysisSource] = Query(
-        default=[AnalysisSource.GOOGLE_SHEETS, AnalysisSource.ARGAAM],
-        description="Data sources to include",
-    ),
-    force_refresh: bool = Query(False, description="Force fresh data fetch"),
-    client_id: str = Depends(get_client_id),
-):
-    """
-    Get consolidated multi-source analysis with source breakdown.
-
-    Returns:
-    - Consensus price from all sources
-    - Data quality assessment
-    - Source-specific data
-    - Discrepancy analysis
-    """
-    await rate_limiter.check_limit(client_id)
-
-    if not ADVANCED_ANALYSIS_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Multi-source analysis is not available",
-        )
-
-    try:
-        raw = await asyncio.wait_for(
-            get_multi_source_analysis_fn(
-                symbol=symbol,
-                sources=[s.value for s in sources],
-                force_refresh=force_refresh,
-            ),
-            timeout=ANALYSIS_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Multi-source analysis timeout",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Multi-source analysis failed for {symbol}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Multi-source analysis failed",
-        )
-
-    # Normalize into dict
-    if isinstance(raw, MultiSourceAnalysis):
-        return raw
-    if hasattr(raw, "to_dict"):
-        data = raw.to_dict()  # type: ignore[attr-defined]
-    elif isinstance(raw, dict):
-        data = raw
-    else:
-        data = raw.__dict__
-
-    data.setdefault("symbol", symbol.upper())
-    return MultiSourceAnalysis(**data)
-
-
-@router.get("/cache/info", response_model=CacheStats)
-async def get_ai_cache_info():
-    """Get detailed cache statistics for the AI analyzer."""
-    if not ADVANCED_ANALYSIS_ENABLED:
-        return CacheStats(
-            total_entries=0,
-            entries_by_source={},
-            memory_usage_mb=0.0,
-            hit_rate=0.0,
-            oldest_entry=None,
-            newest_entry=None,
-            ttl_minutes=CACHE_TTL_MINUTES,
-        )
-
-    try:
-        info = await analyzer.get_cache_info()
-        return CacheStats(**info)
-    except Exception as e:
-        logger.error(f"Cache info retrieval failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Cache info retrieval failed",
-        )
-
-
-@router.post("/cache/clear")
-async def clear_ai_cache(
-    payload: CacheClearRequest,
-    client_id: str = Depends(get_client_id),
-):
-    """
-    Enhanced cache clearing with safety features.
-
-    Safety Features:
-    - Confirmation required for bulk clears
-    - Dry run mode to preview impact
-    - Rate limiting
-    - Audit logging
-    """
-    await rate_limiter.check_limit(client_id)
-
-    if not ADVANCED_ANALYSIS_ENABLED:
-        return {"status": "mock", "cleared": 0}
-
-    try:
-        logger.info(f"Cache clear requested by {client_id}: {payload.dict()}")
-
-        if payload.dry_run:
-            preview = await analyzer.get_cache_info()
-            return {
-                "status": "dry_run",
-                "would_clear": preview.get("total_entries", 0),
-                "details": preview,
-            }
-
-        result = await analyzer.clear_cache(
-            symbol=payload.symbol,
-            source=payload.source.value if payload.source else None,
-        )
-
-        logger.info(f"Cache cleared: {result}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Cache clear failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Cache clear failed: {str(e)}",
-        )
-
-
-@router.get("/health")
-async def analysis_health_check():
-    """Health check for AI analysis service."""
-    health_status: Dict[str, Any] = {
-        "service": "ai_analysis",
-        "status": "healthy" if ADVANCED_ANALYSIS_ENABLED else "degraded",
-        "advanced_analysis_enabled": ADVANCED_ANALYSIS_ENABLED,
-        "analyzer_available": analyzer is not None,
-        "timestamp": datetime.now().isoformat(),
-        "cache_enabled": True,
-        "rate_limiter_active": True,
+    return {
+        "value_score": value_score,
+        "quality_score": quality_score,
+        "momentum_score": momentum_score,
     }
 
-    if ADVANCED_ANALYSIS_ENABLED:
-        try:
-            stats = await analyzer.get_cache_info()
-            health_status.update(
-                {
-                    "cache_entries": stats.get("total_entries", 0),
-                    "cache_hit_rate": stats.get("hit_rate", 0.0),
-                }
-            )
-        except Exception:
-            health_status["cache_status"] = "unavailable"
 
-    return health_status
+def _compute_overall_and_reco(
+    opportunity_score: Optional[float],
+    value_score: Optional[float],
+    quality_score: Optional[float],
+    momentum_score: Optional[float],
+) -> Dict[str, Optional[float]]:
+    scores = [
+        s for s in [opportunity_score, value_score, quality_score, momentum_score]
+        if isinstance(s, (int, float))
+    ]
+    if not scores:
+        return {"overall_score": None, "recommendation": None}
+
+    overall = sum(scores) / len(scores)
+
+    if overall >= 80:
+        reco = "STRONG_BUY"
+    elif overall >= 65:
+        reco = "BUY"
+    elif overall >= 45:
+        reco = "HOLD"
+    elif overall >= 30:
+        reco = "REDUCE"
+    else:
+        reco = "SELL"
+
+    return {"overall_score": overall, "recommendation": reco}
 
 
-@router.get("/symbols/supported")
-async def get_supported_symbols(
-    exchange: Optional[str] = Query(None, description="Filter by exchange"),
-    sector: Optional[str] = Query(None, description="Filter by sector"),
-):
+def _quote_to_analysis(quote: UnifiedQuote) -> SingleAnalysisResponse:
+    base_scores = _compute_scores(quote)
+    more = _compute_overall_and_reco(
+        opportunity_score=quote.opportunity_score,
+        value_score=base_scores["value_score"],
+        quality_score=base_scores["quality_score"],
+        momentum_score=base_scores["momentum_score"],
+    )
+
+    return SingleAnalysisResponse(
+        symbol=quote.symbol,
+        name=quote.name,
+        market_region=quote.market_region,
+        price=quote.price,
+        change_pct=quote.change_pct,
+        market_cap=quote.market_cap,
+        pe_ttm=quote.pe_ttm,
+        pb=quote.pb,
+        dividend_yield=quote.dividend_yield,
+        roe=quote.roe,
+        roa=quote.roa,
+        data_quality=quote.data_quality,
+        value_score=base_scores["value_score"],
+        quality_score=base_scores["quality_score"],
+        momentum_score=base_scores["momentum_score"],
+        opportunity_score=quote.opportunity_score,
+        overall_score=more["overall_score"],
+        recommendation=more["recommendation"],
+        last_updated_utc=quote.last_updated_utc,
+        sources=[src.provider for src in (quote.sources or [])],
+        notes=quote.notes,
+    )
+
+
+def _build_sheet_headers() -> List[str]:
+    """Headers to use directly in Google Sheets."""
+    return [
+        "Symbol",
+        "Company Name",
+        "Market Region",
+        "Price",
+        "Change %",
+        "Market Cap",
+        "P/E (TTM)",
+        "P/B",
+        "Dividend Yield %",
+        "ROE %",
+        "Data Quality",
+        "Value Score",
+        "Quality Score",
+        "Momentum Score",
+        "Opportunity Score",
+        "Overall Score",
+        "Recommendation",
+        "Last Updated (UTC)",
+        "Sources",
+    ]
+
+
+def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
     """
-    Get list of symbols supported by the AI analysis engine.
-
-    This endpoint helps clients discover available symbols.
+    Flatten one analysis result to a row (all primitives),
+    so Apps Script can use setValues() safely.
     """
-    if not ADVANCED_ANALYSIS_ENABLED:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Analysis engine unavailable",
-        )
+    return [
+        a.symbol,
+        a.name or "",
+        a.market_region or "",
+        a.price,
+        a.change_pct,
+        a.market_cap,
+        a.pe_ttm,
+        a.pb,
+        (a.dividend_yield * 100.0) if a.dividend_yield is not None else None,
+        (a.roe * 100.0) if a.roe is not None else None,
+        a.data_quality,
+        a.value_score,
+        a.quality_score,
+        a.momentum_score,
+        a.opportunity_score,
+        a.overall_score,
+        a.recommendation,
+        a.last_updated_utc.isoformat() if a.last_updated_utc else None,
+        ", ".join(a.sources) if a.sources else "",
+    ]
+
+
+# ----------------------------------------------------------------------
+# ROUTES
+# ----------------------------------------------------------------------
+
+
+@router.get("/quote", response_model=SingleAnalysisResponse)
+async def analyze_single_quote(ticker: str) -> SingleAnalysisResponse:
+    """
+    High-level AI/quant analysis for a single ticker.
+    Designed to be consumed by Google Sheets / Apps Script.
+    """
+    ticker = (ticker or "").strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker is required")
 
     try:
-        supported_symbols = await analyzer.get_supported_symbols(
-            exchange=exchange,
-            sector=sector,
+        quote = await get_enriched_quote(ticker)
+        analysis = _quote_to_analysis(quote)
+
+        # If we truly have no data from providers, mark an explicit error
+        if analysis.data_quality == "MISSING":
+            analysis.error = "No data available from providers"
+        return analysis
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # NEVER crash Google Sheets – always return a valid row
+        return SingleAnalysisResponse(
+            symbol=ticker.upper(),
+            data_quality="MISSING",
+            error=f"Exception in analysis: {exc}",
         )
-        total = len(supported_symbols)
-        return {
-            "count": min(total, 100),
-            "symbols": supported_symbols[:100],  # Limit response size
-            "total_available": total,
+
+
+@router.post("/quotes", response_model=BatchAnalysisResponse)
+async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisResponse:
+    """
+    Batch AI/quant analysis for multiple tickers.
+    """
+    tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
+    if not tickers:
+        raise HTTPException(status_code=400, detail="At least one ticker is required")
+
+    try:
+        unified_quotes = await get_enriched_quotes(tickers)
+    except Exception as exc:
+        # Total failure – return placeholder rows for all tickers
+        placeholder_results: List[SingleAnalysisResponse] = [
+            SingleAnalysisResponse(
+                symbol=t.upper(),
+                data_quality="MISSING",
+                error=f"Batch analysis failed: {exc}",
+            )
+            for t in tickers
+        ]
+        return BatchAnalysisResponse(results=placeholder_results)
+
+    results: List[SingleAnalysisResponse] = []
+    for t, q in zip(tickers, unified_quotes):
+        try:
+            # If get_enriched_quotes already returns a UnifiedQuote with MISSING,
+            # we still convert to keep consistent structure.
+            analysis = _quote_to_analysis(q)
+            if analysis.data_quality == "MISSING":
+                analysis.error = "No data available from providers"
+            results.append(analysis)
+        except Exception as exc:
+            results.append(
+                SingleAnalysisResponse(
+                    symbol=t.upper(),
+                    data_quality="MISSING",
+                    error=f"Exception building analysis: {exc}",
+                )
+            )
+
+    return BatchAnalysisResponse(results=results)
+
+
+@router.post("/sheet-rows", response_model=SheetAnalysisResponse)
+async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse:
+    """
+    Google Sheets-friendly endpoint.
+
+    Returns:
+        {
+          "headers": [...],
+          "rows": [ [row for t1], [row for t2], ... ]
         }
-    except Exception as e:
-        logger.error(f"Failed to get supported symbols: {e}", exc_info=True)
-        return {"count": 0, "symbols": [], "error": str(e)}
+
+    Apps Script can simply setValues() using rows with the returned headers.
+    """
+    batch = await analyze_batch_quotes(body)
+    headers = _build_sheet_headers()
+
+    rows: List[List[Any]] = []
+    for res in batch.results:
+        rows.append(_analysis_to_sheet_row(res))
+
+    return SheetAnalysisResponse(headers=headers, rows=rows)
