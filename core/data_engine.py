@@ -1,64 +1,73 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – v1.5 (FIXED)
-Updates:
-1. FIXED: Removed self-calling infinite loop for KSA data.
-2. ADDED: Direct Yahoo Finance (yfinance) fallback for KSA symbols.
-3. IMPROVED: Better error handling for missing data.
+UNIFIED DATA & ANALYSIS ENGINE – v2.0 (MULTI-PROVIDER)
+
+Key points:
+- EODHD for real-time price (KSA + Global)
+- FMP for extra fundamentals (PE, EPS, 52W, etc.) where available
+- Yahoo Finance (yfinance) as universal fallback
+- Returns UnifiedQuote model used by Sheets & analysis layer
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import logging
+import os
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Literal, Tuple, Any
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import aiohttp
-# Critical: Import yfinance for live data
+import aiohttp  # type: ignore
+
+# yfinance is optional but strongly recommended
 try:
-    import yfinance as yf
-except ImportError:
-    yf = None
+    import yfinance as yf  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    yf = None  # type: ignore
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field  # type: ignore
 
 # ----------------------------------------------------------------------
 # Logging
 # ----------------------------------------------------------------------
-
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
 
-# Read from environment
+# Legacy / future backend integration (kept for compatibility)
 BACKEND_BASE_URL = os.getenv(
     "BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com"
 )
 APP_TOKEN = os.getenv("APP_TOKEN", "")
 BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "")
 
-# Enabled providers
-_enabled_raw = os.getenv(
-    "ENABLED_PROVIDERS", "alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp,yfinance"
-)
+# Enabled providers list (lowercase)
+_enabled_raw = os.getenv("ENABLED_PROVIDERS", "eodhd,fmp,yfinance")
 ENABLED_PROVIDERS: List[str] = [
-    p.strip() for p in _enabled_raw.split(",") if p.strip()
+    p.strip().lower() for p in _enabled_raw.split(",") if p.strip()
 ]
 
-# Force Yahoo as fallback if not explicitly set
-PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "yfinance")
+# Primary provider preference
+PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "eodhd").lower()
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "25"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))  # reserved for future use
 
+# Provider-specific config
+EODHD_API_KEY = os.getenv("EODHD_API_KEY", "")
+EODHD_BASE_URL = os.getenv("EODHD_BASE_URL", "https://eodhd.com/api")
+
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+FMP_BASE_URL = os.getenv(
+    "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+)
+
+# Types
 DataQualityLevel = Literal["EXCELLENT", "GOOD", "FAIR", "POOR", "MISSING"]
 MarketRegion = Literal["KSA", "GLOBAL", "UNKNOWN"]
-
 
 # ----------------------------------------------------------------------
 # MODELS
@@ -67,6 +76,7 @@ MarketRegion = Literal["KSA", "GLOBAL", "UNKNOWN"]
 
 class QuoteSourceInfo(BaseModel):
     """Details about a single provider source used in the merged quote."""
+
     provider: str
     timestamp: datetime
     fields: List[str] = Field(default_factory=list)
@@ -120,9 +130,8 @@ class UnifiedQuote(BaseModel):
     notes: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Compatibility properties
+    # Compatibility helpers (keep old attribute names working)
     # ------------------------------------------------------------------
-
     @property
     def last_updated(self) -> Optional[datetime]:
         return self.last_updated_utc
@@ -144,77 +153,152 @@ class UnifiedQuote(BaseModel):
 # PROVIDER ADAPTERS
 # ----------------------------------------------------------------------
 
+
 async def fetch_from_yahoo(symbol: str) -> Dict[str, Any]:
     """
-    Fetch data from Yahoo Finance (yfinance).
-    Handles both Global and KSA symbols (KSA symbols must end in .SR).
+    Fetch data from Yahoo Finance via yfinance.
+
+    Used as a universal fallback when API providers do not return data.
+    Handles both global and KSA (.SR) symbols.
     """
     if not yf:
-        logger.error("yfinance module not found. Please add to requirements.txt")
+        logger.error("yfinance module not found. Please add it to requirements.txt")
         return {}
 
     try:
-        # Run synchronous yfinance call in a thread
         loop = asyncio.get_event_loop()
         ticker = await loop.run_in_executor(None, yf.Ticker, symbol)
-        
-        # Fetch info dict (contains price + fundamentals)
-        # We use fast_info for price if possible, but .info has fundamentals
         info = await loop.run_in_executor(None, lambda: ticker.info)
-        
-        # Fallback for price if 'info' is missing live data
-        if not info or ('currentPrice' not in info and 'regularMarketPrice' not in info):
+
+        # If price is missing, fallback to a 1-day history snapshot
+        if not info or (
+            "currentPrice" not in info and "regularMarketPrice" not in info
+        ):
             hist = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
             if not hist.empty:
                 info = info or {}
-                info['currentPrice'] = hist['Close'].iloc[-1]
-                info['previousClose'] = hist['Open'].iloc[-1]
-                info['regularMarketVolume'] = int(hist['Volume'].iloc[-1])
+                info["currentPrice"] = float(hist["Close"].iloc[-1])
+                info["previousClose"] = float(hist["Open"].iloc[-1])
+                info["regularMarketVolume"] = int(hist["Volume"].iloc[-1])
             else:
-                logger.warning(f"Yahoo Finance returned no data for {symbol}")
+                logger.warning("Yahoo Finance returned no data for %s", symbol)
                 return {}
 
         return _normalize_yahoo_quote(info, symbol)
-
-    except Exception as e:
-        logger.error(f"Yahoo Finance fetch failed for {symbol}: {e}")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Yahoo Finance fetch failed for %s: %s", symbol, exc)
         return {}
+
+
+async def fetch_from_eodhd(symbol: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
+    """
+    Fetch real-time quote from EODHD /real-time/{code} endpoint.
+    """
+    if not EODHD_API_KEY:
+        logger.debug("EODHD_API_KEY not configured – skipping EODHD for %s", symbol)
+        return {}
+
+    # Normalize ticker: if it already has '.', assume fully-qualified (e.g. 1120.SR, MSFT.US)
+    # otherwise assume US equity and append .US
+    t = symbol.strip().upper()
+    code = t if "." in t else f"{t}.US"
+
+    url = f"{EODHD_BASE_URL.rstrip('/')}/real-time/{code}"
+    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+
+    try:
+        async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.warning(
+                    "EODHD HTTP %s for %s (%s): %s", resp.status, symbol, code, text
+                )
+                return {}
+            data = await resp.json()
+    except Exception as exc:  # pragma: no cover - network
+        logger.error("EODHD request failed for %s (%s): %s", symbol, code, exc)
+        return {}
+
+    if not isinstance(data, dict) or "code" not in data:
+        logger.warning("EODHD payload invalid for %s: %s", symbol, data)
+        return {}
+
+    return _normalize_eodhd_quote(data, symbol)
+
+
+async def fetch_from_fmp(symbol: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
+    """
+    Fetch quote & basic fundamentals from FinancialModelingPrep.
+
+    Uses /quote/{symbol}, which returns a list with a single item.
+    """
+    if not FMP_API_KEY:
+        logger.debug("FMP_API_KEY not configured – skipping FMP for %s", symbol)
+        return {}
+
+    url = f"{FMP_BASE_URL.rstrip('/')}/quote/{symbol.upper()}"
+    params = {"apikey": FMP_API_KEY}
+
+    try:
+        async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.warning("FMP HTTP %s for %s: %s", resp.status, symbol, text)
+                return {}
+            data = await resp.json()
+    except Exception as exc:  # pragma: no cover - network
+        logger.error("FMP request failed for %s: %s", symbol, exc)
+        return {}
+
+    if not isinstance(data, list) or not data:
+        logger.warning("FMP payload invalid for %s: %s", symbol, data)
+        return {}
+
+    return _normalize_fmp_quote(data[0], symbol)
 
 
 async def fetch_from_backend_api(symbol: str) -> Dict[str, Any]:
     """
-    Fetch from external backend (Legacy).
-    Skipped if configured URL matches current host to prevent loops.
+    (Optional) Fetch from an external backend API.
+
+    NOTE:
+    - Disabled by default to avoid self-calling loops inside the same container.
+    - You can safely extend this later if you expose a dedicated data microservice.
     """
-    # Prevent self-calling loop
     if "tadawul-fast-bridge" in BACKEND_BASE_URL:
-        logger.debug(f"Skipping backend fetch for {symbol} to avoid infinite loop.")
+        logger.debug(
+            "Skipping backend API fetch for %s to avoid possible infinite loop", symbol
+        )
         return {}
-        
-    # (Existing logic omitted for safety, relying on yfinance)
+
+    # Placeholder – currently unused
     return {}
 
 
 # ----------------------------------------------------------------------
-# NORMALIZATION
+# NORMALIZATION HELPERS
 # ----------------------------------------------------------------------
 
+
 def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """Normalize Yahoo Finance dict to UnifiedQuote."""
+    """Normalize Yahoo Finance dict to UnifiedQuote-compatible payload."""
     now = datetime.now(timezone.utc)
-    
-    # Yahoo keys vary (currentPrice vs regularMarketPrice)
-    price = data.get("currentPrice") or data.get("regularMarketPrice") or data.get("previousClose")
+
+    price = (
+        data.get("currentPrice")
+        or data.get("regularMarketPrice")
+        or data.get("previousClose")
+    )
     prev_close = data.get("previousClose") or data.get("regularMarketPreviousClose")
-    
-    # Calculate change if missing
-    change = None
-    change_pct = None
-    if price and prev_close:
+
+    change = data.get("change")
+    change_pct = data.get("changePercent") or data.get("changePercentRaw")
+
+    if change is None and price is not None and prev_close:
         change = price - prev_close
         change_pct = (change / prev_close) * 100.0
 
-    return {
+    payload: Dict[str, Any] = {
         "symbol": symbol,
         "name": data.get("longName") or data.get("shortName"),
         "price": price,
@@ -225,13 +309,11 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "volume": data.get("volume") or data.get("regularMarketVolume"),
         "market_cap": data.get("marketCap"),
         "currency": data.get("currency"),
-        "exchange": data.get("exchange"),
+        "exchange": data.get("exchange") or data.get("exchangeTimezoneName"),
         "fifty_two_week_high": data.get("fiftyTwoWeekHigh"),
         "fifty_two_week_low": data.get("fiftyTwoWeekLow"),
-        
         "change": change,
         "change_pct": change_pct,
-
         # Fundamentals
         "eps_ttm": data.get("trailingEps"),
         "pe_ttm": data.get("trailingPE"),
@@ -244,27 +326,122 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "operating_margin": data.get("operatingMargins"),
         "revenue_growth_yoy": data.get("revenueGrowth"),
         "net_income_growth_yoy": data.get("earningsGrowth"),
-        
         "last_updated_utc": now,
         "__source__": QuoteSourceInfo(
-            provider="yfinance",
-            timestamp=now,
-            fields=list(data.keys())
+            provider="yfinance", timestamp=now, fields=list(data.keys())
         ),
     }
+    return payload
+
+
+def _normalize_eodhd_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """Normalize EODHD real-time payload to UnifiedQuote-compatible dict."""
+    now = datetime.now(timezone.utc)
+
+    price = data.get("close")
+    prev_close = data.get("previousClose")
+    change = data.get("change")
+    change_pct = data.get("change_p")
+
+    if change is None and price is not None and prev_close:
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100.0
+
+    ts = data.get("timestamp")
+    if isinstance(ts, (int, float)):
+        try:
+            last_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            last_dt = now
+    else:
+        last_dt = now
+
+    currency = _infer_currency_from_symbol(symbol)
+
+    payload: Dict[str, Any] = {
+        "symbol": symbol,
+        "name": data.get("name"),
+        "exchange": data.get("exchange_short_name") or data.get("exchange"),
+        "currency": currency,
+        "price": price,
+        "prev_close": prev_close,
+        "open": data.get("open"),
+        "high": data.get("high"),
+        "low": data.get("low"),
+        "volume": data.get("volume"),
+        "market_cap": data.get("market_cap") or data.get("marketCap"),
+        "change": change,
+        "change_pct": change_pct,
+        # 52w fields: not always available on this endpoint – leave None for now
+        "last_updated_utc": last_dt,
+        "__source__": QuoteSourceInfo(
+            provider="eodhd", timestamp=last_dt, fields=list(data.keys())
+        ),
+    }
+    return payload
+
+
+def _normalize_fmp_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """Normalize FMP /quote payload to UnifiedQuote-compatible dict."""
+    now = datetime.now(timezone.utc)
+
+    price = data.get("price")
+    prev_close = data.get("previousClose")
+    change = data.get("change")
+    change_pct = data.get("changesPercentage")
+
+    if change is None and price is not None and prev_close:
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100.0
+
+    payload: Dict[str, Any] = {
+        "symbol": symbol,
+        "name": data.get("name"),
+        "exchange": data.get("exchange"),
+        "currency": data.get("currency"),
+        "price": price,
+        "prev_close": prev_close,
+        "open": data.get("open"),
+        "high": data.get("dayHigh"),
+        "low": data.get("dayLow"),
+        "volume": data.get("volume"),
+        "market_cap": data.get("marketCap"),
+        "fifty_two_week_high": data.get("yearHigh"),
+        "fifty_two_week_low": data.get("yearLow"),
+        # Fundamentals (where available for your plan)
+        "eps_ttm": data.get("eps"),
+        "pe_ttm": data.get("pe"),
+        "pb": data.get("priceToBook"),
+        "dividend_yield": data.get("yield"),
+        "last_updated_utc": now,
+        "change": change,
+        "change_pct": change_pct,
+        "__source__": QuoteSourceInfo(
+            provider="fmp", timestamp=now, fields=list(data.keys())
+        ),
+    }
+    return payload
+
+
+def _infer_currency_from_symbol(symbol: str) -> str:
+    s = symbol.upper()
+    if s.endswith(".SR"):
+        return "SAR"
+    return "USD"
 
 
 def _calculate_change_fields(data: Dict[str, Any]) -> None:
     price = data.get("price")
     prev_close = data.get("prev_close")
-
     if price is not None and prev_close:
         data["change"] = price - prev_close
         data["change_pct"] = (price - prev_close) / prev_close * 100.0
 
 
 def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
-    if symbol.upper().endswith(".SR") or (exchange and "Saudi" in str(exchange)):
+    if symbol.upper().endswith(".SR") or (
+        exchange and "SAUDI" in str(exchange).upper()
+    ):
         return "KSA"
     return "GLOBAL"
 
@@ -272,7 +449,6 @@ def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
 def _assess_data_quality(data: Dict[str, Any]) -> Tuple[DataQualityLevel, List[str]]:
     required = ["price", "prev_close", "volume"]
     missing = [f for f in required if data.get(f) is None]
-    
     if len(missing) == len(required):
         return "MISSING", missing
     if not missing:
@@ -281,63 +457,161 @@ def _assess_data_quality(data: Dict[str, Any]) -> Tuple[DataQualityLevel, List[s
 
 
 def _compute_opportunity_score(data: Dict[str, Any]) -> Optional[float]:
-    """Simple scoring logic."""
+    """
+    Very simple opportunity score based mainly on P/E and dividend yield.
+    0–100 scale.
+    """
     pe = data.get("pe_ttm")
-    if pe is None: return None
-    
+    dy = data.get("dividend_yield")
+    if pe is None and dy is None:
+        return None
+
     score = 50.0
-    if 0 < pe < 15: score += 20
-    elif pe > 30: score -= 10
-    return score
+
+    # Value tilt via P/E
+    if isinstance(pe, (int, float)):
+        if 0 < pe < 12:
+            score += 25
+        elif 12 <= pe <= 20:
+            score += 10
+        elif pe > 35:
+            score -= 15
+
+    # Income tilt via dividend yield
+    if isinstance(dy, (int, float)):
+        if 0.02 <= dy <= 0.06:
+            score += 10
+        elif dy > 0.08:
+            score -= 5
+
+    return max(0.0, min(100.0, score))
 
 
 # ----------------------------------------------------------------------
-# PUBLIC ENTRYPOINT
+# PROVIDER MERGING
 # ----------------------------------------------------------------------
+
+
+async def _gather_provider_payloads(symbol: str) -> Dict[str, Any]:
+    """
+    Call all enabled providers (EODHD, FMP, Yahoo) and merge results.
+
+    Priority order:
+        1) PRIMARY_PROVIDER (if available)
+        2) Remaining providers from ENABLED_PROVIDERS
+    """
+    symbol = symbol.strip().upper()
+    providers_in_env = [p for p in ENABLED_PROVIDERS if p in {"eodhd", "fmp", "yfinance"}]
+
+    # Build order with primary first
+    order: List[str] = []
+    primary = PRIMARY_PROVIDER
+    if primary in providers_in_env:
+        order.append(primary)
+    for p in providers_in_env:
+        if p not in order:
+            order.append(p)
+
+    if not order:
+        logger.warning("No providers enabled – falling back to Yahoo only.")
+        order = ["yfinance"]
+
+    merged: Dict[str, Any] = {"symbol": symbol}
+    sources: List[QuoteSourceInfo] = []
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tasks: Dict[str, asyncio.Task] = {}
+
+        for provider in order:
+            if provider == "eodhd":
+                tasks["eodhd"] = asyncio.create_task(fetch_from_eodhd(symbol, session))
+            elif provider == "fmp":
+                tasks["fmp"] = asyncio.create_task(fetch_from_fmp(symbol, session))
+            elif provider == "yfinance":
+                tasks["yfinance"] = asyncio.create_task(fetch_from_yahoo(symbol))
+
+        if not tasks:
+            return {}
+
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        for provider_name, result in zip(tasks.keys(), results):
+            if isinstance(result, Exception):  # pragma: no cover - defensive
+                logger.error(
+                    "Provider %s raised exception for %s: %s",
+                    provider_name,
+                    symbol,
+                    result,
+                )
+                continue
+
+            data = result or {}
+            if not data:
+                continue
+
+            src = data.pop("__source__", None)
+            if isinstance(src, QuoteSourceInfo):
+                sources.append(src)
+
+            for key, value in data.items():
+                if value is None:
+                    continue
+                if key not in merged or merged.get(key) is None:
+                    merged[key] = value
+
+    merged["sources"] = sources
+    if merged.get("last_updated_utc") is None:
+        merged["last_updated_utc"] = datetime.now(timezone.utc)
+
+    _calculate_change_fields(merged)
+    return merged
+
+
+# ----------------------------------------------------------------------
+# PUBLIC ENTRYPOINTS
+# ----------------------------------------------------------------------
+
 
 async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     """
     Public enriched quote function.
-    Now defaults to Yahoo Finance for reliable KSA & Global data.
+
+    This is the main entrypoint used by the rest of the system.
+    It merges data from multiple providers (EODHD, FMP, Yahoo finance).
     """
     symbol = symbol.strip().upper()
-    
-    logger.info(f"[DataEngine] Fetching enriched quote for: {symbol}")
-    
-    # 1. Fetch from Yahoo Finance
-    raw_data = await fetch_from_yahoo(symbol)
-    
+    logger.info("[DataEngine] Fetching enriched quote for: %s", symbol)
+
+    raw_data = await _gather_provider_payloads(symbol)
+
     if not raw_data:
-        logger.warning(f"No data found for {symbol}")
+        logger.warning("No data found for %s", symbol)
         return UnifiedQuote(
             symbol=symbol,
             last_updated_utc=datetime.now(timezone.utc),
             data_quality="MISSING",
-            data_gaps=["No data from providers"]
+            data_gaps=["No data from providers"],
         )
 
-    # 2. Process and Enrich
     dq, gaps = _assess_data_quality(raw_data)
-    
-    # Calculate simple opportunity score
     opp_score = _compute_opportunity_score(raw_data)
-    
+
     quote = UnifiedQuote(
         **raw_data,
-        market_region=_infer_market_region(symbol, raw_data.get("exchange")),
+        market_region=_infer_market_region(
+            symbol, raw_data.get("exchange")
+        ),
         data_quality=dq,
         data_gaps=gaps,
         opportunity_score=opp_score,
-        sources=[raw_data.get("__source__")] if raw_data.get("__source__") else []
     )
-    
+
     return quote
 
 
 async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
-    """
-    Fetch multiple quotes concurrently.
-    """
+    """Fetch multiple quotes concurrently."""
     tasks = [get_enriched_quote(sym) for sym in symbols]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -346,7 +620,13 @@ async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
         if isinstance(result, UnifiedQuote):
             quotes.append(result)
         else:
-            logger.error(f"[DataEngine] Error fetching {sym}: {result}")
-            quotes.append(UnifiedQuote(symbol=sym, data_quality="MISSING"))
+            logger.error("[DataEngine] Error fetching %s: %s", sym, result)
+            quotes.append(
+                UnifiedQuote(
+                    symbol=sym.strip().upper(),
+                    data_quality="MISSING",
+                    data_gaps=[f"Exception: {result}"],
+                )
+            )
 
     return quotes
