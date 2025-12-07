@@ -1,12 +1,3 @@
-The most critical fix is in `core/data_engine.py`. The version you shared (v1.4) is the one causing the infinite loop because it tries to call your own backend API.
-
-Here is the **Full, Updated Script (v1.5)**.
-
-**Action:** Replace the entire content of `core/data_engine.py` with the code below.
-
-### `core/data_engine.py` (Fixed & Updated)
-
-```python
 """
 core/data_engine.py
 ----------------------------------------------------------------------
@@ -216,7 +207,14 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     price = data.get("currentPrice") or data.get("regularMarketPrice") or data.get("previousClose")
     prev_close = data.get("previousClose") or data.get("regularMarketPreviousClose")
     
-    result = {
+    # Calculate change if missing
+    change = None
+    change_pct = None
+    if price and prev_close:
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100.0
+
+    return {
         "symbol": symbol,
         "name": data.get("longName") or data.get("shortName"),
         "price": price,
@@ -231,6 +229,9 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "fifty_two_week_high": data.get("fiftyTwoWeekHigh"),
         "fifty_two_week_low": data.get("fiftyTwoWeekLow"),
         
+        "change": change,
+        "change_pct": change_pct,
+
         # Fundamentals
         "eps_ttm": data.get("trailingEps"),
         "pe_ttm": data.get("trailingPE"),
@@ -251,9 +252,6 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
             fields=list(data.keys())
         ),
     }
-    
-    _calculate_change_fields(result)
-    return result
 
 
 def _calculate_change_fields(data: Dict[str, Any]) -> None:
@@ -352,4 +350,3 @@ async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
             quotes.append(UnifiedQuote(symbol=sym, data_quality="MISSING"))
 
     return quotes
-```
