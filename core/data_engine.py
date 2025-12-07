@@ -1,13 +1,42 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – v2.0 (MULTI-PROVIDER)
+UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.1 (MULTI-PROVIDER)
 
-Key points:
-- EODHD for real-time price (KSA + Global)
-- FMP for extra fundamentals (PE, EPS, 52W, etc.) where available
-- Yahoo Finance (yfinance) as universal fallback
-- Returns UnifiedQuote model used by Sheets & analysis layer
+Role in Architecture
+--------------------
+- This module is the "legacy" but still fully functional data engine.
+- New features prefer `core.data_engine_v2.DataEngine`, but many routes
+  still fall back to `core.data_engine.DataEngine` if v2 is missing.
+- This file is therefore kept **100% compatible** and now exposes a
+  proper `DataEngine` class with async methods:
+
+    - DataEngine.get_enriched_quote(symbol)
+    - DataEngine.get_enriched_quotes(symbols)
+
+Key Behaviors
+-------------
+- Uses multiple providers:
+    • EODHD (GLOBAL ONLY – **never** for .SR / KSA)
+    • FMP
+    • Yahoo Finance (yfinance) as universal fallback
+- Merges provider outputs into a single `UnifiedQuote` Pydantic model.
+- Provides a simple `opportunity_score` and `data_quality` signal.
+- Exposes alias fields via `UnifiedQuote.model_dump()` so that
+  Google Sheets endpoints (via routes/enriched_quote.py) see
+  dashboard-friendly keys like:
+
+    • last_price         -> from price
+    • previous_close     -> from prev_close
+    • high_52w / low_52w -> from fifty_two_week_high/low
+    • change_percent     -> from change_pct
+    • as_of_utc          -> from last_updated_utc
+    • timezone           -> inferred from market_region
+
+Notes for KSA (.SR)
+-------------------
+- EODHD is **not used** for KSA symbols (".SR").
+- KSA tickers use FMP (if available) + Yahoo Finance as main sources.
 """
 
 from __future__ import annotations
@@ -21,7 +50,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import aiohttp  # type: ignore
 
 # yfinance is optional but strongly recommended
-try:
+try:  # pragma: no cover - import guard
     import yfinance as yf  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     yf = None  # type: ignore
@@ -68,6 +97,7 @@ FMP_BASE_URL = os.getenv(
 # Types
 DataQualityLevel = Literal["EXCELLENT", "GOOD", "FAIR", "POOR", "MISSING"]
 MarketRegion = Literal["KSA", "GLOBAL", "UNKNOWN"]
+
 
 # ----------------------------------------------------------------------
 # MODELS
@@ -130,7 +160,7 @@ class UnifiedQuote(BaseModel):
     notes: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Compatibility helpers (keep old attribute names working)
+    # Compatibility helpers (keep old attribute names / keys working)
     # ------------------------------------------------------------------
     @property
     def last_updated(self) -> Optional[datetime]:
@@ -147,6 +177,56 @@ class UnifiedQuote(BaseModel):
     @property
     def provider_sources(self) -> List[str]:
         return [s.provider for s in self.sources]
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """
+        Extend BaseModel.model_dump with extra alias keys so that
+        downstream routers (especially /v1/enriched endpoints) can
+        use consistent names without changing older code.
+
+        Aliases added:
+            - last_price       (from price)
+            - previous_close   (from prev_close)
+            - high_52w         (from fifty_two_week_high)
+            - low_52w          (from fifty_two_week_low)
+            - change_percent   (from change_pct)
+            - as_of_utc        (from last_updated_utc)
+            - as_of_local      (same as as_of_utc for now)
+            - timezone         ('Asia/Riyadh' for KSA, else 'UTC')
+        """
+        data = super().model_dump(*args, **kwargs)
+
+        # Price aliases
+        if "price" in data and "last_price" not in data:
+            data["last_price"] = data["price"]
+        if "prev_close" in data and "previous_close" not in data:
+            data["previous_close"] = data["prev_close"]
+
+        # 52W aliases
+        if "fifty_two_week_high" in data and "high_52w" not in data:
+            data["high_52w"] = data["fifty_two_week_high"]
+        if "fifty_two_week_low" in data and "low_52w" not in data:
+            data["low_52w"] = data["fifty_two_week_low"]
+
+        # Change aliases
+        if "change_pct" in data and "change_percent" not in data:
+            data["change_percent"] = data["change_pct"]
+
+        # Timestamp / timezone aliases
+        dt = data.get("last_updated_utc")
+        if "as_of_utc" not in data:
+            data["as_of_utc"] = dt
+        if "as_of_local" not in data:
+            data["as_of_local"] = dt
+
+        if "timezone" not in data:
+            mr = data.get("market_region", "UNKNOWN")
+            if mr == "KSA":
+                data["timezone"] = "Asia/Riyadh"
+            else:
+                data["timezone"] = "UTC"
+
+        return data
 
 
 # ----------------------------------------------------------------------
@@ -174,7 +254,9 @@ async def fetch_from_yahoo(symbol: str) -> Dict[str, Any]:
         if not info or (
             "currentPrice" not in info and "regularMarketPrice" not in info
         ):
-            hist = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
+            hist = await loop.run_in_executor(
+                None, lambda: ticker.history(period="1d")
+            )
             if not hist.empty:
                 info = info or {}
                 info["currentPrice"] = float(hist["Close"].iloc[-1])
@@ -193,6 +275,9 @@ async def fetch_from_yahoo(symbol: str) -> Dict[str, Any]:
 async def fetch_from_eodhd(symbol: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
     Fetch real-time quote from EODHD /real-time/{code} endpoint.
+
+    NOTE:
+    - **Not used for KSA (.SR)**; see _gather_provider_payloads.
     """
     if not EODHD_API_KEY:
         logger.debug("EODHD_API_KEY not configured – skipping EODHD for %s", symbol)
@@ -497,11 +582,23 @@ async def _gather_provider_payloads(symbol: str) -> Dict[str, Any]:
     Call all enabled providers (EODHD, FMP, Yahoo) and merge results.
 
     Priority order:
-        1) PRIMARY_PROVIDER (if available)
+        1) PRIMARY_PROVIDER (if available and allowed)
         2) Remaining providers from ENABLED_PROVIDERS
+
+    IMPORTANT (KSA rule):
+        - If symbol ends with '.SR', EODHD is **skipped**, since it
+          does not work reliably for Tadawul.
     """
     symbol = symbol.strip().upper()
-    providers_in_env = [p for p in ENABLED_PROVIDERS if p in {"eodhd", "fmp", "yfinance"}]
+    is_ksa = symbol.endswith(".SR")
+
+    # Restrict to known providers and apply KSA rule for EODHD
+    providers_in_env = [
+        p for p in ENABLED_PROVIDERS if p in {"eodhd", "fmp", "yfinance"}
+    ]
+    if is_ksa and "eodhd" in providers_in_env:
+        providers_in_env.remove("eodhd")
+        logger.debug("Skipping EODHD for KSA symbol %s", symbol)
 
     # Build order with primary first
     order: List[str] = []
@@ -569,19 +666,20 @@ async def _gather_provider_payloads(symbol: str) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# PUBLIC ENTRYPOINTS
+# PUBLIC ENTRYPOINTS (MODULE-LEVEL)
 # ----------------------------------------------------------------------
 
 
 async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     """
-    Public enriched quote function.
+    Public enriched quote function (module-level).
 
-    This is the main entrypoint used by the rest of the system.
-    It merges data from multiple providers (EODHD, FMP, Yahoo finance).
+    This is the main legacy entrypoint used by older parts of the
+    system. Newer code should prefer `DataEngine.get_enriched_quote`,
+    which simply wraps this function.
     """
     symbol = symbol.strip().upper()
-    logger.info("[DataEngine] Fetching enriched quote for: %s", symbol)
+    logger.info("[DataEngine v1] Fetching enriched quote for: %s", symbol)
 
     raw_data = await _gather_provider_payloads(symbol)
 
@@ -611,7 +709,9 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
 
 
 async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
-    """Fetch multiple quotes concurrently."""
+    """
+    Fetch multiple quotes concurrently (module-level).
+    """
     tasks = [get_enriched_quote(sym) for sym in symbols]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -620,7 +720,7 @@ async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
         if isinstance(result, UnifiedQuote):
             quotes.append(result)
         else:
-            logger.error("[DataEngine] Error fetching %s: %s", sym, result)
+            logger.error("[DataEngine v1] Error fetching %s: %s", sym, result)
             quotes.append(
                 UnifiedQuote(
                     symbol=sym.strip().upper(),
@@ -630,3 +730,48 @@ async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
             )
 
     return quotes
+
+
+# ----------------------------------------------------------------------
+# OOP WRAPPER – DataEngine CLASS
+# ----------------------------------------------------------------------
+
+
+class DataEngine:
+    """
+    Thin OOP wrapper around the legacy module-level functions.
+
+    This class is what `routes.enriched_quote` and
+    `routes.advanced_analysis` expect when they do:
+
+        from core.data_engine import DataEngine
+        engine = DataEngine()
+        quote = await engine.get_enriched_quote("AAPL")
+
+    It keeps all behavior in one place and is fully async.
+    """
+
+    def __init__(
+        self,
+        enabled_providers: Optional[List[str]] = None,
+        primary_provider: Optional[str] = None,
+    ) -> None:
+        """
+        Optional per-instance overrides for provider config.
+
+        If not provided, uses global ENV-based configuration.
+        """
+        self.enabled_providers = enabled_providers or ENABLED_PROVIDERS
+        self.primary_provider = (primary_provider or PRIMARY_PROVIDER).lower()
+
+    async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
+        """
+        Instance method: just delegates to module-level function for now.
+        """
+        return await get_enriched_quote(symbol)
+
+    async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
+        """
+        Instance method: delegate to module-level batch function.
+        """
+        return await get_enriched_quotes(symbols)
