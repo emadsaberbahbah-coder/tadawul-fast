@@ -4,23 +4,25 @@ main.py
 Tadawul Fast Bridge - Main Application
 Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
 
-- FastAPI backend for:
-    • Enriched Quotes      (v1/enriched)
-    • AI Analysis          (v1/analysis)
-    • Advanced Analysis    (v1/advanced)  [optional – only if router exists]
-    • KSA / Argaam Gateway (v1/argaam)
-    • Legacy Quotes        (v1/quote, v1/legacy/sheet-rows)
+FastAPI backend for:
+    • Enriched Quotes       (v1/enriched)
+    • AI Analysis           (v1/analysis)
+    • Advanced Analysis     (v1/advanced)  [optional – only if router imports]
+    • KSA / Argaam Gateway  (v1/argaam)
+    • Legacy Quotes         (v1/quote, v1/legacy/sheet-rows)
 
-- Integrated with:
+Integrated with:
     • core.data_engine / core.data_engine_v2 (multi-provider engine):
-        - KSA via Tadawul/Argaam gateway (NO EODHD for .SR)
-        - Global via EODHD + FMP + other providers
-    • env.py (all config & tokens, Sheets meta, etc.)
+        - KSA via Tadawul/Argaam gateway and v1 delegate (NO EODHD for .SR)
+        - Global via FMP + optional EODHD + optional Finnhub
+    • env.py (all config & tokens, providers, Sheets meta, etc.)
     • Google Sheets / Apps Script flows
       (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
-       Commodities_FX, My_Portfolio, Insights_Analysis, Investment_Advisor, etc.)
+       Commodities_FX, My_Portfolio_Investment, Insights_Analysis,
+       Investment_Advisor, Economic_Calendar, Investment_Income_Statement)
 
 Notes
+-----
 - This file NEVER calls external market providers directly.
   All market data flows through the unified data engine and/or dedicated KSA gateway.
 - KSA (.SR) routing is handled by the unified engine and KSA router,
@@ -59,11 +61,18 @@ except Exception:  # pragma: no cover - defensive fallback
 
 @dataclass
 class _SettingsFallback:
+    """
+    Minimal fallback if env.py.settings is not available.
+    Keeps the app bootable for local / emergency scenarios.
+    """
+
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
+    app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
+    app_version: str = os.getenv("APP_VERSION", "4.0.0")
 
 
-# Prefer settings from env.py (Settings instance), otherwise use fallback dataclass
+# Prefer Settings instance from env.py; otherwise use fallback dataclass
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
 
@@ -100,15 +109,16 @@ def _get_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-APP_NAME: str = _get_env_attr("APP_NAME", "tadawul-fast-bridge")
-APP_VERSION: str = _get_env_attr("APP_VERSION", "4.0.0")
+# Core app identity & tokens
+APP_NAME: str = getattr(settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge"))
+APP_VERSION: str = getattr(settings, "app_version", _get_env_attr("APP_VERSION", "4.0.0"))
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
 BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "")
 
 ENABLE_CORS_ALL_ORIGINS: bool = _get_bool("ENABLE_CORS_ALL_ORIGINS", True)
 
-# For /v1/status service flags
+# Google integration flags for /v1/status
 GOOGLE_SHEETS_CREDENTIALS_RAW: str = getattr(
     _env_mod,
     "GOOGLE_SHEETS_CREDENTIALS_RAW",
@@ -130,19 +140,29 @@ HAS_SECURE_TOKEN: bool = getattr(
 
 # Optional provider information (for /v1/status)
 def _get_providers_meta() -> Dict[str, Any]:
-    enabled = None
-    primary = None
+    """
+    Summarize provider configuration for diagnostics.
+    Prefer env.settings if available, otherwise raw env vars.
+    """
+    enabled: Optional[List[str]] = None
+    primary: Optional[str] = None
+
     try:
-        enabled = getattr(_env_mod, "ENABLED_PROVIDERS", None) if _env_mod else None
-        if not enabled:
+        if hasattr(settings, "enabled_providers"):
+            enabled = list(getattr(settings, "enabled_providers", [])) or None
+        else:
             raw = os.getenv("ENABLED_PROVIDERS")
             if raw:
                 enabled = [p.strip() for p in raw.split(",") if p.strip()]
-        primary = (
-            getattr(_env_mod, "PRIMARY_PROVIDER", None)
-            if _env_mod
-            else None
-        ) or os.getenv("PRIMARY_PROVIDER")
+
+        if hasattr(settings, "primary_or_default_provider"):
+            primary = getattr(settings, "primary_or_default_provider", None)
+        else:
+            primary = (
+                getattr(_env_mod, "PRIMARY_PROVIDER", None)
+                if _env_mod
+                else None
+            ) or os.getenv("PRIMARY_PROVIDER")
     except Exception:  # pragma: no cover - extremely defensive
         enabled = None
         primary = None
@@ -214,7 +234,7 @@ except Exception:  # very defensive
     DEFAULT_SPREADSHEET_ID = None
 
 # ------------------------------------------------------------
-# Rate limiting (SlowAPI) – light default
+# Rate limiting (SlowAPI) – light defaults
 # ------------------------------------------------------------
 
 limiter = Limiter(key_func=get_remote_address, headers_enabled=True)
@@ -311,6 +331,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Middleware: CORS
 if ENABLE_CORS_ALL_ORIGINS:
+    # Open CORS – convenient for Google Sheets, Apps Script, and local tools
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -322,7 +343,10 @@ else:
     # Stricter mode – tuned for Google Sheets / Apps Script
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["https://docs.google.com", "https://script.google.com"],
+        allow_origins=[
+            "https://docs.google.com",
+            "https://script.google.com",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -370,7 +394,7 @@ app.include_router(
 # ------------------------------------------------------------
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root() -> str:
     """
     Simple HTML landing page for quick checks.
@@ -411,7 +435,7 @@ async def root() -> str:
           <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
           <li><code>/v1/enriched/health</code></li>
           <li><code>/v1/analysis/health</code></li>
-          <li><code>/v1/advanced/health</code> (if enabled)</li>
+          <li><code>/v1/advanced/ping</code> (if enabled)</li>
           <li><code>/v1/argaam/health</code> (KSA / Argaam gateway)</li>
         </ul>
 
@@ -426,9 +450,9 @@ async def root() -> str:
         <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
           KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.<br/>
           Global (non-.SR) tickers are handled via the unified engine using the
-          configured global providers (EODHD/FMP/etc.).<br/>
+          configured global providers (FMP, EODHD, Finnhub, etc.).<br/>
           Google Sheets 9-page dashboard should use the <code>* /sheet-rows</code> endpoints
-          exposed by each router (see <code>/v1/status</code>).
+          exposed by each router (see <code>/v1/status</code> for a complete list).
         </p>
       </body>
     </html>
@@ -526,7 +550,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "notes": [
             "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
             "No direct EODHD calls are made for KSA inside this main application.",
-            "Global (non-.SR) tickers use EODHD + FMP + other providers via core.data_engine / core.data_engine_v2.",
+            "Global (non-.SR) tickers use FMP + optional EODHD + optional Finnhub via core.data_engine / core.data_engine_v2.",
             "Google Sheets 9-page dashboard should use the /sheet-rows endpoints listed in 'sheet_endpoints'.",
         ],
     }
