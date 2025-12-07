@@ -1,504 +1,437 @@
 """
-advanced_analysis.py
-------------------------------------------------------------
-ADVANCED ANALYSIS & RISK ROUTES – GOOGLE SHEETS FRIENDLY (v1.1)
+routes/advanced_analysis.py
 
-- Builds on core.data_engine.UnifiedQuote (multi-provider data)
-- Computes:
-    • Value / Quality / Momentum / Opportunity Scores (0–100)
-    • Overall Score (0–100)
-    • Risk Level (LOW / MEDIUM / HIGH / UNKNOWN)
-    • Confidence Score (0–100) based on data_quality & sources
-    • Short textual notes for dashboards / Sheets
-- Exposes:
-    • /v1/advanced/health
-    • /v1/advanced/symbol
-    • /v1/advanced/symbols
-    • /v1/advanced/sheet-rows
-- Google Sheets:
-    • /sheet-rows returns { headers: [...], rows: [[...], ...] }
-- Never crashes Sheets: errors become data_quality="MISSING" + error text
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES
+================================================
+Purpose:
+- Expose "advanced analysis" and "opportunity ranking" endpoints
+  on top of the unified DataEngine (core.data_engine_v2).
+- Designed to be Google Sheets–friendly and API-friendly.
+
+Key ideas:
+- Use DataEngine v2 if available, else fall back to v1, else stub.
+- Take a list of tickers, fetch enriched quotes, and build a
+  scoreboard sorted by Opportunity Score.
+- Compute a simple risk bucket based on Opportunity & Data Quality.
+
+Typical usage from main.py:
+    from routes import advanced_analysis
+    app.include_router(advanced_analysis.router, prefix="")
+
+Endpoints:
+- GET /v1/advanced/ping
+- GET /v1/advanced/scoreboard?tickers=AAPL,MSFT,GOOGL&top_n=50
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from core.data_engine import UnifiedQuote, get_enriched_quote, get_enriched_quotes
+logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------------
+# =============================================================================
+# DATA ENGINE IMPORT & FALLBACKS
+# =============================================================================
+
+_ENGINE_IS_STUB = False
+
+try:
+    # Preferred: new v2 engine
+    from core.data_engine_v2 import DataEngine  # type: ignore[attr-defined]
+    logger.info("AdvancedAnalysis: using DataEngine from core.data_engine_v2")
+except Exception as exc_v2:
+    logger.error(
+        "AdvancedAnalysis: Failed to import DataEngine from core.data_engine_v2: %s",
+        exc_v2,
+    )
+    try:
+        # Fallback: legacy engine
+        from core.data_engine import DataEngine  # type: ignore[attr-defined]
+        logger.info("AdvancedAnalysis: using fallback DataEngine from core.data_engine")
+    except Exception as exc_v1:
+        logger.error(
+            "AdvancedAnalysis: Failed to import DataEngine from core.data_engine: %s",
+            exc_v1,
+        )
+
+        class DataEngine:  # type: ignore[no-redef]
+            """
+            Stub DataEngine used ONLY when the real engine fails to import.
+            Always returns placeholder / missing data.
+            """
+
+            async def get_enriched_quote(self, ticker: str) -> Dict[str, Any]:
+                return {
+                    "symbol": ticker,
+                    "name": None,
+                    "market": None,
+                    "sector": None,
+                    "currency": None,
+                    "price": None,
+                    "fair_value": None,
+                    "upside_percent": None,
+                    "value_score": 0.0,
+                    "quality_score": 0.0,
+                    "momentum_score": 0.0,
+                    "opportunity_score": 0.0,
+                    "data_quality_score": 0.0,
+                    "recommendation_label": "MISSING",
+                    "risk_label": "UNKNOWN",
+                    "notes": "STUB_ENGINE: DataEngine could not be imported on backend.",
+                }
+
+        _ENGINE_IS_STUB = True
+        logger.error(
+            "AdvancedAnalysis: Using STUB DataEngine – all responses will contain "
+            "MISSING placeholder values."
+        )
+
+
+# Global singleton engine (lazy init)
+_engine: Optional[DataEngine] = None
+
+
+def get_engine() -> DataEngine:
+    """
+    Get (and lazily create) the shared DataEngine instance.
+    """
+    global _engine
+    if _engine is None:
+        _engine = DataEngine()  # type: ignore[call-arg]
+    return _engine
+
+
+# =============================================================================
+# Pydantic MODELS
+# =============================================================================
+
+
+class AdvancedItem(BaseModel):
+    """
+    A compact, Sheets-friendly view of an enriched quote with
+    scores and advanced signals.
+    """
+
+    symbol: str = Field(..., description="Ticker symbol, e.g. 1120.SR or AAPL")
+    name: Optional[str] = Field(None, description="Company or instrument name")
+    market: Optional[str] = Field(None, description="Market or exchange code")
+    sector: Optional[str] = Field(None, description="Sector if available")
+    currency: Optional[str] = Field(None, description="Trading currency")
+
+    price: Optional[float] = Field(None, description="Last traded price")
+    fair_value: Optional[float] = Field(None, description="Modelled fair value")
+    upside_percent: Optional[float] = Field(
+        None, description="(FairValue - Price)/Price * 100"
+    )
+
+    value_score: Optional[float] = Field(
+        None, description="0–100 Value factor score (cheaper is higher)"
+    )
+    quality_score: Optional[float] = Field(
+        None, description="0–100 Quality factor score (profitability/strength)"
+    )
+    momentum_score: Optional[float] = Field(
+        None, description="0–100 Momentum factor score"
+    )
+    opportunity_score: Optional[float] = Field(
+        None, description="0–100 composite opportunity score"
+    )
+    data_quality_score: Optional[float] = Field(
+        None, description="0–100 confidence in the underlying data"
+    )
+
+    recommendation: Optional[str] = Field(
+        None, description="Text label from engine e.g. STRONG_BUY / BUY / HOLD / SELL"
+    )
+    risk_label: Optional[str] = Field(
+        None, description="Optional risk category from engine, if available"
+    )
+    risk_bucket: Optional[str] = Field(
+        None,
+        description=(
+            "Derived bucket combining opportunity & data quality, "
+            "e.g. 'HIGH_OPP_HIGH_CONF', 'MED_OPP_HIGH_CONF', 'LOW_CONF', etc."
+        ),
+    )
+
+    provider: Optional[str] = Field(
+        None, description="Primary data provider/source if available"
+    )
+    data_age_minutes: Optional[float] = Field(
+        None, description="Approx. age of quote in minutes (if provided)"
+    )
+
+
+class AdvancedScoreboardResponse(BaseModel):
+    """
+    Top-level response model for /v1/advanced/scoreboard.
+    """
+
+    generated_at_utc: str = Field(
+        ..., description="ISO datetime (UTC) when the scoreboard was generated"
+    )
+    engine_is_stub: bool = Field(
+        ..., description="True if a stub DataEngine was used (no real data)."
+    )
+    total_requested: int = Field(
+        ..., description="Total tickers requested by client (after de-dup)."
+    )
+    total_returned: int = Field(
+        ..., description="Total tickers successfully analyzed and returned."
+    )
+    top_n_applied: bool = Field(
+        ..., description="True if results were truncated to top_n."
+    )
+    tickers: List[str] = Field(
+        ..., description="Cleaned list of requested tickers in order processed."
+    )
+    items: List[AdvancedItem] = Field(
+        ..., description="List of AdvancedItem entries sorted by opportunity."
+    )
+
+
+# =============================================================================
 # ROUTER
-# ----------------------------------------------------------------------
+# =============================================================================
 
 router = APIRouter(
     prefix="/v1/advanced",
     tags=["Advanced Analysis"],
 )
 
-# ----------------------------------------------------------------------
-# MODELS
-# ----------------------------------------------------------------------
 
-
-class AdvancedAnalysisResponse(BaseModel):
-    """
-    Advanced signal pack for a single symbol:
-    - scores, risk, confidence, notes
-    - safe for direct use in Google Sheets.
-    """
-
-    symbol: str
-    name: Optional[str] = None
-    market_region: Optional[str] = None
-
-    price: Optional[float] = None
-    change_pct: Optional[float] = None
-    market_cap: Optional[float] = None
-
-    # Core scores
-    value_score: Optional[float] = None
-    quality_score: Optional[float] = None
-    momentum_score: Optional[float] = None
-    opportunity_score: Optional[float] = None
-    overall_score: Optional[float] = None
-
-    # Risk / confidence
-    risk_level: Optional[str] = None  # LOW / MEDIUM / HIGH / UNKNOWN
-    confidence_score: Optional[float] = None  # 0–100
-    data_quality: str = "MISSING"
-
-    # Outcome
-    recommendation: Optional[str] = None
-
-    # Meta
-    last_updated_utc: Optional[datetime] = None
-    sources: List[str] = Field(default_factory=list)
-
-    # Commentary / errors
-    notes: Optional[str] = None
-    error: Optional[str] = None
-
-
-class BatchAdvancedRequest(BaseModel):
-    tickers: List[str]
-
-
-class BatchAdvancedResponse(BaseModel):
-    results: List[AdvancedAnalysisResponse]
-
-
-class SheetAdvancedResponse(BaseModel):
-    headers: List[str]
-    rows: List[List[Any]]
-
-
-# ----------------------------------------------------------------------
+# =============================================================================
 # INTERNAL HELPERS
-# ----------------------------------------------------------------------
+# =============================================================================
 
 
-def _safe_float(x: Any) -> Optional[float]:
+def _safe_float(value: Any) -> Optional[float]:
+    """
+    Convert a value to float if possible, else None.
+    """
     try:
-        if x is None:
+        if value is None:
             return None
-        return float(x)
+        return float(value)
     except Exception:
         return None
 
 
-def _base_value_quality_momentum(q: UnifiedQuote) -> Dict[str, Optional[float]]:
+def _compute_risk_bucket(
+    opportunity: Optional[float], data_quality: Optional[float]
+) -> str:
     """
-    Core scoring layer (Value / Quality / Momentum).
-    0–100 scale, deterministic so Sheets can rely on it.
+    Very simple risk/opportunity bucketing, purely heuristic.
+    You can refine later based on your investment logic.
     """
-    pe = _safe_float(q.pe_ttm)
-    pb = _safe_float(q.pb)
-    dy = _safe_float(q.dividend_yield)
-    roe = _safe_float(q.roe)
-    profit_margin = _safe_float(q.profit_margin)
-    change_pct = _safe_float(q.change_pct)
+    opp = opportunity or 0.0
+    dq = data_quality or 0.0
 
-    # ------------------------
-    # Value score (P/E, P/B, Div Yield)
-    # ------------------------
-    vs = 50.0
-    if pe is not None:
-        if 0 < pe < 12:
-            vs += 20
-        elif 12 <= pe <= 20:
-            vs += 10
-        elif pe > 35:
-            vs -= 15
-    if pb is not None:
-        if 0 < pb < 1:
-            vs += 10
-        elif pb > 4:
-            vs -= 10
-    if dy is not None:
-        if 0.02 <= dy <= 0.06:
-            vs += 10
-        elif dy > 0.08:
-            vs -= 5
-    value_score = max(0.0, min(100.0, vs))
+    if dq < 40:
+        return "LOW_CONFIDENCE"
 
-    # ------------------------
-    # Quality score (ROE, profit margin)
-    # ------------------------
-    qs = 50.0
-    if roe is not None:
-        if roe >= 0.20:
-            qs += 25
-        elif 0.10 <= roe < 0.20:
-            qs += 10
-        elif roe < 0.0:
-            qs -= 15
-    if profit_margin is not None:
-        if profit_margin >= 0.20:
-            qs += 20
-        elif 0.10 <= profit_margin < 0.20:
-            qs += 10
-        elif profit_margin < 0.0:
-            qs -= 10
-    quality_score = max(0.0, min(100.0, qs))
+    if opp >= 75 and dq >= 70:
+        return "HIGH_OPP_HIGH_CONF"
+    if 55 <= opp < 75 and dq >= 60:
+        return "MED_OPP_HIGH_CONF"
+    if opp >= 55 and 40 <= dq < 60:
+        return "OPP_WITH_MED_CONF"
 
-    # ------------------------
-    # Momentum score (daily change %)
-    # ------------------------
-    ms = 50.0
-    if change_pct is not None:
-        if change_pct > 0:
-            ms += min(change_pct, 10) * 2  # cap upside contribution
-        elif change_pct < 0:
-            ms += max(change_pct, -10) * 2  # penalties for deep red
-    momentum_score = max(0.0, min(100.0, ms))
-
-    return {
-        "value_score": value_score,
-        "quality_score": quality_score,
-        "momentum_score": momentum_score,
-    }
+    return "NEUTRAL_OR_LOW_OPP"
 
 
-def _overall_and_reco(
-    opportunity_score: Optional[float],
-    value_score: Optional[float],
-    quality_score: Optional[float],
-    momentum_score: Optional[float],
-) -> Dict[str, Optional[float]]:
+async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
     """
-    Aggregate scores into Overall + Recommendation.
+    For each ticker, call DataEngine.get_enriched_quote and map it into AdvancedItem.
+    Any failures are logged and skipped.
     """
-    scores = [
-        s
-        for s in [opportunity_score, value_score, quality_score, momentum_score]
-        if isinstance(s, (int, float))
-    ]
-    if not scores:
-        return {"overall_score": None, "recommendation": None}
+    engine = get_engine()
+    results: List[AdvancedItem] = []
 
-    overall = sum(scores) / len(scores)
+    for raw_symbol in tickers:
+        symbol = raw_symbol.strip()
+        if not symbol:
+            continue
 
-    if overall >= 80:
-        reco = "STRONG_BUY"
-    elif overall >= 65:
-        reco = "BUY"
-    elif overall >= 45:
-        reco = "HOLD"
-    elif overall >= 30:
-        reco = "REDUCE"
-    else:
-        reco = "SELL"
+        try:
+            enriched = await engine.get_enriched_quote(symbol)  # type: ignore[attr-defined]
 
-    return {"overall_score": overall, "recommendation": reco}
+            # DataEngine v2 likely returns a Pydantic model; fall back to dict.
+            if hasattr(enriched, "model_dump"):
+                data = enriched.model_dump()  # type: ignore[call-arg]
+            elif isinstance(enriched, dict):
+                data = enriched
+            else:
+                # Unknown type, best effort via __dict__
+                data = getattr(enriched, "__dict__", {}) or {}
+
+            # Extract fields with graceful fallbacks for both v1/v2 naming variations.
+            price = _safe_float(
+                data.get("price")
+                or data.get("last_price")
+                or data.get("close")
+                or data.get("last")
+            )
+            fair_value = _safe_float(
+                data.get("fair_value")
+                or data.get("intrinsic_value")
+                or data.get("target_price")
+            )
+            upside_percent = _safe_float(
+                data.get("upside_percent") or data.get("upside") or data.get("upside_pct")
+            )
+
+            value_score = _safe_float(data.get("value_score"))
+            quality_score = _safe_float(data.get("quality_score"))
+            momentum_score = _safe_float(data.get("momentum_score"))
+            opportunity_score = _safe_float(data.get("opportunity_score"))
+            data_quality_score = _safe_float(
+                data.get("data_quality_score") or data.get("quality")
+            )
+
+            risk_bucket = _compute_risk_bucket(opportunity_score, data_quality_score)
+
+            item = AdvancedItem(
+                symbol=data.get("symbol")
+                or data.get("ticker")
+                or data.get("code")
+                or symbol,
+                name=data.get("name") or data.get("company_name"),
+                market=data.get("market") or data.get("exchange"),
+                sector=data.get("sector"),
+                currency=data.get("currency"),
+                price=price,
+                fair_value=fair_value,
+                upside_percent=upside_percent,
+                value_score=value_score,
+                quality_score=quality_score,
+                momentum_score=momentum_score,
+                opportunity_score=opportunity_score,
+                data_quality_score=data_quality_score,
+                recommendation=(
+                    data.get("recommendation_label")
+                    or data.get("recommendation")
+                    or data.get("rating")
+                ),
+                risk_label=data.get("risk_label"),
+                risk_bucket=risk_bucket,
+                provider=data.get("provider") or data.get("primary_provider"),
+                data_age_minutes=_safe_float(data.get("data_age_minutes")),
+            )
+
+            results.append(item)
+
+        except Exception as exc:
+            logger.exception(
+                "AdvancedAnalysis: Failed to load/enrich ticker '%s': %s", symbol, exc
+            )
+
+    return results
 
 
-def _risk_level_from_quote(q: UnifiedQuote) -> str:
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+
+
+@router.get("/ping", summary="Quick health-check for advanced analysis")
+async def ping() -> Dict[str, Any]:
     """
-    Simple risk level from 1-day move + data_quality.
-    Educational / demo logic.
-    """
-    if q.data_quality == "MISSING":
-        return "UNKNOWN"
+    Lightweight ping endpoint to confirm the advanced analysis routes are alive.
 
-    cp = _safe_float(q.change_pct)
-    if cp is None:
-        return "MEDIUM"
-
-    abs_cp = abs(cp)
-    if abs_cp <= 1.5:
-        return "LOW"
-    elif abs_cp <= 4.0:
-        return "MEDIUM"
-    else:
-        return "HIGH"
-
-
-def _confidence_from_quote(q: UnifiedQuote) -> float:
-    """
-    Confidence 0–100 based on data_quality + number of sources.
-    """
-    base = {
-        "EXCELLENT": 85.0,
-        "GOOD": 70.0,
-        "FAIR": 55.0,
-        "POOR": 40.0,
-        "MISSING": 20.0,
-    }.get(q.data_quality, 40.0)
-
-    n_sources = len(q.sources or [])
-    bonus = min(10.0, float(n_sources) * 2.5)  # cap bonus at +10
-
-    conf = base + bonus
-    return max(0.0, min(100.0, conf))
-
-
-def _build_notes(
-    symbol: str,
-    risk_level: Optional[str],
-    recommendation: Optional[str],
-    opportunity_score: Optional[float],
-) -> Optional[str]:
-    """
-    Short human-readable note for dashboard / Sheets.
-    """
-    parts: List[str] = []
-
-    if recommendation:
-        parts.append(f"Signal: {recommendation}")
-
-    if risk_level:
-        parts.append(f"Risk: {risk_level}")
-
-    if opportunity_score is not None:
-        parts.append(f"OppScore≈{round(float(opportunity_score), 1)}")
-
-    if not parts:
-        return None
-
-    return " | ".join(parts)
-
-
-def _quote_to_advanced(q: UnifiedQuote) -> AdvancedAnalysisResponse:
-    """
-    Convert UnifiedQuote -> AdvancedAnalysisResponse.
-    Shared logic with Investment Advisor / Insights sheets.
-    """
-    base_scores = _base_value_quality_momentum(q)
-    opp_score = _safe_float(q.opportunity_score)
-
-    agg = _overall_and_reco(
-        opportunity_score=opp_score,
-        value_score=base_scores["value_score"],
-        quality_score=base_scores["quality_score"],
-        momentum_score=base_scores["momentum_score"],
-    )
-
-    risk_level = _risk_level_from_quote(q)
-    confidence = _confidence_from_quote(q)
-    notes = _build_notes(
-        symbol=q.symbol,
-        risk_level=risk_level,
-        recommendation=agg["recommendation"],
-        opportunity_score=opp_score,
-    )
-
-    return AdvancedAnalysisResponse(
-        symbol=q.symbol,
-        name=q.name,
-        market_region=q.market_region,
-        price=_safe_float(q.price),
-        change_pct=_safe_float(q.change_pct),
-        market_cap=_safe_float(q.market_cap),
-        value_score=base_scores["value_score"],
-        quality_score=base_scores["quality_score"],
-        momentum_score=base_scores["momentum_score"],
-        opportunity_score=opp_score,
-        overall_score=agg["overall_score"],
-        risk_level=risk_level,
-        confidence_score=confidence,
-        data_quality=q.data_quality,
-        recommendation=agg["recommendation"],
-        last_updated_utc=q.last_updated_utc,
-        sources=[src.provider for src in (q.sources or [])],
-        notes=notes,
-    )
-
-
-def _build_sheet_headers() -> List[str]:
-    """
-    Headers for Advanced Analysis – ready for Google Sheets.
-    """
-    return [
-        "Symbol",
-        "Company Name",
-        "Market Region",
-        "Price",
-        "Change %",
-        "Market Cap",
-        "Value Score",
-        "Quality Score",
-        "Momentum Score",
-        "Opportunity Score",
-        "Overall Score",
-        "Risk Level",
-        "Confidence Score",
-        "Recommendation",
-        "Data Quality",
-        "Sources",
-        "Last Updated (UTC)",
-        "Notes",
-        "Error",
-    ]
-
-
-def _advanced_to_sheet_row(a: AdvancedAnalysisResponse) -> List[Any]:
-    """
-    Flatten one AdvancedAnalysisResponse to a primitive-only row for setValues().
-    """
-    return [
-        a.symbol,
-        a.name or "",
-        a.market_region or "",
-        a.price,
-        a.change_pct,
-        a.market_cap,
-        a.value_score,
-        a.quality_score,
-        a.momentum_score,
-        a.opportunity_score,
-        a.overall_score,
-        a.risk_level or "",
-        a.confidence_score,
-        a.recommendation or "",
-        a.data_quality,
-        ", ".join(a.sources) if a.sources else "",
-        a.last_updated_utc.isoformat() if a.last_updated_utc else None,
-        a.notes or "",
-        a.error or "",
-    ]
-
-
-# ----------------------------------------------------------------------
-# ROUTES
-# ----------------------------------------------------------------------
-
-
-@router.get("/health")
-async def advanced_health() -> Dict[str, Any]:
-    """
-    Simple health check for this module.
+    Does NOT require calling any external providers; just returns meta info.
     """
     return {
         "status": "ok",
-        "module": "advanced_analysis",
-        "version": "1.1",
+        "engine_is_stub": _ENGINE_IS_STUB,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "module": "routes.advanced_analysis",
     }
 
 
-@router.get("/symbol", response_model=AdvancedAnalysisResponse)
-async def analyze_symbol(
-    symbol: str = Query(..., alias="symbol"),
-) -> AdvancedAnalysisResponse:
+@router.get(
+    "/scoreboard",
+    response_model=AdvancedScoreboardResponse,
+    summary="Build an advanced opportunity scoreboard for a list of tickers",
+)
+async def advanced_scoreboard(
+    tickers: str = Query(
+        ...,
+        description=(
+            "Comma-separated tickers, e.g. '1120.SR,1180.SR,2222.SR' or 'AAPL,MSFT'. "
+            "Spaces are allowed."
+        ),
+    ),
+    top_n: int = Query(
+        50,
+        ge=1,
+        le=500,
+        description="Maximum number of rows to return, sorted by Opportunity Score.",
+    ),
+) -> AdvancedScoreboardResponse:
     """
-    Advanced analysis for a single symbol.
+    Main Advanced Analysis endpoint.
 
-    Example:
-        GET /v1/advanced/symbol?symbol=AAPL
-        GET /v1/advanced/symbol?symbol=1120.SR
+    1) Parse tickers from query string.
+    2) Use DataEngine to get enriched quotes per ticker.
+    3) Build AdvancedItem list and sort by opportunity_score (desc).
+    4) Truncate to top_n and return a clean, Sheets-ready payload.
     """
-    ticker = (symbol or "").strip()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="Symbol is required")
+    # 1) Parse and clean tickers
+    raw_list = [t.strip() for t in tickers.split(",") if t.strip()]
+    cleaned: List[str] = []
+    seen = set()
 
-    try:
-        quote = await get_enriched_quote(ticker)
-        advanced = _quote_to_advanced(quote)
-        if advanced.data_quality == "MISSING":
-            advanced.error = "No data available from providers"
-        return advanced
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # NEVER break Google Sheets – always return a valid body
-        return AdvancedAnalysisResponse(
-            symbol=ticker.upper(),
-            data_quality="MISSING",
-            error=f"Exception in advanced analysis: {exc}",
+    for t in raw_list:
+        if t not in seen:
+            cleaned.append(t)
+            seen.add(t)
+
+    if not cleaned:
+        raise HTTPException(
+            status_code=400, detail="You must provide at least one non-empty ticker."
         )
 
+    # 2) Fetch enriched data
+    items = await _fetch_enriched_for_tickers(cleaned)
 
-@router.post("/symbols", response_model=BatchAdvancedResponse)
-async def analyze_symbols(
-    body: BatchAdvancedRequest,
-) -> BatchAdvancedResponse:
-    """
-    Advanced analysis for multiple symbols at once.
-
-    Body:
-        {
-          "tickers": ["AAPL", "MSFT", "1120.SR"]
-        }
-    """
-    tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
-    if not tickers:
-        raise HTTPException(status_code=400, detail="At least one symbol is required")
-
-    try:
-        unified_quotes = await get_enriched_quotes(tickers)
-    except Exception as exc:
-        # Total failure – placeholder entries for all
-        return BatchAdvancedResponse(
-            results=[
-                AdvancedAnalysisResponse(
-                    symbol=t.upper(),
-                    data_quality="MISSING",
-                    error=f"Batch advanced analysis failed: {exc}",
-                )
-                for t in tickers
-            ]
+    if not items:
+        # Nothing could be fetched; likely DataEngine is stub or providers failing
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Failed to retrieve data for all requested tickers. "
+                "Check provider API keys, network, or logs."
+            ),
         )
 
-    results: List[AdvancedAnalysisResponse] = []
-    for t, q in zip(tickers, unified_quotes):
-        try:
-            a = _quote_to_advanced(q)
-            if a.data_quality == "MISSING":
-                a.error = "No data available from providers"
-            results.append(a)
-        except Exception as exc:
-            results.append(
-                AdvancedAnalysisResponse(
-                    symbol=t.upper(),
-                    data_quality="MISSING",
-                    error=f"Exception building advanced analysis: {exc}",
-                )
-            )
+    # 3) Sort by opportunity_score (desc), then data_quality_score (desc)
+    def _score_key(it: AdvancedItem) -> float:
+        opp = it.opportunity_score or 0.0
+        dq = it.data_quality_score or 0.0
+        # Slight boost for higher data quality
+        return opp * 1_000 + dq
 
-    return BatchAdvancedResponse(results=results)
+    items_sorted = sorted(items, key=_score_key, reverse=True)
 
+    # 4) Truncate to top_n
+    top_n_applied = False
+    if len(items_sorted) > top_n:
+        items_sorted = items_sorted[:top_n]
+        top_n_applied = True
 
-@router.post("/sheet-rows", response_model=SheetAdvancedResponse)
-async def advanced_sheet_rows(
-    body: BatchAdvancedRequest,
-) -> SheetAdvancedResponse:
-    """
-    Google Sheets–friendly endpoint.
-
-    Returns:
-        {
-          "headers": [...],
-          "rows": [ [row for s1], [row for s2], ... ]
-        }
-
-    Apps Script usage pattern:
-        - First row = headers
-        - Following rows = values
-    """
-    batch = await analyze_symbols(body)
-    headers = _build_sheet_headers()
-    rows: List[List[Any]] = [_advanced_to_sheet_row(a) for a in batch.results]
-    return SheetAdvancedResponse(headers=headers, rows=rows)
+    response = AdvancedScoreboardResponse(
+        generated_at_utc=datetime.now(timezone.utc).isoformat(),
+        engine_is_stub=_ENGINE_IS_STUB,
+        total_requested=len(cleaned),
+        total_returned=len(items_sorted),
+        top_n_applied=top_n_applied,
+        tickers=cleaned,
+        items=items_sorted,
+    )
+    return response
