@@ -1,7 +1,7 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.1)
+Enriched Quotes Router (v2.2)
 
 - Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
@@ -24,6 +24,7 @@ Google Sheets usage:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -203,10 +204,13 @@ class EnrichedQuoteResponse(BaseModel):
     ma_50d: Optional[float] = None
 
     # Meta
+    data_source: Optional[str] = Field(
+        None, description="Primary data source/provider used by the engine"
+    )
     provider: Optional[str] = None
     data_quality: str = Field(
         "UNKNOWN",
-        description="EXCELLENT / GOOD / FAIR / POOR / MISSING / STALE / UNKNOWN",
+        description="OK / PARTIAL / MISSING / STALE / UNKNOWN (legacy labels still accepted)",
     )
     as_of_utc: Optional[str] = None
     as_of_local: Optional[str] = None
@@ -272,6 +276,16 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
     return await _engine.get_enriched_quotes(clean)
 
 
+def _normalize_scalar(value: Any) -> Any:
+    """
+    Ensure values that might be datetime/date are converted to ISO strings.
+    This keeps FastAPI/Pydantic happy and matches Google Sheets expectations.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
 def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
     """
     Convert the engine's UnifiedQuote (Pydantic model or dict) into
@@ -301,7 +315,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
     def g(*keys: str, default: Any = None) -> Any:
         for k in keys:
             if k in data and data[k] is not None:
-                return data[k]
+                return _normalize_scalar(data[k])
         return default
 
     symbol = str(g("symbol", "ticker", default="")).upper()
@@ -312,7 +326,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         name=g("name", "company_name", "longName", "shortName"),
         sector=g("sector"),
         sub_sector=g("sub_sector", "industry"),
-        market=g("market", "exchange", "exchange_short_name"),
+        market=g("market", "market_region", "exchange", "exchange_short_name"),
         currency=g("currency"),
         listing_date=g("listing_date"),
         # Price / liquidity
@@ -327,7 +341,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         low_52w=g("low_52w", "fifty_two_week_low", "yearLow"),
         position_52w_percent=g("position_52w_percent", "fifty_two_week_position"),
         volume=g("volume", "regularMarketVolume"),
-        avg_volume_30d=g("avg_volume_30d", "average_volume_30d"),
+        avg_volume_30d=g("avg_volume_30d", "average_volume_30d", "avg_volume"),
         value_traded=g("value_traded"),
         turnover_rate=g("turnover_rate"),
         bid_price=g("bid_price"),
@@ -406,6 +420,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         ma_20d=g("ma_20d"),
         ma_50d=g("ma_50d"),
         # Meta
+        data_source=g("data_source", "provider", "primary_provider", "primary_source"),
         provider=g("provider", "primary_provider", "primary_source"),
         data_quality=g(
             "data_quality",
@@ -413,7 +428,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
             default="UNKNOWN",
         ),
         as_of_utc=g("as_of_utc", "last_updated_utc"),
-        as_of_local=g("as_of_local"),
+        as_of_local=g("as_of_local", "last_updated_riyadh", "last_updated_local"),
         timezone=g("timezone"),
         error=g("error"),
     )
@@ -498,6 +513,7 @@ def _build_sheet_headers() -> List[str]:
         "Moving Avg (20D)",
         "Moving Avg (50D)",
         # Meta
+        "Data Source",
         "Provider",
         "Data Quality",
         "Last Updated (UTC)",
@@ -581,6 +597,7 @@ def _enriched_to_sheet_row(e: EnrichedQuoteResponse) -> List[Any]:
         e.ma_20d,
         e.ma_50d,
         # Meta
+        e.data_source,
         e.provider,
         e.data_quality,
         e.as_of_utc,
@@ -603,7 +620,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.1",
+        "version": "2.2",
         "engine_mode": _ENGINE_MODE,
     }
 
