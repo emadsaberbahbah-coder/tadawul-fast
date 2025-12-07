@@ -29,8 +29,10 @@ Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -51,18 +53,64 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from env import (
-    APP_NAME,
-    APP_VERSION,
-    APP_TOKEN,
-    BACKUP_APP_TOKEN,
-    BACKEND_BASE_URL,
-    ENABLE_CORS_ALL_ORIGINS,
-    HAS_SECURE_TOKEN,
-    GOOGLE_SHEETS_CREDENTIALS_RAW,
-    GOOGLE_APPS_SCRIPT_BACKUP_URL,
-    settings,
-)
+# ------------------------------------------------------------
+# Configuration import (env.py) with safe fallback to os.environ
+# ------------------------------------------------------------
+
+try:
+    # Preferred path: use your dedicated env.py module
+    from env import (
+        APP_NAME,
+        APP_VERSION,
+        APP_TOKEN,
+        BACKUP_APP_TOKEN,
+        BACKEND_BASE_URL,
+        ENABLE_CORS_ALL_ORIGINS,
+        HAS_SECURE_TOKEN,
+        GOOGLE_SHEETS_CREDENTIALS_RAW,
+        GOOGLE_APPS_SCRIPT_BACKUP_URL,
+        settings,
+    )
+except Exception:  # pragma: no cover - defensive fallback
+    logging.warning(
+        "env.py not found or failed to import. "
+        "Falling back to environment variables directly."
+    )
+
+    @dataclass
+    class _Settings:
+        app_env: str = os.getenv("APP_ENV", "production")
+        default_spreadsheet_id: Optional[str] = os.getenv(
+            "DEFAULT_SPREADSHEET_ID", None
+        )
+
+    settings = _Settings()
+
+    APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
+    APP_VERSION: str = os.getenv("APP_VERSION", "4.0.0")
+    APP_TOKEN: str = os.getenv("APP_TOKEN", "")
+    BACKUP_APP_TOKEN: str = os.getenv("BACKUP_APP_TOKEN", "")
+    BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", "")
+
+    def _bool(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+
+    ENABLE_CORS_ALL_ORIGINS: bool = _bool("ENABLE_CORS_ALL_ORIGINS", True)
+    HAS_SECURE_TOKEN: bool = bool(APP_TOKEN or BACKUP_APP_TOKEN)
+
+    GOOGLE_SHEETS_CREDENTIALS_RAW: str = os.getenv(
+        "GOOGLE_SHEETS_CREDENTIALS", ""
+    )
+    GOOGLE_APPS_SCRIPT_BACKUP_URL: str = os.getenv(
+        "GOOGLE_APPS_SCRIPT_BACKUP_URL", ""
+    )
+
+# ------------------------------------------------------------
+# Routers & legacy services
+# ------------------------------------------------------------
 
 # Routers:
 # - enriched_quote, ai_analysis, advanced_analysis live under routes/
