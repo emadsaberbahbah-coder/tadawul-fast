@@ -1,35 +1,36 @@
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam routes for Tadawul Fast Bridge – v1.0
+KSA / Argaam routes for Tadawul Fast Bridge – v1.1
 
 GOAL
-- Provide a clean, dedicated KSA provider route that does NOT depend on EODHD.
-- Designed to work alongside:
-    • main.py              (FastAPI app + token auth)
-    • core.data_engine     (unified engine for KSA + Global)
-    • google_sheets_service.py (sheet-rows pattern)
-    • google_apps_script_client.py / index.html (JavaScript / Apps Script)
+- Dedicated KSA provider route that does NOT depend on EODHD.
+- Uses your external Argaam/Tadawul "gateway" service (often Java)
+  as a data source for .SR symbols.
+- Aligned with:
+    • main.py                (FastAPI app, token auth, rate limiting)
+    • env.py                 (central config, incl. ARGAAM_GATEWAY_URL)
+    • google_sheets_service  (sheet-rows pattern: headers + rows)
+    • index.html / JS        (same API style as /v1/enriched/*)
 
 ASSUMPTION
-- You have (or will build) a KSA/Argaam "gateway" service (often Java)
-  which exposes an HTTP JSON API for Tadawul tickers, e.g.:
+- The KSA gateway exposes an HTTP JSON API like:
 
-    GET {ARGAAM_GATEWAY_URL}/quote?symbol=1120.SR
+      GET {ARGAAM_GATEWAY_URL}/quote?symbol=1120.SR
 
-  or similar. This Python router calls that gateway and normalizes the data.
+  returning a JSON object with common fields (name, lastPrice, change, etc.).
 
-ENV VARS (set in Render dashboard or locally)
+ENV (in env.py and Render dashboard)
 - ARGAAM_GATEWAY_URL  -> e.g. https://your-ksa-gateway.example.com
-- ARGAAM_API_KEY      -> optional, if your gateway requires an API key header
+- ARGAAM_API_KEY      -> optional, e.g. header X-API-KEY
 
 HOW TO PLUG INTO main.py
 ------------------------
-1) Add import:
+1) Import router:
 
     from routes import routes_argaam
 
-2) Include router (with token dependency):
+2) Include router (re-using require_app_token):
 
     app.include_router(
         routes_argaam.router,
@@ -42,14 +43,11 @@ Then you can call:
     GET  /v1/argaam/quote?symbol=1120.SR
     GET  /v1/argaam/quotes?tickers=1120.SR,1180.SR
     POST /v1/argaam/sheet-rows   { "tickers": ["1120.SR","1180.SR"] }
-
-The /sheet-rows response is compatible with Google Sheets / JS:
-    { "headers": [...], "rows": [[...], ...], "meta": {...} }
 """
 
 from __future__ import annotations
 
-import os
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -57,19 +55,17 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from env import APP_NAME, APP_VERSION
+from env import (
+    APP_NAME,
+    APP_VERSION,
+    ARGAAM_GATEWAY_URL,
+    ARGAAM_API_KEY,
+)
 
 router = APIRouter(
     prefix="/v1/argaam",
     tags=["KSA / Argaam"],
 )
-
-# ----------------------------------------------------------------------
-# ENV CONFIG
-# ----------------------------------------------------------------------
-
-ARGAAM_GATEWAY_URL: str = (os.getenv("ARGAAM_GATEWAY_URL") or "").strip()
-ARGAAM_API_KEY: str = (os.getenv("ARGAAM_API_KEY") or "").strip()
 
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -84,7 +80,7 @@ class ArgaamQuote(BaseModel):
     Normalized KSA quote using your Argaam / Tadawul gateway.
 
     NOTE:
-    - remote_raw can always be inspected for debugging if mappings need tuning.
+    - remote_raw holds the original gateway JSON for debugging/mapping.
     """
 
     symbol: str
@@ -119,7 +115,7 @@ class ArgaamQuote(BaseModel):
 class ArgaamSheetRowsRequest(BaseModel):
     tickers: List[str] = Field(
         default_factory=list,
-        description="List of KSA symbols (e.g. ['1120.SR','1180.SR']). Non-KSA are ignored.",
+        description="List of KSA symbols (['1120.SR','1180.SR']). Non-KSA are ignored.",
     )
 
 
@@ -138,7 +134,7 @@ def _ensure_gateway_configured() -> None:
     if not ARGAAM_GATEWAY_URL:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ARGAAM_GATEWAY_URL is not configured. Set it in environment.",
+            detail="ARGAAM_GATEWAY_URL is not configured. Set it in environment/env.py.",
         )
 
 
@@ -153,19 +149,18 @@ def _safe_float(x: Any) -> Optional[float]:
 
 def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
     """
-    Map arbitrary gateway JSON into ArgaamQuote.
+    Map the gateway JSON into ArgaamQuote.
 
-    We try several common key names; you can adjust if your gateway
-    uses different fields.
-
-    This is intentionally defensive and keeps `remote_raw` for debugging.
+    We try several common key names from stock APIs; if your gateway
+    uses different fields, only this function needs to be adjusted.
     """
-    # Common key variants from typical JSON APIs
+    # Identity
     name = payload.get("name") or payload.get("companyName") or payload.get("Name")
     sector = payload.get("sector") or payload.get("Sector")
     market = payload.get("market") or payload.get("exchange") or "Tadawul"
     currency = payload.get("currency") or payload.get("Currency") or "SAR"
 
+    # Prices & change
     last_price = (
         payload.get("lastPrice")
         or payload.get("last")
@@ -180,9 +175,11 @@ def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
         or payload.get("ChangePercent")
     )
 
+    # Volume & cap
     volume = payload.get("volume") or payload.get("Volume")
     market_cap = payload.get("marketCap") or payload.get("MarketCap")
 
+    # 52-week
     high_52w = (
         payload.get("fiftyTwoWeekHigh")
         or payload.get("fifty_two_week_high")
@@ -203,14 +200,14 @@ def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
     )
     last_utc: Optional[datetime] = None
     if ts:
-        # Try ISO format first
         if isinstance(ts, str):
+            # ISO string
             try:
                 last_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except Exception:
                 last_utc = None
         elif isinstance(ts, (int, float)):
-            # treat as unix seconds
+            # Unix seconds
             try:
                 last_utc = datetime.fromtimestamp(float(ts), tz=timezone.utc)
             except Exception:
@@ -248,8 +245,6 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
 
     EXPECTED GATEWAY CONTRACT (example):
         GET {ARGAAM_GATEWAY_URL}/quote?symbol=1120.SR
-
-    You can adjust the path/params if your gateway differs.
     """
     _ensure_gateway_configured()
 
@@ -297,6 +292,14 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
         )
 
     return _parse_argaam_payload(symbol, payload)
+
+
+async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
+    """
+    Fetch multiple KSA quotes concurrently from the gateway.
+    """
+    tasks = [asyncio.create_task(_fetch_argaam_quote(sym)) for sym in symbols]
+    return await asyncio.gather(*tasks)
 
 
 def _build_sheet_headers() -> List[str]:
@@ -357,7 +360,7 @@ async def argaam_health() -> Dict[str, Any]:
     """
     Lightweight health endpoint for KSA / Argaam gateway.
 
-    Does NOT call the external gateway to keep it fast and cheap.
+    Does NOT call the external gateway (fast & cheap).
     Just checks config and returns static info.
     """
     now = datetime.now(timezone.utc)
@@ -370,13 +373,15 @@ async def argaam_health() -> Dict[str, Any]:
         "timestamp_utc": now.isoformat(),
         "notes": [
             "This route is dedicated to KSA (.SR) tickers.",
-            "Set ARGAAM_GATEWAY_URL to plug in your KSA/Argaam Java service.",
+            "Set ARGAAM_GATEWAY_URL (and ARGAAM_API_KEY if needed) in env.py / Render.",
         ],
     }
 
 
 @router.get("/quote", response_model=ArgaamQuote)
-async def get_argaam_quote(symbol: str = Query(..., description="KSA symbol, e.g. 1120.SR")):
+async def get_argaam_quote(
+    symbol: str = Query(..., description="KSA symbol, e.g. 1120.SR"),
+):
     """
     Return a single KSA quote from the Argaam/Tadawul gateway.
 
@@ -411,11 +416,7 @@ async def get_argaam_quotes(
             detail="No valid KSA (.SR) symbols provided.",
         )
 
-    quotes: List[ArgaamQuote] = []
-    # Fetch sequentially for simplicity; you can switch to asyncio.gather if desired.
-    for sym in symbols:
-        q = await _fetch_argaam_quote(sym)
-        quotes.append(q)
+    quotes = await _fetch_argaam_quotes_bulk(symbols)
 
     return {
         "quotes": [q.dict(by_alias=True) for q in quotes],
@@ -466,10 +467,7 @@ async def get_argaam_sheet_rows(body: ArgaamSheetRowsRequest) -> ArgaamSheetRows
             },
         )
 
-    quotes: List[ArgaamQuote] = []
-    for sym in symbols:
-        q = await _fetch_argaam_quote(sym)
-        quotes.append(q)
+    quotes = await _fetch_argaam_quotes_bulk(symbols)
 
     headers = _build_sheet_headers()
     rows = [_quote_to_sheet_row(q) for q in quotes]
