@@ -1,20 +1,25 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.0
+Core Data & Analysis Engine - v2.0 (Unified)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
 Key features
 ------------
-- Async, multi-provider quote engine (FMP + optional EODHD + optional Finnhub).
+- Async, multi-provider quote engine:
+    • FMP  (primary fundamentals + quotes)
+    • EODHD (optional – GLOBAL ONLY, never for KSA .SR)
+    • Finnhub (optional – price-only support)
 - KSA (.SR) tickers are KSA-safe:
     • Never call EODHD directly for .SR symbols.
     • If the legacy core.data_engine is available, it is used as the
       primary KSA delegate (Tadawul / Argaam routing).
 - Simple in-memory caching with TTL to reduce API calls.
 - UnifiedQuote Pydantic model aligned with:
-    • routes/enriched_quote.EnrichedQuoteResponse
+    • routes.enriched_quote
+    • routes.ai_analysis
+    • routes.advanced_analysis
     • legacy_service (v1/quote + v1/legacy/sheet-rows)
     • 9-page Google Sheets dashboard philosophy
 - Basic AI-style scoring:
@@ -22,17 +27,40 @@ Key features
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
 
-Environment variables
----------------------
-ENABLED_PROVIDERS       # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
-PRIMARY_PROVIDER        # (not enforced here – order of ENABLED_PROVIDERS is used)
-FMP_API_KEY             # required for FMP provider
-EODHD_BASE_URL          # optional; default "https://eodhd.com/api"
-EODHD_API_KEY           # optional
-FINNHUB_API_KEY         # optional
-DATAENGINE_CACHE_TTL    # optional; seconds, default 120
-DATAENGINE_TIMEOUT      # optional; per-provider timeout in seconds, default 10
-LOCAL_TIMEZONE          # optional; default "Asia/Riyadh"
+Environment / Config integration
+--------------------------------
+Primary configuration is read from env.py if present:
+
+    from env import settings
+
+    settings.enabled_providers            # ['eodhd','fmp','yfinance',...]
+    settings.engine_cache_ttl_seconds     # cache TTL
+    settings.http_timeout                 # HTTP timeout (seconds)
+    settings.engine_enable_advanced_analysis
+    settings.fmp_api_key, settings.fmp_base_url
+    settings.eodhd_api_key, settings.eodhd_base_url
+    settings.finnhub_api_key
+
+Fallbacks:
+    ENABLED_PROVIDERS       # e.g. "fmp,eodhd,finnhub"
+    DATAENGINE_CACHE_TTL    # seconds, default 120
+    DATAENGINE_TIMEOUT      # seconds, default 10
+    FMP_API_KEY
+    FMP_BASE_URL
+    EODHD_API_KEY
+    EODHD_BASE_URL
+    FINNHUB_API_KEY
+    LOCAL_TIMEZONE          # default "Asia/Riyadh"
+
+Public async API
+----------------
+    from core.data_engine_v2 import DataEngine
+
+    engine = DataEngine()
+    quote  = await engine.get_enriched_quote("AAPL")
+    quotes = await engine.get_enriched_quotes(["AAPL","MSFT","1120.SR"])
+
+Returned objects are UnifiedQuote Pydantic models (model_dump()-ready).
 """
 
 from __future__ import annotations
@@ -48,15 +76,47 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from pydantic import BaseModel, Field
 
-try:
-    # Python 3.11+
+# -----------------------------------------------------------------------------
+# Optional zoneinfo support for local time
+# -----------------------------------------------------------------------------
+try:  # pragma: no cover
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Optional env.py integration (single source of truth for settings)
+# -----------------------------------------------------------------------------
+try:  # pragma: no cover - safe optional import
+    import env as _env_mod  # type: ignore
+
+    _ENV_SETTINGS = getattr(_env_mod, "settings", None)
+except Exception:  # pragma: no cover
+    _env_mod = None  # type: ignore
+    _ENV_SETTINGS = None  # type: ignore
+
+
+def _env_or_os(name: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Helper to read a scalar value from env.settings first, then raw env vars.
+    """
+    # Try env.py convenience constants (e.g. FMP_API_KEY, FMP_BASE_URL)
+    if _env_mod is not None and hasattr(_env_mod, name):
+        try:
+            val = getattr(_env_mod, name)
+            if val is not None:
+                return str(val)
+        except Exception:
+            pass
+    # Fallback: OS environment
+    return os.getenv(name, default)
+
+
+# -----------------------------------------------------------------------------
 # Optional import of v1 engine for KSA delegation
+# -----------------------------------------------------------------------------
 try:  # pragma: no cover - best-effort
     from core import data_engine as _v1_engine  # type: ignore
 
@@ -66,9 +126,9 @@ except Exception:  # pragma: no cover - if core.data_engine is missing
     _HAS_V1_ENGINE = False
 
 
-# ============================================================================
+# =============================================================================
 # ProviderSource & UnifiedQuote models
-# ============================================================================
+# =============================================================================
 
 
 class ProviderSource(BaseModel):
@@ -86,8 +146,8 @@ class UnifiedQuote(BaseModel):
     sector: Optional[str] = None
     sub_sector: Optional[str] = None
     industry: Optional[str] = None
-    market: Optional[str] = None          # e.g. "US", "KSA"
-    market_region: Optional[str] = None   # alias for legacy engine / sheets
+    market: Optional[str] = None  # e.g. "US", "KSA"
+    market_region: Optional[str] = None  # alias for legacy engine / sheets
     exchange: Optional[str] = None
     currency: Optional[str] = None
     listing_date: Optional[str] = None  # YYYY-MM-DD if available
@@ -95,6 +155,7 @@ class UnifiedQuote(BaseModel):
     # Capital structure
     shares_outstanding: Optional[float] = None
     free_float: Optional[float] = None
+    market_cap: Optional[float] = None
 
     # Price / liquidity
     last_price: Optional[float] = None
@@ -146,7 +207,6 @@ class UnifiedQuote(BaseModel):
     debt_to_equity: Optional[float] = None
     current_ratio: Optional[float] = None
     quick_ratio: Optional[float] = None
-    market_cap: Optional[float] = None
 
     # Growth / profitability
     revenue_growth_percent: Optional[float] = None
@@ -174,6 +234,7 @@ class UnifiedQuote(BaseModel):
     momentum_score: Optional[float] = None
     opportunity_score: Optional[float] = None
     recommendation: Optional[str] = None
+    risk_label: Optional[str] = None  # optional risk label if a higher layer sets it
 
     # Technicals
     rsi_14: Optional[float] = None
@@ -187,7 +248,7 @@ class UnifiedQuote(BaseModel):
     )
     primary_provider: Optional[str] = None
     provider: Optional[str] = None
-    data_source: Optional[str] = None  # alias for "Data Source" column on Sheets
+    data_source: Optional[str] = None  # alias for 'Data Source' column on Sheets
     sources: Optional[List[ProviderSource]] = None
 
     # Timestamps
@@ -208,14 +269,15 @@ class _CacheEntry:
     quote: UnifiedQuote
 
 
-# ============================================================================
+# =============================================================================
 # DataEngine
-# ============================================================================
+# =============================================================================
 
 
 class DataEngine:
     """
-    Core async engine used by routes.enriched_quote and any AI analysis routes.
+    Core async engine used by routes.enriched_quote, ai_analysis,
+    advanced_analysis, and legacy_service.
 
     Public async methods:
         - get_enriched_quote(symbol: str) -> UnifiedQuote
@@ -227,24 +289,43 @@ class DataEngine:
         cache_ttl: Optional[int] = None,
         provider_timeout: Optional[int] = None,
         enabled_providers: Optional[List[str]] = None,
-        enable_advanced_analysis: bool = True,
+        enable_advanced_analysis: Optional[bool] = None,
     ) -> None:
-        # Config from env with sensible defaults
-        self.cache_ttl: int = (
-            cache_ttl
-            if cache_ttl is not None
-            else int(os.getenv("DATAENGINE_CACHE_TTL", "120") or "120")
-        )
-        self.provider_timeout: int = (
-            provider_timeout
-            if provider_timeout is not None
-            else int(os.getenv("DATAENGINE_TIMEOUT", "10") or "10")
-        )
-        self.enable_advanced_analysis: bool = enable_advanced_analysis
-        self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
+        # ------------------------------------------------------------------
+        # Cache TTL
+        # ------------------------------------------------------------------
+        if cache_ttl is not None:
+            self.cache_ttl: int = int(cache_ttl)
+        elif _ENV_SETTINGS is not None:
+            # Use env.settings if available
+            self.cache_ttl = int(
+                getattr(_ENV_SETTINGS, "engine_cache_ttl_seconds", 300) or 300
+            )
+        else:
+            # Fallback to DATAENGINE_CACHE_TTL env var or default 120s
+            self.cache_ttl = int(os.getenv("DATAENGINE_CACHE_TTL", "120") or "120")
 
+        # ------------------------------------------------------------------
+        # HTTP timeout per provider
+        # ------------------------------------------------------------------
+        if provider_timeout is not None:
+            self.provider_timeout: int = int(provider_timeout)
+        elif _ENV_SETTINGS is not None:
+            self.provider_timeout = int(
+                getattr(_ENV_SETTINGS, "http_timeout", 10) or 10
+            )
+        else:
+            self.provider_timeout = int(
+                os.getenv("DATAENGINE_TIMEOUT", "10") or "10"
+            )
+
+        # ------------------------------------------------------------------
+        # Enabled providers
+        # ------------------------------------------------------------------
         if enabled_providers is not None:
-            providers = enabled_providers
+            providers = [p.strip().lower() for p in enabled_providers if p.strip()]
+        elif _ENV_SETTINGS is not None:
+            providers = [p.strip().lower() for p in _ENV_SETTINGS.enabled_providers]
         else:
             raw = os.getenv("ENABLED_PROVIDERS", "fmp")
             providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
@@ -259,14 +340,40 @@ class DataEngine:
             # Always have at least FMP in the list
             self.enabled_providers = ["fmp"]
 
+        # ------------------------------------------------------------------
+        # Advanced analysis flag
+        # ------------------------------------------------------------------
+        if enable_advanced_analysis is not None:
+            self.enable_advanced_analysis: bool = bool(enable_advanced_analysis)
+        elif _ENV_SETTINGS is not None:
+            self.enable_advanced_analysis = bool(
+                getattr(_ENV_SETTINGS, "engine_enable_advanced_analysis", True)
+            )
+        else:
+            raw_flag = os.getenv("ENGINE_ENABLE_ADVANCED_ANALYSIS", "true")
+            self.enable_advanced_analysis = raw_flag.strip().lower() in {
+                "true",
+                "1",
+                "yes",
+                "on",
+            }
+
+        # ------------------------------------------------------------------
+        # Local timezone (for Riyadh timestamps / 9-page Sheets alignment)
+        # ------------------------------------------------------------------
+        self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
+
+        # In-memory cache
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.0 initialized (providers=%s, cache_ttl=%ss, timeout=%ss, v1_delegate=%s)",
+            "DataEngine v2.0 initialized (providers=%s, cache_ttl=%ss, timeout=%ss, "
+            "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
             self.cache_ttl,
             self.provider_timeout,
             _HAS_V1_ENGINE,
+            self.enable_advanced_analysis,
         )
 
     # ------------------------------------------------------------------ #
@@ -384,7 +491,7 @@ class DataEngine:
         # 2) Multi-provider orchestration (global, and KSA if no v1 delegate)
         providers = list(self.enabled_providers)
 
-        # KSA-safe: never call EODHD for .SR / .TADAWUL symbols
+        # KSA-safe: NEVER call EODHD for .SR / .TADAWUL symbols
         if is_ksa and "eodhd" in providers:
             providers = [p for p in providers if p != "eodhd"]
             logger.debug(
@@ -413,7 +520,9 @@ class DataEngine:
             elif provider == "finnhub":
                 tasks.append(
                     asyncio.create_task(
-                        self._safe_call_provider("finnhub", self._fetch_from_finnhub, symbol)
+                        self._safe_call_provider(
+                            "finnhub", self._fetch_from_finnhub, symbol
+                        )
                     )
                 )
             else:
@@ -440,7 +549,7 @@ class DataEngine:
 
         # If all are MISSING, merge error messages
         combined_error = "; ".join(
-            [q.error for q in results if q.error]  # type: ignore
+            [q.error for q in results if q and q.error]  # type: ignore
         )
         return UnifiedQuote(
             symbol=symbol,
@@ -491,12 +600,23 @@ class DataEngine:
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_fmp(self, symbol: str) -> Optional[UnifiedQuote]:
-        api_key = os.getenv("FMP_API_KEY")
+        # Prefer env.settings.fmp_api_key / fmp_base_url, then OS env
+        api_key = (
+            getattr(_ENV_SETTINGS, "fmp_api_key", None)
+            if _ENV_SETTINGS is not None
+            else None
+        ) or _env_or_os("FMP_API_KEY")
+        base_url = (
+            getattr(_ENV_SETTINGS, "fmp_base_url", None)
+            if _ENV_SETTINGS is not None
+            else None
+        ) or _env_or_os("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3")
+
         if not api_key:
             logger.warning("FMP_API_KEY not set; skipping FMP for %s", symbol)
             return None
 
-        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
+        url = f"{base_url.rstrip('/')}/quote/{symbol}"
 
         async with httpx.AsyncClient(timeout=self.provider_timeout) as client:
             resp = await client.get(url, params={"apikey": api_key})
@@ -611,8 +731,17 @@ class DataEngine:
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_eodhd(self, symbol: str) -> Optional[UnifiedQuote]:
-        api_key = os.getenv("EODHD_API_KEY")
-        base_url = os.getenv("EODHD_BASE_URL", "https://eodhd.com/api")
+        # Prefer env.settings.eodhd_api_key / eodhd_base_url, then OS env
+        api_key = (
+            getattr(_ENV_SETTINGS, "eodhd_api_key", None)
+            if _ENV_SETTINGS is not None
+            else None
+        ) or _env_or_os("EODHD_API_KEY")
+        base_url = (
+            getattr(_ENV_SETTINGS, "eodhd_base_url", None)
+            if _ENV_SETTINGS is not None
+            else None
+        ) or _env_or_os("EODHD_BASE_URL", "https://eodhd.com/api")
 
         if not api_key:
             logger.warning("EODHD_API_KEY not set; skipping EODHD for %s", symbol)
@@ -724,7 +853,13 @@ class DataEngine:
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_finnhub(self, symbol: str) -> Optional[UnifiedQuote]:
-        api_key = os.getenv("FINNHUB_API_KEY")
+        # Prefer env.settings.finnhub_api_key, then OS env
+        api_key = (
+            getattr(_ENV_SETTINGS, "finnhub_api_key", None)
+            if _ENV_SETTINGS is not None
+            else None
+        ) or _env_or_os("FINNHUB_API_KEY")
+
         if not api_key:
             logger.warning("FINNHUB_API_KEY not set; skipping Finnhub for %s", symbol)
             return None
@@ -981,6 +1116,10 @@ class DataEngine:
         - Quality score: EPS sign + PE range
         - Momentum score: % change + 52W position
         - Opportunity score: weighted combination
+
+        This is intentionally simple and deterministic so that Google Sheets
+        and higher layers (Investment Advisor, Insights_Analysis page) can
+        reuse/override it as needed.
         """
         # Quality score
         quality = 50.0
@@ -1020,7 +1159,9 @@ class DataEngine:
         if q.change_percent is not None or q.change_pct is not None:
             try:
                 cp = float(
-                    q.change_percent if q.change_percent is not None else q.change_pct  # type: ignore[arg-type]
+                    q.change_percent
+                    if q.change_percent is not None
+                    else q.change_pct  # type: ignore[arg-type]
                 )
                 momentum += max(-20.0, min(20.0, cp))
             except Exception:
