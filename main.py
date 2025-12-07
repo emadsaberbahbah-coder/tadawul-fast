@@ -7,14 +7,14 @@ Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
 - FastAPI backend for:
     • Enriched Quotes      (v1/enriched)
     • AI Analysis          (v1/analysis)
-    • Advanced Analysis    (v1/advanced)
+    • Advanced Analysis    (v1/advanced)  [optional – only if router exists]
     • KSA / Argaam Gateway (v1/argaam)
     • Legacy Quotes        (v1/quote, v1/legacy/sheet-rows)
 
 - Integrated with:
-    • core.data_engine (multi-provider engine):
+    • core.data_engine / core.data_engine_v2 (multi-provider engine):
         - KSA via Tadawul/Argaam gateway (NO EODHD for .SR)
-        - Global via EODHD + FMP
+        - Global via EODHD + FMP + Yahoo
     • env.py (all config & tokens, Sheets meta, etc.)
     • Google Sheets / Apps Script flows
       (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
@@ -115,8 +115,24 @@ except Exception:  # pragma: no cover - defensive fallback
 # Routers:
 # - enriched_quote, ai_analysis, advanced_analysis live under routes/
 # - routes_argaam.py is at project root in your repo
-from routes import enriched_quote, ai_analysis, advanced_analysis
-import routes_argaam
+
+# Always import the core routers
+from routes import enriched_quote, ai_analysis  # type: ignore
+
+# advanced_analysis is optional – don't crash the app if it's missing
+try:  # pragma: no cover - importing optional router
+    from routes import advanced_analysis  # type: ignore
+    _ADVANCED_ANALYSIS_AVAILABLE = True
+except Exception as _advanced_exc:  # pragma: no cover - defensive
+    logging.error(
+        "advanced_analysis router could not be imported: %s. "
+        "The /v1/advanced* endpoints will be disabled for this deploy.",
+        _advanced_exc,
+    )
+    advanced_analysis = None  # type: ignore
+    _ADVANCED_ANALYSIS_AVAILABLE = False
+
+import routes_argaam  # type: ignore
 
 from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
@@ -215,7 +231,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "🚀 Starting %s (env=%s, version=%s)",
         APP_NAME,
-        settings.app_env,
+        getattr(settings, "app_env", "production"),
         APP_VERSION,
     )
     yield
@@ -281,10 +297,16 @@ app.include_router(
 )
 
 # Advanced analysis / risk engine (extra KPIs, risk buckets, etc.)
-app.include_router(
-    advanced_analysis.router,
-    dependencies=[Depends(require_app_token)],
-)
+if _ADVANCED_ANALYSIS_AVAILABLE and advanced_analysis is not None:
+    app.include_router(
+        advanced_analysis.router,  # type: ignore[attr-defined]
+        dependencies=[Depends(require_app_token)],
+    )
+else:
+    logger.warning(
+        "Advanced analysis router is not available – "
+        "skipping /v1/advanced* endpoints for this deploy."
+    )
 
 # KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD
 app.include_router(
@@ -314,7 +336,7 @@ async def root() -> str:
       <head><title>{APP_NAME}</title></head>
       <body style="font-family:system-ui;background:#0b1020;color:#edf2f7;padding:20px;">
         <h1>{APP_NAME}</h1>
-        <p>Environment: <strong>{settings.app_env}</strong></p>
+        <p>Environment: <strong>{getattr(settings, 'app_env', 'production')}</strong></p>
         <p>Version: <strong>{APP_VERSION}</strong></p>
         <p>Base URL: <code>{BACKEND_BASE_URL}</code></p>
         <p>Default Spreadsheet (9-page dashboard): {default_sheet_html}</p>
@@ -325,12 +347,12 @@ async def root() -> str:
           <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
           <li><code>/v1/enriched/health</code></li>
           <li><code>/v1/analysis/health</code></li>
-          <li><code>/v1/advanced/health</code></li>
+          <li><code>/v1/advanced/health</code> (if enabled)</li>
           <li><code>/v1/argaam/health</code> (KSA / Argaam gateway)</li>
         </ul>
         <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
           KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.
-          Global (non-.SR) tickers are handled via EODHD + FMP.
+          Global (non-.SR) tickers are handled via EODHD + FMP + Yahoo.
         </p>
       </body>
     </html>
@@ -348,7 +370,7 @@ async def basic_health() -> Dict[str, Any]:
         "status": "ok",
         "app": APP_NAME,
         "version": APP_VERSION,
-        "env": settings.app_env,
+        "env": getattr(settings, "app_env", "production"),
         "time_utc": now.isoformat(),
         "uptime_seconds": uptime_seconds,
     }
@@ -393,17 +415,18 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
     return {
         "status": "operational",
         "version": APP_VERSION,
-        "environment": settings.app_env,
+        "environment": getattr(settings, "app_env", "production"),
         "uptime_seconds": uptime_seconds,
         "timestamp": now.isoformat(),
         "backend_base_url": BACKEND_BASE_URL,
         "services": services,
         "auth": auth,
         "sheets": sheets_meta,
+        "advanced_analysis_enabled": _ADVANCED_ANALYSIS_AVAILABLE,
         "notes": [
             "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
             "No direct EODHD calls are made for KSA inside this main application.",
-            "Global (non-.SR) tickers use EODHD + FMP via core.data_engine.",
+            "Global (non-.SR) tickers use EODHD + FMP + Yahoo via core.data_engine / core.data_engine_v2.",
         ],
     }
 
@@ -463,9 +486,9 @@ async def legacy_sheet_rows_endpoint(
           "meta": {...}
         }
 
-    Can be used by:
+    Used by:
         - Google Apps Script (UrlFetchApp)
-        - google_sheets_service (if you want the legacy layout)
+        - google_sheets_service (legacy layout for 9 pages if needed)
     """
     payload = await build_legacy_sheet_payload(body.tickers or [])
     return LegacyQuoteSheetResponse(
