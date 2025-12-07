@@ -1,7 +1,7 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.1)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.2)
 
 - Preferred backend:
     • core.data_engine_v2.DataEngine (class-based unified engine)
@@ -92,7 +92,7 @@ except Exception as e_v2:  # pragma: no cover - defensive
                     "roa": None,
                     "data_quality": "MISSING",
                     "opportunity_score": None,
-                    "last_updated_utc": None,
+                    "as_of_utc": None,
                     "sources": [],
                     "notes": None,
                     "error": (
@@ -140,9 +140,9 @@ class SingleAnalysisResponse(BaseModel):
     market_cap: Optional[float] = None
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
+    dividend_yield: Optional[float] = None  # stored as fraction (0–1)
+    roe: Optional[float] = None             # stored as fraction (0–1)
+    roa: Optional[float] = None             # optional, currently not in sheet
 
     data_quality: str = "MISSING"
 
@@ -240,6 +240,25 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _normalize_percent_like(x: Any) -> Optional[float]:
+    """
+    Convert any percent-like value into a fraction (0–1) for internal use.
+
+    - If x is None -> None
+    - If 0 <= x <= 1  -> treated as fraction already (e.g. 0.15 = 15%)
+    - If 1 < x <= 100 -> treated as percent, converted to fraction (e.g. 15 -> 0.15)
+    - If x > 100      -> left as-is (defensive; will be clamped by scoring)
+    """
+    v = _safe_float(x)
+    if v is None:
+        return None
+    if 0.0 <= v <= 1.0:
+        return v
+    if 1.0 < v <= 100.0:
+        return v / 100.0
+    return v
+
+
 def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
     """
     Basic AI-like scoring layer. 0–100 scale for each score.
@@ -247,9 +266,11 @@ def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
     """
     pe = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
     pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
-    dy = _safe_float(_qget(quote, "dividend_yield", "dividend_yield_percent"))
-    roe = _safe_float(_qget(quote, "roe", "roe_percent"))
-    profit_margin = _safe_float(
+    dy = _normalize_percent_like(
+        _qget(quote, "dividend_yield", "dividend_yield_percent", "dividendYield")
+    )
+    roe = _normalize_percent_like(_qget(quote, "roe", "roe_percent", "returnOnEquity"))
+    profit_margin = _normalize_percent_like(
         _qget(quote, "profit_margin", "net_margin_percent", "profitMargins")
     )
     change_pct = _safe_float(
@@ -259,7 +280,6 @@ def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
     # ------------------------
     # Value score (P/E, P/B, Dividend Yield)
     # ------------------------
-    value_score: Optional[float] = None
     vs = 50.0
     if pe is not None:
         if 0 < pe < 12:
@@ -274,19 +294,19 @@ def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
         elif pb > 4:
             vs -= 10
     if dy is not None:
-        if 0.02 <= dy <= 0.06:
+        # dy is fraction here (0–1)
+        if 0.02 <= dy <= 0.06:  # 2–6%
             vs += 10
-        elif dy > 0.08:
+        elif dy > 0.08:  # >8%
             vs -= 5
-    value_score = max(0.0, min(100.0, vs))
+    value_score: float = max(0.0, min(100.0, vs))
 
     # ------------------------
     # Quality score (ROE, profit margin)
     # ------------------------
-    quality_score: Optional[float] = None
     qs = 50.0
     if roe is not None:
-        if roe >= 0.20:
+        if roe >= 0.20:  # ≥20%
             qs += 25
         elif 0.10 <= roe < 0.20:
             qs += 10
@@ -299,19 +319,18 @@ def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
             qs += 10
         elif profit_margin < 0.0:
             qs -= 10
-    quality_score = max(0.0, min(100.0, qs))
+    quality_score: float = max(0.0, min(100.0, qs))
 
     # ------------------------
     # Momentum score (daily change %)
     # ------------------------
-    momentum_score: Optional[float] = None
     ms = 50.0
     if change_pct is not None:
         if change_pct > 0:
             ms += min(change_pct, 10) * 2  # cap upside contribution
         elif change_pct < 0:
             ms += max(change_pct, -10) * 2  # penalties for deep red
-    momentum_score = max(0.0, min(100.0, ms))
+    momentum_score: float = max(0.0, min(100.0, ms))
 
     return {
         "value_score": value_score,
@@ -378,7 +397,13 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
 
     symbol = str(_qget(quote, "symbol", "ticker") or "").upper()
     name = _qget(quote, "name", "company_name", "longName", "shortName")
-    market_region = _qget(quote, "market_region")
+    market_region = _qget(
+        quote,
+        "market_region",
+        "market",
+        "exchange_short_name",
+        "exchange",
+    )
 
     price = _safe_float(_qget(quote, "price", "last_price"))
     change_pct = _safe_float(
@@ -387,11 +412,11 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
     market_cap = _safe_float(_qget(quote, "market_cap", "marketCap"))
     pe_ttm = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
     pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
-    dividend_yield = _safe_float(
-        _qget(quote, "dividend_yield", "dividend_yield_percent")
+    dividend_yield = _normalize_percent_like(
+        _qget(quote, "dividend_yield", "dividend_yield_percent", "dividendYield")
     )
-    roe = _safe_float(_qget(quote, "roe", "roe_percent"))
-    roa = _safe_float(_qget(quote, "roa", "roa_percent"))
+    roe = _normalize_percent_like(_qget(quote, "roe", "roe_percent", "returnOnEquity"))
+    roa = _normalize_percent_like(_qget(quote, "roa", "roa_percent", "returnOnAssets"))
     data_quality = str(_qget(quote, "data_quality") or "MISSING")
 
     last_updated_raw = _qget(quote, "last_updated_utc", "as_of_utc")
@@ -451,11 +476,15 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
 
 
 def _build_sheet_headers() -> List[str]:
-    """Headers to use directly in Google Sheets."""
+    """
+    Headers to use directly in Google Sheets for the AI/Insights layer.
+    This is mainly for the Insights_Analysis page, but can be reused for
+    any scoring/AI overlay on top of the other 8 pages.
+    """
     return [
         "Symbol",
         "Company Name",
-        "Market Region",
+        "Market / Region",
         "Price",
         "Change %",
         "Market Cap",
@@ -525,7 +554,7 @@ async def analysis_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "ai_analysis",
-        "version": "2.1",
+        "version": "2.2",
         "engine_mode": _ENGINE_MODE,
     }
 
