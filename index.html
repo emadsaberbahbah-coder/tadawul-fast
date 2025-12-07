@@ -404,7 +404,7 @@
   <header>
     <div class="title-block">
       <h1>Tadawul Fast Bridge – Control Panel</h1>
-      <p>Unified data engine for KSA + Global markets, Google Sheets, and AI analysis.</p>
+      <p>Unified data engine for KSA (.SR) + Global markets, 9-page Google Sheets dashboard, and AI analysis.</p>
     </div>
     <div>
       <div class="pill">
@@ -415,8 +415,9 @@
   </header>
 
   <main>
-    <!-- LEFT COLUMN: SETTINGS + HEALTH -->
+    <!-- LEFT COLUMN: SETTINGS + HEALTH + STATUS -->
     <section>
+      <!-- Connection card -->
       <div class="card" id="cfg-card">
         <div class="card-header">
           <h2>Connection</h2>
@@ -447,10 +448,11 @@
         <div id="cfg-error" class="error-text" style="display:none;"></div>
       </div>
 
+      <!-- Module Health -->
       <div class="card">
         <div class="card-header">
           <h2>Module Health</h2>
-          <small>Checks /v1/enriched, /v1/analysis, /v1/advanced</small>
+          <small>Checks /v1/enriched, /v1/analysis, /v1/advanced, /v1/argaam</small>
         </div>
         <div class="status-grid" id="healthGrid">
           <div class="status-card">
@@ -465,19 +467,58 @@
             <h3>Advanced Analysis</h3>
             <div class="value" id="health-adv">–</div>
           </div>
+          <div class="status-card">
+            <h3>KSA / Argaam</h3>
+            <div class="value" id="health-argaam">–</div>
+          </div>
         </div>
         <div class="row" style="margin-top:10px; justify-content:flex-end;">
           <button class="btn secondary sm" id="refreshHealthBtn">Refresh Health</button>
         </div>
       </div>
+
+      <!-- Service Status (/v1/status) -->
+      <div class="card">
+        <div class="card-header">
+          <h2>Service Status</h2>
+          <small>/v1/status snapshot (backend + Google Sheets)</small>
+        </div>
+        <div class="status-grid">
+          <div class="status-card">
+            <h3>Environment / Version</h3>
+            <div class="value" id="status-env">–</div>
+          </div>
+          <div class="status-card">
+            <h3>Google Sheets</h3>
+            <div class="value" id="status-sheets">–</div>
+          </div>
+          <div class="status-card">
+            <h3>Default Spreadsheet</h3>
+            <div class="value" id="status-spreadsheet">–</div>
+          </div>
+          <div class="status-card">
+            <h3>Auth / Tokens</h3>
+            <div class="value" id="status-auth">–</div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:8px; justify-content:flex-end;">
+          <button class="btn secondary sm" id="refreshStatusBtn">Refresh Status</button>
+        </div>
+        <div class="small-note">
+          Reflects how the backend sees configuration for your 9-page Google Sheets dashboard
+          (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio, Insights_Analysis, etc.).
+        </div>
+        <pre id="statusRaw" style="margin-top:6px;">{}</pre>
+      </div>
     </section>
 
     <!-- RIGHT COLUMN: OPERATIONS -->
     <section>
+      <!-- Quick symbol check -->
       <div class="card">
         <div class="card-header">
           <h2>Quick Symbol Check</h2>
-          <small>Single symbol from Enriched / AI / Advanced</small>
+          <small>Test single symbol from Enriched / AI / Advanced</small>
         </div>
         <div class="row">
           <div>
@@ -497,16 +538,17 @@
           <button class="btn sm" id="runQuickBtn">Run</button>
         </div>
         <div class="small-note">
-          KSA symbols end with <code>.SR</code> and will use Tadawul/Argaam under the hood,
-          not EODHD.
+          KSA symbols end with <code>.SR</code> and will use Tadawul/Argaam under the hood
+          (engine will not call EODHD for KSA).
         </div>
         <pre id="quickResult" style="margin-top:8px;">{}</pre>
       </div>
 
+      <!-- Batch sheet-rows preview -->
       <div class="card">
         <div class="card-header">
           <h2>Batch Sheet Rows Preview</h2>
-          <small>Same structure as Google Sheets pages</small>
+          <small>Same structure as the 9 Google Sheets pages (/sheet-rows)</small>
         </div>
         <div class="row">
           <div>
@@ -532,7 +574,8 @@
   </main>
 
   <footer>
-    KSA tickers (<code>.SR</code>) are internally routed away from EODHD – core data engine uses Tadawul/Argaam providers.
+    KSA tickers (<code>.SR</code>) are internally routed away from EODHD – the core data engine uses Tadawul/Argaam providers.
+    Global tickers use EODHD + FMP, with sheet-rows powering your 9 Google Sheets pages.
   </footer>
 </div>
 
@@ -544,20 +587,36 @@
     };
 
     const els = {
+      // config
       baseUrl: document.getElementById("baseUrl"),
       token: document.getElementById("token"),
       cfgStatus: document.getElementById("cfg-status"),
       cfgError: document.getElementById("cfg-error"),
       saveCfgBtn: document.getElementById("saveCfgBtn"),
       clearCfgBtn: document.getElementById("clearCfgBtn"),
+
+      // health
       healthEnriched: document.getElementById("health-enriched"),
       healthAi: document.getElementById("health-ai"),
       healthAdv: document.getElementById("health-adv"),
+      healthArgaam: document.getElementById("health-argaam"),
       refreshHealthBtn: document.getElementById("refreshHealthBtn"),
+
+      // status (/v1/status)
+      statusEnv: document.getElementById("status-env"),
+      statusSheets: document.getElementById("status-sheets"),
+      statusSpreadsheet: document.getElementById("status-spreadsheet"),
+      statusAuth: document.getElementById("status-auth"),
+      refreshStatusBtn: document.getElementById("refreshStatusBtn"),
+      statusRaw: document.getElementById("statusRaw"),
+
+      // quick symbol
       quickSymbol: document.getElementById("quickSymbol"),
       quickType: document.getElementById("quickType"),
       runQuickBtn: document.getElementById("runQuickBtn"),
       quickResult: document.getElementById("quickResult"),
+
+      // batch
       batchType: document.getElementById("batchType"),
       batchTickers: document.getElementById("batchTickers"),
       runBatchBtn: document.getElementById("runBatchBtn"),
@@ -567,6 +626,9 @@
       tickerSplitRow: document.getElementById("tickerSplitRow"),
     };
 
+    // --------------------------------------------------------
+    // Config helpers
+    // --------------------------------------------------------
     function loadConfig() {
       const storedBase = localStorage.getItem("tfb_base_url");
       const storedToken = localStorage.getItem("tfb_app_token");
@@ -597,6 +659,9 @@
       els.cfgError.textContent = "";
     }
 
+    // --------------------------------------------------------
+    // Fetch helper
+    // --------------------------------------------------------
     async function apiFetch(path, options = {}) {
       const base = (state.baseUrl || window.location.origin).replace(/\/$/, "");
       const url = base + path;
@@ -631,6 +696,9 @@
       return data;
     }
 
+    // --------------------------------------------------------
+    // Helpers
+    // --------------------------------------------------------
     function classifyTickers(tickers) {
       const ksa = [];
       const global = [];
@@ -646,6 +714,89 @@
       return { ksa, global };
     }
 
+    // --------------------------------------------------------
+    // Health & Status
+    // --------------------------------------------------------
+    async function updateHealthCard(kind) {
+      const idMap = {
+        enriched: els.healthEnriched,
+        analysis: els.healthAi,
+        advanced: els.healthAdv,
+        argaam: els.healthArgaam,
+      };
+      const el = idMap[kind];
+      if (!el) return;
+      el.textContent = "Checking...";
+      el.classList.remove("ok", "bad");
+
+      let path;
+      if (kind === "enriched") path = "/v1/enriched/health";
+      else if (kind === "analysis") path = "/v1/analysis/health";
+      else if (kind === "advanced") path = "/v1/advanced/health";
+      else path = "/v1/argaam/health";
+
+      try {
+        const data = await apiFetch(path);
+        const okText = data && data.status ? data.status : "OK";
+        el.textContent = okText;
+        el.classList.add("ok");
+      } catch (e) {
+        el.textContent = "Error";
+        el.classList.add("bad");
+      }
+    }
+
+    async function updateStatusCard() {
+      if (!els.statusEnv || !els.statusRaw) return;
+      els.statusEnv.textContent = "Loading...";
+      els.statusSheets.textContent = "Loading...";
+      els.statusSpreadsheet.textContent = "Loading...";
+      els.statusAuth.textContent = "Loading...";
+      els.statusEnv.classList.remove("ok", "bad");
+      els.statusSheets.classList.remove("ok", "bad");
+      els.statusSpreadsheet.classList.remove("ok", "bad");
+      els.statusAuth.classList.remove("ok", "bad");
+      els.statusRaw.textContent = "Loading /v1/status...";
+
+      try {
+        const data = await apiFetch("/v1/status");
+        els.statusRaw.textContent = JSON.stringify(data, null, 2);
+
+        const env = data.environment || data.env || "-";
+        const version = data.version || "-";
+        els.statusEnv.textContent = env + " / " + version;
+        els.statusEnv.classList.add("ok");
+
+        const services = data.services || {};
+        const sheetsOk = !!services.google_sheets;
+        els.statusSheets.textContent = sheetsOk ? "Configured" : "Missing";
+        els.statusSheets.classList.add(sheetsOk ? "ok" : "bad");
+
+        const sheetsMeta = data.sheets || {};
+        const hasDefault = !!sheetsMeta.has_default_spreadsheet;
+        const sheetId = sheetsMeta.default_spreadsheet_id || "(not set)";
+        els.statusSpreadsheet.textContent = hasDefault ? sheetId : "Not configured";
+        els.statusSpreadsheet.classList.add(hasDefault ? "ok" : "bad");
+
+        const auth = data.auth || {};
+        const hasToken = !!auth.has_secure_token;
+        els.statusAuth.textContent = hasToken ? "Tokens configured" : "No token";
+        els.statusAuth.classList.add(hasToken ? "ok" : "bad");
+      } catch (e) {
+        els.statusEnv.textContent = "Error";
+        els.statusSheets.textContent = "Error";
+        els.statusSpreadsheet.textContent = "Error";
+        els.statusAuth.textContent = "Error";
+        els.statusEnv.classList.add("bad");
+        els.statusSheets.classList.add("bad");
+        els.statusSpreadsheet.classList.add("bad");
+        els.statusAuth.classList.add("bad");
+        els.statusRaw.textContent =
+          "Error calling /v1/status: " +
+          (e.data ? JSON.stringify(e.data) : e.toString());
+      }
+    }
+
     async function testConfigAndHealth() {
       els.cfgError.style.display = "none";
       els.cfgError.textContent = "";
@@ -655,6 +806,8 @@
           updateHealthCard("enriched"),
           updateHealthCard("analysis"),
           updateHealthCard("advanced"),
+          updateHealthCard("argaam"),
+          updateStatusCard(),
         ]);
         els.cfgStatus.textContent = "Connection OK";
       } catch (e) {
@@ -665,33 +818,9 @@
       }
     }
 
-    async function updateHealthCard(kind) {
-      const idMap = {
-        enriched: els.healthEnriched,
-        analysis: els.healthAi,
-        advanced: els.healthAdv,
-      };
-      const el = idMap[kind];
-      if (!el) return;
-      el.textContent = "Checking...";
-
-      let path;
-      if (kind === "enriched") path = "/v1/enriched/health";
-      else if (kind === "analysis") path = "/v1/analysis/health";
-      else path = "/v1/advanced/health";
-
-      try {
-        const data = await apiFetch(path);
-        el.textContent = "OK";
-        el.classList.remove("bad");
-        el.classList.add("ok");
-      } catch (e) {
-        el.textContent = "Error";
-        el.classList.remove("ok");
-        el.classList.add("bad");
-      }
-    }
-
+    // --------------------------------------------------------
+    // Quick symbol check
+    // --------------------------------------------------------
     async function runQuickCheck() {
       const symbol = els.quickSymbol.value.trim();
       const type = els.quickType.value;
@@ -720,6 +849,9 @@
       }
     }
 
+    // --------------------------------------------------------
+    // Batch preview (sheet-rows)
+    // --------------------------------------------------------
     function renderTickerSplit() {
       const raw = els.batchTickers.value.split("\n");
       const { ksa, global } = classifyTickers(raw);
@@ -745,7 +877,8 @@
     }
 
     async function runBatchPreview() {
-      els.batchError.style.display = "none";
+      els.batchError.style.display = "block";
+      els.batchError.style.color = "#fc8181";
       els.batchError.textContent = "";
       els.batchTableContainer.style.display = "none";
       els.batchTableContainer.innerHTML = "";
@@ -757,7 +890,6 @@
         if (t) tickers.push(t);
       });
       if (!tickers.length) {
-        els.batchError.style.display = "block";
         els.batchError.textContent = "Please enter at least one ticker.";
         return;
       }
@@ -772,7 +904,6 @@
         endpoint = "/v1/advanced/sheet-rows";
       }
 
-      els.batchError.style.display = "block";
       els.batchError.textContent = "Loading from backend...";
 
       try {
@@ -820,10 +951,10 @@
           "OK – previewing the exact headers/rows used by the Google Sheets pages.";
         els.batchError.style.color = "#68d391";
       } catch (e) {
-        els.batchError.style.display = "block";
         els.batchError.style.color = "#fc8181";
         els.batchError.textContent =
-          "Error loading /sheet-rows: " + (e.data ? JSON.stringify(e.data) : e.toString());
+          "Error loading /sheet-rows: " +
+          (e.data ? JSON.stringify(e.data) : e.toString());
       }
     }
 
@@ -837,6 +968,9 @@
       els.tickerSplitRow.innerHTML = "";
     }
 
+    // --------------------------------------------------------
+    // Events & init
+    // --------------------------------------------------------
     function initEvents() {
       els.saveCfgBtn.addEventListener("click", async () => {
         saveConfig();
@@ -851,6 +985,10 @@
         await testConfigAndHealth();
       });
 
+      els.refreshStatusBtn.addEventListener("click", async () => {
+        await updateStatusCard();
+      });
+
       els.runQuickBtn.addEventListener("click", runQuickCheck);
 
       els.batchTickers.addEventListener("input", renderTickerSplit);
@@ -862,6 +1000,8 @@
       loadConfig();
       initEvents();
       renderTickerSplit();
+      // Optional: initial lightweight status load (no error if fails)
+      updateStatusCard().catch(() => {});
     }
 
     init();
