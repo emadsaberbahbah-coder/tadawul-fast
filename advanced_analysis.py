@@ -1,17 +1,19 @@
 """
 routes/advanced_analysis.py
-
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES
 ================================================
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES
+
 Purpose:
 - Expose "advanced analysis" and "opportunity ranking" endpoints
-  on top of the unified DataEngine (core.data_engine_v2 or core.data_engine).
+  on top of the unified DataEngine (core.data_engine_v2 if available).
 - Designed to be Google Sheets–friendly and API-friendly.
 
 Key ideas:
-- Use DataEngine v2 if available, else fall back to v1 (module-level), else stub.
+- Prefer DataEngine v2 (class-based, multi-provider).
+- If v2 is missing, fall back to legacy core.data_engine module-level API.
+- If both fail, use a STUB engine (always returns MISSING/placeholder data).
 - Take a list of tickers, fetch enriched quotes, and build a
-  scoreboard sorted by Opportunity Score.
+  scoreboard sorted by Opportunity Score + Data Quality.
 - Compute a simple risk bucket based on Opportunity & Data Quality.
 
 Typical usage from main.py:
@@ -19,7 +21,7 @@ Typical usage from main.py:
     app.include_router(advanced_analysis.router)
 
 Endpoints:
-- GET  /v1/advanced/ping
+- GET  /v1/advanced/ping      (alias: /health)
 - GET  /v1/advanced/scoreboard?tickers=AAPL,MSFT,GOOGL&top_n=50
 - POST /v1/advanced/sheet-rows   (Google Sheets–friendly scoreboard)
 """
@@ -33,7 +35,17 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("routes.advanced_analysis")
+
+# =============================================================================
+# Optional env.py integration (for provider config / logging only)
+# =============================================================================
+
+try:  # pragma: no cover - optional
+    import env as _env  # type: ignore
+except Exception:
+    _env = None  # type: ignore
+
 
 # =============================================================================
 # DATA ENGINE IMPORT & FALLBACKS (aligned with enriched_quote / ai_analysis)
@@ -48,9 +60,22 @@ try:
     # Preferred: new v2 engine (class-based)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    _engine = _V2DataEngine()
+    if _env is not None:
+        # Use env-provided config when available
+        cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
+        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
+        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
+        _engine = _V2DataEngine(
+            cache_ttl=cache_ttl,
+            enabled_providers=enabled_providers,
+            enable_advanced_analysis=enable_adv,
+        )
+    else:
+        _engine = _V2DataEngine()
+
     _ENGINE_MODE = "v2"
-    logger.info("AdvancedAnalysis: using DataEngine from core.data_engine_v2")
+    logger.info("AdvancedAnalysis: using DataEngine v2 from core.data_engine_v2")
+
 except Exception as exc_v2:  # pragma: no cover - defensive
     logger.exception(
         "AdvancedAnalysis: Failed to import/use core.data_engine_v2.DataEngine: %s",
@@ -136,6 +161,7 @@ async def _engine_get_quote(symbol: str) -> Any:
         return await _engine.get_enriched_quote(sym)
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
+    # stub path
     return await _engine.get_enriched_quote(sym)
 
 
@@ -151,6 +177,7 @@ async def _engine_get_quotes(symbols: List[str]) -> List[Any]:
         return await _engine.get_enriched_quotes(clean)
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+    # stub path
     return await _engine.get_enriched_quotes(clean)
 
 
@@ -318,8 +345,8 @@ def _extract_data_quality_score(data: Dict[str, Any]) -> Optional[float]:
 
     mapping = {
         "EXCELLENT": 90.0,
-        "GOOD": 80.0,
-        "OK": 75.0,
+        "OK": 80.0,
+        "GOOD": 75.0,
         "FAIR": 55.0,
         "PARTIAL": 50.0,
         "STALE": 40.0,
@@ -374,24 +401,11 @@ async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
     """
     For each ticker, call the engine and map it into AdvancedItem.
     Uses batch engine call when available for better performance.
-
-    - If the engine hard-fails, returns [] so that:
-        • /v1/advanced/scoreboard -> 502 with a clear message
-        • /v1/advanced/sheet-rows -> headers + 0 rows (safe for Sheets)
     """
     if not tickers:
         return []
 
-    try:
-        unified_quotes = await _engine_get_quotes(tickers)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception(
-            "AdvancedAnalysis: Engine error while fetching tickers=%s: %s",
-            tickers,
-            exc,
-        )
-        return []
-
+    unified_quotes = await _engine_get_quotes(tickers)
     results: List[AdvancedItem] = []
 
     for raw_symbol, enriched in zip(tickers, unified_quotes):
@@ -437,7 +451,11 @@ async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
                 or data.get("last_updated_utc")
                 or data.get("timestamp_utc")
             )
-            data_age_minutes = _compute_data_age_minutes(as_of_utc)
+            if isinstance(as_of_utc, datetime):
+                as_of_str = as_of_utc.isoformat()
+            else:
+                as_of_str = str(as_of_utc) if as_of_utc else None
+            data_age_minutes = _compute_data_age_minutes(as_of_str)
 
             risk_bucket = _compute_risk_bucket(opportunity_score, data_quality_score)
 
@@ -482,6 +500,8 @@ async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
 def _score_key(it: AdvancedItem) -> float:
     """
     Sorting key: primarily Opportunity Score, then Data Quality Score.
+
+    - We multiply opportunity_score by 1000 to give it more weight.
     """
     opp = it.opportunity_score or 0.0
     dq = it.data_quality_score or 0.0
@@ -551,9 +571,10 @@ def _advanced_item_to_row(item: AdvancedItem) -> List[Any]:
 
 
 @router.get("/ping", summary="Quick health-check for advanced analysis")
+@router.get("/health", summary="Quick health-check for advanced analysis (alias)")
 async def ping() -> Dict[str, Any]:
     """
-    Lightweight ping endpoint to confirm the advanced analysis routes are alive.
+    Lightweight ping/health endpoint to confirm the advanced analysis routes are alive.
 
     Does NOT require calling any external providers; just returns meta info.
     """
