@@ -5,17 +5,17 @@ Tadawul Fast Bridge - Main Application
 Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
 
 - FastAPI backend for:
-    • Enriched Quotes (v1/enriched)
-    • AI Analysis (v1/analysis)
-    • Advanced Analysis & Risk (v1/advanced)
+    • Enriched Quotes      (v1/enriched)
+    • AI Analysis          (v1/analysis)
+    • Advanced Analysis    (v1/advanced)
     • KSA / Argaam Gateway (v1/argaam)
-    • Legacy Quotes (v1/quote, v1/legacy/sheet-rows)
+    • Legacy Quotes        (v1/quote, v1/legacy/sheet-rows)
 
 - Integrated with:
-    • core.data_engine (multi-provider engine:
+    • core.data_engine (multi-provider engine):
         - KSA via Tadawul/Argaam gateway (NO EODHD for .SR)
-        - Global via EODHD + FMP)
-    • env.py (all config & tokens, Argaam, Sheets, defaults)
+        - Global via EODHD + FMP
+    • env.py (all config & tokens, Sheets meta, etc.)
     • Google Sheets / Apps Script flows
       (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
        Commodities_FX, My_Portfolio, Insights_Analysis, etc.)
@@ -61,11 +61,15 @@ from env import (
     HAS_SECURE_TOKEN,
     GOOGLE_SHEETS_CREDENTIALS_RAW,
     GOOGLE_APPS_SCRIPT_BACKUP_URL,
-    DEFAULT_SPREADSHEET_ID,
     settings,
 )
 
-from routes import enriched_quote, ai_analysis, advanced_analysis, routes_argaam
+# Routers:
+# - enriched_quote, ai_analysis, advanced_analysis live under routes/
+# - routes_argaam.py is at project root in your repo
+from routes import enriched_quote, ai_analysis, advanced_analysis
+import routes_argaam
+
 from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
 # ------------------------------------------------------------
@@ -74,13 +78,24 @@ from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
 logger = logging.getLogger("tadawul_fast_bridge")
 if not logger.handlers:
-    # Basic config if not configured by host
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
 START_TIME = time.time()
+
+# ------------------------------------------------------------
+# Derived / optional values from env.settings
+# ------------------------------------------------------------
+
+try:
+    # Newer env.py version exposes this; if not, we fall back to None.
+    DEFAULT_SPREADSHEET_ID: Optional[str] = getattr(
+        settings, "default_spreadsheet_id", None
+    )
+except Exception:  # very defensive
+    DEFAULT_SPREADSHEET_ID = None
 
 # ------------------------------------------------------------
 # Rate limiting (SlowAPI) – light default
@@ -115,7 +130,7 @@ async def require_app_token(
 
     token: Optional[str] = None
 
-    # 1) Authorization: Bearer
+    # 1) Authorization: Bearer <token>
     if credentials and credentials.scheme.lower() == "bearer":
         token = (credentials.credentials or "").strip()
 
@@ -127,7 +142,7 @@ async def require_app_token(
         if header_token:
             token = header_token.strip()
 
-    # 3) ?token= query param (for old tests)
+    # 3) ?token=<token> query param (legacy tests)
     if not token:
         query_token = request.query_params.get("token")
         if query_token:
@@ -168,8 +183,8 @@ app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Tadawul Fast Bridge – Unified KSA + Global data engine with Google Sheets "
-        "integration (9-page investment dashboard)."
+        "Tadawul Fast Bridge – Unified KSA + Global data engine "
+        "with 9-page Google Sheets investment dashboard integration."
     ),
     lifespan=lifespan,
 )
@@ -188,7 +203,7 @@ if ENABLE_CORS_ALL_ORIGINS:
         allow_headers=["*"],
     )
 else:
-    # Restrict to Google Docs/Script if you want stricter CORS in future
+    # Stricter mode – can be customized as needed
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["https://docs.google.com", "https://script.google.com"],
@@ -205,19 +220,19 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # Include routers (protected by token if configured)
 # ------------------------------------------------------------
 
-# Unified Enriched Quotes
+# Unified Enriched Quotes (for both KSA + Global, using engine routing)
 app.include_router(
     enriched_quote.router,
     dependencies=[Depends(require_app_token)],
 )
 
-# AI-based analysis
+# AI-based analysis (narrative, scores, AI recommendations)
 app.include_router(
     ai_analysis.router,
     dependencies=[Depends(require_app_token)],
 )
 
-# Advanced analysis / risk engine
+# Advanced analysis / risk engine (extra KPIs, risk buckets, etc.)
 app.include_router(
     advanced_analysis.router,
     dependencies=[Depends(require_app_token)],
