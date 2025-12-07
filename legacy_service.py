@@ -1,17 +1,16 @@
 """
 legacy_service.py
 ------------------------------------------------------------
-LEGACY SERVICE BRIDGE – v2.0
+LEGACY SERVICE BRIDGE – v2.1
 
 GOAL
-- Provide a stable "legacy" layer on top of the new core.data_engine,
+- Provide a stable "legacy" layer on top of the new unified data engine,
   so old clients (PowerShell, early Google Sheets scripts, etc.) can
   still receive the classic /v1/quote-style payload.
 
 KEY FEATURES
-- NO direct EODHD calls. All data comes via core.data_engine.
-- KSA (.SR) tickers are handled by the new engine (Tadawul/Argaam
-  providers) – this module does NOT care if EODHD works or not.
+- NO direct EODHD calls. All data comes via the unified data engine.
+- KSA (.SR) tickers are handled by Tadawul/Argaam providers inside the engine.
 - Legacy quote format:
       {
           "quotes": [ { ... legacy fields ... } ],
@@ -23,28 +22,22 @@ KEY FEATURES
 
 TYPICAL USAGE
 -------------
-1) In a FastAPI router (for full backward compatibility):
+1) In FastAPI (see main.py):
 
-    from fastapi import APIRouter, Query
     from legacy_service import get_legacy_quotes
 
-    router = APIRouter(prefix="/v1")
-
-    @router.get("/quote")
+    @app.get("/v1/quote")
     async def legacy_quote(tickers: str = Query(...)):
-        # tickers="AAPL,MSFT,1120.SR"
         symbols = [t.strip() for t in tickers.split(",") if t.strip()]
         return await get_legacy_quotes(symbols)
 
-2) In a Google Sheets helper:
+2) In a Sheets helper:
 
     from legacy_service import build_legacy_sheet_payload
 
     payload = await build_legacy_sheet_payload(["AAPL", "MSFT", "1120.SR"])
     headers = payload["headers"]
     rows    = payload["rows"]
-    # -> use headers + rows with Sheets API setValues()
-
 """
 
 from __future__ import annotations
@@ -53,8 +46,67 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from env import APP_NAME, APP_VERSION, BACKEND_BASE_URL
-from core.data_engine import UnifiedQuote, get_enriched_quotes
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# ENV CONFIG – env.py preferred, env vars fallback
+# ----------------------------------------------------------------------
+
+APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
+APP_VERSION: str = os.getenv("APP_VERSION", "4.0.0")
+BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", "").strip()
+
+try:  # pragma: no cover - optional env.py
+    from env import (  # type: ignore
+        APP_NAME as _ENV_APP_NAME,
+        APP_VERSION as _ENV_APP_VERSION,
+        BACKEND_BASE_URL as _ENV_BACKEND_BASE_URL,
+    )
+
+    if _ENV_APP_NAME:
+        APP_NAME = _ENV_APP_NAME
+    if _ENV_APP_VERSION:
+        APP_VERSION = _ENV_APP_VERSION
+    if _ENV_BACKEND_BASE_URL:
+        BACKEND_BASE_URL = _ENV_BACKEND_BASE_URL.strip()
+
+    logger.info("[LegacyService] Config loaded from env.py.")
+except Exception:  # pragma: no cover - defensive
+    logger.warning(
+        "[LegacyService] env.py not available or failed to import. "
+        "Using environment variables for APP_NAME/APP_VERSION/BACKEND_BASE_URL."
+    )
+
+# ----------------------------------------------------------------------
+# DATA ENGINE IMPORT (v2 preferred, v1 fallback)
+# ----------------------------------------------------------------------
+
+# We normalize engine access through _get_enriched_quotes so this module
+# works even if you later refactor the engine again.
+
+try:
+    # Preferred: v2 class-based engine
+    from core.data_engine_v2 import DataEngine, UnifiedQuote  # type: ignore
+
+    _ENGINE = DataEngine()
+
+    async def _get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
+        return await _ENGINE.get_enriched_quotes(symbols)
+
+    logger.info("[LegacyService] Using DataEngine from core.data_engine_v2.")
+except Exception:  # pragma: no cover - fallback
+    logger.warning(
+        "[LegacyService] core.data_engine_v2 not usable; "
+        "falling back to core.data_engine.get_enriched_quotes."
+    )
+    from core.data_engine import UnifiedQuote, get_enriched_quotes as _get_enriched_quotes  # type: ignore
+
+    async def _get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
+        return await _get_enriched_quotes(symbols)
+
 
 # ----------------------------------------------------------------------
 # CONSTANTS / TIMEZONES
@@ -171,51 +223,52 @@ def _unified_to_legacy(q: UnifiedQuote) -> LegacyQuote:
     Map UnifiedQuote -> LegacyQuote.
     This is the central mapping used for all legacy responses.
     """
-    price = _safe_float(q.price)
-    prev_close = _safe_float(q.prev_close)
-    high_52w = _safe_float(q.fifty_two_week_high)
-    low_52w = _safe_float(q.fifty_two_week_low)
+    price = _safe_float(getattr(q, "price", None))
+    prev_close = _safe_float(getattr(q, "prev_close", None))
+    high_52w = _safe_float(getattr(q, "fifty_two_week_high", None))
+    low_52w = _safe_float(getattr(q, "fifty_two_week_low", None))
 
     pos_52w = _compute_52w_position_pct(price, low_52w, high_52w)
 
-    last_utc = q.last_updated_utc
+    last_utc = getattr(q, "last_updated_utc", None)
     last_riyadh = _to_riyadh(last_utc)
 
-    data_source = ", ".join(src.provider for src in (q.sources or []))
+    sources = getattr(q, "sources", None) or []
+    data_source = ", ".join(getattr(src, "provider", "") for src in sources if src)
 
     return LegacyQuote(
         ticker=q.symbol,
         symbol=q.symbol,
-        name=q.name,
-        exchange=q.exchange,
-        market=q.market_region,
-        currency=q.currency,
+        name=getattr(q, "name", None),
+        exchange=getattr(q, "exchange", None),
+        market=getattr(q, "market_region", None),
+        currency=getattr(q, "currency", None),
         sector=getattr(q, "sector", None),
         industry=getattr(q, "industry", None),
         price=price,
         previous_close=prev_close,
-        open=_safe_float(q.open),
-        high=_safe_float(q.high),
-        low=_safe_float(q.low),
-        change=_safe_float(q.change),
-        change_percent=_safe_float(q.change_pct),
-        volume=_safe_float(q.volume),
+        open=_safe_float(getattr(q, "open", None)),
+        high=_safe_float(getattr(q, "high", None)),
+        low=_safe_float(getattr(q, "low", None)),
+        change=_safe_float(getattr(q, "change", None)),
+        change_percent=_safe_float(getattr(q, "change_pct", None)),
+        volume=_safe_float(getattr(q, "volume", None)),
         avg_volume=_safe_float(getattr(q, "avg_volume", None)),
-        market_cap=_safe_float(q.market_cap),
+        market_cap=_safe_float(getattr(q, "market_cap", None)),
         shares_outstanding=_safe_float(getattr(q, "shares_outstanding", None)),
         free_float=_safe_float(getattr(q, "free_float", None)),
         fifty_two_week_high=high_52w,
         fifty_two_week_low=low_52w,
         fifty_two_week_position_pct=pos_52w,
-        eps=_safe_float(q.eps_ttm),
-        pe_ratio=_safe_float(q.pe_ttm),
-        pb_ratio=_safe_float(q.pb),
-        dividend_yield=_safe_float(q.dividend_yield),
-        roe=_safe_float(q.roe),
-        roa=_safe_float(q.roa),
-        profit_margin=_safe_float(q.profit_margin),
-        debt_to_equity=_safe_float(q.debt_to_equity),
-        data_quality=q.data_quality,
+        eps=_safe_float(getattr(q, "eps_ttm", None)),
+        pe_ratio=_safe_float(getattr(q, "pe_ttm", None)),
+        pb_ratio=_safe_float(getattr(q, "pb", None)),
+        dividend_yield=_safe_float(getattr(q, "dividend_yield", None)),
+        roe=_safe_float(getattr(q, "roe", None)),
+        roa=_safe_float(getattr(q, "roa", None)),
+        profit_margin=_safe_float(getattr(q, "profit_margin", None)),
+        debt_to_equity=_safe_float(getattr(q, "debt_to_equity", None)),
+        data_quality=getattr(q, "data_quality", "MISSING"),
         data_source=data_source or None,
         last_updated_utc=last_utc,
         last_updated_riyadh=last_riyadh,
@@ -382,22 +435,20 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             },
         }
 
-    # Call the new unified engine (handles KSA vs Global internally)
+    # Call the unified engine (handles KSA vs Global internally)
     try:
-        unified_quotes = await get_enriched_quotes(symbols)
+        unified_quotes = await _get_enriched_quotes(symbols)
     except Exception as exc:
-        # Total failure – return placeholders for all
-        legacy_quotes: List[LegacyQuote] = []
-        for t in symbols:
-            legacy_quotes.append(
-                LegacyQuote(
-                    ticker=t,
-                    symbol=t,
-                    data_quality="MISSING",
-                    error=f"Data engine error: {exc}",
-                )
+        logger.exception("[LegacyService] Data engine error for symbols=%s", symbols)
+        legacy_quotes: List[LegacyQuote] = [
+            LegacyQuote(
+                ticker=t,
+                symbol=t,
+                data_quality="MISSING",
+                error=f"Data engine error: {exc}",
             )
-
+            for t in symbols
+        ]
         return {
             "quotes": [_legacy_to_dict(lq) for lq in legacy_quotes],
             "meta": {
@@ -406,7 +457,7 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "app": APP_NAME,
                 "version": APP_VERSION,
                 "backend_url": BACKEND_BASE_URL,
-                "note": "Failed to fetch data from core.data_engine.",
+                "note": "Failed to fetch data from unified data engine.",
             },
         }
 
@@ -415,7 +466,9 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
         try:
             lq = _unified_to_legacy(uq)
         except Exception as exc:
-            # Local mapping failure for this symbol – still return placeholder
+            logger.exception(
+                "[LegacyService] Legacy mapping error for %s", sym, exc_info=exc
+            )
             lq = LegacyQuote(
                 ticker=sym,
                 symbol=sym,
@@ -432,7 +485,10 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             "app": APP_NAME,
             "version": APP_VERSION,
             "backend_url": BACKEND_BASE_URL,
-            "note": "Legacy format built on UnifiedQuote v2 (KSA via Tadawul/Argaam, no direct EODHD).",
+            "note": (
+                "Legacy format built on UnifiedQuote engine v2 "
+                "(KSA via Tadawul/Argaam, no direct EODHD from this module)."
+            ),
         },
     }
     return payload
@@ -504,13 +560,12 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
             debt_to_equity=q.get("debt_to_equity"),
             data_quality=q.get("data_quality", "MISSING"),
             data_source=q.get("data_source"),
-            last_updated_utc=None,  # we render string ISO in row anyway
+            last_updated_utc=None,
             last_updated_riyadh=None,
             error=q.get("error"),
         )
 
-        # If the dict has ISO datetimes, we can parse them back for completeness
-        # (optional; safe to ignore if parsing fails)
+        # Optionally parse ISO timestamps back (defensive; safe to ignore failures)
         lu_utc = q.get("last_updated_utc")
         lu_riyadh = q.get("last_updated_riyadh")
         try:
