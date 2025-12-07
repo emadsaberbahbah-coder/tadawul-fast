@@ -1,68 +1,77 @@
-Here is the **Full, Final `core/data_engine.py` (v1.5)**.
-
-**Action:** Replace your entire `core/data_engine.py` file with this code. It includes the critical `yfinance` logic to break your data loop and fetch real prices.
-
-```python
 """
-core/data_engine.py
-----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – v1.5 (FIXED)
-Updates:
-1. FIXED: Removed self-calling infinite loop for KSA data.
-2. ADDED: Direct Yahoo Finance (yfinance) fallback for KSA symbols.
-3. IMPROVED: Better error handling for missing data.
+routes_argaam.py
+------------------------------------------------------------
+KSA / Argaam routes for Tadawul Fast Bridge – v1.0
+
+GOAL
+- Provide a clean, dedicated KSA provider route that does NOT depend on EODHD.
+- Designed to work alongside:
+    • main.py              (FastAPI app + token auth)
+    • core.data_engine     (unified engine for KSA + Global)
+    • google_sheets_service.py (sheet-rows pattern)
+    • google_apps_script_client.py / index.html (JavaScript / Apps Script)
+
+ASSUMPTION
+- You have (or will build) a KSA/Argaam "gateway" service (often Java)
+  which exposes an HTTP JSON API for Tadawul tickers, e.g.:
+
+    GET {ARGAAM_GATEWAY_URL}/quote?symbol=1120.SR
+
+  or similar. This Python router calls that gateway and normalizes the data.
+
+ENV VARS (set in Render dashboard or locally)
+- ARGAAM_GATEWAY_URL  -> e.g. https://your-ksa-gateway.example.com
+- ARGAAM_API_KEY      -> optional, if your gateway requires an API key header
+
+HOW TO PLUG INTO main.py
+------------------------
+1) Add import:
+
+    from routes import routes_argaam
+
+2) Include router (with token dependency):
+
+    app.include_router(
+        routes_argaam.router,
+        dependencies=[Depends(require_app_token)],
+    )
+
+Then you can call:
+
+    GET  /v1/argaam/health
+    GET  /v1/argaam/quote?symbol=1120.SR
+    GET  /v1/argaam/quotes?tickers=1120.SR,1180.SR
+    POST /v1/argaam/sheet-rows   { "tickers": ["1120.SR","1180.SR"] }
+
+The /sheet-rows response is compatible with Google Sheets / JS:
+    { "headers": [...], "rows": [[...], ...], "meta": {...} }
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
-import logging
-from datetime import datetime, timezone
-from typing import Dict, Optional, List, Literal, Tuple, Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-import aiohttp
-# Critical: Import yfinance for live data
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-
+import httpx
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-# ----------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------
+from env import APP_NAME, APP_VERSION
 
-logger = logging.getLogger(__name__)
-
-# ----------------------------------------------------------------------
-# CONFIGURATION
-# ----------------------------------------------------------------------
-
-# Read from environment
-BACKEND_BASE_URL = os.getenv(
-    "BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com"
+router = APIRouter(
+    prefix="/v1/argaam",
+    tags=["KSA / Argaam"],
 )
-APP_TOKEN = os.getenv("APP_TOKEN", "")
-BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "")
 
-# Enabled providers
-_enabled_raw = os.getenv(
-    "ENABLED_PROVIDERS", "alpha_vantage,finnhub,eodhd,marketstack,twelvedata,fmp,yfinance"
-)
-ENABLED_PROVIDERS: List[str] = [
-    p.strip() for p in _enabled_raw.split(",") if p.strip()
-]
+# ----------------------------------------------------------------------
+# ENV CONFIG
+# ----------------------------------------------------------------------
 
-# Force Yahoo as fallback if not explicitly set
-PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "yfinance")
+ARGAAM_GATEWAY_URL: str = (os.getenv("ARGAAM_GATEWAY_URL") or "").strip()
+ARGAAM_API_KEY: str = (os.getenv("ARGAAM_API_KEY") or "").strip()
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-
-DataQualityLevel = Literal["EXCELLENT", "GOOD", "FAIR", "POOR", "MISSING"]
-MarketRegion = Literal["KSA", "GLOBAL", "UNKNOWN"]
+RIYADH_TZ = timezone(timedelta(hours=3))
 
 
 # ----------------------------------------------------------------------
@@ -70,289 +79,407 @@ MarketRegion = Literal["KSA", "GLOBAL", "UNKNOWN"]
 # ----------------------------------------------------------------------
 
 
-class QuoteSourceInfo(BaseModel):
-    """Details about a single provider source used in the merged quote."""
-    provider: str
-    timestamp: datetime
-    fields: List[str] = Field(default_factory=list)
+class ArgaamQuote(BaseModel):
+    """
+    Normalized KSA quote using your Argaam / Tadawul gateway.
 
+    NOTE:
+    - remote_raw can always be inspected for debugging if mappings need tuning.
+    """
 
-class UnifiedQuote(BaseModel):
-    # Identity
     symbol: str
     name: Optional[str] = None
-    exchange: Optional[str] = None
+    sector: Optional[str] = None
+    market: Optional[str] = None
     currency: Optional[str] = None
-    market_region: MarketRegion = "UNKNOWN"
 
-    # Intraday price snapshot
-    price: Optional[float] = None
-    prev_close: Optional[float] = None
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    volume: Optional[float] = None
-
-    # Derived price info
+    last_price: Optional[float] = None
+    previous_close: Optional[float] = None
     change: Optional[float] = None
-    change_pct: Optional[float] = None
-    fifty_two_week_high: Optional[float] = None
-    fifty_two_week_low: Optional[float] = None
+    change_percent: Optional[float] = None
 
-    # Fundamentals
+    volume: Optional[float] = None
     market_cap: Optional[float] = None
-    eps_ttm: Optional[float] = None
-    pe_ttm: Optional[float] = None
-    pb: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
-    debt_to_equity: Optional[float] = None
-    profit_margin: Optional[float] = None
-    operating_margin: Optional[float] = None
-    revenue_growth_yoy: Optional[float] = None
-    net_income_growth_yoy: Optional[float] = None
 
-    # Meta
+    fifty_two_week_high: Optional[float] = Field(
+        default=None, alias="fiftyTwoWeekHigh"
+    )
+    fifty_two_week_low: Optional[float] = Field(default=None, alias="fiftyTwoWeekLow")
+
     last_updated_utc: Optional[datetime] = None
-    data_quality: DataQualityLevel = "MISSING"
-    data_gaps: List[str] = Field(default_factory=list)
-    sources: List[QuoteSourceInfo] = Field(default_factory=list)
+    last_updated_riyadh: Optional[datetime] = None
 
-    # Analysis
-    opportunity_score: Optional[float] = None
-    risk_flag: Optional[str] = None
-    notes: Optional[str] = None
+    data_source: str = "argaam-gateway"
+    remote_raw: Optional[Dict[str, Any]] = None
 
-    # ------------------------------------------------------------------
-    # Compatibility properties
-    # ------------------------------------------------------------------
+    class Config:
+        allow_population_by_field_name = True
 
-    @property
-    def last_updated(self) -> Optional[datetime]:
-        return self.last_updated_utc
 
-    @property
-    def pe_ratio(self) -> Optional[float]:
-        return self.pe_ttm
+class ArgaamSheetRowsRequest(BaseModel):
+    tickers: List[str] = Field(
+        default_factory=list,
+        description="List of KSA symbols (e.g. ['1120.SR','1180.SR']). Non-KSA are ignored.",
+    )
 
-    @property
-    def price_change(self) -> Optional[float]:
-        return self.change
 
-    @property
-    def provider_sources(self) -> List[str]:
-        return [s.provider for s in self.sources]
+class ArgaamSheetRowsResponse(BaseModel):
+    headers: List[str]
+    rows: List[List[Any]]
+    meta: Dict[str, Any]
 
 
 # ----------------------------------------------------------------------
-# PROVIDER ADAPTERS
+# INTERNAL HELPERS
 # ----------------------------------------------------------------------
 
-async def fetch_from_yahoo(symbol: str) -> Dict[str, Any]:
+
+def _ensure_gateway_configured() -> None:
+    if not ARGAAM_GATEWAY_URL:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ARGAAM_GATEWAY_URL is not configured. Set it in environment.",
+        )
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
     """
-    Fetch data from Yahoo Finance (yfinance).
-    Handles both Global and KSA symbols (KSA symbols must end in .SR).
+    Map arbitrary gateway JSON into ArgaamQuote.
+
+    We try several common key names; you can adjust if your gateway
+    uses different fields.
+
+    This is intentionally defensive and keeps `remote_raw` for debugging.
     """
-    if not yf:
-        logger.error("yfinance module not found. Please add to requirements.txt")
-        return {}
+    # Common key variants from typical JSON APIs
+    name = payload.get("name") or payload.get("companyName") or payload.get("Name")
+    sector = payload.get("sector") or payload.get("Sector")
+    market = payload.get("market") or payload.get("exchange") or "Tadawul"
+    currency = payload.get("currency") or payload.get("Currency") or "SAR"
+
+    last_price = (
+        payload.get("lastPrice")
+        or payload.get("last")
+        or payload.get("price")
+        or payload.get("LastPrice")
+    )
+    prev_close = payload.get("previousClose") or payload.get("prevClose")
+    change_val = payload.get("change") or payload.get("Change")
+    change_pct = (
+        payload.get("changePercent")
+        or payload.get("changePct")
+        or payload.get("ChangePercent")
+    )
+
+    volume = payload.get("volume") or payload.get("Volume")
+    market_cap = payload.get("marketCap") or payload.get("MarketCap")
+
+    high_52w = (
+        payload.get("fiftyTwoWeekHigh")
+        or payload.get("fifty_two_week_high")
+        or payload.get("52WeekHigh")
+    )
+    low_52w = (
+        payload.get("fiftyTwoWeekLow")
+        or payload.get("fifty_two_week_low")
+        or payload.get("52WeekLow")
+    )
+
+    # Last updated
+    ts = (
+        payload.get("lastUpdated")
+        or payload.get("lastUpdate")
+        or payload.get("timestamp")
+        or payload.get("LastUpdated")
+    )
+    last_utc: Optional[datetime] = None
+    if ts:
+        # Try ISO format first
+        if isinstance(ts, str):
+            try:
+                last_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                last_utc = None
+        elif isinstance(ts, (int, float)):
+            # treat as unix seconds
+            try:
+                last_utc = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            except Exception:
+                last_utc = None
+
+    last_riyadh: Optional[datetime] = None
+    if last_utc:
+        if last_utc.tzinfo is None:
+            last_utc = last_utc.replace(tzinfo=timezone.utc)
+        last_riyadh = last_utc.astimezone(RIYADH_TZ)
+
+    return ArgaamQuote(
+        symbol=symbol.upper(),
+        name=name,
+        sector=sector,
+        market=market,
+        currency=currency,
+        last_price=_safe_float(last_price),
+        previous_close=_safe_float(prev_close),
+        change=_safe_float(change_val),
+        change_percent=_safe_float(change_pct),
+        volume=_safe_float(volume),
+        market_cap=_safe_float(market_cap),
+        fiftyTwoWeekHigh=_safe_float(high_52w),
+        fiftyTwoWeekLow=_safe_float(low_52w),
+        last_updated_utc=last_utc,
+        last_updated_riyadh=last_riyadh,
+        remote_raw=payload,
+    )
+
+
+async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
+    """
+    Call the external KSA/Argaam gateway for a single symbol.
+
+    EXPECTED GATEWAY CONTRACT (example):
+        GET {ARGAAM_GATEWAY_URL}/quote?symbol=1120.SR
+
+    You can adjust the path/params if your gateway differs.
+    """
+    _ensure_gateway_configured()
+
+    if not symbol.upper().endswith(".SR"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="routes_argaam only supports KSA symbols ending with '.SR'.",
+        )
+
+    url = ARGAAM_GATEWAY_URL.rstrip("/") + "/quote"
+    params = {"symbol": symbol.upper()}
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    if ARGAAM_API_KEY:
+        headers["X-API-KEY"] = ARGAAM_API_KEY
+
+    timeout = httpx.Timeout(15.0, connect=5.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.get(url, params=params, headers=headers)
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Error connecting to Argaam gateway: {exc}",
+            ) from exc
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Argaam gateway HTTP {resp.status_code}: {resp.text[:200]}",
+        )
 
     try:
-        # Run synchronous yfinance call in a thread
-        loop = asyncio.get_event_loop()
-        ticker = await loop.run_in_executor(None, yf.Ticker, symbol)
-        
-        # Fetch info dict (contains price + fundamentals)
-        # We use fast_info for price if possible, but .info has fundamentals
-        info = await loop.run_in_executor(None, lambda: ticker.info)
-        
-        # Fallback for price if 'info' is missing live data
-        if not info or ('currentPrice' not in info and 'regularMarketPrice' not in info):
-            hist = await loop.run_in_executor(None, lambda: ticker.history(period="1d"))
-            if not hist.empty:
-                info = info or {}
-                info['currentPrice'] = hist['Close'].iloc[-1]
-                info['previousClose'] = hist['Open'].iloc[-1]
-                info['regularMarketVolume'] = int(hist['Volume'].iloc[-1])
-            else:
-                logger.warning(f"Yahoo Finance returned no data for {symbol}")
-                return {}
+        payload = resp.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Argaam gateway returned invalid JSON: {exc}",
+        ) from exc
 
-        return _normalize_yahoo_quote(info, symbol)
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unexpected Argaam gateway response type: {type(payload)}",
+        )
 
-    except Exception as e:
-        logger.error(f"Yahoo Finance fetch failed for {symbol}: {e}")
-        return {}
+    return _parse_argaam_payload(symbol, payload)
 
 
-async def fetch_from_backend_api(symbol: str) -> Dict[str, Any]:
+def _build_sheet_headers() -> List[str]:
     """
-    Fetch from external backend (Legacy).
-    Skipped if configured URL matches current host to prevent loops.
+    Headers for Google Sheets / Apps Script (KSA Argaam view).
     """
-    # Prevent self-calling loop
-    if "tadawul-fast-bridge" in BACKEND_BASE_URL:
-        logger.debug(f"Skipping backend fetch for {symbol} to avoid infinite loop.")
-        return {}
-        
-    # (Existing logic omitted for safety, relying on yfinance)
-    return {}
+    return [
+        "Symbol",
+        "Company Name",
+        "Sector",
+        "Market",
+        "Currency",
+        "Last Price",
+        "Previous Close",
+        "Change",
+        "Change %",
+        "Volume",
+        "Market Cap",
+        "52W High",
+        "52W Low",
+        "Last Updated (UTC)",
+        "Last Updated (Riyadh)",
+        "Data Source",
+    ]
+
+
+def _quote_to_sheet_row(q: ArgaamQuote) -> List[Any]:
+    """
+    Convert ArgaamQuote into a single row for Google Sheets.
+    """
+    return [
+        q.symbol,
+        q.name or "",
+        q.sector or "",
+        q.market or "",
+        q.currency or "",
+        q.last_price,
+        q.previous_close,
+        q.change,
+        q.change_percent,
+        q.volume,
+        q.market_cap,
+        q.fifty_two_week_high,
+        q.fifty_two_week_low,
+        q.last_updated_utc.isoformat() if q.last_updated_utc else None,
+        q.last_updated_riyadh.isoformat() if q.last_updated_riyadh else None,
+        q.data_source,
+    ]
 
 
 # ----------------------------------------------------------------------
-# NORMALIZATION
+# ENDPOINTS
 # ----------------------------------------------------------------------
 
-def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """Normalize Yahoo Finance dict to UnifiedQuote."""
+
+@router.get("/health")
+async def argaam_health() -> Dict[str, Any]:
+    """
+    Lightweight health endpoint for KSA / Argaam gateway.
+
+    Does NOT call the external gateway to keep it fast and cheap.
+    Just checks config and returns static info.
+    """
     now = datetime.now(timezone.utc)
-    
-    # Yahoo keys vary (currentPrice vs regularMarketPrice)
-    price = data.get("currentPrice") or data.get("regularMarketPrice") or data.get("previousClose")
-    prev_close = data.get("previousClose") or data.get("regularMarketPreviousClose")
-    
-    # Calculate change if missing
-    change = None
-    change_pct = None
-    if price and prev_close:
-        change = price - prev_close
-        change_pct = (change / prev_close) * 100.0
-
     return {
-        "symbol": symbol,
-        "name": data.get("longName") or data.get("shortName"),
-        "price": price,
-        "prev_close": prev_close,
-        "open": data.get("open") or data.get("regularMarketOpen"),
-        "high": data.get("dayHigh") or data.get("regularMarketDayHigh"),
-        "low": data.get("dayLow") or data.get("regularMarketDayLow"),
-        "volume": data.get("volume") or data.get("regularMarketVolume"),
-        "market_cap": data.get("marketCap"),
-        "currency": data.get("currency"),
-        "exchange": data.get("exchange"),
-        "fifty_two_week_high": data.get("fiftyTwoWeekHigh"),
-        "fifty_two_week_low": data.get("fiftyTwoWeekLow"),
-        
-        "change": change,
-        "change_pct": change_pct,
-
-        # Fundamentals
-        "eps_ttm": data.get("trailingEps"),
-        "pe_ttm": data.get("trailingPE"),
-        "pb": data.get("priceToBook"),
-        "dividend_yield": data.get("dividendYield"),
-        "roe": data.get("returnOnEquity"),
-        "roa": data.get("returnOnAssets"),
-        "debt_to_equity": data.get("debtToEquity"),
-        "profit_margin": data.get("profitMargins"),
-        "operating_margin": data.get("operatingMargins"),
-        "revenue_growth_yoy": data.get("revenueGrowth"),
-        "net_income_growth_yoy": data.get("earningsGrowth"),
-        
-        "last_updated_utc": now,
-        "__source__": QuoteSourceInfo(
-            provider="yfinance",
-            timestamp=now,
-            fields=list(data.keys())
-        ),
+        "status": "ok" if ARGAAM_GATEWAY_URL else "not_configured",
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "provider": "argaam-gateway",
+        "gateway_configured": bool(ARGAAM_GATEWAY_URL),
+        "timestamp_utc": now.isoformat(),
+        "notes": [
+            "This route is dedicated to KSA (.SR) tickers.",
+            "Set ARGAAM_GATEWAY_URL to plug in your KSA/Argaam Java service.",
+        ],
     }
 
 
-def _calculate_change_fields(data: Dict[str, Any]) -> None:
-    price = data.get("price")
-    prev_close = data.get("prev_close")
-
-    if price is not None and prev_close:
-        data["change"] = price - prev_close
-        data["change_pct"] = (price - prev_close) / prev_close * 100.0
-
-
-def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
-    if symbol.upper().endswith(".SR") or (exchange and "Saudi" in str(exchange)):
-        return "KSA"
-    return "GLOBAL"
-
-
-def _assess_data_quality(data: Dict[str, Any]) -> Tuple[DataQualityLevel, List[str]]:
-    required = ["price", "prev_close", "volume"]
-    missing = [f for f in required if data.get(f) is None]
-    
-    if len(missing) == len(required):
-        return "MISSING", missing
-    if not missing:
-        return "EXCELLENT", missing
-    return "FAIR", missing
-
-
-def _compute_opportunity_score(data: Dict[str, Any]) -> Optional[float]:
-    """Simple scoring logic."""
-    pe = data.get("pe_ttm")
-    if pe is None: return None
-    
-    score = 50.0
-    if 0 < pe < 15: score += 20
-    elif pe > 30: score -= 10
-    return score
-
-
-# ----------------------------------------------------------------------
-# PUBLIC ENTRYPOINT
-# ----------------------------------------------------------------------
-
-async def get_enriched_quote(symbol: str) -> UnifiedQuote:
+@router.get("/quote", response_model=ArgaamQuote)
+async def get_argaam_quote(symbol: str = Query(..., description="KSA symbol, e.g. 1120.SR")):
     """
-    Public enriched quote function.
-    Now defaults to Yahoo Finance for reliable KSA & Global data.
+    Return a single KSA quote from the Argaam/Tadawul gateway.
+
+    Example:
+        GET /v1/argaam/quote?symbol=1120.SR
     """
-    symbol = symbol.strip().upper()
-    
-    logger.info(f"[DataEngine] Fetching enriched quote for: {symbol}")
-    
-    # 1. Fetch from Yahoo Finance
-    raw_data = await fetch_from_yahoo(symbol)
-    
-    if not raw_data:
-        logger.warning(f"No data found for {symbol}")
-        return UnifiedQuote(
-            symbol=symbol,
-            last_updated_utc=datetime.now(timezone.utc),
-            data_quality="MISSING",
-            data_gaps=["No data from providers"]
+    return await _fetch_argaam_quote(symbol)
+
+
+@router.get("/quotes")
+async def get_argaam_quotes(
+    tickers: str = Query(
+        ...,
+        description="Comma-separated KSA symbols, e.g. 1120.SR,1180.SR,1010.SR",
+    )
+) -> Dict[str, Any]:
+    """
+    Return multiple KSA quotes.
+
+    Response:
+        {
+          "quotes": [ {ArgaamQuote}, ... ],
+          "meta": { ... }
+        }
+    """
+    raw_symbols = [t.strip() for t in tickers.split(",") if t.strip()]
+    symbols = [s for s in raw_symbols if s.upper().endswith(".SR")]
+
+    if not symbols:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid KSA (.SR) symbols provided.",
         )
 
-    # 2. Process and Enrich
-    dq, gaps = _assess_data_quality(raw_data)
-    
-    # Calculate simple opportunity score
-    opp_score = _compute_opportunity_score(raw_data)
-    
-    quote = UnifiedQuote(
-        **raw_data,
-        market_region=_infer_market_region(symbol, raw_data.get("exchange")),
-        data_quality=dq,
-        data_gaps=gaps,
-        opportunity_score=opp_score,
-        sources=[raw_data.get("__source__")] if raw_data.get("__source__") else []
-    )
-    
-    return quote
+    quotes: List[ArgaamQuote] = []
+    # Fetch sequentially for simplicity; you can switch to asyncio.gather if desired.
+    for sym in symbols:
+        q = await _fetch_argaam_quote(sym)
+        quotes.append(q)
+
+    return {
+        "quotes": [q.dict(by_alias=True) for q in quotes],
+        "meta": {
+            "requested": raw_symbols,
+            "resolved_ksa": symbols,
+            "count": len(quotes),
+            "provider": "argaam-gateway",
+            "note": "KSA quotes from Argaam/Tadawul gateway (no EODHD).",
+        },
+    }
 
 
-async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
+@router.post("/sheet-rows", response_model=ArgaamSheetRowsResponse)
+async def get_argaam_sheet_rows(body: ArgaamSheetRowsRequest) -> ArgaamSheetRowsResponse:
     """
-    Fetch multiple quotes concurrently.
+    Sheet-friendly representation for KSA quotes:
+
+        POST /v1/argaam/sheet-rows
+        {
+          "tickers": ["1120.SR","1180.SR"]
+        }
+
+    Response:
+        {
+          "headers": [...],
+          "rows": [[...], ...],
+          "meta": {...}
+        }
+
+    This format is directly compatible with:
+      - google_sheets_service.py (values.update)
+      - Google Apps Script / JavaScript (index.html) expecting headers+rows
     """
-    tasks = [get_enriched_quote(sym) for sym in symbols]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    raw_symbols = [t.strip() for t in (body.tickers or []) if t and t.strip()]
+    symbols = [s for s in raw_symbols if s.upper().endswith(".SR")]
 
-    quotes: List[UnifiedQuote] = []
-    for sym, result in zip(symbols, results):
-        if isinstance(result, UnifiedQuote):
-            quotes.append(result)
-        else:
-            logger.error(f"[DataEngine] Error fetching {sym}: {result}")
-            quotes.append(UnifiedQuote(symbol=sym, data_quality="MISSING"))
+    if not symbols:
+        return ArgaamSheetRowsResponse(
+            headers=_build_sheet_headers(),
+            rows=[],
+            meta={
+                "requested": raw_symbols,
+                "resolved_ksa": [],
+                "count": 0,
+                "provider": "argaam-gateway",
+                "note": "No valid KSA (.SR) tickers provided.",
+            },
+        )
 
-    return quotes
-```
+    quotes: List[ArgaamQuote] = []
+    for sym in symbols:
+        q = await _fetch_argaam_quote(sym)
+        quotes.append(q)
+
+    headers = _build_sheet_headers()
+    rows = [_quote_to_sheet_row(q) for q in quotes]
+
+    meta = {
+        "requested": raw_symbols,
+        "resolved_ksa": symbols,
+        "count": len(quotes),
+        "provider": "argaam-gateway",
+        "note": "Sheet rows for KSA (.SR) tickers using Argaam/Tadawul gateway.",
+    }
+
+    return ArgaamSheetRowsResponse(headers=headers, rows=rows, meta=meta)
