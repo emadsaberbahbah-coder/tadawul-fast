@@ -62,9 +62,9 @@ services:
       # Provider configuration – core.data_engine
       # ------------------------------------------------------
       # IMPORTANT:
-      #   - EODHD is still used for NON-KSA symbols (US, EU, etc.).
+      #   - EODHD is used ONLY for NON-KSA symbols (US, EU, etc.).
       #   - For KSA .SR tickers, core.data_engine routes to Tadawul/Argaam
-      #     (no direct EODHD calls for KSA in our new architecture).
+      #     via the ARGAAM gateway (NO EODHD for KSA).
       #
       # You can keep "eodhd" enabled, it will only be used where valid.
       - key: ENABLED_PROVIDERS
@@ -91,12 +91,24 @@ services:
         value: "https://eodhd.com/api"
 
       # ------------------------------------------------------
-      # FMP – fundamentals / extra quotes
+      # FMP – fundamentals / extra quotes (non-KSA)
       # ------------------------------------------------------
       - key: FMP_API_KEY
         sync: false     # set the real key in the Render dashboard
       - key: FMP_BASE_URL
         value: "https://financialmodelingprep.com/api/v3"
+
+      # ------------------------------------------------------
+      # KSA / Argaam – Tadawul gateway provider (.SR only)
+      # ------------------------------------------------------
+      # Your Java / KSA gateway for Tadawul / Argaam data.
+      # Example value: https://your-ksa-gateway.onrender.com
+      - key: ARGAAM_GATEWAY_URL
+        value: ""
+
+      # Optional API key for the KSA gateway (sent as X-API-KEY)
+      - key: ARGAAM_API_KEY
+        sync: false     # set the real key in the Render dashboard
 
       # ------------------------------------------------------
       # Optional extra providers (for future expansion)
@@ -113,6 +125,12 @@ services:
       # as a single line string (exactly what env.py expects).
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false     # paste the one-line JSON in the Render dashboard
+
+      # MASTER spreadsheet ID for ALL 9 pages
+      # (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX,
+      #  My_Portfolio, Insights_Analysis, Investment_Advisor, etc.)
+      - key: DEFAULT_SPREADSHEET_ID
+        value: ""       # set your master Google Sheet ID in the dashboard
 
       # Optional backup Apps Script WebApp URL (for dual-side refresh)
       - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
