@@ -1,18 +1,24 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.0+)
+Enriched Quotes Router (v2.1)
 
-- Uses core.data_engine_v2.DataEngine as the primary backend.
-- If not available, falls back to core.data_engine.DataEngine.
-- If neither exists or does not expose DataEngine, uses a safe stub engine
-  so the API still runs and returns MISSING data instead of crashing.
+- Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
+- Fallback backend: core.data_engine (module-level async functions).
+- Last-resort: in-process stub engine that always returns MISSING data
+  (so the API + Google Sheets never crash even if engines are misconfigured).
 
 Exposes:
     • /v1/enriched/health
     • /v1/enriched/quote?symbol=...
     • /v1/enriched/quotes        (POST)
     • /v1/enriched/sheet-rows    (POST) – Google Sheets friendly
+
+Google Sheets usage:
+    - KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio
+      can all call /v1/enriched/sheet-rows and map directly to the unified
+      9-page dashboard structure (Identity → Price/Liquidity → Fundamentals →
+      Growth/Profitability → Valuation/Risk → AI/Technical → Meta).
 """
 
 from __future__ import annotations
@@ -29,56 +35,77 @@ logger = logging.getLogger(__name__)
 # Data engine import (robust with fallbacks)
 # ----------------------------------------------------------------------
 
+_ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
+_engine: Any = None
+_data_engine_module: Any = None
+
 try:
-    # Preferred: new engine
-    from core.data_engine_v2 import DataEngine  # type: ignore
-    logger.info("Using DataEngine from core.data_engine_v2")
-except Exception:
-    # Any failure here (module missing OR DataEngine missing) goes to fallback
+    # Preferred new engine (class-based, lives in core.data_engine_v2)
+    from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
+
+    _engine = _V2DataEngine()
+    _ENGINE_MODE = "v2"
+    logger.info("routes.enriched_quote: Using DataEngine from core.data_engine_v2")
+except Exception as e_v2:  # pragma: no cover - defensive
+    logger.exception(
+        "routes.enriched_quote: Failed to import/use core.data_engine_v2.DataEngine: %s",
+        e_v2,
+    )
     try:
-        # Fallback: legacy engine
-        from core.data_engine import DataEngine  # type: ignore
+        # Fallback: legacy engine module (core.data_engine) which exposes
+        # async functions get_enriched_quote / get_enriched_quotes.
+        from core import data_engine as _data_engine_module  # type: ignore
+
+        _ENGINE_MODE = "v1_module"
         logger.warning(
-            "core.data_engine_v2 not usable; falling back to core.data_engine.DataEngine"
+            "routes.enriched_quote: Falling back to core.data_engine module-level API"
         )
-    except Exception:
-        # If this also fails (module missing or no DataEngine symbol), use stub
-        logger.error(
-            "No usable DataEngine found in core.data_engine_v2 or core.data_engine. "
-            "Using stub DataEngine with MISSING data responses."
+    except Exception as e_v1:  # pragma: no cover - defensive
+        logger.exception(
+            "routes.enriched_quote: Failed to import core.data_engine as fallback: %s",
+            e_v1,
         )
 
-        class DataEngine:  # type: ignore[no-redef]
+        class _StubEngine:
             """
             Safe stub engine so the service can start even if the real engine
             is missing. All responses will have data_quality='MISSING'.
             """
 
             async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
+                sym = (symbol or "").strip().upper()
                 return {
-                    "symbol": symbol,
+                    "symbol": sym,
                     "data_quality": "MISSING",
                     "error": (
-                        "Data engine module or DataEngine class not found "
-                        "(core.data_engine_v2 / core.data_engine)"
+                        "Data engine modules (core.data_engine_v2/core.data_engine) "
+                        "are not available or failed to import."
                     ),
                 }
 
             async def get_enriched_quotes(
                 self, symbols: List[str]
             ) -> List[Dict[str, Any]]:
-                return [
-                    {
-                        "symbol": s,
-                        "data_quality": "MISSING",
-                        "error": (
-                            "Data engine module or DataEngine class not found "
-                            "(core.data_engine_v2 / core.data_engine)"
-                        ),
-                    }
-                    for s in symbols
-                ]
+                out: List[Dict[str, Any]] = []
+                for s in symbols:
+                    sym = (s or "").strip().upper()
+                    out.append(
+                        {
+                            "symbol": sym,
+                            "data_quality": "MISSING",
+                            "error": (
+                                "Data engine modules (core.data_engine_v2/core.data_engine) "
+                                "are not available or failed to import."
+                            ),
+                        }
+                    )
+                return out
 
+        _engine = _StubEngine()
+        _ENGINE_MODE = "stub"
+        logger.error(
+            "routes.enriched_quote: Using in-process stub DataEngine with MISSING data responses."
+        )
 
 # ----------------------------------------------------------------------
 # Router
@@ -88,9 +115,6 @@ router = APIRouter(
     prefix="/v1/enriched",
     tags=["Enriched Quotes"],
 )
-
-# Single shared engine instance (async-safe usage via await)
-_engine = DataEngine()
 
 # ----------------------------------------------------------------------
 # Pydantic models (API responses)
@@ -182,7 +206,7 @@ class EnrichedQuoteResponse(BaseModel):
     provider: Optional[str] = None
     data_quality: str = Field(
         "UNKNOWN",
-        description="OK / PARTIAL / MISSING / STALE",
+        description="EXCELLENT / GOOD / FAIR / POOR / MISSING / STALE / UNKNOWN",
     )
     as_of_utc: Optional[str] = None
     as_of_local: Optional[str] = None
@@ -213,16 +237,39 @@ class SheetEnrichedResponse(BaseModel):
 
 async def get_enriched_quote(symbol: str) -> Any:
     """
-    Thin async wrapper around the core DataEngine.
+    Thin async wrapper around the configured engine.
+
+    Supports:
+      - v2 engine: core.data_engine_v2.DataEngine().get_enriched_quote(...)
+      - v1 engine: core.data_engine.get_enriched_quote(...)
+      - stub engine: in-process fallback
     """
-    return await _engine.get_enriched_quote(symbol)
+    sym = (symbol or "").strip()
+    if not sym:
+        return None
+
+    if _ENGINE_MODE == "v2":
+        return await _engine.get_enriched_quote(sym)
+    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
+        return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
+    # Stub
+    return await _engine.get_enriched_quote(sym)
 
 
 async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
     """
     Thin async wrapper for batch quotes.
     """
-    return await _engine.get_enriched_quotes(symbols)
+    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
+    if not clean:
+        return []
+
+    if _ENGINE_MODE == "v2":
+        return await _engine.get_enriched_quotes(clean)
+    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
+        return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+    # Stub
+    return await _engine.get_enriched_quotes(clean)
 
 
 def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
@@ -251,7 +298,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
             error=f"Unsupported quote object type: {type(raw)!r}",
         )
 
-    def g(*keys, default=None):
+    def g(*keys: str, default: Any = None) -> Any:
         for k in keys:
             if k in data and data[k] is not None:
                 return data[k]
@@ -262,24 +309,24 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
     return EnrichedQuoteResponse(
         # Identity
         symbol=symbol,
-        name=g("name", "company_name"),
+        name=g("name", "company_name", "longName", "shortName"),
         sector=g("sector"),
         sub_sector=g("sub_sector", "industry"),
-        market=g("market", "exchange"),
+        market=g("market", "exchange", "exchange_short_name"),
         currency=g("currency"),
         listing_date=g("listing_date"),
         # Price / liquidity
-        last_price=g("last_price", "price"),
-        previous_close=g("previous_close"),
-        open=g("open"),
-        high=g("high"),
-        low=g("low"),
+        last_price=g("last_price", "price", "currentPrice", "regularMarketPrice"),
+        previous_close=g("previous_close", "prev_close", "previousClose"),
+        open=g("open", "regularMarketOpen"),
+        high=g("high", "dayHigh", "regularMarketDayHigh"),
+        low=g("low", "dayLow", "regularMarketDayLow"),
         change=g("change"),
-        change_percent=g("change_percent"),
-        high_52w=g("high_52w", "fifty_two_week_high"),
-        low_52w=g("low_52w", "fifty_two_week_low"),
+        change_percent=g("change_percent", "change_pct", "changePercent"),
+        high_52w=g("high_52w", "fifty_two_week_high", "yearHigh"),
+        low_52w=g("low_52w", "fifty_two_week_low", "yearLow"),
         position_52w_percent=g("position_52w_percent", "fifty_two_week_position"),
-        volume=g("volume"),
+        volume=g("volume", "regularMarketVolume"),
         avg_volume_30d=g("avg_volume_30d", "average_volume_30d"),
         value_traded=g("value_traded"),
         turnover_rate=g("turnover_rate"),
@@ -290,30 +337,60 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         spread_percent=g("spread_percent"),
         liquidity_score=g("liquidity_score"),
         # Fundamentals
-        eps_ttm=g("eps_ttm", "eps"),
-        pe_ratio=g("pe_ratio", "pe"),
-        pb_ratio=g("pb_ratio", "pb"),
-        dividend_yield_percent=g("dividend_yield_percent", "dividend_yield"),
+        eps_ttm=g("eps_ttm", "eps", "trailingEps"),
+        pe_ratio=g("pe_ratio", "pe", "pe_ttm", "trailingPE"),
+        pb_ratio=g("pb_ratio", "pb", "priceToBook"),
+        dividend_yield_percent=g(
+            "dividend_yield_percent",
+            "dividend_yield",
+            "dividendYield",
+        ),
         dividend_payout_ratio=g("dividend_payout_ratio"),
-        roe_percent=g("roe_percent", "roe"),
-        roa_percent=g("roa_percent", "roa"),
-        debt_to_equity=g("debt_to_equity"),
+        roe_percent=g("roe_percent", "roe", "returnOnEquity"),
+        roa_percent=g("roa_percent", "roa", "returnOnAssets"),
+        debt_to_equity=g("debt_to_equity", "debtToEquity"),
         current_ratio=g("current_ratio"),
         quick_ratio=g("quick_ratio"),
-        market_cap=g("market_cap"),
+        market_cap=g("market_cap", "marketCap"),
         # Growth / profitability
-        revenue_growth_percent=g("revenue_growth_percent"),
-        net_income_growth_percent=g("net_income_growth_percent"),
-        ebitda_margin_percent=g("ebitda_margin_percent"),
-        operating_margin_percent=g("operating_margin_percent"),
-        net_margin_percent=g("net_margin_percent"),
+        revenue_growth_percent=g(
+            "revenue_growth_percent",
+            "revenue_growth_yoy",
+            "revenueGrowth",
+        ),
+        net_income_growth_percent=g(
+            "net_income_growth_percent",
+            "net_income_growth_yoy",
+            "earningsGrowth",
+        ),
+        ebitda_margin_percent=g("ebitda_margin_percent", "ebitda_margin"),
+        operating_margin_percent=g(
+            "operating_margin_percent",
+            "operating_margin",
+            "operatingMargins",
+        ),
+        net_margin_percent=g(
+            "net_margin_percent",
+            "profit_margin",
+            "profitMargins",
+        ),
         # Valuation / risk
         ev_to_ebitda=g("ev_to_ebitda"),
-        price_to_sales=g("price_to_sales"),
-        price_to_cash_flow=g("price_to_cash_flow"),
-        peg_ratio=g("peg_ratio"),
+        price_to_sales=g(
+            "price_to_sales",
+            "priceToSales",
+            "priceToSalesRatio",
+        ),
+        price_to_cash_flow=g(
+            "price_to_cash_flow",
+            "priceToCashFlow",
+        ),
+        peg_ratio=g("peg_ratio", "pegRatio"),
         beta=g("beta"),
-        volatility_30d_percent=g("volatility_30d_percent", "volatility_30d"),
+        volatility_30d_percent=g(
+            "volatility_30d_percent",
+            "volatility_30d",
+        ),
         # AI valuation & scores
         fair_value=g("fair_value"),
         upside_percent=g("upside_percent"),
@@ -322,16 +399,20 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         quality_score=g("quality_score"),
         momentum_score=g("momentum_score"),
         opportunity_score=g("opportunity_score"),
-        recommendation=g("recommendation"),
+        recommendation=g("recommendation", "rating", "consensusRating"),
         # Technicals
         rsi_14=g("rsi_14"),
         macd=g("macd"),
         ma_20d=g("ma_20d"),
         ma_50d=g("ma_50d"),
         # Meta
-        provider=g("provider", "primary_provider"),
-        data_quality=g("data_quality", default="UNKNOWN"),
-        as_of_utc=g("as_of_utc"),
+        provider=g("provider", "primary_provider", "primary_source"),
+        data_quality=g(
+            "data_quality",
+            "data_quality_level",
+            default="UNKNOWN",
+        ),
+        as_of_utc=g("as_of_utc", "last_updated_utc"),
         as_of_local=g("as_of_local"),
         timezone=g("timezone"),
         error=g("error"),
@@ -343,6 +424,9 @@ def _build_sheet_headers() -> List[str]:
     Headers aligned with your 9-page dashboard philosophy:
     Identity, Price/Liquidity, Fundamentals, Growth/Profitability,
     Valuation/Risk, AI/Technical, Meta.
+
+    All KSA/Global/Mutual Funds/Commodities_FX/My_Portfolio sheets can re-use
+    this structure (or a superset) without breaking Apps Script.
     """
     return [
         # Identity
@@ -519,7 +603,8 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.0",
+        "version": "2.1",
+        "engine_mode": _ENGINE_MODE,
     }
 
 
@@ -626,6 +711,10 @@ async def get_enriched_sheet_rows(
     Apps Script usage pattern:
         - First row = headers
         - Following rows = values
+
+    This endpoint is the core bridge for the 9-page Ultimate Investment
+    Dashboard (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX,
+    My_Portfolio, Insights_Analysis).
     """
     batch = await get_enriched_quotes_route(body)
     headers = _build_sheet_headers()
