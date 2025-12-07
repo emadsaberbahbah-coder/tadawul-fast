@@ -1,7 +1,7 @@
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam routes for Tadawul Fast Bridge – v2.0
+KSA / Argaam routes for Tadawul Fast Bridge – v2.1
 
 GOAL
 - Dedicated KSA provider route that does NOT depend on EODHD.
@@ -31,9 +31,11 @@ EXPOSED ENDPOINTS
     GET  /v1/argaam/quotes?tickers=1120.SR,1180.SR
     POST /v1/argaam/sheet-rows   { "tickers": ["1120.SR","1180.SR"] }
 
-NOTE
+NOTES
 - Designed to be VERY defensive for Google Sheets:
-  - /sheet-rows never throws 500; it returns rows with error text instead.
+  - /sheet-rows never throws 500; it returns headers + rows with error text instead.
+- Sheet headers are aligned with /v1/enriched/sheet-rows (9-page dashboard template),
+  but most fundamental/AI fields are left blank – this is a KSA price/identity layer.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +78,10 @@ try:  # pragma: no cover - optional env.py
     if _ENV_API_KEY:
         ARGAAM_API_KEY = _ENV_API_KEY.strip()
 
-    logger.info("[Argaam] Config loaded from env.py.")
+    logger.info("routes_argaam: Config loaded from env.py.")
 except Exception:  # pragma: no cover - defensive
     logger.warning(
-        "[Argaam] env.py not available or failed to import. "
+        "routes_argaam: env.py not available or failed to import. "
         "Using environment variables for APP_NAME/APP_VERSION/ARGAAM_GATEWAY_URL/ARGAAM_API_KEY."
     )
 
@@ -93,6 +95,38 @@ router = APIRouter(
 )
 
 RIYADH_TZ = timezone(timedelta(hours=3))
+
+# ----------------------------------------------------------------------
+# SYMBOL HELPERS (aligned with DataEngine v2)
+# ----------------------------------------------------------------------
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """
+    Normalize KSA-style symbols:
+      - TADAWUL:1120 -> 1120.SR
+      - 1120.TADAWUL -> 1120.SR
+      - 1120        -> 1120.SR
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", ".SR")
+
+    if s.isdigit():
+        s = f"{s}.SR"
+
+    return s
+
+
+def _is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return s.endswith(".SR") or s.endswith(".TADAWUL")
 
 
 # ----------------------------------------------------------------------
@@ -109,12 +143,16 @@ class ArgaamQuote(BaseModel):
     - error is used when the gateway call fails; row still returned.
     """
 
+    model_config = ConfigDict(populate_by_name=True)
+
+    # Identity
     symbol: str
     name: Optional[str] = None
     sector: Optional[str] = None
     market: Optional[str] = None
     currency: Optional[str] = None
 
+    # Price / liquidity (subset)
     last_price: Optional[float] = None
     previous_close: Optional[float] = None
     change: Optional[float] = None
@@ -130,15 +168,14 @@ class ArgaamQuote(BaseModel):
         default=None, alias="fiftyTwoWeekLow"
     )
 
+    # Timestamps
     last_updated_utc: Optional[datetime] = None
     last_updated_riyadh: Optional[datetime] = None
 
+    # Meta
     data_source: str = "argaam-gateway"
     remote_raw: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
-
-    class Config:
-        allow_population_by_field_name = True
 
 
 class ArgaamSheetRowsRequest(BaseModel):
@@ -149,9 +186,18 @@ class ArgaamSheetRowsRequest(BaseModel):
 
 
 class ArgaamSheetRowsResponse(BaseModel):
+    """
+    Simple sheet-rows contract:
+        { "headers": [...], "rows": [[...], ...] }
+
+    Aligned with:
+      - /v1/enriched/sheet-rows
+      - /v1/analysis/sheet-rows
+      - /v1/advanced/sheet-rows
+    """
+
     headers: List[str]
     rows: List[List[Any]]
-    meta: Dict[str, Any]
 
 
 # ----------------------------------------------------------------------
@@ -249,7 +295,7 @@ def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
         last_riyadh = last_utc.astimezone(RIYADH_TZ)
 
     return ArgaamQuote(
-        symbol=symbol.upper(),
+        symbol=_normalize_symbol(symbol),
         name=name,
         sector=sector,
         market=market,
@@ -277,14 +323,15 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
     """
     _ensure_gateway_configured()
 
-    if not symbol.upper().endswith(".SR"):
+    norm = _normalize_symbol(symbol)
+    if not _is_ksa_symbol(norm):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="routes_argaam only supports KSA symbols ending with '.SR'.",
+            detail="routes_argaam only supports KSA symbols ending with '.SR' or numeric codes.",
         )
 
     url = ARGAAM_GATEWAY_URL.rstrip("/") + "/quote"
-    params = {"symbol": symbol.upper()}
+    params = {"symbol": norm}
     headers: Dict[str, str] = {"Accept": "application/json"}
     if ARGAAM_API_KEY:
         headers["X-API-KEY"] = ARGAAM_API_KEY
@@ -295,7 +342,7 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
         try:
             resp = await client.get(url, params=params, headers=headers)
         except httpx.RequestError as exc:
-            logger.error("[Argaam] Request error for %s: %s", symbol, exc)
+            logger.error("routes_argaam: Request error for %s: %s", norm, exc)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Error connecting to Argaam gateway: {exc}",
@@ -303,9 +350,9 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
 
     if resp.status_code < 200 or resp.status_code >= 300:
         logger.error(
-            "[Argaam] Gateway HTTP %s for %s: %s",
+            "routes_argaam: Gateway HTTP %s for %s: %s",
             resp.status_code,
-            symbol,
+            norm,
             resp.text[:300],
         )
         raise HTTPException(
@@ -316,7 +363,7 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
     try:
         payload = resp.json()
     except Exception as exc:
-        logger.error("[Argaam] Invalid JSON for %s: %s", symbol, exc)
+        logger.error("routes_argaam: Invalid JSON for %s: %s", norm, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Argaam gateway returned invalid JSON: {exc}",
@@ -337,7 +384,7 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
             detail=f"Unexpected Argaam gateway response type: {type(payload)}",
         )
 
-    return _parse_argaam_payload(symbol, payload)
+    return _parse_argaam_payload(norm, payload)
 
 
 async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
@@ -351,18 +398,19 @@ async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
     if not symbols:
         return []
 
-    tasks = [asyncio.create_task(_fetch_argaam_quote(sym)) for sym in symbols]
+    normalized = [_normalize_symbol(s) for s in symbols]
+    tasks = [asyncio.create_task(_fetch_argaam_quote(sym)) for sym in normalized]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     quotes: List[ArgaamQuote] = []
-    for sym, res in zip(symbols, results):
+    for sym, res in zip(normalized, results):
         if isinstance(res, Exception):
             # Convert any error into a "soft" ArgaamQuote
             msg = f"Argaam gateway error: {res}"
-            logger.error("[Argaam] Error fetching %s: %s", sym, res)
+            logger.error("routes_argaam: Error fetching %s: %s", sym, res)
             quotes.append(
                 ArgaamQuote(
-                    symbol=sym.upper(),
+                    symbol=_normalize_symbol(sym),
                     name=None,
                     sector=None,
                     market="Tadawul",
@@ -389,54 +437,206 @@ async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
 
 def _build_sheet_headers() -> List[str]:
     """
-    Headers for Google Sheets / Apps Script (KSA Argaam view).
+    Headers aligned with the unified enriched sheet structure
+    (Identity → Price/Liquidity → Fundamentals → Growth/Profitability
+     → Valuation/Risk → AI/Technical → Meta).
 
-    This can be used for a dedicated KSA-only tab or merged into
-    your KSA_Tadawul page, depending on how you wire google_sheets_service.
+    KSA / Argaam fills mainly Identity + Price/Liquidity + basic Meta.
+    The rest is left blank so it can drop directly into KSA_Tadawul or
+    shared 9-page templates without breaking Apps Script.
     """
     return [
+        # Identity
         "Symbol",
         "Company Name",
         "Sector",
+        "Sub-Sector",
         "Market",
         "Currency",
+        "Listing Date",
+        # Price / Liquidity
         "Last Price",
         "Previous Close",
+        "Open",
+        "High",
+        "Low",
         "Change",
         "Change %",
+        "52 Week High",
+        "52 Week Low",
+        "52W Position %",
         "Volume",
+        "Average Volume (30D)",
+        "Value Traded",
+        "Turnover Rate",
+        "Bid Price",
+        "Ask Price",
+        "Bid Size",
+        "Ask Size",
+        "Spread %",
+        "Liquidity Score",
+        # Fundamentals
+        "EPS (TTM)",
+        "P/E Ratio",
+        "P/B Ratio",
+        "Dividend Yield %",
+        "Dividend Payout",
+        "ROE %",
+        "ROA %",
+        "Debt/Equity",
+        "Current Ratio",
+        "Quick Ratio",
         "Market Cap",
-        "52W High",
-        "52W Low",
+        # Growth / Profitability
+        "Revenue Growth %",
+        "Net Income Growth %",
+        "EBITDA Margin %",
+        "Operating Margin %",
+        "Net Margin %",
+        # Valuation / Risk
+        "EV/EBITDA",
+        "Price/Sales",
+        "Price/Cash Flow",
+        "PEG Ratio",
+        "Beta",
+        "Volatility (30D) %",
+        # AI Valuation & Scores
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
+        "Value Score",
+        "Quality Score",
+        "Momentum Score",
+        "Opportunity Score",
+        "Recommendation",
+        # Technical
+        "RSI (14)",
+        "MACD",
+        "Moving Avg (20D)",
+        "Moving Avg (50D)",
+        # Meta
+        "Provider",
+        "Data Quality",
         "Last Updated (UTC)",
-        "Last Updated (Riyadh)",
-        "Data Source",
+        "Last Updated (Local)",
+        "Timezone",
         "Error",
     ]
 
 
 def _quote_to_sheet_row(q: ArgaamQuote) -> List[Any]:
     """
-    Convert ArgaamQuote into a single row for Google Sheets.
+    Convert ArgaamQuote into a single row aligned with _build_sheet_headers.
+    Only KSA-specific fields are filled; all others are left None.
     """
+    # Compute 52W position %
+    pos_52w = None
+    if (
+        q.fifty_two_week_high is not None
+        and q.fifty_two_week_low is not None
+        and q.last_price is not None
+        and q.fifty_two_week_high != q.fifty_two_week_low
+    ):
+        try:
+            pos_52w = (
+                (float(q.last_price) - float(q.fifty_two_week_low))
+                / (float(q.fifty_two_week_high) - float(q.fifty_two_week_low))
+                * 100.0
+            )
+        except Exception:
+            pos_52w = None
+
+    # Data quality heuristic
+    if q.error:
+        data_quality = "MISSING"
+    elif q.last_price is not None:
+        data_quality = "OK"
+    else:
+        data_quality = "PARTIAL"
+
+    as_of_utc = q.last_updated_utc.isoformat() if q.last_updated_utc else None
+    as_of_local = (
+        q.last_updated_riyadh.isoformat() if q.last_updated_riyadh else None
+    )
+
+    provider = q.data_source or "argaam-gateway"
+
     return [
+        # Identity
         q.symbol,
-        q.name or "",
-        q.sector or "",
-        q.market or "",
-        q.currency or "",
+        q.name,
+        q.sector,
+        None,  # Sub-Sector (not provided by gateway)
+        q.market,
+        q.currency,
+        None,  # Listing Date
+        # Price / Liquidity
         q.last_price,
         q.previous_close,
+        None,  # Open
+        None,  # High (intraday)
+        None,  # Low (intraday)
         q.change,
         q.change_percent,
-        q.volume,
-        q.market_cap,
         q.fifty_two_week_high,
         q.fifty_two_week_low,
-        q.last_updated_utc.isoformat() if q.last_updated_utc else None,
-        q.last_updated_riyadh.isoformat() if q.last_updated_riyadh else None,
-        q.data_source,
-        q.error or "",
+        pos_52w,
+        q.volume,
+        None,  # Average Volume (30D)
+        None,  # Value Traded
+        None,  # Turnover Rate
+        None,  # Bid Price
+        None,  # Ask Price
+        None,  # Bid Size
+        None,  # Ask Size
+        None,  # Spread %
+        None,  # Liquidity Score
+        # Fundamentals
+        None,  # EPS (TTM)
+        None,  # P/E Ratio
+        None,  # P/B Ratio
+        None,  # Dividend Yield %
+        None,  # Dividend Payout
+        None,  # ROE %
+        None,  # ROA %
+        None,  # Debt/Equity
+        None,  # Current Ratio
+        None,  # Quick Ratio
+        q.market_cap,
+        # Growth / Profitability
+        None,  # Revenue Growth %
+        None,  # Net Income Growth %
+        None,  # EBITDA Margin %
+        None,  # Operating Margin %
+        None,  # Net Margin %
+        # Valuation / Risk
+        None,  # EV/EBITDA
+        None,  # Price/Sales
+        None,  # Price/Cash Flow
+        None,  # PEG Ratio
+        None,  # Beta
+        None,  # Volatility (30D) %
+        # AI Valuation & Scores
+        None,  # Fair Value
+        None,  # Upside %
+        None,  # Valuation Label
+        None,  # Value Score
+        None,  # Quality Score
+        None,  # Momentum Score
+        None,  # Opportunity Score
+        None,  # Recommendation
+        # Technical
+        None,  # RSI (14)
+        None,  # MACD
+        None,  # Moving Avg (20D)
+        None,  # Moving Avg (50D)
+        # Meta
+        provider,
+        data_quality,
+        as_of_utc,
+        as_of_local,
+        "Asia/Riyadh",
+        q.error,
     ]
 
 
@@ -470,22 +670,33 @@ async def argaam_health() -> Dict[str, Any]:
 
 @router.get("/quote", response_model=ArgaamQuote)
 async def get_argaam_quote(
-    symbol: str = Query(..., description="KSA symbol, e.g. 1120.SR"),
+    symbol: str = Query(..., description="KSA symbol, e.g. 1120.SR or 1120"),
 ) -> ArgaamQuote:
     """
     Return a single KSA quote from the Argaam/Tadawul gateway.
 
     Example:
         GET /v1/argaam/quote?symbol=1120.SR
+        GET /v1/argaam/quote?symbol=1120
     """
-    return await _fetch_argaam_quote(symbol)
+    try:
+        return await _fetch_argaam_quote(symbol)
+    except HTTPException:
+        # Pass through FastAPI-style errors for API clients
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("routes_argaam: Unexpected error in /quote for %s", symbol)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unexpected error in Argaam quote: {exc}",
+        )
 
 
 @router.get("/quotes")
 async def get_argaam_quotes(
     tickers: str = Query(
         ...,
-        description="Comma-separated KSA symbols, e.g. 1120.SR,1180.SR,1010.SR",
+        description="Comma-separated KSA symbols, e.g. 1120.SR,1180.SR,1010.SR or numeric codes",
     )
 ) -> Dict[str, Any]:
     """
@@ -501,7 +712,11 @@ async def get_argaam_quotes(
     - If some symbols fail, they still appear with error filled-in.
     """
     raw_symbols = [t.strip() for t in tickers.split(",") if t.strip()]
-    symbols = [s for s in raw_symbols if s.upper().endswith(".SR")]
+    symbols = [
+        _normalize_symbol(s)
+        for s in raw_symbols
+        if _is_ksa_symbol(_normalize_symbol(s))
+    ]
 
     if not symbols:
         raise HTTPException(
@@ -510,11 +725,10 @@ async def get_argaam_quotes(
         )
 
     quotes = await _fetch_argaam_quotes_bulk(symbols)
-
     error_count = sum(1 for q in quotes if q.error)
 
     return {
-        "quotes": [q.dict(by_alias=True) for q in quotes],
+        "quotes": [q.model_dump(by_alias=True) for q in quotes],
         "meta": {
             "requested": raw_symbols,
             "resolved_ksa": symbols,
@@ -541,47 +755,35 @@ async def get_argaam_sheet_rows(
     Response:
         {
           "headers": [...],
-          "rows": [[...], ...],
-          "meta": {...}
+          "rows": [[...], ...]
         }
 
     This format is directly compatible with:
       - google_sheets_service.py (values.update)
-      - Google Apps Script / JavaScript expecting headers+rows
+      - Google Apps Script expecting headers+rows
       - KSA-specific sections of your 9-page dashboard.
     """
     raw_symbols = [t.strip() for t in (body.tickers or []) if t and t.strip()]
-    symbols = [s for s in raw_symbols if s.upper().endswith(".SR")]
+    symbols = [
+        _normalize_symbol(s)
+        for s in raw_symbols
+        if _is_ksa_symbol(_normalize_symbol(s))
+    ]
 
+    # For Sheets: never 4xx/5xx – just return empty table if no valid KSA.
     if not symbols:
+        logger.warning(
+            "routes_argaam: sheet-rows called with no valid KSA symbols. Requested=%s",
+            raw_symbols,
+        )
         return ArgaamSheetRowsResponse(
             headers=_build_sheet_headers(),
             rows=[],
-            meta={
-                "requested": raw_symbols,
-                "resolved_ksa": [],
-                "count": 0,
-                "error_count": 0,
-                "provider": "argaam-gateway",
-                "note": "No valid KSA (.SR) tickers provided.",
-            },
         )
 
-    # Very defensive – any per-symbol error becomes a row with .error text
     quotes = await _fetch_argaam_quotes_bulk(symbols)
 
     headers = _build_sheet_headers()
     rows = [_quote_to_sheet_row(q) for q in quotes]
 
-    error_count = sum(1 for q in quotes if q.error)
-
-    meta = {
-        "requested": raw_symbols,
-        "resolved_ksa": symbols,
-        "count": len(quotes),
-        "error_count": error_count,
-        "provider": "argaam-gateway",
-        "note": "Sheet rows for KSA (.SR) tickers using Argaam/Tadawul gateway.",
-    }
-
-    return ArgaamSheetRowsResponse(headers=headers, rows=rows, meta=meta)
+    return ArgaamSheetRowsResponse(headers=headers, rows=rows)
