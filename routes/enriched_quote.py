@@ -1,12 +1,14 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.0)
+Enriched Quotes Router (v2.0+)
 
-- Uses core.data_engine_v2.DataEngine as the single backend.
-- KSA (.SR) tickers: handled by KSA-safe providers (NO direct EODHD).
-- Global (non-.SR): handled by EODHD + FMP via the engine.
-- Provides:
+- Uses core.data_engine_v2.DataEngine as the primary backend.
+- If not available, falls back to core.data_engine.DataEngine.
+- If neither exists, uses a safe stub engine so the API still runs.
+
+KSA (.SR) tickers and global tickers are handled by the engine.
+Provides:
     • /v1/enriched/health
     • /v1/enriched/quote?symbol=...
     • /v1/enriched/quotes        (POST)
@@ -15,12 +17,66 @@ Enriched Quotes Router (v2.0)
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from core.data_engine_v2 import DataEngine
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# Data engine import (robust with fallbacks)
+# ----------------------------------------------------------------------
+
+try:
+    # Preferred: new engine
+    from core.data_engine_v2 import DataEngine  # type: ignore
+    logger.info("Using DataEngine from core.data_engine_v2")
+except ModuleNotFoundError:
+    try:
+        # Fallback: legacy engine
+        from core.data_engine import DataEngine  # type: ignore
+        logger.warning(
+            "core.data_engine_v2 not found; falling back to core.data_engine.DataEngine"
+        )
+    except ModuleNotFoundError:
+        logger.error(
+            "No data engine module found (core.data_engine_v2 / core.data_engine). "
+            "Using stub DataEngine with MISSING data responses."
+        )
+
+        class DataEngine:  # type: ignore[no-redef]
+            """
+            Safe stub engine so the service can start even if the real engine
+            is missing. All responses will have data_quality='MISSING'.
+            """
+
+            async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
+                return {
+                    "symbol": symbol,
+                    "data_quality": "MISSING",
+                    "error": (
+                        "Data engine module not found "
+                        "(core.data_engine_v2 / core.data_engine)"
+                    ),
+                }
+
+            async def get_enriched_quotes(
+                self, symbols: List[str]
+            ) -> List[Dict[str, Any]]:
+                return [
+                    {
+                        "symbol": s,
+                        "data_quality": "MISSING",
+                        "error": (
+                            "Data engine module not found "
+                            "(core.data_engine_v2 / core.data_engine)"
+                        ),
+                    }
+                    for s in symbols
+                ]
+
 
 # ----------------------------------------------------------------------
 # Router
@@ -31,9 +87,8 @@ router = APIRouter(
     tags=["Enriched Quotes"],
 )
 
-# Single shared engine instance (async-safe usage)
+# Single shared engine instance (async-safe usage via await)
 _engine = DataEngine()
-
 
 # ----------------------------------------------------------------------
 # Pydantic models (API responses)
@@ -211,7 +266,6 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         market=g("market", "exchange"),
         currency=g("currency"),
         listing_date=g("listing_date"),
-
         # Price / liquidity
         last_price=g("last_price", "price"),
         previous_close=g("previous_close"),
@@ -223,7 +277,6 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         high_52w=g("high_52w", "fifty_two_week_high"),
         low_52w=g("low_52w", "fifty_two_week_low"),
         position_52w_percent=g("position_52w_percent", "fifty_two_week_position"),
-
         volume=g("volume"),
         avg_volume_30d=g("avg_volume_30d", "average_volume_30d"),
         value_traded=g("value_traded"),
@@ -234,7 +287,6 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         ask_size=g("ask_size"),
         spread_percent=g("spread_percent"),
         liquidity_score=g("liquidity_score"),
-
         # Fundamentals
         eps_ttm=g("eps_ttm", "eps"),
         pe_ratio=g("pe_ratio", "pe"),
@@ -247,14 +299,12 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         current_ratio=g("current_ratio"),
         quick_ratio=g("quick_ratio"),
         market_cap=g("market_cap"),
-
         # Growth / profitability
         revenue_growth_percent=g("revenue_growth_percent"),
         net_income_growth_percent=g("net_income_growth_percent"),
         ebitda_margin_percent=g("ebitda_margin_percent"),
         operating_margin_percent=g("operating_margin_percent"),
         net_margin_percent=g("net_margin_percent"),
-
         # Valuation / risk
         ev_to_ebitda=g("ev_to_ebitda"),
         price_to_sales=g("price_to_sales"),
@@ -262,7 +312,6 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         peg_ratio=g("peg_ratio"),
         beta=g("beta"),
         volatility_30d_percent=g("volatility_30d_percent", "volatility_30d"),
-
         # AI valuation & scores
         fair_value=g("fair_value"),
         upside_percent=g("upside_percent"),
@@ -272,13 +321,11 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         momentum_score=g("momentum_score"),
         opportunity_score=g("opportunity_score"),
         recommendation=g("recommendation"),
-
         # Technicals
         rsi_14=g("rsi_14"),
         macd=g("macd"),
         ma_20d=g("ma_20d"),
         ma_50d=g("ma_50d"),
-
         # Meta
         provider=g("provider", "primary_provider"),
         data_quality=g("data_quality", default="UNKNOWN"),
@@ -498,6 +545,7 @@ async def get_enriched_quote_route(
     except HTTPException:
         raise
     except Exception as exc:
+        logger.exception("Exception in get_enriched_quote_route for %s", ticker)
         # Never break Google Sheets – always return a valid response
         return EnrichedQuoteResponse(
             symbol=ticker.upper(),
@@ -525,6 +573,7 @@ async def get_enriched_quotes_route(
     try:
         unified_quotes = await get_enriched_quotes(tickers)
     except Exception as exc:
+        logger.exception("Batch enriched quotes failed for tickers=%s", tickers)
         # Complete failure – build placeholder entries for all
         return BatchEnrichedResponse(
             results=[
@@ -545,6 +594,9 @@ async def get_enriched_quotes_route(
                 enriched.error = enriched.error or "No data available from providers"
             results.append(enriched)
         except Exception as exc:
+            logger.exception(
+                "Exception building enriched quote for %s in batch", t, exc_info=exc
+            )
             results.append(
                 EnrichedQuoteResponse(
                     symbol=t.upper(),
