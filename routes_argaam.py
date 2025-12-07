@@ -1,7 +1,7 @@
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam routes for Tadawul Fast Bridge – v1.1
+KSA / Argaam routes for Tadawul Fast Bridge – v2.0
 
 GOAL
 - Dedicated KSA provider route that does NOT depend on EODHD.
@@ -11,7 +11,7 @@ GOAL
     • main.py                (FastAPI app, token auth, rate limiting)
     • env.py                 (central config, incl. ARGAAM_GATEWAY_URL)
     • google_sheets_service  (sheet-rows pattern: headers + rows)
-    • index.html / JS        (same API style as /v1/enriched/*)
+    • 9-page Google Sheets dashboard (KSA_Tadawul page in particular)
 
 ASSUMPTION
 - The KSA gateway exposes an HTTP JSON API like:
@@ -24,30 +24,23 @@ ENV (in env.py and Render dashboard)
 - ARGAAM_GATEWAY_URL  -> e.g. https://your-ksa-gateway.example.com
 - ARGAAM_API_KEY      -> optional, e.g. header X-API-KEY
 
-HOW TO PLUG INTO main.py
-------------------------
-1) Import router:
-
-    from routes import routes_argaam
-
-2) Include router (re-using require_app_token):
-
-    app.include_router(
-        routes_argaam.router,
-        dependencies=[Depends(require_app_token)],
-    )
-
-Then you can call:
-
+EXPOSED ENDPOINTS
+-----------------
     GET  /v1/argaam/health
     GET  /v1/argaam/quote?symbol=1120.SR
     GET  /v1/argaam/quotes?tickers=1120.SR,1180.SR
     POST /v1/argaam/sheet-rows   { "tickers": ["1120.SR","1180.SR"] }
+
+NOTE
+- Designed to be VERY defensive for Google Sheets:
+  - /sheet-rows never throws 500; it returns rows with error text instead.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -55,12 +48,44 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from env import (
-    APP_NAME,
-    APP_VERSION,
-    ARGAAM_GATEWAY_URL,
-    ARGAAM_API_KEY,
-)
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# ENV CONFIG – env.py preferred, env vars fallback
+# ----------------------------------------------------------------------
+
+APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
+APP_VERSION: str = os.getenv("APP_VERSION", "4.0.0")
+ARGAAM_GATEWAY_URL: str = os.getenv("ARGAAM_GATEWAY_URL", "").strip()
+ARGAAM_API_KEY: str = os.getenv("ARGAAM_API_KEY", "").strip()
+
+try:  # pragma: no cover - optional env.py
+    from env import (  # type: ignore
+        APP_NAME as _ENV_APP_NAME,
+        APP_VERSION as _ENV_APP_VERSION,
+        ARGAAM_GATEWAY_URL as _ENV_GATEWAY_URL,
+        ARGAAM_API_KEY as _ENV_API_KEY,
+    )
+
+    if _ENV_APP_NAME:
+        APP_NAME = _ENV_APP_NAME
+    if _ENV_APP_VERSION:
+        APP_VERSION = _ENV_APP_VERSION
+    if _ENV_GATEWAY_URL:
+        ARGAAM_GATEWAY_URL = _ENV_GATEWAY_URL.strip()
+    if _ENV_API_KEY:
+        ARGAAM_API_KEY = _ENV_API_KEY.strip()
+
+    logger.info("[Argaam] Config loaded from env.py.")
+except Exception:  # pragma: no cover - defensive
+    logger.warning(
+        "[Argaam] env.py not available or failed to import. "
+        "Using environment variables for APP_NAME/APP_VERSION/ARGAAM_GATEWAY_URL/ARGAAM_API_KEY."
+    )
+
+# ----------------------------------------------------------------------
+# ROUTER & TIMEZONE
+# ----------------------------------------------------------------------
 
 router = APIRouter(
     prefix="/v1/argaam",
@@ -81,6 +106,7 @@ class ArgaamQuote(BaseModel):
 
     NOTE:
     - remote_raw holds the original gateway JSON for debugging/mapping.
+    - error is used when the gateway call fails; row still returned.
     """
 
     symbol: str
@@ -100,13 +126,16 @@ class ArgaamQuote(BaseModel):
     fifty_two_week_high: Optional[float] = Field(
         default=None, alias="fiftyTwoWeekHigh"
     )
-    fifty_two_week_low: Optional[float] = Field(default=None, alias="fiftyTwoWeekLow")
+    fifty_two_week_low: Optional[float] = Field(
+        default=None, alias="fiftyTwoWeekLow"
+    )
 
     last_updated_utc: Optional[datetime] = None
     last_updated_riyadh: Optional[datetime] = None
 
     data_source: str = "argaam-gateway"
     remote_raw: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
     class Config:
         allow_population_by_field_name = True
@@ -266,12 +295,19 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
         try:
             resp = await client.get(url, params=params, headers=headers)
         except httpx.RequestError as exc:
+            logger.error("[Argaam] Request error for %s: %s", symbol, exc)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Error connecting to Argaam gateway: {exc}",
             ) from exc
 
     if resp.status_code < 200 or resp.status_code >= 300:
+        logger.error(
+            "[Argaam] Gateway HTTP %s for %s: %s",
+            resp.status_code,
+            symbol,
+            resp.text[:300],
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Argaam gateway HTTP {resp.status_code}: {resp.text[:200]}",
@@ -280,10 +316,20 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
     try:
         payload = resp.json()
     except Exception as exc:
+        logger.error("[Argaam] Invalid JSON for %s: %s", symbol, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Argaam gateway returned invalid JSON: {exc}",
         ) from exc
+
+    # Some gateways might return a list; take the first item
+    if isinstance(payload, list):
+        if not payload:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Argaam gateway returned empty list.",
+            )
+        payload = payload[0]
 
     if not isinstance(payload, dict):
         raise HTTPException(
@@ -297,14 +343,56 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
 async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
     """
     Fetch multiple KSA quotes concurrently from the gateway.
+
+    VERY DEFENSIVE:
+    - Never raises in normal use; instead returns ArgaamQuote with error text
+      for any symbol that fails. This keeps Google Sheets safe.
     """
+    if not symbols:
+        return []
+
     tasks = [asyncio.create_task(_fetch_argaam_quote(sym)) for sym in symbols]
-    return await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    quotes: List[ArgaamQuote] = []
+    for sym, res in zip(symbols, results):
+        if isinstance(res, Exception):
+            # Convert any error into a "soft" ArgaamQuote
+            msg = f"Argaam gateway error: {res}"
+            logger.error("[Argaam] Error fetching %s: %s", sym, res)
+            quotes.append(
+                ArgaamQuote(
+                    symbol=sym.upper(),
+                    name=None,
+                    sector=None,
+                    market="Tadawul",
+                    currency="SAR",
+                    last_price=None,
+                    previous_close=None,
+                    change=None,
+                    change_percent=None,
+                    volume=None,
+                    market_cap=None,
+                    fiftyTwoWeekHigh=None,
+                    fiftyTwoWeekLow=None,
+                    last_updated_utc=None,
+                    last_updated_riyadh=None,
+                    data_source="argaam-gateway-error",
+                    remote_raw=None,
+                    error=msg,
+                )
+            )
+        else:
+            quotes.append(res)
+    return quotes
 
 
 def _build_sheet_headers() -> List[str]:
     """
     Headers for Google Sheets / Apps Script (KSA Argaam view).
+
+    This can be used for a dedicated KSA-only tab or merged into
+    your KSA_Tadawul page, depending on how you wire google_sheets_service.
     """
     return [
         "Symbol",
@@ -323,6 +411,7 @@ def _build_sheet_headers() -> List[str]:
         "Last Updated (UTC)",
         "Last Updated (Riyadh)",
         "Data Source",
+        "Error",
     ]
 
 
@@ -347,6 +436,7 @@ def _quote_to_sheet_row(q: ArgaamQuote) -> List[Any]:
         q.last_updated_utc.isoformat() if q.last_updated_utc else None,
         q.last_updated_riyadh.isoformat() if q.last_updated_riyadh else None,
         q.data_source,
+        q.error or "",
     ]
 
 
@@ -381,7 +471,7 @@ async def argaam_health() -> Dict[str, Any]:
 @router.get("/quote", response_model=ArgaamQuote)
 async def get_argaam_quote(
     symbol: str = Query(..., description="KSA symbol, e.g. 1120.SR"),
-):
+) -> ArgaamQuote:
     """
     Return a single KSA quote from the Argaam/Tadawul gateway.
 
@@ -406,6 +496,9 @@ async def get_argaam_quotes(
           "quotes": [ {ArgaamQuote}, ... ],
           "meta": { ... }
         }
+
+    NOTE
+    - If some symbols fail, they still appear with error filled-in.
     """
     raw_symbols = [t.strip() for t in tickers.split(",") if t.strip()]
     symbols = [s for s in raw_symbols if s.upper().endswith(".SR")]
@@ -418,12 +511,15 @@ async def get_argaam_quotes(
 
     quotes = await _fetch_argaam_quotes_bulk(symbols)
 
+    error_count = sum(1 for q in quotes if q.error)
+
     return {
         "quotes": [q.dict(by_alias=True) for q in quotes],
         "meta": {
             "requested": raw_symbols,
             "resolved_ksa": symbols,
             "count": len(quotes),
+            "error_count": error_count,
             "provider": "argaam-gateway",
             "note": "KSA quotes from Argaam/Tadawul gateway (no EODHD).",
         },
@@ -431,7 +527,9 @@ async def get_argaam_quotes(
 
 
 @router.post("/sheet-rows", response_model=ArgaamSheetRowsResponse)
-async def get_argaam_sheet_rows(body: ArgaamSheetRowsRequest) -> ArgaamSheetRowsResponse:
+async def get_argaam_sheet_rows(
+    body: ArgaamSheetRowsRequest,
+) -> ArgaamSheetRowsResponse:
     """
     Sheet-friendly representation for KSA quotes:
 
@@ -449,7 +547,8 @@ async def get_argaam_sheet_rows(body: ArgaamSheetRowsRequest) -> ArgaamSheetRows
 
     This format is directly compatible with:
       - google_sheets_service.py (values.update)
-      - Google Apps Script / JavaScript (index.html) expecting headers+rows
+      - Google Apps Script / JavaScript expecting headers+rows
+      - KSA-specific sections of your 9-page dashboard.
     """
     raw_symbols = [t.strip() for t in (body.tickers or []) if t and t.strip()]
     symbols = [s for s in raw_symbols if s.upper().endswith(".SR")]
@@ -462,20 +561,25 @@ async def get_argaam_sheet_rows(body: ArgaamSheetRowsRequest) -> ArgaamSheetRows
                 "requested": raw_symbols,
                 "resolved_ksa": [],
                 "count": 0,
+                "error_count": 0,
                 "provider": "argaam-gateway",
                 "note": "No valid KSA (.SR) tickers provided.",
             },
         )
 
+    # Very defensive – any per-symbol error becomes a row with .error text
     quotes = await _fetch_argaam_quotes_bulk(symbols)
 
     headers = _build_sheet_headers()
     rows = [_quote_to_sheet_row(q) for q in quotes]
 
+    error_count = sum(1 for q in quotes if q.error)
+
     meta = {
         "requested": raw_symbols,
         "resolved_ksa": symbols,
         "count": len(quotes),
+        "error_count": error_count,
         "provider": "argaam-gateway",
         "note": "Sheet rows for KSA (.SR) tickers using Argaam/Tadawul gateway.",
     }
