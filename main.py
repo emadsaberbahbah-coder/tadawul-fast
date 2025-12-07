@@ -14,16 +14,17 @@ Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
 - Integrated with:
     • core.data_engine / core.data_engine_v2 (multi-provider engine):
         - KSA via Tadawul/Argaam gateway (NO EODHD for .SR)
-        - Global via EODHD + FMP + Yahoo
+        - Global via EODHD + FMP + other providers
     • env.py (all config & tokens, Sheets meta, etc.)
     • Google Sheets / Apps Script flows
       (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
-       Commodities_FX, My_Portfolio, Insights_Analysis, etc.)
+       Commodities_FX, My_Portfolio, Insights_Analysis, Investment_Advisor, etc.)
 
-- IMPORTANT:
-    • This file NEVER calls EODHD directly.
-    • KSA (.SR) routing is handled by the unified engine and
-      KSA router using non-EODHD KSA providers.
+Notes
+- This file NEVER calls external market providers directly.
+  All market data flows through the unified data engine and/or dedicated KSA gateway.
+- KSA (.SR) routing is handled by the unified engine and KSA router,
+  using non-EODHD KSA providers only.
 """
 
 from __future__ import annotations
@@ -36,17 +37,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import (
-    Depends,
-    FastAPI,
-    HTTPException,
-    Query,
-    Request,
-    status,
-)
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -69,13 +63,14 @@ class _SettingsFallback:
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
 
 
-# Prefer settings from env.py, otherwise use fallback dataclass
+# Prefer settings from env.py (Settings instance), otherwise use fallback dataclass
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
 
 def _get_env_attr(name: str, default: str = "") -> str:
     """
     Helper to read config from env.py if available, otherwise from OS env vars.
+    Returns a string representation.
     """
     if _env_mod is not None and hasattr(_env_mod, name):
         value = getattr(_env_mod, name)
@@ -97,12 +92,12 @@ def _get_bool(name: str, default: bool = False) -> bool:
         if isinstance(val, bool):
             return val
         if isinstance(val, str):
-            return val.strip().lower() in ("1", "true", "yes", "on", "y")
+            return val.strip().lower() in {"1", "true", "yes", "on", "y"}
 
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 APP_NAME: str = _get_env_attr("APP_NAME", "tadawul-fast-bridge")
@@ -114,8 +109,6 @@ BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "")
 ENABLE_CORS_ALL_ORIGINS: bool = _get_bool("ENABLE_CORS_ALL_ORIGINS", True)
 
 # For /v1/status service flags
-# If env.py exposes GOOGLE_SHEETS_CREDENTIALS_RAW, use that;
-# otherwise fall back to the raw JSON string env var.
 GOOGLE_SHEETS_CREDENTIALS_RAW: str = getattr(
     _env_mod,
     "GOOGLE_SHEETS_CREDENTIALS_RAW",
@@ -133,6 +126,32 @@ ARGAAM_GATEWAY_URL: str = _get_env_attr("ARGAAM_GATEWAY_URL", "")
 HAS_SECURE_TOKEN: bool = getattr(
     _env_mod, "HAS_SECURE_TOKEN", bool(APP_TOKEN or BACKUP_APP_TOKEN)
 )
+
+
+# Optional provider information (for /v1/status)
+def _get_providers_meta() -> Dict[str, Any]:
+    enabled = None
+    primary = None
+    try:
+        enabled = getattr(_env_mod, "ENABLED_PROVIDERS", None) if _env_mod else None
+        if not enabled:
+            raw = os.getenv("ENABLED_PROVIDERS")
+            if raw:
+                enabled = [p.strip() for p in raw.split(",") if p.strip()]
+        primary = (
+            getattr(_env_mod, "PRIMARY_PROVIDER", None)
+            if _env_mod
+            else None
+        ) or os.getenv("PRIMARY_PROVIDER")
+    except Exception:  # pragma: no cover - extremely defensive
+        enabled = None
+        primary = None
+
+    return {
+        "enabled": enabled,
+        "primary": primary,
+    }
+
 
 # ------------------------------------------------------------
 # Routers & legacy services
@@ -157,11 +176,11 @@ except Exception as _advanced_exc:  # pragma: no cover - defensive
     advanced_analysis = None  # type: ignore
     _ADVANCED_ANALYSIS_AVAILABLE = False
 
-# KSA / Argaam gateway routes
+# KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD
 import routes_argaam  # type: ignore
 
-# Legacy service abstraction
-from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
+# Legacy service abstraction (global + KSA via unified engine)
+from legacy_service import build_legacy_sheet_payload, get_legacy_quotes
 
 # ------------------------------------------------------------
 # Logging
@@ -169,8 +188,15 @@ from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
 logger = logging.getLogger("tadawul_fast_bridge")
 if not logger.handlers:
+    # If env.LOG_LEVEL is defined, prefer it; otherwise INFO
+    log_level_name = _get_env_attr("LOG_LEVEL", "INFO").upper()
+    try:
+        log_level = getattr(logging, log_level_name, logging.INFO)
+    except Exception:
+        log_level = logging.INFO
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
@@ -212,10 +238,10 @@ async def require_app_token(
       - X-APP-TOKEN: <token>
       - ?token=<token>
 
-    If no APP_TOKEN/BACKUP_APP_TOKEN is configured, this is a no-op.
+    If no APP_TOKEN/BACKUP_APP_TOKEN is configured, this is a no-op (dev mode).
     """
     if not HAS_SECURE_TOKEN:
-        # No token configured -> no enforcement (development mode)
+        # No token configured -> no enforcement (development mode / local tests)
         return None
 
     token: Optional[str] = None
@@ -293,7 +319,7 @@ if ENABLE_CORS_ALL_ORIGINS:
         allow_headers=["*"],
     )
 else:
-    # Stricter mode – can be customized as needed
+    # Stricter mode – tuned for Google Sheets / Apps Script
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["https://docs.google.com", "https://script.google.com"],
@@ -333,7 +359,7 @@ else:
         "skipping /v1/advanced* endpoints for this deploy."
     )
 
-# KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD
+# KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD from here
 app.include_router(
     routes_argaam.router,
     dependencies=[Depends(require_app_token)],
@@ -348,11 +374,23 @@ app.include_router(
 async def root() -> str:
     """
     Simple HTML landing page for quick checks.
+    Helpful when testing from a browser or Render "Open app" button.
     """
     default_sheet_html = (
         f"<code>{DEFAULT_SPREADSHEET_ID}</code>"
         if DEFAULT_SPREADSHEET_ID
         else "<em>not configured</em>"
+    )
+    providers_meta = _get_providers_meta()
+    providers_html = (
+        f"<code>{', '.join(providers_meta['enabled'])}</code>"
+        if providers_meta.get("enabled")
+        else "<em>not configured</em>"
+    )
+    primary_provider_html = (
+        f"<code>{providers_meta.get('primary')}</code>"
+        if providers_meta.get("primary")
+        else "<em>auto</em>"
     )
 
     return f"""
@@ -364,6 +402,8 @@ async def root() -> str:
         <p>Version: <strong>{APP_VERSION}</strong></p>
         <p>Base URL: <code>{BACKEND_BASE_URL}</code></p>
         <p>Default Spreadsheet (9-page dashboard): {default_sheet_html}</p>
+        <p>Providers (global): {providers_html} &nbsp;|&nbsp; Primary: {primary_provider_html}</p>
+
         <h2>Quick Links</h2>
         <ul>
           <li><code>/health</code></li>
@@ -374,10 +414,21 @@ async def root() -> str:
           <li><code>/v1/advanced/health</code> (if enabled)</li>
           <li><code>/v1/argaam/health</code> (KSA / Argaam gateway)</li>
         </ul>
+
+        <h3>Auth usage (for Sheets / scripts)</h3>
+        <p style="font-size:0.9rem;color:#a0aec0;">
+          Send your app token as either:<br/>
+          • <code>Authorization: Bearer &lt;APP_TOKEN&gt;</code><br/>
+          • <code>X-APP-TOKEN: &lt;APP_TOKEN&gt;</code><br/>
+          • or <code>?token=&lt;APP_TOKEN&gt;</code> on legacy endpoints.<br/>
+        </p>
+
         <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
           KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.<br/>
-          Global (non-.SR) tickers are handled via EODHD + FMP + Yahoo
-          through the unified data engine.
+          Global (non-.SR) tickers are handled via the unified engine using the
+          configured global providers (EODHD/FMP/etc.).<br/>
+          Google Sheets 9-page dashboard should use the <code>* /sheet-rows</code> endpoints
+          exposed by each router (see <code>/v1/status</code>).
         </p>
       </body>
     </html>
@@ -388,6 +439,7 @@ async def root() -> str:
 async def basic_health() -> Dict[str, Any]:
     """
     Very lightweight health endpoint (no external calls).
+    Suitable for uptime checks and Render health probes.
     """
     now = datetime.now(timezone.utc)
     uptime_seconds = time.time() - START_TIME
@@ -421,7 +473,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
             and hasattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS")
         ),
         "google_apps_script": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
-        "cache": False,  # placeholder for future cache
+        "cache": False,  # placeholder for future cache (Redis/Memory/etc.)
     }
 
     # Whether tokens are configured + how the request came in
@@ -452,6 +504,8 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "ksa_argaam": "/v1/argaam/sheet-rows",
     }
 
+    providers_meta = _get_providers_meta()
+
     return {
         "status": "operational",
         "version": APP_VERSION,
@@ -463,6 +517,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "auth": auth,
         "sheets": sheets_meta,
         "sheet_endpoints": sheet_endpoints,
+        "providers": providers_meta,
         "advanced_analysis_enabled": _ADVANCED_ANALYSIS_AVAILABLE,
         "ksa_argaam_gateway": {
             "configured": bool(ARGAAM_GATEWAY_URL),
@@ -471,7 +526,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "notes": [
             "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
             "No direct EODHD calls are made for KSA inside this main application.",
-            "Global (non-.SR) tickers use EODHD + FMP + Yahoo via core.data_engine / core.data_engine_v2.",
+            "Global (non-.SR) tickers use EODHD + FMP + other providers via core.data_engine / core.data_engine_v2.",
             "Google Sheets 9-page dashboard should use the /sheet-rows endpoints listed in 'sheet_endpoints'.",
         ],
     }
@@ -506,7 +561,7 @@ async def legacy_quote_endpoint(
     _token: Optional[str] = Depends(require_app_token),
 ) -> JSONResponse:
     """
-    Legacy quote endpoint (used by early PowerShell tests).
+    Legacy quote endpoint (used by early PowerShell tests and ad-hoc checks).
 
     Example:
         GET /v1/quote?tickers=AAPL
