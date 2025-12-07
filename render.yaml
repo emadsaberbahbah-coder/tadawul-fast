@@ -1,582 +1,134 @@
-# =============================================================================
-# Tadawul Fast Bridge - Render Deployment Configuration
-# Version: 4.0.0 | Python: 3.11.9 | Environment: Production
-# Aligned with: main.py, requirements.txt, index.html
-# =============================================================================
+# ============================================================
+# Tadawul Fast Bridge – Render Configuration
+# Unified KSA + Global market data + Google Sheets integration
+# ============================================================
 
 services:
   - type: web
     name: tadawul-fast-bridge
     env: python
-    plan: free
-    region: oregon
-
-    # Render Python runtime
-    runtime:
-      pythonVersion: "3.11.9"
-
-    # =========================================================================
-    # Build Configuration
-    # =========================================================================
-    buildCommand: |
-      echo "🚀 Building Tadawul Fast Bridge v4.0.0..."
-      echo "🐍 Python 3.11.9 | FastAPI | Production"
-      echo "📊 Enabling metrics, health checks, and Google Sheets integration..."
-
-      # Upgrade pip and install dependencies
-      pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
-
-      # Create necessary directories (safe if they already exist)
-      mkdir -p logs cache_backups scripts static
-      echo "✅ Project structure ensured (logs, cache_backups, scripts, static)"
-
-      # -----------------------------------------------------------------------
-      # scripts/dependency_check.py  – verify core libs (no strict versions)
-      # -----------------------------------------------------------------------
-      cat > scripts/dependency_check.py << 'EOF'
-      #!/usr/bin/env python3
-      """
-      Dependency Validation for Tadawul Fast Bridge v4.0.0
-      - Checks presence of key libraries used in main.py / requirements.txt
-      - Does NOT fail build on version mismatch, only on missing core libs
-      """
-      import sys
-      import platform
-      import importlib
-
-      CORE_PACKAGES = [
-          "fastapi",
-          "uvicorn",
-          "aiohttp",
-          "httpx",
-          "pydantic",
-          "pydantic_settings",
-          "slowapi",
-          "redis",
-          "gspread",
-          "googleapiclient",
-      ]
-
-      def check_dependencies() -> bool:
-          print("🔍 Checking core Python dependencies...")
-          print(f"🐍 Python: {sys.version.split()[0]}")
-          print(f"💻 Platform: {platform.system()} {platform.release()}")
-
-          missing = []
-          checked = 0
-
-          for pkg in CORE_PACKAGES:
-              checked += 1
-              try:
-                  module_name = pkg.replace("-", "_")
-                  module = importlib.import_module(module_name)
-                  version = getattr(module, "__version__", "unknown")
-                  print(f"✅ {pkg}: {version}")
-              except Exception as e:
-                  missing.append(pkg)
-                  print(f"❌ {pkg}: MISSING ({e})")
-
-          print("\n📊 Dependency check summary:")
-          print(f"   Total core packages: {len(CORE_PACKAGES)}")
-          print(f"   Checked: {checked}")
-          print(f"   Missing: {len(missing)}")
-
-          if missing:
-              print(f"🚨 Missing core packages: {missing}")
-              # Fail build only if we are missing critical libs
-              return False
-
-          print("✅ All required core packages are available")
-          return True
-
-      if __name__ == "__main__":
-          ok = check_dependencies()
-          sys.exit(0 if ok else 1)
-      EOF
-
-      # -----------------------------------------------------------------------
-      # scripts/validate_credentials.py – GOOGLE_SHEETS_CREDENTIALS sanity check
-      # -----------------------------------------------------------------------
-      cat > scripts/validate_credentials.py << 'EOF'
-      #!/usr/bin/env python3
-      """
-      Google Sheets Service Account Credentials Validation
-      - Reads GOOGLE_SHEETS_CREDENTIALS from environment (JSON string)
-      - Performs lightweight structural checks (non-blocking in production)
-      """
-      import os
-      import json
-      import sys
-
-      def validate_google_credentials() -> bool:
-          credentials_str = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-
-          # We keep checks simple & non-blocking for Render
-          total_checks = 5
-          passed = 0
-          failed = 0
-
-          if not credentials_str:
-              print("ℹ️ GOOGLE_SHEETS_CREDENTIALS is not set (Apps Script-only mode is allowed).")
-              print("📊 Credential check skipped – 0/5 executed")
-              return True
-
-          try:
-              credentials = json.loads(credentials_str)
-              passed += 1
-              print("✅ GOOGLE_SHEETS_CREDENTIALS is valid JSON")
-
-              required_fields = ["type", "project_id", "private_key_id", "private_key", "client_email"]
-              missing = [f for f in required_fields if f not in credentials]
-              if missing:
-                  failed += 1
-                  print(f"❌ Missing required fields: {missing}")
-              else:
-                  passed += 1
-                  print("✅ All required fields present")
-
-              private_key = credentials.get("private_key", "")
-              if private_key.startswith("-----BEGIN PRIVATE KEY-----"):
-                  passed += 1
-                  print("✅ Private key begins with expected header")
-              else:
-                  failed += 1
-                  print("⚠️  Private key header may be incorrect")
-
-              if private_key.strip().endswith("END PRIVATE KEY-----"):
-                  passed += 1
-                  print("✅ Private key ends with expected footer")
-              else:
-                  failed += 1
-                  print("⚠️  Private key footer may be incorrect")
-
-              client_email = credentials.get("client_email", "")
-              if client_email and "@".join(client_email.split("@")[:2]) and client_email.endswith(".iam.gserviceaccount.com"):
-                  passed += 1
-                  print(f"✅ Service account email format looks valid: {client_email}")
-              else:
-                  failed += 1
-                  print(f"⚠️  Service account email may be invalid: {client_email}")
-
-          except json.JSONDecodeError as e:
-              print(f"❌ Invalid JSON in GOOGLE_SHEETS_CREDENTIALS: {e}")
-              return False
-          except Exception as e:
-              print(f"❌ Unexpected error while validating credentials: {e}")
-              return False
-
-          executed = passed + failed
-          print("\n📊 Credential validation summary:")
-          print(f"   Checks executed: {executed}/{total_checks}")
-          print(f"   Passed: {passed}")
-          print(f"   Failed: {failed}")
-          print(f"   Success rate: {(passed / executed * 100 if executed else 0):.1f}%")
-
-          # Do NOT block startup if only minor issues
-          return True
-
-      if __name__ == "__main__":
-          ok = validate_google_credentials()
-          sys.exit(0 if ok else 1)
-      EOF
-
-      # -----------------------------------------------------------------------
-      # scripts/startup_check.py – env vars required by main.py / Sheets bridge
-      # -----------------------------------------------------------------------
-      cat > scripts/startup_check.py << 'EOF'
-      #!/usr/bin/env python3
-      """
-      Startup Environment Variable Check for Tadawul Fast Bridge v4.0.0
-      - Required: SPREADSHEET_ID, GOOGLE_APPS_SCRIPT_URL
-      - Optional: APP_TOKEN + provider API keys (for extended features)
-      """
-      import os
-      import sys
-
-      def check_environment() -> bool:
-          required_vars = [
-              "SPREADSHEET_ID",
-              "GOOGLE_APPS_SCRIPT_URL",
-          ]
-
-          optional_vars = [
-              "GOOGLE_SHEETS_CREDENTIALS",
-              "APP_TOKEN",
-              "BACKUP_APP_TOKEN",
-              "ALPHA_VANTAGE_API_KEY",
-              "FINNHUB_API_KEY",
-              "EODHD_API_KEY",
-              "TWELVEDATA_API_KEY",
-              "MARKETSTACK_API_KEY",
-              "FMP_API_KEY",
-          ]
-
-          print("🔍 Starting environment variable validation...")
-
-          missing_required = []
-          present_required = []
-          present_optional = []
-          missing_optional = []
-
-          for var in required_vars:
-              if os.getenv(var):
-                  present_required.append(var)
-                  print(f"✅ Required: {var} = Present")
-              else:
-                  missing_required.append(var)
-                  print(f"❌ Required: {var} = MISSING")
-
-          for var in optional_vars:
-              if os.getenv(var):
-                  present_optional.append(var)
-                  print(f"✅ Optional: {var} = Present")
-              else:
-                  missing_optional.append(var)
-                  print(f"ℹ️  Optional: {var} = Not set")
-
-          total = len(required_vars) + len(optional_vars)
-          present = len(present_required) + len(present_optional)
-          completion = (present / total * 100) if total else 0.0
-
-          print("\n📊 Environment Variable Summary:")
-          print(f"   Total checked: {total}")
-          print(f"   Required present: {len(present_required)}/{len(required_vars)}")
-          print(f"   Optional present: {len(present_optional)}/{len(optional_vars)}")
-          print(f"   Overall completion: {completion:.1f}%")
-
-          if missing_required:
-              print(f"\n🚨 CRITICAL: Missing required variables: {missing_required}")
-              print("   The Google Sheets / Apps Script bridge WILL NOT WORK without these.")
-              return False
-
-          if missing_optional:
-              print(f"\n⚠️  {len(missing_optional)} optional variables are not set.")
-              print("   Extended data providers may be limited, but core service can still run.")
-
-          print("\n✅ Environment check completed.")
-          return True
-
-      if __name__ == "__main__":
-          ok = check_environment()
-          sys.exit(0 if ok else 1)
-      EOF
-
-      # -----------------------------------------------------------------------
-      # scripts/performance_counter.py – simple system metrics on build
-      # -----------------------------------------------------------------------
-      cat > scripts/performance_counter.py << 'EOF'
-      #!/usr/bin/env python3
-      """
-      Performance Counter Snapshot for Tadawul Fast Bridge
-      - Runs at build/start time for quick diagnostics (CPU / RAM / disk)
-      """
-      import time
-      import sys
-
-      try:
-          import psutil  # type: ignore
-      except Exception:
-          print("ℹ️ psutil not available, skipping performance snapshot.")
-          sys.exit(0)
-
-      def count_performance_metrics() -> bool:
-          print("📊 Performance Metrics Snapshot")
-          print("=" * 40)
-
-          checks_performed = 0
-          checks_failed = 0
-          start_time = time.time()
-
-          # CPU
-          try:
-              physical = psutil.cpu_count(logical=False)
-              logical = psutil.cpu_count(logical=True)
-              checks_performed += 1
-              print(f"✅ CPU cores: {physical} physical, {logical} logical")
-          except Exception as e:
-              checks_performed += 1
-              checks_failed += 1
-              print(f"❌ CPU info failed: {e}")
-
-          # Memory
-          try:
-              mem = psutil.virtual_memory()
-              checks_performed += 1
-              print(f"✅ Memory: {mem.total / (1024**3):.2f} GB total, {mem.available / (1024**3):.2f} GB available")
-          except Exception as e:
-              checks_performed += 1
-              checks_failed += 1
-              print(f"❌ Memory info failed: {e}")
-
-          # Disk
-          try:
-              disk = psutil.disk_usage("/")
-              checks_performed += 1
-              print(f"✅ Disk: {disk.total / (1024**3):.2f} GB total, {disk.free / (1024**3):.2f} GB free")
-          except Exception as e:
-              checks_performed += 1
-              checks_failed += 1
-              print(f"❌ Disk info failed: {e}")
-
-          elapsed = time.time() - start_time
-
-          print("\n📊 Performance Counter Summary:")
-          print(f"   Checks performed: {checks_performed}")
-          print(f"   Checks failed: {checks_failed}")
-          print(f"   Success rate: {((checks_performed - checks_failed) / checks_performed * 100 if checks_performed else 0):.1f}%")
-          print(f"   Elapsed time: {elapsed:.3f}s")
-
-          # Never block build because of this
-          return True
-
-      if __name__ == "__main__":
-          count_performance_metrics()
-          sys.exit(0)
-      EOF
-
-      chmod +x scripts/dependency_check.py scripts/startup_check.py scripts/validate_credentials.py scripts/performance_counter.py
-
-      echo "🔧 Running dependency checks..."
-      python scripts/dependency_check.py || echo "⚠️ Dependency check reported issues (continuing build)"
-
-      echo "🔧 Running environment startup checks..."
-      python scripts/startup_check.py || echo "⚠️ Startup check reported issues (continuing build)"
-
-      echo "🔧 Running performance snapshot..."
-      python scripts/performance_counter.py || echo "⚠️ Performance counter skipped/failed (continuing build)"
-
-      echo "✅ Build phase completed for Tadawul Fast Bridge v4.0.0"
-
-    # =========================================================================
-    # Start Command
-    # =========================================================================
-    startCommand: |
-      echo "🔧 Starting Tadawul Fast Bridge v4.0.0"
-      echo "🌍 Environment: ${ENVIRONMENT:-production}"
-      echo "👥 Workers: ${WEB_CONCURRENCY:-2}"
-      echo "🔗 Port (Render): ${PORT}"
-      echo "📊 Log Level: ${LOG_LEVEL:-info}"
-
-      echo "🔧 Validating Google Sheets credentials..."
-      python scripts/validate_credentials.py || echo "⚠️ Credentials validation reported issues (non-blocking)"
-
-      echo "🔧 Running startup environment checks..."
-      python scripts/startup_check.py || echo "⚠️ Startup env check reported issues (non-blocking)"
-
-      echo "🔧 Running performance snapshot..."
-      python scripts/performance_counter.py || echo "⚠️ Performance snapshot reported issues (non-blocking)"
-
-      echo "🚀 Launching FastAPI application with Uvicorn..."
-      uvicorn main:app \
-        --host 0.0.0.0 \
-        --port "${PORT}" \
-        --workers "${WEB_CONCURRENCY:-2}" \
-        --proxy-headers \
-        --forwarded-allow-ips="*" \
-        --log-level "${LOG_LEVEL:-info}" \
-        --access-log \
-        --loop asyncio \
-        --timeout-keep-alive 60 \
-        --timeout-graceful-shutdown 30 \
-        --header "x-powered-by:TadawulFastBridge/4.0.0" \
-        --header "x-server:FastAPI-Uvicorn" \
-        --header "x-metrics:enabled" || \
-      {
-        echo "⚠️ Primary multi-worker start failed, falling back to single worker..."
-        uvicorn main:app \
-          --host 0.0.0.0 \
-          --port "${PORT}" \
-          --workers 1 \
-          --log-level "warning" \
-          --access-log \
-          --header "x-metrics:fallback-single-worker"
-      }
-
+    plan: starter        # or "free", "starter", "standard" as you prefer
+    region: frankfurt    # choose your preferred region
     autoDeploy: true
 
-    # =========================================================================
-    # Health Check (Render native)
-    # main.py: /health is a lightweight status endpoint
-    # =========================================================================
-    healthCheck:
-      path: /health
-      initialDelay: 45
-      period: 60
-      timeout: 25
-      successThreshold: 1
-      failureThreshold: 3
-      headers:
-        - name: User-Agent
-          value: "Render-Health-Check/1.0"
-        - name: X-Health-Check
-          value: "true"
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
 
-    # =========================================================================
-    # Non-secret Environment Variables (safe defaults)
-    # These can be overridden from Render dashboard if needed
-    # =========================================================================
+    startCommand: |
+      uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    # Main health check used by Render to confirm the service is healthy
+    healthCheckPath: /health
+
     envVars:
-      # Core Application Identity
-      - key: SERVICE_NAME
-        value: "Tadawul Fast Bridge"
-      - key: SERVICE_VERSION
+      # ------------------------------------------------------
+      # Core application meta (read by env.py & main.py)
+      # ------------------------------------------------------
+      - key: APP_ENV
+        value: prod
+
+      - key: APP_VERSION
         value: "4.0.0"
-      - key: ENVIRONMENT
-        value: "production"
-      - key: DEBUG
-        value: "false"
-      - key: APP_HOST
-        value: "0.0.0.0"
-      - key: APP_PORT
-        value: "8000"
 
-      # FastAPI / Uvicorn
-      - key: WEB_CONCURRENCY
-        value: "2"
-      - key: PYTHONUNBUFFERED
-        value: "true"
+      - key: APP_NAME
+        value: "Tadawul Fast Bridge"
 
-      # API Documentation
-      - key: ENABLE_SWAGGER
-        value: "true"
-      - key: ENABLE_REDOC
-        value: "true"
+      # Python version hint for Render
+      - key: PYTHON_VERSION
+        value: "3.11.9"
 
-      # Security & Authentication
-      - key: REQUIRE_AUTH
-        value: "true"
-      - key: ENABLE_RATE_LIMITING
-        value: "true"
-      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
-        value: "120"
+      # Backend base URL – used by Sheets/Apps Script integration
+      # NOTE: Render will expose the service on an external URL like:
+      #   https://tadawul-fast-bridge.onrender.com
+      # You can update this to your actual external URL if needed.
+      - key: BACKEND_BASE_URL
+        value: "https://tadawul-fast-bridge.onrender.com"
 
-      # CORS Configuration
-      - key: CORS_ORIGINS
-        value: '["http://localhost:3000", "https://tadawul-fast-bridge.onrender.com"]'
+      # ------------------------------------------------------
+      # Auth Tokens – used by main.py (require_app_token)
+      # ------------------------------------------------------
+      # APP_TOKEN is used by:
+      #   - Google Apps Script (X-APP-TOKEN header)
+      #   - Google Sheets / PowerShell tools
+      - key: APP_TOKEN
+        generateValue: true
 
-      # Cache Configuration (aligned with Settings in main.py)
-      - key: CACHE_DEFAULT_TTL
-        value: "1800"
-      - key: CACHE_MAX_SIZE
-        value: "50000"
-      - key: CACHE_BACKUP_ENABLED
-        value: "true"
-      - key: CACHE_SAVE_INTERVAL
-        value: "10"
+      # Optional backup app token
+      - key: BACKUP_APP_TOKEN
+        value: ""
 
-      # Google Sheets / Apps Script Integration
-      - key: SPREADSHEET_ID
-        value: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
-      - key: GOOGLE_APPS_SCRIPT_URL
-        value: "https://script.google.com/macros/s/AKfycbwnIX0hIaffDJVnHZUxej4zoLPQZgpdMMpkA9YP1xPQVxqwvEAXuIHWcF7qBIVsntnLkg/exec"
-      - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
-        value: "https://script.google.com/macros/s/AKfycbyI7a_xj7zvCa10CnzJP9wf8N1qPG3DYYb-LVkUCOEVEHjALzZq_Ox9YUJgbkzq86py6g/exec"
+      # ------------------------------------------------------
+      # Provider configuration – core.data_engine
+      # ------------------------------------------------------
+      # IMPORTANT:
+      #   - EODHD is still used for NON-KSA symbols (US, EU, etc.).
+      #   - For KSA .SR tickers, core.data_engine routes to Tadawul/Argaam
+      #     (no direct EODHD calls for KSA in our new architecture).
+      #
+      # You can keep "eodhd" enabled, it will only be used where valid.
+      - key: ENABLED_PROVIDERS
+        value: "eodhd,fmp,yfinance"
 
-      # HTTP / Retry Settings
+      # Primary provider (for GLOBAL, not for KSA)
+      - key: PRIMARY_PROVIDER
+        value: "eodhd"
+
+      # Global HTTP timeout (seconds) for outbound provider calls
       - key: HTTP_TIMEOUT
-        value: "30"
+        value: "25"
+
+      # Max retries for transient failures (reserved for future use)
       - key: MAX_RETRIES
-        value: "3"
-      - key: RETRY_DELAY
-        value: "1.0"
+        value: "2"
 
-      # Tadawul-specific Configuration
-      - key: TADAWUL_MARKET_ENABLED
+      # ------------------------------------------------------
+      # EODHD – main non-KSA real-time quote provider
+      # ------------------------------------------------------
+      - key: EODHD_API_KEY
+        sync: false     # set the real key in the Render dashboard
+      - key: EODHD_BASE_URL
+        value: "https://eodhd.com/api"
+
+      # ------------------------------------------------------
+      # FMP – fundamentals / extra quotes
+      # ------------------------------------------------------
+      - key: FMP_API_KEY
+        sync: false     # set the real key in the Render dashboard
+      - key: FMP_BASE_URL
+        value: "https://financialmodelingprep.com/api/v3"
+
+      # ------------------------------------------------------
+      # Optional extra providers (for future expansion)
+      # ------------------------------------------------------
+      - key: FINNHUB_API_KEY
+        sync: false     # optional
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false     # optional
+
+      # ------------------------------------------------------
+      # Google Sheets / Apps Script integration
+      # ------------------------------------------------------
+      # GOOGLE_SHEETS_CREDENTIALS must be the FULL service account JSON
+      # as a single line string (exactly what env.py expects).
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false     # paste the one-line JSON in the Render dashboard
+
+      # Optional backup Apps Script WebApp URL (for dual-side refresh)
+      - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
+        value: ""
+
+      # Optional GCP project id (for logs/monitoring if you need it)
+      - key: GOOGLE_PROJECT_ID
+        value: ""
+
+      # ------------------------------------------------------
+      # CORS / Logging
+      # ------------------------------------------------------
+      # Allow all origins – required for Google Sheets & Apps Script usage.
+      - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
-      - key: TADAWUL_REFRESH_INTERVAL
-        value: "60"
-      - key: TADAWUL_MAX_SYMBOLS
-        value: "200"
-      - key: TZ
-        value: "Asia/Riyadh"
 
-      # Logging Configuration
+      # Global log level (env.py -> LOG_LEVEL)
       - key: LOG_LEVEL
         value: "INFO"
-      - key: LOG_FORMAT
-        value: "detailed"
-      - key: LOG_ENABLE_FILE
-        value: "false"
-
-      # Metrics / Counting
-      - key: ENABLE_METRICS_COUNTING
-        value: "true"
-      - key: METRICS_INTERVAL_SECONDS
-        value: "300"
-      - key: COUNT_API_REQUESTS
-        value: "true"
-      - key: COUNT_CACHE_HITS
-        value: "true"
-      - key: COUNT_ERRORS
-        value: "true"
-      - key: MAX_METRICS_HISTORY
-        value: "1000"
-
-    # =========================================================================
-    # Secrets (managed via Render Dashboard)
-    # =========================================================================
-    secrets:
-      # Auth tokens
-      - key: APP_TOKEN
-        fromSecret: tadawul-app-token
-      - key: BACKUP_APP_TOKEN
-        fromSecret: tadawul-backup-token
-
-      # Google Service Account (JSON)
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        fromSecret: google-sheets-credentials-json
-
-      # External Financial API Keys
-      - key: ALPHA_VANTAGE_API_KEY
-        fromSecret: alpha-vantage-api-key
-      - key: FINNHUB_API_KEY
-        fromSecret: finnhub-api-key
-      - key: EODHD_API_KEY
-        fromSecret: eodhd-api-key
-      - key: TWELVEDATA_API_KEY
-        fromSecret: twelvedata-api-key
-      - key: MARKETSTACK_API_KEY
-        fromSecret: marketstack-api-key
-      - key: FMP_API_KEY
-        fromSecret: fmp-api-key
-
-    # =========================================================================
-    # Security Headers
-    # =========================================================================
-    headers:
-      - path: "/*"
-        name: "X-Frame-Options"
-        value: "DENY"
-      - path: "/*"
-        name: "X-Content-Type-Options"
-        value: "nosniff"
-      - path: "/*"
-        name: "Referrer-Policy"
-        value: "strict-origin-when-cross-origin"
-      - path: "/*"
-        name: "X-XSS-Protection"
-        value: "1; mode=block"
-      - path: "/health"
-        name: "Cache-Control"
-        value: "no-cache, no-store, must-revalidate"
-      - path: "/*"
-        name: "X-Powered-By"
-        value: "TadawulFastBridge/4.0.0"
-      - path: "/*"
-        name: "X-Metrics-Enabled"
-        value: "true"
-
-    # =========================================================================
-    # Scaling Configuration (free plan = single instance, but keep config clean)
-    # =========================================================================
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-      targetMemoryPercent: 70
-      targetCPUPercent: 70
-      metrics:
-        - type: cpu
-          target: 70
-        - type: memory
-          target: 70
