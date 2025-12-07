@@ -1,26 +1,29 @@
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v2.0
+Google Sheets helper for Tadawul Fast Bridge – v2.1
 
 GOALS
 - Centralize all direct Google Sheets access in one place.
 - Integrate tightly with:
-    • env.py      (GOOGLE_SHEETS_CREDENTIALS, BACKEND_BASE_URL, APP_TOKEN)
+    • env.py / environment variables:
+          GOOGLE_SHEETS_CREDENTIALS or GOOGLE_SHEETS_CREDENTIALS_RAW
+          BACKEND_BASE_URL
+          APP_TOKEN
     • backend routes:
           /v1/enriched/sheet-rows
           /v1/analysis/sheet-rows
           /v1/advanced/sheet-rows
 - Provide generic helpers to refresh ANY sheet/page with:
-    • Enriched quotes (fundamentals style)
-    • AI analysis scores
+    • Enriched quotes (fundamentals-style, 60+ columns)
+    • AI analysis scores (Value / Quality / Momentum / Overall / Reco)
     • Advanced analysis & risk scores
 
 IMPORTANT – KSA vs GLOBAL
 - EODHD API is NOT used directly here.
 - For all tickers, including KSA (.SR), this module calls your own backend
-  endpoints (which internally use core.data_engine).
-- core.data_engine is responsible for using Tadawul/Argaam providers
+  endpoints (which internally use core.data_engine_v2 / core.data_engine).
+- The unified engine is responsible for using Tadawul/Argaam providers
   for KSA tickers instead of EODHD. This module never calls EODHD itself.
 
 USAGE EXAMPLES
@@ -31,7 +34,7 @@ USAGE EXAMPLES
         refresh_sheet_with_advanced_analysis,
     )
 
-    # Refresh a KSA Tadawul page
+    # Refresh a KSA Tadawul page (headers in row 5, data from row 6)
     refresh_sheet_with_enriched_quotes(
         spreadsheet_id="YOUR_SHEET_ID",
         sheet_name="KSA_Tadawul",
@@ -39,10 +42,10 @@ USAGE EXAMPLES
         start_cell="A5",
     )
 
-    # Refresh Global Markets analysis
+    # Refresh Global Markets AI analysis (Insights_Analysis page)
     refresh_sheet_with_ai_analysis(
         spreadsheet_id="YOUR_SHEET_ID",
-        sheet_name="Global_Markets",
+        sheet_name="Insights_Analysis",
         tickers=["AAPL", "MSFT", "NVDA"],
         start_cell="A5",
     )
@@ -53,19 +56,69 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from env import (
-    GOOGLE_SHEETS_CREDENTIALS,
-    BACKEND_BASE_URL,
-    APP_TOKEN,
-)
-
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# env.py INTEGRATION + SAFE FALLBACKS
+# ----------------------------------------------------------------------
+
+# We try to import from env.py first (preferred), but fall back to pure
+# environment variables if env.py is missing or misconfigured.
+#
+# We support BOTH:
+#   - GOOGLE_SHEETS_CREDENTIALS  (dict from env.py)
+#   - GOOGLE_SHEETS_CREDENTIALS_RAW / GOOGLE_SHEETS_CREDENTIALS (JSON string)
+#
+
+# Default placeholders (will be overwritten if env.py exists)
+BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", "").strip()
+APP_TOKEN: str = os.getenv("APP_TOKEN", "").strip()
+GOOGLE_SHEETS_CREDENTIALS: Any = {}
+GOOGLE_SHEETS_CREDENTIALS_RAW: str = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
+
+try:  # pragma: no cover - env.py is optional
+    from env import (  # type: ignore
+        BACKEND_BASE_URL as _ENV_BACKEND_BASE_URL,
+        APP_TOKEN as _ENV_APP_TOKEN,
+    )
+    # Optional names; may or may not exist
+    try:
+        from env import GOOGLE_SHEETS_CREDENTIALS as _ENV_SHEETS_CREDS  # type: ignore
+    except Exception:  # pragma: no cover
+        _ENV_SHEETS_CREDS = None
+
+    try:
+        from env import (  # type: ignore
+            GOOGLE_SHEETS_CREDENTIALS_RAW as _ENV_SHEETS_CREDS_RAW,
+        )
+    except Exception:  # pragma: no cover
+        _ENV_SHEETS_CREDS_RAW = None
+
+    # Override base URL and token if provided by env.py
+    if _ENV_BACKEND_BASE_URL:
+        BACKEND_BASE_URL = _ENV_BACKEND_BASE_URL.strip()
+    if _ENV_APP_TOKEN:
+        APP_TOKEN = _ENV_APP_TOKEN.strip()
+
+    if _ENV_SHEETS_CREDS is not None:
+        GOOGLE_SHEETS_CREDENTIALS = _ENV_SHEETS_CREDS
+    if _ENV_SHEETS_CREDS_RAW:
+        GOOGLE_SHEETS_CREDENTIALS_RAW = _ENV_SHEETS_CREDS_RAW.strip()
+
+    logger.info("[GoogleSheets] Config loaded from env.py.")
+except Exception:  # pragma: no cover - defensive
+    logger.warning(
+        "[GoogleSheets] env.py not available or failed to import. "
+        "Falling back to raw environment variables."
+    )
+
 
 # ----------------------------------------------------------------------
 # Optional Google API imports (lazy-checked in get_sheets_service)
@@ -80,11 +133,12 @@ except Exception:  # pragma: no cover
     build = None  # type: ignore
 
     class HttpError(Exception):  # fallback type
+        """Fallback error type when googleapiclient is not installed."""
         pass
 
 
 # ----------------------------------------------------------------------
-# Constants
+# Constants / Globals
 # ----------------------------------------------------------------------
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -95,7 +149,7 @@ _SSL_CONTEXT = ssl.create_default_context()
 
 
 # ----------------------------------------------------------------------
-# Helpers: KSA vs GLOBAL tickers
+# Helpers: KSA vs GLOBAL tickers (for logging / diagnostics)
 # ----------------------------------------------------------------------
 
 
@@ -108,7 +162,7 @@ def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
     NOTE:
     - This module NEVER calls EODHD directly.
     - The split is mainly for logging/diagnostics and future routing.
-    - All tickers are still sent to backend endpoints; core.data_engine
+    - All tickers are still sent to backend endpoints; the unified engine
       decides how to fetch data for KSA vs GLOBAL.
     """
     ksa: List[str] = []
@@ -127,15 +181,60 @@ def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
 
 
 # ----------------------------------------------------------------------
-# Google Sheets client
+# Google Sheets credentials handling
 # ----------------------------------------------------------------------
+
+
+def _get_creds_dict() -> Dict[str, Any]:
+    """
+    Resolve the Google service account credentials dict from either:
+        - GOOGLE_SHEETS_CREDENTIALS (dict from env.py), or
+        - GOOGLE_SHEETS_CREDENTIALS_RAW JSON string (env or env.py), or
+        - GOOGLE_SHEETS_CREDENTIALS JSON string (env).
+
+    Raises RuntimeError if we cannot produce a valid dict.
+    """
+    # 1) If we already have a dict, use it directly
+    if isinstance(GOOGLE_SHEETS_CREDENTIALS, dict) and GOOGLE_SHEETS_CREDENTIALS:
+        return GOOGLE_SHEETS_CREDENTIALS
+
+    # 2) Try RAW JSON string from env.py or env
+    raw = GOOGLE_SHEETS_CREDENTIALS_RAW
+    if not raw:
+        # As a last resort, check env directly again
+        env_raw = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
+        if env_raw:
+            raw = env_raw
+
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            else:
+                logger.error(
+                    "[GoogleSheets] GOOGLE_SHEETS_CREDENTIALS JSON did not parse to dict (got %s).",
+                    type(parsed),
+                )
+        except Exception as exc:
+            logger.error(
+                "[GoogleSheets] Failed to parse GOOGLE_SHEETS_CREDENTIALS JSON: %s",
+                exc,
+            )
+
+    raise RuntimeError(
+        "Google Sheets credentials not available. "
+        "Ensure GOOGLE_SHEETS_CREDENTIALS (JSON) is set in environment "
+        "or provided via env.py."
+    )
 
 
 def get_sheets_service():
     """
     Build or reuse a Google Sheets API client.
 
-    Uses GOOGLE_SHEETS_CREDENTIALS (dict) from env.py.
+    Uses GOOGLE_SHEETS_CREDENTIALS (dict) or GOOGLE_SHEETS_CREDENTIALS_RAW (JSON)
+    from env.py / environment variables.
     """
     global _SHEETS_SERVICE
 
@@ -149,13 +248,7 @@ def get_sheets_service():
             "  pip install google-api-python-client google-auth"
         )
 
-    creds_dict = GOOGLE_SHEETS_CREDENTIALS
-    if not creds_dict:
-        raise RuntimeError(
-            "GOOGLE_SHEETS_CREDENTIALS is not configured in environment. "
-            "Set it to the full service account JSON."
-        )
-
+    creds_dict = _get_creds_dict()
     creds = Credentials.from_service_account_info(creds_dict, scopes=_SCOPES)
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     _SHEETS_SERVICE = service
@@ -180,7 +273,14 @@ def read_range(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
             .get(spreadsheetId=spreadsheet_id, range=range_a1)
             .execute()
         )
-        return result.get("values", [])
+        values = result.get("values", [])
+        logger.info(
+            "[GoogleSheets] Read %d rows from %s!%s.",
+            len(values),
+            spreadsheet_id,
+            range_a1,
+        )
+        return values
     except HttpError as exc:
         logger.error(
             "[GoogleSheets] Error reading range %s!%s: %s",
@@ -250,11 +350,7 @@ def clear_range(spreadsheet_id: str, range_a1: str) -> Dict[str, Any]:
             )
             .execute()
         )
-        logger.info(
-            "[GoogleSheets] Cleared %s!%s.",
-            spreadsheet_id,
-            range_a1,
-        )
+        logger.info("[GoogleSheets] Cleared %s!%s.", spreadsheet_id, range_a1)
         return result
     except HttpError as exc:
         logger.error(
@@ -269,6 +365,15 @@ def clear_range(spreadsheet_id: str, range_a1: str) -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 # Backend client for /sheet-rows endpoints
 # ----------------------------------------------------------------------
+
+
+def _normalize_endpoint(endpoint: str) -> str:
+    """
+    Ensure that the endpoint has a leading slash.
+    """
+    if not endpoint.startswith("/"):
+        return "/" + endpoint
+    return endpoint
 
 
 def _call_backend_sheet_rows(
@@ -294,7 +399,7 @@ def _call_backend_sheet_rows(
 
     NOTE:
     - This function does NOT call EODHD directly.
-    - It only calls your backend, which internally uses core.data_engine.
+    - It only calls your backend, which internally uses the unified data engine.
     """
     base = (BACKEND_BASE_URL or "").rstrip("/")
     if not base:
@@ -303,7 +408,8 @@ def _call_backend_sheet_rows(
             "cannot call backend /sheet-rows endpoints."
         )
 
-    url = base + endpoint
+    ep = _normalize_endpoint(endpoint)
+    url = base + ep
 
     payload = {"tickers": tickers or []}
     headers: Dict[str, str] = {
@@ -315,6 +421,12 @@ def _call_backend_sheet_rows(
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
+    logger.info(
+        "[Backend] Calling %s with %d tickers.",
+        ep,
+        len(tickers or []),
+    )
+
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             status = getattr(resp, "status", resp.getcode())
@@ -324,7 +436,7 @@ def _call_backend_sheet_rows(
                 logger.error(
                     "[Backend] HTTP %s calling %s: %s",
                     status,
-                    endpoint,
+                    ep,
                     text[:300],
                 )
                 raise RuntimeError(
@@ -335,7 +447,7 @@ def _call_backend_sheet_rows(
             except Exception as exc:
                 logger.error(
                     "[Backend] Error parsing JSON from %s: %s",
-                    endpoint,
+                    ep,
                     exc,
                 )
                 raise
@@ -345,7 +457,7 @@ def _call_backend_sheet_rows(
 
             if "headers" not in parsed or "rows" not in parsed:
                 raise RuntimeError(
-                    f"Backend response from {endpoint} missing 'headers' or 'rows'."
+                    f"Backend response from {ep} missing 'headers' or 'rows'."
                 )
 
             return parsed
@@ -355,17 +467,17 @@ def _call_backend_sheet_rows(
         logger.error(
             "[Backend] HTTPError %s calling %s: %s",
             exc.code,
-            endpoint,
+            ep,
             body[:300],
         )
         raise RuntimeError(f"Backend HTTPError {exc.code}: {exc.reason}") from exc
 
     except urllib.error.URLError as exc:
-        logger.error("[Backend] URLError calling %s: %s", endpoint, exc)
+        logger.error("[Backend] URLError calling %s: %s", ep, exc)
         raise RuntimeError(f"Backend URLError: {exc}") from exc
 
     except Exception as exc:
-        logger.exception("[Backend] Unexpected error calling %s", endpoint)
+        logger.exception("[Backend] Unexpected error calling %s", ep)
         raise
 
 
@@ -384,7 +496,7 @@ async def _call_backend_sheet_rows_async(
 
 
 # ----------------------------------------------------------------------
-# HIGH-LEVEL REFRESH HELPERS (for ALL pages)
+# HIGH-LEVEL REFRESH HELPERS (for ALL 9 pages)
 # ----------------------------------------------------------------------
 
 
@@ -397,6 +509,11 @@ def _build_sheet_values_from_backend_payload(
 
     backend_payload:
         { "headers": [...], "rows": [[...], ...] }
+
+    NOTE:
+    - We *always* prepend headers row, so Apps Script can safely:
+          setValues(values)
+      starting at the header row (e.g. A5).
     """
     headers = backend_payload.get("headers") or []
     rows = backend_payload.get("rows") or []
@@ -420,7 +537,7 @@ def refresh_sheet_with_enriched_quotes(
         POST {BACKEND_BASE_URL}/v1/enriched/sheet-rows
 
     - Suitable for KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, etc.
-    - KSA tickers (.SR) are handled by core.data_engine (Tadawul/Argaam, not EODHD).
+    - KSA tickers (.SR) are handled by the unified engine (Tadawul/Argaam, not EODHD).
 
     Parameters
     ----------
@@ -469,7 +586,9 @@ def refresh_sheet_with_ai_analysis(
 
         POST {BACKEND_BASE_URL}/v1/analysis/sheet-rows
 
-    - Good for "Insights & Analysis" type pages.
+    Ideal for:
+    - Insights_Analysis page
+    - Any scoring/AI layer on top of KSA_Tadawul / Global_Markets / Funds / FX.
     """
     split = split_tickers_by_market(tickers)
     logger.info(
@@ -505,7 +624,8 @@ def refresh_sheet_with_advanced_analysis(
 
         POST {BACKEND_BASE_URL}/v1/advanced/sheet-rows
 
-    - Good for Investment Advisor / Advanced Insights pages.
+    Ideal for:
+    - Investment_Advisor / Advanced_Insights / Risk_Buckets-style pages.
     """
     split = split_tickers_by_market(tickers)
     logger.info(
@@ -530,7 +650,7 @@ def refresh_sheet_with_advanced_analysis(
 
 
 # ----------------------------------------------------------------------
-# ASYNC VERSIONS (optional for FastAPI background tasks)
+# ASYNC VERSIONS (optional for FastAPI background tasks / workers)
 # ----------------------------------------------------------------------
 
 
