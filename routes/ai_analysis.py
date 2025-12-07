@@ -1,12 +1,12 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.0)
 
 - Uses core.data_engine.get_enriched_quote(s) for live data
-- Computes value / quality / momentum / overall scores
-- Returns clean JSON for API + sheet-friendly rows
-- Never throws 500 for normal data issues: returns MISSING rows
+- Computes Value / Quality / Momentum / Overall / Recommendation
+- Returns clean JSON + sheet-friendly rows
+- Designed to avoid 500 errors: on failure returns MISSING with error text
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from core.data_engine import UnifiedQuote, get_enriched_quote, get_enriched_quotes
@@ -110,7 +110,7 @@ def _compute_scores(q: UnifiedQuote) -> Dict[str, Optional[float]]:
     change_pct = _safe_float(q.change_pct)
 
     # ------------------------
-    # Value score (P/E, P/B, Div Yield)
+    # Value score (P/E, P/B, Dividend Yield)
     # ------------------------
     vs = 50.0
     if pe is not None:
@@ -177,7 +177,8 @@ def _compute_overall_and_reco(
     momentum_score: Optional[float],
 ) -> Dict[str, Optional[float]]:
     scores = [
-        s for s in [opportunity_score, value_score, quality_score, momentum_score]
+        s
+        for s in [opportunity_score, value_score, quality_score, momentum_score]
         if isinstance(s, (int, float))
     ]
     if not scores:
@@ -291,11 +292,26 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
 # ----------------------------------------------------------------------
 
 
+@router.get("/health")
+async def analysis_health() -> Dict[str, Any]:
+    """
+    Simple health check for this module.
+    """
+    return {
+        "status": "ok",
+        "module": "ai_analysis",
+        "version": "2.0",
+    }
+
+
 @router.get("/quote", response_model=SingleAnalysisResponse)
-async def analyze_single_quote(ticker: str) -> SingleAnalysisResponse:
+async def analyze_single_quote(ticker: str = Query(..., alias="symbol")) -> SingleAnalysisResponse:
     """
     High-level AI/quant analysis for a single ticker.
     Designed to be consumed by Google Sheets / Apps Script.
+
+    Example:
+        GET /v1/analysis/quote?symbol=AAPL
     """
     ticker = (ticker or "").strip()
     if not ticker:
@@ -312,7 +328,7 @@ async def analyze_single_quote(ticker: str) -> SingleAnalysisResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        # NEVER crash Google Sheets – always return a valid row
+        # NEVER crash Google Sheets – always return a valid body
         return SingleAnalysisResponse(
             symbol=ticker.upper(),
             data_quality="MISSING",
@@ -324,6 +340,11 @@ async def analyze_single_quote(ticker: str) -> SingleAnalysisResponse:
 async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisResponse:
     """
     Batch AI/quant analysis for multiple tickers.
+
+    Body:
+        {
+          "tickers": ["AAPL", "MSFT", "1120.SR"]
+        }
     """
     tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
     if not tickers:
@@ -346,8 +367,7 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
     results: List[SingleAnalysisResponse] = []
     for t, q in zip(tickers, unified_quotes):
         try:
-            # If get_enriched_quotes already returns a UnifiedQuote with MISSING,
-            # we still convert to keep consistent structure.
+            # Convert UnifiedQuote (even if MISSING) to analysis response
             analysis = _quote_to_analysis(q)
             if analysis.data_quality == "MISSING":
                 analysis.error = "No data available from providers"
