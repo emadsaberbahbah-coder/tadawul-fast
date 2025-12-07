@@ -8,20 +8,26 @@ Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
     • Enriched Quotes (v1/enriched)
     • AI Analysis (v1/analysis)
     • Advanced Analysis & Risk (v1/advanced)
+    • KSA / Argaam Gateway (v1/argaam)
     • Legacy Quotes (v1/quote, v1/legacy/sheet-rows)
+
 - Integrated with:
-    • core.data_engine (multi-provider engine, KSA via Tadawul/Argaam)
-    • env.py (all config & tokens)
-    • Google Sheets / Apps Script flows (via other modules)
-- EODHD:
+    • core.data_engine (multi-provider engine:
+        - KSA via Tadawul/Argaam gateway (NO EODHD for .SR)
+        - Global via EODHD + FMP)
+    • env.py (all config & tokens, Argaam, Sheets, defaults)
+    • Google Sheets / Apps Script flows
+      (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
+       Commodities_FX, My_Portfolio, Insights_Analysis, etc.)
+
+- IMPORTANT:
     • This file NEVER calls EODHD directly.
-    • KSA (.SR) is handled by core.data_engine using non-EODHD providers.
+    • KSA (.SR) routing is handled by the unified engine and
+      KSA router using non-EODHD KSA providers.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -55,10 +61,11 @@ from env import (
     HAS_SECURE_TOKEN,
     GOOGLE_SHEETS_CREDENTIALS_RAW,
     GOOGLE_APPS_SCRIPT_BACKUP_URL,
+    DEFAULT_SPREADSHEET_ID,
     settings,
 )
 
-from routes import enriched_quote, ai_analysis, advanced_analysis
+from routes import enriched_quote, ai_analysis, advanced_analysis, routes_argaam
 from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
 
 # ------------------------------------------------------------
@@ -160,7 +167,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    description="Tadawul Fast Bridge – Unified KSA + Global data engine with Google Sheets integration.",
+    description=(
+        "Tadawul Fast Bridge – Unified KSA + Global data engine with Google Sheets "
+        "integration (9-page investment dashboard)."
+    ),
     lifespan=lifespan,
 )
 
@@ -178,7 +188,7 @@ if ENABLE_CORS_ALL_ORIGINS:
         allow_headers=["*"],
     )
 else:
-    # You can adjust allowed origins if you want to restrict
+    # Restrict to Google Docs/Script if you want stricter CORS in future
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["https://docs.google.com", "https://script.google.com"],
@@ -195,16 +205,27 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # Include routers (protected by token if configured)
 # ------------------------------------------------------------
 
+# Unified Enriched Quotes
 app.include_router(
     enriched_quote.router,
     dependencies=[Depends(require_app_token)],
 )
+
+# AI-based analysis
 app.include_router(
     ai_analysis.router,
     dependencies=[Depends(require_app_token)],
 )
+
+# Advanced analysis / risk engine
 app.include_router(
     advanced_analysis.router,
+    dependencies=[Depends(require_app_token)],
+)
+
+# KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD
+app.include_router(
+    routes_argaam.router,
     dependencies=[Depends(require_app_token)],
 )
 
@@ -217,8 +238,14 @@ app.include_router(
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
     """
-    Simple HTML landing page.
+    Simple HTML landing page for quick checks.
     """
+    default_sheet_html = (
+        f"<code>{DEFAULT_SPREADSHEET_ID}</code>"
+        if DEFAULT_SPREADSHEET_ID
+        else "<em>not configured</em>"
+    )
+
     return f"""
     <html>
       <head><title>{APP_NAME}</title></head>
@@ -227,14 +254,20 @@ async def root() -> str:
         <p>Environment: <strong>{settings.app_env}</strong></p>
         <p>Version: <strong>{APP_VERSION}</strong></p>
         <p>Base URL: <code>{BACKEND_BASE_URL}</code></p>
-        <p>
-          Try:
-          <ul>
-            <li><code>/health</code></li>
-            <li><code>/v1/status</code></li>
-            <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
-            <li><code>/v1/enriched/health</code>, <code>/v1/analysis/health</code>, <code>/v1/advanced/health</code></li>
-          </ul>
+        <p>Default Spreadsheet (9-page dashboard): {default_sheet_html}</p>
+        <h2>Quick Links</h2>
+        <ul>
+          <li><code>/health</code></li>
+          <li><code>/v1/status</code></li>
+          <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
+          <li><code>/v1/enriched/health</code></li>
+          <li><code>/v1/analysis/health</code></li>
+          <li><code>/v1/advanced/health</code></li>
+          <li><code>/v1/argaam/health</code> (KSA / Argaam gateway)</li>
+        </ul>
+        <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
+          KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.
+          Global (non-.SR) tickers are handled via EODHD + FMP.
         </p>
       </body>
     </html>
@@ -261,7 +294,7 @@ async def basic_health() -> Dict[str, Any]:
 @app.get("/v1/status")
 async def status_endpoint(request: Request) -> Dict[str, Any]:
     """
-    More detailed status used by your PowerShell tests.
+    Detailed status used by your PowerShell / integration tests.
 
     Example:
         GET /v1/status
@@ -274,10 +307,10 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
     services = {
         "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW),
         "google_apps_script": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
-        "cache": False,  # placeholder for future Redis/Memory cache
+        "cache": False,  # placeholder for future cache
     }
 
-    # Whether tokens are configured
+    # Whether tokens are configured + how the request came in
     auth = {
         "has_secure_token": HAS_SECURE_TOKEN,
         "token_in_query": bool(request.query_params.get("token")),
@@ -286,6 +319,12 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
             or request.headers.get("X-APP-TOKEN")
             or request.headers.get("x-app-token")
         ),
+    }
+
+    # Sheets-related info for the 9-page dashboard
+    sheets_meta = {
+        "default_spreadsheet_id": DEFAULT_SPREADSHEET_ID,
+        "has_default_spreadsheet": bool(DEFAULT_SPREADSHEET_ID),
     }
 
     return {
@@ -297,9 +336,11 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "backend_base_url": BACKEND_BASE_URL,
         "services": services,
         "auth": auth,
+        "sheets": sheets_meta,
         "notes": [
             "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
             "No direct EODHD calls are made for KSA inside this main application.",
+            "Global (non-.SR) tickers use EODHD + FMP via core.data_engine.",
         ],
     }
 
@@ -372,7 +413,7 @@ async def legacy_sheet_rows_endpoint(
 
 
 # ------------------------------------------------------------
-# Global error handlers (optional but nice)
+# Global error handlers
 # ------------------------------------------------------------
 
 
