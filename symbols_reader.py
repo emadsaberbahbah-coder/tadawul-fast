@@ -1,1991 +1,447 @@
-# =============================================================================
-# Enhanced Google Sheets Symbols Reader
-# Version: 4.1.0 | Python: 3.11.9 | Render Optimized
-# Integrated with: Tadawul Stock Analysis API
-# =============================================================================
+"""
+symbols_reader.py
+===========================================================
+Central symbol reader for ALL 9 Google Sheets pages.
+
+GOALS
+- Be the single place where we read "which symbols should we fetch" from
+  Google Sheets (KSA, Global, Funds, FX, Portfolio, etc.).
+- Cleanly separate:
+    • KSA symbols (.SR)  -> to be fetched by KSA/Tadawul/Argaam providers
+      (NO EODHD for KSA).
+    • Non-KSA symbols    -> to be fetched by global providers (EODHD, FMP, etc.).
+- Work nicely with:
+    • google_sheets_service.py (for Sheets API access)
+    • core/data_engine.py      (unified engine, provider routing)
+    • routes/*                 (enriched, analysis, advanced, etc.)
+    • Google Apps Script / tools calling into Python
+
+ASSUMPTIONS
+-----------
+1) Your Sheets use a consistent pattern:
+    - Header row is often ROW 5.
+    - Data starts at ROW 6.
+    - There is a "Symbol" or "Ticker" column in the header row.
+
+2) Sheet names (default, can be overridden in callers):
+    - "KSA_Tadawul"
+    - "Global_Markets"
+    - "Mutual_Funds"
+    - "Commodities_FX"
+    - "My_Portfolio"
+    - "Insights_Analysis"   (for analysis-based symbols)
+    - etc.
+
+USAGE EXAMPLES
+--------------
+    from symbols_reader import (
+        get_symbols_from_sheet,
+        get_page_symbols,
+    )
+
+    # 1) Read symbols from a sheet (generic)
+    syms = get_symbols_from_sheet(
+        spreadsheet_id="YOUR_SHEET_ID",
+        sheet_name="KSA_Tadawul",
+        header_row=5,
+    )
+    # syms["all"]   -> all valid symbols
+    # syms["ksa"]   -> only .SR
+    # syms["global"]-> all non-.SR symbols
+
+    # 2) Use page presets (optional)
+    page_syms = get_page_symbols(
+        page_key="KSA_TADAWUL",
+        spreadsheet_id="YOUR_SHEET_ID",   # or omit if you set DEFAULT_SPREADSHEET_ID
+    )
+
+NOTE
+----
+- This module does NOT call EODHD or any provider.
+- It only reads symbols from Google Sheets and classifies them.
+- The actual provider routing (KSA vs global) is done by core.data_engine.
+"""
+
+from __future__ import annotations
 
 import os
-import sys
-import json
-import asyncio
-import hashlib
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass, field
-from enum import Enum
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-# Core Framework
-from pydantic import (
-    BaseModel,
-    Field,
-    field_validator,
-    AliasChoices,
-    ConfigDict,
-)
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    wait_fixed,
-    retry_if_exception_type,
-)
+from google_sheets_service import read_range, split_tickers_by_market
 
-# Google Services
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.errors import HttpError
+logger = logging.getLogger(__name__)
 
-# Monitoring & Logging
-import structlog
-from prometheus_client import Counter, Histogram, Gauge
+# Try to pull a default spreadsheet id from env settings if available,
+# but do NOT require env.py to change immediately.
+try:
+    from env import settings  # type: ignore
 
-# Caching
-from cachetools import TTLCache
-import redis
-from redis import Redis
-
-# Utilities
-from dateutil import parser
-
-# System
-import psutil
-
-# FastAPI integration
-from fastapi import (
-    APIRouter,
-    HTTPException,
-    Depends,
-    status,
-    Query,
-)
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-
-class SymbolsReaderSettings(BaseSettings):
-    """Symbols reader configuration."""
-
-    # Core Configuration
-    spreadsheet_id: str = Field(
-        "",
-        description="Google Sheets spreadsheet ID",
-        validation_alias=AliasChoices(
-            "SYMBOLS_SPREADSHEET_ID",
-            "SPREADSHEET_ID",
-            "GOOGLE_SHEETS_SPREADSHEET_ID",
-        ),
+    DEFAULT_SPREADSHEET_ID: str = (
+        getattr(settings, "default_spreadsheet_id", "") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
     )
-    enabled: bool = Field(True, description="Enable symbols reader")
-    default_tab_name: str = Field(
-        "Market_Leaders", description="Default sheet name"
-    )
-
-    # Cache Configuration
-    cache_enabled: bool = Field(True, description="Enable caching")
-    cache_ttl_seconds: int = Field(
-        1800, description="Cache TTL in seconds"
-    )
-    cache_max_size: int = Field(
-        1000, description="Maximum cache size"
-    )
-    cache_backend: str = Field(
-        "memory", description="Cache backend (memory, redis, hybrid)"
-    )
-
-    # Redis Configuration
-    redis_enabled: bool = Field(True, description="Enable Redis cache")
-    redis_url: str = Field(
-        "",
-        description="Redis connection URL",
-        validation_alias=AliasChoices(
-            "SYMBOLS_REDIS_URL",
-            "REDIS_URL",
-        ),
-    )
-    redis_ttl: int = Field(1800, description="Redis cache TTL")
-
-    # Google Sheets Configuration
-    google_sheets_credentials: str = Field(
-        "",
-        description="Google service account JSON",
-        validation_alias=AliasChoices(
-            "SYMBOLS_GOOGLE_SHEETS_CREDENTIALS",
-            "GOOGLE_SHEETS_CREDENTIALS",
-        ),
-    )
-    google_sheets_timeout: int = Field(
-        30, description="Google Sheets API timeout"
-    )
-    google_sheets_max_retries: int = Field(
-        3, description="Maximum retry attempts"
-    )
-
-    # Performance Configuration
-    max_concurrent_requests: int = Field(
-        5, description="Maximum concurrent requests"
-    )
-    request_timeout: int = Field(
-        30, description="Request timeout in seconds"
-    )
-    batch_size: int = Field(
-        50, description="Batch processing size"
-    )
-
-    # Fallback Configuration
-    enable_fallback: bool = Field(
-        True, description="Enable fallback to hardcoded symbols"
-    )
-    fallback_symbols: str = Field(
-        "7201.SR,1211.SR,2222.SR,2380.SR,4030.SR,4200.SR,1120.SR,1150.SR,2010.SR,2020.SR",
-        description="Comma-separated fallback symbols",
-    )
-
-    # Monitoring Configuration
-    enable_metrics: bool = Field(True, description="Enable Prometheus metrics")
-    log_level: str = Field("INFO", description="Logging level")
-
-    model_config = SettingsConfigDict(
-        env_prefix="SYMBOLS_",
-        case_sensitive=False,
-        extra="ignore",
-    )
-
-    @field_validator("cache_ttl_seconds")
-    @classmethod
-    def validate_cache_ttl(cls, v: int) -> int:
-        """Validate cache TTL."""
-        if v < 60:
-            return 60
-        if v > 86400:
-            return 86400
-        return v
-
-    @field_validator("google_sheets_timeout")
-    @classmethod
-    def validate_timeout(cls, v: int) -> int:
-        """Validate timeout."""
-        if v < 5:
-            return 5
-        if v > 120:
-            return 120
-        return v
+except Exception:  # pragma: no cover - fallback if env.py not yet updated
+    DEFAULT_SPREADSHEET_ID = os.getenv("DEFAULT_SPREADSHEET_ID", "")
 
 
-# =============================================================================
-# Prometheus Metrics
-# =============================================================================
-
-
-class SymbolsReaderMetrics:
-    """Prometheus metrics for symbols reader."""
-
-    def __init__(self):
-        # Request metrics
-        self.requests_total = Counter(
-            "symbols_reader_requests_total",
-            "Total symbols reader requests",
-            ["operation", "status"],
-        )
-
-        self.request_duration_seconds = Histogram(
-            "symbols_reader_request_duration_seconds",
-            "Symbols reader request duration",
-            ["operation"],
-            buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
-        )
-
-        # Cache metrics
-        self.cache_hits_total = Counter(
-            "symbols_reader_cache_hits_total",
-            "Total symbols reader cache hits",
-            ["cache_type"],
-        )
-
-        self.cache_misses_total = Counter(
-            "symbols_reader_cache_misses_total",
-            "Total symbols reader cache misses",
-            ["cache_type"],
-        )
-
-        # Data metrics
-        self.symbols_processed_total = Counter(
-            "symbols_reader_symbols_processed_total",
-            "Total symbols processed",
-            ["source"],
-        )
-
-        self.data_quality = Gauge(
-            "symbols_reader_data_quality",
-            "Data quality score (0-100)",
-        )
-
-        # Error metrics
-        self.errors_total = Counter(
-            "symbols_reader_errors_total",
-            "Total symbols reader errors",
-            ["error_type"],
-        )
-
-    def record_request(self, operation: str, status: str, duration: float):
-        """Record request metrics."""
-        self.requests_total.labels(
-            operation=operation, status=status
-        ).inc()
-        self.request_duration_seconds.labels(
-            operation=operation
-        ).observe(duration)
-
-    def record_cache_hit(self, cache_type: str):
-        """Record cache hit."""
-        self.cache_hits_total.labels(cache_type=cache_type).inc()
-
-    def record_cache_miss(self, cache_type: str):
-        """Record cache miss."""
-        self.cache_misses_total.labels(cache_type=cache_type).inc()
-
-    def record_symbols_processed(self, source: str, count: int):
-        """Record symbols processed."""
-        # Increment once per symbol (keeps label cardinality small)
-        self.symbols_processed_total.labels(source=source).inc(count)
-
-    def record_error(self, error_type: str):
-        """Record error."""
-        self.errors_total.labels(error_type=error_type).inc()
-
-
-# =============================================================================
-# Logging Configuration
-# =============================================================================
-
-
-def setup_symbols_reader_logger():
-    """Configure structured logging for symbols reader."""
-
-    structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.contextvars.merge_contextvars,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.stdlib.BoundLogger,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        cache_logger_on_first_use=True,
-    )
-
-    return structlog.get_logger("symbols_reader")
-
-
-# =============================================================================
-# Data Models
-# =============================================================================
-
-
-class SymbolType(str, Enum):
-    """Symbol type enumeration."""
-
-    SAUDI = "saudi"
-    GCC = "gcc"
-    INTERNATIONAL = "international"
-    CRYPTO = "crypto"
-    ETF = "etf"
-    BOND = "bond"
-
-
-class MarketSector(str, Enum):
-    """Market sector enumeration."""
-
-    BANKING = "banking"
-    PETROCHEMICALS = "petrochemicals"
-    TELECOM = "telecom"
-    CEMENT = "cement"
-    RETAIL = "retail"
-    INSURANCE = "insurance"
-    ENERGY = "energy"
-    REAL_ESTATE = "real_estate"
-    TRANSPORTATION = "transportation"
-    HEALTHCARE = "healthcare"
-    INDUSTRIAL = "industrial"
-    AGRICULTURE = "agriculture"
-    OTHER = "other"
-
+# ----------------------------------------------------------------------
+# PAGE CONFIG (for your 9 pages) – can be overridden by callers
+# ----------------------------------------------------------------------
 
 @dataclass
-class SymbolRecord:
-    """Symbol data record."""
-
-    # Core Identification
-    symbol: str
-    isin: Optional[str] = None
-    cusip: Optional[str] = None
-    sedol: Optional[str] = None
-
-    # Names
-    name_ar: Optional[str] = None
-    name_en: Optional[str] = None
-    short_name: Optional[str] = None
-    company_name: Optional[str] = None
-
-    # Classification
-    symbol_type: SymbolType = SymbolType.SAUDI
-    market_sector: MarketSector = MarketSector.OTHER
-    industry: Optional[str] = None
-    sub_industry: Optional[str] = None
-    gics_sector: Optional[str] = None
-    gics_industry: Optional[str] = None
-
-    # Market Information
-    exchange: Optional[str] = None
-    market: Optional[str] = None
-    currency: str = "SAR"
-    country: str = "SA"
-
-    # Financial Metrics
-    market_cap: Optional[float] = None
-    shares_outstanding: Optional[int] = None
-    free_float: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    eps: Optional[float] = None
-    pe_ratio: Optional[float] = None
-    pb_ratio: Optional[float] = None
-
-    # Status Flags
-    is_active: bool = True
-    is_tradable: bool = True
-    is_suspended: bool = False
-    include_in_ranking: bool = True
-    include_in_index: bool = False
-
-    # Metadata
-    data_source: str = "google_sheets"
-    last_updated: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    data_quality: float = 1.0
-    confidence_score: float = 1.0
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        data = {
-            "symbol": self.symbol,
-            "symbol_type": self.symbol_type.value,
-            "market_sector": self.market_sector.value,
-            "currency": self.currency,
-            "country": self.country,
-            "is_active": self.is_active,
-            "is_tradable": self.is_tradable,
-            "include_in_ranking": self.include_in_ranking,
-            "data_source": self.data_source,
-            "last_updated": self.last_updated.isoformat(),
-            "data_quality": self.data_quality,
-        }
-
-        # Add optional fields if they exist
-        optional_fields = [
-            "isin",
-            "cusip",
-            "sedol",
-            "name_ar",
-            "name_en",
-            "short_name",
-            "company_name",
-            "industry",
-            "sub_industry",
-            "gics_sector",
-            "gics_industry",
-            "exchange",
-            "market",
-            "market_cap",
-            "shares_outstanding",
-            "free_float",
-            "dividend_yield",
-            "eps",
-            "pe_ratio",
-            "pb_ratio",
-            "is_suspended",
-            "include_in_index",
-            "confidence_score",
-        ]
-
-        for field_name in optional_fields:
-            value = getattr(self, field_name)
-            if value is not None:
-                data[field_name] = value
-
-        return data
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SymbolRecord":
-        """Create SymbolRecord from dictionary."""
-        # Parse datetime
-        if "last_updated" in data and isinstance(
-            data["last_updated"], str
-        ):
-            data["last_updated"] = parser.parse(data["last_updated"])
-
-        # Convert string enums
-        if "symbol_type" in data:
-            data["symbol_type"] = SymbolType(data["symbol_type"])
-
-        if "market_sector" in data:
-            data["market_sector"] = MarketSector(data["market_sector"])
-
-        return cls(**data)
+class PageConfig:
+    key: str
+    sheet_name: str
+    header_row: int = 5  # where headers live
+    max_columns: int = 52  # up to column AZ (~52) for header detection
 
 
-class SymbolsResponse(BaseModel):
-    """Symbols response model."""
-
-    success: bool
-    timestamp: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    source: str
-    count: int
-    symbols: List[Dict[str, Any]]
-    metadata: Dict[str, Any]
-    warnings: List[str] = []
-    error: Optional[str] = None
-
-    model_config = ConfigDict(
-        json_encoders={datetime: lambda v: v.isoformat()}
-    )
-
-
-class SymbolsBatchRequest(BaseModel):
-    """Symbols batch request model."""
-
-    sheet_names: Optional[List[str]] = None
-    use_cache: bool = True
-    refresh_cache: bool = False
-    limit: Optional[int] = Field(None, ge=1, le=1000)
-
-
-class SymbolsCacheInfo(BaseModel):
-    """Cache information model."""
-
-    cache_enabled: bool
-    cache_backend: str
-    cache_size: int
-    cache_hits: int
-    cache_misses: int
-    cache_hit_ratio: float
-    cache_ttl_seconds: int
-    memory_usage_mb: float
-
-
-# =============================================================================
-# Cache Manager
-# =============================================================================
+DEFAULT_PAGE_CONFIGS: Dict[str, PageConfig] = {
+    # KSA Tadawul market
+    "KSA_TADAWUL": PageConfig(
+        key="KSA_TADAWUL",
+        sheet_name="KSA_Tadawul",
+        header_row=5,
+    ),
+    # Global markets
+    "GLOBAL_MARKETS": PageConfig(
+        key="GLOBAL_MARKETS",
+        sheet_name="Global_Markets",
+        header_row=5,
+    ),
+    # Mutual funds
+    "MUTUAL_FUNDS": PageConfig(
+        key="MUTUAL_FUNDS",
+        sheet_name="Mutual_Funds",
+        header_row=5,
+    ),
+    # Commodities & FX
+    "COMMODITIES_FX": PageConfig(
+        key="COMMODITIES_FX",
+        sheet_name="Commodities_FX",
+        header_row=5,
+    ),
+    # Portfolio (user positions)
+    "MY_PORTFOLIO": PageConfig(
+        key="MY_PORTFOLIO",
+        sheet_name="My_Portfolio",
+        header_row=5,
+    ),
+    # Insights / Analysis (if it has symbols)
+    "INSIGHTS_ANALYSIS": PageConfig(
+        key="INSIGHTS_ANALYSIS",
+        sheet_name="Insights_Analysis",
+        header_row=5,
+    ),
+    # You can extend with:
+    # "INVESTMENT_ADVISOR": PageConfig(...),
+    # "MARKET_LEADERS": PageConfig(...),
+}
 
 
-class SymbolsCacheManager:
-    """Cache manager for symbols data."""
+# ----------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ----------------------------------------------------------------------
 
-    def __init__(
-        self,
-        settings: SymbolsReaderSettings,
-        metrics: SymbolsReaderMetrics,
-    ):
-        self.settings = settings
-        self.metrics = metrics
-        self.logger = setup_symbols_reader_logger()
 
-        # Initialize caches
-        self.memory_cache: Optional[TTLCache] = None
-        self.redis_client: Optional[Redis] = None
+def _resolve_spreadsheet_id(spreadsheet_id: Optional[str] = None) -> str:
+    """
+    Resolve spreadsheet ID from argument or DEFAULT_SPREADSHEET_ID.
 
-        self._init_caches()
+    Raises ValueError if nothing is configured.
+    """
+    sid = (spreadsheet_id or "").strip() or DEFAULT_SPREADSHEET_ID
+    if not sid:
+        raise ValueError(
+            "Spreadsheet ID is required but not provided. "
+            "Either pass `spreadsheet_id` explicitly or configure "
+            "DEFAULT_SPREADSHEET_ID (env var or settings.default_spreadsheet_id)."
+        )
+    return sid
 
-        # Statistics
-        self.hits = 0
-        self.misses = 0
 
-    def _init_caches(self):
-        """Initialize cache backends."""
-        try:
-            # Initialize memory cache
-            if self.settings.cache_backend in ["memory", "hybrid"]:
-                self.memory_cache = TTLCache(
-                    maxsize=self.settings.cache_max_size,
-                    ttl=self.settings.cache_ttl_seconds,
-                )
-                self.logger.info("Memory cache initialized")
+def _column_index_to_letter(idx: int) -> str:
+    """
+    Convert 0-based column index to A1 column letter.
+    e.g. 0 -> 'A', 25 -> 'Z', 26 -> 'AA'
+    """
+    letters = ""
+    idx += 1  # 1-based
+    while idx > 0:
+        idx, remainder = divmod(idx - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
 
-            # Initialize Redis cache
-            if (
-                self.settings.cache_backend in ["redis", "hybrid"]
-                and self.settings.redis_enabled
-            ):
-                if self.settings.redis_url:
-                    self.redis_client = Redis.from_url(
-                        self.settings.redis_url,
-                        decode_responses=True,
-                        socket_connect_timeout=5,
-                        socket_timeout=5,
-                    )
 
-                    # Test connection
-                    self.redis_client.ping()
-                    self.logger.info("Redis cache initialized")
-                else:
-                    self.logger.warning("Redis URL not configured")
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
 
-        except Exception as e:
-            self.logger.error(
-                "Cache initialization failed", error=str(e)
-            )
 
-    def _get_cache_key(self, key: str) -> str:
-        """Generate cache key with prefix."""
-        return f"symbols:{key}"
+def _normalize_symbol(cell_value: Any) -> Optional[str]:
+    """
+    Convert a raw cell value to a clean symbol string or None.
 
-    async def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get data from cache."""
-        if not self.settings.cache_enabled:
-            return None
+    - Strips whitespace.
+    - Uppercases.
+    - Treats '', 'NA', '-' as None.
+    """
+    if cell_value is None:
+        return None
+    if isinstance(cell_value, (int, float)):
+        # Some people store 1120 as number; we can accept it and treat as string
+        text = str(cell_value)
+    else:
+        text = str(cell_value)
+    text = text.strip().upper()
+    if not text:
+        return None
+    if text in {"NA", "N/A", "-", "--"}:
+        return None
+    return text
 
-        cache_key = self._get_cache_key(key)
 
-        try:
-            # Try memory cache first
-            if self.memory_cache:
-                data = self.memory_cache.get(cache_key)
-                if data:
-                    self.hits += 1
-                    self.metrics.record_cache_hit("memory")
-                    self.logger.debug("Memory cache hit", key=key)
-                    return data
+def _detect_symbol_column(
+    spreadsheet_id: str,
+    sheet_name: str,
+    header_row: int,
+    max_columns: int,
+) -> Optional[int]:
+    """
+    Read the header row and detect which column contains 'Symbol' or 'Ticker'.
 
-            # Try Redis cache
-            if self.redis_client:
-                data_str = self.redis_client.get(cache_key)
-                if data_str:
-                    try:
-                        parsed_data = json.loads(data_str)
-                        # Store in memory cache for faster access
-                        if self.memory_cache:
-                            self.memory_cache[cache_key] = parsed_data
-
-                        self.hits += 1
-                        self.metrics.record_cache_hit("redis")
-                        self.logger.debug("Redis cache hit", key=key)
-                        return parsed_data
-                    except json.JSONDecodeError:
-                        pass
-
-            self.misses += 1
-            self.metrics.record_cache_miss("memory")
-
-        except Exception as e:
-            self.logger.warning(
-                "Cache get error", key=key, error=str(e)
-            )
-
+    Returns:
+        0-based column index, or None if not found.
+    """
+    # Example: "KSA_Tadawul!A5:AZ5"
+    last_col_letter = _column_index_to_letter(max_columns - 1)
+    range_a1 = f"{sheet_name}!A{header_row}:{last_col_letter}{header_row}"
+    rows = read_range(spreadsheet_id, range_a1)
+    if not rows:
         return None
 
-    async def set(
-        self, key: str, data: Dict[str, Any], ttl: Optional[int] = None
-    ):
-        """Set data in cache."""
-        if not self.settings.cache_enabled:
-            return
+    header = rows[0]  # first row in the returned range
+    normalized = [str(c or "").strip().lower() for c in header]
 
-        cache_key = self._get_cache_key(key)
-        ttl = ttl or self.settings.cache_ttl_seconds
+    candidates = {"symbol", "ticker", "code"}
+    for idx, col_name in enumerate(normalized):
+        if col_name in candidates:
+            return idx
 
-        try:
-            # Store in memory cache
-            if self.memory_cache:
-                self.memory_cache[cache_key] = data
-
-            # Store in Redis
-            if self.redis_client:
-                serialized = json.dumps(data)
-                self.redis_client.setex(cache_key, ttl, serialized)
-
-            self.logger.debug("Cache set", key=key)
-
-        except Exception as e:
-            self.logger.warning(
-                "Cache set error", key=key, error=str(e)
-            )
-
-    async def delete(self, key: str):
-        """Delete data from cache."""
-        cache_key = self._get_cache_key(key)
-
-        try:
-            if self.memory_cache and cache_key in self.memory_cache:
-                del self.memory_cache[cache_key]
-
-            if self.redis_client:
-                self.redis_client.delete(cache_key)
-
-            self.logger.debug("Cache delete", key=key)
-
-        except Exception as e:
-            self.logger.warning(
-                "Cache delete error", key=key, error=str(e)
-            )
-
-    async def clear(self):
-        """Clear cache."""
-        try:
-            if self.memory_cache:
-                self.memory_cache.clear()
-
-            if self.redis_client:
-                # Delete all symbols cache keys
-                pattern = "symbols:*"
-                keys = self.redis_client.keys(pattern)
-                if keys:
-                    self.redis_client.delete(*keys)
-
-            self.hits = 0
-            self.misses = 0
-
-            self.logger.info("Cache cleared")
-
-        except Exception as e:
-            self.logger.error("Cache clear error", error=str(e))
-
-    async def get_info(self) -> SymbolsCacheInfo:
-        """Get cache information."""
-        import sys
-
-        # Calculate memory usage
-        memory_usage = 0
-        if self.memory_cache:
-            for key, value in self.memory_cache.items():
-                memory_usage += sys.getsizeof(key) + sys.getsizeof(
-                    value
-                )
-
-        memory_usage_mb = memory_usage / (1024 * 1024)
-
-        # Calculate hit ratio
-        total_requests = self.hits + self.misses
-        hit_ratio = (
-            self.hits / total_requests if total_requests > 0 else 0.0
-        )
-
-        return SymbolsCacheInfo(
-            cache_enabled=self.settings.cache_enabled,
-            cache_backend=self.settings.cache_backend,
-            cache_size=len(self.memory_cache)
-            if self.memory_cache
-            else 0,
-            cache_hits=self.hits,
-            cache_misses=self.misses,
-            cache_hit_ratio=round(hit_ratio, 3),
-            cache_ttl_seconds=self.settings.cache_ttl_seconds,
-            memory_usage_mb=round(memory_usage_mb, 2),
-        )
+    return None
 
 
-# =============================================================================
-# Google Sheets Service
-# =============================================================================
+def _read_symbols_from_column(
+    spreadsheet_id: str,
+    sheet_name: str,
+    col_idx: int,
+    header_row: int,
+) -> List[str]:
+    """
+    Read all symbols from a single column (0-based col index), below the header row.
+    """
+    col_letter = _column_index_to_letter(col_idx)
+    start_row = header_row + 1  # data starts after header
+    range_a1 = f"{sheet_name}!{col_letter}{start_row}:{col_letter}"
+
+    values = read_range(spreadsheet_id, range_a1)
+    symbols: List[str] = []
+    for row in values:
+        if not row:
+            continue
+        cell = row[0]
+        sym = _normalize_symbol(cell)
+        if sym:
+            symbols.append(sym)
+
+    return _dedupe_preserve_order(symbols)
 
 
-class GoogleSheetsService:
-    """Google Sheets service for symbols data."""
+# ----------------------------------------------------------------------
+# PUBLIC API
+# ----------------------------------------------------------------------
 
-    def __init__(
-        self,
-        settings: SymbolsReaderSettings,
-        metrics: SymbolsReaderMetrics,
-    ):
-        self.settings = settings
-        self.metrics = metrics
-        self.logger = setup_symbols_reader_logger()
 
-        self.client: Optional[gspread.Client] = None
-        self.spreadsheet: Optional[gspread.Spreadsheet] = None
-        self._init_client()
+def get_symbols_from_sheet(
+    spreadsheet_id: Optional[str],
+    sheet_name: str,
+    header_row: int = 5,
+    max_columns: int = 52,
+) -> Dict[str, List[str]]:
+    """
+    Generic reader: read symbols from the given sheet.
 
-    def _init_client(self):
-        """Initialize Google Sheets client."""
-        if not self.settings.google_sheets_credentials:
-            self.logger.warning(
-                "Google Sheets credentials not configured"
-            )
-            return
+    Returns a dict:
+        {
+          "all":    [... all valid symbols ...],
+          "ksa":    [... only .SR tickers (KSA) ...],
+          "global": [... non-.SR symbols ...]
+        }
 
-        try:
-            # Parse credentials JSON
-            creds_dict = json.loads(
-                self.settings.google_sheets_credentials
-            )
+    This is the main function you'll use when you want to:
+        - Refresh KSA_Tadawul page
+        - Refresh Global_Markets / Mutual_Funds / Commodities_FX
+        - Or any other sheet that has a Symbol/Ticker column.
+    """
+    sid = _resolve_spreadsheet_id(spreadsheet_id)
+    if not sheet_name:
+        raise ValueError("sheet_name is required for get_symbols_from_sheet().")
 
-            # Create credentials
-            scopes = [
-                "https://www.googleapis.com/auth/spreadsheets.readonly",
-                "https://www.googleapis.com/auth/drive.readonly",
-            ]
-
-            credentials = Credentials.from_service_account_info(
-                creds_dict, scopes=scopes
-            )
-
-            # Initialize client
-            self.client = gspread.authorize(credentials)
-
-            self.logger.info("Google Sheets client initialized")
-
-        except json.JSONDecodeError as e:
-            self.logger.error(
-                "Invalid Google credentials JSON", error=str(e)
-            )
-        except Exception as e:
-            self.logger.error(
-                "Google Sheets client initialization failed",
-                error=str(e),
-            )
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(
-            (gspread.exceptions.APIError, HttpError)
-        ),
+    # 1) Detect symbol column from the header row
+    col_idx = _detect_symbol_column(
+        spreadsheet_id=sid,
+        sheet_name=sheet_name,
+        header_row=header_row,
+        max_columns=max_columns,
     )
-    async def get_spreadsheet(self) -> Optional[gspread.Spreadsheet]:
-        """Get spreadsheet by ID."""
-        if not self.client or not self.settings.spreadsheet_id:
-            return None
+    if col_idx is None:
+        logger.warning(
+            "[symbols_reader] Could not detect Symbol/Ticker column in %s!row=%d; "
+            "no symbols will be returned.",
+            sheet_name,
+            header_row,
+        )
+        return {"all": [], "ksa": [], "global": []}
 
-        try:
-            start_time = datetime.now(timezone.utc)
-
-            # Blocking call in a thread to avoid blocking event loop
-            loop = asyncio.get_running_loop()
-            spreadsheet = await loop.run_in_executor(
-                None,
-                lambda: self.client.open_by_key(
-                    self.settings.spreadsheet_id
-                ),
-            )
-            self.spreadsheet = spreadsheet
-
-            duration = (
-                datetime.now(timezone.utc) - start_time
-            ).total_seconds()
-            self.metrics.record_request(
-                "get_spreadsheet", "success", duration
-            )
-
-            self.logger.info(
-                "Spreadsheet loaded", title=self.spreadsheet.title
-            )
-
-            return self.spreadsheet
-
-        except gspread.exceptions.SpreadsheetNotFound:
-            self.metrics.record_request(
-                "get_spreadsheet", "not_found", 0
-            )
-            self.logger.error(
-                "Spreadsheet not found",
-                id=self.settings.spreadsheet_id,
-            )
-        except Exception as e:
-            self.metrics.record_request("get_spreadsheet", "error", 0)
-            self.metrics.record_error(type(e).__name__)
-            self.logger.error(
-                "Spreadsheet load failed", error=str(e)
-            )
-
-        return None
-
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_fixed(2),
-        retry=retry_if_exception_type(
-            (gspread.exceptions.APIError, HttpError)
-        ),
+    # 2) Read all symbols from that column
+    raw_symbols = _read_symbols_from_column(
+        spreadsheet_id=sid,
+        sheet_name=sheet_name,
+        col_idx=col_idx,
+        header_row=header_row,
     )
-    async def get_worksheet_data(
-        self, sheet_name: str
-    ) -> Optional[List[List[str]]]:
-        """Get all data from a worksheet."""
-        if not self.spreadsheet:
-            spreadsheet = await self.get_spreadsheet()
-            if not spreadsheet:
-                return None
 
-        try:
-            start_time = datetime.now(timezone.utc)
+    # 3) Split into KSA vs GLOBAL (consistent with google_sheets_service)
+    split = split_tickers_by_market(raw_symbols)
 
-            loop = asyncio.get_running_loop()
-
-            def _load():
-                worksheet = self.spreadsheet.worksheet(sheet_name)
-                return worksheet.get_all_values()
-
-            values = await loop.run_in_executor(None, _load)
-
-            duration = (
-                datetime.now(timezone.utc) - start_time
-            ).total_seconds()
-            self.metrics.record_request(
-                "get_worksheet_data", "success", duration
-            )
-
-            self.logger.info(
-                "Worksheet data loaded",
-                sheet_name=sheet_name,
-                rows=len(values),
-                columns=len(values[0]) if values else 0,
-            )
-
-            return values
-
-        except gspread.exceptions.WorksheetNotFound:
-            self.metrics.record_request(
-                "get_worksheet_data", "not_found", 0
-            )
-            self.logger.warning(
-                "Worksheet not found", sheet_name=sheet_name
-            )
-        except Exception as e:
-            self.metrics.record_request(
-                "get_worksheet_data", "error", 0
-            )
-            self.metrics.record_error(type(e).__name__)
-            self.logger.error(
-                "Worksheet data load failed",
-                sheet_name=sheet_name,
-                error=str(e),
-            )
-
-        return None
+    return {
+        "all": raw_symbols,
+        "ksa": split["ksa"],
+        "global": split["global"],
+    }
 
 
-# =============================================================================
-# Data Parser
-# =============================================================================
+def get_page_symbols(
+    page_key: str,
+    spreadsheet_id: Optional[str] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[str]]:
+    """
+    Read symbols for a specific logical "page" (KSA, Global, Funds, FX, etc.)
+    using DEFAULT_PAGE_CONFIGS, optionally overridden.
 
-
-class SymbolsDataParser:
-    """Parse symbols data from various formats."""
-
-    def __init__(self, metrics: SymbolsReaderMetrics):
-        self.metrics = metrics
-        self.logger = setup_symbols_reader_logger()
-
-        # Column mappings
-        self.column_mappings = {
-            "symbol": ["Symbol", "Ticker", "Code", "رمز", "الرمز"],
-            "name_en": [
-                "Name (EN)",
-                "English Name",
-                "Company Name",
-                "اسم انجليزي",
-                "الاسم الإنجليزي",
-            ],
-            "name_ar": [
-                "Name (AR)",
-                "Arabic Name",
-                "اسم عربي",
-                "الاسم العربي",
-            ],
-            "market_sector": [
-                "Sector",
-                "Industry",
-                "Market Sector",
-                "قطاع",
-                "القطاع",
-            ],
-            "market_cap": [
-                "Market Cap",
-                "Market Capitalization",
-                "Capitalization",
-                "القيمة السوقية",
-            ],
-            "exchange": [
-                "Exchange",
-                "Market",
-                "Exchange Code",
-                "سوق",
-                "السوق",
-            ],
-            "currency": ["Currency", "Curr", "عملة", "العملة"],
-            "is_active": [
-                "Active",
-                "Status",
-                "Is Active",
-                "نشط",
-                "حالة",
-            ],
-            "include_in_ranking": [
-                "Include",
-                "Rank",
-                "Include in Ranking",
-                "يشمل",
-                "مشمول",
-            ],
-        }
-
-    def parse_google_sheets_data(
-        self, data: List[List[str]], sheet_name: str
-    ) -> List[SymbolRecord]:
-        """Parse Google Sheets data into SymbolRecords."""
-        symbols: List[SymbolRecord] = []
-
-        if not data or len(data) < 2:
-            return symbols
-
-        # Get header row
-        headers = data[0]
-
-        # Map column indices
-        column_indices = self._map_columns(headers)
-
-        # Parse data rows
-        for row_idx, row in enumerate(data[1:], start=2):
-            try:
-                # Skip empty rows
-                if not any(cell.strip() for cell in row if cell):
-                    continue
-
-                symbol_record = self._parse_row(
-                    row, column_indices, sheet_name
-                )
-                if symbol_record:
-                    symbols.append(symbol_record)
-
-            except Exception as e:
-                self.logger.warning(
-                    "Row parsing failed",
-                    sheet_name=sheet_name,
-                    row=row_idx,
-                    error=str(e),
-                )
-
-        self.metrics.record_symbols_processed(
-            "google_sheets", len(symbols)
-        )
-
-        self.logger.info(
-            "Google Sheets data parsed",
-            sheet_name=sheet_name,
-            symbols_count=len(symbols),
-            total_rows=len(data) - 1,
-        )
-
-        return symbols
-
-    def _map_columns(self, headers: List[str]) -> Dict[str, int]:
-        """Map header names to column indices."""
-        column_indices: Dict[str, int] = {}
-
-        for col_idx, header in enumerate(headers):
-            header_lower = str(header).strip().lower()
-
-            for field, aliases in self.column_mappings.items():
-                for alias in aliases:
-                    alias_lower = alias.lower()
-
-                    # Exact match
-                    if header_lower == alias_lower:
-                        column_indices[field] = col_idx
-                        break
-
-                    # Contains match (robust to small variations)
-                    if alias_lower in header_lower or header_lower in alias_lower:
-                        column_indices[field] = col_idx
-                        break
-
-                if field in column_indices:
-                    break
-
-        return column_indices
-
-    def _parse_row(
-        self,
-        row: List[str],
-        column_indices: Dict[str, int],
-        sheet_name: str,
-    ) -> Optional[SymbolRecord]:
-        """Parse a single row into SymbolRecord."""
-        # Extract symbol
-        symbol_idx = column_indices.get("symbol", 0)
-        if symbol_idx >= len(row):
-            return None
-
-        symbol = str(row[symbol_idx]).strip().upper()
-        if not symbol:
-            return None
-
-        # Skip invalid symbols
-        if symbol.lower() in ["", "n/a", "null", "none", "undefined"]:
-            return None
-
-        # Extract other fields
-        name_en = self._get_field(row, column_indices.get("name_en"))
-        name_ar = self._get_field(row, column_indices.get("name_ar"))
-
-        # Parse market sector
-        market_sector_str = self._get_field(
-            row, column_indices.get("market_sector")
-        )
-        market_sector = self._parse_market_sector(market_sector_str)
-
-        # Parse market cap
-        market_cap_str = self._get_field(
-            row, column_indices.get("market_cap")
-        )
-        market_cap = self._parse_market_cap(market_cap_str)
-
-        # Parse flags
-        is_active_str = self._get_field(
-            row, column_indices.get("is_active")
-        )
-        is_active = self._parse_boolean(is_active_str, default=True)
-
-        include_in_ranking_str = self._get_field(
-            row, column_indices.get("include_in_ranking")
-        )
-        include_in_ranking = self._parse_boolean(
-            include_in_ranking_str, default=True
-        )
-
-        # Determine symbol type based on sheet name and symbol format
-        symbol_type = self._determine_symbol_type(symbol, sheet_name)
-
-        return SymbolRecord(
-            symbol=symbol,
-            name_en=name_en,
-            name_ar=name_ar,
-            company_name=name_en or name_ar,
-            market_sector=market_sector,
-            market_cap=market_cap,
-            is_active=is_active,
-            include_in_ranking=include_in_ranking,
-            symbol_type=symbol_type,
-            data_source=f"google_sheets:{sheet_name}",
-            data_quality=self._calculate_data_quality(
-                row, column_indices
-            ),
-        )
-
-    def _get_field(
-        self, row: List[str], col_idx: Optional[int]
-    ) -> Optional[str]:
-        """Safely get field from row."""
-        if col_idx is None or col_idx >= len(row):
-            return None
-
-        value = str(row[col_idx]).strip()
-        return value if value else None
-
-    def _parse_market_sector(
-        self, sector_str: Optional[str]
-    ) -> MarketSector:
-        """Parse market sector string to enum."""
-        if not sector_str:
-            return MarketSector.OTHER
-
-        sector_lower = sector_str.lower()
-
-        sector_mapping = {
-            "bank": MarketSector.BANKING,
-            "banks": MarketSector.BANKING,
-            "banking": MarketSector.BANKING,
-            "petrochemical": MarketSector.PETROCHEMICALS,
-            "petrochemicals": MarketSector.PETROCHEMICALS,
-            "chemical": MarketSector.PETROCHEMICALS,
-            "telecom": MarketSector.TELECOM,
-            "telecommunication": MarketSector.TELECOM,
-            "cement": MarketSector.CEMENT,
-            "construction": MarketSector.CEMENT,
-            "retail": MarketSector.RETAIL,
-            "consumer": MarketSector.RETAIL,
-            "insurance": MarketSector.INSURANCE,
-            "energy": MarketSector.ENERGY,
-            "oil": MarketSector.ENERGY,
-            "gas": MarketSector.ENERGY,
-            "real estate": MarketSector.REAL_ESTATE,
-            "property": MarketSector.REAL_ESTATE,
-            "transportation": MarketSector.TRANSPORTATION,
-            "transport": MarketSector.TRANSPORTATION,
-            "healthcare": MarketSector.HEALTHCARE,
-            "medical": MarketSector.HEALTHCARE,
-            "industrial": MarketSector.INDUSTRIAL,
-            "manufacturing": MarketSector.INDUSTRIAL,
-            "agriculture": MarketSector.AGRICULTURE,
-            "farming": MarketSector.AGRICULTURE,
-        }
-
-        # Try exact/keyword matches
-        for key, value in sector_mapping.items():
-            if key in sector_lower:
-                return value
-
-        # Try Arabic keywords
-        arabic_sectors = {
-            "بنك": MarketSector.BANKING,
-            "بتروكيماويات": MarketSector.PETROCHEMICALS,
-            "اتصالات": MarketSector.TELECOM,
-            "اسمنت": MarketSector.CEMENT,
-            "تجزئة": MarketSector.RETAIL,
-            "تأمين": MarketSector.INSURANCE,
-            "طاقة": MarketSector.ENERGY,
-            "عقار": MarketSector.REAL_ESTATE,
-            "نقل": MarketSector.TRANSPORTATION,
-            "صحة": MarketSector.HEALTHCARE,
-            "صناعي": MarketSector.INDUSTRIAL,
-            "زراعة": MarketSector.AGRICULTURE,
-        }
-
-        for arabic_key, value in arabic_sectors.items():
-            if arabic_key in sector_str:
-                return value
-
-        return MarketSector.OTHER
-
-    def _parse_market_cap(
-        self, market_cap_str: Optional[str]
-    ) -> Optional[float]:
-        """Parse market cap string to float."""
-        if not market_cap_str:
-            return None
-
-        try:
-            cleaned = market_cap_str.replace(",", "").replace(" ", "")
-
-            multipliers = {
-                "k": 1e3,
-                "m": 1e6,
-                "b": 1e9,
-                "t": 1e12,
+    Parameters
+    ----------
+    page_key : str
+        One of:
+          - 'KSA_TADAWUL'
+          - 'GLOBAL_MARKETS'
+          - 'MUTUAL_FUNDS'
+          - 'COMMODITIES_FX'
+          - 'MY_PORTFOLIO'
+          - 'INSIGHTS_ANALYSIS'
+        (and any others you add to DEFAULT_PAGE_CONFIGS)
+    spreadsheet_id : Optional[str]
+        If None, uses DEFAULT_SPREADSHEET_ID.
+    overrides : Optional[dict]
+        For dynamic tweaks like custom header_row or sheet_name:
+            {
+              "sheet_name": "Custom_Sheet",
+              "header_row": 6,
+              "max_columns": 40
             }
 
-            for suffix, multiplier in multipliers.items():
-                if cleaned.lower().endswith(suffix):
-                    number_part = cleaned[:-1]
-                    if number_part:
-                        return float(number_part) * multiplier
-
-            return float(cleaned)
-
-        except (ValueError, TypeError):
-            return None
-
-    def _parse_boolean(self, value: Optional[str], default: bool) -> bool:
-        """Parse boolean string."""
-        if not value:
-            return default
-
-        value_lower = value.lower()
-
-        true_values = [
-            "true",
-            "yes",
-            "y",
-            "1",
-            "active",
-            "enabled",
-            "include",
-            "نعم",
-            "مفعل",
-            "نشط",
-        ]
-        false_values = [
-            "false",
-            "no",
-            "n",
-            "0",
-            "inactive",
-            "disabled",
-            "exclude",
-            "لا",
-            "غير مفعل",
-            "غير نشط",
-        ]
-
-        if value_lower in true_values:
-            return True
-        if value_lower in false_values:
-            return False
-
-        return default
-
-    def _determine_symbol_type(
-        self, symbol: str, sheet_name: str
-    ) -> SymbolType:
-        """Determine symbol type based on symbol format and sheet name."""
-        symbol_lower = symbol.lower()
-        sheet_lower = sheet_name.lower()
-
-        # Saudi symbols (.SR suffix)
-        if symbol.endswith(".SR") or ".SR" in symbol:
-            return SymbolType.SAUDI
-
-        # Crypto
-        if any(
-            crypto in symbol_lower
-            for crypto in ["btc", "eth", "xrp", "ada", "doge"]
-        ):
-            return SymbolType.CRYPTO
-
-        # ETFs
-        if any(
-            etf in sheet_lower
-            for etf in ["etf", "exchange traded fund"]
-        ):
-            return SymbolType.ETF
-
-        # Bonds
-        if any(
-            bond in sheet_lower
-            for bond in ["bond", "sukuk", "fixed income"]
-        ):
-            return SymbolType.BOND
-
-        # GCC symbols
-        gcc_suffixes = [".KW", ".QA", ".BH", ".AE", ".OM"]
-        if any(suffix in symbol for suffix in gcc_suffixes):
-            return SymbolType.GCC
-
-        return SymbolType.INTERNATIONAL
-
-    def _calculate_data_quality(
-        self, row: List[str], column_indices: Dict[str, int]
-    ) -> float:
-        """Calculate data quality score (0-1)."""
-        required_fields = ["symbol", "name_en", "market_sector"]
-
-        quality_score = 0.0
-
-        for field in required_fields:
-            if field in column_indices:
-                col_idx = column_indices[field]
-                if col_idx < len(row) and row[col_idx]:
-                    quality_score += 0.2
-
-        # Bonus for having market cap
-        if "market_cap" in column_indices:
-            col_idx = column_indices["market_cap"]
-            if col_idx < len(row) and row[col_idx]:
-                quality_score += 0.2
-
-        return min(quality_score, 1.0)
-
-
-# =============================================================================
-# Fallback Service
-# =============================================================================
-
-
-class SymbolsFallbackService:
-    """Fallback service for symbols data."""
-
-    def __init__(
-        self,
-        settings: SymbolsReaderSettings,
-        metrics: SymbolsReaderMetrics,
-    ):
-        self.settings = settings
-        self.metrics = metrics
-        self.logger = setup_symbols_reader_logger()
-
-    async def get_fallback_symbols(self) -> List[SymbolRecord]:
-        """Get fallback symbols."""
-        symbols: List[SymbolRecord] = []
-
-        fallback_list = self.settings.fallback_symbols.split(",")
-
-        for symbol_str in fallback_list:
-            symbol = symbol_str.strip()
-            if symbol:
-                symbols.append(self._create_fallback_symbol(symbol))
-
-        self.metrics.record_symbols_processed(
-            "fallback", len(symbols)
-        )
-
-        self.logger.info(
-            "Fallback symbols loaded", count=len(symbols)
-        )
-
-        return symbols
-
-    def _create_fallback_symbol(self, symbol: str) -> SymbolRecord:
-        """Create SymbolRecord for fallback symbol."""
-        symbol_mapping = {
-            "7201.SR": (
-                "STC",
-                "Saudi Telecom Company",
-                MarketSector.TELECOM,
-            ),
-            "1211.SR": (
-                "Ma'aden",
-                "Saudi Arabian Mining Company",
-                MarketSector.PETROCHEMICALS,
-            ),
-            "2222.SR": (
-                "Aramco",
-                "Saudi Arabian Oil Company",
-                MarketSector.ENERGY,
-            ),
-            "2380.SR": (
-                "PetroRabigh",
-                "Rabigh Refining and Petrochemical Company",
-                MarketSector.PETROCHEMICALS,
-            ),
-            "4030.SR": (
-                "Bahri",
-                "National Shipping Company of Saudi Arabia",
-                MarketSector.TRANSPORTATION,
-            ),
-            "4200.SR": (
-                "Al-Dawaa",
-                "Al-Dawaa Medical Services Company",
-                MarketSector.HEALTHCARE,
-            ),
-            "1120.SR": (
-                "Al Rajhi Bank",
-                "Al Rajhi Banking and Investment Corporation",
-                MarketSector.BANKING,
-            ),
-            "1150.SR": (
-                "Alinma Bank",
-                "Alinma Bank",
-                MarketSector.BANKING,
-            ),
-            "2010.SR": (
-                "SABIC",
-                "Saudi Basic Industries Corporation",
-                MarketSector.PETROCHEMICALS,
-            ),
-            "2020.SR": (
-                "SABIC Agri-Nutrients",
-                "SABIC Agri-Nutrients Company",
-                MarketSector.PETROCHEMICALS,
-            ),
+    Returns
+    -------
+    dict:
+        {
+          "all": [...],
+          "ksa": [...],
+          "global": [...]
         }
 
-        symbol_upper = symbol.upper()
-
-        if symbol_upper in symbol_mapping:
-            short_name, company_name, sector = symbol_mapping[
-                symbol_upper
-            ]
-            name_en = f"{short_name} ({symbol_upper})"
-        else:
-            name_en = symbol_upper
-            company_name = symbol_upper
-            sector = MarketSector.OTHER
-
-        return SymbolRecord(
-            symbol=symbol_upper,
-            name_en=name_en,
-            company_name=company_name,
-            market_sector=sector,
-            symbol_type=SymbolType.SAUDI
-            if symbol_upper.endswith(".SR")
-            else SymbolType.INTERNATIONAL,
-            currency="SAR"
-            if symbol_upper.endswith(".SR")
-            else "USD",
-            country="SA"
-            if symbol_upper.endswith(".SR")
-            else "US",
-            is_active=True,
-            include_in_ranking=True,
-            data_source="fallback",
-            data_quality=0.5,
+    EXAMPLE:
+        syms = get_page_symbols("KSA_TADAWUL", spreadsheet_id="...")
+        # syms["ksa"]   -> all .SR to send to Tadawul/Argaam engine
+        # syms["global"]-> should be empty for this page (normally)
+    """
+    key = page_key.upper().strip()
+    base_cfg = DEFAULT_PAGE_CONFIGS.get(key)
+    if not base_cfg:
+        raise ValueError(
+            f"Unknown page_key '{page_key}'. "
+            f"Valid keys: {', '.join(DEFAULT_PAGE_CONFIGS.keys())}"
         )
 
+    cfg = PageConfig(
+        key=base_cfg.key,
+        sheet_name=base_cfg.sheet_name,
+        header_row=base_cfg.header_row,
+        max_columns=base_cfg.max_columns,
+    )
 
-# =============================================================================
-# Main Service
-# =============================================================================
+    if overrides:
+        if "sheet_name" in overrides:
+            cfg.sheet_name = str(overrides["sheet_name"])
+        if "header_row" in overrides:
+            cfg.header_row = int(overrides["header_row"])
+        if "max_columns" in overrides:
+            cfg.max_columns = int(overrides["max_columns"])
+
+    return get_symbols_from_sheet(
+        spreadsheet_id=spreadsheet_id,
+        sheet_name=cfg.sheet_name,
+        header_row=cfg.header_row,
+        max_columns=cfg.max_columns,
+    )
 
 
-class SymbolsReaderService:
-    """Main symbols reader service."""
+def get_all_pages_symbols(
+    page_keys: Optional[List[str]] = None,
+    spreadsheet_id: Optional[str] = None,
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Convenience helper: read symbols for multiple pages at once.
 
-    def __init__(self, settings: SymbolsReaderSettings):
-        self.settings = settings
-        self.metrics: Optional[SymbolsReaderMetrics] = (
-            SymbolsReaderMetrics()
-            if settings.enable_metrics
-            else None
-        )
-        self.logger = setup_symbols_reader_logger()
+    Parameters
+    ----------
+    page_keys : Optional[List[str]]
+        If None, uses all keys from DEFAULT_PAGE_CONFIGS.
+        Otherwise a list like ["KSA_TADAWUL","GLOBAL_MARKETS",...].
+    spreadsheet_id : Optional[str]
+        If None, uses DEFAULT_SPREADSHEET_ID.
 
-        # Initialize components (only if metrics are enabled)
-        self.cache_manager: Optional[SymbolsCacheManager] = (
-            SymbolsCacheManager(settings, self.metrics)
-            if self.metrics
-            else None
-        )
-        self.google_sheets_service: Optional[GoogleSheetsService] = (
-            GoogleSheetsService(settings, self.metrics)
-            if self.metrics
-            else None
-        )
-        self.data_parser: Optional[SymbolsDataParser] = (
-            SymbolsDataParser(self.metrics) if self.metrics else None
-        )
-        self.fallback_service: Optional[SymbolsFallbackService] = (
-            SymbolsFallbackService(settings, self.metrics)
-            if self.metrics
-            else None
-        )
+    Returns
+    -------
+    dict:
+        {
+          "KSA_TADAWUL": { "all": [...], "ksa": [...], "global": [...] },
+          "GLOBAL_MARKETS": { ... },
+          ...
+        }
+    """
+    sid = _resolve_spreadsheet_id(spreadsheet_id)
+    keys = page_keys or list(DEFAULT_PAGE_CONFIGS.keys())
 
-        # Statistics
-        self.start_time = datetime.now(timezone.utc)
-        self.total_requests = 0
-        self.total_symbols = 0
-        self.successful_fetches = 0
-        self.failed_fetches = 0
-
-    async def get_symbols(
-        self,
-        sheet_names: Optional[List[str]] = None,
-        use_cache: bool = True,
-        refresh_cache: bool = False,
-        limit: Optional[int] = None,
-    ) -> SymbolsResponse:
-        """Get symbols from multiple sources with fallback."""
-        start_time = datetime.now(timezone.utc)
-        self.total_requests += 1
-
+    result: Dict[str, Dict[str, List[str]]] = {}
+    for key in keys:
         try:
-            if not sheet_names:
-                sheet_names = [self.settings.default_tab_name]
-
-            cache_key = self._generate_cache_key(sheet_names)
-
-            # Cache lookup
-            if (
-                use_cache
-                and not refresh_cache
-                and self.cache_manager is not None
-            ):
-                cached_data = await self.cache_manager.get(cache_key)
-                if cached_data:
-                    processing_time = (
-                        datetime.now(timezone.utc) - start_time
-                    ).total_seconds()
-
-                    self.logger.info(
-                        "Cache hit",
-                        sheet_names=sheet_names,
-                        symbols_count=len(
-                            cached_data.get("symbols", [])
-                        ),
-                    )
-
-                    return SymbolsResponse(
-                        success=True,
-                        source="cache",
-                        count=len(cached_data.get("symbols", [])),
-                        symbols=cached_data.get("symbols", []),
-                        metadata={
-                            "cache_hit": True,
-                            "processing_time": processing_time,
-                        },
-                    )
-
-            # Fetch from Google Sheets
-            symbols: List[SymbolRecord] = []
-            source = "google_sheets"
-
-            if (
-                self.google_sheets_service is not None
-                and self.data_parser is not None
-            ):
-                symbols = await self._fetch_from_google_sheets(
-                    sheet_names
-                )
-
-            # If Google Sheets fails / disabled and fallback enabled
-            if (not symbols) and self.settings.enable_fallback:
-                source = "fallback"
-                if self.fallback_service is not None:
-                    self.logger.warning(
-                        "Google Sheets fetch failed or disabled, using fallback"
-                    )
-                    symbols = (
-                        await self.fallback_service.get_fallback_symbols()
-                    )
-
-            # Apply limit
-            if limit and symbols:
-                symbols = symbols[:limit]
-
-            symbols_dict = [s.to_dict() for s in symbols]
-
-            # Cache store
-            if self.cache_manager is not None and symbols:
-                cache_data = {
-                    "symbols": symbols_dict,
-                    "timestamp": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
-                }
-                await self.cache_manager.set(cache_key, cache_data)
-
-            processing_time = (
-                datetime.now(timezone.utc) - start_time
-            ).total_seconds()
-
-            # Statistics
-            self.total_symbols += len(symbols)
-            if symbols:
-                self.successful_fetches += 1
-            else:
-                self.failed_fetches += 1
-
-            self.logger.info(
-                "Symbols fetched",
-                source=source,
-                count=len(symbols),
-                processing_time=processing_time,
+            result[key] = get_page_symbols(
+                page_key=key,
+                spreadsheet_id=sid,
             )
-
-            return SymbolsResponse(
-                success=bool(symbols),
-                source=source,
-                count=len(symbols),
-                symbols=symbols_dict,
-                metadata={
-                    "cache_hit": False,
-                    "processing_time": processing_time,
-                    "sheet_names": sheet_names,
-                },
+        except Exception as exc:
+            logger.error(
+                "[symbols_reader] Error reading symbols for page %s: %s",
+                key,
+                exc,
             )
+            result[key] = {"all": [], "ksa": [], "global": []}
 
-        except Exception as e:
-            processing_time = (
-                datetime.now(timezone.utc) - start_time
-            ).total_seconds()
-            self.failed_fetches += 1
-
-            self.logger.error(
-                "Symbols fetch failed",
-                error=str(e),
-                processing_time=processing_time,
-            )
-
-            # Fallback on error
-            if (
-                self.settings.enable_fallback
-                and self.fallback_service is not None
-            ):
-                fallback_symbols = (
-                    await self.fallback_service.get_fallback_symbols()
-                )
-                fallback_dict = [s.to_dict() for s in fallback_symbols]
-
-                return SymbolsResponse(
-                    success=True,
-                    source="fallback_error",
-                    count=len(fallback_dict),
-                    symbols=fallback_dict,
-                    metadata={
-                        "processing_time": processing_time,
-                        "error": str(e),
-                    },
-                    warnings=["Using fallback symbols due to error"],
-                )
-
-            return SymbolsResponse(
-                success=False,
-                source="error",
-                count=0,
-                symbols=[],
-                metadata={"processing_time": processing_time},
-                error=str(e),
-            )
-
-    async def _fetch_from_google_sheets(
-        self, sheet_names: List[str]
-    ) -> List[SymbolRecord]:
-        """Fetch symbols from Google Sheets."""
-        if (
-            self.google_sheets_service is None
-            or self.data_parser is None
-        ):
-            return []
-
-        all_symbols: List[SymbolRecord] = []
-
-        for sheet_name in sheet_names:
-            try:
-                data = await self.google_sheets_service.get_worksheet_data(
-                    sheet_name
-                )
-                if not data:
-                    continue
-
-                symbols = self.data_parser.parse_google_sheets_data(
-                    data, sheet_name
-                )
-                all_symbols.extend(symbols)
-
-            except Exception as e:
-                self.logger.error(
-                    "Sheet processing failed",
-                    sheet_name=sheet_name,
-                    error=str(e),
-                )
-
-        return all_symbols
-
-    def _generate_cache_key(self, sheet_names: List[str]) -> str:
-        """Generate cache key from sheet names."""
-        sorted_names = sorted(sheet_names)
-        key_string = "_".join(sorted_names)
-        key_hash = hashlib.md5(key_string.encode()).hexdigest()[:16]
-        return f"symbols_{key_hash}"
-
-    async def get_cache_info(self) -> SymbolsCacheInfo:
-        """Get cache information."""
-        if self.cache_manager is not None:
-            return await self.cache_manager.get_info()
-
-        return SymbolsCacheInfo(
-            cache_enabled=False,
-            cache_backend="none",
-            cache_size=0,
-            cache_hits=0,
-            cache_misses=0,
-            cache_hit_ratio=0.0,
-            cache_ttl_seconds=0,
-            memory_usage_mb=0.0,
-        )
-
-    async def clear_cache(self):
-        """Clear cache."""
-        if self.cache_manager is not None:
-            await self.cache_manager.clear()
-
-    async def get_health(self) -> Dict[str, Any]:
-        """Get service health information."""
-        uptime = (
-            datetime.now(timezone.utc) - self.start_time
-        ).total_seconds()
-
-        health_status: Dict[str, Any] = {
-            "status": "healthy",
-            "version": "4.1.0",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "uptime_seconds": round(uptime, 2),
-            "uptime_hours": round(uptime / 3600, 2),
-            "total_requests": self.total_requests,
-            "total_symbols": self.total_symbols,
-            "successful_fetches": self.successful_fetches,
-            "failed_fetches": self.failed_fetches,
-            "success_rate": round(
-                self.successful_fetches / max(self.total_requests, 1),
-                3,
-            ),
-        }
-
-        if (
-            self.google_sheets_service
-            and self.google_sheets_service.client
-        ):
-            health_status["google_sheets"] = "connected"
-        else:
-            health_status["google_sheets"] = "disconnected"
-
-        if self.cache_manager is not None:
-            cache_info = await self.get_cache_info()
-            health_status["cache"] = cache_info.model_dump()
-
-        if self.failed_fetches > self.successful_fetches:
-            health_status["status"] = "degraded"
-        elif self.failed_fetches == self.total_requests and self.total_requests > 0:
-            health_status["status"] = "unhealthy"
-
-        return health_status
-
-
-# =============================================================================
-# Application State Management
-# =============================================================================
-
-
-class SymbolsReaderAppState:
-    """Application state manager for symbols reader."""
-
-    def __init__(self):
-        self.settings = SymbolsReaderSettings()
-        self.service: Optional[SymbolsReaderService] = None
-        self.initialized = False
-
-    async def initialize(self):
-        """Initialize symbols reader application."""
-        if self.initialized:
-            return
-
-        self.service = SymbolsReaderService(self.settings)
-        self.initialized = True
-
-        logger = setup_symbols_reader_logger()
-        logger.info(
-            "SymbolsReader initialized",
-            version="4.1.0",
-            spreadsheet_id=self.settings.spreadsheet_id[:8] + "..."
-            if self.settings.spreadsheet_id
-            else "None",
-            cache_enabled=self.settings.cache_enabled,
-        )
-
-    async def shutdown(self):
-        """Shutdown symbols reader application."""
-        # No heavy cleanup currently
-        self.initialized = False
-
-
-# Global app state (aligned with routes_argaam.py style)
-symbols_app_state = SymbolsReaderAppState()
-
-
-async def get_symbols_reader_service() -> SymbolsReaderService:
-    """FastAPI dependency to get an initialized symbols reader service."""
-    if not symbols_app_state.initialized:
-        await symbols_app_state.initialize()
-
-    if not symbols_app_state.service:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Symbols reader service not initialized",
-        )
-
-    return symbols_app_state.service
-
-
-# =============================================================================
-# FastAPI Router
-# =============================================================================
-
-router = APIRouter(
-    prefix="/api/v1/symbols",
-    tags=["Symbols Reader"],
-    responses={
-        401: {"description": "Unauthorized"},
-        403: {"description": "Forbidden"},
-        429: {"description": "Too Many Requests"},
-        500: {"description": "Internal Server Error"},
-    },
-)
-
-
-@router.on_event("startup")
-async def symbols_startup_event():
-    """Startup event handler for symbols reader."""
-    await symbols_app_state.initialize()
-    logger = setup_symbols_reader_logger()
-    logger.info(
-        "SymbolsReader routes initialized",
-        version="4.1.0",
-        spreadsheet_id=symbols_app_state.settings.spreadsheet_id[:8]
-        + "..."
-        if symbols_app_state.settings.spreadsheet_id
-        else "None",
-        cache_enabled=symbols_app_state.settings.cache_enabled,
-    )
-
-
-@router.on_event("shutdown")
-async def symbols_shutdown_event():
-    """Shutdown event handler for symbols reader."""
-    await symbols_app_state.shutdown()
-    logger = setup_symbols_reader_logger()
-    logger.info("SymbolsReader routes shutdown complete")
-
-
-@router.get(
-    "/",
-    response_model=SymbolsResponse,
-    summary="Get Symbols",
-)
-async def api_get_symbols(
-    sheet_names: Optional[str] = Query(
-        None,
-        description=(
-            "Comma-separated sheet names "
-            '(default: "Market_Leaders")'
-        ),
-    ),
-    use_cache: bool = Query(
-        True, description="Use cached results if available"
-    ),
-    refresh_cache: bool = Query(
-        False, description="Force refresh and ignore cache"
-    ),
-    limit: Optional[int] = Query(
-        None,
-        ge=1,
-        le=1000,
-        description="Limit number of symbols returned",
-    ),
-    service: SymbolsReaderService = Depends(
-        get_symbols_reader_service
-    ),
-):
-    """
-    Get symbols from Google Sheets / fallback.
-
-    - **sheet_names**: Comma-separated list of sheet names.
-    - **use_cache**: Use cache if available.
-    - **refresh_cache**: Force refresh and bypass cache.
-    - **limit**: Maximum number of symbols to return.
-    """
-    sheets_list: Optional[List[str]] = None
-    if sheet_names:
-        sheets_list = [
-            s.strip()
-            for s in sheet_names.split(",")
-            if s.strip()
-        ]
-
-    return await service.get_symbols(
-        sheet_names=sheets_list,
-        use_cache=use_cache,
-        refresh_cache=refresh_cache,
-        limit=limit,
-    )
-
-
-@router.get(
-    "/health",
-    summary="Symbols Reader Health",
-)
-async def symbols_health_check(
-    service: SymbolsReaderService = Depends(
-        get_symbols_reader_service
-    ),
-):
-    """Get symbols reader health status."""
-    return await service.get_health()
-
-
-@router.get(
-    "/cache/info",
-    response_model=SymbolsCacheInfo,
-    summary="Cache Information",
-)
-async def api_get_cache_info(
-    service: SymbolsReaderService = Depends(
-        get_symbols_reader_service
-    ),
-):
-    """Get cache information and statistics."""
-    return await service.get_cache_info()
-
-
-@router.delete(
-    "/cache/clear",
-    summary="Clear Cache",
-)
-async def api_clear_cache(
-    service: SymbolsReaderService = Depends(
-        get_symbols_reader_service
-    ),
-):
-    """Clear symbols cache (memory + Redis)."""
-    await service.clear_cache()
-    logger = setup_symbols_reader_logger()
-    logger.info("Symbols cache cleared via API")
-
-    return {
-        "status": "success",
-        "message": "Cache cleared successfully",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@router.get(
-    "/stats",
-    summary="Symbols Reader Statistics",
-)
-async def api_get_stats(
-    service: SymbolsReaderService = Depends(
-        get_symbols_reader_service
-    ),
-):
-    """Get service statistics and metrics."""
-    uptime = (
-        datetime.now(timezone.utc) - service.start_time
-    ).total_seconds()
-
-    cache_info = await service.get_cache_info()
-
-    return {
-        "uptime_seconds": round(uptime, 2),
-        "uptime_hours": round(uptime / 3600, 2),
-        "total_requests": service.total_requests,
-        "total_symbols": service.total_symbols,
-        "successful_fetches": service.successful_fetches,
-        "failed_fetches": service.failed_fetches,
-        "success_rate": round(
-            service.successful_fetches
-            / max(service.total_requests, 1),
-            3,
-        ),
-        "cache_info": cache_info.model_dump(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@router.get(
-    "/root",
-    summary="Symbols Reader Root",
-)
-async def symbols_root():
-    """Root endpoint for Symbols Reader API."""
-    return {
-        "name": "Symbols Reader API",
-        "version": "4.1.0",
-        "description": "High-performance Google Sheets symbols loader with caching and fallback",
-        "status": "operational",
-        "endpoints": {
-            "root": "/api/v1/symbols/root",
-            "symbols": "/api/v1/symbols/",
-            "health": "/api/v1/symbols/health",
-            "cache_info": "/api/v1/symbols/cache/info",
-            "cache_clear": "/api/v1/symbols/cache/clear",
-            "stats": "/api/v1/symbols/stats",
-        },
-    }
-
-
-def get_symbols_router() -> APIRouter:
-    """Export router (aligned with Argaam router pattern)."""
-    return router
-
-
-# =============================================================================
-# Direct Execution (for testing)
-# =============================================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    from fastapi import FastAPI
-
-    app = FastAPI(
-        title="Symbols Reader Test API",
-        version="4.1.0",
-    )
-    app.include_router(router)
-
-    uvicorn.run(app, host="127.0.0.1", port=8002)
+    return result
