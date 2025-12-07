@@ -5,11 +5,11 @@ TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES
 ================================================
 Purpose:
 - Expose "advanced analysis" and "opportunity ranking" endpoints
-  on top of the unified DataEngine (core.data_engine_v2).
+  on top of the unified DataEngine (core.data_engine_v2 or core.data_engine).
 - Designed to be Google Sheets–friendly and API-friendly.
 
 Key ideas:
-- Use DataEngine v2 if available, else fall back to v1, else stub.
+- Use DataEngine v2 if available, else fall back to v1 (module-level), else stub.
 - Take a list of tickers, fetch enriched quotes, and build a
   scoreboard sorted by Opportunity Score.
 - Compute a simple risk bucket based on Opportunity & Data Quality.
@@ -223,7 +223,9 @@ class AdvancedScoreboardResponse(BaseModel):
     generated_at_utc: str = Field(
         ..., description="ISO datetime (UTC) when the scoreboard was generated"
     )
-    engine_mode: str = Field(..., description="Which engine mode was used (v2/v1_module/stub)")
+    engine_mode: str = Field(
+        ..., description="Which engine mode was used (v2/v1_module/stub)"
+    )
     engine_is_stub: bool = Field(
         ..., description="True if a stub DataEngine was used (no real data)."
     )
@@ -316,8 +318,8 @@ def _extract_data_quality_score(data: Dict[str, Any]) -> Optional[float]:
 
     mapping = {
         "EXCELLENT": 90.0,
-        "OK": 80.0,
-        "GOOD": 75.0,
+        "GOOD": 80.0,
+        "OK": 75.0,
         "FAIR": 55.0,
         "PARTIAL": 50.0,
         "STALE": 40.0,
@@ -372,11 +374,24 @@ async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
     """
     For each ticker, call the engine and map it into AdvancedItem.
     Uses batch engine call when available for better performance.
+
+    - If the engine hard-fails, returns [] so that:
+        • /v1/advanced/scoreboard -> 502 with a clear message
+        • /v1/advanced/sheet-rows -> headers + 0 rows (safe for Sheets)
     """
     if not tickers:
         return []
 
-    unified_quotes = await _engine_get_quotes(tickers)
+    try:
+        unified_quotes = await _engine_get_quotes(tickers)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "AdvancedAnalysis: Engine error while fetching tickers=%s: %s",
+            tickers,
+            exc,
+        )
+        return []
+
     results: List[AdvancedItem] = []
 
     for raw_symbol, enriched in zip(tickers, unified_quotes):
