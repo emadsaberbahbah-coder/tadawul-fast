@@ -2,7 +2,7 @@
 main.py
 ===========================================================
 Tadawul Fast Bridge - Main Application
-Version: 4.0.x (Unified Engine + Google Sheets + KSA-safe)
+Version: 4.1.x (Unified Engine + Google Sheets + KSA-safe)
 
 FastAPI backend for:
     • Enriched Quotes       (v1/enriched)
@@ -69,7 +69,7 @@ class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.0.0")
+    app_version: str = os.getenv("APP_VERSION", "4.1.0")
 
 
 # Prefer Settings instance from env.py; otherwise use fallback dataclass
@@ -110,8 +110,12 @@ def _get_bool(name: str, default: bool = False) -> bool:
 
 
 # Core app identity & tokens
-APP_NAME: str = getattr(settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge"))
-APP_VERSION: str = getattr(settings, "app_version", _get_env_attr("APP_VERSION", "4.0.0"))
+APP_NAME: str = getattr(
+    settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
+)
+APP_VERSION: str = getattr(
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.1.0")
+)
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
 BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "")
@@ -197,7 +201,18 @@ except Exception as _advanced_exc:  # pragma: no cover - defensive
     _ADVANCED_ANALYSIS_AVAILABLE = False
 
 # KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD
-import routes_argaam  # type: ignore
+try:  # pragma: no cover - optional, but expected in your project
+    import routes_argaam  # type: ignore
+
+    _ARGAAM_AVAILABLE = True
+except Exception as _argaam_exc:  # pragma: no cover - defensive
+    logging.error(
+        "routes_argaam router could not be imported: %s. "
+        "The /v1/argaam* endpoints will be disabled for this deploy.",
+        _argaam_exc,
+    )
+    routes_argaam = None  # type: ignore
+    _ARGAAM_AVAILABLE = False
 
 # Legacy service abstraction (global + KSA via unified engine)
 from legacy_service import build_legacy_sheet_payload, get_legacy_quotes
@@ -384,10 +399,16 @@ else:
     )
 
 # KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD from here
-app.include_router(
-    routes_argaam.router,
-    dependencies=[Depends(require_app_token)],
-)
+if _ARGAAM_AVAILABLE and routes_argaam is not None:
+    app.include_router(
+        routes_argaam.router,
+        dependencies=[Depends(require_app_token)],
+    )
+else:
+    logger.warning(
+        "KSA / Argaam router is not available – "
+        "skipping /v1/argaam* endpoints for this deploy."
+    )
 
 # ------------------------------------------------------------
 # Root / Health / Status
@@ -525,7 +546,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
             "/v1/advanced/sheet-rows" if _ADVANCED_ANALYSIS_AVAILABLE else None
         ),
         "legacy": "/v1/legacy/sheet-rows",
-        "ksa_argaam": "/v1/argaam/sheet-rows",
+        "ksa_argaam": "/v1/argaam/sheet-rows" if _ARGAAM_AVAILABLE else None,
     }
 
     providers_meta = _get_providers_meta()
@@ -546,6 +567,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "ksa_argaam_gateway": {
             "configured": bool(ARGAAM_GATEWAY_URL),
             "gateway_url_prefix": (ARGAAM_GATEWAY_URL or "")[:80] or None,
+            "router_available": _ARGAAM_AVAILABLE,
         },
         "notes": [
             "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
