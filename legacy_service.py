@@ -1,7 +1,7 @@
 """
 legacy_service.py
 ------------------------------------------------------------
-LEGACY SERVICE BRIDGE – v3.0
+LEGACY SERVICE BRIDGE – v3.1
 
 GOAL
 - Provide a stable "legacy" layer on top of the new unified data engine,
@@ -22,6 +22,7 @@ KEY FEATURES
 
 ALIGNMENT
 - Engine usage & fallbacks aligned with:
+    • core.data_engine_v2.DataEngine
     • routes/enriched_quote.py
     • routes/ai_analysis.py
     • routes/advanced_analysis.py
@@ -216,6 +217,8 @@ class LegacyQuote:
     currency: Optional[str] = None
     sector: Optional[str] = None
     industry: Optional[str] = None
+    sub_sector: Optional[str] = None
+    listing_date: Optional[str] = None
 
     # Prices & change
     price: Optional[float] = None
@@ -247,6 +250,31 @@ class LegacyQuote:
     roa: Optional[float] = None
     profit_margin: Optional[float] = None
     debt_to_equity: Optional[float] = None
+    revenue_growth: Optional[float] = None
+    net_income_growth: Optional[float] = None
+    ebitda_margin: Optional[float] = None
+    operating_margin: Optional[float] = None
+
+    # Risk / valuation extras (optional, but aligned with v2 engine)
+    beta: Optional[float] = None
+    volatility_30d: Optional[float] = None
+    volatility_30d_percent: Optional[float] = None
+    ev_to_ebitda: Optional[float] = None
+    price_to_sales: Optional[float] = None
+    price_to_cash_flow: Optional[float] = None
+    peg_ratio: Optional[float] = None
+
+    # AI-style scoring & technicals
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
+    opportunity_score: Optional[float] = None
+    recommendation: Optional[str] = None
+    valuation_label: Optional[str] = None
+    rsi_14: Optional[float] = None
+    macd: Optional[float] = None
+    ma_20d: Optional[float] = None
+    ma_50d: Optional[float] = None
 
     # Data quality & meta
     data_quality: str = "MISSING"
@@ -341,16 +369,16 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
             error="No quote data returned from engine",
         )
 
-    symbol = str(
-        _g(data, "symbol", "ticker", default="").upper()
-    )
+    symbol = str(_g(data, "symbol", "ticker", default="").upper())
 
     name = _g(data, "name", "company_name", "longName", "shortName")
     exchange = _g(data, "exchange", "market", "primary_exchange")
     market_region = _g(data, "market_region", "region", "country")
     currency = _g(data, "currency")
     sector = _g(data, "sector")
-    industry = _g(data, "industry", "sub_sector", "industryGroup")
+    industry = _g(data, "industry", "industryGroup")
+    sub_sector = _g(data, "sub_sector", "industry_group")
+    listing_date = _g(data, "listing_date")
 
     price = _safe_float(
         _g(data, "price", "last_price", "close", "regularMarketPrice")
@@ -381,7 +409,12 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
         _g(data, "fifty_two_week_low", "low_52w", "yearLow")
     )
 
-    pos_52w = _compute_52w_position_pct(price, low_52w, high_52w)
+    # Prefer engine-computed 52W position if present, else compute
+    pos_52w = _safe_float(
+        _g(data, "position_52w_percent", "fifty_two_week_position")
+    )
+    if pos_52w is None:
+        pos_52w = _compute_52w_position_pct(price, low_52w, high_52w)
 
     eps = _safe_float(_g(data, "eps_ttm", "eps"))
     pe_ratio = _safe_float(_g(data, "pe_ttm", "pe_ratio", "pe"))
@@ -397,6 +430,47 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
     debt_to_equity = _safe_float(
         _g(data, "debt_to_equity", "debtToEquity")
     )
+
+    revenue_growth = _safe_float(
+        _g(data, "revenue_growth_percent", "revenueGrowth")
+    )
+    net_income_growth = _safe_float(
+        _g(data, "net_income_growth_percent", "netIncomeGrowth")
+    )
+    ebitda_margin = _safe_float(
+        _g(data, "ebitda_margin_percent", "ebitdaMargin")
+    )
+    operating_margin = _safe_float(
+        _g(data, "operating_margin_percent", "operatingMargin")
+    )
+
+    beta = _safe_float(_g(data, "beta"))
+    volatility_30d = _safe_float(
+        _g(data, "volatility_30d", "volatility_30d_percent")
+    )
+    volatility_30d_percent = _safe_float(
+        _g(data, "volatility_30d_percent", "volatility_30d")
+    )
+    ev_to_ebitda = _safe_float(_g(data, "ev_to_ebitda", "evToEbitda"))
+    price_to_sales = _safe_float(
+        _g(data, "price_to_sales", "priceToSales")
+    )
+    price_to_cash_flow = _safe_float(
+        _g(data, "price_to_cash_flow", "priceToCashFlow")
+    )
+    peg_ratio = _safe_float(_g(data, "peg_ratio", "pegRatio"))
+
+    value_score = _safe_float(_g(data, "value_score"))
+    quality_score = _safe_float(_g(data, "quality_score"))
+    momentum_score = _safe_float(_g(data, "momentum_score"))
+    opportunity_score = _safe_float(_g(data, "opportunity_score"))
+    recommendation = _g(data, "recommendation")
+    valuation_label = _g(data, "valuation_label")
+
+    rsi_14 = _safe_float(_g(data, "rsi_14"))
+    macd = _safe_float(_g(data, "macd"))
+    ma_20d = _safe_float(_g(data, "ma_20d"))
+    ma_50d = _safe_float(_g(data, "ma_50d"))
 
     data_quality = str(
         _g(data, "data_quality", "data_quality_level", default="MISSING")
@@ -441,6 +515,8 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
         currency=currency,
         sector=sector,
         industry=industry,
+        sub_sector=sub_sector,
+        listing_date=listing_date,
         price=price,
         previous_close=prev_close,
         open=open_price,
@@ -464,6 +540,27 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
         roa=roa,
         profit_margin=profit_margin,
         debt_to_equity=debt_to_equity,
+        revenue_growth=revenue_growth,
+        net_income_growth=net_income_growth,
+        ebitda_margin=ebitda_margin,
+        operating_margin=operating_margin,
+        beta=beta,
+        volatility_30d=volatility_30d,
+        volatility_30d_percent=volatility_30d_percent,
+        ev_to_ebitda=ev_to_ebitda,
+        price_to_sales=price_to_sales,
+        price_to_cash_flow=price_to_cash_flow,
+        peg_ratio=peg_ratio,
+        value_score=value_score,
+        quality_score=quality_score,
+        momentum_score=momentum_score,
+        opportunity_score=opportunity_score,
+        recommendation=recommendation,
+        valuation_label=valuation_label,
+        rsi_14=rsi_14,
+        macd=macd,
+        ma_20d=ma_20d,
+        ma_50d=ma_50d,
         data_quality=data_quality,
         data_source=data_source,
         last_updated_utc=last_utc,
@@ -485,6 +582,8 @@ def _legacy_to_dict(lq: LegacyQuote) -> Dict[str, Any]:
         "currency": lq.currency,
         "sector": lq.sector,
         "industry": lq.industry,
+        "sub_sector": lq.sub_sector,
+        "listing_date": lq.listing_date,
         "price": lq.price,
         "previous_close": lq.previous_close,
         "open": lq.open,
@@ -508,6 +607,27 @@ def _legacy_to_dict(lq: LegacyQuote) -> Dict[str, Any]:
         "roa": lq.roa,
         "profit_margin": lq.profit_margin,
         "debt_to_equity": lq.debt_to_equity,
+        "revenue_growth": lq.revenue_growth,
+        "net_income_growth": lq.net_income_growth,
+        "ebitda_margin": lq.ebitda_margin,
+        "operating_margin": lq.operating_margin,
+        "beta": lq.beta,
+        "volatility_30d": lq.volatility_30d,
+        "volatility_30d_percent": lq.volatility_30d_percent,
+        "ev_to_ebitda": lq.ev_to_ebitda,
+        "price_to_sales": lq.price_to_sales,
+        "price_to_cash_flow": lq.price_to_cash_flow,
+        "peg_ratio": lq.peg_ratio,
+        "value_score": lq.value_score,
+        "quality_score": lq.quality_score,
+        "momentum_score": lq.momentum_score,
+        "opportunity_score": lq.opportunity_score,
+        "recommendation": lq.recommendation,
+        "valuation_label": lq.valuation_label,
+        "rsi_14": lq.rsi_14,
+        "macd": lq.macd,
+        "ma_20d": lq.ma_20d,
+        "ma_50d": lq.ma_50d,
         "data_quality": lq.data_quality,
         "data_source": lq.data_source,
         "last_updated_utc": (
@@ -523,13 +643,13 @@ def _legacy_to_dict(lq: LegacyQuote) -> Dict[str, Any]:
 def _build_sheet_headers() -> List[str]:
     """
     A compact legacy header set for Google Sheets.
-    This is simpler than the 59-column advanced templates, and mirrors
-    the legacy quote fields you were using early on.
 
     SAFE for:
       - Legacy Sheets tabs
       - Ad-hoc test tabs
-    (9-page main dashboard should use /v1/enriched/sheet-rows instead.)
+
+    The 9-page main dashboard should use the enriched/advanced sheet-rows
+    endpoints instead; this is only for legacy-style support.
     """
     return [
         "Symbol",
@@ -710,7 +830,8 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "note": (
                 "Legacy format built on UnifiedQuote-style engine "
-                f"(mode={_ENGINE_MODE}; KSA via Tadawul/Argaam, no direct EODHD here)."
+                f"(mode={_ENGINE_MODE}; KSA via Tadawul/Argaam providers, "
+                "no direct EODHD calls here)."
             ),
         },
     }
@@ -741,8 +862,8 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
         - any script that needs simple headers/rows.
 
     NOTE
-    - 9-page Ultimate Dashboard should prefer /v1/enriched/sheet-rows and
-      /v1/analysis/sheet-rows; this is mainly for legacy/test tabs.
+    - 9-page Ultimate Dashboard should prefer enriched / analysis sheet-rows
+      endpoints; this is mainly for legacy/test tabs.
     """
     legacy_payload = await get_legacy_quotes(tickers)
     quotes = legacy_payload.get("quotes", [])
@@ -762,6 +883,8 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
             currency=q.get("currency"),
             sector=q.get("sector"),
             industry=q.get("industry"),
+            sub_sector=q.get("sub_sector"),
+            listing_date=q.get("listing_date"),
             price=q.get("price"),
             previous_close=q.get("previous_close"),
             open=q.get("open"),
@@ -785,6 +908,27 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
             roa=q.get("roa"),
             profit_margin=q.get("profit_margin"),
             debt_to_equity=q.get("debt_to_equity"),
+            revenue_growth=q.get("revenue_growth"),
+            net_income_growth=q.get("net_income_growth"),
+            ebitda_margin=q.get("ebitda_margin"),
+            operating_margin=q.get("operating_margin"),
+            beta=q.get("beta"),
+            volatility_30d=q.get("volatility_30d"),
+            volatility_30d_percent=q.get("volatility_30d_percent"),
+            ev_to_ebitda=q.get("ev_to_ebitda"),
+            price_to_sales=q.get("price_to_sales"),
+            price_to_cash_flow=q.get("price_to_cash_flow"),
+            peg_ratio=q.get("peg_ratio"),
+            value_score=q.get("value_score"),
+            quality_score=q.get("quality_score"),
+            momentum_score=q.get("momentum_score"),
+            opportunity_score=q.get("opportunity_score"),
+            recommendation=q.get("recommendation"),
+            valuation_label=q.get("valuation_label"),
+            rsi_14=q.get("rsi_14"),
+            macd=q.get("macd"),
+            ma_20d=q.get("ma_20d"),
+            ma_50d=q.get("ma_50d"),
             data_quality=q.get("data_quality", "MISSING"),
             data_source=q.get("data_source"),
             last_updated_utc=None,
@@ -813,3 +957,10 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
         "rows": rows,
         "meta": meta,
     }
+
+
+__all__ = [
+    "LegacyQuote",
+    "get_legacy_quotes",
+    "build_legacy_sheet_payload",
+]
