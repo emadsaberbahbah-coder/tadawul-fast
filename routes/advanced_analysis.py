@@ -52,41 +52,62 @@ except Exception:
 # =============================================================================
 
 _ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
-_ENGINE_IS_STUB: bool = False
+_ENGINE_IS_STUB: bool = True
 _engine: Any = None
 _data_engine_module: Any = None
 
-try:
-    # Preferred: new v2 engine (class-based)
+# Preferred: new v2 engine (class-based)
+try:  # pragma: no cover - defensive
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
+    # Build kwargs defensively – only pass what DataEngine supports
+    engine_kwargs: Dict[str, Any] = {}
+
     if _env is not None:
-        # Use env-provided config when available
         cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
+        if cache_ttl is not None:
+            engine_kwargs["cache_ttl"] = cache_ttl
+
+        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+        if provider_timeout is not None:
+            engine_kwargs["provider_timeout"] = provider_timeout
+
         enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
+        if enabled_providers:
+            engine_kwargs["enabled_providers"] = enabled_providers
+
         enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
-        _engine = _V2DataEngine(
-            cache_ttl=cache_ttl,
-            enabled_providers=enabled_providers,
-            enable_advanced_analysis=enable_adv,
-        )
-    else:
+        engine_kwargs["enable_advanced_analysis"] = enable_adv
+
+    try:
+        if engine_kwargs:
+            _engine = _V2DataEngine(**engine_kwargs)
+        else:
+            _engine = _V2DataEngine()
+    except TypeError:
+        # If signature mismatch, fall back to default constructor
         _engine = _V2DataEngine()
 
     _ENGINE_MODE = "v2"
-    logger.info("AdvancedAnalysis: using DataEngine v2 from core.data_engine_v2")
+    _ENGINE_IS_STUB = False
+    logger.info(
+        "AdvancedAnalysis: using DataEngine v2 from core.data_engine_v2 (kwargs=%s)",
+        list(engine_kwargs.keys()),
+    )
 
 except Exception as exc_v2:  # pragma: no cover - defensive
     logger.exception(
         "AdvancedAnalysis: Failed to import/use core.data_engine_v2.DataEngine: %s",
         exc_v2,
     )
+
+    # Fallback: legacy engine module with async functions:
+    #   get_enriched_quote / get_enriched_quotes
     try:
-        # Fallback: legacy engine module with async functions:
-        #   get_enriched_quote / get_enriched_quotes
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
+        _ENGINE_IS_STUB = False
         logger.warning(
             "AdvancedAnalysis: Falling back to core.data_engine module-level API"
         )
@@ -406,6 +427,11 @@ async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
         return []
 
     unified_quotes = await _engine_get_quotes(tickers)
+    if unified_quotes is None:
+        unified_quotes = []
+    if not isinstance(unified_quotes, list):
+        unified_quotes = [unified_quotes]
+
     results: List[AdvancedItem] = []
 
     for raw_symbol, enriched in zip(tickers, unified_quotes):
