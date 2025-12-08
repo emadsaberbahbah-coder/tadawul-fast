@@ -1,5 +1,7 @@
 """
-KSA / Argaam routes for Tadawul Fast Bridge – v2.2
+routes_argaam.py
+============================================================
+KSA / Argaam routes for Tadawul Fast Bridge – v2.3
 
 GOAL
 - Dedicated KSA provider route that does NOT depend on EODHD.
@@ -54,6 +56,11 @@ SHEET CONTRACT
     • Meta (provider, data quality, timestamps, error)
   All other fields are left blank (None) so that the 9-page
   Apps Script + Sheets logic stays compatible.
+
+IMPORTANT
+---------
+- This module NEVER calls EODHD directly.
+- All KSA data comes from your Argaam/Tadawul gateway only.
 """
 
 from __future__ import annotations
@@ -71,9 +78,9 @@ from pydantic import BaseModel, Field, ConfigDict
 # Use a stable logger name to match production logging config
 logger = logging.getLogger("routes_argaam")
 
-# ============================================================================
+# ======================================================================
 # ENV CONFIG – env.py preferred, environment variables as fallback
-# ============================================================================
+# ======================================================================
 
 APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
 APP_VERSION: str = os.getenv("APP_VERSION", "4.0.0")
@@ -105,9 +112,15 @@ except Exception:
         "ARGAAM_GATEWAY_URL/ARGAAM_API_KEY."
     )
 
-# ============================================================================
+# Optional configurable timeout (seconds) via env, default 15s
+try:
+    _ARGAAM_TIMEOUT: float = float(os.getenv("ARGAAM_TIMEOUT", "15.0"))
+except Exception:
+    _ARGAAM_TIMEOUT = 15.0
+
+# ======================================================================
 # ROUTER & TIMEZONE
-# ============================================================================
+# ======================================================================
 
 router = APIRouter(
     prefix="/v1/argaam",
@@ -118,10 +131,9 @@ RIYADH_TZ = timezone(timedelta(hours=3))
 
 __all__ = ["router"]  # explicit export for main.py / auto-discovery
 
-
-# ============================================================================
+# ======================================================================
 # SYMBOL HELPERS (aligned with DataEngine conventions)
-# ============================================================================
+# ======================================================================
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -150,13 +162,13 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _is_ksa_symbol(symbol: str) -> bool:
-    s = (symbol or "").upper()
-    return s.endswith(".SR") or s.endswith(".TADAWUL") or s.isdigit()
+    s = (symbol or "").strip().upper()
+    return bool(s) and (s.endswith(".SR") or s.endswith(".TADAWUL") or s.isdigit())
 
 
-# ============================================================================
+# ======================================================================
 # MODELS
-# ============================================================================
+# ======================================================================
 
 
 class ArgaamQuote(BaseModel):
@@ -241,17 +253,19 @@ class ArgaamSheetRowsResponse(BaseModel):
     rows: List[List[Any]]
 
 
-# ============================================================================
+# ======================================================================
 # INTERNAL HELPERS
-# ============================================================================
+# ======================================================================
 
 
 def _ensure_gateway_configured() -> None:
     if not ARGAAM_GATEWAY_URL:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ARGAAM_GATEWAY_URL is not configured. "
-                   "Set it in env.py or Render environment variables.",
+            detail=(
+                "ARGAAM_GATEWAY_URL is not configured. "
+                "Set it in env.py or Render environment variables."
+            ),
         )
 
 
@@ -386,7 +400,7 @@ def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
         symbol=_normalize_symbol(symbol),
         name=name,
         sector=sector,
-        subSector=sub_sector,
+        sub_sector=sub_sector,
         market=market,
         currency=currency,
         last_price=_safe_float(last_price),
@@ -407,8 +421,8 @@ def _parse_argaam_payload(symbol: str, payload: Dict[str, Any]) -> ArgaamQuote:
         spread_percent=_safe_float(spread_pct),
         liquidity_score=_safe_float(liquidity_score),
         market_cap=_safe_float(market_cap),
-        fiftyTwoWeekHigh=_safe_float(high_52w),
-        fiftyTwoWeekLow=_safe_float(low_52w),
+        fifty_two_week_high=_safe_float(high_52w),
+        fifty_two_week_low=_safe_float(low_52w),
         last_updated_utc=last_utc,
         last_updated_riyadh=last_riyadh,
         remote_raw=payload,
@@ -440,7 +454,7 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
     if ARGAAM_API_KEY:
         headers["X-API-KEY"] = ARGAAM_API_KEY
 
-    timeout = httpx.Timeout(15.0, connect=5.0)
+    timeout = httpx.Timeout(_ARGAAM_TIMEOUT, connect=5.0)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -490,7 +504,7 @@ async def _fetch_argaam_quote(symbol: str) -> ArgaamQuote:
 
     quote = _parse_argaam_payload(norm, payload)
 
-    # Cheap, local data-quality tag
+    # Simple local data-quality tag
     if quote.error:
         quote.data_quality = "MISSING"
     elif quote.last_price is not None:
@@ -526,7 +540,7 @@ async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
                     symbol=_normalize_symbol(sym),
                     name=None,
                     sector=None,
-                    subSector=None,
+                    sub_sector=None,
                     market="Tadawul",
                     currency="SAR",
                     last_price=None,
@@ -547,8 +561,8 @@ async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
                     spread_percent=None,
                     liquidity_score=None,
                     market_cap=None,
-                    fiftyTwoWeekHigh=None,
-                    fiftyTwoWeekLow=None,
+                    fifty_two_week_high=None,
+                    fifty_two_week_low=None,
                     last_updated_utc=None,
                     last_updated_riyadh=None,
                     data_source="argaam-gateway-error",
@@ -562,9 +576,9 @@ async def _fetch_argaam_quotes_bulk(symbols: List[str]) -> List[ArgaamQuote]:
     return quotes
 
 
-# ============================================================================
+# ======================================================================
 # SHEET HELPERS
-# ============================================================================
+# ======================================================================
 
 
 def _build_sheet_headers() -> List[str]:
@@ -662,7 +676,7 @@ def _quote_to_sheet_row(q: ArgaamQuote) -> List[Any]:
     Only KSA-specific fields are filled; all others are left None.
     """
     # Compute 52W position %
-    pos_52w = None
+    pos_52w: Optional[float] = None
     if (
         q.fifty_two_week_high is not None
         and q.fifty_two_week_low is not None
@@ -767,9 +781,9 @@ def _quote_to_sheet_row(q: ArgaamQuote) -> List[Any]:
     ]
 
 
-# ============================================================================
+# ======================================================================
 # ENDPOINTS
-# ============================================================================
+# ======================================================================
 
 
 @router.get("/health")
