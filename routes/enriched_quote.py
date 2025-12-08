@@ -1,7 +1,7 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.2)
+Enriched Quotes Router (v2.3)
 
 - Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
@@ -19,6 +19,10 @@ Google Sheets usage:
       can all call /v1/enriched/sheet-rows and map directly to the unified
       9-page dashboard structure (Identity → Price/Liquidity → Fundamentals →
       Growth/Profitability → Valuation/Risk → AI/Technical → Meta).
+
+Alignment:
+    - Header structure is aligned with routes_argaam._build_sheet_headers
+      so all 9 pages share the same layout.
 """
 
 from __future__ import annotations
@@ -30,13 +34,23 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("routes.enriched_quote")
+
+# ----------------------------------------------------------------------
+# Optional env.py (for future configuration, logging, etc.)
+# ----------------------------------------------------------------------
+
+try:  # pragma: no cover - optional
+    import env as _env  # type: ignore
+except Exception:
+    _env = None  # type: ignore
 
 # ----------------------------------------------------------------------
 # Data engine import (robust with fallbacks)
 # ----------------------------------------------------------------------
 
 _ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
+_ENGINE_IS_STUB: bool = False
 _engine: Any = None
 _data_engine_module: Any = None
 
@@ -44,9 +58,30 @@ try:
     # Preferred new engine (class-based, lives in core.data_engine_v2)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    _engine = _V2DataEngine()
+    if _env is not None:
+        # Optional: use basic config from env.py if present
+        cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
+        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
+        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
+        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+
+        kwargs: Dict[str, Any] = {}
+        if cache_ttl is not None:
+            kwargs["cache_ttl"] = cache_ttl
+        if enabled_providers is not None:
+            kwargs["enabled_providers"] = enabled_providers
+        if enable_adv is not None:
+            kwargs["enable_advanced_analysis"] = enable_adv
+        if provider_timeout is not None:
+            kwargs["provider_timeout"] = provider_timeout
+
+        _engine = _V2DataEngine(**kwargs)
+    else:
+        _engine = _V2DataEngine()
+
     _ENGINE_MODE = "v2"
-    logger.info("routes.enriched_quote: Using DataEngine from core.data_engine_v2")
+    logger.info("routes.enriched_quote: Using DataEngine v2 from core.data_engine_v2")
+
 except Exception as e_v2:  # pragma: no cover - defensive
     logger.exception(
         "routes.enriched_quote: Failed to import/use core.data_engine_v2.DataEngine: %s",
@@ -104,8 +139,9 @@ except Exception as e_v2:  # pragma: no cover - defensive
 
         _engine = _StubEngine()
         _ENGINE_MODE = "stub"
+        _ENGINE_IS_STUB = True
         logger.error(
-            "routes.enriched_quote: Using in-process stub DataEngine with MISSING data responses."
+            "routes.enriched_quote: Using in-process STUB DataEngine with MISSING data responses."
         )
 
 # ----------------------------------------------------------------------
@@ -440,8 +476,9 @@ def _build_sheet_headers() -> List[str]:
     Identity, Price/Liquidity, Fundamentals, Growth/Profitability,
     Valuation/Risk, AI/Technical, Meta.
 
-    All KSA/Global/Mutual Funds/Commodities_FX/My_Portfolio sheets can re-use
-    this structure (or a superset) without breaking Apps Script.
+    This structure is aligned with routes_argaam._build_sheet_headers so that
+    KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX and My_Portfolio
+    can all share the same template.
     """
     return [
         # Identity
@@ -513,7 +550,6 @@ def _build_sheet_headers() -> List[str]:
         "Moving Avg (20D)",
         "Moving Avg (50D)",
         # Meta
-        "Data Source",
         "Provider",
         "Data Quality",
         "Last Updated (UTC)",
@@ -527,6 +563,7 @@ def _enriched_to_sheet_row(e: EnrichedQuoteResponse) -> List[Any]:
     """
     Convert EnrichedQuoteResponse to a row aligned with _build_sheet_headers.
     """
+    provider = e.provider or e.data_source
     return [
         # Identity
         e.symbol,
@@ -597,8 +634,7 @@ def _enriched_to_sheet_row(e: EnrichedQuoteResponse) -> List[Any]:
         e.ma_20d,
         e.ma_50d,
         # Meta
-        e.data_source,
-        e.provider,
+        provider,
         e.data_quality,
         e.as_of_utc,
         e.as_of_local,
@@ -620,8 +656,9 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.2",
+        "version": "2.3",
         "engine_mode": _ENGINE_MODE,
+        "engine_is_stub": _ENGINE_IS_STUB,
     }
 
 
@@ -733,7 +770,44 @@ async def get_enriched_sheet_rows(
     Dashboard (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX,
     My_Portfolio, Insights_Analysis).
     """
-    batch = await get_enriched_quotes_route(body)
     headers = _build_sheet_headers()
-    rows: List[List[Any]] = [_enriched_to_sheet_row(e) for e in batch.results]
+    tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
+
+    # Sheets-safe: if no tickers, just return headers + empty rows (no 400).
+    if not tickers:
+        return SheetEnrichedResponse(headers=headers, rows=[])
+
+    try:
+        unified_quotes = await get_enriched_quotes(tickers)
+    except Exception as exc:
+        logger.exception("Enriched sheet-rows failed for tickers=%s", tickers)
+        # Total provider failure – still return headers and placeholder rows.
+        rows: List[List[Any]] = []
+        for t in tickers:
+            placeholder = EnrichedQuoteResponse(
+                symbol=t.upper(),
+                data_quality="MISSING",
+                error=f"Enriched sheet-rows failed: {exc}",
+            )
+            rows.append(_enriched_to_sheet_row(placeholder))
+        return SheetEnrichedResponse(headers=headers, rows=rows)
+
+    rows: List[List[Any]] = []
+    for t, q in zip(tickers, unified_quotes):
+        try:
+            enriched = _quote_to_enriched(q)
+            if enriched.data_quality == "MISSING":
+                enriched.error = enriched.error or "No data available from providers"
+            rows.append(_enriched_to_sheet_row(enriched))
+        except Exception as exc:
+            logger.exception(
+                "Exception building sheet row for %s", t, exc_info=exc
+            )
+            fallback = EnrichedQuoteResponse(
+                symbol=t.upper(),
+                data_quality="MISSING",
+                error=f"Exception building sheet row: {exc}",
+            )
+            rows.append(_enriched_to_sheet_row(fallback))
+
     return SheetEnrichedResponse(headers=headers, rows=rows)
