@@ -7,7 +7,7 @@
 fastapi
 uvicorn[standard]
 
-# HTTP / async clients (used by core.data_engine and routes)
+# HTTP / async clients (used by core.data_engine, core.data_engine_v2, routes)
 httpx
 aiohttp
 requests
@@ -25,6 +25,9 @@ google-api-python-client
 google-auth
 google-auth-httplib2
 
-# Utilities & robustness (can be used by data_engine, caching, retries)
+# Optional market data fallback (Yahoo Finance via v1 engine)
+yfinance
+
+# Utilities & robustness (caching, retries, etc.)
 cachetools
 tenacity
