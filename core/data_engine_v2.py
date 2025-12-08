@@ -48,7 +48,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import httpx
 from pydantic import BaseModel, Field
@@ -450,31 +450,12 @@ class DataEngine:
             )
 
         results = await asyncio.gather(*tasks)
-
-        # Pick the first "OK" result
-        for q in results:
-            if q.data_quality == "OK":
-                return q
-
-        # Otherwise, prefer PARTIAL over MISSING if any
-        for q in results:
-            if q.data_quality == "PARTIAL":
-                return q
-
-        # If all are MISSING, merge error messages
-        combined_error = "; ".join(
-            [q.error for q in results if q.error]  # type: ignore
-        )
-        return UnifiedQuote(
-            symbol=symbol,
-            data_quality="MISSING",
-            error=combined_error or "All providers failed or returned no data",
-        )
+        return self._merge_provider_results(symbol, results)
 
     async def _safe_call_provider(
         self,
         provider_name: str,
-        func,
+        func: Callable[[str], Any],
         symbol: str,
     ) -> UnifiedQuote:
         """
@@ -495,6 +476,8 @@ class DataEngine:
             q.primary_provider = q.primary_provider or provider_name
             q.provider = q.provider or provider_name
             q.data_source = q.data_source or provider_name
+            if not q.sources:
+                q.sources = [ProviderSource(provider=provider_name, note="primary")]
             return q
         except Exception as exc:
             logger.exception(
@@ -508,6 +491,129 @@ class DataEngine:
                 data_source=provider_name,
                 error=f"Provider {provider_name} exception: {exc}",
             )
+
+    def _merge_provider_results(
+        self, symbol: str, results: List[UnifiedQuote]
+    ) -> UnifiedQuote:
+        """
+        Merge multiple provider UnifiedQuote results into a single UnifiedQuote.
+        - Prefer first OK result, then PARTIAL.
+        - Backfill missing fields from other OK/PARTIAL results.
+        - Combine sources and error messages.
+        """
+        if not results:
+            return UnifiedQuote(
+                symbol=symbol,
+                data_quality="MISSING",
+                error="No provider results",
+            )
+
+        # Separate by quality
+        ok_or_partial: List[UnifiedQuote] = [
+            q for q in results if q.data_quality in ("OK", "PARTIAL")
+        ]
+
+        # All providers failed
+        if not ok_or_partial:
+            combined_error = "; ".join([q.error for q in results if q.error])  # type: ignore
+            return UnifiedQuote(
+                symbol=symbol,
+                data_quality="MISSING",
+                error=combined_error or "All providers failed or returned no data",
+            )
+
+        # Choose base quote: first OK, else first PARTIAL
+        base: UnifiedQuote = next(
+            (q for q in ok_or_partial if q.data_quality == "OK"), ok_or_partial[0]
+        )
+
+        # Get field names for UnifiedQuote for safe merging
+        field_map = getattr(UnifiedQuote, "model_fields", None)
+        if field_map is None:
+            field_map = getattr(UnifiedQuote, "__fields__", {})
+        field_names = list(field_map.keys())
+
+        # Use dict representation of base as starting point
+        if hasattr(base, "model_dump"):
+            merged_data: Dict[str, Any] = base.model_dump()
+        else:  # pydantic v1 fallback
+            merged_data = base.dict()  # type: ignore[attr-defined]
+
+        # Merge from other OK/PARTIAL quotes
+        for q in ok_or_partial:
+            if q is base:
+                continue
+            if hasattr(q, "model_dump"):
+                data = q.model_dump()
+            else:
+                data = q.dict()  # type: ignore[attr-defined]
+
+            for k in field_names:
+                if k == "symbol":
+                    continue
+                if merged_data.get(k) is None:
+                    val = data.get(k)
+                    if val is not None:
+                        merged_data[k] = val
+
+        # Symbol must be normalized symbol argument
+        merged_data["symbol"] = symbol.upper()
+
+        # Combine data_quality: OK if any OK, else PARTIAL
+        merged_quality = (
+            "OK"
+            if any(q.data_quality == "OK" for q in ok_or_partial)
+            else "PARTIAL"
+        )
+        merged_data["data_quality"] = merged_quality
+
+        # Combine sources
+        combined_sources: List[ProviderSource] = []
+        seen_providers: set[str] = set()
+        for q in ok_or_partial:
+            # Use q.sources if present, otherwise synthesize from provider fields
+            if q.sources:
+                for s in q.sources:
+                    prov = (s.provider or "").lower()
+                    if prov and prov not in seen_providers:
+                        seen_providers.add(prov)
+                        combined_sources.append(s)
+            else:
+                prov = (q.primary_provider or q.provider or q.data_source or "").lower()
+                if prov and prov not in seen_providers:
+                    seen_providers.add(prov)
+                    combined_sources.append(
+                        ProviderSource(provider=prov, note="merged")
+                    )
+
+        if combined_sources:
+            merged_data["sources"] = combined_sources
+            merged_data["primary_provider"] = (
+                merged_data.get("primary_provider")
+                or combined_sources[0].provider
+            )
+            merged_data["provider"] = (
+                merged_data.get("provider") or combined_sources[0].provider
+            )
+            merged_data["data_source"] = (
+                merged_data.get("data_source") or combined_sources[0].provider
+            )
+
+        # Merge error messages for debugging if everything is PARTIAL
+        combined_error = "; ".join(
+            sorted({q.error for q in results if q.error})  # type: ignore
+        )
+        if combined_error:
+            merged_data["error"] = combined_error
+
+        try:
+            merged_quote = UnifiedQuote(**merged_data)
+        except Exception as exc:
+            # Extremely defensive: if merge fails, fall back to base
+            logger.exception("Failed to merge provider results for %s: %s", symbol, exc)
+            return base
+
+        return merged_quote
 
     # ------------------------------------------------------------------ #
     # Provider: Financial Modeling Prep (FMP)
@@ -534,6 +640,8 @@ class DataEngine:
         quote.primary_provider = "fmp"
         quote.provider = "fmp"
         quote.data_source = "fmp"
+        if not quote.sources:
+            quote.sources = [ProviderSource(provider="fmp", note="FMP quote")]
         return quote
 
     def _map_fmp_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
@@ -656,6 +764,8 @@ class DataEngine:
         q.primary_provider = "eodhd"
         q.provider = "eodhd"
         q.data_source = "eodhd"
+        if not q.sources:
+            q.sources = [ProviderSource(provider="eodhd", note="EODHD quote")]
         return q
 
     def _map_eodhd_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
