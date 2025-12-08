@@ -1,18 +1,20 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.2 (MULTI-PROVIDER)
+UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.3 (MULTI-PROVIDER)
 
 Role in Architecture
 --------------------
 - This module is the "legacy" but still fully functional data engine.
-- New features prefer `core.data_engine_v2.DataEngine`, but many routes
-  still fall back to `core.data_engine.DataEngine` if v2 is missing.
-- This file is therefore kept compatible and exposes a `DataEngine`
-  class with async methods:
-
-    - DataEngine.get_enriched_quote(symbol)
-    - DataEngine.get_enriched_quotes(symbols)
+- Many routes still fall back to `core.data_engine` when
+  `core.data_engine_v2.DataEngine` is missing or disabled.
+- It exposes both:
+    • Module-level async functions:
+        - get_enriched_quote(symbol)
+        - get_enriched_quotes(symbols)
+    • A thin async class wrapper:
+        - DataEngine.get_enriched_quote(symbol)
+        - DataEngine.get_enriched_quotes(symbols)
 
 Key Behaviors
 -------------
@@ -23,12 +25,12 @@ Key Behaviors
 - Merges provider outputs into a single `UnifiedQuote` Pydantic model.
 - Provides a simple `opportunity_score` and `data_quality` signal.
 - Exposes alias fields via `UnifiedQuote.model_dump()` so that
-  Google Sheets endpoints (via routes/enriched_quote.py) see
-  dashboard-friendly keys like:
+  Google Sheets endpoints (via routes/enriched_quote.py, legacy_service)
+  see dashboard-friendly keys like:
 
     • last_price         -> from price
     • previous_close     -> from prev_close
-    • high_52w / low_52w -> from fifty_two_week_high/low
+    • high_52w / low_52w -> from fifty_two_week_high / fifty_two_week_low
     • change_percent     -> from change_pct
     • as_of_utc          -> from last_updated_utc
     • timezone           -> inferred from market_region
@@ -36,25 +38,41 @@ Key Behaviors
 Global vs KSA
 -------------
 - EODHD is used **only** for GLOBAL symbols (no .SR suffix).
-- For KSA (.SR) tickers this engine relies on FMP + Yahoo Finance,
-  and v2 / KSA-specific routes (e.g. /v1/argaam) should be preferred
-  for production KSA coverage.
+- For KSA (.SR) tickers this engine relies on FMP + Yahoo Finance.
+- KSA-specific Tadawul/Argaam routing is handled in v2 and /v1/argaam
+  routes and can be used as the preferred source for production KSA.
 
-EODHD Fundamentals
-------------------
-- For global symbols, this engine now calls:
+EODHD Fundamentals – ENHANCED
+-----------------------------
+- For GLOBAL symbols, this engine now calls:
     1) /real-time/{TICKER}
     2) /fundamentals/{TICKER}
-  and merges both into a richer quote:
+  and merges fields from:
+    • General
+    • Highlights
+    • Technicals
+    • Valuation
+
+  into a richer quote:
+
     • sector / industry / listing_date
     • market_cap
-    • eps_ttm / pe_ttm
+    • eps_ttm / pe_ttm / pb
     • dividend_yield
     • beta
     • 52-week high / low
+    • roe / roa
+    • profit_margin / operating_margin
+    • revenue_growth_yoy / net_income_growth_yoy
 
 - This behaviour can be toggled via:
     ENABLE_EODHD_FUNDAMENTALS = "0" / "1" (env var, default = "1")
+
+NOTE
+----
+- This engine is deliberately **defensive**:
+    • No direct EODHD calls for .SR / KSA.
+    • Yahoo is a safety fallback when API providers fail.
 """
 
 from __future__ import annotations
@@ -115,7 +133,8 @@ FMP_BASE_URL = os.getenv(
 # Toggle for extra EODHD fundamentals call
 _ENABLE_EODHD_FUNDAMENTALS_RAW = os.getenv("ENABLE_EODHD_FUNDAMENTALS", "1")
 ENABLE_EODHD_FUNDAMENTALS: bool = (
-    _ENABLE_EODHD_FUNDAMENTALS_RAW.strip().lower() not in {"0", "false", "no", "off"}
+    _ENABLE_EODHD_FUNDAMENTALS_RAW.strip().lower()
+    not in {"0", "false", "no", "off"}
 )
 
 # Types
@@ -308,8 +327,9 @@ async def fetch_from_eodhd(symbol: str, session: aiohttp.ClientSession) -> Dict[
     - Uses /real-time/{code} for price snapshot.
     - If ENABLE_EODHD_FUNDAMENTALS is true, also calls
       /fundamentals/{code} and merges extra fields (sector, industry,
-      listing_date, eps_ttm, pe_ttm, dividend_yield, beta, 52w high/low,
-      market_cap, etc.).
+      listing_date, eps_ttm, pe_ttm, pb, dividend_yield, beta, 52w high/low,
+      market_cap, roe, roa, profit_margin, operating_margin,
+      revenue_growth_yoy, net_income_growth_yoy).
 
     NOTE:
     - **Not used for KSA (.SR)**; see _gather_provider_payloads which
@@ -373,7 +393,9 @@ async def fetch_from_eodhd(symbol: str, session: aiohttp.ClientSession) -> Dict[
         realtime_data = await _request_json(realtime_url)
 
     if not isinstance(realtime_data, dict) or "code" not in realtime_data:
-        logger.warning("EODHD payload invalid for %s (%s): %s", symbol, code, realtime_data)
+        logger.warning(
+            "EODHD payload invalid for %s (%s): %s", symbol, code, realtime_data
+        )
         return {}
 
     if not isinstance(fundamentals_data, dict):
@@ -423,7 +445,8 @@ async def fetch_from_backend_api(symbol: str) -> Dict[str, Any]:
     """
     if "tadawul-fast-bridge" in BACKEND_BASE_URL:
         logger.debug(
-            "Skipping backend API fetch for %s to avoid possible infinite loop", symbol
+            "Skipping backend API fetch for %s to avoid possible infinite loop",
+            symbol,
         )
         return {}
 
@@ -502,6 +525,8 @@ def _normalize_eodhd_quote(
     """
     Normalize EODHD real-time payload (+ optional fundamentals)
     to UnifiedQuote-compatible dict.
+
+    This is where most of the GLOBAL fundamentals are mapped.
     """
     now = datetime.now(timezone.utc)
 
@@ -526,6 +551,7 @@ def _normalize_eodhd_quote(
     general: Dict[str, Any] = {}
     highlights: Dict[str, Any] = {}
     technicals: Dict[str, Any] = {}
+    valuation: Dict[str, Any] = {}
 
     if isinstance(fundamentals, dict) and fundamentals:
         g = fundamentals.get("General")
@@ -537,6 +563,9 @@ def _normalize_eodhd_quote(
         t = fundamentals.get("Technicals")
         if isinstance(t, dict):
             technicals = t
+        v = fundamentals.get("Valuation")
+        if isinstance(v, dict):
+            valuation = v
 
     # Identity & static attributes
     currency = general.get("CurrencyCode") or _infer_currency_from_symbol(symbol)
@@ -544,7 +573,7 @@ def _normalize_eodhd_quote(
     industry = general.get("Industry") or general.get("GicIndustry")
     listing_date = general.get("IPODate")
 
-    # Fundamentals from highlights/fundamentals
+    # Fundamentals from highlights/valuation/technicals
     market_cap = (
         data.get("market_cap")
         or data.get("marketCap")
@@ -552,21 +581,53 @@ def _normalize_eodhd_quote(
         or highlights.get("MarketCapitalization")
     )
 
-    eps_ttm = highlights.get("EpsTTM")
-    if eps_ttm is None:
-        eps_ttm = highlights.get("EPS") or highlights.get("EarningsShare")
+    # EPS
+    eps_ttm = (
+        highlights.get("EpsTTM")
+        or highlights.get("EPS")
+        or highlights.get("EarningsShare")
+    )
 
-    pe_ttm = highlights.get("PERatio") or data.get("pe")
+    # P/E
+    pe_ttm = (
+        highlights.get("PERatio")
+        or valuation.get("TrailingPE")
+        or data.get("pe")
+    )
 
+    # Dividend yield
     dividend_yield = highlights.get("DividendYield")
-    beta = highlights.get("Beta")
 
-    fifty_two_week_high = technicals.get("52WeekHigh")
-    fifty_two_week_low = technicals.get("52WeekLow")
+    # PB ratio
+    pb = (
+        valuation.get("PriceBookMRQ")
+        or valuation.get("PriceBookTTM")
+        or valuation.get("PriceBook")
+    )
+
+    # Risk & profitability
+    beta = highlights.get("Beta") or technicals.get("Beta")
+    roe = highlights.get("ReturnOnEquityTTM")
+    roa = highlights.get("ReturnOnAssetsTTM")
+    profit_margin = highlights.get("ProfitMargin")
+    operating_margin = (
+        highlights.get("OperatingMarginTTM") or highlights.get("OperatingMargin5Y")
+    )
+
+    # Growth
+    revenue_growth_yoy = highlights.get("QuarterlyRevenueGrowthYOY")
+    net_income_growth_yoy = highlights.get("QuarterlyEarningsGrowthYOY")
+
+    fifty_two_week_high = (
+        technicals.get("52WeekHigh") or highlights.get("Week52High")
+    )
+    fifty_two_week_low = (
+        technicals.get("52WeekLow") or highlights.get("Week52Low")
+    )
 
     # Merge field names for provider source info
     fields = list(data.keys())
-    for section in (general, highlights, technicals):
+    for section in (general, highlights, technicals, valuation):
         if isinstance(section, dict):
             fields.extend(list(section.keys()))
 
@@ -593,8 +654,15 @@ def _normalize_eodhd_quote(
         "fifty_two_week_low": fifty_two_week_low,
         "eps_ttm": eps_ttm,
         "pe_ttm": pe_ttm,
+        "pb": pb,
         "dividend_yield": dividend_yield,
         "beta": beta,
+        "roe": roe,
+        "roa": roa,
+        "profit_margin": profit_margin,
+        "operating_margin": operating_margin,
+        "revenue_growth_yoy": revenue_growth_yoy,
+        "net_income_growth_yoy": net_income_growth_yoy,
         "last_updated_utc": last_dt,
         "__source__": QuoteSourceInfo(
             provider="eodhd", timestamp=last_dt, fields=fields
@@ -653,6 +721,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith(".SR"):
         return "SAR"
+    # Default assumption for global tickers when fundamentals are missing
     return "USD"
 
 
@@ -818,8 +887,8 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     Public enriched quote function (module-level).
 
     This is the main legacy entrypoint used by older parts of the
-    system. Newer code should prefer `DataEngine.get_enriched_quote`,
-    which simply wraps this function.
+    system. Newer code may use `core.data_engine_v2.DataEngine`,
+    but this remains the safe fallback.
     """
     symbol = symbol.strip().upper()
     logger.info("[DataEngine v1] Fetching enriched quote for: %s", symbol)
@@ -885,13 +954,11 @@ class DataEngine:
     Thin OOP wrapper around the legacy module-level functions.
 
     This class is what `routes.enriched_quote` and
-    `routes.advanced_analysis` expect when they do:
+    `legacy_service` / `ai_analysis` expect when they do:
 
         from core.data_engine import DataEngine
         engine = DataEngine()
         quote = await engine.get_enriched_quote("AAPL")
-
-    It keeps all behavior in one place and is fully async.
     """
 
     def __init__(
