@@ -1,7 +1,7 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.1
+Core Data & Analysis Engine - v2.2 (Sheets-aligned)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
@@ -30,7 +30,9 @@ DATAENGINE_CACHE_TTL             # optional; seconds, default 120 if both missin
 ENGINE_PROVIDER_TIMEOUT_SECONDS  # optional; overrides DATAENGINE_TIMEOUT
 DATAENGINE_TIMEOUT               # optional; per-provider timeout in seconds, default 10
 ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
+PRIMARY_PROVIDER                 # optional; if set and in enabled list, used first
 LOCAL_TIMEZONE                   # optional; default "Asia/Riyadh"
+ENABLE_ADVANCED_ANALYSIS         # optional; "1/true/on" to enable, "0/false/off" to disable
 
 Provider API keys
 -----------------
@@ -48,7 +50,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from pydantic import BaseModel, Field
@@ -236,7 +238,7 @@ class DataEngine:
         cache_ttl: Optional[int] = None,
         provider_timeout: Optional[int] = None,
         enabled_providers: Optional[List[str]] = None,
-        enable_advanced_analysis: bool = True,
+        enable_advanced_analysis: Optional[bool] = None,
     ) -> None:
         # Cache TTL (seconds)
         if cache_ttl is not None:
@@ -260,7 +262,22 @@ class DataEngine:
             )
             self.provider_timeout = int(timeout_env)
 
-        self.enable_advanced_analysis: bool = enable_advanced_analysis
+        # Advanced analysis toggle (env + explicit override)
+        if enable_advanced_analysis is not None:
+            self.enable_advanced_analysis = bool(enable_advanced_analysis)
+        else:
+            flag = os.getenv("ENABLE_ADVANCED_ANALYSIS")
+            if flag is None:
+                self.enable_advanced_analysis = True
+            else:
+                self.enable_advanced_analysis = flag.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                    "y",
+                }
+
         self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
 
         # Enabled providers – accept list OR comma-separated string
@@ -273,6 +290,12 @@ class DataEngine:
             raw = os.getenv("ENABLED_PROVIDERS", "fmp")
 
         providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+        # Primary provider hint (for ordering)
+        self.primary_provider_env: Optional[str] = (
+            os.getenv("PRIMARY_PROVIDER", "") or ""
+        ).strip().lower() or None
+
         self.enabled_providers: List[str] = []
         for p in providers:
             if p and p not in self.enabled_providers:
@@ -282,14 +305,27 @@ class DataEngine:
             # Always have at least FMP in the list
             self.enabled_providers = ["fmp"]
 
+        # If PRIMARY_PROVIDER is set and present, move it to the front
+        if (
+            self.primary_provider_env
+            and self.primary_provider_env in self.enabled_providers
+        ):
+            self.enabled_providers.sort(
+                key=lambda p: 0 if p == self.primary_provider_env else 1
+            )
+
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.1 initialized (providers=%s, cache_ttl=%ss, timeout=%ss, v1_delegate=%s)",
+            "DataEngine v2.2 initialized "
+            "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, "
+            "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
+            self.primary_provider_env or "auto",
             self.cache_ttl,
             self.provider_timeout,
             _HAS_V1_ENGINE,
+            self.enable_advanced_analysis,
         )
 
     # ------------------------------------------------------------------ #
@@ -369,19 +405,22 @@ class DataEngine:
     def _now_dt_pair(self) -> Tuple[datetime, Optional[datetime], Optional[str]]:
         """
         Returns (as_of_utc_dt, as_of_local_dt, timezone_name)
+
+        - as_of_utc is always UTC "now".
+        - as_of_local is converted using LOCAL_TIMEZONE if possible.
+        - timezone_name is LOCAL_TIMEZONE on success, else "UTC".
         """
         now_utc = datetime.now(timezone.utc)
         as_of_local: Optional[datetime] = None
-        tz_name: Optional[str] = None
+        tz_name: Optional[str] = "UTC"
 
         if ZoneInfo is not None:
             try:
                 tz = ZoneInfo(self.local_tz_name)
-                local_dt = now_utc.astimezone(tz)
-                as_of_local = local_dt
+                as_of_local = now_utc.astimezone(tz)
                 tz_name = self.local_tz_name
             except Exception:
-                tz_name = None
+                # Fallback: keep tz_name="UTC" and no local datetime
                 as_of_local = None
 
         return now_utc, as_of_local, tz_name
@@ -500,6 +539,9 @@ class DataEngine:
         - Prefer first OK result, then PARTIAL.
         - Backfill missing fields from other OK/PARTIAL results.
         - Combine sources and error messages.
+
+        This is designed to align cleanly with the "unified sheet" template
+        used by the 9-page Google Sheets dashboard.
         """
         if not results:
             return UnifiedQuote(
@@ -539,7 +581,7 @@ class DataEngine:
         else:  # pydantic v1 fallback
             merged_data = base.dict()  # type: ignore[attr-defined]
 
-        # Merge from other OK/PARTIAL quotes
+        # Merge from other OK/PARTIAL quotes (only fill Nones)
         for q in ok_or_partial:
             if q is base:
                 continue
@@ -627,7 +669,8 @@ class DataEngine:
 
         url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
 
-        async with httpx.AsyncClient(timeout=self.provider_timeout) as client:
+        timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params={"apikey": api_key})
             resp.raise_for_status()
             data = resp.json()
@@ -645,6 +688,15 @@ class DataEngine:
         return quote
 
     def _map_fmp_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
+        """
+        Map FMP /quote response into UnifiedQuote.
+
+        NOTE:
+        - FMP /quote is primarily price- and basic-fundamental-oriented.
+        - More advanced ratios (ROE/ROA/margins) may require additional
+          endpoints; this engine only uses what is available here.
+        """
+
         def gv(*keys: str, default=None):
             for k in keys:
                 if k in d and d[k] is not None:
@@ -687,14 +739,37 @@ class DataEngine:
 
         as_of_utc, as_of_local, tz_name = self._now_dt_pair()
 
+        eps_val = gv("eps", "epsTTM")
+        pe_val = gv("pe", "peTTM")
+        pb_val = gv("priceToBook", "pb", "pbRatio")
+
+        dividend_yield = gv("dividendYield", "lastDiv", "yield")
+        if dividend_yield is not None:
+            try:
+                # FMP often returns dividendYield as %, sometimes as fraction.
+                # We standardize to % where possible.
+                if dividend_yield < 1.0:
+                    dividend_yield_percent = float(dividend_yield) * 100.0
+                else:
+                    dividend_yield_percent = float(dividend_yield)
+            except Exception:
+                dividend_yield_percent = None
+        else:
+            dividend_yield_percent = None
+
+        shares_outstanding = gv("sharesOutstanding", "shares_outstanding")
+
         q = UnifiedQuote(
             symbol=str(gv("symbol", default=symbol)).upper(),
             name=gv("name"),
             company_name=gv("name"),
-            market=gv("exchange"),
-            market_region=gv("exchange"),
-            exchange=gv("exchange"),
+            sector=gv("sector"),
+            industry=gv("industry"),
+            market=gv("exchangeShortName", "exchange"),
+            market_region=gv("exchangeShortName", "exchange"),
+            exchange=gv("exchangeShortName", "exchange"),
             currency=gv("currency"),
+            shares_outstanding=shares_outstanding,
             last_price=last_price,
             price=last_price,
             previous_close=previous_close,
@@ -716,11 +791,15 @@ class DataEngine:
             average_volume_30d=gv("avgVolume"),
             avg_volume=gv("avgVolume"),
             market_cap=gv("marketCap"),
-            eps_ttm=gv("eps"),
-            eps=gv("eps"),
-            pe_ratio=gv("pe"),
-            pe=gv("pe"),
-            pe_ttm=gv("pe"),
+            eps_ttm=eps_val,
+            eps=eps_val,
+            pe_ratio=pe_val,
+            pe=pe_val,
+            pe_ttm=pe_val,
+            pb_ratio=pb_val,
+            pb=pb_val,
+            dividend_yield_percent=dividend_yield_percent,
+            dividend_yield=dividend_yield_percent,
             beta=gv("beta"),
             ma_50d=gv("priceAvg50"),
             data_quality="OK" if last_price is not None else "PARTIAL",
@@ -752,7 +831,8 @@ class DataEngine:
         url = f"{base_url.rstrip('/')}/real-time/{symbol}"
         params = {"api_token": api_key, "fmt": "json"}
 
-        async with httpx.AsyncClient(timeout=self.provider_timeout) as client:
+        timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             d = resp.json()
@@ -769,6 +849,15 @@ class DataEngine:
         return q
 
     def _map_eodhd_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
+        """
+        Map EODHD real-time response into UnifiedQuote.
+
+        NOTE:
+        - EODHD is not used for KSA (.SR) symbols – see _get_enriched_quote_uncached.
+        - We only rely on the quote-style fields; deeper fundamentals would require
+          additional endpoints.
+        """
+
         def gv(*keys: str, default=None):
             for k in keys:
                 if k in d and d[k] is not None:
@@ -792,8 +881,8 @@ class DataEngine:
             except Exception:
                 change_pct = None
 
-        high_52w = gv("fifty_two_week_high", "high_52w")
-        low_52w = gv("fifty_two_week_low", "low_52w")
+        high_52w = gv("fifty_two_week_high", "high_52w", "year_high")
+        low_52w = gv("fifty_two_week_low", "low_52w", "year_low")
         position_52w = gv("fifty_two_week_position", "position_52w_percent")
 
         if (
@@ -812,6 +901,15 @@ class DataEngine:
                 position_52w = None
 
         as_of_utc, as_of_local, tz_name = self._now_dt_pair()
+
+        eps_val = gv("eps", "EPS")
+        pe_val = gv("pe", "PE", "pe_ratio")
+        pb_val = gv("pb", "P_B", "price_to_book", "priceToBook")
+        dividend_yield = gv("dividend_yield", "DividendYield")
+
+        market_cap = gv("market_cap", "marketCapitalization")
+        volume_val = gv("volume")
+        avg_vol = gv("avgVolume", "average_volume")
 
         q = UnifiedQuote(
             symbol=str(gv("code", "symbol", default=symbol)).upper(),
@@ -837,7 +935,20 @@ class DataEngine:
             fifty_two_week_low=low_52w,
             position_52w_percent=position_52w,
             fifty_two_week_position=position_52w,
-            volume=gv("volume"),
+            volume=volume_val,
+            avg_volume_30d=avg_vol,
+            average_volume_30d=avg_vol,
+            avg_volume=avg_vol,
+            market_cap=market_cap,
+            eps_ttm=eps_val,
+            eps=eps_val,
+            pe_ratio=pe_val,
+            pe=pe_val,
+            pe_ttm=pe_val,
+            pb_ratio=pb_val,
+            pb=pb_val,
+            dividend_yield=dividend_yield,
+            dividend_yield_percent=dividend_yield,
             data_quality="OK" if last_price is not None else "PARTIAL",
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
@@ -865,7 +976,8 @@ class DataEngine:
         url = "https://finnhub.io/api/v1/quote"
         params = {"symbol": symbol, "token": api_key}
 
-        async with httpx.AsyncClient(timeout=self.provider_timeout) as client:
+        timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             d = resp.json()
@@ -946,6 +1058,7 @@ class DataEngine:
         market_region = gv("market_region", "market")
         exchange = gv("exchange")
         currency = gv("currency")
+        listing_date = gv("listing_date", "ipo_date", "list_date")
 
         last_price = gv("price", "last_price")
         previous_close = gv("prev_close", "previous_close")
@@ -969,10 +1082,40 @@ class DataEngine:
         pe_ttm = gv("pe_ttm", "pe", "pe_ratio")
         pb = gv("pb", "pb_ratio")
         dividend_yield = gv("dividend_yield", "dividend_yield_percent")
-        roe = gv("roe")
-        roa = gv("roa")
+        dividend_payout_ratio = gv("dividend_payout_ratio")
+        roe = gv("roe", "roe_percent")
+        roa = gv("roa", "roa_percent")
         profit_margin = gv("profit_margin", "net_margin_percent")
         debt_to_equity = gv("debt_to_equity")
+        current_ratio = gv("current_ratio")
+        quick_ratio = gv("quick_ratio")
+
+        revenue_growth = gv("revenue_growth_percent", "revenue_growth")
+        net_income_growth = gv("net_income_growth_percent", "net_income_growth")
+        ebitda_margin = gv("ebitda_margin_percent", "ebitda_margin")
+        operating_margin = gv("operating_margin_percent", "operating_margin")
+        net_margin = gv("net_margin_percent", "net_margin")
+
+        ev_to_ebitda = gv("ev_to_ebitda", "ev_ebitda")
+        price_to_sales = gv("price_to_sales", "ps_ratio")
+        price_to_cash_flow = gv("price_to_cash_flow", "pcf_ratio")
+        peg_ratio = gv("peg_ratio", "peg")
+        beta = gv("beta")
+        volatility_30d = gv("volatility_30d_percent", "volatility_30d")
+
+        value_score = gv("value_score")
+        quality_score = gv("quality_score")
+        momentum_score = gv("momentum_score")
+        opportunity_score = gv("opportunity_score")
+        recommendation = gv("recommendation")
+        valuation_label = gv("valuation_label")
+        fair_value = gv("fair_value")
+        upside_percent = gv("upside_percent")
+
+        rsi_14 = gv("rsi_14")
+        macd = gv("macd")
+        ma_20d = gv("ma_20d", "moving_average_20d")
+        ma_50d = gv("ma_50d", "moving_average_50d")
 
         data_quality = gv("data_quality", default="UNKNOWN")
         sources = gv("sources")
@@ -1046,6 +1189,7 @@ class DataEngine:
             market_region=market_region,
             exchange=exchange,
             currency=currency,
+            listing_date=listing_date,
             shares_outstanding=shares_outstanding,
             free_float=free_float,
             last_price=last_price,
@@ -1078,13 +1222,40 @@ class DataEngine:
             pb=pb,
             dividend_yield=dividend_yield,
             dividend_yield_percent=dividend_yield,
+            dividend_payout_ratio=dividend_payout_ratio,
             roe=roe,
             roe_percent=roe,
             roa=roa,
             roa_percent=roa,
             profit_margin=profit_margin,
-            net_margin_percent=profit_margin,
+            net_margin_percent=net_margin or profit_margin,
             debt_to_equity=debt_to_equity,
+            current_ratio=current_ratio,
+            quick_ratio=quick_ratio,
+            revenue_growth_percent=revenue_growth,
+            net_income_growth_percent=net_income_growth,
+            ebitda_margin_percent=ebitda_margin,
+            operating_margin_percent=operating_margin,
+            net_margin_percent=net_margin or profit_margin,
+            ev_to_ebitda=ev_to_ebitda,
+            price_to_sales=price_to_sales,
+            price_to_cash_flow=price_to_cash_flow,
+            peg_ratio=peg_ratio,
+            beta=beta,
+            volatility_30d=volatility_30d,
+            volatility_30d_percent=volatility_30d,
+            fair_value=fair_value,
+            upside_percent=upside_percent,
+            valuation_label=valuation_label,
+            value_score=value_score,
+            quality_score=quality_score,
+            momentum_score=momentum_score,
+            opportunity_score=opportunity_score,
+            recommendation=recommendation,
+            rsi_14=rsi_14,
+            macd=macd,
+            ma_20d=ma_20d,
+            ma_50d=ma_50d,
             data_quality=data_quality,
             primary_provider=primary_provider,
             provider=provider,
@@ -1099,7 +1270,9 @@ class DataEngine:
         )
 
         if self.enable_advanced_analysis:
-            self._apply_basic_scoring(q, source="v1_delegate")
+            # v1 might already have scores; only top-up if missing
+            if q.value_score is None or q.quality_score is None or q.momentum_score is None:
+                self._apply_basic_scoring(q, source="v1_delegate")
 
         return q
 
@@ -1112,10 +1285,15 @@ class DataEngine:
         Lightweight scoring engine:
         - Value score: based mainly on PE and dividend yield
         - Quality score: EPS sign + PE range
-        - Momentum score: % change + 52W position
+        - Momentum score: % change + 52W position + basic volatility penalty
         - Opportunity score: weighted combination
+
+        This is intentionally simple and deterministic so that
+        Google Sheets & Apps Script can rely on it as a stable layer.
         """
-        # Quality score
+        # -------------------------
+        # Quality score (EPS + PE)
+        # -------------------------
         quality = 50.0
         pe = q.pe_ratio or q.pe or q.pe_ttm
         eps = q.eps_ttm or q.eps
@@ -1132,7 +1310,9 @@ class DataEngine:
         elif eps is not None and eps <= 0:
             quality = 30.0
 
-        # Value score
+        # -------------------------
+        # Value score (PE + Yield)
+        # -------------------------
         value = 50.0
         if pe is not None and pe > 0:
             try:
@@ -1148,12 +1328,16 @@ class DataEngine:
             except Exception:
                 pass
 
+        # -------------------------
         # Momentum score
+        # -------------------------
         momentum = 50.0
         if q.change_percent is not None or q.change_pct is not None:
             try:
                 cp = float(
-                    q.change_percent if q.change_percent is not None else q.change_pct  # type: ignore[arg-type]
+                    q.change_percent
+                    if q.change_percent is not None
+                    else q.change_pct  # type: ignore[arg-type]
                 )
                 momentum += max(-20.0, min(20.0, cp))
             except Exception:
@@ -1169,12 +1353,26 @@ class DataEngine:
             except Exception:
                 pass
 
+        # Volatility penalty (if 30D vol is high, reduce momentum slightly)
+        vol = q.volatility_30d_percent or q.volatility_30d
+        if vol is not None:
+            try:
+                v = float(vol)
+                # Above ~25% 30D vol, treat as higher risk and subtract up to 15 pts
+                if v > 25.0:
+                    penalty = min(15.0, (v - 25.0) / 2.0)
+                    momentum -= max(0.0, penalty)
+            except Exception:
+                pass
+
         # Clamp scores
         value = max(0.0, min(100.0, value))
         quality = max(0.0, min(100.0, quality))
         momentum = max(0.0, min(100.0, momentum))
 
+        # -------------------------
         # Opportunity score (weighted)
+        # -------------------------
         opportunity = value * 0.4 + quality * 0.3 + momentum * 0.3
 
         q.value_score = round(value, 2)
