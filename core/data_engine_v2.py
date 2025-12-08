@@ -1,25 +1,30 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.2 (Sheets-aligned)
+Core Data & Analysis Engine - v2.3 (Sheets-aligned, v1-backed)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
 Key features
 ------------
-- Async, multi-provider quote engine (FMP + optional EODHD + optional Finnhub).
-- KSA (.SR) tickers are KSA-safe:
-    • Never call EODHD directly for .SR symbols.
-    • If the legacy core.data_engine is available, it is used as the
-      primary KSA delegate (Tadawul / Argaam routing).
-- Simple in-memory caching with TTL to reduce API calls.
-- UnifiedQuote Pydantic model aligned with:
-    • routes/enriched_quote.EnrichedQuoteResponse
-    • routes/ai_analysis.SingleAnalysisResponse
-    • legacy_service (v1/quote + v1/legacy/sheet-rows)
-    • 9-page Google Sheets dashboard philosophy
-- Basic AI-style scoring:
-    • Value / Quality / Momentum / Opportunity + Recommendation
+- Uses the improved legacy engine `core.data_engine` (v1) as the
+  PRIMARY source for **all** markets (GLOBAL + KSA).
+    • v1 already handles multi-provider routing:
+        - GLOBAL: EODHD + FMP + Yahoo (where available)
+        - KSA: FMP + Yahoo + Tadawul/Argaam (via its own logic)
+    • This avoids duplicated logic and ensures all routes use the same
+      canonical data pipeline.
+
+- This v2 engine adds:
+    • Simple in-memory caching with TTL to reduce API calls.
+    • A sheet-aligned `UnifiedQuote` model that maps v1 fields into:
+        - Identity (Symbol, Sector, Market, etc.)
+        - Price & Liquidity (Last Price, 52W position, Volume, etc.)
+        - Fundamentals (PE, PB, EPS, Dividend Yield, ROE, ROA, etc.)
+        - Valuation / Risk / Technicals
+    • Basic AI-style scoring:
+        - Value / Quality / Momentum / Opportunity + Recommendation
+
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
 
@@ -29,17 +34,17 @@ ENGINE_CACHE_TTL_SECONDS         # optional; seconds, overrides DATAENGINE_CACHE
 DATAENGINE_CACHE_TTL             # optional; seconds, default 120 if both missing
 ENGINE_PROVIDER_TIMEOUT_SECONDS  # optional; overrides DATAENGINE_TIMEOUT
 DATAENGINE_TIMEOUT               # optional; per-provider timeout in seconds, default 10
-ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
-PRIMARY_PROVIDER                 # optional; if set and in enabled list, used first
+ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (fallback list). Default: "fmp"
+PRIMARY_PROVIDER                 # optional; if set and in enabled list, used first (fallback only)
 LOCAL_TIMEZONE                   # optional; default "Asia/Riyadh"
 ENABLE_ADVANCED_ANALYSIS         # optional; "1/true/on" to enable, "0/false/off" to disable
 
-Provider API keys
------------------
-FMP_API_KEY                      # required for FMP provider
+Provider API keys (fallback path)
+---------------------------------
+FMP_API_KEY                      # used only if v1 delegate fails
 EODHD_BASE_URL                   # optional; default "https://eodhd.com/api"
-EODHD_API_KEY                    # optional
-FINNHUB_API_KEY                  # optional
+EODHD_API_KEY                    # used only if v1 delegate fails
+FINNHUB_API_KEY                  # used only if v1 delegate fails
 """
 
 from __future__ import annotations
@@ -61,11 +66,10 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Optional import of v1 engine for KSA delegation
+# Optional import of v1 engine (PRIMARY data source)
 # ---------------------------------------------------------------------------
 
 try:  # pragma: no cover - best-effort
@@ -228,9 +232,16 @@ class DataEngine:
     """
     Core async engine used by routes.enriched_quote and AI/analysis routes.
 
-    Public async methods:
-        - get_enriched_quote(symbol: str) -> UnifiedQuote
-        - get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]
+    PRIMARY behavior:
+        - Delegates to `core.data_engine` (v1) for ALL symbols.
+        - v1 already handles:
+            • GLOBAL: EODHD + FMP + Yahoo merging (+ fundamentals)
+            • KSA: KSA-safe routing via Tadawul / Argaam logic
+
+    Added by v2:
+        - Caching
+        - Sheet-aligned UnifiedQuote mapping
+        - Basic AI scoring (Value / Quality / Momentum / Opportunity)
     """
 
     def __init__(
@@ -251,7 +262,7 @@ class DataEngine:
             )
             self.cache_ttl = int(ttl_env)
 
-        # Per-provider timeout (seconds)
+        # Per-provider timeout (seconds) – used only in fallback path
         if provider_timeout is not None:
             self.provider_timeout = int(provider_timeout)
         else:
@@ -280,7 +291,7 @@ class DataEngine:
 
         self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
 
-        # Enabled providers – accept list OR comma-separated string
+        # Enabled providers – FMP/EODHD/Finnhub are used ONLY as fallback
         if enabled_providers is not None:
             if isinstance(enabled_providers, str):
                 raw = enabled_providers
@@ -291,7 +302,7 @@ class DataEngine:
 
         providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
 
-        # Primary provider hint (for ordering)
+        # Primary provider hint (for ordering, fallback only)
         self.primary_provider_env: Optional[str] = (
             os.getenv("PRIMARY_PROVIDER", "") or ""
         ).strip().lower() or None
@@ -302,7 +313,7 @@ class DataEngine:
                 self.enabled_providers.append(p)
 
         if not self.enabled_providers:
-            # Always have at least FMP in the list
+            # Always have at least FMP in the list (fallback)
             self.enabled_providers = ["fmp"]
 
         # If PRIMARY_PROVIDER is set and present, move it to the front
@@ -317,7 +328,7 @@ class DataEngine:
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.2 initialized "
+            "DataEngine v2.3 initialized "
             "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, "
             "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
@@ -430,27 +441,34 @@ class DataEngine:
     # ------------------------------------------------------------------ #
 
     async def _get_enriched_quote_uncached(self, symbol: str) -> UnifiedQuote:
+        """
+        PRIMARY path:
+            - Delegate to v1 engine (core.data_engine) for ALL markets.
+
+        FALLBACK path (only if v1 fails/unavailable):
+            - Use direct providers (FMP / EODHD / Finnhub) and merge.
+        """
         is_ksa = self._is_ksa_symbol(symbol)
 
-        # 1) KSA-safe delegate: if legacy core.data_engine is available, use it first
-        if is_ksa and _HAS_V1_ENGINE:
+        # 1) Primary: v1 delegate for ALL markets
+        if _HAS_V1_ENGINE:
             try:
                 # v1 engine exposes an async get_enriched_quotes(List[str]) API
                 v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                 if v1_quotes:
-                    logger.debug("Using v1 KSA delegate for %s", symbol)
+                    logger.debug("Using v1 delegate engine for %s", symbol)
                     return self._from_v1_quote(v1_quotes[0])
             except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("V1 KSA delegate failed for %s: %s", symbol, exc)
+                logger.exception("V1 delegate engine failed for %s: %s", symbol, exc)
 
-        # 2) Multi-provider orchestration (global, and KSA if no v1 delegate)
+        # 2) Fallback: Multi-provider orchestration (rare in practice)
         providers = list(self.enabled_providers)
 
         # KSA-safe: never call EODHD for .SR / .TADAWUL symbols
         if is_ksa and "eodhd" in providers:
             providers = [p for p in providers if p != "eodhd"]
             logger.debug(
-                "KSA-safe mode: removed EODHD from providers for %s -> %s",
+                "KSA-safe mode (fallback): removed EODHD from providers for %s -> %s",
                 symbol,
                 providers,
             )
@@ -459,33 +477,33 @@ class DataEngine:
         tasks: List[asyncio.Task[UnifiedQuote]] = []
 
         for provider in providers:
-            provider = provider.lower()
-            if provider == "fmp":
+            p = provider.lower()
+            if p == "fmp":
                 tasks.append(
                     asyncio.create_task(
                         self._safe_call_provider("fmp", self._fetch_from_fmp, symbol)
                     )
                 )
-            elif provider == "eodhd":
+            elif p == "eodhd":
                 tasks.append(
                     asyncio.create_task(
                         self._safe_call_provider("eodhd", self._fetch_from_eodhd, symbol)
                     )
                 )
-            elif provider == "finnhub":
+            elif p == "finnhub":
                 tasks.append(
                     asyncio.create_task(
                         self._safe_call_provider("finnhub", self._fetch_from_finnhub, symbol)
                     )
                 )
             else:
-                logger.warning("Unknown provider '%s' configured; ignoring", provider)
+                logger.warning("Unknown provider '%s' configured; ignoring", p)
 
         if not tasks:
             return UnifiedQuote(
                 symbol=symbol,
                 data_quality="MISSING",
-                error="No valid providers configured (ENABLED_PROVIDERS)",
+                error="No valid providers configured (ENABLED_PROVIDERS) and v1 delegate unavailable",
             )
 
         results = await asyncio.gather(*tasks)
@@ -658,7 +676,7 @@ class DataEngine:
         return merged_quote
 
     # ------------------------------------------------------------------ #
-    # Provider: Financial Modeling Prep (FMP)
+    # Provider: Financial Modeling Prep (FMP) – Fallback only
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_fmp(self, symbol: str) -> Optional[UnifiedQuote]:
@@ -690,11 +708,6 @@ class DataEngine:
     def _map_fmp_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
         """
         Map FMP /quote response into UnifiedQuote.
-
-        NOTE:
-        - FMP /quote is primarily price- and basic-fundamental-oriented.
-        - More advanced ratios (ROE/ROA/margins) may require additional
-          endpoints; this engine only uses what is available here.
         """
 
         def gv(*keys: str, default=None):
@@ -817,7 +830,7 @@ class DataEngine:
         return q
 
     # ------------------------------------------------------------------ #
-    # Provider: EODHD (optional – mainly for global, not KSA .SR)
+    # Provider: EODHD (fallback – mainly for global, not KSA .SR)
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_eodhd(self, symbol: str) -> Optional[UnifiedQuote]:
@@ -828,7 +841,12 @@ class DataEngine:
             logger.warning("EODHD_API_KEY not set; skipping EODHD for %s", symbol)
             return None
 
-        url = f"{base_url.rstrip('/')}/real-time/{symbol}"
+        # Map bare symbols like AAPL -> AAPL.US for EODHD
+        request_code = symbol
+        if "." not in request_code:
+            request_code = f"{request_code}.US"
+
+        url = f"{base_url.rstrip('/')}/real-time/{request_code}"
         params = {"api_token": api_key, "fmt": "json"}
 
         timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
@@ -851,11 +869,6 @@ class DataEngine:
     def _map_eodhd_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
         """
         Map EODHD real-time response into UnifiedQuote.
-
-        NOTE:
-        - EODHD is not used for KSA (.SR) symbols – see _get_enriched_quote_uncached.
-        - We only rely on the quote-style fields; deeper fundamentals would require
-          additional endpoints.
         """
 
         def gv(*keys: str, default=None):
@@ -964,7 +977,7 @@ class DataEngine:
         return q
 
     # ------------------------------------------------------------------ #
-    # Provider: Finnhub (optional – real-time price only)
+    # Provider: Finnhub (fallback – real-time price only)
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_finnhub(self, symbol: str) -> Optional[UnifiedQuote]:
@@ -1032,7 +1045,7 @@ class DataEngine:
         return q
 
     # ------------------------------------------------------------------ #
-    # KSA delegate mapping (from v1 UnifiedQuote to v2 UnifiedQuote)
+    # KSA/global v1 delegate mapping (from v1 UnifiedQuote to v2)
     # ------------------------------------------------------------------ #
 
     def _from_v1_quote(self, v1_q: Any) -> UnifiedQuote:
@@ -1090,8 +1103,10 @@ class DataEngine:
         current_ratio = gv("current_ratio")
         quick_ratio = gv("quick_ratio")
 
-        revenue_growth = gv("revenue_growth_percent", "revenue_growth")
-        net_income_growth = gv("net_income_growth_percent", "net_income_growth")
+        revenue_growth = gv("revenue_growth_percent", "revenue_growth", "revenue_growth_yoy")
+        net_income_growth = gv(
+            "net_income_growth_percent", "net_income_growth", "net_income_growth_yoy"
+        )
         ebitda_margin = gv("ebitda_margin_percent", "ebitda_margin")
         operating_margin = gv("operating_margin_percent", "operating_margin")
         net_margin = gv("net_margin_percent", "net_margin")
@@ -1271,7 +1286,11 @@ class DataEngine:
 
         if self.enable_advanced_analysis:
             # v1 might already have scores; only top-up if missing
-            if q.value_score is None or q.quality_score is None or q.momentum_score is None:
+            if (
+                q.value_score is None
+                or q.quality_score is None
+                or q.momentum_score is None
+            ):
                 self._apply_basic_scoring(q, source="v1_delegate")
 
         return q
