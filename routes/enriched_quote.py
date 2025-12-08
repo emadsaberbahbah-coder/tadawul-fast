@@ -1,7 +1,7 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.3)
+Enriched Quotes Router (v2.4)
 
 - Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
@@ -168,6 +168,12 @@ class EnrichedQuoteResponse(BaseModel):
     currency: Optional[str] = Field(None, description="Trading currency, e.g. SAR, USD")
     listing_date: Optional[str] = Field(
         None, description="Listing date in YYYY-MM-DD (if available)"
+    )
+    shares_outstanding: Optional[float] = Field(
+        None, description="Shares outstanding, if available"
+    )
+    free_float: Optional[float] = Field(
+        None, description="Free float shares, if available"
     )
 
     # Price / liquidity
@@ -364,7 +370,9 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         sub_sector=g("sub_sector", "industry"),
         market=g("market", "market_region", "exchange", "exchange_short_name"),
         currency=g("currency"),
-        listing_date=g("listing_date"),
+        listing_date=g("listing_date", "ipo_date", "IPODate"),
+        shares_outstanding=g("shares_outstanding", "sharesOutstanding"),
+        free_float=g("free_float", "freeFloat"),
         # Price / liquidity
         last_price=g("last_price", "price", "currentPrice", "regularMarketPrice"),
         previous_close=g("previous_close", "prev_close", "previousClose"),
@@ -388,12 +396,13 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         liquidity_score=g("liquidity_score"),
         # Fundamentals
         eps_ttm=g("eps_ttm", "eps", "trailingEps"),
-        pe_ratio=g("pe_ratio", "pe", "pe_ttm", "trailingPE"),
-        pb_ratio=g("pb_ratio", "pb", "priceToBook"),
+        pe_ratio=g("pe_ratio", "pe", "pe_ttm", "trailingPE", "PERatio"),
+        pb_ratio=g("pb_ratio", "pb", "priceToBook", "P_B"),
         dividend_yield_percent=g(
             "dividend_yield_percent",
             "dividend_yield",
             "dividendYield",
+            "DividendYield",
         ),
         dividend_payout_ratio=g("dividend_payout_ratio"),
         roe_percent=g("roe_percent", "roe", "returnOnEquity"),
@@ -401,7 +410,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         debt_to_equity=g("debt_to_equity", "debtToEquity"),
         current_ratio=g("current_ratio"),
         quick_ratio=g("quick_ratio"),
-        market_cap=g("market_cap", "marketCap"),
+        market_cap=g("market_cap", "marketCap", "MarketCapitalization"),
         # Growth / profitability
         revenue_growth_percent=g(
             "revenue_growth_percent",
@@ -479,6 +488,11 @@ def _build_sheet_headers() -> List[str]:
     This structure is aligned with routes_argaam._build_sheet_headers so that
     KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX and My_Portfolio
     can all share the same template.
+
+    NOTE:
+    - shares_outstanding / free_float are available in JSON, but are not
+      currently included in the Sheets header template to keep compatibility
+      with existing Apps Script modules.
     """
     return [
         # Identity
@@ -656,7 +670,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.3",
+        "version": "2.4",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
     }
