@@ -1,7 +1,7 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.0
+Core Data & Analysis Engine - v2.1
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
@@ -15,6 +15,7 @@ Key features
 - Simple in-memory caching with TTL to reduce API calls.
 - UnifiedQuote Pydantic model aligned with:
     • routes/enriched_quote.EnrichedQuoteResponse
+    • routes/ai_analysis.SingleAnalysisResponse
     • legacy_service (v1/quote + v1/legacy/sheet-rows)
     • 9-page Google Sheets dashboard philosophy
 - Basic AI-style scoring:
@@ -22,17 +23,21 @@ Key features
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
 
-Environment variables
----------------------
-ENABLED_PROVIDERS       # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
-PRIMARY_PROVIDER        # (not enforced here – order of ENABLED_PROVIDERS is used)
-FMP_API_KEY             # required for FMP provider
-EODHD_BASE_URL          # optional; default "https://eodhd.com/api"
-EODHD_API_KEY           # optional
-FINNHUB_API_KEY         # optional
-DATAENGINE_CACHE_TTL    # optional; seconds, default 120
-DATAENGINE_TIMEOUT      # optional; per-provider timeout in seconds, default 10
-LOCAL_TIMEZONE          # optional; default "Asia/Riyadh"
+Configuration (env vars)
+------------------------
+ENGINE_CACHE_TTL_SECONDS         # optional; seconds, overrides DATAENGINE_CACHE_TTL
+DATAENGINE_CACHE_TTL             # optional; seconds, default 120 if both missing
+ENGINE_PROVIDER_TIMEOUT_SECONDS  # optional; overrides DATAENGINE_TIMEOUT
+DATAENGINE_TIMEOUT               # optional; per-provider timeout in seconds, default 10
+ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
+LOCAL_TIMEZONE                   # optional; default "Asia/Riyadh"
+
+Provider API keys
+-----------------
+FMP_API_KEY                      # required for FMP provider
+EODHD_BASE_URL                   # optional; default "https://eodhd.com/api"
+EODHD_API_KEY                    # optional
+FINNHUB_API_KEY                  # optional
 """
 
 from __future__ import annotations
@@ -219,7 +224,7 @@ class _CacheEntry:
 
 class DataEngine:
     """
-    Core async engine used by routes.enriched_quote and any AI analysis routes.
+    Core async engine used by routes.enriched_quote and AI/analysis routes.
 
     Public async methods:
         - get_enriched_quote(symbol: str) -> UnifiedQuote
@@ -233,27 +238,41 @@ class DataEngine:
         enabled_providers: Optional[List[str]] = None,
         enable_advanced_analysis: bool = True,
     ) -> None:
-        # Config from env with sensible defaults
-        self.cache_ttl: int = (
-            cache_ttl
-            if cache_ttl is not None
-            else int(os.getenv("DATAENGINE_CACHE_TTL", "120") or "120")
-        )
-        self.provider_timeout: int = (
-            provider_timeout
-            if provider_timeout is not None
-            else int(os.getenv("DATAENGINE_TIMEOUT", "10") or "10")
-        )
+        # Cache TTL (seconds)
+        if cache_ttl is not None:
+            self.cache_ttl = int(cache_ttl)
+        else:
+            ttl_env = (
+                os.getenv("ENGINE_CACHE_TTL_SECONDS")
+                or os.getenv("DATAENGINE_CACHE_TTL")
+                or "120"
+            )
+            self.cache_ttl = int(ttl_env)
+
+        # Per-provider timeout (seconds)
+        if provider_timeout is not None:
+            self.provider_timeout = int(provider_timeout)
+        else:
+            timeout_env = (
+                os.getenv("ENGINE_PROVIDER_TIMEOUT_SECONDS")
+                or os.getenv("DATAENGINE_TIMEOUT")
+                or "10"
+            )
+            self.provider_timeout = int(timeout_env)
+
         self.enable_advanced_analysis: bool = enable_advanced_analysis
         self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
 
+        # Enabled providers – accept list OR comma-separated string
         if enabled_providers is not None:
-            providers = enabled_providers
+            if isinstance(enabled_providers, str):
+                raw = enabled_providers
+            else:
+                raw = ",".join(str(p) for p in enabled_providers)
         else:
             raw = os.getenv("ENABLED_PROVIDERS", "fmp")
-            providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
 
-        # Normalize and de-duplicate providers
+        providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
         self.enabled_providers: List[str] = []
         for p in providers:
             if p and p not in self.enabled_providers:
@@ -266,7 +285,7 @@ class DataEngine:
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.0 initialized (providers=%s, cache_ttl=%ss, timeout=%ss, v1_delegate=%s)",
+            "DataEngine v2.1 initialized (providers=%s, cache_ttl=%ss, timeout=%ss, v1_delegate=%s)",
             self.enabled_providers,
             self.cache_ttl,
             self.provider_timeout,
