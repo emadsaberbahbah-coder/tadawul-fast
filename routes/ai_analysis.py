@@ -1,7 +1,7 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.2)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.3)
 
 - Preferred backend:
     • core.data_engine_v2.DataEngine (class-based unified engine)
@@ -26,39 +26,81 @@ AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.2)
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("routes.ai_analysis")
 
 # ----------------------------------------------------------------------
-# ENGINE DETECTION & FALLBACKS
+# Optional env.py integration (for engine configuration / diagnostics)
+# ----------------------------------------------------------------------
+
+try:  # pragma: no cover - optional
+    import env as _env  # type: ignore
+except Exception:
+    _env = None  # type: ignore
+
+# ----------------------------------------------------------------------
+# ENGINE DETECTION & FALLBACKS (aligned with advanced_analysis)
 # ----------------------------------------------------------------------
 
 _ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
+_ENGINE_IS_STUB: bool = True
 _engine: Any = None
 _data_engine_module: Any = None
 
-try:
-    # Preferred: new unified engine
+# Preferred: new unified engine (class-based)
+try:  # pragma: no cover - defensive
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    _engine = _V2DataEngine()
+    engine_kwargs: Dict[str, Any] = {}
+
+    if _env is not None:
+        cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
+        if cache_ttl is not None:
+            engine_kwargs["cache_ttl"] = cache_ttl
+
+        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+        if provider_timeout is not None:
+            engine_kwargs["provider_timeout"] = provider_timeout
+
+        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
+        if enabled_providers:
+            engine_kwargs["enabled_providers"] = enabled_providers
+
+        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
+        engine_kwargs["enable_advanced_analysis"] = enable_adv
+
+    try:
+        if engine_kwargs:
+            _engine = _V2DataEngine(**engine_kwargs)
+        else:
+            _engine = _V2DataEngine()
+    except TypeError:
+        # Signature mismatch -> fall back to default constructor
+        _engine = _V2DataEngine()
+
     _ENGINE_MODE = "v2"
-    logger.info("ai_analysis: Using DataEngine from core.data_engine_v2")
+    _ENGINE_IS_STUB = False
+    logger.info(
+        "ai_analysis: Using DataEngine v2 from core.data_engine_v2 (kwargs=%s)",
+        list(engine_kwargs.keys()),
+    )
+
 except Exception as e_v2:  # pragma: no cover - defensive
     logger.exception(
         "ai_analysis: Failed to import/use core.data_engine_v2.DataEngine: %s",
         e_v2,
     )
+    # Fallback: legacy data engine module with async functions
     try:
-        # Fallback: legacy data engine module with async functions
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
+        _ENGINE_IS_STUB = False
         logger.warning(
             "ai_analysis: Falling back to core.data_engine module-level API"
         )
@@ -111,8 +153,8 @@ except Exception as e_v2:  # pragma: no cover - defensive
 
         _engine = _StubEngine()
         _ENGINE_MODE = "stub"
+        _ENGINE_IS_STUB = True
         logger.error("ai_analysis: Using stub DataEngine with MISSING data.")
-
 
 # ----------------------------------------------------------------------
 # ROUTER
@@ -508,6 +550,8 @@ def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:
         return None
     try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
     except Exception:
         return None
@@ -547,6 +591,7 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
 
 
 @router.get("/health")
+@router.get("/ping", summary="Quick health-check for AI analysis")
 async def analysis_health() -> Dict[str, Any]:
     """
     Simple health check for this module.
@@ -554,8 +599,10 @@ async def analysis_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "ai_analysis",
-        "version": "2.2",
+        "version": "2.3",
         "engine_mode": _ENGINE_MODE,
+        "engine_is_stub": _ENGINE_IS_STUB,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -606,6 +653,7 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
         }
     """
     tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
+
     if not tickers:
         raise HTTPException(status_code=400, detail="At least one ticker is required")
 
@@ -624,10 +672,24 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
         ]
         return BatchAnalysisResponse(results=placeholder_results)
 
+    # Defensive: ensure we always iterate len(tickers) times
+    if unified_quotes is None:
+        unified_quotes = []
+    if not isinstance(unified_quotes, list):
+        unified_quotes = [unified_quotes]
+
+    # Pad or truncate to match number of tickers
+    if len(unified_quotes) < len(tickers):
+        unified_quotes.extend([None] * (len(tickers) - len(unified_quotes)))
+    elif len(unified_quotes) > len(tickers):
+        unified_quotes = unified_quotes[: len(tickers)]
+
     results: List[SingleAnalysisResponse] = []
     for t, q in zip(tickers, unified_quotes):
         try:
             analysis = _quote_to_analysis(q)
+            if not analysis.symbol:
+                analysis.symbol = t.upper()
             if analysis.data_quality == "MISSING" and not analysis.error:
                 analysis.error = "No data available from providers"
             results.append(analysis)
@@ -664,6 +726,7 @@ async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse
         - Any scoring/AI layer on top of KSA_Tadawul, Global_Markets,
           Mutual_Funds, Commodities_FX, and My_Portfolio pages.
     """
+    # Reuse the batch endpoint to guarantee identical logic
     batch = await analyze_batch_quotes(body)
     headers = _build_sheet_headers()
 
