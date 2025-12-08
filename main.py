@@ -2,14 +2,14 @@
 main.py
 ===========================================================
 Tadawul Fast Bridge - Main Application
-Version: 4.1.x (Unified Engine + Google Sheets + KSA-safe)
+Version: 4.2.x (Unified Engine + Google Sheets + KSA-safe)
 
 FastAPI backend for:
-    • Enriched Quotes       (v1/enriched)
-    • AI Analysis           (v1/analysis)
-    • Advanced Analysis     (v1/advanced)  [optional – only if router imports]
-    • KSA / Argaam Gateway  (v1/argaam)
-    • Legacy Quotes         (v1/quote, v1/legacy/sheet-rows)
+    • Enriched Quotes       (/v1/enriched)
+    • AI Analysis           (/v1/analysis)
+    • Advanced Analysis     (/v1/advanced)  [optional – only if router imports]
+    • KSA / Argaam Gateway  (/v1/argaam)
+    • Legacy Quotes         (/v1/quote, /v1/legacy/sheet-rows)
 
 Integrated with:
     • core.data_engine / core.data_engine_v2 (multi-provider engine):
@@ -69,10 +69,10 @@ class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.1.0")
+    app_version: str = os.getenv("APP_VERSION", "4.2.0")
 
 
-# Prefer Settings instance from env.py; otherwise use fallback dataclass
+# Prefer Settings instance from env.py; otherwise use fallback dataclass instance
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
 
@@ -95,7 +95,9 @@ def _get_env_attr(name: str, default: str = "") -> str:
 def _get_bool(name: str, default: bool = False) -> bool:
     """
     Helper to read a boolean from env.py or environment variables.
+    Accepts bool or typical truthy strings.
     """
+    # Prefer env.py attribute if present
     if _env_mod is not None and hasattr(_env_mod, name):
         val = getattr(_env_mod, name)
         if isinstance(val, bool):
@@ -114,7 +116,7 @@ APP_NAME: str = getattr(
     settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
 )
 APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.1.0")
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.2.0")
 )
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
@@ -136,10 +138,11 @@ GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr(
 # KSA / Argaam gateway visibility in /v1/status
 ARGAAM_GATEWAY_URL: str = _get_env_attr("ARGAAM_GATEWAY_URL", "")
 
-# HAS_SECURE_TOKEN: if env.py defines it, use that; otherwise derive from tokens
-HAS_SECURE_TOKEN: bool = getattr(
-    _env_mod, "HAS_SECURE_TOKEN", bool(APP_TOKEN or BACKUP_APP_TOKEN)
-)
+# HAS_SECURE_TOKEN:
+# - If env.py / env vars define HAS_SECURE_TOKEN, respect that (parsed via _get_bool).
+# - Otherwise derive from presence of APP_TOKEN / BACKUP_APP_TOKEN.
+_HAS_TOKEN_CONFIGURED = bool(APP_TOKEN or BACKUP_APP_TOKEN)
+HAS_SECURE_TOKEN: bool = _get_bool("HAS_SECURE_TOKEN", _HAS_TOKEN_CONFIGURED)
 
 
 # Optional provider information (for /v1/status)
@@ -152,21 +155,25 @@ def _get_providers_meta() -> Dict[str, Any]:
     primary: Optional[str] = None
 
     try:
+        # Try settings.enabled_providers (if defined in env.py)
         if hasattr(settings, "enabled_providers"):
-            enabled = list(getattr(settings, "enabled_providers", [])) or None
-        else:
+            maybe_list = getattr(settings, "enabled_providers", None)
+            if isinstance(maybe_list, (list, tuple)):
+                enabled = list(maybe_list) or None
+
+        # Fallback: ENABLED_PROVIDERS env var
+        if enabled is None:
             raw = os.getenv("ENABLED_PROVIDERS")
             if raw:
                 enabled = [p.strip() for p in raw.split(",") if p.strip()]
 
+        # Primary provider: settings or env
         if hasattr(settings, "primary_or_default_provider"):
             primary = getattr(settings, "primary_or_default_provider", None)
-        else:
-            primary = (
-                getattr(_env_mod, "PRIMARY_PROVIDER", None)
-                if _env_mod
-                else None
-            ) or os.getenv("PRIMARY_PROVIDER")
+        if not primary and _env_mod is not None and hasattr(_env_mod, "PRIMARY_PROVIDER"):
+            primary = getattr(_env_mod, "PRIMARY_PROVIDER")
+        if not primary:
+            primary = os.getenv("PRIMARY_PROVIDER")
     except Exception:  # pragma: no cover - extremely defensive
         enabled = None
         primary = None
