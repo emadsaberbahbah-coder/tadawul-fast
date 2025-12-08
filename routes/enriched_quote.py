@@ -1,7 +1,7 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.4)
+Enriched Quotes Router (v2.5)
 
 - Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
@@ -23,6 +23,11 @@ Google Sheets usage:
 Alignment:
     - Header structure is aligned with routes_argaam._build_sheet_headers
       so all 9 pages share the same layout.
+
+Notes:
+    - JSON responses expose a richer set of fields (incl. shares_outstanding /
+      free_float) than the Google Sheets header template to keep backwards
+      compatibility with existing Apps Script modules.
 """
 
 from __future__ import annotations
@@ -37,12 +42,12 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("routes.enriched_quote")
 
 # ----------------------------------------------------------------------
-# Optional env.py (for future configuration, logging, etc.)
+# Optional env.py (for engine configuration, logging, etc.)
 # ----------------------------------------------------------------------
 
 try:  # pragma: no cover - optional
     import env as _env  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - env.py is optional
     _env = None  # type: ignore
 
 # ----------------------------------------------------------------------
@@ -54,47 +59,70 @@ _ENGINE_IS_STUB: bool = False
 _engine: Any = None
 _data_engine_module: Any = None
 
-try:
-    # Preferred new engine (class-based, lives in core.data_engine_v2)
+# We separate import vs. initialization to get clearer logs.
+_HAS_V2_ENGINE: bool = False
+
+# --- Step 1: Try to import the v2 engine class ------------------------
+try:  # pragma: no cover - import-only
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    if _env is not None:
-        # Optional: use basic config from env.py if present
-        cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
-        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
-        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
-        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+    _HAS_V2_ENGINE = True
+    logger.info("routes.enriched_quote: core.data_engine_v2.DataEngine import OK")
+except Exception as e_v2_import:  # pragma: no cover - defensive
+    logger.exception(
+        "routes.enriched_quote: Import of core.data_engine_v2.DataEngine failed: %s",
+        e_v2_import,
+    )
+    _HAS_V2_ENGINE = False
 
+# --- Step 2: If import worked, try to initialize the v2 engine --------
+if _HAS_V2_ENGINE:
+    try:
         kwargs: Dict[str, Any] = {}
-        if cache_ttl is not None:
-            kwargs["cache_ttl"] = cache_ttl
-        if enabled_providers is not None:
-            kwargs["enabled_providers"] = enabled_providers
-        if enable_adv is not None:
-            kwargs["enable_advanced_analysis"] = enable_adv
-        if provider_timeout is not None:
-            kwargs["provider_timeout"] = provider_timeout
+
+        if _env is not None:
+            # These are all optional; DataEngine will also read env vars directly.
+            cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
+            enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
+            enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
+            provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+
+            if cache_ttl is not None:
+                kwargs["cache_ttl"] = cache_ttl
+            if enabled_providers is not None:
+                kwargs["enabled_providers"] = enabled_providers
+            if enable_adv is not None:
+                kwargs["enable_advanced_analysis"] = enable_adv
+            if provider_timeout is not None:
+                kwargs["provider_timeout"] = provider_timeout
 
         _engine = _V2DataEngine(**kwargs)
-    else:
-        _engine = _V2DataEngine()
+        _ENGINE_MODE = "v2"
+        logger.info(
+            "routes.enriched_quote: Using DataEngine v2 from core.data_engine_v2 "
+            "with kwargs=%s",
+            {
+                k: ("***" if "key" in k.lower() or "token" in k.lower() else v)
+                for k, v in kwargs.items()
+            },
+        )
+    except Exception as e_v2_init:  # pragma: no cover - defensive
+        logger.exception(
+            "routes.enriched_quote: Initialization of DataEngine v2 failed: %s",
+            e_v2_init,
+        )
+        _engine = None
+        _ENGINE_MODE = "stub"
 
-    _ENGINE_MODE = "v2"
-    logger.info("routes.enriched_quote: Using DataEngine v2 from core.data_engine_v2")
-
-except Exception as e_v2:  # pragma: no cover - defensive
-    logger.exception(
-        "routes.enriched_quote: Failed to import/use core.data_engine_v2.DataEngine: %s",
-        e_v2,
-    )
+# --- Step 3: If v2 is not available, try legacy v1 module -------------
+if _engine is None:
     try:
-        # Fallback: legacy engine module (core.data_engine) which exposes
-        # async functions get_enriched_quote / get_enriched_quotes.
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
         logger.warning(
-            "routes.enriched_quote: Falling back to core.data_engine module-level API"
+            "routes.enriched_quote: Falling back to core.data_engine module-level API "
+            "(engine_mode='v1_module')"
         )
     except Exception as e_v1:  # pragma: no cover - defensive
         logger.exception(
@@ -294,7 +322,7 @@ async def get_enriched_quote(symbol: str) -> Any:
     if not sym:
         return None
 
-    if _ENGINE_MODE == "v2":
+    if _ENGINE_MODE == "v2" and _engine is not None:
         return await _engine.get_enriched_quote(sym)
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
@@ -310,7 +338,7 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
     if not clean:
         return []
 
-    if _ENGINE_MODE == "v2":
+    if _ENGINE_MODE == "v2" and _engine is not None:
         return await _engine.get_enriched_quotes(clean)
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
@@ -367,37 +395,49 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         symbol=symbol,
         name=g("name", "company_name", "longName", "shortName"),
         sector=g("sector"),
-        sub_sector=g("sub_sector", "industry"),
-        market=g("market", "market_region", "exchange", "exchange_short_name"),
+        sub_sector=g("sub_sector", "industry", "industry_group", "industryGroup"),
+        market=g(
+            "market",
+            "market_region",
+            "exchange",
+            "exchange_short_name",
+            "primary_exchange",
+        ),
         currency=g("currency"),
-        listing_date=g("listing_date", "ipo_date", "IPODate"),
-        shares_outstanding=g("shares_outstanding", "sharesOutstanding"),
+        listing_date=g("listing_date", "ipo_date", "IPODate", "ipoDate", "list_date"),
+        shares_outstanding=g(
+            "shares_outstanding", "sharesOutstanding", "ShareOutstanding"
+        ),
         free_float=g("free_float", "freeFloat"),
         # Price / liquidity
-        last_price=g("last_price", "price", "currentPrice", "regularMarketPrice"),
-        previous_close=g("previous_close", "prev_close", "previousClose"),
-        open=g("open", "regularMarketOpen"),
-        high=g("high", "dayHigh", "regularMarketDayHigh"),
-        low=g("low", "dayLow", "regularMarketDayLow"),
+        last_price=g(
+            "last_price", "price", "currentPrice", "regularMarketPrice", "close"
+        ),
+        previous_close=g("previous_close", "prev_close", "previousClose", "pc"),
+        open=g("open", "regularMarketOpen", "o"),
+        high=g("high", "dayHigh", "regularMarketDayHigh", "h"),
+        low=g("low", "dayLow", "regularMarketDayLow", "l"),
         change=g("change"),
-        change_percent=g("change_percent", "change_pct", "changePercent"),
+        change_percent=g("change_percent", "change_pct", "changePercent", "change_p"),
         high_52w=g("high_52w", "fifty_two_week_high", "yearHigh"),
         low_52w=g("low_52w", "fifty_two_week_low", "yearLow"),
         position_52w_percent=g("position_52w_percent", "fifty_two_week_position"),
         volume=g("volume", "regularMarketVolume"),
-        avg_volume_30d=g("avg_volume_30d", "average_volume_30d", "avg_volume"),
+        avg_volume_30d=g(
+            "avg_volume_30d", "average_volume_30d", "avg_volume", "avgVolume"
+        ),
         value_traded=g("value_traded"),
         turnover_rate=g("turnover_rate"),
-        bid_price=g("bid_price"),
-        ask_price=g("ask_price"),
-        bid_size=g("bid_size"),
-        ask_size=g("ask_size"),
+        bid_price=g("bid_price", "bid"),
+        ask_price=g("ask_price", "ask"),
+        bid_size=g("bid_size", "bidSize"),
+        ask_size=g("ask_size", "askSize"),
         spread_percent=g("spread_percent"),
         liquidity_score=g("liquidity_score"),
         # Fundamentals
         eps_ttm=g("eps_ttm", "eps", "trailingEps"),
         pe_ratio=g("pe_ratio", "pe", "pe_ttm", "trailingPE", "PERatio"),
-        pb_ratio=g("pb_ratio", "pb", "priceToBook", "P_B"),
+        pb_ratio=g("pb_ratio", "pb", "priceToBook", "P_B", "price_to_book"),
         dividend_yield_percent=g(
             "dividend_yield_percent",
             "dividend_yield",
@@ -424,9 +464,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         ),
         ebitda_margin_percent=g("ebitda_margin_percent", "ebitda_margin"),
         operating_margin_percent=g(
-            "operating_margin_percent",
-            "operating_margin",
-            "operatingMargins",
+            "operating_margin_percent", "operating_margin", "operatingMargins"
         ),
         net_margin_percent=g(
             "net_margin_percent",
@@ -434,7 +472,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
             "profitMargins",
         ),
         # Valuation / risk
-        ev_to_ebitda=g("ev_to_ebitda"),
+        ev_to_ebitda=g("ev_to_ebitda", "ev_ebitda"),
         price_to_sales=g(
             "price_to_sales",
             "priceToSales",
@@ -444,7 +482,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
             "price_to_cash_flow",
             "priceToCashFlow",
         ),
-        peg_ratio=g("peg_ratio", "pegRatio"),
+        peg_ratio=g("peg_ratio", "pegRatio", "peg"),
         beta=g("beta"),
         volatility_30d_percent=g(
             "volatility_30d_percent",
@@ -465,8 +503,21 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         ma_20d=g("ma_20d"),
         ma_50d=g("ma_50d"),
         # Meta
-        data_source=g("data_source", "provider", "primary_provider", "primary_source"),
-        provider=g("provider", "primary_provider", "primary_source"),
+        data_source=g(
+            "data_source",
+            "provider",
+            "primary_provider",
+            "primary_source",
+            "source",
+            "dataProvider",
+        ),
+        provider=g(
+            "provider",
+            "primary_provider",
+            "primary_source",
+            "source",
+            "dataProvider",
+        ),
         data_quality=g(
             "data_quality",
             "data_quality_level",
@@ -670,7 +721,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.4",
+        "version": "2.5",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
     }
