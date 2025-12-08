@@ -2,13 +2,13 @@
 main.py
 ===========================================================
 Tadawul Fast Bridge - Main Application
-Version: 4.2.x (Unified Engine + Google Sheets + KSA-safe)
+Version: 4.3.0 (Unified Engine + Google Sheets + KSA-safe)
 
 FastAPI backend for:
-    • Enriched Quotes       (/v1/enriched)
-    • AI Analysis           (/v1/analysis)
-    • Advanced Analysis     (/v1/advanced)  [optional – only if router imports]
-    • KSA / Argaam Gateway  (/v1/argaam)
+    • Enriched Quotes       (/v1/enriched*)
+    • AI Analysis           (/v1/analysis*)
+    • Advanced Analysis     (/v1/advanced*)  [optional – only if router imports]
+    • KSA / Argaam Gateway  (/v1/argaam*)
     • Legacy Quotes         (/v1/quote, /v1/legacy/sheet-rows)
 
 Integrated with:
@@ -53,7 +53,7 @@ from slowapi.util import get_remote_address
 # Configuration import (env.py) with safe, non-crashing fallback
 # ------------------------------------------------------------
 
-try:
+try:  # pragma: no cover - env.py is optional
     import env as _env_mod  # type: ignore
 except Exception:  # pragma: no cover - defensive fallback
     _env_mod = None  # type: ignore
@@ -69,7 +69,7 @@ class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.2.0")
+    app_version: str = os.getenv("APP_VERSION", "4.3.0")
 
 
 # Prefer Settings instance from env.py; otherwise use fallback dataclass instance
@@ -111,12 +111,15 @@ def _get_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+# ------------------------------------------------------------
 # Core app identity & tokens
+# ------------------------------------------------------------
+
 APP_NAME: str = getattr(
     settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
 )
 APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.2.0")
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.3.0")
 )
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
@@ -693,4 +696,21 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             "status_code": 500,
             "detail": "Internal server error – see backend logs.",
         },
+    )
+
+
+# ------------------------------------------------------------
+# Public exports & local dev entrypoint
+# ------------------------------------------------------------
+
+__all__ = ["app"]
+
+if __name__ == "__main__":  # Local development helper
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
     )
