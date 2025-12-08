@@ -1,15 +1,15 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.1 (MULTI-PROVIDER)
+UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.2 (MULTI-PROVIDER)
 
 Role in Architecture
 --------------------
 - This module is the "legacy" but still fully functional data engine.
 - New features prefer `core.data_engine_v2.DataEngine`, but many routes
   still fall back to `core.data_engine.DataEngine` if v2 is missing.
-- This file is therefore kept **100% compatible** and now exposes a
-  proper `DataEngine` class with async methods:
+- This file is therefore kept compatible and exposes a `DataEngine`
+  class with async methods:
 
     - DataEngine.get_enriched_quote(symbol)
     - DataEngine.get_enriched_quotes(symbols)
@@ -33,10 +33,28 @@ Key Behaviors
     • as_of_utc          -> from last_updated_utc
     • timezone           -> inferred from market_region
 
-Notes for KSA (.SR)
--------------------
-- EODHD is **not used** for KSA symbols (".SR").
-- KSA tickers use FMP (if available) + Yahoo Finance as main sources.
+Global vs KSA
+-------------
+- EODHD is used **only** for GLOBAL symbols (no .SR suffix).
+- For KSA (.SR) tickers this engine relies on FMP + Yahoo Finance,
+  and v2 / KSA-specific routes (e.g. /v1/argaam) should be preferred
+  for production KSA coverage.
+
+EODHD Fundamentals
+------------------
+- For global symbols, this engine now calls:
+    1) /real-time/{TICKER}
+    2) /fundamentals/{TICKER}
+  and merges both into a richer quote:
+    • sector / industry / listing_date
+    • market_cap
+    • eps_ttm / pe_ttm
+    • dividend_yield
+    • beta
+    • 52-week high / low
+
+- This behaviour can be toggled via:
+    ENABLE_EODHD_FUNDAMENTALS = "0" / "1" (env var, default = "1")
 """
 
 from __future__ import annotations
@@ -79,7 +97,7 @@ ENABLED_PROVIDERS: List[str] = [
     p.strip().lower() for p in _enabled_raw.split(",") if p.strip()
 ]
 
-# Primary provider preference
+# Primary provider preference (usually "eodhd" for your paid plan)
 PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "eodhd").lower()
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "25"))
@@ -92,6 +110,12 @@ EODHD_BASE_URL = os.getenv("EODHD_BASE_URL", "https://eodhd.com/api")
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 FMP_BASE_URL = os.getenv(
     "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+)
+
+# Toggle for extra EODHD fundamentals call
+_ENABLE_EODHD_FUNDAMENTALS_RAW = os.getenv("ENABLE_EODHD_FUNDAMENTALS", "1")
+ENABLE_EODHD_FUNDAMENTALS: bool = (
+    _ENABLE_EODHD_FUNDAMENTALS_RAW.strip().lower() not in {"0", "false", "no", "off"}
 )
 
 # Types
@@ -119,6 +143,9 @@ class UnifiedQuote(BaseModel):
     exchange: Optional[str] = None
     currency: Optional[str] = None
     market_region: MarketRegion = "UNKNOWN"
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    listing_date: Optional[str] = None  # ISO string (e.g. "1980-12-12")
 
     # Intraday price snapshot
     price: Optional[float] = None
@@ -147,6 +174,7 @@ class UnifiedQuote(BaseModel):
     operating_margin: Optional[float] = None
     revenue_growth_yoy: Optional[float] = None
     net_income_growth_yoy: Optional[float] = None
+    beta: Optional[float] = None
 
     # Meta
     last_updated_utc: Optional[datetime] = None
@@ -274,41 +302,84 @@ async def fetch_from_yahoo(symbol: str) -> Dict[str, Any]:
 
 async def fetch_from_eodhd(symbol: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
-    Fetch real-time quote from EODHD /real-time/{code} endpoint.
+    Fetch real-time quote (and optional fundamentals) from EODHD.
+
+    Behaviour:
+    - Uses /real-time/{code} for price snapshot.
+    - If ENABLE_EODHD_FUNDAMENTALS is true, also calls
+      /fundamentals/{code} and merges extra fields (sector, industry,
+      listing_date, eps_ttm, pe_ttm, dividend_yield, beta, 52w high/low,
+      market_cap, etc.).
 
     NOTE:
-    - **Not used for KSA (.SR)**; see _gather_provider_payloads.
+    - **Not used for KSA (.SR)**; see _gather_provider_payloads which
+      skips EODHD for Tadawul tickers.
     """
     if not EODHD_API_KEY:
         logger.debug("EODHD_API_KEY not configured – skipping EODHD for %s", symbol)
         return {}
 
-    # Normalize ticker: if it already has '.', assume fully-qualified (e.g. 1120.SR, MSFT.US)
-    # otherwise assume US equity and append .US
     t = symbol.strip().upper()
+    # If no suffix, assume US equity for EODHD
     code = t if "." in t else f"{t}.US"
+    base = EODHD_BASE_URL.rstrip("/")
 
-    url = f"{EODHD_BASE_URL.rstrip('/')}/real-time/{code}"
-    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+    async def _request_json(url: str) -> Dict[str, Any]:
+        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+        try:
+            async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.warning(
+                        "EODHD HTTP %s for %s (%s) [%s]: %s",
+                        resp.status,
+                        symbol,
+                        code,
+                        url,
+                        text,
+                    )
+                    return {}
+                try:
+                    return await resp.json()
+                except Exception as exc:
+                    logger.warning(
+                        "EODHD JSON decode failed for %s (%s) [%s]: %s",
+                        symbol,
+                        code,
+                        url,
+                        exc,
+                    )
+                    return {}
+        except Exception as exc:  # pragma: no cover - network
+            logger.error(
+                "EODHD request failed for %s (%s) [%s]: %s",
+                symbol,
+                code,
+                url,
+                exc,
+            )
+            return {}
 
-    try:
-        async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.warning(
-                    "EODHD HTTP %s for %s (%s): %s", resp.status, symbol, code, text
-                )
-                return {}
-            data = await resp.json()
-    except Exception as exc:  # pragma: no cover - network
-        logger.error("EODHD request failed for %s (%s): %s", symbol, code, exc)
+    realtime_url = f"{base}/real-time/{code}"
+    fundamentals_data: Dict[str, Any] = {}
+
+    if ENABLE_EODHD_FUNDAMENTALS:
+        fundamentals_url = f"{base}/fundamentals/{code}"
+        realtime_data, fundamentals_data = await asyncio.gather(
+            _request_json(realtime_url),
+            _request_json(fundamentals_url),
+        )
+    else:
+        realtime_data = await _request_json(realtime_url)
+
+    if not isinstance(realtime_data, dict) or "code" not in realtime_data:
+        logger.warning("EODHD payload invalid for %s (%s): %s", symbol, code, realtime_data)
         return {}
 
-    if not isinstance(data, dict) or "code" not in data:
-        logger.warning("EODHD payload invalid for %s: %s", symbol, data)
-        return {}
+    if not isinstance(fundamentals_data, dict):
+        fundamentals_data = {}
 
-    return _normalize_eodhd_quote(data, symbol)
+    return _normalize_eodhd_quote(realtime_data, symbol, fundamentals_data)
 
 
 async def fetch_from_fmp(symbol: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
@@ -399,6 +470,10 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "fifty_two_week_low": data.get("fiftyTwoWeekLow"),
         "change": change,
         "change_pct": change_pct,
+        # Extra identity & risk where available
+        "sector": data.get("sector"),
+        "industry": data.get("industry"),
+        "beta": data.get("beta"),
         # Fundamentals
         "eps_ttm": data.get("trailingEps"),
         "pe_ttm": data.get("trailingPE"),
@@ -419,8 +494,15 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     return payload
 
 
-def _normalize_eodhd_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """Normalize EODHD real-time payload to UnifiedQuote-compatible dict."""
+def _normalize_eodhd_quote(
+    data: Dict[str, Any],
+    symbol: str,
+    fundamentals: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize EODHD real-time payload (+ optional fundamentals)
+    to UnifiedQuote-compatible dict.
+    """
     now = datetime.now(timezone.utc)
 
     price = data.get("close")
@@ -441,26 +523,81 @@ def _normalize_eodhd_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     else:
         last_dt = now
 
-    currency = _infer_currency_from_symbol(symbol)
+    general: Dict[str, Any] = {}
+    highlights: Dict[str, Any] = {}
+    technicals: Dict[str, Any] = {}
+
+    if isinstance(fundamentals, dict) and fundamentals:
+        g = fundamentals.get("General")
+        if isinstance(g, dict):
+            general = g
+        h = fundamentals.get("Highlights")
+        if isinstance(h, dict):
+            highlights = h
+        t = fundamentals.get("Technicals")
+        if isinstance(t, dict):
+            technicals = t
+
+    # Identity & static attributes
+    currency = general.get("CurrencyCode") or _infer_currency_from_symbol(symbol)
+    sector = general.get("Sector")
+    industry = general.get("Industry") or general.get("GicIndustry")
+    listing_date = general.get("IPODate")
+
+    # Fundamentals from highlights/fundamentals
+    market_cap = (
+        data.get("market_cap")
+        or data.get("marketCap")
+        or general.get("MarketCapitalization")
+        or highlights.get("MarketCapitalization")
+    )
+
+    eps_ttm = highlights.get("EpsTTM")
+    if eps_ttm is None:
+        eps_ttm = highlights.get("EPS") or highlights.get("EarningsShare")
+
+    pe_ttm = highlights.get("PERatio") or data.get("pe")
+
+    dividend_yield = highlights.get("DividendYield")
+    beta = highlights.get("Beta")
+
+    fifty_two_week_high = technicals.get("52WeekHigh")
+    fifty_two_week_low = technicals.get("52WeekLow")
+
+    # Merge field names for provider source info
+    fields = list(data.keys())
+    for section in (general, highlights, technicals):
+        if isinstance(section, dict):
+            fields.extend(list(section.keys()))
 
     payload: Dict[str, Any] = {
         "symbol": symbol,
-        "name": data.get("name"),
-        "exchange": data.get("exchange_short_name") or data.get("exchange"),
+        "name": general.get("Name") or data.get("name"),
+        "exchange": general.get("Exchange")
+        or data.get("exchange_short_name")
+        or data.get("exchange"),
         "currency": currency,
+        "sector": sector,
+        "industry": industry,
+        "listing_date": listing_date,
         "price": price,
         "prev_close": prev_close,
         "open": data.get("open"),
         "high": data.get("high"),
         "low": data.get("low"),
         "volume": data.get("volume"),
-        "market_cap": data.get("market_cap") or data.get("marketCap"),
+        "market_cap": market_cap,
         "change": change,
         "change_pct": change_pct,
-        # 52w fields: not always available on this endpoint – leave None for now
+        "fifty_two_week_high": fifty_two_week_high,
+        "fifty_two_week_low": fifty_two_week_low,
+        "eps_ttm": eps_ttm,
+        "pe_ttm": pe_ttm,
+        "dividend_yield": dividend_yield,
+        "beta": beta,
         "last_updated_utc": last_dt,
         "__source__": QuoteSourceInfo(
-            provider="eodhd", timestamp=last_dt, fields=list(data.keys())
+            provider="eodhd", timestamp=last_dt, fields=fields
         ),
     }
     return payload
@@ -493,7 +630,11 @@ def _normalize_fmp_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "market_cap": data.get("marketCap"),
         "fifty_two_week_high": data.get("yearHigh"),
         "fifty_two_week_low": data.get("yearLow"),
-        # Fundamentals (where available for your plan)
+        # Extra where available
+        "sector": data.get("sector"),
+        "industry": data.get("industry"),
+        "beta": data.get("beta"),
+        # Fundamentals (depending on your FMP plan)
         "eps_ttm": data.get("eps"),
         "pe_ttm": data.get("pe"),
         "pb": data.get("priceToBook"),
@@ -622,7 +763,9 @@ async def _gather_provider_payloads(symbol: str) -> Dict[str, Any]:
 
         for provider in order:
             if provider == "eodhd":
-                tasks["eodhd"] = asyncio.create_task(fetch_from_eodhd(symbol, session))
+                tasks["eodhd"] = asyncio.create_task(
+                    fetch_from_eodhd(symbol, session)
+                )
             elif provider == "fmp":
                 tasks["fmp"] = asyncio.create_task(fetch_from_fmp(symbol, session))
             elif provider == "yfinance":
@@ -759,14 +902,16 @@ class DataEngine:
         """
         Optional per-instance overrides for provider config.
 
-        If not provided, uses global ENV-based configuration.
+        NOTE: For now, these are informational only – the actual
+        provider list still comes from global ENV variables so that
+        behaviour is consistent across the whole app.
         """
         self.enabled_providers = enabled_providers or ENABLED_PROVIDERS
         self.primary_provider = (primary_provider or PRIMARY_PROVIDER).lower()
 
     async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
         """
-        Instance method: just delegates to module-level function for now.
+        Instance method: delegates to module-level function for now.
         """
         return await get_enriched_quote(symbol)
 
