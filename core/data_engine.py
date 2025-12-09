@@ -1,7 +1,7 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.3 (MULTI-PROVIDER)
+UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.4 (MULTI-PROVIDER, KSA-SAFE)
 
 Role in Architecture
 --------------------
@@ -33,7 +33,10 @@ Key Behaviors
     • high_52w / low_52w -> from fifty_two_week_high / fifty_two_week_low
     • change_percent     -> from change_pct
     • as_of_utc          -> from last_updated_utc
+    • as_of_local        -> from last_updated_utc (or same as-of for now)
     • timezone           -> inferred from market_region
+    • data_source        -> from primary provider
+    • provider           -> from primary provider
 
 Global vs KSA
 -------------
@@ -62,8 +65,11 @@ EODHD Fundamentals – ENHANCED
     • beta
     • 52-week high / low
     • roe / roa
-    • profit_margin / operating_margin
+    • profit_margin / operating_margin / ebitda_margin
     • revenue_growth_yoy / net_income_growth_yoy
+    • price_to_sales / price_to_cash_flow / ev_to_ebitda / peg_ratio
+    • avg_volume_30d
+    • shares_outstanding / free_float (where available)
 
 - This behaviour can be toggled via:
     ENABLE_EODHD_FUNDAMENTALS = "0" / "1" (env var, default = "1")
@@ -163,8 +169,10 @@ class UnifiedQuote(BaseModel):
     currency: Optional[str] = None
     market_region: MarketRegion = "UNKNOWN"
     sector: Optional[str] = None
-    industry: Optional[str] = None
+    industry: Optional[str] = None  # mapped to sub_sector in router
     listing_date: Optional[str] = None  # ISO string (e.g. "1980-12-12")
+    shares_outstanding: Optional[float] = None
+    free_float: Optional[float] = None
 
     # Intraday price snapshot
     price: Optional[float] = None
@@ -173,12 +181,23 @@ class UnifiedQuote(BaseModel):
     high: Optional[float] = None
     low: Optional[float] = None
     volume: Optional[float] = None
+    avg_volume_30d: Optional[float] = None
+    value_traded: Optional[float] = None
+    turnover_rate: Optional[float] = None
+
+    bid_price: Optional[float] = None
+    ask_price: Optional[float] = None
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
+    spread_percent: Optional[float] = None
+    liquidity_score: Optional[float] = None
 
     # Derived price info
     change: Optional[float] = None
     change_pct: Optional[float] = None
     fifty_two_week_high: Optional[float] = None
     fifty_two_week_low: Optional[float] = None
+    fifty_two_week_position: Optional[float] = None  # 0–100
 
     # Fundamentals
     market_cap: Optional[float] = None
@@ -186,23 +205,41 @@ class UnifiedQuote(BaseModel):
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
     dividend_yield: Optional[float] = None
+    dividend_payout_ratio: Optional[float] = None
     roe: Optional[float] = None
     roa: Optional[float] = None
     debt_to_equity: Optional[float] = None
+    current_ratio: Optional[float] = None
+    quick_ratio: Optional[float] = None
     profit_margin: Optional[float] = None
     operating_margin: Optional[float] = None
+    ebitda_margin: Optional[float] = None
     revenue_growth_yoy: Optional[float] = None
     net_income_growth_yoy: Optional[float] = None
     beta: Optional[float] = None
 
-    # Meta
+    # Valuation / risk
+    ev_to_ebitda: Optional[float] = None
+    price_to_sales: Optional[float] = None
+    price_to_cash_flow: Optional[float] = None
+    peg_ratio: Optional[float] = None
+    volatility_30d_percent: Optional[float] = None
+
+    # Meta & analysis
     last_updated_utc: Optional[datetime] = None
     data_quality: DataQualityLevel = "MISSING"
     data_gaps: List[str] = Field(default_factory=list)
     sources: List[QuoteSourceInfo] = Field(default_factory=list)
 
-    # Analysis
+    # AI / scoring
+    fair_value: Optional[float] = None
+    upside_percent: Optional[float] = None
+    valuation_label: Optional[str] = None
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
     opportunity_score: Optional[float] = None
+    recommendation: Optional[str] = None
     risk_flag: Optional[str] = None
     notes: Optional[str] = None
 
@@ -238,8 +275,11 @@ class UnifiedQuote(BaseModel):
             - low_52w          (from fifty_two_week_low)
             - change_percent   (from change_pct)
             - as_of_utc        (from last_updated_utc)
-            - as_of_local      (same as as_of_utc for now)
+            - as_of_local      (from last_updated_utc for now)
             - timezone         ('Asia/Riyadh' for KSA, else 'UTC')
+            - data_source      (from primary provider)
+            - provider         (from primary provider)
+            - primary_provider (from primary provider; internal-ish)
         """
         data = super().model_dump(*args, **kwargs)
 
@@ -272,6 +312,22 @@ class UnifiedQuote(BaseModel):
                 data["timezone"] = "Asia/Riyadh"
             else:
                 data["timezone"] = "UTC"
+
+        # Primary provider → provider + data_source aliases
+        primary_provider: Optional[str] = None
+        sources = data.get("sources") or []
+        if isinstance(sources, list) and sources:
+            try:
+                first = sources[0]
+                if isinstance(first, dict):
+                    primary_provider = first.get("provider")
+            except Exception:  # pragma: no cover - defensive
+                primary_provider = None
+
+        if primary_provider:
+            data.setdefault("primary_provider", primary_provider)
+            data.setdefault("provider", primary_provider)
+            data.setdefault("data_source", primary_provider)
 
         return data
 
@@ -327,9 +383,12 @@ async def fetch_from_eodhd(symbol: str, session: aiohttp.ClientSession) -> Dict[
     - Uses /real-time/{code} for price snapshot.
     - If ENABLE_EODHD_FUNDAMENTALS is true, also calls
       /fundamentals/{code} and merges extra fields (sector, industry,
-      listing_date, eps_ttm, pe_ttm, pb, dividend_yield, beta, 52w high/low,
-      market_cap, roe, roa, profit_margin, operating_margin,
-      revenue_growth_yoy, net_income_growth_yoy).
+      listing_date, eps_ttm, pe_ttm, pb, dividend_yield, beta,
+      52w high/low, market_cap, roe, roa, profit_margin,
+      operating_margin, ebitda_margin, revenue_growth_yoy,
+      net_income_growth_yoy, price_to_sales, price_to_cash_flow,
+      ev_to_ebitda, peg_ratio, avg_volume_30d, shares_outstanding)
+      into the payload.
 
     NOTE:
     - **Not used for KSA (.SR)**; see _gather_provider_payloads which
@@ -477,6 +536,28 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         change = price - prev_close
         change_pct = (change / prev_close) * 100.0
 
+    fifty_two_week_high = data.get("fiftyTwoWeekHigh")
+    fifty_two_week_low = data.get("fiftyTwoWeekLow")
+
+    avg_volume_30d = (
+        data.get("averageDailyVolume10Day")
+        or data.get("averageDailyVolume3Month")
+        or data.get("averageVolume")
+    )
+
+    # Valuation & risk fields (best-effort mapping)
+    price_to_sales = (
+        data.get("priceToSalesTrailing12Months")
+        or data.get("priceToSales")
+    )
+    price_to_cash_flow = data.get("priceToCashflow") or data.get("priceToCashFlow")
+    ev_to_ebitda = data.get("enterpriseToEbitda")
+    peg_ratio = data.get("pegRatio")
+
+    ebitda_margin = data.get("ebitdaMargins")
+    profit_margin = data.get("profitMargins")
+    operating_margin = data.get("operatingMargins")
+
     payload: Dict[str, Any] = {
         "symbol": symbol,
         "name": data.get("longName") or data.get("shortName"),
@@ -486,17 +567,20 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "high": data.get("dayHigh") or data.get("regularMarketDayHigh"),
         "low": data.get("dayLow") or data.get("regularMarketDayLow"),
         "volume": data.get("volume") or data.get("regularMarketVolume"),
+        "avg_volume_30d": avg_volume_30d,
         "market_cap": data.get("marketCap"),
         "currency": data.get("currency"),
         "exchange": data.get("exchange") or data.get("exchangeTimezoneName"),
-        "fifty_two_week_high": data.get("fiftyTwoWeekHigh"),
-        "fifty_two_week_low": data.get("fiftyTwoWeekLow"),
+        "fifty_two_week_high": fifty_two_week_high,
+        "fifty_two_week_low": fifty_two_week_low,
         "change": change,
         "change_pct": change_pct,
-        # Extra identity & risk where available
+        # Identity & risk
         "sector": data.get("sector"),
         "industry": data.get("industry"),
-        "beta": data.get("beta"),
+        # Shares / float
+        "shares_outstanding": data.get("sharesOutstanding"),
+        "free_float": data.get("floatShares"),
         # Fundamentals
         "eps_ttm": data.get("trailingEps"),
         "pe_ttm": data.get("trailingPE"),
@@ -505,10 +589,18 @@ def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "roe": data.get("returnOnEquity"),
         "roa": data.get("returnOnAssets"),
         "debt_to_equity": data.get("debtToEquity"),
-        "profit_margin": data.get("profitMargins"),
-        "operating_margin": data.get("operatingMargins"),
+        "profit_margin": profit_margin,
+        "operating_margin": operating_margin,
+        "ebitda_margin": ebitda_margin,
         "revenue_growth_yoy": data.get("revenueGrowth"),
         "net_income_growth_yoy": data.get("earningsGrowth"),
+        "beta": data.get("beta"),
+        # Valuation
+        "price_to_sales": price_to_sales,
+        "price_to_cash_flow": price_to_cash_flow,
+        "ev_to_ebitda": ev_to_ebitda,
+        "peg_ratio": peg_ratio,
+        # Meta
         "last_updated_utc": now,
         "__source__": QuoteSourceInfo(
             provider="yfinance", timestamp=now, fields=list(data.keys())
@@ -573,6 +665,14 @@ def _normalize_eodhd_quote(
     industry = general.get("Industry") or general.get("GicIndustry")
     listing_date = general.get("IPODate")
 
+    # Shares
+    shares_outstanding = (
+        general.get("SharesOutstanding")
+        or highlights.get("SharesOutstanding")
+        or general.get("ShareOutstanding")
+    )
+    free_float = general.get("FloatShares")
+
     # Fundamentals from highlights/valuation/technicals
     market_cap = (
         data.get("market_cap")
@@ -613,6 +713,11 @@ def _normalize_eodhd_quote(
     operating_margin = (
         highlights.get("OperatingMarginTTM") or highlights.get("OperatingMargin5Y")
     )
+    ebitda_margin = (
+        highlights.get("EBITDAmarginTTM")
+        or highlights.get("EBITDA_MarginTTM")
+        or highlights.get("EBITDAMarginTTM")
+    )
 
     # Growth
     revenue_growth_yoy = highlights.get("QuarterlyRevenueGrowthYOY")
@@ -624,6 +729,25 @@ def _normalize_eodhd_quote(
     fifty_two_week_low = (
         technicals.get("52WeekLow") or highlights.get("Week52Low")
     )
+
+    # Volumes / averages
+    avg_volume_30d = (
+        technicals.get("AverageVolume30Day")
+        or technicals.get("AverageVolume30D")
+        or technicals.get("AverageVolume")
+    )
+
+    # Valuation extras
+    price_to_sales = (
+        valuation.get("PriceSalesTTM")
+        or valuation.get("PriceToSalesTTM")
+    )
+    price_to_cash_flow = (
+        valuation.get("PriceCashFlowTTM")
+        or valuation.get("PriceToCashFlowTTM")
+    )
+    ev_to_ebitda = valuation.get("EVToEBITDA") or valuation.get("EV_EBITDA")
+    peg_ratio = valuation.get("PEGRatio")
 
     # Merge field names for provider source info
     fields = list(data.keys())
@@ -641,12 +765,15 @@ def _normalize_eodhd_quote(
         "sector": sector,
         "industry": industry,
         "listing_date": listing_date,
+        "shares_outstanding": shares_outstanding,
+        "free_float": free_float,
         "price": price,
         "prev_close": prev_close,
         "open": data.get("open"),
         "high": data.get("high"),
         "low": data.get("low"),
         "volume": data.get("volume"),
+        "avg_volume_30d": avg_volume_30d,
         "market_cap": market_cap,
         "change": change,
         "change_pct": change_pct,
@@ -661,8 +788,13 @@ def _normalize_eodhd_quote(
         "roa": roa,
         "profit_margin": profit_margin,
         "operating_margin": operating_margin,
+        "ebitda_margin": ebitda_margin,
         "revenue_growth_yoy": revenue_growth_yoy,
         "net_income_growth_yoy": net_income_growth_yoy,
+        "price_to_sales": price_to_sales,
+        "price_to_cash_flow": price_to_cash_flow,
+        "ev_to_ebitda": ev_to_ebitda,
+        "peg_ratio": peg_ratio,
         "last_updated_utc": last_dt,
         "__source__": QuoteSourceInfo(
             provider="eodhd", timestamp=last_dt, fields=fields
@@ -684,6 +816,11 @@ def _normalize_fmp_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         change = price - prev_close
         change_pct = (change / prev_close) * 100.0
 
+    fifty_two_week_high = data.get("yearHigh")
+    fifty_two_week_low = data.get("yearLow")
+
+    avg_volume_30d = data.get("avgVolume") or data.get("avgVolume10days")
+
     payload: Dict[str, Any] = {
         "symbol": symbol,
         "name": data.get("name"),
@@ -695,18 +832,24 @@ def _normalize_fmp_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "high": data.get("dayHigh"),
         "low": data.get("dayLow"),
         "volume": data.get("volume"),
+        "avg_volume_30d": avg_volume_30d,
         "market_cap": data.get("marketCap"),
-        "fifty_two_week_high": data.get("yearHigh"),
-        "fifty_two_week_low": data.get("yearLow"),
+        "fifty_two_week_high": fifty_two_week_high,
+        "fifty_two_week_low": fifty_two_week_low,
         # Extra where available
         "sector": data.get("sector"),
         "industry": data.get("industry"),
         "beta": data.get("beta"),
+        # Shares
+        "shares_outstanding": data.get("sharesOutstanding"),
         # Fundamentals (depending on your FMP plan)
         "eps_ttm": data.get("eps"),
         "pe_ttm": data.get("pe"),
         "pb": data.get("priceToBook"),
         "dividend_yield": data.get("yield"),
+        # Valuation extras where exposed
+        "price_to_sales": data.get("priceToSalesTrailing12Months"),
+        # Meta
         "last_updated_utc": now,
         "change": change,
         "change_pct": change_pct,
@@ -726,11 +869,35 @@ def _infer_currency_from_symbol(symbol: str) -> str:
 
 
 def _calculate_change_fields(data: Dict[str, Any]) -> None:
+    """
+    Enrich in-place:
+    - change / change_pct (if missing)
+    - 52W position (0–100) if price & 52W high/low available
+    """
     price = data.get("price")
     prev_close = data.get("prev_close")
+
     if price is not None and prev_close:
-        data["change"] = price - prev_close
-        data["change_pct"] = (price - prev_close) / prev_close * 100.0
+        if data.get("change") is None:
+            data["change"] = price - prev_close
+        if data.get("change_pct") is None and prev_close:
+            data["change_pct"] = (price - prev_close) / prev_close * 100.0
+
+    high_52 = data.get("fifty_two_week_high")
+    low_52 = data.get("fifty_two_week_low")
+    if (
+        price is not None
+        and high_52 is not None
+        and low_52 is not None
+        and high_52 != low_52
+    ):
+        try:
+            pos = (price - low_52) / (high_52 - low_52) * 100.0
+            # Clamp to [0, 100]
+            pos = max(0.0, min(100.0, pos))
+            data["fifty_two_week_position"] = pos
+        except Exception:  # pragma: no cover - defensive
+            pass
 
 
 def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
@@ -742,23 +909,76 @@ def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
 
 
 def _assess_data_quality(data: Dict[str, Any]) -> Tuple[DataQualityLevel, List[str]]:
-    required = ["price", "prev_close", "volume"]
-    missing = [f for f in required if data.get(f) is None]
-    if len(missing) == len(required):
-        return "MISSING", missing
-    if not missing:
-        return "EXCELLENT", missing
-    return "FAIR", missing
+    """
+    Score data quality on 0–100, then map to:
+        EXCELLENT / GOOD / FAIR / POOR / MISSING
+
+    Core fields:
+        price, prev_close, volume
+
+    Fundamentals (bonus):
+        market_cap, eps_ttm, pe_ttm, pb, dividend_yield, roe, roa
+    """
+    price = data.get("price")
+    prev_close = data.get("prev_close")
+    volume = data.get("volume")
+
+    core_missing = [f for f in ["price", "prev_close", "volume"] if data.get(f) is None]
+
+    # No core signal at all
+    if price is None and prev_close is None and volume is None:
+        return "MISSING", core_missing
+
+    score = 0
+
+    # Core signals (max 80)
+    if price is not None:
+        score += 40
+    if prev_close is not None:
+        score += 20
+    if volume is not None:
+        score += 20
+
+    # Fundamentals (max +20)
+    funda_fields = [
+        "market_cap",
+        "eps_ttm",
+        "pe_ttm",
+        "pb",
+        "dividend_yield",
+        "roe",
+        "roa",
+    ]
+    available_funda = sum(1 for f in funda_fields if data.get(f) is not None)
+    if available_funda:
+        score += min(20, int(20 * available_funda / len(funda_fields)))
+
+    if score >= 80:
+        level: DataQualityLevel = "EXCELLENT"
+    elif score >= 60:
+        level = "GOOD"
+    elif score >= 40:
+        level = "FAIR"
+    else:
+        level = "POOR"
+
+    return level, core_missing
 
 
 def _compute_opportunity_score(data: Dict[str, Any]) -> Optional[float]:
     """
-    Very simple opportunity score based mainly on P/E and dividend yield.
-    0–100 scale.
+    Very simple opportunity score based mainly on P/E, dividend yield,
+    and a mild tilt for growth/profitability.
+
+    0–100 scale. This is intentionally simple – v2 engine can
+    implement more advanced AI-style scoring.
     """
     pe = data.get("pe_ttm")
     dy = data.get("dividend_yield")
-    if pe is None and dy is None:
+    growth = data.get("revenue_growth_yoy")
+    margin = data.get("profit_margin")
+
+    if pe is None and dy is None and growth is None and margin is None:
         return None
 
     score = 50.0
@@ -777,6 +997,20 @@ def _compute_opportunity_score(data: Dict[str, Any]) -> Optional[float]:
         if 0.02 <= dy <= 0.06:
             score += 10
         elif dy > 0.08:
+            score -= 5
+
+    # Growth tilt
+    if isinstance(growth, (int, float)):
+        if growth > 0.15:
+            score += 10
+        elif growth < 0:
+            score -= 5
+
+    # Profitability tilt
+    if isinstance(margin, (int, float)):
+        if margin > 0.2:
+            score += 5
+        elif margin < 0.05:
             score -= 5
 
     return max(0.0, min(100.0, score))
@@ -863,6 +1097,7 @@ async def _gather_provider_payloads(symbol: str) -> Dict[str, Any]:
             if isinstance(src, QuoteSourceInfo):
                 sources.append(src)
 
+            # Merge non-null fields if not already set
             for key, value in data.items():
                 if value is None:
                     continue
