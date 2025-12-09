@@ -1,14 +1,32 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.5)
+Enriched Quotes Router (v2.6)
 
 - Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
 - Last-resort: in-process stub engine that always returns MISSING data
   (so the API + Google Sheets never crash even if engines are misconfigured).
 
-Exposes:
+KSA Integration (NEW v2.6)
+--------------------------
+- For KSA symbols (".SR"), this router now tries to fetch data from the
+  dedicated Argaam / Tadawul route:
+
+      GET /v1/argaam/quote?symbol=1120
+
+  using the BACKEND_BASE_URL + APP_TOKEN (if configured).
+
+  Priority:
+      1) If symbol ends with ".SR":
+            • Try Argaam route first.
+            • If Argaam returns a valid payload, use it directly.
+            • If Argaam fails, fall back to legacy engine (which may still
+              return MISSING if providers have no KSA coverage).
+      2) For non-KSA symbols:
+            • Use the configured engine (v2 or v1_module) exactly as before.
+
+Endpoints:
     • /v1/enriched/health
     • /v1/enriched/quote?symbol=...
     • /v1/enriched/quotes        (POST)
@@ -16,39 +34,59 @@ Exposes:
 
 Google Sheets usage:
     - KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio
-      can all call /v1/enriched/sheet-rows and map directly to the unified
+      all call /v1/enriched/sheet-rows and map directly to the unified
       9-page dashboard structure (Identity → Price/Liquidity → Fundamentals →
       Growth/Profitability → Valuation/Risk → AI/Technical → Meta).
 
 Alignment:
     - Header structure is aligned with routes_argaam._build_sheet_headers
       so all 9 pages share the same layout.
-
-Notes:
-    - JSON responses expose a richer set of fields (incl. shares_outstanding /
-      free_float) than the Google Sheets header template to keep backwards
-      compatibility with existing Apps Script modules.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("routes.enriched_quote")
 
 # ----------------------------------------------------------------------
-# Optional env.py (for engine configuration, logging, etc.)
+# Optional env.py (for future configuration, logging, etc.)
 # ----------------------------------------------------------------------
 
 try:  # pragma: no cover - optional
     import env as _env  # type: ignore
-except Exception:  # pragma: no cover - env.py is optional
+except Exception:
     _env = None  # type: ignore
+
+# ----------------------------------------------------------------------
+# Backend base URL + App Token for internal Argaam calls
+# ----------------------------------------------------------------------
+
+if _env is not None:
+    _BACKEND_BASE_URL = (
+        getattr(_env, "BACKEND_BASE_URL", None)
+        or getattr(_env, "SERVICE_BASE_URL", None)
+        or "https://tadawul-fast-bridge.onrender.com"
+    )
+    _APP_TOKEN = (
+        getattr(_env, "APP_TOKEN", None)
+        or getattr(_env, "X_APP_TOKEN", None)
+        or ""
+    )
+else:
+    _BACKEND_BASE_URL = os.getenv(
+        "BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com"
+    )
+    _APP_TOKEN = os.getenv("APP_TOKEN", "") or os.getenv("X_APP_TOKEN", "")
+
+_BACKEND_BASE_URL = (_BACKEND_BASE_URL or "").rstrip("/")
 
 # ----------------------------------------------------------------------
 # Data engine import (robust with fallbacks)
@@ -59,70 +97,47 @@ _ENGINE_IS_STUB: bool = False
 _engine: Any = None
 _data_engine_module: Any = None
 
-# We separate import vs. initialization to get clearer logs.
-_HAS_V2_ENGINE: bool = False
-
-# --- Step 1: Try to import the v2 engine class ------------------------
-try:  # pragma: no cover - import-only
+try:
+    # Preferred new engine (class-based, lives in core.data_engine_v2)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    _HAS_V2_ENGINE = True
-    logger.info("routes.enriched_quote: core.data_engine_v2.DataEngine import OK")
-except Exception as e_v2_import:  # pragma: no cover - defensive
-    logger.exception(
-        "routes.enriched_quote: Import of core.data_engine_v2.DataEngine failed: %s",
-        e_v2_import,
-    )
-    _HAS_V2_ENGINE = False
+    if _env is not None:
+        # Optional: use basic config from env.py if present
+        cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
+        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
+        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
+        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
 
-# --- Step 2: If import worked, try to initialize the v2 engine --------
-if _HAS_V2_ENGINE:
-    try:
         kwargs: Dict[str, Any] = {}
-
-        if _env is not None:
-            # These are all optional; DataEngine will also read env vars directly.
-            cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
-            enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
-            enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
-            provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
-
-            if cache_ttl is not None:
-                kwargs["cache_ttl"] = cache_ttl
-            if enabled_providers is not None:
-                kwargs["enabled_providers"] = enabled_providers
-            if enable_adv is not None:
-                kwargs["enable_advanced_analysis"] = enable_adv
-            if provider_timeout is not None:
-                kwargs["provider_timeout"] = provider_timeout
+        if cache_ttl is not None:
+            kwargs["cache_ttl"] = cache_ttl
+        if enabled_providers is not None:
+            kwargs["enabled_providers"] = enabled_providers
+        if enable_adv is not None:
+            kwargs["enable_advanced_analysis"] = enable_adv
+        if provider_timeout is not None:
+            kwargs["provider_timeout"] = provider_timeout
 
         _engine = _V2DataEngine(**kwargs)
-        _ENGINE_MODE = "v2"
-        logger.info(
-            "routes.enriched_quote: Using DataEngine v2 from core.data_engine_v2 "
-            "with kwargs=%s",
-            {
-                k: ("***" if "key" in k.lower() or "token" in k.lower() else v)
-                for k, v in kwargs.items()
-            },
-        )
-    except Exception as e_v2_init:  # pragma: no cover - defensive
-        logger.exception(
-            "routes.enriched_quote: Initialization of DataEngine v2 failed: %s",
-            e_v2_init,
-        )
-        _engine = None
-        _ENGINE_MODE = "stub"
+    else:
+        _engine = _V2DataEngine()
 
-# --- Step 3: If v2 is not available, try legacy v1 module -------------
-if _engine is None:
+    _ENGINE_MODE = "v2"
+    logger.info("routes.enriched_quote: Using DataEngine v2 from core.data_engine_v2")
+
+except Exception as e_v2:  # pragma: no cover - defensive
+    logger.exception(
+        "routes.enriched_quote: Failed to import/use core.data_engine_v2.DataEngine: %s",
+        e_v2,
+    )
     try:
+        # Fallback: legacy engine module (core.data_engine) which exposes
+        # async functions get_enriched_quote / get_enriched_quotes.
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
         logger.warning(
-            "routes.enriched_quote: Falling back to core.data_engine module-level API "
-            "(engine_mode='v1_module')"
+            "routes.enriched_quote: Falling back to core.data_engine module-level API"
         )
     except Exception as e_v1:  # pragma: no cover - defensive
         logger.exception(
@@ -322,7 +337,7 @@ async def get_enriched_quote(symbol: str) -> Any:
     if not sym:
         return None
 
-    if _ENGINE_MODE == "v2" and _engine is not None:
+    if _ENGINE_MODE == "v2":
         return await _engine.get_enriched_quote(sym)
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
@@ -338,12 +353,89 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
     if not clean:
         return []
 
-    if _ENGINE_MODE == "v2" and _engine is not None:
+    if _ENGINE_MODE == "v2":
         return await _engine.get_enriched_quotes(clean)
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
     # Stub
     return await _engine.get_enriched_quotes(clean)
+
+
+async def _fetch_ksa_via_argaam(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    KSA-specific helper: fetch data for a Tadawul symbol via the
+    internal /v1/argaam/quote endpoint.
+
+    Behaviour:
+        - Accepts symbol with or without ".SR" (1120 or 1120.SR).
+        - Calls: GET {BACKEND_BASE_URL}/v1/argaam/quote?symbol=1120
+        - Sends X-APP-TOKEN header if available.
+        - Returns a dict compatible with _quote_to_enriched (very tolerant).
+    """
+    raw = (symbol or "").strip().upper()
+    if not raw:
+        return None
+
+    # Argaam route expects "1120" (without .SR) based on your usage.
+    code = raw[:-3] if raw.endswith(".SR") else raw
+
+    if not _BACKEND_BASE_URL:
+        logger.warning(
+            "KSA Argaam fetch skipped for %s (%s) – BACKEND_BASE_URL not configured",
+            symbol,
+            code,
+        )
+        return None
+
+    url = f"{_BACKEND_BASE_URL}/v1/argaam/quote"
+    params = {"symbol": code}
+    headers: Dict[str, str] = {}
+    if _APP_TOKEN:
+        headers["X-APP-TOKEN"] = _APP_TOKEN
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+
+        if resp.status_code != 200:
+            text = resp.text
+            logger.warning(
+                "KSA Argaam HTTP %s for %s (%s): %s",
+                resp.status_code,
+                symbol,
+                code,
+                text,
+            )
+            return None
+
+        data = resp.json()
+        if not isinstance(data, dict):
+            logger.warning(
+                "KSA Argaam payload invalid for %s (%s): %s", symbol, code, data
+            )
+            return None
+
+        # Ensure a few key fields are present/normalized
+        data.setdefault("symbol", raw)
+        data.setdefault("market", "KSA")
+        data.setdefault("market_region", "KSA")
+        data.setdefault("exchange", "TADAWUL")
+        data.setdefault("currency", "SAR")
+        data.setdefault("timezone", "Asia/Riyadh")
+        now = datetime.utcnow()
+        data.setdefault("as_of_utc", now)
+        data.setdefault("as_of_local", now)
+        data.setdefault("provider", "argaam")
+        data.setdefault("data_source", "argaam")
+        data.setdefault("data_quality", "EXCELLENT")
+
+        return data
+
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "KSA Argaam request failed for %s (%s): %s", symbol, code, exc
+        )
+        return None
 
 
 def _normalize_scalar(value: Any) -> Any:
@@ -395,49 +487,37 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         symbol=symbol,
         name=g("name", "company_name", "longName", "shortName"),
         sector=g("sector"),
-        sub_sector=g("sub_sector", "industry", "industry_group", "industryGroup"),
-        market=g(
-            "market",
-            "market_region",
-            "exchange",
-            "exchange_short_name",
-            "primary_exchange",
-        ),
+        sub_sector=g("sub_sector", "industry"),
+        market=g("market", "market_region", "exchange", "exchange_short_name"),
         currency=g("currency"),
-        listing_date=g("listing_date", "ipo_date", "IPODate", "ipoDate", "list_date"),
-        shares_outstanding=g(
-            "shares_outstanding", "sharesOutstanding", "ShareOutstanding"
-        ),
+        listing_date=g("listing_date", "ipo_date", "IPODate"),
+        shares_outstanding=g("shares_outstanding", "sharesOutstanding"),
         free_float=g("free_float", "freeFloat"),
         # Price / liquidity
-        last_price=g(
-            "last_price", "price", "currentPrice", "regularMarketPrice", "close"
-        ),
-        previous_close=g("previous_close", "prev_close", "previousClose", "pc"),
-        open=g("open", "regularMarketOpen", "o"),
-        high=g("high", "dayHigh", "regularMarketDayHigh", "h"),
-        low=g("low", "dayLow", "regularMarketDayLow", "l"),
+        last_price=g("last_price", "price", "currentPrice", "regularMarketPrice"),
+        previous_close=g("previous_close", "prev_close", "previousClose"),
+        open=g("open", "regularMarketOpen"),
+        high=g("high", "dayHigh", "regularMarketDayHigh"),
+        low=g("low", "dayLow", "regularMarketDayLow"),
         change=g("change"),
-        change_percent=g("change_percent", "change_pct", "changePercent", "change_p"),
+        change_percent=g("change_percent", "change_pct", "changePercent"),
         high_52w=g("high_52w", "fifty_two_week_high", "yearHigh"),
         low_52w=g("low_52w", "fifty_two_week_low", "yearLow"),
         position_52w_percent=g("position_52w_percent", "fifty_two_week_position"),
         volume=g("volume", "regularMarketVolume"),
-        avg_volume_30d=g(
-            "avg_volume_30d", "average_volume_30d", "avg_volume", "avgVolume"
-        ),
+        avg_volume_30d=g("avg_volume_30d", "average_volume_30d", "avg_volume"),
         value_traded=g("value_traded"),
         turnover_rate=g("turnover_rate"),
-        bid_price=g("bid_price", "bid"),
-        ask_price=g("ask_price", "ask"),
-        bid_size=g("bid_size", "bidSize"),
-        ask_size=g("ask_size", "askSize"),
+        bid_price=g("bid_price"),
+        ask_price=g("ask_price"),
+        bid_size=g("bid_size"),
+        ask_size=g("ask_size"),
         spread_percent=g("spread_percent"),
         liquidity_score=g("liquidity_score"),
         # Fundamentals
         eps_ttm=g("eps_ttm", "eps", "trailingEps"),
         pe_ratio=g("pe_ratio", "pe", "pe_ttm", "trailingPE", "PERatio"),
-        pb_ratio=g("pb_ratio", "pb", "priceToBook", "P_B", "price_to_book"),
+        pb_ratio=g("pb_ratio", "pb", "priceToBook", "P_B"),
         dividend_yield_percent=g(
             "dividend_yield_percent",
             "dividend_yield",
@@ -464,7 +544,9 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         ),
         ebitda_margin_percent=g("ebitda_margin_percent", "ebitda_margin"),
         operating_margin_percent=g(
-            "operating_margin_percent", "operating_margin", "operatingMargins"
+            "operating_margin_percent",
+            "operating_margin",
+            "operatingMargins",
         ),
         net_margin_percent=g(
             "net_margin_percent",
@@ -472,7 +554,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
             "profitMargins",
         ),
         # Valuation / risk
-        ev_to_ebitda=g("ev_to_ebitda", "ev_ebitda"),
+        ev_to_ebitda=g("ev_to_ebitda"),
         price_to_sales=g(
             "price_to_sales",
             "priceToSales",
@@ -482,7 +564,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
             "price_to_cash_flow",
             "priceToCashFlow",
         ),
-        peg_ratio=g("peg_ratio", "pegRatio", "peg"),
+        peg_ratio=g("peg_ratio", "pegRatio"),
         beta=g("beta"),
         volatility_30d_percent=g(
             "volatility_30d_percent",
@@ -503,21 +585,8 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
         ma_20d=g("ma_20d"),
         ma_50d=g("ma_50d"),
         # Meta
-        data_source=g(
-            "data_source",
-            "provider",
-            "primary_provider",
-            "primary_source",
-            "source",
-            "dataProvider",
-        ),
-        provider=g(
-            "provider",
-            "primary_provider",
-            "primary_source",
-            "source",
-            "dataProvider",
-        ),
+        data_source=g("data_source", "provider", "primary_provider", "primary_source"),
+        provider=g("provider", "primary_provider", "primary_source"),
         data_quality=g(
             "data_quality",
             "data_quality_level",
@@ -721,7 +790,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.5",
+        "version": "2.6",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
     }
@@ -742,12 +811,28 @@ async def get_enriched_quote_route(
     if not ticker:
         raise HTTPException(status_code=400, detail="Symbol is required")
 
+    is_ksa = ticker.upper().endswith(".SR")
+
     try:
+        # 1) KSA path – try Argaam / Tadawul first
+        if is_ksa:
+            ksa_raw = await _fetch_ksa_via_argaam(ticker)
+            if ksa_raw:
+                enriched = _quote_to_enriched(ksa_raw)
+                if enriched.data_quality == "MISSING":
+                    enriched.error = (
+                        enriched.error
+                        or "No data available from KSA Argaam providers"
+                    )
+                return enriched
+
+        # 2) Global / fallback engine path
         quote = await get_enriched_quote(ticker)
         enriched = _quote_to_enriched(quote)
         if enriched.data_quality == "MISSING":
             enriched.error = enriched.error or "No data available from providers"
         return enriched
+
     except HTTPException:
         raise
     except Exception as exc:
@@ -776,28 +861,53 @@ async def get_enriched_quotes_route(
     if not tickers:
         raise HTTPException(status_code=400, detail="At least one symbol is required")
 
-    try:
-        unified_quotes = await get_enriched_quotes(tickers)
-    except Exception as exc:
-        logger.exception("Batch enriched quotes failed for tickers=%s", tickers)
-        # Complete failure – build placeholder entries for all
-        return BatchEnrichedResponse(
-            results=[
-                EnrichedQuoteResponse(
+    results: List[EnrichedQuoteResponse] = []
+
+    # Partition into KSA vs non-KSA for better control
+    ksa_tickers = [t for t in tickers if t.upper().endswith(".SR")]
+    non_ksa_tickers = [t for t in tickers if not t.upper().endswith(".SR")]
+
+    # First fetch non-KSA via engine
+    engine_map: Dict[str, Any] = {}
+    if non_ksa_tickers:
+        try:
+            unified_quotes = await get_enriched_quotes(non_ksa_tickers)
+            for t, q in zip(non_ksa_tickers, unified_quotes):
+                engine_map[t] = q
+        except Exception as exc:
+            logger.exception(
+                "Batch enriched quotes failed for non-KSA tickers=%s", non_ksa_tickers
+            )
+            for t in non_ksa_tickers:
+                engine_map[t] = None
+
+    # Fetch KSA via Argaam
+    ksa_map: Dict[str, Any] = {}
+    for t in ksa_tickers:
+        try:
+            ksa_raw = await _fetch_ksa_via_argaam(t)
+            ksa_map[t] = ksa_raw
+        except Exception as exc:
+            logger.exception("Batch KSA Argaam fetch failed for %s", t)
+            ksa_map[t] = None
+
+    # Build responses in original order
+    for t in tickers:
+        raw = ksa_map.get(t) if t.upper().endswith(".SR") else engine_map.get(t)
+        try:
+            if raw is None:
+                enriched = EnrichedQuoteResponse(
                     symbol=t.upper(),
                     data_quality="MISSING",
-                    error=f"Batch enriched quotes failed: {exc}",
+                    error="No data available from providers or KSA engine",
                 )
-                for t in tickers
-            ]
-        )
-
-    results: List[EnrichedQuoteResponse] = []
-    for t, q in zip(tickers, unified_quotes):
-        try:
-            enriched = _quote_to_enriched(q)
-            if enriched.data_quality == "MISSING":
-                enriched.error = enriched.error or "No data available from providers"
+            else:
+                enriched = _quote_to_enriched(raw)
+                if enriched.data_quality == "MISSING":
+                    enriched.error = (
+                        enriched.error
+                        or "No data available from providers or KSA engine"
+                    )
             results.append(enriched)
         except Exception as exc:
             logger.exception(
@@ -842,27 +952,53 @@ async def get_enriched_sheet_rows(
     if not tickers:
         return SheetEnrichedResponse(headers=headers, rows=[])
 
-    try:
-        unified_quotes = await get_enriched_quotes(tickers)
-    except Exception as exc:
-        logger.exception("Enriched sheet-rows failed for tickers=%s", tickers)
-        # Total provider failure – still return headers and placeholder rows.
-        rows: List[List[Any]] = []
-        for t in tickers:
-            placeholder = EnrichedQuoteResponse(
-                symbol=t.upper(),
-                data_quality="MISSING",
-                error=f"Enriched sheet-rows failed: {exc}",
-            )
-            rows.append(_enriched_to_sheet_row(placeholder))
-        return SheetEnrichedResponse(headers=headers, rows=rows)
+    # Partition tickers
+    ksa_tickers = [t for t in tickers if t.upper().endswith(".SR")]
+    non_ksa_tickers = [t for t in tickers if not t.upper().endswith(".SR")]
 
-    rows: List[List[Any]] = []
-    for t, q in zip(tickers, unified_quotes):
+    quotes_map: Dict[str, Any] = {}
+
+    # 1) Non-KSA via engine
+    if non_ksa_tickers:
         try:
-            enriched = _quote_to_enriched(q)
-            if enriched.data_quality == "MISSING":
-                enriched.error = enriched.error or "No data available from providers"
+            unified_quotes = await get_enriched_quotes(non_ksa_tickers)
+            for t, q in zip(non_ksa_tickers, unified_quotes):
+                quotes_map[t] = q
+        except Exception as exc:
+            logger.exception(
+                "Enriched sheet-rows engine batch failed for non-KSA tickers=%s",
+                non_ksa_tickers,
+            )
+            for t in non_ksa_tickers:
+                quotes_map[t] = None
+
+    # 2) KSA via Argaam
+    for t in ksa_tickers:
+        try:
+            ksa_raw = await _fetch_ksa_via_argaam(t)
+            quotes_map[t] = ksa_raw
+        except Exception as exc:
+            logger.exception("Enriched sheet-rows KSA Argaam failed for %s", t)
+            quotes_map[t] = None
+
+    # 3) Build rows in original order
+    rows: List[List[Any]] = []
+    for t in tickers:
+        raw = quotes_map.get(t)
+        try:
+            if raw is None:
+                enriched = EnrichedQuoteResponse(
+                    symbol=t.upper(),
+                    data_quality="MISSING",
+                    error="No data available from providers or KSA engine",
+                )
+            else:
+                enriched = _quote_to_enriched(raw)
+                if enriched.data_quality == "MISSING":
+                    enriched.error = (
+                        enriched.error
+                        or "No data available from providers or KSA engine"
+                    )
             rows.append(_enriched_to_sheet_row(enriched))
         except Exception as exc:
             logger.exception(
