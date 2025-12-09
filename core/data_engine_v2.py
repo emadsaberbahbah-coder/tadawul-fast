@@ -261,7 +261,8 @@ class UnifiedQuote(BaseModel):
 
     # Meta & providers
     data_quality: str = Field(
-        "UNKNOWN", description="OK / PARTIAL / MISSING / STALE / UNKNOWN / GOOD / FAIR / POOR / EXCELLENT"
+        "UNKNOWN",
+        description="OK / PARTIAL / MISSING / STALE / UNKNOWN / GOOD / FAIR / POOR / EXCELLENT",
     )
     primary_provider: Optional[str] = None
     provider: Optional[str] = None
@@ -845,22 +846,18 @@ class DataEngine:
         pe_val = gv("pe", "peTTM")
         pb_val = gv("priceToBook", "pb", "pbRatio")
 
-        dividend_yield = gv("dividendYield", "lastDiv", "yield")
-        if dividend_yield is not None:
+        dividend_yield_raw = gv("dividendYield", "lastDiv", "yield")
+        dividend_yield_percent = None
+        if dividend_yield_raw is not None:
             try:
-                # FMP often returns dividendYield as fraction of price.
-                # We standardize to a "percent-like" scale, but keep
-                # legacy behavior (to avoid breaking existing sheets):
-                #  - If <1.0, treat as fraction of 1, multiply by 100.
-                #  - If >=1.0, treat as already percent-ish.
-                if dividend_yield < 1.0:
-                    dividend_yield_percent = float(dividend_yield) * 100.0
+                dy_val = float(dividend_yield_raw)
+                # If <1, assume fraction of 1 and convert to %; else treat as already %.
+                if dy_val < 1.0:
+                    dividend_yield_percent = dy_val * 100.0
                 else:
-                    dividend_yield_percent = float(dividend_yield)
+                    dividend_yield_percent = dy_val
             except Exception:
                 dividend_yield_percent = None
-        else:
-            dividend_yield_percent = None
 
         shares_outstanding = gv("sharesOutstanding", "shares_outstanding")
 
@@ -1099,11 +1096,24 @@ class DataEngine:
             gv("pb", "P_B", "price_to_book", "priceToBook")
             or gf(valuation, "PriceBookMRQ")
         )
-        dividend_yield = (
+
+        dividend_yield_raw = (
             gv("dividend_yield", "DividendYield")
             or gf(highlights, "DividendYield")
             or gf(splits, "ForwardAnnualDividendYield")
         )
+        dividend_yield_percent = None
+        if dividend_yield_raw is not None:
+            try:
+                dy_val = float(dividend_yield_raw)
+                # If <1, assume fraction of 1 and convert to %; else treat as already %.
+                if dy_val < 1.0:
+                    dividend_yield_percent = dy_val * 100.0
+                else:
+                    dividend_yield_percent = dy_val
+            except Exception:
+                dividend_yield_percent = None
+
         dividend_rate = (
             gf(splits, "ForwardAnnualDividendRate")
             or gf(highlights, "DividendShare")
@@ -1152,7 +1162,7 @@ class DataEngine:
         beta_val = gv("beta") or gf(technicals, "Beta")
         target_price_val = gf(highlights, "WallStreetTargetPrice")
 
-        # Techncial moving averages
+        # Technical moving averages
         ma_50d_val = gv("ma_50d") or gf(technicals, "50DayMA")
 
         # Dividend dates
@@ -1235,8 +1245,8 @@ class DataEngine:
             pe_ttm=pe_val,
             pb_ratio=pb_val,
             pb=pb_val,
-            dividend_yield=dividend_yield,
-            dividend_yield_percent=dividend_yield,
+            dividend_yield=dividend_yield_percent,
+            dividend_yield_percent=dividend_yield_percent,
             dividend_rate=dividend_rate,
             dividend_payout_ratio=dividend_payout_ratio,
             profit_margin=profit_margin,
@@ -1578,7 +1588,11 @@ class DataEngine:
 
         if self.enable_advanced_analysis:
             # v1 might already have scores; only top-up if missing
-            if q.value_score is None or q.quality_score is None or q.momentum_score is None:
+            if (
+                q.value_score is None
+                or q.quality_score is None
+                or q.momentum_score is None
+            ):
                 self._apply_basic_scoring(q, source="v1_delegate")
 
         return q
@@ -1631,9 +1645,14 @@ class DataEngine:
         dy = q.dividend_yield_percent or q.dividend_yield
         if dy is not None and dy > 0:
             try:
-                # We treat dy as "percent-like" but keep it relative
-                # and small, adding up to +20 points.
-                value = min(90.0, value + min(20.0, float(dy) * 20.0))
+                dy_val = float(dy)
+                # Normalize to %: if <1, assume fraction and *100; else already %.
+                if dy_val < 1.0:
+                    dy_pct = dy_val * 100.0
+                else:
+                    dy_pct = dy_val
+                # Add up to +20 points for dividend yield
+                value = min(90.0, value + min(20.0, dy_pct))
             except Exception:
                 pass
 
