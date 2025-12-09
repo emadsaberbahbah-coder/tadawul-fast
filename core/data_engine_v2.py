@@ -1,13 +1,18 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.4 (Sheets-aligned, hardened)
+Core Data & Analysis Engine - v2.5
+(Global fundamentals-enriched, Sheets-aligned, hardened)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
 Key features
 ------------
 - Async, multi-provider quote engine (FMP + optional EODHD + optional Finnhub).
+- Global shares:
+    • Real-time prices (Finnhub/EODHD/FMP).
+    • Deep fundamentals via EODHD /fundamentals (sector, margins, ROE/ROA,
+      growth, ownership, short ratio, target price, dividends, etc.).
 - KSA (.SR) tickers are KSA-safe:
     • Never call EODHD directly for .SR symbols.
     • If the legacy core.data_engine is available, it is used as the
@@ -20,6 +25,7 @@ Key features
     • 9-page Google Sheets dashboard philosophy
 - Basic AI-style scoring:
     • Value / Quality / Momentum / Opportunity + Recommendation
+    • Uses target_price (if available) to derive fair_value & upside %.
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
     • Hardened __init__: bad env values (TTL, timeout, providers) never crash import.
@@ -157,9 +163,13 @@ class UnifiedQuote(BaseModel):
     currency: Optional[str] = None
     listing_date: Optional[str] = None  # YYYY-MM-DD if available
 
-    # Capital structure
+    # Capital structure / ownership / short interest
     shares_outstanding: Optional[float] = None
     free_float: Optional[float] = None
+    insider_ownership_percent: Optional[float] = None
+    institutional_ownership_percent: Optional[float] = None
+    short_ratio: Optional[float] = None
+    short_percent_float: Optional[float] = None
 
     # Price / liquidity
     last_price: Optional[float] = None
@@ -204,6 +214,8 @@ class UnifiedQuote(BaseModel):
     dividend_yield_percent: Optional[float] = None
     dividend_yield: Optional[float] = None
     dividend_payout_ratio: Optional[float] = None
+    dividend_rate: Optional[float] = None          # annual dividend per share if available
+    ex_dividend_date: Optional[str] = None         # YYYY-MM-DD if available
     roe_percent: Optional[float] = None
     roe: Optional[float] = None
     roa_percent: Optional[float] = None
@@ -229,6 +241,7 @@ class UnifiedQuote(BaseModel):
     beta: Optional[float] = None
     volatility_30d_percent: Optional[float] = None
     volatility_30d: Optional[float] = None
+    target_price: Optional[float] = None   # e.g. Wall Street target price if available
 
     # AI valuation & scores
     fair_value: Optional[float] = None
@@ -372,7 +385,7 @@ class DataEngine:
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.4 initialized "
+            "DataEngine v2.5 initialized "
             "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, "
             "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
@@ -835,8 +848,11 @@ class DataEngine:
         dividend_yield = gv("dividendYield", "lastDiv", "yield")
         if dividend_yield is not None:
             try:
-                # FMP often returns dividendYield as %, sometimes as fraction.
-                # We standardize to % where possible.
+                # FMP often returns dividendYield as fraction of price.
+                # We standardize to a "percent-like" scale, but keep
+                # legacy behavior (to avoid breaking existing sheets):
+                #  - If <1.0, treat as fraction of 1, multiply by 100.
+                #  - If >=1.0, treat as already percent-ish.
                 if dividend_yield < 1.0:
                     dividend_yield_percent = float(dividend_yield) * 100.0
                 else:
@@ -929,40 +945,102 @@ class DataEngine:
             logger.warning("EODHD_API_KEY not set; skipping EODHD for %s", symbol)
             return None
 
-        url = f"{base_url.rstrip('/')}/real-time/{symbol}"
-        params = {"api_token": api_key, "fmt": "json"}
+        # Real-time endpoint uses the symbol as-is; fundamentals usually
+        # expect "AAPL.US" style codes. As a pragmatic default:
+        fund_symbol = symbol
+        if "." not in symbol and not self._is_ksa_symbol(symbol):
+            # Treat plain symbols (AAPL, MSFT, NVDA) as US-listed
+            fund_symbol = f"{symbol}.US"
+
+        rt_url = f"{base_url.rstrip('/')}/real-time/{symbol}"
+        fund_url = f"{base_url.rstrip('/')}/fundamentals/{fund_symbol}"
 
         timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            d = resp.json()
+        fundamentals_data: Optional[Dict[str, Any]] = None
 
-        if not isinstance(d, dict) or not d:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # 1) Real-time quote (primary for price / intraday)
+            resp = await client.get(rt_url, params={"api_token": api_key, "fmt": "json"})
+            resp.raise_for_status()
+            rt_data = resp.json()
+
+            # 2) Fundamentals (sector, margins, ROE/ROA, ownership, target price, etc.)
+            try:
+                fund_resp = await client.get(
+                    fund_url, params={"api_token": api_key, "fmt": "json"}
+                )
+                if fund_resp.status_code == 200:
+                    tmp = fund_resp.json()
+                    if isinstance(tmp, dict) and tmp:
+                        fundamentals_data = tmp
+                else:
+                    logger.debug(
+                        "EODHD fundamentals non-200 for %s (%s): %s",
+                        symbol,
+                        fund_symbol,
+                        fund_resp.status_code,
+                    )
+            except Exception as exc:  # fundamentals are optional
+                logger.debug(
+                    "EODHD fundamentals fetch failed for %s (%s): %s",
+                    symbol,
+                    fund_symbol,
+                    exc,
+                )
+
+        if not isinstance(rt_data, dict) or not rt_data:
             return None
 
-        q = self._map_eodhd_to_unified(symbol, d)
+        q = self._map_eodhd_to_unified(symbol, rt_data, fundamentals=fundamentals_data)
         q.primary_provider = "eodhd"
         q.provider = "eodhd"
         q.data_source = "eodhd"
         if not q.sources:
-            q.sources = [ProviderSource(provider="eodhd", note="EODHD quote")]
+            q.sources = [ProviderSource(provider="eodhd", note="EODHD quote+fundamentals")]
         return q
 
-    def _map_eodhd_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
+    def _map_eodhd_to_unified(
+        self,
+        symbol: str,
+        d: Dict[str, Any],
+        fundamentals: Optional[Dict[str, Any]] = None,
+    ) -> UnifiedQuote:
         """
-        Map EODHD real-time response into UnifiedQuote.
+        Map EODHD real-time response + optional /fundamentals response into UnifiedQuote.
 
-        NOTE:
+        NOTES:
         - EODHD is not used for KSA (.SR) symbols – see _get_enriched_quote_uncached.
-        - We only rely on the quote-style fields; deeper fundamentals would require
-          additional endpoints.
+        - Real-time endpoint provides OHLC + basic fields.
+        - Fundamentals endpoint adds rich data (sector, margins, ROE/ROA, ownership,
+          short ratio, target price, dividend metrics, etc.).
         """
 
         def gv(*keys: str, default=None):
             for k in keys:
                 if k in d and d[k] is not None:
                     return d[k]
+            return default
+
+        # Fundamentals sections (if available)
+        general: Dict[str, Any] = {}
+        highlights: Dict[str, Any] = {}
+        valuation: Dict[str, Any] = {}
+        shares: Dict[str, Any] = {}
+        technicals: Dict[str, Any] = {}
+        splits: Dict[str, Any] = {}
+
+        if isinstance(fundamentals, dict) and fundamentals:
+            general = fundamentals.get("General") or {}
+            highlights = fundamentals.get("Highlights") or {}
+            valuation = fundamentals.get("Valuation") or {}
+            shares = fundamentals.get("SharesStats") or {}
+            technicals = fundamentals.get("Technicals") or {}
+            splits = fundamentals.get("SplitsDividends") or {}
+
+        def gf(section: Dict[str, Any], *keys: str, default=None):
+            for k in keys:
+                if k in section and section[k] is not None:
+                    return section[k]
             return default
 
         last_price = gv("close", "price", "last")
@@ -982,8 +1060,15 @@ class DataEngine:
             except Exception:
                 change_pct = None
 
-        high_52w = gv("fifty_two_week_high", "high_52w", "year_high")
-        low_52w = gv("fifty_two_week_low", "low_52w", "year_low")
+        # 52W range: prefer fundamentals.Technicals if available
+        high_52w = (
+            gv("fifty_two_week_high", "high_52w", "year_high")
+            or gf(technicals, "52WeekHigh")
+        )
+        low_52w = (
+            gv("fifty_two_week_low", "low_52w", "year_low")
+            or gf(technicals, "52WeekLow")
+        )
         position_52w = gv("fifty_two_week_position", "position_52w_percent")
 
         if (
@@ -1003,16 +1088,90 @@ class DataEngine:
 
         as_of_utc, as_of_local, tz_name = self._now_dt_pair()
 
-        eps_val = gv("eps", "EPS")
-        pe_val = gv("pe", "PE", "pe_ratio")
-        pb_val = gv("pb", "P_B", "price_to_book", "priceToBook")
-        dividend_yield = gv("dividend_yield", "DividendYield")
+        # Fundamentals enrichment
+        eps_val = gv("eps", "EPS") or gf(highlights, "EarningsShare", "DilutedEpsTTM")
+        pe_val = (
+            gv("pe", "PE", "pe_ratio")
+            or gf(highlights, "PERatio")
+            or gf(valuation, "TrailingPE")
+        )
+        pb_val = (
+            gv("pb", "P_B", "price_to_book", "priceToBook")
+            or gf(valuation, "PriceBookMRQ")
+        )
+        dividend_yield = (
+            gv("dividend_yield", "DividendYield")
+            or gf(highlights, "DividendYield")
+            or gf(splits, "ForwardAnnualDividendYield")
+        )
+        dividend_rate = (
+            gf(splits, "ForwardAnnualDividendRate")
+            or gf(highlights, "DividendShare")
+        )
+        dividend_payout_ratio = gf(splits, "PayoutRatio")
 
-        market_cap = gv("market_cap", "marketCapitalization")
+        market_cap = gv("market_cap", "marketCapitalization") or gf(
+            highlights, "MarketCapitalization"
+        )
         volume_val = gv("volume")
-        avg_vol = gv("avgVolume", "average_volume")
+        avg_vol = gv("avgVolume", "average_volume") or gf(
+            technicals, "20DayAverageVolume"
+        )
 
-        market_raw = gv("exchange_short_name", "exchange")
+        # Ownership / short interest
+        insider_ownership = gf(
+            shares, "PercentInsiders", "PercentHeldByInsiders"
+        )
+        institutional_ownership = gf(
+            shares, "PercentInstitutions", "PercentHeldByInstitutions"
+        )
+        short_ratio_val = gf(shares, "ShortRatio")
+        short_percent_float = gf(shares, "ShortPercentFloat", "ShortPercent")
+
+        # Margins & returns
+        profit_margin = gf(highlights, "ProfitMargin")
+        operating_margin = gf(highlights, "OperatingMarginTTM")
+        roa_val = gf(highlights, "ReturnOnAssetsTTM")
+        roe_val = gf(highlights, "ReturnOnEquityTTM")
+        revenue_growth = gf(highlights, "QuarterlyRevenueGrowthYOY")
+        net_income_growth = gf(highlights, "QuarterlyEarningsGrowthYOY")
+        ebitda_val = gf(highlights, "EBITDA")
+        revenue_ttm = gf(highlights, "RevenueTTM")
+
+        ebitda_margin = None
+        if ebitda_val is not None and revenue_ttm:
+            try:
+                ebitda_margin = float(ebitda_val) / float(revenue_ttm)
+            except Exception:
+                ebitda_margin = None
+
+        # Valuation extras
+        price_sales = gf(valuation, "PriceSalesTTM")
+        ev_to_ebitda_val = gf(valuation, "EnterpriseValueEbitda")
+        peg_val = gf(highlights, "PEGRatio")
+        beta_val = gv("beta") or gf(technicals, "Beta")
+        target_price_val = gf(highlights, "WallStreetTargetPrice")
+
+        # Techncial moving averages
+        ma_50d_val = gv("ma_50d") or gf(technicals, "50DayMA")
+
+        # Dividend dates
+        ex_div_date = gf(splits, "ExDividendDate")
+
+        # Identity enrichment
+        general_name = gf(general, "Name")
+        sector = gf(general, "Sector")
+        industry = gf(
+            general,
+            "Industry",
+            "GicIndustry",
+            "GicSubIndustry",
+        )
+        listing_date = gf(general, "IPODate")
+        exchange_fund = gf(general, "Exchange")
+        currency_code = gf(general, "CurrencyCode")
+
+        market_raw = gv("exchange_short_name", "exchange") or exchange_fund
         market = market_raw
         market_region = market_raw
         if market_raw:
@@ -1023,14 +1182,31 @@ class DataEngine:
             else:
                 market = "GLOBAL"
 
+        currency_val = gv("currency", "currency_code") or currency_code
+
+        # Shares
+        shares_outstanding = gv("shares_outstanding") or gf(
+            shares, "SharesOutstanding"
+        )
+        free_float = gf(shares, "SharesFloat")
+
         q = UnifiedQuote(
             symbol=str(gv("code", "symbol", default=symbol)).upper(),
-            name=gv("name"),
-            company_name=gv("name"),
+            name=gv("name") or general_name,
+            company_name=gv("name") or general_name,
+            sector=sector,
+            industry=industry,
             market=market,
             market_region=market_region,
             exchange=market_raw,
-            currency=gv("currency", "currency_code"),
+            currency=currency_val,
+            listing_date=listing_date,
+            shares_outstanding=shares_outstanding,
+            free_float=free_float,
+            insider_ownership_percent=insider_ownership,
+            institutional_ownership_percent=institutional_ownership,
+            short_ratio=short_ratio_val,
+            short_percent_float=short_percent_float,
             last_price=last_price,
             price=last_price,
             previous_close=previous_close,
@@ -1061,13 +1237,33 @@ class DataEngine:
             pb=pb_val,
             dividend_yield=dividend_yield,
             dividend_yield_percent=dividend_yield,
+            dividend_rate=dividend_rate,
+            dividend_payout_ratio=dividend_payout_ratio,
+            profit_margin=profit_margin,
+            net_margin_percent=profit_margin,
+            operating_margin_percent=operating_margin,
+            ebitda_margin_percent=ebitda_margin,
+            roe=roe_val,
+            roe_percent=roe_val,
+            roa=roa_val,
+            roa_percent=roa_val,
+            revenue_growth_percent=revenue_growth,
+            net_income_growth_percent=net_income_growth,
+            ev_to_ebitda=ev_to_ebitda_val,
+            price_to_sales=price_sales,
+            peg_ratio=peg_val,
+            beta=beta_val,
+            # volatility_30d(_percent) left None – could be derived from history later
+            target_price=target_price_val,
+            ex_dividend_date=ex_div_date,
+            ma_50d=ma_50d_val,
             data_quality="OK" if last_price is not None else "PARTIAL",
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
             as_of_local=as_of_local,
             timezone=tz_name,
-            raw=d,
+            raw={"realtime": d, "fundamentals": fundamentals} if fundamentals else d,
         )
 
         if self.enable_advanced_analysis:
@@ -1435,7 +1631,9 @@ class DataEngine:
         dy = q.dividend_yield_percent or q.dividend_yield
         if dy is not None and dy > 0:
             try:
-                value = min(90.0, value + min(20.0, float(dy)))
+                # We treat dy as "percent-like" but keep it relative
+                # and small, adding up to +20 points.
+                value = min(90.0, value + min(20.0, float(dy) * 20.0))
             except Exception:
                 pass
 
@@ -1502,6 +1700,26 @@ class DataEngine:
             q.recommendation = "REDUCE"
         else:
             q.recommendation = "SELL"
+
+        # If we have a target_price and no explicit fair_value/upside yet,
+        # treat target_price as fair_value and compute upside %.
+        if q.fair_value is None and q.target_price is not None:
+            q.fair_value = q.target_price
+
+        if (
+            q.fair_value is not None
+            and q.last_price is not None
+            and q.upside_percent is None
+        ):
+            try:
+                q.upside_percent = round(
+                    (float(q.fair_value) - float(q.last_price))
+                    / float(q.last_price)
+                    * 100.0,
+                    2,
+                )
+            except Exception:
+                pass
 
         # Valuation label based on value score
         if q.value_score is not None:
