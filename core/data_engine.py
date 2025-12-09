@@ -1,7 +1,8 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.4 (MULTI-PROVIDER, KSA-SAFE)
+UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.5
+(MULTI-PROVIDER, KSA-SAFE, 9-PAGE DASHBOARD READY)
 
 Role in Architecture
 --------------------
@@ -61,7 +62,7 @@ EODHD Fundamentals – ENHANCED
     • sector / industry / listing_date
     • market_cap
     • eps_ttm / pe_ttm / pb
-    • dividend_yield
+    • dividend_yield (+ payout ratio where available)
     • beta
     • 52-week high / low
     • roe / roa
@@ -243,6 +244,12 @@ class UnifiedQuote(BaseModel):
     risk_flag: Optional[str] = None
     notes: Optional[str] = None
 
+    # Light technicals (mainly for sheet columns)
+    rsi_14: Optional[float] = None
+    macd: Optional[float] = None
+    ma_20d: Optional[float] = None
+    ma_50d: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Compatibility helpers (keep old attribute names / keys working)
     # ------------------------------------------------------------------
@@ -321,6 +328,8 @@ class UnifiedQuote(BaseModel):
                 first = sources[0]
                 if isinstance(first, dict):
                     primary_provider = first.get("provider")
+                elif isinstance(first, QuoteSourceInfo):
+                    primary_provider = first.provider
             except Exception:  # pragma: no cover - defensive
                 primary_provider = None
 
@@ -369,7 +378,104 @@ async def fetch_from_yahoo(symbol: str) -> Dict[str, Any]:
                 logger.warning("Yahoo Finance returned no data for %s", symbol)
                 return {}
 
-        return _normalize_yahoo_quote(info, symbol)
+        price = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or info.get("previousClose")
+        )
+        prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose")
+
+        change = info.get("change")
+        change_pct = info.get("changePercent") or info.get("changePercentRaw")
+
+        if change is None and price is not None and prev_close:
+            change = price - prev_close
+            change_pct = (change / prev_close) * 100.0
+
+        fifty_two_week_high = info.get("fiftyTwoWeekHigh")
+        fifty_two_week_low = info.get("fiftyTwoWeekLow")
+
+        avg_volume_30d = (
+            info.get("averageDailyVolume10Day")
+            or info.get("averageDailyVolume3Month")
+            or info.get("averageVolume")
+        )
+
+        # Valuation & risk fields (best-effort mapping)
+        price_to_sales = (
+            info.get("priceToSalesTrailing12Months")
+            or info.get("priceToSales")
+        )
+        price_to_cash_flow = (
+            info.get("priceToCashflow") or info.get("priceToCashFlow")
+        )
+        ev_to_ebitda = info.get("enterpriseToEbitda")
+        peg_ratio = info.get("pegRatio")
+
+        ebitda_margin = info.get("ebitdaMargins")
+        profit_margin = info.get("profitMargins")
+        operating_margin = info.get("operatingMargins")
+
+        now = datetime.now(timezone.utc)
+
+        payload: Dict[str, Any] = {
+            "symbol": symbol,
+            "name": info.get("longName") or info.get("shortName"),
+            "price": price,
+            "prev_close": prev_close,
+            "open": info.get("open") or info.get("regularMarketOpen"),
+            "high": info.get("dayHigh") or info.get("regularMarketDayHigh"),
+            "low": info.get("dayLow") or info.get("regularMarketDayLow"),
+            "volume": info.get("volume") or info.get("regularMarketVolume"),
+            "avg_volume_30d": avg_volume_30d,
+            "market_cap": info.get("marketCap"),
+            "currency": info.get("currency"),
+            "exchange": info.get("exchange") or info.get("exchangeTimezoneName"),
+            "fifty_two_week_high": fifty_two_week_high,
+            "fifty_two_week_low": fifty_two_week_low,
+            "change": change,
+            "change_pct": change_pct,
+            # Identity & risk
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            # Shares / float
+            "shares_outstanding": info.get("sharesOutstanding"),
+            "free_float": info.get("floatShares"),
+            # Fundamentals
+            "eps_ttm": info.get("trailingEps"),
+            "pe_ttm": info.get("trailingPE"),
+            "pb": info.get("priceToBook"),
+            "dividend_yield": info.get("dividendYield"),
+            "dividend_payout_ratio": info.get("payoutRatio"),
+            "roe": info.get("returnOnEquity"),
+            "roa": info.get("returnOnAssets"),
+            "debt_to_equity": info.get("debtToEquity"),
+            "profit_margin": profit_margin,
+            "operating_margin": operating_margin,
+            "ebitda_margin": ebitda_margin,
+            "revenue_growth_yoy": info.get("revenueGrowth"),
+            "net_income_growth_yoy": info.get("earningsGrowth"),
+            "beta": info.get("beta"),
+            # Liquidity / balance sheet
+            "current_ratio": info.get("currentRatio"),
+            "quick_ratio": info.get("quickRatio"),
+            # Bid/ask (for spread / liquidity)
+            "bid_price": info.get("bid"),
+            "ask_price": info.get("ask"),
+            "bid_size": info.get("bidSize"),
+            "ask_size": info.get("askSize"),
+            # Valuation
+            "price_to_sales": price_to_sales,
+            "price_to_cash_flow": price_to_cash_flow,
+            "ev_to_ebitda": ev_to_ebitda,
+            "peg_ratio": peg_ratio,
+            # Meta
+            "last_updated_utc": now,
+            "__source__": QuoteSourceInfo(
+                provider="yfinance", timestamp=now, fields=list(info.keys())
+            ),
+        }
+        return payload
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Yahoo Finance fetch failed for %s: %s", symbol, exc)
         return {}
@@ -518,97 +624,6 @@ async def fetch_from_backend_api(symbol: str) -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
-def _normalize_yahoo_quote(data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """Normalize Yahoo Finance dict to UnifiedQuote-compatible payload."""
-    now = datetime.now(timezone.utc)
-
-    price = (
-        data.get("currentPrice")
-        or data.get("regularMarketPrice")
-        or data.get("previousClose")
-    )
-    prev_close = data.get("previousClose") or data.get("regularMarketPreviousClose")
-
-    change = data.get("change")
-    change_pct = data.get("changePercent") or data.get("changePercentRaw")
-
-    if change is None and price is not None and prev_close:
-        change = price - prev_close
-        change_pct = (change / prev_close) * 100.0
-
-    fifty_two_week_high = data.get("fiftyTwoWeekHigh")
-    fifty_two_week_low = data.get("fiftyTwoWeekLow")
-
-    avg_volume_30d = (
-        data.get("averageDailyVolume10Day")
-        or data.get("averageDailyVolume3Month")
-        or data.get("averageVolume")
-    )
-
-    # Valuation & risk fields (best-effort mapping)
-    price_to_sales = (
-        data.get("priceToSalesTrailing12Months")
-        or data.get("priceToSales")
-    )
-    price_to_cash_flow = data.get("priceToCashflow") or data.get("priceToCashFlow")
-    ev_to_ebitda = data.get("enterpriseToEbitda")
-    peg_ratio = data.get("pegRatio")
-
-    ebitda_margin = data.get("ebitdaMargins")
-    profit_margin = data.get("profitMargins")
-    operating_margin = data.get("operatingMargins")
-
-    payload: Dict[str, Any] = {
-        "symbol": symbol,
-        "name": data.get("longName") or data.get("shortName"),
-        "price": price,
-        "prev_close": prev_close,
-        "open": data.get("open") or data.get("regularMarketOpen"),
-        "high": data.get("dayHigh") or data.get("regularMarketDayHigh"),
-        "low": data.get("dayLow") or data.get("regularMarketDayLow"),
-        "volume": data.get("volume") or data.get("regularMarketVolume"),
-        "avg_volume_30d": avg_volume_30d,
-        "market_cap": data.get("marketCap"),
-        "currency": data.get("currency"),
-        "exchange": data.get("exchange") or data.get("exchangeTimezoneName"),
-        "fifty_two_week_high": fifty_two_week_high,
-        "fifty_two_week_low": fifty_two_week_low,
-        "change": change,
-        "change_pct": change_pct,
-        # Identity & risk
-        "sector": data.get("sector"),
-        "industry": data.get("industry"),
-        # Shares / float
-        "shares_outstanding": data.get("sharesOutstanding"),
-        "free_float": data.get("floatShares"),
-        # Fundamentals
-        "eps_ttm": data.get("trailingEps"),
-        "pe_ttm": data.get("trailingPE"),
-        "pb": data.get("priceToBook"),
-        "dividend_yield": data.get("dividendYield"),
-        "roe": data.get("returnOnEquity"),
-        "roa": data.get("returnOnAssets"),
-        "debt_to_equity": data.get("debtToEquity"),
-        "profit_margin": profit_margin,
-        "operating_margin": operating_margin,
-        "ebitda_margin": ebitda_margin,
-        "revenue_growth_yoy": data.get("revenueGrowth"),
-        "net_income_growth_yoy": data.get("earningsGrowth"),
-        "beta": data.get("beta"),
-        # Valuation
-        "price_to_sales": price_to_sales,
-        "price_to_cash_flow": price_to_cash_flow,
-        "ev_to_ebitda": ev_to_ebitda,
-        "peg_ratio": peg_ratio,
-        # Meta
-        "last_updated_utc": now,
-        "__source__": QuoteSourceInfo(
-            provider="yfinance", timestamp=now, fields=list(data.keys())
-        ),
-    }
-    return payload
-
-
 def _normalize_eodhd_quote(
     data: Dict[str, Any],
     symbol: str,
@@ -697,6 +712,7 @@ def _normalize_eodhd_quote(
 
     # Dividend yield
     dividend_yield = highlights.get("DividendYield")
+    dividend_payout_ratio = highlights.get("PayoutRatio")
 
     # PB ratio
     pb = (
@@ -783,6 +799,7 @@ def _normalize_eodhd_quote(
         "pe_ttm": pe_ttm,
         "pb": pb,
         "dividend_yield": dividend_yield,
+        "dividend_payout_ratio": dividend_payout_ratio,
         "beta": beta,
         "roe": roe,
         "roa": roa,
@@ -868,21 +885,27 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     return "USD"
 
 
-def _calculate_change_fields(data: Dict[str, Any]) -> None:
+def _calculate_change_and_secondary_fields(data: Dict[str, Any]) -> None:
     """
     Enrich in-place:
     - change / change_pct (if missing)
     - 52W position (0–100) if price & 52W high/low available
+    - value_traded (price * volume)
+    - turnover_rate (volume / shares_outstanding, as %)
+    - spread_percent (from bid/ask)
+    - liquidity_score (rough 0–100 based on volume + market_cap)
     """
     price = data.get("price")
     prev_close = data.get("prev_close")
 
+    # Basic change fields
     if price is not None and prev_close:
         if data.get("change") is None:
             data["change"] = price - prev_close
         if data.get("change_pct") is None and prev_close:
             data["change_pct"] = (price - prev_close) / prev_close * 100.0
 
+    # 52W position
     high_52 = data.get("fifty_two_week_high")
     low_52 = data.get("fifty_two_week_low")
     if (
@@ -898,6 +921,61 @@ def _calculate_change_fields(data: Dict[str, Any]) -> None:
             data["fifty_two_week_position"] = pos
         except Exception:  # pragma: no cover - defensive
             pass
+
+    # Value traded (approximate)
+    volume = data.get("volume")
+    if price is not None and isinstance(volume, (int, float)):
+        data.setdefault("value_traded", price * volume)
+
+    # Turnover rate (% of shares traded today)
+    shares_outstanding = data.get("shares_outstanding")
+    if (
+        isinstance(volume, (int, float))
+        and isinstance(shares_outstanding, (int, float))
+        and shares_outstanding > 0
+    ):
+        try:
+            data.setdefault(
+                "turnover_rate", (volume / shares_outstanding) * 100.0
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    # Spread %
+    bid = data.get("bid_price")
+    ask = data.get("ask_price")
+    if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            spread_pct = (ask - bid) / mid * 100.0
+            data.setdefault("spread_percent", spread_pct)
+
+    # Simple liquidity_score heuristic (0–100)
+    mcap = data.get("market_cap")
+    score = 0.0
+
+    if isinstance(volume, (int, float)):
+        if volume >= 10_000_000:
+            score += 40
+        elif volume >= 1_000_000:
+            score += 30
+        elif volume >= 100_000:
+            score += 20
+        elif volume > 0:
+            score += 10
+
+    if isinstance(mcap, (int, float)):
+        if mcap >= 50_000_000_000:
+            score += 40
+        elif mcap >= 10_000_000_000:
+            score += 30
+        elif mcap >= 2_000_000_000:
+            score += 20
+        elif mcap > 0:
+            score += 10
+
+    if score > 0:
+        data.setdefault("liquidity_score", max(0.0, min(100.0, score)))
 
 
 def _infer_market_region(symbol: str, exchange: Optional[str]) -> MarketRegion:
@@ -1108,7 +1186,12 @@ async def _gather_provider_payloads(symbol: str) -> Dict[str, Any]:
     if merged.get("last_updated_utc") is None:
         merged["last_updated_utc"] = datetime.now(timezone.utc)
 
-    _calculate_change_fields(merged)
+    # Ensure currency at least has a sensible default (e.g. .SR -> SAR)
+    if merged.get("currency") is None:
+        merged["currency"] = _infer_currency_from_symbol(symbol)
+
+    # Secondary fields: change, 52W position, value_traded, turnover, spread, liquidity
+    _calculate_change_and_secondary_fields(merged)
     return merged
 
 
