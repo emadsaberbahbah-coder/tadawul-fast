@@ -1,32 +1,28 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.3 (Sheets-aligned, v1-backed)
+Core Data & Analysis Engine - v2.3 (Sheets-aligned, hardened)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
 Key features
 ------------
-- Uses the improved legacy engine `core.data_engine` (v1) as the
-  PRIMARY source for **all** markets (GLOBAL + KSA).
-    • v1 already handles multi-provider routing:
-        - GLOBAL: EODHD + FMP + Yahoo (where available)
-        - KSA: FMP + Yahoo + Tadawul/Argaam (via its own logic)
-    • This avoids duplicated logic and ensures all routes use the same
-      canonical data pipeline.
-
-- This v2 engine adds:
-    • Simple in-memory caching with TTL to reduce API calls.
-    • A sheet-aligned `UnifiedQuote` model that maps v1 fields into:
-        - Identity (Symbol, Sector, Market, etc.)
-        - Price & Liquidity (Last Price, 52W position, Volume, etc.)
-        - Fundamentals (PE, PB, EPS, Dividend Yield, ROE, ROA, etc.)
-        - Valuation / Risk / Technicals
-    • Basic AI-style scoring:
-        - Value / Quality / Momentum / Opportunity + Recommendation
-
+- Async, multi-provider quote engine (FMP + optional EODHD + optional Finnhub).
+- KSA (.SR) tickers are KSA-safe:
+    • Never call EODHD directly for .SR symbols.
+    • If the legacy core.data_engine is available, it is used as the
+      primary KSA delegate (Tadawul / Argaam routing).
+- Simple in-memory caching with TTL to reduce API calls.
+- UnifiedQuote Pydantic model aligned with:
+    • routes/enriched_quote.EnrichedQuoteResponse
+    • routes/ai_analysis.SingleAnalysisResponse
+    • legacy_service (v1/quote + v1/legacy/sheet-rows)
+    • 9-page Google Sheets dashboard philosophy
+- Basic AI-style scoring:
+    • Value / Quality / Momentum / Opportunity + Recommendation
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
+    • Hardened __init__: bad env values (TTL, timeout, providers) never crash import.
 
 Configuration (env vars)
 ------------------------
@@ -34,17 +30,17 @@ ENGINE_CACHE_TTL_SECONDS         # optional; seconds, overrides DATAENGINE_CACHE
 DATAENGINE_CACHE_TTL             # optional; seconds, default 120 if both missing
 ENGINE_PROVIDER_TIMEOUT_SECONDS  # optional; overrides DATAENGINE_TIMEOUT
 DATAENGINE_TIMEOUT               # optional; per-provider timeout in seconds, default 10
-ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (fallback list). Default: "fmp"
-PRIMARY_PROVIDER                 # optional; if set and in enabled list, used first (fallback only)
+ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
+PRIMARY_PROVIDER                 # optional; if set and in enabled list, used first
 LOCAL_TIMEZONE                   # optional; default "Asia/Riyadh"
 ENABLE_ADVANCED_ANALYSIS         # optional; "1/true/on" to enable, "0/false/off" to disable
 
-Provider API keys (fallback path)
----------------------------------
-FMP_API_KEY                      # used only if v1 delegate fails
+Provider API keys
+-----------------
+FMP_API_KEY                      # required for FMP provider
 EODHD_BASE_URL                   # optional; default "https://eodhd.com/api"
-EODHD_API_KEY                    # used only if v1 delegate fails
-FINNHUB_API_KEY                  # used only if v1 delegate fails
+EODHD_API_KEY                    # optional
+FINNHUB_API_KEY                  # optional
 """
 
 from __future__ import annotations
@@ -66,10 +62,11 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Optional import of v1 engine (PRIMARY data source)
+# Optional import of v1 engine for KSA delegation
 # ---------------------------------------------------------------------------
 
 try:  # pragma: no cover - best-effort
@@ -81,9 +78,62 @@ except Exception:  # pragma: no cover - if core.data_engine is missing
     _HAS_V1_ENGINE = False
 
 
-# ===========================================================================
+# =======================================================================
+# Helper utilities (safe configuration parsing)
+# =======================================================================
+
+
+def _safe_int(value: Any, default: int, label: str) -> int:
+    """
+    Safely parse an integer from env/config.
+    Never raises – logs a warning and returns default on error.
+    """
+    if value is None:
+        return default
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        s = str(value).strip()
+        return int(s)
+    except Exception:
+        logger.warning(
+            "DataEngine config: invalid integer for %s=%r; falling back to %s",
+            label,
+            value,
+            default,
+        )
+        return default
+
+
+def _safe_bool(value: Any, default: bool, label: str) -> bool:
+    """
+    Safely parse a boolean toggle from env/config.
+    Accepts truthy strings/numbers; never raises.
+    """
+    if value is None:
+        return default
+    try:
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in {"1", "true", "yes", "on", "y"}:
+            return True
+        if s in {"0", "false", "no", "off", "n"}:
+            return False
+    except Exception:
+        pass
+    logger.warning(
+        "DataEngine config: invalid boolean for %s=%r; falling back to %s",
+        label,
+        value,
+        default,
+    )
+    return default
+
+
+# =======================================================================
 # ProviderSource & UnifiedQuote models
-# ===========================================================================
+# =======================================================================
 
 
 class ProviderSource(BaseModel):
@@ -101,7 +151,7 @@ class UnifiedQuote(BaseModel):
     sector: Optional[str] = None
     sub_sector: Optional[str] = None
     industry: Optional[str] = None
-    market: Optional[str] = None          # e.g. "US", "KSA"
+    market: Optional[str] = None          # e.g. "KSA", "GLOBAL", "US"
     market_region: Optional[str] = None   # alias for legacy engine / sheets
     exchange: Optional[str] = None
     currency: Optional[str] = None
@@ -223,25 +273,18 @@ class _CacheEntry:
     quote: UnifiedQuote
 
 
-# ===========================================================================
+# =======================================================================
 # DataEngine
-# ===========================================================================
+# =======================================================================
 
 
 class DataEngine:
     """
     Core async engine used by routes.enriched_quote and AI/analysis routes.
 
-    PRIMARY behavior:
-        - Delegates to `core.data_engine` (v1) for ALL symbols.
-        - v1 already handles:
-            • GLOBAL: EODHD + FMP + Yahoo merging (+ fundamentals)
-            • KSA: KSA-safe routing via Tadawul / Argaam logic
-
-    Added by v2:
-        - Caching
-        - Sheet-aligned UnifiedQuote mapping
-        - Basic AI scoring (Value / Quality / Momentum / Opportunity)
+    Public async methods:
+        - get_enriched_quote(symbol: str) -> UnifiedQuote
+        - get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]
     """
 
     def __init__(
@@ -251,76 +294,75 @@ class DataEngine:
         enabled_providers: Optional[List[str]] = None,
         enable_advanced_analysis: Optional[bool] = None,
     ) -> None:
-        # Cache TTL (seconds)
+        # Cache TTL (seconds) – hardened parsing
         if cache_ttl is not None:
-            self.cache_ttl = int(cache_ttl)
+            self.cache_ttl = _safe_int(cache_ttl, 120, "cache_ttl")
         else:
             ttl_env = (
                 os.getenv("ENGINE_CACHE_TTL_SECONDS")
                 or os.getenv("DATAENGINE_CACHE_TTL")
-                or "120"
             )
-            self.cache_ttl = int(ttl_env)
+            self.cache_ttl = _safe_int(ttl_env, 120, "ENGINE_CACHE_TTL_SECONDS/DATAENGINE_CACHE_TTL")
 
-        # Per-provider timeout (seconds) – used only in fallback path
+        # Per-provider timeout (seconds) – hardened parsing
         if provider_timeout is not None:
-            self.provider_timeout = int(provider_timeout)
+            self.provider_timeout = _safe_int(provider_timeout, 10, "provider_timeout")
         else:
             timeout_env = (
                 os.getenv("ENGINE_PROVIDER_TIMEOUT_SECONDS")
                 or os.getenv("DATAENGINE_TIMEOUT")
-                or "10"
             )
-            self.provider_timeout = int(timeout_env)
+            self.provider_timeout = _safe_int(
+                timeout_env, 10, "ENGINE_PROVIDER_TIMEOUT_SECONDS/DATAENGINE_TIMEOUT"
+            )
 
-        # Advanced analysis toggle (env + explicit override)
+        # Advanced analysis toggle (env + explicit override) – hardened parsing
         if enable_advanced_analysis is not None:
-            self.enable_advanced_analysis = bool(enable_advanced_analysis)
+            self.enable_advanced_analysis = _safe_bool(
+                enable_advanced_analysis, True, "enable_advanced_analysis"
+            )
         else:
             flag = os.getenv("ENABLE_ADVANCED_ANALYSIS")
-            if flag is None:
-                self.enable_advanced_analysis = True
-            else:
-                self.enable_advanced_analysis = flag.strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                    "y",
-                }
+            self.enable_advanced_analysis = _safe_bool(
+                flag, True, "ENABLE_ADVANCED_ANALYSIS"
+            )
 
+        # Local timezone
         self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
 
-        # Enabled providers – FMP/EODHD/Finnhub are used ONLY as fallback
+        # Enabled providers – accept list OR comma-separated string
+        providers_raw: Optional[str]
         if enabled_providers is not None:
             if isinstance(enabled_providers, str):
-                raw = enabled_providers
+                providers_raw = enabled_providers
             else:
-                raw = ",".join(str(p) for p in enabled_providers)
+                providers_raw = ",".join(str(p) for p in enabled_providers)
         else:
-            raw = os.getenv("ENABLED_PROVIDERS", "fmp")
+            providers_raw = os.getenv("ENABLED_PROVIDERS", "fmp")
 
-        providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        providers: List[str] = []
+        try:
+            for p in (providers_raw or "").split(","):
+                p = p.strip().lower()
+                if p and p not in providers:
+                    providers.append(p)
+        except Exception:
+            logger.warning(
+                "DataEngine config: invalid ENABLED_PROVIDERS=%r; falling back to ['fmp']",
+                providers_raw,
+            )
+            providers = ["fmp"]
 
-        # Primary provider hint (for ordering, fallback only)
-        self.primary_provider_env: Optional[str] = (
-            os.getenv("PRIMARY_PROVIDER", "") or ""
-        ).strip().lower() or None
+        if not providers:
+            providers = ["fmp"]
 
-        self.enabled_providers: List[str] = []
-        for p in providers:
-            if p and p not in self.enabled_providers:
-                self.enabled_providers.append(p)
+        # Primary provider hint (for ordering)
+        primary_env = (os.getenv("PRIMARY_PROVIDER", "") or "").strip().lower() or None
+        self.primary_provider_env: Optional[str] = primary_env
 
-        if not self.enabled_providers:
-            # Always have at least FMP in the list (fallback)
-            self.enabled_providers = ["fmp"]
-
-        # If PRIMARY_PROVIDER is set and present, move it to the front
-        if (
-            self.primary_provider_env
-            and self.primary_provider_env in self.enabled_providers
-        ):
+        # Final enabled_providers with primary first
+        self.enabled_providers: List[str] = providers[:]
+        if self.primary_provider_env and self.primary_provider_env in self.enabled_providers:
             self.enabled_providers.sort(
                 key=lambda p: 0 if p == self.primary_provider_env else 1
             )
@@ -441,34 +483,27 @@ class DataEngine:
     # ------------------------------------------------------------------ #
 
     async def _get_enriched_quote_uncached(self, symbol: str) -> UnifiedQuote:
-        """
-        PRIMARY path:
-            - Delegate to v1 engine (core.data_engine) for ALL markets.
-
-        FALLBACK path (only if v1 fails/unavailable):
-            - Use direct providers (FMP / EODHD / Finnhub) and merge.
-        """
         is_ksa = self._is_ksa_symbol(symbol)
 
-        # 1) Primary: v1 delegate for ALL markets
-        if _HAS_V1_ENGINE:
+        # 1) KSA-safe delegate: if legacy core.data_engine is available, use it first
+        if is_ksa and _HAS_V1_ENGINE:
             try:
                 # v1 engine exposes an async get_enriched_quotes(List[str]) API
                 v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                 if v1_quotes:
-                    logger.debug("Using v1 delegate engine for %s", symbol)
+                    logger.debug("Using v1 KSA delegate for %s", symbol)
                     return self._from_v1_quote(v1_quotes[0])
             except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("V1 delegate engine failed for %s: %s", symbol, exc)
+                logger.exception("V1 KSA delegate failed for %s: %s", symbol, exc)
 
-        # 2) Fallback: Multi-provider orchestration (rare in practice)
+        # 2) Multi-provider orchestration (global, and KSA if no v1 delegate)
         providers = list(self.enabled_providers)
 
         # KSA-safe: never call EODHD for .SR / .TADAWUL symbols
         if is_ksa and "eodhd" in providers:
             providers = [p for p in providers if p != "eodhd"]
             logger.debug(
-                "KSA-safe mode (fallback): removed EODHD from providers for %s -> %s",
+                "KSA-safe mode: removed EODHD from providers for %s -> %s",
                 symbol,
                 providers,
             )
@@ -477,33 +512,33 @@ class DataEngine:
         tasks: List[asyncio.Task[UnifiedQuote]] = []
 
         for provider in providers:
-            p = provider.lower()
-            if p == "fmp":
+            provider = provider.lower()
+            if provider == "fmp":
                 tasks.append(
                     asyncio.create_task(
                         self._safe_call_provider("fmp", self._fetch_from_fmp, symbol)
                     )
                 )
-            elif p == "eodhd":
+            elif provider == "eodhd":
                 tasks.append(
                     asyncio.create_task(
                         self._safe_call_provider("eodhd", self._fetch_from_eodhd, symbol)
                     )
                 )
-            elif p == "finnhub":
+            elif provider == "finnhub":
                 tasks.append(
                     asyncio.create_task(
                         self._safe_call_provider("finnhub", self._fetch_from_finnhub, symbol)
                     )
                 )
             else:
-                logger.warning("Unknown provider '%s' configured; ignoring", p)
+                logger.warning("Unknown provider '%s' configured; ignoring", provider)
 
         if not tasks:
             return UnifiedQuote(
                 symbol=symbol,
                 data_quality="MISSING",
-                error="No valid providers configured (ENABLED_PROVIDERS) and v1 delegate unavailable",
+                error="No valid providers configured (ENABLED_PROVIDERS)",
             )
 
         results = await asyncio.gather(*tasks)
@@ -570,7 +605,7 @@ class DataEngine:
 
         # Separate by quality
         ok_or_partial: List[UnifiedQuote] = [
-            q for q in results if q.data_quality in ("OK", "PARTIAL")
+            q for q in results if q.data_quality in ("OK", "PARTIAL", "EXCELLENT")
         ]
 
         # All providers failed
@@ -582,9 +617,10 @@ class DataEngine:
                 error=combined_error or "All providers failed or returned no data",
             )
 
-        # Choose base quote: first OK, else first PARTIAL
+        # Choose base quote: prefer EXCELLENT/OK, else PARTIAL
         base: UnifiedQuote = next(
-            (q for q in ok_or_partial if q.data_quality == "OK"), ok_or_partial[0]
+            (q for q in ok_or_partial if q.data_quality in ("EXCELLENT", "OK")),
+            ok_or_partial[0],
         )
 
         # Get field names for UnifiedQuote for safe merging
@@ -619,12 +655,13 @@ class DataEngine:
         # Symbol must be normalized symbol argument
         merged_data["symbol"] = symbol.upper()
 
-        # Combine data_quality: OK if any OK, else PARTIAL
-        merged_quality = (
-            "OK"
-            if any(q.data_quality == "OK" for q in ok_or_partial)
-            else "PARTIAL"
-        )
+        # Combine data_quality: EXCELLENT > OK > PARTIAL
+        if any(q.data_quality == "EXCELLENT" for q in ok_or_partial):
+            merged_quality = "EXCELLENT"
+        elif any(q.data_quality == "OK" for q in ok_or_partial):
+            merged_quality = "OK"
+        else:
+            merged_quality = "PARTIAL"
         merged_data["data_quality"] = merged_quality
 
         # Combine sources
@@ -676,7 +713,7 @@ class DataEngine:
         return merged_quote
 
     # ------------------------------------------------------------------ #
-    # Provider: Financial Modeling Prep (FMP) – Fallback only
+    # Provider: Financial Modeling Prep (FMP)
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_fmp(self, symbol: str) -> Optional[UnifiedQuote]:
@@ -708,6 +745,11 @@ class DataEngine:
     def _map_fmp_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
         """
         Map FMP /quote response into UnifiedQuote.
+
+        NOTE:
+        - FMP /quote is primarily price- and basic-fundamental-oriented.
+        - More advanced ratios (ROE/ROA/margins) may require additional
+          endpoints; this engine only uses what is available here.
         """
 
         def gv(*keys: str, default=None):
@@ -772,15 +814,27 @@ class DataEngine:
 
         shares_outstanding = gv("sharesOutstanding", "shares_outstanding")
 
+        market_raw = gv("exchangeShortName", "exchange")
+        market = market_raw
+        market_region = market_raw
+        if market_raw:
+            # Simple GLOBAL vs KSA-style mapping for sheets friendliness
+            mr = str(market_raw).upper()
+            if mr in {"TADAWUL", "NOMU", "KSA"}:
+                market = "KSA"
+                market_region = "KSA"
+            else:
+                market = "GLOBAL"
+
         q = UnifiedQuote(
             symbol=str(gv("symbol", default=symbol)).upper(),
             name=gv("name"),
             company_name=gv("name"),
             sector=gv("sector"),
             industry=gv("industry"),
-            market=gv("exchangeShortName", "exchange"),
-            market_region=gv("exchangeShortName", "exchange"),
-            exchange=gv("exchangeShortName", "exchange"),
+            market=market,
+            market_region=market_region,
+            exchange=market_raw,
             currency=gv("currency"),
             shares_outstanding=shares_outstanding,
             last_price=last_price,
@@ -830,7 +884,7 @@ class DataEngine:
         return q
 
     # ------------------------------------------------------------------ #
-    # Provider: EODHD (fallback – mainly for global, not KSA .SR)
+    # Provider: EODHD (optional – mainly for global, not KSA .SR)
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_eodhd(self, symbol: str) -> Optional[UnifiedQuote]:
@@ -841,12 +895,7 @@ class DataEngine:
             logger.warning("EODHD_API_KEY not set; skipping EODHD for %s", symbol)
             return None
 
-        # Map bare symbols like AAPL -> AAPL.US for EODHD
-        request_code = symbol
-        if "." not in request_code:
-            request_code = f"{request_code}.US"
-
-        url = f"{base_url.rstrip('/')}/real-time/{request_code}"
+        url = f"{base_url.rstrip('/')}/real-time/{symbol}"
         params = {"api_token": api_key, "fmt": "json"}
 
         timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
@@ -869,6 +918,11 @@ class DataEngine:
     def _map_eodhd_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
         """
         Map EODHD real-time response into UnifiedQuote.
+
+        NOTE:
+        - EODHD is not used for KSA (.SR) symbols – see _get_enriched_quote_uncached.
+        - We only rely on the quote-style fields; deeper fundamentals would require
+          additional endpoints.
         """
 
         def gv(*keys: str, default=None):
@@ -924,13 +978,24 @@ class DataEngine:
         volume_val = gv("volume")
         avg_vol = gv("avgVolume", "average_volume")
 
+        market_raw = gv("exchange_short_name", "exchange")
+        market = market_raw
+        market_region = market_raw
+        if market_raw:
+            mr = str(market_raw).upper()
+            if mr in {"TADAWUL", "NOMU", "KSA"}:
+                market = "KSA"
+                market_region = "KSA"
+            else:
+                market = "GLOBAL"
+
         q = UnifiedQuote(
             symbol=str(gv("code", "symbol", default=symbol)).upper(),
             name=gv("name"),
             company_name=gv("name"),
-            market=gv("exchange_short_name", "exchange"),
-            market_region=gv("exchange_short_name", "exchange"),
-            exchange=gv("exchange_short_name", "exchange"),
+            market=market,
+            market_region=market_region,
+            exchange=market_raw,
             currency=gv("currency", "currency_code"),
             last_price=last_price,
             price=last_price,
@@ -977,7 +1042,7 @@ class DataEngine:
         return q
 
     # ------------------------------------------------------------------ #
-    # Provider: Finnhub (fallback – real-time price only)
+    # Provider: Finnhub (optional – real-time price only)
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_finnhub(self, symbol: str) -> Optional[UnifiedQuote]:
@@ -1045,7 +1110,7 @@ class DataEngine:
         return q
 
     # ------------------------------------------------------------------ #
-    # KSA/global v1 delegate mapping (from v1 UnifiedQuote to v2)
+    # KSA delegate mapping (from v1 UnifiedQuote to v2 UnifiedQuote)
     # ------------------------------------------------------------------ #
 
     def _from_v1_quote(self, v1_q: Any) -> UnifiedQuote:
@@ -1103,10 +1168,8 @@ class DataEngine:
         current_ratio = gv("current_ratio")
         quick_ratio = gv("quick_ratio")
 
-        revenue_growth = gv("revenue_growth_percent", "revenue_growth", "revenue_growth_yoy")
-        net_income_growth = gv(
-            "net_income_growth_percent", "net_income_growth", "net_income_growth_yoy"
-        )
+        revenue_growth = gv("revenue_growth_percent", "revenue_growth")
+        net_income_growth = gv("net_income_growth_percent", "net_income_growth")
         ebitda_margin = gv("ebitda_margin_percent", "ebitda_margin")
         operating_margin = gv("operating_margin_percent", "operating_margin")
         net_margin = gv("net_margin_percent", "net_margin")
@@ -1286,11 +1349,7 @@ class DataEngine:
 
         if self.enable_advanced_analysis:
             # v1 might already have scores; only top-up if missing
-            if (
-                q.value_score is None
-                or q.quality_score is None
-                or q.momentum_score is None
-            ):
+            if q.value_score is None or q.quality_score is None or q.momentum_score is None:
                 self._apply_basic_scoring(q, source="v1_delegate")
 
         return q
