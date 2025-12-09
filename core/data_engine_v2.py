@@ -1,7 +1,7 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.3 (Sheets-aligned, hardened)
+Core Data & Analysis Engine - v2.4 (Sheets-aligned, hardened)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
 
@@ -66,7 +66,7 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Optional import of v1 engine for KSA delegation
+# Optional import of v1 engine for KSA delegation / global fallback
 # ---------------------------------------------------------------------------
 
 try:  # pragma: no cover - best-effort
@@ -248,7 +248,7 @@ class UnifiedQuote(BaseModel):
 
     # Meta & providers
     data_quality: str = Field(
-        "UNKNOWN", description="OK / PARTIAL / MISSING / STALE / UNKNOWN"
+        "UNKNOWN", description="OK / PARTIAL / MISSING / STALE / UNKNOWN / GOOD / FAIR / POOR / EXCELLENT"
     )
     primary_provider: Optional[str] = None
     provider: Optional[str] = None
@@ -302,7 +302,9 @@ class DataEngine:
                 os.getenv("ENGINE_CACHE_TTL_SECONDS")
                 or os.getenv("DATAENGINE_CACHE_TTL")
             )
-            self.cache_ttl = _safe_int(ttl_env, 120, "ENGINE_CACHE_TTL_SECONDS/DATAENGINE_CACHE_TTL")
+            self.cache_ttl = _safe_int(
+                ttl_env, 120, "ENGINE_CACHE_TTL_SECONDS/DATAENGINE_CACHE_TTL"
+            )
 
         # Per-provider timeout (seconds) – hardened parsing
         if provider_timeout is not None:
@@ -370,7 +372,7 @@ class DataEngine:
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.3 initialized "
+            "DataEngine v2.4 initialized "
             "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, "
             "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
@@ -535,6 +537,15 @@ class DataEngine:
                 logger.warning("Unknown provider '%s' configured; ignoring", provider)
 
         if not tasks:
+            # As an ultimate fallback, try v1 engine (global) if available
+            if _HAS_V1_ENGINE and not is_ksa:
+                try:
+                    v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
+                    if v1_quotes:
+                        return self._from_v1_quote(v1_quotes[0])
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.exception("V1 global delegate failed for %s: %s", symbol, exc)
+
             return UnifiedQuote(
                 symbol=symbol,
                 data_quality="MISSING",
@@ -542,7 +553,23 @@ class DataEngine:
             )
 
         results = await asyncio.gather(*tasks)
-        return self._merge_provider_results(symbol, results)
+        merged = self._merge_provider_results(symbol, results)
+
+        # 3) Global fallback via v1 engine if all providers failed / missing
+        if (
+            not is_ksa
+            and _HAS_V1_ENGINE
+            and merged.data_quality in ("MISSING", "UNKNOWN")
+        ):
+            try:
+                v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
+                if v1_quotes:
+                    logger.debug("Using v1 global fallback for %s", symbol)
+                    return self._from_v1_quote(v1_quotes[0])
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("V1 global fallback failed for %s: %s", symbol, exc)
+
+        return merged
 
     async def _safe_call_provider(
         self,
@@ -589,8 +616,8 @@ class DataEngine:
     ) -> UnifiedQuote:
         """
         Merge multiple provider UnifiedQuote results into a single UnifiedQuote.
-        - Prefer first OK result, then PARTIAL.
-        - Backfill missing fields from other OK/PARTIAL results.
+        - Prefer highest quality result (EXCELLENT/GOOD/OK), then FAIR/PARTIAL.
+        - Backfill missing fields from other non-MISSING results.
         - Combine sources and error messages.
 
         This is designed to align cleanly with the "unified sheet" template
@@ -603,13 +630,13 @@ class DataEngine:
                 error="No provider results",
             )
 
-        # Separate by quality
-        ok_or_partial: List[UnifiedQuote] = [
-            q for q in results if q.data_quality in ("OK", "PARTIAL", "EXCELLENT")
+        # Treat anything except MISSING/UNKNOWN as usable
+        usable: List[UnifiedQuote] = [
+            q for q in results if q.data_quality not in ("MISSING", "UNKNOWN")
         ]
 
         # All providers failed
-        if not ok_or_partial:
+        if not usable:
             combined_error = "; ".join([q.error for q in results if q.error])  # type: ignore
             return UnifiedQuote(
                 symbol=symbol,
@@ -617,11 +644,24 @@ class DataEngine:
                 error=combined_error or "All providers failed or returned no data",
             )
 
-        # Choose base quote: prefer EXCELLENT/OK, else PARTIAL
-        base: UnifiedQuote = next(
-            (q for q in ok_or_partial if q.data_quality in ("EXCELLENT", "OK")),
-            ok_or_partial[0],
-        )
+        # Choose base quote by data_quality priority
+        priority_order = [
+            "EXCELLENT",
+            "GOOD",
+            "OK",
+            "FAIR",
+            "PARTIAL",
+            "POOR",
+        ]
+
+        def _quality_rank(q: UnifiedQuote) -> int:
+            dq = (q.data_quality or "UNKNOWN").upper()
+            try:
+                return priority_order.index(dq)
+            except ValueError:
+                return len(priority_order)
+
+        base: UnifiedQuote = sorted(usable, key=_quality_rank)[0]
 
         # Get field names for UnifiedQuote for safe merging
         field_map = getattr(UnifiedQuote, "model_fields", None)
@@ -635,8 +675,8 @@ class DataEngine:
         else:  # pydantic v1 fallback
             merged_data = base.dict()  # type: ignore[attr-defined]
 
-        # Merge from other OK/PARTIAL quotes (only fill Nones)
-        for q in ok_or_partial:
+        # Merge from other usable quotes (only fill Nones)
+        for q in usable:
             if q is base:
                 continue
             if hasattr(q, "model_dump"):
@@ -655,19 +695,13 @@ class DataEngine:
         # Symbol must be normalized symbol argument
         merged_data["symbol"] = symbol.upper()
 
-        # Combine data_quality: EXCELLENT > OK > PARTIAL
-        if any(q.data_quality == "EXCELLENT" for q in ok_or_partial):
-            merged_quality = "EXCELLENT"
-        elif any(q.data_quality == "OK" for q in ok_or_partial):
-            merged_quality = "OK"
-        else:
-            merged_quality = "PARTIAL"
-        merged_data["data_quality"] = merged_quality
+        # Combine data_quality based on best available
+        merged_data["data_quality"] = base.data_quality or "UNKNOWN"
 
         # Combine sources
         combined_sources: List[ProviderSource] = []
         seen_providers: set[str] = set()
-        for q in ok_or_partial:
+        for q in usable:
             # Use q.sources if present, otherwise synthesize from provider fields
             if q.sources:
                 for s in q.sources:
@@ -696,7 +730,7 @@ class DataEngine:
                 merged_data.get("data_source") or combined_sources[0].provider
             )
 
-        # Merge error messages for debugging if everything is PARTIAL
+        # Merge error messages for debugging (if any)
         combined_error = "; ".join(
             sorted({q.error for q in results if q.error})  # type: ignore
         )
@@ -1314,7 +1348,6 @@ class DataEngine:
             net_income_growth_percent=net_income_growth,
             ebitda_margin_percent=ebitda_margin,
             operating_margin_percent=operating_margin,
-            net_margin_percent=net_margin or profit_margin,
             ev_to_ebitda=ev_to_ebitda,
             price_to_sales=price_to_sales,
             price_to_cash_flow=price_to_cash_flow,
