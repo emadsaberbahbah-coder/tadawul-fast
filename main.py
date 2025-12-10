@@ -2,7 +2,7 @@
 main.py
 ===========================================================
 Tadawul Fast Bridge - Main Application
-Version: 4.3.0 (Unified Engine + Google Sheets + KSA-safe)
+Version: 4.4.0 (Unified Engine v2.5 + AI v2.4 + Sheets + KSA-safe)
 
 FastAPI backend for:
     • Enriched Quotes       (/v1/enriched*)
@@ -12,7 +12,7 @@ FastAPI backend for:
     • Legacy Quotes         (/v1/quote, /v1/legacy/sheet-rows)
 
 Integrated with:
-    • core.data_engine / core.data_engine_v2 (multi-provider engine):
+    • core.data_engine / core.data_engine_v2 (multi-provider unified engine):
         - KSA via Tadawul/Argaam gateway and v1 delegate (NO EODHD for .SR)
         - Global via FMP + optional EODHD + optional Finnhub
     • env.py (all config & tokens, providers, Sheets meta, etc.)
@@ -69,7 +69,7 @@ class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.3.0")
+    app_version: str = os.getenv("APP_VERSION", "4.4.0")
 
 
 # Prefer Settings instance from env.py; otherwise use fallback dataclass instance
@@ -119,7 +119,7 @@ APP_NAME: str = getattr(
     settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
 )
 APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.3.0")
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.4.0")
 )
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
@@ -448,6 +448,10 @@ async def root() -> str:
         else "<em>auto</em>"
     )
 
+    # Light introspection of engine modes for quick visual debug
+    enriched_engine_mode = getattr(enriched_quote, "_ENGINE_MODE", None)
+    ai_engine_mode = getattr(ai_analysis, "_ENGINE_MODE", None)
+
     return f"""
     <html>
       <head><title>{APP_NAME}</title></head>
@@ -458,12 +462,17 @@ async def root() -> str:
         <p>Base URL: <code>{BACKEND_BASE_URL}</code></p>
         <p>Default Spreadsheet (9-page dashboard): {default_sheet_html}</p>
         <p>Providers (global): {providers_html} &nbsp;|&nbsp; Primary: {primary_provider_html}</p>
+        <p>Enriched engine mode: <code>{enriched_engine_mode}</code> &nbsp;|&nbsp;
+           AI engine mode: <code>{ai_engine_mode}</code></p>
 
         <h2>Quick Links</h2>
         <ul>
           <li><code>/health</code></li>
           <li><code>/v1/status</code></li>
-          <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
+          <li><code>/v1/quote?tickers=AAPL</code> (legacy global)</li>
+          <li><code>/v1/quote?tickers=1120.SR</code> (legacy KSA)</li>
+          <li><code>/v1/enriched/quote?symbol=AAPL</code></li>
+          <li><code>/v1/enriched/quote?symbol=1120.SR</code></li>
           <li><code>/v1/enriched/health</code></li>
           <li><code>/v1/analysis/health</code></li>
           <li><code>/v1/advanced/ping</code> (if enabled)</li>
@@ -561,6 +570,21 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
 
     providers_meta = _get_providers_meta()
 
+    # Light engine metadata for diagnostics (no imports of internals)
+    engine_meta = {
+        "enriched_quote": {
+            "engine_mode": getattr(enriched_quote, "_ENGINE_MODE", None),
+            "engine_is_stub": getattr(enriched_quote, "_ENGINE_IS_STUB", None),
+        },
+        "ai_analysis": {
+            "engine_mode": getattr(ai_analysis, "_ENGINE_MODE", None),
+            "engine_is_stub": getattr(ai_analysis, "_ENGINE_IS_STUB", None),
+        },
+        "advanced_analysis": {
+            "available": _ADVANCED_ANALYSIS_AVAILABLE,
+        },
+    }
+
     return {
         "status": "operational",
         "version": APP_VERSION,
@@ -573,6 +597,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "sheets": sheets_meta,
         "sheet_endpoints": sheet_endpoints,
         "providers": providers_meta,
+        "engine": engine_meta,
         "advanced_analysis_enabled": _ADVANCED_ANALYSIS_AVAILABLE,
         "ksa_argaam_gateway": {
             "configured": bool(ARGAAM_GATEWAY_URL),
