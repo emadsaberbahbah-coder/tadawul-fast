@@ -1,7 +1,7 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.5
+Core Data & Analysis Engine - v2.6
 (Global fundamentals-enriched, Sheets-aligned, hardened)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
@@ -25,7 +25,10 @@ Key features
     • 9-page Google Sheets dashboard philosophy
 - Basic AI-style scoring:
     • Value / Quality / Momentum / Opportunity + Recommendation
-    • Uses target_price (if available) to derive fair_value & upside %.
+    • overall_score field for "AI Score" columns on Sheets.
+    • Uses target_price (if available) to derive fair_value, upside %, and
+      expected ROI horizons (exp_roi_3m / exp_roi_12m).
+    • Simple risk_label / risk_bucket based on beta, volatility, and opportunity.
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
     • Hardened __init__: bad env values (TTL, timeout, providers) never crash import.
@@ -201,7 +204,7 @@ class UnifiedQuote(BaseModel):
     bid_size: Optional[float] = None
     ask_size: Optional[float] = None
     spread_percent: Optional[float] = None
-    liquidity_score: Optional[float] = None
+    liquidity_score: Optional[float] = None  # 0–100 liquidity heuristic
 
     # Fundamentals
     eps_ttm: Optional[float] = None
@@ -251,7 +254,12 @@ class UnifiedQuote(BaseModel):
     quality_score: Optional[float] = None
     momentum_score: Optional[float] = None
     opportunity_score: Optional[float] = None
+    overall_score: Optional[float] = None   # main "AI Score" for Sheets
     recommendation: Optional[str] = None
+    risk_label: Optional[str] = None        # e.g., LOW_RISK / MEDIUM_RISK / HIGH_RISK
+    risk_bucket: Optional[str] = None       # e.g., HIGH_OPP_HIGH_CONF, MED_OPP, LOW_OPP
+    exp_roi_3m: Optional[float] = None      # Expected ROI over ~3 months (%)
+    exp_roi_12m: Optional[float] = None     # Expected ROI over ~12 months (%)
 
     # Technicals
     rsi_14: Optional[float] = None
@@ -262,7 +270,7 @@ class UnifiedQuote(BaseModel):
     # Meta & providers
     data_quality: str = Field(
         "UNKNOWN",
-        description="OK / PARTIAL / MISSING / STALE / UNKNOWN / GOOD / FAIR / POOR / EXCELLENT",
+        description="FULL / PARTIAL / MISSING / STALE / UNKNOWN (Sheets maps to confidence)",
     )
     primary_provider: Optional[str] = None
     provider: Optional[str] = None
@@ -386,7 +394,7 @@ class DataEngine:
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.5 initialized "
+            "DataEngine v2.6 initialized "
             "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, "
             "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
@@ -429,6 +437,9 @@ class DataEngine:
                 data_quality="MISSING",
                 error=f"Exception in DataEngine.get_enriched_quote: {exc}",
             )
+
+        # Normalize quality once at the end for Sheet compatibility
+        self._normalize_data_quality(quote)
 
         # Cache even MISSING responses (short TTL) to avoid hammering providers
         self._cache[symbol_norm] = _CacheEntry(
@@ -508,7 +519,9 @@ class DataEngine:
                 v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                 if v1_quotes:
                     logger.debug("Using v1 KSA delegate for %s", symbol)
-                    return self._from_v1_quote(v1_quotes[0])
+                    q = self._from_v1_quote(v1_quotes[0])
+                    self._normalize_data_quality(q)
+                    return q
             except Exception as exc:  # pragma: no cover - defensive
                 logger.exception("V1 KSA delegate failed for %s: %s", symbol, exc)
 
@@ -556,7 +569,9 @@ class DataEngine:
                 try:
                     v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                     if v1_quotes:
-                        return self._from_v1_quote(v1_quotes[0])
+                        q = self._from_v1_quote(v1_quotes[0])
+                        self._normalize_data_quality(q)
+                        return q
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.exception("V1 global delegate failed for %s: %s", symbol, exc)
 
@@ -579,7 +594,9 @@ class DataEngine:
                 v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                 if v1_quotes:
                     logger.debug("Using v1 global fallback for %s", symbol)
-                    return self._from_v1_quote(v1_quotes[0])
+                    q = self._from_v1_quote(v1_quotes[0])
+                    self._normalize_data_quality(q)
+                    return q
             except Exception as exc:  # pragma: no cover - defensive
                 logger.exception("V1 global fallback failed for %s: %s", symbol, exc)
 
@@ -611,6 +628,9 @@ class DataEngine:
             q.data_source = q.data_source or provider_name
             if not q.sources:
                 q.sources = [ProviderSource(provider=provider_name, note="primary")]
+
+            # Normalize quality once here as well
+            self._normalize_data_quality(q)
             return q
         except Exception as exc:
             logger.exception(
@@ -630,7 +650,7 @@ class DataEngine:
     ) -> UnifiedQuote:
         """
         Merge multiple provider UnifiedQuote results into a single UnifiedQuote.
-        - Prefer highest quality result (EXCELLENT/GOOD/OK), then FAIR/PARTIAL.
+        - Prefer highest quality result (FULL/EXCELLENT/GOOD/OK), then FAIR/PARTIAL.
         - Backfill missing fields from other non-MISSING results.
         - Combine sources and error messages.
 
@@ -643,6 +663,10 @@ class DataEngine:
                 data_quality="MISSING",
                 error="No provider results",
             )
+
+        # Normalize quality for all incoming quotes
+        for q in results:
+            self._normalize_data_quality(q)
 
         # Treat anything except MISSING/UNKNOWN as usable
         usable: List[UnifiedQuote] = [
@@ -660,6 +684,7 @@ class DataEngine:
 
         # Choose base quote by data_quality priority
         priority_order = [
+            "FULL",
             "EXCELLENT",
             "GOOD",
             "OK",
@@ -758,7 +783,119 @@ class DataEngine:
             logger.exception("Failed to merge provider results for %s: %s", symbol, exc)
             return base
 
+        # Normalize the merged result as a final step
+        self._normalize_data_quality(merged_quote)
         return merged_quote
+
+    # ------------------------------------------------------------------ #
+    # Quality normalization & liquidity scoring
+    # ------------------------------------------------------------------ #
+
+    def _normalize_data_quality(self, q: UnifiedQuote) -> None:
+        """
+        Normalize q.data_quality into canonical values:
+        - FULL / PARTIAL / MISSING / STALE / UNKNOWN
+
+        Also tries to infer quality from available fields if UNKNOWN.
+        This is critical so Sheets can cleanly map to Confidence levels.
+        """
+        dq_raw = (q.data_quality or "UNKNOWN").upper().strip()
+
+        # Map synonyms from providers / v1 to canonical values
+        if dq_raw in {"OK", "GOOD", "EXCELLENT"}:
+            dq = "FULL"
+        elif dq_raw in {"FAIR"}:
+            dq = "PARTIAL"
+        elif dq_raw in {"POOR"}:
+            dq = "PARTIAL"
+        elif dq_raw in {"MISSING"}:
+            dq = "MISSING"
+        elif dq_raw in {"STALE"}:
+            dq = "STALE"
+        elif dq_raw in {"UNKNOWN", "", "NONE"}:
+            dq = "UNKNOWN"
+        else:
+            dq = dq_raw
+
+        # If still UNKNOWN or inconsistent, infer from fields
+        has_price = q.last_price is not None or q.price is not None
+        has_basic = (
+            q.volume is not None
+            or q.market_cap is not None
+            or q.eps_ttm is not None
+            or q.pe_ttm is not None
+            or q.dividend_yield_percent is not None
+        )
+        has_deep = (
+            q.roe_percent is not None
+            or q.roa_percent is not None
+            or q.revenue_growth_percent is not None
+            or q.net_margin_percent is not None
+        )
+
+        if dq in {"UNKNOWN"}:
+            if not has_price and not has_basic and not has_deep:
+                dq = "MISSING"
+            elif has_price and (has_basic or has_deep):
+                dq = "FULL"
+            elif has_price:
+                dq = "PARTIAL"
+            else:
+                dq = "PARTIAL" if (has_basic or has_deep) else "MISSING"
+        else:
+            # If a quote is labelled FULL but has no price, downgrade
+            if dq == "FULL" and not has_price:
+                dq = "PARTIAL"
+            # If labelled PARTIAL but truly empty, mark MISSING
+            if dq == "PARTIAL" and not has_price and not has_basic and not has_deep:
+                dq = "MISSING"
+
+        q.data_quality = dq
+
+    def _compute_liquidity_score(
+        self,
+        volume: Optional[float],
+        avg_volume: Optional[float],
+        market_cap: Optional[float],
+    ) -> Optional[float]:
+        """
+        Very rough 0–100 liquidity heuristic:
+        - Based on current vs. avg volume and market cap band.
+        - Only used as a helper for Sheets ranking; not financial advice.
+        """
+        try:
+            vol = float(volume) if volume is not None else None
+            avg = float(avg_volume) if avg_volume is not None else None
+            mc = float(market_cap) if market_cap is not None else None
+        except Exception:
+            return None
+
+        if vol is None or vol <= 0:
+            return None
+
+        score = 50.0
+
+        # Volume vs. average
+        if avg is not None and avg > 0:
+            ratio = vol / avg
+            if ratio >= 3.0:
+                score += 20.0
+            elif ratio >= 1.0:
+                score += 10.0
+            elif ratio < 0.5:
+                score -= 10.0
+
+        # Market cap band
+        if mc is not None:
+            if mc >= 1e11:
+                score += 10.0
+            elif mc >= 1e10:
+                score += 5.0
+            elif mc <= 1e9:
+                score -= 10.0
+
+        score = max(0.0, min(100.0, score))
+        return round(score, 2)
 
     # ------------------------------------------------------------------ #
     # Provider: Financial Modeling Prep (FMP)
@@ -860,7 +997,6 @@ class DataEngine:
                 dividend_yield_percent = None
 
         shares_outstanding = gv("sharesOutstanding", "shares_outstanding")
-
         market_raw = gv("exchangeShortName", "exchange")
         market = market_raw
         market_region = market_raw
@@ -872,6 +1008,10 @@ class DataEngine:
                 market_region = "KSA"
             else:
                 market = "GLOBAL"
+
+        volume_val = gv("volume")
+        avg_vol = gv("avgVolume")
+        market_cap = gv("marketCap")
 
         q = UnifiedQuote(
             symbol=str(gv("symbol", default=symbol)).upper(),
@@ -900,11 +1040,11 @@ class DataEngine:
             fifty_two_week_low=low_52w,
             position_52w_percent=position_52w,
             fifty_two_week_position=position_52w,
-            volume=gv("volume"),
-            avg_volume_30d=gv("avgVolume"),
-            average_volume_30d=gv("avgVolume"),
-            avg_volume=gv("avgVolume"),
-            market_cap=gv("marketCap"),
+            volume=volume_val,
+            avg_volume_30d=avg_vol,
+            average_volume_30d=avg_vol,
+            avg_volume=avg_vol,
+            market_cap=market_cap,
             eps_ttm=eps_val,
             eps=eps_val,
             pe_ratio=pe_val,
@@ -916,7 +1056,6 @@ class DataEngine:
             dividend_yield=dividend_yield_percent,
             beta=gv("beta"),
             ma_50d=gv("priceAvg50"),
-            data_quality="OK" if last_price is not None else "PARTIAL",
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
@@ -925,6 +1064,13 @@ class DataEngine:
             raw=d,
         )
 
+        # Liquidity score
+        liq = self._compute_liquidity_score(volume_val, avg_vol, market_cap)
+        if liq is not None:
+            q.liquidity_score = liq
+
+        # Normalize quality & apply scoring
+        self._normalize_data_quality(q)
         if self.enable_advanced_analysis:
             self._apply_basic_scoring(q, source="fmp")
 
@@ -1267,7 +1413,6 @@ class DataEngine:
             target_price=target_price_val,
             ex_dividend_date=ex_div_date,
             ma_50d=ma_50d_val,
-            data_quality="OK" if last_price is not None else "PARTIAL",
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
@@ -1276,6 +1421,13 @@ class DataEngine:
             raw={"realtime": d, "fundamentals": fundamentals} if fundamentals else d,
         )
 
+        # Liquidity score
+        liq = self._compute_liquidity_score(volume_val, avg_vol, market_cap)
+        if liq is not None:
+            q.liquidity_score = liq
+
+        # Normalize quality & apply scoring
+        self._normalize_data_quality(q)
         if self.enable_advanced_analysis:
             self._apply_basic_scoring(q, source="eodhd")
 
@@ -1335,7 +1487,6 @@ class DataEngine:
             change_percent=change_pct,
             change_pct=change_pct,
             volume=None,  # Finnhub quote doesn't always include volume here
-            data_quality="PARTIAL" if last_price is not None else "MISSING",
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
@@ -1344,6 +1495,8 @@ class DataEngine:
             raw=d,
         )
 
+        # Normalize quality & apply scoring
+        self._normalize_data_quality(q)
         if self.enable_advanced_analysis:
             self._apply_basic_scoring(q, source="finnhub")
 
@@ -1429,6 +1582,9 @@ class DataEngine:
         valuation_label = gv("valuation_label")
         fair_value = gv("fair_value")
         upside_percent = gv("upside_percent")
+        risk_label = gv("risk_label")
+        risk_bucket = gv("risk_bucket")
+        overall_score = gv("overall_score")
 
         rsi_14 = gv("rsi_14")
         macd = gv("macd")
@@ -1568,6 +1724,7 @@ class DataEngine:
             quality_score=quality_score,
             momentum_score=momentum_score,
             opportunity_score=opportunity_score,
+            overall_score=overall_score,
             recommendation=recommendation,
             rsi_14=rsi_14,
             macd=macd,
@@ -1586,12 +1743,19 @@ class DataEngine:
             raw=None,
         )
 
+        # Liquidity score (if not provided)
+        liq = self._compute_liquidity_score(volume, avg_volume, market_cap)
+        if liq is not None and q.liquidity_score is None:
+            q.liquidity_score = liq
+
+        # Normalize quality & optionally top-up scoring
+        self._normalize_data_quality(q)
         if self.enable_advanced_analysis:
-            # v1 might already have scores; only top-up if missing
             if (
                 q.value_score is None
                 or q.quality_score is None
                 or q.momentum_score is None
+                or q.opportunity_score is None
             ):
                 self._apply_basic_scoring(q, source="v1_delegate")
 
@@ -1608,10 +1772,16 @@ class DataEngine:
         - Quality score: EPS sign + PE range
         - Momentum score: % change + 52W position + basic volatility penalty
         - Opportunity score: weighted combination
+        - overall_score: alias for opportunity_score (for Sheets "AI Score")
+        - Basic risk_label / risk_bucket based on beta, volatility & opportunity.
+        - exp_roi_12m / exp_roi_3m derived from fair_value/target_price if available.
 
         This is intentionally simple and deterministic so that
         Google Sheets & Apps Script can rely on it as a stable layer.
         """
+        # Ensure data_quality is normalized before risk buckets
+        self._normalize_data_quality(q)
+
         # -------------------------
         # Quality score (EPS + PE)
         # -------------------------
@@ -1707,6 +1877,7 @@ class DataEngine:
         q.quality_score = round(quality, 2)
         q.momentum_score = round(momentum, 2)
         q.opportunity_score = round(opportunity, 2)
+        q.overall_score = q.opportunity_score
 
         # Rough recommendation buckets
         if opportunity >= 80:
@@ -1720,23 +1891,24 @@ class DataEngine:
         else:
             q.recommendation = "SELL"
 
-        # If we have a target_price and no explicit fair_value/upside yet,
-        # treat target_price as fair_value and compute upside %.
+        # If we have a target_price and no explicit fair_value yet,
+        # treat target_price as fair_value.
         if q.fair_value is None and q.target_price is not None:
             q.fair_value = q.target_price
 
-        if (
-            q.fair_value is not None
-            and q.last_price is not None
-            and q.upside_percent is None
-        ):
+        # Upside % and expected ROI horizons
+        if q.fair_value is not None and q.last_price is not None:
             try:
-                q.upside_percent = round(
-                    (float(q.fair_value) - float(q.last_price))
-                    / float(q.last_price)
-                    * 100.0,
-                    2,
-                )
+                fv = float(q.fair_value)
+                lp = float(q.last_price)
+                if q.upside_percent is None:
+                    q.upside_percent = round((fv - lp) / lp * 100.0, 2)
+                # 12M ROI: use upside as baseline
+                if q.exp_roi_12m is None:
+                    q.exp_roi_12m = round((fv - lp) / lp * 100.0, 2)
+                # 3M ROI: simple proportional fraction (quarter of 12M)
+                if q.exp_roi_3m is None and q.exp_roi_12m is not None:
+                    q.exp_roi_3m = round(q.exp_roi_12m / 4.0, 2)
             except Exception:
                 pass
 
@@ -1750,6 +1922,72 @@ class DataEngine:
                 q.valuation_label = "FAIR_VALUE"
             else:
                 q.valuation_label = "EXPENSIVE"
+
+        # -------------------------
+        # Risk label & bucket
+        # -------------------------
+        risk_label = None
+        risk_bucket = None
+        beta_val = None
+        vol_val = None
+
+        try:
+            if q.beta is not None:
+                beta_val = float(q.beta)
+        except Exception:
+            beta_val = None
+
+        try:
+            if q.volatility_30d_percent is not None:
+                vol_val = float(q.volatility_30d_percent)
+            elif q.volatility_30d is not None:
+                vol_val = float(q.volatility_30d)
+        except Exception:
+            vol_val = None
+
+        risk_score = 50.0
+        if beta_val is not None:
+            if beta_val > 1.5:
+                risk_score += 20.0
+            elif beta_val > 1.2:
+                risk_score += 10.0
+            elif beta_val < 0.8:
+                risk_score -= 10.0
+
+        if vol_val is not None:
+            if vol_val > 35.0:
+                risk_score += 20.0
+            elif vol_val > 25.0:
+                risk_score += 10.0
+            elif vol_val < 15.0:
+                risk_score -= 10.0
+
+        if risk_score >= 70.0:
+            risk_label = "HIGH_RISK"
+        elif risk_score >= 45.0:
+            risk_label = "MEDIUM_RISK"
+        else:
+            risk_label = "LOW_RISK"
+
+        q.risk_label = risk_label
+
+        opp = q.opportunity_score if q.opportunity_score is not None else opportunity
+        dq_norm = (q.data_quality or "UNKNOWN").upper()
+        high_conf = dq_norm in {"FULL", "GOOD", "EXCELLENT"}
+
+        if opp >= 80 and risk_label in {"LOW_RISK", "MEDIUM_RISK"} and high_conf:
+            risk_bucket = "HIGH_OPP_HIGH_CONF"
+        elif opp >= 65 and high_conf:
+            risk_bucket = "HIGH_OPP_MED_CONF"
+        elif opp >= 50:
+            risk_bucket = "MED_OPP"
+        else:
+            risk_bucket = "LOW_OPP"
+
+        q.risk_bucket = risk_bucket
+
+        # Normalize quality again as a final step
+        self._normalize_data_quality(q)
 
 
 __all__ = ["UnifiedQuote", "ProviderSource", "DataEngine"]
