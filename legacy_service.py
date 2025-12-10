@@ -1,7 +1,7 @@
 """
 legacy_service.py
 ------------------------------------------------------------
-LEGACY SERVICE BRIDGE – v3.1
+LEGACY SERVICE BRIDGE – v3.2 (Aligned with App v4.3.0)
 
 GOAL
 - Provide a stable "legacy" layer on top of the new unified data engine,
@@ -22,13 +22,15 @@ KEY FEATURES
 
 ALIGNMENT
 - Engine usage & fallbacks aligned with:
-    • core.data_engine_v2.DataEngine
+    • core.data_engine_v2.DataEngine (preferred, class-based)
+    • core.data_engine (module-level async functions, fallback)
     • routes/enriched_quote.py
     • routes/ai_analysis.py
     • routes/advanced_analysis.py
 - Symbol normalization aligned with KSA / Tadawul logic used elsewhere:
-    • 1120      -> 1120.SR
-    • TADAWUL:1120 or 1120.TADAWUL -> 1120.SR
+    • 1120                -> 1120.SR
+    • TADAWUL:1120        -> 1120.SR
+    • 1120.TADAWUL        -> 1120.SR
 """
 
 from __future__ import annotations
@@ -40,52 +42,97 @@ from typing import Any, Dict, List, Optional
 import logging
 import os
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("legacy_service")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
 
 # ----------------------------------------------------------------------
-# ENV CONFIG – env.py preferred, env vars fallback
+# ENV / SETTINGS – env.settings preferred, env vars fallback
 # ----------------------------------------------------------------------
 
-APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
-APP_VERSION: str = os.getenv("APP_VERSION", "4.0.0")
-BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", "").strip()
-
-try:  # pragma: no cover - optional env.py
-    from env import (  # type: ignore
-        APP_NAME as _ENV_APP_NAME,
-        APP_VERSION as _ENV_APP_VERSION,
-        BACKEND_BASE_URL as _ENV_BACKEND_BASE_URL,
-    )
-
-    if _ENV_APP_NAME:
-        APP_NAME = _ENV_APP_NAME
-    if _ENV_APP_VERSION:
-        APP_VERSION = _ENV_APP_VERSION
-    if _ENV_BACKEND_BASE_URL:
-        BACKEND_BASE_URL = _ENV_BACKEND_BASE_URL.strip()
-
-    logger.info("[LegacyService] Config loaded from env.py.")
-except Exception:  # pragma: no cover - defensive
+try:  # pragma: no cover - env.py optional
+    import env as _env_mod  # type: ignore
+except Exception:  # pragma: no cover
+    _env_mod = None  # type: ignore
     logger.warning(
-        "[LegacyService] env.py not available or failed to import. "
-        "Using environment variables for APP_NAME/APP_VERSION/BACKEND_BASE_URL."
+        "[LegacyService] env.py not available. "
+        "Using OS environment variables for basic config."
     )
+
+
+@dataclass
+class _SettingsFallback:
+    app_env: str = os.getenv("APP_ENV", "production")
+    app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
+    app_version: str = os.getenv("APP_VERSION", "4.3.0")
+    backend_base_url: str = os.getenv("BACKEND_BASE_URL", "").strip()
+
+
+settings = getattr(_env_mod, "settings", _SettingsFallback())
+
+APP_NAME: str = getattr(
+    settings, "app_name", os.getenv("APP_NAME", "tadawul-fast-bridge")
+)
+APP_VERSION: str = getattr(
+    settings, "app_version", os.getenv("APP_VERSION", "4.3.0")
+)
+BACKEND_BASE_URL: str = getattr(
+    settings, "backend_base_url", os.getenv("BACKEND_BASE_URL", "")
+).strip()
+
 
 # ----------------------------------------------------------------------
 # DATA ENGINE IMPORT / FALLBACKS (v2 preferred, v1 module, stub)
 # ----------------------------------------------------------------------
 
 _ENGINE_MODE: str = "stub"  # "v2", "v1_module", "stub"
+_ENGINE_IS_STUB: bool = True
 _engine: Any = None
 _data_engine_module: Any = None
 
-try:
-    # Preferred: new class-based engine (core.data_engine_v2)
+try:  # Preferred: new class-based engine (core.data_engine_v2)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    _engine = _V2DataEngine()
+    engine_kwargs: Dict[str, Any] = {}
+
+    # Optional engine tuning via env.py
+    if _env_mod is not None:
+        cache_ttl = getattr(_env_mod, "ENGINE_CACHE_TTL_SECONDS", None)
+        if cache_ttl is not None:
+            engine_kwargs["cache_ttl"] = cache_ttl
+
+        provider_timeout = getattr(
+            _env_mod, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None
+        )
+        if provider_timeout is not None:
+            engine_kwargs["provider_timeout"] = provider_timeout
+
+        enabled_providers = getattr(_env_mod, "ENABLED_PROVIDERS", None)
+        if enabled_providers:
+            engine_kwargs["enabled_providers"] = enabled_providers
+
+        enable_adv = getattr(
+            _env_mod, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True
+        )
+        engine_kwargs["enable_advanced_analysis"] = enable_adv
+
+    try:
+        if engine_kwargs:
+            _engine = _V2DataEngine(**engine_kwargs)
+        else:
+            _engine = _V2DataEngine()
+    except TypeError:
+        # Signature mismatch -> fall back to default constructor
+        _engine = _V2DataEngine()
+
     _ENGINE_MODE = "v2"
-    logger.info("[LegacyService] Using DataEngine from core.data_engine_v2.")
+    _ENGINE_IS_STUB = False
+    logger.info(
+        "[LegacyService] Using DataEngine v2 from core.data_engine_v2 "
+        "(kwargs=%s).",
+        list(engine_kwargs.keys()),
+    )
+
 except Exception as e_v2:  # pragma: no cover - defensive
     logger.exception(
         "[LegacyService] Failed to init core.data_engine_v2.DataEngine: %s",
@@ -96,6 +143,7 @@ except Exception as e_v2:  # pragma: no cover - defensive
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
+        _ENGINE_IS_STUB = False
         logger.warning(
             "[LegacyService] Falling back to core.data_engine module-level API."
         )
@@ -122,7 +170,8 @@ except Exception as e_v2:  # pragma: no cover - defensive
                             "symbol": sym,
                             "data_quality": "MISSING",
                             "error": (
-                                "Unified data engine (v2/v1) unavailable in LegacyService."
+                                "Unified data engine (v2/v1) unavailable in "
+                                "LegacyService."
                             ),
                         }
                     )
@@ -130,6 +179,7 @@ except Exception as e_v2:  # pragma: no cover - defensive
 
         _engine = _StubEngine()
         _ENGINE_MODE = "stub"
+        _ENGINE_IS_STUB = True
         logger.error(
             "[LegacyService] Using stub DataEngine – legacy responses will "
             "contain MISSING placeholder data."
@@ -145,7 +195,7 @@ async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
       - v1:  core.data_engine.get_enriched_quotes(...)
       - stub: _engine.get_enriched_quotes(...) -> MISSING data
     """
-    clean = [s for s in (symbols or []) if s]
+    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
     if not clean:
         return []
 
@@ -740,6 +790,7 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "version": ...,
                 "backend_url": ...,
                 "engine_mode": ...,
+                "engine_is_stub": bool,
                 "note": ...
             }
         }
@@ -759,6 +810,7 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "version": APP_VERSION,
                 "backend_url": BACKEND_BASE_URL,
                 "engine_mode": _ENGINE_MODE,
+                "engine_is_stub": _ENGINE_IS_STUB,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "note": "No symbols provided.",
             },
@@ -790,6 +842,7 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "version": APP_VERSION,
                 "backend_url": BACKEND_BASE_URL,
                 "engine_mode": _ENGINE_MODE,
+                "engine_is_stub": _ENGINE_IS_STUB,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "note": "Failed to fetch data from unified data engine.",
             },
@@ -827,11 +880,13 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             "version": APP_VERSION,
             "backend_url": BACKEND_BASE_URL,
             "engine_mode": _ENGINE_MODE,
+            "engine_is_stub": _ENGINE_IS_STUB,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "note": (
                 "Legacy format built on UnifiedQuote-style engine "
-                f"(mode={_ENGINE_MODE}; KSA via Tadawul/Argaam providers, "
-                "no direct EODHD calls here)."
+                f"(mode={_ENGINE_MODE}, stub={_ENGINE_IS_STUB}; "
+                "KSA via Tadawul/Argaam providers, "
+                "no direct EODHD calls in legacy_service)."
             ),
         },
     }
