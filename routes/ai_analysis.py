@@ -1,10 +1,10 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.3)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.4)
 
 - Preferred backend:
-    • core.data_engine_v2.DataEngine (class-based unified engine)
+    • core.data_engine_v2.DataEngine (class-based unified engine, v2.5+)
 
 - Fallback backend:
     • core.data_engine (module-level async functions:
@@ -16,6 +16,8 @@ AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.3)
 
 - Computes:
     • Value / Quality / Momentum / Opportunity / Overall / Recommendation
+    • Reuses engine-provided scores when available (preferred),
+      otherwise computes a simple deterministic overlay.
 
 - Designed for:
     • 9-page Google Sheets dashboard
@@ -44,7 +46,7 @@ except Exception:
     _env = None  # type: ignore
 
 # ----------------------------------------------------------------------
-# ENGINE DETECTION & FALLBACKS (aligned with advanced_analysis)
+# ENGINE DETECTION & FALLBACKS (aligned with advanced_analysis / v2.5)
 # ----------------------------------------------------------------------
 
 _ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
@@ -71,6 +73,7 @@ try:  # pragma: no cover - defensive
         if enabled_providers:
             engine_kwargs["enabled_providers"] = enabled_providers
 
+        # Bridge env flag to DataEngine(enable_advanced_analysis=...)
         enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
         engine_kwargs["enable_advanced_analysis"] = enable_adv
 
@@ -195,6 +198,11 @@ class SingleAnalysisResponse(BaseModel):
     overall_score: Optional[float] = None
     recommendation: Optional[str] = None
 
+    # AI valuation overlay (engine v2.5+)
+    fair_value: Optional[float] = None
+    upside_percent: Optional[float] = None
+    valuation_label: Optional[str] = None
+
     last_updated_utc: Optional[datetime] = None
     sources: List[str] = Field(default_factory=list)
 
@@ -301,10 +309,14 @@ def _normalize_percent_like(x: Any) -> Optional[float]:
     return v
 
 
-def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
+def _compute_scores_from_raw(quote: Any) -> Dict[str, Optional[float]]:
     """
     Basic AI-like scoring layer. 0–100 scale for each score.
-    Uses fields from the unified engine (v2 or v1).
+    Uses raw fields from the unified engine (v2 or v1).
+
+    NOTE:
+        This is a fallback when the engine did not already provide
+        value_score / quality_score / momentum_score.
     """
     pe = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
     pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
@@ -381,6 +393,77 @@ def _compute_scores(quote: Any) -> Dict[str, Optional[float]]:
     }
 
 
+def _clamp_score(v: Any) -> Optional[float]:
+    s = _safe_float(v)
+    if s is None:
+        return None
+    return max(0.0, min(100.0, s))
+
+
+def _get_or_compute_scores(quote: Any) -> Dict[str, Optional[float]]:
+    """
+    Prefer engine-provided scores (DataEngine v2.5), fall back
+    to local deterministic scoring when missing.
+
+    If the engine is a stub or the data_quality is MISSING/UNKNOWN,
+    returns all scores as None (no fake 50/50/50).
+    """
+    dq = str(_qget(quote, "data_quality") or "").upper()
+    if _ENGINE_IS_STUB or dq in {"MISSING", "UNKNOWN", ""}:
+        return {
+            "value_score": None,
+            "quality_score": None,
+            "momentum_score": None,
+        }
+
+    pre_value = _clamp_score(_qget(quote, "value_score"))
+    pre_quality = _clamp_score(_qget(quote, "quality_score"))
+    pre_momentum = _clamp_score(_qget(quote, "momentum_score"))
+
+    # If engine already provided all three, just reuse them
+    if pre_value is not None and pre_quality is not None and pre_momentum is not None:
+        return {
+            "value_score": pre_value,
+            "quality_score": pre_quality,
+            "momentum_score": pre_momentum,
+        }
+
+    # Otherwise compute from raw fundamentals, but keep any precomputed fields
+    computed = _compute_scores_from_raw(quote)
+
+    return {
+        "value_score": pre_value if pre_value is not None else computed["value_score"],
+        "quality_score": (
+            pre_quality if pre_quality is not None else computed["quality_score"]
+        ),
+        "momentum_score": (
+            pre_momentum if pre_momentum is not None else computed["momentum_score"]
+        ),
+    }
+
+
+def _compute_opportunity_score(
+    quote: Any,
+    base_scores: Dict[str, Optional[float]],
+) -> Optional[float]:
+    """
+    Prefer engine-provided opportunity_score, otherwise derive a simple
+    weighted combination of value / quality / momentum.
+    """
+    existing = _safe_float(_qget(quote, "opportunity_score"))
+    if existing is not None:
+        return max(0.0, min(100.0, existing))
+
+    v = base_scores.get("value_score")
+    q = base_scores.get("quality_score")
+    m = base_scores.get("momentum_score")
+    if isinstance(v, (int, float)) and isinstance(q, (int, float)) and isinstance(
+        m, (int, float)
+    ):
+        return round(v * 0.4 + q * 0.3 + m * 0.3, 2)
+    return None
+
+
 def _compute_overall_and_reco(
     opportunity_score: Optional[float],
     value_score: Optional[float],
@@ -427,9 +510,9 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
             error="No quote data returned from engine",
         )
 
-    base_scores = _compute_scores(quote)
-
-    opportunity_score = _safe_float(_qget(quote, "opportunity_score"))
+    # 1) Scores: reuse engine scores when available, otherwise compute
+    base_scores = _get_or_compute_scores(quote)
+    opportunity_score = _compute_opportunity_score(quote, base_scores)
     more = _compute_overall_and_reco(
         opportunity_score=opportunity_score,
         value_score=base_scores["value_score"],
@@ -437,6 +520,7 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
         momentum_score=base_scores["momentum_score"],
     )
 
+    # 2) Core identity & metrics
     symbol = str(_qget(quote, "symbol", "ticker") or "").upper()
     name = _qget(quote, "name", "company_name", "longName", "shortName")
     market_region = _qget(
@@ -461,6 +545,19 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
     roa = _normalize_percent_like(_qget(quote, "roa", "roa_percent", "returnOnAssets"))
     data_quality = str(_qget(quote, "data_quality") or "MISSING")
 
+    # 3) AI valuation overlay (fair value / upside / label)
+    fair_value = _safe_float(_qget(quote, "fair_value", "target_price"))
+    upside_percent = _safe_float(_qget(quote, "upside_percent"))
+    if upside_percent is None and fair_value is not None and price is not None:
+        try:
+            upside_percent = round(
+                (float(fair_value) - float(price)) / float(price) * 100.0, 2
+            )
+        except Exception:
+            upside_percent = None
+    valuation_label = _qget(quote, "valuation_label")
+
+    # 4) Timestamps
     last_updated_raw = _qget(quote, "last_updated_utc", "as_of_utc")
     # Pydantic will parse this; it's fine if it's str or datetime
     last_updated_utc: Optional[datetime]
@@ -474,7 +571,7 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
     else:
         last_updated_utc = None
 
-    # Sources can be objects, dicts, or strings
+    # 5) Sources can be objects, dicts, or strings
     raw_sources = _qget(quote, "sources") or []
     sources: List[str] = []
     try:
@@ -510,6 +607,9 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
         opportunity_score=opportunity_score,
         overall_score=more["overall_score"],
         recommendation=more["recommendation"],
+        fair_value=fair_value,
+        upside_percent=upside_percent,
+        valuation_label=valuation_label,
         last_updated_utc=last_updated_utc,
         sources=sources,
         notes=notes,
@@ -522,6 +622,12 @@ def _build_sheet_headers() -> List[str]:
     Headers to use directly in Google Sheets for the AI/Insights layer.
     This is mainly for the Insights_Analysis page, but can be reused for
     any scoring/AI overlay on top of the other 8 pages.
+
+    NOTE:
+        For backward compatibility, we keep the original set of 19
+        columns here. AI valuation fields (fair_value / upside /
+        valuation_label) are exposed in the JSON API but not yet
+        added to the sheet rows.
     """
     return [
         "Symbol",
@@ -561,6 +667,10 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
     """
     Flatten one analysis result to a row (all primitives),
     so Apps Script can use setValues() safely.
+
+    NOTE:
+        Only the original 19 columns are output here for now.
+        fair_value / upside_percent / valuation_label remain JSON-only.
     """
     return [
         a.symbol,
@@ -599,7 +709,7 @@ async def analysis_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "ai_analysis",
-        "version": "2.3",
+        "version": "2.4",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -660,7 +770,7 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
     try:
         unified_quotes = await _engine_get_quotes(tickers)
     except Exception as exc:
-        logger.exception("Batch analysis failed for tickers=%s", tickers)
+        logger.exception("Batch analysis failed for tickers=%s: %s", tickers, exc)
         # Total failure – return placeholder rows for all tickers
         placeholder_results: List[SingleAnalysisResponse] = [
             SingleAnalysisResponse(
@@ -695,7 +805,7 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
             results.append(analysis)
         except Exception as exc:
             logger.exception(
-                "Exception building analysis for %s in batch", t, exc_info=exc
+                "Exception building analysis for %s in batch: %s", t, exc
             )
             results.append(
                 SingleAnalysisResponse(
