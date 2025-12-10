@@ -1,41 +1,152 @@
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam Gateway – v1.1
+KSA / Argaam Gateway – v2.0 (DataEngine v2 wrapper, KSA-safe)
 
-Thin KSA-only wrapper on top of the unified DataEngine v2.
+This router is a thin KSA-only layer on top of the unified DataEngine v2.
 
-- Only accepts Tadawul-style symbols (.SR or numeric).
-- Uses core.data_engine_v2.DataEngine which internally:
-    • delegates KSA to v1 engine / Tadawul+Argaam providers (NO EODHD),
-    • uses FMP/EODHD/Finnhub for non-KSA (but we block those here).
+GOALS
+- Accept ONLY Tadawul-style KSA symbols (.SR or numeric / TADAWUL:code).
+- Never call EODHD or any external global provider directly from here.
+- Reuse the same enriched structures & sheet-rows contract as:
+      routes/enriched_quote.py  (/v1/enriched/*)
+- Be extremely defensive:
+      • If the engine is unavailable, return MISSING placeholder data
+        instead of crashing.
+      • For Google Sheets /sheet-rows, never raise 4xx for "no symbols" –
+        always return a valid table (headers + empty rows).
 
-Exposes:
-    • GET  /v1/argaam/health
-    • GET  /v1/argaam/quote?symbol=1120.SR
-    • POST /v1/argaam/quotes      (JSON -> list of EnrichedQuoteResponse)
-    • POST /v1/argaam/sheet-rows  (Google Sheets–friendly, same structure
-                                    as /v1/enriched/sheet-rows: headers + rows)
+EXPOSED ENDPOINTS
+-----------------
+    GET  /v1/argaam/health
+    GET  /v1/argaam/quote?symbol=1120.SR
+    POST /v1/argaam/quotes      { "tickers": ["1120.SR","1180", ...] }
+    POST /v1/argaam/sheet-rows  { "tickers": ["1120.SR","1180", ...] }
+
+SHEET CONTRACT
+--------------
+- /sheet-rows uses the SAME headers + row layout as /v1/enriched/sheet-rows
+  so it can drop directly into the 9-page Google Sheets dashboard:
+    • KSA_Tadawul
+    • Global_Markets
+    • Mutual_Funds
+    • Commodities_FX
+    • Insights_Analysis
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from core.data_engine_v2 import DataEngine
-from routes.enriched_quote import (
+logger = logging.getLogger("routes_argaam")
+
+# ---------------------------------------------------------------------------
+# env.py integration (optional) – app name / version / gateway URL
+# ---------------------------------------------------------------------------
+
+APP_NAME: str = os.getenv("APP_NAME", "tadawul-fast-bridge")
+APP_VERSION: str = os.getenv("APP_VERSION", "4.3.0")
+ARGAAM_GATEWAY_URL: str = os.getenv("ARGAAM_GATEWAY_URL", "").strip()
+
+try:  # pragma: no cover - env.py is optional
+    import env as _env_mod  # type: ignore
+
+    APP_NAME = getattr(_env_mod, "APP_NAME", APP_NAME)
+    APP_VERSION = getattr(_env_mod, "APP_VERSION", APP_VERSION)
+    if getattr(_env_mod, "ARGAAM_GATEWAY_URL", None):
+        ARGAAM_GATEWAY_URL = str(getattr(_env_mod, "ARGAAM_GATEWAY_URL")).strip()
+
+    logger.info("routes_argaam: Config loaded from env.py.")
+except Exception:  # pragma: no cover - defensive
+    logger.warning(
+        "routes_argaam: env.py not available or failed to import. "
+        "Using environment variables for APP_NAME / APP_VERSION / ARGAAM_GATEWAY_URL."
+    )
+    _env_mod = None  # type: ignore
+
+# ---------------------------------------------------------------------------
+# DataEngine v2 import with stub fallback (never crash the app)
+# ---------------------------------------------------------------------------
+
+_ENGINE_MODE: str = "stub"
+_enabled_providers: List[str] = []
+
+try:
+    from core.data_engine_v2 import DataEngine as _DataEngineClass  # type: ignore
+
+    _ENGINE_MODE = "v2"
+except Exception as exc:  # pragma: no cover - defensive
+    logger.exception(
+        "routes_argaam: Failed to import core.data_engine_v2.DataEngine: %s",
+        exc,
+    )
+    _DataEngineClass = None  # type: ignore
+    _ENGINE_MODE = "stub"
+
+
+class _StubEngine:
+    """
+    Stub engine used ONLY when DataEngine v2 is unavailable.
+
+    Always returns MISSING placeholder data, but keeps all endpoints alive.
+    """
+
+    enabled_providers: List[str] = []
+
+    async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
+        sym = (symbol or "").strip().upper()
+        return {
+            "symbol": sym,
+            "market": "KSA",
+            "currency": "SAR",
+            "data_quality": "MISSING",
+            "data_source": "ksa_gateway_stub",
+            "error": "DataEngine v2 unavailable in routes_argaam; using stub.",
+        }
+
+    async def get_enriched_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        return [await self.get_enriched_quote(s) for s in (symbols or [])]
+
+
+if _ENGINE_MODE == "v2" and _DataEngineClass is not None:
+    try:
+        _engine = _DataEngineClass()
+        _enabled_providers = list(getattr(_engine, "enabled_providers", []))
+        logger.info(
+            "routes_argaam: Using DataEngine v2 (enabled_providers=%s).",
+            _enabled_providers,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "routes_argaam: Failed to init DataEngine v2 instance: %s", exc
+        )
+        _engine = _StubEngine()
+        _ENGINE_MODE = "stub"
+else:
+    _engine = _StubEngine()
+    logger.error(
+        "routes_argaam: DataEngine v2 not available – using stub MISSING engine."
+    )
+
+# ---------------------------------------------------------------------------
+# Import enriched models & helpers (single source of truth)
+# ---------------------------------------------------------------------------
+
+from routes.enriched_quote import (  # type: ignore
     EnrichedQuoteResponse,
     _quote_to_enriched,
     _build_sheet_headers as _enriched_headers,
     _enriched_to_sheet_row as _enriched_row,
 )
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
 
 router = APIRouter(
     prefix="/v1/argaam",
@@ -43,41 +154,72 @@ router = APIRouter(
 )
 
 # ---------------------------------------------------------------------------
-# Engine & basic config
+# Symbol normalization – aligned with DataEngine conventions
 # ---------------------------------------------------------------------------
-
-# Reuse the unified engine (KSA-safe: no EODHD for .SR inside DataEngine)
-_engine = DataEngine()
-
-# Optional external KSA gateway URL (for future use / diagnostics)
-ARGAAM_GATEWAY_URL: str = os.getenv("ARGAAM_GATEWAY_URL", "")
 
 
 def _normalize_ksa_symbol(symbol: str) -> str:
-    """Normalize symbol using the same rules as DataEngine."""
-    # staticmethod from DataEngine (already used by main engine)
-    return DataEngine._normalize_symbol(symbol)
+    """
+    Normalize symbol using the same rules as DataEngine when possible.
+
+    Fallback manual normalization if DataEngine class is not available:
+        - TADAWUL:1120   -> 1120.SR
+        - 1120.TADAWUL   -> 1120.SR
+        - 1120           -> 1120.SR
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+
+    # Prefer DataEngine's own normalization if we have the class
+    if "DataEngine" in globals() or "_DataEngineClass" in globals():
+        try:
+            # We use the class directly to avoid touching the instance
+            if _DataEngineClass is not None and hasattr(_DataEngineClass, "_normalize_symbol"):
+                return _DataEngineClass._normalize_symbol(s)  # type: ignore[attr-defined]
+        except Exception:
+            # Fall back to manual rules if anything goes wrong
+            pass
+
+    # Manual KSA-friendly normalization
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+
+    if s.endswith(".TADAWUL"):
+        s = s[: -len(".TADAWUL")] + ".SR"
+
+    if s.isdigit():
+        s = f"{s}.SR"
+
+    return s
+
+
+def _is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    return bool(s) and (s.endswith(".SR") or s.endswith(".TADAWUL") or s.isdigit())
 
 
 def _ensure_ksa(symbol: str) -> str:
     """
-    Ensure symbol is KSA (.SR / .TADAWUL or numeric) and normalize.
+    Ensure symbol is KSA (.SR / .TADAWUL / numeric) and normalize.
 
     - Accepts: "1120", "1120.SR", "TADAWUL:1120", "1120.TADAWUL"
     - Output:  "1120.SR"
     """
     s = _normalize_ksa_symbol(symbol)
     if not s:
-        raise HTTPException(status_code=400, detail="Symbol is required")
-
-    # KSA only: numeric or .SR / .TADAWUL
-    if not (s.isdigit() or s.endswith(".SR") or s.endswith(".TADAWUL")):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Symbol is required",
+        )
+
+    if not _is_ksa_symbol(s):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="KSA / Argaam gateway only supports Tadawul (.SR) tickers",
         )
 
-    # Ensure .SR suffix for pure numeric
+    # Ensure .SR for pure numeric AFTER validation
     if s.isdigit():
         s = f"{s}.SR"
 
@@ -113,24 +255,26 @@ class KSASheetResponse(BaseModel):
 @router.get("/health")
 async def argaam_health() -> Dict[str, Any]:
     """
-    Simple health check for KSA / Argaam gateway.
+    Lightweight health endpoint for the KSA / Argaam gateway.
 
-    This does not call any external provider – it just reports
-    configuration and engine mode.
+    Does NOT call any external providers – just reports configuration
+    + engine mode, for use by /v1/status and external monitors.
     """
     return {
         "status": "ok",
         "module": "routes_argaam",
-        "engine": "DataEngine_v2",
-        "enabled_providers": list(getattr(_engine, "enabled_providers", [])),
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "engine_mode": _ENGINE_MODE,
+        "enabled_providers": _enabled_providers,
         "gateway": {
             "configured": bool(ARGAAM_GATEWAY_URL),
             "url_prefix": (ARGAAM_GATEWAY_URL or "")[:80] or None,
         },
         "notes": [
             "KSA (.SR) symbols are normalized and enforced here.",
-            "DataEngine v2 internally delegates KSA to the v1 KSA engine "
-            "and/or Tadawul/Argaam providers with NO EODHD for .SR.",
+            "DataEngine v2 internally delegates KSA to KSA-safe providers "
+            "(Tadawul / Argaam). No direct EODHD calls for .SR inside this router.",
         ],
     }
 
@@ -141,21 +285,28 @@ async def argaam_health() -> Dict[str, Any]:
 
 
 @router.get("/quote", response_model=EnrichedQuoteResponse)
-async def ksa_single_quote(symbol: str = Query(..., description="KSA symbol, e.g. 1120 or 1120.SR")) -> EnrichedQuoteResponse:
+async def ksa_single_quote(
+    symbol: str = Query(..., description="KSA symbol, e.g. 1120 or 1120.SR"),
+) -> EnrichedQuoteResponse:
     """
     Single-symbol KSA quote, JSON format (EnrichedQuoteResponse).
 
     Example:
         GET /v1/argaam/quote?symbol=1120.SR
+        GET /v1/argaam/quote?symbol=1120
     """
     ksa_symbol = _ensure_ksa(symbol)
+    logger.info("routes_argaam: /quote requested for %s", ksa_symbol)
 
     try:
-        q = await _engine.get_enriched_quote(ksa_symbol)
-    except Exception as exc:
-        logger.exception("KSA /argaam/quote engine failure for %s", ksa_symbol)
+        q = await _engine.get_enriched_quote(ksa_symbol)  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "routes_argaam: DataEngine failure in /quote for %s", ksa_symbol
+        )
         return EnrichedQuoteResponse(
             symbol=ksa_symbol,
+            market="KSA",
             data_quality="MISSING",
             data_source="ksa_gateway",
             error=f"KSA / Argaam gateway error: {exc}",
@@ -187,34 +338,53 @@ async def ksa_batch_quotes(body: KSABatchRequest) -> List[EnrichedQuoteResponse]
     """
     tickers_raw = body.tickers or []
     if not tickers_raw:
-        raise HTTPException(status_code=400, detail="At least one symbol is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one symbol is required",
+        )
 
+    # Normalize, validate as KSA, and de-duplicate (preserve order)
+    seen: set[str] = set()
     ksa_symbols: List[str] = []
     for t in tickers_raw:
         try:
-            ksa_symbols.append(_ensure_ksa(t))
+            sym = _ensure_ksa(t)
         except HTTPException as exc:
-            # Instead of failing the whole batch, log + skip invalid symbol
             logger.warning(
-                "Skipping non-KSA symbol in /v1/argaam/quotes: %s (%s)", t, exc.detail
+                "routes_argaam: Skipping non-KSA symbol in /quotes: %s (%s)",
+                t,
+                exc.detail,
             )
+            continue
+        if sym not in seen:
+            seen.add(sym)
+            ksa_symbols.append(sym)
 
     if not ksa_symbols:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="No valid KSA (.SR) symbols found in request",
         )
 
+    logger.info(
+        "routes_argaam: /quotes for %d KSA symbols (raw=%d).",
+        len(ksa_symbols),
+        len(tickers_raw),
+    )
+
     try:
-        unified_quotes = await _engine.get_enriched_quotes(ksa_symbols)
-    except Exception as exc:
-        logger.exception("KSA /argaam/quotes engine failure for %s", ksa_symbols)
+        unified_quotes = await _engine.get_enriched_quotes(ksa_symbols)  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "routes_argaam: DataEngine failure in /quotes for %s", ksa_symbols
+        )
         # Return placeholders instead of 500
         results: List[EnrichedQuoteResponse] = []
         for sym in ksa_symbols:
             results.append(
                 EnrichedQuoteResponse(
                     symbol=sym,
+                    market="KSA",
                     data_quality="MISSING",
                     data_source="ksa_gateway",
                     error=f"KSA / Argaam gateway error: {exc}",
@@ -227,7 +397,6 @@ async def ksa_batch_quotes(body: KSABatchRequest) -> List[EnrichedQuoteResponse]
         try:
             enriched = _quote_to_enriched(q)
 
-            # Force KSA context & provider label
             if not enriched.market:
                 enriched.market = "KSA"
             if not enriched.data_source:
@@ -237,12 +406,13 @@ async def ksa_batch_quotes(body: KSABatchRequest) -> List[EnrichedQuoteResponse]
                 enriched.error = "No data available from KSA providers"
 
             results.append(enriched)
-        except Exception as exc:
-            logger.exception("Error mapping KSA quote in /quotes: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("routes_argaam: Error mapping KSA quote in /quotes: %s", exc)
             sym = str(getattr(q, "symbol", "")).upper()
             results.append(
                 EnrichedQuoteResponse(
                     symbol=sym,
+                    market="KSA",
                     data_quality="MISSING",
                     data_source="ksa_gateway",
                     error=f"Exception mapping KSA quote: {exc}",
@@ -273,33 +443,70 @@ async def ksa_sheet_rows(body: KSABatchRequest) -> KSASheetResponse:
               "ksa_only": true
           }
         }
+
+    DESIGN:
+    - Never raise 4xx for "no valid symbols" – always return a valid table.
+    - This makes Apps Script & Sheets refresh flows robust.
     """
     tickers_raw = body.tickers or []
-    if not tickers_raw:
-        raise HTTPException(status_code=400, detail="At least one symbol is required")
-
-    ksa_symbols: List[str] = []
-    for t in tickers_raw:
-        try:
-            ksa_symbols.append(_ensure_ksa(t))
-        except HTTPException as exc:
-            logger.warning(
-                "Skipping non-KSA symbol in /v1/argaam/sheet-rows: %s (%s)", t, exc.detail
-            )
-
-    if not ksa_symbols:
-        raise HTTPException(
-            status_code=400,
-            detail="No valid KSA (.SR) symbols found in request",
-        )
 
     headers = _enriched_headers()
     rows: List[List[Any]] = []
 
+    if not tickers_raw:
+        logger.warning("routes_argaam: /sheet-rows called with empty tickers list.")
+        meta = {
+            "requested": [],
+            "normalized": [],
+            "count": 0,
+            "ksa_only": True,
+            "note": "No symbols provided.",
+        }
+        return KSASheetResponse(headers=headers, rows=rows, meta=meta)
+
+    # Normalize, validate as KSA, and de-duplicate (preserve order)
+    seen: set[str] = set()
+    ksa_symbols: List[str] = []
+    for t in tickers_raw:
+        try:
+            sym = _ensure_ksa(t)
+        except HTTPException as exc:
+            logger.warning(
+                "routes_argaam: Skipping non-KSA symbol in /sheet-rows: %s (%s)",
+                t,
+                exc.detail,
+            )
+            continue
+        if sym not in seen:
+            seen.add(sym)
+            ksa_symbols.append(sym)
+
+    if not ksa_symbols:
+        logger.warning(
+            "routes_argaam: /sheet-rows called with no valid KSA symbols. raw=%s",
+            tickers_raw,
+        )
+        meta = {
+            "requested": list(tickers_raw),
+            "normalized": [],
+            "count": 0,
+            "ksa_only": True,
+            "note": "No valid KSA (.SR) symbols found.",
+        }
+        return KSASheetResponse(headers=headers, rows=rows, meta=meta)
+
+    logger.info(
+        "routes_argaam: /sheet-rows for %d KSA symbols (raw=%d).",
+        len(ksa_symbols),
+        len(tickers_raw),
+    )
+
     try:
-        unified_quotes = await _engine.get_enriched_quotes(ksa_symbols)
-    except Exception as exc:
-        logger.exception("KSA sheet-rows engine failure for %s", ksa_symbols)
+        unified_quotes = await _engine.get_enriched_quotes(ksa_symbols)  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "routes_argaam: DataEngine failure in /sheet-rows for %s", ksa_symbols
+        )
         # Return placeholder rows with error instead of 500
         for sym in ksa_symbols:
             placeholder = EnrichedQuoteResponse(
@@ -324,7 +531,6 @@ async def ksa_sheet_rows(body: KSABatchRequest) -> KSASheetResponse:
         try:
             enriched = _quote_to_enriched(q)
 
-            # Force KSA context & provider label
             if not enriched.market:
                 enriched.market = "KSA"
             if not enriched.data_source:
@@ -334,8 +540,10 @@ async def ksa_sheet_rows(body: KSABatchRequest) -> KSASheetResponse:
                 enriched.error = "No data available from KSA providers"
 
             rows.append(_enriched_row(enriched))
-        except Exception as exc:
-            logger.exception("Error mapping KSA quote to sheet row: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception(
+                "routes_argaam: Error mapping KSA quote to sheet row: %s", exc
+            )
             placeholder = EnrichedQuoteResponse(
                 symbol=str(getattr(q, "symbol", "")).upper(),
                 market="KSA",
@@ -353,3 +561,6 @@ async def ksa_sheet_rows(body: KSABatchRequest) -> KSASheetResponse:
     }
 
     return KSASheetResponse(headers=headers, rows=rows, meta=meta)
+
+
+__all__ = ["router"]
