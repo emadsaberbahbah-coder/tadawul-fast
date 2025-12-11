@@ -1,7 +1,7 @@
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v2.3
+Google Sheets helper for Tadawul Fast Bridge – v2.4
 
 GOALS
 - Centralize all direct Google Sheets access in one place.
@@ -17,18 +17,26 @@ GOALS
           /v1/advanced/sheet-rows
 
 - Provide generic helpers to refresh ANY sheet/page with:
-    • Enriched quotes (fundamentals-style, 60+ columns)
-    • AI analysis scores (Value / Quality / Momentum / Overall / Reco)
+    • Enriched quotes (fundamentals-style, unified multi-page template)
+    • AI analysis scores (Value / Quality / Momentum / Opportunity / Reco)
     • Advanced analysis & risk scores
 
 IMPORTANT – KSA vs GLOBAL
 - EODHD API is NOT used directly here.
 - For all tickers (KSA .SR and Global), this module calls ONLY your backend
   endpoints, which internally use:
-      core.data_engine_v2 / core.data_engine
-      Tadawul / Argaam / other providers
+      core.data_engine_v2 (yfinance-based, KSA-safe routing)
+      Tadawul / Argaam / other providers as configured.
 - The unified engine is responsible for using Tadawul/Argaam providers
   for KSA tickers instead of EODHD. This module never calls EODHD itself.
+
+SHEET-NAME AWARE
+- The backend /v1/enriched/sheet-rows (and /v1/analysis, /v1/advanced)
+  now accept an optional "sheet_name" in the JSON body.
+- This file ALWAYS sends the current sheet_name to the backend so it can:
+      • Select the correct column template (KSA, Global, Mutual Funds,
+        Commodities_FX, My_Portfolio, Insights_Analysis, etc.).
+      • Align headers with your MASTER_HEADERS / schemas.py contract.
 """
 
 from __future__ import annotations
@@ -40,7 +48,7 @@ import os
 import ssl
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger("google_sheets_service")
 if not logger.handlers:
@@ -152,7 +160,7 @@ def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
         - global:  all others
 
     NOTE:
-    - This module NEVER calls EODHD directly.
+    - This module NEVER calls any market provider directly (no EODHD, no Yahoo).
     - The split is only for logging/diagnostics.
     - All tickers are still sent to backend endpoints; the unified engine
       decides how to fetch data for KSA vs GLOBAL.
@@ -407,6 +415,7 @@ def _ensure_backend_config() -> str:
 def _call_backend_sheet_rows(
     endpoint: str,
     tickers: List[str],
+    sheet_name: str | None = None,
     timeout: float = _BACKEND_TIMEOUT,
 ) -> Dict[str, Any]:
     """
@@ -417,7 +426,10 @@ def _call_backend_sheet_rows(
         /v1/advanced/sheet-rows
 
     BODY:
-        { "tickers": [ ... ] }
+        {
+          "tickers": [...],
+          "sheet_name": "KSA_Tadawul"   # optional, but we ALWAYS send it
+        }
 
     RETURNS:
         {
@@ -445,7 +457,11 @@ def _call_backend_sheet_rows(
             seen.add(tt)
             clean_tickers.append(tt)
 
-    payload = {"tickers": clean_tickers}
+    payload: Dict[str, Any] = {"tickers": clean_tickers}
+    # Always send sheet_name if we know it, so backend can pick correct template
+    if sheet_name:
+        payload["sheet_name"] = sheet_name
+
     headers: Dict[str, str] = {
         "Content-Type": "application/json; charset=utf-8",
     }
@@ -456,9 +472,10 @@ def _call_backend_sheet_rows(
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
     logger.info(
-        "[Backend] Calling %s with %d tickers.",
+        "[Backend] Calling %s with %d tickers (sheet_name=%s).",
         ep,
         len(clean_tickers),
+        sheet_name,
     )
 
     try:
@@ -523,6 +540,7 @@ def _call_backend_sheet_rows(
 async def _call_backend_sheet_rows_async(
     endpoint: str,
     tickers: List[str],
+    sheet_name: str | None = None,
     timeout: float = _BACKEND_TIMEOUT,
 ) -> Dict[str, Any]:
     """
@@ -531,7 +549,13 @@ async def _call_backend_sheet_rows_async(
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, lambda: _call_backend_sheet_rows(endpoint, tickers, timeout)
+        None,
+        lambda: _call_backend_sheet_rows(
+            endpoint=endpoint,
+            tickers=tickers,
+            sheet_name=sheet_name,
+            timeout=timeout,
+        ),
     )
 
 
@@ -573,6 +597,14 @@ def _refresh_sheet_generic(
     clear_existing: bool,
     log_label: str,
 ) -> Dict[str, Any]:
+    """
+    Generic refresh used by enriched, AI, and advanced layers.
+
+    sheet_name:
+        - Used for:
+            • Google Sheets tab (e.g., 'KSA_Tadawul', 'Global_Markets')
+            • Backend 'sheet_name' parameter to pick correct column template.
+    """
     split = split_tickers_by_market(tickers)
     logger.info(
         "%s Refreshing %s!%s with %d tickers (KSA=%d, Global=%d) via %s...",
@@ -585,7 +617,11 @@ def _refresh_sheet_generic(
         endpoint,
     )
 
-    backend_data = _call_backend_sheet_rows(endpoint=endpoint, tickers=tickers)
+    backend_data = _call_backend_sheet_rows(
+        endpoint=endpoint,
+        tickers=tickers,
+        sheet_name=sheet_name,
+    )
     values = _build_sheet_values_from_backend_payload(backend_data)
 
     full_range = f"{sheet_name}!{start_cell}"
@@ -611,9 +647,11 @@ def refresh_sheet_with_enriched_quotes(
         - Global_Markets
         - Mutual_Funds
         - Commodities_FX
+        - My_Portfolio
         - Any fundamentals-style page
 
     KSA tickers (.SR) are handled by the unified engine (Tadawul/Argaam, NOT EODHD).
+    The sheet_name is sent to the backend so it can use the right header template.
     """
     return _refresh_sheet_generic(
         endpoint="/v1/enriched/sheet-rows",
@@ -642,6 +680,8 @@ def refresh_sheet_with_ai_analysis(
         - Insights_Analysis page
         - Any scoring/AI layer on top of:
               KSA_Tadawul / Global_Markets / Mutual_Funds / Commodities_FX.
+
+    The sheet_name is sent to the backend to allow different layouts per page.
     """
     return _refresh_sheet_generic(
         endpoint="/v1/analysis/sheet-rows",
@@ -670,6 +710,8 @@ def refresh_sheet_with_advanced_analysis(
         - Investment_Advisor
         - Advanced_Insights / Risk_Buckets-style pages
         - Any page that needs deeper risk / factor breakdown.
+
+    The sheet_name is sent to the backend to align output with the target sheet.
     """
     return _refresh_sheet_generic(
         endpoint="/v1/advanced/sheet-rows",
@@ -696,6 +738,9 @@ async def _refresh_sheet_generic_async(
     clear_existing: bool,
     log_label: str,
 ) -> Dict[str, Any]:
+    """
+    Async version of the generic refresh helper.
+    """
     split = split_tickers_by_market(tickers)
     logger.info(
         "%s (async) Refreshing %s!%s with %d tickers (KSA=%d, Global=%d) via %s...",
@@ -708,11 +753,15 @@ async def _refresh_sheet_generic_async(
         endpoint,
     )
 
-    loop = asyncio.get_running_loop()
-    backend_data = await _call_backend_sheet_rows_async(endpoint=endpoint, tickers=tickers)
+    backend_data = await _call_backend_sheet_rows_async(
+        endpoint=endpoint,
+        tickers=tickers,
+        sheet_name=sheet_name,
+    )
     values = _build_sheet_values_from_backend_payload(backend_data)
     full_range = f"{sheet_name}!{start_cell}"
 
+    loop = asyncio.get_running_loop()
     if clear_existing:
         await loop.run_in_executor(
             None,
