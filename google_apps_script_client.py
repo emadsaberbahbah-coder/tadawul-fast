@@ -1,48 +1,24 @@
 """
 google_apps_script_client.py
 ------------------------------------------------------------
-Google Apps Script client for Tadawul Fast Bridge
+Google Apps Script client for Tadawul Fast Bridge – v2.1
 
-GOAL
-- Provide a robust way for the backend (or management scripts) to talk
-  to your deployed Google Apps Script WebApp.
-- Support live data integration with Google Sheets as a backup or helper
-  to direct Google Sheets API usage (google_sheets_service.py).
-- Explicitly handle KSA tickers (e.g. 1120.SR) separately from GLOBAL
-  tickers because EODHD does NOT work reliably for KSA financial markets.
+GOALS
+- Provide a robust way for backend/tools to talk to your deployed
+  Google Apps Script WebApp (backup / helper, not the primary path).
+- KSA tickers (.SR) are explicitly separated from GLOBAL tickers in
+  the payload so Apps Script can route:
+      • KSA  → Tadawul / Argaam / KSA-safe backend endpoints
+      • Global → other providers (EODHD/FMP/etc., but NOT from Python).
 
-KEY IDEAS
-- Central client using:
-    • GOOGLE_APPS_SCRIPT_BACKUP_URL  (from env)
-    • APP_TOKEN (sent as X-APP-TOKEN header if set)
-- Safe helpers:
-    • split_tickers_by_market() -> (ksa, global)
-    • build_quotes_payload(...)  # designed for KSA + Global tickers
-- Generic call methods:
-    • call_script(...)           # sync
-    • call_script_async(...)     # async wrapper
-    • sync_quotes_to_sheet(...)  # opinionated helper for quotes sheets
+CONFIGURATION (env.py or OS env vars)
+- GOOGLE_APPS_SCRIPT_BACKUP_URL   (full WebApp URL)
+- APP_TOKEN                       (sent as X-APP-TOKEN)
+- BACKEND_BASE_URL                (optional; passed as metadata)
 
-USAGE EXAMPLES
---------------
-    from google_apps_script_client import (
-        apps_script_client,
-        sync_quotes_to_sheet,
-    )
-
-    # Simple sync call (e.g. from CLI script)
-    result = apps_script_client.call_script(
-        mode="healthCheck",
-        payload={"ping": "hello from backend"},
-    )
-
-    # Async usage inside FastAPI background task
-    await sync_quotes_to_sheet(
-        sheet_id="your-sheet-id",
-        sheet_name="KSA_Tadawul",
-        tickers=["1120.SR", "1180.SR", "AAPL", "MSFT"],
-        mode="refresh_quotes",
-    )
+IMPORTANT
+- This module NEVER calls any market data provider directly.
+- It only calls your Apps Script WebApp.
 """
 
 from __future__ import annotations
@@ -56,14 +32,48 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import os
 
-from env import (
-    GOOGLE_APPS_SCRIPT_BACKUP_URL,
-    APP_TOKEN,
-    BACKEND_BASE_URL,
-)
+logger = logging.getLogger("google_apps_script_client")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
 
-logger = logging.getLogger(__name__)
+# ----------------------------------------------------------------------
+# env.py + environment integration
+# ----------------------------------------------------------------------
+
+try:  # pragma: no cover - env.py is optional
+    import env as _env_mod  # type: ignore
+    logger.info("[AppsScriptClient] env.py detected for configuration.")
+except Exception:  # pragma: no cover - defensive
+    _env_mod = None  # type: ignore
+    logger.warning(
+        "[AppsScriptClient] env.py not available. Falling back to OS env vars."
+    )
+
+
+def _get_env_attr(name: str, default: str = "") -> str:
+    """
+    Read config from env.py if present, otherwise from OS environment.
+    """
+    if _env_mod is not None and hasattr(_env_mod, name):
+        value = getattr(_env_mod, name)
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return default
+    return os.getenv(name, default)
+
+
+GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr(
+    "GOOGLE_APPS_SCRIPT_BACKUP_URL", ""
+).strip()
+APP_TOKEN: str = _get_env_attr("APP_TOKEN", "").strip()
+BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "").strip()
+
+_SSL_CONTEXT = ssl.create_default_context()
 
 
 # ----------------------------------------------------------------------
@@ -106,10 +116,8 @@ def split_tickers_by_market(tickers: List[str]) -> Tuple[List[str], List[str]]:
     - KSA tickers end with '.SR' (e.g. 1120.SR, 1180.SR, 1211.SR)
     - EVERYTHING ELSE is treated as 'global' (AAPL, MSFT, NVDA,...)
 
-    This is important because:
-    - EODHD is NOT working for KSA.
-    - KSA tickers should be routed to Tadawul / Argaam providers through
-      your KSA-specific endpoints (e.g. routes_argaam.py) on the Apps Script side.
+    Python NEVER calls EODHD or any provider here.
+    This split is just to help Apps Script / backend route correctly.
     """
     ksa: List[str] = []
     global_: List[str] = []
@@ -118,17 +126,13 @@ def split_tickers_by_market(tickers: List[str]) -> Tuple[List[str], List[str]]:
         t_clean = (t or "").strip()
         if not t_clean:
             continue
-        if t_clean.upper().endswith(".SR"):
-            ksa.append(t_clean.upper())
+        up = t_clean.upper()
+        if up.endswith(".SR"):
+            ksa.append(up)
         else:
-            global_.append(t_clean.upper())
+            global_.append(up)
 
     return ksa, global_
-
-
-def _default_ssl_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    return ctx
 
 
 # ----------------------------------------------------------------------
@@ -140,8 +144,8 @@ class GoogleAppsScriptClient:
     """
     Lightweight client to call a deployed Google Apps Script WebApp.
 
-    - Uses only the standard library (urllib) to avoid new dependencies.
-    - Automatically includes APP_TOKEN via X-APP-TOKEN header if available.
+    - Uses only stdlib (urllib) – no extra dependencies.
+    - Automatically includes APP_TOKEN via X-APP-TOKEN header if set.
     - Provides sync + async wrappers.
     """
 
@@ -151,19 +155,30 @@ class GoogleAppsScriptClient:
         app_token: Optional[str] = None,
         timeout: float = 30.0,
     ) -> None:
-        self.base_url: str = (base_url or GOOGLE_APPS_SCRIPT_BACKUP_URL or "").strip()
-        self.app_token: Optional[str] = app_token or APP_TOKEN
+        raw_url = (base_url or GOOGLE_APPS_SCRIPT_BACKUP_URL or "").strip()
+
+        # If someone configured without scheme, assume https://
+        if raw_url and not raw_url.startswith(("http://", "https://")):
+            logger.warning(
+                "[AppsScriptClient] GOOGLE_APPS_SCRIPT_BACKUP_URL has no scheme, "
+                "assuming https://%s",
+                raw_url,
+            )
+            raw_url = "https://" + raw_url
+
+        self.base_url: str = raw_url.rstrip("/")
+        self.app_token: Optional[str] = (app_token or APP_TOKEN or "").strip()
         self.timeout: float = timeout
-        self._ssl_context = _default_ssl_context()
+        self._ssl_context = _SSL_CONTEXT
 
         if not self.base_url:
             logger.warning(
-                "[GoogleAppsScriptClient] GOOGLE_APPS_SCRIPT_BACKUP_URL is not set. "
+                "[AppsScriptClient] GOOGLE_APPS_SCRIPT_BACKUP_URL is not configured. "
                 "Client will not be able to call Apps Script."
             )
         else:
             logger.info(
-                "[GoogleAppsScriptClient] Configured with base_url=%s (backend=%s)",
+                "[AppsScriptClient] Initialized with base_url=%s (backend=%s)",
                 self.base_url,
                 BACKEND_BASE_URL,
             )
@@ -185,8 +200,8 @@ class GoogleAppsScriptClient:
         Parameters
         ----------
         mode: str
-            Logical mode / operation. Will be appended as a query parameter
-            'mode=...' so your Apps Script can switch on it.
+            Logical mode / operation. Will be appended as query parameter
+            'mode=...' so Apps Script can switch on it.
         payload: dict | None
             JSON body for POST/PUT calls; ignored for GET.
         method: str
@@ -194,7 +209,7 @@ class GoogleAppsScriptClient:
         extra_query: dict | None
             Additional query parameters to append to the URL.
 
-        RETURNS
+        Returns
         -------
         AppsScriptResult
         """
@@ -211,9 +226,8 @@ class GoogleAppsScriptClient:
         if extra_query:
             query_params.update({k: str(v) for k, v in extra_query.items()})
 
-        # Build URL with query
+        # Build URL with merged query
         url_parts = list(urllib.parse.urlparse(self.base_url))
-        # Merge or extend existing query
         existing_qs = dict(urllib.parse.parse_qsl(url_parts[4]))
         existing_qs.update(query_params)
         url_parts[4] = urllib.parse.urlencode(existing_qs)
@@ -299,7 +313,7 @@ class GoogleAppsScriptClient:
             )
 
     # ------------------------------------------------------------------
-    # Async wrapper (optional, for use inside FastAPI)
+    # Async wrapper (for FastAPI / async workers)
     # ------------------------------------------------------------------
 
     async def call_script_async(
@@ -319,7 +333,7 @@ class GoogleAppsScriptClient:
         )
 
     # ------------------------------------------------------------------
-    # Opinionated helper for quote sheets
+    # Opinionated helpers for quote sheets
     # ------------------------------------------------------------------
 
     def build_quotes_payload(
@@ -332,20 +346,11 @@ class GoogleAppsScriptClient:
         """
         Build a standardized payload for 'quotes to sheet' operations.
 
-        Important:
         - Automatically splits tickers into:
-            • ksa_tickers   -> for Tadawul/Argaam routes (EODHD not used)
-            • global_tickers -> for EODHD/FMP/etc.
-        - Includes app/backend metadata so Apps Script can decide how to call
-          /v1/quote, /v1/enriched, /v1/argaam, etc.
-
-        Apps Script can read:
-            payload["ksa_tickers"]
-            payload["global_tickers"]
-            payload["all_tickers"]
-            payload["sheet"]["id"]
-            payload["sheet"]["name"]
-            payload["backend"]["base_url"]
+              • ksa_tickers    (.SR only)
+              • global_tickers (everything else)
+        - Includes backend metadata so Apps Script can, if needed, call
+          your FastAPI backend (/v1/enriched, /v1/argaam, etc.).
         """
         ksa_tickers, global_tickers = split_tickers_by_market(tickers)
 
@@ -381,23 +386,9 @@ class GoogleAppsScriptClient:
         """
         High-level helper: instruct Apps Script to refresh a quotes sheet.
 
-        Parameters
-        ----------
-        sheet_id: str
-            The Spreadsheet ID (or an alias your Apps Script understands).
-        sheet_name: str
-            Target sheet/tab name (e.g. 'KSA_Tadawul', 'Global_Markets').
-        tickers: list[str]
-            List of symbols to refresh (KSA + global mixed).
-        mode: str
-            Logical operation name. Defaults to 'refresh_quotes'.
-            Apps Script will receive it as ?mode=refresh_quotes.
-        extra_meta: dict | None
-            Extra metadata to send (e.g. range info, layout version).
-
-        Returns
-        -------
-        AppsScriptResult
+        Apps Script receives:
+        - ?mode=<mode> in query
+        - JSON body from build_quotes_payload(...)
         """
         payload = self.build_quotes_payload(
             sheet_id=sheet_id,
@@ -445,9 +436,6 @@ def get_apps_script_client() -> GoogleAppsScriptClient:
     return apps_script_client
 
 
-# Shortcuts for callers that prefer function-style API -----------------
-
-
 def call_script(
     mode: str,
     payload: Optional[Dict[str, Any]] = None,
@@ -455,7 +443,7 @@ def call_script(
     extra_query: Optional[Dict[str, str]] = None,
 ) -> AppsScriptResult:
     """
-    Function-style shortcut to apps_script_client.call_script(...)
+    Function-style shortcut to apps_script_client.call_script(...).
     """
     return apps_script_client.call_script(
         mode=mode,
@@ -472,7 +460,7 @@ async def call_script_async(
     extra_query: Optional[Dict[str, str]] = None,
 ) -> AppsScriptResult:
     """
-    Async function-style shortcut to apps_script_client.call_script_async(...)
+    Async function-style shortcut to apps_script_client.call_script_async(...).
     """
     return await apps_script_client.call_script_async(
         mode=mode,
@@ -518,3 +506,16 @@ async def sync_quotes_to_sheet_async(
         mode=mode,
         extra_meta=extra_meta,
     )
+
+
+__all__ = [
+    "AppsScriptResult",
+    "GoogleAppsScriptClient",
+    "apps_script_client",
+    "get_apps_script_client",
+    "split_tickers_by_market",
+    "call_script",
+    "call_script_async",
+    "sync_quotes_to_sheet",
+    "sync_quotes_to_sheet_async",
+]
