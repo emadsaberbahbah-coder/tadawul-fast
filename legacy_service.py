@@ -1,15 +1,16 @@
 """
 legacy_service.py
 ------------------------------------------------------------
-LEGACY SERVICE BRIDGE – v3.2 (Aligned with App v4.3.0)
+LEGACY SERVICE BRIDGE – v3.3 (Aligned with App v4.4.0 / Engine v2.5)
 
 GOAL
-- Provide a stable "legacy" layer on top of the new unified data engine,
-  so old clients (PowerShell, early Google Sheets scripts, etc.) can
-  still receive the classic /v1/quote-style payload.
+- Provide a stable "legacy" layer on top of the unified data engine,
+  so old clients (PowerShell, early Google Sheets scripts, test tabs)
+  can still receive the classic /v1/quote-style payload.
 
-KEY FEATURES
-- NO direct EODHD calls. All data comes via the unified data engine.
+KEY PRINCIPLES
+- NO direct EODHD calls here.
+- All data comes via the unified data engine (v2 preferred, v1 module fallback).
 - KSA (.SR) tickers are handled by Tadawul/Argaam providers inside the engine.
 - Legacy quote format:
       {
@@ -18,7 +19,7 @@ KEY FEATURES
       }
 - Google Sheets integration helpers:
       • build_legacy_sheet_payload(tickers)
-        -> { "headers": [...], "rows": [[...], ...] }
+        -> { "headers": [...], "rows": [[...], ...], "meta": {...} }
 
 ALIGNMENT
 - Engine usage & fallbacks aligned with:
@@ -27,20 +28,33 @@ ALIGNMENT
     • routes/enriched_quote.py
     • routes/ai_analysis.py
     • routes/advanced_analysis.py
+    • routes_argaam.py (KSA / Tadawul-Argaam gateway)
 - Symbol normalization aligned with KSA / Tadawul logic used elsewhere:
     • 1120                -> 1120.SR
     • TADAWUL:1120        -> 1120.SR
     • 1120.TADAWUL        -> 1120.SR
+    • 1120.SR             -> 1120.SR
+    • AAPL                -> AAPL
+
+USAGE
+- main.py:
+      from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
+      # /v1/quote, /v1/legacy/sheet-rows use these functions.
+
+- Preferred for new dashboards:
+      /v1/enriched/sheet-rows
+      /v1/analysis/sheet-rows
+      /v1/advanced/sheet-rows
+  This legacy layer is mainly for backward compatibility and quick tests.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-
 import logging
 import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("legacy_service")
 if not logger.handlers:
@@ -64,22 +78,37 @@ except Exception:  # pragma: no cover
 class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.3.0")
+    app_version: str = os.getenv("APP_VERSION", "4.4.0")
     backend_base_url: str = os.getenv("BACKEND_BASE_URL", "").strip()
+
+
+def _get_env_attr(name: str, default: str = "") -> str:
+    """
+    Helper to read config from env.py if available, otherwise from OS env vars.
+    Returns a string representation.
+    """
+    if _env_mod is not None and hasattr(_env_mod, name):
+        value = getattr(_env_mod, name)
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return default
+    return os.getenv(name, default)
 
 
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
 APP_NAME: str = getattr(
-    settings, "app_name", os.getenv("APP_NAME", "tadawul-fast-bridge")
+    settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
 )
 APP_VERSION: str = getattr(
-    settings, "app_version", os.getenv("APP_VERSION", "4.3.0")
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.4.0")
 )
 BACKEND_BASE_URL: str = getattr(
-    settings, "backend_base_url", os.getenv("BACKEND_BASE_URL", "")
+    settings, "backend_base_url", _get_env_attr("BACKEND_BASE_URL", "")
 ).strip()
-
 
 # ----------------------------------------------------------------------
 # DATA ENGINE IMPORT / FALLBACKS (v2 preferred, v1 module, stub)
@@ -89,6 +118,7 @@ _ENGINE_MODE: str = "stub"  # "v2", "v1_module", "stub"
 _ENGINE_IS_STUB: bool = True
 _engine: Any = None
 _data_engine_module: Any = None
+_ENABLED_PROVIDERS: List[str] = []
 
 try:  # Preferred: new class-based engine (core.data_engine_v2)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
@@ -127,10 +157,12 @@ try:  # Preferred: new class-based engine (core.data_engine_v2)
 
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
+    _ENABLED_PROVIDERS = list(getattr(_engine, "enabled_providers", []))
     logger.info(
         "[LegacyService] Using DataEngine v2 from core.data_engine_v2 "
-        "(kwargs=%s).",
+        "(kwargs=%s, enabled_providers=%s).",
         list(engine_kwargs.keys()),
+        _ENABLED_PROVIDERS,
     )
 
 except Exception as e_v2:  # pragma: no cover - defensive
@@ -163,15 +195,17 @@ except Exception as e_v2:  # pragma: no cover - defensive
                 self, symbols: List[str]
             ) -> List[Dict[str, Any]]:
                 out: List[Dict[str, Any]] = []
-                for s in symbols:
+                for s in symbols or []:
                     sym = (s or "").strip().upper()
+                    if not sym:
+                        continue
                     out.append(
                         {
                             "symbol": sym,
                             "data_quality": "MISSING",
                             "error": (
                                 "Unified data engine (v2/v1) unavailable in "
-                                "LegacyService."
+                                "legacy_service."
                             ),
                         }
                     )
@@ -201,8 +235,10 @@ async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
 
     if _ENGINE_MODE == "v2":
         return await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+
     # Stub mode
     return await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
 
@@ -225,7 +261,12 @@ def _normalize_symbol(symbol: str) -> str:
     - TADAWUL:1120   -> 1120.SR
     - 1120.TADAWUL   -> 1120.SR
     - 1120           -> 1120.SR
+    - 1120.SR        -> 1120.SR
     - AAPL           -> AAPL
+
+    NOTE:
+    - The engine itself may apply additional normalization.
+    - This function ensures KSA numeric codes are pushed to .SR format.
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -243,6 +284,26 @@ def _normalize_symbol(symbol: str) -> str:
     return s
 
 
+def _split_tickers_by_market(symbols: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Simple diagnostic split into KSA vs Global (for meta only).
+
+    KSA:    endswith('.SR')
+    Global: everything else
+    """
+    ksa: List[str] = []
+    global_: List[str] = []
+    for s in symbols or []:
+        ss = (s or "").strip().upper()
+        if not ss:
+            continue
+        if ss.endswith(".SR"):
+            ksa.append(ss)
+        else:
+            global_.append(ss)
+    return ksa, global_
+
+
 # ----------------------------------------------------------------------
 # DATA STRUCTURES
 # ----------------------------------------------------------------------
@@ -251,7 +312,7 @@ def _normalize_symbol(symbol: str) -> str:
 @dataclass
 class LegacyQuote:
     """
-    Legacy quote representation, modeled on your original /v1/quote
+    Legacy quote representation, modeled on the original /v1/quote
     response used in PowerShell tests, but backed by UnifiedQuote-like data.
 
     NOTE:
@@ -305,7 +366,7 @@ class LegacyQuote:
     ebitda_margin: Optional[float] = None
     operating_margin: Optional[float] = None
 
-    # Risk / valuation extras (optional, but aligned with v2 engine)
+    # Risk / valuation extras
     beta: Optional[float] = None
     volatility_30d: Optional[float] = None
     volatility_30d_percent: Optional[float] = None
@@ -423,7 +484,7 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
 
     name = _g(data, "name", "company_name", "longName", "shortName")
     exchange = _g(data, "exchange", "market", "primary_exchange")
-    market_region = _g(data, "market_region", "region", "country")
+    market_region = _g(data, "market_region", "region", "country", "market")
     currency = _g(data, "currency")
     sector = _g(data, "sector")
     industry = _g(data, "industry", "industryGroup")
@@ -786,11 +847,14 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "requested": [...],
                 "normalized": [...],
                 "count": int,
+                "markets": { "ksa": int, "global": int },
                 "app": ...,
                 "version": ...,
                 "backend_url": ...,
                 "engine_mode": ...,
                 "engine_is_stub": bool,
+                "enabled_providers": [...],
+                "timestamp_utc": ...,
                 "note": ...
             }
         }
@@ -799,6 +863,8 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
     normalized = [_normalize_symbol(t) for t in raw_symbols]
     normalized = [s for s in normalized if s]
 
+    ksa_syms, global_syms = _split_tickers_by_market(normalized)
+
     if not normalized:
         return {
             "quotes": [],
@@ -806,11 +872,13 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "requested": raw_symbols,
                 "normalized": [],
                 "count": 0,
+                "markets": {"ksa": 0, "global": 0},
                 "app": APP_NAME,
                 "version": APP_VERSION,
                 "backend_url": BACKEND_BASE_URL,
                 "engine_mode": _ENGINE_MODE,
                 "engine_is_stub": _ENGINE_IS_STUB,
+                "enabled_providers": _ENABLED_PROVIDERS,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "note": "No symbols provided.",
             },
@@ -838,11 +906,16 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "requested": raw_symbols,
                 "normalized": normalized,
                 "count": len(legacy_quotes),
+                "markets": {
+                    "ksa": len(ksa_syms),
+                    "global": len(global_syms),
+                },
                 "app": APP_NAME,
                 "version": APP_VERSION,
                 "backend_url": BACKEND_BASE_URL,
                 "engine_mode": _ENGINE_MODE,
                 "engine_is_stub": _ENGINE_IS_STUB,
+                "enabled_providers": _ENABLED_PROVIDERS,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "note": "Failed to fetch data from unified data engine.",
             },
@@ -876,17 +949,22 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             "requested": raw_symbols,
             "normalized": normalized,
             "count": len(legacy_quotes),
+            "markets": {
+                "ksa": len(ksa_syms),
+                "global": len(global_syms),
+            },
             "app": APP_NAME,
             "version": APP_VERSION,
             "backend_url": BACKEND_BASE_URL,
             "engine_mode": _ENGINE_MODE,
             "engine_is_stub": _ENGINE_IS_STUB,
+            "enabled_providers": _ENABLED_PROVIDERS,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "note": (
                 "Legacy format built on UnifiedQuote-style engine "
                 f"(mode={_ENGINE_MODE}, stub={_ENGINE_IS_STUB}; "
-                "KSA via Tadawul/Argaam providers, "
-                "no direct EODHD calls in legacy_service)."
+                "KSA via Tadawul/Argaam providers; "
+                "no direct EODHD calls inside legacy_service)."
             ),
         },
     }
@@ -917,8 +995,9 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
         - any script that needs simple headers/rows.
 
     NOTE
-    - 9-page Ultimate Dashboard should prefer enriched / analysis sheet-rows
-      endpoints; this is mainly for legacy/test tabs.
+    - The 9-page Ultimate Dashboard should prefer enriched / analysis
+      sheet-rows endpoints; this is mainly for legacy/test tabs and
+      PowerShell experiments.
     """
     legacy_payload = await get_legacy_quotes(tickers)
     quotes = legacy_payload.get("quotes", [])
