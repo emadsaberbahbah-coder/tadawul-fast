@@ -2,7 +2,7 @@
 main.py
 ===========================================================
 Tadawul Fast Bridge - Main Application
-Version: 4.4.0 (Unified Engine v2.5 + AI v2.4 + Sheets + KSA-safe)
+Version: 4.5.0 (Unified Engine v2.6 + AI v2.5 + Sheets + KSA-safe)
 
 FastAPI backend for:
     • Enriched Quotes       (/v1/enriched*)
@@ -12,9 +12,9 @@ FastAPI backend for:
     • Legacy Quotes         (/v1/quote, /v1/legacy/sheet-rows)
 
 Integrated with:
-    • core.data_engine / core.data_engine_v2 (multi-provider unified engine):
-        - KSA via Tadawul/Argaam gateway and v1 delegate (NO EODHD for .SR)
-        - Global via FMP + optional EODHD + optional Finnhub
+    • core.data_engine_v2 (multi-provider unified engine):
+          - KSA via Tadawul/Argaam gateway + KSA-safe delegates
+          - Global via FMP + optional EODHD + optional Finnhub
     • env.py (all config & tokens, providers, Sheets meta, etc.)
     • Google Sheets / Apps Script flows
       (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
@@ -25,8 +25,8 @@ Notes
 -----
 - This file NEVER calls external market providers directly.
   All market data flows through the unified data engine and/or dedicated KSA gateway.
-- KSA (.SR) routing is handled by the unified engine and KSA router,
-  using non-EODHD KSA providers only.
+- KSA (.SR) routing is handled KSA-safe:
+      • No direct EODHD calls for .SR anywhere in this app.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.4.0")
+    app_version: str = os.getenv("APP_VERSION", "4.5.0")
 
 
 # Prefer Settings instance from env.py; otherwise use fallback dataclass instance
@@ -119,7 +119,7 @@ APP_NAME: str = getattr(
     settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
 )
 APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.4.0")
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.5.0")
 )
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
@@ -488,7 +488,7 @@ async def root() -> str:
         </p>
 
         <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
-          KSA (.SR) tickers are handled via Tadawul/Argaam gateway only.<br/>
+          KSA (.SR) tickers are handled via Tadawul/Argaam gateway only (no direct EODHD).<br/>
           Global (non-.SR) tickers are handled via the unified engine using the
           configured global providers (FMP, EODHD, Finnhub, etc.).<br/>
           Google Sheets 9-page dashboard should use the <code>* /sheet-rows</code> endpoints
@@ -605,9 +605,8 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
             "router_available": _ARGAAM_AVAILABLE,
         },
         "notes": [
-            "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers.",
-            "No direct EODHD calls are made for KSA inside this main application.",
-            "Global (non-.SR) tickers use FMP + optional EODHD + optional Finnhub via core.data_engine / core.data_engine_v2.",
+            "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers (no direct EODHD calls).",
+            "Global (non-.SR) tickers use FMP + optional EODHD + optional Finnhub via core.data_engine_v2.",
             "Google Sheets 9-page dashboard should use the /sheet-rows endpoints listed in 'sheet_endpoints'.",
         ],
     }
