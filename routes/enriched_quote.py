@@ -1,30 +1,30 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.6)
+Enriched Quotes Router (v2.7)
 
 - Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
 - Last-resort: in-process stub engine that always returns MISSING data
   (so the API + Google Sheets never crash even if engines are misconfigured).
 
-KSA Integration (NEW v2.6)
---------------------------
-- For KSA symbols (".SR"), this router now tries to fetch data from the
-  dedicated Argaam / Tadawul route:
+KSA Integration
+---------------
+- For KSA symbols (".SR"), this router can fetch from the dedicated
+  Argaam / Tadawul route:
 
       GET /v1/argaam/quote?symbol=1120
 
-  using the BACKEND_BASE_URL + APP_TOKEN (if configured).
+  using BACKEND_BASE_URL + APP_TOKEN (if configured).
 
   Priority:
       1) If symbol ends with ".SR":
             • Try Argaam route first.
             • If Argaam returns a valid payload, use it directly.
-            • If Argaam fails, fall back to legacy engine (which may still
+            • If Argaam fails, fall back to the generic engine (which may still
               return MISSING if providers have no KSA coverage).
       2) For non-KSA symbols:
-            • Use the configured engine (v2 or v1_module) exactly as before.
+            • Use the configured engine (v2 or v1_module).
 
 Endpoints:
     • /v1/enriched/health
@@ -35,16 +35,35 @@ Endpoints:
 Google Sheets usage:
     - KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio
       all call /v1/enriched/sheet-rows and map directly to the unified
-      9-page dashboard structure (Identity → Price/Liquidity → Fundamentals →
-      Growth/Profitability → Valuation/Risk → AI/Technical → Meta).
+      dashboard structure:
+
+        Identity →
+        Price/Liquidity →
+        Fundamentals →
+        Growth/Profitability →
+        Valuation/Risk →
+        AI/Technical →
+        Meta
 
 Alignment:
-    - Header structure is aligned with routes_argaam._build_sheet_headers
-      so all 9 pages share the same layout.
+    - Header structure is aligned with _build_sheet_headers and your
+      Config.gs MASTER_HEADERS so all 9 pages share the same layout.
+
+Performance v2.7 (IMPORTANT CHANGE)
+-----------------------------------
+- Large batches (e.g. 100+ tickers from Global_Markets) are now processed
+  in CHUNKS to avoid provider timeouts and 502 errors.
+
+    * Non-KSA tickers: chunked via the engine.
+    * KSA tickers: fetched via Argaam one-by-one (short timeout).
+
+- On any batch failure, the route still returns sheet rows with
+  data_quality="MISSING" instead of crashing.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, date
@@ -57,7 +76,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("routes.enriched_quote")
 
 # ----------------------------------------------------------------------
-# Optional env.py (for future configuration, logging, etc.)
+# Optional env.py (for configuration, logging, etc.)
 # ----------------------------------------------------------------------
 
 try:  # pragma: no cover - optional
@@ -66,7 +85,7 @@ except Exception:
     _env = None  # type: ignore
 
 # ----------------------------------------------------------------------
-# Backend base URL + App Token for internal Argaam calls
+# Back-end base URL + App Token for internal Argaam calls
 # ----------------------------------------------------------------------
 
 if _env is not None:
@@ -89,6 +108,19 @@ else:
 _BACKEND_BASE_URL = (_BACKEND_BASE_URL or "").rstrip("/")
 
 # ----------------------------------------------------------------------
+# Batch / timeout configuration (to avoid 502 on large requests)
+# ----------------------------------------------------------------------
+
+# Max number of non-KSA tickers per engine batch call
+_NON_KSA_BATCH_SIZE = 40
+
+# Max timeout (seconds) for one engine batch
+_ENGINE_BATCH_TIMEOUT = 30.0
+
+# Timeout for KSA / Argaam single quote (seconds)
+_ARGAAM_TIMEOUT = 12.0
+
+# ----------------------------------------------------------------------
 # Data engine import (robust with fallbacks)
 # ----------------------------------------------------------------------
 
@@ -102,7 +134,6 @@ try:
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
     if _env is not None:
-        # Optional: use basic config from env.py if present
         cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
         enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
         enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
@@ -186,6 +217,18 @@ except Exception as e_v2:  # pragma: no cover - defensive
         logger.error(
             "routes.enriched_quote: Using in-process STUB DataEngine with MISSING data responses."
         )
+
+# ----------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------
+
+
+def _chunk_list(items: List[str], size: int) -> List[List[str]]:
+    """Split a list into chunks of max 'size' items."""
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
 
 # ----------------------------------------------------------------------
 # Router
@@ -320,18 +363,13 @@ class SheetEnrichedResponse(BaseModel):
 
 
 # ----------------------------------------------------------------------
-# Internal helpers
+# Internal engine helpers
 # ----------------------------------------------------------------------
 
 
-async def get_enriched_quote(symbol: str) -> Any:
+async def get_enriched_quote_engine(symbol: str) -> Any:
     """
-    Thin async wrapper around the configured engine.
-
-    Supports:
-      - v2 engine: core.data_engine_v2.DataEngine().get_enriched_quote(...)
-      - v1 engine: core.data_engine.get_enriched_quote(...)
-      - stub engine: in-process fallback
+    Thin async wrapper around the configured engine for a single symbol.
     """
     sym = (symbol or "").strip()
     if not sym:
@@ -345,9 +383,9 @@ async def get_enriched_quote(symbol: str) -> Any:
     return await _engine.get_enriched_quote(sym)
 
 
-async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
+async def get_enriched_quotes_engine(symbols: List[str]) -> List[Any]:
     """
-    Thin async wrapper for batch quotes.
+    Thin async wrapper for batch quotes (no chunking here).
     """
     clean = [s.strip() for s in (symbols or []) if s and s.strip()]
     if not clean:
@@ -359,6 +397,62 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
     # Stub
     return await _engine.get_enriched_quotes(clean)
+
+
+async def get_enriched_quotes_engine_chunked(symbols: List[str]) -> Dict[str, Any]:
+    """
+    Chunked batched engine calls to avoid timeouts for large lists (e.g. 100+ tickers).
+
+    Returns a mapping: { symbol: raw_quote_or_None }
+    """
+    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
+    out: Dict[str, Any] = {}
+
+    if not clean:
+        return out
+
+    chunks = _chunk_list(clean, _NON_KSA_BATCH_SIZE)
+    logger.info(
+        "Enriched engine batch: %d symbols in %d chunk(s) (mode=%s)",
+        len(clean),
+        len(chunks),
+        _ENGINE_MODE,
+    )
+
+    for chunk in chunks:
+        try:
+            # Bound time for each chunk so we don't hang forever
+            batch = await asyncio.wait_for(
+                get_enriched_quotes_engine(chunk),
+                timeout=_ENGINE_BATCH_TIMEOUT,
+            )
+            for t, q in zip(chunk, batch):
+                out[t] = q
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Engine batch timeout for chunk of size %d (symbols=%s)",
+                len(chunk),
+                chunk,
+            )
+            for t in chunk:
+                # Mark as missing; downstream will create MISSING rows
+                out.setdefault(t, None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception(
+                "Engine batch failure for chunk of size %d (symbols=%s): %s",
+                len(chunk),
+                chunk,
+                exc,
+            )
+            for t in chunk:
+                out.setdefault(t, None)
+
+    return out
+
+
+# ----------------------------------------------------------------------
+# KSA / Argaam helper
+# ----------------------------------------------------------------------
 
 
 async def _fetch_ksa_via_argaam(symbol: str) -> Optional[Dict[str, Any]]:
@@ -394,7 +488,7 @@ async def _fetch_ksa_via_argaam(symbol: str) -> Optional[Dict[str, Any]]:
         headers["X-APP-TOKEN"] = _APP_TOKEN
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=_ARGAAM_TIMEOUT) as client:
             resp = await client.get(url, params=params, headers=headers)
 
         if resp.status_code != 200:
@@ -436,6 +530,11 @@ async def _fetch_ksa_via_argaam(symbol: str) -> Optional[Dict[str, Any]]:
             "KSA Argaam request failed for %s (%s): %s", symbol, code, exc
         )
         return None
+
+
+# ----------------------------------------------------------------------
+# Normalization helpers
+# ----------------------------------------------------------------------
 
 
 def _normalize_scalar(value: Any) -> Any:
@@ -601,18 +700,7 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
 
 def _build_sheet_headers() -> List[str]:
     """
-    Headers aligned with your 9-page dashboard philosophy:
-    Identity, Price/Liquidity, Fundamentals, Growth/Profitability,
-    Valuation/Risk, AI/Technical, Meta.
-
-    This structure is aligned with routes_argaam._build_sheet_headers so that
-    KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX and My_Portfolio
-    can all share the same template.
-
-    NOTE:
-    - shares_outstanding / free_float are available in JSON, but are not
-      currently included in the Sheets header template to keep compatibility
-      with existing Apps Script modules.
+    Headers aligned with your 9-page dashboard philosophy and Config.gs MASTER_HEADERS.
     """
     return [
         # Identity
@@ -790,7 +878,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.6",
+        "version": "2.7",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
     }
@@ -827,7 +915,7 @@ async def get_enriched_quote_route(
                 return enriched
 
         # 2) Global / fallback engine path
-        quote = await get_enriched_quote(ticker)
+        quote = await get_enriched_quote_engine(ticker)
         enriched = _quote_to_enriched(quote)
         if enriched.data_quality == "MISSING":
             enriched.error = enriched.error or "No data available from providers"
@@ -867,22 +955,14 @@ async def get_enriched_quotes_route(
     ksa_tickers = [t for t in tickers if t.upper().endswith(".SR")]
     non_ksa_tickers = [t for t in tickers if not t.upper().endswith(".SR")]
 
-    # First fetch non-KSA via engine
     engine_map: Dict[str, Any] = {}
-    if non_ksa_tickers:
-        try:
-            unified_quotes = await get_enriched_quotes(non_ksa_tickers)
-            for t, q in zip(non_ksa_tickers, unified_quotes):
-                engine_map[t] = q
-        except Exception as exc:
-            logger.exception(
-                "Batch enriched quotes failed for non-KSA tickers=%s", non_ksa_tickers
-            )
-            for t in non_ksa_tickers:
-                engine_map[t] = None
-
-    # Fetch KSA via Argaam
     ksa_map: Dict[str, Any] = {}
+
+    # Non-KSA via chunked engine
+    if non_ksa_tickers:
+        engine_map = await get_enriched_quotes_engine_chunked(non_ksa_tickers)
+
+    # KSA via Argaam
     for t in ksa_tickers:
         try:
             ksa_raw = await _fetch_ksa_via_argaam(t)
@@ -938,12 +1018,11 @@ async def get_enriched_sheet_rows(
         }
 
     Apps Script usage pattern:
-        - First row = headers
-        - Following rows = values
+        - Row 5  = headers
+        - Row 6+ = values
 
-    This endpoint is the core bridge for the 9-page Ultimate Investment
-    Dashboard (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX,
-    My_Portfolio, Insights_Analysis).
+    This endpoint is the core bridge for the Ultimate Investment Dashboard
+    (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio, etc.).
     """
     headers = _build_sheet_headers()
     tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
@@ -958,19 +1037,18 @@ async def get_enriched_sheet_rows(
 
     quotes_map: Dict[str, Any] = {}
 
-    # 1) Non-KSA via engine
+    # 1) Non-KSA via chunked engine
     if non_ksa_tickers:
         try:
-            unified_quotes = await get_enriched_quotes(non_ksa_tickers)
-            for t, q in zip(non_ksa_tickers, unified_quotes):
-                quotes_map[t] = q
+            engine_map = await get_enriched_quotes_engine_chunked(non_ksa_tickers)
+            quotes_map.update(engine_map)
         except Exception as exc:
             logger.exception(
                 "Enriched sheet-rows engine batch failed for non-KSA tickers=%s",
                 non_ksa_tickers,
             )
             for t in non_ksa_tickers:
-                quotes_map[t] = None
+                quotes_map.setdefault(t, None)
 
     # 2) KSA via Argaam
     for t in ksa_tickers:
