@@ -1,764 +1,303 @@
 """
-v1 Core Data & Analysis Engine
-===========================================================
-Core Data & Analysis Engine - v2.0
+core/data_engine.py  (previously v1_core_data_engine_notes.txt)
+===============================================================
+LEGACY WRAPPER AROUND DATAENGINE v2 – v3.0
 
-Enhanced with:
-- Multi-provider merging (EODHD + FMP for global)
-- KSA-safe routing (NO EODHD for .SR; uses Argaam/Tadawul gateway)
-- Simple data quality scoring
-- Async batch support for all 9 Google Sheets pages
+PURPOSE
+- Provide a *backwards-compatible* module-level API for the original
+  "v1 core data engine" while delegating all real work to the new
+  class-based engine in `core.data_engine_v2`.
+- Keep old imports working, such as:
+      from core import data_engine
+      from core.data_engine import get_enriched_quotes, UnifiedQuote, DataEngine
+- Ensure KSA safety and provider logic are defined ONLY once in
+  `core.data_engine_v2` (single source of truth).
 
-This module is the central engine used by:
-- routes/enriched_quote.py     (/v1/enriched/...)
-- routes/ai_analysis.py        (/v1/analysis/...)
-- routes/advanced_analysis.py  (/v1/advanced/...)
-- Any other routes that need UnifiedQuote objects
+MAIN BEHAVIOR
+- Tries to import:
+      from core.data_engine_v2 import DataEngine, UnifiedQuote, QuoteSource
+- If successful:
+      • DataEngine (here) is an alias of the v2 DataEngine.
+      • get_enriched_quote(s) simply forward to the v2 engine instance.
+      • UnifiedQuote & QuoteSource are re-exported from v2.
+- If v2 cannot be imported:
+      • Falls back to a very small stub engine that always returns
+        MISSING UnifiedQuote objects (no crashes, but clearly marked).
+      • This keeps the app importable even in emergency / partial setups.
 
-Google Sheets integration:
-- Google Sheets pages (KSA, Global, Funds, Commodities_FX, Portfolio,
-  Insights_Analysis, etc.) call FastAPI endpoints like:
-    • /v1/enriched/sheet-rows
-    • /v1/analysis/sheet-rows
-    • /v1/advanced/sheet-rows
-  Those endpoints internally use this engine:
-    • get_enriched_quote()
-    • get_enriched_quotes()
-
-IMPORTANT:
-- EODHD is NEVER used for KSA (.SR) tickers.
-- KSA symbols are routed exclusively to the Argaam/Tadawul gateway
-  via KsaArgaamProvider.
+NOTES
+- EODHD is NEVER called for KSA (.SR) tickers – that logic lives in
+  `core.data_engine_v2` and its provider set.
+- For any new development, prefer importing directly from
+  `core.data_engine_v2` rather than this wrapper.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import httpx
-from pydantic import BaseModel, Field
-
 logger = logging.getLogger("core.data_engine")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
 # ---------------------------------------------------------------------------
-# Config helpers (env + optional env.py settings)
+# Try to import the "real" v2 engine + models
 # ---------------------------------------------------------------------------
+
+_ENGINE_MODE: str = "stub"
+_ENGINE_IS_STUB: bool = True
 
 try:
-    # Optional central settings (if env.py exists)
-    from env import settings  # type: ignore
-except Exception:  # pragma: no cover - if env.py isn't ready, fall back to os.getenv
-    settings = None  # type: ignore
-
-
-def _get_env(name: str, default: Optional[str] = None) -> str:
-    """
-    Read a config value:
-      1) from env.settings.<lowercase_name> if available
-      2) otherwise from os.getenv(NAME)
-    """
-    if settings is not None and hasattr(settings, name.lower()):
-        val = getattr(settings, name.lower())
-        if val is not None:
-            return str(val)
-    return os.getenv(name, default or "") or ""
-
-
-EODHD_API_KEY = _get_env("EODHD_API_KEY")
-EODHD_BASE_URL = _get_env("EODHD_BASE_URL", "https://eodhd.com/api")
-FMP_API_KEY = _get_env("FMP_API_KEY")
-FMP_BASE_URL = _get_env("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3")
-
-ARGAAM_GATEWAY_URL = _get_env("ARGAAM_GATEWAY_URL")
-ARGAAM_API_KEY = _get_env("ARGAAM_API_KEY")
-
-ENABLED_PROVIDERS_RAW = _get_env("ENABLED_PROVIDERS", "eodhd,fmp")
-PRIMARY_PROVIDER = _get_env("PRIMARY_PROVIDER", "eodhd")
-HTTP_TIMEOUT = float(_get_env("HTTP_TIMEOUT", "20") or "20")
-
-ENABLED_PROVIDERS: List[str] = [
-    p.strip().lower() for p in ENABLED_PROVIDERS_RAW.split(",") if p.strip()
-]
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-
-def is_ksa_symbol(symbol: str) -> bool:
-    """Detect KSA / Tadawul tickers (e.g. 1120.SR)."""
-    return symbol.upper().endswith(".SR")
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None or x == "":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-
-class QuoteSource(BaseModel):
-    """
-    Metadata about which provider contributed to the final UnifiedQuote.
-    """
-
-    provider: str
-    latency_ms: Optional[float] = None
-    timestamp_utc: Optional[datetime] = None
-    raw: Optional[Dict[str, Any]] = None
-
-
-class UnifiedQuote(BaseModel):
-    """
-    Unified, provider-agnostic quote used by all routes and Google Sheets pages.
-    """
-
-    # Identity
-    symbol: str
-    name: Optional[str] = None
-    exchange: Optional[str] = None
-    market_region: Optional[str] = None
-    currency: Optional[str] = None
-    sector: Optional[str] = None
-    industry: Optional[str] = None
-
-    # Prices
-    price: Optional[float] = None
-    prev_close: Optional[float] = None
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    change: Optional[float] = None
-    change_pct: Optional[float] = None
-
-    # Volume / liquidity
-    volume: Optional[float] = None
-    avg_volume: Optional[float] = None
-    market_cap: Optional[float] = None
-    shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
-
-    # 52-week
-    fifty_two_week_high: Optional[float] = None
-    fifty_two_week_low: Optional[float] = None
-
-    # Fundamentals
-    eps_ttm: Optional[float] = None
-    pe_ttm: Optional[float] = None
-    pb: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
-    profit_margin: Optional[float] = None
-    debt_to_equity: Optional[float] = None
-
-    # Advanced metrics placeholders (used by AI/Advanced routes)
-    volatility_30d: Optional[float] = None
-    fair_value: Optional[float] = None
-    upside_pct: Optional[float] = None
-    valuation_label: Optional[str] = None
-    value_score: Optional[float] = None
-    quality_score: Optional[float] = None
-    momentum_score: Optional[float] = None
-    opportunity_score: Optional[float] = None
-    rank: Optional[int] = None
-    recommendation: Optional[str] = None
-
-    # Meta
-    data_quality: str = "UNKNOWN"
-    sources: List[QuoteSource] = Field(default_factory=list)
-    last_updated_utc: Optional[datetime] = None
-    error: Optional[str] = None
-
-
-@dataclass
-class ProviderQuote:
-    """
-    Internal representation of a provider-specific quote.
-    """
-
-    provider: str
-    symbol: str
-    name: Optional[str] = None
-    exchange: Optional[str] = None
-    market_region: Optional[str] = None
-    currency: Optional[str] = None
-    sector: Optional[str] = None
-    industry: Optional[str] = None
-
-    price: Optional[float] = None
-    prev_close: Optional[float] = None
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    change: Optional[float] = None
-    change_pct: Optional[float] = None
-
-    volume: Optional[float] = None
-    avg_volume: Optional[float] = None
-    market_cap: Optional[float] = None
-    shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
-
-    fifty_two_week_high: Optional[float] = None
-    fifty_two_week_low: Optional[float] = None
-
-    eps_ttm: Optional[float] = None
-    pe_ttm: Optional[float] = None
-    pb: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
-    profit_margin: Optional[float] = None
-    debt_to_equity: Optional[float] = None
-
-    raw: Optional[Dict[str, Any]] = None
-    latency_ms: Optional[float] = None
-    timestamp_utc: Optional[datetime] = None
-
-
-# ---------------------------------------------------------------------------
-# Provider implementations
-# ---------------------------------------------------------------------------
-
-
-class BaseProvider:
-    name: str = "base"
-
-    async def fetch(self, symbol: str) -> Optional[ProviderQuote]:
-        raise NotImplementedError
-
-
-class EodhdProvider(BaseProvider):
-    """
-    EODHD provider for NON-KSA symbols only.
-    """
-
-    name = "eodhd"
-
-    async def fetch(self, symbol: str) -> Optional[ProviderQuote]:
-        if not EODHD_API_KEY:
-            return None
-        if is_ksa_symbol(symbol):
-            # Never use EODHD for KSA
-            return None
-
-        url = f"{EODHD_BASE_URL.rstrip('/')}/real-time/{symbol}"
-        params = {
-            "api_token": EODHD_API_KEY,
-            "fmt": "json",
-        }
-        timeout = httpx.Timeout(HTTP_TIMEOUT, connect=5.0)
-        start = datetime.now()
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-            except Exception as exc:
-                logger.warning("EODHD error for %s: %s", symbol, exc)
-                return None
-
-        latency_ms = (datetime.now() - start).total_seconds() * 1000.0
-        try:
-            data = resp.json()
-        except Exception as exc:
-            logger.warning("EODHD JSON error for %s: %s", symbol, exc)
-            return None
-
-        # EODHD returns dict; gracefully handle missing fields
-        price = safe_float(data.get("close"))
-        prev_close = safe_float(data.get("previousClose") or data.get("previous_close"))
-        change = safe_float(data.get("change") or data.get("day_change"))
-        change_pct = safe_float(data.get("change_p") or data.get("change_percent"))
-
-        return ProviderQuote(
-            provider=self.name,
-            symbol=data.get("code") or symbol,
-            name=data.get("name"),
-            exchange=data.get("exchange_short_name") or data.get("exchange"),
-            market_region=data.get("exchange") or None,
-            currency=data.get("currency"),
-            sector=data.get("sector"),
-            industry=data.get("industry"),
-            price=price,
-            prev_close=prev_close,
-            open=safe_float(data.get("open")),
-            high=safe_float(data.get("high")),
-            low=safe_float(data.get("low")),
-            change=change,
-            change_pct=change_pct,
-            volume=safe_float(data.get("volume")),
-            avg_volume=safe_float(data.get("avg_volume")),
-            market_cap=safe_float(data.get("market_cap")),
-            shares_outstanding=safe_float(data.get("shares_outstanding")),
-            fifty_two_week_high=safe_float(
-                data.get("fifty_two_week_high") or data.get("high_52_week")
-            ),
-            fifty_two_week_low=safe_float(
-                data.get("fifty_two_week_low") or data.get("low_52_week")
-            ),
-            eps_ttm=safe_float(data.get("eps")),
-            pe_ttm=safe_float(data.get("pe")),
-            pb=safe_float(data.get("pb")),
-            dividend_yield=safe_float(data.get("dividend_yield")),
-            raw=data,
-            latency_ms=latency_ms,
-            timestamp_utc=utc_now(),
-        )
-
-
-class FmpProvider(BaseProvider):
-    """
-    FMP provider for NON-KSA symbols only.
-    """
-
-    name = "fmp"
-
-    async def fetch(self, symbol: str) -> Optional[ProviderQuote]:
-        if not FMP_API_KEY:
-            return None
-        if is_ksa_symbol(symbol):
-            # Never use FMP for KSA directly
-            return None
-
-        url = f"{FMP_BASE_URL.rstrip('/')}/quote/{symbol}"
-        params = {"apikey": FMP_API_KEY}
-        timeout = httpx.Timeout(HTTP_TIMEOUT, connect=5.0)
-        start = datetime.now()
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-            except Exception as exc:
-                logger.warning("FMP error for %s: %s", symbol, exc)
-                return None
-
-        latency_ms = (datetime.now() - start).total_seconds() * 1000.0
-
-        try:
-            arr = resp.json()
-        except Exception as exc:
-            logger.warning("FMP JSON error for %s: %s", symbol, exc)
-            return None
-
-        if not isinstance(arr, list) or not arr:
-            return None
-        data = arr[0]
-
-        price = safe_float(data.get("price"))
-        prev_close = safe_float(data.get("previousClose"))
-        change = None
-        change_pct = None
-        if price is not None and prev_close is not None:
-            change = price - prev_close
-            if prev_close != 0:
-                change_pct = (change / prev_close) * 100.0
-
-        return ProviderQuote(
-            provider=self.name,
-            symbol=data.get("symbol") or symbol,
-            name=data.get("name"),
-            exchange=data.get("exchangeShortName") or data.get("exchange"),
-            market_region=data.get("exchange") or None,
-            currency=data.get("currency"),
-            sector=data.get("sector"),
-            industry=data.get("industry"),
-            price=price,
-            prev_close=prev_close,
-            open=safe_float(data.get("open")),
-            high=safe_float(data.get("dayHigh")),
-            low=safe_float(data.get("dayLow")),
-            change=change,
-            change_pct=change_pct,
-            volume=safe_float(data.get("volume")),
-            avg_volume=safe_float(data.get("avgVolume")),
-            market_cap=safe_float(data.get("marketCap")),
-            shares_outstanding=safe_float(data.get("sharesOutstanding")),
-            fifty_two_week_high=safe_float(data.get("yearHigh")),
-            fifty_two_week_low=safe_float(data.get("yearLow")),
-            eps_ttm=safe_float(data.get("eps")),
-            pe_ttm=safe_float(data.get("pe")),
-            pb=safe_float(data.get("priceToBook")),
-            dividend_yield=safe_float(data.get("dividendYield")),
-            raw=data,
-            latency_ms=latency_ms,
-            timestamp_utc=utc_now(),
-        )
-
-
-class KsaArgaamProvider(BaseProvider):
-    """
-    KSA provider using the external Argaam/Tadawul gateway.
-
-    IMPORTANT:
-    - This provider is used ONLY for .SR symbols.
-    - It does NOT use EODHD at all.
-    """
-
-    name = "argaam-gateway"
-
-    async def fetch(self, symbol: str) -> Optional[ProviderQuote]:
-        if not ARGAAM_GATEWAY_URL:
-            logger.warning("KSA Argaam provider not configured (ARGAAM_GATEWAY_URL).")
-            return None
-
-        if not is_ksa_symbol(symbol):
-            return None
-
-        url = ARGAAM_GATEWAY_URL.rstrip("/") + "/quote"
-        params = {"symbol": symbol.upper()}
-        headers: Dict[str, str] = {"Accept": "application/json"}
-        if ARGAAM_API_KEY:
-            headers["X-API-KEY"] = ARGAAM_API_KEY
-
-        timeout = httpx.Timeout(HTTP_TIMEOUT, connect=5.0)
-        start = datetime.now()
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                resp = await client.get(url, params=params, headers=headers)
-                resp.raise_for_status()
-            except Exception as exc:
-                logger.warning("Argaam gateway error for %s: %s", symbol, exc)
-                return None
-
-        latency_ms = (datetime.now() - start).total_seconds() * 1000.0
-        try:
-            data = resp.json()
-        except Exception as exc:
-            logger.warning("Argaam gateway JSON error for %s: %s", symbol, exc)
-            return None
-
-        if not isinstance(data, dict):
-            logger.warning("Unexpected Argaam structure for %s: %r", symbol, data)
-            return None
-
-        name = data.get("name") or data.get("companyName") or data.get("Name")
-        sector = data.get("sector") or data.get("Sector")
-        market = data.get("market") or data.get("exchange") or "Tadawul"
-        currency = data.get("currency") or data.get("Currency") or "SAR"
-
-        last_price = (
-            data.get("lastPrice")
-            or data.get("last")
-            or data.get("price")
-            or data.get("LastPrice")
-        )
-        prev_close = data.get("previousClose") or data.get("prevClose")
-        change = data.get("change") or data.get("Change")
-        change_pct = (
-            data.get("changePercent")
-            or data.get("changePct")
-            or data.get("ChangePercent")
-        )
-
-        volume = data.get("volume") or data.get("Volume")
-        market_cap = data.get("marketCap") or data.get("MarketCap")
-
-        high_52w = (
-            data.get("fiftyTwoWeekHigh")
-            or data.get("fifty_two_week_high")
-            or data.get("52WeekHigh")
-        )
-        low_52w = (
-            data.get("fiftyTwoWeekLow")
-            or data.get("fifty_two_week_low")
-            or data.get("52WeekLow")
-        )
-
-        # Timestamp
-        ts = (
-            data.get("lastUpdated")
-            or data.get("lastUpdate")
-            or data.get("timestamp")
-            or data.get("LastUpdated")
-        )
-        ts_dt: Optional[datetime] = None
-        if ts:
-            if isinstance(ts, str):
-                try:
-                    ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                except Exception:
-                    ts_dt = None
-            elif isinstance(ts, (int, float)):
-                try:
-                    ts_dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
-                except Exception:
-                    ts_dt = None
-
-        return ProviderQuote(
-            provider=self.name,
-            symbol=symbol.upper(),
-            name=name,
-            exchange="Tadawul",
-            market_region=market,
-            currency=currency,
-            sector=sector,
-            industry=data.get("industry"),
-            price=safe_float(last_price),
-            prev_close=safe_float(prev_close),
-            open=safe_float(data.get("open")),
-            high=safe_float(data.get("high")),
-            low=safe_float(data.get("low")),
-            change=safe_float(change),
-            change_pct=safe_float(change_pct),
-            volume=safe_float(volume),
-            avg_volume=None,
-            market_cap=safe_float(market_cap),
-            shares_outstanding=None,
-            fifty_two_week_high=safe_float(high_52w),
-            fifty_two_week_low=safe_float(low_52w),
-            raw=data,
-            latency_ms=latency_ms,
-            timestamp_utc=ts_dt or utc_now(),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Data engine
-# ---------------------------------------------------------------------------
-
-
-class DataEngine:
-    """
-    The main engine used by all routes to get enriched quotes.
-    """
-
-    def __init__(self) -> None:
-        self.global_providers: List[BaseProvider] = []
-        self.ksa_provider: Optional[BaseProvider] = None
-
-        # Configure providers based on env
-        if "eodhd" in ENABLED_PROVIDERS:
-            self.global_providers.append(EodhdProvider())
-        if "fmp" in ENABLED_PROVIDERS:
-            self.global_providers.append(FmpProvider())
-
-        # KSA provider (only Argaam; EODHD is never used for .SR)
-        self.ksa_provider = KsaArgaamProvider()
-
-    async def _fetch_from_providers(self, symbol: str) -> List[ProviderQuote]:
+    # Primary, modern engine
+    from core.data_engine_v2 import (  # type: ignore
+        DataEngine as _V2DataEngine,
+        UnifiedQuote,
+        QuoteSource,
+    )
+
+    _ENGINE_MODE = "v2"
+    _ENGINE_IS_STUB = False
+    logger.info("core.data_engine: Delegating to core.data_engine_v2.DataEngine.")
+
+except Exception as exc:  # pragma: no cover - defensive fallback
+    logger.exception(
+        "core.data_engine: Failed to import core.data_engine_v2. "
+        "Falling back to stub engine. Error: %s",
+        exc,
+    )
+    _ENGINE_MODE = "stub"
+    _ENGINE_IS_STUB = True
+
+    # -----------------------------------------------------------------------
+    # Minimal local models for stub mode
+    # -----------------------------------------------------------------------
+    from pydantic import BaseModel, Field  # type: ignore
+
+    class QuoteSource(BaseModel):
         """
-        Fetch quotes from the appropriate providers for a symbol.
-        - KSA (.SR): only KSA provider (Argaam gateway).
-        - Non-KSA: global providers (EODHD, FMP, etc.).
+        Minimal provider metadata (stub mode).
         """
-        if is_ksa_symbol(symbol):
-            if not self.ksa_provider:
-                return []
-            quote = await self.ksa_provider.fetch(symbol)
-            return [q for q in [quote] if q is not None]
 
-        # Non-KSA: global providers
-        tasks = [prov.fetch(symbol) for prov in self.global_providers]
-        if not tasks:
-            return []
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        quotes: List[ProviderQuote] = []
-        for res in results:
-            if isinstance(res, Exception):
-                continue
-            if res is not None:
-                quotes.append(res)
-        return quotes
+        provider: str
+        latency_ms: Optional[float] = None
+        timestamp_utc: Optional[datetime] = None
+        raw: Optional[Dict[str, Any]] = None
 
-    def _merge_quotes(
-        self,
-        symbol: str,
-        provider_quotes: List[ProviderQuote],
-    ) -> UnifiedQuote:
+    class UnifiedQuote(BaseModel):
         """
-        Merge multiple ProviderQuote objects into a single UnifiedQuote.
+        Minimal UnifiedQuote placeholder used in stub mode.
 
-        Heuristic:
-        - Prefer PRIMARY_PROVIDER as base (or Argaam for KSA).
-        - Use other providers to fill missing fields.
-        - Derive change/change_pct if needed.
-        - Compute simple data_quality (FULL / PARTIAL / MISSING).
+        The full model is defined in core.data_engine_v2; this is only used
+        if that module cannot be imported.
         """
-        uq = UnifiedQuote(symbol=symbol.upper(), last_updated_utc=utc_now())
 
-        if not provider_quotes:
-            uq.data_quality = "MISSING"
-            uq.error = "No data returned from any provider."
-            return uq
+        symbol: str
+        price: Optional[float] = None
+        data_quality: str = "MISSING"
+        last_updated_utc: Optional[datetime] = None
+        market: Optional[str] = None
+        market_region: Optional[str] = None
+        currency: Optional[str] = None
+        error: Optional[str] = None
+        sources: List[QuoteSource] = Field(default_factory=list)
 
-        # Choose base provider: for KSA, always Argaam; otherwise PRIMARY_PROVIDER if available.
-        base: Optional[ProviderQuote] = None
+    class _V2DataEngine:  # type: ignore[no-redef]
+        """
+        Stub engine implementation used ONLY when core.data_engine_v2
+        is not available. It never raises, but always returns MISSING data.
+        """
 
-        if is_ksa_symbol(symbol):
-            for pq in provider_quotes:
-                if pq.provider.startswith("argaam"):
-                    base = pq
-                    break
-        if base is None and PRIMARY_PROVIDER:
-            for pq in provider_quotes:
-                if pq.provider.lower() == PRIMARY_PROVIDER.lower():
-                    base = pq
-                    break
-        if base is None:
-            base = provider_quotes[0]
-
-        # Helper to copy attributes if present
-        def apply_from(pq: ProviderQuote, only_if_missing: bool = False) -> None:
-            for field in (
-                "name",
-                "exchange",
-                "market_region",
-                "currency",
-                "sector",
-                "industry",
-                "price",
-                "prev_close",
-                "open",
-                "high",
-                "low",
-                "change",
-                "change_pct",
-                "volume",
-                "avg_volume",
-                "market_cap",
-                "shares_outstanding",
-                "free_float",
-                "fifty_two_week_high",
-                "fifty_two_week_low",
-                "eps_ttm",
-                "pe_ttm",
-                "pb",
-                "dividend_yield",
-                "roe",
-                "roa",
-                "profit_margin",
-                "debt_to_equity",
-            ):
-                val = getattr(pq, field)
-                if only_if_missing:
-                    if getattr(uq, field) is None and val is not None:
-                        setattr(uq, field, val)
-                else:
-                    if val is not None:
-                        setattr(uq, field, val)
-
-        # Apply base first (overwrite everything)
-        apply_from(base, only_if_missing=False)
-
-        # Then other providers fill gaps
-        for pq in provider_quotes:
-            if pq is base:
-                continue
-            apply_from(pq, only_if_missing=True)
-
-        # Derive change / change_pct if missing
-        if uq.price is not None and uq.prev_close is not None:
-            if uq.change is None:
-                uq.change = uq.price - uq.prev_close
-            if uq.change_pct is None and uq.prev_close != 0:
-                uq.change_pct = (uq.change / uq.prev_close) * 100.0
-
-        # Simple data quality heuristic
-        has_price = uq.price is not None
-        has_volume = uq.volume is not None
-        has_fundamentals = uq.pe_ttm is not None or uq.market_cap is not None
-
-        if not has_price:
-            uq.data_quality = "MISSING"
-        elif has_price and has_volume and has_fundamentals:
-            uq.data_quality = "FULL"
-        elif has_price:
-            uq.data_quality = "PARTIAL"
-        else:
-            uq.data_quality = "UNKNOWN"
-
-        # Sources metadata (without heavy raw payload to keep responses light)
-        uq.sources = [
-            QuoteSource(
-                provider=pq.provider,
-                latency_ms=pq.latency_ms,
-                timestamp_utc=pq.timestamp_utc,
-                raw=None,  # set pq.raw here if you want to expose full data
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            logger.error(
+                "core.data_engine: Using stub DataEngine – core.data_engine_v2 "
+                "is not available. All quotes will be MISSING."
             )
-            for pq in provider_quotes
-        ]
 
-        return uq
-
-    async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
-        """
-        Public entrypoint: get a fully merged UnifiedQuote for a single symbol.
-        """
-        try:
-            provider_quotes = await self._fetch_from_providers(symbol)
-            unified = self._merge_quotes(symbol, provider_quotes)
-            return unified
-        except Exception as exc:
-            logger.exception("Error in get_enriched_quote for %s", symbol)
+        async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
+            sym = (symbol or "").strip().upper()
+            now = datetime.now(timezone.utc)
             return UnifiedQuote(
-                symbol=symbol.upper(),
-                last_updated_utc=utc_now(),
-                data_quality="ERROR",
-                error=str(exc),
+                symbol=sym or "",
+                price=None,
+                data_quality="MISSING",
+                last_updated_utc=now,
+                market=None,
+                market_region=None,
+                currency=None,
+                error="Unified engine v2 unavailable (stub mode).",
+                sources=[
+                    QuoteSource(
+                        provider="stub_engine",
+                        latency_ms=None,
+                        timestamp_utc=now,
+                        raw=None,
+                    )
+                ],
             )
 
-    async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
-        """
-        Batch version of get_enriched_quote for multiple symbols.
-        """
-        tasks = [self.get_enriched_quote(sym) for sym in symbols]
-        if not tasks:
-            return []
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        unified_quotes: List[UnifiedQuote] = []
-        for sym, res in zip(symbols, results):
-            if isinstance(res, Exception):
-                logger.exception("Error in batch get_enriched_quotes for %s", sym)
-                unified_quotes.append(
-                    UnifiedQuote(
-                        symbol=sym.upper(),
-                        last_updated_utc=utc_now(),
-                        data_quality="ERROR",
-                        error=str(res),
-                    )
-                )
-            else:
-                unified_quotes.append(res)
-        return unified_quotes
+        async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
+            if not symbols:
+                return []
+            return [await self.get_enriched_quote(s) for s in symbols]
 
 
 # ---------------------------------------------------------------------------
-# Singleton engine instance + convenience functions
+# Engine instance & compatibility alias
 # ---------------------------------------------------------------------------
 
-_engine = DataEngine()
+# Shared engine instance used by module-level helpers below
+_engine = _V2DataEngine()
+
+# For backwards compatibility, expose DataEngine as the engine class type.
+# In v2 mode, this is the real DataEngine class; in stub mode, it's the stub.
+DataEngine = _V2DataEngine  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# Module-level convenience functions (v1-style API)
+# ---------------------------------------------------------------------------
 
 
 async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     """
-    Convenience wrapper so routes can do:
+    Backwards-compatible convenience wrapper:
 
-        q = await get_enriched_quote("AAPL")
+        from core.data_engine import get_enriched_quote
+
+    Delegates to the shared DataEngine instance (_engine).
+
+    Returns:
+        UnifiedQuote (from v2, or stub placeholder in fallback mode).
     """
-    return await _engine.get_enriched_quote(symbol)
+    try:
+        return await _engine.get_enriched_quote(symbol)  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - extremely defensive
+        logger.exception("core.data_engine: Error in get_enriched_quote(%s)", symbol)
+        now = datetime.now(timezone.utc)
+        return UnifiedQuote(
+            symbol=(symbol or "").strip().upper(),
+            price=None,
+            data_quality="ERROR",
+            last_updated_utc=now,
+            error=f"Unhandled error in get_enriched_quote: {exc}",
+            sources=[
+                QuoteSource(
+                    provider="core.data_engine_error",
+                    latency_ms=None,
+                    timestamp_utc=now,
+                    raw=None,
+                )
+            ],
+        )
 
 
 async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
     """
-    Convenience wrapper so routes can do:
+    Backwards-compatible batch wrapper:
 
-        quotes = await get_enriched_quotes(["AAPL","MSFT"])
+        from core.data_engine import get_enriched_quotes
+
+    Delegates to the shared DataEngine instance (_engine).
+
+    Returns:
+        list[UnifiedQuote]
     """
-    return await _engine.get_enriched_quotes(symbols)
+    clean: List[str] = [s.strip() for s in (symbols or []) if s and s.strip()]
+    if not clean:
+        return []
+
+    try:
+        results = await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - extremely defensive
+        logger.exception(
+            "core.data_engine: Error in get_enriched_quotes(%s)", clean
+        )
+        now = datetime.now(timezone.utc)
+        # Return one error quote per requested symbol
+        return [
+            UnifiedQuote(
+                symbol=sym.upper(),
+                price=None,
+                data_quality="ERROR",
+                last_updated_utc=now,
+                error=f"Unhandled error in get_enriched_quotes: {exc}",
+                sources=[
+                    QuoteSource(
+                        provider="core.data_engine_error",
+                        latency_ms=None,
+                        timestamp_utc=now,
+                        raw=None,
+                    )
+                ],
+            )
+            for sym in clean
+        ]
+
+    # Be defensive: enforce type + symbol mapping
+    out: List[UnifiedQuote] = []
+    now = datetime.now(timezone.utc)
+    for sym, q in zip(clean, results):
+        if isinstance(q, UnifiedQuote):
+            out.append(q)
+        else:
+            # Unexpected type from underlying engine; wrap as error quote
+            out.append(
+                UnifiedQuote(
+                    symbol=sym.upper(),
+                    price=None,
+                    data_quality="ERROR",
+                    last_updated_utc=now,
+                    error=(
+                        f"Engine returned non-UnifiedQuote instance: "
+                        f"{type(q)!r}"
+                    ),
+                    sources=[
+                        QuoteSource(
+                            provider="core.data_engine_type_error",
+                            latency_ms=None,
+                            timestamp_utc=now,
+                            raw=None,
+                        )
+                    ],
+                )
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Introspection helpers (optional, used by diagnostics)
+# ---------------------------------------------------------------------------
+
+
+def get_engine_meta() -> Dict[str, Any]:
+    """
+    Light introspection about the underlying engine.
+
+    Useful for /v1/status or debugging endpoints.
+    """
+    enabled_providers: Optional[List[str]] = None
+
+    try:
+        enabled_providers = list(getattr(_engine, "enabled_providers", []))  # type: ignore[attr-defined]
+    except Exception:
+        enabled_providers = None
+
+    return {
+        "engine_mode": _ENGINE_MODE,
+        "engine_is_stub": _ENGINE_IS_STUB,
+        "enabled_providers": enabled_providers,
+    }
+
+
+__all__ = [
+    "UnifiedQuote",
+    "QuoteSource",
+    "DataEngine",
+    "get_enriched_quote",
+    "get_enriched_quotes",
+    "get_engine_meta",
+]
