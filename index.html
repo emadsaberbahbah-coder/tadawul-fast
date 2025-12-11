@@ -404,12 +404,15 @@
   <header>
     <div class="title-block">
       <h1>Tadawul Fast Bridge – Control Panel</h1>
-      <p>Unified data engine for KSA (.SR) + Global markets, 9-page Google Sheets dashboard, and AI analysis.</p>
+      <p>
+        Unified Data Engine v2 for KSA (.SR) & Global markets –
+        powering your 9-page Ultimate Investment Dashboard, Google Sheets, and AI analysis.
+      </p>
     </div>
     <div>
-      <div class="pill">
+      <div class="pill" id="connection-pill">
         <span class="dot"></span>
-        <span>Backend & Sheets Console</span>
+        <span id="connection-pill-text">Backend & Sheets Console</span>
       </div>
     </div>
   </header>
@@ -428,14 +431,14 @@
             <label for="baseUrl">Backend Base URL</label>
             <input id="baseUrl" type="text" placeholder="https://tadawul-fast-bridge.onrender.com" />
             <div class="small-note">
-              Defaults to the current origin if left empty.
+              If empty, uses the current origin (<code>window.location.origin</code>).
             </div>
           </div>
         </div>
         <div class="row">
           <div>
             <label for="token">APP Token (X-APP-TOKEN)</label>
-            <input id="token" type="password" placeholder="Optional – for secured endpoints" />
+            <input id="token" type="password" placeholder="Required if backend enforces token" />
             <div class="small-note">
               Stored only in your browser (localStorage).
             </div>
@@ -505,8 +508,9 @@
           <button class="btn secondary sm" id="refreshStatusBtn">Refresh Status</button>
         </div>
         <div class="small-note">
-          Reflects how the backend sees configuration for your 9-page Google Sheets dashboard
-          (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio, Insights_Analysis, etc.).
+          Reflects how the backend sees configuration for your 9 Google Sheets pages
+          (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio,
+          Insights_Analysis, Investment_Advisor, Economic_Calendar, Income Statement, etc.).
         </div>
         <pre id="statusRaw" style="margin-top:6px;">{}</pre>
       </div>
@@ -518,7 +522,7 @@
       <div class="card">
         <div class="card-header">
           <h2>Quick Symbol Check</h2>
-          <small>Test single symbol from Enriched / AI / Advanced</small>
+          <small>Test single symbol from Enriched / AI / Advanced / KSA Gateway</small>
         </div>
         <div class="row">
           <div>
@@ -531,6 +535,7 @@
               <option value="enriched">Enriched Quote (/v1/enriched/quote)</option>
               <option value="analysis">AI Analysis (/v1/analysis/quote)</option>
               <option value="advanced">Advanced (/v1/advanced/symbol)</option>
+              <option value="argaam">KSA Gateway (/v1/argaam/quote)</option>
             </select>
           </div>
         </div>
@@ -538,8 +543,8 @@
           <button class="btn sm" id="runQuickBtn">Run</button>
         </div>
         <div class="small-note">
-          KSA symbols end with <code>.SR</code> and will use Tadawul/Argaam under the hood
-          (engine will not call EODHD for KSA).
+          KSA symbols end with <code>.SR</code> and use Tadawul/Argaam providers internally.
+          The unified data engine never calls EODHD for KSA tickers.
         </div>
         <pre id="quickResult" style="margin-top:8px;">{}</pre>
       </div>
@@ -574,8 +579,9 @@
   </main>
 
   <footer>
-    KSA tickers (<code>.SR</code>) are internally routed away from EODHD – the core data engine uses Tadawul/Argaam providers.
-    Global tickers use EODHD + FMP, with sheet-rows powering your 9 Google Sheets pages.
+    KSA tickers (<code>.SR</code>) are routed to Tadawul/Argaam providers via the KSA gateway –
+    no direct EODHD usage for KSA. Global tickers use EODHD + FMP, with /sheet-rows powering
+    your 9 Google Sheets pages and Investment Advisor logic.
   </footer>
 </div>
 
@@ -594,6 +600,8 @@
       cfgError: document.getElementById("cfg-error"),
       saveCfgBtn: document.getElementById("saveCfgBtn"),
       clearCfgBtn: document.getElementById("clearCfgBtn"),
+      connectionPill: document.getElementById("connection-pill"),
+      connectionPillText: document.getElementById("connection-pill-text"),
 
       // health
       healthEnriched: document.getElementById("health-enriched"),
@@ -657,6 +665,9 @@
       els.cfgStatus.textContent = "Reset to defaults, not tested";
       els.cfgError.style.display = "none";
       els.cfgError.textContent = "";
+      if (els.connectionPillText) {
+        els.connectionPillText.textContent = "Backend & Sheets Console";
+      }
     }
 
     // --------------------------------------------------------
@@ -712,6 +723,15 @@
         }
       });
       return { ksa, global };
+    }
+
+    function setConnectionPill(ok) {
+      if (!els.connectionPill || !els.connectionPillText) return;
+      if (ok) {
+        els.connectionPillText.textContent = "Connected to backend";
+      } else {
+        els.connectionPillText.textContent = "Connection error";
+      }
     }
 
     // --------------------------------------------------------
@@ -801,6 +821,7 @@
       els.cfgError.style.display = "none";
       els.cfgError.textContent = "";
       els.cfgStatus.textContent = "Testing...";
+      setConnectionPill(false);
       try {
         await Promise.all([
           updateHealthCard("enriched"),
@@ -810,11 +831,13 @@
           updateStatusCard(),
         ]);
         els.cfgStatus.textContent = "Connection OK";
+        setConnectionPill(true);
       } catch (e) {
         els.cfgStatus.textContent = "Health check failed";
         els.cfgError.style.display = "block";
         els.cfgError.textContent =
           "Health check failed. Check base URL / token or backend logs.";
+        setConnectionPill(false);
       }
     }
 
@@ -834,8 +857,11 @@
         path = "/v1/enriched/quote?symbol=" + encodeURIComponent(symbol);
       } else if (type === "analysis") {
         path = "/v1/analysis/quote?symbol=" + encodeURIComponent(symbol);
-      } else {
+      } else if (type === "advanced") {
         path = "/v1/advanced/symbol?symbol=" + encodeURIComponent(symbol);
+      } else {
+        // KSA Gateway – routes directly to Argaam/Tadawul gateway
+        path = "/v1/argaam/quote?symbol=" + encodeURIComponent(symbol);
       }
 
       try {
