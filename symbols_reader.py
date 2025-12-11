@@ -7,94 +7,123 @@ GOALS
 - Be the single place where we read "which symbols should we fetch" from
   Google Sheets (KSA, Global, Funds, FX, Portfolio, etc.).
 - Cleanly separate:
-    • KSA symbols (.SR)  -> to be fetched by KSA/Tadawul/Argaam providers
-      (NO EODHD for KSA).
-    • Non-KSA symbols    -> to be fetched by global providers (EODHD, FMP, etc.).
+    • KSA symbols (.SR)  -> KSA/Tadawul/Argaam providers
+      (NO EODHD for KSA anywhere).
+    • Non-KSA symbols    -> Global providers (FMP, etc.).
 - Work nicely with:
-    • google_sheets_service.py (for Sheets API access)
-    • core/data_engine.py      (unified engine, provider routing)
-    • routes/*                 (enriched, analysis, advanced, etc.)
-    • Google Apps Script / tools calling into Python
+    • google_sheets_service.py (Sheets API access + helpers)
+    • core.data_engine / core.data_engine_v2 (unified engine)
+    • routes/* (enriched, analysis, advanced, KSA gateway)
+    • Google Apps Script / external tools calling into Python.
 
 ASSUMPTIONS
 -----------
-1) Your Sheets use a consistent pattern:
-    - Header row is often ROW 5.
+1) Sheets follow a consistent pattern:
+    - Header row is usually ROW 5.
     - Data starts at ROW 6.
-    - There is a "Symbol" or "Ticker" column in the header row.
+    - There is a "Symbol" / "Ticker" / "Code" column in the header row.
 
-2) Sheet names (default, can be overridden in callers):
+2) Default sheet names (can be overridden by callers):
     - "KSA_Tadawul"
     - "Global_Markets"
     - "Mutual_Funds"
     - "Commodities_FX"
     - "My_Portfolio"
-    - "Insights_Analysis"   (for analysis-based symbols)
-    - etc.
+    - "Insights_Analysis"
+    - (Optionally: "Market_Leaders", "Investment_Advisor", etc.)
 
 USAGE EXAMPLES
 --------------
     from symbols_reader import (
         get_symbols_from_sheet,
         get_page_symbols,
+        get_all_pages_symbols,
     )
 
-    # 1) Read symbols from a sheet (generic)
+    # 1) Generic: read symbols from a sheet
     syms = get_symbols_from_sheet(
         spreadsheet_id="YOUR_SHEET_ID",
         sheet_name="KSA_Tadawul",
         header_row=5,
     )
-    # syms["all"]   -> all valid symbols
-    # syms["ksa"]   -> only .SR
-    # syms["global"]-> all non-.SR symbols
+    # syms["all"]    -> all valid symbols on that page
+    # syms["ksa"]    -> only .SR symbols
+    # syms["global"] -> non-.SR symbols
 
-    # 2) Use page presets (optional)
+    # 2) Using logical pages (KSA / Global / Funds / FX / Portfolio...)
     page_syms = get_page_symbols(
         page_key="KSA_TADAWUL",
-        spreadsheet_id="YOUR_SHEET_ID",   # or omit if you set DEFAULT_SPREADSHEET_ID
+        spreadsheet_id="YOUR_SHEET_ID",
     )
 
 NOTE
 ----
-- This module does NOT call EODHD or any provider.
-- It only reads symbols from Google Sheets and classifies them.
-- The actual provider routing (KSA vs global) is done by core.data_engine.
+- This module does NOT talk to any market data provider.
+- It ONLY reads symbols from Google Sheets and classifies them.
+- Actual market routing (KSA vs Global) is handled by the unified data engine.
 """
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+# Sheets client – this is the ONLY dependency:
+#   read_range: low-level reader
+#   split_tickers_by_market: returns {"ksa": [...], "global": [...], "all": [...]?}
 from google_sheets_service import read_range, split_tickers_by_market
 
-logger = logging.getLogger(__name__)
-
-# Try to pull a default spreadsheet id from env settings if available,
-# but do NOT require env.py to change immediately.
-try:
-    from env import settings  # type: ignore
-
-    DEFAULT_SPREADSHEET_ID: str = (
-        getattr(settings, "default_spreadsheet_id", "") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
+logger = logging.getLogger("symbols_reader")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-except Exception:  # pragma: no cover - fallback if env.py not yet updated
-    DEFAULT_SPREADSHEET_ID = os.getenv("DEFAULT_SPREADSHEET_ID", "")
-
 
 # ----------------------------------------------------------------------
-# PAGE CONFIG (for your 9 pages) – can be overridden by callers
+# DEFAULT SPREADSHEET ID RESOLUTION (env.py + env vars)
 # ----------------------------------------------------------------------
+
+try:  # pragma: no cover - env.py is optional
+    import env as _env_mod  # type: ignore
+except Exception:  # pragma: no cover
+    _env_mod = None  # type: ignore
+
+
+def _resolve_default_spreadsheet_id() -> str:
+    """
+    Read the default spreadsheet ID from env.settings.default_spreadsheet_id
+    if available; otherwise from the DEFAULT_SPREADSHEET_ID env var.
+    """
+    sid = ""
+    try:
+        if _env_mod is not None and hasattr(_env_mod, "settings"):
+            settings = getattr(_env_mod, "settings")
+            sid = getattr(settings, "default_spreadsheet_id", "") or ""
+    except Exception:
+        sid = ""
+
+    if not sid:
+        sid = os.getenv("DEFAULT_SPREADSHEET_ID", "").strip()
+
+    return sid
+
+
+DEFAULT_SPREADSHEET_ID: str = _resolve_default_spreadsheet_id()
+
+# ----------------------------------------------------------------------
+# PAGE CONFIG (for your 9+ pages) – can be overridden by callers
+# ----------------------------------------------------------------------
+
 
 @dataclass
 class PageConfig:
     key: str
     sheet_name: str
-    header_row: int = 5  # where headers live
-    max_columns: int = 52  # up to column AZ (~52) for header detection
+    header_row: int = 5        # where headers live
+    max_columns: int = 64      # enough for ~59-column layout
 
 
 DEFAULT_PAGE_CONFIGS: Dict[str, PageConfig] = {
@@ -134,14 +163,21 @@ DEFAULT_PAGE_CONFIGS: Dict[str, PageConfig] = {
         sheet_name="Insights_Analysis",
         header_row=5,
     ),
-    # You can extend with:
-    # "INVESTMENT_ADVISOR": PageConfig(...),
-    # "MARKET_LEADERS": PageConfig(...),
+    # Optional page presets (you can use these later if you like)
+    "MARKET_LEADERS": PageConfig(
+        key="MARKET_LEADERS",
+        sheet_name="Market_Leaders",
+        header_row=5,
+    ),
+    "INVESTMENT_ADVISOR": PageConfig(
+        key="INVESTMENT_ADVISOR",
+        sheet_name="Investment_Advisor",
+        header_row=5,
+    ),
 }
 
-
 # ----------------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS – internal
 # ----------------------------------------------------------------------
 
 
@@ -163,18 +199,23 @@ def _resolve_spreadsheet_id(spreadsheet_id: Optional[str] = None) -> str:
 
 def _column_index_to_letter(idx: int) -> str:
     """
-    Convert 0-based column index to A1 column letter.
-    e.g. 0 -> 'A', 25 -> 'Z', 26 -> 'AA'
+    Convert 0-based column index to an A1-style column letter.
+      0 -> 'A', 25 -> 'Z', 26 -> 'AA', etc.
     """
+    if idx < 0:
+        raise ValueError("Column index must be >= 0")
     letters = ""
-    idx += 1  # 1-based
-    while idx > 0:
-        idx, remainder = divmod(idx - 1, 26)
+    n = idx + 1  # 1-based
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
         letters = chr(65 + remainder) + letters
     return letters
 
 
 def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    """
+    Remove duplicates while preserving the original order.
+    """
     seen = set()
     out: List[str] = []
     for v in values:
@@ -190,20 +231,23 @@ def _normalize_symbol(cell_value: Any) -> Optional[str]:
 
     - Strips whitespace.
     - Uppercases.
-    - Treats '', 'NA', '-' as None.
+    - Treats '', 'NA', '-', '--' as None.
+    - Accepts numbers (e.g. 1120) and converts to string ("1120").
     """
     if cell_value is None:
         return None
+
     if isinstance(cell_value, (int, float)):
-        # Some people store 1120 as number; we can accept it and treat as string
         text = str(cell_value)
     else:
         text = str(cell_value)
+
     text = text.strip().upper()
     if not text:
         return None
     if text in {"NA", "N/A", "-", "--"}:
         return None
+
     return text
 
 
@@ -219,21 +263,50 @@ def _detect_symbol_column(
     Returns:
         0-based column index, or None if not found.
     """
-    # Example: "KSA_Tadawul!A5:AZ5"
     last_col_letter = _column_index_to_letter(max_columns - 1)
     range_a1 = f"{sheet_name}!A{header_row}:{last_col_letter}{header_row}"
-    rows = read_range(spreadsheet_id, range_a1)
-    if not rows:
+
+    try:
+        rows = read_range(spreadsheet_id, range_a1)
+    except Exception as exc:
+        logger.error(
+            "[symbols_reader] Error reading header row for %s!%s: %s",
+            sheet_name,
+            range_a1,
+            exc,
+        )
         return None
 
-    header = rows[0]  # first row in the returned range
+    if not rows:
+        logger.warning(
+            "[symbols_reader] No header row data found in range %s for sheet %s.",
+            range_a1,
+            sheet_name,
+        )
+        return None
+
+    header = rows[0]
     normalized = [str(c or "").strip().lower() for c in header]
 
+    # Accept exact logical names; avoid accidental match with random text
     candidates = {"symbol", "ticker", "code"}
     for idx, col_name in enumerate(normalized):
         if col_name in candidates:
+            logger.info(
+                "[symbols_reader] Detected symbol column '%s' at index %d on %s.",
+                col_name,
+                idx,
+                sheet_name,
+            )
             return idx
 
+    logger.warning(
+        "[symbols_reader] Could not detect Symbol/Ticker column in %s (row %d). "
+        "Header row was: %s",
+        sheet_name,
+        header_row,
+        header,
+    )
     return None
 
 
@@ -250,7 +323,17 @@ def _read_symbols_from_column(
     start_row = header_row + 1  # data starts after header
     range_a1 = f"{sheet_name}!{col_letter}{start_row}:{col_letter}"
 
-    values = read_range(spreadsheet_id, range_a1)
+    try:
+        values = read_range(spreadsheet_id, range_a1)
+    except Exception as exc:
+        logger.error(
+            "[symbols_reader] Error reading symbols column for %s!%s: %s",
+            sheet_name,
+            range_a1,
+            exc,
+        )
+        return []
+
     symbols: List[str] = []
     for row in values:
         if not row:
@@ -260,7 +343,15 @@ def _read_symbols_from_column(
         if sym:
             symbols.append(sym)
 
-    return _dedupe_preserve_order(symbols)
+    deduped = _dedupe_preserve_order(symbols)
+    logger.info(
+        "[symbols_reader] Read %d raw symbols (%d unique) from %s!%s.",
+        len(symbols),
+        len(deduped),
+        sheet_name,
+        col_letter,
+    )
+    return deduped
 
 
 # ----------------------------------------------------------------------
@@ -272,7 +363,7 @@ def get_symbols_from_sheet(
     spreadsheet_id: Optional[str],
     sheet_name: str,
     header_row: int = 5,
-    max_columns: int = 52,
+    max_columns: int = 64,
 ) -> Dict[str, List[str]]:
     """
     Generic reader: read symbols from the given sheet.
@@ -284,16 +375,16 @@ def get_symbols_from_sheet(
           "global": [... non-.SR symbols ...]
         }
 
-    This is the main function you'll use when you want to:
+    This is the main function you will use when you want to:
         - Refresh KSA_Tadawul page
         - Refresh Global_Markets / Mutual_Funds / Commodities_FX
-        - Or any other sheet that has a Symbol/Ticker column.
+        - Or any sheet that has a Symbol/Ticker column.
     """
     sid = _resolve_spreadsheet_id(spreadsheet_id)
     if not sheet_name:
         raise ValueError("sheet_name is required for get_symbols_from_sheet().")
 
-    # 1) Detect symbol column from the header row
+    # 1) Detect symbol column index from header row
     col_idx = _detect_symbol_column(
         spreadsheet_id=sid,
         sheet_name=sheet_name,
@@ -302,10 +393,9 @@ def get_symbols_from_sheet(
     )
     if col_idx is None:
         logger.warning(
-            "[symbols_reader] Could not detect Symbol/Ticker column in %s!row=%d; "
-            "no symbols will be returned.",
+            "[symbols_reader] No symbol column detected for sheet '%s'. "
+            "Returning empty symbol lists.",
             sheet_name,
-            header_row,
         )
         return {"all": [], "ksa": [], "global": []}
 
@@ -317,13 +407,19 @@ def get_symbols_from_sheet(
         header_row=header_row,
     )
 
+    if not raw_symbols:
+        return {"all": [], "ksa": [], "global": []}
+
     # 3) Split into KSA vs GLOBAL (consistent with google_sheets_service)
     split = split_tickers_by_market(raw_symbols)
 
+    ksa_syms = split.get("ksa", []) if isinstance(split, dict) else []
+    global_syms = split.get("global", []) if isinstance(split, dict) else []
+
     return {
         "all": raw_symbols,
-        "ksa": split["ksa"],
-        "global": split["global"],
+        "ksa": ksa_syms,
+        "global": global_syms,
     }
 
 
@@ -339,13 +435,15 @@ def get_page_symbols(
     Parameters
     ----------
     page_key : str
-        One of:
+        One of (case-insensitive):
           - 'KSA_TADAWUL'
           - 'GLOBAL_MARKETS'
           - 'MUTUAL_FUNDS'
           - 'COMMODITIES_FX'
           - 'MY_PORTFOLIO'
           - 'INSIGHTS_ANALYSIS'
+          - 'MARKET_LEADERS'
+          - 'INVESTMENT_ADVISOR'
         (and any others you add to DEFAULT_PAGE_CONFIGS)
     spreadsheet_id : Optional[str]
         If None, uses DEFAULT_SPREADSHEET_ID.
@@ -363,20 +461,15 @@ def get_page_symbols(
         {
           "all": [...],
           "ksa": [...],
-          "global": [...]
+          "global": [...],
         }
-
-    EXAMPLE:
-        syms = get_page_symbols("KSA_TADAWUL", spreadsheet_id="...")
-        # syms["ksa"]   -> all .SR to send to Tadawul/Argaam engine
-        # syms["global"]-> should be empty for this page (normally)
     """
     key = page_key.upper().strip()
     base_cfg = DEFAULT_PAGE_CONFIGS.get(key)
     if not base_cfg:
         raise ValueError(
             f"Unknown page_key '{page_key}'. "
-            f"Valid keys: {', '.join(DEFAULT_PAGE_CONFIGS.keys())}"
+            f"Valid keys: {', '.join(sorted(DEFAULT_PAGE_CONFIGS.keys()))}"
         )
 
     cfg = PageConfig(
@@ -393,6 +486,15 @@ def get_page_symbols(
             cfg.header_row = int(overrides["header_row"])
         if "max_columns" in overrides:
             cfg.max_columns = int(overrides["max_columns"])
+
+    logger.info(
+        "[symbols_reader] Reading symbols for page '%s' from sheet '%s' "
+        "(header_row=%d, max_columns=%d).",
+        cfg.key,
+        cfg.sheet_name,
+        cfg.header_row,
+        cfg.max_columns,
+    )
 
     return get_symbols_from_sheet(
         spreadsheet_id=spreadsheet_id,
@@ -445,3 +547,13 @@ def get_all_pages_symbols(
             result[key] = {"all": [], "ksa": [], "global": []}
 
     return result
+
+
+__all__ = [
+    "PageConfig",
+    "DEFAULT_PAGE_CONFIGS",
+    "DEFAULT_SPREADSHEET_ID",
+    "get_symbols_from_sheet",
+    "get_page_symbols",
+    "get_all_pages_symbols",
+]
