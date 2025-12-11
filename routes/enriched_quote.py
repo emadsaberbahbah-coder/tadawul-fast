@@ -1,9 +1,9 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.7)
+Enriched Quotes Router (v2.8)
 
-- Preferred backend: core.data_engine_v2.DataEngine (class-based engine).
+- Preferred backend: core.data_engine_v2.DataEngineV2 (class-based engine).
 - Fallback backend: core.data_engine (module-level async functions).
 - Last-resort: in-process stub engine that always returns MISSING data
   (so the API + Google Sheets never crash even if engines are misconfigured).
@@ -21,8 +21,7 @@ KSA Integration
       1) If symbol ends with ".SR":
             • Try Argaam route first.
             • If Argaam returns a valid payload, use it directly.
-            • If Argaam fails, fall back to the generic engine (which may still
-              return MISSING if providers have no KSA coverage).
+            • If Argaam fails, fall back to the generic engine (v2 / v1).
       2) For non-KSA symbols:
             • Use the configured engine (v2 or v1_module).
 
@@ -46,12 +45,12 @@ Google Sheets usage:
         Meta
 
 Alignment:
-    - Header structure is aligned with _build_sheet_headers and your
-      Config.gs MASTER_HEADERS so all 9 pages share the same layout.
+    - Header structure is aligned with your MASTER_HEADERS and Universal Template
+      so all market pages share the same layout.
 
-Performance v2.7 (IMPORTANT CHANGE)
------------------------------------
-- Large batches (e.g. 100+ tickers from Global_Markets) are now processed
+Performance v2.8
+----------------
+- Large batches (e.g. 100+ tickers from Global_Markets) are processed
   in CHUNKS to avoid provider timeouts and 502 errors.
 
     * Non-KSA tickers: chunked via the engine.
@@ -131,34 +130,24 @@ _data_engine_module: Any = None
 
 try:
     # Preferred new engine (class-based, lives in core.data_engine_v2)
-    from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
+    from core.data_engine_v2 import DataEngineV2 as _V2DataEngine  # type: ignore
 
     if _env is not None:
         cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
-        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
-        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
-        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
-
         kwargs: Dict[str, Any] = {}
         if cache_ttl is not None:
-            kwargs["cache_ttl"] = cache_ttl
-        if enabled_providers is not None:
-            kwargs["enabled_providers"] = enabled_providers
-        if enable_adv is not None:
-            kwargs["enable_advanced_analysis"] = enable_adv
-        if provider_timeout is not None:
-            kwargs["provider_timeout"] = provider_timeout
-
+            # DataEngineV2 expects cache_ttl_seconds
+            kwargs["cache_ttl_seconds"] = cache_ttl
         _engine = _V2DataEngine(**kwargs)
     else:
         _engine = _V2DataEngine()
 
     _ENGINE_MODE = "v2"
-    logger.info("routes.enriched_quote: Using DataEngine v2 from core.data_engine_v2")
+    logger.info("routes.enriched_quote: Using DataEngineV2 from core.data_engine_v2")
 
 except Exception as e_v2:  # pragma: no cover - defensive
     logger.exception(
-        "routes.enriched_quote: Failed to import/use core.data_engine_v2.DataEngine: %s",
+        "routes.enriched_quote: Failed to import/use core.data_engine_v2.DataEngineV2: %s",
         e_v2,
     )
     try:
@@ -370,16 +359,21 @@ class SheetEnrichedResponse(BaseModel):
 async def get_enriched_quote_engine(symbol: str) -> Any:
     """
     Thin async wrapper around the configured engine for a single symbol.
+    v2 engine is synchronous; v1/stub engines are async.
     """
     sym = (symbol or "").strip()
     if not sym:
         return None
 
     if _ENGINE_MODE == "v2":
-        return await _engine.get_enriched_quote(sym)
+        # DataEngineV2 is synchronous
+        return _engine.get_enriched_quote(sym)
+
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
+        # Legacy async module-level engine
         return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
-    # Stub
+
+    # Stub is async
     return await _engine.get_enriched_quote(sym)
 
 
@@ -392,10 +386,13 @@ async def get_enriched_quotes_engine(symbols: List[str]) -> List[Any]:
         return []
 
     if _ENGINE_MODE == "v2":
-        return await _engine.get_enriched_quotes(clean)
+        # DataEngineV2 is synchronous
+        return _engine.get_enriched_quotes(clean)
+
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
-    # Stub
+
+    # Stub is async
     return await _engine.get_enriched_quotes(clean)
 
 
@@ -700,7 +697,8 @@ def _quote_to_enriched(raw: Any) -> EnrichedQuoteResponse:
 
 def _build_sheet_headers() -> List[str]:
     """
-    Headers aligned with your 9-page dashboard philosophy and Config.gs MASTER_HEADERS.
+    Headers aligned with your Universal Market Template.
+    (Must match the order used by your Google Sheets and Config.gs MASTER_HEADERS.)
     """
     return [
         # Identity
@@ -878,7 +876,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "2.7",
+        "version": "2.8",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
     }
