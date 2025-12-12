@@ -1,7 +1,7 @@
 """
 routes/advanced_analysis.py
 ================================================
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v2.2)
 
 Purpose:
 - Expose "advanced analysis" and "opportunity ranking" endpoints
@@ -24,6 +24,11 @@ Endpoints:
 - GET  /v1/advanced/ping      (alias: /health)
 - GET  /v1/advanced/scoreboard?tickers=AAPL,MSFT,GOOGL&top_n=50
 - POST /v1/advanced/sheet-rows   (Google Sheets–friendly scoreboard)
+
+Notes:
+- KSA-safe: this module NEVER calls market data providers directly.
+  It only talks to the DataEngine, which is responsible for routing
+  KSA (.SR) tickers via Tadawul/Argaam (no EODHD for KSA).
 """
 
 from __future__ import annotations
@@ -36,6 +41,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("routes.advanced_analysis")
+
+ADVANCED_ANALYSIS_VERSION = "2.2"
 
 # =============================================================================
 # Optional env.py integration (for provider config / logging only)
@@ -64,18 +71,24 @@ try:  # pragma: no cover - defensive
     engine_kwargs: Dict[str, Any] = {}
 
     if _env is not None:
+        # Cache TTL for DataEngine
         cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
         if cache_ttl is not None:
             engine_kwargs["cache_ttl"] = cache_ttl
 
+        # Provider timeout: prefer dedicated knob, fallback to HTTP_TIMEOUT
         provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+        if provider_timeout is None:
+            provider_timeout = getattr(_env, "HTTP_TIMEOUT", None)
         if provider_timeout is not None:
             engine_kwargs["provider_timeout"] = provider_timeout
 
+        # Enabled providers (GLOBAL only – KSA handled by KSA-safe engine path)
         enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
         if enabled_providers:
             engine_kwargs["enabled_providers"] = enabled_providers
 
+        # Enable engine-level advanced analysis if supported
         enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
         engine_kwargs["enable_advanced_analysis"] = enable_adv
 
@@ -422,11 +435,24 @@ async def _fetch_enriched_for_tickers(tickers: List[str]) -> List[AdvancedItem]:
     """
     For each ticker, call the engine and map it into AdvancedItem.
     Uses batch engine call when available for better performance.
+
+    Defensive:
+    - Any engine failure will be caught and logged,
+      returning an empty list instead of raising.
     """
     if not tickers:
         return []
 
-    unified_quotes = await _engine_get_quotes(tickers)
+    try:
+        unified_quotes = await _engine_get_quotes(tickers)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(
+            "AdvancedAnalysis: engine_get_quotes failed for tickers=%s: %s",
+            tickers,
+            exc,
+        )
+        return []
+
     if unified_quotes is None:
         unified_quotes = []
     if not isinstance(unified_quotes, list):
@@ -604,12 +630,18 @@ async def ping() -> Dict[str, Any]:
 
     Does NOT require calling any external providers; just returns meta info.
     """
+    env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
+    app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
+
     return {
         "status": "ok",
+        "module": "routes.advanced_analysis",
+        "version": ADVANCED_ANALYSIS_VERSION,
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
+        "environment": env_name or "unknown",
+        "app_version": app_version or "unknown",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "module": "routes.advanced_analysis",
     }
 
 
