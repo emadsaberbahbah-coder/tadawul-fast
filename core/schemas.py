@@ -1,69 +1,75 @@
 """
 core/schemas.py
-===============================================
-Schema helpers & sheet header registry - v1.3
+====================================================
+Single source of truth for:
+- Canonical Google Sheet names (9-page dashboard)
+- Sheet name aliases (tolerant to rename / spacing / case)
+- Universal Market Template headers (59 columns)
+- Public helper: get_headers_for_sheet(sheet_name)
 
-Author: Emad Bahbah (with GPT-5.2 Thinking)
-
-Why this file exists
---------------------
-Some routes (routes.enriched_quote / ai_analysis / advanced_analysis) prefer to ask
-core.schemas for the exact header list of a sheet, so the backend output is ALWAYS
-aligned with Google Sheets columns.
-
-This file provides:
-- UNIVERSAL_MARKET_HEADERS (59 columns)
-- get_headers_for_sheet(sheet_name)
-- sheet name aliases (KSA/Global/Mutual Funds/FX variations)
-
-If a sheet name is unknown, we return the universal headers by default.
+Author: Emad Bahbah (with GPT-5)
+Version: 1.3.0
 """
 
 from __future__ import annotations
 
-import re
-from typing import Dict, List, Sequence
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-# ============================================================================
-# Universal Market Template (59 columns)
-# IMPORTANT: Keep this aligned with Apps Script header row (Row 5)
-# ============================================================================
+# =============================================================================
+# 1) CANONICAL SHEET NAMES (SORTED ORDER)
+# =============================================================================
 
-UNIVERSAL_MARKET_HEADERS: List[str] = [
+# The "sorted order" you want the system to treat as the official dashboard order.
+CANONICAL_SHEET_ORDER: List[str] = [
+    "Market_Leaders",
+    "KSA_Tadawul_Market",
+    "Global_Markets",
+    "Mutual_Funds",
+    "Commodities_FX",
+    "My_Portfolio",
+    "Insights_Analysis",
+    "Advanced_Analysis",
+    "Investment_Advisor",
+]
+
+# =============================================================================
+# 2) UNIVERSAL MARKET TEMPLATE (59 COLUMNS)
+# =============================================================================
+# NOTE:
+# - Keep this stable across KSA / Global / Mutual Funds / Commodities-FX.
+# - Apps Script and backend should both align to this order.
+
+UNIVERSAL_MARKET_HEADERS_V59: List[str] = [
     # Identity
     "Symbol",
     "Company Name",
     "Sector",
-    "Sub-Sector",
+    "Industry",
     "Market",
     "Currency",
-    "Listing Date",
 
     # Price snapshot
-    "Last Price",
+    "Current Price",
     "Previous Close",
     "Price Change",
     "Percent Change",
     "Day High",
     "Day Low",
-
-    # 52W stats
     "52W High",
     "52W Low",
-    "52W Position %",
 
     # Liquidity
     "Volume",
     "Avg Volume (30D)",
     "Value Traded",
-    "Turnover %",
+
+    # Size
     "Shares Outstanding",
     "Free Float %",
     "Market Cap",
-    "Free Float Market Cap",
-    "Liquidity Score",
 
-    # Fundamentals / valuation
+    # Valuation + earnings
     "EPS (TTM)",
     "Forward EPS",
     "P/E (TTM)",
@@ -72,12 +78,9 @@ UNIVERSAL_MARKET_HEADERS: List[str] = [
     "P/S",
     "EV/EBITDA",
 
-    # Dividends
+    # Dividends + profitability
     "Dividend Yield %",
-    "Dividend Rate",
     "Payout Ratio %",
-
-    # Profitability
     "ROE %",
     "ROA %",
     "Net Margin %",
@@ -87,13 +90,20 @@ UNIVERSAL_MARKET_HEADERS: List[str] = [
     "Revenue Growth %",
     "Net Income Growth %",
 
-    # Risk / technical
+    # Balance sheet + risk
+    "Debt/Equity",
+    "Current Ratio",
+    "Quick Ratio",
     "Beta",
     "Volatility (30D)",
+
+    # Technical
     "RSI (14)",
     "MACD",
+    "MA20",
+    "MA50",
 
-    # AI valuation & scoring
+    # AI / scoring
     "Fair Value",
     "Upside %",
     "Valuation Label",
@@ -101,108 +111,217 @@ UNIVERSAL_MARKET_HEADERS: List[str] = [
     "Quality Score",
     "Momentum Score",
     "Opportunity Score",
-    "Rank",
+    "Overall Score",
+    "Target Price",
     "Recommendation",
 
-    # Provenance / timestamps
+    # Provenance
     "Data Source",
-    "Last Updated (Riyadh)",
     "Data Quality",
     "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
     "Error",
 ]
 
-# Backward compatible aliases (some older files may import these names)
-UNIVERSAL_HEADERS = UNIVERSAL_MARKET_HEADERS
-UNIVERSAL_MARKET_TEMPLATE_HEADERS = UNIVERSAL_MARKET_HEADERS
+# =============================================================================
+# 3) TEMPLATES PER SHEET
+# =============================================================================
 
+# For now we keep the same template for all market pages.
+# If later you want Mutual Funds to have a trimmed template, do it here only.
+SHEET_HEADERS: Dict[str, List[str]] = {
+    "KSA_Tadawul_Market": UNIVERSAL_MARKET_HEADERS_V59,
+    "Global_Markets": UNIVERSAL_MARKET_HEADERS_V59,
+    "Mutual_Funds": UNIVERSAL_MARKET_HEADERS_V59,
+    "Commodities_FX": UNIVERSAL_MARKET_HEADERS_V59,
 
-# ============================================================================
-# Sheet header registry (use universal headers for core market pages)
-# ============================================================================
-
-_SHEET_HEADERS: Dict[str, List[str]] = {
-    # Main market pages (use same 59-col template)
-    "ksa_tadawul_market": UNIVERSAL_MARKET_HEADERS,
-    "ksa_tadawul": UNIVERSAL_MARKET_HEADERS,
-    "ksa_market": UNIVERSAL_MARKET_HEADERS,
-
-    "global_markets": UNIVERSAL_MARKET_HEADERS,
-    "global_market": UNIVERSAL_MARKET_HEADERS,
-
-    "mutual_funds": UNIVERSAL_MARKET_HEADERS,
-    "mutual_fund": UNIVERSAL_MARKET_HEADERS,
-    "funds": UNIVERSAL_MARKET_HEADERS,
-
-    "commodities_fx": UNIVERSAL_MARKET_HEADERS,
-    "commodities__fx": UNIVERSAL_MARKET_HEADERS,
-    "fx": UNIVERSAL_MARKET_HEADERS,
-    "commodities": UNIVERSAL_MARKET_HEADERS,
-
-    "my_portfolio": UNIVERSAL_MARKET_HEADERS,
-    "portfolio": UNIVERSAL_MARKET_HEADERS,
+    # Non-market pages: default to universal headers if needed (safe fallback).
+    "Market_Leaders": UNIVERSAL_MARKET_HEADERS_V59,
+    "My_Portfolio": UNIVERSAL_MARKET_HEADERS_V59,
+    "Insights_Analysis": UNIVERSAL_MARKET_HEADERS_V59,
+    "Advanced_Analysis": UNIVERSAL_MARKET_HEADERS_V59,
+    "Investment_Advisor": UNIVERSAL_MARKET_HEADERS_V59,
 }
 
-# Friendly aliases (sheet tab names may contain spaces or different casing)
-_SHEET_ALIASES: Dict[str, str] = {
-    "ksa tadawul market": "ksa_tadawul_market",
-    "ksa_tadawul_market": "ksa_tadawul_market",
-    "ksa_tadawul": "ksa_tadawul",
-    "ksa market": "ksa_market",
-    "ksa_market": "ksa_market",
+# =============================================================================
+# 4) SHEET NAME ALIASES (RENAMES / SPACING / OLD NAMES)
+# =============================================================================
 
-    "global markets": "global_markets",
-    "global_markets": "global_markets",
+SHEET_NAME_ALIASES: Dict[str, List[str]] = {
+    # Market pages
+    "KSA_Tadawul_Market": [
+        "KSA_Tadawul",
+        "KSA Tadawul",
+        "KSA Tadawul Market",
+        "KSA_TadawulMarket",
+        "KSA_Market",
+        "KSA Market",
+        "KSA_Tadawul_Market",
+        "05_KSA_Tadawul_Market",
+    ],
+    "Global_Markets": [
+        "Global Markets",
+        "Global_Market",
+        "Global Market",
+        "Global_Markets_Stock",
+        "06_Global_Markets",
+        "Global_Markets",
+    ],
+    "Mutual_Funds": [
+        "Mutual Funds",
+        "Mutual_Fund",
+        "MutualFund",
+        "Mutual_Funds",
+    ],
+    "Commodities_FX": [
+        "Commodities & FX",
+        "Commodities_FX_Market",
+        "Commodities FX",
+        "Commodities_FX",
+        "09_Commodities_FX_Market",
+    ],
 
-    "mutual funds": "mutual_funds",
-    "mutual_funds": "mutual_funds",
-
-    "commodities & fx": "commodities_fx",
-    "commodities_fx": "commodities_fx",
-    "commodities fx": "commodities_fx",
-
-    "my portfolio": "my_portfolio",
-    "my_portfolio": "my_portfolio",
+    # Other pages
+    "Market_Leaders": [
+        "Market Leaders",
+        "Leaders",
+        "Market_Leaders",
+    ],
+    "My_Portfolio": [
+        "My Portfolio",
+        "Portfolio",
+        "My_Portfolio",
+    ],
+    "Insights_Analysis": [
+        "Insights",
+        "Insights & Analysis",
+        "Insights_Analysis",
+        "Insights_And_Analysis",
+    ],
+    "Advanced_Analysis": [
+        "Advanced Analysis",
+        "Analysis",
+        "Advanced_Analysis",
+    ],
+    "Investment_Advisor": [
+        "Investment Advisor",
+        "Advisor",
+        "Investment_Advisor",
+    ],
 }
 
+# =============================================================================
+# 5) INTERNAL NORMALIZATION + LOOKUPS
+# =============================================================================
 
-def _norm_sheet_name(name: str) -> str:
-    s = (name or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+def _norm(s: str) -> str:
+    """Normalize sheet name for alias matching (case/space/underscore tolerant)."""
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .strip()
+        .lower()
+        .replace("&", "and")
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace("__", "_")
+    )
 
+# alias -> canonical
+_ALIAS_TO_CANONICAL: Dict[str, str] = {}
 
-def get_headers_for_sheet(sheet_name: str) -> List[str]:
+def _build_alias_index() -> None:
+    _ALIAS_TO_CANONICAL.clear()
+
+    # canonical names map to themselves
+    for canon in CANONICAL_SHEET_ORDER:
+        _ALIAS_TO_CANONICAL[_norm(canon)] = canon
+
+    # add configured aliases
+    for canon, aliases in SHEET_NAME_ALIASES.items():
+        _ALIAS_TO_CANONICAL[_norm(canon)] = canon
+        for a in aliases:
+            _ALIAS_TO_CANONICAL[_norm(a)] = canon
+
+_build_alias_index()
+
+# =============================================================================
+# 6) PUBLIC API
+# =============================================================================
+
+def normalize_sheet_name(sheet_name: str) -> str:
     """
-    Return headers for a given sheet name.
-
-    - Accepts many variants ("Global_Markets", "global markets", etc.)
-    - If unknown sheet name: returns UNIVERSAL_MARKET_HEADERS (safe default)
+    Return canonical sheet name if recognized, otherwise return the original input.
     """
-    raw = _norm_sheet_name(sheet_name)
-    if not raw:
-        return list(UNIVERSAL_MARKET_HEADERS)
+    key = _norm(sheet_name)
+    return _ALIAS_TO_CANONICAL.get(key, sheet_name)
 
-    key = _SHEET_ALIASES.get(raw, raw)
-    key = key.replace(" ", "_")
+def get_headers_for_sheet(sheet_name: str, *, fallback: Optional[List[str]] = None) -> List[str]:
+    """
+    Main function expected by routes (enriched_quote / others).
 
-    headers = _SHEET_HEADERS.get(key)
+    - Accepts many aliases.
+    - Returns a COPY of the header list to avoid accidental mutation.
+    - If sheet is unknown, returns fallback (or universal template).
+    """
+    canon = normalize_sheet_name(sheet_name)
+
+    headers = SHEET_HEADERS.get(canon)
     if headers:
         return list(headers)
 
-    # Safe fallback (prevents crashes and stops the routes warning)
-    return list(UNIVERSAL_MARKET_HEADERS)
+    if fallback is not None:
+        return list(fallback)
 
+    return list(UNIVERSAL_MARKET_HEADERS_V59)
 
-def list_supported_sheets() -> List[str]:
-    """Return canonical sheet keys supported by get_headers_for_sheet()."""
-    return sorted(set(_SHEET_HEADERS.keys()))
+def get_canonical_sheets_sorted() -> List[str]:
+    """Return the official sorted sheet list (your requested ordering)."""
+    return list(CANONICAL_SHEET_ORDER)
 
+def get_alias_map() -> Dict[str, str]:
+    """Return a normalized alias->canonical map (for debugging)."""
+    return dict(_ALIAS_TO_CANONICAL)
+
+def validate_templates(raise_on_error: bool = False) -> Tuple[bool, List[str]]:
+    """
+    Validate that:
+    - All canonical sheets have a template entry
+    - Header templates have no duplicates
+    """
+    issues: List[str] = []
+
+    for canon in CANONICAL_SHEET_ORDER:
+        if canon not in SHEET_HEADERS:
+            issues.append(f"Missing SHEET_HEADERS entry for canonical sheet: {canon}")
+
+    for name, headers in SHEET_HEADERS.items():
+        seen = set()
+        dups = []
+        for h in headers:
+            if h in seen:
+                dups.append(h)
+            seen.add(h)
+        if dups:
+            issues.append(f"Duplicate headers in template '{name}': {sorted(set(dups))}")
+
+    ok = len(issues) == 0
+    if (not ok) and raise_on_error:
+        raise ValueError("Schema template validation failed:\n- " + "\n- ".join(issues))
+    return ok, issues
+
+# Validate at import-time (safe, non-fatal)
+validate_templates(raise_on_error=False)
 
 __all__ = [
-    "UNIVERSAL_MARKET_HEADERS",
-    "UNIVERSAL_HEADERS",
-    "UNIVERSAL_MARKET_TEMPLATE_HEADERS",
+    "CANONICAL_SHEET_ORDER",
+    "UNIVERSAL_MARKET_HEADERS_V59",
+    "SHEET_HEADERS",
+    "SHEET_NAME_ALIASES",
+    "normalize_sheet_name",
     "get_headers_for_sheet",
-    "list_supported_sheets",
+    "get_canonical_sheets_sorted",
+    "get_alias_map",
+    "validate_templates",
 ]
