@@ -1,7 +1,7 @@
 """
 core/data_engine.py
 ----------------------------------------------------------------------
-UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.5
+UNIFIED DATA & ANALYSIS ENGINE – LEGACY v2.6
 (MULTI-PROVIDER, KSA-SAFE, 9-PAGE DASHBOARD READY)
 
 Role in Architecture
@@ -24,10 +24,11 @@ Key Behaviors
     • FMP
     • Yahoo Finance (yfinance) as universal fallback
 - Merges provider outputs into a single `UnifiedQuote` Pydantic model.
-- Provides a simple `opportunity_score` and `data_quality` signal.
+- Provides simple factor scores (value / quality / momentum) plus an
+  `opportunity_score` and `data_quality` signal.
 - Exposes alias fields via `UnifiedQuote.model_dump()` so that
-  Google Sheets endpoints (via routes/enriched_quote.py, legacy_service)
-  see dashboard-friendly keys like:
+  Google Sheets endpoints (via routes/enriched_quote.py, legacy_service,
+  ai_analysis, advanced_analysis) see dashboard-friendly keys like:
 
     • last_price         -> from price
     • previous_close     -> from prev_close
@@ -48,7 +49,7 @@ Global vs KSA
 
 EODHD Fundamentals – ENHANCED
 -----------------------------
-- For GLOBAL symbols, this engine now calls:
+- For GLOBAL symbols, this engine can call:
     1) /real-time/{TICKER}
     2) /fundamentals/{TICKER}
   and merges fields from:
@@ -106,43 +107,147 @@ from pydantic import BaseModel, Field  # type: ignore
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
+# Optional env.py integration (for unified configuration)
+# ----------------------------------------------------------------------
+
+try:  # pragma: no cover - optional
+    import env as _env  # type: ignore
+except Exception:
+    _env = None  # type: ignore
+
+
+def _get_str_config(name: str, default: str) -> str:
+    """
+    Prefer env.<NAME> if available, otherwise os.getenv(NAME, default).
+    Always returns a string.
+    """
+    if _env is not None and hasattr(_env, name):
+        try:
+            val = getattr(_env, name)
+            if val is None:
+                return default
+            return str(val)
+        except Exception:
+            return default
+    return os.getenv(name, default)
+
+
+def _get_int_config(name: str, default: int) -> int:
+    """
+    Prefer env.<NAME> if available, otherwise os.getenv(NAME).
+    Coerces to int with a defensive fallback.
+    """
+    if _env is not None and hasattr(_env, name):
+        try:
+            return int(getattr(_env, name))
+        except Exception:
+            pass
+    raw = os.getenv(name)
+    if raw is not None:
+        try:
+            return int(raw)
+        except Exception:
+            pass
+    return default
+
+
+def _get_bool_config(name: str, default: bool) -> bool:
+    """
+    Read a boolean-style flag from env or os.environ.
+    Accepts common false-ish strings: "0", "false", "no", "off".
+    """
+    if _env is not None and hasattr(_env, name):
+        val = getattr(_env, name)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            raw = val.strip().lower()
+            if raw in {"0", "false", "no", "off"}:
+                return False
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+    raw_env = os.getenv(name)
+    if raw_env is None:
+        return default
+    raw = raw_env.strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return default
+
+
+# ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
 
 # Legacy / future backend integration (kept for compatibility)
-BACKEND_BASE_URL = os.getenv(
+BACKEND_BASE_URL = _get_str_config(
     "BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com"
 )
-APP_TOKEN = os.getenv("APP_TOKEN", "")
-BACKUP_APP_TOKEN = os.getenv("BACKUP_APP_TOKEN", "")
+APP_TOKEN = _get_str_config("APP_TOKEN", "")
+BACKUP_APP_TOKEN = _get_str_config("BACKUP_APP_TOKEN", "")
 
 # Enabled providers list (lowercase)
-_enabled_raw = os.getenv("ENABLED_PROVIDERS", "eodhd,fmp,yfinance")
+_providers_raw: Any
+if _env is not None and hasattr(_env, "ENABLED_PROVIDERS"):
+    _providers_raw = getattr(_env, "ENABLED_PROVIDERS")
+else:
+    _providers_raw = os.getenv("ENABLED_PROVIDERS", "eodhd,fmp,yfinance")
+
+if isinstance(_providers_raw, str):
+    _enabled_raw = _providers_raw
+elif isinstance(_providers_raw, (list, tuple, set)):
+    _enabled_raw = ",".join(str(p) for p in _providers_raw)
+else:
+    _enabled_raw = "eodhd,fmp,yfinance"
+
 ENABLED_PROVIDERS: List[str] = [
     p.strip().lower() for p in _enabled_raw.split(",") if p.strip()
 ]
 
 # Primary provider preference (usually "eodhd" for your paid plan)
-PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "eodhd").lower()
+PRIMARY_PROVIDER = _get_str_config("PRIMARY_PROVIDER", "eodhd").lower()
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "25"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))  # reserved for future use
+# Provider timeout: prefer ENGINE_PROVIDER_TIMEOUT_SECONDS, then HTTP_TIMEOUT
+_http_timeout_val: Optional[int] = None
+if _env is not None and hasattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS"):
+    try:
+        _http_timeout_val = int(getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS"))
+    except Exception:
+        _http_timeout_val = None
+if _http_timeout_val is None:
+    env_http = (
+        os.getenv("ENGINE_PROVIDER_TIMEOUT_SECONDS") or os.getenv("HTTP_TIMEOUT")
+    )
+    if env_http is not None:
+        try:
+            _http_timeout_val = int(env_http)
+        except Exception:
+            _http_timeout_val = None
+if _http_timeout_val is None:
+    _http_timeout_val = 25
+
+HTTP_TIMEOUT: int = _http_timeout_val
+MAX_RETRIES: int = _get_int_config("MAX_RETRIES", 2)  # reserved for future use
 
 # Provider-specific config
-EODHD_API_KEY = os.getenv("EODHD_API_KEY", "")
-EODHD_BASE_URL = os.getenv("EODHD_BASE_URL", "https://eodhd.com/api")
+EODHD_API_KEY = _get_str_config("EODHD_API_KEY", "")
+EODHD_BASE_URL = _get_str_config("EODHD_BASE_URL", "https://eodhd.com/api")
 
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-FMP_BASE_URL = os.getenv(
+FMP_API_KEY = _get_str_config("FMP_API_KEY", "")
+FMP_BASE_URL = _get_str_config(
     "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
 )
 
 # Toggle for extra EODHD fundamentals call
-_ENABLE_EODHD_FUNDAMENTALS_RAW = os.getenv("ENABLE_EODHD_FUNDAMENTALS", "1")
-ENABLE_EODHD_FUNDAMENTALS: bool = (
-    _ENABLE_EODHD_FUNDAMENTALS_RAW.strip().lower()
-    not in {"0", "false", "no", "off"}
-)
+_ENABLE_EODHD_FUNDAMENTALS_RAW = _get_str_config("ENABLE_EODHD_FUNDAMENTALS", "1")
+ENABLE_EODHD_FUNDAMENTALS: bool = _ENABLE_EODHD_FUNDAMENTALS_RAW.strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 # Types
 DataQualityLevel = Literal["EXCELLENT", "GOOD", "FAIR", "POOR", "MISSING"]
@@ -339,6 +444,160 @@ class UnifiedQuote(BaseModel):
             data.setdefault("data_source", primary_provider)
 
         return data
+
+
+# ----------------------------------------------------------------------
+# UTILITIES FOR SCORING
+# ----------------------------------------------------------------------
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _normalize_percent_like(x: Any) -> Optional[float]:
+    """
+    Convert any percent-like value into a fraction (0–1) for internal use.
+
+    - If x is None -> None
+    - If 0 <= x <= 1  -> treated as fraction already (e.g. 0.15 = 15%)
+    - If 1 < x <= 100 -> treated as percent, converted to fraction (e.g. 15 -> 0.15)
+    - If x > 100      -> left as-is (defensive; will be clamped by scoring)
+    """
+    v = _safe_float(x)
+    if v is None:
+        return None
+    if 0.0 <= v <= 1.0:
+        return v
+    if 1.0 < v <= 100.0:
+        return v / 100.0
+    return v
+
+
+def _compute_factor_scores(data: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Basic factor-style scoring layer for the legacy engine.
+
+    Returns a dict with:
+        - value_score (0–100)
+        - quality_score (0–100)
+        - momentum_score (0–100)
+
+    This mirrors (simplified) logic used in routes.ai_analysis so that
+    both engines feel consistent to the 9-page dashboard.
+    """
+    pe = _safe_float(data.get("pe_ttm"))
+    pb = _safe_float(data.get("pb"))
+    dy = _normalize_percent_like(data.get("dividend_yield"))
+    roe = _normalize_percent_like(data.get("roe"))
+    profit_margin = _normalize_percent_like(data.get("profit_margin"))
+    change_pct = _safe_float(data.get("change_pct"))
+
+    # ------------------------
+    # Value score (P/E, P/B, Dividend Yield)
+    # ------------------------
+    vs = 50.0
+    if pe is not None:
+        if 0 < pe < 12:
+            vs += 20
+        elif 12 <= pe <= 20:
+            vs += 10
+        elif pe > 35:
+            vs -= 15
+    if pb is not None:
+        if 0 < pb < 1:
+            vs += 10
+        elif pb > 4:
+            vs -= 10
+    if dy is not None:
+        # dy is fraction here (0–1)
+        if 0.02 <= dy <= 0.06:  # 2–6%
+            vs += 10
+        elif dy > 0.08:  # >8%
+            vs -= 5
+    value_score: float = max(0.0, min(100.0, vs))
+
+    # ------------------------
+    # Quality score (ROE, profit margin)
+    # ------------------------
+    qs = 50.0
+    if roe is not None:
+        if roe >= 0.20:  # ≥20%
+            qs += 25
+        elif 0.10 <= roe < 0.20:
+            qs += 10
+        elif roe < 0.0:
+            qs -= 15
+    if profit_margin is not None:
+        if profit_margin >= 0.20:
+            qs += 20
+        elif 0.10 <= profit_margin < 0.20:
+            qs += 10
+        elif profit_margin < 0.0:
+            qs -= 10
+    quality_score: float = max(0.0, min(100.0, qs))
+
+    # ------------------------
+    # Momentum score (daily change %)
+    # ------------------------
+    ms = 50.0
+    if change_pct is not None:
+        if change_pct > 0:
+            ms += min(change_pct, 10) * 2  # cap upside contribution
+        elif change_pct < 0:
+            ms += max(change_pct, -10) * 2  # penalties for deep red
+    momentum_score: float = max(0.0, min(100.0, ms))
+
+    return {
+        "value_score": value_score,
+        "quality_score": quality_score,
+        "momentum_score": momentum_score,
+    }
+
+
+def _compute_opportunity_score(
+    data: Dict[str, Any],
+    factor_scores: Dict[str, Optional[float]],
+) -> Optional[float]:
+    """
+    Combine factor scores into a single opportunity_score, with
+    a mild tilt for growth and profitability.
+
+    0–100 scale. This is intentionally simple – DataEngine v2 can
+    implement more advanced AI-style scoring.
+    """
+    v = factor_scores.get("value_score")
+    q = factor_scores.get("quality_score")
+    m = factor_scores.get("momentum_score")
+
+    base_scores = [s for s in (v, q, m) if isinstance(s, (int, float))]
+    if base_scores:
+        score = sum(base_scores) / len(base_scores)
+    else:
+        score = 50.0
+
+    # Extra small adjustments using growth & profit margin if available
+    growth = _safe_float(data.get("revenue_growth_yoy"))
+    margin = _safe_float(data.get("profit_margin"))
+
+    if growth is not None:
+        if growth > 0.15:
+            score += 5
+        elif growth < 0:
+            score -= 5
+
+    if margin is not None:
+        if margin > 0.2:
+            score += 5
+        elif margin < 0.05:
+            score -= 5
+
+    return max(0.0, min(100.0, score))
 
 
 # ----------------------------------------------------------------------
@@ -1043,57 +1302,6 @@ def _assess_data_quality(data: Dict[str, Any]) -> Tuple[DataQualityLevel, List[s
     return level, core_missing
 
 
-def _compute_opportunity_score(data: Dict[str, Any]) -> Optional[float]:
-    """
-    Very simple opportunity score based mainly on P/E, dividend yield,
-    and a mild tilt for growth/profitability.
-
-    0–100 scale. This is intentionally simple – v2 engine can
-    implement more advanced AI-style scoring.
-    """
-    pe = data.get("pe_ttm")
-    dy = data.get("dividend_yield")
-    growth = data.get("revenue_growth_yoy")
-    margin = data.get("profit_margin")
-
-    if pe is None and dy is None and growth is None and margin is None:
-        return None
-
-    score = 50.0
-
-    # Value tilt via P/E
-    if isinstance(pe, (int, float)):
-        if 0 < pe < 12:
-            score += 25
-        elif 12 <= pe <= 20:
-            score += 10
-        elif pe > 35:
-            score -= 15
-
-    # Income tilt via dividend yield
-    if isinstance(dy, (int, float)):
-        if 0.02 <= dy <= 0.06:
-            score += 10
-        elif dy > 0.08:
-            score -= 5
-
-    # Growth tilt
-    if isinstance(growth, (int, float)):
-        if growth > 0.15:
-            score += 10
-        elif growth < 0:
-            score -= 5
-
-    # Profitability tilt
-    if isinstance(margin, (int, float)):
-        if margin > 0.2:
-            score += 5
-        elif margin < 0.05:
-            score -= 5
-
-    return max(0.0, min(100.0, score))
-
-
 # ----------------------------------------------------------------------
 # PROVIDER MERGING
 # ----------------------------------------------------------------------
@@ -1222,8 +1430,10 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
             data_gaps=["No data from providers"],
         )
 
+    # Data quality and factor scores
     dq, gaps = _assess_data_quality(raw_data)
-    opp_score = _compute_opportunity_score(raw_data)
+    factor_scores = _compute_factor_scores(raw_data)
+    opp_score = _compute_opportunity_score(raw_data, factor_scores)
 
     quote = UnifiedQuote(
         **raw_data,
@@ -1232,6 +1442,9 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
         ),
         data_quality=dq,
         data_gaps=gaps,
+        value_score=factor_scores["value_score"],
+        quality_score=factor_scores["quality_score"],
+        momentum_score=factor_scores["momentum_score"],
         opportunity_score=opp_score,
     )
 
