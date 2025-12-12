@@ -1,31 +1,19 @@
+```python
 """
 env.py
 ------------------------------------------------------------
 Centralized environment configuration for Tadawul Fast Bridge.
 
-- Loads all key config from environment variables (Render, .env, etc.).
-- Provides:
-    • settings: Settings          -> main config object
-    • Convenience constants       -> APP_ENV, APP_TOKEN, ENABLED_PROVIDERS, etc.
+Goals
+- Zero-crash config loading (Render/.env/local).
+- Strong defaults + safe parsing for bool/int/list/JSON.
+- Keeps backwards-compatible exports used across the codebase:
+    • settings: Settings
+    • Convenience constants: APP_ENV, APP_TOKEN, ENABLED_PROVIDERS, etc.
 
-Integrated with:
-    • core.data_engine_v2 / core.data_engine
-    • routes:
-        - routes.enriched_quote
-        - routes.ai_analysis
-        - routes.advanced_analysis (optional)
-        - routes_argaam
-        - legacy_service
-    • Google Sheets integration:
-        - Service Account JSON
-        - Default master spreadsheet for the 9+ dashboard pages
-        - Per-page sheet names (KSA, Global, Funds, FX, Portfolio, Insights, etc.)
-
-Design principles:
-    - No hard crash if a variable is missing.
-      We provide sensible defaults and only WARN in logs for important ones.
-    - EODHD is **never** used for KSA (.SR) tickers:
-      KSA is handled by Tadawul/Argaam gateway via data engine v1 + v2 delegate.
+Notes
+- EODHD is **GLOBAL ONLY** (never for KSA .SR) — enforced in the engine/routes.
+- GOOGLE_SHEETS_CREDENTIALS is expected as full JSON string (usually one-line).
 """
 
 from __future__ import annotations
@@ -40,48 +28,98 @@ from pydantic import BaseModel, Field
 # ----------------------------------------------------------------------
 # Optional: load from .env during local development
 # ----------------------------------------------------------------------
-try:  # pragma: no cover - optional dependency
-    from dotenv import load_dotenv
+try:  # pragma: no cover
+    from dotenv import load_dotenv  # type: ignore
 
     load_dotenv()
 except Exception:
-    # Safe if python-dotenv is not installed
     pass
 
 logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
-# Helper functions
+# Helpers (safe parsing)
 # ----------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "on", "y"}
+_FALSY = {"0", "false", "no", "off", "n"}
+
+
+def _get_str(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip()
+
+
+def _get_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        logger.warning("[env] Invalid int for %s=%r, using default=%s", key, raw, default)
+        return default
+
+
+def _get_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
+    logger.warning("[env] Invalid bool for %s=%r, using default=%s", key, raw, default)
+    return default
+
+
 def _split_list(value: Optional[str]) -> List[str]:
-    """Split comma-separated env values into a clean list."""
     if not value:
         return []
-    return [v.strip() for v in value.split(",") if v.strip()]
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def _split_list_lower(value: Optional[str]) -> List[str]:
+    return [v.lower() for v in _split_list(value)]
 
 
 def _masked(value: Optional[str]) -> str:
-    """
-    Return a masked representation for secrets (for logs only).
-    Example: 'ab***yz (len=16)'
-    """
     if not value:
         return "<empty>"
-    length = len(value)
-    if length <= 4:
-        return "*" * length
-    return f"{value[:2]}***{value[-2:]} (len={length})"
+    s = str(value)
+    n = len(s)
+    if n <= 4:
+        return "*" * n
+    return f"{s[:2]}***{s[-2:]} (len={n})"
 
 
 def _load_json(value: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Parse JSON from an env string; log a warning if invalid."""
+    """
+    Parse JSON from an env string; returns None if missing/invalid.
+    Handles common cases:
+      - raw JSON object string
+      - JSON wrapped in quotes
+      - accidental whitespace
+    """
     if not value:
         return None
+    raw = str(value).strip()
+
+    # If it looks like it's wrapped in quotes, unwrap once
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
+
+    # Basic sanity: must look like JSON object
+    if not raw.startswith("{"):
+        return None
+
     try:
-        return json.loads(value)
+        return json.loads(raw)
     except Exception as exc:
-        logger.warning("Failed to parse JSON env value: %s", exc)
+        logger.warning("[env] Failed to parse JSON env value (len=%s): %s", len(raw), exc)
         return None
 
 
@@ -92,249 +130,125 @@ class Settings(BaseModel):
     # --------------------------------------------------------------
     # Application meta
     # --------------------------------------------------------------
-    app_name: str = Field(
-        default=os.getenv("APP_NAME", "Tadawul Fast Bridge"),
-        description="Display name used for logs and monitoring.",
-    )
-    app_env: str = Field(
-        default=os.getenv("APP_ENV", "dev"),
-        description="Environment: dev / test / prod.",
-    )
-    app_version: str = Field(
-        default=os.getenv("APP_VERSION", "4.0.0"),
-        description="Application version string.",
-    )
+    app_name: str = Field(default_factory=lambda: _get_str("APP_NAME", "Tadawul Fast Bridge"))
+    app_env: str = Field(default_factory=lambda: _get_str("APP_ENV", "production"))
+    app_version: str = Field(default_factory=lambda: _get_str("APP_VERSION", "4.5.1"))
 
     # --------------------------------------------------------------
     # Base URLs & tokens
     # --------------------------------------------------------------
     backend_base_url: str = Field(
-        default=os.getenv(
-            "BACKEND_BASE_URL",
-            "https://tadawul-fast-bridge.onrender.com",
-        ),
-        description="Public base URL of this FastAPI service.",
+        default_factory=lambda: _get_str("BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com")
     )
 
-    app_token: Optional[str] = Field(
-        default=os.getenv("APP_TOKEN"),
-        description="Primary application token for internal/auth calls.",
-    )
-    backup_app_token: Optional[str] = Field(
-        default=os.getenv("BACKUP_APP_TOKEN"),
-        description="Backup app token (fallback).",
+    app_token: Optional[str] = Field(default_factory=lambda: os.getenv("APP_TOKEN"))
+    backup_app_token: Optional[str] = Field(default_factory=lambda: os.getenv("BACKUP_APP_TOKEN"))
+
+    # If set, overrides auto-derivation in main.py
+    has_secure_token_env: Optional[bool] = Field(
+        default_factory=lambda: None if os.getenv("HAS_SECURE_TOKEN") is None else _get_bool("HAS_SECURE_TOKEN", True)
     )
 
     # --------------------------------------------------------------
     # Providers configuration (for unified data engine)
     # --------------------------------------------------------------
     enabled_providers: List[str] = Field(
-        default_factory=lambda: _split_list(
-            os.getenv("ENABLED_PROVIDERS", "eodhd,fmp,yfinance")
-        ),
-        description="List of enabled providers: eodhd,fmp,yfinance,finnhub,alpha,...",
+        default_factory=lambda: _split_list_lower(_get_str("ENABLED_PROVIDERS", "eodhd,fmp,yfinance")),
+        description="Enabled providers list: eodhd,fmp,yfinance,finnhub,...",
     )
 
-    primary_provider: str = Field(
-        default=os.getenv("PRIMARY_PROVIDER", "eodhd").lower(),
-        description="Primary provider preference (eodhd/fmp/yfinance/...).",
-    )
+    primary_provider: str = Field(default_factory=lambda: _get_str("PRIMARY_PROVIDER", "eodhd").lower())
+    http_timeout: int = Field(default_factory=lambda: _get_int("HTTP_TIMEOUT", 25))
+    max_retries: int = Field(default_factory=lambda: _get_int("MAX_RETRIES", 2))
 
-    http_timeout: int = Field(
-        default=int(os.getenv("HTTP_TIMEOUT", "25")),
-        description="Global HTTP timeout (seconds) for outbound API calls.",
-    )
+    # Engine knobs (align with render.yaml)
+    engine_cache_ttl_seconds: int = Field(default_factory=lambda: _get_int("ENGINE_CACHE_TTL_SECONDS", 60))
+    engine_provider_timeout_seconds: int = Field(default_factory=lambda: _get_int("ENGINE_PROVIDER_TIMEOUT_SECONDS", 20))
+    engine_enable_advanced_analysis: bool = Field(default_factory=lambda: _get_bool("ENGINE_ENABLE_ADVANCED_ANALYSIS", True))
 
-    max_retries: int = Field(
-        default=int(os.getenv("MAX_RETRIES", "2")),
-        description="Retry count for transient failures (reserved for future).",
-    )
-
-    # Engine-level knobs (used by core.data_engine_v2)
-    engine_cache_ttl_seconds: int = Field(
-        default=int(os.getenv("ENGINE_CACHE_TTL_SECONDS", "300")),
-        description="Default cache TTL for DataEngine v2 (seconds).",
-    )
-    engine_enable_advanced_analysis: bool = Field(
-        default=os.getenv("ENGINE_ENABLE_ADVANCED_ANALYSIS", "true").lower()
-        in {"true", "1", "yes", "on", "y"},
-        description="Enable advanced/AI analysis inside the engine, if supported.",
-    )
+    # KSA engine cache knob (align with render.yaml)
+    ksa_engine_cache_ttl_seconds: int = Field(default_factory=lambda: _get_int("KSA_ENGINE_CACHE_TTL_SECONDS", 60))
 
     # --------------------------------------------------------------
     # EODHD provider (GLOBAL ONLY – NOT USED FOR KSA .SR)
     # --------------------------------------------------------------
-    eodhd_api_key: Optional[str] = Field(
-        default=os.getenv("EODHD_API_KEY"),
-        description="EODHD API key (for non-KSA real-time quotes).",
-    )
-    eodhd_base_url: str = Field(
-        default=os.getenv("EODHD_BASE_URL", "https://eodhd.com/api"),
-        description="Base URL for EODHD endpoints.",
-    )
+    eodhd_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("EODHD_API_KEY"))
+    eodhd_base_url: str = Field(default_factory=lambda: _get_str("EODHD_BASE_URL", "https://eodhd.com/api"))
 
     # --------------------------------------------------------------
-    # FinancialModelingPrep (FMP) provider
+    # FinancialModelingPrep (FMP)
     # --------------------------------------------------------------
-    fmp_api_key: Optional[str] = Field(
-        default=os.getenv("FMP_API_KEY"),
-        description="FinancialModelingPrep API key (fundamentals/quotes).",
-    )
-    fmp_base_url: str = Field(
-        default=os.getenv(
-            "FMP_BASE_URL",
-            "https://financialmodelingprep.com/api/v3",
-        ),
-        description="Base URL for FMP endpoints.",
-    )
+    fmp_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("FMP_API_KEY"))
+    fmp_base_url: str = Field(default_factory=lambda: _get_str("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"))
 
     # --------------------------------------------------------------
-    # Other optional providers (for future expansion)
+    # Optional providers
     # --------------------------------------------------------------
-    finnhub_api_key: Optional[str] = Field(
-        default=os.getenv("FINNHUB_API_KEY"),
-        description="Finnhub API key (optional, intraday/RT).",
-    )
-
-    alpha_vantage_api_key: Optional[str] = Field(
-        default=os.getenv("ALPHA_VANTAGE_API_KEY"),
-        description="Alpha Vantage API key (optional).",
-    )
+    finnhub_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("FINNHUB_API_KEY"))
+    alpha_vantage_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("ALPHA_VANTAGE_API_KEY"))
 
     # --------------------------------------------------------------
-    # KSA / Argaam provider (used by routes_argaam + v1 engine)
+    # KSA / Argaam provider (used by routes_argaam + legacy delegate)
     # --------------------------------------------------------------
-    argaam_gateway_url: Optional[str] = Field(
-        default=os.getenv("ARGAAM_GATEWAY_URL"),
-        description="Base URL for KSA Argaam/Tadawul gateway service (e.g. Java backend).",
-    )
-    argaam_api_key: Optional[str] = Field(
-        default=os.getenv("ARGAAM_API_KEY"),
-        description="Optional API key for KSA Argaam gateway (sent as X-API-KEY).",
-    )
+    argaam_gateway_url: Optional[str] = Field(default_factory=lambda: os.getenv("ARGAAM_GATEWAY_URL"))
+    argaam_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("ARGAAM_API_KEY"))
 
     # --------------------------------------------------------------
     # Google Sheets / Apps Script integration
     # --------------------------------------------------------------
-    google_sheets_credentials_raw: Optional[str] = Field(
-        default=os.getenv("GOOGLE_SHEETS_CREDENTIALS"),
-        description="Service account JSON for Google Sheets (stringified).",
-    )
-
-    google_apps_script_backup_url: Optional[str] = Field(
-        default=os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL"),
-        description="Deployed Apps Script WebApp URL for backup refresh.",
-    )
-
-    google_project_id: Optional[str] = Field(
-        default=os.getenv("GOOGLE_PROJECT_ID"),
-        description="Optional Google Cloud project ID (for logging/monitoring).",
-    )
-
-    # Master spreadsheet ID for all dashboard pages
-    default_spreadsheet_id: Optional[str] = Field(
-        default=os.getenv("DEFAULT_SPREADSHEET_ID"),
-        description="Default Google Sheets spreadsheet ID for the 9+ dashboard pages.",
-    )
+    google_sheets_credentials_raw: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_SHEETS_CREDENTIALS"))
+    google_apps_script_backup_url: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL"))
+    google_project_id: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_PROJECT_ID"))
+    default_spreadsheet_id: Optional[str] = Field(default_factory=lambda: os.getenv("DEFAULT_SPREADSHEET_ID"))
 
     # --------------------------------------------------------------
     # Dashboard – Sheet Name configuration
-    # (can be overridden via env; these are just safe defaults)
     # --------------------------------------------------------------
-    ksa_sheet_name: str = Field(
-        default=os.getenv("SHEET_KSA_TADAWUL", "KSA_Tadawul"),
-        description="Sheet name for the KSA Tadawul page.",
-    )
-    global_sheet_name: str = Field(
-        default=os.getenv("SHEET_GLOBAL_MARKETS", "Global_Markets"),
-        description="Sheet name for Global Markets page.",
-    )
-    mutual_funds_sheet_name: str = Field(
-        default=os.getenv("SHEET_MUTUAL_FUNDS", "Mutual_Funds"),
-        description="Sheet name for Mutual Funds page.",
-    )
-    commodities_fx_sheet_name: str = Field(
-        default=os.getenv("SHEET_COMMODITIES_FX", "Commodities_FX"),
-        description="Sheet name for Commodities & FX page.",
-    )
-    market_leaders_sheet_name: str = Field(
-        default=os.getenv("SHEET_MARKET_LEADERS", "Market_Leaders"),
-        description="Sheet name for Market Leaders / Symbol Master page.",
-    )
-    portfolio_sheet_name: str = Field(
-        default=os.getenv("SHEET_MY_PORTFOLIO", "My_Portfolio"),
-        description="Sheet name for My Portfolio / Investment page.",
-    )
-    insights_sheet_name: str = Field(
-        default=os.getenv("SHEET_INSIGHTS_ANALYSIS", "Insights_Analysis"),
-        description="Sheet name for Insights & AI Analysis page.",
-    )
-    advisor_sheet_name: str = Field(
-        default=os.getenv("SHEET_INVESTMENT_ADVISOR", "Investment_Advisor"),
-        description="Sheet name for Investment Advisor / Assumptions page.",
-    )
-    economic_calendar_sheet_name: str = Field(
-        default=os.getenv("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar"),
-        description="Sheet name for Economic Calendar page.",
-    )
-    income_statement_sheet_name: str = Field(
-        default=os.getenv("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement"),
-        description="Sheet name for Investment Income Statement page.",
-    )
+    ksa_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_KSA_TADAWUL", "KSA_Tadawul"))
+    global_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_GLOBAL_MARKETS", "Global_Markets"))
+    mutual_funds_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_MUTUAL_FUNDS", "Mutual_Funds"))
+    commodities_fx_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_COMMODITIES_FX", "Commodities_FX"))
+    market_leaders_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_MARKET_LEADERS", "Market_Leaders"))
+    portfolio_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_MY_PORTFOLIO", "My_Portfolio"))
+    insights_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_INSIGHTS_ANALYSIS", "Insights_Analysis"))
+    advisor_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_INVESTMENT_ADVISOR", "Investment_Advisor"))
+    economic_calendar_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar"))
+    income_statement_sheet_name: str = Field(default_factory=lambda: _get_str("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement"))
 
     # --------------------------------------------------------------
-    # Misc integration flags
+    # Misc flags
     # --------------------------------------------------------------
-    enable_cors_all_origins: bool = Field(
-        default=os.getenv("ENABLE_CORS_ALL_ORIGINS", "true").lower()
-        in {"true", "1", "yes", "on", "y"},
-        description="Allow CORS from all origins (for Sheets, local testing).",
-    )
-
-    log_level: str = Field(
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        description="Global log level (DEBUG/INFO/WARN/ERROR).",
-    )
+    enable_cors_all_origins: bool = Field(default_factory=lambda: _get_bool("ENABLE_CORS_ALL_ORIGINS", True))
+    log_level: str = Field(default_factory=lambda: _get_str("LOG_LEVEL", "INFO").upper())
 
     # --------------------------------------------------------------
-    # Derived / helper properties (not env vars directly)
+    # Derived / helper properties
     # --------------------------------------------------------------
     @property
     def google_sheets_credentials(self) -> Optional[Dict[str, Any]]:
-        """
-        Parsed dict version of the Google Sheets service account JSON.
-        This expects the full JSON string in GOOGLE_SHEETS_CREDENTIALS.
-        """
         return _load_json(self.google_sheets_credentials_raw)
 
     @property
     def has_secure_token(self) -> bool:
+        # If explicitly set by env, respect it; otherwise derive from token presence
+        if self.has_secure_token_env is not None:
+            return bool(self.has_secure_token_env)
         return bool(self.app_token or self.backup_app_token)
 
     @property
     def is_production(self) -> bool:
-        return self.app_env.lower() in {"prod", "production"}
+        return self.app_env.strip().lower() in {"prod", "production"}
 
     @property
     def primary_or_default_provider(self) -> str:
-        """
-        Return the primary provider if it's in enabled_providers,
-        otherwise fall back to the first enabled provider (or 'eodhd').
-        """
-        if self.primary_provider and self.primary_provider in self.enabled_providers:
-            return self.primary_provider
-        return (self.enabled_providers or ["eodhd"])[0]
+        enabled = [p for p in self.enabled_providers if p]
+        primary = (self.primary_provider or "").lower()
+        if primary and primary in enabled:
+            return primary
+        return (enabled or ["eodhd"])[0]
 
     @property
     def dashboard_sheet_names(self) -> Dict[str, str]:
-        """
-        Central mapping for all dashboard sheet names.
-
-        Used by:
-          - google_sheets_service.py
-          - Any Sheets/Apps Script bridges
-          - routes that need to know tab names for logging/meta.
-        """
         return {
             "ksa": self.ksa_sheet_name,
             "global": self.global_sheet_name,
@@ -353,98 +267,54 @@ class Settings(BaseModel):
         return bool(self.default_spreadsheet_id)
 
     # --------------------------------------------------------------
-    # Init hooks / validation
+    # Startup logging (safe, no crashes)
     # --------------------------------------------------------------
     def post_init_warnings(self) -> None:
-        """
-        Log important warnings once at startup (missing keys, etc.).
-        This is called once when env.settings is created.
-        """
-        # Set global log level early
-        try:
-            logging.getLogger().setLevel(self.log_level.upper())
-        except Exception:
-            pass
+        # Minimal, safe logs (do not print secrets)
+        logger.info("[env] App=%s | Env=%s | Version=%s", self.app_name, self.app_env, self.app_version)
+        logger.info("[env] Providers=%s | primary=%s", ",".join(self.enabled_providers) or "<none>", self.primary_or_default_provider)
+        logger.info("[env] APP_TOKEN=%s | BACKUP_APP_TOKEN=%s", _masked(self.app_token), _masked(self.backup_app_token))
 
-        # Environment summary
-        logger.info(
-            "[env] App: %s | Env: %s | Version: %s",
-            self.app_name,
-            self.app_env,
-            self.app_version,
-        )
+        logger.info("[env] GOOGLE_SHEETS_CREDENTIALS=%s", "<set>" if self.google_sheets_credentials_raw else "<missing>")
+        logger.info("[env] DEFAULT_SPREADSHEET_ID=%s", self.default_spreadsheet_id or "<missing>")
+        logger.info("[env] Dashboard sheets=%s", self.dashboard_sheet_names)
 
-        # Providers
-        logger.info(
-            "[env] Providers enabled: %s | primary: %s",
-            ", ".join(self.enabled_providers) if self.enabled_providers else "<none>",
-            self.primary_or_default_provider,
-        )
+        # Provider warnings
+        if "eodhd" in self.enabled_providers and not self.eodhd_api_key:
+            logger.warning("[env] EODHD_API_KEY missing but eodhd enabled (GLOBAL quotes may fail).")
+        if "fmp" in self.enabled_providers and not self.fmp_api_key:
+            logger.warning("[env] FMP_API_KEY missing but fmp enabled (fundamentals may be limited).")
 
-        # Secrets (masked)
-        logger.info("[env] APP_TOKEN: %s", _masked(self.app_token))
-        logger.info("[env] BACKUP_APP_TOKEN: %s", _masked(self.backup_app_token))
-        logger.info("[env] EODHD_API_KEY: %s", _masked(self.eodhd_api_key))
-        logger.info("[env] FMP_API_KEY: %s", _masked(self.fmp_api_key))
-        logger.info("[env] ARGAAM_API_KEY: %s", _masked(self.argaam_api_key))
-        logger.info(
-            "[env] GOOGLE_SHEETS_CREDENTIALS: %s",
-            "<set>" if self.google_sheets_credentials_raw else "<missing>",
-        )
-        logger.info(
-            "[env] DEFAULT_SPREADSHEET_ID: %s",
-            self.default_spreadsheet_id if self.default_spreadsheet_id else "<missing>",
-        )
-
-        # Dashboard sheet names
-        logger.info("[env] Dashboard sheets: %s", self.dashboard_sheet_names)
-
-        # Warnings – Global providers
-        if not self.eodhd_api_key and "eodhd" in self.enabled_providers:
-            logger.warning(
-                "[env] EODHD_API_KEY missing but 'eodhd' is in ENABLED_PROVIDERS – "
-                "live quotes for non-KSA markets may fail."
-            )
-        if not self.fmp_api_key and "fmp" in self.enabled_providers:
-            logger.warning(
-                "[env] FMP_API_KEY missing but 'fmp' is in ENABLED_PROVIDERS – "
-                "fundamentals enrichment may be limited."
-            )
-
-        # Warnings – KSA / Argaam
+        # KSA warning
         if not self.argaam_gateway_url:
-            logger.warning(
-                "[env] ARGAAM_GATEWAY_URL missing – KSA (.SR) via Argaam gateway "
-                "will not work. Remember: EODHD is NOT used for KSA in the engine."
-            )
+            logger.warning("[env] ARGAAM_GATEWAY_URL missing (KSA .SR gateway may fail).")
 
-        # Warnings – Google Sheets
+        # Sheets warning
         if not self.google_sheets_credentials_raw:
-            logger.warning(
-                "[env] GOOGLE_SHEETS_CREDENTIALS missing – direct Google Sheets "
-                "API calls from backend will not work."
-            )
+            logger.warning("[env] GOOGLE_SHEETS_CREDENTIALS missing (backend Sheets API disabled).")
         if not self.default_spreadsheet_id:
-            logger.warning(
-                "[env] DEFAULT_SPREADSHEET_ID missing – some helpers for the 9-page "
-                "dashboard may need explicit spreadsheet_id passed in."
-            )
+            logger.warning("[env] DEFAULT_SPREADSHEET_ID missing (some dashboard helpers may need explicit spreadsheet_id).")
 
 
 # ----------------------------------------------------------------------
 # Global settings instance
 # ----------------------------------------------------------------------
 def _init_settings() -> Settings:
-    s = Settings()
-    s.post_init_warnings()
-    return s
+    try:
+        s = Settings()
+        s.post_init_warnings()
+        return s
+    except Exception as exc:
+        # Last-resort: never crash import
+        logger.error("[env] Failed to initialize Settings, using emergency defaults: %s", exc)
+        return Settings.model_validate({})  # type: ignore
 
 
 settings: Settings = _init_settings()
 
 
 # ----------------------------------------------------------------------
-# Convenience constants for legacy modules / routes
+# Convenience constants for legacy modules / routes (backwards compatible)
 # ----------------------------------------------------------------------
 
 # Meta
@@ -457,13 +327,17 @@ BACKEND_BASE_URL: str = settings.backend_base_url
 APP_TOKEN: Optional[str] = settings.app_token
 BACKUP_APP_TOKEN: Optional[str] = settings.backup_app_token
 
-# Providers & timeouts (align with core.data_engine_v2 expectations)
+# Providers & timeouts
 ENABLED_PROVIDERS: List[str] = settings.enabled_providers
 PRIMARY_PROVIDER: str = settings.primary_or_default_provider
 HTTP_TIMEOUT: int = settings.http_timeout
 MAX_RETRIES: int = settings.max_retries
+
 ENGINE_CACHE_TTL_SECONDS: int = settings.engine_cache_ttl_seconds
+ENGINE_PROVIDER_TIMEOUT_SECONDS: int = settings.engine_provider_timeout_seconds
 ENGINE_ENABLE_ADVANCED_ANALYSIS: bool = settings.engine_enable_advanced_analysis
+
+KSA_ENGINE_CACHE_TTL_SECONDS: int = settings.ksa_engine_cache_ttl_seconds
 
 # Provider-specific
 EODHD_API_KEY: Optional[str] = settings.eodhd_api_key
@@ -473,7 +347,7 @@ FMP_BASE_URL: str = settings.fmp_base_url
 FINNHUB_API_KEY: Optional[str] = settings.finnhub_api_key
 ALPHA_VANTAGE_API_KEY: Optional[str] = settings.alpha_vantage_api_key
 
-# KSA / Argaam provider
+# KSA / Argaam
 ARGAAM_GATEWAY_URL: Optional[str] = settings.argaam_gateway_url
 ARGAAM_API_KEY: Optional[str] = settings.argaam_api_key
 
@@ -484,7 +358,7 @@ GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = settings.google_apps_script_backu
 GOOGLE_PROJECT_ID: Optional[str] = settings.google_project_id
 DEFAULT_SPREADSHEET_ID: Optional[str] = settings.default_spreadsheet_id
 
-# Dashboard sheet names (for direct imports in other modules)
+# Dashboard sheet names
 SHEET_KSA_TADAWUL: str = settings.ksa_sheet_name
 SHEET_GLOBAL_MARKETS: str = settings.global_sheet_name
 SHEET_MUTUAL_FUNDS: str = settings.mutual_funds_sheet_name
@@ -502,6 +376,7 @@ LOG_LEVEL: str = settings.log_level
 HAS_SECURE_TOKEN: bool = settings.has_secure_token
 IS_PRODUCTION: bool = settings.is_production
 
+
 __all__ = [
     "Settings",
     "settings",
@@ -516,7 +391,9 @@ __all__ = [
     "HTTP_TIMEOUT",
     "MAX_RETRIES",
     "ENGINE_CACHE_TTL_SECONDS",
+    "ENGINE_PROVIDER_TIMEOUT_SECONDS",
     "ENGINE_ENABLE_ADVANCED_ANALYSIS",
+    "KSA_ENGINE_CACHE_TTL_SECONDS",
     "EODHD_API_KEY",
     "EODHD_BASE_URL",
     "FMP_API_KEY",
@@ -545,3 +422,4 @@ __all__ = [
     "HAS_SECURE_TOKEN",
     "IS_PRODUCTION",
 ]
+```
