@@ -2,35 +2,30 @@
 main.py
 ===========================================================
 Tadawul Fast Bridge - Main Application
-Version: 4.5.0 (Unified Engine v2.6 + AI v2.5 + Sheets + KSA-safe)
+Version: 4.5.1 (Boot-safe + Router Lazy-Load)
+
+Key improvement vs prior:
+- NEVER hard-crashes on router import errors.
+- Starts FAST (passes Render health check), then loads routers in background.
+- If routers fail to import, app still stays up for /health, /v1/status, legacy endpoints.
 
 FastAPI backend for:
     • Enriched Quotes       (/v1/enriched*)
     • AI Analysis           (/v1/analysis*)
-    • Advanced Analysis     (/v1/advanced*)  [optional – only if router imports]
+    • Advanced Analysis     (/v1/advanced*)  [optional]
     • KSA / Argaam Gateway  (/v1/argaam*)
     • Legacy Quotes         (/v1/quote, /v1/legacy/sheet-rows)
-
-Integrated with:
-    • core.data_engine_v2 (multi-provider unified engine):
-          - KSA via Tadawul/Argaam gateway + KSA-safe delegates
-          - Global via FMP + optional EODHD + optional Finnhub
-    • env.py (all config & tokens, providers, Sheets meta, etc.)
-    • Google Sheets / Apps Script flows
-      (9 pages: KSA_Tadawul, Global_Markets, Mutual_Funds,
-       Commodities_FX, My_Portfolio_Investment, Insights_Analysis,
-       Investment_Advisor, Economic_Calendar, Investment_Income_Statement)
 
 Notes
 -----
 - This file NEVER calls external market providers directly.
-  All market data flows through the unified data engine and/or dedicated KSA gateway.
-- KSA (.SR) routing is handled KSA-safe:
-      • No direct EODHD calls for .SR anywhere in this app.
+- KSA (.SR) routing should remain KSA-safe (no direct EODHD for .SR).
 """
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 import logging
 import os
 import time
@@ -47,40 +42,32 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 # ------------------------------------------------------------
 # Configuration import (env.py) with safe, non-crashing fallback
 # ------------------------------------------------------------
 
-try:  # pragma: no cover - env.py is optional
+try:  # pragma: no cover
     import env as _env_mod  # type: ignore
-except Exception:  # pragma: no cover - defensive fallback
+except Exception:
     _env_mod = None  # type: ignore
 
 
 @dataclass
 class _SettingsFallback:
-    """
-    Minimal fallback if env.py.settings is not available.
-    Keeps the app bootable for local / emergency scenarios.
-    """
+    """Minimal fallback if env.py.settings is not available."""
 
     app_env: str = os.getenv("APP_ENV", "production")
     default_spreadsheet_id: Optional[str] = os.getenv("DEFAULT_SPREADSHEET_ID", None)
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.5.0")
+    app_version: str = os.getenv("APP_VERSION", "4.5.1")
 
 
-# Prefer Settings instance from env.py; otherwise use fallback dataclass instance
+# Prefer Settings instance from env.py; otherwise fallback instance
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
 
 def _get_env_attr(name: str, default: str = "") -> str:
-    """
-    Helper to read config from env.py if available, otherwise from OS env vars.
-    Returns a string representation.
-    """
     if _env_mod is not None and hasattr(_env_mod, name):
         value = getattr(_env_mod, name)
         if isinstance(value, str):
@@ -93,11 +80,6 @@ def _get_env_attr(name: str, default: str = "") -> str:
 
 
 def _get_bool(name: str, default: bool = False) -> bool:
-    """
-    Helper to read a boolean from env.py or environment variables.
-    Accepts bool or typical truthy strings.
-    """
-    # Prefer env.py attribute if present
     if _env_mod is not None and hasattr(_env_mod, name):
         val = getattr(_env_mod, name)
         if isinstance(val, bool):
@@ -115,117 +97,34 @@ def _get_bool(name: str, default: bool = False) -> bool:
 # Core app identity & tokens
 # ------------------------------------------------------------
 
-APP_NAME: str = getattr(
-    settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
-)
+APP_NAME: str = getattr(settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast"))
 APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.5.0")
+    settings, "app_version", _get_env_attr("APP_VERSION", "4.5.1")
 )
+
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
 BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "")
 
 ENABLE_CORS_ALL_ORIGINS: bool = _get_bool("ENABLE_CORS_ALL_ORIGINS", True)
 
-# Google integration flags for /v1/status
 GOOGLE_SHEETS_CREDENTIALS_RAW: str = getattr(
     _env_mod,
     "GOOGLE_SHEETS_CREDENTIALS_RAW",
     os.getenv("GOOGLE_SHEETS_CREDENTIALS", ""),
 )
 
-GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr(
-    "GOOGLE_APPS_SCRIPT_BACKUP_URL", ""
-)
-
-# KSA / Argaam gateway visibility in /v1/status
+GOOGLE_APPS_SCRIPT_BACKUP_URL: str = _get_env_attr("GOOGLE_APPS_SCRIPT_BACKUP_URL", "")
 ARGAAM_GATEWAY_URL: str = _get_env_attr("ARGAAM_GATEWAY_URL", "")
 
-# HAS_SECURE_TOKEN:
-# - If env.py / env vars define HAS_SECURE_TOKEN, respect that (parsed via _get_bool).
-# - Otherwise derive from presence of APP_TOKEN / BACKUP_APP_TOKEN.
 _HAS_TOKEN_CONFIGURED = bool(APP_TOKEN or BACKUP_APP_TOKEN)
 HAS_SECURE_TOKEN: bool = _get_bool("HAS_SECURE_TOKEN", _HAS_TOKEN_CONFIGURED)
 
+try:
+    DEFAULT_SPREADSHEET_ID: Optional[str] = getattr(settings, "default_spreadsheet_id", None)
+except Exception:
+    DEFAULT_SPREADSHEET_ID = None
 
-# Optional provider information (for /v1/status)
-def _get_providers_meta() -> Dict[str, Any]:
-    """
-    Summarize provider configuration for diagnostics.
-    Prefer env.settings if available, otherwise raw env vars.
-    """
-    enabled: Optional[List[str]] = None
-    primary: Optional[str] = None
-
-    try:
-        # Try settings.enabled_providers (if defined in env.py)
-        if hasattr(settings, "enabled_providers"):
-            maybe_list = getattr(settings, "enabled_providers", None)
-            if isinstance(maybe_list, (list, tuple)):
-                enabled = list(maybe_list) or None
-
-        # Fallback: ENABLED_PROVIDERS env var
-        if enabled is None:
-            raw = os.getenv("ENABLED_PROVIDERS")
-            if raw:
-                enabled = [p.strip() for p in raw.split(",") if p.strip()]
-
-        # Primary provider: settings or env
-        if hasattr(settings, "primary_or_default_provider"):
-            primary = getattr(settings, "primary_or_default_provider", None)
-        if not primary and _env_mod is not None and hasattr(_env_mod, "PRIMARY_PROVIDER"):
-            primary = getattr(_env_mod, "PRIMARY_PROVIDER")
-        if not primary:
-            primary = os.getenv("PRIMARY_PROVIDER")
-    except Exception:  # pragma: no cover - extremely defensive
-        enabled = None
-        primary = None
-
-    return {
-        "enabled": enabled,
-        "primary": primary,
-    }
-
-
-# ------------------------------------------------------------
-# Routers & legacy services
-# ------------------------------------------------------------
-
-# Core routers:
-# - routes/enriched_quote.py
-# - routes/ai_analysis.py
-from routes import enriched_quote, ai_analysis  # type: ignore
-
-# advanced_analysis is optional – if not present, we only disable /v1/advanced*
-try:  # pragma: no cover - optional router import
-    from routes import advanced_analysis  # type: ignore
-
-    _ADVANCED_ANALYSIS_AVAILABLE = True
-except Exception as _advanced_exc:  # pragma: no cover - defensive
-    logging.error(
-        "advanced_analysis router could not be imported: %s. "
-        "The /v1/advanced* endpoints will be disabled for this deploy.",
-        _advanced_exc,
-    )
-    advanced_analysis = None  # type: ignore
-    _ADVANCED_ANALYSIS_AVAILABLE = False
-
-# KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD
-try:  # pragma: no cover - optional, but expected in your project
-    import routes_argaam  # type: ignore
-
-    _ARGAAM_AVAILABLE = True
-except Exception as _argaam_exc:  # pragma: no cover - defensive
-    logging.error(
-        "routes_argaam router could not be imported: %s. "
-        "The /v1/argaam* endpoints will be disabled for this deploy.",
-        _argaam_exc,
-    )
-    routes_argaam = None  # type: ignore
-    _ARGAAM_AVAILABLE = False
-
-# Legacy service abstraction (global + KSA via unified engine)
-from legacy_service import build_legacy_sheet_payload, get_legacy_quotes
 
 # ------------------------------------------------------------
 # Logging
@@ -233,36 +132,70 @@ from legacy_service import build_legacy_sheet_payload, get_legacy_quotes
 
 logger = logging.getLogger("tadawul_fast_bridge")
 if not logger.handlers:
-    # If env.LOG_LEVEL is defined, prefer it; otherwise INFO
-    log_level_name = _get_env_attr("LOG_LEVEL", "INFO").upper()
-    try:
-        log_level = getattr(logging, log_level_name, logging.INFO)
-    except Exception:
-        log_level = logging.INFO
-
+    level_name = _get_env_attr("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
-        level=log_level,
+        level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
 START_TIME = time.time()
 
-# ------------------------------------------------------------
-# Derived / optional values from env.settings
-# ------------------------------------------------------------
-
-try:
-    DEFAULT_SPREADSHEET_ID: Optional[str] = getattr(
-        settings, "default_spreadsheet_id", None
-    )
-except Exception:  # very defensive
-    DEFAULT_SPREADSHEET_ID = None
 
 # ------------------------------------------------------------
-# Rate limiting (SlowAPI) – light defaults
+# Provider meta helper (for /v1/status)
 # ------------------------------------------------------------
 
-limiter = Limiter(key_func=get_remote_address, headers_enabled=True)
+def _get_providers_meta() -> Dict[str, Any]:
+    enabled: Optional[List[str]] = None
+    primary: Optional[str] = None
+
+    try:
+        if hasattr(settings, "enabled_providers"):
+            maybe_list = getattr(settings, "enabled_providers", None)
+            if isinstance(maybe_list, (list, tuple)):
+                enabled = list(maybe_list) or None
+
+        if enabled is None:
+            raw = os.getenv("ENABLED_PROVIDERS")
+            if raw:
+                enabled = [p.strip() for p in raw.split(",") if p.strip()]
+
+        if hasattr(settings, "primary_or_default_provider"):
+            primary = getattr(settings, "primary_or_default_provider", None)
+        if not primary and _env_mod is not None and hasattr(_env_mod, "PRIMARY_PROVIDER"):
+            primary = getattr(_env_mod, "PRIMARY_PROVIDER")
+        if not primary:
+            primary = os.getenv("PRIMARY_PROVIDER")
+    except Exception:
+        enabled = None
+        primary = None
+
+    return {"enabled": enabled, "primary": primary}
+
+
+# ------------------------------------------------------------
+# Rate limiting (SlowAPI) – proxy-aware remote address
+# ------------------------------------------------------------
+
+def _client_ip(request: Request) -> str:
+    """
+    Prefer X-Forwarded-For when behind Render proxy/CDN.
+    Falls back to starlette request.client.host.
+    """
+    xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    if xff:
+        # first IP is the original client
+        ip = xff.split(",")[0].strip()
+        if ip:
+            return ip
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+limiter = Limiter(key_func=_client_ip, headers_enabled=True)
+
 
 # ------------------------------------------------------------
 # Auth – APP_TOKEN / BACKUP_APP_TOKEN
@@ -276,34 +209,26 @@ async def require_app_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
 ) -> Optional[str]:
     """
-    Require a valid APP token *only if* a token is configured.
+    Require a valid APP token only if token auth is enabled.
 
     Accepts:
       - Authorization: Bearer <token>
       - X-APP-TOKEN: <token>
       - ?token=<token>
-
-    If no APP_TOKEN/BACKUP_APP_TOKEN is configured, this is a no-op (dev mode).
     """
     if not HAS_SECURE_TOKEN:
-        # No token configured -> no enforcement (development mode / local tests)
         return None
 
     token: Optional[str] = None
 
-    # 1) Authorization: Bearer <token>
     if credentials and credentials.scheme.lower() == "bearer":
         token = (credentials.credentials or "").strip()
 
-    # 2) X-APP-TOKEN header (for Google Apps Script / PowerShell, etc.)
     if not token:
-        header_token = request.headers.get("X-APP-TOKEN") or request.headers.get(
-            "x-app-token"
-        )
+        header_token = request.headers.get("X-APP-TOKEN") or request.headers.get("x-app-token")
         if header_token:
             token = header_token.strip()
 
-    # 3) ?token=<token> query param (legacy tests)
     if not token:
         query_token = request.query_params.get("token")
         if query_token:
@@ -312,28 +237,7 @@ async def require_app_token(
     if token and token in {APP_TOKEN, BACKUP_APP_TOKEN}:
         return token
 
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or missing API token",
-    )
-
-
-# ------------------------------------------------------------
-# Lifespan (startup / shutdown)
-# ------------------------------------------------------------
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info(
-        "🚀 Starting %s (env=%s, version=%s)",
-        APP_NAME,
-        getattr(settings, "app_env", "production"),
-        APP_VERSION,
-    )
-    yield
-    uptime = time.time() - START_TIME
-    logger.info("🛑 Shutting down after %.1f seconds", uptime)
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API token")
 
 
 # ------------------------------------------------------------
@@ -343,99 +247,144 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    description=(
-        "Tadawul Fast Bridge – Unified KSA + Global data engine "
-        "with 9-page Google Sheets investment dashboard integration."
-    ),
-    lifespan=lifespan,
+    description="Tadawul Fast Bridge – Unified KSA + Global data + Google Sheets integration.",
 )
 
-# Attach rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Middleware: CORS
+# CORS: keep wide-open for Sheets, but avoid invalid '*' + credentials combination
 if ENABLE_CORS_ALL_ORIGINS:
-    # Open CORS – convenient for Google Sheets, Apps Script, and local tools
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 else:
-    # Stricter mode – tuned for Google Sheets / Apps Script
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "https://docs.google.com",
-            "https://script.google.com",
-        ],
-        allow_credentials=True,
+        allow_origins=["https://docs.google.com", "https://script.google.com"],
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-# Middleware: GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+
 # ------------------------------------------------------------
-# Include routers (protected by token if configured)
+# Router lazy-load (prevents deploy timeout due to import errors)
 # ------------------------------------------------------------
 
-# Unified Enriched Quotes (for both KSA + Global, using engine routing)
-app.include_router(
-    enriched_quote.router,
-    dependencies=[Depends(require_app_token)],
-)
+ROUTER_STATE: Dict[str, Any] = {
+    "loading": False,
+    "loaded": False,
+    "error": None,
+    "started_at_utc": None,
+    "finished_at_utc": None,
+    "routers": {
+        "enriched": {"available": False, "error": None},
+        "ai_analysis": {"available": False, "error": None},
+        "advanced_analysis": {"available": False, "error": None},
+        "ksa_argaam": {"available": False, "error": None},
+    },
+}
 
-# AI-based analysis (scores + recommendation)
-app.include_router(
-    ai_analysis.router,
-    dependencies=[Depends(require_app_token)],
-)
+_router_lock = asyncio.Lock()
 
-# Advanced analysis / risk engine (extra KPIs, risk buckets, etc.) – optional
-if _ADVANCED_ANALYSIS_AVAILABLE and advanced_analysis is not None:
-    app.include_router(
-        advanced_analysis.router,  # type: ignore[attr-defined]
-        dependencies=[Depends(require_app_token)],
-    )
-else:
-    logger.warning(
-        "Advanced analysis router is not available – "
-        "skipping /v1/advanced* endpoints for this deploy."
-    )
 
-# KSA / Argaam gateway routes (v1/argaam/*) – .SR only, NO EODHD from here
-if _ARGAAM_AVAILABLE and routes_argaam is not None:
-    app.include_router(
-        routes_argaam.router,
-        dependencies=[Depends(require_app_token)],
-    )
-else:
-    logger.warning(
-        "KSA / Argaam router is not available – "
-        "skipping /v1/argaam* endpoints for this deploy."
-    )
+async def _import_module_threaded(module_path: str):
+    return await asyncio.to_thread(importlib.import_module, module_path)
+
+
+async def _load_routers_once() -> None:
+    async with _router_lock:
+        if ROUTER_STATE["loaded"] or ROUTER_STATE["loading"]:
+            return
+        ROUTER_STATE["loading"] = True
+        ROUTER_STATE["started_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        # Small delay so /health can respond immediately after boot
+        await asyncio.sleep(1.0)
+
+        # 1) Enriched quotes router
+        try:
+            enriched_mod = await _import_module_threaded("routes.enriched_quote")
+            app.include_router(enriched_mod.router, dependencies=[Depends(require_app_token)])
+            ROUTER_STATE["routers"]["enriched"]["available"] = True
+        except Exception as e:
+            logger.exception("Failed to import routes.enriched_quote")
+            ROUTER_STATE["routers"]["enriched"]["error"] = str(e)
+
+        # 2) AI analysis router
+        try:
+            ai_mod = await _import_module_threaded("routes.ai_analysis")
+            app.include_router(ai_mod.router, dependencies=[Depends(require_app_token)])
+            ROUTER_STATE["routers"]["ai_analysis"]["available"] = True
+        except Exception as e:
+            logger.exception("Failed to import routes.ai_analysis")
+            ROUTER_STATE["routers"]["ai_analysis"]["error"] = str(e)
+
+        # 3) Advanced analysis router (optional)
+        try:
+            adv_mod = await _import_module_threaded("routes.advanced_analysis")
+            app.include_router(adv_mod.router, dependencies=[Depends(require_app_token)])
+            ROUTER_STATE["routers"]["advanced_analysis"]["available"] = True
+        except Exception as e:
+            # optional; do not treat as fatal
+            ROUTER_STATE["routers"]["advanced_analysis"]["error"] = str(e)
+
+        # 4) KSA / Argaam gateway router (optional but expected)
+        try:
+            argaam_mod = await _import_module_threaded("routes_argaam")
+            app.include_router(argaam_mod.router, dependencies=[Depends(require_app_token)])
+            ROUTER_STATE["routers"]["ksa_argaam"]["available"] = True
+        except Exception as e:
+            ROUTER_STATE["routers"]["ksa_argaam"]["error"] = str(e)
+
+        # Mark loaded if at least core routers are available
+        core_ok = (
+            ROUTER_STATE["routers"]["enriched"]["available"]
+            and ROUTER_STATE["routers"]["ai_analysis"]["available"]
+        )
+        ROUTER_STATE["loaded"] = bool(core_ok)
+
+        if core_ok:
+            logger.info("✅ Core routers loaded (enriched + ai_analysis).")
+        else:
+            logger.warning("⚠️ Routers not fully loaded. Service stays up for debugging (/v1/status).")
+
+    except Exception as e:
+        ROUTER_STATE["error"] = str(e)
+        logger.exception("Router loader failed unexpectedly")
+    finally:
+        ROUTER_STATE["loading"] = False
+        ROUTER_STATE["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    logger.info("🚀 Starting %s (env=%s, version=%s)", APP_NAME, getattr(settings, "app_env", "production"), APP_VERSION)
+    # Start router import in background (non-blocking boot)
+    asyncio.create_task(_load_routers_once())
+    yield
+    uptime = time.time() - START_TIME
+    logger.info("🛑 Shutting down after %.1f seconds", uptime)
+
+
+# attach lifespan after defining it
+app.router.lifespan_context = lifespan
+
 
 # ------------------------------------------------------------
 # Root / Health / Status
 # ------------------------------------------------------------
 
-
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root() -> str:
-    """
-    Simple HTML landing page for quick checks.
-    Helpful when testing from a browser or Render "Open app" button.
-    """
-    default_sheet_html = (
-        f"<code>{DEFAULT_SPREADSHEET_ID}</code>"
-        if DEFAULT_SPREADSHEET_ID
-        else "<em>not configured</em>"
-    )
     providers_meta = _get_providers_meta()
     providers_html = (
         f"<code>{', '.join(providers_meta['enabled'])}</code>"
@@ -448,9 +397,10 @@ async def root() -> str:
         else "<em>auto</em>"
     )
 
-    # Light introspection of engine modes for quick visual debug
-    enriched_engine_mode = getattr(enriched_quote, "_ENGINE_MODE", None)
-    ai_engine_mode = getattr(ai_analysis, "_ENGINE_MODE", None)
+    def _badge(ok: bool) -> str:
+        return "✅" if ok else "❌"
+
+    r = ROUTER_STATE["routers"]
 
     return f"""
     <html>
@@ -460,39 +410,28 @@ async def root() -> str:
         <p>Environment: <strong>{getattr(settings, 'app_env', 'production')}</strong></p>
         <p>Version: <strong>{APP_VERSION}</strong></p>
         <p>Base URL: <code>{BACKEND_BASE_URL}</code></p>
-        <p>Default Spreadsheet (9-page dashboard): {default_sheet_html}</p>
+        <p>Default Spreadsheet: <code>{DEFAULT_SPREADSHEET_ID or "not configured"}</code></p>
         <p>Providers (global): {providers_html} &nbsp;|&nbsp; Primary: {primary_provider_html}</p>
-        <p>Enriched engine mode: <code>{enriched_engine_mode}</code> &nbsp;|&nbsp;
-           AI engine mode: <code>{ai_engine_mode}</code></p>
+
+        <h2>Router Status</h2>
+        <ul>
+          <li>Enriched: {_badge(bool(r['enriched']['available']))}</li>
+          <li>AI Analysis: {_badge(bool(r['ai_analysis']['available']))}</li>
+          <li>Advanced: {_badge(bool(r['advanced_analysis']['available']))}</li>
+          <li>KSA Argaam: {_badge(bool(r['ksa_argaam']['available']))}</li>
+        </ul>
 
         <h2>Quick Links</h2>
         <ul>
           <li><code>/health</code></li>
           <li><code>/v1/status</code></li>
-          <li><code>/v1/quote?tickers=AAPL</code> (legacy global)</li>
-          <li><code>/v1/quote?tickers=1120.SR</code> (legacy KSA)</li>
-          <li><code>/v1/enriched/quote?symbol=AAPL</code></li>
-          <li><code>/v1/enriched/quote?symbol=1120.SR</code></li>
-          <li><code>/v1/enriched/health</code></li>
-          <li><code>/v1/analysis/health</code></li>
-          <li><code>/v1/advanced/ping</code> (if enabled)</li>
-          <li><code>/v1/argaam/health</code> (KSA / Argaam gateway)</li>
+          <li><code>/v1/router-state</code></li>
+          <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
+          <li><code>/v1/quote?tickers=1120.SR</code> (legacy)</li>
         </ul>
 
-        <h3>Auth usage (for Sheets / scripts)</h3>
-        <p style="font-size:0.9rem;color:#a0aec0;">
-          Send your app token as either:<br/>
-          • <code>Authorization: Bearer &lt;APP_TOKEN&gt;</code><br/>
-          • <code>X-APP-TOKEN: &lt;APP_TOKEN&gt;</code><br/>
-          • or <code>?token=&lt;APP_TOKEN&gt;</code> on legacy endpoints.<br/>
-        </p>
-
         <p style="margin-top:24px;font-size:0.9rem;color:#a0aec0;">
-          KSA (.SR) tickers are handled via Tadawul/Argaam gateway only (no direct EODHD).<br/>
-          Global (non-.SR) tickers are handled via the unified engine using the
-          configured global providers (FMP, EODHD, Finnhub, etc.).<br/>
-          Google Sheets 9-page dashboard should use the <code>* /sheet-rows</code> endpoints
-          exposed by each router (see <code>/v1/status</code> for a complete list).
+          If routers are still loading or failed, check <code>/v1/status</code> and Render logs.
         </p>
       </body>
     </html>
@@ -501,10 +440,6 @@ async def root() -> str:
 
 @app.get("/health")
 async def basic_health() -> Dict[str, Any]:
-    """
-    Very lightweight health endpoint (no external calls).
-    Suitable for uptime checks and Render health probes.
-    """
     now = datetime.now(timezone.utc)
     uptime_seconds = time.time() - START_TIME
     return {
@@ -514,33 +449,26 @@ async def basic_health() -> Dict[str, Any]:
         "env": getattr(settings, "app_env", "production"),
         "time_utc": now.isoformat(),
         "uptime_seconds": uptime_seconds,
+        "routers_loaded": bool(ROUTER_STATE["loaded"]),
+        "routers_loading": bool(ROUTER_STATE["loading"]),
     }
+
+
+@app.get("/v1/router-state")
+async def router_state() -> Dict[str, Any]:
+    return ROUTER_STATE
 
 
 @app.get("/v1/status")
 async def status_endpoint(request: Request) -> Dict[str, Any]:
-    """
-    Detailed status used by PowerShell / integration tests and Sheets hooks.
-
-    Example:
-        GET /v1/status
-        GET /v1/status?token=...
-    """
     now = datetime.now(timezone.utc)
     uptime_seconds = time.time() - START_TIME
 
-    # Simple service flags (no heavy external calls here)
     services = {
-        "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW)
-        or (
-            _env_mod is not None
-            and hasattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS")
-        ),
+        "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW),
         "google_apps_script": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
-        "cache": False,  # placeholder for future cache (Redis/Memory/etc.)
     }
 
-    # Whether tokens are configured + how the request came in
     auth = {
         "has_secure_token": HAS_SECURE_TOKEN,
         "token_in_query": bool(request.query_params.get("token")),
@@ -551,38 +479,19 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         ),
     }
 
-    # Sheets-related info for the 9-page dashboard
     sheets_meta = {
         "default_spreadsheet_id": DEFAULT_SPREADSHEET_ID,
         "has_default_spreadsheet": bool(DEFAULT_SPREADSHEET_ID),
     }
 
-    # For Apps Script / Google Sheets integration – single source of truth
-    sheet_endpoints = {
-        "enriched": "/v1/enriched/sheet-rows",
-        "ai_analysis": "/v1/analysis/sheet-rows",
-        "advanced_analysis": (
-            "/v1/advanced/sheet-rows" if _ADVANCED_ANALYSIS_AVAILABLE else None
-        ),
-        "legacy": "/v1/legacy/sheet-rows",
-        "ksa_argaam": "/v1/argaam/sheet-rows" if _ARGAAM_AVAILABLE else None,
-    }
-
     providers_meta = _get_providers_meta()
 
-    # Light engine metadata for diagnostics (no imports of internals)
-    engine_meta = {
-        "enriched_quote": {
-            "engine_mode": getattr(enriched_quote, "_ENGINE_MODE", None),
-            "engine_is_stub": getattr(enriched_quote, "_ENGINE_IS_STUB", None),
-        },
-        "ai_analysis": {
-            "engine_mode": getattr(ai_analysis, "_ENGINE_MODE", None),
-            "engine_is_stub": getattr(ai_analysis, "_ENGINE_IS_STUB", None),
-        },
-        "advanced_analysis": {
-            "available": _ADVANCED_ANALYSIS_AVAILABLE,
-        },
+    sheet_endpoints = {
+        "legacy": "/v1/legacy/sheet-rows",
+        "enriched": "/v1/enriched/sheet-rows" if ROUTER_STATE["routers"]["enriched"]["available"] else None,
+        "ai_analysis": "/v1/analysis/sheet-rows" if ROUTER_STATE["routers"]["ai_analysis"]["available"] else None,
+        "advanced_analysis": "/v1/advanced/sheet-rows" if ROUTER_STATE["routers"]["advanced_analysis"]["available"] else None,
+        "ksa_argaam": "/v1/argaam/sheet-rows" if ROUTER_STATE["routers"]["ksa_argaam"]["available"] else None,
     }
 
     return {
@@ -595,33 +504,27 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
         "services": services,
         "auth": auth,
         "sheets": sheets_meta,
-        "sheet_endpoints": sheet_endpoints,
         "providers": providers_meta,
-        "engine": engine_meta,
-        "advanced_analysis_enabled": _ADVANCED_ANALYSIS_AVAILABLE,
+        "router_state": ROUTER_STATE,
+        "sheet_endpoints": sheet_endpoints,
         "ksa_argaam_gateway": {
             "configured": bool(ARGAAM_GATEWAY_URL),
-            "gateway_url_prefix": (ARGAAM_GATEWAY_URL or "")[:80] or None,
-            "router_available": _ARGAAM_AVAILABLE,
+            "gateway_url_prefix": (ARGAAM_GATEWAY_URL or "")[:120] or None,
+            "router_available": bool(ROUTER_STATE["routers"]["ksa_argaam"]["available"]),
         },
         "notes": [
-            "KSA (.SR) tickers are handled by the unified data engine using Tadawul/Argaam providers (no direct EODHD calls).",
-            "Global (non-.SR) tickers use FMP + optional EODHD + optional Finnhub via core.data_engine_v2.",
-            "Google Sheets 9-page dashboard should use the /sheet-rows endpoints listed in 'sheet_endpoints'.",
+            "If deploy previously timed out, this build-safe main.py keeps /health alive even if routers fail.",
+            "Fix router import errors by checking Render logs + the router_state errors above.",
         ],
     }
 
 
 # ------------------------------------------------------------
-# Legacy endpoints (v1/quote + v1/legacy/sheet-rows)
+# Legacy endpoints (keep always available; import heavy module lazily)
 # ------------------------------------------------------------
 
-
 class LegacyQuoteSheetRequest(BaseModel):
-    tickers: List[str] = Field(
-        default_factory=list,
-        description="List of symbols, e.g. ['1120.SR','1180.SR','AAPL']",
-    )
+    tickers: List[str] = Field(default_factory=list, description="Symbols list, e.g. ['1120.SR','AAPL']")
 
 
 class LegacyQuoteSheetResponse(BaseModel):
@@ -634,20 +537,12 @@ class LegacyQuoteSheetResponse(BaseModel):
 @limiter.limit("120/minute")
 async def legacy_quote_endpoint(
     request: Request,
-    tickers: str = Query(
-        ...,
-        description="Comma-separated symbols, e.g. AAPL,MSFT,1120.SR",
-    ),
+    tickers: str = Query(..., description="Comma-separated symbols, e.g. AAPL,MSFT,1120.SR"),
     _token: Optional[str] = Depends(require_app_token),
 ) -> JSONResponse:
-    """
-    Legacy quote endpoint (used by early PowerShell tests and ad-hoc checks).
-
-    Example:
-        GET /v1/quote?tickers=AAPL
-        GET /v1/quote?tickers=AAPL,MSFT,1120.SR
-    """
     symbols = [t.strip() for t in tickers.split(",") if t.strip()]
+    # Lazy import (prevents startup crash if legacy_service has issues)
+    from legacy_service import get_legacy_quotes  # type: ignore
     payload = await get_legacy_quotes(symbols)
     return JSONResponse(content=payload)
 
@@ -659,19 +554,7 @@ async def legacy_sheet_rows_endpoint(
     body: LegacyQuoteSheetRequest,
     _token: Optional[str] = Depends(require_app_token),
 ) -> LegacyQuoteSheetResponse:
-    """
-    Google Sheets–friendly legacy data:
-
-        {
-          "headers": [...],
-          "rows": [[...], ...],
-          "meta": {...}
-        }
-
-    Used by:
-        - Google Apps Script (UrlFetchApp)
-        - google_sheets_service (legacy layout for any page if needed)
-    """
+    from legacy_service import build_legacy_sheet_payload  # type: ignore
     payload = await build_legacy_sheet_payload(body.tickers or [])
     return LegacyQuoteSheetResponse(
         headers=payload.get("headers", []),
@@ -681,55 +564,55 @@ async def legacy_sheet_rows_endpoint(
 
 
 # ------------------------------------------------------------
-# Global error handlers
+# Error handlers
 # ------------------------------------------------------------
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """
-    Standardize HTTPException responses.
-    """
-    logger.warning(
-        "HTTPException (%s) at %s: %s",
-        exc.status_code,
-        request.url.path,
-        exc.detail,
-    )
+    # If a router endpoint is hit while routers are still loading, return 503 instead of 404
+    if exc.status_code == 404:
+        path = request.url.path or ""
+        if path.startswith(("/v1/enriched", "/v1/analysis", "/v1/advanced", "/v1/argaam")):
+            if ROUTER_STATE["loading"]:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={
+                        "error": True,
+                        "status_code": 503,
+                        "detail": "Service warming up (routers loading). Retry in a few seconds.",
+                    },
+                )
+            if not ROUTER_STATE["loaded"]:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={
+                        "error": True,
+                        "status_code": 503,
+                        "detail": "Routers not available (import failed). Check /v1/router-state and logs.",
+                        "router_state": ROUTER_STATE,
+                    },
+                )
+
+    logger.warning("HTTPException (%s) at %s: %s", exc.status_code, request.url.path, exc.detail)
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": True,
-            "status_code": exc.status_code,
-            "detail": exc.detail,
-        },
+        content={"error": True, "status_code": exc.status_code, "detail": exc.detail},
     )
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """
-    Catch-all for uncaught exceptions – ensures we do not leak stack traces
-    in production while still logging them server-side.
-    """
     logger.exception("Unhandled exception at %s", request.url.path)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": True,
-            "status_code": 500,
-            "detail": "Internal server error – see backend logs.",
-        },
+        content={"error": True, "status_code": 500, "detail": "Internal server error – see backend logs."},
     )
 
 
-# ------------------------------------------------------------
-# Public exports & local dev entrypoint
-# ------------------------------------------------------------
-
 __all__ = ["app"]
 
-if __name__ == "__main__":  # Local development helper
+
+if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
