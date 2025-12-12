@@ -18,7 +18,7 @@ Integrated with:
         - legacy_service
     • Google Sheets integration:
         - Service Account JSON
-        - Default master spreadsheet for the 9 dashboard pages
+        - Default master spreadsheet for the 9+ dashboard pages
         - Per-page sheet names (KSA, Global, Funds, FX, Portfolio, Insights, etc.)
 
 Design principles:
@@ -130,14 +130,14 @@ class Settings(BaseModel):
     # --------------------------------------------------------------
     enabled_providers: List[str] = Field(
         default_factory=lambda: _split_list(
-            os.getenv("ENABLED_PROVIDERS", "fmp,eodhd,finnhub")
+            os.getenv("ENABLED_PROVIDERS", "eodhd,fmp,yfinance")
         ),
-        description="List of enabled providers: fmp,eodhd,finnhub,yfinance,alpha,...",
+        description="List of enabled providers: eodhd,fmp,yfinance,finnhub,alpha,...",
     )
 
     primary_provider: str = Field(
-        default=os.getenv("PRIMARY_PROVIDER", "fmp").lower(),
-        description="Primary provider preference (fmp/eodhd/yfinance/...).",
+        default=os.getenv("PRIMARY_PROVIDER", "eodhd").lower(),
+        description="Primary provider preference (eodhd/fmp/yfinance/...).",
     )
 
     http_timeout: int = Field(
@@ -231,14 +231,14 @@ class Settings(BaseModel):
         description="Optional Google Cloud project ID (for logging/monitoring).",
     )
 
-    # Master spreadsheet ID for all 9 pages (KSA, Global, Funds, FX, Portfolio, etc.)
+    # Master spreadsheet ID for all dashboard pages
     default_spreadsheet_id: Optional[str] = Field(
         default=os.getenv("DEFAULT_SPREADSHEET_ID"),
-        description="Default Google Sheets spreadsheet ID for the 9 dashboard pages.",
+        description="Default Google Sheets spreadsheet ID for the 9+ dashboard pages.",
     )
 
     # --------------------------------------------------------------
-    # 9-Page Dashboard – Sheet Name configuration
+    # Dashboard – Sheet Name configuration
     # (can be overridden via env; these are just safe defaults)
     # --------------------------------------------------------------
     ksa_sheet_name: str = Field(
@@ -257,8 +257,12 @@ class Settings(BaseModel):
         default=os.getenv("SHEET_COMMODITIES_FX", "Commodities_FX"),
         description="Sheet name for Commodities & FX page.",
     )
+    market_leaders_sheet_name: str = Field(
+        default=os.getenv("SHEET_MARKET_LEADERS", "Market_Leaders"),
+        description="Sheet name for Market Leaders / Symbol Master page.",
+    )
     portfolio_sheet_name: str = Field(
-        default=os.getenv("SHEET_MY_PORTFOLIO", "My_Portfolio_Investment"),
+        default=os.getenv("SHEET_MY_PORTFOLIO", "My_Portfolio"),
         description="Sheet name for My Portfolio / Investment page.",
     )
     insights_sheet_name: str = Field(
@@ -315,16 +319,16 @@ class Settings(BaseModel):
     def primary_or_default_provider(self) -> str:
         """
         Return the primary provider if it's in enabled_providers,
-        otherwise fall back to the first enabled provider (or 'fmp').
+        otherwise fall back to the first enabled provider (or 'eodhd').
         """
         if self.primary_provider and self.primary_provider in self.enabled_providers:
             return self.primary_provider
-        return (self.enabled_providers or ["fmp"])[0]
+        return (self.enabled_providers or ["eodhd"])[0]
 
     @property
     def dashboard_sheet_names(self) -> Dict[str, str]:
         """
-        Central mapping for the 9-page dashboard sheet names.
+        Central mapping for all dashboard sheet names.
 
         Used by:
           - google_sheets_service.py
@@ -336,12 +340,17 @@ class Settings(BaseModel):
             "global": self.global_sheet_name,
             "mutual_funds": self.mutual_funds_sheet_name,
             "commodities_fx": self.commodities_fx_sheet_name,
+            "market_leaders": self.market_leaders_sheet_name,
             "portfolio": self.portfolio_sheet_name,
             "insights": self.insights_sheet_name,
             "advisor": self.advisor_sheet_name,
             "economic_calendar": self.economic_calendar_sheet_name,
             "income_statement": self.income_statement_sheet_name,
         }
+
+    @property
+    def has_default_spreadsheet(self) -> bool:
+        return bool(self.default_spreadsheet_id)
 
     # --------------------------------------------------------------
     # Init hooks / validation
@@ -387,7 +396,7 @@ class Settings(BaseModel):
             self.default_spreadsheet_id if self.default_spreadsheet_id else "<missing>",
         )
 
-        # 9-page sheet names
+        # Dashboard sheet names
         logger.info("[env] Dashboard sheets: %s", self.dashboard_sheet_names)
 
         # Warnings – Global providers
@@ -475,11 +484,12 @@ GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = settings.google_apps_script_backu
 GOOGLE_PROJECT_ID: Optional[str] = settings.google_project_id
 DEFAULT_SPREADSHEET_ID: Optional[str] = settings.default_spreadsheet_id
 
-# 9-Page dashboard sheet names (for direct imports in other modules)
+# Dashboard sheet names (for direct imports in other modules)
 SHEET_KSA_TADAWUL: str = settings.ksa_sheet_name
 SHEET_GLOBAL_MARKETS: str = settings.global_sheet_name
 SHEET_MUTUAL_FUNDS: str = settings.mutual_funds_sheet_name
 SHEET_COMMODITIES_FX: str = settings.commodities_fx_sheet_name
+SHEET_MARKET_LEADERS: str = settings.market_leaders_sheet_name
 SHEET_MY_PORTFOLIO: str = settings.portfolio_sheet_name
 SHEET_INSIGHTS_ANALYSIS: str = settings.insights_sheet_name
 SHEET_INVESTMENT_ADVISOR: str = settings.advisor_sheet_name
@@ -524,6 +534,7 @@ __all__ = [
     "SHEET_GLOBAL_MARKETS",
     "SHEET_MUTUAL_FUNDS",
     "SHEET_COMMODITIES_FX",
+    "SHEET_MARKET_LEADERS",
     "SHEET_MY_PORTFOLIO",
     "SHEET_INSIGHTS_ANALYSIS",
     "SHEET_INVESTMENT_ADVISOR",
