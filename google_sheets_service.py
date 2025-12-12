@@ -1,42 +1,19 @@
+```python
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v2.4
+Google Sheets helper for Tadawul Fast Bridge – v2.6
 
 GOALS
-- Centralize all direct Google Sheets access in one place.
-- Integrate tightly with:
-    • env.py / environment variables:
-          GOOGLE_SHEETS_CREDENTIALS
-          GOOGLE_SHEETS_CREDENTIALS_RAW
-          BACKEND_BASE_URL
-          APP_TOKEN
-    • backend routes (KSA-safe, NO direct EODHD calls here):
-          /v1/enriched/sheet-rows
-          /v1/analysis/sheet-rows
-          /v1/advanced/sheet-rows
+- Centralize ALL direct Google Sheets access here.
+- Call ONLY the backend /sheet-rows endpoints (no direct providers).
+- Always send `sheet_name` to backend so it can choose the right template/schema.
+- Strongly defensive: safe env fallbacks, retries, chunking, clear controls.
 
-- Provide generic helpers to refresh ANY sheet/page with:
-    • Enriched quotes (fundamentals-style, unified multi-page template)
-    • AI analysis scores (Value / Quality / Momentum / Opportunity / Reco)
-    • Advanced analysis & risk scores
-
-IMPORTANT – KSA vs GLOBAL
-- EODHD API is NOT used directly here.
-- For all tickers (KSA .SR and Global), this module calls ONLY your backend
-  endpoints, which internally use:
-      core.data_engine_v2 (yfinance-based, KSA-safe routing)
-      Tadawul / Argaam / other providers as configured.
-- The unified engine is responsible for using Tadawul/Argaam providers
-  for KSA tickers instead of EODHD. This module never calls EODHD itself.
-
-SHEET-NAME AWARE
-- The backend /v1/enriched/sheet-rows (and /v1/analysis, /v1/advanced)
-  now accept an optional "sheet_name" in the JSON body.
-- This file ALWAYS sends the current sheet_name to the backend so it can:
-      • Select the correct column template (KSA, Global, Mutual Funds,
-        Commodities_FX, My_Portfolio, Insights_Analysis, etc.).
-      • Align headers with your MASTER_HEADERS / schemas.py contract.
+Backend endpoints (POST)
+- /v1/enriched/sheet-rows
+- /v1/analysis/sheet-rows
+- /v1/advanced/sheet-rows
 """
 
 from __future__ import annotations
@@ -46,84 +23,96 @@ import json
 import logging
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 if not logger.handlers:
-    # Let main.py control root config; here we only set a sane default level.
     logger.setLevel(logging.INFO)
 
 # ----------------------------------------------------------------------
-# env.py INTEGRATION + SAFE FALLBACKS
-# ----------------------------------------------------------------------
-# We integrate with env.py if present, otherwise use pure environment vars.
-#
-# Supported inputs:
-#   - BACKEND_BASE_URL, APP_TOKEN
-#   - GOOGLE_SHEETS_CREDENTIALS         (dict in env.py, or JSON string in env)
-#   - GOOGLE_SHEETS_CREDENTIALS_RAW     (JSON string, env or env.py)
+# env.py integration + safe fallbacks
 # ----------------------------------------------------------------------
 
-try:  # pragma: no cover - env.py is optional
+try:  # pragma: no cover
     import env as _env_mod  # type: ignore
+
+    _SETTINGS = getattr(_env_mod, "settings", None)
     logger.info("[GoogleSheets] env.py detected for configuration.")
-except Exception:  # pragma: no cover - defensive
+except Exception:  # pragma: no cover
     _env_mod = None  # type: ignore
-    logger.warning(
-        "[GoogleSheets] env.py not available. Using OS environment variables only."
-    )
+    _SETTINGS = None
+    logger.warning("[GoogleSheets] env.py not available. Using OS env vars only.")
 
 
-def _get_env_attr(name: str, default: str = "") -> str:
-    """
-    Helper to read config from env.py if available, otherwise from OS env vars.
-    Returns a string representation.
-    """
+def _env_get_str(name: str, default: str = "") -> str:
+    # Prefer env.settings.<snake_case> if present
+    if _SETTINGS is not None:
+        # Common mappings used in this module
+        mapping = {
+            "BACKEND_BASE_URL": "backend_base_url",
+            "APP_TOKEN": "app_token",
+            "GOOGLE_SHEETS_CREDENTIALS_RAW": "google_sheets_credentials_raw",
+            "DEFAULT_SPREADSHEET_ID": "default_spreadsheet_id",
+        }
+        attr = mapping.get(name)
+        if attr and hasattr(_SETTINGS, attr):
+            try:
+                v = getattr(_SETTINGS, attr)
+                if v is None:
+                    return default
+                return str(v).strip()
+            except Exception:
+                pass
+
+    # Prefer env.<NAME> convenience constants (backwards compatible)
     if _env_mod is not None and hasattr(_env_mod, name):
-        value = getattr(_env_mod, name)
-        if isinstance(value, str):
-            return value
         try:
-            return str(value)
+            v = getattr(_env_mod, name)
+            if v is None:
+                return default
+            return str(v).strip()
         except Exception:
             return default
-    return os.getenv(name, default)
+
+    return (os.getenv(name, default) or default).strip()
 
 
-BACKEND_BASE_URL: str = _get_env_attr("BACKEND_BASE_URL", "").strip()
-APP_TOKEN: str = _get_env_attr("APP_TOKEN", "").strip()
+def _env_get_dict(name: str) -> Optional[Dict[str, Any]]:
+    # Prefer env.<NAME> dict constants if present
+    if _env_mod is not None and hasattr(_env_mod, name):
+        try:
+            v = getattr(_env_mod, name)
+            if isinstance(v, dict) and v:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+BACKEND_BASE_URL: str = _env_get_str("BACKEND_BASE_URL", "")
+APP_TOKEN: str = _env_get_str("APP_TOKEN", "")
 
 # Credentials may come as:
-#   - dict:   env.GOOGLE_SHEETS_CREDENTIALS
-#   - JSON:   env.GOOGLE_SHEETS_CREDENTIALS_RAW
-#   - JSON:   env var GOOGLE_SHEETS_CREDENTIALS_RAW
-#   - JSON:   env var GOOGLE_SHEETS_CREDENTIALS
-GOOGLE_SHEETS_CREDENTIALS: Any = {}
-if _env_mod is not None and hasattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS"):
-    GOOGLE_SHEETS_CREDENTIALS = getattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS")
-
-_raw_from_env_mod = ""
-if _env_mod is not None and hasattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS_RAW"):
-    try:
-        _raw_from_env_mod = str(
-            getattr(_env_mod, "GOOGLE_SHEETS_CREDENTIALS_RAW") or ""
-        ).strip()
-    except Exception:
-        _raw_from_env_mod = ""
-
+# - env.GOOGLE_SHEETS_CREDENTIALS (dict)
+# - env.GOOGLE_SHEETS_CREDENTIALS_RAW (string)
+# - OS env GOOGLE_SHEETS_CREDENTIALS / GOOGLE_SHEETS_CREDENTIALS_RAW (string)
+GOOGLE_SHEETS_CREDENTIALS: Any = _env_get_dict("GOOGLE_SHEETS_CREDENTIALS") or {}
 GOOGLE_SHEETS_CREDENTIALS_RAW: str = (
-    _raw_from_env_mod
+    _env_get_str("GOOGLE_SHEETS_CREDENTIALS_RAW", "")
     or os.getenv("GOOGLE_SHEETS_CREDENTIALS_RAW", "").strip()
     or os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
 )
+
+DEFAULT_SPREADSHEET_ID: str = _env_get_str("DEFAULT_SPREADSHEET_ID", "").strip()
 
 # ----------------------------------------------------------------------
 # Optional Google API imports (lazy-checked in get_sheets_service)
 # ----------------------------------------------------------------------
 
-try:  # pragma: no cover - optional dependency
+try:  # pragma: no cover
     from google.oauth2.service_account import Credentials  # type: ignore
     from googleapiclient.discovery import build  # type: ignore
     from googleapiclient.errors import HttpError  # type: ignore
@@ -131,43 +120,31 @@ except Exception:  # pragma: no cover
     Credentials = None  # type: ignore
     build = None  # type: ignore
 
-    class HttpError(Exception):  # fallback type
-        """Fallback HttpError when googleapiclient is not installed."""
-
+    class HttpError(Exception):  # type: ignore
         pass
 
 
 # ----------------------------------------------------------------------
-# Constants / Globals
+# Module constants / globals
 # ----------------------------------------------------------------------
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _SHEETS_SERVICE = None  # lazy singleton
 
-_BACKEND_TIMEOUT = 30.0  # seconds
+_BACKEND_TIMEOUT = float(os.getenv("BACKEND_TIMEOUT_SECONDS", "30") or 30)
+_BACKEND_MAX_TICKERS_PER_CALL = int(os.getenv("BACKEND_MAX_TICKERS_PER_CALL", "120") or 120)
+_BACKEND_RETRIES = int(os.getenv("BACKEND_RETRIES", "2") or 2)
+
 _SSL_CONTEXT = ssl.create_default_context()
 
 
 # ----------------------------------------------------------------------
-# Helpers: KSA vs GLOBAL tickers (for logging / diagnostics only)
+# Helpers: market split (diagnostics only)
 # ----------------------------------------------------------------------
 
-
 def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
-    """
-    Split mixed tickers into:
-        - ksa:     ones ending with '.SR'
-        - global:  all others
-
-    NOTE:
-    - This module NEVER calls any market provider directly (no EODHD, no Yahoo).
-    - The split is only for logging/diagnostics.
-    - All tickers are still sent to backend endpoints; the unified engine
-      decides how to fetch data for KSA vs GLOBAL.
-    """
     ksa: List[str] = []
     global_: List[str] = []
-
     for t in tickers or []:
         clean = (t or "").strip()
         if not clean:
@@ -177,99 +154,78 @@ def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
             ksa.append(up)
         else:
             global_.append(up)
-
     return {"ksa": ksa, "global": global_}
 
 
 # ----------------------------------------------------------------------
-# Google Sheets credentials handling
+# Credentials handling
 # ----------------------------------------------------------------------
+
+def _parse_credentials_json(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse service-account JSON from env strings.
+    Handles:
+      - raw JSON
+      - JSON wrapped in quotes
+      - accidental escaping
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+
+    # unwrap single layer of quotes
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # common case: newlines escaped
+    # (do NOT do aggressive unescaping; keep safe)
+    try:
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
 
 
 def _get_creds_dict() -> Dict[str, Any]:
-    """
-    Resolve the Google service account credentials dict from either:
-        - GOOGLE_SHEETS_CREDENTIALS (dict from env.py), or
-        - GOOGLE_SHEETS_CREDENTIALS_RAW JSON string (env or env.py), or
-        - GOOGLE_SHEETS_CREDENTIALS JSON string (env).
-
-    Raises RuntimeError if we cannot produce a valid dict.
-
-    IMPORTANT:
-    - It is valid to paste the FULL service account JSON into the env var
-      GOOGLE_SHEETS_CREDENTIALS (or GOOGLE_SHEETS_CREDENTIALS_RAW) exactly
-      as you downloaded it from Google Cloud. This function will parse it.
-    """
-    # 1) If we already have a dict, use it directly
+    # 1) dict from env.py
     if isinstance(GOOGLE_SHEETS_CREDENTIALS, dict) and GOOGLE_SHEETS_CREDENTIALS:
         return GOOGLE_SHEETS_CREDENTIALS
 
-    # 2) Try RAW JSON string from env.py or env
-    raw = GOOGLE_SHEETS_CREDENTIALS_RAW
-    if not raw:
-        # Fallback: try GOOGLE_SHEETS_CREDENTIALS again, just in case
-        env_raw = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
-        if env_raw:
-            raw = env_raw
-
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-            logger.error(
-                "[GoogleSheets] GOOGLE_SHEETS_CREDENTIALS JSON did not parse to dict (got %s).",
-                type(parsed),
-            )
-        except Exception as exc:
-            logger.error(
-                "[GoogleSheets] Failed to parse GOOGLE_SHEETS_CREDENTIALS JSON: %s",
-                exc,
-            )
+    # 2) raw JSON from env.py / env vars
+    raw = GOOGLE_SHEETS_CREDENTIALS_RAW or os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
+    parsed = _parse_credentials_json(raw)
+    if isinstance(parsed, dict) and parsed:
+        return parsed
 
     raise RuntimeError(
         "Google Sheets credentials not available. "
-        "Ensure GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CREDENTIALS_RAW "
-        "is set in environment or provided via env.py."
+        "Set GOOGLE_SHEETS_CREDENTIALS (full service-account JSON) in Render env vars."
     )
 
 
 def get_sheets_service():
-    """
-    Build or reuse a Google Sheets API client.
-
-    Uses GOOGLE_SHEETS_CREDENTIALS (dict) or GOOGLE_SHEETS_CREDENTIALS_RAW (JSON)
-    from env.py / environment variables.
-    """
     global _SHEETS_SERVICE
-
     if _SHEETS_SERVICE is not None:
         return _SHEETS_SERVICE
 
     if Credentials is None or build is None:
         raise RuntimeError(
-            "google-api-python-client and google-auth are required to use "
-            "google_sheets_service. Please install:\n"
+            "google-api-python-client and google-auth are required. Install:\n"
             "  pip install google-api-python-client google-auth"
         )
 
     creds_dict = _get_creds_dict()
     creds = Credentials.from_service_account_info(creds_dict, scopes=_SCOPES)
-    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    _SHEETS_SERVICE = service
+    _SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
     logger.info("[GoogleSheets] Sheets service initialized.")
-    return service
+    return _SHEETS_SERVICE
 
 
 # ----------------------------------------------------------------------
 # Low-level Sheets helpers
 # ----------------------------------------------------------------------
 
-
 def read_range(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
-    """
-    Read values from the given spreadsheet + A1 range.
-    """
     service = get_sheets_service()
     try:
         result = (
@@ -279,20 +235,10 @@ def read_range(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
             .execute()
         )
         values = result.get("values", [])
-        logger.info(
-            "[GoogleSheets] Read %d rows from %s!%s.",
-            len(values),
-            spreadsheet_id,
-            range_a1,
-        )
+        logger.info("[GoogleSheets] Read %d rows from %s!%s.", len(values), spreadsheet_id, range_a1)
         return values
     except HttpError as exc:
-        logger.error(
-            "[GoogleSheets] Error reading range %s!%s: %s",
-            spreadsheet_id,
-            range_a1,
-            exc,
-        )
+        logger.error("[GoogleSheets] Error reading %s!%s: %s", spreadsheet_id, range_a1, exc)
         raise
 
 
@@ -302,12 +248,6 @@ def write_range(
     values: List[List[Any]],
     value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Write values to the given spreadsheet + A1 range.
-
-    - If you specify only top-left cell (e.g. 'KSA_Tadawul!A5'),
-      Sheets will expand to fit the values size.
-    """
     service = get_sheets_service()
     body = {"values": values or []}
     try:
@@ -322,27 +262,14 @@ def write_range(
             )
             .execute()
         )
-        logger.info(
-            "[GoogleSheets] Updated %s!%s (%s cells).",
-            spreadsheet_id,
-            range_a1,
-            result.get("updatedCells", 0),
-        )
+        logger.info("[GoogleSheets] Updated %s!%s (%s cells).", spreadsheet_id, range_a1, result.get("updatedCells", 0))
         return result
     except HttpError as exc:
-        logger.error(
-            "[GoogleSheets] Error writing range %s!%s: %s",
-            spreadsheet_id,
-            range_a1,
-            exc,
-        )
+        logger.error("[GoogleSheets] Error writing %s!%s: %s", spreadsheet_id, range_a1, exc)
         raise
 
 
 def clear_range(spreadsheet_id: str, range_a1: str) -> Dict[str, Any]:
-    """
-    Clear (empty) a given range.
-    """
     service = get_sheets_service()
     try:
         result = (
@@ -358,234 +285,241 @@ def clear_range(spreadsheet_id: str, range_a1: str) -> Dict[str, Any]:
         logger.info("[GoogleSheets] Cleared %s!%s.", spreadsheet_id, range_a1)
         return result
     except HttpError as exc:
-        logger.error(
-            "[GoogleSheets] Error clearing range %s!%s: %s",
-            spreadsheet_id,
-            range_a1,
-            exc,
-        )
+        logger.error("[GoogleSheets] Error clearing %s!%s: %s", spreadsheet_id, range_a1, exc)
         raise
 
 
 # ----------------------------------------------------------------------
-# Backend client for /sheet-rows endpoints
+# Backend /sheet-rows client
 # ----------------------------------------------------------------------
 
-
 def _normalize_endpoint(endpoint: str) -> str:
-    """
-    Ensure that the endpoint has a leading slash.
-    """
-    if not endpoint.startswith("/"):
-        return "/" + endpoint
-    return endpoint
+    return endpoint if endpoint.startswith("/") else f"/{endpoint}"
 
 
-def _ensure_backend_config() -> str:
-    """
-    Ensure BACKEND_BASE_URL is configured and normalized.
-    Logs warning if APP_TOKEN is missing (non-fatal).
-    Returns the normalized base URL without trailing slash.
-    """
+def _ensure_backend_base_url() -> str:
     base = (BACKEND_BASE_URL or "").strip()
     if not base:
-        raise RuntimeError(
-            "BACKEND_BASE_URL is not configured; "
-            "cannot call backend /sheet-rows endpoints."
-        )
-
-    # If somebody accidentally set without scheme, try to help
+        raise RuntimeError("BACKEND_BASE_URL is not configured; cannot call backend /sheet-rows endpoints.")
     if not base.startswith("http://") and not base.startswith("https://"):
-        logger.warning(
-            "[Backend] BACKEND_BASE_URL has no scheme, "
-            "assuming https://%s",
-            base,
-        )
+        logger.warning("[Backend] BACKEND_BASE_URL has no scheme; assuming https://%s", base)
         base = "https://" + base
-
-    if not APP_TOKEN:
-        logger.warning(
-            "[Backend] APP_TOKEN is empty; backend may reject unauthorized "
-            "sheet-rows calls."
-        )
-
     return base.rstrip("/")
+
+
+def _normalize_tickers(tickers: List[str]) -> List[str]:
+    # Deduplicate while preserving order; normalize to upper-case
+    seen = set()
+    out: List[str] = []
+    for t in tickers or []:
+        tt = (t or "").strip()
+        if not tt:
+            continue
+        tt = tt.upper()
+        if tt not in seen:
+            seen.add(tt)
+            out.append(tt)
+    return out
+
+
+def _chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
+    if chunk_size <= 0:
+        return [items]
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Tuple[int, str]:
+    headers: Dict[str, str] = {"Content-Type": "application/json; charset=utf-8"}
+    if APP_TOKEN:
+        headers["X-APP-TOKEN"] = APP_TOKEN
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
+        status_code = getattr(resp, "status", resp.getcode())
+        raw = resp.read()
+        text = raw.decode("utf-8", errors="replace")
+        return status_code, text
+
+
+def _call_backend_sheet_rows_once(
+    endpoint: str,
+    tickers: List[str],
+    sheet_name: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    base = _ensure_backend_base_url()
+    ep = _normalize_endpoint(endpoint)
+    url = base + ep
+
+    if not sheet_name or not str(sheet_name).strip():
+        raise RuntimeError("sheet_name is required (must always be sent to backend).")
+
+    clean_tickers = _normalize_tickers(tickers)
+    payload: Dict[str, Any] = {
+        "tickers": clean_tickers,
+        "sheet_name": sheet_name,  # ALWAYS send
+    }
+
+    status_code, text = _http_post_json(url, payload, timeout)
+
+    if status_code < 200 or status_code >= 300:
+        # Provide clearer errors for common auth mistakes
+        preview = text[:300]
+        if status_code in (401, 403):
+            raise RuntimeError(
+                f"Backend auth error HTTP {status_code} at {ep}. "
+                f"Check APP_TOKEN / HAS_SECURE_TOKEN. Body: {preview}"
+            )
+        raise RuntimeError(f"Backend error HTTP {status_code} at {ep}. Body: {preview}")
+
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:
+        raise RuntimeError(f"Error parsing backend JSON from {ep}: {exc}. Body: {text[:200]}") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Unexpected backend response type from {ep}: {type(parsed)}")
+
+    if "headers" not in parsed or "rows" not in parsed:
+        raise RuntimeError(f"Backend response from {ep} missing 'headers' or 'rows'.")
+
+    return parsed
 
 
 def _call_backend_sheet_rows(
     endpoint: str,
     tickers: List[str],
-    sheet_name: str | None = None,
+    sheet_name: str,
     timeout: float = _BACKEND_TIMEOUT,
+    max_tickers_per_call: int = _BACKEND_MAX_TICKERS_PER_CALL,
+    retries: int = _BACKEND_RETRIES,
 ) -> Dict[str, Any]:
     """
-    Call one of the backend's sheet-rows endpoints:
+    Chunk + retry wrapper.
 
-        /v1/enriched/sheet-rows
-        /v1/analysis/sheet-rows
-        /v1/advanced/sheet-rows
+    Returns a single payload:
+      { "headers": [...], "rows": [...] }
 
-    BODY:
-        {
-          "tickers": [...],
-          "sheet_name": "KSA_Tadawul"   # optional, but we ALWAYS send it
-        }
-
-    RETURNS:
-        {
-          "headers": [...],
-          "rows": [[...], ...]
-        }
-
-    NOTE:
-    - This function does NOT call any external market provider (no EODHD).
-    - It only calls your backend, which internally uses the unified data engine
-      with KSA-safe routing (Tadawul/Argaam for .SR).
+    Rows are concatenated in the same order as the (deduped) input tickers.
     """
-    base = _ensure_backend_config()
-    ep = _normalize_endpoint(endpoint)
-    url = base + ep
+    base_tickers = _normalize_tickers(tickers)
+    chunks = _chunk_list(base_tickers, max_tickers_per_call)
 
-    # Deduplicate while preserving order
-    seen = set()
-    clean_tickers: List[str] = []
-    for t in tickers or []:
-        tt = (t or "").strip()
-        if not tt:
-            continue
-        if tt not in seen:
-            seen.add(tt)
-            clean_tickers.append(tt)
+    all_headers: Optional[List[Any]] = None
+    all_rows: List[List[Any]] = []
 
-    payload: Dict[str, Any] = {"tickers": clean_tickers}
-    # Always send sheet_name if we know it, so backend can pick correct template
-    if sheet_name:
-        payload["sheet_name"] = sheet_name
+    t0 = time.time()
 
-    headers: Dict[str, str] = {
-        "Content-Type": "application/json; charset=utf-8",
-    }
-    if APP_TOKEN:
-        headers["X-APP-TOKEN"] = APP_TOKEN
+    for idx, chunk in enumerate(chunks, start=1):
+        attempt = 0
+        last_err: Optional[Exception] = None
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        while attempt <= retries:
+            try:
+                attempt += 1
+                logger.info(
+                    "[Backend] %s chunk %d/%d (tickers=%d, attempt=%d, sheet_name=%s)",
+                    _normalize_endpoint(endpoint),
+                    idx,
+                    len(chunks),
+                    len(chunk),
+                    attempt,
+                    sheet_name,
+                )
+                payload = _call_backend_sheet_rows_once(
+                    endpoint=endpoint,
+                    tickers=chunk,
+                    sheet_name=sheet_name,
+                    timeout=timeout,
+                )
+                headers = payload.get("headers") or []
+                rows = payload.get("rows") or []
 
+                # keep first headers; warn if later headers differ
+                if all_headers is None:
+                    all_headers = list(headers)
+                else:
+                    if list(headers) != list(all_headers):
+                        logger.warning("[Backend] Headers differ across chunks; using first chunk headers.")
+
+                all_rows.extend(rows)
+                break
+
+            except urllib.error.URLError as exc:
+                last_err = exc
+                if attempt > retries:
+                    raise RuntimeError(f"Backend URLError after retries: {exc}") from exc
+                time.sleep(0.6 * attempt)
+
+            except urllib.error.HTTPError as exc:
+                last_err = exc
+                if attempt > retries:
+                    raise RuntimeError(f"Backend HTTPError after retries: {exc}") from exc
+                time.sleep(0.6 * attempt)
+
+            except Exception as exc:
+                last_err = exc
+                # retry only for likely transient backend issues
+                if attempt > retries:
+                    raise
+                time.sleep(0.6 * attempt)
+
+        if last_err is not None and attempt > retries:
+            raise last_err
+
+    dt = time.time() - t0
     logger.info(
-        "[Backend] Calling %s with %d tickers (sheet_name=%s).",
-        ep,
-        len(clean_tickers),
-        sheet_name,
+        "[Backend] Completed %s (tickers=%d, chunks=%d) in %.2fs",
+        _normalize_endpoint(endpoint),
+        len(base_tickers),
+        len(chunks),
+        dt,
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
-            status_code = getattr(resp, "status", resp.getcode())
-            raw = resp.read()
-            text = raw.decode("utf-8", errors="replace")
-            if status_code < 200 or status_code >= 300:
-                logger.error(
-                    "[Backend] HTTP %s calling %s: %s",
-                    status_code,
-                    ep,
-                    text[:300],
-                )
-                raise RuntimeError(
-                    f"Backend /sheet-rows error HTTP {status_code}: {text[:200]}"
-                )
-
-            try:
-                parsed = json.loads(text)
-            except Exception as exc:
-                logger.error(
-                    "[Backend] Error parsing JSON from %s: %s",
-                    ep,
-                    exc,
-                )
-                raise RuntimeError(
-                    f"Error parsing backend JSON from {ep}: {exc}"
-                ) from exc
-
-            if not isinstance(parsed, dict):
-                raise RuntimeError(
-                    f"Unexpected backend response type from {ep}: {type(parsed)}"
-                )
-
-            if "headers" not in parsed or "rows" not in parsed:
-                raise RuntimeError(
-                    f"Backend response from {ep} missing 'headers' or 'rows'."
-                )
-
-            return parsed
-
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        logger.error(
-            "[Backend] HTTPError %s calling %s: %s",
-            exc.code,
-            ep,
-            body[:300],
-        )
-        raise RuntimeError(f"Backend HTTPError {exc.code}: {exc.reason}") from exc
-
-    except urllib.error.URLError as exc:
-        logger.error("[Backend] URLError calling %s: %s", ep, exc)
-        raise RuntimeError(f"Backend URLError: {exc}") from exc
-
-    except Exception as exc:
-        logger.exception("[Backend] Unexpected error calling %s", ep)
-        raise RuntimeError(f"Backend unexpected error calling {ep}: {exc}") from exc
+    return {"headers": all_headers or [], "rows": all_rows}
 
 
 async def _call_backend_sheet_rows_async(
     endpoint: str,
     tickers: List[str],
-    sheet_name: str | None = None,
+    sheet_name: str,
     timeout: float = _BACKEND_TIMEOUT,
 ) -> Dict[str, Any]:
-    """
-    Async wrapper around _call_backend_sheet_rows.
-    Offloads blocking IO to a thread pool.
-    """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        lambda: _call_backend_sheet_rows(
-            endpoint=endpoint,
-            tickers=tickers,
-            sheet_name=sheet_name,
-            timeout=timeout,
-        ),
+        lambda: _call_backend_sheet_rows(endpoint=endpoint, tickers=tickers, sheet_name=sheet_name, timeout=timeout),
     )
 
 
 # ----------------------------------------------------------------------
-# HIGH-LEVEL REFRESH HELPERS (for ALL 9 pages)
+# Value builders + refresh helpers
 # ----------------------------------------------------------------------
 
-
-def _build_sheet_values_from_backend_payload(
-    backend_payload: Dict[str, Any],
-) -> List[List[Any]]:
-    """
-    Combine headers + rows into a `values` list suitable for setValues()
-    or Sheets API values.update().
-
-    backend_payload:
-        { "headers": [...], "rows": [[...], ...] }
-
-    NOTE:
-    - We *always* prepend the headers row, so Apps Script / Sheets can safely:
-          setValues(values)
-      starting at the header row (e.g. 'A5').
-    """
-    headers = backend_payload.get("headers") or []
-    rows = backend_payload.get("rows") or []
+def _build_values_from_backend_payload(payload: Dict[str, Any]) -> List[List[Any]]:
+    headers = payload.get("headers") or []
+    rows = payload.get("rows") or []
     values: List[List[Any]] = []
     if headers:
         values.append(list(headers))
     values.extend(rows)
     return values
+
+
+def _safe_clear_mode_range(sheet_name: str, start_cell: str) -> str:
+    """
+    Default clear range: from start cell row to ZZ, leaving rows above intact.
+    Example:
+      start_cell="A5" -> clear "Sheet!A5:ZZ"
+    """
+    # start_cell like "A5" or "B6"
+    start = (start_cell or "A1").strip().upper()
+    # keep only letters+digits; defensive
+    col = "".join([c for c in start if c.isalpha()]) or "A"
+    row = "".join([c for c in start if c.isdigit()]) or "1"
+    return f"{sheet_name}!{col}{row}:ZZ"
 
 
 def _refresh_sheet_generic(
@@ -595,39 +529,38 @@ def _refresh_sheet_generic(
     tickers: List[str],
     start_cell: str,
     clear_existing: bool,
+    value_input_option: str,
     log_label: str,
 ) -> Dict[str, Any]:
-    """
-    Generic refresh used by enriched, AI, and advanced layers.
+    if not spreadsheet_id:
+        raise RuntimeError("spreadsheet_id is required.")
+    if not sheet_name or not str(sheet_name).strip():
+        raise RuntimeError("sheet_name is required.")
+    if not start_cell:
+        start_cell = "A1"
 
-    sheet_name:
-        - Used for:
-            • Google Sheets tab (e.g., 'KSA_Tadawul', 'Global_Markets')
-            • Backend 'sheet_name' parameter to pick correct column template.
-    """
     split = split_tickers_by_market(tickers)
     logger.info(
-        "%s Refreshing %s!%s with %d tickers (KSA=%d, Global=%d) via %s...",
+        "%s Refreshing %s!%s (tickers=%d | KSA=%d | Global=%d) via %s",
         log_label,
         sheet_name,
         start_cell,
-        len(split["ksa"]) + len(split["global"]),
+        len(_normalize_tickers(tickers)),
         len(split["ksa"]),
         len(split["global"]),
-        endpoint,
+        _normalize_endpoint(endpoint),
     )
 
-    backend_data = _call_backend_sheet_rows(
-        endpoint=endpoint,
-        tickers=tickers,
-        sheet_name=sheet_name,
-    )
-    values = _build_sheet_values_from_backend_payload(backend_data)
+    payload = _call_backend_sheet_rows(endpoint=endpoint, tickers=tickers, sheet_name=sheet_name)
+    values = _build_values_from_backend_payload(payload)
 
-    full_range = f"{sheet_name}!{start_cell}"
     if clear_existing:
-        clear_range(spreadsheet_id, f"{sheet_name}!A:ZZ")
-    return write_range(spreadsheet_id, full_range, values)
+        # Safer than clearing entire A:ZZ always
+        clear_a1 = _safe_clear_mode_range(sheet_name, start_cell)
+        clear_range(spreadsheet_id, clear_a1)
+
+    target_a1 = f"{sheet_name}!{start_cell}"
+    return write_range(spreadsheet_id, target_a1, values, value_input_option=value_input_option)
 
 
 def refresh_sheet_with_enriched_quotes(
@@ -636,23 +569,8 @@ def refresh_sheet_with_enriched_quotes(
     tickers: List[str],
     start_cell: str = "A1",
     clear_existing: bool = False,
+    value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Refresh a sheet with ENRICHED QUOTE data from backend:
-
-        POST {BACKEND_BASE_URL}/v1/enriched/sheet-rows
-
-    Suitable for:
-        - KSA_Tadawul
-        - Global_Markets
-        - Mutual_Funds
-        - Commodities_FX
-        - My_Portfolio
-        - Any fundamentals-style page
-
-    KSA tickers (.SR) are handled by the unified engine (Tadawul/Argaam, NOT EODHD).
-    The sheet_name is sent to the backend so it can use the right header template.
-    """
     return _refresh_sheet_generic(
         endpoint="/v1/enriched/sheet-rows",
         spreadsheet_id=spreadsheet_id,
@@ -660,6 +578,7 @@ def refresh_sheet_with_enriched_quotes(
         tickers=tickers,
         start_cell=start_cell,
         clear_existing=clear_existing,
+        value_input_option=value_input_option,
         log_label="[Sheets][Enriched]",
     )
 
@@ -670,19 +589,8 @@ def refresh_sheet_with_ai_analysis(
     tickers: List[str],
     start_cell: str = "A1",
     clear_existing: bool = False,
+    value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Refresh a sheet with AI ANALYSIS data from backend:
-
-        POST {BACKEND_BASE_URL}/v1/analysis/sheet-rows
-
-    Ideal for:
-        - Insights_Analysis page
-        - Any scoring/AI layer on top of:
-              KSA_Tadawul / Global_Markets / Mutual_Funds / Commodities_FX.
-
-    The sheet_name is sent to the backend to allow different layouts per page.
-    """
     return _refresh_sheet_generic(
         endpoint="/v1/analysis/sheet-rows",
         spreadsheet_id=spreadsheet_id,
@@ -690,6 +598,7 @@ def refresh_sheet_with_ai_analysis(
         tickers=tickers,
         start_cell=start_cell,
         clear_existing=clear_existing,
+        value_input_option=value_input_option,
         log_label="[Sheets][AI]",
     )
 
@@ -700,19 +609,8 @@ def refresh_sheet_with_advanced_analysis(
     tickers: List[str],
     start_cell: str = "A1",
     clear_existing: bool = False,
+    value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Refresh a sheet with ADVANCED ANALYSIS & RISK data from backend:
-
-        POST {BACKEND_BASE_URL}/v1/advanced/sheet-rows
-
-    Ideal for:
-        - Investment_Advisor
-        - Advanced_Insights / Risk_Buckets-style pages
-        - Any page that needs deeper risk / factor breakdown.
-
-    The sheet_name is sent to the backend to align output with the target sheet.
-    """
     return _refresh_sheet_generic(
         endpoint="/v1/advanced/sheet-rows",
         spreadsheet_id=spreadsheet_id,
@@ -720,14 +618,14 @@ def refresh_sheet_with_advanced_analysis(
         tickers=tickers,
         start_cell=start_cell,
         clear_existing=clear_existing,
+        value_input_option=value_input_option,
         log_label="[Sheets][Advanced]",
     )
 
 
 # ----------------------------------------------------------------------
-# ASYNC VERSIONS (for FastAPI background tasks / workers)
+# Async versions
 # ----------------------------------------------------------------------
-
 
 async def _refresh_sheet_generic_async(
     endpoint: str,
@@ -736,40 +634,41 @@ async def _refresh_sheet_generic_async(
     tickers: List[str],
     start_cell: str,
     clear_existing: bool,
+    value_input_option: str,
     log_label: str,
 ) -> Dict[str, Any]:
-    """
-    Async version of the generic refresh helper.
-    """
+    if not spreadsheet_id:
+        raise RuntimeError("spreadsheet_id is required.")
+    if not sheet_name or not str(sheet_name).strip():
+        raise RuntimeError("sheet_name is required.")
+    if not start_cell:
+        start_cell = "A1"
+
     split = split_tickers_by_market(tickers)
     logger.info(
-        "%s (async) Refreshing %s!%s with %d tickers (KSA=%d, Global=%d) via %s...",
+        "%s (async) Refreshing %s!%s (tickers=%d | KSA=%d | Global=%d) via %s",
         log_label,
         sheet_name,
         start_cell,
-        len(split["ksa"]) + len(split["global"]),
+        len(_normalize_tickers(tickers)),
         len(split["ksa"]),
         len(split["global"]),
-        endpoint,
+        _normalize_endpoint(endpoint),
     )
 
-    backend_data = await _call_backend_sheet_rows_async(
-        endpoint=endpoint,
-        tickers=tickers,
-        sheet_name=sheet_name,
-    )
-    values = _build_sheet_values_from_backend_payload(backend_data)
-    full_range = f"{sheet_name}!{start_cell}"
+    payload = await _call_backend_sheet_rows_async(endpoint=endpoint, tickers=tickers, sheet_name=sheet_name)
+    values = _build_values_from_backend_payload(payload)
 
     loop = asyncio.get_running_loop()
+
     if clear_existing:
-        await loop.run_in_executor(
-            None,
-            lambda: clear_range(spreadsheet_id, f"{sheet_name}!A:ZZ"),
-        )
+        clear_a1 = _safe_clear_mode_range(sheet_name, start_cell)
+        await loop.run_in_executor(None, lambda: clear_range(spreadsheet_id, clear_a1))
+
+    target_a1 = f"{sheet_name}!{start_cell}"
     return await loop.run_in_executor(
         None,
-        lambda: write_range(spreadsheet_id, full_range, values),
+        lambda: write_range(spreadsheet_id, target_a1, values, value_input_option=value_input_option),
     )
 
 
@@ -779,10 +678,8 @@ async def refresh_sheet_with_enriched_quotes_async(
     tickers: List[str],
     start_cell: str = "A1",
     clear_existing: bool = False,
+    value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Async version of refresh_sheet_with_enriched_quotes.
-    """
     return await _refresh_sheet_generic_async(
         endpoint="/v1/enriched/sheet-rows",
         spreadsheet_id=spreadsheet_id,
@@ -790,6 +687,7 @@ async def refresh_sheet_with_enriched_quotes_async(
         tickers=tickers,
         start_cell=start_cell,
         clear_existing=clear_existing,
+        value_input_option=value_input_option,
         log_label="[Sheets][Enriched]",
     )
 
@@ -800,10 +698,8 @@ async def refresh_sheet_with_ai_analysis_async(
     tickers: List[str],
     start_cell: str = "A1",
     clear_existing: bool = False,
+    value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Async version of refresh_sheet_with_ai_analysis.
-    """
     return await _refresh_sheet_generic_async(
         endpoint="/v1/analysis/sheet-rows",
         spreadsheet_id=spreadsheet_id,
@@ -811,6 +707,7 @@ async def refresh_sheet_with_ai_analysis_async(
         tickers=tickers,
         start_cell=start_cell,
         clear_existing=clear_existing,
+        value_input_option=value_input_option,
         log_label="[Sheets][AI]",
     )
 
@@ -821,10 +718,8 @@ async def refresh_sheet_with_advanced_analysis_async(
     tickers: List[str],
     start_cell: str = "A1",
     clear_existing: bool = False,
+    value_input_option: str = "RAW",
 ) -> Dict[str, Any]:
-    """
-    Async version of refresh_sheet_with_advanced_analysis.
-    """
     return await _refresh_sheet_generic_async(
         endpoint="/v1/advanced/sheet-rows",
         spreadsheet_id=spreadsheet_id,
@@ -832,11 +727,13 @@ async def refresh_sheet_with_advanced_analysis_async(
         tickers=tickers,
         start_cell=start_cell,
         clear_existing=clear_existing,
+        value_input_option=value_input_option,
         log_label="[Sheets][Advanced]",
     )
 
 
 __all__ = [
+    "DEFAULT_SPREADSHEET_ID",
     "split_tickers_by_market",
     "get_sheets_service",
     "read_range",
@@ -849,3 +746,4 @@ __all__ = [
     "refresh_sheet_with_ai_analysis_async",
     "refresh_sheet_with_advanced_analysis_async",
 ]
+```
