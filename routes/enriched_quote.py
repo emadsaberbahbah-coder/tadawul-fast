@@ -1,12 +1,13 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v3.0)
+Enriched Quotes Router (v3.1)
 
 Unified on top of:
     - core.data_engine_v2.DataEngine (async, multi-provider, KSA-safe)
     - core.enriched_quote.EnrichedQuote (sheet-friendly model)
-    - core.schemas.get_headers_for_sheet (single source of truth for headers)
+    - core.schemas.get_headers_for_sheet (if available, otherwise fallback
+      to a local Universal Market Template header list)
 
 Key responsibilities
 --------------------
@@ -17,13 +18,17 @@ Key responsibilities
 Design notes
 ------------
 - This router never talks directly to Yahoo / FMP / EODHD / Argaam.
-  All provider logic lives in DataEngine / v1 delegate.
-- KSA (.SR) symbols are handled by DataEngine:
-    • Never calls EODHD directly.
-    • Delegates to core.data_engine (v1) for Tadawul/Argaam if available.
+  All provider logic lives in DataEngine / its v1 delegate.
+- KSA (.SR) symbols are handled KSA-safe by DataEngine:
+    • Engine ensures EODHD is not used for KSA (per its own design).
 - Extremely defensive:
     • If engine import fails, a stub engine is used (data_quality="MISSING").
     • Batch calls are chunked and bounded by timeouts so Sheets never hangs.
+
+Compatibility
+-------------
+- Exposes `EnrichedQuoteResponse` as an alias of `EnrichedQuote` so that
+  legacy modules (e.g., routes_argaam.py) can still import it without changes.
 """
 
 from __future__ import annotations
@@ -44,14 +49,16 @@ logger = logging.getLogger("routes.enriched_quote")
 _ENGINE_MODE: str = "unknown"
 _ENGINE_IS_STUB: bool = False
 
-try:  # Preferred path: new async engine + sheet model
+try:
+    # Preferred path: real async engine + sheet model
     from core.data_engine_v2 import DataEngine, UnifiedQuote  # type: ignore
     from core.enriched_quote import EnrichedQuote  # type: ignore
 
     _engine: Any = DataEngine()
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
-    logger.info("routes.enriched_quote: Using core.data_engine_v2.DataEngine (v2 engine)")
+    logger.info("routes.enriched_quote: Using core.data_engine_v2.DataEngine")
+
 except Exception as exc:  # pragma: no cover - defensive
     logger.exception(
         "routes.enriched_quote: Failed to import DataEngine/EnrichedQuote; "
@@ -104,6 +111,9 @@ except Exception as exc:  # pragma: no cover - defensive
     _ENGINE_MODE = "stub"
     _ENGINE_IS_STUB = True
 
+# Backwards-compatible alias for legacy routes (e.g. routes_argaam.py)
+EnrichedQuoteResponse = EnrichedQuote  # type: ignore[misc]
+
 # ======================================================================
 # Header helper (core.schemas) with safe fallback
 # ======================================================================
@@ -111,16 +121,16 @@ except Exception as exc:  # pragma: no cover - defensive
 try:
     from core.schemas import get_headers_for_sheet as _get_headers_for_sheet  # type: ignore
 except Exception as exc:  # pragma: no cover - defensive
-    logger.exception(
-        "routes.enriched_quote: Failed to import core.schemas.get_headers_for_sheet; "
-        "using local universal header fallback: %s",
+    logger.warning(
+        "routes.enriched_quote: core.schemas.get_headers_for_sheet not available; "
+        "using local Universal Market Template headers: %s",
         exc,
     )
 
     def _get_headers_for_sheet(sheet_name: Optional[str]) -> List[str]:
         """
-        Fallback header builder – identical to your Universal Market Template.
-        This keeps the API working even if core.schemas is missing.
+        Fallback header builder – Universal Market Template.
+        This keeps the API working even if core.schemas is missing that helper.
         """
         return [
             # Identity
@@ -301,7 +311,9 @@ async def _build_sheet_rows(
             enriched = EnrichedQuote.from_unified(uq)
         except Exception as exc:
             logger.exception(
-                "Conversion UnifiedQuote -> EnrichedQuote failed for %s", t, exc_info=exc
+                "Conversion UnifiedQuote -> EnrichedQuote failed for %s",
+                t,
+                exc_info=exc,
             )
             enriched = EnrichedQuote(
                 symbol=uq.symbol or t.upper(),
@@ -338,8 +350,10 @@ class BatchEnrichedRequest(BaseModel):
     )
     sheet_name: Optional[str] = Field(
         default=None,
-        description="Optional sheet name (e.g. 'KSA_Tadawul', 'Global_Markets', etc.) "
-        "used only by /sheet-rows to select the correct headers.",
+        description=(
+            "Optional sheet name (e.g. 'KSA_Tadawul', 'Global_Markets', etc.) "
+            "used only by /sheet-rows to select the correct headers."
+        ),
     )
 
 
@@ -365,7 +379,7 @@ async def enriched_health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "enriched_quote",
-        "version": "3.0",
+        "version": "3.1",
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
     }
@@ -400,7 +414,9 @@ async def get_enriched_quote_route(
         enriched = EnrichedQuote.from_unified(uq)
     except Exception as exc:
         logger.exception(
-            "Conversion UnifiedQuote -> EnrichedQuote failed for %s", ticker, exc_info=exc
+            "Conversion UnifiedQuote -> EnrichedQuote failed for %s",
+            ticker,
+            exc_info=exc,
         )
         enriched = EnrichedQuote(
             symbol=uq.symbol or ticker.upper(),
@@ -446,7 +462,9 @@ async def get_enriched_quotes_route(
             enriched = EnrichedQuote.from_unified(uq)
         except Exception as exc:
             logger.exception(
-                "Conversion UnifiedQuote -> EnrichedQuote failed for %s", t, exc_info=exc
+                "Conversion UnifiedQuote -> EnrichedQuote failed for %s",
+                t,
+                exc_info=exc,
             )
             enriched = EnrichedQuote(
                 symbol=uq.symbol or t.upper(),
