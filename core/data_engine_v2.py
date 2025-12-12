@@ -1,7 +1,7 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.6
+Core Data & Analysis Engine - v2.7
 (Global fundamentals-enriched, Sheets-aligned, hardened)
 
 Author: Emad Bahbah (with GPT-5.1 Thinking)
@@ -22,7 +22,7 @@ Key features
     • routes/enriched_quote.EnrichedQuoteResponse
     • routes/ai_analysis.SingleAnalysisResponse
     • legacy_service (v1/quote + v1/legacy/sheet-rows)
-    • 9-page Google Sheets dashboard philosophy
+    • 9-page Google Sheets dashboard philosophy (KSA / Global / Funds / FX).
 - Basic AI-style scoring:
     • Value / Quality / Momentum / Opportunity + Recommendation
     • overall_score field for "AI Score" columns on Sheets.
@@ -32,6 +32,8 @@ Key features
 - Extremely defensive:
     • Never raises on normal usage (returns MISSING with error instead).
     • Hardened __init__: bad env values (TTL, timeout, providers) never crash import.
+    • Alias-normalization layer so Sheets always see consistent fields
+      (last_price/price, 52W aliases, dividend yield %, ROE/ROA %, etc.).
 
 Configuration (env vars)
 ------------------------
@@ -394,7 +396,7 @@ class DataEngine:
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.6 initialized "
+            "DataEngine v2.7 initialized "
             "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, "
             "v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
@@ -438,7 +440,7 @@ class DataEngine:
                 error=f"Exception in DataEngine.get_enriched_quote: {exc}",
             )
 
-        # Normalize quality once at the end for Sheet compatibility
+        # Normalize quality & aliases once at the end for Sheet compatibility
         self._normalize_data_quality(quote)
 
         # Cache even MISSING responses (short TTL) to avoid hammering providers
@@ -629,7 +631,7 @@ class DataEngine:
             if not q.sources:
                 q.sources = [ProviderSource(provider=provider_name, note="primary")]
 
-            # Normalize quality once here as well
+            # Normalize quality & aliases once here as well
             self._normalize_data_quality(q)
             return q
         except Exception as exc:
@@ -664,7 +666,7 @@ class DataEngine:
                 error="No provider results",
             )
 
-        # Normalize quality for all incoming quotes
+        # Normalize quality & aliases for all incoming quotes
         for q in results:
             self._normalize_data_quality(q)
 
@@ -675,7 +677,7 @@ class DataEngine:
 
         # All providers failed
         if not usable:
-            combined_error = "; ".join([q.error for q in results if q.error])  # type: ignore
+            combined_error = "; ".join([str(q.error) for q in results if q.error])
             return UnifiedQuote(
                 symbol=symbol,
                 data_quality="MISSING",
@@ -771,7 +773,7 @@ class DataEngine:
 
         # Merge error messages for debugging (if any)
         combined_error = "; ".join(
-            sorted({q.error for q in results if q.error})  # type: ignore
+            sorted({str(q.error) for q in results if q.error})
         )
         if combined_error:
             merged_data["error"] = combined_error
@@ -783,22 +785,130 @@ class DataEngine:
             logger.exception("Failed to merge provider results for %s: %s", symbol, exc)
             return base
 
-        # Normalize the merged result as a final step
+        # Normalize the merged result (aliases + quality) as a final step
         self._normalize_data_quality(merged_quote)
         return merged_quote
 
     # ------------------------------------------------------------------ #
-    # Quality normalization & liquidity scoring
+    # Quality normalization, aliases & liquidity scoring
     # ------------------------------------------------------------------ #
+
+    def _normalize_alias_fields(self, q: UnifiedQuote) -> None:
+        """
+        Normalize and mirror aliases so Sheets always see consistent fields
+        across KSA / Global / Mutual Funds / Commodities-FX pages.
+        """
+
+        # --- Price & previous close ---
+        if q.last_price is None and q.price is not None:
+            q.last_price = q.price
+        if q.price is None and q.last_price is not None:
+            q.price = q.last_price
+
+        if q.previous_close is None and q.prev_close is not None:
+            q.previous_close = q.prev_close
+        if q.prev_close is None and q.previous_close is not None:
+            q.prev_close = q.previous_close
+
+        # --- 52-week high/low & position ---
+        if q.high_52w is None and q.fifty_two_week_high is not None:
+            q.high_52w = q.fifty_two_week_high
+        if q.fifty_two_week_high is None and q.high_52w is not None:
+            q.fifty_two_week_high = q.high_52w
+
+        if q.low_52w is None and q.fifty_two_week_low is not None:
+            q.low_52w = q.fifty_two_week_low
+        if q.fifty_two_week_low is None and q.low_52w is not None:
+            q.fifty_two_week_low = q.low_52w
+
+        if q.position_52w_percent is None and q.fifty_two_week_position is not None:
+            q.position_52w_percent = q.fifty_two_week_position
+        if q.fifty_two_week_position is None and q.position_52w_percent is not None:
+            q.fifty_two_week_position = q.position_52w_percent
+
+        # --- Dividend yield & ROE/ROA percentages ---
+        if q.dividend_yield_percent is None and q.dividend_yield is not None:
+            q.dividend_yield_percent = q.dividend_yield
+        if q.dividend_yield is None and q.dividend_yield_percent is not None:
+            q.dividend_yield = q.dividend_yield_percent
+
+        if q.roe_percent is None and q.roe is not None:
+            q.roe_percent = q.roe
+        if q.roe is None and q.roe_percent is not None:
+            q.roe = q.roe_percent
+
+        if q.roa_percent is None and q.roa is not None:
+            q.roa_percent = q.roa
+        if q.roa is None and q.roa_percent is not None:
+            q.roa = q.roa_percent
+
+        # --- Net margin / profit margin aliases ---
+        if q.net_margin_percent is None and q.profit_margin is not None:
+            q.net_margin_percent = q.profit_margin
+        if q.profit_margin is None and q.net_margin_percent is not None:
+            q.profit_margin = q.net_margin_percent
+
+        # --- Average volume aliases ---
+        if q.avg_volume_30d is None:
+            if q.average_volume_30d is not None:
+                q.avg_volume_30d = q.average_volume_30d
+            elif q.avg_volume is not None:
+                q.avg_volume_30d = q.avg_volume
+
+        if q.average_volume_30d is None and q.avg_volume_30d is not None:
+            q.average_volume_30d = q.avg_volume_30d
+        if q.avg_volume is None and q.avg_volume_30d is not None:
+            q.avg_volume = q.avg_volume_30d
+
+        # --- Volatility aliases ---
+        if q.volatility_30d_percent is None and q.volatility_30d is not None:
+            q.volatility_30d_percent = q.volatility_30d
+        if q.volatility_30d is None and q.volatility_30d_percent is not None:
+            q.volatility_30d = q.volatility_30d_percent
+
+        # --- Market / region normalization ---
+        if q.market_region is None and q.market is not None:
+            mr = str(q.market).upper()
+            if mr in {"KSA", "TADAWUL", "NOMU"}:
+                q.market_region = "KSA"
+            else:
+                q.market_region = "GLOBAL"
+
+        # --- Timezone & as_of timestamps ---
+        if q.as_of_utc is None and q.last_updated_utc is not None:
+            q.as_of_utc = q.last_updated_utc
+        if q.as_of_local is None and q.last_updated_riyadh is not None:
+            q.as_of_local = q.last_updated_riyadh
+
+        # If still missing, synthesize now
+        if q.as_of_utc is None:
+            now_utc, as_local, tz_name = self._now_dt_pair()
+            q.as_of_utc = now_utc
+            if q.as_of_local is None:
+                q.as_of_local = as_local
+            if q.timezone is None:
+                q.timezone = tz_name
+
+        # If timezone missing, infer from market_region or use local_tz_name
+        if q.timezone is None:
+            if q.market_region == "KSA":
+                q.timezone = "Asia/Riyadh"
+            else:
+                q.timezone = self.local_tz_name or "UTC"
 
     def _normalize_data_quality(self, q: UnifiedQuote) -> None:
         """
         Normalize q.data_quality into canonical values:
         - FULL / PARTIAL / MISSING / STALE / UNKNOWN
 
-        Also tries to infer quality from available fields if UNKNOWN.
+        Also:
+        - Normalizes alias fields (price vs. last_price, 52W, yields, ROE/ROA, etc.).
+        - Tries to infer quality from available fields if UNKNOWN.
         This is critical so Sheets can cleanly map to Confidence levels.
         """
+        # Always normalize aliases first so quality inference sees full picture
+        self._normalize_alias_fields(q)
+
         dq_raw = (q.data_quality or "UNKNOWN").upper().strip()
 
         # Map synonyms from providers / v1 to canonical values
@@ -1748,7 +1858,7 @@ class DataEngine:
         if liq is not None and q.liquidity_score is None:
             q.liquidity_score = liq
 
-        # Normalize quality & optionally top-up scoring
+        # Normalize aliases & quality & optionally top-up scoring
         self._normalize_data_quality(q)
         if self.enable_advanced_analysis:
             if (
@@ -1779,7 +1889,7 @@ class DataEngine:
         This is intentionally simple and deterministic so that
         Google Sheets & Apps Script can rely on it as a stable layer.
         """
-        # Ensure data_quality is normalized before risk buckets
+        # Ensure data_quality & aliases are normalized before risk buckets
         self._normalize_data_quality(q)
 
         # -------------------------
@@ -1986,7 +2096,7 @@ class DataEngine:
 
         q.risk_bucket = risk_bucket
 
-        # Normalize quality again as a final step
+        # Normalize aliases & quality again as a final step
         self._normalize_data_quality(q)
 
 
