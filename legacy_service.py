@@ -1,7 +1,8 @@
+```python
 """
 legacy_service.py
 ------------------------------------------------------------
-LEGACY SERVICE BRIDGE – v3.3 (Aligned with App v4.4.0 / Engine v2.5)
+LEGACY SERVICE BRIDGE – v3.6 (Aligned with App v4.5+ / Engine v2.x)
 
 GOAL
 - Provide a stable "legacy" layer on top of the unified data engine,
@@ -9,43 +10,14 @@ GOAL
   can still receive the classic /v1/quote-style payload.
 
 KEY PRINCIPLES
-- NO direct EODHD calls here.
+- NO direct EODHD / Yahoo / providers calls here.
 - All data comes via the unified data engine (v2 preferred, v1 module fallback).
 - KSA (.SR) tickers are handled by Tadawul/Argaam providers inside the engine.
-- Legacy quote format:
-      {
-          "quotes": [ { ... legacy fields ... } ],
-          "meta":   { ... context ... }
-      }
-- Google Sheets integration helpers:
-      • build_legacy_sheet_payload(tickers)
-        -> { "headers": [...], "rows": [[...], ...], "meta": {...} }
+- Strongly defensive: normalization, mapping, and failures never crash the app.
 
-ALIGNMENT
-- Engine usage & fallbacks aligned with:
-    • core.data_engine_v2.DataEngine (preferred, class-based)
-    • core.data_engine (module-level async functions, fallback)
-    • routes/enriched_quote.py
-    • routes/ai_analysis.py
-    • routes/advanced_analysis.py
-    • routes_argaam.py (KSA / Tadawul-Argaam gateway)
-- Symbol normalization aligned with KSA / Tadawul logic used elsewhere:
-    • 1120                -> 1120.SR
-    • TADAWUL:1120        -> 1120.SR
-    • 1120.TADAWUL        -> 1120.SR
-    • 1120.SR             -> 1120.SR
-    • AAPL                -> AAPL
-
-USAGE
-- main.py:
-      from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
-      # /v1/quote, /v1/legacy/sheet-rows use these functions.
-
-- Preferred for new dashboards:
-      /v1/enriched/sheet-rows
-      /v1/analysis/sheet-rows
-      /v1/advanced/sheet-rows
-  This legacy layer is mainly for backward compatibility and quick tests.
+PUBLIC API
+- get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]
+- build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]
 """
 
 from __future__ import annotations
@@ -64,13 +36,15 @@ if not logger.handlers:
 # ENV / SETTINGS – env.settings preferred, env vars fallback
 # ----------------------------------------------------------------------
 
-try:  # pragma: no cover - env.py optional
+try:  # pragma: no cover
     import env as _env_mod  # type: ignore
+
+    _SETTINGS = getattr(_env_mod, "settings", None)
 except Exception:  # pragma: no cover
     _env_mod = None  # type: ignore
+    _SETTINGS = None
     logger.warning(
-        "[LegacyService] env.py not available. "
-        "Using OS environment variables for basic config."
+        "[LegacyService] env.py not available. Using OS environment variables only."
     )
 
 
@@ -78,37 +52,47 @@ except Exception:  # pragma: no cover
 class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.4.0")
-    backend_base_url: str = os.getenv("BACKEND_BASE_URL", "").strip()
+    app_version: str = os.getenv("APP_VERSION", "4.5.0")
+    backend_base_url: str = (os.getenv("BACKEND_BASE_URL", "") or "").strip()
 
 
-def _get_env_attr(name: str, default: str = "") -> str:
-    """
-    Helper to read config from env.py if available, otherwise from OS env vars.
-    Returns a string representation.
-    """
+def _env_get_str(name: str, default: str = "") -> str:
+    # Prefer env.settings.<snake_case> if present
+    if _SETTINGS is not None:
+        mapping = {
+            "APP_ENV": "app_env",
+            "APP_NAME": "app_name",
+            "APP_VERSION": "app_version",
+            "BACKEND_BASE_URL": "backend_base_url",
+        }
+        attr = mapping.get(name)
+        if attr and hasattr(_SETTINGS, attr):
+            try:
+                v = getattr(_SETTINGS, attr)
+                if v is None:
+                    return default
+                return str(v).strip()
+            except Exception:
+                pass
+
+    # Prefer env.<NAME> constants (back-compat)
     if _env_mod is not None and hasattr(_env_mod, name):
-        value = getattr(_env_mod, name)
-        if isinstance(value, str):
-            return value
         try:
-            return str(value)
+            v = getattr(_env_mod, name)
+            if v is None:
+                return default
+            return str(v).strip()
         except Exception:
             return default
-    return os.getenv(name, default)
+
+    return (os.getenv(name, default) or default).strip()
 
 
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
-APP_NAME: str = getattr(
-    settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge")
-)
-APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.4.0")
-)
-BACKEND_BASE_URL: str = getattr(
-    settings, "backend_base_url", _get_env_attr("BACKEND_BASE_URL", "")
-).strip()
+APP_NAME: str = getattr(settings, "app_name", _env_get_str("APP_NAME", "Tadawul Fast Bridge"))
+APP_VERSION: str = getattr(settings, "app_version", _env_get_str("APP_VERSION", "4.5.0"))
+BACKEND_BASE_URL: str = getattr(settings, "backend_base_url", _env_get_str("BACKEND_BASE_URL", "")).strip()
 
 # ----------------------------------------------------------------------
 # DATA ENGINE IMPORT / FALLBACKS (v2 preferred, v1 module, stub)
@@ -120,80 +104,61 @@ _engine: Any = None
 _data_engine_module: Any = None
 _ENABLED_PROVIDERS: List[str] = []
 
-try:  # Preferred: new class-based engine (core.data_engine_v2)
+try:  # Preferred: class-based engine (core.data_engine_v2)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
     engine_kwargs: Dict[str, Any] = {}
 
-    # Optional engine tuning via env.py
-    if _env_mod is not None:
-        cache_ttl = getattr(_env_mod, "ENGINE_CACHE_TTL_SECONDS", None)
-        if cache_ttl is not None:
-            engine_kwargs["cache_ttl"] = cache_ttl
+    # Optional tuning via env.py constants or settings (defensive)
+    def _maybe(name: str) -> Any:
+        if _env_mod is not None and hasattr(_env_mod, name):
+            return getattr(_env_mod, name)
+        return None
 
-        provider_timeout = getattr(
-            _env_mod, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None
-        )
-        if provider_timeout is not None:
-            engine_kwargs["provider_timeout"] = provider_timeout
+    cache_ttl = _maybe("ENGINE_CACHE_TTL_SECONDS")
+    if cache_ttl is not None:
+        engine_kwargs["cache_ttl"] = cache_ttl
 
-        enabled_providers = getattr(_env_mod, "ENABLED_PROVIDERS", None)
-        if enabled_providers:
-            engine_kwargs["enabled_providers"] = enabled_providers
+    provider_timeout = _maybe("ENGINE_PROVIDER_TIMEOUT_SECONDS")
+    if provider_timeout is not None:
+        engine_kwargs["provider_timeout"] = provider_timeout
 
-        enable_adv = getattr(
-            _env_mod, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True
-        )
+    enabled_providers = _maybe("ENABLED_PROVIDERS")
+    if enabled_providers:
+        engine_kwargs["enabled_providers"] = enabled_providers
+
+    enable_adv = _maybe("ENGINE_ENABLE_ADVANCED_ANALYSIS")
+    if enable_adv is not None:
         engine_kwargs["enable_advanced_analysis"] = enable_adv
 
     try:
-        if engine_kwargs:
-            _engine = _V2DataEngine(**engine_kwargs)
-        else:
-            _engine = _V2DataEngine()
+        _engine = _V2DataEngine(**engine_kwargs) if engine_kwargs else _V2DataEngine()
     except TypeError:
-        # Signature mismatch -> fall back to default constructor
         _engine = _V2DataEngine()
 
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
-    _ENABLED_PROVIDERS = list(getattr(_engine, "enabled_providers", []))
+    _ENABLED_PROVIDERS = list(getattr(_engine, "enabled_providers", []) or [])
     logger.info(
-        "[LegacyService] Using DataEngine v2 from core.data_engine_v2 "
-        "(kwargs=%s, enabled_providers=%s).",
+        "[LegacyService] Using DataEngine v2 (kwargs=%s, enabled_providers=%s).",
         list(engine_kwargs.keys()),
         _ENABLED_PROVIDERS,
     )
 
-except Exception as e_v2:  # pragma: no cover - defensive
-    logger.exception(
-        "[LegacyService] Failed to init core.data_engine_v2.DataEngine: %s",
-        e_v2,
-    )
+except Exception as e_v2:  # pragma: no cover
+    logger.exception("[LegacyService] Failed to init core.data_engine_v2.DataEngine: %s", e_v2)
     try:
-        # Fallback: legacy module-level engine (core.data_engine.get_enriched_quotes)
+        # Fallback: module-level engine (core.data_engine.get_enriched_quotes)
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
         _ENGINE_IS_STUB = False
-        logger.warning(
-            "[LegacyService] Falling back to core.data_engine module-level API."
-        )
-    except Exception as e_v1:  # pragma: no cover - defensive
-        logger.exception(
-            "[LegacyService] Failed to import core.data_engine as fallback: %s",
-            e_v1,
-        )
+        logger.warning("[LegacyService] Falling back to core.data_engine module-level API.")
+    except Exception as e_v1:  # pragma: no cover
+        logger.exception("[LegacyService] Failed to import core.data_engine fallback: %s", e_v1)
 
         class _StubEngine:
-            """
-            Stub engine used ONLY when no real engine is available.
-            Returns placeholder MISSING data for all symbols.
-            """
-
-            async def get_enriched_quotes(
-                self, symbols: List[str]
-            ) -> List[Dict[str, Any]]:
+            async def get_enriched_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
                 out: List[Dict[str, Any]] = []
                 for s in symbols or []:
                     sym = (s or "").strip().upper()
@@ -203,10 +168,7 @@ except Exception as e_v2:  # pragma: no cover - defensive
                         {
                             "symbol": sym,
                             "data_quality": "MISSING",
-                            "error": (
-                                "Unified data engine (v2/v1) unavailable in "
-                                "legacy_service."
-                            ),
+                            "error": "Unified data engine (v2/v1) unavailable in legacy_service.",
                         }
                     )
                 return out
@@ -214,21 +176,10 @@ except Exception as e_v2:  # pragma: no cover - defensive
         _engine = _StubEngine()
         _ENGINE_MODE = "stub"
         _ENGINE_IS_STUB = True
-        logger.error(
-            "[LegacyService] Using stub DataEngine – legacy responses will "
-            "contain MISSING placeholder data."
-        )
+        logger.error("[LegacyService] Using stub engine – legacy responses will be MISSING placeholders.")
 
 
 async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
-    """
-    Unified wrapper to call the underlying engine in any mode.
-
-    Supports:
-      - v2:  _engine.get_enriched_quotes(...)
-      - v1:  core.data_engine.get_enriched_quotes(...)
-      - stub: _engine.get_enriched_quotes(...) -> MISSING data
-    """
     clean = [s.strip() for s in (symbols or []) if s and s.strip()]
     if not clean:
         return []
@@ -239,7 +190,6 @@ async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
     if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
         return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
 
-    # Stub mode
     return await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
 
 
@@ -249,10 +199,10 @@ async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
 
 RIYADH_TZ = timezone(timedelta(hours=3))
 
+
 # ----------------------------------------------------------------------
 # SYMBOL HELPERS (aligned with KSA logic elsewhere)
 # ----------------------------------------------------------------------
-
 
 def _normalize_symbol(symbol: str) -> str:
     """
@@ -262,11 +212,7 @@ def _normalize_symbol(symbol: str) -> str:
     - 1120.TADAWUL   -> 1120.SR
     - 1120           -> 1120.SR
     - 1120.SR        -> 1120.SR
-    - AAPL           -> AAPL
-
-    NOTE:
-    - The engine itself may apply additional normalization.
-    - This function ensures KSA numeric codes are pushed to .SR format.
+    - aapl           -> AAPL
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -278,6 +224,7 @@ def _normalize_symbol(symbol: str) -> str:
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", ".SR")
 
+    # Normalize bare numeric KSA codes to .SR
     if s.isdigit():
         s = f"{s}.SR"
 
@@ -285,40 +232,32 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _split_tickers_by_market(symbols: List[str]) -> Tuple[List[str], List[str]]:
-    """
-    Simple diagnostic split into KSA vs Global (for meta only).
-
-    KSA:    endswith('.SR')
-    Global: everything else
-    """
     ksa: List[str] = []
     global_: List[str] = []
     for s in symbols or []:
         ss = (s or "").strip().upper()
         if not ss:
             continue
-        if ss.endswith(".SR"):
-            ksa.append(ss)
-        else:
-            global_.append(ss)
+        (ksa if ss.endswith(".SR") else global_).append(ss)
     return ksa, global_
+
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for it in items or []:
+        if it and it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
 
 
 # ----------------------------------------------------------------------
 # DATA STRUCTURES
 # ----------------------------------------------------------------------
 
-
 @dataclass
 class LegacyQuote:
-    """
-    Legacy quote representation, modeled on the original /v1/quote
-    response used in PowerShell tests, but backed by UnifiedQuote-like data.
-
-    NOTE:
-    - Many fields may be None depending on provider data.
-    """
-
     # Identity
     ticker: str
     symbol: str
@@ -396,9 +335,8 @@ class LegacyQuote:
 
 
 # ----------------------------------------------------------------------
-# INTERNAL HELPERS – TYPES / MAPPING
+# INTERNAL HELPERS – mapping and typing
 # ----------------------------------------------------------------------
-
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -435,13 +373,6 @@ def _compute_52w_position_pct(
 
 
 def _quote_to_dict(q: Any) -> Dict[str, Any]:
-    """
-    Convert a UnifiedQuote-like object into a plain dict:
-
-    - Supports pydantic models (.model_dump())
-    - Plain dicts
-    - Fallback to __dict__
-    """
     if q is None:
         return {}
     if hasattr(q, "model_dump"):
@@ -455,120 +386,83 @@ def _quote_to_dict(q: Any) -> Dict[str, Any]:
 
 
 def _g(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    """
-    Safe getter for multiple candidate keys.
-    """
     for k in keys:
         if k in data and data[k] is not None:
             return data[k]
     return default
 
 
-def _unified_to_legacy(quote: Any) -> LegacyQuote:
-    """
-    Map UnifiedQuote-like object/dict -> LegacyQuote.
-    This is the central mapping used for all legacy responses.
-    """
+def _parse_iso_dt(x: Any) -> Optional[datetime]:
+    if isinstance(x, datetime):
+        return x
+    if isinstance(x, str) and x.strip():
+        s = x.strip()
+        try:
+            dt = datetime.fromisoformat(s)
+            return dt
+        except Exception:
+            return None
+    return None
+
+
+def _unified_to_legacy(quote: Any, fallback_symbol: str = "") -> LegacyQuote:
     data = _quote_to_dict(quote)
+    symbol = str(_g(data, "symbol", "ticker", default=fallback_symbol) or "").upper()
 
-    if not data:
-        # Fully missing quote from engine
-        return LegacyQuote(
-            ticker="",
-            symbol="",
-            data_quality="MISSING",
-            error="No quote data returned from engine",
-        )
-
-    symbol = str(_g(data, "symbol", "ticker", default="").upper())
+    if not symbol:
+        symbol = (fallback_symbol or "").upper()
 
     name = _g(data, "name", "company_name", "longName", "shortName")
-    exchange = _g(data, "exchange", "market", "primary_exchange")
-    market_region = _g(data, "market_region", "region", "country", "market")
+    exchange = _g(data, "exchange", "primary_exchange", "exchangeName")
+    market_region = _g(data, "market", "market_region", "region", "country")
     currency = _g(data, "currency")
     sector = _g(data, "sector")
     industry = _g(data, "industry", "industryGroup")
     sub_sector = _g(data, "sub_sector", "industry_group")
     listing_date = _g(data, "listing_date")
 
-    price = _safe_float(
-        _g(data, "price", "last_price", "close", "regularMarketPrice")
-    )
-    prev_close = _safe_float(
-        _g(data, "previous_close", "prev_close", "previousClose")
-    )
+    price = _safe_float(_g(data, "price", "last_price", "close", "regularMarketPrice"))
+    prev_close = _safe_float(_g(data, "previous_close", "prev_close", "previousClose"))
     open_price = _safe_float(_g(data, "open", "regularMarketOpen"))
     high_price = _safe_float(_g(data, "high", "dayHigh", "regularMarketDayHigh"))
     low_price = _safe_float(_g(data, "low", "dayLow", "regularMarketDayLow"))
+
     change = _safe_float(_g(data, "change"))
-    change_pct = _safe_float(
-        _g(data, "change_pct", "change_percent", "changePercent")
-    )
+    change_pct = _safe_float(_g(data, "change_pct", "change_percent", "changePercent"))
 
     volume = _safe_float(_g(data, "volume", "regularMarketVolume"))
-    avg_volume = _safe_float(
-        _g(data, "avg_volume", "avg_volume_30d", "average_volume_30d")
-    )
+    avg_volume = _safe_float(_g(data, "avg_volume", "avg_volume_30d", "average_volume_30d"))
     market_cap = _safe_float(_g(data, "market_cap", "marketCap"))
     shares_outstanding = _safe_float(_g(data, "shares_outstanding"))
     free_float = _safe_float(_g(data, "free_float"))
 
-    high_52w = _safe_float(
-        _g(data, "fifty_two_week_high", "high_52w", "yearHigh")
-    )
-    low_52w = _safe_float(
-        _g(data, "fifty_two_week_low", "low_52w", "yearLow")
-    )
+    high_52w = _safe_float(_g(data, "high_52w", "fifty_two_week_high", "yearHigh"))
+    low_52w = _safe_float(_g(data, "low_52w", "fifty_two_week_low", "yearLow"))
 
-    # Prefer engine-computed 52W position if present, else compute
-    pos_52w = _safe_float(
-        _g(data, "position_52w_percent", "fifty_two_week_position")
-    )
+    pos_52w = _safe_float(_g(data, "position_52w_percent", "fifty_two_week_position"))
     if pos_52w is None:
         pos_52w = _compute_52w_position_pct(price, low_52w, high_52w)
 
     eps = _safe_float(_g(data, "eps_ttm", "eps"))
     pe_ratio = _safe_float(_g(data, "pe_ttm", "pe_ratio", "pe"))
     pb_ratio = _safe_float(_g(data, "pb", "pb_ratio", "priceToBook"))
-    dividend_yield = _safe_float(
-        _g(data, "dividend_yield", "dividend_yield_percent")
-    )
+    dividend_yield = _safe_float(_g(data, "dividend_yield", "dividend_yield_percent"))
     roe = _safe_float(_g(data, "roe", "roe_percent", "returnOnEquity"))
     roa = _safe_float(_g(data, "roa", "roa_percent", "returnOnAssets"))
-    profit_margin = _safe_float(
-        _g(data, "profit_margin", "net_margin_percent", "profitMargins")
-    )
-    debt_to_equity = _safe_float(
-        _g(data, "debt_to_equity", "debtToEquity")
-    )
+    profit_margin = _safe_float(_g(data, "profit_margin", "net_margin_percent", "profitMargins"))
+    debt_to_equity = _safe_float(_g(data, "debt_to_equity", "debtToEquity"))
 
-    revenue_growth = _safe_float(
-        _g(data, "revenue_growth_percent", "revenueGrowth")
-    )
-    net_income_growth = _safe_float(
-        _g(data, "net_income_growth_percent", "netIncomeGrowth")
-    )
-    ebitda_margin = _safe_float(
-        _g(data, "ebitda_margin_percent", "ebitdaMargin")
-    )
-    operating_margin = _safe_float(
-        _g(data, "operating_margin_percent", "operatingMargin")
-    )
+    revenue_growth = _safe_float(_g(data, "revenue_growth_percent", "revenueGrowth"))
+    net_income_growth = _safe_float(_g(data, "net_income_growth_percent", "netIncomeGrowth"))
+    ebitda_margin = _safe_float(_g(data, "ebitda_margin_percent", "ebitdaMargin"))
+    operating_margin = _safe_float(_g(data, "operating_margin_percent", "operatingMargin"))
 
     beta = _safe_float(_g(data, "beta"))
-    volatility_30d = _safe_float(
-        _g(data, "volatility_30d", "volatility_30d_percent")
-    )
-    volatility_30d_percent = _safe_float(
-        _g(data, "volatility_30d_percent", "volatility_30d")
-    )
+    volatility_30d = _safe_float(_g(data, "volatility_30d"))
+    volatility_30d_percent = _safe_float(_g(data, "volatility_30d_percent"))
     ev_to_ebitda = _safe_float(_g(data, "ev_to_ebitda", "evToEbitda"))
-    price_to_sales = _safe_float(
-        _g(data, "price_to_sales", "priceToSales")
-    )
-    price_to_cash_flow = _safe_float(
-        _g(data, "price_to_cash_flow", "priceToCashFlow")
-    )
+    price_to_sales = _safe_float(_g(data, "price_to_sales", "priceToSales"))
+    price_to_cash_flow = _safe_float(_g(data, "price_to_cash_flow", "priceToCashFlow"))
     peg_ratio = _safe_float(_g(data, "peg_ratio", "pegRatio"))
 
     value_score = _safe_float(_g(data, "value_score"))
@@ -583,24 +477,14 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
     ma_20d = _safe_float(_g(data, "ma_20d"))
     ma_50d = _safe_float(_g(data, "ma_50d"))
 
-    data_quality = str(
-        _g(data, "data_quality", "data_quality_level", default="MISSING")
-    )
+    data_quality = str(_g(data, "data_quality", "data_quality_level", default="MISSING"))
+    error = _g(data, "error", default=None)
 
-    # Last updated
-    last_updated_raw = _g(data, "last_updated_utc", "as_of_utc")
-    last_utc: Optional[datetime] = None
-    if isinstance(last_updated_raw, datetime):
-        last_utc = last_updated_raw
-    elif isinstance(last_updated_raw, str):
-        try:
-            last_utc = datetime.fromisoformat(last_updated_raw)
-        except Exception:
-            last_utc = None
-
+    # last updated
+    last_utc = _parse_iso_dt(_g(data, "last_updated_utc", "as_of_utc"))
     last_riyadh = _to_riyadh(last_utc) if last_utc else None
 
-    # Sources -> data_source string
+    # sources list -> "a,b,c"
     raw_sources = _g(data, "sources", default=[]) or []
     sources: List[str] = []
     try:
@@ -614,8 +498,6 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
     except Exception:
         pass
     data_source = ", ".join([s for s in sources if s]) or None
-
-    error = _g(data, "error", default=None)
 
     return LegacyQuote(
         ticker=symbol,
@@ -681,9 +563,6 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
 
 
 def _legacy_to_dict(lq: LegacyQuote) -> Dict[str, Any]:
-    """
-    Convert LegacyQuote dataclass to plain dict, ready for JSON response.
-    """
     return {
         "ticker": lq.ticker,
         "symbol": lq.symbol,
@@ -741,27 +620,17 @@ def _legacy_to_dict(lq: LegacyQuote) -> Dict[str, Any]:
         "ma_50d": lq.ma_50d,
         "data_quality": lq.data_quality,
         "data_source": lq.data_source,
-        "last_updated_utc": (
-            lq.last_updated_utc.isoformat() if lq.last_updated_utc else None
-        ),
-        "last_updated_riyadh": (
-            lq.last_updated_riyadh.isoformat() if lq.last_updated_riyadh else None
-        ),
+        "last_updated_utc": lq.last_updated_utc.isoformat() if lq.last_updated_utc else None,
+        "last_updated_riyadh": lq.last_updated_riyadh.isoformat() if lq.last_updated_riyadh else None,
         "error": lq.error,
     }
 
 
+# ----------------------------------------------------------------------
+# SHEETS helpers (legacy, compact)
+# ----------------------------------------------------------------------
+
 def _build_sheet_headers() -> List[str]:
-    """
-    A compact legacy header set for Google Sheets.
-
-    SAFE for:
-      - Legacy Sheets tabs
-      - Ad-hoc test tabs
-
-    The 9-page main dashboard should use the enriched/advanced sheet-rows
-    endpoints instead; this is only for legacy-style support.
-    """
     return [
         "Symbol",
         "Name",
@@ -792,9 +661,6 @@ def _build_sheet_headers() -> List[str]:
 
 
 def _legacy_to_sheet_row(lq: LegacyQuote) -> List[Any]:
-    """
-    Flatten LegacyQuote into a single row for setValues().
-    """
     return [
         lq.symbol,
         lq.name or "",
@@ -825,51 +691,24 @@ def _legacy_to_sheet_row(lq: LegacyQuote) -> List[Any]:
 
 
 # ----------------------------------------------------------------------
-# PUBLIC API – LEGACY QUOTES
+# PUBLIC API
 # ----------------------------------------------------------------------
 
-
 async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
-    """
-    Core function: return legacy-style quotes payload.
-
-    Parameters
-    ----------
-    tickers : list[str]
-        List of symbols, e.g. ["1120.SR", "1180.SR", "AAPL"].
-
-    RETURNS
-    -------
-    dict:
-        {
-            "quotes": [ { ... legacy fields ... } ],
-            "meta":   {
-                "requested": [...],
-                "normalized": [...],
-                "count": int,
-                "markets": { "ksa": int, "global": int },
-                "app": ...,
-                "version": ...,
-                "backend_url": ...,
-                "engine_mode": ...,
-                "engine_is_stub": bool,
-                "enabled_providers": [...],
-                "timestamp_utc": ...,
-                "note": ...
-            }
-        }
-    """
-    raw_symbols = [t.strip() for t in (tickers or []) if t and t.strip()]
-    normalized = [_normalize_symbol(t) for t in raw_symbols]
+    raw = [t.strip() for t in (tickers or []) if t and t.strip()]
+    normalized = [_normalize_symbol(t) for t in raw]
     normalized = [s for s in normalized if s]
+    normalized = _dedupe_preserve_order(normalized)
 
     ksa_syms, global_syms = _split_tickers_by_market(normalized)
+
+    now_utc = datetime.now(timezone.utc).isoformat()
 
     if not normalized:
         return {
             "quotes": [],
             "meta": {
-                "requested": raw_symbols,
+                "requested": raw,
                 "normalized": [],
                 "count": 0,
                 "markets": {"ksa": 0, "global": 0},
@@ -879,138 +718,97 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
                 "engine_mode": _ENGINE_MODE,
                 "engine_is_stub": _ENGINE_IS_STUB,
                 "enabled_providers": _ENABLED_PROVIDERS,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "timestamp_utc": now_utc,
                 "note": "No symbols provided.",
             },
         }
 
-    # Call the unified engine (handles KSA vs Global internally)
     try:
         unified_quotes = await _engine_get_enriched_quotes(normalized)
     except Exception as exc:
-        logger.exception(
-            "[LegacyService] Data engine error for symbols=%s", normalized
-        )
-        legacy_quotes: List[LegacyQuote] = [
-            LegacyQuote(
-                ticker=sym,
-                symbol=sym,
-                data_quality="MISSING",
-                error=f"Data engine error: {exc}",
+        logger.exception("[LegacyService] Engine error for symbols=%s", normalized)
+        quotes = [
+            _legacy_to_dict(
+                LegacyQuote(
+                    ticker=s,
+                    symbol=s,
+                    data_quality="MISSING",
+                    error=f"Data engine error: {exc}",
+                )
             )
-            for sym in normalized
+            for s in normalized
         ]
         return {
-            "quotes": [_legacy_to_dict(lq) for lq in legacy_quotes],
+            "quotes": quotes,
             "meta": {
-                "requested": raw_symbols,
+                "requested": raw,
                 "normalized": normalized,
-                "count": len(legacy_quotes),
-                "markets": {
-                    "ksa": len(ksa_syms),
-                    "global": len(global_syms),
-                },
+                "count": len(quotes),
+                "markets": {"ksa": len(ksa_syms), "global": len(global_syms)},
                 "app": APP_NAME,
                 "version": APP_VERSION,
                 "backend_url": BACKEND_BASE_URL,
                 "engine_mode": _ENGINE_MODE,
                 "engine_is_stub": _ENGINE_IS_STUB,
                 "enabled_providers": _ENABLED_PROVIDERS,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "note": "Failed to fetch data from unified data engine.",
+                "timestamp_utc": now_utc,
+                "note": "Failed to fetch data from unified engine.",
             },
         }
 
-    legacy_quotes: List[LegacyQuote] = []
-    for idx, sym in enumerate(normalized):
-        uq = unified_quotes[idx] if idx < len(unified_quotes) else None
+    legacy_list: List[LegacyQuote] = []
+    for i, sym in enumerate(normalized):
+        uq = unified_quotes[i] if i < len(unified_quotes) else None
         try:
             if uq is None:
                 raise ValueError("No quote returned from engine")
-            lq = _unified_to_legacy(uq)
-            if not lq.symbol:
-                lq.symbol = sym
-                lq.ticker = sym
+            legacy_list.append(_unified_to_legacy(uq, fallback_symbol=sym))
         except Exception as exc:
-            logger.exception(
-                "[LegacyService] Legacy mapping error for %s", sym, exc_info=exc
+            logger.exception("[LegacyService] Mapping error for %s", sym)
+            legacy_list.append(
+                LegacyQuote(
+                    ticker=sym,
+                    symbol=sym,
+                    data_quality="MISSING",
+                    error=f"Legacy mapping error: {exc}",
+                )
             )
-            lq = LegacyQuote(
-                ticker=sym,
-                symbol=sym,
-                data_quality="MISSING",
-                error=f"Legacy mapping error: {exc}",
-            )
-        legacy_quotes.append(lq)
 
-    payload = {
-        "quotes": [_legacy_to_dict(lq) for lq in legacy_quotes],
+    return {
+        "quotes": [_legacy_to_dict(lq) for lq in legacy_list],
         "meta": {
-            "requested": raw_symbols,
+            "requested": raw,
             "normalized": normalized,
-            "count": len(legacy_quotes),
-            "markets": {
-                "ksa": len(ksa_syms),
-                "global": len(global_syms),
-            },
+            "count": len(legacy_list),
+            "markets": {"ksa": len(ksa_syms), "global": len(global_syms)},
             "app": APP_NAME,
             "version": APP_VERSION,
             "backend_url": BACKEND_BASE_URL,
             "engine_mode": _ENGINE_MODE,
             "engine_is_stub": _ENGINE_IS_STUB,
             "enabled_providers": _ENABLED_PROVIDERS,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": now_utc,
             "note": (
-                "Legacy format built on UnifiedQuote-style engine "
-                f"(mode={_ENGINE_MODE}, stub={_ENGINE_IS_STUB}; "
-                "KSA via Tadawul/Argaam providers; "
-                "no direct EODHD calls inside legacy_service)."
+                "Legacy format built on unified engine (no direct provider calls here). "
+                "KSA numeric symbols normalized to .SR."
             ),
         },
     }
-    return payload
-
-
-# ----------------------------------------------------------------------
-# PUBLIC API – GOOGLE SHEETS HELPERS
-# ----------------------------------------------------------------------
 
 
 async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
-    """
-    Build a Google Sheets–friendly payload using the legacy quote format.
-
-    RETURNS
-    -------
-    dict:
-        {
-            "headers": [...],
-            "rows": [[...], ...],
-            "meta": { ... same as get_legacy_quotes.meta ... }
-        }
-
-    This can be used by:
-        - google_sheets_service (write_range)
-        - Google Apps Script bridge
-        - any script that needs simple headers/rows.
-
-    NOTE
-    - The 9-page Ultimate Dashboard should prefer enriched / analysis
-      sheet-rows endpoints; this is mainly for legacy/test tabs and
-      PowerShell experiments.
-    """
-    legacy_payload = await get_legacy_quotes(tickers)
-    quotes = legacy_payload.get("quotes", [])
-    meta = legacy_payload.get("meta", {})
+    payload = await get_legacy_quotes(tickers)
+    quotes = payload.get("quotes", []) or []
+    meta = payload.get("meta", {}) or {}
 
     headers = _build_sheet_headers()
     rows: List[List[Any]] = []
 
     for q in quotes:
-        # q is already a dict in legacy shape; reconstruct LegacyQuote for row:
+        # q is dict (legacy). Convert quickly without strict parsing.
         lq = LegacyQuote(
-            ticker=q.get("ticker", ""),
-            symbol=q.get("symbol", ""),
+            ticker=q.get("ticker", "") or "",
+            symbol=q.get("symbol", "") or "",
             name=q.get("name"),
             exchange=q.get("exchange"),
             market=q.get("market"),
@@ -1063,34 +861,15 @@ async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
             macd=q.get("macd"),
             ma_20d=q.get("ma_20d"),
             ma_50d=q.get("ma_50d"),
-            data_quality=q.get("data_quality", "MISSING"),
+            data_quality=q.get("data_quality", "MISSING") or "MISSING",
             data_source=q.get("data_source"),
-            last_updated_utc=None,
-            last_updated_riyadh=None,
+            last_updated_utc=_parse_iso_dt(q.get("last_updated_utc")),
+            last_updated_riyadh=_parse_iso_dt(q.get("last_updated_riyadh")),
             error=q.get("error"),
         )
-
-        # Optionally parse ISO timestamps back (defensive; safe to ignore failures)
-        lu_utc = q.get("last_updated_utc")
-        lu_riyadh = q.get("last_updated_riyadh")
-        try:
-            if lu_utc:
-                lq.last_updated_utc = datetime.fromisoformat(lu_utc)
-        except Exception:
-            pass
-        try:
-            if lu_riyadh:
-                lq.last_updated_riyadh = datetime.fromisoformat(lu_riyadh)
-        except Exception:
-            pass
-
         rows.append(_legacy_to_sheet_row(lq))
 
-    return {
-        "headers": headers,
-        "rows": rows,
-        "meta": meta,
-    }
+    return {"headers": headers, "rows": rows, "meta": meta}
 
 
 __all__ = [
@@ -1098,3 +877,4 @@ __all__ = [
     "get_legacy_quotes",
     "build_legacy_sheet_payload",
 ]
+```
