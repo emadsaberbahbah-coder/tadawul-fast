@@ -1,192 +1,197 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.5)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.6.0)
 
-- Preferred backend:
-    • core.data_engine_v2.DataEngine (class-based unified engine, v2.5+)
+Preferred backend:
+  - core.data_engine_v2.DataEngine (class-based unified engine)
 
-- Fallback backend:
-    • core.data_engine (module-level async functions:
-        get_enriched_quote / get_enriched_quotes)
+Fallback backend:
+  - core.data_engine (module-level async functions)
 
-- Last-resort:
-    • In-process stub engine that always returns MISSING data so that
-      the API and Google Sheets never crash.
+Last-resort:
+  - In-process stub engine that returns MISSING placeholders (never crashes Sheets)
 
-- Computes:
-    • Value / Quality / Momentum / Opportunity / Overall / Recommendation
-    • Reuses engine-provided scores when available (preferred),
-      otherwise computes a simple deterministic overlay.
-    • Exposes AI valuation overlay:
-        - fair_value
-        - upside_percent
-        - valuation_label
+Provides:
+  - GET  /v1/analysis/health  (alias: /ping)
+  - GET  /v1/analysis/quote?symbol=...
+  - POST /v1/analysis/quotes
+  - POST /v1/analysis/sheet-rows   (headers + rows for Google Sheets)
 
-- Designed for:
-    • 9-page Google Sheets dashboard (Insights_Analysis, etc.)
-    • KSA-safe routing (KSA handled by the unified engine / Argaam –
-      NO direct EODHD calls for .SR from here)
+Design goals:
+  - KSA-safe: this router never calls providers directly.
+  - Extremely defensive: bounded batch size, chunking, timeout, concurrency.
+  - Never throws 502 for Sheets endpoints; returns headers + rows (maybe empty).
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
+import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "2.5"
+AI_ANALYSIS_VERSION = "2.6.0"
 
 # ----------------------------------------------------------------------
-# Optional env.py integration (for engine configuration / diagnostics)
+# Optional env.py integration (safe)
 # ----------------------------------------------------------------------
-
-try:  # pragma: no cover - optional
+try:  # pragma: no cover
     import env as _env  # type: ignore
 except Exception:
     _env = None  # type: ignore
 
 # ----------------------------------------------------------------------
-# ENGINE DETECTION & FALLBACKS (aligned with advanced_analysis / v2.5)
+# Runtime limits (env overrides)
 # ----------------------------------------------------------------------
+DEFAULT_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "50"))
+DEFAULT_BATCH_TIMEOUT = float(os.getenv("AI_BATCH_TIMEOUT_SEC", "30"))
+DEFAULT_CONCURRENCY = int(os.getenv("AI_BATCH_CONCURRENCY", "3"))
+DEFAULT_MAX_TICKERS = int(os.getenv("AI_MAX_TICKERS", "500"))
 
-_ENGINE_MODE: str = "stub"  # "v2", "v1_module", or "stub"
+# ----------------------------------------------------------------------
+# ENGINE DETECTION & FALLBACKS
+# ----------------------------------------------------------------------
+_ENGINE_MODE: str = "stub"  # "v2" | "v1_module" | "stub"
 _ENGINE_IS_STUB: bool = True
-_engine: Any = None
-_data_engine_module: Any = None
 
-# Preferred: new unified engine (class-based)
-try:  # pragma: no cover - defensive
+# v2 preferred
+try:
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
-    engine_kwargs: Dict[str, Any] = {}
+    def _build_v2_kwargs() -> Dict[str, Any]:
+        """
+        Build kwargs from env.py but ONLY pass what DataEngine.__init__ accepts.
+        This avoids signature mismatch errors across versions.
+        """
+        if _env is None:
+            return {}
 
-    if _env is not None:
-        # Cache TTL
-        cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
-        if cache_ttl is not None:
-            engine_kwargs["cache_ttl"] = cache_ttl
+        candidates: Dict[str, Any] = {}
 
-        # Provider timeout: prefer dedicated knob, fall back to HTTP_TIMEOUT
-        provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
-        if provider_timeout is None:
-            provider_timeout = getattr(_env, "HTTP_TIMEOUT", None)
-        if provider_timeout is not None:
-            engine_kwargs["provider_timeout"] = provider_timeout
+        # Common knobs used in your project
+        if hasattr(_env, "ENGINE_CACHE_TTL_SECONDS"):
+            candidates["cache_ttl"] = getattr(_env, "ENGINE_CACHE_TTL_SECONDS")
+        if hasattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS"):
+            candidates["provider_timeout"] = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS")
+        elif hasattr(_env, "HTTP_TIMEOUT"):
+            candidates["provider_timeout"] = getattr(_env, "HTTP_TIMEOUT")
+        if hasattr(_env, "ENABLED_PROVIDERS"):
+            candidates["enabled_providers"] = getattr(_env, "ENABLED_PROVIDERS")
+        if hasattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS"):
+            candidates["enable_advanced_analysis"] = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS")
 
-        # Enabled providers
-        enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
-        if enabled_providers:
-            engine_kwargs["enabled_providers"] = enabled_providers
+        # Filter by actual signature
+        try:
+            sig = inspect.signature(_V2DataEngine.__init__)
+            allowed = set(sig.parameters.keys())
+            allowed.discard("self")
+            return {k: v for k, v in candidates.items() if k in allowed and v is not None}
+        except Exception:
+            return {}
 
-        # Bridge env flag to DataEngine(enable_advanced_analysis=...)
-        enable_adv = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS", True)
-        engine_kwargs["enable_advanced_analysis"] = enable_adv
-
-    try:
-        if engine_kwargs:
-            _engine = _V2DataEngine(**engine_kwargs)
-        else:
-            _engine = _V2DataEngine()
-    except TypeError:
-        # Signature mismatch -> fall back to default constructor
-        _engine = _V2DataEngine()
+    @lru_cache(maxsize=1)
+    def _get_engine_singleton() -> Any:
+        kwargs = _build_v2_kwargs()
+        try:
+            return _V2DataEngine(**kwargs) if kwargs else _V2DataEngine()
+        except TypeError:
+            # ultimate fallback if signature differs
+            return _V2DataEngine()
 
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
-    logger.info(
-        "ai_analysis: Using DataEngine v2 from core.data_engine_v2 (kwargs=%s)",
-        list(engine_kwargs.keys()),
-    )
+    logger.info("routes.ai_analysis: using DataEngine v2 (singleton)")
 
-except Exception as e_v2:  # pragma: no cover - defensive
-    logger.exception(
-        "ai_analysis: Failed to import/use core.data_engine_v2.DataEngine: %s",
-        e_v2,
-    )
-    # Fallback: legacy data engine module with async functions
+except Exception as exc_v2:  # pragma: no cover
+    logger.exception("routes.ai_analysis: failed to import DataEngine v2: %s", exc_v2)
+
+    # v1 module fallback
     try:
         from core import data_engine as _data_engine_module  # type: ignore
 
+        @lru_cache(maxsize=1)
+        def _get_engine_singleton() -> Any:
+            return _data_engine_module
+
         _ENGINE_MODE = "v1_module"
         _ENGINE_IS_STUB = False
-        logger.warning(
-            "ai_analysis: Falling back to core.data_engine module-level API"
-        )
-    except Exception as e_v1:  # pragma: no cover - defensive
-        logger.exception(
-            "ai_analysis: Failed to import core.data_engine as fallback: %s",
-            e_v1,
-        )
+        logger.warning("routes.ai_analysis: falling back to core.data_engine module-level API")
+
+    except Exception as exc_v1:  # pragma: no cover
+        logger.exception("routes.ai_analysis: failed to import v1 fallback: %s", exc_v1)
 
         class _StubEngine:
-            """
-            Safe stub engine when no real engine is available.
-
-            All responses have data_quality='MISSING', but the API
-            stays up and Google Sheets never see 500 errors.
-            """
-
             async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
-                sym = (symbol or "").strip().upper()
+                sym = (symbol or "").strip().upper() or "UNKNOWN"
                 return {
                     "symbol": sym,
                     "name": None,
                     "market_region": "UNKNOWN",
+                    "market": None,
+                    "currency": None,
                     "price": None,
+                    "last_price": None,
                     "change_pct": None,
+                    "change_percent": None,
                     "market_cap": None,
                     "pe_ttm": None,
+                    "pe_ratio": None,
                     "pb": None,
+                    "pb_ratio": None,
                     "dividend_yield": None,
+                    "dividend_yield_percent": None,
                     "roe": None,
-                    "roa": None,
+                    "roe_percent": None,
                     "data_quality": "MISSING",
+                    "value_score": None,
+                    "quality_score": None,
+                    "momentum_score": None,
                     "opportunity_score": None,
+                    "overall_score": None,
+                    "recommendation": "MISSING",
+                    "fair_value": None,
+                    "upside_percent": None,
+                    "valuation_label": None,
                     "as_of_utc": None,
+                    "last_updated_utc": None,
                     "sources": [],
                     "notes": None,
                     "error": (
-                        "Data engine modules (core.data_engine_v2/core.data_engine) "
-                        "are not available or failed to import."
+                        "STUB_ENGINE: core.data_engine_v2/core.data_engine unavailable."
                     ),
                 }
 
-            async def get_enriched_quotes(
-                self, symbols: List[str]
-            ) -> List[Dict[str, Any]]:
-                out: List[Dict[str, Any]] = []
-                for s in symbols:
-                    out.append(await self.get_enriched_quote(s))
-                return out
+            async def get_enriched_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+                return [await self.get_enriched_quote(s) for s in (symbols or [])]
 
-        _engine = _StubEngine()
+        @lru_cache(maxsize=1)
+        def _get_engine_singleton() -> Any:
+            return _StubEngine()
+
         _ENGINE_MODE = "stub"
         _ENGINE_IS_STUB = True
-        logger.error("ai_analysis: Using stub DataEngine with MISSING data.")
+        logger.error("routes.ai_analysis: using STUB engine (MISSING placeholders).")
+
 
 # ----------------------------------------------------------------------
 # ROUTER
 # ----------------------------------------------------------------------
+router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
-router = APIRouter(
-    prefix="/v1/analysis",
-    tags=["AI & Analysis"],
-)
 
 # ----------------------------------------------------------------------
 # MODELS
 # ----------------------------------------------------------------------
-
-
 class SingleAnalysisResponse(BaseModel):
-    """One ticker full analysis – safe for Sheets consumption."""
-
     symbol: str
     name: Optional[str] = None
     market_region: Optional[str] = None
@@ -196,9 +201,11 @@ class SingleAnalysisResponse(BaseModel):
     market_cap: Optional[float] = None
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
-    dividend_yield: Optional[float] = None  # stored as fraction (0–1)
-    roe: Optional[float] = None             # stored as fraction (0–1)
-    roa: Optional[float] = None             # optional, currently not in sheet
+
+    # stored internally as fraction (0–1); sheet output converts to %
+    dividend_yield: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
 
     data_quality: str = "MISSING"
 
@@ -209,7 +216,7 @@ class SingleAnalysisResponse(BaseModel):
     overall_score: Optional[float] = None
     recommendation: Optional[str] = None
 
-    # AI valuation overlay (engine v2.5+)
+    # AI valuation overlay
     fair_value: Optional[float] = None
     upside_percent: Optional[float] = None
     valuation_label: Optional[str] = None
@@ -218,11 +225,11 @@ class SingleAnalysisResponse(BaseModel):
     sources: List[str] = Field(default_factory=list)
 
     notes: Optional[str] = None
-    error: Optional[str] = None  # text error instead of 500
+    error: Optional[str] = None
 
 
 class BatchAnalysisRequest(BaseModel):
-    tickers: List[str]
+    tickers: List[str] = Field(default_factory=list)
 
 
 class BatchAnalysisResponse(BaseModel):
@@ -235,62 +242,10 @@ class SheetAnalysisResponse(BaseModel):
 
 
 # ----------------------------------------------------------------------
-# INTERNAL HELPERS – ENGINE WRAPPERS
+# INTERNAL HELPERS
 # ----------------------------------------------------------------------
-
-
-async def _engine_get_quote(symbol: str) -> Any:
-    """
-    Unified wrapper for a single quote, hiding engine differences.
-    """
-    sym = (symbol or "").strip()
-    if not sym:
-        return None
-
-    if _ENGINE_MODE == "v2":
-        return await _engine.get_enriched_quote(sym)
-    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
-        return await _data_engine_module.get_enriched_quote(sym)  # type: ignore[attr-defined]
-    # Stub
-    return await _engine.get_enriched_quote(sym)
-
-
-async def _engine_get_quotes(symbols: List[str]) -> List[Any]:
-    """
-    Unified wrapper for multiple quotes.
-    """
-    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
-    if not clean:
-        return []
-
-    if _ENGINE_MODE == "v2":
-        return await _engine.get_enriched_quotes(clean)
-    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
-        return await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
-    # Stub
-    return await _engine.get_enriched_quotes(clean)
-
-
-def _qget(obj: Any, *names: str) -> Any:
-    """
-    Safely get a field from a UnifiedQuote-like object or dict.
-
-    Tries attributes first, then dict keys, returns None if not found.
-    """
-    if obj is None:
-        return None
-    for name in names:
-        if hasattr(obj, name):
-            try:
-                val = getattr(obj, name)
-                if val is not None:
-                    return val
-            except Exception:
-                continue
-        if isinstance(obj, dict) and name in obj and obj[name] is not None:
-            return obj[name]
-    return None
-
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -300,15 +255,18 @@ def _safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+def _clamp_0_100(x: Any) -> Optional[float]:
+    v = _safe_float(x)
+    if v is None:
+        return None
+    return max(0.0, min(100.0, v))
 
-def _normalize_percent_like(x: Any) -> Optional[float]:
+def _normalize_percent_like_to_fraction(x: Any) -> Optional[float]:
     """
-    Convert any percent-like value into a fraction (0–1) for internal use.
-
-    - If x is None -> None
-    - If 0 <= x <= 1  -> treated as fraction already (e.g. 0.15 = 15%)
-    - If 1 < x <= 100 -> treated as percent, converted to fraction (e.g. 15 -> 0.15)
-    - If x > 100      -> left as-is (defensive; will be clamped by scoring)
+    Returns fraction 0–1.
+    Accepts:
+      - 0..1 already fraction
+      - 1..100 treated as percent
     """
     v = _safe_float(x)
     if v is None:
@@ -317,287 +275,361 @@ def _normalize_percent_like(x: Any) -> Optional[float]:
         return v
     if 1.0 < v <= 100.0:
         return v / 100.0
-    return v
+    return v  # defensive
 
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump()  # type: ignore[call-arg]
+        except Exception:
+            pass
+    return getattr(obj, "__dict__", {}) or {}
 
-def _compute_scores_from_raw(quote: Any) -> Dict[str, Optional[float]]:
+def _qget(obj: Any, *names: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for n in names:
+            if n in obj and obj[n] is not None:
+                return obj[n]
+        return None
+    for n in names:
+        if hasattr(obj, n):
+            try:
+                v = getattr(obj, n)
+                if v is not None:
+                    return v
+            except Exception:
+                continue
+    return None
+
+def _clean_tickers(items: Sequence[str]) -> List[str]:
+    raw = [(x or "").strip() for x in (items or [])]
+    raw = [x for x in raw if x]
+    seen = set()
+    out: List[str] = []
+    for x in raw:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+def _chunk(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+def _valuation_label_from_upside(upside_percent: Optional[float]) -> Optional[str]:
+    if upside_percent is None:
+        return None
+    if upside_percent >= 25:
+        return "UNDERVALUED"
+    if upside_percent <= -15:
+        return "OVERVALUED"
+    return "FAIR"
+
+def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]:
     """
-    Basic AI-like scoring layer. 0–100 scale for each score.
-    Uses raw fields from the unified engine (v2 or v1).
-
-    NOTE:
-        This is a fallback when the engine did not already provide
-        value_score / quality_score / momentum_score.
+    Deterministic (non-random) fallback scoring 0–100.
+    Only used when engine did not provide the scores and data_quality isn't MISSING.
     """
-    pe = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
-    pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
-    dy = _normalize_percent_like(
-        _qget(quote, "dividend_yield", "dividend_yield_percent", "dividendYield")
-    )
-    roe = _normalize_percent_like(_qget(quote, "roe", "roe_percent", "returnOnEquity"))
-    profit_margin = _normalize_percent_like(
-        _qget(quote, "profit_margin", "net_margin_percent", "profitMargins")
-    )
-    change_pct = _safe_float(
-        _qget(quote, "change_pct", "change_percent", "changePercent")
-    )
+    dq = str(data.get("data_quality") or "").upper()
+    if dq in {"MISSING", "UNKNOWN", ""}:
+        return {"value_score": None, "quality_score": None, "momentum_score": None}
 
-    # ------------------------
-    # Value score (P/E, P/B, Dividend Yield)
-    # ------------------------
-    vs = 50.0
+    pe = _safe_float(data.get("pe_ttm") or data.get("pe_ratio") or data.get("pe"))
+    pb = _safe_float(data.get("pb") or data.get("pb_ratio"))
+    dy = _normalize_percent_like_to_fraction(
+        data.get("dividend_yield") or data.get("dividend_yield_percent")
+    )
+    roe = _normalize_percent_like_to_fraction(data.get("roe") or data.get("roe_percent"))
+    change_pct = _safe_float(data.get("change_pct") or data.get("change_percent"))
+
+    # Value
+    v = 50.0
     if pe is not None:
         if 0 < pe < 12:
-            vs += 20
+            v += 20
         elif 12 <= pe <= 20:
-            vs += 10
+            v += 10
         elif pe > 35:
-            vs -= 15
+            v -= 15
     if pb is not None:
         if 0 < pb < 1:
-            vs += 10
+            v += 10
         elif pb > 4:
-            vs -= 10
+            v -= 10
     if dy is not None:
-        # dy is fraction here (0–1)
-        if 0.02 <= dy <= 0.06:  # 2–6%
-            vs += 10
-        elif dy > 0.08:  # >8%
-            vs -= 5
-    value_score: float = max(0.0, min(100.0, vs))
+        if 0.02 <= dy <= 0.06:
+            v += 10
+        elif dy > 0.08:
+            v -= 5
+    value_score = max(0.0, min(100.0, v))
 
-    # ------------------------
-    # Quality score (ROE, profit margin)
-    # ------------------------
-    qs = 50.0
+    # Quality
+    q = 50.0
     if roe is not None:
-        if roe >= 0.20:  # ≥20%
-            qs += 25
+        if roe >= 0.20:
+            q += 25
         elif 0.10 <= roe < 0.20:
-            qs += 10
-        elif roe < 0.0:
-            qs -= 15
-    if profit_margin is not None:
-        if profit_margin >= 0.20:
-            qs += 20
-        elif 0.10 <= profit_margin < 0.20:
-            qs += 10
-        elif profit_margin < 0.0:
-            qs -= 10
-    quality_score: float = max(0.0, min(100.0, qs))
+            q += 10
+        elif roe < 0:
+            q -= 15
+    quality_score = max(0.0, min(100.0, q))
 
-    # ------------------------
-    # Momentum score (daily change %)
-    # ------------------------
-    ms = 50.0
+    # Momentum (daily change)
+    m = 50.0
     if change_pct is not None:
         if change_pct > 0:
-            ms += min(change_pct, 10) * 2  # cap upside contribution
+            m += min(change_pct, 10) * 2
         elif change_pct < 0:
-            ms += max(change_pct, -10) * 2  # penalties for deep red
-    momentum_score: float = max(0.0, min(100.0, ms))
+            m += max(change_pct, -10) * 2
+    momentum_score = max(0.0, min(100.0, m))
 
     return {
-        "value_score": value_score,
-        "quality_score": quality_score,
-        "momentum_score": momentum_score,
+        "value_score": round(value_score, 2),
+        "quality_score": round(quality_score, 2),
+        "momentum_score": round(momentum_score, 2),
     }
 
-
-def _clamp_score(v: Any) -> Optional[float]:
-    s = _safe_float(v)
-    if s is None:
-        return None
-    return max(0.0, min(100.0, s))
-
-
-def _get_or_compute_scores(quote: Any) -> Dict[str, Optional[float]]:
-    """
-    Prefer engine-provided scores (DataEngine v2.5), fall back
-    to local deterministic scoring when missing.
-
-    If the engine is a stub or the data_quality is MISSING/UNKNOWN,
-    returns all scores as None (no fake 50/50/50).
-    """
-    dq = str(_qget(quote, "data_quality") or "").upper()
-    if _ENGINE_IS_STUB or dq in {"MISSING", "UNKNOWN", ""}:
-        return {
-            "value_score": None,
-            "quality_score": None,
-            "momentum_score": None,
-        }
-
-    pre_value = _clamp_score(_qget(quote, "value_score"))
-    pre_quality = _clamp_score(_qget(quote, "quality_score"))
-    pre_momentum = _clamp_score(_qget(quote, "momentum_score"))
-
-    # If engine already provided all three, just reuse them
-    if pre_value is not None and pre_quality is not None and pre_momentum is not None:
-        return {
-            "value_score": pre_value,
-            "quality_score": pre_quality,
-            "momentum_score": pre_momentum,
-        }
-
-    # Otherwise compute from raw fundamentals, but keep any precomputed fields
-    computed = _compute_scores_from_raw(quote)
-
-    return {
-        "value_score": pre_value if pre_value is not None else computed["value_score"],
-        "quality_score": (
-            pre_quality if pre_quality is not None else computed["quality_score"]
-        ),
-        "momentum_score": (
-            pre_momentum if pre_momentum is not None else computed["momentum_score"]
-        ),
-    }
-
-
-def _compute_opportunity_score(
-    quote: Any,
-    base_scores: Dict[str, Optional[float]],
-) -> Optional[float]:
-    """
-    Prefer engine-provided opportunity_score, otherwise derive a simple
-    weighted combination of value / quality / momentum.
-    """
-    existing = _safe_float(_qget(quote, "opportunity_score"))
+def _compute_opportunity_score(data: Dict[str, Any], scores: Dict[str, Optional[float]]) -> Optional[float]:
+    existing = _clamp_0_100(data.get("opportunity_score"))
     if existing is not None:
-        return max(0.0, min(100.0, existing))
-
-    v = base_scores.get("value_score")
-    q = base_scores.get("quality_score")
-    m = base_scores.get("momentum_score")
-    if isinstance(v, (int, float)) and isinstance(q, (int, float)) and isinstance(
-        m, (int, float)
-    ):
+        return existing
+    v = scores.get("value_score")
+    q = scores.get("quality_score")
+    m = scores.get("momentum_score")
+    if isinstance(v, (int, float)) and isinstance(q, (int, float)) and isinstance(m, (int, float)):
         return round(v * 0.4 + q * 0.3 + m * 0.3, 2)
     return None
 
-
 def _compute_overall_and_reco(
-    opportunity_score: Optional[float],
-    value_score: Optional[float],
-    quality_score: Optional[float],
-    momentum_score: Optional[float],
-) -> Dict[str, Optional[float]]:
-    scores = [
-        s
-        for s in [opportunity_score, value_score, quality_score, momentum_score]
-        if isinstance(s, (int, float))
-    ]
-    if not scores:
-        return {"overall_score": None, "recommendation": None}
+    opportunity: Optional[float],
+    value: Optional[float],
+    quality: Optional[float],
+    momentum: Optional[float],
+    existing_overall: Optional[float] = None,
+    existing_reco: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[str]]:
+    if existing_overall is not None:
+        overall = max(0.0, min(100.0, existing_overall))
+    else:
+        parts = [x for x in (opportunity, value, quality, momentum) if isinstance(x, (int, float))]
+        overall = round(sum(parts) / len(parts), 2) if parts else None
 
-    overall = sum(scores) / len(scores)
+    if existing_reco:
+        return overall, str(existing_reco)
+
+    if overall is None:
+        return None, None
 
     if overall >= 80:
-        reco = "STRONG_BUY"
-    elif overall >= 65:
-        reco = "BUY"
-    elif overall >= 45:
-        reco = "HOLD"
-    elif overall >= 30:
-        reco = "REDUCE"
-    else:
-        reco = "SELL"
+        return overall, "STRONG_BUY"
+    if overall >= 65:
+        return overall, "BUY"
+    if overall >= 45:
+        return overall, "HOLD"
+    if overall >= 30:
+        return overall, "REDUCE"
+    return overall, "SELL"
 
-    return {"overall_score": overall, "recommendation": reco}
+def _parse_dt(x: Any) -> Optional[datetime]:
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        return x
+    try:
+        dt = datetime.fromisoformat(str(x))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
-
-def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
-    """
-    Convert a UnifiedQuote-like object to SingleAnalysisResponse.
-
-    Works with:
-    - core.data_engine_v2.UnifiedQuote
-    - core.data_engine.UnifiedQuote
-    - dict payloads
-    """
-    if quote is None:
-        return SingleAnalysisResponse(
-            symbol="",
-            data_quality="MISSING",
-            error="No quote data returned from engine",
-        )
-
-    # 1) Scores: reuse engine scores when available, otherwise compute
-    base_scores = _get_or_compute_scores(quote)
-    opportunity_score = _compute_opportunity_score(quote, base_scores)
-    more = _compute_overall_and_reco(
-        opportunity_score=opportunity_score,
-        value_score=base_scores["value_score"],
-        quality_score=base_scores["quality_score"],
-        momentum_score=base_scores["momentum_score"],
-    )
-
-    # 2) Core identity & metrics
-    symbol = str(_qget(quote, "symbol", "ticker") or "").upper()
-    name = _qget(quote, "name", "company_name", "longName", "shortName")
-    market_region = _qget(
-        quote,
-        "market_region",
-        "market",
-        "exchange_short_name",
-        "exchange",
-    )
-
-    price = _safe_float(_qget(quote, "price", "last_price"))
-    change_pct = _safe_float(
-        _qget(quote, "change_pct", "change_percent", "changePercent")
-    )
-    market_cap = _safe_float(_qget(quote, "market_cap", "marketCap"))
-    pe_ttm = _safe_float(_qget(quote, "pe_ttm", "pe_ratio", "pe"))
-    pb = _safe_float(_qget(quote, "pb", "pb_ratio", "priceToBook"))
-    dividend_yield = _normalize_percent_like(
-        _qget(quote, "dividend_yield", "dividend_yield_percent", "dividendYield")
-    )
-    roe = _normalize_percent_like(_qget(quote, "roe", "roe_percent", "returnOnEquity"))
-    roa = _normalize_percent_like(_qget(quote, "roa", "roa_percent", "returnOnAssets"))
-    data_quality = str(_qget(quote, "data_quality") or "MISSING")
-
-    # 3) AI valuation overlay (fair value / upside / label)
-    fair_value = _safe_float(_qget(quote, "fair_value", "target_price"))
-    upside_percent = _safe_float(_qget(quote, "upside_percent"))
-    if upside_percent is None and fair_value is not None and price is not None:
-        try:
-            upside_percent = round(
-                (float(fair_value) - float(price)) / float(price) * 100.0, 2
-            )
-        except Exception:
-            upside_percent = None
-    valuation_label = _qget(quote, "valuation_label")
-
-    # 4) Timestamps
-    last_updated_raw = _qget(quote, "last_updated_utc", "as_of_utc")
-    # Pydantic will parse this; it's fine if it's str or datetime
-    last_updated_utc: Optional[datetime]
-    if isinstance(last_updated_raw, datetime):
-        last_updated_utc = last_updated_raw
-    elif isinstance(last_updated_raw, str):
-        try:
-            last_updated_utc = datetime.fromisoformat(last_updated_raw)
-        except Exception:
-            last_updated_utc = None
-    else:
-        last_updated_utc = None
-
-    # 5) Sources can be objects, dicts, or strings
-    raw_sources = _qget(quote, "sources") or []
-    sources: List[str] = []
+def _extract_sources(raw_sources: Any) -> List[str]:
+    if not raw_sources:
+        return []
+    out: List[str] = []
     try:
         for s in raw_sources:
-            if hasattr(s, "provider"):
-                sources.append(str(getattr(s, "provider")))
+            if isinstance(s, str):
+                out.append(s)
             elif isinstance(s, dict) and "provider" in s:
-                sources.append(str(s["provider"]))
+                out.append(str(s["provider"]))
+            elif hasattr(s, "provider"):
+                out.append(str(getattr(s, "provider")))
             else:
-                sources.append(str(s))
+                out.append(str(s))
     except Exception:
-        pass
+        return []
+    # de-dup preserve order
+    seen = set()
+    cleaned: List[str] = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        cleaned.append(x)
+    return cleaned
 
-    notes = _qget(quote, "notes")
-    error = _qget(quote, "error")
+
+# ----------------------------------------------------------------------
+# ENGINE CALLS (chunked + timeout + bounded concurrency)
+# ----------------------------------------------------------------------
+async def _engine_get_many(symbols: List[str]) -> List[Any]:
+    eng = _get_engine_singleton()
+
+    # v2 or stub object method
+    if hasattr(eng, "get_enriched_quotes"):
+        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
+
+    # v1 module-level async function
+    if hasattr(eng, "get_enriched_quotes"):
+        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
+
+    # fallback: per ticker
+    out: List[Any] = []
+    for s in symbols:
+        if hasattr(eng, "get_enriched_quote"):
+            out.append(await eng.get_enriched_quote(s))  # type: ignore[attr-defined]
+        else:
+            out.append({"symbol": s.upper(), "data_quality": "MISSING", "error": "Engine missing methods"})
+    return out
+
+async def _get_quotes_chunked(
+    symbols: List[str],
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
+    max_concurrency: int = DEFAULT_CONCURRENCY,
+) -> Dict[str, Any]:
+    clean = _clean_tickers(symbols)
+    if not clean:
+        return {}
+
+    chunks = _chunk(clean, batch_size)
+    sem = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Any]:
+        async with sem:
+            try:
+                res = await asyncio.wait_for(_engine_get_many(chunk_syms), timeout=timeout_sec)
+                return chunk_syms, res
+            except Exception as e:
+                return chunk_syms, e
+
+    results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
+
+    out: Dict[str, Any] = {}
+    for chunk_syms, res in results:
+        if isinstance(res, Exception):
+            msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
+            logger.warning("ai_analysis: %s for chunk(size=%d): %s", msg, len(chunk_syms), chunk_syms)
+            for s in chunk_syms:
+                out[s] = {"symbol": s.upper(), "data_quality": "MISSING", "error": msg}
+            continue
+
+        returned = list(res or [])
+        # Map by symbol if possible, else zip by order
+        by_symbol: Dict[str, Any] = {}
+        for q in returned:
+            d = _model_to_dict(q)
+            sym = (d.get("symbol") or d.get("ticker") or "").strip().upper()
+            if sym:
+                by_symbol[sym] = q
+
+        for s, q in zip(chunk_syms, returned):
+            out.setdefault(s, q)
+
+        for s in chunk_syms:
+            if s not in out:
+                out[s] = by_symbol.get(s.upper()) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
+
+    return out
+
+
+# ----------------------------------------------------------------------
+# TRANSFORM: quote -> SingleAnalysisResponse
+# ----------------------------------------------------------------------
+def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
+    symbol = (raw_symbol or "").strip().upper()
+    data = _model_to_dict(quote)
+
+    # Ensure symbol
+    symbol = str(data.get("symbol") or data.get("ticker") or symbol or "").upper() or symbol or "UNKNOWN"
+
+    dq = str(data.get("data_quality") or "MISSING")
+    name = data.get("name") or data.get("company_name")
+    market_region = data.get("market_region") or data.get("market") or data.get("exchange")
+
+    price = _safe_float(data.get("price") or data.get("last_price") or data.get("close") or data.get("last"))
+    change_pct = _safe_float(data.get("change_pct") or data.get("change_percent") or data.get("changePercent"))
+    market_cap = _safe_float(data.get("market_cap") or data.get("marketCap"))
+    pe_ttm = _safe_float(data.get("pe_ttm") or data.get("pe_ratio") or data.get("pe"))
+    pb = _safe_float(data.get("pb") or data.get("pb_ratio") or data.get("priceToBook"))
+
+    dividend_yield = _normalize_percent_like_to_fraction(
+        data.get("dividend_yield") or data.get("dividend_yield_percent") or data.get("dividendYield")
+    )
+    roe = _normalize_percent_like_to_fraction(
+        data.get("roe") or data.get("roe_percent") or data.get("returnOnEquity")
+    )
+    roa = _normalize_percent_like_to_fraction(
+        data.get("roa") or data.get("roa_percent") or data.get("returnOnAssets")
+    )
+
+    # Scores: prefer engine-provided, else fallback (if dq not MISSING)
+    value_score = _clamp_0_100(data.get("value_score"))
+    quality_score = _clamp_0_100(data.get("quality_score"))
+    momentum_score = _clamp_0_100(data.get("momentum_score"))
+
+    if value_score is None or quality_score is None or momentum_score is None:
+        fb = _compute_scores_fallback(data)
+        value_score = value_score if value_score is not None else fb["value_score"]
+        quality_score = quality_score if quality_score is not None else fb["quality_score"]
+        momentum_score = momentum_score if momentum_score is not None else fb["momentum_score"]
+
+    opportunity_score = _compute_opportunity_score(
+        data, {"value_score": value_score, "quality_score": quality_score, "momentum_score": momentum_score}
+    )
+
+    existing_overall = _clamp_0_100(data.get("overall_score"))
+    existing_reco = data.get("recommendation") or data.get("recommendation_label") or data.get("rating")
+    overall_score, recommendation = _compute_overall_and_reco(
+        opportunity=opportunity_score,
+        value=value_score,
+        quality=quality_score,
+        momentum=momentum_score,
+        existing_overall=existing_overall,
+        existing_reco=str(existing_reco) if existing_reco is not None else None,
+    )
+
+    # AI valuation overlay
+    fair_value = _safe_float(data.get("fair_value") or data.get("target_price") or data.get("intrinsic_value"))
+    upside_percent = _safe_float(data.get("upside_percent") or data.get("upside") or data.get("upside_pct"))
+    if upside_percent is None and fair_value is not None and price is not None and price != 0:
+        try:
+            upside_percent = round((fair_value - price) / price * 100.0, 2)
+        except Exception:
+            upside_percent = None
+
+    valuation_label = data.get("valuation_label") or _valuation_label_from_upside(upside_percent)
+
+    # timestamps & sources
+    last_updated_utc = _parse_dt(data.get("last_updated_utc") or data.get("as_of_utc") or data.get("timestamp_utc"))
+    sources = _extract_sources(data.get("sources") or data.get("providers") or [])
+
+    notes = data.get("notes")
+    error = data.get("error")
+
+    # Make missing more explicit (but never crash)
+    if str(dq).upper() == "MISSING" and not error:
+        error = "No data available from providers"
 
     return SingleAnalysisResponse(
         symbol=symbol,
@@ -611,13 +643,13 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
         dividend_yield=dividend_yield,
         roe=roe,
         roa=roa,
-        data_quality=data_quality,
-        value_score=base_scores["value_score"],
-        quality_score=base_scores["quality_score"],
-        momentum_score=base_scores["momentum_score"],
+        data_quality=str(dq),
+        value_score=value_score,
+        quality_score=quality_score,
+        momentum_score=momentum_score,
         opportunity_score=opportunity_score,
-        overall_score=more["overall_score"],
-        recommendation=more["recommendation"],
+        overall_score=overall_score,
+        recommendation=recommendation,
         fair_value=fair_value,
         upside_percent=upside_percent,
         valuation_label=valuation_label,
@@ -628,28 +660,23 @@ def _quote_to_analysis(quote: Any) -> SingleAnalysisResponse:
     )
 
 
+# ----------------------------------------------------------------------
+# SHEET HELPERS
+# ----------------------------------------------------------------------
 def _build_sheet_headers() -> List[str]:
-    """
-    Headers to use directly in Google Sheets for the AI/Insights layer.
-    This is mainly for the Insights_Analysis page, but can be reused for
-    any scoring/AI overlay on top of the other 8 pages.
-
-    NOTE:
-        We now include AI valuation overlay columns (Fair Value / Upside % /
-        Valuation Label) at the end, so Insights_Analysis immediately sees
-        valuation outputs next to scores.
-    """
     return [
         "Symbol",
         "Company Name",
         "Market / Region",
         "Price",
         "Change %",
+
         "Market Cap",
         "P/E (TTM)",
         "P/B",
         "Dividend Yield %",
         "ROE %",
+
         "Data Quality",
         "Value Score",
         "Quality Score",
@@ -657,13 +684,16 @@ def _build_sheet_headers() -> List[str]:
         "Opportunity Score",
         "Overall Score",
         "Recommendation",
+
         "Last Updated (UTC)",
         "Sources",
+
         "Fair Value",
         "Upside %",
         "Valuation Label",
-    ]
 
+        "Error",
+    ]
 
 def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:
@@ -675,25 +705,20 @@ def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     except Exception:
         return None
 
-
 def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
-    """
-    Flatten one analysis result to a row (all primitives),
-    so Apps Script can use setValues() safely.
-
-    Columns align with _build_sheet_headers().
-    """
     return [
         a.symbol,
         a.name or "",
         a.market_region or "",
         a.price,
         a.change_pct,
+
         a.market_cap,
         a.pe_ttm,
         a.pb,
         (a.dividend_yield * 100.0) if a.dividend_yield is not None else None,
         (a.roe * 100.0) if a.roe is not None else None,
+
         a.data_quality,
         a.value_score,
         a.quality_score,
@@ -701,71 +726,62 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
         a.opportunity_score,
         a.overall_score,
         a.recommendation,
+
         _to_iso(a.last_updated_utc),
         ", ".join(a.sources) if a.sources else "",
+
         a.fair_value,
         a.upside_percent,
         a.valuation_label or "",
+
+        a.error or "",
     ]
 
 
 # ----------------------------------------------------------------------
 # ROUTES
 # ----------------------------------------------------------------------
-
-
 @router.get("/health")
-@router.get("/ping", summary="Quick health-check for AI analysis")
+@router.get("/ping")
 async def analysis_health() -> Dict[str, Any]:
-    """
-    Simple health check for this module.
-    """
     env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
     app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
 
     return {
         "status": "ok",
-        "module": "ai_analysis",
+        "module": "routes.ai_analysis",
         "version": AI_ANALYSIS_VERSION,
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
         "environment": env_name or "unknown",
         "app_version": app_version or "unknown",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "batch_size": DEFAULT_BATCH_SIZE,
+        "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
+        "batch_concurrency": DEFAULT_CONCURRENCY,
+        "max_tickers": DEFAULT_MAX_TICKERS,
+        "timestamp_utc": _now_utc().isoformat(),
     }
 
 
 @router.get("/quote", response_model=SingleAnalysisResponse)
 async def analyze_single_quote(
-    ticker: str = Query(..., alias="symbol"),
+    symbol: str = Query(..., alias="symbol"),
 ) -> SingleAnalysisResponse:
     """
-    High-level AI/quant analysis for a single ticker.
-    Designed to be consumed by Google Sheets / Apps Script.
-
-    Example:
-        GET /v1/analysis/quote?symbol=AAPL
-        GET /v1/analysis/quote?symbol=1120.SR
+    AI/quant analysis for ONE ticker. Always returns a valid body (never 500).
     """
-    ticker = (ticker or "").strip()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="Ticker is required")
+    t = (symbol or "").strip()
+    if not t:
+        return SingleAnalysisResponse(symbol="", data_quality="MISSING", error="Symbol is required")
 
     try:
-        quote = await _engine_get_quote(ticker)
-        analysis = _quote_to_analysis(quote)
-
-        # If we truly have no data from providers, mark an explicit error
-        if analysis.data_quality.upper() == "MISSING" and not analysis.error:
-            analysis.error = "No data available from providers"
-        return analysis
-    except HTTPException:
-        raise
+        m = await _get_quotes_chunked([t], batch_size=1)
+        q = m.get(t) or {"symbol": t.upper(), "data_quality": "MISSING", "error": "No data returned"}
+        return _quote_to_analysis(t, q)
     except Exception as exc:
-        logger.exception("Exception in analyze_single_quote for %s", ticker)
-        # NEVER crash Google Sheets – always return a valid body
+        logger.exception("ai_analysis: exception in /quote for %s", t)
         return SingleAnalysisResponse(
-            symbol=ticker.upper(),
+            symbol=t.upper(),
             data_quality="MISSING",
             error=f"Exception in analysis: {exc}",
         )
@@ -774,65 +790,34 @@ async def analyze_single_quote(
 @router.post("/quotes", response_model=BatchAnalysisResponse)
 async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisResponse:
     """
-    Batch AI/quant analysis for multiple tickers.
-
-    Body:
-        {
-          "tickers": ["AAPL", "MSFT", "1120.SR"]
-        }
+    Batch AI/quant analysis. Never 500; returns MISSING rows on failure.
     """
-    tickers = [t.strip() for t in (body.tickers or []) if t and t.strip()]
-
+    tickers = _clean_tickers(body.tickers or [])
     if not tickers:
-        raise HTTPException(status_code=400, detail="At least one ticker is required")
+        return BatchAnalysisResponse(results=[])
+
+    if len(tickers) > DEFAULT_MAX_TICKERS:
+        tickers = tickers[:DEFAULT_MAX_TICKERS]
 
     try:
-        unified_quotes = await _engine_get_quotes(tickers)
+        m = await _get_quotes_chunked(tickers)
     except Exception as exc:
-        logger.exception("Batch analysis failed for tickers=%s: %s", tickers, exc)
-        # Total failure – return placeholder rows for all tickers
-        placeholder_results: List[SingleAnalysisResponse] = [
-            SingleAnalysisResponse(
-                symbol=t.upper(),
-                data_quality="MISSING",
-                error=f"Batch analysis failed: {exc}",
-            )
-            for t in tickers
-        ]
-        return BatchAnalysisResponse(results=placeholder_results)
-
-    # Defensive: ensure we always iterate len(tickers) times
-    if unified_quotes is None:
-        unified_quotes = []
-    if not isinstance(unified_quotes, list):
-        unified_quotes = [unified_quotes]
-
-    # Pad or truncate to match number of tickers
-    if len(unified_quotes) < len(tickers):
-        unified_quotes.extend([None] * (len(tickers) - len(unified_quotes)))
-    elif len(unified_quotes) > len(tickers):
-        unified_quotes = unified_quotes[: len(tickers)]
+        logger.exception("ai_analysis: batch failure: %s", exc)
+        return BatchAnalysisResponse(
+            results=[
+                SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Batch failure: {exc}")
+                for t in tickers
+            ]
+        )
 
     results: List[SingleAnalysisResponse] = []
-    for t, q in zip(tickers, unified_quotes):
+    for t in tickers:
+        q = m.get(t) or {"symbol": t.upper(), "data_quality": "MISSING", "error": "No data returned"}
         try:
-            analysis = _quote_to_analysis(q)
-            if not analysis.symbol:
-                analysis.symbol = t.upper()
-            if analysis.data_quality.upper() == "MISSING" and not analysis.error:
-                analysis.error = "No data available from providers"
-            results.append(analysis)
+            results.append(_quote_to_analysis(t, q))
         except Exception as exc:
-            logger.exception(
-                "Exception building analysis for %s in batch: %s", t, exc
-            )
-            results.append(
-                SingleAnalysisResponse(
-                    symbol=t.upper(),
-                    data_quality="MISSING",
-                    error=f"Exception building analysis: {exc}",
-                )
-            )
+            logger.exception("ai_analysis: transform failure for %s: %s", t, exc)
+            results.append(SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Transform failure: {exc}"))
 
     return BatchAnalysisResponse(results=results)
 
@@ -840,27 +825,13 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
 @router.post("/sheet-rows", response_model=SheetAnalysisResponse)
 async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse:
     """
-    Google Sheets-friendly endpoint.
-
-    Returns:
-        {
-          "headers": [...],
-          "rows": [ [row for t1], [row for t2], ... ]
-        }
-
-    Apps Script can simply setValues() using rows with the returned headers.
-
-    This is designed for:
-        - Insights_Analysis sheet
-        - Any scoring/AI layer on top of KSA_Tadawul, Global_Markets,
-          Mutual_Funds, Commodities_FX, and My_Portfolio pages.
+    Google Sheets–friendly endpoint:
+      returns { headers, rows } always (even if empty).
     """
-    # Reuse the batch endpoint to guarantee identical logic
-    batch = await analyze_batch_quotes(body)
     headers = _build_sheet_headers()
-
-    rows: List[List[Any]] = []
-    for res in batch.results:
-        rows.append(_analysis_to_sheet_row(res))
-
+    batch = await analyze_batch_quotes(body)
+    rows = [_analysis_to_sheet_row(r) for r in batch.results]
     return SheetAnalysisResponse(headers=headers, rows=rows)
+
+
+__all__ = ["router", "SingleAnalysisResponse", "BatchAnalysisRequest", "BatchAnalysisResponse", "SheetAnalysisResponse"]
