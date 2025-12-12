@@ -1,25 +1,23 @@
 # ============================================================
-# Tadawul Fast Bridge – Render Configuration
+# Tadawul Fast Bridge – Render Blueprint Configuration
 # Unified KSA + Global market data + Google Sheets integration
-# Version aligned with main.py (4.4.0)
 # ============================================================
 
 services:
   - type: web
     name: tadawul-fast-bridge
     env: python
-    plan: starter              # "free", "starter", "standard", ...
-    region: frankfurt          # choose your preferred region
+    plan: starter
+    region: frankfurt
     autoDeploy: true
 
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
+    # Keep build simple + fast (Render already manages Python)
+    buildCommand: pip install -r requirements.txt
 
-    startCommand: |
-      uvicorn main:app --host 0.0.0.0 --port $PORT
+    # IMPORTANT: must bind to 0.0.0.0 and Render-provided $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
 
-    # Main health check used by Render to confirm the service is healthy
+    # Render health check
     healthCheckPath: /health
 
     envVars:
@@ -39,140 +37,105 @@ services:
       - key: PYTHON_VERSION
         value: "3.11.9"
 
-      # Backend base URL – used by Sheets/Apps Script & status endpoints
-      # NOTE: Render exposes something like:
-      #   https://tadawul-fast-bridge.onrender.com
-      # If you change the service name or use a custom domain, update this.
+      # Backend base URL used by Sheets/Apps Script
       - key: BACKEND_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
 
       # ------------------------------------------------------
       # Auth Tokens – used by main.py (require_app_token)
       # ------------------------------------------------------
-      # APP_TOKEN is used by:
-      #   - Google Apps Script (X-APP-TOKEN header)
-      #   - Google Sheets / PowerShell tools
       - key: APP_TOKEN
         generateValue: true
 
-      # Optional backup app token (for rotation / secondary clients)
       - key: BACKUP_APP_TOKEN
         value: ""
 
-      # If set, overrides automatic detection (optional).
-      # When TRUE, all router groups enforce token auth.
       - key: HAS_SECURE_TOKEN
         value: "true"
 
       # ------------------------------------------------------
       # Provider configuration – core.data_engine / data_engine_v2
       # ------------------------------------------------------
-      # IMPORTANT:
-      #   - EODHD is used ONLY for NON-KSA symbols (US, EU, etc.).
-      #   - For KSA .SR tickers, the unified engine routes to the
-      #     internal KSA / Argaam gateway (NO EODHD for KSA).
       - key: ENABLED_PROVIDERS
         value: "eodhd,fmp,yfinance"
 
-      # Primary provider (for GLOBAL, not for KSA)
       - key: PRIMARY_PROVIDER
         value: "eodhd"
 
-      # Global HTTP timeout (seconds) for outbound provider calls
       - key: HTTP_TIMEOUT
         value: "25"
 
-      # Unified engine tuning (used by core.data_engine_v2 & legacy_service)
       - key: ENGINE_CACHE_TTL_SECONDS
-        value: "60"          # cache lifetime for engine in seconds
-      - key: ENGINE_PROVIDER_TIMEOUT_SECONDS
-        value: "20"          # per-provider timeout inside engine
-      - key: ENGINE_ENABLE_ADVANCED_ANALYSIS
-        value: "true"        # allow advanced metrics in engine
+        value: "60"
 
-      # KSA-specific engine cache (used by routes_argaam.py if exposed in env.py)
+      - key: ENGINE_PROVIDER_TIMEOUT_SECONDS
+        value: "20"
+
+      - key: ENGINE_ENABLE_ADVANCED_ANALYSIS
+        value: "true"
+
       - key: KSA_ENGINE_CACHE_TTL_SECONDS
         value: "60"
 
-      # Max retries for transient failures (reserved for future use)
       - key: MAX_RETRIES
         value: "2"
 
       # ------------------------------------------------------
-      # EODHD – main non-KSA real-time quote provider
-      # (NEVER used for .SR tickers – enforced in code)
+      # EODHD (GLOBAL only — never for .SR)
       # ------------------------------------------------------
       - key: EODHD_API_KEY
-        sync: false          # set the real key in the Render dashboard
+        sync: false
 
       - key: EODHD_BASE_URL
         value: "https://eodhd.com/api"
 
       # ------------------------------------------------------
-      # FMP – fundamentals / extra quotes (non-KSA)
+      # FMP (GLOBAL fundamentals / extra quotes)
       # ------------------------------------------------------
       - key: FMP_API_KEY
-        sync: false          # set the real key in the Render dashboard
+        sync: false
 
       - key: FMP_BASE_URL
         value: "https://financialmodelingprep.com/api/v3"
 
       # ------------------------------------------------------
-      # KSA / Argaam – Tadawul gateway provider (.SR only)
+      # KSA / Argaam gateway (.SR only)
       # ------------------------------------------------------
-      # Internal KSA gateway endpoint (this service itself).
-      # core.data_engine → KsaArgaamProvider will call:
-      #   {ARGAAM_GATEWAY_URL}/quote?symbol=1120.SR
-      # So we point to our own /v1/argaam routes.
       - key: ARGAAM_GATEWAY_URL
         value: "https://tadawul-fast-bridge.onrender.com/v1/argaam"
 
-      # Optional API key for an external KSA gateway (not required when
-      # using the internal /v1/argaam routes; keep empty by default).
       - key: ARGAAM_API_KEY
         sync: false
 
       # ------------------------------------------------------
-      # Optional extra providers (for future expansion)
+      # Optional extra providers (future)
       # ------------------------------------------------------
       - key: FINNHUB_API_KEY
-        sync: false          # optional
+        sync: false
+
       - key: ALPHA_VANTAGE_API_KEY
-        sync: false          # optional
+        sync: false
 
       # ------------------------------------------------------
       # Google Sheets / Apps Script integration
       # ------------------------------------------------------
-      # GOOGLE_SHEETS_CREDENTIALS must be the FULL service-account JSON
-      # flattened into a single line string.
-      # Example: paste the entire JSON as one line in the Render dashboard.
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
 
-      # MASTER spreadsheet ID for ALL 9 pages:
-      #   KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX,
-      #   My_Portfolio_Investment, Insights_Analysis,
-      #   Investment_Advisor, Economic_Calendar,
-      #   Investment_Income_Statement.
       - key: DEFAULT_SPREADSHEET_ID
-        value: ""            # set your master Google Sheet ID in the dashboard
+        sync: false
 
-      # Optional backup Apps Script WebApp URL (for dual-side refresh,
-      # or as a fallback if Sheets API is temporarily throttled).
       - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
         value: ""
 
-      # Optional GCP project id (for logs/monitoring if needed)
       - key: GOOGLE_PROJECT_ID
         value: ""
 
       # ------------------------------------------------------
       # CORS / Logging
       # ------------------------------------------------------
-      # Allow all origins – required for Google Sheets & Apps Script usage.
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
 
-      # Global log level (used by main.py / logging.basicConfig)
       - key: LOG_LEVEL
         value: "INFO"
