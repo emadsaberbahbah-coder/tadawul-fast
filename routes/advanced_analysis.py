@@ -1,11 +1,11 @@
 """
 routes/advanced_analysis.py
 ================================================
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v2.4.0)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v2.5.0)
 
 Purpose
 -------
-- Expose "advanced analysis" and "opportunity ranking" endpoints
+- Expose "advanced analysis" + "opportunity ranking" endpoints
   on top of the unified engine (core.data_engine_v2 preferred).
 - Google Sheets–friendly: provides /sheet-rows (headers + rows).
 
@@ -17,12 +17,14 @@ Endpoints
 
 Design notes
 ------------
-- This router NEVER calls providers directly. It only talks to the engine.
+- Router NEVER calls providers directly. It only talks to the engine.
 - Defensive + stable for Sheets:
+    • Normalizes tickers (1120 -> 1120.SR, TADAWUL:1120 -> 1120.SR)
     • Dedupes tickers (preserves order)
     • Chunked batch requests + bounded concurrency + timeout per chunk
-    • Returns empty items/rows (200) instead of throwing 502 on provider failure
+    • Returns 200 with MISSING items instead of 502 on provider failure
 - Singleton engine per process to avoid repeated initialization.
+- Sorting is deterministic and favors Opportunity, then confidence, then upside.
 
 Author: Emad Bahbah (with GPT-5.2 Thinking)
 """
@@ -41,47 +43,88 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "2.4.0"
+ADVANCED_ANALYSIS_VERSION = "2.5.0"
 
 # =============================================================================
 # Runtime config (env overrides)
 # =============================================================================
 
-DEFAULT_BATCH_SIZE = int(os.getenv("ADV_BATCH_SIZE", "50"))
-DEFAULT_BATCH_TIMEOUT = float(os.getenv("ADV_BATCH_TIMEOUT_SEC", "30"))
-DEFAULT_MAX_TICKERS = int(os.getenv("ADV_MAX_TICKERS", "500"))
-DEFAULT_CONCURRENCY = int(os.getenv("ADV_BATCH_CONCURRENCY", "3"))
+DEFAULT_BATCH_SIZE = int(os.getenv("ADV_BATCH_SIZE", "50") or 50)
+DEFAULT_BATCH_TIMEOUT = float(os.getenv("ADV_BATCH_TIMEOUT_SEC", "30") or 30)
+DEFAULT_MAX_TICKERS = int(os.getenv("ADV_MAX_TICKERS", "500") or 500)
+DEFAULT_CONCURRENCY = int(os.getenv("ADV_BATCH_CONCURRENCY", "3") or 3)
 
 # =============================================================================
-# Optional env.py integration (purely metadata)
+# Optional env.py integration (purely metadata + optional engine kwargs)
 # =============================================================================
 
 try:  # pragma: no cover
     import env as _env  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     _env = None  # type: ignore
+
+
+def _get_env_attr(name: str, default: Any = None) -> Any:
+    if _env is not None and hasattr(_env, name):
+        try:
+            return getattr(_env, name)
+        except Exception:
+            return default
+    return os.getenv(name, default)
 
 
 # =============================================================================
 # Engine import & fallbacks (v2 preferred -> v1 module -> stub)
 # =============================================================================
 
-_ENGINE_MODE: str = "stub"       # v2 | v1_module | stub
+_ENGINE_MODE: str = "stub"  # v2 | v1_module | stub
 _ENGINE_IS_STUB: bool = True
+_data_engine_module: Any = None
 
 try:
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
     from core.data_engine_v2 import UnifiedQuote  # type: ignore
 
+    def _build_engine_kwargs() -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {}
+
+        enabled = _get_env_attr("ENABLED_PROVIDERS", None)
+        if isinstance(enabled, (list, tuple)) and enabled:
+            kwargs["enabled_providers"] = list(enabled)
+        elif isinstance(enabled, str) and enabled.strip():
+            kwargs["enabled_providers"] = [p.strip() for p in enabled.split(",") if p.strip()]
+
+        cache_ttl = _get_env_attr("ENGINE_CACHE_TTL_SECONDS", None)
+        if cache_ttl is None:
+            cache_ttl = _get_env_attr("DATAENGINE_CACHE_TTL", None)
+        if cache_ttl is not None:
+            kwargs["cache_ttl"] = cache_ttl
+
+        provider_timeout = _get_env_attr("ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+        if provider_timeout is None:
+            provider_timeout = _get_env_attr("DATAENGINE_TIMEOUT", None)
+        if provider_timeout is not None:
+            kwargs["provider_timeout"] = provider_timeout
+
+        enable_adv = _get_env_attr("ENGINE_ENABLE_ADVANCED_ANALYSIS", None)
+        if enable_adv is None:
+            enable_adv = _get_env_attr("ENABLE_ADVANCED_ANALYSIS", None)
+        if enable_adv is not None:
+            kwargs["enable_advanced_analysis"] = enable_adv
+
+        return kwargs
+
     @lru_cache(maxsize=1)
     def _get_engine_singleton() -> Any:
-        return _V2DataEngine()
+        kwargs = _build_engine_kwargs()
+        try:
+            return _V2DataEngine(**kwargs) if kwargs else _V2DataEngine()
+        except TypeError:
+            return _V2DataEngine()
 
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
     logger.info("AdvancedAnalysis: using DataEngine v2 (singleton)")
-
-    _data_engine_module = None  # type: ignore
 
 except Exception as exc_v2:  # pragma: no cover
     logger.exception("AdvancedAnalysis: failed to import DataEngine v2: %s", exc_v2)
@@ -96,7 +139,7 @@ except Exception as exc_v2:  # pragma: no cover
 
         @lru_cache(maxsize=1)
         def _get_engine_singleton() -> Any:
-            # v1 is module-level; singleton returns the module itself
+            # v1 is module-level; singleton returns module itself
             return _data_engine_module
 
         _ENGINE_MODE = "v1_module"
@@ -118,6 +161,7 @@ except Exception as exc_v2:  # pragma: no cover
                     "symbol": sym,
                     "name": None,
                     "market": None,
+                    "market_region": None,
                     "sector": None,
                     "currency": None,
                     "last_price": None,
@@ -145,7 +189,7 @@ except Exception as exc_v2:  # pragma: no cover
 
         _ENGINE_MODE = "stub"
         _ENGINE_IS_STUB = True
-        _data_engine_module = None  # type: ignore
+        _data_engine_module = None
         logger.error("AdvancedAnalysis: using STUB engine (all values will be MISSING).")
 
 
@@ -156,8 +200,29 @@ except Exception as exc_v2:  # pragma: no cover
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+def _normalize_symbol(symbol: str) -> str:
+    """
+    Align with legacy_service + enriched_quote:
+      - 1120 -> 1120.SR
+      - TADAWUL:1120 -> 1120.SR
+      - 1120.TADAWUL -> 1120.SR
+      - Trim + upper
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", ".SR")
+    if s.isdigit():
+        s = f"{s}.SR"
+    return s
+
+
 def _clean_tickers(items: Sequence[str]) -> List[str]:
-    raw = [(x or "").strip() for x in (items or [])]
+    raw = [_normalize_symbol(x) for x in (items or [])]
     raw = [x for x in raw if x]
     seen = set()
     out: List[str] = []
@@ -168,16 +233,19 @@ def _clean_tickers(items: Sequence[str]) -> List[str]:
         out.append(x)
     return out
 
+
 def _parse_tickers_csv(s: str) -> List[str]:
     if not s:
         return []
     parts = [p.strip() for p in s.split(",")]
     return _clean_tickers(parts)
 
+
 def _chunk(items: List[str], size: int) -> List[List[str]]:
     if size <= 0:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
+
 
 def _safe_float(v: Any) -> Optional[float]:
     try:
@@ -186,6 +254,7 @@ def _safe_float(v: Any) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
 
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
@@ -198,6 +267,7 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
         except Exception:
             pass
     return getattr(obj, "__dict__", {}) or {}
+
 
 def _map_data_quality_to_score(label: Optional[str]) -> Optional[float]:
     if not label:
@@ -216,14 +286,16 @@ def _map_data_quality_to_score(label: Optional[str]) -> Optional[float]:
     }
     return mapping.get(dq, 30.0)
 
+
 def _extract_data_quality_score(data: Dict[str, Any]) -> Optional[float]:
-    # 1) explicit numeric
-    for k in ("data_quality_score", "dq_score", "quality_score_numeric", "confidence_score"):
+    # 1) explicit numeric candidates
+    for k in ("data_quality_score", "dq_score", "quality_score_numeric", "confidence_score", "ai_confidence_score"):
         x = _safe_float(data.get(k))
         if x is not None:
             return x
     # 2) string label
     return _map_data_quality_to_score(data.get("data_quality") or data.get("data_quality_level"))
+
 
 def _compute_risk_bucket(opportunity: Optional[float], dq: Optional[float]) -> str:
     opp = opportunity or 0.0
@@ -242,6 +314,7 @@ def _compute_risk_bucket(opportunity: Optional[float], dq: Optional[float]) -> s
         return "LOW_OPP_HIGH_CONF"
 
     return "NEUTRAL"
+
 
 def _data_age_minutes(as_of_utc: Any) -> Optional[float]:
     if not as_of_utc:
@@ -266,21 +339,21 @@ def _data_age_minutes(as_of_utc: Any) -> Optional[float]:
 async def _engine_get_many(symbols: List[str]) -> List[Any]:
     eng = _get_engine_singleton()
 
-    # v2/stub object
+    # v2 or stub (object with async method)
     if hasattr(eng, "get_enriched_quotes"):
         return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
 
-    # v1 module-level
+    # v1 module-level (if singleton returns module)
     if hasattr(eng, "get_enriched_quotes"):
         return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
 
-    # fallback: per symbol if only single method exists
+    # fallback: per symbol
     out: List[Any] = []
     for s in symbols:
         if hasattr(eng, "get_enriched_quote"):
             out.append(await eng.get_enriched_quote(s))  # type: ignore[attr-defined]
         else:
-            out.append({"symbol": s.upper(), "data_quality": "MISSING", "error": "Engine missing methods"})
+            out.append({"symbol": (s or "").upper(), "data_quality": "MISSING", "error": "Engine missing methods"})
     return out
 
 
@@ -291,6 +364,10 @@ async def _get_quotes_chunked(
     timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
     max_concurrency: int = DEFAULT_CONCURRENCY,
 ) -> Dict[str, Any]:
+    """
+    Returns map keyed by normalized input symbol (exact string in cleaned list).
+    Always returns a value per input symbol (possibly MISSING dict).
+    """
     clean = _clean_tickers(symbols)
     if not clean:
         return {}
@@ -317,22 +394,27 @@ async def _get_quotes_chunked(
                 out[s] = {"symbol": s.upper(), "data_quality": "MISSING", "error": msg}
             continue
 
-        # map returned by symbol if possible, else order zip
         returned = list(res or [])
+
+        # Build symbol->payload map if possible
         by_sym: Dict[str, Any] = {}
         for q in returned:
             d = _model_to_dict(q)
-            sym = (d.get("symbol") or d.get("ticker") or "").strip().upper()
+            sym = _normalize_symbol(str(d.get("symbol") or d.get("ticker") or ""))
             if sym:
                 by_sym[sym] = q
 
-        for s, q in zip(chunk_syms, returned):
-            out.setdefault(s, q)
+        # Assign in order first (best-effort)
+        for i, s in enumerate(chunk_syms):
+            if i < len(returned):
+                out[s] = returned[i]
+            else:
+                out[s] = by_sym.get(s) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
 
-        # fill missing by symbol lookup
+        # Prefer exact symbol match if order seems off
         for s in chunk_syms:
-            if s not in out:
-                out[s] = by_sym.get(s.upper()) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
+            if s in by_sym:
+                out[s] = by_sym[s]
 
     return out
 
@@ -402,9 +484,10 @@ class AdvancedSheetResponse(BaseModel):
 def _to_advanced_item(raw_symbol: str, payload: Any) -> AdvancedItem:
     d = _model_to_dict(payload)
 
-    symbol = (d.get("symbol") or d.get("ticker") or raw_symbol or "").strip() or raw_symbol
-    symbol = symbol.upper()
+    symbol = _normalize_symbol(str(d.get("symbol") or d.get("ticker") or raw_symbol or "")) or _normalize_symbol(raw_symbol)
+    symbol = symbol or (raw_symbol or "").strip().upper() or "UNKNOWN"
 
+    # Flexible field names
     last_price = _safe_float(d.get("last_price") or d.get("price") or d.get("close") or d.get("last"))
     fair_value = _safe_float(d.get("fair_value") or d.get("intrinsic_value") or d.get("target_price"))
     upside = _safe_float(d.get("upside_percent") or d.get("upside") or d.get("upside_pct"))
@@ -427,16 +510,19 @@ def _to_advanced_item(raw_symbol: str, payload: Any) -> AdvancedItem:
     age_min = _data_age_minutes(as_of_utc)
 
     rec = d.get("recommendation") or d.get("recommendation_label") or d.get("rating")
-    risk_label = d.get("risk_label")
+    risk_label = d.get("risk_label") or d.get("risk")
     risk_bucket = _compute_risk_bucket(opportunity_score, dq_score)
 
     provider = d.get("primary_provider") or d.get("provider") or d.get("data_source")
     error = d.get("error")
 
+    # Market name preference
+    market = d.get("market_region") or d.get("market") or d.get("exchange")
+
     return AdvancedItem(
         symbol=symbol,
         name=d.get("name") or d.get("company_name"),
-        market=d.get("market") or d.get("exchange"),
+        market=str(market) if market is not None else None,
         sector=d.get("sector"),
         currency=d.get("currency"),
         last_price=last_price,
@@ -460,6 +546,7 @@ def _to_advanced_item(raw_symbol: str, payload: Any) -> AdvancedItem:
 
 
 def _sort_key(it: AdvancedItem) -> float:
+    # Strong priority: opportunity, then confidence, then upside
     opp = it.opportunity_score or 0.0
     dq = it.data_quality_score or 0.0
     up = it.upside_percent or 0.0
@@ -533,6 +620,10 @@ async def advanced_health() -> Dict[str, Any]:
     env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
     app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
 
+    eng = _get_engine_singleton()
+    providers = getattr(eng, "enabled_providers", None) or getattr(eng, "providers", None)
+    primary = getattr(eng, "primary_provider", None) or getattr(eng, "primary", None)
+
     return {
         "status": "ok",
         "module": "routes.advanced_analysis",
@@ -541,6 +632,8 @@ async def advanced_health() -> Dict[str, Any]:
         "engine_is_stub": _ENGINE_IS_STUB,
         "environment": env_name or "unknown",
         "app_version": app_version or "unknown",
+        "engine_providers": providers,
+        "engine_primary": primary,
         "batch_size": DEFAULT_BATCH_SIZE,
         "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
         "batch_concurrency": DEFAULT_CONCURRENCY,
@@ -578,8 +671,8 @@ async def advanced_scoreboard(
         payload = unified_map.get(s) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
         items.append(_to_advanced_item(s, payload))
 
-    # sort & truncate
     items_sorted = sorted(items, key=_sort_key, reverse=True)
+
     top_applied = False
     if len(items_sorted) > top_n:
         items_sorted = items_sorted[:top_n]
