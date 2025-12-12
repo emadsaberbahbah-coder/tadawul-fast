@@ -19,12 +19,14 @@ Provides:
   - POST /v1/analysis/sheet-rows   (headers + rows for Google Sheets)
 
 Design goals:
-  - KSA-safe: this router never calls providers directly.
+  - KSA-safe: router never calls providers directly.
   - Extremely defensive: bounded batch size, chunking, timeout, concurrency.
   - Never throws 502 for Sheets endpoints; returns headers + rows (maybe empty).
-  - Normalizes KSA symbols: "1120" -> "1120.SR", "TADAWUL:1120" -> "1120.SR".
 
-Author: Emad Bahbah (with GPT-5.2 Thinking)
+v2.7.0 Improvements:
+  - Accept optional sheet_name; ignore unknown body fields (prevents 422).
+  - Preserve input order (map results by symbol, not by zip order).
+  - Always pad rows to header length for Sheets safety.
 """
 
 from __future__ import annotations
@@ -49,26 +51,16 @@ AI_ANALYSIS_VERSION = "2.7.0"
 # ----------------------------------------------------------------------
 try:  # pragma: no cover
     import env as _env  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     _env = None  # type: ignore
-
-
-def _get_env_attr(name: str, default: Any = None) -> Any:
-    if _env is not None and hasattr(_env, name):
-        try:
-            return getattr(_env, name)
-        except Exception:
-            return default
-    return os.getenv(name, default)
-
 
 # ----------------------------------------------------------------------
 # Runtime limits (env overrides)
 # ----------------------------------------------------------------------
-DEFAULT_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "50") or 50)
-DEFAULT_BATCH_TIMEOUT = float(os.getenv("AI_BATCH_TIMEOUT_SEC", "30") or 30)
-DEFAULT_CONCURRENCY = int(os.getenv("AI_BATCH_CONCURRENCY", "3") or 3)
-DEFAULT_MAX_TICKERS = int(os.getenv("AI_MAX_TICKERS", "500") or 500)
+DEFAULT_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "50"))
+DEFAULT_BATCH_TIMEOUT = float(os.getenv("AI_BATCH_TIMEOUT_SEC", "30"))
+DEFAULT_CONCURRENCY = int(os.getenv("AI_BATCH_CONCURRENCY", "3"))
+DEFAULT_MAX_TICKERS = int(os.getenv("AI_MAX_TICKERS", "500"))
 
 # ----------------------------------------------------------------------
 # ENGINE DETECTION & FALLBACKS
@@ -76,53 +68,31 @@ DEFAULT_MAX_TICKERS = int(os.getenv("AI_MAX_TICKERS", "500") or 500)
 _ENGINE_MODE: str = "stub"  # "v2" | "v1_module" | "stub"
 _ENGINE_IS_STUB: bool = True
 
-# v2 preferred
 try:
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
     def _build_v2_kwargs() -> Dict[str, Any]:
-        """
-        Build kwargs from env.py / env vars but ONLY pass what DataEngine.__init__ accepts.
-        This avoids signature mismatch errors across versions.
-        """
+        if _env is None:
+            return {}
+
         candidates: Dict[str, Any] = {}
 
-        # Common knobs used in your project
-        cache_ttl = _get_env_attr("ENGINE_CACHE_TTL_SECONDS", None)
-        if cache_ttl is None:
-            cache_ttl = _get_env_attr("DATAENGINE_CACHE_TTL", None)
-        if cache_ttl is not None:
-            candidates["cache_ttl"] = cache_ttl
+        if hasattr(_env, "ENGINE_CACHE_TTL_SECONDS"):
+            candidates["cache_ttl"] = getattr(_env, "ENGINE_CACHE_TTL_SECONDS")
+        if hasattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS"):
+            candidates["provider_timeout"] = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS")
+        elif hasattr(_env, "HTTP_TIMEOUT"):
+            candidates["provider_timeout"] = getattr(_env, "HTTP_TIMEOUT")
+        if hasattr(_env, "ENABLED_PROVIDERS"):
+            candidates["enabled_providers"] = getattr(_env, "ENABLED_PROVIDERS")
+        if hasattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS"):
+            candidates["enable_advanced_analysis"] = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS")
 
-        provider_timeout = _get_env_attr("ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
-        if provider_timeout is None:
-            provider_timeout = _get_env_attr("HTTP_TIMEOUT", None)
-        if provider_timeout is None:
-            provider_timeout = _get_env_attr("DATAENGINE_TIMEOUT", None)
-        if provider_timeout is not None:
-            candidates["provider_timeout"] = provider_timeout
-
-        enabled = _get_env_attr("ENABLED_PROVIDERS", None)
-        if enabled is not None:
-            candidates["enabled_providers"] = enabled
-
-        enable_adv = _get_env_attr("ENGINE_ENABLE_ADVANCED_ANALYSIS", None)
-        if enable_adv is None:
-            enable_adv = _get_env_attr("ENABLE_ADVANCED_ANALYSIS", None)
-        if enable_adv is not None:
-            candidates["enable_advanced_analysis"] = enable_adv
-
-        # Filter by actual signature (most robust)
         try:
             sig = inspect.signature(_V2DataEngine.__init__)
             allowed = set(sig.parameters.keys())
             allowed.discard("self")
-            clean: Dict[str, Any] = {}
-            for k, v in candidates.items():
-                if k not in allowed or v is None:
-                    continue
-                clean[k] = v
-            return clean
+            return {k: v for k, v in candidates.items() if k in allowed and v is not None}
         except Exception:
             return {}
 
@@ -141,7 +111,6 @@ try:
 except Exception as exc_v2:  # pragma: no cover
     logger.exception("routes.ai_analysis: failed to import DataEngine v2: %s", exc_v2)
 
-    # v1 module fallback
     try:
         from core import data_engine as _data_engine_module  # type: ignore
 
@@ -158,7 +127,7 @@ except Exception as exc_v2:  # pragma: no cover
 
         class _StubEngine:
             async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
-                sym = _normalize_symbol(symbol) or "UNKNOWN"
+                sym = (symbol or "").strip().upper() or "UNKNOWN"
                 return {
                     "symbol": sym,
                     "name": None,
@@ -179,7 +148,6 @@ except Exception as exc_v2:  # pragma: no cover
                     "roe": None,
                     "roe_percent": None,
                     "roa": None,
-                    "roa_percent": None,
                     "data_quality": "MISSING",
                     "value_score": None,
                     "quality_score": None,
@@ -216,9 +184,14 @@ router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
 # ----------------------------------------------------------------------
-# MODELS
+# MODELS (ignore extra fields to prevent 422 from Sheets client)
 # ----------------------------------------------------------------------
-class SingleAnalysisResponse(BaseModel):
+class _ExtraIgnoreBase(BaseModel):
+    class Config:
+        extra = "ignore"
+
+
+class SingleAnalysisResponse(_ExtraIgnoreBase):
     symbol: str
     name: Optional[str] = None
     market_region: Optional[str] = None
@@ -229,10 +202,9 @@ class SingleAnalysisResponse(BaseModel):
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
 
-    # stored internally as fraction (0–1); sheet output converts to %
-    dividend_yield: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
+    dividend_yield: Optional[float] = None  # fraction 0–1
+    roe: Optional[float] = None             # fraction 0–1
+    roa: Optional[float] = None             # fraction 0–1
 
     data_quality: str = "MISSING"
 
@@ -243,7 +215,6 @@ class SingleAnalysisResponse(BaseModel):
     overall_score: Optional[float] = None
     recommendation: Optional[str] = None
 
-    # AI valuation overlay
     fair_value: Optional[float] = None
     upside_percent: Optional[float] = None
     valuation_label: Optional[str] = None
@@ -255,15 +226,16 @@ class SingleAnalysisResponse(BaseModel):
     error: Optional[str] = None
 
 
-class BatchAnalysisRequest(BaseModel):
+class BatchAnalysisRequest(_ExtraIgnoreBase):
     tickers: List[str] = Field(default_factory=list)
+    sheet_name: Optional[str] = None  # optional, safe for Sheets client
 
 
-class BatchAnalysisResponse(BaseModel):
+class BatchAnalysisResponse(_ExtraIgnoreBase):
     results: List[SingleAnalysisResponse]
 
 
-class SheetAnalysisResponse(BaseModel):
+class SheetAnalysisResponse(_ExtraIgnoreBase):
     headers: List[str]
     rows: List[List[Any]]
 
@@ -274,7 +246,6 @@ class SheetAnalysisResponse(BaseModel):
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -283,21 +254,13 @@ def _safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def _clamp_0_100(x: Any) -> Optional[float]:
     v = _safe_float(x)
     if v is None:
         return None
     return max(0.0, min(100.0, v))
 
-
 def _normalize_percent_like_to_fraction(x: Any) -> Optional[float]:
-    """
-    Returns fraction 0–1.
-    Accepts:
-      - 0..1 already fraction
-      - 1..100 treated as percent
-    """
     v = _safe_float(x)
     if v is None:
         return None
@@ -305,8 +268,7 @@ def _normalize_percent_like_to_fraction(x: Any) -> Optional[float]:
         return v
     if 1.0 < v <= 100.0:
         return v / 100.0
-    return v  # defensive
-
+    return v
 
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
@@ -315,50 +277,28 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
         return obj
     if hasattr(obj, "model_dump"):
         try:
-            return obj.model_dump()  # type: ignore[call-arg]
+            return obj.model_dump()  # type: ignore
         except Exception:
             pass
     return getattr(obj, "__dict__", {}) or {}
 
-
 def _clean_tickers(items: Sequence[str]) -> List[str]:
-    raw = [_normalize_symbol(x) for x in (items or [])]
+    raw = [(x or "").strip() for x in (items or [])]
     raw = [x for x in raw if x]
     seen = set()
     out: List[str] = []
     for x in raw:
-        if x in seen:
+        ux = x.upper()
+        if ux in seen:
             continue
-        seen.add(x)
-        out.append(x)
+        seen.add(ux)
+        out.append(ux)
     return out
-
 
 def _chunk(items: List[str], size: int) -> List[List[str]]:
     if size <= 0:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-def _normalize_symbol(symbol: str) -> str:
-    """
-    Normalize input symbols:
-      - 1120 -> 1120.SR
-      - TADAWUL:1120 -> 1120.SR
-      - 1120.TADAWUL -> 1120.SR
-      - trims + upper
-    """
-    s = (symbol or "").strip().upper()
-    if not s:
-        return ""
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"):
-        s = s.replace(".TADAWUL", ".SR")
-    if s.isdigit():
-        s = f"{s}.SR"
-    return s
-
 
 def _valuation_label_from_upside(upside_percent: Optional[float]) -> Optional[str]:
     if upside_percent is None:
@@ -369,12 +309,7 @@ def _valuation_label_from_upside(upside_percent: Optional[float]) -> Optional[st
         return "OVERVALUED"
     return "FAIR"
 
-
 def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """
-    Deterministic fallback scoring 0–100.
-    Used ONLY when engine did not provide scores and data_quality isn't MISSING.
-    """
     dq = str(data.get("data_quality") or "").upper()
     if dq in {"MISSING", "UNKNOWN", ""}:
         return {"value_score": None, "quality_score": None, "momentum_score": None}
@@ -385,7 +320,6 @@ def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]
     roe = _normalize_percent_like_to_fraction(data.get("roe") or data.get("roe_percent"))
     change_pct = _safe_float(data.get("change_pct") or data.get("change_percent"))
 
-    # Value (simple heuristics)
     v = 50.0
     if pe is not None:
         if 0 < pe < 12:
@@ -406,7 +340,6 @@ def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]
             v -= 5
     value_score = max(0.0, min(100.0, v))
 
-    # Quality
     q = 50.0
     if roe is not None:
         if roe >= 0.20:
@@ -417,7 +350,6 @@ def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]
             q -= 15
     quality_score = max(0.0, min(100.0, q))
 
-    # Momentum (daily change)
     m = 50.0
     if change_pct is not None:
         if change_pct > 0:
@@ -432,7 +364,6 @@ def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]
         "momentum_score": round(momentum_score, 2),
     }
 
-
 def _compute_opportunity_score(data: Dict[str, Any], scores: Dict[str, Optional[float]]) -> Optional[float]:
     existing = _clamp_0_100(data.get("opportunity_score"))
     if existing is not None:
@@ -443,7 +374,6 @@ def _compute_opportunity_score(data: Dict[str, Any], scores: Dict[str, Optional[
     if isinstance(v, (int, float)) and isinstance(q, (int, float)) and isinstance(m, (int, float)):
         return round(v * 0.4 + q * 0.3 + m * 0.3, 2)
     return None
-
 
 def _compute_overall_and_reco(
     opportunity: Optional[float],
@@ -475,20 +405,16 @@ def _compute_overall_and_reco(
         return overall, "REDUCE"
     return overall, "SELL"
 
-
 def _parse_dt(x: Any) -> Optional[datetime]:
     if x is None:
         return None
     if isinstance(x, datetime):
-        return x
+        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
     try:
         dt = datetime.fromisoformat(str(x))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
-
 
 def _extract_sources(raw_sources: Any) -> List[str]:
     if not raw_sources:
@@ -506,7 +432,6 @@ def _extract_sources(raw_sources: Any) -> List[str]:
                 out.append(str(s))
     except Exception:
         return []
-    # de-dup preserve order
     seen = set()
     cleaned: List[str] = []
     for x in out:
@@ -518,20 +443,21 @@ def _extract_sources(raw_sources: Any) -> List[str]:
 
 
 # ----------------------------------------------------------------------
-# ENGINE CALLS (chunked + timeout + bounded concurrency)
+# ENGINE CALLS
 # ----------------------------------------------------------------------
 async def _engine_get_many(symbols: List[str]) -> List[Any]:
     eng = _get_engine_singleton()
 
-    # v2/stub object method
+    # object method
     if hasattr(eng, "get_enriched_quotes"):
         return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
 
-    # v1 module-level async function
+    # v1 module fallback: function or coroutine attribute
     if hasattr(eng, "get_enriched_quotes"):
-        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
+        fn = getattr(eng, "get_enriched_quotes")
+        return await fn(symbols)
 
-    # fallback: per ticker
+    # per ticker fallback
     out: List[Any] = []
     for s in symbols:
         if hasattr(eng, "get_enriched_quote"):
@@ -540,7 +466,6 @@ async def _engine_get_many(symbols: List[str]) -> List[Any]:
             out.append({"symbol": s.upper(), "data_quality": "MISSING", "error": "Engine missing methods"})
     return out
 
-
 async def _get_quotes_chunked(
     symbols: List[str],
     *,
@@ -548,10 +473,6 @@ async def _get_quotes_chunked(
     timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
     max_concurrency: int = DEFAULT_CONCURRENCY,
 ) -> Dict[str, Any]:
-    """
-    Returns map keyed by normalized input symbol (exact string in cleaned list).
-    Always returns a value per requested symbol (possibly MISSING dict).
-    """
     clean = _clean_tickers(symbols)
     if not clean:
         return {}
@@ -575,30 +496,27 @@ async def _get_quotes_chunked(
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
             logger.warning("ai_analysis: %s for chunk(size=%d): %s", msg, len(chunk_syms), chunk_syms)
             for s in chunk_syms:
-                out[s] = {"symbol": s.upper(), "data_quality": "MISSING", "error": msg}
+                out[s] = {"symbol": s, "data_quality": "MISSING", "error": msg}
             continue
 
         returned = list(res or [])
 
-        # Map by symbol if possible (more robust than relying on order)
+        # map by returned symbol (order-independent)
         by_symbol: Dict[str, Any] = {}
         for q in returned:
             d = _model_to_dict(q)
-            sym = _normalize_symbol(str(d.get("symbol") or d.get("ticker") or ""))
+            sym = (d.get("symbol") or d.get("ticker") or "").strip().upper()
             if sym:
                 by_symbol[sym] = q
 
-        # Fill in order first (best-effort)
-        for i, s in enumerate(chunk_syms):
-            if i < len(returned):
-                out.setdefault(s, returned[i])
-            else:
-                out.setdefault(s, by_symbol.get(s) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"})
-
-        # Prefer exact symbol match if available
-        for s in chunk_syms:
-            if s in by_symbol:
-                out[s] = by_symbol[s]
+        # for each requested symbol, pick by_symbol, else fallback to positional if safe
+        for idx, s in enumerate(chunk_syms):
+            picked = by_symbol.get(s.upper())
+            if picked is None and idx < len(returned):
+                picked = returned[idx]
+            if picked is None:
+                picked = {"symbol": s, "data_quality": "MISSING", "error": "No data returned"}
+            out[s] = picked
 
     return out
 
@@ -607,11 +525,10 @@ async def _get_quotes_chunked(
 # TRANSFORM: quote -> SingleAnalysisResponse
 # ----------------------------------------------------------------------
 def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
-    symbol_in = _normalize_symbol(raw_symbol)
+    symbol_in = (raw_symbol or "").strip().upper()
     data = _model_to_dict(quote)
 
-    symbol = _normalize_symbol(str(data.get("symbol") or data.get("ticker") or symbol_in or "")) or (symbol_in or "UNKNOWN")
-
+    symbol = str(data.get("symbol") or data.get("ticker") or symbol_in or "").upper() or (symbol_in or "UNKNOWN")
     dq = str(data.get("data_quality") or "MISSING")
     name = data.get("name") or data.get("company_name")
     market_region = data.get("market_region") or data.get("market") or data.get("exchange")
@@ -632,7 +549,6 @@ def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
         data.get("roa") or data.get("roa_percent") or data.get("returnOnAssets")
     )
 
-    # Scores: prefer engine-provided, else fallback
     value_score = _clamp_0_100(data.get("value_score"))
     quality_score = _clamp_0_100(data.get("quality_score"))
     momentum_score = _clamp_0_100(data.get("momentum_score"))
@@ -658,7 +574,6 @@ def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
         existing_reco=str(existing_reco) if existing_reco is not None else None,
     )
 
-    # AI valuation overlay
     fair_value = _safe_float(data.get("fair_value") or data.get("target_price") or data.get("intrinsic_value"))
     upside_percent = _safe_float(data.get("upside_percent") or data.get("upside") or data.get("upside_pct"))
     if upside_percent is None and fair_value is not None and price is not None and price != 0:
@@ -674,7 +589,6 @@ def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
 
     notes = data.get("notes")
     error = data.get("error")
-
     if str(dq).upper() == "MISSING" and not error:
         error = "No data available from providers"
 
@@ -717,13 +631,11 @@ def _build_sheet_headers() -> List[str]:
         "Market / Region",
         "Price",
         "Change %",
-
         "Market Cap",
         "P/E (TTM)",
         "P/B",
         "Dividend Yield %",
         "ROE %",
-
         "Data Quality",
         "Value Score",
         "Quality Score",
@@ -731,17 +643,13 @@ def _build_sheet_headers() -> List[str]:
         "Opportunity Score",
         "Overall Score",
         "Recommendation",
-
         "Last Updated (UTC)",
         "Sources",
-
         "Fair Value",
         "Upside %",
         "Valuation Label",
-
         "Error",
     ]
-
 
 def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:
@@ -753,21 +661,25 @@ def _to_iso(dt: Optional[datetime]) -> Optional[str]:
     except Exception:
         return None
 
+def _pad_row(row: List[Any], length: int) -> List[Any]:
+    if len(row) == length:
+        return row
+    if len(row) < length:
+        return row + [None] * (length - len(row))
+    return row[:length]
 
-def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
-    return [
+def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[Any]:
+    row = [
         a.symbol,
         a.name or "",
         a.market_region or "",
         a.price,
         a.change_pct,
-
         a.market_cap,
         a.pe_ttm,
         a.pb,
         (a.dividend_yield * 100.0) if a.dividend_yield is not None else None,
         (a.roe * 100.0) if a.roe is not None else None,
-
         a.data_quality,
         a.value_score,
         a.quality_score,
@@ -775,16 +687,14 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
         a.opportunity_score,
         a.overall_score,
         a.recommendation,
-
         _to_iso(a.last_updated_utc),
         ", ".join(a.sources) if a.sources else "",
-
         a.fair_value,
         a.upside_percent,
         a.valuation_label or "",
-
         a.error or "",
     ]
+    return _pad_row(row, header_len)
 
 
 # ----------------------------------------------------------------------
@@ -796,10 +706,6 @@ async def analysis_health() -> Dict[str, Any]:
     env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
     app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
 
-    eng = _get_engine_singleton()
-    providers = getattr(eng, "enabled_providers", None) or getattr(eng, "providers", None)
-    primary = getattr(eng, "primary_provider", None) or getattr(eng, "primary", None)
-
     return {
         "status": "ok",
         "module": "routes.ai_analysis",
@@ -808,8 +714,6 @@ async def analysis_health() -> Dict[str, Any]:
         "engine_is_stub": _ENGINE_IS_STUB,
         "environment": env_name or "unknown",
         "app_version": app_version or "unknown",
-        "engine_providers": providers,
-        "engine_primary": primary,
         "batch_size": DEFAULT_BATCH_SIZE,
         "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
         "batch_concurrency": DEFAULT_CONCURRENCY,
@@ -817,32 +721,22 @@ async def analysis_health() -> Dict[str, Any]:
         "timestamp_utc": _now_utc().isoformat(),
     }
 
-
 @router.get("/quote", response_model=SingleAnalysisResponse)
-async def analyze_single_quote(
-    symbol: str = Query(..., alias="symbol"),
-) -> SingleAnalysisResponse:
-    """
-    AI/quant analysis for ONE ticker. Always returns a valid body (never 500).
-    """
-    t = _normalize_symbol(symbol)
+async def analyze_single_quote(symbol: str = Query(..., alias="symbol")) -> SingleAnalysisResponse:
+    t = (symbol or "").strip()
     if not t:
         return SingleAnalysisResponse(symbol="", data_quality="MISSING", error="Symbol is required")
 
     try:
         m = await _get_quotes_chunked([t], batch_size=1)
-        q = m.get(t) or {"symbol": t.upper(), "data_quality": "MISSING", "error": "No data returned"}
+        q = m.get(t.upper()) or {"symbol": t.upper(), "data_quality": "MISSING", "error": "No data returned"}
         return _quote_to_analysis(t, q)
     except Exception as exc:
         logger.exception("ai_analysis: exception in /quote for %s", t)
         return SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Exception in analysis: {exc}")
 
-
 @router.post("/quotes", response_model=BatchAnalysisResponse)
 async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisResponse:
-    """
-    Batch AI/quant analysis. Never 500; returns MISSING rows on failure.
-    """
     tickers = _clean_tickers(body.tickers or [])
     if not tickers:
         return BatchAnalysisResponse(results=[])
@@ -855,37 +749,28 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
     except Exception as exc:
         logger.exception("ai_analysis: batch failure: %s", exc)
         return BatchAnalysisResponse(
-            results=[SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Batch failure: {exc}") for t in tickers]
+            results=[SingleAnalysisResponse(symbol=t, data_quality="MISSING", error=f"Batch failure: {exc}") for t in tickers]
         )
 
     results: List[SingleAnalysisResponse] = []
     for t in tickers:
-        q = m.get(t) or {"symbol": t.upper(), "data_quality": "MISSING", "error": "No data returned"}
+        q = m.get(t.upper()) or {"symbol": t, "data_quality": "MISSING", "error": "No data returned"}
         try:
             results.append(_quote_to_analysis(t, q))
         except Exception as exc:
             logger.exception("ai_analysis: transform failure for %s: %s", t, exc)
-            results.append(SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Transform failure: {exc}"))
+            results.append(SingleAnalysisResponse(symbol=t, data_quality="MISSING", error=f"Transform failure: {exc}"))
 
     return BatchAnalysisResponse(results=results)
 
-
 @router.post("/sheet-rows", response_model=SheetAnalysisResponse)
 async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse:
-    """
-    Google Sheets–friendly endpoint:
-      returns { headers, rows } always (even if empty).
-    """
     headers = _build_sheet_headers()
+    header_len = len(headers)
+
     batch = await analyze_batch_quotes(body)
-    rows = [_analysis_to_sheet_row(r) for r in batch.results]
+    rows = [_analysis_to_sheet_row(r, header_len) for r in batch.results]
+
     return SheetAnalysisResponse(headers=headers, rows=rows)
 
-
-__all__ = [
-    "router",
-    "SingleAnalysisResponse",
-    "BatchAnalysisRequest",
-    "BatchAnalysisResponse",
-    "SheetAnalysisResponse",
-]
+__all__ = ["router", "SingleAnalysisResponse", "BatchAnalysisRequest", "BatchAnalysisResponse", "SheetAnalysisResponse"]
