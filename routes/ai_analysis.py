@@ -1,7 +1,7 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.4)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.5)
 
 - Preferred backend:
     • core.data_engine_v2.DataEngine (class-based unified engine, v2.5+)
@@ -18,11 +18,15 @@ AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.4)
     • Value / Quality / Momentum / Opportunity / Overall / Recommendation
     • Reuses engine-provided scores when available (preferred),
       otherwise computes a simple deterministic overlay.
+    • Exposes AI valuation overlay:
+        - fair_value
+        - upside_percent
+        - valuation_label
 
 - Designed for:
-    • 9-page Google Sheets dashboard
-    • KSA-safe routing (KSA handled by the unified engine / Argaam,
-      no direct EODHD calls for .SR from here)
+    • 9-page Google Sheets dashboard (Insights_Analysis, etc.)
+    • KSA-safe routing (KSA handled by the unified engine / Argaam –
+      NO direct EODHD calls for .SR from here)
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("routes.ai_analysis")
+
+AI_ANALYSIS_VERSION = "2.5"
 
 # ----------------------------------------------------------------------
 # Optional env.py integration (for engine configuration / diagnostics)
@@ -61,14 +67,19 @@ try:  # pragma: no cover - defensive
     engine_kwargs: Dict[str, Any] = {}
 
     if _env is not None:
+        # Cache TTL
         cache_ttl = getattr(_env, "ENGINE_CACHE_TTL_SECONDS", None)
         if cache_ttl is not None:
             engine_kwargs["cache_ttl"] = cache_ttl
 
+        # Provider timeout: prefer dedicated knob, fall back to HTTP_TIMEOUT
         provider_timeout = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
+        if provider_timeout is None:
+            provider_timeout = getattr(_env, "HTTP_TIMEOUT", None)
         if provider_timeout is not None:
             engine_kwargs["provider_timeout"] = provider_timeout
 
+        # Enabled providers
         enabled_providers = getattr(_env, "ENABLED_PROVIDERS", None)
         if enabled_providers:
             engine_kwargs["enabled_providers"] = enabled_providers
@@ -624,10 +635,9 @@ def _build_sheet_headers() -> List[str]:
     any scoring/AI overlay on top of the other 8 pages.
 
     NOTE:
-        For backward compatibility, we keep the original set of 19
-        columns here. AI valuation fields (fair_value / upside /
-        valuation_label) are exposed in the JSON API but not yet
-        added to the sheet rows.
+        We now include AI valuation overlay columns (Fair Value / Upside % /
+        Valuation Label) at the end, so Insights_Analysis immediately sees
+        valuation outputs next to scores.
     """
     return [
         "Symbol",
@@ -649,6 +659,9 @@ def _build_sheet_headers() -> List[str]:
         "Recommendation",
         "Last Updated (UTC)",
         "Sources",
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
     ]
 
 
@@ -668,9 +681,7 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
     Flatten one analysis result to a row (all primitives),
     so Apps Script can use setValues() safely.
 
-    NOTE:
-        Only the original 19 columns are output here for now.
-        fair_value / upside_percent / valuation_label remain JSON-only.
+    Columns align with _build_sheet_headers().
     """
     return [
         a.symbol,
@@ -692,6 +703,9 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse) -> List[Any]:
         a.recommendation,
         _to_iso(a.last_updated_utc),
         ", ".join(a.sources) if a.sources else "",
+        a.fair_value,
+        a.upside_percent,
+        a.valuation_label or "",
     ]
 
 
@@ -706,12 +720,17 @@ async def analysis_health() -> Dict[str, Any]:
     """
     Simple health check for this module.
     """
+    env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
+    app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
+
     return {
         "status": "ok",
         "module": "ai_analysis",
-        "version": "2.4",
+        "version": AI_ANALYSIS_VERSION,
         "engine_mode": _ENGINE_MODE,
         "engine_is_stub": _ENGINE_IS_STUB,
+        "environment": env_name or "unknown",
+        "app_version": app_version or "unknown",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -737,7 +756,7 @@ async def analyze_single_quote(
         analysis = _quote_to_analysis(quote)
 
         # If we truly have no data from providers, mark an explicit error
-        if analysis.data_quality == "MISSING" and not analysis.error:
+        if analysis.data_quality.upper() == "MISSING" and not analysis.error:
             analysis.error = "No data available from providers"
         return analysis
     except HTTPException:
@@ -800,7 +819,7 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
             analysis = _quote_to_analysis(q)
             if not analysis.symbol:
                 analysis.symbol = t.upper()
-            if analysis.data_quality == "MISSING" and not analysis.error:
+            if analysis.data_quality.upper() == "MISSING" and not analysis.error:
                 analysis.error = "No data available from providers"
             results.append(analysis)
         except Exception as exc:
