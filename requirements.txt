@@ -1,33 +1,23 @@
-# ==========================================
-# Tadawul Fast Bridge – Requirements
-# Unified engine for 9 pages + Google Sheets
-# ==========================================
-
-# Web framework & ASGI server (FastAPI + Uvicorn)
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-
-# HTTP / async clients (used by core.data_engine, core.data_engine_v2, routes)
-httpx>=0.27.0
-aiohttp>=3.9.0
-requests>=2.32.0
-
-# Validation & settings (env.py, models, routes)
-pydantic>=2.7.0
-pydantic-settings>=2.3.0
-python-dotenv>=1.0.1
-
-# Rate limiting (used in main.py via SlowAPI)
+# --- Web API / Backend ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.6
+pydantic-settings>=2.2
 slowapi>=0.1.9
+python-dotenv>=1.0
 
-# Google Sheets / Google APIs (google_sheets_service.py)
-google-api-python-client>=2.151.0
-google-auth>=2.35.0
+# --- HTTP Clients (engine/providers usually need at least one) ---
+httpx>=0.27
+aiohttp>=3.10
+requests>=2.32
+
+# --- Performance / JSON (optional but recommended) ---
+orjson>=3.10
+
+# --- Google Sheets (service account) ---
+google-api-python-client>=2.140
+google-auth>=2.33
 google-auth-httplib2>=0.2.0
 
-# Optional market data fallback (Yahoo Finance via legacy / v1 engine)
-yfinance>=0.2.40
-
-# Utilities & robustness (caching, retries, etc.)
-cachetools>=5.3.0
-tenacity>=9.0.0
+# --- Common utilities (often pulled indirectly, but safe to include) ---
+cachetools>=5.3
