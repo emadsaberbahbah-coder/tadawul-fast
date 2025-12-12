@@ -1,7 +1,7 @@
 """
 legacy_service.py
 ------------------------------------------------------------
-LEGACY SERVICE BRIDGE – v3.4 (Aligned with App v4.4.0 / Engine v2.7+)
+LEGACY SERVICE BRIDGE – v3.5 (Boot-safe, chunked, aligned with Engine v2/v1)
 
 GOAL
 - Provide a stable "legacy" layer on top of the unified data engine,
@@ -9,52 +9,22 @@ GOAL
   can still receive the classic /v1/quote-style payload.
 
 KEY PRINCIPLES
-- NO direct EODHD calls here.
+- NO direct provider calls here (no EODHD/Yahoo/FMP/etc).
 - All data comes via the unified data engine (v2 preferred, v1 module fallback).
-- KSA (.SR) tickers are handled by Tadawul/Argaam providers inside the engine.
-- Legacy quote format:
-      {
-          "quotes": [ { ... legacy fields ... } ],
-          "meta":   { ... context ... }
-      }
-- Google Sheets integration helpers:
-      • build_legacy_sheet_payload(tickers)
-        -> { "headers": [...], "rows": [[...], ...], "meta": {...} }
+- KSA (.SR) tickers are handled by Tadawul/Argaam inside the engine.
+- Boot-safe: never crashes app import; falls back to stub engine.
 
-ALIGNMENT
-- Engine usage & fallbacks aligned with:
-    • core.data_engine_v2.DataEngine (preferred, class-based)
-    • core.data_engine (module-level async functions, fallback)
-    • routes/enriched_quote.py
-    • routes/ai_analysis.py
-    • routes/advanced_analysis.py
-    • routes_argaam.py (KSA / Tadawul-Argaam gateway)
-
-SYMBOL NORMALIZATION
-- 1120                -> 1120.SR
-- TADAWUL:1120        -> 1120.SR
-- 1120.TADAWUL        -> 1120.SR
-- 1120.SR             -> 1120.SR
-- AAPL                -> AAPL
-
-USAGE
-- main.py:
-      from legacy_service import get_legacy_quotes, build_legacy_sheet_payload
-      # /v1/quote, /v1/legacy/sheet-rows use these functions.
-
-NOTE
-- Preferred for the 9-page dashboard:
-      /v1/enriched/sheet-rows
-      /v1/analysis/sheet-rows
-      /v1/advanced/sheet-rows
-  This legacy layer is mainly for backward compatibility and quick tests.
+PUBLIC API
+- get_legacy_quotes(tickers) -> {"quotes":[...], "meta": {...}}
+- build_legacy_sheet_payload(tickers) -> {"headers":[...], "rows":[...], "meta": {...}}
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,14 +34,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("legacy_service")
 if not logger.handlers:
-    # Avoid duplicate handlers in reload environments
     handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    handler.setFormatter(
+        logging.Formatter(fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     )
-    handler.setFormatter(formatter)
     logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+logger.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 
 # ----------------------------------------------------------------------
 # ENV / SETTINGS – env.py preferred, env vars fallback
@@ -81,30 +49,24 @@ try:  # pragma: no cover
     import env as _env_mod  # type: ignore
 except Exception:  # pragma: no cover
     _env_mod = None  # type: ignore
-    logger.warning(
-        "[LegacyService] env.py not available. Using OS environment variables."
-    )
+    logger.warning("[LegacyService] env.py not available. Using OS environment variables.")
 
 
 @dataclass
 class _SettingsFallback:
     app_env: str = os.getenv("APP_ENV", "production")
     app_name: str = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    app_version: str = os.getenv("APP_VERSION", "4.4.0")
+    app_version: str = os.getenv("APP_VERSION", "4.5.1")
     backend_base_url: str = os.getenv("BACKEND_BASE_URL", "").strip()
 
 
 def _get_env_attr(name: str, default: str = "") -> str:
-    """
-    Helper: read config from env.py if available, otherwise OS env vars.
-    Returns string representation.
-    """
     if _env_mod is not None and hasattr(_env_mod, name):
-        value = getattr(_env_mod, name)
-        if isinstance(value, str):
-            return value
+        v = getattr(_env_mod, name)
+        if isinstance(v, str):
+            return v
         try:
-            return str(value)
+            return str(v)
         except Exception:
             return default
     return os.getenv(name, default)
@@ -113,8 +75,22 @@ def _get_env_attr(name: str, default: str = "") -> str:
 settings = getattr(_env_mod, "settings", _SettingsFallback())
 
 APP_NAME: str = getattr(settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast-bridge"))
-APP_VERSION: str = getattr(settings, "app_version", _get_env_attr("APP_VERSION", "4.4.0"))
+APP_VERSION: str = getattr(settings, "app_version", _get_env_attr("APP_VERSION", "4.5.1"))
 BACKEND_BASE_URL: str = getattr(settings, "backend_base_url", _get_env_attr("BACKEND_BASE_URL", "")).strip()
+
+# ----------------------------------------------------------------------
+# Timezones
+# ----------------------------------------------------------------------
+
+UTC = timezone.utc
+RIYADH_TZ = timezone(timedelta(hours=3))
+
+# ----------------------------------------------------------------------
+# Batch controls (avoid long hangs for Sheets / slow providers)
+# ----------------------------------------------------------------------
+
+LEGACY_BATCH_SIZE = int(os.getenv("LEGACY_BATCH_SIZE", "40"))
+LEGACY_BATCH_TIMEOUT_SECONDS = float(os.getenv("LEGACY_BATCH_TIMEOUT_SECONDS", "25"))
 
 # ----------------------------------------------------------------------
 # DATA ENGINE IMPORT / FALLBACKS (v2 preferred, v1 module, stub)
@@ -127,12 +103,10 @@ _data_engine_module: Any = None
 _ENABLED_PROVIDERS: List[str] = []
 
 try:
-    # Preferred: class-based engine (core.data_engine_v2)
     from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
 
     engine_kwargs: Dict[str, Any] = {}
 
-    # Optional tuning via env.py
     if _env_mod is not None:
         cache_ttl = getattr(_env_mod, "ENGINE_CACHE_TTL_SECONDS", None)
         if cache_ttl is None:
@@ -150,7 +124,6 @@ try:
         if enabled_providers:
             engine_kwargs["enabled_providers"] = enabled_providers
 
-        # Accept multiple naming conventions
         enable_adv = getattr(_env_mod, "ENGINE_ENABLE_ADVANCED_ANALYSIS", None)
         if enable_adv is None:
             enable_adv = getattr(_env_mod, "ENABLE_ADVANCED_ANALYSIS", None)
@@ -160,12 +133,11 @@ try:
     try:
         _engine = _V2DataEngine(**engine_kwargs) if engine_kwargs else _V2DataEngine()
     except TypeError:
-        # Signature mismatch -> fallback to default ctor
         _engine = _V2DataEngine()
 
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
-    _ENABLED_PROVIDERS = list(getattr(_engine, "enabled_providers", []))
+    _ENABLED_PROVIDERS = list(getattr(_engine, "enabled_providers", [])) or []
     logger.info(
         "[LegacyService] Using DataEngine v2 (kwargs=%s, enabled_providers=%s).",
         list(engine_kwargs.keys()),
@@ -173,20 +145,15 @@ try:
     )
 
 except Exception as e_v2:  # pragma: no cover
-    logger.exception(
-        "[LegacyService] Failed to init core.data_engine_v2.DataEngine: %s", e_v2
-    )
+    logger.exception("[LegacyService] Failed to init core.data_engine_v2.DataEngine: %s", e_v2)
     try:
-        # Fallback: legacy module-level engine
         from core import data_engine as _data_engine_module  # type: ignore
 
         _ENGINE_MODE = "v1_module"
         _ENGINE_IS_STUB = False
         logger.warning("[LegacyService] Falling back to core.data_engine module-level API.")
     except Exception as e_v1:  # pragma: no cover
-        logger.exception(
-            "[LegacyService] Failed to import core.data_engine as fallback: %s", e_v1
-        )
+        logger.exception("[LegacyService] Failed to import core.data_engine as fallback: %s", e_v1)
 
         class _StubEngine:
             async def get_enriched_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
@@ -199,9 +166,7 @@ except Exception as e_v2:  # pragma: no cover
                         {
                             "symbol": sym,
                             "data_quality": "MISSING",
-                            "error": (
-                                "Unified data engine (v2/v1) unavailable in legacy_service."
-                            ),
+                            "error": "Legacy stub engine: unified engine (v2/v1) unavailable.",
                         }
                     )
                 return out
@@ -209,83 +174,35 @@ except Exception as e_v2:  # pragma: no cover
         _engine = _StubEngine()
         _ENGINE_MODE = "stub"
         _ENGINE_IS_STUB = True
-        logger.error(
-            "[LegacyService] Using stub engine – responses will contain MISSING placeholder data."
-        )
-
-
-async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
-    """
-    Unified wrapper to call the underlying engine in any mode.
-    Guarantees returned list order matches input order when possible.
-    """
-    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
-    if not clean:
-        return []
-
-    # v2
-    if _ENGINE_MODE == "v2":
-        results = await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
-        # If engine returns a list, attempt to re-align by symbol if needed
-        if isinstance(results, list) and len(results) == len(clean):
-            return results
-
-        # Defensive: map by symbol
-        mapping: Dict[str, Any] = {}
-        if isinstance(results, list):
-            for r in results:
-                try:
-                    d = _quote_to_dict(r)
-                    sym = str(d.get("symbol") or d.get("ticker") or "").upper()
-                    if sym:
-                        mapping[sym] = r
-                except Exception:
-                    continue
-        return [mapping.get(s.upper()) for s in clean]
-
-    # v1 module
-    if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
-        results = await _data_engine_module.get_enriched_quotes(clean)  # type: ignore[attr-defined]
-        if isinstance(results, list) and len(results) == len(clean):
-            return results
-        mapping: Dict[str, Any] = {}
-        if isinstance(results, list):
-            for r in results:
-                try:
-                    d = _quote_to_dict(r)
-                    sym = str(d.get("symbol") or d.get("ticker") or "").upper()
-                    if sym:
-                        mapping[sym] = r
-                except Exception:
-                    continue
-        return [mapping.get(s.upper()) for s in clean]
-
-    # stub
-    return await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+        logger.error("[LegacyService] Using stub engine – legacy responses will be MISSING.")
 
 
 # ----------------------------------------------------------------------
-# CONSTANTS / TIMEZONES
+# Symbol helpers
 # ----------------------------------------------------------------------
-
-RIYADH_TZ = timezone(timedelta(hours=3))
-
-# ----------------------------------------------------------------------
-# SYMBOL HELPERS
-# ----------------------------------------------------------------------
-
 
 def _normalize_symbol(symbol: str) -> str:
+    """
+    Normalize common inputs:
+      - 1120 -> 1120.SR
+      - TADAWUL:1120 -> 1120.SR
+      - 1120.TADAWUL -> 1120.SR
+      - keep AAPL as AAPL
+    """
     s = (symbol or "").strip().upper()
     if not s:
         return ""
 
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
+    # Allow "TADAWUL:1120"
+    if ":" in s:
+        prefix, rest = s.split(":", 1)
+        if prefix in {"TADAWUL", "SA", "KSA"}:
+            s = rest.strip()
 
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", ".SR")
 
+    # Pure numeric -> KSA
     if s.isdigit():
         s = f"{s}.SR"
 
@@ -293,8 +210,7 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _split_tickers_by_market(symbols: List[str]) -> Tuple[List[str], List[str]]:
-    ksa: List[str] = []
-    global_: List[str] = []
+    ksa, global_ = [], []
     for s in symbols or []:
         ss = (s or "").strip().upper()
         if not ss:
@@ -303,10 +219,82 @@ def _split_tickers_by_market(symbols: List[str]) -> Tuple[List[str], List[str]]:
     return ksa, global_
 
 
+def _chunk(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 # ----------------------------------------------------------------------
-# DATA STRUCTURES
+# Internal helpers – dict access / parsing
 # ----------------------------------------------------------------------
 
+def _quote_to_dict(q: Any) -> Dict[str, Any]:
+    if q is None:
+        return {}
+    if hasattr(q, "model_dump"):
+        try:
+            return q.model_dump()  # type: ignore[call-arg]
+        except Exception:
+            pass
+    if isinstance(q, dict):
+        return q
+    return getattr(q, "__dict__", {}) or {}
+
+
+def _g(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for k in keys:
+        if k in data and data[k] is not None:
+            return data[k]
+    return default
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _safe_iso(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.isoformat()
+    except Exception:
+        return None
+
+
+def _to_riyadh(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(RIYADH_TZ)
+
+
+def _compute_52w_position_pct(
+    price: Optional[float], low_52w: Optional[float], high_52w: Optional[float]
+) -> Optional[float]:
+    if price is None or low_52w is None or high_52w is None:
+        return None
+    span = high_52w - low_52w
+    if span <= 0:
+        return None
+    try:
+        pct = (price - low_52w) / span * 100.0
+        return max(0.0, min(100.0, pct))
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------
+# LegacyQuote dataclass
+# ----------------------------------------------------------------------
 
 @dataclass
 class LegacyQuote:
@@ -386,81 +374,16 @@ class LegacyQuote:
     error: Optional[str] = None
 
 
-# ----------------------------------------------------------------------
-# INTERNAL HELPERS – TYPES / MAPPING
-# ----------------------------------------------------------------------
-
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _to_riyadh(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(RIYADH_TZ)
-
-
-def _compute_52w_position_pct(
-    price: Optional[float],
-    low_52w: Optional[float],
-    high_52w: Optional[float],
-) -> Optional[float]:
-    if price is None or low_52w is None or high_52w is None:
-        return None
-    span = high_52w - low_52w
-    if span <= 0:
-        return None
-    try:
-        pct = (price - low_52w) / span * 100.0
-        return max(0.0, min(100.0, pct))
-    except Exception:
-        return None
-
-
-def _quote_to_dict(q: Any) -> Dict[str, Any]:
-    if q is None:
-        return {}
-    if hasattr(q, "model_dump"):
-        try:
-            return q.model_dump()  # type: ignore[call-arg]
-        except Exception:
-            pass
-    if isinstance(q, dict):
-        return q
-    return getattr(q, "__dict__", {}) or {}
-
-
-def _g(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    for k in keys:
-        if k in data and data[k] is not None:
-            return data[k]
-    return default
-
-
-def _unified_to_legacy(quote: Any) -> LegacyQuote:
+def _unified_to_legacy(quote: Any, fallback_symbol: str = "") -> LegacyQuote:
     data = _quote_to_dict(quote)
 
-    if not data:
-        return LegacyQuote(
-            ticker="",
-            symbol="",
-            data_quality="MISSING",
-            error="No quote data returned from engine",
-        )
-
-    symbol = str(_g(data, "symbol", "ticker", default="").upper())
+    symbol = str(_g(data, "symbol", "ticker", default=fallback_symbol).upper())
+    if not symbol:
+        symbol = (fallback_symbol or "").upper()
 
     name = _g(data, "name", "company_name", "longName", "shortName")
-    exchange = _g(data, "exchange", "primary_exchange")
-    market_region = _g(data, "market_region", "region", "country", "market")
+    exchange = _g(data, "exchange", "primary_exchange", "exchange_short_name")
+    market_region = _g(data, "market_region", "market", "region", "country")
     currency = _g(data, "currency")
     sector = _g(data, "sector")
     industry = _g(data, "industry", "industryGroup")
@@ -472,8 +395,21 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
     open_price = _safe_float(_g(data, "open", "regularMarketOpen"))
     high_price = _safe_float(_g(data, "high", "dayHigh", "regularMarketDayHigh"))
     low_price = _safe_float(_g(data, "low", "dayLow", "regularMarketDayLow"))
+
     change = _safe_float(_g(data, "change"))
     change_pct = _safe_float(_g(data, "change_pct", "change_percent", "changePercent"))
+
+    # Derive change / change% if missing and we have price + prev_close
+    if change is None and price is not None and prev_close is not None:
+        try:
+            change = float(price) - float(prev_close)
+        except Exception:
+            pass
+    if change_pct is None and price is not None and prev_close not in (None, 0):
+        try:
+            change_pct = (float(price) - float(prev_close)) / float(prev_close) * 100.0
+        except Exception:
+            pass
 
     volume = _safe_float(_g(data, "volume", "regularMarketVolume"))
     avg_volume = _safe_float(_g(data, "avg_volume", "avg_volume_30d", "average_volume_30d"))
@@ -483,7 +419,6 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
 
     high_52w = _safe_float(_g(data, "fifty_two_week_high", "high_52w", "yearHigh"))
     low_52w = _safe_float(_g(data, "fifty_two_week_low", "low_52w", "yearLow"))
-
     pos_52w = _safe_float(_g(data, "position_52w_percent", "fifty_two_week_position"))
     if pos_52w is None:
         pos_52w = _compute_52w_position_pct(price, low_52w, high_52w)
@@ -514,7 +449,7 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
     quality_score = _safe_float(_g(data, "quality_score"))
     momentum_score = _safe_float(_g(data, "momentum_score"))
     opportunity_score = _safe_float(_g(data, "opportunity_score"))
-    recommendation = _g(data, "recommendation")
+    recommendation = _g(data, "recommendation", "recommendation_label")
     valuation_label = _g(data, "valuation_label")
 
     rsi_14 = _safe_float(_g(data, "rsi_14"))
@@ -524,6 +459,7 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
 
     data_quality = str(_g(data, "data_quality", "data_quality_level", default="MISSING"))
 
+    # timestamps
     last_updated_raw = _g(data, "last_updated_utc", "as_of_utc")
     last_utc: Optional[datetime] = None
     if isinstance(last_updated_raw, datetime):
@@ -533,9 +469,9 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
             last_utc = datetime.fromisoformat(last_updated_raw)
         except Exception:
             last_utc = None
-
     last_riyadh = _to_riyadh(last_utc) if last_utc else None
 
+    # sources -> string
     raw_sources = _g(data, "sources", default=[]) or []
     sources: List[str] = []
     try:
@@ -616,68 +552,77 @@ def _unified_to_legacy(quote: Any) -> LegacyQuote:
 
 
 def _legacy_to_dict(lq: LegacyQuote) -> Dict[str, Any]:
-    return {
-        "ticker": lq.ticker,
-        "symbol": lq.symbol,
-        "name": lq.name,
-        "exchange": lq.exchange,
-        "market": lq.market,
-        "currency": lq.currency,
-        "sector": lq.sector,
-        "industry": lq.industry,
-        "sub_sector": lq.sub_sector,
-        "listing_date": lq.listing_date,
-        "price": lq.price,
-        "previous_close": lq.previous_close,
-        "open": lq.open,
-        "high": lq.high,
-        "low": lq.low,
-        "change": lq.change,
-        "change_percent": lq.change_percent,
-        "volume": lq.volume,
-        "avg_volume": lq.avg_volume,
-        "market_cap": lq.market_cap,
-        "shares_outstanding": lq.shares_outstanding,
-        "free_float": lq.free_float,
-        "fifty_two_week_high": lq.fifty_two_week_high,
-        "fifty_two_week_low": lq.fifty_two_week_low,
-        "fifty_two_week_position_pct": lq.fifty_two_week_position_pct,
-        "eps": lq.eps,
-        "pe_ratio": lq.pe_ratio,
-        "pb_ratio": lq.pb_ratio,
-        "dividend_yield": lq.dividend_yield,
-        "roe": lq.roe,
-        "roa": lq.roa,
-        "profit_margin": lq.profit_margin,
-        "debt_to_equity": lq.debt_to_equity,
-        "revenue_growth": lq.revenue_growth,
-        "net_income_growth": lq.net_income_growth,
-        "ebitda_margin": lq.ebitda_margin,
-        "operating_margin": lq.operating_margin,
-        "beta": lq.beta,
-        "volatility_30d": lq.volatility_30d,
-        "volatility_30d_percent": lq.volatility_30d_percent,
-        "ev_to_ebitda": lq.ev_to_ebitda,
-        "price_to_sales": lq.price_to_sales,
-        "price_to_cash_flow": lq.price_to_cash_flow,
-        "peg_ratio": lq.peg_ratio,
-        "value_score": lq.value_score,
-        "quality_score": lq.quality_score,
-        "momentum_score": lq.momentum_score,
-        "opportunity_score": lq.opportunity_score,
-        "recommendation": lq.recommendation,
-        "valuation_label": lq.valuation_label,
-        "rsi_14": lq.rsi_14,
-        "macd": lq.macd,
-        "ma_20d": lq.ma_20d,
-        "ma_50d": lq.ma_50d,
-        "data_quality": lq.data_quality,
-        "data_source": lq.data_source,
-        "last_updated_utc": lq.last_updated_utc.isoformat() if lq.last_updated_utc else None,
-        "last_updated_riyadh": lq.last_updated_riyadh.isoformat() if lq.last_updated_riyadh else None,
-        "error": lq.error,
-    }
+    d = asdict(lq)
+    # convert datetimes to iso (keep keys stable)
+    d["last_updated_utc"] = _safe_iso(lq.last_updated_utc)
+    d["last_updated_riyadh"] = _safe_iso(lq.last_updated_riyadh)
+    return d
 
+
+# ----------------------------------------------------------------------
+# Engine unified wrapper (chunked + timeout)
+# ----------------------------------------------------------------------
+
+async def _engine_get_enriched_quotes(symbols: List[str]) -> List[Any]:
+    clean = [s.strip() for s in (symbols or []) if s and s.strip()]
+    if not clean:
+        return []
+
+    chunks = _chunk(clean, LEGACY_BATCH_SIZE)
+    results_map: Dict[str, Any] = {}
+
+    async def _call_engine(batch_syms: List[str]) -> List[Any]:
+        if _ENGINE_MODE == "v2":
+            fn = getattr(_engine, "get_enriched_quotes", None)
+            if callable(fn):
+                return await fn(batch_syms)  # type: ignore[misc]
+            # fallback if older engine name exists
+            fn2 = getattr(_engine, "get_quotes", None)
+            if callable(fn2):
+                return await fn2(batch_syms)  # type: ignore[misc]
+            return []
+        if _ENGINE_MODE == "v1_module" and _data_engine_module is not None:
+            return await _data_engine_module.get_enriched_quotes(batch_syms)  # type: ignore[attr-defined]
+        # stub
+        return await _engine.get_enriched_quotes(batch_syms)  # type: ignore[attr-defined]
+
+    for ch in chunks:
+        try:
+            batch = await asyncio.wait_for(_call_engine(ch), timeout=LEGACY_BATCH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("[LegacyService] Engine batch timeout (size=%d).", len(ch))
+            batch = []
+        except Exception as exc:
+            logger.exception("[LegacyService] Engine batch failure: %s", exc)
+            batch = []
+
+        # Map by symbol (defensive). If engine returned aligned list, zip works too.
+        if isinstance(batch, list) and len(batch) == len(ch):
+            for s, q in zip(ch, batch):
+                results_map[s.upper()] = q
+        else:
+            if isinstance(batch, list):
+                for q in batch:
+                    d = _quote_to_dict(q)
+                    sym = str(d.get("symbol") or d.get("ticker") or "").upper()
+                    if sym:
+                        results_map[sym] = q
+
+        # ensure we always have placeholders for missing symbols in this chunk
+        for s in ch:
+            if s.upper() not in results_map:
+                results_map[s.upper()] = {
+                    "symbol": s.upper(),
+                    "data_quality": "MISSING",
+                    "error": "No data returned from engine (batch missing).",
+                }
+
+    return [results_map.get(s.upper()) for s in clean]
+
+
+# ----------------------------------------------------------------------
+# Sheets helpers
+# ----------------------------------------------------------------------
 
 def _build_sheet_headers() -> List[str]:
     return [
@@ -713,7 +658,7 @@ def _legacy_to_sheet_row(lq: LegacyQuote) -> List[Any]:
     return [
         lq.symbol,
         lq.name or "",
-        lq.exchange or lq.market or "",
+        (lq.exchange or lq.market or ""),
         lq.currency or "",
         lq.sector or "",
         lq.industry or "",
@@ -733,8 +678,8 @@ def _legacy_to_sheet_row(lq: LegacyQuote) -> List[Any]:
         lq.fifty_two_week_position_pct,
         lq.data_quality,
         lq.data_source or "",
-        lq.last_updated_utc.isoformat() if lq.last_updated_utc else None,
-        lq.last_updated_riyadh.isoformat() if lq.last_updated_riyadh else None,
+        _safe_iso(lq.last_updated_utc),
+        _safe_iso(lq.last_updated_riyadh),
         lq.error or "",
     ]
 
@@ -743,7 +688,6 @@ def _legacy_to_sheet_row(lq: LegacyQuote) -> List[Any]:
 # PUBLIC API – LEGACY QUOTES
 # ----------------------------------------------------------------------
 
-
 async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
     raw_symbols = [t.strip() for t in (tickers or []) if t and t.strip()]
     normalized = [_normalize_symbol(t) for t in raw_symbols]
@@ -751,24 +695,23 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
 
     ksa_syms, global_syms = _split_tickers_by_market(normalized)
 
+    meta_base = {
+        "requested": raw_symbols,
+        "normalized": normalized,
+        "count": 0,
+        "markets": {"ksa": len(ksa_syms), "global": len(global_syms)},
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "backend_url": BACKEND_BASE_URL,
+        "engine_mode": _ENGINE_MODE,
+        "engine_is_stub": _ENGINE_IS_STUB,
+        "enabled_providers": _ENABLED_PROVIDERS,
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+    }
+
     if not normalized:
-        return {
-            "quotes": [],
-            "meta": {
-                "requested": raw_symbols,
-                "normalized": [],
-                "count": 0,
-                "markets": {"ksa": 0, "global": 0},
-                "app": APP_NAME,
-                "version": APP_VERSION,
-                "backend_url": BACKEND_BASE_URL,
-                "engine_mode": _ENGINE_MODE,
-                "engine_is_stub": _ENGINE_IS_STUB,
-                "enabled_providers": _ENABLED_PROVIDERS,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "note": "No symbols provided.",
-            },
-        }
+        meta_base["note"] = "No symbols provided."
+        return {"quotes": [], "meta": meta_base}
 
     try:
         unified_quotes = await _engine_get_enriched_quotes(normalized)
@@ -783,31 +726,15 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             )
             for sym in normalized
         ]
-        return {
-            "quotes": [_legacy_to_dict(lq) for lq in legacy_quotes],
-            "meta": {
-                "requested": raw_symbols,
-                "normalized": normalized,
-                "count": len(legacy_quotes),
-                "markets": {"ksa": len(ksa_syms), "global": len(global_syms)},
-                "app": APP_NAME,
-                "version": APP_VERSION,
-                "backend_url": BACKEND_BASE_URL,
-                "engine_mode": _ENGINE_MODE,
-                "engine_is_stub": _ENGINE_IS_STUB,
-                "enabled_providers": _ENABLED_PROVIDERS,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "note": "Failed to fetch data from unified data engine.",
-            },
-        }
+        meta_base["count"] = len(legacy_quotes)
+        meta_base["note"] = "Failed to fetch data from unified data engine."
+        return {"quotes": [_legacy_to_dict(lq) for lq in legacy_quotes], "meta": meta_base}
 
     legacy_quotes: List[LegacyQuote] = []
     for idx, sym in enumerate(normalized):
         uq = unified_quotes[idx] if idx < len(unified_quotes) else None
         try:
-            if uq is None:
-                raise ValueError("No quote returned from engine")
-            lq = _unified_to_legacy(uq)
+            lq = _unified_to_legacy(uq, fallback_symbol=sym)
             if not lq.symbol:
                 lq.symbol = sym
                 lq.ticker = sym
@@ -821,119 +748,112 @@ async def get_legacy_quotes(tickers: List[str]) -> Dict[str, Any]:
             )
         legacy_quotes.append(lq)
 
-    return {
-        "quotes": [_legacy_to_dict(lq) for lq in legacy_quotes],
-        "meta": {
-            "requested": raw_symbols,
-            "normalized": normalized,
-            "count": len(legacy_quotes),
-            "markets": {"ksa": len(ksa_syms), "global": len(global_syms)},
-            "app": APP_NAME,
-            "version": APP_VERSION,
-            "backend_url": BACKEND_BASE_URL,
-            "engine_mode": _ENGINE_MODE,
-            "engine_is_stub": _ENGINE_IS_STUB,
-            "enabled_providers": _ENABLED_PROVIDERS,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "note": (
-                "Legacy format built on UnifiedQuote-style engine "
-                f"(mode={_ENGINE_MODE}, stub={_ENGINE_IS_STUB}; "
-                "KSA via Tadawul/Argaam providers; "
-                "no direct EODHD calls inside legacy_service)."
-            ),
-        },
-    }
+    meta_base["count"] = len(legacy_quotes)
+    meta_base["note"] = (
+        "Legacy format built on UnifiedQuote-style engine "
+        f"(mode={_ENGINE_MODE}, stub={_ENGINE_IS_STUB}; "
+        "KSA via Tadawul/Argaam inside engine; no direct provider calls here)."
+    )
+
+    return {"quotes": [_legacy_to_dict(lq) for lq in legacy_quotes], "meta": meta_base}
 
 
 # ----------------------------------------------------------------------
 # PUBLIC API – GOOGLE SHEETS HELPERS
 # ----------------------------------------------------------------------
 
-
 async def build_legacy_sheet_payload(tickers: List[str]) -> Dict[str, Any]:
     legacy_payload = await get_legacy_quotes(tickers)
-    quotes = legacy_payload.get("quotes", [])
-    meta = legacy_payload.get("meta", {})
+    quotes = legacy_payload.get("quotes", []) or []
+    meta = legacy_payload.get("meta", {}) or {}
 
     headers = _build_sheet_headers()
     rows: List[List[Any]] = []
 
     for q in quotes:
-        lq = LegacyQuote(
-            ticker=q.get("ticker", ""),
-            symbol=q.get("symbol", ""),
-            name=q.get("name"),
-            exchange=q.get("exchange"),
-            market=q.get("market"),
-            currency=q.get("currency"),
-            sector=q.get("sector"),
-            industry=q.get("industry"),
-            sub_sector=q.get("sub_sector"),
-            listing_date=q.get("listing_date"),
-            price=q.get("price"),
-            previous_close=q.get("previous_close"),
-            open=q.get("open"),
-            high=q.get("high"),
-            low=q.get("low"),
-            change=q.get("change"),
-            change_percent=q.get("change_percent"),
-            volume=q.get("volume"),
-            avg_volume=q.get("avg_volume"),
-            market_cap=q.get("market_cap"),
-            shares_outstanding=q.get("shares_outstanding"),
-            free_float=q.get("free_float"),
-            fifty_two_week_high=q.get("fifty_two_week_high"),
-            fifty_two_week_low=q.get("fifty_two_week_low"),
-            fifty_two_week_position_pct=q.get("fifty_two_week_position_pct"),
-            eps=q.get("eps"),
-            pe_ratio=q.get("pe_ratio"),
-            pb_ratio=q.get("pb_ratio"),
-            dividend_yield=q.get("dividend_yield"),
-            roe=q.get("roe"),
-            roa=q.get("roa"),
-            profit_margin=q.get("profit_margin"),
-            debt_to_equity=q.get("debt_to_equity"),
-            revenue_growth=q.get("revenue_growth"),
-            net_income_growth=q.get("net_income_growth"),
-            ebitda_margin=q.get("ebitda_margin"),
-            operating_margin=q.get("operating_margin"),
-            beta=q.get("beta"),
-            volatility_30d=q.get("volatility_30d"),
-            volatility_30d_percent=q.get("volatility_30d_percent"),
-            ev_to_ebitda=q.get("ev_to_ebitda"),
-            price_to_sales=q.get("price_to_sales"),
-            price_to_cash_flow=q.get("price_to_cash_flow"),
-            peg_ratio=q.get("peg_ratio"),
-            value_score=q.get("value_score"),
-            quality_score=q.get("quality_score"),
-            momentum_score=q.get("momentum_score"),
-            opportunity_score=q.get("opportunity_score"),
-            recommendation=q.get("recommendation"),
-            valuation_label=q.get("valuation_label"),
-            rsi_14=q.get("rsi_14"),
-            macd=q.get("macd"),
-            ma_20d=q.get("ma_20d"),
-            ma_50d=q.get("ma_50d"),
-            data_quality=q.get("data_quality", "MISSING"),
-            data_source=q.get("data_source"),
-            error=q.get("error"),
-        )
-
-        # parse timestamps (optional)
-        lu_utc = q.get("last_updated_utc")
-        lu_riyadh = q.get("last_updated_riyadh")
         try:
-            if lu_utc:
-                lq.last_updated_utc = datetime.fromisoformat(lu_utc)
-        except Exception:
-            pass
-        try:
-            if lu_riyadh:
-                lq.last_updated_riyadh = datetime.fromisoformat(lu_riyadh)
-        except Exception:
-            pass
+            # build row from dict directly (avoid fragile iso parsing here)
+            lq = LegacyQuote(
+                ticker=q.get("ticker", "") or q.get("symbol", ""),
+                symbol=q.get("symbol", "") or q.get("ticker", ""),
+                name=q.get("name"),
+                exchange=q.get("exchange"),
+                market=q.get("market"),
+                currency=q.get("currency"),
+                sector=q.get("sector"),
+                industry=q.get("industry"),
+                sub_sector=q.get("sub_sector"),
+                listing_date=q.get("listing_date"),
+                price=q.get("price"),
+                previous_close=q.get("previous_close"),
+                open=q.get("open"),
+                high=q.get("high"),
+                low=q.get("low"),
+                change=q.get("change"),
+                change_percent=q.get("change_percent"),
+                volume=q.get("volume"),
+                avg_volume=q.get("avg_volume"),
+                market_cap=q.get("market_cap"),
+                shares_outstanding=q.get("shares_outstanding"),
+                free_float=q.get("free_float"),
+                fifty_two_week_high=q.get("fifty_two_week_high"),
+                fifty_two_week_low=q.get("fifty_two_week_low"),
+                fifty_two_week_position_pct=q.get("fifty_two_week_position_pct"),
+                eps=q.get("eps"),
+                pe_ratio=q.get("pe_ratio"),
+                pb_ratio=q.get("pb_ratio"),
+                dividend_yield=q.get("dividend_yield"),
+                roe=q.get("roe"),
+                roa=q.get("roa"),
+                profit_margin=q.get("profit_margin"),
+                debt_to_equity=q.get("debt_to_equity"),
+                revenue_growth=q.get("revenue_growth"),
+                net_income_growth=q.get("net_income_growth"),
+                ebitda_margin=q.get("ebitda_margin"),
+                operating_margin=q.get("operating_margin"),
+                beta=q.get("beta"),
+                volatility_30d=q.get("volatility_30d"),
+                volatility_30d_percent=q.get("volatility_30d_percent"),
+                ev_to_ebitda=q.get("ev_to_ebitda"),
+                price_to_sales=q.get("price_to_sales"),
+                price_to_cash_flow=q.get("price_to_cash_flow"),
+                peg_ratio=q.get("peg_ratio"),
+                value_score=q.get("value_score"),
+                quality_score=q.get("quality_score"),
+                momentum_score=q.get("momentum_score"),
+                opportunity_score=q.get("opportunity_score"),
+                recommendation=q.get("recommendation"),
+                valuation_label=q.get("valuation_label"),
+                rsi_14=q.get("rsi_14"),
+                macd=q.get("macd"),
+                ma_20d=q.get("ma_20d"),
+                ma_50d=q.get("ma_50d"),
+                data_quality=q.get("data_quality", "MISSING"),
+                data_source=q.get("data_source"),
+                error=q.get("error"),
+            )
 
-        rows.append(_legacy_to_sheet_row(lq))
+            # parse optional timestamps
+            lu_utc = q.get("last_updated_utc")
+            lu_riyadh = q.get("last_updated_riyadh")
+            if isinstance(lu_utc, str) and lu_utc:
+                try:
+                    lq.last_updated_utc = datetime.fromisoformat(lu_utc)
+                except Exception:
+                    pass
+            if isinstance(lu_riyadh, str) and lu_riyadh:
+                try:
+                    lq.last_updated_riyadh = datetime.fromisoformat(lu_riyadh)
+                except Exception:
+                    pass
+
+            rows.append(_legacy_to_sheet_row(lq))
+        except Exception as exc:
+            # Never break Sheets
+            sym = (q.get("symbol") or q.get("ticker") or "").upper()
+            rows.append(
+                [sym] + [None] * (len(headers) - 2) + [f"Row build error: {exc}"]
+            )
 
     return {"headers": headers, "rows": rows, "meta": meta}
 
