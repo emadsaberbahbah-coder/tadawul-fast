@@ -1,51 +1,54 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.8
-(Global fundamentals-enriched, Sheets-aligned, hardened + derived-fields)
+Core Data & Analysis Engine - v2.7.1
+(Global fundamentals-enriched, Sheets-aligned, hardened)
 
-Author: Emad Bahbah (with GPT-5.2 Thinking)
+Author: Emad Bahbah (with GPT-5.x Thinking)
 
 Key features
 ------------
-- Async, multi-provider quote engine:
-    • FMP (price + basic fundamentals)
-    • EODHD (real-time + optional deep fundamentals)  [GLOBAL ONLY]
-    • Finnhub (real-time price)
+- Async, multi-provider quote engine (FMP + optional EODHD + optional Finnhub).
+- Global shares:
+    • Real-time prices (Finnhub/EODHD/FMP).
+    • Deep fundamentals via EODHD /fundamentals (sector, margins, ROE/ROA,
+      growth, ownership, short ratio, target price, dividends, etc.).
 - KSA (.SR) tickers are KSA-safe:
-    • Never call EODHD for .SR symbols.
-    • If legacy core.data_engine exists, it is used as the primary KSA delegate.
-- In-memory cache with TTL.
-- UnifiedQuote aligned with:
-    • routes/enriched_quote
-    • routes/ai_analysis
-    • legacy_service
-    • 9-page Google Sheets philosophy
-- Deterministic scoring (Value / Quality / Momentum / Opportunity) + recommendation.
-- Derived fields (safe):
-    • change, change %, 52W position, value_traded, turnover_rate, spread_percent,
-      liquidity_score (heuristic).
+    • Never call EODHD directly for .SR symbols.
+    • If the legacy core.data_engine is available, it is used as the
+      primary KSA delegate (Tadawul / Argaam routing).
+- Simple in-memory caching with TTL to reduce API calls.
+- UnifiedQuote Pydantic model aligned with:
+    • routes/enriched_quote.EnrichedQuoteResponse
+    • routes/ai_analysis.SingleAnalysisResponse
+    • legacy_service (v1/quote + v1/legacy/sheet-rows)
+    • 9-page Google Sheets dashboard philosophy (KSA / Global / Funds / FX).
+- Basic AI-style scoring:
+    • Value / Quality / Momentum / Opportunity + Recommendation
+    • overall_score field for "AI Score" columns on Sheets.
+    • Uses target_price (if available) to derive fair_value, upside %, and
+      expected ROI horizons (exp_roi_3m / exp_roi_12m).
+    • Simple risk_label / risk_bucket based on beta, volatility, and opportunity.
 - Extremely defensive:
-    • Never raises on normal usage.
-    • Hardened env parsing.
-    • Provider failures never crash the engine.
+    • Never raises on normal usage (returns MISSING with error instead).
+    • Hardened __init__: bad env values (TTL, timeout, providers) never crash import.
+    • Alias-normalization layer so Sheets always see consistent fields
+      (last_price/price, 52W aliases, dividend yield %, ROE/ROA %, etc.).
 
 Configuration (env vars)
 ------------------------
 ENGINE_CACHE_TTL_SECONDS         # optional; seconds, overrides DATAENGINE_CACHE_TTL
-DATAENGINE_CACHE_TTL             # optional; seconds, default 120
+DATAENGINE_CACHE_TTL             # optional; seconds, default 120 if both missing
 ENGINE_PROVIDER_TIMEOUT_SECONDS  # optional; overrides DATAENGINE_TIMEOUT
 DATAENGINE_TIMEOUT               # optional; per-provider timeout in seconds, default 10
-ENGINE_MAX_CONCURRENCY           # optional; global semaphore for provider calls, default 25
-ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" default "fmp"
+ENABLED_PROVIDERS                # e.g. "fmp,eodhd,finnhub" (case-insensitive). Default: "fmp"
 PRIMARY_PROVIDER                 # optional; if set and in enabled list, used first
 LOCAL_TIMEZONE                   # optional; default "Asia/Riyadh"
-ENABLE_ADVANCED_ANALYSIS         # optional; "1/true/on" enable, "0/false/off" disable
-FMP_DEEP_ENRICH                  # optional; "1" enables extra FMP endpoints (can be heavy)
+ENABLE_ADVANCED_ANALYSIS         # optional; "1/true/on" to enable, "0/false/off" to disable
 
 Provider API keys
 -----------------
-FMP_API_KEY
+FMP_API_KEY                      # required for FMP provider
 EODHD_BASE_URL                   # optional; default "https://eodhd.com/api"
 EODHD_API_KEY                    # optional
 FINNHUB_API_KEY                  # optional
@@ -65,26 +68,23 @@ import httpx
 from pydantic import BaseModel, Field
 
 try:
+    # Python 3.11+
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
+
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Optional import of v1 engine for KSA delegation / global fallback
 # ---------------------------------------------------------------------------
 
-try:  # pragma: no cover
+try:  # pragma: no cover - best-effort
     from core import data_engine as _v1_engine  # type: ignore
+
     _HAS_V1_ENGINE = True
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - if core.data_engine is missing
     _v1_engine = None  # type: ignore
     _HAS_V1_ENGINE = False
 
@@ -93,28 +93,34 @@ except Exception:  # pragma: no cover
 # Helper utilities (safe configuration parsing)
 # =======================================================================
 
+
 def _safe_int(value: Any, default: int, label: str) -> int:
+    """
+    Safely parse an integer from env/config.
+    Never raises – logs a warning and returns default on error.
+    """
     if value is None:
         return default
     try:
         if isinstance(value, (int, float)):
             return int(value)
-        return int(str(value).strip())
+        s = str(value).strip()
+        return int(s)
     except Exception:
-        logger.warning("DataEngine config: invalid integer for %s=%r; using %s", label, value, default)
+        logger.warning(
+            "DataEngine config: invalid integer for %s=%r; falling back to %s",
+            label,
+            value,
+            default,
+        )
         return default
 
 
-def _safe_float(value: Any) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
 def _safe_bool(value: Any, default: bool, label: str) -> bool:
+    """
+    Safely parse a boolean toggle from env/config.
+    Accepts truthy strings/numbers; never raises.
+    """
     if value is None:
         return default
     try:
@@ -127,25 +133,33 @@ def _safe_bool(value: Any, default: bool, label: str) -> bool:
             return False
     except Exception:
         pass
-    logger.warning("DataEngine config: invalid boolean for %s=%r; using %s", label, value, default)
+    logger.warning(
+        "DataEngine config: invalid boolean for %s=%r; falling back to %s",
+        label,
+        value,
+        default,
+    )
     return default
 
 
-def _uniq_list_lower(items: List[str]) -> List[str]:
-    out: List[str] = []
-    seen: set[str] = set()
-    for x in items:
-        s = (x or "").strip().lower()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
 
 
 # =======================================================================
 # ProviderSource & UnifiedQuote models
 # =======================================================================
+
 
 class ProviderSource(BaseModel):
     provider: str
@@ -162,11 +176,11 @@ class UnifiedQuote(BaseModel):
     sector: Optional[str] = None
     sub_sector: Optional[str] = None
     industry: Optional[str] = None
-    market: Optional[str] = None
-    market_region: Optional[str] = None
+    market: Optional[str] = None          # e.g. "KSA", "GLOBAL", "US"
+    market_region: Optional[str] = None   # alias for legacy engine / sheets
     exchange: Optional[str] = None
     currency: Optional[str] = None
-    listing_date: Optional[str] = None
+    listing_date: Optional[str] = None  # YYYY-MM-DD if available
 
     # Capital structure / ownership / short interest
     shares_outstanding: Optional[float] = None
@@ -180,7 +194,7 @@ class UnifiedQuote(BaseModel):
     last_price: Optional[float] = None
     price: Optional[float] = None
     previous_close: Optional[float] = None
-    prev_close: Optional[float] = None
+    prev_close: Optional[float] = None  # alias for legacy_service
     open: Optional[float] = None
     high: Optional[float] = None
     low: Optional[float] = None
@@ -206,7 +220,7 @@ class UnifiedQuote(BaseModel):
     bid_size: Optional[float] = None
     ask_size: Optional[float] = None
     spread_percent: Optional[float] = None
-    liquidity_score: Optional[float] = None
+    liquidity_score: Optional[float] = None  # 0–100 liquidity heuristic
 
     # Fundamentals
     eps_ttm: Optional[float] = None
@@ -219,8 +233,8 @@ class UnifiedQuote(BaseModel):
     dividend_yield_percent: Optional[float] = None
     dividend_yield: Optional[float] = None
     dividend_payout_ratio: Optional[float] = None
-    dividend_rate: Optional[float] = None
-    ex_dividend_date: Optional[str] = None
+    dividend_rate: Optional[float] = None          # annual dividend per share if available
+    ex_dividend_date: Optional[str] = None         # YYYY-MM-DD if available
     roe_percent: Optional[float] = None
     roe: Optional[float] = None
     roa_percent: Optional[float] = None
@@ -236,7 +250,7 @@ class UnifiedQuote(BaseModel):
     ebitda_margin_percent: Optional[float] = None
     operating_margin_percent: Optional[float] = None
     net_margin_percent: Optional[float] = None
-    profit_margin: Optional[float] = None
+    profit_margin: Optional[float] = None  # alias used in legacy_service
 
     # Valuation / risk
     ev_to_ebitda: Optional[float] = None
@@ -270,7 +284,10 @@ class UnifiedQuote(BaseModel):
     ma_50d: Optional[float] = None
 
     # Meta & providers
-    data_quality: str = Field("UNKNOWN", description="FULL / PARTIAL / MISSING / STALE / UNKNOWN")
+    data_quality: str = Field(
+        "UNKNOWN",
+        description="FULL / PARTIAL / MISSING / STALE / UNKNOWN (Sheets maps to confidence)",
+    )
     primary_provider: Optional[str] = None
     provider: Optional[str] = None
     data_source: Optional[str] = None
@@ -298,32 +315,36 @@ class _CacheEntry:
 # DataEngine
 # =======================================================================
 
+
 class DataEngine:
+    """
+    Core async engine used by routes.enriched_quote and AI/analysis routes.
+
+    Public async methods:
+        - get_enriched_quote(symbol: str) -> UnifiedQuote
+        - get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]
+    """
+
     def __init__(
         self,
         cache_ttl: Optional[int] = None,
         provider_timeout: Optional[int] = None,
-        enabled_providers: Optional[List[str] | str] = None,
+        enabled_providers: Optional[List[str]] = None,
         enable_advanced_analysis: Optional[bool] = None,
     ) -> None:
-        # Cache TTL
+        # Cache TTL (seconds) – hardened parsing
         if cache_ttl is not None:
             self.cache_ttl = _safe_int(cache_ttl, 120, "cache_ttl")
         else:
             ttl_env = os.getenv("ENGINE_CACHE_TTL_SECONDS") or os.getenv("DATAENGINE_CACHE_TTL")
             self.cache_ttl = _safe_int(ttl_env, 120, "ENGINE_CACHE_TTL_SECONDS/DATAENGINE_CACHE_TTL")
 
-        # Provider timeout
+        # Per-provider timeout (seconds) – hardened parsing
         if provider_timeout is not None:
             self.provider_timeout = _safe_int(provider_timeout, 10, "provider_timeout")
         else:
             timeout_env = os.getenv("ENGINE_PROVIDER_TIMEOUT_SECONDS") or os.getenv("DATAENGINE_TIMEOUT")
             self.provider_timeout = _safe_int(timeout_env, 10, "ENGINE_PROVIDER_TIMEOUT_SECONDS/DATAENGINE_TIMEOUT")
-
-        # Concurrency limiter (global)
-        conc_env = os.getenv("ENGINE_MAX_CONCURRENCY")
-        self.max_concurrency = _safe_int(conc_env, 25, "ENGINE_MAX_CONCURRENCY")
-        self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
 
         # Advanced analysis toggle
         if enable_advanced_analysis is not None:
@@ -332,46 +353,52 @@ class DataEngine:
             flag = os.getenv("ENABLE_ADVANCED_ANALYSIS")
             self.enable_advanced_analysis = _safe_bool(flag, True, "ENABLE_ADVANCED_ANALYSIS")
 
-        # FMP deep enrich toggle (can be heavy)
-        self.fmp_deep_enrich = _safe_bool(os.getenv("FMP_DEEP_ENRICH"), False, "FMP_DEEP_ENRICH")
-
         # Local timezone
         self.local_tz_name: str = os.getenv("LOCAL_TIMEZONE", "Asia/Riyadh")
 
-        # Enabled providers
-        if enabled_providers is None:
-            providers_raw = os.getenv("ENABLED_PROVIDERS", "fmp")
-        elif isinstance(enabled_providers, str):
-            providers_raw = enabled_providers
+        # Enabled providers – accept list OR comma-separated string
+        providers_raw: Optional[str]
+        if enabled_providers is not None:
+            if isinstance(enabled_providers, str):
+                providers_raw = enabled_providers
+            else:
+                providers_raw = ",".join(str(p) for p in enabled_providers)
         else:
-            providers_raw = ",".join(str(p) for p in enabled_providers)
+            providers_raw = os.getenv("ENABLED_PROVIDERS", "fmp")
 
-        providers = _uniq_list_lower([p for p in (providers_raw or "").split(",")])
+        providers: List[str] = []
+        try:
+            for p in (providers_raw or "").split(","):
+                p = p.strip().lower()
+                if p and p not in providers:
+                    providers.append(p)
+        except Exception:
+            logger.warning("DataEngine config: invalid ENABLED_PROVIDERS=%r; falling back to ['fmp']", providers_raw)
+            providers = ["fmp"]
+
         if not providers:
             providers = ["fmp"]
 
-        # Primary provider ordering
+        # Primary provider hint (for ordering)
         primary_env = (os.getenv("PRIMARY_PROVIDER", "") or "").strip().lower() or None
-        self.primary_provider_env = primary_env
+        self.primary_provider_env: Optional[str] = primary_env
 
-        self.enabled_providers = providers[:]
+        # Final enabled_providers with primary first
+        self.enabled_providers: List[str] = providers[:]
         if self.primary_provider_env and self.primary_provider_env in self.enabled_providers:
             self.enabled_providers.sort(key=lambda p: 0 if p == self.primary_provider_env else 1)
 
         self._cache: Dict[str, _CacheEntry] = {}
 
         logger.info(
-            "DataEngine v2.8 initialized "
-            "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, max_concurrency=%s, "
-            "v1_delegate=%s, advanced_analysis=%s, fmp_deep_enrich=%s)",
+            "DataEngine v2.7.1 initialized "
+            "(providers=%s, primary=%s, cache_ttl=%ss, timeout=%ss, v1_delegate=%s, advanced_analysis=%s)",
             self.enabled_providers,
             self.primary_provider_env or "auto",
             self.cache_ttl,
             self.provider_timeout,
-            self.max_concurrency,
             _HAS_V1_ENGINE,
             self.enable_advanced_analysis,
-            self.fmp_deep_enrich,
         )
 
     # ------------------------------------------------------------------ #
@@ -379,6 +406,11 @@ class DataEngine:
     # ------------------------------------------------------------------ #
 
     async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
+        """
+        Main entry point for a single symbol.
+        - Uses in-memory cache.
+        - Never raises (returns UnifiedQuote with data_quality='MISSING' on errors).
+        """
         symbol_norm = self._normalize_symbol(symbol)
         if not symbol_norm:
             return UnifiedQuote(symbol="", data_quality="MISSING", error="Empty or invalid symbol")
@@ -398,19 +430,22 @@ class DataEngine:
                 error=f"Exception in DataEngine.get_enriched_quote: {exc}",
             )
 
-        # Final normalization + derived fields
+        # Normalize quality & aliases once at the end for Sheet compatibility
         self._normalize_data_quality(quote)
-        self._finalize_derived_fields(quote)
 
+        # Cache even MISSING responses to avoid hammering providers
         self._cache[symbol_norm] = _CacheEntry(expires_at=now + self.cache_ttl, quote=quote)
         return quote
 
     async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
-        tasks = [self.get_enriched_quote(s) for s in (symbols or [])]
+        """
+        Batch version – concurrently fetches multiple symbols.
+        """
+        tasks = [self.get_enriched_quote(s) for s in symbols]
         return await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------ #
-    # Symbol utils
+    # Internal helpers
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -419,12 +454,16 @@ class DataEngine:
         if not s:
             return ""
 
+        # Normalize some TADAWUL formats to 1120.SR style
         if s.startswith("TADAWUL:"):
             s = s.split(":", 1)[1].strip()
         if s.endswith(".TADAWUL"):
             s = s.replace(".TADAWUL", ".SR")
+
+        # Ensure .SR suffix for pure numeric KSA tickers
         if s.isdigit():
             s = f"{s}.SR"
+
         return s
 
     @staticmethod
@@ -433,9 +472,13 @@ class DataEngine:
         return s.endswith(".SR") or s.endswith(".TADAWUL")
 
     def _now_dt_pair(self) -> Tuple[datetime, Optional[datetime], Optional[str]]:
+        """
+        Returns (as_of_utc_dt, as_of_local_dt, timezone_name)
+        """
         now_utc = datetime.now(timezone.utc)
         as_of_local: Optional[datetime] = None
         tz_name: Optional[str] = "UTC"
+
         if ZoneInfo is not None:
             try:
                 tz = ZoneInfo(self.local_tz_name)
@@ -443,78 +486,78 @@ class DataEngine:
                 tz_name = self.local_tz_name
             except Exception:
                 as_of_local = None
+
         return now_utc, as_of_local, tz_name
 
     # ------------------------------------------------------------------ #
-    # Core orchestration
+    # Core fetch + provider orchestration
     # ------------------------------------------------------------------ #
 
     async def _get_enriched_quote_uncached(self, symbol: str) -> UnifiedQuote:
         is_ksa = self._is_ksa_symbol(symbol)
 
-        # 1) KSA delegate to v1 engine if available
+        # 1) KSA-safe delegate: if legacy core.data_engine is available, use it first
         if is_ksa and _HAS_V1_ENGINE:
             try:
                 v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                 if v1_quotes:
+                    logger.debug("Using v1 KSA delegate for %s", symbol)
                     q = self._from_v1_quote(v1_quotes[0])
                     self._normalize_data_quality(q)
-                    self._finalize_derived_fields(q)
                     return q
             except Exception as exc:  # pragma: no cover
                 logger.exception("V1 KSA delegate failed for %s: %s", symbol, exc)
 
-        # 2) Multi-provider orchestration
+        # 2) Multi-provider orchestration (global, and KSA if no v1 delegate)
         providers = list(self.enabled_providers)
 
-        # KSA-safe: never call EODHD for .SR / .TADAWUL
+        # KSA-safe: never call EODHD for .SR / .TADAWUL symbols
         if is_ksa and "eodhd" in providers:
             providers = [p for p in providers if p != "eodhd"]
+            logger.debug("KSA-safe mode: removed EODHD from providers for %s -> %s", symbol, providers)
 
         tasks: List[asyncio.Task[UnifiedQuote]] = []
 
         for provider in providers:
-            p = provider.lower()
-            if p == "fmp":
+            provider = provider.lower()
+            if provider == "fmp":
                 tasks.append(asyncio.create_task(self._safe_call_provider("fmp", self._fetch_from_fmp, symbol)))
-            elif p == "eodhd":
+            elif provider == "eodhd":
                 tasks.append(asyncio.create_task(self._safe_call_provider("eodhd", self._fetch_from_eodhd, symbol)))
-            elif p == "finnhub":
+            elif provider == "finnhub":
                 tasks.append(asyncio.create_task(self._safe_call_provider("finnhub", self._fetch_from_finnhub, symbol)))
             else:
                 logger.warning("Unknown provider '%s' configured; ignoring", provider)
 
         if not tasks:
+            # Ultimate fallback: try v1 engine (global) if available
             if _HAS_V1_ENGINE and not is_ksa:
                 try:
                     v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                     if v1_quotes:
                         q = self._from_v1_quote(v1_quotes[0])
                         self._normalize_data_quality(q)
-                        self._finalize_derived_fields(q)
                         return q
                 except Exception as exc:  # pragma: no cover
-                    logger.exception("V1 global fallback failed for %s: %s", symbol, exc)
+                    logger.exception("V1 global delegate failed for %s: %s", symbol, exc)
 
-            return UnifiedQuote(symbol=symbol, data_quality="MISSING", error="No valid providers configured")
+            return UnifiedQuote(symbol=symbol, data_quality="MISSING", error="No valid providers configured (ENABLED_PROVIDERS)")
 
         results = await asyncio.gather(*tasks)
         merged = self._merge_provider_results(symbol, results)
 
-        # 3) Global fallback via v1 if merged is missing
+        # 3) Global fallback via v1 engine if all providers failed / missing
         if (not is_ksa) and _HAS_V1_ENGINE and merged.data_quality in ("MISSING", "UNKNOWN"):
             try:
                 v1_quotes = await _v1_engine.get_enriched_quotes([symbol])  # type: ignore[attr-defined]
                 if v1_quotes:
+                    logger.debug("Using v1 global fallback for %s", symbol)
                     q = self._from_v1_quote(v1_quotes[0])
                     self._normalize_data_quality(q)
-                    self._finalize_derived_fields(q)
                     return q
             except Exception as exc:  # pragma: no cover
                 logger.exception("V1 global fallback failed for %s: %s", symbol, exc)
 
-        self._normalize_data_quality(merged)
-        self._finalize_derived_fields(merged)
         return merged
 
     async def _safe_call_provider(
@@ -523,10 +566,11 @@ class DataEngine:
         func: Callable[[str], Any],
         symbol: str,
     ) -> UnifiedQuote:
+        """
+        Wrap a provider call so it can never break the engine.
+        """
         try:
-            async with self._sem:
-                q = await func(symbol)
-
+            q = await func(symbol)
             if q is None:
                 return UnifiedQuote(
                     symbol=symbol,
@@ -535,7 +579,6 @@ class DataEngine:
                     provider=provider_name,
                     data_source=provider_name,
                     error=f"{provider_name} returned no data",
-                    sources=[ProviderSource(provider=provider_name, note="no data")],
                 )
 
             q.primary_provider = q.primary_provider or provider_name
@@ -545,7 +588,6 @@ class DataEngine:
                 q.sources = [ProviderSource(provider=provider_name, note="primary")]
 
             self._normalize_data_quality(q)
-            self._finalize_derived_fields(q)
             return q
         except Exception as exc:
             logger.exception("Provider '%s' exception for %s: %s", provider_name, symbol, exc)
@@ -556,36 +598,41 @@ class DataEngine:
                 provider=provider_name,
                 data_source=provider_name,
                 error=f"Provider {provider_name} exception: {exc}",
-                sources=[ProviderSource(provider=provider_name, note="exception")],
             )
 
     def _merge_provider_results(self, symbol: str, results: List[UnifiedQuote]) -> UnifiedQuote:
+        """
+        Merge multiple provider UnifiedQuote results into a single UnifiedQuote.
+        """
         if not results:
             return UnifiedQuote(symbol=symbol, data_quality="MISSING", error="No provider results")
 
         for q in results:
             self._normalize_data_quality(q)
 
-        usable = [q for q in results if q.data_quality not in ("MISSING", "UNKNOWN")]
+        usable: List[UnifiedQuote] = [q for q in results if q.data_quality not in ("MISSING", "UNKNOWN")]
+
         if not usable:
             combined_error = "; ".join([str(q.error) for q in results if q.error])
-            return UnifiedQuote(symbol=symbol, data_quality="MISSING", error=combined_error or "All providers failed")
+            return UnifiedQuote(symbol=symbol, data_quality="MISSING", error=combined_error or "All providers failed or returned no data")
 
         priority_order = ["FULL", "EXCELLENT", "GOOD", "OK", "FAIR", "PARTIAL", "POOR"]
 
-        def rank(q: UnifiedQuote) -> int:
+        def _quality_rank(q: UnifiedQuote) -> int:
             dq = (q.data_quality or "UNKNOWN").upper()
             try:
                 return priority_order.index(dq)
             except ValueError:
                 return len(priority_order)
 
-        base = sorted(usable, key=rank)[0]
+        base: UnifiedQuote = sorted(usable, key=_quality_rank)[0]
 
-        field_map = getattr(UnifiedQuote, "model_fields", None) or getattr(UnifiedQuote, "__fields__", {})
+        field_map = getattr(UnifiedQuote, "model_fields", None)
+        if field_map is None:
+            field_map = getattr(UnifiedQuote, "__fields__", {})
         field_names = list(field_map.keys())
 
-        merged_data = base.model_dump() if hasattr(base, "model_dump") else base.dict()  # type: ignore[attr-defined]
+        merged_data: Dict[str, Any] = base.model_dump() if hasattr(base, "model_dump") else base.dict()  # type: ignore[attr-defined]
 
         for q in usable:
             if q is base:
@@ -594,25 +641,27 @@ class DataEngine:
             for k in field_names:
                 if k == "symbol":
                     continue
-                if merged_data.get(k) is None and data.get(k) is not None:
-                    merged_data[k] = data.get(k)
+                if merged_data.get(k) is None:
+                    val = data.get(k)
+                    if val is not None:
+                        merged_data[k] = val
 
         merged_data["symbol"] = symbol.upper()
         merged_data["data_quality"] = base.data_quality or "UNKNOWN"
 
         combined_sources: List[ProviderSource] = []
-        seen: set[str] = set()
+        seen_providers: set[str] = set()
         for q in usable:
             if q.sources:
                 for s in q.sources:
                     prov = (s.provider or "").lower()
-                    if prov and prov not in seen:
-                        seen.add(prov)
+                    if prov and prov not in seen_providers:
+                        seen_providers.add(prov)
                         combined_sources.append(s)
             else:
                 prov = (q.primary_provider or q.provider or q.data_source or "").lower()
-                if prov and prov not in seen:
-                    seen.add(prov)
+                if prov and prov not in seen_providers:
+                    seen_providers.add(prov)
                     combined_sources.append(ProviderSource(provider=prov, note="merged"))
 
         if combined_sources:
@@ -632,15 +681,14 @@ class DataEngine:
             return base
 
         self._normalize_data_quality(merged_quote)
-        self._finalize_derived_fields(merged_quote)
         return merged_quote
 
     # ------------------------------------------------------------------ #
-    # Normalization + derived fields
+    # Quality normalization, aliases & liquidity scoring
     # ------------------------------------------------------------------ #
 
     def _normalize_alias_fields(self, q: UnifiedQuote) -> None:
-        # Price aliases
+        # Price & previous close
         if q.last_price is None and q.price is not None:
             q.last_price = q.price
         if q.price is None and q.last_price is not None:
@@ -651,7 +699,13 @@ class DataEngine:
         if q.prev_close is None and q.previous_close is not None:
             q.prev_close = q.previous_close
 
-        # 52W aliases
+        # Change percent aliases
+        if q.change_percent is None and q.change_pct is not None:
+            q.change_percent = q.change_pct
+        if q.change_pct is None and q.change_percent is not None:
+            q.change_pct = q.change_percent
+
+        # 52-week aliases
         if q.high_52w is None and q.fifty_two_week_high is not None:
             q.high_52w = q.fifty_two_week_high
         if q.fifty_two_week_high is None and q.high_52w is not None:
@@ -667,13 +721,12 @@ class DataEngine:
         if q.fifty_two_week_position is None and q.position_52w_percent is not None:
             q.fifty_two_week_position = q.position_52w_percent
 
-        # Yield aliases
+        # Dividend yield & ROE/ROA percentage aliases
         if q.dividend_yield_percent is None and q.dividend_yield is not None:
             q.dividend_yield_percent = q.dividend_yield
         if q.dividend_yield is None and q.dividend_yield_percent is not None:
             q.dividend_yield = q.dividend_yield_percent
 
-        # ROE/ROA aliases
         if q.roe_percent is None and q.roe is not None:
             q.roe_percent = q.roe
         if q.roe is None and q.roe_percent is not None:
@@ -684,13 +737,13 @@ class DataEngine:
         if q.roa is None and q.roa_percent is not None:
             q.roa = q.roa_percent
 
-        # Net margin alias
+        # Net margin / profit margin aliases
         if q.net_margin_percent is None and q.profit_margin is not None:
             q.net_margin_percent = q.profit_margin
         if q.profit_margin is None and q.net_margin_percent is not None:
             q.profit_margin = q.net_margin_percent
 
-        # Avg volume aliases
+        # Average volume aliases
         if q.avg_volume_30d is None:
             if q.average_volume_30d is not None:
                 q.avg_volume_30d = q.average_volume_30d
@@ -708,15 +761,15 @@ class DataEngine:
         if q.volatility_30d is None and q.volatility_30d_percent is not None:
             q.volatility_30d = q.volatility_30d_percent
 
-        # Market / region
-        if q.market_region is None:
-            if self._is_ksa_symbol(q.symbol):
+        # Market / region normalization
+        if q.market_region is None and q.market is not None:
+            mr = str(q.market).upper()
+            if mr in {"KSA", "TADAWUL", "NOMU"}:
                 q.market_region = "KSA"
-                q.market = q.market or "KSA"
-            elif q.market is not None:
+            else:
                 q.market_region = "GLOBAL"
 
-        # Timestamps
+        # Timezone & as_of timestamps
         if q.as_of_utc is None and q.last_updated_utc is not None:
             q.as_of_utc = q.last_updated_utc
         if q.as_of_local is None and q.last_updated_riyadh is not None:
@@ -725,11 +778,16 @@ class DataEngine:
         if q.as_of_utc is None:
             now_utc, as_local, tz_name = self._now_dt_pair()
             q.as_of_utc = now_utc
-            q.as_of_local = q.as_of_local or as_local
-            q.timezone = q.timezone or tz_name
+            if q.as_of_local is None:
+                q.as_of_local = as_local
+            if q.timezone is None:
+                q.timezone = tz_name
 
         if q.timezone is None:
-            q.timezone = "Asia/Riyadh" if q.market_region == "KSA" else (self.local_tz_name or "UTC")
+            if q.market_region == "KSA":
+                q.timezone = "Asia/Riyadh"
+            else:
+                q.timezone = self.local_tz_name or "UTC"
 
     def _normalize_data_quality(self, q: UnifiedQuote) -> None:
         self._normalize_alias_fields(q)
@@ -740,21 +798,28 @@ class DataEngine:
             dq = "FULL"
         elif dq_raw in {"FAIR", "POOR"}:
             dq = "PARTIAL"
-        elif dq_raw == "MISSING":
+        elif dq_raw in {"MISSING"}:
             dq = "MISSING"
-        elif dq_raw == "STALE":
+        elif dq_raw in {"STALE"}:
             dq = "STALE"
         elif dq_raw in {"UNKNOWN", "", "NONE"}:
             dq = "UNKNOWN"
         else:
             dq = dq_raw
 
-        has_price = q.last_price is not None or q.price is not None
-        has_basic = any(
-            x is not None for x in [q.volume, q.market_cap, q.eps_ttm, q.pe_ttm, q.dividend_yield_percent]
+        has_price = (q.last_price is not None) or (q.price is not None)
+        has_basic = (
+            q.volume is not None
+            or q.market_cap is not None
+            or q.eps_ttm is not None
+            or q.pe_ttm is not None
+            or q.dividend_yield_percent is not None
         )
-        has_deep = any(
-            x is not None for x in [q.roe_percent, q.roa_percent, q.revenue_growth_percent, q.net_margin_percent]
+        has_deep = (
+            q.roe_percent is not None
+            or q.roa_percent is not None
+            or q.revenue_growth_percent is not None
+            or q.net_margin_percent is not None
         )
 
         if dq == "UNKNOWN":
@@ -769,76 +834,23 @@ class DataEngine:
         else:
             if dq == "FULL" and not has_price:
                 dq = "PARTIAL"
-            if dq == "PARTIAL" and not has_price and not has_basic and not has_deep:
+            if dq == "PARTIAL" and (not has_price) and (not has_basic) and (not has_deep):
                 dq = "MISSING"
 
         q.data_quality = dq
 
-    def _finalize_derived_fields(self, q: UnifiedQuote) -> None:
-        # change & change%
-        if q.change is None and q.last_price is not None and q.previous_close is not None:
-            try:
-                q.change = float(q.last_price) - float(q.previous_close)
-            except Exception:
-                pass
-
-        if q.change_percent is None and q.change is not None and q.previous_close:
-            try:
-                q.change_percent = float(q.change) / float(q.previous_close) * 100.0
-            except Exception:
-                pass
-
-        if q.change_pct is None and q.change_percent is not None:
-            q.change_pct = q.change_percent
-
-        # 52W position
-        if q.position_52w_percent is None and q.last_price is not None and q.low_52w is not None and q.high_52w is not None:
-            try:
-                span = float(q.high_52w) - float(q.low_52w)
-                if span > 0:
-                    q.position_52w_percent = max(0.0, min(100.0, (float(q.last_price) - float(q.low_52w)) / span * 100.0))
-                    q.fifty_two_week_position = q.position_52w_percent
-            except Exception:
-                pass
-
-        # value traded
-        if q.value_traded is None and q.volume is not None and q.last_price is not None:
-            try:
-                q.value_traded = float(q.volume) * float(q.last_price)
-            except Exception:
-                pass
-
-        # turnover_rate (volume / shares_outstanding)
-        if q.turnover_rate is None and q.volume is not None and q.shares_outstanding not in (None, 0):
-            try:
-                q.turnover_rate = float(q.volume) / float(q.shares_outstanding) * 100.0
-            except Exception:
-                pass
-
-        # spread_percent
-        if q.spread_percent is None and q.bid_price is not None and q.ask_price is not None:
-            try:
-                mid = (float(q.bid_price) + float(q.ask_price)) / 2.0
-                if mid > 0:
-                    q.spread_percent = (float(q.ask_price) - float(q.bid_price)) / mid * 100.0
-            except Exception:
-                pass
-
-        # liquidity_score
-        if q.liquidity_score is None:
-            liq = self._compute_liquidity_score(q.volume, q.avg_volume_30d, q.market_cap)
-            if liq is not None:
-                q.liquidity_score = liq
-
-        # scoring
-        if self.enable_advanced_analysis:
-            if q.opportunity_score is None or q.value_score is None or q.quality_score is None or q.momentum_score is None:
-                self._apply_basic_scoring(q, source="finalize")
-
-    def _compute_liquidity_score(self, volume: Optional[float], avg_volume: Optional[float], market_cap: Optional[float]) -> Optional[float]:
-        vol = _safe_float(volume)
-        avg = _safe_float(avg_volume)
-        mc = _safe_float(market_cap)
+    def _compute_liquidity_score(
+        self,
+        volume: Optional[float],
+        avg_volume: Optional[float],
+        market_cap: Optional[float],
+    ) -> Optional[float]:
+        try:
+            vol = float(volume) if volume is not None else None
+            avg = float(avg_volume) if avg_volume is not None else None
+            mc = float(market_cap) if market_cap is not None else None
+        except Exception:
+            return None
 
         if vol is None or vol <= 0:
             return None
@@ -866,263 +878,234 @@ class DataEngine:
         return round(score, 2)
 
     # ------------------------------------------------------------------ #
-    # Providers
+    # Provider: Financial Modeling Prep (FMP)
     # ------------------------------------------------------------------ #
 
     async def _fetch_from_fmp(self, symbol: str) -> Optional[UnifiedQuote]:
         api_key = os.getenv("FMP_API_KEY")
         if not api_key:
+            logger.warning("FMP_API_KEY not set; skipping FMP for %s", symbol)
             return None
+
+        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
 
         timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            quote_url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
-            resp = await client.get(quote_url, params={"apikey": api_key})
-            if resp.status_code != 200:
-                return None
+            resp = await client.get(url, params={"apikey": api_key})
+            resp.raise_for_status()
             data = resp.json()
-            if not isinstance(data, list) or not data:
-                return None
-            raw_quote = data[0]
 
-            profile = None
-            metrics_ttm = None
-            ratios_ttm = None
+        if not isinstance(data, list) or not data:
+            return None
 
-            # Deep enrich is optional (can be heavy)
-            if self.fmp_deep_enrich:
-                try:
-                    prof_url = f"https://financialmodelingprep.com/api/v3/profile/{symbol}"
-                    prof = await client.get(prof_url, params={"apikey": api_key})
-                    if prof.status_code == 200:
-                        pj = prof.json()
-                        if isinstance(pj, list) and pj:
-                            profile = pj[0]
-                except Exception:
-                    profile = None
+        raw = data[0]
+        quote = self._map_fmp_to_unified(symbol, raw)
+        quote.primary_provider = "fmp"
+        quote.provider = "fmp"
+        quote.data_source = "fmp"
+        if not quote.sources:
+            quote.sources = [ProviderSource(provider="fmp", note="FMP quote")]
+        return quote
 
-                # These endpoints exist for many symbols, but are treated as best-effort
-                try:
-                    km_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{symbol}"
-                    km = await client.get(km_url, params={"apikey": api_key})
-                    if km.status_code == 200:
-                        kj = km.json()
-                        if isinstance(kj, list) and kj:
-                            metrics_ttm = kj[0]
-                except Exception:
-                    metrics_ttm = None
-
-                try:
-                    rt_url = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}"
-                    rr = await client.get(rt_url, params={"apikey": api_key})
-                    if rr.status_code == 200:
-                        rj = rr.json()
-                        if isinstance(rj, list) and rj:
-                            ratios_ttm = rj[0]
-                except Exception:
-                    ratios_ttm = None
-
-        q = self._map_fmp_to_unified(symbol, raw_quote, profile=profile, metrics_ttm=metrics_ttm, ratios_ttm=ratios_ttm)
-        q.primary_provider = "fmp"
-        q.provider = "fmp"
-        q.data_source = "fmp"
-        q.sources = q.sources or [ProviderSource(provider="fmp", note="FMP quote")]
-        self._normalize_data_quality(q)
-        self._finalize_derived_fields(q)
-        return q
-
-    def _map_fmp_to_unified(
-        self,
-        symbol: str,
-        d: Dict[str, Any],
-        profile: Optional[Dict[str, Any]] = None,
-        metrics_ttm: Optional[Dict[str, Any]] = None,
-        ratios_ttm: Optional[Dict[str, Any]] = None,
-    ) -> UnifiedQuote:
-        def gv(obj: Optional[Dict[str, Any]], *keys: str, default=None):
-            if not isinstance(obj, dict):
-                return default
+    def _map_fmp_to_unified(self, symbol: str, d: Dict[str, Any]) -> UnifiedQuote:
+        def gv(*keys: str, default=None):
             for k in keys:
-                if k in obj and obj[k] is not None:
-                    return obj[k]
+                if k in d and d[k] is not None:
+                    return d[k]
             return default
 
-        last_price = gv(d, "price")
-        previous_close = gv(d, "previousClose")
-        change = gv(d, "change")
-        change_pct = gv(d, "changesPercentage")
+        last_price = gv("price")
+        previous_close = gv("previousClose")
+        change = gv("change")
+        change_pct = gv("changesPercentage")
 
-        high_52w = gv(d, "yearHigh")
-        low_52w = gv(d, "yearLow")
+        if change is None and last_price is not None and previous_close:
+            try:
+                change = float(last_price) - float(previous_close)
+            except Exception:
+                change = None
+
+        if change_pct is None and change is not None and previous_close:
+            try:
+                change_pct = (float(change) / float(previous_close)) * 100.0
+            except Exception:
+                change_pct = None
+
+        high_52w = gv("yearHigh")
+        low_52w = gv("yearLow")
+        position_52w = None
+        if high_52w is not None and low_52w is not None and last_price is not None and high_52w != low_52w:
+            try:
+                position_52w = (float(last_price) - float(low_52w)) / (float(high_52w) - float(low_52w))
+                position_52w *= 100.0
+            except Exception:
+                position_52w = None
 
         as_of_utc, as_of_local, tz_name = self._now_dt_pair()
 
-        eps_val = gv(d, "eps", "epsTTM")
-        pe_val = gv(d, "pe", "peTTM")
-        pb_val = gv(d, "priceToBook", "pb", "pbRatio")
-        beta_val = gv(d, "beta")
+        eps_val = gv("eps", "epsTTM")
+        pe_val = gv("pe", "peTTM")
+        pb_val = gv("priceToBook", "pb", "pbRatio")
 
-        # Profile enrich
-        name = gv(d, "name") or gv(profile, "companyName", "company_name", "name")
-        sector = gv(d, "sector") or gv(profile, "sector")
-        industry = gv(d, "industry") or gv(profile, "industry")
-        exchange = gv(d, "exchangeShortName") or gv(profile, "exchangeShortName")
-        currency = gv(d, "currency") or gv(profile, "currency")
-
-        # Market region heuristic
-        market = "GLOBAL"
-        market_region = "GLOBAL"
-        if self._is_ksa_symbol(symbol) or (exchange and str(exchange).upper() in {"TADAWUL", "NOMU", "KSA"}):
-            market = "KSA"
-            market_region = "KSA"
-
-        volume_val = gv(d, "volume")
-        avg_vol = gv(d, "avgVolume")
-        market_cap = gv(d, "marketCap")
-
-        # Dividend yield
-        dividend_yield_raw = gv(d, "dividendYield") or gv(profile, "lastDiv")
+        dividend_yield_raw = gv("dividendYield", "yield")
         dividend_yield_percent = None
         if dividend_yield_raw is not None:
             try:
-                dy = float(dividend_yield_raw)
-                dividend_yield_percent = dy * 100.0 if dy < 1.0 else dy
+                dy_val = float(dividend_yield_raw)
+                dividend_yield_percent = dy_val * 100.0 if dy_val < 1.0 else dy_val
             except Exception:
                 dividend_yield_percent = None
 
-        # Metrics / ratios enrich (best effort)
-        roe = _safe_float(gv(metrics_ttm, "roeTTM", "returnOnEquityTTM"))
-        roa = _safe_float(gv(metrics_ttm, "roaTTM", "returnOnAssetsTTM"))
-        net_margin = _safe_float(gv(metrics_ttm, "netProfitMarginTTM"))
-        operating_margin = _safe_float(gv(metrics_ttm, "operatingProfitMarginTTM"))
-        debt_to_equity = _safe_float(gv(metrics_ttm, "debtToEquityTTM"))
-        current_ratio = _safe_float(gv(metrics_ttm, "currentRatioTTM"))
-        quick_ratio = _safe_float(gv(metrics_ttm, "quickRatioTTM"))
+        shares_outstanding = gv("sharesOutstanding", "shares_outstanding")
+        market_raw = gv("exchangeShortName", "exchange")
+        market = market_raw
+        market_region = market_raw
+        if market_raw:
+            mr = str(market_raw).upper()
+            if mr in {"TADAWUL", "NOMU", "KSA"}:
+                market = "KSA"
+                market_region = "KSA"
+            else:
+                market = "GLOBAL"
 
-        price_to_sales = _safe_float(gv(ratios_ttm, "priceToSalesRatioTTM"))
-        peg_ratio = _safe_float(gv(ratios_ttm, "pegRatioTTM"))
+        volume_val = gv("volume")
+        avg_vol = gv("avgVolume")
+        market_cap = gv("marketCap")
 
         q = UnifiedQuote(
-            symbol=str(gv(d, "symbol", default=symbol)).upper(),
-            name=name,
-            company_name=name,
-            sector=sector,
-            industry=industry,
+            symbol=str(gv("symbol", default=symbol)).upper(),
+            name=gv("name"),
+            company_name=gv("name"),
+            sector=gv("sector"),
+            industry=gv("industry"),
             market=market,
             market_region=market_region,
-            exchange=exchange,
-            currency=currency,
-            last_price=_safe_float(last_price),
-            price=_safe_float(last_price),
-            previous_close=_safe_float(previous_close),
-            prev_close=_safe_float(previous_close),
-            open=_safe_float(gv(d, "open")),
-            high=_safe_float(gv(d, "dayHigh")),
-            low=_safe_float(gv(d, "dayLow")),
-            change=_safe_float(change),
-            change_percent=_safe_float(change_pct),
-            change_pct=_safe_float(change_pct),
-            high_52w=_safe_float(high_52w),
-            low_52w=_safe_float(low_52w),
-            fifty_two_week_high=_safe_float(high_52w),
-            fifty_two_week_low=_safe_float(low_52w),
-            volume=_safe_float(volume_val),
-            avg_volume_30d=_safe_float(avg_vol),
-            average_volume_30d=_safe_float(avg_vol),
-            avg_volume=_safe_float(avg_vol),
-            market_cap=_safe_float(market_cap),
-            eps_ttm=_safe_float(eps_val),
-            eps=_safe_float(eps_val),
-            pe_ratio=_safe_float(pe_val),
-            pe=_safe_float(pe_val),
-            pe_ttm=_safe_float(pe_val),
-            pb_ratio=_safe_float(pb_val),
-            pb=_safe_float(pb_val),
-            dividend_yield_percent=_safe_float(dividend_yield_percent),
-            dividend_yield=_safe_float(dividend_yield_percent),
-            beta=_safe_float(beta_val),
-            roe=_safe_float(roe),
-            roe_percent=_safe_float(roe),
-            roa=_safe_float(roa),
-            roa_percent=_safe_float(roa),
-            net_margin_percent=_safe_float(net_margin),
-            profit_margin=_safe_float(net_margin),
-            operating_margin_percent=_safe_float(operating_margin),
-            debt_to_equity=_safe_float(debt_to_equity),
-            current_ratio=_safe_float(current_ratio),
-            quick_ratio=_safe_float(quick_ratio),
-            price_to_sales=_safe_float(price_to_sales),
-            peg_ratio=_safe_float(peg_ratio),
+            exchange=market_raw,
+            currency=gv("currency"),
+            shares_outstanding=_to_float(shares_outstanding),
+            last_price=_to_float(last_price),
+            price=_to_float(last_price),
+            previous_close=_to_float(previous_close),
+            prev_close=_to_float(previous_close),
+            open=_to_float(gv("open")),
+            high=_to_float(gv("dayHigh")),
+            low=_to_float(gv("dayLow")),
+            change=_to_float(change),
+            change_percent=_to_float(change_pct),
+            change_pct=_to_float(change_pct),
+            high_52w=_to_float(high_52w),
+            low_52w=_to_float(low_52w),
+            fifty_two_week_high=_to_float(high_52w),
+            fifty_two_week_low=_to_float(low_52w),
+            position_52w_percent=_to_float(position_52w),
+            fifty_two_week_position=_to_float(position_52w),
+            volume=_to_float(volume_val),
+            avg_volume_30d=_to_float(avg_vol),
+            average_volume_30d=_to_float(avg_vol),
+            avg_volume=_to_float(avg_vol),
+            market_cap=_to_float(market_cap),
+            eps_ttm=_to_float(eps_val),
+            eps=_to_float(eps_val),
+            pe_ratio=_to_float(pe_val),
+            pe=_to_float(pe_val),
+            pe_ttm=_to_float(pe_val),
+            pb_ratio=_to_float(pb_val),
+            pb=_to_float(pb_val),
+            dividend_yield_percent=_to_float(dividend_yield_percent),
+            dividend_yield=_to_float(dividend_yield_percent),
+            beta=_to_float(gv("beta")),
+            ma_50d=_to_float(gv("priceAvg50")),
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
             as_of_local=as_of_local,
             timezone=tz_name,
-            raw={"quote": d, "profile": profile, "metrics_ttm": metrics_ttm, "ratios_ttm": ratios_ttm},
+            raw=d,
         )
+
+        liq = self._compute_liquidity_score(q.volume, q.avg_volume_30d, q.market_cap)
+        if liq is not None:
+            q.liquidity_score = liq
 
         self._normalize_data_quality(q)
         if self.enable_advanced_analysis:
             self._apply_basic_scoring(q, source="fmp")
+
         return q
 
-    async def _fetch_from_eodhd(self, symbol: str) -> Optional[UnifiedQuote]:
-        # GLOBAL ONLY (never for KSA)
-        if self._is_ksa_symbol(symbol):
-            return None
+    # ------------------------------------------------------------------ #
+    # Provider: EODHD (optional – mainly for global, not KSA .SR)
+    # ------------------------------------------------------------------ #
 
+    async def _fetch_from_eodhd(self, symbol: str) -> Optional[UnifiedQuote]:
         api_key = os.getenv("EODHD_API_KEY")
         base_url = os.getenv("EODHD_BASE_URL", "https://eodhd.com/api")
+
         if not api_key:
+            logger.warning("EODHD_API_KEY not set; skipping EODHD for %s", symbol)
             return None
 
-        fund_symbol = symbol if "." in symbol else f"{symbol}.US"
+        fund_symbol = symbol
+        if "." not in symbol and not self._is_ksa_symbol(symbol):
+            fund_symbol = f"{symbol}.US"
+
         rt_url = f"{base_url.rstrip('/')}/real-time/{symbol}"
         fund_url = f"{base_url.rstrip('/')}/fundamentals/{fund_symbol}"
 
         timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            rt = await client.get(rt_url, params={"api_token": api_key, "fmt": "json"})
-            if rt.status_code != 200:
-                return None
-            rt_data = rt.json()
-            if not isinstance(rt_data, dict) or not rt_data:
-                return None
+        fundamentals_data: Optional[Dict[str, Any]] = None
 
-            fundamentals_data = None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(rt_url, params={"api_token": api_key, "fmt": "json"})
+            resp.raise_for_status()
+            rt_data = resp.json()
+
             try:
-                fd = await client.get(fund_url, params={"api_token": api_key, "fmt": "json"})
-                if fd.status_code == 200:
-                    tmp = fd.json()
+                fund_resp = await client.get(fund_url, params={"api_token": api_key, "fmt": "json"})
+                if fund_resp.status_code == 200:
+                    tmp = fund_resp.json()
                     if isinstance(tmp, dict) and tmp:
                         fundamentals_data = tmp
-            except Exception:
-                fundamentals_data = None
+            except Exception as exc:
+                logger.debug("EODHD fundamentals fetch failed for %s (%s): %s", symbol, fund_symbol, exc)
+
+        if not isinstance(rt_data, dict) or not rt_data:
+            return None
 
         q = self._map_eodhd_to_unified(symbol, rt_data, fundamentals=fundamentals_data)
         q.primary_provider = "eodhd"
         q.provider = "eodhd"
         q.data_source = "eodhd"
-        q.sources = q.sources or [ProviderSource(provider="eodhd", note="EODHD realtime+fundamentals")]
-        self._normalize_data_quality(q)
-        if self.enable_advanced_analysis:
-            self._apply_basic_scoring(q, source="eodhd")
-        self._finalize_derived_fields(q)
+        if not q.sources:
+            q.sources = [ProviderSource(provider="eodhd", note="EODHD quote+fundamentals")]
         return q
 
-    def _map_eodhd_to_unified(self, symbol: str, d: Dict[str, Any], fundamentals: Optional[Dict[str, Any]] = None) -> UnifiedQuote:
-        def gv(obj: Dict[str, Any], *keys: str, default=None):
+    def _map_eodhd_to_unified(
+        self,
+        symbol: str,
+        d: Dict[str, Any],
+        fundamentals: Optional[Dict[str, Any]] = None,
+    ) -> UnifiedQuote:
+        def gv(*keys: str, default=None):
             for k in keys:
-                if k in obj and obj[k] is not None:
-                    return obj[k]
+                if k in d and d[k] is not None:
+                    return d[k]
             return default
 
-        general = (fundamentals or {}).get("General") or {}
-        highlights = (fundamentals or {}).get("Highlights") or {}
-        valuation = (fundamentals or {}).get("Valuation") or {}
-        shares = (fundamentals or {}).get("SharesStats") or {}
-        technicals = (fundamentals or {}).get("Technicals") or {}
-        splits = (fundamentals or {}).get("SplitsDividends") or {}
+        general: Dict[str, Any] = {}
+        highlights: Dict[str, Any] = {}
+        valuation: Dict[str, Any] = {}
+        shares: Dict[str, Any] = {}
+        technicals: Dict[str, Any] = {}
+        splits: Dict[str, Any] = {}
+
+        if isinstance(fundamentals, dict) and fundamentals:
+            general = fundamentals.get("General") or {}
+            highlights = fundamentals.get("Highlights") or {}
+            valuation = fundamentals.get("Valuation") or {}
+            shares = fundamentals.get("SharesStats") or {}
+            technicals = fundamentals.get("Technicals") or {}
+            splits = fundamentals.get("SplitsDividends") or {}
 
         def gf(section: Dict[str, Any], *keys: str, default=None):
             for k in keys:
@@ -1130,144 +1113,201 @@ class DataEngine:
                     return section[k]
             return default
 
-        last_price = gv(d, "close", "price", "last")
-        previous_close = gv(d, "previousClose", "previous_close")
-        change = gv(d, "change")
-        change_pct = gv(d, "change_p", "change_percent")
+        last_price = gv("close", "price", "last")
+        previous_close = gv("previousClose", "previous_close")
+        change = gv("change")
+        change_pct = gv("change_p", "change_percent")
 
-        high_52w = gf(technicals, "52WeekHigh") or gv(d, "year_high", "high_52w", "fifty_two_week_high")
-        low_52w = gf(technicals, "52WeekLow") or gv(d, "year_low", "low_52w", "fifty_two_week_low")
+        if change is None and last_price is not None and previous_close:
+            try:
+                change = float(last_price) - float(previous_close)
+            except Exception:
+                change = None
+
+        if change_pct is None and change is not None and previous_close:
+            try:
+                change_pct = (float(change) / float(previous_close)) * 100.0
+            except Exception:
+                change_pct = None
+
+        high_52w = (gv("fifty_two_week_high", "high_52w", "year_high") or gf(technicals, "52WeekHigh"))
+        low_52w = (gv("fifty_two_week_low", "low_52w", "year_low") or gf(technicals, "52WeekLow"))
+        position_52w = gv("fifty_two_week_position", "position_52w_percent")
+
+        if position_52w is None and high_52w is not None and low_52w is not None and last_price is not None and high_52w != low_52w:
+            try:
+                position_52w = (float(last_price) - float(low_52w)) / (float(high_52w) - float(low_52w))
+                position_52w *= 100.0
+            except Exception:
+                position_52w = None
 
         as_of_utc, as_of_local, tz_name = self._now_dt_pair()
 
-        eps_val = gf(highlights, "EarningsShare", "DilutedEpsTTM") or gv(d, "eps")
-        pe_val = gf(highlights, "PERatio") or gf(valuation, "TrailingPE") or gv(d, "pe")
-        pb_val = gf(valuation, "PriceBookMRQ") or gv(d, "pb", "priceToBook")
+        eps_val = gv("eps", "EPS") or gf(highlights, "EarningsShare", "DilutedEpsTTM")
+        pe_val = gv("pe", "PE", "pe_ratio") or gf(highlights, "PERatio") or gf(valuation, "TrailingPE")
+        pb_val = gv("pb", "P_B", "price_to_book", "priceToBook") or gf(valuation, "PriceBookMRQ")
 
-        dividend_yield_raw = gf(highlights, "DividendYield") or gf(splits, "ForwardAnnualDividendYield") or gv(d, "dividend_yield")
+        dividend_yield_raw = gv("dividend_yield", "DividendYield") or gf(highlights, "DividendYield") or gf(splits, "ForwardAnnualDividendYield")
         dividend_yield_percent = None
         if dividend_yield_raw is not None:
             try:
-                dy = float(dividend_yield_raw)
-                dividend_yield_percent = dy * 100.0 if dy < 1.0 else dy
+                dy_val = float(dividend_yield_raw)
+                dividend_yield_percent = dy_val * 100.0 if dy_val < 1.0 else dy_val
             except Exception:
                 dividend_yield_percent = None
 
-        market_cap = gf(highlights, "MarketCapitalization") or gv(d, "market_cap")
-        volume_val = gv(d, "volume")
-        avg_vol = gf(technicals, "20DayAverageVolume") or gv(d, "avgVolume", "average_volume")
+        dividend_rate = gf(splits, "ForwardAnnualDividendRate") or gf(highlights, "DividendShare")
+        dividend_payout_ratio = gf(splits, "PayoutRatio")
 
-        # Identity
-        name = gf(general, "Name")
+        market_cap = gv("market_cap", "marketCapitalization") or gf(highlights, "MarketCapitalization")
+        volume_val = gv("volume")
+        avg_vol = gv("avgVolume", "average_volume") or gf(technicals, "20DayAverageVolume")
+
+        insider_ownership = gf(shares, "PercentInsiders", "PercentHeldByInsiders")
+        institutional_ownership = gf(shares, "PercentInstitutions", "PercentHeldByInstitutions")
+        short_ratio_val = gf(shares, "ShortRatio")
+        short_percent_float = gf(shares, "ShortPercentFloat", "ShortPercent")
+
+        profit_margin = gf(highlights, "ProfitMargin")
+        operating_margin = gf(highlights, "OperatingMarginTTM")
+        roa_val = gf(highlights, "ReturnOnAssetsTTM")
+        roe_val = gf(highlights, "ReturnOnEquityTTM")
+        revenue_growth = gf(highlights, "QuarterlyRevenueGrowthYOY")
+        net_income_growth = gf(highlights, "QuarterlyEarningsGrowthYOY")
+        ebitda_val = gf(highlights, "EBITDA")
+        revenue_ttm = gf(highlights, "RevenueTTM")
+
+        ebitda_margin = None
+        if ebitda_val is not None and revenue_ttm:
+            try:
+                ebitda_margin = float(ebitda_val) / float(revenue_ttm)
+            except Exception:
+                ebitda_margin = None
+
+        price_sales = gf(valuation, "PriceSalesTTM")
+        ev_to_ebitda_val = gf(valuation, "EnterpriseValueEbitda")
+        peg_val = gf(highlights, "PEGRatio")
+        beta_val = gv("beta") or gf(technicals, "Beta")
+        target_price_val = gf(highlights, "WallStreetTargetPrice")
+        ma_50d_val = gv("ma_50d") or gf(technicals, "50DayMA")
+
+        ex_div_date = gf(splits, "ExDividendDate")
+
+        general_name = gf(general, "Name")
         sector = gf(general, "Sector")
         industry = gf(general, "Industry", "GicIndustry", "GicSubIndustry")
         listing_date = gf(general, "IPODate")
-        exchange = gf(general, "Exchange") or gv(d, "exchange")
-        currency = gf(general, "CurrencyCode") or gv(d, "currency")
+        exchange_fund = gf(general, "Exchange")
+        currency_code = gf(general, "CurrencyCode")
 
-        # Ownership & short
-        insider_own = gf(shares, "PercentInsiders", "PercentHeldByInsiders")
-        inst_own = gf(shares, "PercentInstitutions", "PercentHeldByInstitutions")
-        short_ratio = gf(shares, "ShortRatio")
-        short_pct_float = gf(shares, "ShortPercentFloat", "ShortPercent")
+        market_raw = gv("exchange_short_name", "exchange") or exchange_fund
+        market = market_raw
+        market_region = market_raw
+        if market_raw:
+            mr = str(market_raw).upper()
+            if mr in {"TADAWUL", "NOMU", "KSA"}:
+                market = "KSA"
+                market_region = "KSA"
+            else:
+                market = "GLOBAL"
 
-        # Margins & returns
-        profit_margin = gf(highlights, "ProfitMargin")
-        operating_margin = gf(highlights, "OperatingMarginTTM")
-        roa = gf(highlights, "ReturnOnAssetsTTM")
-        roe = gf(highlights, "ReturnOnEquityTTM")
-        rev_growth = gf(highlights, "QuarterlyRevenueGrowthYOY")
-        earn_growth = gf(highlights, "QuarterlyEarningsGrowthYOY")
+        currency_val = gv("currency", "currency_code") or currency_code
 
-        price_sales = gf(valuation, "PriceSalesTTM")
-        ev_ebitda = gf(valuation, "EnterpriseValueEbitda")
-        peg = gf(highlights, "PEGRatio")
-        beta = gf(technicals, "Beta") or gv(d, "beta")
-        target_price = gf(highlights, "WallStreetTargetPrice")
-
-        dividend_rate = gf(splits, "ForwardAnnualDividendRate") or gf(highlights, "DividendShare")
-        payout_ratio = gf(splits, "PayoutRatio")
-        ex_div = gf(splits, "ExDividendDate")
-
-        shares_out = gf(shares, "SharesOutstanding") or gv(d, "shares_outstanding")
+        shares_outstanding = gv("shares_outstanding") or gf(shares, "SharesOutstanding")
         free_float = gf(shares, "SharesFloat")
 
         q = UnifiedQuote(
-            symbol=str(gv(d, "code", "symbol", default=symbol)).upper(),
-            name=name,
-            company_name=name,
+            symbol=str(gv("code", "symbol", default=symbol)).upper(),
+            name=gv("name") or general_name,
+            company_name=gv("name") or general_name,
             sector=sector,
             industry=industry,
-            market="GLOBAL",
-            market_region="GLOBAL",
-            exchange=exchange,
-            currency=currency,
+            market=market,
+            market_region=market_region,
+            exchange=market_raw,
+            currency=currency_val,
             listing_date=listing_date,
-            shares_outstanding=_safe_float(shares_out),
-            free_float=_safe_float(free_float),
-            insider_ownership_percent=_safe_float(insider_own),
-            institutional_ownership_percent=_safe_float(inst_own),
-            short_ratio=_safe_float(short_ratio),
-            short_percent_float=_safe_float(short_pct_float),
-            last_price=_safe_float(last_price),
-            price=_safe_float(last_price),
-            previous_close=_safe_float(previous_close),
-            prev_close=_safe_float(previous_close),
-            open=_safe_float(gv(d, "open")),
-            high=_safe_float(gv(d, "high")),
-            low=_safe_float(gv(d, "low")),
-            change=_safe_float(change),
-            change_percent=_safe_float(change_pct),
-            change_pct=_safe_float(change_pct),
-            high_52w=_safe_float(high_52w),
-            low_52w=_safe_float(low_52w),
-            fifty_two_week_high=_safe_float(high_52w),
-            fifty_two_week_low=_safe_float(low_52w),
-            volume=_safe_float(volume_val),
-            avg_volume_30d=_safe_float(avg_vol),
-            average_volume_30d=_safe_float(avg_vol),
-            avg_volume=_safe_float(avg_vol),
-            market_cap=_safe_float(market_cap),
-            eps_ttm=_safe_float(eps_val),
-            eps=_safe_float(eps_val),
-            pe_ratio=_safe_float(pe_val),
-            pe=_safe_float(pe_val),
-            pe_ttm=_safe_float(pe_val),
-            pb_ratio=_safe_float(pb_val),
-            pb=_safe_float(pb_val),
-            dividend_yield=_safe_float(dividend_yield_percent),
-            dividend_yield_percent=_safe_float(dividend_yield_percent),
-            dividend_rate=_safe_float(dividend_rate),
-            dividend_payout_ratio=_safe_float(payout_ratio),
-            ex_dividend_date=ex_div,
-            profit_margin=_safe_float(profit_margin),
-            net_margin_percent=_safe_float(profit_margin),
-            operating_margin_percent=_safe_float(operating_margin),
-            roe=_safe_float(roe),
-            roe_percent=_safe_float(roe),
-            roa=_safe_float(roa),
-            roa_percent=_safe_float(roa),
-            revenue_growth_percent=_safe_float(rev_growth),
-            net_income_growth_percent=_safe_float(earn_growth),
-            ev_to_ebitda=_safe_float(ev_ebitda),
-            price_to_sales=_safe_float(price_sales),
-            peg_ratio=_safe_float(peg),
-            beta=_safe_float(beta),
-            target_price=_safe_float(target_price),
+            shares_outstanding=_to_float(shares_outstanding),
+            free_float=_to_float(free_float),
+            insider_ownership_percent=_to_float(insider_ownership),
+            institutional_ownership_percent=_to_float(institutional_ownership),
+            short_ratio=_to_float(short_ratio_val),
+            short_percent_float=_to_float(short_percent_float),
+            last_price=_to_float(last_price),
+            price=_to_float(last_price),
+            previous_close=_to_float(previous_close),
+            prev_close=_to_float(previous_close),
+            open=_to_float(gv("open")),
+            high=_to_float(gv("high")),
+            low=_to_float(gv("low")),
+            change=_to_float(change),
+            change_percent=_to_float(change_pct),
+            change_pct=_to_float(change_pct),
+            high_52w=_to_float(high_52w),
+            low_52w=_to_float(low_52w),
+            fifty_two_week_high=_to_float(high_52w),
+            fifty_two_week_low=_to_float(low_52w),
+            position_52w_percent=_to_float(position_52w),
+            fifty_two_week_position=_to_float(position_52w),
+            volume=_to_float(volume_val),
+            avg_volume_30d=_to_float(avg_vol),
+            average_volume_30d=_to_float(avg_vol),
+            avg_volume=_to_float(avg_vol),
+            market_cap=_to_float(market_cap),
+            eps_ttm=_to_float(eps_val),
+            eps=_to_float(eps_val),
+            pe_ratio=_to_float(pe_val),
+            pe=_to_float(pe_val),
+            pe_ttm=_to_float(pe_val),
+            pb_ratio=_to_float(pb_val),
+            pb=_to_float(pb_val),
+            dividend_yield=_to_float(dividend_yield_percent),
+            dividend_yield_percent=_to_float(dividend_yield_percent),
+            dividend_rate=_to_float(dividend_rate),
+            dividend_payout_ratio=_to_float(dividend_payout_ratio),
+            profit_margin=_to_float(profit_margin),
+            net_margin_percent=_to_float(profit_margin),
+            operating_margin_percent=_to_float(operating_margin),
+            ebitda_margin_percent=_to_float(ebitda_margin),
+            roe=_to_float(roe_val),
+            roe_percent=_to_float(roe_val),
+            roa=_to_float(roa_val),
+            roa_percent=_to_float(roa_val),
+            revenue_growth_percent=_to_float(revenue_growth),
+            net_income_growth_percent=_to_float(net_income_growth),
+            ev_to_ebitda=_to_float(ev_to_ebitda_val),
+            price_to_sales=_to_float(price_sales),
+            peg_ratio=_to_float(peg_val),
+            beta=_to_float(beta_val),
+            target_price=_to_float(target_price_val),
+            ex_dividend_date=ex_div_date,
+            ma_50d=_to_float(ma_50d_val),
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
             as_of_local=as_of_local,
             timezone=tz_name,
-            raw={"realtime": d, "fundamentals": fundamentals} if fundamentals else {"realtime": d},
+            raw={"realtime": d, "fundamentals": fundamentals} if fundamentals else d,
         )
 
+        liq = self._compute_liquidity_score(q.volume, q.avg_volume_30d, q.market_cap)
+        if liq is not None:
+            q.liquidity_score = liq
+
         self._normalize_data_quality(q)
+        if self.enable_advanced_analysis:
+            self._apply_basic_scoring(q, source="eodhd")
+
         return q
+
+    # ------------------------------------------------------------------ #
+    # Provider: Finnhub (optional – real-time price only)
+    # ------------------------------------------------------------------ #
 
     async def _fetch_from_finnhub(self, symbol: str) -> Optional[UnifiedQuote]:
         api_key = os.getenv("FINNHUB_API_KEY")
         if not api_key:
+            logger.warning("FINNHUB_API_KEY not set; skipping Finnhub for %s", symbol)
             return None
 
         url = "https://finnhub.io/api/v1/quote"
@@ -1276,39 +1316,42 @@ class DataEngine:
         timeout = httpx.Timeout(self.provider_timeout, connect=self.provider_timeout)
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params=params)
-            if resp.status_code != 200:
-                return None
+            resp.raise_for_status()
             d = resp.json()
 
         if not isinstance(d, dict) or not d:
             return None
 
         last_price = d.get("c")
-        prev_close = d.get("pc")
+        previous_close = d.get("pc")
+        open_price = d.get("o")
+        high = d.get("h")
+        low = d.get("l")
 
         change = None
         change_pct = None
-        if last_price is not None and prev_close:
+        if last_price is not None and previous_close:
             try:
-                change = float(last_price) - float(prev_close)
-                change_pct = float(change) / float(prev_close) * 100.0
+                change = float(last_price) - float(previous_close)
+                change_pct = (float(change) / float(previous_close)) * 100.0
             except Exception:
-                pass
+                change = None
+                change_pct = None
 
         as_of_utc, as_of_local, tz_name = self._now_dt_pair()
 
         q = UnifiedQuote(
             symbol=symbol.upper(),
-            last_price=_safe_float(last_price),
-            price=_safe_float(last_price),
-            previous_close=_safe_float(prev_close),
-            prev_close=_safe_float(prev_close),
-            open=_safe_float(d.get("o")),
-            high=_safe_float(d.get("h")),
-            low=_safe_float(d.get("l")),
-            change=_safe_float(change),
-            change_percent=_safe_float(change_pct),
-            change_pct=_safe_float(change_pct),
+            last_price=_to_float(last_price),
+            price=_to_float(last_price),
+            previous_close=_to_float(previous_close),
+            prev_close=_to_float(previous_close),
+            open=_to_float(open_price),
+            high=_to_float(high),
+            low=_to_float(low),
+            change=_to_float(change),
+            change_percent=_to_float(change_pct),
+            change_pct=_to_float(change_pct),
             last_updated_utc=as_of_utc,
             last_updated_riyadh=as_of_local,
             as_of_utc=as_of_utc,
@@ -1318,13 +1361,20 @@ class DataEngine:
         )
 
         self._normalize_data_quality(q)
+        if self.enable_advanced_analysis:
+            self._apply_basic_scoring(q, source="finnhub")
+
         return q
 
     # ------------------------------------------------------------------ #
-    # v1 delegate mapping
+    # KSA delegate mapping (from v1 UnifiedQuote to v2 UnifiedQuote)
     # ------------------------------------------------------------------ #
 
     def _from_v1_quote(self, v1_q: Any) -> UnifiedQuote:
+        """
+        Map a core.data_engine.UnifiedQuote (v1) instance to this v2 UnifiedQuote.
+        """
+
         def gv(*names: str, default=None):
             for n in names:
                 if hasattr(v1_q, n):
@@ -1346,7 +1396,103 @@ class DataEngine:
 
         last_price = gv("price", "last_price")
         previous_close = gv("prev_close", "previous_close")
+        open_price = gv("open")
+        high = gv("high")
+        low = gv("low")
+        change = gv("change")
+        change_pct = gv("change_pct", "change_percent")
 
+        high_52w = gv("fifty_two_week_high", "high_52w")
+        low_52w = gv("fifty_two_week_low", "low_52w")
+        pos_52w = gv("fifty_two_week_position", "position_52w_percent")
+
+        volume = gv("volume")
+        avg_volume = gv("avg_volume", "avg_volume_30d")
+        market_cap = gv("market_cap")
+        shares_outstanding = gv("shares_outstanding")
+        free_float = gv("free_float")
+
+        eps_ttm = gv("eps_ttm", "eps")
+        pe_ttm = gv("pe_ttm", "pe", "pe_ratio")
+        pb = gv("pb", "pb_ratio")
+        dividend_yield = gv("dividend_yield", "dividend_yield_percent")
+        dividend_payout_ratio = gv("dividend_payout_ratio")
+        roe = gv("roe", "roe_percent")
+        roa = gv("roa", "roa_percent")
+        profit_margin = gv("profit_margin", "net_margin_percent")
+        debt_to_equity = gv("debt_to_equity")
+        current_ratio = gv("current_ratio")
+        quick_ratio = gv("quick_ratio")
+
+        revenue_growth = gv("revenue_growth_percent", "revenue_growth")
+        net_income_growth = gv("net_income_growth_percent", "net_income_growth")
+        ebitda_margin = gv("ebitda_margin_percent", "ebitda_margin")
+        operating_margin = gv("operating_margin_percent", "operating_margin")
+        net_margin = gv("net_margin_percent", "net_margin")
+
+        ev_to_ebitda = gv("ev_to_ebitda", "ev_ebitda")
+        price_to_sales = gv("price_to_sales", "ps_ratio")
+        price_to_cash_flow = gv("price_to_cash_flow", "pcf_ratio")
+        peg_ratio = gv("peg_ratio", "peg")
+        beta = gv("beta")
+        volatility_30d = gv("volatility_30d_percent", "volatility_30d")
+
+        value_score = gv("value_score")
+        quality_score = gv("quality_score")
+        momentum_score = gv("momentum_score")
+        opportunity_score = gv("opportunity_score")
+        recommendation = gv("recommendation")
+        valuation_label = gv("valuation_label")
+        fair_value = gv("fair_value")
+        upside_percent = gv("upside_percent")
+        risk_label = gv("risk_label")
+        risk_bucket = gv("risk_bucket")
+        overall_score = gv("overall_score")
+
+        rsi_14 = gv("rsi_14")
+        macd = gv("macd")
+        ma_20d = gv("ma_20d", "moving_average_20d")
+        ma_50d = gv("ma_50d", "moving_average_50d")
+
+        data_quality = gv("data_quality", default="UNKNOWN")
+        sources = gv("sources")
+        last_updated_utc = gv("last_updated_utc")
+        last_updated_riyadh = gv("last_updated_riyadh", "last_updated_local")
+
+        as_of_utc = last_updated_utc
+        as_of_local = last_updated_riyadh
+        tz_name = gv("timezone")
+
+        if last_updated_utc is None:
+            as_of_utc, as_of_local, tz_name = self._now_dt_pair()
+            last_updated_utc = as_of_utc
+            last_updated_riyadh = as_of_local
+
+        provider = None
+        primary_provider = None
+        provider_sources: Optional[List[ProviderSource]] = None
+
+        if sources:
+            try:
+                if isinstance(sources, list) and sources:
+                    tmp_sources: List[ProviderSource] = []
+                    for s in sources:
+                        if isinstance(s, dict):
+                            prov = str(s.get("provider") or s.get("name") or s.get("source") or "")
+                            tmp_sources.append(ProviderSource(provider=prov, weight=s.get("weight"), quality=s.get("quality")))
+                        else:
+                            prov = str(getattr(s, "provider", None) or getattr(s, "name", None) or getattr(s, "source", None) or "")
+                            tmp_sources.append(ProviderSource(provider=prov, weight=getattr(s, "weight", None), quality=getattr(s, "quality", None)))
+                    provider_sources = tmp_sources
+                    if tmp_sources:
+                        primary_provider = tmp_sources[0].provider
+                        provider = primary_provider
+            except Exception:
+                provider_sources = None
+                provider = None
+                primary_provider = None
+
+        # ✅ IMPORTANT: This UnifiedQuote(...) call is fully closed (fixes your Render SyntaxError)
         q = UnifiedQuote(
             symbol=symbol,
             name=name,
@@ -1359,65 +1505,255 @@ class DataEngine:
             exchange=exchange,
             currency=currency,
             listing_date=listing_date,
-            shares_outstanding=_safe_float(gv("shares_outstanding")),
-            free_float=_safe_float(gv("free_float")),
-            last_price=_safe_float(last_price),
-            price=_safe_float(last_price),
-            previous_close=_safe_float(previous_close),
-            prev_close=_safe_float(previous_close),
-            open=_safe_float(gv("open")),
-            high=_safe_float(gv("high")),
-            low=_safe_float(gv("low")),
-            change=_safe_float(gv("change")),
-            change_percent=_safe_float(gv("change_pct", "change_percent")),
-            change_pct=_safe_float(gv("change_pct", "change_percent")),
-            high_52w=_safe_float(gv("fifty_two_week_high", "high_52w")),
-            low_52w=_safe_float(gv("fifty_two_week_low", "low_52w")),
-            fifty_two_week_high=_safe_float(gv("fifty_two_week_high", "high_52w")),
-            fifty_two_week_low=_safe_float(gv("fifty_two_week_low", "low_52w")),
-            position_52w_percent=_safe_float(gv("fifty_two_week_position", "position_52w_percent")),
-            fifty_two_week_position=_safe_float(gv("fifty_two_week_position", "position_52w_percent")),
-            volume=_safe_float(gv("volume")),
-            avg_volume_30d=_safe_float(gv("avg_volume", "avg_volume_30d")),
-            average_volume_30d=_safe_float(gv("avg_volume", "avg_volume_30d")),
-            avg_volume=_safe_float(gv("avg_volume", "avg_volume_30d")),
-            market_cap=_safe_float(gv("market_cap")),
-            eps_ttm=_safe_float(gv("eps_ttm", "eps")),
-            eps=_safe_float(gv("eps_ttm", "eps")),
-            pe_ttm=_safe_float(gv("pe_ttm", "pe", "pe_ratio")),
-            pe=_safe_float(gv("pe_ttm", "pe", "pe_ratio")),
-            pe_ratio=_safe_float(gv("pe_ttm", "pe", "pe_ratio")),
-            pb=_safe_float(gv("pb", "pb_ratio")),
-            pb_ratio=_safe_float(gv("pb", "pb_ratio")),
-            dividend_yield=_safe_float(gv("dividend_yield", "dividend_yield_percent")),
-            dividend_yield_percent=_safe_float(gv("dividend_yield", "dividend_yield_percent")),
-            dividend_payout_ratio=_safe_float(gv("dividend_payout_ratio")),
-            roe=_safe_float(gv("roe", "roe_percent")),
-            roe_percent=_safe_float(gv("roe", "roe_percent")),
-            roa=_safe_float(gv("roa", "roa_percent")),
-            roa_percent=_safe_float(gv("roa", "roa_percent")),
-            profit_margin=_safe_float(gv("profit_margin", "net_margin_percent")),
-            net_margin_percent=_safe_float(gv("net_margin_percent", "profit_margin")),
-            debt_to_equity=_safe_float(gv("debt_to_equity")),
-            current_ratio=_safe_float(gv("current_ratio")),
-            quick_ratio=_safe_float(gv("quick_ratio")),
-            revenue_growth_percent=_safe_float(gv("revenue_growth_percent", "revenue_growth")),
-            net_income_growth_percent=_safe_float(gv("net_income_growth_percent", "net_income_growth")),
-            ebitda_margin_percent=_safe_float(gv("ebitda_margin_percent", "ebitda_margin")),
-            operating_margin_percent=_safe_float(gv("operating_margin_percent", "operating_margin")),
-            ev_to_ebitda=_safe_float(gv("ev_to_ebitda", "ev_ebitda")),
-            price_to_sales=_safe_float(gv("price_to_sales", "ps_ratio")),
-            price_to_cash_flow=_safe_float(gv("price_to_cash_flow", "pcf_ratio")),
-            peg_ratio=_safe_float(gv("peg_ratio", "peg")),
-            beta=_safe_float(gv("beta")),
-            volatility_30d_percent=_safe_float(gv("volatility_30d_percent", "volatility_30d")),
-            volatility_30d=_safe_float(gv("volatility_30d_percent", "volatility_30d")),
-            fair_value=_safe_float(gv("fair_value")),
-            upside_percent=_safe_float(gv("upside_percent")),
-            valuation_label=gv("valuation_label"),
-            value_score=_safe_float(gv("value_score")),
-            quality_score=_safe_float(gv("quality_score")),
-            momentum_score=_safe_float(gv("momentum_score")),
-            opportunity_score=_safe_float(gv("opportunity_score")),
-            overall_score=_safe_float(gv("overall_score")),
-            recommendat
+            shares_outstanding=_to_float(shares_outstanding),
+            free_float=_to_float(free_float),
+            last_price=_to_float(last_price),
+            price=_to_float(last_price),
+            previous_close=_to_float(previous_close),
+            prev_close=_to_float(previous_close),
+            open=_to_float(open_price),
+            high=_to_float(high),
+            low=_to_float(low),
+            change=_to_float(change),
+            change_percent=_to_float(change_pct),
+            change_pct=_to_float(change_pct),
+            high_52w=_to_float(high_52w),
+            low_52w=_to_float(low_52w),
+            fifty_two_week_high=_to_float(high_52w),
+            fifty_two_week_low=_to_float(low_52w),
+            position_52w_percent=_to_float(pos_52w),
+            fifty_two_week_position=_to_float(pos_52w),
+            volume=_to_float(volume),
+            avg_volume_30d=_to_float(avg_volume),
+            average_volume_30d=_to_float(avg_volume),
+            avg_volume=_to_float(avg_volume),
+            market_cap=_to_float(market_cap),
+            eps_ttm=_to_float(eps_ttm),
+            eps=_to_float(eps_ttm),
+            pe_ratio=_to_float(pe_ttm),
+            pe=_to_float(pe_ttm),
+            pe_ttm=_to_float(pe_ttm),
+            pb_ratio=_to_float(pb),
+            pb=_to_float(pb),
+            dividend_yield=_to_float(dividend_yield),
+            dividend_yield_percent=_to_float(dividend_yield),
+            dividend_payout_ratio=_to_float(dividend_payout_ratio),
+            roe=_to_float(roe),
+            roe_percent=_to_float(roe),
+            roa=_to_float(roa),
+            roa_percent=_to_float(roa),
+            profit_margin=_to_float(profit_margin),
+            net_margin_percent=_to_float(net_margin) if net_margin is not None else _to_float(profit_margin),
+            debt_to_equity=_to_float(debt_to_equity),
+            current_ratio=_to_float(current_ratio),
+            quick_ratio=_to_float(quick_ratio),
+            revenue_growth_percent=_to_float(revenue_growth),
+            net_income_growth_percent=_to_float(net_income_growth),
+            ebitda_margin_percent=_to_float(ebitda_margin),
+            operating_margin_percent=_to_float(operating_margin),
+            ev_to_ebitda=_to_float(ev_to_ebitda),
+            price_to_sales=_to_float(price_to_sales),
+            price_to_cash_flow=_to_float(price_to_cash_flow),
+            peg_ratio=_to_float(peg_ratio),
+            beta=_to_float(beta),
+            volatility_30d=_to_float(volatility_30d),
+            volatility_30d_percent=_to_float(volatility_30d),
+            fair_value=_to_float(fair_value),
+            upside_percent=_to_float(upside_percent),
+            valuation_label=valuation_label,
+            value_score=_to_float(value_score),
+            quality_score=_to_float(quality_score),
+            momentum_score=_to_float(momentum_score),
+            opportunity_score=_to_float(opportunity_score),
+            overall_score=_to_float(overall_score),
+            recommendation=recommendation,
+            risk_label=risk_label,
+            risk_bucket=risk_bucket,
+            rsi_14=_to_float(rsi_14),
+            macd=_to_float(macd),
+            ma_20d=_to_float(ma_20d),
+            ma_50d=_to_float(ma_50d),
+            data_quality=str(data_quality or "UNKNOWN"),
+            primary_provider=primary_provider,
+            provider=provider,
+            data_source=provider,
+            sources=provider_sources,
+            last_updated_utc=last_updated_utc,
+            last_updated_riyadh=last_updated_riyadh,
+            as_of_utc=as_of_utc,
+            as_of_local=as_of_local,
+            timezone=tz_name,
+            raw=None,
+        )
+
+        liq = self._compute_liquidity_score(q.volume, q.avg_volume_30d, q.market_cap)
+        if liq is not None and q.liquidity_score is None:
+            q.liquidity_score = liq
+
+        self._normalize_data_quality(q)
+        if self.enable_advanced_analysis:
+            if q.value_score is None or q.quality_score is None or q.momentum_score is None or q.opportunity_score is None:
+                self._apply_basic_scoring(q, source="v1_delegate")
+
+        return q
+
+    # ------------------------------------------------------------------ #
+    # Basic AI-style scoring (Value / Quality / Momentum / Opportunity)
+    # ------------------------------------------------------------------ #
+
+    def _apply_basic_scoring(self, q: UnifiedQuote, source: str) -> None:
+        self._normalize_data_quality(q)
+
+        quality = 50.0
+        pe = q.pe_ratio or q.pe or q.pe_ttm
+        eps = q.eps_ttm or q.eps
+
+        if eps is not None and eps > 0 and pe is not None and pe > 0:
+            if pe < 10:
+                quality = 80.0
+            elif pe < 20:
+                quality = 70.0
+            elif pe < 30:
+                quality = 60.0
+            else:
+                quality = 50.0
+        elif eps is not None and eps <= 0:
+            quality = 30.0
+
+        value = 50.0
+        if pe is not None and pe > 0:
+            try:
+                value = max(10.0, min(90.0, 100.0 / (1.0 + pe / 10.0)))
+            except Exception:
+                value = 50.0
+
+        dy = q.dividend_yield_percent or q.dividend_yield
+        if dy is not None and dy > 0:
+            try:
+                dy_val = float(dy)
+                dy_pct = dy_val * 100.0 if dy_val < 1.0 else dy_val
+                value = min(90.0, value + min(20.0, dy_pct))
+            except Exception:
+                pass
+
+        momentum = 50.0
+        if q.change_percent is not None or q.change_pct is not None:
+            try:
+                cp = float(q.change_percent if q.change_percent is not None else q.change_pct)
+                momentum += max(-20.0, min(20.0, cp))
+            except Exception:
+                pass
+
+        if q.position_52w_percent is not None:
+            try:
+                p = float(q.position_52w_percent)
+                if p > 80:
+                    momentum += 5.0
+                elif p < 20:
+                    momentum -= 5.0
+            except Exception:
+                pass
+
+        vol = q.volatility_30d_percent or q.volatility_30d
+        if vol is not None:
+            try:
+                v = float(vol)
+                if v > 25.0:
+                    penalty = min(15.0, (v - 25.0) / 2.0)
+                    momentum -= max(0.0, penalty)
+            except Exception:
+                pass
+
+        value = max(0.0, min(100.0, value))
+        quality = max(0.0, min(100.0, quality))
+        momentum = max(0.0, min(100.0, momentum))
+
+        opportunity = value * 0.4 + quality * 0.3 + momentum * 0.3
+
+        q.value_score = round(value, 2)
+        q.quality_score = round(quality, 2)
+        q.momentum_score = round(momentum, 2)
+        q.opportunity_score = round(opportunity, 2)
+        q.overall_score = q.opportunity_score
+
+        if opportunity >= 80:
+            q.recommendation = "STRONG_BUY"
+        elif opportunity >= 65:
+            q.recommendation = "BUY"
+        elif opportunity >= 50:
+            q.recommendation = "HOLD"
+        elif opportunity >= 35:
+            q.recommendation = "REDUCE"
+        else:
+            q.recommendation = "SELL"
+
+        if q.fair_value is None and q.target_price is not None:
+            q.fair_value = q.target_price
+
+        if q.fair_value is not None and q.last_price is not None:
+            try:
+                fv = float(q.fair_value)
+                lp = float(q.last_price)
+                if q.upside_percent is None:
+                    q.upside_percent = round((fv - lp) / lp * 100.0, 2)
+                if q.exp_roi_12m is None:
+                    q.exp_roi_12m = round((fv - lp) / lp * 100.0, 2)
+                if q.exp_roi_3m is None and q.exp_roi_12m is not None:
+                    q.exp_roi_3m = round(q.exp_roi_12m / 4.0, 2)
+            except Exception:
+                pass
+
+        if q.value_score is not None:
+            if q.value_score >= 80:
+                q.valuation_label = "DEEP_VALUE"
+            elif q.value_score >= 65:
+                q.valuation_label = "UNDERVALUED"
+            elif q.value_score >= 45:
+                q.valuation_label = "FAIR_VALUE"
+            else:
+                q.valuation_label = "EXPENSIVE"
+
+        beta_val = _to_float(q.beta)
+        vol_val = _to_float(q.volatility_30d_percent if q.volatility_30d_percent is not None else q.volatility_30d)
+
+        risk_score = 50.0
+        if beta_val is not None:
+            if beta_val > 1.5:
+                risk_score += 20.0
+            elif beta_val > 1.2:
+                risk_score += 10.0
+            elif beta_val < 0.8:
+                risk_score -= 10.0
+
+        if vol_val is not None:
+            if vol_val > 35.0:
+                risk_score += 20.0
+            elif vol_val > 25.0:
+                risk_score += 10.0
+            elif vol_val < 15.0:
+                risk_score -= 10.0
+
+        if risk_score >= 70.0:
+            q.risk_label = "HIGH_RISK"
+        elif risk_score >= 45.0:
+            q.risk_label = "MEDIUM_RISK"
+        else:
+            q.risk_label = "LOW_RISK"
+
+        opp = q.opportunity_score if q.opportunity_score is not None else opportunity
+        dq_norm = (q.data_quality or "UNKNOWN").upper()
+        high_conf = dq_norm in {"FULL", "GOOD", "EXCELLENT"}
+
+        if opp >= 80 and q.risk_label in {"LOW_RISK", "MEDIUM_RISK"} and high_conf:
+            q.risk_bucket = "HIGH_OPP_HIGH_CONF"
+        elif opp >= 65 and high_conf:
+            q.risk_bucket = "HIGH_OPP_MED_CONF"
+        elif opp >= 50:
+            q.risk_bucket = "MED_OPP"
+        else:
+            q.risk_bucket = "LOW_OPP"
+
+        self._normalize_data_quality(q)
+
+
+__all__ = ["UnifiedQuote", "ProviderSource", "DataEngine"]
