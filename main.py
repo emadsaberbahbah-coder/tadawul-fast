@@ -40,8 +40,41 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
+
+# ------------------------------------------------------------
+# Optional SlowAPI (boot-safe)
+# ------------------------------------------------------------
+
+_HAS_SLOWAPI = True
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+except Exception:
+    _HAS_SLOWAPI = False
+
+    class RateLimitExceeded(Exception):
+        pass
+
+    class Limiter:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def limit(self, _rule: str):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+    def _rate_limit_exceeded_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": True,
+                "status_code": 429,
+                "detail": "Rate limit exceeded",
+            },
+        )
+
 
 # ------------------------------------------------------------
 # Configuration import (env.py) with safe, non-crashing fallback
@@ -98,9 +131,7 @@ def _get_bool(name: str, default: bool = False) -> bool:
 # ------------------------------------------------------------
 
 APP_NAME: str = getattr(settings, "app_name", _get_env_attr("APP_NAME", "tadawul-fast"))
-APP_VERSION: str = getattr(
-    settings, "app_version", _get_env_attr("APP_VERSION", "4.5.1")
-)
+APP_VERSION: str = getattr(settings, "app_version", _get_env_attr("APP_VERSION", "4.5.1"))
 
 APP_TOKEN: str = _get_env_attr("APP_TOKEN", "")
 BACKUP_APP_TOKEN: str = _get_env_attr("BACKUP_APP_TOKEN", "")
@@ -175,7 +206,7 @@ def _get_providers_meta() -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# Rate limiting (SlowAPI) – proxy-aware remote address
+# Rate limiting – proxy-aware client IP
 # ------------------------------------------------------------
 
 def _client_ip(request: Request) -> str:
@@ -185,7 +216,6 @@ def _client_ip(request: Request) -> str:
     """
     xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
     if xff:
-        # first IP is the original client
         ip = xff.split(",")[0].strip()
         if ip:
             return ip
@@ -237,7 +267,158 @@ async def require_app_token(
     if token and token in {APP_TOKEN, BACKUP_APP_TOKEN}:
         return token
 
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API token")
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API token",
+    )
+
+
+# ------------------------------------------------------------
+# Router lazy-load (prevents deploy timeout due to import errors)
+# ------------------------------------------------------------
+
+ROUTER_STATE: Dict[str, Any] = {
+    "loading": False,
+    "loaded_core": False,   # enriched + ai_analysis
+    "error": None,
+    "started_at_utc": None,
+    "finished_at_utc": None,
+    "routers": {
+        "enriched": {"available": False, "error": None},
+        "ai_analysis": {"available": False, "error": None},
+        "advanced_analysis": {"available": False, "error": None},
+        "ksa_argaam": {"available": False, "error": None},
+    },
+}
+
+_router_lock = asyncio.Lock()
+
+
+async def _import_module_threaded(module_path: str):
+    return await asyncio.to_thread(importlib.import_module, module_path)
+
+
+def _mark_router(router_key: str, available: bool, error: Optional[str]) -> None:
+    ROUTER_STATE["routers"][router_key]["available"] = bool(available)
+    ROUTER_STATE["routers"][router_key]["error"] = error
+
+
+def _core_ok() -> bool:
+    r = ROUTER_STATE["routers"]
+    return bool(r["enriched"]["available"] and r["ai_analysis"]["available"])
+
+
+async def _load_routers_once(app: FastAPI) -> None:
+    """
+    Load missing routers exactly once per process boot, but safe to call again:
+    - It will SKIP routers already marked available (prevents duplicate include_router()).
+    - It will try again for routers that previously failed.
+    """
+    async with _router_lock:
+        if ROUTER_STATE["loading"]:
+            return
+        ROUTER_STATE["loading"] = True
+        ROUTER_STATE["started_at_utc"] = datetime.now(timezone.utc).isoformat()
+        ROUTER_STATE["error"] = None
+
+    try:
+        # Small delay so /health can respond immediately after boot
+        await asyncio.sleep(0.5)
+
+        changed = False
+
+        # 1) Enriched quotes router
+        if not ROUTER_STATE["routers"]["enriched"]["available"]:
+            try:
+                enriched_mod = await _import_module_threaded("routes.enriched_quote")
+                app.include_router(
+                    enriched_mod.router,
+                    dependencies=[Depends(require_app_token)],
+                )
+                _mark_router("enriched", True, None)
+                changed = True
+            except Exception as e:
+                logger.exception("Failed to import routes.enriched_quote")
+                _mark_router("enriched", False, str(e))
+
+        # 2) AI analysis router
+        if not ROUTER_STATE["routers"]["ai_analysis"]["available"]:
+            try:
+                ai_mod = await _import_module_threaded("routes.ai_analysis")
+                app.include_router(
+                    ai_mod.router,
+                    dependencies=[Depends(require_app_token)],
+                )
+                _mark_router("ai_analysis", True, None)
+                changed = True
+            except Exception as e:
+                logger.exception("Failed to import routes.ai_analysis")
+                _mark_router("ai_analysis", False, str(e))
+
+        # 3) Advanced analysis router (optional)
+        if not ROUTER_STATE["routers"]["advanced_analysis"]["available"]:
+            try:
+                adv_mod = await _import_module_threaded("routes.advanced_analysis")
+                app.include_router(
+                    adv_mod.router,
+                    dependencies=[Depends(require_app_token)],
+                )
+                _mark_router("advanced_analysis", True, None)
+                changed = True
+            except Exception as e:
+                # optional; do not treat as fatal
+                _mark_router("advanced_analysis", False, str(e))
+
+        # 4) KSA / Argaam gateway router (optional but expected)
+        if not ROUTER_STATE["routers"]["ksa_argaam"]["available"]:
+            try:
+                argaam_mod = await _import_module_threaded("routes_argaam")
+                app.include_router(
+                    argaam_mod.router,
+                    dependencies=[Depends(require_app_token)],
+                )
+                _mark_router("ksa_argaam", True, None)
+                changed = True
+            except Exception as e:
+                _mark_router("ksa_argaam", False, str(e))
+
+        ROUTER_STATE["loaded_core"] = _core_ok()
+
+        if ROUTER_STATE["loaded_core"]:
+            logger.info("✅ Core routers loaded (enriched + ai_analysis).")
+        else:
+            logger.warning(
+                "⚠️ Core routers NOT loaded. Service stays up for debugging (/v1/status)."
+            )
+
+        # If OpenAPI was requested early, refresh schema after dynamic include_router()
+        if changed:
+            try:
+                app.openapi_schema = None
+            except Exception:
+                pass
+
+    except Exception as e:
+        ROUTER_STATE["error"] = str(e)
+        logger.exception("Router loader failed unexpectedly")
+    finally:
+        ROUTER_STATE["loading"] = False
+        ROUTER_STATE["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "🚀 Starting %s (env=%s, version=%s)",
+        APP_NAME,
+        getattr(settings, "app_env", "production"),
+        APP_VERSION,
+    )
+    # Start router import in background (non-blocking boot)
+    asyncio.create_task(_load_routers_once(app))
+    yield
+    uptime = time.time() - START_TIME
+    logger.info("🛑 Shutting down after %.1f seconds", uptime)
 
 
 # ------------------------------------------------------------
@@ -248,10 +429,13 @@ app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description="Tadawul Fast Bridge – Unified KSA + Global data + Google Sheets integration.",
+    lifespan=lifespan,
 )
 
+# SlowAPI integration (only if installed)
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if _HAS_SLOWAPI:
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS: keep wide-open for Sheets, but avoid invalid '*' + credentials combination
 if ENABLE_CORS_ALL_ORIGINS:
@@ -272,111 +456,6 @@ else:
     )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-
-# ------------------------------------------------------------
-# Router lazy-load (prevents deploy timeout due to import errors)
-# ------------------------------------------------------------
-
-ROUTER_STATE: Dict[str, Any] = {
-    "loading": False,
-    "loaded": False,
-    "error": None,
-    "started_at_utc": None,
-    "finished_at_utc": None,
-    "routers": {
-        "enriched": {"available": False, "error": None},
-        "ai_analysis": {"available": False, "error": None},
-        "advanced_analysis": {"available": False, "error": None},
-        "ksa_argaam": {"available": False, "error": None},
-    },
-}
-
-_router_lock = asyncio.Lock()
-
-
-async def _import_module_threaded(module_path: str):
-    return await asyncio.to_thread(importlib.import_module, module_path)
-
-
-async def _load_routers_once() -> None:
-    async with _router_lock:
-        if ROUTER_STATE["loaded"] or ROUTER_STATE["loading"]:
-            return
-        ROUTER_STATE["loading"] = True
-        ROUTER_STATE["started_at_utc"] = datetime.now(timezone.utc).isoformat()
-
-    try:
-        # Small delay so /health can respond immediately after boot
-        await asyncio.sleep(1.0)
-
-        # 1) Enriched quotes router
-        try:
-            enriched_mod = await _import_module_threaded("routes.enriched_quote")
-            app.include_router(enriched_mod.router, dependencies=[Depends(require_app_token)])
-            ROUTER_STATE["routers"]["enriched"]["available"] = True
-        except Exception as e:
-            logger.exception("Failed to import routes.enriched_quote")
-            ROUTER_STATE["routers"]["enriched"]["error"] = str(e)
-
-        # 2) AI analysis router
-        try:
-            ai_mod = await _import_module_threaded("routes.ai_analysis")
-            app.include_router(ai_mod.router, dependencies=[Depends(require_app_token)])
-            ROUTER_STATE["routers"]["ai_analysis"]["available"] = True
-        except Exception as e:
-            logger.exception("Failed to import routes.ai_analysis")
-            ROUTER_STATE["routers"]["ai_analysis"]["error"] = str(e)
-
-        # 3) Advanced analysis router (optional)
-        try:
-            adv_mod = await _import_module_threaded("routes.advanced_analysis")
-            app.include_router(adv_mod.router, dependencies=[Depends(require_app_token)])
-            ROUTER_STATE["routers"]["advanced_analysis"]["available"] = True
-        except Exception as e:
-            # optional; do not treat as fatal
-            ROUTER_STATE["routers"]["advanced_analysis"]["error"] = str(e)
-
-        # 4) KSA / Argaam gateway router (optional but expected)
-        try:
-            argaam_mod = await _import_module_threaded("routes_argaam")
-            app.include_router(argaam_mod.router, dependencies=[Depends(require_app_token)])
-            ROUTER_STATE["routers"]["ksa_argaam"]["available"] = True
-        except Exception as e:
-            ROUTER_STATE["routers"]["ksa_argaam"]["error"] = str(e)
-
-        # Mark loaded if at least core routers are available
-        core_ok = (
-            ROUTER_STATE["routers"]["enriched"]["available"]
-            and ROUTER_STATE["routers"]["ai_analysis"]["available"]
-        )
-        ROUTER_STATE["loaded"] = bool(core_ok)
-
-        if core_ok:
-            logger.info("✅ Core routers loaded (enriched + ai_analysis).")
-        else:
-            logger.warning("⚠️ Routers not fully loaded. Service stays up for debugging (/v1/status).")
-
-    except Exception as e:
-        ROUTER_STATE["error"] = str(e)
-        logger.exception("Router loader failed unexpectedly")
-    finally:
-        ROUTER_STATE["loading"] = False
-        ROUTER_STATE["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    logger.info("🚀 Starting %s (env=%s, version=%s)", APP_NAME, getattr(settings, "app_env", "production"), APP_VERSION)
-    # Start router import in background (non-blocking boot)
-    asyncio.create_task(_load_routers_once())
-    yield
-    uptime = time.time() - START_TIME
-    logger.info("🛑 Shutting down after %.1f seconds", uptime)
-
-
-# attach lifespan after defining it
-app.router.lifespan_context = lifespan
 
 
 # ------------------------------------------------------------
@@ -426,6 +505,7 @@ async def root() -> str:
           <li><code>/health</code></li>
           <li><code>/v1/status</code></li>
           <li><code>/v1/router-state</code></li>
+          <li><code>/v1/routers/retry</code> (POST)</li>
           <li><code>/v1/quote?tickers=AAPL</code> (legacy)</li>
           <li><code>/v1/quote?tickers=1120.SR</code> (legacy)</li>
         </ul>
@@ -449,7 +529,7 @@ async def basic_health() -> Dict[str, Any]:
         "env": getattr(settings, "app_env", "production"),
         "time_utc": now.isoformat(),
         "uptime_seconds": uptime_seconds,
-        "routers_loaded": bool(ROUTER_STATE["loaded"]),
+        "routers_loaded_core": bool(ROUTER_STATE["loaded_core"]),
         "routers_loading": bool(ROUTER_STATE["loading"]),
     }
 
@@ -457,6 +537,23 @@ async def basic_health() -> Dict[str, Any]:
 @app.get("/v1/router-state")
 async def router_state() -> Dict[str, Any]:
     return ROUTER_STATE
+
+
+@app.post("/v1/routers/retry")
+async def retry_router_load(
+    request: Request,
+    _token: Optional[str] = Depends(require_app_token),
+) -> Dict[str, Any]:
+    """
+    Manually retry loading routers (safe).
+    - Skips routers already available.
+    - Tries again for failed routers.
+    """
+    if ROUTER_STATE["loading"]:
+        return {"ok": True, "message": "Routers are already loading", "router_state": ROUTER_STATE}
+
+    asyncio.create_task(_load_routers_once(app))
+    return {"ok": True, "message": "Router load triggered", "router_state": ROUTER_STATE}
 
 
 @app.get("/v1/status")
@@ -467,6 +564,7 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
     services = {
         "google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS_RAW),
         "google_apps_script": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
+        "slowapi_installed": bool(_HAS_SLOWAPI),
     }
 
     auth = {
@@ -513,8 +611,8 @@ async def status_endpoint(request: Request) -> Dict[str, Any]:
             "router_available": bool(ROUTER_STATE["routers"]["ksa_argaam"]["available"]),
         },
         "notes": [
-            "If deploy previously timed out, this build-safe main.py keeps /health alive even if routers fail.",
-            "Fix router import errors by checking Render logs + the router_state errors above.",
+            "This boot-safe main.py keeps /health alive even if routers fail.",
+            "If routers failed, check /v1/router-state errors and Render logs, then POST /v1/routers/retry.",
         ],
     }
 
@@ -567,12 +665,26 @@ async def legacy_sheet_rows_endpoint(
 # Error handlers
 # ------------------------------------------------------------
 
+def _router_key_for_path(path: str) -> Optional[str]:
+    if path.startswith("/v1/enriched"):
+        return "enriched"
+    if path.startswith("/v1/analysis"):
+        return "ai_analysis"
+    if path.startswith("/v1/advanced"):
+        return "advanced_analysis"
+    if path.startswith("/v1/argaam"):
+        return "ksa_argaam"
+    return None
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    # If a router endpoint is hit while routers are still loading, return 503 instead of 404
+    # If an endpoint is hit while routers are loading or missing, return 503 instead of 404
     if exc.status_code == 404:
         path = request.url.path or ""
-        if path.startswith(("/v1/enriched", "/v1/analysis", "/v1/advanced", "/v1/argaam")):
+        rk = _router_key_for_path(path)
+
+        if rk is not None:
             if ROUTER_STATE["loading"]:
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -582,14 +694,16 @@ async def http_exception_handler(request: Request, exc: HTTPException):
                         "detail": "Service warming up (routers loading). Retry in a few seconds.",
                     },
                 )
-            if not ROUTER_STATE["loaded"]:
+
+            # If that router is not available, return a clear 503 (even if other routers are fine)
+            if not ROUTER_STATE["routers"][rk]["available"]:
                 return JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={
                         "error": True,
                         "status_code": 503,
-                        "detail": "Routers not available (import failed). Check /v1/router-state and logs.",
-                        "router_state": ROUTER_STATE,
+                        "detail": f"Router '{rk}' not available (import failed). Check /v1/router-state and logs.",
+                        "router_error": ROUTER_STATE["routers"][rk]["error"],
                     },
                 )
 
