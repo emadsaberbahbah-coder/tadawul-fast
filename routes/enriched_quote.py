@@ -1,27 +1,28 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v3.4.0)
+Enriched Quotes Router (v3.5.0)
 
 Unified on top of:
   - core.data_engine_v2.DataEngine (async, multi-provider, KSA-safe)
   - core.enriched_quote.EnrichedQuote (sheet-friendly model)
-  - core.schemas.get_headers_for_sheet (preferred; multi-sheet schema)
+  - core.schemas.get_headers_for_sheet (59-column schema)
+  - core.scoring_engine (AI scoring & recommendations)
 
 Responsibilities
 ----------------
-- GET  /v1/enriched/health       -> router + engine diagnostics
-- GET  /v1/enriched/headers      -> headers only (debug / Apps Script setup)
-- GET  /v1/enriched/quote        -> single EnrichedQuote JSON
-- POST /v1/enriched/quotes       -> batch EnrichedQuote JSON objects
-- POST /v1/enriched/sheet-rows   -> headers + rows for Google Sheets
+- GET  /v1/enriched/health        -> router + engine diagnostics
+- GET  /v1/enriched/headers       -> headers only (debug / Apps Script setup)
+- GET  /v1/enriched/quote         -> single EnrichedQuote JSON (with scores)
+- POST /v1/enriched/quotes        -> batch EnrichedQuote JSON objects (with scores)
+- POST /v1/enriched/sheet-rows    -> headers + rows for Google Sheets
 
 Design notes
 ------------
 - Router NEVER talks directly to market providers.
 - Very defensive: chunked calls + concurrency limit + timeout per chunk.
 - Singleton engine per process to avoid repeated DataEngine init.
-- Preserves input order in sheet-rows and batch results.
+- AUTOMATIC SCORING: All quotes are passed through core.scoring_engine.
 
 Author: Emad Bahbah (with GPT-5.2 Thinking)
 """
@@ -32,23 +33,29 @@ import asyncio
 import logging
 import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+# --- CORE IMPORTS ---
+from core.data_engine_v2 import DataEngine, UnifiedQuote
+from core.enriched_quote import EnrichedQuote
+from core.scoring_engine import enrich_with_scores
+from core.schemas import get_headers_for_sheet
+
 logger = logging.getLogger("routes.enriched_quote")
 
-API_VERSION = "3.4.0"
+API_VERSION = "3.5.0"
 
 # =============================================================================
 # Config (env override)
 # =============================================================================
 
 DEFAULT_BATCH_SIZE = int(os.getenv("ENRICHED_BATCH_SIZE", "40") or 40)
-DEFAULT_BATCH_TIMEOUT = float(os.getenv("ENRICHED_BATCH_TIMEOUT_SEC", "30") or 30)
+DEFAULT_BATCH_TIMEOUT = float(os.getenv("ENRICHED_BATCH_TIMEOUT_SEC", "45") or 45)
 DEFAULT_MAX_TICKERS = int(os.getenv("ENRICHED_MAX_TICKERS", "250") or 250)
-DEFAULT_MAX_CONCURRENCY = int(os.getenv("ENRICHED_BATCH_CONCURRENCY", "3") or 3)
+DEFAULT_MAX_CONCURRENCY = int(os.getenv("ENRICHED_BATCH_CONCURRENCY", "5") or 5)
 
 # =============================================================================
 # Optional env.py integration (safe)
@@ -126,189 +133,25 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
 
 
 # =============================================================================
-# Engine + models (real preferred, stub fallback)
+# Engine Singleton
 # =============================================================================
 
-_ENGINE_MODE: str = "unknown"
-_ENGINE_IS_STUB: bool = False
-
-try:
-    from core.data_engine_v2 import DataEngine, UnifiedQuote  # type: ignore
-    from core.enriched_quote import EnrichedQuote  # type: ignore
-
-    def _build_engine_kwargs() -> Dict[str, Any]:
-        """
-        Initialize DataEngine with optional tuning if available.
-        Works across versions by passing only known/likely kwargs; falls back on TypeError.
-        """
-        kwargs: Dict[str, Any] = {}
-
-        # providers
-        enabled = _get_env_attr("ENABLED_PROVIDERS", None)
-        if isinstance(enabled, (list, tuple)) and enabled:
-            kwargs["enabled_providers"] = list(enabled)
-        elif isinstance(enabled, str) and enabled.strip():
-            kwargs["enabled_providers"] = [p.strip() for p in enabled.split(",") if p.strip()]
-
-        # cache ttl
-        cache_ttl = _get_env_attr("ENGINE_CACHE_TTL_SECONDS", None)
-        if cache_ttl is None:
-            cache_ttl = _get_env_attr("DATAENGINE_CACHE_TTL", None)
-        if cache_ttl is not None:
-            kwargs["cache_ttl"] = cache_ttl
-
-        # provider timeout
-        provider_timeout = _get_env_attr("ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
-        if provider_timeout is None:
-            provider_timeout = _get_env_attr("DATAENGINE_TIMEOUT", None)
-        if provider_timeout is not None:
-            kwargs["provider_timeout"] = provider_timeout
-
-        # advanced analysis toggle (optional)
-        enable_adv = _get_env_attr("ENGINE_ENABLE_ADVANCED_ANALYSIS", None)
-        if enable_adv is None:
-            enable_adv = _get_env_attr("ENABLE_ADVANCED_ANALYSIS", None)
-        if enable_adv is not None:
-            kwargs["enable_advanced_analysis"] = enable_adv
-
-        return kwargs
-
-    @lru_cache(maxsize=1)
-    def _get_engine_singleton() -> Any:
-        """
-        Ensure we only initialize DataEngine once per process.
-        """
-        kwargs = _build_engine_kwargs()
-        try:
-            return DataEngine(**kwargs) if kwargs else DataEngine()
-        except TypeError:
-            # Signature mismatch across versions -> safe fallback
-            return DataEngine()
-
-    _ENGINE_MODE = "v2"
-    _ENGINE_IS_STUB = False
-    logger.info("routes.enriched_quote: Using core.data_engine_v2.DataEngine (singleton)")
-
-except Exception as exc:  # pragma: no cover
-    logger.exception(
-        "routes.enriched_quote: Failed to import DataEngine/EnrichedQuote; "
-        "falling back to stub engine: %s",
-        exc,
-    )
-
-    class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
-        symbol: str
-        data_quality: str = "MISSING"
-        error: Optional[str] = None
-
-    class EnrichedQuote(BaseModel):  # type: ignore[no-redef]
-        symbol: str
-        data_quality: str = "MISSING"
-        error: Optional[str] = None
-
-        @classmethod
-        def from_unified(cls, uq: "UnifiedQuote | Dict[str, Any]") -> "EnrichedQuote":
-            if isinstance(uq, dict):
-                sym = str(uq.get("symbol") or uq.get("ticker") or "").upper()
-                return cls(symbol=sym or "UNKNOWN", data_quality=uq.get("data_quality", "MISSING"), error=uq.get("error"))
-            return cls(symbol=(uq.symbol or "").upper(), data_quality=uq.data_quality, error=uq.error)
-
-        def to_row(self, headers: Sequence[str]) -> List[Any]:
-            hdrs = list(headers or [])
-            if not hdrs:
-                return [self.symbol]
-            # first column assumed to be Symbol
-            return [self.symbol] + [None] * (len(hdrs) - 1)
-
-    class _StubEngine:
-        async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
-            sym = _normalize_symbol(symbol) or "UNKNOWN"
-            return UnifiedQuote(
-                symbol=sym,
-                data_quality="MISSING",
-                error="DataEngine v2 unavailable; using stub engine",
-            )
-
-        async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
-            return [await self.get_enriched_quote(s) for s in (symbols or [])]
-
-    @lru_cache(maxsize=1)
-    def _get_engine_singleton() -> Any:
-        return _StubEngine()
-
-    _ENGINE_MODE = "stub"
-    _ENGINE_IS_STUB = True
-
-
-# Backwards-compatible alias for legacy imports
-EnrichedQuoteResponse = EnrichedQuote  # type: ignore[misc]
+@lru_cache(maxsize=1)
+def _get_engine_singleton() -> DataEngine:
+    """
+    Ensure we only initialize DataEngine once per process.
+    """
+    logger.info("routes.enriched_quote: Initializing core.data_engine_v2.DataEngine singleton")
+    return DataEngine()
 
 
 # =============================================================================
-# Header helper (core.schemas) with robust fallbacks
+# Core Async Logic
 # =============================================================================
 
-def _fallback_headers() -> List[str]:
-    # Last-resort minimal stable header set
-    return ["Symbol", "Data Quality", "Error"]
-
-try:
-    from core.schemas import get_headers_for_sheet as _get_headers_for_sheet  # type: ignore
-except Exception as exc:  # pragma: no cover
-    logger.warning(
-        "routes.enriched_quote: core.schemas.get_headers_for_sheet not available; "
-        "using EnrichedQuote-based fallback headers. (%s)",
-        exc,
-    )
-
-    def _get_headers_for_sheet(sheet_name: Optional[str]) -> List[str]:
-        # Prefer model-provided headers if present
-        try:
-            if hasattr(EnrichedQuote, "get_headers"):
-                hdrs = EnrichedQuote.get_headers(sheet_name)  # type: ignore[attr-defined]
-                if isinstance(hdrs, list) and hdrs:
-                    return [str(x) for x in hdrs]
-            if hasattr(EnrichedQuote, "headers"):
-                hdrs = getattr(EnrichedQuote, "headers")  # type: ignore[attr-defined]
-                if isinstance(hdrs, list) and hdrs:
-                    return [str(x) for x in hdrs]
-        except Exception:
-            pass
-        return _fallback_headers()
-
-
-# =============================================================================
-# Engine call wrappers (support alternate method names safely)
-# =============================================================================
-
-async def _engine_get_one(symbol: str) -> Any:
-    eng = _get_engine_singleton()
-    if hasattr(eng, "get_enriched_quote"):
-        return await eng.get_enriched_quote(symbol)  # type: ignore[attr-defined]
-    if hasattr(eng, "get_quote"):
-        return await eng.get_quote(symbol)  # type: ignore[attr-defined]
-    raise RuntimeError("Engine missing get_enriched_quote/get_quote")
-
-
-async def _engine_get_many(symbols: List[str]) -> List[Any]:
-    eng = _get_engine_singleton()
-    if hasattr(eng, "get_enriched_quotes"):
-        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
-    if hasattr(eng, "get_quotes"):
-        return await eng.get_quotes(symbols)  # type: ignore[attr-defined]
-    # fallback: per-symbol
-    out: List[Any] = []
-    for s in symbols:
-        out.append(await _engine_get_one(s))
-    return out
-
-
-def _make_missing_unified(symbol: str, message: str) -> Any:
+def _make_missing_unified(symbol: str, message: str) -> UnifiedQuote:
     sym = _normalize_symbol(symbol) or (symbol or "").strip().upper() or "UNKNOWN"
-    try:
-        return UnifiedQuote(symbol=sym, data_quality="MISSING", error=message)
-    except Exception:
-        return {"symbol": sym, "data_quality": "MISSING", "error": message}
+    return UnifiedQuote(symbol=sym, data_quality="MISSING", error=message).finalize()
 
 
 async def _get_unified_quotes_chunked(
@@ -317,40 +160,43 @@ async def _get_unified_quotes_chunked(
     batch_size: int = DEFAULT_BATCH_SIZE,
     timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
-) -> Dict[str, Any]:
+) -> Dict[str, UnifiedQuote]:
     """
-    Chunked + concurrency-limited batch fetch.
+    Chunked + concurrency-limited batch fetch using V2 Engine.
     Returns dict keyed by the (normalized) input symbol string.
     """
     clean = _clean_tickers(symbols)
     if not clean:
         return {}
 
+    engine = _get_engine_singleton()
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
     logger.info(
-        "Enriched batch: %d symbols in %d chunk(s) (engine=%s, batch=%d, timeout=%.1fs, conc=%d)",
+        "Enriched batch: %d symbols in %d chunk(s) (batch=%d, timeout=%.1fs, conc=%d)",
         len(clean),
         len(chunks),
-        _ENGINE_MODE,
         batch_size,
         timeout_sec,
         max(1, max_concurrency),
     )
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[Any] | Exception]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
         async with sem:
             try:
-                result = await asyncio.wait_for(_engine_get_many(chunk_syms), timeout=timeout_sec)
+                # V2 Engine returns List[UnifiedQuote]
+                result = await asyncio.wait_for(engine.get_enriched_quotes(chunk_syms), timeout=timeout_sec)
                 return chunk_syms, result
             except Exception as e:
                 return chunk_syms, e
 
     results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
 
-    out: Dict[str, Any] = {}
+    out: Dict[str, UnifiedQuote] = {}
+    
     for chunk_syms, res in results:
+        # Handle failures
         if isinstance(res, Exception):
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
             logger.warning("%s for chunk(size=%d): %s", msg, len(chunk_syms), chunk_syms)
@@ -358,66 +204,80 @@ async def _get_unified_quotes_chunked(
                 out[s] = _make_missing_unified(s, msg)
             continue
 
-        # Build a symbol->quote map from returned payload
-        by_sym: Dict[str, Any] = {}
-        for q in (res or []):
-            try:
-                sym = getattr(q, "symbol", None) if not isinstance(q, dict) else q.get("symbol")
-                sym = _normalize_symbol(str(sym or ""))
-                if sym:
-                    by_sym[sym] = q
-            except Exception:
-                continue
+        # Handle success
+        returned = list(res or [])
+        chunk_map = {q.symbol.upper(): q for q in returned}
 
         # Preserve order and ensure each input has an output
         for s in chunk_syms:
-            out[s] = by_sym.get(s) or _make_missing_unified(s, "No data returned from engine")
+            s_norm = s.upper()
+            if s_norm in chunk_map:
+                out[s] = chunk_map[s_norm]
+            else:
+                out[s] = _make_missing_unified(s, "No data returned from engine")
 
     return out
 
 
-def _to_enriched(uq: Any, fallback_symbol: str) -> Any:
+def _to_enriched(uq: UnifiedQuote, fallback_symbol: str) -> EnrichedQuote:
+    """
+    Convert UnifiedQuote -> EnrichedQuote AND apply Scoring Logic.
+    """
     sym = _normalize_symbol(fallback_symbol) or (fallback_symbol or "").strip().upper() or "UNKNOWN"
+    
     try:
-        return EnrichedQuote.from_unified(uq)
+        # 1. Convert to EnrichedQuote wrapper
+        eq = EnrichedQuote.from_unified(uq)
+        
+        # 2. Apply Scoring Engine (Calculates scores if missing, adds recommendation)
+        scored_eq = enrich_with_scores(eq)
+        
+        return scored_eq
+        
     except Exception as exc:
         logger.exception("UnifiedQuote -> EnrichedQuote conversion failed for %s", sym, exc_info=exc)
-        try:
-            return EnrichedQuote(symbol=sym, data_quality="MISSING", error=f"Conversion error: {exc}")
-        except Exception:
-            return EnrichedQuote.from_unified({"symbol": sym, "data_quality": "MISSING", "error": f"Conversion error: {exc}"})
+        # Return safe error object
+        return EnrichedQuote(symbol=sym, data_quality="MISSING", error=f"Conversion error: {exc}")
 
 
 async def _build_sheet_rows(
     symbols: List[str],
     sheet_name: Optional[str],
 ) -> Tuple[List[str], List[List[Any]]]:
-    headers = _get_headers_for_sheet(sheet_name)
-    if not headers:
-        headers = _fallback_headers()
-
+    """
+    Fetch data and map to 59-column template for Google Sheets.
+    """
+    # 1. Get correct headers (universal template)
+    headers = get_headers_for_sheet(sheet_name or "Global_Markets")
+    
     clean = _clean_tickers(symbols)
     if not clean:
         return headers, []
 
+    # 2. Fetch data (UnifiedQuotes)
     unified_map = await _get_unified_quotes_chunked(clean)
+    
     rows: List[List[Any]] = []
 
     for s in clean:
         uq = unified_map.get(s) or _make_missing_unified(s, "No data returned from engine")
+        
+        # 3. Convert & Score
         enriched = _to_enriched(uq, s)
 
+        # 4. Map to Sheet Row using headers
         try:
-            row = enriched.to_row(headers)  # type: ignore[attr-defined]
-            if not isinstance(row, list):
-                raise ValueError("to_row did not return a list")
-            # Ensure row length matches headers
+            row = enriched.to_row(headers)
+            
+            # Defensive padding
             if len(row) < len(headers):
                 row = row + [None] * (len(headers) - len(row))
             elif len(row) > len(headers):
                 row = row[: len(headers)]
+                
         except Exception as exc:
             logger.exception("enriched.to_row failed for %s", s, exc_info=exc)
+            # Fallback row
             row = [getattr(enriched, "symbol", s)] + [None] * (len(headers) - 1)
 
         rows.append(row)
@@ -452,17 +312,12 @@ class SheetEnrichedResponse(BaseModel):
 
 @router.get("/health")
 async def enriched_health() -> Dict[str, Any]:
-    eng = _get_engine_singleton()
-    providers = getattr(eng, "enabled_providers", None) or getattr(eng, "providers", None)
-    primary = getattr(eng, "primary_provider", None) or getattr(eng, "primary", None)
     return {
         "status": "ok",
         "module": "enriched_quote",
         "version": API_VERSION,
-        "engine_mode": _ENGINE_MODE,
-        "engine_is_stub": _ENGINE_IS_STUB,
-        "engine_providers": providers,
-        "engine_primary": primary,
+        "engine_mode": "v2",
+        "engine_is_stub": False,
         "batch_size": DEFAULT_BATCH_SIZE,
         "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
         "max_tickers": DEFAULT_MAX_TICKERS,
@@ -474,9 +329,7 @@ async def enriched_health() -> Dict[str, Any]:
 async def get_headers(
     sheet_name: Optional[str] = Query(default=None, description="Sheet name, e.g. 'Global_Markets'"),
 ) -> Dict[str, Any]:
-    headers = _get_headers_for_sheet(sheet_name)
-    if not headers:
-        headers = _fallback_headers()
+    headers = get_headers_for_sheet(sheet_name)
     return {
         "sheet_name": sheet_name,
         "count": len(headers),
@@ -494,12 +347,12 @@ async def get_enriched_quote_route(
         raise HTTPException(status_code=400, detail="Symbol is required")
 
     try:
-        uq = await _engine_get_one(ticker)
+        engine = _get_engine_singleton()
+        uq = await engine.get_enriched_quote(ticker)
+        return _to_enriched(uq, ticker)
     except Exception as exc:
         logger.exception("engine.get_enriched_quote failed for %s", ticker, exc_info=exc)
         return _to_enriched(_make_missing_unified(ticker, f"Engine error: {exc}"), ticker)
-
-    return _to_enriched(uq, ticker)
 
 
 @router.post("/quotes", response_model=BatchEnrichedResponse, response_model_exclude_none=True)
@@ -540,4 +393,4 @@ async def get_enriched_sheet_rows(body: BatchEnrichedRequest) -> SheetEnrichedRe
     return SheetEnrichedResponse(headers=headers, rows=rows)
 
 
-__all__ = ["router", "EnrichedQuoteResponse"]
+__all__ = ["router"]
