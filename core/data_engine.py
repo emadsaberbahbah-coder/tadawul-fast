@@ -1,7 +1,7 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY WRAPPER AROUND DATAENGINE v2 – v3.0
+LEGACY WRAPPER AROUND DATAENGINE v2 – v3.2.0
 
 PURPOSE
 - Provide a *backwards-compatible* module-level API for the original
@@ -20,6 +20,7 @@ MAIN BEHAVIOR
       • DataEngine (here) is an alias of the v2 DataEngine.
       • get_enriched_quote(s) simply forward to the v2 engine instance.
       • UnifiedQuote is re-exported from v2.
+      • QuoteSource is polyfilled if missing in v2 to satisfy legacy imports.
 - If v2 cannot be imported:
       • Falls back to a very small stub engine that always returns
         MISSING UnifiedQuote objects (no crashes, but clearly marked).
@@ -27,7 +28,7 @@ MAIN BEHAVIOR
 
 NOTES
 - EODHD is NEVER called for KSA (.SR) tickers – that logic lives in
-  `core.data_engine_v2` and its provider set.
+  `core.data_engine_v2`.
 """
 
 from __future__ import annotations
@@ -37,13 +38,33 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-# Try to pull config from env.py, else use os
-try:
-    import env
-except ImportError:
-    env = None
-
 logger = logging.getLogger("core.data_engine")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+# ---------------------------------------------------------------------------
+# Polyfill for QuoteSource (Legacy Compatibility)
+# ---------------------------------------------------------------------------
+try:
+    from pydantic import BaseModel, Field
+except ImportError:
+    class BaseModel: # type: ignore
+        def __init__(self, **kwargs): self.__dict__.update(kwargs)
+    def Field(default=None, **kwargs): return default
+
+class QuoteSource(BaseModel):
+    """
+    Legacy provider metadata model.
+    Re-defined here to ensure 'from core.data_engine import QuoteSource' works
+    even if v2 dropped it.
+    """
+    provider: str
+    latency_ms: Optional[float] = None
+    timestamp_utc: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
 
 # ---------------------------------------------------------------------------
 # Try to import the "real" v2 engine + models
@@ -52,10 +73,6 @@ logger = logging.getLogger("core.data_engine")
 _ENGINE_MODE: str = "stub"
 _ENGINE_IS_STUB: bool = True
 
-# We define placeholders first so they exist in module scope if import fails
-class StubUnifiedQuote:
-    pass
-
 try:
     # Primary, modern engine
     from core.data_engine_v2 import (  # type: ignore
@@ -63,12 +80,16 @@ try:
         UnifiedQuote,
     )
 
+    # Check if UnifiedQuote has 'sources' field compatibility
+    # V2 UnifiedQuote might not have 'sources' defined as List[QuoteSource]
+    # We accept this; legacy code usually checks dicts or attributes loosely.
+
     _ENGINE_MODE = "v2"
     _ENGINE_IS_STUB = False
     logger.info("core.data_engine: Delegating to core.data_engine_v2.DataEngine.")
 
 except Exception as exc:  # pragma: no cover - defensive fallback
-    logger.exception(
+    logger.warning(
         "core.data_engine: Failed to import core.data_engine_v2. "
         "Falling back to stub engine. Error: %s",
         exc,
@@ -79,61 +100,50 @@ except Exception as exc:  # pragma: no cover - defensive fallback
     # -----------------------------------------------------------------------
     # Minimal local models for stub mode
     # -----------------------------------------------------------------------
-    try:
-        from pydantic import BaseModel, Field
-    except ImportError:
-        class BaseModel: # type: ignore
-            def __init__(self, **kwargs):
-                self.__dict__.update(kwargs)
-            def dict(self, **kwargs): return self.__dict__
-        def Field(default=None, **kwargs): return default
-
-    class UnifiedQuote(BaseModel):  # type: ignore
+    class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
         """
         Minimal UnifiedQuote placeholder used in stub mode.
         """
         symbol: str
         price: Optional[float] = None
+        current_price: Optional[float] = None # V2 alias
         data_quality: str = "MISSING"
         last_updated_utc: Optional[datetime] = None
         market: Optional[str] = None
         market_region: Optional[str] = None
         currency: Optional[str] = None
         error: Optional[str] = None
-        # Minimal fields to prevent attribute errors in legacy code
+        sources: List[QuoteSource] = Field(default_factory=list)
+        
+        # Compatibility fields
         change: Optional[float] = None
-        change_pct: Optional[float] = None
+        percent_change: Optional[float] = None
         volume: Optional[float] = None
+
+        def finalize(self): return self
 
     class _V2DataEngine:  # type: ignore[no-redef]
         """
         Stub engine implementation used ONLY when core.data_engine_v2
-        is not available. It never raises, but always returns MISSING data.
+        is not available.
         """
-
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            logger.error(
-                "core.data_engine: Using stub DataEngine – core.data_engine_v2 "
-                "is not available. All quotes will be MISSING."
-            )
+            logger.error("core.data_engine: Using stub DataEngine.")
 
         async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
             sym = (symbol or "").strip().upper()
             now = datetime.now(timezone.utc)
             return UnifiedQuote(
                 symbol=sym or "",
-                price=None,
+                current_price=None,
                 data_quality="MISSING",
                 last_updated_utc=now,
-                market=None,
-                market_region=None,
-                currency=None,
                 error="Unified engine v2 unavailable (stub mode).",
+                sources=[QuoteSource(provider="stub", timestamp_utc=now)]
             )
 
         async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
-            if not symbols:
-                return []
+            if not symbols: return []
             return [await self.get_enriched_quote(s) for s in symbols]
 
 
@@ -141,21 +151,27 @@ except Exception as exc:  # pragma: no cover - defensive fallback
 # Engine instance & compatibility alias
 # ---------------------------------------------------------------------------
 
-# Shared engine instance used by module-level helpers below
-# We initialize it once. In a real app, this might be handled by dependency injection,
-# but for the legacy module wrapper, a singleton is standard.
-try:
-    _engine = _V2DataEngine()
-except Exception as e:
-    logger.error(f"Failed to initialize DataEngine: {e}")
-    # Fallback to a dumb stub if even init fails
-    class CrashStub:
-        async def get_enriched_quote(self, s): return UnifiedQuote(symbol=s, error="Engine Crash")
-        async def get_enriched_quotes(self, s): return [await self.get_enriched_quote(x) for x in s]
-    _engine = CrashStub()
-
-# For backwards compatibility, expose DataEngine as the engine class type.
+# Expose DataEngine as the class type
 DataEngine = _V2DataEngine  # type: ignore[assignment]
+
+# Shared singleton instance
+_engine_instance = None
+
+def _get_engine():
+    global _engine_instance
+    if _engine_instance is None:
+        try:
+            _engine_instance = _V2DataEngine()
+        except Exception as e:
+            logger.error(f"Failed to initialize DataEngine: {e}")
+            # Crash-proof stub
+            class CrashStub:
+                async def get_enriched_quote(self, s): 
+                    return UnifiedQuote(symbol=s, error=f"Engine Init Failed: {e}")
+                async def get_enriched_quotes(self, s): 
+                    return [await self.get_enriched_quote(x) for x in s]
+            _engine_instance = CrashStub()
+    return _engine_instance
 
 # ---------------------------------------------------------------------------
 # Module-level convenience functions (v1-style API)
@@ -165,19 +181,16 @@ async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     """
     Backwards-compatible convenience wrapper:
         from core.data_engine import get_enriched_quote
-    Delegates to the shared DataEngine instance (_engine).
     """
+    eng = _get_engine()
     try:
-        return await _engine.get_enriched_quote(symbol)  # type: ignore[attr-defined]
-    except Exception as exc:  # pragma: no cover - extremely defensive
+        return await eng.get_enriched_quote(symbol)  # type: ignore[attr-defined]
+    except Exception as exc:
         logger.exception("core.data_engine: Error in get_enriched_quote(%s)", symbol)
-        now = datetime.now(timezone.utc)
         return UnifiedQuote(
             symbol=(symbol or "").strip().upper(),
-            price=None,
             data_quality="ERROR",
-            last_updated_utc=now,
-            error=f"Unhandled error in get_enriched_quote: {exc}",
+            error=f"Unhandled error: {exc}",
         )
 
 
@@ -185,73 +198,44 @@ async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
     """
     Backwards-compatible batch wrapper:
         from core.data_engine import get_enriched_quotes
-    Delegates to the shared DataEngine instance (_engine).
     """
     clean: List[str] = [s.strip() for s in (symbols or []) if s and s.strip()]
     if not clean:
         return []
 
+    eng = _get_engine()
     try:
-        results = await _engine.get_enriched_quotes(clean)  # type: ignore[attr-defined]
-    except Exception as exc:  # pragma: no cover - extremely defensive
-        logger.exception(
-            "core.data_engine: Error in get_enriched_quotes(%s)", clean
-        )
-        now = datetime.now(timezone.utc)
-        # Return one error quote per requested symbol
+        results = await eng.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.exception("core.data_engine: Error in get_enriched_quotes batch")
         return [
             UnifiedQuote(
                 symbol=sym.upper(),
-                price=None,
                 data_quality="ERROR",
-                last_updated_utc=now,
-                error=f"Unhandled error in get_enriched_quotes: {exc}",
+                error=f"Unhandled error: {exc}",
             )
             for sym in clean
         ]
 
-    # Be defensive: enforce type + symbol mapping
-    out: List[UnifiedQuote] = []
-    now = datetime.now(timezone.utc)
-    
-    # If engine returns fewer results than requested (it shouldn't), handle gracefully
-    # We attempt to match order if possible, but v2 usually returns mapped list.
-    
-    for q in results:
-        if isinstance(q, UnifiedQuote):
-            out.append(q)
-        else:
-            # Unexpected type from underlying engine; wrap as error quote
-            # Likely a dict if using an old v1 StubEngine
-            sym = "UNKNOWN"
-            if isinstance(q, dict):
-                sym = q.get("symbol", "UNKNOWN")
-            
-            out.append(
-                UnifiedQuote(
-                    symbol=str(sym),
-                    price=None,
-                    data_quality="ERROR",
-                    last_updated_utc=now,
-                    error=f"Engine returned non-UnifiedQuote instance: {type(q)!r}",
-                )
-            )
-    return out
+    # Ensure list
+    if not isinstance(results, list):
+        return [
+            UnifiedQuote(symbol=s, data_quality="ERROR", error="Engine return type mismatch") 
+            for s in clean
+        ]
+
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Introspection helpers (optional, used by diagnostics)
+# Introspection helpers
 # ---------------------------------------------------------------------------
 
 def get_engine_meta() -> Dict[str, Any]:
-    """
-    Light introspection about the underlying engine.
-    Useful for /v1/status or debugging endpoints.
-    """
+    eng = _get_engine()
     enabled_providers: Optional[List[str]] = None
-
     try:
-        enabled_providers = list(getattr(_engine, "enabled_providers", []))  # type: ignore[attr-defined]
+        enabled_providers = list(getattr(eng, "enabled_providers", []))  # type: ignore
     except Exception:
         enabled_providers = None
 
@@ -264,6 +248,7 @@ def get_engine_meta() -> Dict[str, Any]:
 
 __all__ = [
     "UnifiedQuote",
+    "QuoteSource",
     "DataEngine",
     "get_enriched_quote",
     "get_enriched_quotes",
