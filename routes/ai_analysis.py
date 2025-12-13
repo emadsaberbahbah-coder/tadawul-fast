@@ -1,16 +1,10 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.7.0)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.8.0)
 
 Preferred backend:
   - core.data_engine_v2.DataEngine (class-based unified engine)
-
-Fallback backend:
-  - core.data_engine (module-level async functions)
-
-Last-resort:
-  - In-process stub engine that returns MISSING placeholders (never crashes Sheets)
 
 Provides:
   - GET  /v1/analysis/health  (alias: /ping)
@@ -22,160 +16,47 @@ Design goals:
   - KSA-safe: router never calls providers directly.
   - Extremely defensive: bounded batch size, chunking, timeout, concurrency.
   - Never throws 502 for Sheets endpoints; returns headers + rows (maybe empty).
+  - ALIGNMENT: Uses core.scoring_engine to ensure scores match Advanced Analysis.
 
-v2.7.0 Improvements:
-  - Accept optional sheet_name; ignore unknown body fields (prevents 422).
-  - Preserve input order (map results by symbol, not by zip order).
-  - Always pad rows to header length for Sheets safety.
+Author: Emad Bahbah (with GPT-5.2 Thinking)
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import os
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+# --- CORE INTEGRATION ---
+from core.data_engine_v2 import DataEngine, UnifiedQuote
+from core.enriched_quote import EnrichedQuote
+from core.scoring_engine import enrich_with_scores
+
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "2.7.0"
-
-# ----------------------------------------------------------------------
-# Optional env.py integration (safe)
-# ----------------------------------------------------------------------
-try:  # pragma: no cover
-    import env as _env  # type: ignore
-except Exception:
-    _env = None  # type: ignore
+AI_ANALYSIS_VERSION = "2.8.0"
 
 # ----------------------------------------------------------------------
 # Runtime limits (env overrides)
 # ----------------------------------------------------------------------
-DEFAULT_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "50"))
-DEFAULT_BATCH_TIMEOUT = float(os.getenv("AI_BATCH_TIMEOUT_SEC", "30"))
-DEFAULT_CONCURRENCY = int(os.getenv("AI_BATCH_CONCURRENCY", "3"))
+DEFAULT_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "20"))
+DEFAULT_BATCH_TIMEOUT = float(os.getenv("AI_BATCH_TIMEOUT_SEC", "45"))
+DEFAULT_CONCURRENCY = int(os.getenv("AI_BATCH_CONCURRENCY", "5"))
 DEFAULT_MAX_TICKERS = int(os.getenv("AI_MAX_TICKERS", "500"))
 
 # ----------------------------------------------------------------------
-# ENGINE DETECTION & FALLBACKS
+# ENGINE SINGLETON
 # ----------------------------------------------------------------------
-_ENGINE_MODE: str = "stub"  # "v2" | "v1_module" | "stub"
-_ENGINE_IS_STUB: bool = True
-
-try:
-    from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
-
-    def _build_v2_kwargs() -> Dict[str, Any]:
-        if _env is None:
-            return {}
-
-        candidates: Dict[str, Any] = {}
-
-        if hasattr(_env, "ENGINE_CACHE_TTL_SECONDS"):
-            candidates["cache_ttl"] = getattr(_env, "ENGINE_CACHE_TTL_SECONDS")
-        if hasattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS"):
-            candidates["provider_timeout"] = getattr(_env, "ENGINE_PROVIDER_TIMEOUT_SECONDS")
-        elif hasattr(_env, "HTTP_TIMEOUT"):
-            candidates["provider_timeout"] = getattr(_env, "HTTP_TIMEOUT")
-        if hasattr(_env, "ENABLED_PROVIDERS"):
-            candidates["enabled_providers"] = getattr(_env, "ENABLED_PROVIDERS")
-        if hasattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS"):
-            candidates["enable_advanced_analysis"] = getattr(_env, "ENGINE_ENABLE_ADVANCED_ANALYSIS")
-
-        try:
-            sig = inspect.signature(_V2DataEngine.__init__)
-            allowed = set(sig.parameters.keys())
-            allowed.discard("self")
-            return {k: v for k, v in candidates.items() if k in allowed and v is not None}
-        except Exception:
-            return {}
-
-    @lru_cache(maxsize=1)
-    def _get_engine_singleton() -> Any:
-        kwargs = _build_v2_kwargs()
-        try:
-            return _V2DataEngine(**kwargs) if kwargs else _V2DataEngine()
-        except TypeError:
-            return _V2DataEngine()
-
-    _ENGINE_MODE = "v2"
-    _ENGINE_IS_STUB = False
-    logger.info("routes.ai_analysis: using DataEngine v2 (singleton)")
-
-except Exception as exc_v2:  # pragma: no cover
-    logger.exception("routes.ai_analysis: failed to import DataEngine v2: %s", exc_v2)
-
-    try:
-        from core import data_engine as _data_engine_module  # type: ignore
-
-        @lru_cache(maxsize=1)
-        def _get_engine_singleton() -> Any:
-            return _data_engine_module
-
-        _ENGINE_MODE = "v1_module"
-        _ENGINE_IS_STUB = False
-        logger.warning("routes.ai_analysis: falling back to core.data_engine module-level API")
-
-    except Exception as exc_v1:  # pragma: no cover
-        logger.exception("routes.ai_analysis: failed to import v1 fallback: %s", exc_v1)
-
-        class _StubEngine:
-            async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
-                sym = (symbol or "").strip().upper() or "UNKNOWN"
-                return {
-                    "symbol": sym,
-                    "name": None,
-                    "market_region": "UNKNOWN",
-                    "market": None,
-                    "currency": None,
-                    "price": None,
-                    "last_price": None,
-                    "change_pct": None,
-                    "change_percent": None,
-                    "market_cap": None,
-                    "pe_ttm": None,
-                    "pe_ratio": None,
-                    "pb": None,
-                    "pb_ratio": None,
-                    "dividend_yield": None,
-                    "dividend_yield_percent": None,
-                    "roe": None,
-                    "roe_percent": None,
-                    "roa": None,
-                    "data_quality": "MISSING",
-                    "value_score": None,
-                    "quality_score": None,
-                    "momentum_score": None,
-                    "opportunity_score": None,
-                    "overall_score": None,
-                    "recommendation": "MISSING",
-                    "fair_value": None,
-                    "upside_percent": None,
-                    "valuation_label": None,
-                    "as_of_utc": None,
-                    "last_updated_utc": None,
-                    "sources": [],
-                    "notes": None,
-                    "error": "STUB_ENGINE: core.data_engine_v2/core.data_engine unavailable.",
-                }
-
-            async def get_enriched_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
-                return [await self.get_enriched_quote(s) for s in (symbols or [])]
-
-        @lru_cache(maxsize=1)
-        def _get_engine_singleton() -> Any:
-            return _StubEngine()
-
-        _ENGINE_MODE = "stub"
-        _ENGINE_IS_STUB = True
-        logger.error("routes.ai_analysis: using STUB engine (MISSING placeholders).")
-
+@lru_cache(maxsize=1)
+def _get_engine_singleton() -> DataEngine:
+    logger.info("routes.ai_analysis: initializing DataEngine v2 singleton")
+    return DataEngine()
 
 # ----------------------------------------------------------------------
 # ROUTER
@@ -202,9 +83,9 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
 
-    dividend_yield: Optional[float] = None  # fraction 0–1
-    roe: Optional[float] = None             # fraction 0–1
-    roa: Optional[float] = None             # fraction 0–1
+    dividend_yield: Optional[float] = None  # fraction 0–1 or percent, normalized later
+    roe: Optional[float] = None             # fraction 0–1 or percent
+    roa: Optional[float] = None             # fraction 0–1 or percent
 
     data_quality: str = "MISSING"
 
@@ -219,7 +100,7 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     upside_percent: Optional[float] = None
     valuation_label: Optional[str] = None
 
-    last_updated_utc: Optional[datetime] = None
+    last_updated_utc: Optional[str] = None
     sources: List[str] = Field(default_factory=list)
 
     notes: Optional[str] = None
@@ -243,44 +124,8 @@ class SheetAnalysisResponse(_ExtraIgnoreBase):
 # ----------------------------------------------------------------------
 # INTERNAL HELPERS
 # ----------------------------------------------------------------------
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def _clamp_0_100(x: Any) -> Optional[float]:
-    v = _safe_float(x)
-    if v is None:
-        return None
-    return max(0.0, min(100.0, v))
-
-def _normalize_percent_like_to_fraction(x: Any) -> Optional[float]:
-    v = _safe_float(x)
-    if v is None:
-        return None
-    if 0.0 <= v <= 1.0:
-        return v
-    if 1.0 < v <= 100.0:
-        return v / 100.0
-    return v
-
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        return obj
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump()  # type: ignore
-        except Exception:
-            pass
-    return getattr(obj, "__dict__", {}) or {}
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def _clean_tickers(items: Sequence[str]) -> List[str]:
     raw = [(x or "").strip() for x in (items or [])]
@@ -300,324 +145,110 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
 
-def _valuation_label_from_upside(upside_percent: Optional[float]) -> Optional[str]:
-    if upside_percent is None:
-        return None
-    if upside_percent >= 25:
-        return "UNDERVALUED"
-    if upside_percent <= -15:
-        return "OVERVALUED"
-    return "FAIR"
-
-def _compute_scores_fallback(data: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    dq = str(data.get("data_quality") or "").upper()
-    if dq in {"MISSING", "UNKNOWN", ""}:
-        return {"value_score": None, "quality_score": None, "momentum_score": None}
-
-    pe = _safe_float(data.get("pe_ttm") or data.get("pe_ratio") or data.get("pe"))
-    pb = _safe_float(data.get("pb") or data.get("pb_ratio"))
-    dy = _normalize_percent_like_to_fraction(data.get("dividend_yield") or data.get("dividend_yield_percent"))
-    roe = _normalize_percent_like_to_fraction(data.get("roe") or data.get("roe_percent"))
-    change_pct = _safe_float(data.get("change_pct") or data.get("change_percent"))
-
-    v = 50.0
-    if pe is not None:
-        if 0 < pe < 12:
-            v += 20
-        elif 12 <= pe <= 20:
-            v += 10
-        elif pe > 35:
-            v -= 15
-    if pb is not None:
-        if 0 < pb < 1:
-            v += 10
-        elif pb > 4:
-            v -= 10
-    if dy is not None:
-        if 0.02 <= dy <= 0.06:
-            v += 10
-        elif dy > 0.08:
-            v -= 5
-    value_score = max(0.0, min(100.0, v))
-
-    q = 50.0
-    if roe is not None:
-        if roe >= 0.20:
-            q += 25
-        elif 0.10 <= roe < 0.20:
-            q += 10
-        elif roe < 0:
-            q -= 15
-    quality_score = max(0.0, min(100.0, q))
-
-    m = 50.0
-    if change_pct is not None:
-        if change_pct > 0:
-            m += min(change_pct, 10) * 2
-        elif change_pct < 0:
-            m += max(change_pct, -10) * 2
-    momentum_score = max(0.0, min(100.0, m))
-
-    return {
-        "value_score": round(value_score, 2),
-        "quality_score": round(quality_score, 2),
-        "momentum_score": round(momentum_score, 2),
-    }
-
-def _compute_opportunity_score(data: Dict[str, Any], scores: Dict[str, Optional[float]]) -> Optional[float]:
-    existing = _clamp_0_100(data.get("opportunity_score"))
-    if existing is not None:
-        return existing
-    v = scores.get("value_score")
-    q = scores.get("quality_score")
-    m = scores.get("momentum_score")
-    if isinstance(v, (int, float)) and isinstance(q, (int, float)) and isinstance(m, (int, float)):
-        return round(v * 0.4 + q * 0.3 + m * 0.3, 2)
-    return None
-
-def _compute_overall_and_reco(
-    opportunity: Optional[float],
-    value: Optional[float],
-    quality: Optional[float],
-    momentum: Optional[float],
-    existing_overall: Optional[float] = None,
-    existing_reco: Optional[str] = None,
-) -> Tuple[Optional[float], Optional[str]]:
-    if existing_overall is not None:
-        overall = max(0.0, min(100.0, existing_overall))
-    else:
-        parts = [x for x in (opportunity, value, quality, momentum) if isinstance(x, (int, float))]
-        overall = round(sum(parts) / len(parts), 2) if parts else None
-
-    if existing_reco:
-        return overall, str(existing_reco)
-
-    if overall is None:
-        return None, None
-
-    if overall >= 80:
-        return overall, "STRONG_BUY"
-    if overall >= 65:
-        return overall, "BUY"
-    if overall >= 45:
-        return overall, "HOLD"
-    if overall >= 30:
-        return overall, "REDUCE"
-    return overall, "SELL"
-
-def _parse_dt(x: Any) -> Optional[datetime]:
-    if x is None:
-        return None
-    if isinstance(x, datetime):
-        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
-    try:
-        dt = datetime.fromisoformat(str(x))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-def _extract_sources(raw_sources: Any) -> List[str]:
-    if not raw_sources:
-        return []
-    out: List[str] = []
-    try:
-        for s in raw_sources:
-            if isinstance(s, str):
-                out.append(s)
-            elif isinstance(s, dict) and "provider" in s:
-                out.append(str(s["provider"]))
-            elif hasattr(s, "provider"):
-                out.append(str(getattr(s, "provider")))
-            else:
-                out.append(str(s))
-    except Exception:
-        return []
-    seen = set()
-    cleaned: List[str] = []
-    for x in out:
-        if x in seen:
-            continue
-        seen.add(x)
-        cleaned.append(x)
-    return cleaned
-
+def _extract_sources(q: EnrichedQuote) -> List[str]:
+    # EnrichedQuote inherits sources from UnifiedQuote
+    if not q.sources:
+        return [q.data_source] if q.data_source else []
+    return [s.provider for s in q.sources]
 
 # ----------------------------------------------------------------------
 # ENGINE CALLS
 # ----------------------------------------------------------------------
-async def _engine_get_many(symbols: List[str]) -> List[Any]:
-    eng = _get_engine_singleton()
-
-    # object method
-    if hasattr(eng, "get_enriched_quotes"):
-        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
-
-    # v1 module fallback: function or coroutine attribute
-    if hasattr(eng, "get_enriched_quotes"):
-        fn = getattr(eng, "get_enriched_quotes")
-        return await fn(symbols)
-
-    # per ticker fallback
-    out: List[Any] = []
-    for s in symbols:
-        if hasattr(eng, "get_enriched_quote"):
-            out.append(await eng.get_enriched_quote(s))  # type: ignore[attr-defined]
-        else:
-            out.append({"symbol": s.upper(), "data_quality": "MISSING", "error": "Engine missing methods"})
-    return out
-
 async def _get_quotes_chunked(
     symbols: List[str],
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
     max_concurrency: int = DEFAULT_CONCURRENCY,
-) -> Dict[str, Any]:
+) -> Dict[str, UnifiedQuote]:
+    """
+    Returns map keyed by normalized input symbol.
+    """
     clean = _clean_tickers(symbols)
     if not clean:
         return {}
 
+    engine = _get_engine_singleton()
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Any]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
         async with sem:
             try:
-                res = await asyncio.wait_for(_engine_get_many(chunk_syms), timeout=timeout_sec)
+                res = await asyncio.wait_for(engine.get_enriched_quotes(chunk_syms), timeout=timeout_sec)
                 return chunk_syms, res
             except Exception as e:
                 return chunk_syms, e
 
     results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
 
-    out: Dict[str, Any] = {}
+    out: Dict[str, UnifiedQuote] = {}
     for chunk_syms, res in results:
         if isinstance(res, Exception):
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
             logger.warning("ai_analysis: %s for chunk(size=%d): %s", msg, len(chunk_syms), chunk_syms)
             for s in chunk_syms:
-                out[s] = {"symbol": s, "data_quality": "MISSING", "error": msg}
+                out[s] = UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error=msg).finalize()
             continue
 
         returned = list(res or [])
+        chunk_map = {q.symbol.upper(): q for q in returned}
 
-        # map by returned symbol (order-independent)
-        by_symbol: Dict[str, Any] = {}
-        for q in returned:
-            d = _model_to_dict(q)
-            sym = (d.get("symbol") or d.get("ticker") or "").strip().upper()
-            if sym:
-                by_symbol[sym] = q
-
-        # for each requested symbol, pick by_symbol, else fallback to positional if safe
-        for idx, s in enumerate(chunk_syms):
-            picked = by_symbol.get(s.upper())
-            if picked is None and idx < len(returned):
-                picked = returned[idx]
-            if picked is None:
-                picked = {"symbol": s, "data_quality": "MISSING", "error": "No data returned"}
-            out[s] = picked
+        for s in chunk_syms:
+            s_norm = s.upper()
+            if s_norm in chunk_map:
+                out[s] = chunk_map[s_norm]
+            else:
+                out[s] = UnifiedQuote(symbol=s_norm, data_quality="MISSING", error="No data returned").finalize()
 
     return out
 
 
 # ----------------------------------------------------------------------
-# TRANSFORM: quote -> SingleAnalysisResponse
+# TRANSFORM: UnifiedQuote -> SingleAnalysisResponse
 # ----------------------------------------------------------------------
-def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
-    symbol_in = (raw_symbol or "").strip().upper()
-    data = _model_to_dict(quote)
+def _quote_to_analysis(raw_symbol: str, uq: UnifiedQuote) -> SingleAnalysisResponse:
+    # 1. Convert to EnrichedQuote
+    eq = EnrichedQuote.from_unified(uq)
+    
+    # 2. Enrich with Scores (consistent logic with Scoring Engine)
+    # This ensures calculated scores are populated even if engine returned raw data
+    scored_eq = enrich_with_scores(eq)
 
-    symbol = str(data.get("symbol") or data.get("ticker") or symbol_in or "").upper() or (symbol_in or "UNKNOWN")
-    dq = str(data.get("data_quality") or "MISSING")
-    name = data.get("name") or data.get("company_name")
-    market_region = data.get("market_region") or data.get("market") or data.get("exchange")
-
-    price = _safe_float(data.get("price") or data.get("last_price") or data.get("close") or data.get("last"))
-    change_pct = _safe_float(data.get("change_pct") or data.get("change_percent") or data.get("changePercent"))
-    market_cap = _safe_float(data.get("market_cap") or data.get("marketCap"))
-    pe_ttm = _safe_float(data.get("pe_ttm") or data.get("pe_ratio") or data.get("pe"))
-    pb = _safe_float(data.get("pb") or data.get("pb_ratio") or data.get("priceToBook"))
-
-    dividend_yield = _normalize_percent_like_to_fraction(
-        data.get("dividend_yield") or data.get("dividend_yield_percent") or data.get("dividendYield")
-    )
-    roe = _normalize_percent_like_to_fraction(
-        data.get("roe") or data.get("roe_percent") or data.get("returnOnEquity")
-    )
-    roa = _normalize_percent_like_to_fraction(
-        data.get("roa") or data.get("roa_percent") or data.get("returnOnAssets")
-    )
-
-    value_score = _clamp_0_100(data.get("value_score"))
-    quality_score = _clamp_0_100(data.get("quality_score"))
-    momentum_score = _clamp_0_100(data.get("momentum_score"))
-
-    if value_score is None or quality_score is None or momentum_score is None:
-        fb = _compute_scores_fallback(data)
-        value_score = value_score if value_score is not None else fb["value_score"]
-        quality_score = quality_score if quality_score is not None else fb["quality_score"]
-        momentum_score = momentum_score if momentum_score is not None else fb["momentum_score"]
-
-    opportunity_score = _compute_opportunity_score(
-        data, {"value_score": value_score, "quality_score": quality_score, "momentum_score": momentum_score}
-    )
-
-    existing_overall = _clamp_0_100(data.get("overall_score"))
-    existing_reco = data.get("recommendation") or data.get("recommendation_label") or data.get("rating")
-    overall_score, recommendation = _compute_overall_and_reco(
-        opportunity=opportunity_score,
-        value=value_score,
-        quality=quality_score,
-        momentum=momentum_score,
-        existing_overall=existing_overall,
-        existing_reco=str(existing_reco) if existing_reco is not None else None,
-    )
-
-    fair_value = _safe_float(data.get("fair_value") or data.get("target_price") or data.get("intrinsic_value"))
-    upside_percent = _safe_float(data.get("upside_percent") or data.get("upside") or data.get("upside_pct"))
-    if upside_percent is None and fair_value is not None and price is not None and price != 0:
-        try:
-            upside_percent = round((fair_value - price) / price * 100.0, 2)
-        except Exception:
-            upside_percent = None
-
-    valuation_label = data.get("valuation_label") or _valuation_label_from_upside(upside_percent)
-
-    last_updated_utc = _parse_dt(data.get("last_updated_utc") or data.get("as_of_utc") or data.get("timestamp_utc"))
-    sources = _extract_sources(data.get("sources") or data.get("providers") or [])
-
-    notes = data.get("notes")
-    error = data.get("error")
-    if str(dq).upper() == "MISSING" and not error:
-        error = "No data available from providers"
-
+    # 3. Map to Response
     return SingleAnalysisResponse(
-        symbol=symbol,
-        name=name,
-        market_region=market_region,
-        price=price,
-        change_pct=change_pct,
-        market_cap=market_cap,
-        pe_ttm=pe_ttm,
-        pb=pb,
-        dividend_yield=dividend_yield,
-        roe=roe,
-        roa=roa,
-        data_quality=str(dq),
-        value_score=value_score,
-        quality_score=quality_score,
-        momentum_score=momentum_score,
-        opportunity_score=opportunity_score,
-        overall_score=overall_score,
-        recommendation=recommendation,
-        fair_value=fair_value,
-        upside_percent=upside_percent,
-        valuation_label=valuation_label,
-        last_updated_utc=last_updated_utc,
-        sources=sources,
-        notes=notes,
-        error=error,
+        symbol=scored_eq.symbol or raw_symbol,
+        name=scored_eq.name,
+        market_region=scored_eq.market or scored_eq.market_region,
+        
+        price=scored_eq.current_price or scored_eq.last_price,
+        change_pct=scored_eq.percent_change or scored_eq.change_percent,
+        market_cap=scored_eq.market_cap,
+        pe_ttm=scored_eq.pe_ttm,
+        pb=scored_eq.pb,
+        
+        dividend_yield=scored_eq.dividend_yield,
+        roe=scored_eq.roe,
+        roa=scored_eq.roa,
+        
+        data_quality=scored_eq.data_quality,
+        
+        value_score=scored_eq.value_score,
+        quality_score=scored_eq.quality_score,
+        momentum_score=scored_eq.momentum_score,
+        opportunity_score=scored_eq.opportunity_score,
+        overall_score=scored_eq.overall_score,
+        recommendation=scored_eq.recommendation,
+        
+        fair_value=scored_eq.fair_value,
+        upside_percent=scored_eq.upside_percent,
+        valuation_label=scored_eq.valuation_label,
+        
+        last_updated_utc=scored_eq.last_updated_utc,
+        sources=_extract_sources(scored_eq),
+        
+        notes=None, # can add logic if UnifiedQuote has notes
+        error=scored_eq.error
     )
 
 
@@ -625,6 +256,7 @@ def _quote_to_analysis(raw_symbol: str, quote: Any) -> SingleAnalysisResponse:
 # SHEET HELPERS
 # ----------------------------------------------------------------------
 def _build_sheet_headers() -> List[str]:
+    # Fixed schema for "AI Analysis" tabs in Sheets
     return [
         "Symbol",
         "Company Name",
@@ -651,16 +283,6 @@ def _build_sheet_headers() -> List[str]:
         "Error",
     ]
 
-def _to_iso(dt: Optional[datetime]) -> Optional[str]:
-    if dt is None:
-        return None
-    try:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
-    except Exception:
-        return None
-
 def _pad_row(row: List[Any], length: int) -> List[Any]:
     if len(row) == length:
         return row
@@ -669,6 +291,17 @@ def _pad_row(row: List[Any], length: int) -> List[Any]:
     return row[:length]
 
 def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[Any]:
+    # Normalize percentages for display (assuming 0.05 -> 5.0 for sheet logic if needed, 
+    # but typically raw decimals are better for Sheets formatting. 
+    # However, legacy sheet expects raw numbers often. 
+    # Let's keep consistent with Scoring Engine inputs which are raw decimals usually)
+    
+    div_y = a.dividend_yield
+    if div_y and abs(div_y) <= 1.0: div_y = div_y * 100.0 # Convert 0.05 to 5.0 for display
+    
+    roe = a.roe
+    if roe and abs(roe) <= 1.0: roe = roe * 100.0
+
     row = [
         a.symbol,
         a.name or "",
@@ -678,8 +311,8 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[A
         a.market_cap,
         a.pe_ttm,
         a.pb,
-        (a.dividend_yield * 100.0) if a.dividend_yield is not None else None,
-        (a.roe * 100.0) if a.roe is not None else None,
+        div_y,
+        roe,
         a.data_quality,
         a.value_score,
         a.quality_score,
@@ -687,7 +320,7 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[A
         a.opportunity_score,
         a.overall_score,
         a.recommendation,
-        _to_iso(a.last_updated_utc),
+        a.last_updated_utc,
         ", ".join(a.sources) if a.sources else "",
         a.fair_value,
         a.upside_percent,
@@ -703,22 +336,16 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[A
 @router.get("/health")
 @router.get("/ping")
 async def analysis_health() -> Dict[str, Any]:
-    env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
-    app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
-
     return {
         "status": "ok",
         "module": "routes.ai_analysis",
         "version": AI_ANALYSIS_VERSION,
-        "engine_mode": _ENGINE_MODE,
-        "engine_is_stub": _ENGINE_IS_STUB,
-        "environment": env_name or "unknown",
-        "app_version": app_version or "unknown",
+        "engine_mode": "v2",
         "batch_size": DEFAULT_BATCH_SIZE,
         "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
         "batch_concurrency": DEFAULT_CONCURRENCY,
         "max_tickers": DEFAULT_MAX_TICKERS,
-        "timestamp_utc": _now_utc().isoformat(),
+        "timestamp_utc": _now_utc_iso(),
     }
 
 @router.get("/quote", response_model=SingleAnalysisResponse)
@@ -729,7 +356,7 @@ async def analyze_single_quote(symbol: str = Query(..., alias="symbol")) -> Sing
 
     try:
         m = await _get_quotes_chunked([t], batch_size=1)
-        q = m.get(t.upper()) or {"symbol": t.upper(), "data_quality": "MISSING", "error": "No data returned"}
+        q = m.get(t) or UnifiedQuote(symbol=t.upper(), data_quality="MISSING", error="No data returned").finalize()
         return _quote_to_analysis(t, q)
     except Exception as exc:
         logger.exception("ai_analysis: exception in /quote for %s", t)
@@ -754,7 +381,10 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
 
     results: List[SingleAnalysisResponse] = []
     for t in tickers:
-        q = m.get(t.upper()) or {"symbol": t, "data_quality": "MISSING", "error": "No data returned"}
+        q = m.get(t)
+        if not q:
+            q = UnifiedQuote(symbol=t.upper(), data_quality="MISSING", error="No data returned").finalize()
+        
         try:
             results.append(_quote_to_analysis(t, q))
         except Exception as exc:
@@ -765,6 +395,9 @@ async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisRespo
 
 @router.post("/sheet-rows", response_model=SheetAnalysisResponse)
 async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse:
+    """
+    Dedicated endpoint for AI Analysis sheet tab.
+    """
     headers = _build_sheet_headers()
     header_len = len(headers)
 
