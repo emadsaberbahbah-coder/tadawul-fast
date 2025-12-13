@@ -1,7 +1,7 @@
 """
 routes/advanced_analysis.py
 ================================================
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v2.5.0)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v2.6.0)
 
 Purpose
 -------
@@ -11,13 +11,13 @@ Purpose
 
 Endpoints
 ---------
-- GET  /v1/advanced/health        (alias: /ping)
+- GET  /v1/advanced/health         (alias: /ping)
 - GET  /v1/advanced/scoreboard?tickers=AAPL,MSFT,1120.SR&top_n=50
-- POST /v1/advanced/sheet-rows    (Sheets-friendly scoreboard)
+- POST /v1/advanced/sheet-rows     (Sheets-friendly scoreboard)
 
 Design notes
 ------------
-- Router NEVER calls providers directly. It only talks to the engine.
+- Router NEVER calls providers directly. It only talks to the DataEngine.
 - Defensive + stable for Sheets:
     • Normalizes tickers (1120 -> 1120.SR, TADAWUL:1120 -> 1120.SR)
     • Dedupes tickers (preserves order)
@@ -36,162 +36,37 @@ import logging
 import os
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+# Imports from Core
+from core.data_engine_v2 import DataEngine, UnifiedQuote
+from core.scoring_engine import enrich_with_scores
+from core.enriched_quote import EnrichedQuote
+
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "2.5.0"
+ADVANCED_ANALYSIS_VERSION = "2.6.0"
 
 # =============================================================================
 # Runtime config (env overrides)
 # =============================================================================
 
-DEFAULT_BATCH_SIZE = int(os.getenv("ADV_BATCH_SIZE", "50") or 50)
-DEFAULT_BATCH_TIMEOUT = float(os.getenv("ADV_BATCH_TIMEOUT_SEC", "30") or 30)
+DEFAULT_BATCH_SIZE = int(os.getenv("ADV_BATCH_SIZE", "20") or 20)
+DEFAULT_BATCH_TIMEOUT = float(os.getenv("ADV_BATCH_TIMEOUT_SEC", "45") or 45)
 DEFAULT_MAX_TICKERS = int(os.getenv("ADV_MAX_TICKERS", "500") or 500)
-DEFAULT_CONCURRENCY = int(os.getenv("ADV_BATCH_CONCURRENCY", "3") or 3)
+DEFAULT_CONCURRENCY = int(os.getenv("ADV_BATCH_CONCURRENCY", "5") or 5)
 
 # =============================================================================
-# Optional env.py integration (purely metadata + optional engine kwargs)
+# Engine Singleton
 # =============================================================================
 
-try:  # pragma: no cover
-    import env as _env  # type: ignore
-except Exception:  # pragma: no cover
-    _env = None  # type: ignore
-
-
-def _get_env_attr(name: str, default: Any = None) -> Any:
-    if _env is not None and hasattr(_env, name):
-        try:
-            return getattr(_env, name)
-        except Exception:
-            return default
-    return os.getenv(name, default)
-
-
-# =============================================================================
-# Engine import & fallbacks (v2 preferred -> v1 module -> stub)
-# =============================================================================
-
-_ENGINE_MODE: str = "stub"  # v2 | v1_module | stub
-_ENGINE_IS_STUB: bool = True
-_data_engine_module: Any = None
-
-try:
-    from core.data_engine_v2 import DataEngine as _V2DataEngine  # type: ignore
-    from core.data_engine_v2 import UnifiedQuote  # type: ignore
-
-    def _build_engine_kwargs() -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {}
-
-        enabled = _get_env_attr("ENABLED_PROVIDERS", None)
-        if isinstance(enabled, (list, tuple)) and enabled:
-            kwargs["enabled_providers"] = list(enabled)
-        elif isinstance(enabled, str) and enabled.strip():
-            kwargs["enabled_providers"] = [p.strip() for p in enabled.split(",") if p.strip()]
-
-        cache_ttl = _get_env_attr("ENGINE_CACHE_TTL_SECONDS", None)
-        if cache_ttl is None:
-            cache_ttl = _get_env_attr("DATAENGINE_CACHE_TTL", None)
-        if cache_ttl is not None:
-            kwargs["cache_ttl"] = cache_ttl
-
-        provider_timeout = _get_env_attr("ENGINE_PROVIDER_TIMEOUT_SECONDS", None)
-        if provider_timeout is None:
-            provider_timeout = _get_env_attr("DATAENGINE_TIMEOUT", None)
-        if provider_timeout is not None:
-            kwargs["provider_timeout"] = provider_timeout
-
-        enable_adv = _get_env_attr("ENGINE_ENABLE_ADVANCED_ANALYSIS", None)
-        if enable_adv is None:
-            enable_adv = _get_env_attr("ENABLE_ADVANCED_ANALYSIS", None)
-        if enable_adv is not None:
-            kwargs["enable_advanced_analysis"] = enable_adv
-
-        return kwargs
-
-    @lru_cache(maxsize=1)
-    def _get_engine_singleton() -> Any:
-        kwargs = _build_engine_kwargs()
-        try:
-            return _V2DataEngine(**kwargs) if kwargs else _V2DataEngine()
-        except TypeError:
-            return _V2DataEngine()
-
-    _ENGINE_MODE = "v2"
-    _ENGINE_IS_STUB = False
-    logger.info("AdvancedAnalysis: using DataEngine v2 (singleton)")
-
-except Exception as exc_v2:  # pragma: no cover
-    logger.exception("AdvancedAnalysis: failed to import DataEngine v2: %s", exc_v2)
-
-    try:
-        from core import data_engine as _data_engine_module  # type: ignore
-
-        class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
-            symbol: str
-            data_quality: Optional[str] = None
-            error: Optional[str] = None
-
-        @lru_cache(maxsize=1)
-        def _get_engine_singleton() -> Any:
-            # v1 is module-level; singleton returns module itself
-            return _data_engine_module
-
-        _ENGINE_MODE = "v1_module"
-        _ENGINE_IS_STUB = False
-        logger.warning("AdvancedAnalysis: falling back to core.data_engine module-level API")
-
-    except Exception as exc_v1:  # pragma: no cover
-        logger.exception("AdvancedAnalysis: failed to import v1 fallback: %s", exc_v1)
-
-        class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
-            symbol: str
-            data_quality: str = "MISSING"
-            error: Optional[str] = None
-
-        class _StubEngine:
-            async def get_enriched_quote(self, symbol: str) -> Dict[str, Any]:
-                sym = (symbol or "").strip().upper() or "UNKNOWN"
-                return {
-                    "symbol": sym,
-                    "name": None,
-                    "market": None,
-                    "market_region": None,
-                    "sector": None,
-                    "currency": None,
-                    "last_price": None,
-                    "fair_value": None,
-                    "upside_percent": None,
-                    "value_score": 0.0,
-                    "quality_score": 0.0,
-                    "momentum_score": 0.0,
-                    "opportunity_score": 0.0,
-                    "overall_score": 0.0,
-                    "recommendation": "MISSING",
-                    "risk_label": "UNKNOWN",
-                    "provider": None,
-                    "data_quality": "MISSING",
-                    "as_of_utc": None,
-                    "error": "STUB_ENGINE: DataEngine could not be imported on backend.",
-                }
-
-            async def get_enriched_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
-                return [await self.get_enriched_quote(s) for s in (symbols or [])]
-
-        @lru_cache(maxsize=1)
-        def _get_engine_singleton() -> Any:
-            return _StubEngine()
-
-        _ENGINE_MODE = "stub"
-        _ENGINE_IS_STUB = True
-        _data_engine_module = None
-        logger.error("AdvancedAnalysis: using STUB engine (all values will be MISSING).")
-
+@lru_cache(maxsize=1)
+def _get_engine_singleton() -> DataEngine:
+    logger.info(f"Initializing DataEngine v2 singleton for Advanced Analysis")
+    return DataEngine()
 
 # =============================================================================
 # Utilities
@@ -256,24 +131,12 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        return obj
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump()  # type: ignore[call-arg]
-        except Exception:
-            pass
-    return getattr(obj, "__dict__", {}) or {}
-
-
 def _map_data_quality_to_score(label: Optional[str]) -> Optional[float]:
     if not label:
         return None
     dq = str(label).strip().upper()
     mapping = {
+        "FULL": 95.0,
         "EXCELLENT": 90.0,
         "GOOD": 80.0,
         "OK": 75.0,
@@ -281,20 +144,9 @@ def _map_data_quality_to_score(label: Optional[str]) -> Optional[float]:
         "PARTIAL": 50.0,
         "STALE": 40.0,
         "POOR": 30.0,
-        "MISSING": 20.0,
-        "UNKNOWN": 30.0,
+        "MISSING": 0.0,
     }
     return mapping.get(dq, 30.0)
-
-
-def _extract_data_quality_score(data: Dict[str, Any]) -> Optional[float]:
-    # 1) explicit numeric candidates
-    for k in ("data_quality_score", "dq_score", "quality_score_numeric", "confidence_score", "ai_confidence_score"):
-        x = _safe_float(data.get(k))
-        if x is not None:
-            return x
-    # 2) string label
-    return _map_data_quality_to_score(data.get("data_quality") or data.get("data_quality_level"))
 
 
 def _compute_risk_bucket(opportunity: Optional[float], dq: Optional[float]) -> str:
@@ -333,29 +185,8 @@ def _data_age_minutes(as_of_utc: Any) -> Optional[float]:
 
 
 # =============================================================================
-# Engine wrappers (supports v2 object OR v1 module OR stub)
+# Core Async Fetch Logic
 # =============================================================================
-
-async def _engine_get_many(symbols: List[str]) -> List[Any]:
-    eng = _get_engine_singleton()
-
-    # v2 or stub (object with async method)
-    if hasattr(eng, "get_enriched_quotes"):
-        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
-
-    # v1 module-level (if singleton returns module)
-    if hasattr(eng, "get_enriched_quotes"):
-        return await eng.get_enriched_quotes(symbols)  # type: ignore[attr-defined]
-
-    # fallback: per symbol
-    out: List[Any] = []
-    for s in symbols:
-        if hasattr(eng, "get_enriched_quote"):
-            out.append(await eng.get_enriched_quote(s))  # type: ignore[attr-defined]
-        else:
-            out.append({"symbol": (s or "").upper(), "data_quality": "MISSING", "error": "Engine missing methods"})
-    return out
-
 
 async def _get_quotes_chunked(
     symbols: List[str],
@@ -363,64 +194,68 @@ async def _get_quotes_chunked(
     batch_size: int = DEFAULT_BATCH_SIZE,
     timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
     max_concurrency: int = DEFAULT_CONCURRENCY,
-) -> Dict[str, Any]:
+) -> Dict[str, UnifiedQuote]:
     """
-    Returns map keyed by normalized input symbol (exact string in cleaned list).
-    Always returns a value per input symbol (possibly MISSING dict).
+    Returns map keyed by normalized input symbol.
     """
     clean = _clean_tickers(symbols)
     if not clean:
         return {}
 
+    engine = _get_engine_singleton()
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[Any] | Exception]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
         async with sem:
             try:
-                res = await asyncio.wait_for(_engine_get_many(chunk_syms), timeout=timeout_sec)
+                # Engine v2 get_enriched_quotes returns List[UnifiedQuote]
+                res = await asyncio.wait_for(engine.get_enriched_quotes(chunk_syms), timeout=timeout_sec)
                 return chunk_syms, res
             except Exception as e:
                 return chunk_syms, e
 
     results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
 
-    out: Dict[str, Any] = {}
+    out: Dict[str, UnifiedQuote] = {}
+    
     for chunk_syms, res in results:
+        # Handle chunk failure
         if isinstance(res, Exception):
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
             logger.warning("AdvancedAnalysis: %s for chunk(size=%d): %s", msg, len(chunk_syms), chunk_syms)
             for s in chunk_syms:
-                out[s] = {"symbol": s.upper(), "data_quality": "MISSING", "error": msg}
+                # Create a placeholder error quote
+                out[s] = UnifiedQuote(
+                    symbol=s.upper(),
+                    data_quality="MISSING", 
+                    error=msg
+                ).finalize()
             continue
 
-        returned = list(res or [])
+        # Handle success
+        returned_quotes = list(res or [])
+        
+        # Create a lookup map by symbol for this chunk
+        chunk_map = {q.symbol.upper(): q for q in returned_quotes}
 
-        # Build symbol->payload map if possible
-        by_sym: Dict[str, Any] = {}
-        for q in returned:
-            d = _model_to_dict(q)
-            sym = _normalize_symbol(str(d.get("symbol") or d.get("ticker") or ""))
-            if sym:
-                by_sym[sym] = q
-
-        # Assign in order first (best-effort)
-        for i, s in enumerate(chunk_syms):
-            if i < len(returned):
-                out[s] = returned[i]
-            else:
-                out[s] = by_sym.get(s) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
-
-        # Prefer exact symbol match if order seems off
+        # Assign to output
         for s in chunk_syms:
-            if s in by_sym:
-                out[s] = by_sym[s]
+            s_norm = s.upper()
+            if s_norm in chunk_map:
+                out[s] = chunk_map[s_norm]
+            else:
+                out[s] = UnifiedQuote(
+                    symbol=s_norm, 
+                    data_quality="MISSING", 
+                    error="No data returned from engine"
+                ).finalize()
 
     return out
 
 
 # =============================================================================
-# Pydantic models
+# Pydantic models for Response
 # =============================================================================
 
 class AdvancedItem(BaseModel):
@@ -456,8 +291,7 @@ class AdvancedItem(BaseModel):
 class AdvancedScoreboardResponse(BaseModel):
     generated_at_utc: str
     version: str
-    engine_mode: str
-    engine_is_stub: bool
+    engine_mode: str = "v2"
 
     total_requested: int
     total_returned: int
@@ -481,67 +315,54 @@ class AdvancedSheetResponse(BaseModel):
 # Transform logic
 # =============================================================================
 
-def _to_advanced_item(raw_symbol: str, payload: Any) -> AdvancedItem:
-    d = _model_to_dict(payload)
+def _to_advanced_item(raw_symbol: str, q: UnifiedQuote) -> AdvancedItem:
+    
+    # 1. Enhance Scores using Scoring Engine if they look default/empty
+    # Convert UnifiedQuote -> EnrichedQuote (compatible for scoring engine)
+    eq = EnrichedQuote.from_unified(q)
+    
+    # If the engine didn't provide strong scores (e.g. they are exactly default 50.0 and confidence is low),
+    # run the scoring engine to recalculate based on raw data.
+    # Note: UnifiedQuote.finalize() sets defaults. enrich_with_scores recalculates based on data.
+    # We always run enrich_with_scores to ensure consistency with the scoring_engine logic.
+    scored_q = enrich_with_scores(eq)
 
-    symbol = _normalize_symbol(str(d.get("symbol") or d.get("ticker") or raw_symbol or "")) or _normalize_symbol(raw_symbol)
-    symbol = symbol or (raw_symbol or "").strip().upper() or "UNKNOWN"
+    # 2. Extract Data
+    symbol = scored_q.symbol or raw_symbol
+    market = scored_q.market or scored_q.market_region
+    dq = scored_q.data_quality
+    dq_score = _map_data_quality_to_score(dq)
 
-    # Flexible field names
-    last_price = _safe_float(d.get("last_price") or d.get("price") or d.get("close") or d.get("last"))
-    fair_value = _safe_float(d.get("fair_value") or d.get("intrinsic_value") or d.get("target_price"))
-    upside = _safe_float(d.get("upside_percent") or d.get("upside") or d.get("upside_pct"))
-
-    value_score = _safe_float(d.get("value_score"))
-    quality_score = _safe_float(d.get("quality_score"))
-    momentum_score = _safe_float(d.get("momentum_score"))
-    opportunity_score = _safe_float(d.get("opportunity_score"))
-    overall_score = _safe_float(d.get("overall_score"))
-
-    data_quality = d.get("data_quality") or d.get("data_quality_level")
-    dq_score = _extract_data_quality_score(d)
-
-    as_of_utc_raw = d.get("as_of_utc") or d.get("last_updated_utc") or d.get("timestamp_utc")
-    if isinstance(as_of_utc_raw, datetime):
-        as_of_utc = as_of_utc_raw.isoformat()
-    else:
-        as_of_utc = str(as_of_utc_raw) if as_of_utc_raw else None
-
+    as_of_utc = scored_q.last_updated_utc
     age_min = _data_age_minutes(as_of_utc)
-
-    rec = d.get("recommendation") or d.get("recommendation_label") or d.get("rating")
-    risk_label = d.get("risk_label") or d.get("risk")
-    risk_bucket = _compute_risk_bucket(opportunity_score, dq_score)
-
-    provider = d.get("primary_provider") or d.get("provider") or d.get("data_source")
-    error = d.get("error")
-
-    # Market name preference
-    market = d.get("market_region") or d.get("market") or d.get("exchange")
+    
+    risk_bucket = _compute_risk_bucket(scored_q.opportunity_score, dq_score)
+    
+    provider = scored_q.data_source or scored_q.primary_provider
 
     return AdvancedItem(
         symbol=symbol,
-        name=d.get("name") or d.get("company_name"),
-        market=str(market) if market is not None else None,
-        sector=d.get("sector"),
-        currency=d.get("currency"),
-        last_price=last_price,
-        fair_value=fair_value,
-        upside_percent=upside,
-        value_score=value_score,
-        quality_score=quality_score,
-        momentum_score=momentum_score,
-        opportunity_score=opportunity_score,
-        overall_score=overall_score,
-        data_quality=str(data_quality) if data_quality is not None else None,
+        name=scored_q.name,
+        market=market,
+        sector=scored_q.sector,
+        currency=scored_q.currency,
+        last_price=scored_q.current_price or scored_q.last_price, # Handle aliases
+        fair_value=scored_q.fair_value,
+        upside_percent=scored_q.upside_percent,
+        value_score=scored_q.value_score,
+        quality_score=scored_q.quality_score,
+        momentum_score=scored_q.momentum_score,
+        opportunity_score=scored_q.opportunity_score,
+        overall_score=scored_q.overall_score,
+        data_quality=dq,
         data_quality_score=dq_score,
-        recommendation=str(rec) if rec is not None else None,
-        risk_label=str(risk_label) if risk_label is not None else None,
+        recommendation=scored_q.recommendation,
+        risk_label=scored_q.valuation_label, # Mapping valuation label to risk label for summary
         risk_bucket=risk_bucket,
-        provider=str(provider) if provider is not None else None,
+        provider=provider,
         as_of_utc=as_of_utc,
         data_age_minutes=age_min,
-        error=str(error) if error is not None else None,
+        error=scored_q.error,
     )
 
 
@@ -550,10 +371,13 @@ def _sort_key(it: AdvancedItem) -> float:
     opp = it.opportunity_score or 0.0
     dq = it.data_quality_score or 0.0
     up = it.upside_percent or 0.0
-    return opp * 1_000_000 + dq * 1_000 + up
+    # Add small tie-breaker using value score
+    val = it.value_score or 0.0
+    return (opp * 1_000_000) + (dq * 1_000) + (up * 10) + val
 
 
 def _sheet_headers() -> List[str]:
+    # Specific headers for the Advanced Analysis sheet
     return [
         "Symbol",
         "Company Name",
@@ -571,7 +395,6 @@ def _sheet_headers() -> List[str]:
         "Data Quality",
         "Data Quality Score",
         "Recommendation",
-        "Risk Label",
         "Risk Bucket",
         "Provider",
         "As Of (UTC)",
@@ -581,6 +404,7 @@ def _sheet_headers() -> List[str]:
 
 
 def _item_to_row(it: AdvancedItem) -> List[Any]:
+    # Must match _sheet_headers order exactly
     return [
         it.symbol,
         it.name,
@@ -598,7 +422,6 @@ def _item_to_row(it: AdvancedItem) -> List[Any]:
         it.data_quality,
         it.data_quality_score,
         it.recommendation,
-        it.risk_label,
         it.risk_bucket,
         it.provider,
         it.as_of_utc,
@@ -617,23 +440,11 @@ router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 @router.get("/health")
 @router.get("/ping")
 async def advanced_health() -> Dict[str, Any]:
-    env_name = getattr(_env, "APP_ENV", None) if _env is not None else None
-    app_version = getattr(_env, "APP_VERSION", None) if _env is not None else None
-
-    eng = _get_engine_singleton()
-    providers = getattr(eng, "enabled_providers", None) or getattr(eng, "providers", None)
-    primary = getattr(eng, "primary_provider", None) or getattr(eng, "primary", None)
-
     return {
         "status": "ok",
         "module": "routes.advanced_analysis",
         "version": ADVANCED_ANALYSIS_VERSION,
-        "engine_mode": _ENGINE_MODE,
-        "engine_is_stub": _ENGINE_IS_STUB,
-        "environment": env_name or "unknown",
-        "app_version": app_version or "unknown",
-        "engine_providers": providers,
-        "engine_primary": primary,
+        "engine_mode": "v2",
         "batch_size": DEFAULT_BATCH_SIZE,
         "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
         "batch_concurrency": DEFAULT_CONCURRENCY,
@@ -648,12 +459,12 @@ async def advanced_scoreboard(
     top_n: int = Query(50, ge=1, le=500, description="Max rows returned after sorting"),
 ) -> AdvancedScoreboardResponse:
     requested = _parse_tickers_csv(tickers)
+    
     if not requested:
         return AdvancedScoreboardResponse(
             generated_at_utc=_now_utc_iso(),
             version=ADVANCED_ANALYSIS_VERSION,
-            engine_mode=_ENGINE_MODE,
-            engine_is_stub=_ENGINE_IS_STUB,
+            engine_mode="v2",
             total_requested=0,
             total_returned=0,
             top_n_applied=False,
@@ -668,8 +479,9 @@ async def advanced_scoreboard(
 
     items: List[AdvancedItem] = []
     for s in requested:
-        payload = unified_map.get(s) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
-        items.append(_to_advanced_item(s, payload))
+        # unified_map[s] is guaranteed to exist by _get_quotes_chunked
+        quote = unified_map[s]
+        items.append(_to_advanced_item(s, quote))
 
     items_sorted = sorted(items, key=_sort_key, reverse=True)
 
@@ -681,8 +493,7 @@ async def advanced_scoreboard(
     return AdvancedScoreboardResponse(
         generated_at_utc=_now_utc_iso(),
         version=ADVANCED_ANALYSIS_VERSION,
-        engine_mode=_ENGINE_MODE,
-        engine_is_stub=_ENGINE_IS_STUB,
+        engine_mode="v2",
         total_requested=len(requested),
         total_returned=len(items_sorted),
         top_n_applied=top_applied,
@@ -693,6 +504,10 @@ async def advanced_scoreboard(
 
 @router.post("/sheet-rows", response_model=AdvancedSheetResponse)
 async def advanced_sheet_rows(body: AdvancedSheetRequest) -> AdvancedSheetResponse:
+    """
+    Dedicated endpoint for Google Sheets "Advanced Analysis" tab.
+    Returns headers + rows sorted by opportunity.
+    """
     requested = _clean_tickers(body.tickers or [])
     headers = _sheet_headers()
 
@@ -706,16 +521,14 @@ async def advanced_sheet_rows(body: AdvancedSheetRequest) -> AdvancedSheetRespon
 
     items: List[AdvancedItem] = []
     for s in requested:
-        payload = unified_map.get(s) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
-        items.append(_to_advanced_item(s, payload))
+        quote = unified_map[s]
+        items.append(_to_advanced_item(s, quote))
 
     items_sorted = sorted(items, key=_sort_key, reverse=True)
+    
     top_n = body.top_n or 50
     if len(items_sorted) > top_n:
         items_sorted = items_sorted[:top_n]
 
     rows = [_item_to_row(it) for it in items_sorted]
     return AdvancedSheetResponse(headers=headers, rows=rows)
-
-
-__all__ = ["router"]
