@@ -1,7 +1,7 @@
 """
 core/data_engine_v2.py
 ===============================================
-Core Data & Analysis Engine - v2.4 (KSA-SAFE + Argaam fallback)
+Core Data & Analysis Engine - v2.5 (KSA-SAFE + Argaam fallback)
 
 Author: Emad Bahbah (with GPT)
 
@@ -26,12 +26,13 @@ Notes
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import httpx
 
@@ -43,8 +44,12 @@ except Exception:  # pragma: no cover
 try:
     from pydantic import BaseModel, Field
 except Exception:  # pragma: no cover
-    BaseModel = object  # type: ignore
-    Field = lambda default=None, **kwargs: default  # type: ignore
+    # Fallback if pydantic is missing (rare in this stack)
+    class BaseModel:
+        def dict(self, **kwargs):
+            return self.__dict__
+    def Field(default=None, **kwargs):
+        return default
 
 # Optional Yahoo Finance fallback (may be blocked depending on Yahoo policy)
 try:
@@ -58,6 +63,12 @@ try:
 except Exception:
     BeautifulSoup = None  # type: ignore
 
+
+# =============================================================================
+# Logging & Config
+# =============================================================================
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Helpers
@@ -88,6 +99,9 @@ def _safe_float(x: Any) -> Optional[float]:
             if s.startswith("(") and s.endswith(")"):
                 s = "-" + s[1:-1]
             s = s.replace(",", "")
+            # Handle percentage
+            if s.endswith("%"):
+                s = s.rstrip("%")
             return float(s)
         return float(x)
     except Exception:
@@ -260,17 +274,43 @@ class UnifiedQuote(BaseModel):
     error: Optional[str] = None
 
     def _default_scores_if_missing(self) -> None:
+        """
+        Calculates simple fallback scores if they weren't provided by the source.
+        This ensures the dashboard doesn't show blank gauges.
+        """
+        # Value Score (simplified heuristic based on PE/PB)
         if self.value_score is None:
-            self.value_score = 50.0
+            vs = 50.0
+            if self.pe_ttm and 0 < self.pe_ttm < 15: vs += 20
+            elif self.pe_ttm and self.pe_ttm > 30: vs -= 15
+            if self.pb and 0 < self.pb < 1.5: vs += 15
+            self.value_score = max(0.0, min(100.0, vs))
+
+        # Quality Score (simplified heuristic based on ROE/Margins)
         if self.quality_score is None:
-            self.quality_score = 50.0
+            qs = 50.0
+            if self.roe and self.roe > 0.15: qs += 20
+            if self.net_margin and self.net_margin > 0.15: qs += 20
+            self.quality_score = max(0.0, min(100.0, qs))
+
+        # Momentum Score (simplified heuristic based on Price vs 52W High)
         if self.momentum_score is None:
-            self.momentum_score = 50.0
+            ms = 50.0
+            if self.current_price and self.high_52w and self.low_52w and self.high_52w != self.low_52w:
+                pos = (self.current_price - self.low_52w) / (self.high_52w - self.low_52w)
+                if pos > 0.8: ms += 20
+                elif pos < 0.2: ms -= 20
+            if self.percent_change and self.percent_change > 2: ms += 10
+            self.momentum_score = max(0.0, min(100.0, ms))
+
+        # Aggregate Scores
         if self.overall_score is None:
             self.overall_score = float((self.value_score + self.quality_score + self.momentum_score) / 3.0)
+        
         if self.opportunity_score is None:
             self.opportunity_score = float(_coalesce(self.overall_score, 50.0))
 
+        # Recommendation Label
         if not self.recommendation:
             s = float(self.overall_score or 50.0)
             if s >= 80:
@@ -293,6 +333,10 @@ class UnifiedQuote(BaseModel):
         return self
 
     def to_sheet_row(self, headers: List[str]) -> List[Any]:
+        """
+        Maps the quote object to a list of values matching the requested headers order.
+        Essential for Google Sheets integration.
+        """
         m = {
             "Symbol": self.symbol,
             "Company Name": self.name,
@@ -421,63 +465,79 @@ class ArgaamProvider:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
 
-        resp = await self._client.get(url, headers=headers)
-        resp.raise_for_status()
-        html = resp.text
+        try:
+            resp = await self._client.get(url, headers=headers)
+            resp.raise_for_status()
+            html = resp.text
 
-        if BeautifulSoup:
-            soup = BeautifulSoup(html, "lxml" if "lxml" in (os.getenv("BS4_PARSER", "lxml").lower()) else "html.parser")
-            text = soup.get_text("\n")
-        else:
-            text = _strip_html_fallback(html)
+            if BeautifulSoup:
+                soup = BeautifulSoup(html, "lxml" if "lxml" in (os.getenv("BS4_PARSER", "lxml").lower()) else "html.parser")
+                text = soup.get_text("\n")
+            else:
+                text = _strip_html_fallback(html)
 
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-        lines = [ln for ln in lines if ln and re.match(r"^\d{3,5}\s+", ln)]
+            lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+            lines = [ln for ln in lines if ln and re.match(r"^\d{3,5}\s+", ln)]
 
-        out: Dict[str, Dict[str, Any]] = {}
-        for ln in lines:
-            parts = ln.split(" ")
-            if len(parts) < 7:
-                continue
+            out: Dict[str, Dict[str, Any]] = {}
+            for ln in lines:
+                parts = ln.split(" ")
+                if len(parts) < 7:
+                    continue
 
-            sym = parts[0]
-            if not re.fullmatch(r"\d{3,5}", sym):
-                continue
+                sym = parts[0]
+                if not re.fullmatch(r"\d{3,5}", sym):
+                    continue
 
-            avg_vol = parts[-3]
-            vol = parts[-2]
-            vol_chg = parts[-1]
-            price = parts[-5]
-            chg = parts[-4]
+                # Argaam table columns often shift, but usually:
+                # Sym | Company | ... | Price | Change | Change% | Vol | AvgVol3m | Vol%
+                # We try to grab from the end as it's more stable for numeric columns
+                
+                # Check if enough parts
+                if len(parts) < 8:
+                    continue
 
-            price_f = _safe_float(price)
-            chg_f = _safe_float(chg)
-            avg_vol_f = _safe_float(avg_vol)
-            vol_i = _safe_int(vol)
-            vol_chg_f = _safe_float(vol_chg)
+                # Heuristic mapping based on observed Argaam structure:
+                # Last columns: VolChange% (optional), Vol, AvgVol, Change%, Change, Price
+                # Let's try to parse from the right side
+                
+                # Try to find Price (usually parts[-5] or similar)
+                # This is fragile scraping; robust logic requires tracking column headers if possible.
+                # Assuming standard layout:
+                # [0]Sym ... [-5]Price [-4]Chg [-3]Vol [-2]AvgVol ... (this varies)
+                
+                # Let's use the provided logic in prompt which assumed a specific layout:
+                # avg_vol = parts[-3], vol = parts[-2], vol_chg = parts[-1], price = parts[-5], chg = parts[-4]
+                # Adjusting to be safe
+                
+                try:
+                    avg_vol = parts[-3]
+                    vol = parts[-2]
+                    vol_chg = parts[-1]
+                    price = parts[-5]
+                    chg = parts[-4]
+                    
+                    # Extract Company Name
+                    mid = parts[1:-5]
+                    company = " ".join(mid).strip()
+                    
+                    out[sym] = {
+                        "symbol": sym,
+                        "company": company,
+                        "price": _safe_float(price),
+                        "change": _safe_float(chg),
+                        "avg_volume_3m": _safe_float(avg_vol),
+                        "volume": _safe_int(vol),
+                        "volume_change_percent": _safe_float(vol_chg),
+                    }
+                except Exception:
+                    continue
 
-            mid = parts[1:-5]
-            short_name = None
-            company = " ".join(mid).strip() or None
-            if mid:
-                last = mid[-1]
-                if re.fullmatch(r"[A-Z0-9\.\-]{2,}", last):
-                    short_name = last
-                    company = " ".join(mid[:-1]).strip() or company
-
-            out[sym] = {
-                "symbol": sym,
-                "company": company,
-                "short_name": short_name,
-                "price": price_f,
-                "change_percent": chg_f,
-                "avg_volume_3m": avg_vol_f,
-                "volume": vol_i,
-                "volume_change_percent": vol_chg_f,
-            }
-
-        self._cache.set(cache_key, out, ttl_sec=self._ttl)
-        return out
+            self._cache.set(cache_key, out, ttl_sec=self._ttl)
+            return out
+        except Exception as e:
+            logger.warning(f"Argaam scraping failed: {e}")
+            return {}
 
     async def quote_ksa(self, symbol: str) -> Optional[UnifiedQuote]:
         code = ksa_numeric(symbol)
@@ -489,13 +549,22 @@ class ArgaamProvider:
         if not row:
             return None
 
+        # Calculate percentage change if not explicitly scraped, or use change/price
+        price = row.get("price")
+        change = row.get("change")
+        pct = None
+        if price and change and (price - change) != 0:
+             prev = price - change
+             pct = (change / prev) * 100.0
+
         q = UnifiedQuote(
             symbol=normalize_symbol(symbol),
             name=row.get("company"),
             market="KSA",
             currency="SAR",
-            current_price=row.get("price"),
-            percent_change=row.get("change_percent"),
+            current_price=price,
+            price_change=change,
+            percent_change=pct,
             volume=row.get("volume"),
             avg_volume_30d=row.get("avg_volume_3m"),
             data_source="argaam",
@@ -521,9 +590,13 @@ class EODHDProvider:
         sym = normalize_eodhd_symbol(symbol)
         url = f"{self.BASE}/real-time/{sym}"
         params = {"api_token": self._key, "fmt": "json"}
-        r = await self._client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = await self._client.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.error(f"EODHD Realtime Error {sym}: {e}")
+            return {}
 
     async def fundamentals(self, symbol: str) -> Dict[str, Any]:
         if not self._key:
@@ -535,11 +608,16 @@ class EODHDProvider:
             return cached
         url = f"{self.BASE}/fundamentals/{sym}"
         params = {"api_token": self._key, "fmt": "json"}
-        r = await self._client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-        self._cache.set(cache_key, data, ttl_sec=float(os.getenv("FUNDAMENTALS_TTL_SEC", "21600")))
-        return data
+        try:
+            r = await self._client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+            # Cache fundamentals longer (6 hours default)
+            self._cache.set(cache_key, data, ttl_sec=float(os.getenv("FUNDAMENTALS_TTL_SEC", "21600")))
+            return data
+        except Exception as e:
+            logger.error(f"EODHD Fundamentals Error {sym}: {e}")
+            return {}
 
 
 class FMPProvider:
@@ -558,12 +636,15 @@ class FMPProvider:
             return None
         sym = normalize_symbol(symbol).upper()
         url = f"{self.BASE}/quote/{sym}"
-        r = await self._client.get(url, params={"apikey": self._key})
-        if r.status_code >= 400:
-            return None
-        js = r.json()
-        if isinstance(js, list) and js:
-            return js[0]
+        try:
+            r = await self._client.get(url, params={"apikey": self._key})
+            if r.status_code >= 400:
+                return None
+            js = r.json()
+            if isinstance(js, list) and js:
+                return js[0]
+        except Exception as e:
+            logger.error(f"FMP Quote Error {sym}: {e}")
         return None
 
 
@@ -798,3 +879,12 @@ class DataEngine:
         q.pb = _safe_float(valuation.get("PriceBookMRQ")) or q.pb
         q.ps = _safe_float(valuation.get("PriceSalesTTM")) or q.ps
         q.ev_ebitda = _safe_float(valuation.get("EnterpriseValueEbitda")) or q.ev_ebitda
+        q.dividend_yield = _safe_float(highlights.get("DividendYield")) or q.dividend_yield
+        q.payout_ratio = _safe_float(highlights.get("PayoutRatio")) or q.payout_ratio
+        q.roe = _safe_float(highlights.get("ReturnOnEquityTTM")) or q.roe
+        q.roa = _safe_float(highlights.get("ReturnOnAssetsTTM")) or q.roa
+        q.net_margin = _safe_float(highlights.get("ProfitMargin")) or q.net_margin
+        q.ebitda_margin = _safe_float(highlights.get("EBITDAMarginTTM")) or q.ebitda_margin
+        q.revenue_growth = _safe_float(highlights.get("QuarterlyRevenueGrowthYOY")) or q.revenue_growth
+        q.net_income_growth = _safe_float(highlights.get("QuarterlyEarningsGrowthYOY")) or q.net_income_growth
+        q.beta = _safe_float(highlights.get("Beta")) or q.beta
