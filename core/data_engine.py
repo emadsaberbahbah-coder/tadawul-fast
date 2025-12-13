@@ -1,250 +1,177 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY WRAPPER AROUND DATAENGINE v2 – v3.2.0
+LEGACY COMPATIBILITY ADAPTER (v3.2.0)
 
-PURPOSE
-- Provide a *backwards-compatible* module-level API for the original
-  "v1 core data engine" while delegating all real work to the new
-  class-based engine in `core.data_engine_v2`.
-- Keep old imports working, such as:
-      from core import data_engine
-      from core.data_engine import get_enriched_quotes, UnifiedQuote, DataEngine
-- Ensure KSA safety and provider logic are defined ONLY once in
-  `core.data_engine_v2` (single source of truth).
+PURPOSE:
+- Acts as a bridge between older code requesting `core.data_engine` 
+  and the modern `core.data_engine_v2` implementation.
+- Ensures backward compatibility for imports and function calls.
+- Provides a "Stub" mode if V2 fails to load, preventing app crashes.
 
-MAIN BEHAVIOR
-- Tries to import:
-      from core.data_engine_v2 import DataEngine, UnifiedQuote
-- If successful:
-      • DataEngine (here) is an alias of the v2 DataEngine.
-      • get_enriched_quote(s) simply forward to the v2 engine instance.
-      • UnifiedQuote is re-exported from v2.
-      • QuoteSource is polyfilled if missing in v2 to satisfy legacy imports.
-- If v2 cannot be imported:
-      • Falls back to a very small stub engine that always returns
-        MISSING UnifiedQuote objects (no crashes, but clearly marked).
-      • This keeps the app importable even in emergency / partial setups.
-
-NOTES
-- EODHD is NEVER called for KSA (.SR) tickers – that logic lives in
-  `core.data_engine_v2`.
+MAPPING:
+- get_enriched_quote(s) -> delegates to v2.DataEngine.get_quote(s)
+- UnifiedQuote -> re-exports v2.UnifiedQuote
 """
 
 from __future__ import annotations
 
 import logging
 import asyncio
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from datetime import datetime
+
+# Pydantic V2 Imports
+try:
+    from pydantic import BaseModel, Field, ConfigDict
+except ImportError:
+    # Fallback for extreme environments
+    class BaseModel: pass
+    def Field(*args, **kwargs): return None
+    def ConfigDict(*args, **kwargs): return None
 
 logger = logging.getLogger("core.data_engine")
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
 
 # ---------------------------------------------------------------------------
-# Polyfill for QuoteSource (Legacy Compatibility)
+# 1. QuoteSource Polyfill (For Legacy Metadata Support)
 # ---------------------------------------------------------------------------
-try:
-    from pydantic import BaseModel, Field
-except ImportError:
-    class BaseModel: # type: ignore
-        def __init__(self, **kwargs): self.__dict__.update(kwargs)
-    def Field(default=None, **kwargs): return default
-
 class QuoteSource(BaseModel):
     """
-    Legacy provider metadata model.
-    Re-defined here to ensure 'from core.data_engine import QuoteSource' works
-    even if v2 dropped it.
+    Legacy provider metadata model. 
+    Kept ensures older type-checks don't fail.
     """
+    model_config = ConfigDict(extra='ignore')
     provider: str
     latency_ms: Optional[float] = None
     timestamp_utc: Optional[datetime] = None
     raw: Optional[Dict[str, Any]] = None
 
 # ---------------------------------------------------------------------------
-# Try to import the "real" v2 engine + models
+# 2. Dynamic Import of V2 Engine
 # ---------------------------------------------------------------------------
-
-_ENGINE_MODE: str = "stub"
-_ENGINE_IS_STUB: bool = True
+_ENGINE_MODE = "stub"
 
 try:
-    # Primary, modern engine
-    from core.data_engine_v2 import (  # type: ignore
-        DataEngine as _V2DataEngine,
-        UnifiedQuote,
-    )
-
-    # Check if UnifiedQuote has 'sources' field compatibility
-    # V2 UnifiedQuote might not have 'sources' defined as List[QuoteSource]
-    # We accept this; legacy code usually checks dicts or attributes loosely.
-
+    # Attempt to import the modern engine
+    from core.data_engine_v2 import DataEngine as _V2DataEngine, UnifiedQuote
     _ENGINE_MODE = "v2"
-    _ENGINE_IS_STUB = False
-    logger.info("core.data_engine: Delegating to core.data_engine_v2.DataEngine.")
+    logger.info("Legacy Adapter: Linked successfully to DataEngine V2.")
 
-except Exception as exc:  # pragma: no cover - defensive fallback
-    logger.warning(
-        "core.data_engine: Failed to import core.data_engine_v2. "
-        "Falling back to stub engine. Error: %s",
-        exc,
-    )
+except ImportError as e:
+    logger.warning(f"Legacy Adapter: V2 Import Failed ({e}). Activating Stub Mode.")
     _ENGINE_MODE = "stub"
-    _ENGINE_IS_STUB = True
 
-    # -----------------------------------------------------------------------
-    # Minimal local models for stub mode
-    # -----------------------------------------------------------------------
-    class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
-        """
-        Minimal UnifiedQuote placeholder used in stub mode.
-        """
+    # --- STUB DEFINITIONS (Safe Mode) ---
+    
+    class UnifiedQuote(BaseModel): # type: ignore
+        """Safe placeholder if V2 is missing."""
+        model_config = ConfigDict(populate_by_name=True, extra='ignore')
         symbol: str
-        price: Optional[float] = None
-        current_price: Optional[float] = None # V2 alias
+        current_price: Optional[float] = None
         data_quality: str = "MISSING"
-        last_updated_utc: Optional[datetime] = None
-        market: Optional[str] = None
-        market_region: Optional[str] = None
-        currency: Optional[str] = None
-        error: Optional[str] = None
-        sources: List[QuoteSource] = Field(default_factory=list)
+        error: Optional[str] = "Engine Unavailable"
+        market: str = "UNKNOWN"
         
-        # Compatibility fields
+        # Legacy fields
+        price: Optional[float] = None 
         change: Optional[float] = None
-        percent_change: Optional[float] = None
-        volume: Optional[float] = None
+        
+        def calculate_simple_scores(self): return self
+        def dict(self, *args, **kwargs): return self.model_dump(*args, **kwargs)
 
-        def finalize(self): return self
+    class _V2DataEngine: # type: ignore
+        """Stub engine that returns empty/error states."""
+        def __init__(self, *args, **kwargs):
+            logger.error("Legacy Adapter: Initialized Stub Engine.")
+        
+        async def get_quote(self, ticker: str) -> UnifiedQuote:
+            return UnifiedQuote(symbol=ticker, error="Engine V2 Missing")
 
-    class _V2DataEngine:  # type: ignore[no-redef]
-        """
-        Stub engine implementation used ONLY when core.data_engine_v2
-        is not available.
-        """
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            logger.error("core.data_engine: Using stub DataEngine.")
-
-        async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
-            sym = (symbol or "").strip().upper()
-            now = datetime.now(timezone.utc)
-            return UnifiedQuote(
-                symbol=sym or "",
-                current_price=None,
-                data_quality="MISSING",
-                last_updated_utc=now,
-                error="Unified engine v2 unavailable (stub mode).",
-                sources=[QuoteSource(provider="stub", timestamp_utc=now)]
-            )
-
-        async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
-            if not symbols: return []
-            return [await self.get_enriched_quote(s) for s in symbols]
-
+        async def get_quotes(self, tickers: List[str]) -> List[UnifiedQuote]:
+            return [UnifiedQuote(symbol=t, error="Engine V2 Missing") for t in tickers]
+        
+        async def aclose(self): pass
 
 # ---------------------------------------------------------------------------
-# Engine instance & compatibility alias
+# 3. Singleton Instance Management
 # ---------------------------------------------------------------------------
 
-# Expose DataEngine as the class type
-DataEngine = _V2DataEngine  # type: ignore[assignment]
+# Expose the class type for type hinting
+DataEngine = _V2DataEngine 
 
-# Shared singleton instance
 _engine_instance = None
 
 def _get_engine():
+    """Singleton accessor for the DataEngine."""
     global _engine_instance
     if _engine_instance is None:
         try:
             _engine_instance = _V2DataEngine()
         except Exception as e:
-            logger.error(f"Failed to initialize DataEngine: {e}")
-            # Crash-proof stub
+            logger.critical(f"Legacy Adapter: Engine Init Failed: {e}")
+            # Emergency crash-proof stub
             class CrashStub:
-                async def get_enriched_quote(self, s): 
-                    return UnifiedQuote(symbol=s, error=f"Engine Init Failed: {e}")
-                async def get_enriched_quotes(self, s): 
-                    return [await self.get_enriched_quote(x) for x in s]
+                async def get_quote(self, s): return UnifiedQuote(symbol=s, error=str(e))
+                async def get_quotes(self, s): return [UnifiedQuote(symbol=x, error=str(e)) for x in s]
             _engine_instance = CrashStub()
     return _engine_instance
 
 # ---------------------------------------------------------------------------
-# Module-level convenience functions (v1-style API)
+# 4. Public API Functions (The Compatibility Layer)
 # ---------------------------------------------------------------------------
 
 async def get_enriched_quote(symbol: str) -> UnifiedQuote:
     """
-    Backwards-compatible convenience wrapper:
-        from core.data_engine import get_enriched_quote
+    Legacy Wrapper: Fetches a single quote using the V2 engine.
+    Usage: quote = await get_enriched_quote("1120.SR")
     """
-    eng = _get_engine()
+    engine = _get_engine()
     try:
-        return await eng.get_enriched_quote(symbol)  # type: ignore[attr-defined]
+        # V2 method name is 'get_quote'
+        if hasattr(engine, "get_quote"):
+            return await engine.get_quote(symbol)
+        
+        # Fallback if V2 interface changes
+        return UnifiedQuote(symbol=symbol, error="Method Mismatch in Engine")
     except Exception as exc:
-        logger.exception("core.data_engine: Error in get_enriched_quote(%s)", symbol)
-        return UnifiedQuote(
-            symbol=(symbol or "").strip().upper(),
-            data_quality="ERROR",
-            error=f"Unhandled error: {exc}",
-        )
+        logger.error(f"Legacy Adapter Error (Single): {exc}")
+        return UnifiedQuote(symbol=symbol, error=str(exc))
 
 
 async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
     """
-    Backwards-compatible batch wrapper:
-        from core.data_engine import get_enriched_quotes
+    Legacy Wrapper: Fetches multiple quotes using the V2 engine.
+    Usage: quotes = await get_enriched_quotes(["1120.SR", "AAPL"])
     """
-    clean: List[str] = [s.strip() for s in (symbols or []) if s and s.strip()]
-    if not clean:
+    clean_symbols = [s.strip() for s in (symbols or []) if s and isinstance(s, str) and s.strip()]
+    
+    if not clean_symbols:
         return []
 
-    eng = _get_engine()
+    engine = _get_engine()
     try:
-        results = await eng.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+        # V2 method name is 'get_quotes'
+        if hasattr(engine, "get_quotes"):
+            return await engine.get_quotes(clean_symbols)
+        
+        # Fallback: Sequential loop if batch method missing
+        return [await get_enriched_quote(s) for s in clean_symbols]
+        
     except Exception as exc:
-        logger.exception("core.data_engine: Error in get_enriched_quotes batch")
-        return [
-            UnifiedQuote(
-                symbol=sym.upper(),
-                data_quality="ERROR",
-                error=f"Unhandled error: {exc}",
-            )
-            for sym in clean
-        ]
-
-    # Ensure list
-    if not isinstance(results, list):
-        return [
-            UnifiedQuote(symbol=s, data_quality="ERROR", error="Engine return type mismatch") 
-            for s in clean
-        ]
-
-    return results
-
+        logger.error(f"Legacy Adapter Error (Batch): {exc}")
+        return [UnifiedQuote(symbol=s, error=str(exc)) for s in clean_symbols]
 
 # ---------------------------------------------------------------------------
-# Introspection helpers
+# 5. Meta Info
 # ---------------------------------------------------------------------------
 
 def get_engine_meta() -> Dict[str, Any]:
-    eng = _get_engine()
-    enabled_providers: Optional[List[str]] = None
-    try:
-        enabled_providers = list(getattr(eng, "enabled_providers", []))  # type: ignore
-    except Exception:
-        enabled_providers = None
-
+    """Returns diagnostics about the active engine."""
     return {
-        "engine_mode": _ENGINE_MODE,
-        "engine_is_stub": _ENGINE_IS_STUB,
-        "enabled_providers": enabled_providers,
+        "mode": _ENGINE_MODE,
+        "is_stub": _ENGINE_MODE == "stub",
+        "adapter_version": "3.2.0"
     }
-
 
 __all__ = [
     "UnifiedQuote",
