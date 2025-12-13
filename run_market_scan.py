@@ -1,28 +1,24 @@
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER & ANALYZER
-Version: 1.2.0 (Engine-safe + Env-safe + Order-safe)
+TADAWUL FAST BRIDGE – MARKET SCANNER & ANALYZER (v2.0.0)
 ===========================================================
 
-What it does
-------------
-1) Loads env.py if available (otherwise uses OS env vars).
-2) Initializes core.data_engine_v2.DataEngine safely (kwargs if supported).
-3) Fetches enriched quotes for a mixed KSA + Global watchlist.
-4) Ranks by Opportunity Score and prints a "briefing" report.
-5) Exports a full CSV report to ./analysis_report_YYYYMMDD_HHMMSSZ.csv
+What it does:
+1. Initializes the Unified Data Engine (V2).
+2. Fetches real-time data + fundamentals for a watchlist.
+3. Applies the AI Scoring Engine (Value, Quality, Momentum).
+4. Generates a ranked "Opportunity Scoreboard" in the console.
+5. Exports a full detailed CSV report compatible with Excel/Sheets.
 
-Usage
------
-python run_market_scan.py
+Usage:
+    python run_market_scan.py
 
-Optional env vars
------------------
-SCAN_TICKERS="1120.SR,2222.SR,AAPL,MSFT"
-SCAN_TICKERS_FILE="watchlist.txt"        # one symbol per line OR CSV with "Symbol" column
-SCAN_TOP_N="25"
-SCAN_MIN_OPP_SCORE="60"
+Configuration (Env Vars):
+    SCAN_TICKERS="1120.SR,2222.SR,AAPL,MSFT"
+    SCAN_TICKERS_FILE="watchlist.txt"  # Path to file with one ticker per line
+    SCAN_TOP_N="20"                    # How many top picks to show
+    SCAN_MIN_OPP_SCORE="60"            # Minimum score filter
 """
 
 from __future__ import annotations
@@ -32,472 +28,222 @@ import csv
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
+# --- SETUP PATH ---
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# --- IMPORTS ---
+try:
+    from env import settings
+    from core.data_engine_v2 import DataEngine, UnifiedQuote
+    from core.enriched_quote import EnrichedQuote
+    from core.scoring_engine import enrich_with_scores
+except ImportError as e:
+    print(f"CRITICAL ERROR: Could not import core modules. Run from project root.\nError: {e}")
+    sys.exit(1)
+
+# Optional pretty printing
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
+# --- LOGGING ---
 logging.basicConfig(
-    level=getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO),
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("MarketScan")
 
-# Ensure imports from project root
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-try:
-    from core.data_engine_v2 import DataEngine  # type: ignore
-except Exception as e:
-    logger.error("Import Error: %s. Run this script from the project root.", e)
-    raise
-
-# env is optional (script must run even without it)
-try:
-    import env  # type: ignore
-except Exception:
-    env = None  # type: ignore
-
-
-# ---------------------------------------------------------------------
-# Default Watchlists (used if SCAN_TICKERS / SCAN_TICKERS_FILE not set)
-# ---------------------------------------------------------------------
-
-KSA_WATCHLIST = [
-    "1120.SR",  # Al Rajhi
-    "1180.SR",  # SNB
-    "2222.SR",  # Aramco
-    "2010.SR",  # SABIC
-    "7010.SR",  # STC
-    "4030.SR",  # Bahri
-    "7202.SR",  # Solutions
-]
-
-GLOBAL_WATCHLIST = [
-    "AAPL",
-    "NVDA",
-    "MSFT",
-    "TSLA",
-    "AMZN",
-    "GOOGL",
-    "EURUSD=X",
-    "BTC-USD",
-]
-
-
-# ---------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------
-
-def _qget(obj: Any, *names: str, default: Any = None) -> Any:
-    """Get attribute/field from pydantic model or dict with fallbacks."""
-    if obj is None:
-        return default
-    for n in names:
-        try:
-            if hasattr(obj, n):
-                v = getattr(obj, n)
-                if v is not None:
-                    return v
-        except Exception:
-            pass
-        if isinstance(obj, dict) and n in obj and obj[n] is not None:
-            return obj[n]
-    return default
-
-
-def _to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump()  # type: ignore
-        except Exception:
-            pass
-    if isinstance(obj, dict):
-        return obj
-    return getattr(obj, "__dict__", {}) or {}
-
-
-def _normalize_symbol(sym: str) -> str:
-    s = (sym or "").strip().upper()
-    if not s:
-        return ""
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"):
-        s = s.replace(".TADAWUL", ".SR")
-    if s.isdigit():
-        s = f"{s}.SR"
-    return s
-
-
-def _dedupe_keep_order(items: Iterable[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in items:
-        xx = _normalize_symbol(x)
-        if not xx or xx in seen:
-            continue
-        seen.add(xx)
-        out.append(xx)
-    return out
-
-
-def _read_tickers_file(path: str) -> List[str]:
-    path = (path or "").strip()
-    if not path:
-        return []
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"SCAN_TICKERS_FILE not found: {path}")
-
-    # If CSV with header including "Symbol" or "Ticker"
-    if path.lower().endswith(".csv"):
-        out: List[str] = []
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                sym = row.get("Symbol") or row.get("Ticker") or row.get("symbol") or row.get("ticker") or ""
-                sym = _normalize_symbol(sym)
-                if sym:
-                    out.append(sym)
-        return out
-
-    # Otherwise: one symbol per line (ignore empty/#comment)
-    out2: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            out2.append(_normalize_symbol(line))
-    return out2
-
-
-def _split_markets(symbols: Sequence[str]) -> Tuple[List[str], List[str]]:
-    ksa: List[str] = []
-    glob: List[str] = []
-    for s in symbols:
-        (ksa if s.endswith(".SR") else glob).append(s)
-    return ksa, glob
-
-
-def _fmt_money(val: Any, ccy: str) -> str:
-    try:
-        if val is None:
-            return "-"
-        v = float(val)
-        return f"{v:,.2f} {ccy or ''}".strip()
-    except Exception:
-        return "-"
-
-
-def _fmt_pct(val: Any) -> str:
-    try:
-        if val is None:
-            return "-"
-        v = float(val)
-        return f"{v:+.2f}%"
-    except Exception:
-        return "-"
-
-
-def _badge_reco(reco: str) -> str:
-    r = (reco or "").strip().upper()
-    if r == "STRONG_BUY":
-        return "🔥 STRONG_BUY"
-    if r == "BUY":
-        return "✅ BUY"
-    if r == "SELL":
-        return "🛑 SELL"
-    if r == "HOLD":
-        return "⏸ HOLD"
-    return r or "-"
-
-
-def _print_header(title: str) -> None:
-    print("\n" + "=" * 78)
-    print(f" {title}")
-    print("=" * 78)
-
-
-# ---------------------------------------------------------------------
-# Engine initialization (kwargs-safe)
-# ---------------------------------------------------------------------
-
-def _env_get(name: str, default: Any = None) -> Any:
-    if env is not None and hasattr(env, name):
-        try:
-            return getattr(env, name)
-        except Exception:
-            return default
-    return os.getenv(name, default)
-
-
-def _build_engine() -> DataEngine:
-    kwargs: Dict[str, Any] = {}
-
-    enabled = _env_get("ENABLED_PROVIDERS", None)
-    if isinstance(enabled, (list, tuple)) and enabled:
-        kwargs["enabled_providers"] = list(enabled)
-    elif isinstance(enabled, str) and enabled.strip():
-        kwargs["enabled_providers"] = [x.strip() for x in enabled.split(",") if x.strip()]
-
-    # Optional knobs (only passed if present)
-    for k_env, k_arg in [
-        ("ENGINE_CACHE_TTL_SECONDS", "cache_ttl"),
-        ("DATAENGINE_CACHE_TTL", "cache_ttl"),
-        ("ENGINE_PROVIDER_TIMEOUT_SECONDS", "provider_timeout"),
-        ("DATAENGINE_TIMEOUT", "provider_timeout"),
-        ("ENGINE_ENABLE_ADVANCED_ANALYSIS", "enable_advanced_analysis"),
-        ("ENABLE_ADVANCED_ANALYSIS", "enable_advanced_analysis"),
-    ]:
-        v = _env_get(k_env, None)
-        if v is not None and k_arg not in kwargs:
-            kwargs[k_arg] = v
-
-    try:
-        return DataEngine(**kwargs) if kwargs else DataEngine()
-    except TypeError:
-        # Signature mismatch -> fall back to default ctor
-        return DataEngine()
-
-
-# ---------------------------------------------------------------------
-# Ticker source selection
-# ---------------------------------------------------------------------
-
-def _load_watchlist() -> List[str]:
-    raw_inline = (os.getenv("SCAN_TICKERS", "") or "").strip()
-    raw_file = (os.getenv("SCAN_TICKERS_FILE", "") or "").strip()
-
-    if raw_file:
-        return _dedupe_keep_order(_read_tickers_file(raw_file))
-
-    if raw_inline:
-        return _dedupe_keep_order([x.strip() for x in raw_inline.split(",") if x.strip()])
-
-    return _dedupe_keep_order(KSA_WATCHLIST + GLOBAL_WATCHLIST)
-
-
-# ---------------------------------------------------------------------
-# Main analysis
-# ---------------------------------------------------------------------
-
-async def run_analysis() -> None:
-    app_env = str(_env_get("APP_ENV", "production") or "production")
-    base_url = str(_env_get("BACKEND_BASE_URL", "") or "")
-    providers = _env_get("ENABLED_PROVIDERS", None)
-
-    tickers = _load_watchlist()
-    ksa_syms, global_syms = _split_markets(tickers)
-
-    top_n = int(os.getenv("SCAN_TOP_N", "25") or 25)
-    min_opp = float(os.getenv("SCAN_MIN_OPP_SCORE", "60") or 60)
-
-    _print_header(f"🚀 MARKET SCAN (env={app_env})")
-    print(f"Tickers: {len(tickers)} | KSA: {len(ksa_syms)} | Global: {len(global_syms)}")
-    print(f"BACKEND_BASE_URL: {base_url or '-'}")
-    print(f"ENABLED_PROVIDERS: {providers or '-'}")
-
-    logger.info("Initializing DataEngine v2...")
-    engine = _build_engine()
-
-    logger.info("Fetching enriched quotes for %d symbols...", len(tickers))
-    t0 = datetime.now(timezone.utc)
-
-    quotes = await engine.get_enriched_quotes(tickers)  # expected: list aligned with input
-    dt = (datetime.now(timezone.utc) - t0).total_seconds()
-    logger.info("Fetch complete in %.2fs.", dt)
-
-    # Normalize into dicts for stable handling
-    qdicts: List[Dict[str, Any]] = []
-    for q in quotes or []:
-        d = _to_dict(q)
-        if not d:
-            d = {"data_quality": "MISSING", "error": "Empty quote object returned"}
-        # enforce symbol
-        d["symbol"] = _normalize_symbol(str(d.get("symbol") or d.get("ticker") or ""))
-        qdicts.append(d)
-
-    # Identify missing
-    def _is_missing(d: Dict[str, Any]) -> bool:
-        dq = str(d.get("data_quality") or d.get("data_quality_level") or "MISSING").upper()
-        return dq == "MISSING" or bool(d.get("error")) and dq in ("MISSING", "ERROR")
-
-    valid = [d for d in qdicts if not _is_missing(d)]
-    missing = [d for d in qdicts if _is_missing(d)]
-
-    # Rank by opportunity score
-    def _opp(d: Dict[str, Any]) -> float:
-        try:
-            v = d.get("opportunity_score")
-            return float(v) if v is not None else 0.0
-        except Exception:
-            return 0.0
-
-    ranked = sorted(valid, key=_opp, reverse=True)
-
-    # ---------------------------------------------------------
-    # REPORT A: TOP OPPORTUNITIES
-    # ---------------------------------------------------------
-    _print_header(f"🏆 TOP OPPORTUNITIES (OppScore >= {min_opp:.0f})")
-    print(f"{'SYMBOL':<12} | {'PRICE':<18} | {'OPP':>6} | {'RECO':<14} | {'UPSIDE':>8} | {'QUALITY':<10}")
-    print("-" * 78)
-
-    shown = 0
-    for d in ranked:
-        opp = _opp(d)
-        if opp < min_opp:
-            continue
-
-        sym = str(d.get("symbol") or "-")
-        ccy = str(d.get("currency") or "")
-        price = d.get("last_price", d.get("price"))
-        reco = str(d.get("recommendation") or "")
-        upside = d.get("upside_percent")
-
-        dq = str(d.get("data_quality") or "OK")
-        print(
-            f"{sym:<12} | "
-            f"{_fmt_money(price, ccy):<18} | "
-            f"{opp:>6.1f} | "
-            f"{_badge_reco(reco):<14} | "
-            f"{(_fmt_pct(upside) if upside is not None else '-'):>8} | "
-            f"{dq:<10}"
-        )
-
-        shown += 1
-        if shown >= top_n:
-            break
-
-    if shown == 0:
-        print("No symbols met the threshold. Try lowering SCAN_MIN_OPP_SCORE.")
-
-    # ---------------------------------------------------------
-    # REPORT B: KSA SNAPSHOT
-    # ---------------------------------------------------------
-    _print_header("🇸🇦 KSA TADAWUL SNAPSHOT")
-    ksa_ranked = [d for d in ranked if str(d.get("symbol") or "").endswith(".SR") or str(d.get("market") or "").upper() == "KSA"]
-    if not ksa_ranked:
-        print("No KSA data returned. (Check Argaam/Tadawul gateway + enabled providers.)")
+# --- DEFAULTS ---
+DEFAULT_KSA = ["1120.SR", "1180.SR", "2222.SR", "2010.SR", "7010.SR", "4030.SR", "7202.SR", "5110.SR"]
+DEFAULT_GLOBAL = ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN", "GOOGL", "EURUSD=X", "BTC-USD", "GC=F"]
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def load_watchlist() -> List[str]:
+    """
+    Load tickers from File > Env Var > Defaults.
+    """
+    # 1. File
+    fname = os.getenv("SCAN_TICKERS_FILE", "")
+    if fname and os.path.exists(fname):
+        logger.info(f"Loading watchlist from {fname}...")
+        with open(fname, 'r', encoding='utf-8') as f:
+            # Handle CSV or plain text
+            lines = [line.strip().split(',')[0] for line in f if line.strip() and not line.startswith("#")]
+        return list(dict.fromkeys(lines)) # Dedupe
+
+    # 2. Env Var
+    env_tickers = os.getenv("SCAN_TICKERS", "")
+    if env_tickers:
+        logger.info("Loading watchlist from SCAN_TICKERS env var...")
+        return [t.strip() for t in env_tickers.split(",") if t.strip()]
+
+    # 3. Defaults
+    logger.info("Using default KSA + Global watchlist...")
+    return DEFAULT_KSA + DEFAULT_GLOBAL
+
+def format_currency(val: float | None, symbol: str) -> str:
+    if val is None: return "-"
+    return f"{val:,.2f} {symbol}"
+
+def format_pct(val: float | None) -> str:
+    if val is None: return "-"
+    prefix = "+" if val > 0 else ""
+    return f"{prefix}{val:.2f}%"
+
+def get_badge(reco: str | None) -> str:
+    r = (reco or "").upper()
+    if r == "STRONG BUY": return "🔥 STRONG BUY"
+    if r == "BUY": return "✅ BUY"
+    if r == "SELL": return "🛑 SELL"
+    if r == "REDUCE": return "⚠️ REDUCE"
+    return "⏸ HOLD"
+
+# =============================================================================
+# MAIN LOGIC
+# =============================================================================
+
+async def main():
+    start_time = time.time()
+    
+    # 1. Configuration
+    tickers = load_watchlist()
+    top_n = int(os.getenv("SCAN_TOP_N", "25"))
+    min_score = float(os.getenv("SCAN_MIN_OPP_SCORE", "0"))
+    
+    print("\n" + "="*60)
+    print(f" 🚀 MARKET SCANNER v2.0")
+    print(f" 📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f" 🎯 Targets: {len(tickers)} symbols")
+    print(f" 🧠 Engine: Core V2 + AI Scoring")
+    print("="*60 + "\n")
+
+    # 2. Initialize Engine
+    engine = DataEngine()
+    
+    # 3. Fetch Data
+    logger.info("Fetching data... (this may take a moment)")
+    unified_quotes = await engine.get_enriched_quotes(tickers)
+    
+    # 4. Enrich & Score
+    analyzed_data: List[EnrichedQuote] = []
+    
+    for uq in unified_quotes:
+        # Convert to Enriched schema
+        eq = EnrichedQuote.from_unified(uq)
+        # Apply Scoring Engine logic (Value, Quality, Momentum)
+        scored = enrich_with_scores(eq)
+        analyzed_data.append(scored)
+
+    # 5. Sort by Opportunity Score
+    ranked = sorted(
+        analyzed_data, 
+        key=lambda x: (x.opportunity_score or 0, x.data_quality != "MISSING"), 
+        reverse=True
+    )
+
+    valid_results = [x for x in ranked if x.data_quality != "MISSING"]
+    missing_results = [x for x in ranked if x.data_quality == "MISSING"]
+
+    # 6. Display Report
+    print(f"\n🏆 TOP OPPORTUNITIES (Score >= {min_score})")
+    print("-" * 80)
+    
+    display_rows = []
+    for q in valid_results:
+        if (q.opportunity_score or 0) < min_score: continue
+        
+        display_rows.append([
+            q.symbol,
+            format_currency(q.current_price, q.currency or ""),
+            format_pct(q.percent_change),
+            f"{q.opportunity_score or 0:.1f}",
+            get_badge(q.recommendation),
+            format_pct(q.upside_percent),
+            f"{q.value_score or 0:.0f}/{q.quality_score or 0:.0f}/{q.momentum_score or 0:.0f}"
+        ])
+    
+    # Limit display
+    final_display = display_rows[:top_n]
+
+    if HAS_TABULATE:
+        headers = ["Symbol", "Price", "Change", "Opp Score", "Recommendation", "Upside", "V/Q/M Scores"]
+        print(tabulate(final_display, headers=headers, tablefmt="simple_grid"))
     else:
-        print(f"{'SYMBOL':<12} | {'LAST':>12} | {'CHG%':>8} | {'VAL_LABEL':<14} | {'OPP':>6}")
-        print("-" * 78)
-        for d in ksa_ranked[: min(25, len(ksa_ranked))]:
-            sym = str(d.get("symbol") or "-")
-            last_price = d.get("last_price")
-            chg = d.get("change_percent")
-            val_label = str(d.get("valuation_label") or "-")
-            opp = _opp(d)
-            print(f"{sym:<12} | {str(last_price or '-'):>12} | {_fmt_pct(chg):>8} | {val_label:<14} | {opp:>6.1f}")
+        # Simple fallback
+        print(f"{'SYMBOL':<10} {'PRICE':<15} {'SCORE':<6} {'RECO':<12} {'UPSIDE':<8}")
+        for row in final_display:
+            print(f"{row[0]:<10} {row[1]:<15} {row[3]:<6} {row[4]:<12} {row[5]:<8}")
 
-    # ---------------------------------------------------------
-    # REPORT C: MISSING / ERRORS
-    # ---------------------------------------------------------
-    if missing:
-        _print_header("⚠️ MISSING / ERROR SYMBOLS")
-        for d in missing:
-            sym = str(d.get("symbol") or d.get("ticker") or "-")
-            err = str(d.get("error") or "MISSING")
-            dq = str(d.get("data_quality") or "MISSING")
-            print(f"- {sym} | {dq} | {err}")
+    # 7. KSA Specific Snapshot
+    print(f"\n🇸🇦 KSA SNAPSHOT")
+    print("-" * 80)
+    ksa_rows = [row for row in display_rows if ".SR" in row[0]]
+    if ksa_rows:
+        if HAS_TABULATE:
+            print(tabulate(ksa_rows[:10], headers=["Symbol", "Price", "Change", "Opp", "Reco", "Upside", "Scores"], tablefmt="simple"))
+        else:
+            for r in ksa_rows[:5]: print(f"{r[0]}: {r[1]} ({r[2]}) - {r[4]}")
+    else:
+        print("No KSA data found in valid results.")
 
-    # ---------------------------------------------------------
-    # EXPORT CSV
-    # ---------------------------------------------------------
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
-    filename = f"analysis_report_{stamp}.csv"
-    logger.info("Exporting CSV: %s", filename)
+    if missing_results:
+        print(f"\n⚠️ MISSING DATA: {len(missing_results)} symbols (Check logs/tickers)")
+        if len(missing_results) < 10:
+            print(", ".join([m.symbol for m in missing_results]))
 
-    columns = [
-        "Symbol",
-        "Name",
-        "Market",
-        "Currency",
-        "Last Price",
-        "Previous Close",
-        "Change",
-        "Change %",
-        "52W High",
-        "52W Low",
-        "52W Position %",
-        "Fair Value",
-        "Upside %",
-        "Value Score",
-        "Quality Score",
-        "Momentum Score",
-        "Opportunity Score",
-        "Recommendation",
-        "Valuation Label",
-        "RSI 14",
-        "Volatility 30D",
-        "Market Cap",
-        "P/E (TTM)",
-        "P/B",
-        "Dividend Yield",
-        "ROE",
-        "Net Margin",
-        "Data Quality",
-        "Data Source",
-        "Error",
+    # 8. CSV Export
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"scan_results_{timestamp}.csv"
+    
+    logger.info(f"Exporting full report to {filename}...")
+    
+    csv_headers = [
+        "Symbol", "Name", "Market", "Sector", "Price", "Change %", "Opportunity Score", 
+        "Recommendation", "Value Score", "Quality Score", "Momentum Score",
+        "Fair Value", "Upside %", "PE (TTM)", "PB", "Div Yield %", "ROE %", 
+        "Data Quality", "Error"
     ]
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(csv_headers)
+        
+        for q in ranked:
+            writer.writerow([
+                q.symbol,
+                q.name,
+                q.market,
+                q.sector,
+                q.current_price,
+                q.percent_change,
+                q.opportunity_score,
+                q.recommendation,
+                q.value_score,
+                q.quality_score,
+                q.momentum_score,
+                q.fair_value,
+                q.upside_percent,
+                q.pe_ttm,
+                q.pb,
+                q.dividend_yield,
+                q.roe,
+                q.data_quality,
+                q.error
+            ])
 
-    def _row(d: Dict[str, Any]) -> List[Any]:
-        return [
-            d.get("symbol"),
-            d.get("name"),
-            d.get("market") or d.get("market_region"),
-            d.get("currency"),
-            d.get("last_price") or d.get("price"),
-            d.get("previous_close"),
-            d.get("change"),
-            d.get("change_percent"),
-            d.get("high_52w") or d.get("fifty_two_week_high"),
-            d.get("low_52w") or d.get("fifty_two_week_low"),
-            d.get("position_52w_percent") or d.get("fifty_two_week_position_pct"),
-            d.get("fair_value"),
-            d.get("upside_percent"),
-            d.get("value_score"),
-            d.get("quality_score"),
-            d.get("momentum_score"),
-            d.get("opportunity_score"),
-            d.get("recommendation"),
-            d.get("valuation_label"),
-            d.get("rsi_14"),
-            d.get("volatility_30d") or d.get("volatility_30d_percent"),
-            d.get("market_cap"),
-            d.get("pe_ttm") or d.get("pe_ratio"),
-            d.get("pb") or d.get("pb_ratio"),
-            d.get("dividend_yield") or d.get("dividend_yield_percent"),
-            d.get("roe") or d.get("roe_percent"),
-            d.get("net_margin_percent") or d.get("profit_margin"),
-            d.get("data_quality"),
-            d.get("data_source"),
-            d.get("error"),
-        ]
-
-    # Export ranked (valid first) then missing
-    export_rows = ranked + missing
-
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(columns)
-        for d in export_rows:
-            w.writerow(_row(d))
-
-    print(f"\n✅ Analysis Complete. CSV saved: {filename}\n")
-
+    print(f"\n✅ Done in {time.time() - start_time:.2f}s")
 
 if __name__ == "__main__":
-    # Windows safety
     if os.name == "nt":
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    asyncio.run(run_analysis())
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
