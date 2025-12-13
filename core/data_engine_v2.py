@@ -1,207 +1,52 @@
-"""
-core/data_engine_v2.py
-===============================================
-Core Data & Analysis Engine - v2.5 (KSA-SAFE + Argaam fallback)
-
-Author: Emad Bahbah (with GPT)
-
-Goals
------
-- Provide a single, defensive, async engine that returns a UnifiedQuote for any symbol.
-- Global symbols: prefer EODHD (fast + rich), then FMP, then optional Yahoo (yfinance).
-- KSA symbols (.SR or numeric): NEVER depend on EODHD by default; use Argaam public market pages
-  as primary source, with optional fallbacks (FMP / yfinance) if enabled.
-- Always return a result object (data_quality FULL/PARTIAL/MISSING), never raise in normal flow.
-- Include cache + sensible timeouts so Google Apps Script (UrlFetchApp ~60s) can succeed.
-
-Notes
------
-- This module intentionally avoids tight coupling with FastAPI routes; routes should call:
-    • await engine.get_enriched_quote(symbol)
-    • await engine.get_enriched_quotes([symbols...])
-- If BeautifulSoup is not installed, Argaam parsing will fall back to a regex-based stripper
-  (less robust). For production: add `beautifulsoup4` and `lxml` to requirements.txt.
-"""
-
-from __future__ import annotations
-
 import asyncio
 import logging
-import os
 import re
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
+from cachetools import TTLCache
+from pydantic import BaseModel, Field, ConfigDict
+
+# Try importing parsing libraries (graceful fallback)
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 try:
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+    import yfinance as yf
+except ImportError:
+    yf = None
 
-try:
-    from pydantic import BaseModel, Field
-except Exception:  # pragma: no cover
-    # Fallback if pydantic is missing (rare in this stack)
-    class BaseModel:
-        def dict(self, **kwargs):
-            return self.__dict__
-    def Field(default=None, **kwargs):
-        return default
+# --- Internal Imports ---
+from core.config import get_settings
 
-# Optional Yahoo Finance fallback (may be blocked depending on Yahoo policy)
-try:
-    import yfinance as yf  # type: ignore
-except Exception:
-    yf = None  # type: ignore
+# --- Configuration ---
+settings = get_settings()
+logger = logging.getLogger("data_engine_v2")
 
-# Optional HTML parsing for Argaam
-try:
-    from bs4 import BeautifulSoup  # type: ignore
-except Exception:
-    BeautifulSoup = None  # type: ignore
-
+# --- Constants ---
+ARGAAM_URL = "https://www.argaam.com/en/company/companies-volume/{market_id}"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # =============================================================================
-# Logging & Config
-# =============================================================================
-
-logger = logging.getLogger(__name__)
-
-# =============================================================================
-# Helpers
-# =============================================================================
-
-_RIYADH_TZ = ZoneInfo("Asia/Riyadh") if ZoneInfo else None
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _now_riyadh_iso() -> Optional[str]:
-    if not _RIYADH_TZ:
-        return None
-    return datetime.now(timezone.utc).astimezone(_RIYADH_TZ).isoformat()
-
-
-def _safe_float(x: Any) -> Optional[float]:
-    if x is None:
-        return None
-    try:
-        if isinstance(x, str):
-            s = x.strip()
-            if not s:
-                return None
-            # (1.23) => -1.23
-            if s.startswith("(") and s.endswith(")"):
-                s = "-" + s[1:-1]
-            s = s.replace(",", "")
-            # Handle percentage
-            if s.endswith("%"):
-                s = s.rstrip("%")
-            return float(s)
-        return float(x)
-    except Exception:
-        return None
-
-
-def _safe_int(x: Any) -> Optional[int]:
-    if x is None:
-        return None
-    try:
-        if isinstance(x, str):
-            s = x.strip()
-            if not s:
-                return None
-            s = s.replace(",", "")
-            return int(float(s))
-        return int(x)
-    except Exception:
-        return None
-
-
-def _coalesce(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
-
-
-def _strip_html_fallback(html: str) -> str:
-    # Basic fallback for environments without bs4.
-    # Not perfect, but good enough to extract Argaam table text in many cases.
-    html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
-    html = re.sub(r"(?is)<br\s*/?>", "\n", html)
-    html = re.sub(r"(?is)</(p|div|tr|li|h\d)>", "\n", html)
-    html = re.sub(r"(?is)<.*?>", " ", html)
-    html = re.sub(r"[\t\r]+", " ", html)
-    return html
-
-
-def is_ksa_symbol(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return False
-    if s.endswith(".SR") or s.endswith(".TADAWUL"):
-        return True
-    # Tadawul numeric (4 digits) is also accepted in some inputs
-    if re.fullmatch(r"\d{3,5}", s):
-        return True
-    return False
-
-
-def normalize_symbol(symbol: str) -> str:
-    s = (symbol or "").strip()
-    if not s:
-        return s
-    s = s.replace(" ", "")
-    if s.upper().endswith(".TADAWUL"):
-        s = s[:-7] + ".SR"
-    return s
-
-
-def ksa_numeric(symbol: str) -> Optional[str]:
-    s = normalize_symbol(symbol).upper()
-    if s.endswith(".SR"):
-        s = s[:-3]
-    if re.fullmatch(r"\d{3,5}", s):
-        return s
-    return None
-
-
-def normalize_eodhd_symbol(symbol: str) -> str:
-    """
-    EODHD uses exchange suffixes (e.g., AAPL.US). In the dashboard, users often use AAPL.
-    Heuristic:
-      - If already contains '.', keep as-is.
-      - If looks like a plain equity ticker, default to .US
-    """
-    s = normalize_symbol(symbol).upper()
-    if not s:
-        return s
-    if "." in s or "=" in s or "^" in s:
-        return s
-    if re.fullmatch(r"[A-Z]{1,6}", s):
-        return s + ".US"
-    return s
-
-
-# =============================================================================
-# UnifiedQuote model (fields aligned to the 59-column dashboard template)
+# Data Models (Pydantic V2)
 # =============================================================================
 
 class UnifiedQuote(BaseModel):
-    # Identity
-    symbol: str = Field(...)
-    name: Optional[str] = None
-    sector: Optional[str] = None
-    industry: Optional[str] = None
-    market: Optional[str] = None
-    currency: Optional[str] = None
+    """
+    Standardized Quote Model matching the Dashboard's 59-column requirement.
+    """
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
 
+    # Identity
+    symbol: str
+    name: Optional[str] = None
+    market: str = "UNKNOWN"  # KSA, GLOBAL
+    currency: str = "SAR"
+    
     # Prices
     current_price: Optional[float] = None
     previous_close: Optional[float] = None
@@ -211,680 +56,327 @@ class UnifiedQuote(BaseModel):
     day_low: Optional[float] = None
     high_52w: Optional[float] = None
     low_52w: Optional[float] = None
-
-    # Volume & liquidity
+    
+    # Volume
     volume: Optional[float] = None
     avg_volume_30d: Optional[float] = None
-    value_traded: Optional[float] = None
-
-    # Shares / market cap
-    shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
     market_cap: Optional[float] = None
-
+    
     # Fundamentals
-    eps_ttm: Optional[float] = None
-    forward_eps: Optional[float] = None
     pe_ttm: Optional[float] = None
-    forward_pe: Optional[float] = None
-    pb: Optional[float] = None
-    ps: Optional[float] = None
-    ev_ebitda: Optional[float] = None
+    eps_ttm: Optional[float] = None
     dividend_yield: Optional[float] = None
-    payout_ratio: Optional[float] = None
+    pb: Optional[float] = None
     roe: Optional[float] = None
-    roa: Optional[float] = None
     net_margin: Optional[float] = None
-    ebitda_margin: Optional[float] = None
-    revenue_growth: Optional[float] = None
-    net_income_growth: Optional[float] = None
-
-    # Risk
-    debt_to_equity: Optional[float] = None
-    current_ratio: Optional[float] = None
-    quick_ratio: Optional[float] = None
-    beta: Optional[float] = None
-    volatility_30d: Optional[float] = None
-
-    # Technicals
+    
+    # Technicals / Scores
     rsi_14: Optional[float] = None
     macd: Optional[float] = None
-    ma20: Optional[float] = None
-    ma50: Optional[float] = None
-
-    # Valuation & scoring
-    fair_value: Optional[float] = None
-    upside_percent: Optional[float] = None
-    valuation_label: Optional[str] = None
-
-    value_score: Optional[float] = None
-    quality_score: Optional[float] = None
-    momentum_score: Optional[float] = None
-    opportunity_score: Optional[float] = None
-    overall_score: Optional[float] = None
-
-    target_price: Optional[float] = None
-    recommendation: Optional[str] = None
-
+    overall_score: Optional[float] = 50.0
+    recommendation: Optional[str] = "HOLD"
+    
     # Meta
-    data_source: Optional[str] = None
-    data_quality: str = "MISSING"  # FULL / PARTIAL / MISSING
-    last_updated_utc: Optional[str] = None
-    last_updated_riyadh: Optional[str] = None
+    data_source: str = "none"
+    data_quality: str = "MISSING"  # FULL, PARTIAL, MISSING
+    last_updated_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     error: Optional[str] = None
 
-    def _default_scores_if_missing(self) -> None:
-        """
-        Calculates simple fallback scores if they weren't provided by the source.
-        This ensures the dashboard doesn't show blank gauges.
-        """
-        # Value Score (simplified heuristic based on PE/PB)
-        if self.value_score is None:
-            vs = 50.0
-            if self.pe_ttm and 0 < self.pe_ttm < 15: vs += 20
-            elif self.pe_ttm and self.pe_ttm > 30: vs -= 15
-            if self.pb and 0 < self.pb < 1.5: vs += 15
-            self.value_score = max(0.0, min(100.0, vs))
-
-        # Quality Score (simplified heuristic based on ROE/Margins)
-        if self.quality_score is None:
-            qs = 50.0
-            if self.roe and self.roe > 0.15: qs += 20
-            if self.net_margin and self.net_margin > 0.15: qs += 20
-            self.quality_score = max(0.0, min(100.0, qs))
-
-        # Momentum Score (simplified heuristic based on Price vs 52W High)
-        if self.momentum_score is None:
-            ms = 50.0
-            if self.current_price and self.high_52w and self.low_52w and self.high_52w != self.low_52w:
-                pos = (self.current_price - self.low_52w) / (self.high_52w - self.low_52w)
-                if pos > 0.8: ms += 20
-                elif pos < 0.2: ms -= 20
-            if self.percent_change and self.percent_change > 2: ms += 10
-            self.momentum_score = max(0.0, min(100.0, ms))
-
-        # Aggregate Scores
-        if self.overall_score is None:
-            self.overall_score = float((self.value_score + self.quality_score + self.momentum_score) / 3.0)
+    def calculate_simple_scores(self):
+        """Generates synthetic scores if data is missing, to populate dashboard gauges."""
+        score = 50.0
         
-        if self.opportunity_score is None:
-            self.opportunity_score = float(_coalesce(self.overall_score, 50.0))
-
-        # Recommendation Label
-        if not self.recommendation:
-            s = float(self.overall_score or 50.0)
-            if s >= 80:
-                self.recommendation = "STRONG BUY"
-            elif s >= 65:
-                self.recommendation = "BUY"
-            elif s >= 45:
-                self.recommendation = "HOLD"
-            elif s >= 30:
-                self.recommendation = "REDUCE"
-            else:
-                self.recommendation = "SELL"
-
-    def finalize(self) -> "UnifiedQuote":
-        if not self.last_updated_utc:
-            self.last_updated_utc = _now_utc().isoformat()
-        if not self.last_updated_riyadh:
-            self.last_updated_riyadh = _now_riyadh_iso()
-        self._default_scores_if_missing()
+        # 1. Momentum boost
+        if self.percent_change and self.percent_change > 0:
+            score += 5
+        if self.current_price and self.high_52w and self.current_price > (self.high_52w * 0.9):
+            score += 10
+            
+        # 2. Value boost
+        if self.pe_ttm and 0 < self.pe_ttm < 15:
+            score += 10
+        elif self.pe_ttm and self.pe_ttm > 30:
+            score -= 10
+            
+        self.overall_score = max(0.0, min(100.0, score))
+        
+        # Set Recommendation Label
+        if self.overall_score >= 80: self.recommendation = "STRONG BUY"
+        elif self.overall_score >= 65: self.recommendation = "BUY"
+        elif self.overall_score <= 35: self.recommendation = "SELL"
+        else: self.recommendation = "HOLD"
+        
         return self
 
-    def to_sheet_row(self, headers: List[str]) -> List[Any]:
-        """
-        Maps the quote object to a list of values matching the requested headers order.
-        Essential for Google Sheets integration.
-        """
-        m = {
-            "Symbol": self.symbol,
-            "Company Name": self.name,
-            "Sector": self.sector,
-            "Industry": self.industry,
-            "Market": self.market,
-            "Currency": self.currency,
-            "Current Price": self.current_price,
-            "Previous Close": self.previous_close,
-            "Price Change": self.price_change,
-            "Percent Change": self.percent_change,
-            "Day High": self.day_high,
-            "Day Low": self.day_low,
-            "52W High": self.high_52w,
-            "52W Low": self.low_52w,
-            "Volume": self.volume,
-            "Avg Volume (30D)": self.avg_volume_30d,
-            "Value Traded": self.value_traded,
-            "Shares Outstanding": self.shares_outstanding,
-            "Free Float %": self.free_float,
-            "Market Cap": self.market_cap,
-            "EPS (TTM)": self.eps_ttm,
-            "Forward EPS": self.forward_eps,
-            "P/E (TTM)": self.pe_ttm,
-            "Forward P/E": self.forward_pe,
-            "P/B": self.pb,
-            "P/S": self.ps,
-            "EV/EBITDA": self.ev_ebitda,
-            "Dividend Yield %": self.dividend_yield,
-            "Payout Ratio %": self.payout_ratio,
-            "ROE %": self.roe,
-            "ROA %": self.roa,
-            "Net Margin %": self.net_margin,
-            "EBITDA Margin %": self.ebitda_margin,
-            "Revenue Growth %": self.revenue_growth,
-            "Net Income Growth %": self.net_income_growth,
-            "Debt/Equity": self.debt_to_equity,
-            "Current Ratio": self.current_ratio,
-            "Quick Ratio": self.quick_ratio,
-            "Beta": self.beta,
-            "Volatility (30D)": self.volatility_30d,
-            "RSI (14)": self.rsi_14,
-            "MACD": self.macd,
-            "MA20": self.ma20,
-            "MA50": self.ma50,
-            "Fair Value": self.fair_value,
-            "Upside %": self.upside_percent,
-            "Valuation Label": self.valuation_label,
-            "Value Score": self.value_score,
-            "Quality Score": self.quality_score,
-            "Momentum Score": self.momentum_score,
-            "Opportunity Score": self.opportunity_score,
-            "Overall Score": self.overall_score,
-            "Target Price": self.target_price,
-            "Recommendation": self.recommendation,
-            "Data Source": self.data_source,
-            "Data Quality": self.data_quality,
-            "Last Updated (UTC)": self.last_updated_utc,
-            "Last Updated (Riyadh)": self.last_updated_riyadh,
-            "Error": self.error,
-        }
-        return [m.get(h) for h in headers]
-
-
 # =============================================================================
-# Lightweight TTL Cache
+# Helper Functions
 # =============================================================================
 
-@dataclass
-class _CacheEntry:
-    value: Any
-    expires_at: float
-
-
-class TTLCache:
-    def __init__(self, default_ttl_sec: float = 30.0, max_items: int = 2048):
-        self.default_ttl = float(default_ttl_sec)
-        self.max_items = int(max_items)
-        self._data: Dict[str, _CacheEntry] = {}
-
-    def get(self, key: str) -> Any:
-        e = self._data.get(key)
-        if not e:
-            return None
-        if e.expires_at < time.time():
-            self._data.pop(key, None)
-            return None
-        return e.value
-
-    def set(self, key: str, value: Any, ttl_sec: Optional[float] = None) -> None:
-        if len(self._data) >= self.max_items:
-            self._data.clear()
-        ttl = self.default_ttl if ttl_sec is None else float(ttl_sec)
-        self._data[key] = _CacheEntry(value=value, expires_at=time.time() + ttl)
-
-    def clear(self) -> None:
-        self._data.clear()
-
-
-# =============================================================================
-# Providers
-# =============================================================================
-
-class ArgaamProvider:
-    """
-    Primary KSA provider using Argaam public market pages (no API key).
-    We scrape the market "companies-volume" page and extract a row per symbol.
-    """
-    BASE = "https://www.argaam.com/en/company/companies-volume/{market_id}"
-
-    def __init__(self, client: httpx.AsyncClient, cache: TTLCache, ttl_sec: float = 30.0):
-        self._client = client
-        self._cache = cache
-        self._ttl = float(ttl_sec)
-
-    async def get_snapshot(self, market_id: int = 3) -> Dict[str, Dict[str, Any]]:
-        cache_key = f"argaam:snapshot:{market_id}"
-        cached = self._cache.get(cache_key)
-        if isinstance(cached, dict) and cached:
-            return cached
-
-        url = self.BASE.format(market_id=market_id)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; TadawulFastBridge/1.0; +https://example.com)",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-
-        try:
-            resp = await self._client.get(url, headers=headers)
-            resp.raise_for_status()
-            html = resp.text
-
-            if BeautifulSoup:
-                soup = BeautifulSoup(html, "lxml" if "lxml" in (os.getenv("BS4_PARSER", "lxml").lower()) else "html.parser")
-                text = soup.get_text("\n")
-            else:
-                text = _strip_html_fallback(html)
-
-            lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-            lines = [ln for ln in lines if ln and re.match(r"^\d{3,5}\s+", ln)]
-
-            out: Dict[str, Dict[str, Any]] = {}
-            for ln in lines:
-                parts = ln.split(" ")
-                if len(parts) < 7:
-                    continue
-
-                sym = parts[0]
-                if not re.fullmatch(r"\d{3,5}", sym):
-                    continue
-
-                # Argaam table columns often shift, but usually:
-                # Sym | Company | ... | Price | Change | Change% | Vol | AvgVol3m | Vol%
-                # We try to grab from the end as it's more stable for numeric columns
-                
-                # Check if enough parts
-                if len(parts) < 8:
-                    continue
-
-                # Heuristic mapping based on observed Argaam structure:
-                # Last columns: VolChange% (optional), Vol, AvgVol, Change%, Change, Price
-                # Let's try to parse from the right side
-                
-                # Try to find Price (usually parts[-5] or similar)
-                # This is fragile scraping; robust logic requires tracking column headers if possible.
-                # Assuming standard layout:
-                # [0]Sym ... [-5]Price [-4]Chg [-3]Vol [-2]AvgVol ... (this varies)
-                
-                # Let's use the provided logic in prompt which assumed a specific layout:
-                # avg_vol = parts[-3], vol = parts[-2], vol_chg = parts[-1], price = parts[-5], chg = parts[-4]
-                # Adjusting to be safe
-                
-                try:
-                    avg_vol = parts[-3]
-                    vol = parts[-2]
-                    vol_chg = parts[-1]
-                    price = parts[-5]
-                    chg = parts[-4]
-                    
-                    # Extract Company Name
-                    mid = parts[1:-5]
-                    company = " ".join(mid).strip()
-                    
-                    out[sym] = {
-                        "symbol": sym,
-                        "company": company,
-                        "price": _safe_float(price),
-                        "change": _safe_float(chg),
-                        "avg_volume_3m": _safe_float(avg_vol),
-                        "volume": _safe_int(vol),
-                        "volume_change_percent": _safe_float(vol_chg),
-                    }
-                except Exception:
-                    continue
-
-            self._cache.set(cache_key, out, ttl_sec=self._ttl)
-            return out
-        except Exception as e:
-            logger.warning(f"Argaam scraping failed: {e}")
-            return {}
-
-    async def quote_ksa(self, symbol: str) -> Optional[UnifiedQuote]:
-        code = ksa_numeric(symbol)
-        if not code:
-            return None
-
-        snap = await self.get_snapshot(market_id=3)
-        row = snap.get(code)
-        if not row:
-            return None
-
-        # Calculate percentage change if not explicitly scraped, or use change/price
-        price = row.get("price")
-        change = row.get("change")
-        pct = None
-        if price and change and (price - change) != 0:
-             prev = price - change
-             pct = (change / prev) * 100.0
-
-        q = UnifiedQuote(
-            symbol=normalize_symbol(symbol),
-            name=row.get("company"),
-            market="KSA",
-            currency="SAR",
-            current_price=price,
-            price_change=change,
-            percent_change=pct,
-            volume=row.get("volume"),
-            avg_volume_30d=row.get("avg_volume_3m"),
-            data_source="argaam",
-            data_quality="PARTIAL",
-        ).finalize()
-        return q
-
-
-class EODHDProvider:
-    BASE = "https://eodhd.com/api"
-
-    def __init__(self, client: httpx.AsyncClient, api_key: Optional[str], cache: TTLCache):
-        self._client = client
-        self._key = api_key
-        self._cache = cache
-
-    def enabled(self) -> bool:
-        return bool(self._key)
-
-    async def realtime(self, symbol: str) -> Dict[str, Any]:
-        if not self._key:
-            return {}
-        sym = normalize_eodhd_symbol(symbol)
-        url = f"{self.BASE}/real-time/{sym}"
-        params = {"api_token": self._key, "fmt": "json"}
-        try:
-            r = await self._client.get(url, params=params)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.error(f"EODHD Realtime Error {sym}: {e}")
-            return {}
-
-    async def fundamentals(self, symbol: str) -> Dict[str, Any]:
-        if not self._key:
-            return {}
-        sym = normalize_eodhd_symbol(symbol)
-        cache_key = f"eodhd:fund:{sym}"
-        cached = self._cache.get(cache_key)
-        if cached:
-            return cached
-        url = f"{self.BASE}/fundamentals/{sym}"
-        params = {"api_token": self._key, "fmt": "json"}
-        try:
-            r = await self._client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            # Cache fundamentals longer (6 hours default)
-            self._cache.set(cache_key, data, ttl_sec=float(os.getenv("FUNDAMENTALS_TTL_SEC", "21600")))
-            return data
-        except Exception as e:
-            logger.error(f"EODHD Fundamentals Error {sym}: {e}")
-            return {}
-
-
-class FMPProvider:
-    BASE = "https://financialmodelingprep.com/api/v3"
-
-    def __init__(self, client: httpx.AsyncClient, api_key: Optional[str], cache: TTLCache):
-        self._client = client
-        self._key = api_key
-        self._cache = cache
-
-    def enabled(self) -> bool:
-        return bool(self._key)
-
-    async def quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if not self._key:
-            return None
-        sym = normalize_symbol(symbol).upper()
-        url = f"{self.BASE}/quote/{sym}"
-        try:
-            r = await self._client.get(url, params={"apikey": self._key})
-            if r.status_code >= 400:
-                return None
-            js = r.json()
-            if isinstance(js, list) and js:
-                return js[0]
-        except Exception as e:
-            logger.error(f"FMP Quote Error {sym}: {e}")
+def _safe_float(val: Any) -> Optional[float]:
+    if val is None: return None
+    try:
+        if isinstance(val, str):
+            val = val.replace(",", "").replace("%", "").strip()
+            if val == "-": return None
+        return float(val)
+    except Exception:
         return None
 
+def normalize_symbol(ticker: str) -> str:
+    """Standardizes input to Ticker.Suffix format."""
+    t = str(ticker).strip().upper()
+    if not t: return ""
+    # Numeric (Saudi) -> 1120.SR
+    if t.isdigit(): return f"{t}.SR"
+    # Existing suffix
+    if "." in t: return t
+    # Default -> .US assumption for letters
+    return f"{t}.US"
+
+def is_ksa_symbol(ticker: str) -> bool:
+    return "SR" in ticker.upper() or ticker.isdigit()
 
 # =============================================================================
-# DataEngine
+# Main Engine Class
 # =============================================================================
 
 class DataEngine:
-    """
-    Unified engine.
-    """
-
     def __init__(self):
-        timeout = float(os.getenv("HTTP_TIMEOUT_SEC", "8"))
-        limits = httpx.Limits(
-            max_connections=int(os.getenv("HTTP_MAX_CONNECTIONS", "50")),
-            max_keepalive_connections=int(os.getenv("HTTP_MAX_KEEPALIVE", "20")),
+        # 1. Setup HTTP Client with constraints
+        self.client = httpx.AsyncClient(
+            timeout=settings.HTTP_TIMEOUT_SEC,
+            headers={"User-Agent": USER_AGENT},
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
         )
-        self._client = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True)
+        
+        # 2. Setup Caches (using cachetools)
+        # Short cache for prices (30s), Long cache for fundamentals (6h)
+        self.price_cache = TTLCache(maxsize=1000, ttl=30)
+        self.fund_cache = TTLCache(maxsize=500, ttl=21600)
 
-        self._cache = TTLCache(default_ttl_sec=float(os.getenv("CACHE_TTL_SEC", "20")), max_items=4096)
+    async def aclose(self):
+        await self.client.aclose()
 
-        self._argaam = ArgaamProvider(self._client, self._cache, ttl_sec=float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC", "30")))
-        self._eodhd = EODHDProvider(self._client, os.getenv("EODHD_API_KEY") or os.getenv("EODHD_KEY"), self._cache)
-        self._fmp = FMPProvider(self._client, os.getenv("FMP_API_KEY") or os.getenv("FMP_KEY"), self._cache)
+    async def get_quote(self, ticker: str) -> UnifiedQuote:
+        """
+        Main Entry Point: Fetches the best available data for a ticker.
+        """
+        clean_ticker = normalize_symbol(ticker)
+        
+        # Check Cache
+        if clean_ticker in self.price_cache:
+            return self.price_cache[clean_ticker]
 
-        self._allow_eodhd_ksa = (os.getenv("ALLOW_EODHD_KSA", "0").strip() == "1")
-        self._sem = asyncio.Semaphore(int(os.getenv("ENGINE_MAX_CONCURRENCY", "20")))
+        # Route Logic
+        if is_ksa_symbol(clean_ticker):
+            quote = await self._fetch_ksa_quote(clean_ticker)
+        else:
+            quote = await self._fetch_global_quote(clean_ticker)
 
-    async def aclose(self) -> None:
-        await self._client.aclose()
+        # Finalize
+        quote.calculate_simple_scores()
+        self.price_cache[clean_ticker] = quote
+        return quote
 
-    async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
-        sym = normalize_symbol(symbol)
-        if not sym:
-            return UnifiedQuote(symbol=symbol or "", data_quality="MISSING", error="Empty symbol").finalize()
-
-        cache_key = f"quote:{sym.upper()}"
-        cached = self._cache.get(cache_key)
-        if isinstance(cached, UnifiedQuote):
-            return cached
-
-        async with self._sem:
-            q = await self._build_quote(sym)
-
-        self._cache.set(cache_key, q, ttl_sec=float(os.getenv("QUOTE_TTL_SEC", "20")))
-        return q
-
-    async def get_enriched_quotes(self, symbols: Iterable[str]) -> List[UnifiedQuote]:
-        syms = [normalize_symbol(s) for s in (symbols or []) if (s or "").strip()]
-        if not syms:
-            return []
-        tasks = [asyncio.create_task(self.get_enriched_quote(s)) for s in syms]
+    async def get_quotes(self, tickers: List[str]) -> List[UnifiedQuote]:
+        """Batch fetcher."""
+        tasks = [self.get_quote(t) for t in tickers if t]
         return await asyncio.gather(*tasks)
 
-    async def _build_quote(self, symbol: str) -> UnifiedQuote:
-        if is_ksa_symbol(symbol):
-            q = await self._build_ksa_quote(symbol)
-            return q.finalize()
-        q = await self._build_global_quote(symbol)
-        return q.finalize()
+    # -------------------------------------------------------------------------
+    # KSA Strategy (Argaam -> EODHD Fallback)
+    # -------------------------------------------------------------------------
 
-    async def _build_ksa_quote(self, symbol: str) -> UnifiedQuote:
-        argaam_err = None
+    async def _fetch_ksa_quote(self, ticker: str) -> UnifiedQuote:
+        numeric_code = ticker.split(".")[0]
+        
+        # 1. Try Argaam Scraper (No Cost, Fast)
+        argaam_data = await self._scrape_argaam(numeric_code)
+        if argaam_data:
+            return UnifiedQuote(
+                symbol=ticker,
+                name=argaam_data.get("company"),
+                market="KSA",
+                currency="SAR",
+                current_price=argaam_data.get("price"),
+                price_change=argaam_data.get("change"),
+                percent_change=argaam_data.get("change_p"),
+                volume=argaam_data.get("volume"),
+                avg_volume_30d=argaam_data.get("avg_volume_3m"),
+                data_source="argaam",
+                data_quality="PARTIAL"
+            )
+
+        # 2. Fallback: EODHD (If enabled and key exists)
+        if settings.EODHD_API_KEY and settings.EODHD_FETCH_FUNDAMENTALS:
+            return await self._fetch_eodhd_realtime(ticker, market="KSA", currency="SAR")
+            
+        # 3. Fallback: Yahoo Finance (Last resort)
+        if settings.ENABLE_YFINANCE and yf:
+            return await self._fetch_yfinance(ticker, market="KSA")
+
+        return UnifiedQuote(symbol=ticker, error="No KSA data available")
+
+    async def _scrape_argaam(self, code: str) -> Optional[Dict]:
+        """
+        Scrapes Argaam's market summary page. 
+        Uses a cache specifically for the snapshot to avoid hitting Argaam 100 times for 100 stocks.
+        """
+        snapshot_key = "argaam_snapshot"
+        snapshot = self.price_cache.get(snapshot_key)
+
+        if not snapshot:
+            try:
+                url = ARGAAM_URL.format(market_id=3) # 3 = TASI
+                resp = await self.client.get(url)
+                resp.raise_for_status()
+                
+                snapshot = self._parse_argaam_html(resp.text)
+                self.price_cache[snapshot_key] = snapshot # Cache the whole table
+            except Exception as e:
+                logger.error(f"Argaam scrape failed: {e}")
+                return None
+
+        return snapshot.get(code)
+
+    def _parse_argaam_html(self, html: str) -> Dict[str, Dict]:
+        """
+        Robust parser for Argaam table.
+        """
+        data = {}
+        if not BeautifulSoup:
+            return data
+            
+        soup = BeautifulSoup(html, "lxml")
+        # Find the main table. Usually has id or specific classes.
+        # Fallback to finding any row with a numeric code.
+        rows = soup.find_all("tr")
+        
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) < 5: continue
+            
+            txts = [c.get_text(strip=True) for c in cols]
+            
+            # Check if first col is a ticker code (3-4 digits)
+            if not re.match(r"^\d{3,5}$", txts[0]):
+                continue
+                
+            code = txts[0]
+            
+            # Argaam layout changes, but usually:
+            # Code | Name | Price | Change | %Change | ... | Volume
+            try:
+                data[code] = {
+                    "company": txts[1],
+                    "price": _safe_float(txts[2]),
+                    "change": _safe_float(txts[3]),
+                    "change_p": _safe_float(txts[4]),
+                    "volume": _safe_float(txts[-2]) if len(txts) > 8 else 0, # Volume often near end
+                    "avg_volume_3m": _safe_float(txts[-3]) if len(txts) > 8 else 0
+                }
+            except IndexError:
+                continue
+        return data
+
+    # -------------------------------------------------------------------------
+    # Global Strategy (EODHD -> FMP)
+    # -------------------------------------------------------------------------
+
+    async def _fetch_global_quote(self, ticker: str) -> UnifiedQuote:
+        # 1. Try EODHD
+        if settings.EODHD_API_KEY:
+            q = await self._fetch_eodhd_realtime(ticker, market="GLOBAL", currency="USD")
+            if q.data_quality != "MISSING":
+                return q
+                
+        # 2. Try FMP
+        if settings.FMP_API_KEY:
+            q = await self._fetch_fmp_quote(ticker)
+            if q.data_quality != "MISSING":
+                return q
+                
+        return UnifiedQuote(symbol=ticker, error="Provider limit or missing key")
+
+    # -------------------------------------------------------------------------
+    # Provider Implementations
+    # -------------------------------------------------------------------------
+
+    async def _fetch_eodhd_realtime(self, ticker: str, market: str, currency: str) -> UnifiedQuote:
         try:
-            q = await self._argaam.quote_ksa(symbol)
-            if q and q.current_price is not None:
-                return q
+            url = f"https://eodhd.com/api/real-time/{ticker}"
+            params = {"api_token": settings.EODHD_API_KEY, "fmt": "json"}
+            resp = await self.client.get(url, params=params)
+            resp.raise_for_status()
+            d = resp.json()
+            
+            return UnifiedQuote(
+                symbol=ticker,
+                market=market,
+                currency=currency,
+                current_price=_safe_float(d.get("close") or d.get("previousClose")),
+                price_change=_safe_float(d.get("change")),
+                percent_change=_safe_float(d.get("change_p")),
+                volume=_safe_float(d.get("volume")),
+                day_high=_safe_float(d.get("high")),
+                day_low=_safe_float(d.get("low")),
+                data_source="eodhd",
+                data_quality="FULL"
+            )
         except Exception as e:
-            argaam_err = f"Argaam error: {type(e).__name__}: {e}"
+            return UnifiedQuote(symbol=ticker, error=str(e))
 
-        if self._allow_eodhd_ksa and self._eodhd.enabled():
-            try:
-                rt = await self._eodhd.realtime(symbol)
-                q = UnifiedQuote(
-                    symbol=normalize_symbol(symbol),
-                    market="KSA",
-                    currency="SAR",
-                    current_price=_safe_float(rt.get("close")),
-                    previous_close=_safe_float(rt.get("previousClose")),
-                    price_change=_safe_float(rt.get("change")),
-                    percent_change=_safe_float(rt.get("change_p")),
-                    day_high=_safe_float(rt.get("high")),
-                    day_low=_safe_float(rt.get("low")),
-                    volume=_safe_float(rt.get("volume")),
-                    data_source="eodhd",
-                    data_quality="PARTIAL",
-                    error=argaam_err,
-                )
-                return q
-            except Exception as e:
-                argaam_err = (argaam_err or "") + f" | EODHD-KSA error: {type(e).__name__}: {e}"
+    async def _fetch_fmp_quote(self, ticker: str) -> UnifiedQuote:
+        try:
+            url = f"https://financialmodelingprep.com/api/v3/quote/{ticker}"
+            resp = await self.client.get(url, params={"apikey": settings.FMP_API_KEY})
+            d = resp.json()
+            if not d: return UnifiedQuote(symbol=ticker)
+            
+            item = d[0]
+            return UnifiedQuote(
+                symbol=ticker,
+                name=item.get("name"),
+                market="GLOBAL",
+                currency="USD",
+                current_price=item.get("price"),
+                price_change=item.get("change"),
+                percent_change=item.get("changesPercentage"),
+                day_high=item.get("dayHigh"),
+                day_low=item.get("dayLow"),
+                high_52w=item.get("yearHigh"),
+                low_52w=item.get("yearLow"),
+                volume=item.get("volume"),
+                market_cap=item.get("marketCap"),
+                pe_ttm=item.get("pe"),
+                eps_ttm=item.get("eps"),
+                data_source="fmp",
+                data_quality="FULL"
+            )
+        except Exception as e:
+            return UnifiedQuote(symbol=ticker, error=str(e))
 
-        if self._fmp.enabled():
-            try:
-                fq = await self._fmp.quote(symbol)
-                if fq:
-                    q = UnifiedQuote(
-                        symbol=symbol,
-                        name=fq.get("name"),
-                        market="KSA",
-                        currency="SAR",
-                        current_price=_safe_float(fq.get("price")),
-                        previous_close=_safe_float(fq.get("previousClose")),
-                        price_change=_safe_float(fq.get("change")),
-                        percent_change=_safe_float(fq.get("changesPercentage")),
-                        day_high=_safe_float(fq.get("dayHigh")),
-                        day_low=_safe_float(fq.get("dayLow")),
-                        volume=_safe_float(fq.get("volume")),
-                        market_cap=_safe_float(fq.get("marketCap")),
-                        data_source="fmp",
-                        data_quality="PARTIAL",
-                        error=argaam_err,
-                    )
-                    return q
-            except Exception as e:
-                argaam_err = (argaam_err or "") + f" | FMP error: {type(e).__name__}: {e}"
-
-        if yf is not None and os.getenv("ENABLE_YFINANCE", "0").strip() == "1":
-            try:
-                y = yf.Ticker(symbol)
-                info = getattr(y, "fast_info", None) or {}
-                price = _safe_float(getattr(info, "last_price", None) or info.get("lastPrice"))
-                q = UnifiedQuote(
-                    symbol=symbol,
-                    market="KSA",
-                    currency="SAR",
-                    current_price=price,
-                    data_source="yfinance",
-                    data_quality="PARTIAL" if price is not None else "MISSING",
-                    error=argaam_err,
-                )
-                return q
-            except Exception as e:
-                argaam_err = (argaam_err or "") + f" | yfinance error: {type(e).__name__}: {e}"
-
-        return UnifiedQuote(
-            symbol=symbol,
-            market="KSA",
-            currency="SAR",
-            data_source="argaam",
-            data_quality="MISSING",
-            error=argaam_err or "No KSA provider returned data",
-        )
-
-    async def _build_global_quote(self, symbol: str) -> UnifiedQuote:
-        eod_err = None
-        if self._eodhd.enabled():
-            try:
-                rt = await self._eodhd.realtime(symbol)
-                q = UnifiedQuote(
-                    symbol=normalize_symbol(symbol),
-                    market="GLOBAL",
-                    currency="USD",
-                    current_price=_safe_float(rt.get("close")),
-                    previous_close=_safe_float(rt.get("previousClose")),
-                    price_change=_safe_float(rt.get("change")),
-                    percent_change=_safe_float(rt.get("change_p")),
-                    day_high=_safe_float(rt.get("high")),
-                    day_low=_safe_float(rt.get("low")),
-                    volume=_safe_float(rt.get("volume")),
-                    data_source="eodhd",
-                    data_quality="PARTIAL",
-                )
-                if os.getenv("EODHD_FETCH_FUNDAMENTALS", "1").strip() == "1":
-                    try:
-                        f = await self._eodhd.fundamentals(symbol)
-                        self._apply_eodhd_fundamentals(q, f)
-                        q.data_quality = "FULL" if q.current_price is not None else "MISSING"
-                    except Exception as e:
-                        q.error = f"EODHD fundamentals error: {type(e).__name__}: {e}"
-                return q
-            except Exception as e:
-                eod_err = f"EODHD error: {type(e).__name__}: {e}"
-        else:
-            eod_err = "EODHD not configured"
-
-        if self._fmp.enabled():
-            try:
-                fq = await self._fmp.quote(symbol)
-                if fq:
-                    q = UnifiedQuote(
-                        symbol=symbol,
-                        name=fq.get("name"),
-                        market="GLOBAL",
-                        currency="USD",
-                        current_price=_safe_float(fq.get("price")),
-                        previous_close=_safe_float(fq.get("previousClose")),
-                        price_change=_safe_float(fq.get("change")),
-                        percent_change=_safe_float(fq.get("changesPercentage")),
-                        day_high=_safe_float(fq.get("dayHigh")),
-                        day_low=_safe_float(fq.get("dayLow")),
-                        high_52w=_safe_float(fq.get("yearHigh")),
-                        low_52w=_safe_float(fq.get("yearLow")),
-                        volume=_safe_float(fq.get("volume")),
-                        market_cap=_safe_float(fq.get("marketCap")),
-                        pe_ttm=_safe_float(fq.get("pe")),
-                        eps_ttm=_safe_float(fq.get("eps")),
-                        data_source="fmp",
-                        data_quality="PARTIAL",
-                        error=eod_err,
-                    )
-                    return q
-            except Exception as e:
-                eod_err = (eod_err or "") + f" | FMP error: {type(e).__name__}: {e}"
-
-        return UnifiedQuote(symbol=symbol, market="GLOBAL", data_source="none", data_quality="MISSING", error=eod_err)
-
-    def _apply_eodhd_fundamentals(self, q: UnifiedQuote, f: Dict[str, Any]) -> None:
-        general = (f or {}).get("General") or {}
-        highlights = (f or {}).get("Highlights") or {}
-        valuation = (f or {}).get("Valuation") or {}
-        shares = (f or {}).get("SharesStats") or {}
-        tech = (f or {}).get("Technicals") or {}
-
-        q.name = q.name or general.get("Name")
-        q.sector = q.sector or general.get("Sector")
-        q.industry = q.industry or general.get("Industry")
-        q.currency = q.currency or general.get("CurrencyCode")
-
-        q.high_52w = _safe_float(tech.get("52WeekHigh")) or _safe_float(highlights.get("52WeekHigh")) or q.high_52w
-        q.low_52w = _safe_float(tech.get("52WeekLow")) or _safe_float(highlights.get("52WeekLow")) or q.low_52w
-
-        q.market_cap = _safe_float(highlights.get("MarketCapitalization")) or q.market_cap
-        q.shares_outstanding = _safe_float(shares.get("SharesOutstanding")) or q.shares_outstanding
-        q.free_float = _safe_float(shares.get("FloatShares")) or q.free_float
-
-        q.eps_ttm = _safe_float(highlights.get("EarningsShare")) or q.eps_ttm
-        q.forward_eps = _safe_float(highlights.get("EPSEstimateNextYear")) or q.forward_eps
-        q.pe_ttm = _safe_float(highlights.get("PERatio")) or q.pe_ttm
-        q.forward_pe = _safe_float(highlights.get("ForwardPE")) or q.forward_pe
-        q.pb = _safe_float(valuation.get("PriceBookMRQ")) or q.pb
-        q.ps = _safe_float(valuation.get("PriceSalesTTM")) or q.ps
-        q.ev_ebitda = _safe_float(valuation.get("EnterpriseValueEbitda")) or q.ev_ebitda
-        q.dividend_yield = _safe_float(highlights.get("DividendYield")) or q.dividend_yield
-        q.payout_ratio = _safe_float(highlights.get("PayoutRatio")) or q.payout_ratio
-        q.roe = _safe_float(highlights.get("ReturnOnEquityTTM")) or q.roe
-        q.roa = _safe_float(highlights.get("ReturnOnAssetsTTM")) or q.roa
-        q.net_margin = _safe_float(highlights.get("ProfitMargin")) or q.net_margin
-        q.ebitda_margin = _safe_float(highlights.get("EBITDAMarginTTM")) or q.ebitda_margin
-        q.revenue_growth = _safe_float(highlights.get("QuarterlyRevenueGrowthYOY")) or q.revenue_growth
-        q.net_income_growth = _safe_float(highlights.get("QuarterlyEarningsGrowthYOY")) or q.net_income_growth
-        q.beta = _safe_float(highlights.get("Beta")) or q.beta
+    async def _fetch_yfinance(self, ticker: str, market: str) -> UnifiedQuote:
+        try:
+            # Run blocking YF call in thread
+            def sync_yf():
+                t = yf.Ticker(ticker)
+                return t.fast_info
+            
+            info = await asyncio.to_thread(sync_yf)
+            
+            return UnifiedQuote(
+                symbol=ticker,
+                market=market,
+                current_price=info.last_price,
+                previous_close=info.previous_close,
+                price_change=info.last_price - info.previous_close,
+                percent_change=((info.last_price - info.previous_close)/info.previous_close)*100,
+                volume=info.last_volume,
+                currency=info.currency,
+                data_source="yfinance",
+                data_quality="PARTIAL"
+            )
+        except Exception as e:
+            return UnifiedQuote(symbol=ticker, error=str(e))
