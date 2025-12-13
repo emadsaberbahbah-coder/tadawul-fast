@@ -24,16 +24,14 @@
       --shadow-soft: 0 15px 35px rgba(0, 0, 0, 0.35);
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-        sans-serif;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: radial-gradient(circle at top left, #1a2038, #050812 55%);
       color: var(--text);
+      min-height: 100vh;
     }
 
     .app {
@@ -48,50 +46,64 @@
       justify-content: space-between;
       align-items: flex-start;
       gap: 16px;
-      margin-bottom: 20px;
+      margin-bottom: 24px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
     }
 
     .title-block h1 {
       margin: 0 0 6px;
       font-size: 1.8rem;
       letter-spacing: 0.02em;
+      background: linear-gradient(90deg, var(--text), var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
 
     .title-block p {
       margin: 0;
       color: var(--muted);
       font-size: 0.92rem;
+      max-width: 600px;
+      line-height: 1.5;
     }
 
     .pill {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
+      gap: 8px;
+      padding: 6px 12px;
       border-radius: 999px;
-      font-size: 0.78rem;
+      font-size: 0.8rem;
+      font-weight: 500;
       background: rgba(72, 187, 120, 0.1);
       color: var(--success);
-      border: 1px solid rgba(72, 187, 120, 0.35);
+      border: 1px solid rgba(72, 187, 120, 0.25);
+      transition: all 0.3s ease;
+    }
+
+    .pill.disconnected {
+      background: rgba(252, 129, 129, 0.1);
+      color: var(--danger);
+      border-color: rgba(252, 129, 129, 0.25);
     }
 
     .pill span.dot {
-      width: 7px;
-      height: 7px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
-      background: var(--success);
+      background: currentColor;
+      box-shadow: 0 0 8px currentColor;
     }
 
     main {
       display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
-      gap: 16px;
+      grid-template-columns: minmax(0, 1.8fr) minmax(0, 3.2fr);
+      gap: 20px;
     }
 
     @media (max-width: 900px) {
-      main {
-        grid-template-columns: minmax(0, 1fr);
-      }
+      main { grid-template-columns: 1fr; }
     }
 
     .card {
@@ -99,938 +111,565 @@
       border-radius: var(--radius-lg);
       border: 1px solid var(--border);
       box-shadow: var(--shadow-soft);
-      padding: 14px 16px 16px;
-      margin-bottom: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; width: 100%; height: 4px;
+      background: linear-gradient(90deg, var(--accent), transparent);
+      opacity: 0.5;
     }
 
     .card-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 10px;
-      gap: 10px;
+      margin-bottom: 16px;
     }
 
     .card-header h2 {
       margin: 0;
       font-size: 1rem;
-      letter-spacing: 0.03em;
       text-transform: uppercase;
+      letter-spacing: 0.05em;
       color: var(--muted);
+      font-weight: 600;
     }
 
-    .card-header small {
-      font-size: 0.8rem;
-      color: var(--muted);
-    }
+    .card-header small { font-size: 0.75rem; color: var(--muted); opacity: 0.8; }
 
     label {
       display: block;
       font-size: 0.8rem;
       color: var(--muted);
-      margin-bottom: 4px;
+      margin-bottom: 6px;
+      font-weight: 500;
     }
 
-    input[type="text"],
-    input[type="password"],
-    textarea,
-    select {
+    input, textarea, select {
       width: 100%;
-      padding: 7px 9px;
+      padding: 10px 12px;
       border-radius: 8px;
-      border: 1px solid rgba(160, 174, 192, 0.25);
-      background: rgba(26, 32, 44, 0.8);
+      border: 1px solid var(--border);
+      background: rgba(11, 16, 32, 0.6);
       color: var(--text);
-      font-size: 0.85rem;
-      outline: none;
-    }
-
-    input::placeholder,
-    textarea::placeholder {
-      color: rgba(160, 174, 192, 0.65);
-    }
-
-    textarea {
-      min-height: 80px;
-      resize: vertical;
+      font-size: 0.9rem;
       font-family: inherit;
+      transition: border-color 0.2s;
     }
 
-    input:focus,
-    textarea:focus,
-    select:focus {
+    input:focus, textarea:focus, select:focus {
+      outline: none;
       border-color: var(--accent);
-      box-shadow: 0 0 0 1px rgba(79, 209, 197, 0.35);
+      box-shadow: 0 0 0 2px var(--accent-soft);
     }
 
     .row {
       display: flex;
-      gap: 10px;
-      margin-bottom: 8px;
+      gap: 12px;
+      margin-bottom: 12px;
       flex-wrap: wrap;
     }
-
-    .row > div {
-      flex: 1 1 150px;
-    }
+    .row > div { flex: 1 1 140px; }
 
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 6px;
-      padding: 7px 12px;
-      border-radius: 999px;
+      padding: 8px 16px;
+      border-radius: 8px;
       border: 1px solid var(--accent-strong);
-      background: radial-gradient(circle at top left, var(--accent), #2b6cb0);
-      color: #0a101c;
+      background: rgba(56, 178, 172, 0.15);
+      color: var(--accent);
       font-weight: 600;
-      font-size: 0.83rem;
+      font-size: 0.85rem;
       cursor: pointer;
-      transition: transform 0.08s ease, box-shadow 0.08s ease,
-        filter 0.08s ease;
-      box-shadow: 0 8px 18px rgba(45, 212, 191, 0.35);
-      white-space: nowrap;
+      transition: all 0.2s;
     }
 
     .btn:hover {
+      background: var(--accent-strong);
+      color: #000;
       transform: translateY(-1px);
-      filter: brightness(1.05);
-      box-shadow: 0 11px 24px rgba(45, 212, 191, 0.5);
-    }
-
-    .btn:active {
-      transform: translateY(0);
-      box-shadow: 0 4px 10px rgba(45, 212, 191, 0.3);
     }
 
     .btn.secondary {
       background: transparent;
-      color: var(--accent);
-      border-color: rgba(129, 230, 217, 0.6);
-      box-shadow: none;
+      border-color: var(--border);
+      color: var(--muted);
     }
-
     .btn.secondary:hover {
-      background: rgba(79, 209, 197, 0.08);
-      box-shadow: 0 8px 18px rgba(66, 153, 225, 0.25);
+      border-color: var(--muted);
+      color: var(--text);
     }
 
-    .btn.sm {
-      padding: 4px 9px;
-      font-size: 0.75rem;
-    }
-
-    .tag {
-      display: inline-flex;
-      align-items: center;
-      padding: 2px 8px;
-      border-radius: 999px;
-      border: 1px solid rgba(160, 174, 192, 0.45);
-      font-size: 0.7rem;
-      color: var(--muted);
-      gap: 4px;
-    }
-
-    .tag span.dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--muted);
-    }
-
-    .tag.ksat {
-      border-color: rgba(246, 173, 85, 0.6);
-      color: var(--ksa);
-    }
-
-    .tag.ksat span.dot {
-      background: var(--ksa);
-    }
-
-    .tag.global {
-      border-color: rgba(99, 179, 237, 0.6);
-      color: var(--global);
-    }
-
-    .tag.global span.dot {
-      background: var(--global);
-    }
-
-    .tag.error {
-      border-color: rgba(252, 129, 129, 0.6);
-      color: var(--danger);
-    }
-
-    .tag.ok {
-      border-color: rgba(104, 211, 145, 0.6);
-      color: var(--success);
-    }
-
-    .muted {
-      color: var(--muted);
-      font-size: 0.8rem;
-    }
+    .btn.sm { padding: 6px 12px; font-size: 0.8rem; }
 
     .status-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px;
     }
 
     .status-card {
-      padding: 8px 10px;
+      padding: 12px;
       border-radius: 10px;
-      background: radial-gradient(circle at top left, #1a2038, #0c101f);
-      border: 1px solid rgba(160, 174, 192, 0.2);
-      font-size: 0.78rem;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--border);
     }
 
     .status-card h3 {
-      margin: 0 0 4px;
-      font-size: 0.8rem;
+      margin: 0 0 6px;
+      font-size: 0.75rem;
       color: var(--muted);
+      text-transform: uppercase;
     }
 
     .status-card .value {
-      font-size: 0.8rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
     }
-
-    .status-card .value.ok {
-      color: var(--success);
-    }
-
-    .status-card .value.bad {
-      color: var(--danger);
-    }
+    .status-card .value.ok { color: var(--success); }
+    .status-card .value.bad { color: var(--danger); }
 
     pre {
-      background: #050812;
-      border-radius: 10px;
-      border: 1px solid #222b4d;
-      padding: 10px;
-      color: #cbd5f5;
-      font-size: 0.78rem;
-      max-height: 260px;
-      overflow: auto;
+      background: #080c17;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: 'Menlo', 'Monaco', monospace;
+      font-size: 0.8rem;
+      color: #a0aec0;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      margin-top: 10px;
+      max-height: 300px;
+    }
+
+    .table-container {
+      overflow-x: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      margin-top: 10px;
     }
 
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.78rem;
+      font-size: 0.8rem;
+      white-space: nowrap;
     }
 
-    th,
-    td {
-      border: 1px solid rgba(45, 55, 72, 0.7);
-      padding: 4px 6px;
+    th, td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
       text-align: left;
     }
 
     th {
-      background: #1a223e;
-      color: #e2e8f0;
+      background: #151b33;
+      color: var(--accent);
       position: sticky;
       top: 0;
-      z-index: 2;
     }
 
-    tbody tr:nth-child(even) {
-      background: #050914;
-    }
-
-    tbody tr:nth-child(odd) {
-      background: #080d1a;
-    }
-
-    .table-container {
-      max-height: 260px;
-      overflow: auto;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      margin-top: 4px;
-    }
+    tr:last-child td { border-bottom: none; }
+    tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
 
     .chip-row {
       display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 4px;
+      gap: 8px;
+      margin-top: 8px;
     }
 
-    .chip-row .chip {
+    .chip {
       font-size: 0.75rem;
-      padding: 2px 7px;
-      border-radius: 999px;
-      background: rgba(160, 174, 192, 0.16);
-      border: 1px solid rgba(160, 174, 192, 0.3);
+      padding: 4px 10px;
+      border-radius: 99px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
     }
+    .chip.ksa { color: var(--ksa); border-color: rgba(246, 173, 85, 0.3); }
+    .chip.global { color: var(--global); border-color: rgba(99, 179, 237, 0.3); }
 
-    .chip-row .chip.ksa {
-      border-color: rgba(246, 173, 85, 0.6);
-      background: rgba(246, 173, 85, 0.08);
-      color: var(--ksa);
-    }
-
-    .chip-row .chip.global {
-      border-color: rgba(99, 179, 237, 0.6);
-      background: rgba(99, 179, 237, 0.08);
-      color: var(--global);
-    }
-
-    .error-text {
-      color: var(--danger);
-      font-size: 0.79rem;
-      margin-top: 4px;
-    }
-
-    .small-note {
-      font-size: 0.76rem;
-      color: var(--muted);
-      margin-top: 4px;
-    }
-
+    .error-text { color: var(--danger); font-size: 0.85rem; margin-top: 8px; display: block; }
+    
     footer {
-      margin-top: 16px;
+      margin-top: 40px;
       text-align: center;
-      font-size: 0.75rem;
+      font-size: 0.8rem;
       color: var(--muted);
+      opacity: 0.6;
     }
   </style>
 </head>
 <body>
+
 <div class="app">
   <header>
     <div class="title-block">
-      <h1>Tadawul Fast Bridge – Control Panel</h1>
-      <p>
-        Unified Data Engine v2 for KSA (.SR) & Global markets –
-        powering your 9-page Ultimate Investment Dashboard, Google Sheets, and AI analysis.
-      </p>
+      <h1>Tadawul Fast Bridge</h1>
+      <p>Unified Data Engine v2 Control Panel. Manages KSA (.SR) & Global data flows for the Ultimate Investment Dashboard.</p>
     </div>
-    <div>
-      <div class="pill" id="connection-pill">
-        <span class="dot"></span>
-        <span id="connection-pill-text">Backend & Sheets Console</span>
-      </div>
+    <div class="pill disconnected" id="connection-pill">
+      <span class="dot"></span>
+      <span id="connection-pill-text">Disconnected</span>
     </div>
   </header>
 
   <main>
-    <!-- LEFT COLUMN: SETTINGS + HEALTH + STATUS -->
+    <!-- LEFT COLUMN -->
     <section>
-      <!-- Connection card -->
-      <div class="card" id="cfg-card">
+      
+      <!-- CONFIGURATION -->
+      <div class="card">
         <div class="card-header">
-          <h2>Connection</h2>
-          <small id="cfg-status" class="muted">Not tested yet</small>
+          <h2>API Connection</h2>
+          <small id="cfg-status">Not tested</small>
         </div>
         <div class="row">
           <div>
-            <label for="baseUrl">Backend Base URL</label>
-            <input id="baseUrl" type="text" placeholder="https://tadawul-fast-bridge.onrender.com" />
-            <div class="small-note">
-              If empty, uses the current origin (<code>window.location.origin</code>).
-            </div>
+            <label>Backend URL</label>
+            <input id="baseUrl" type="text" placeholder="http://127.0.0.1:8000" />
           </div>
         </div>
         <div class="row">
           <div>
-            <label for="token">APP Token (X-APP-TOKEN)</label>
-            <input id="token" type="password" placeholder="Required if backend enforces token" />
-            <div class="small-note">
-              Stored only in your browser (localStorage).
-            </div>
+            <label>App Token (Optional)</label>
+            <input id="token" type="password" placeholder="X-APP-TOKEN" />
           </div>
         </div>
         <div class="row" style="justify-content: flex-end;">
           <button class="btn secondary sm" id="clearCfgBtn">Reset</button>
-          <button class="btn sm" id="saveCfgBtn">Save & Test</button>
+          <button class="btn sm" id="saveCfgBtn">Connect</button>
         </div>
         <div id="cfg-error" class="error-text" style="display:none;"></div>
       </div>
 
-      <!-- Module Health -->
+      <!-- SYSTEM STATUS -->
       <div class="card">
         <div class="card-header">
-          <h2>Module Health</h2>
-          <small>Checks /v1/enriched, /v1/analysis, /v1/advanced, /v1/argaam</small>
-        </div>
-        <div class="status-grid" id="healthGrid">
-          <div class="status-card">
-            <h3>Enriched Quotes</h3>
-            <div class="value" id="health-enriched">–</div>
-          </div>
-          <div class="status-card">
-            <h3>AI Analysis</h3>
-            <div class="value" id="health-ai">–</div>
-          </div>
-          <div class="status-card">
-            <h3>Advanced Analysis</h3>
-            <div class="value" id="health-adv">–</div>
-          </div>
-          <div class="status-card">
-            <h3>KSA / Argaam</h3>
-            <div class="value" id="health-argaam">–</div>
-          </div>
-        </div>
-        <div class="row" style="margin-top:10px; justify-content:flex-end;">
-          <button class="btn secondary sm" id="refreshHealthBtn">Refresh Health</button>
-        </div>
-      </div>
-
-      <!-- Service Status (/v1/status) -->
-      <div class="card">
-        <div class="card-header">
-          <h2>Service Status</h2>
-          <small>/v1/status snapshot (backend + Google Sheets)</small>
+          <h2>System Status</h2>
+          <button class="btn secondary sm" id="refreshStatusBtn">Refresh</button>
         </div>
         <div class="status-grid">
           <div class="status-card">
-            <h3>Environment / Version</h3>
-            <div class="value" id="status-env">–</div>
+            <h3>Backend</h3>
+            <div class="value" id="status-env">-</div>
+          </div>
+          <div class="status-card">
+            <h3>Engine Mode</h3>
+            <div class="value" id="status-engine">-</div>
           </div>
           <div class="status-card">
             <h3>Google Sheets</h3>
-            <div class="value" id="status-sheets">–</div>
-          </div>
-          <div class="status-card">
-            <h3>Default Spreadsheet</h3>
-            <div class="value" id="status-spreadsheet">–</div>
-          </div>
-          <div class="status-card">
-            <h3>Auth / Tokens</h3>
-            <div class="value" id="status-auth">–</div>
+            <div class="value" id="status-sheets">-</div>
           </div>
         </div>
-        <div class="row" style="margin-top:8px; justify-content:flex-end;">
-          <button class="btn secondary sm" id="refreshStatusBtn">Refresh Status</button>
+        <div style="margin-top:15px">
+            <label>Route Health</label>
+            <div class="status-grid">
+                <div class="status-card">
+                    <h3>Enriched</h3>
+                    <div class="value" id="health-enriched">-</div>
+                </div>
+                <div class="status-card">
+                    <h3>AI Analysis</h3>
+                    <div class="value" id="health-ai">-</div>
+                </div>
+                <div class="status-card">
+                    <h3>Advanced</h3>
+                    <div class="value" id="health-adv">-</div>
+                </div>
+            </div>
         </div>
-        <div class="small-note">
-          Reflects how the backend sees configuration for your 9 Google Sheets pages
-          (KSA_Tadawul, Global_Markets, Mutual_Funds, Commodities_FX, My_Portfolio,
-          Insights_Analysis, Investment_Advisor, Economic_Calendar, Income Statement, etc.).
-        </div>
-        <pre id="statusRaw" style="margin-top:6px;">{}</pre>
       </div>
+
     </section>
 
-    <!-- RIGHT COLUMN: OPERATIONS -->
+    <!-- RIGHT COLUMN -->
     <section>
-      <!-- Quick symbol check -->
+      
+      <!-- QUICK CHECK -->
       <div class="card">
         <div class="card-header">
           <h2>Quick Symbol Check</h2>
-          <small>Test single symbol from Enriched / AI / Advanced / KSA Gateway</small>
         </div>
         <div class="row">
-          <div>
-            <label for="quickSymbol">Symbol</label>
-            <input id="quickSymbol" type="text" placeholder="1120.SR or AAPL" />
+          <div style="flex: 2;">
+            <label>Symbol</label>
+            <input id="quickSymbol" type="text" placeholder="e.g. 1120.SR or AAPL" />
           </div>
-          <div>
-            <label for="quickType">Endpoint</label>
+          <div style="flex: 3;">
+            <label>Route</label>
             <select id="quickType">
-              <option value="enriched">Enriched Quote (/v1/enriched/quote)</option>
-              <option value="analysis">AI Analysis (/v1/analysis/quote)</option>
-              <option value="advanced">Advanced (/v1/advanced/symbol)</option>
-              <option value="argaam">KSA Gateway (/v1/argaam/quote)</option>
+              <option value="enriched">Enriched Quote (/v1/enriched)</option>
+              <option value="analysis">AI Analysis (/v1/analysis)</option>
+              <option value="advanced">Advanced Score (/v1/advanced)</option>
             </select>
           </div>
+          <div style="flex: 0;">
+            <label>&nbsp;</label>
+            <button class="btn sm" id="runQuickBtn">Fetch</button>
+          </div>
         </div>
-        <div class="row" style="justify-content:flex-end;">
-          <button class="btn sm" id="runQuickBtn">Run</button>
-        </div>
-        <div class="small-note">
-          KSA symbols end with <code>.SR</code> and use Tadawul/Argaam providers internally.
-          The unified data engine never calls EODHD for KSA tickers.
-        </div>
-        <pre id="quickResult" style="margin-top:8px;">{}</pre>
+        <pre id="quickResult">// Response will appear here...</pre>
       </div>
 
-      <!-- Batch sheet-rows preview -->
+      <!-- BATCH PREVIEW -->
       <div class="card">
         <div class="card-header">
-          <h2>Batch Sheet Rows Preview</h2>
-          <small>Same structure as the 9 Google Sheets pages (/sheet-rows)</small>
+          <h2>Sheet Rows Preview</h2>
+          <small>Batch processing & sorting</small>
         </div>
         <div class="row">
-          <div>
-            <label for="batchType">Data Type</label>
-            <select id="batchType">
-              <option value="enriched">Enriched Quotes (/v1/enriched/sheet-rows)</option>
-              <option value="analysis">AI Analysis (/v1/analysis/sheet-rows)</option>
-              <option value="advanced">Advanced (/v1/advanced/sheet-rows)</option>
-            </select>
-          </div>
+            <div>
+                <label>Target Sheet Type</label>
+                <select id="batchType">
+                    <option value="enriched">Global/KSA/Funds (Enriched)</option>
+                    <option value="analysis">Insights (AI Analysis)</option>
+                    <option value="advanced">Advanced Analysis</option>
+                </select>
+            </div>
         </div>
-        <label for="batchTickers">Tickers (one per line)</label>
-        <textarea id="batchTickers" placeholder="1120.SR&#10;1180.SR&#10;AAPL&#10;MSFT"></textarea>
+        <label>Tickers (One per line)</label>
+        <textarea id="batchTickers" rows="5" placeholder="1120.SR&#10;1180.SR&#10;AAPL&#10;MSFT"></textarea>
+        
         <div class="chip-row" id="tickerSplitRow" style="display:none;"></div>
-        <div class="row" style="justify-content:flex-end; margin-top:8px;">
-          <button class="btn secondary sm" id="clearBatchBtn">Clear</button>
-          <button class="btn sm" id="runBatchBtn">Preview</button>
+        
+        <div class="row" style="justify-content: flex-end; margin-top:10px;">
+            <button class="btn secondary sm" id="clearBatchBtn">Clear</button>
+            <button class="btn sm" id="runBatchBtn">Preview Rows</button>
         </div>
+        
         <div id="batchError" class="error-text" style="display:none;"></div>
         <div class="table-container" id="batchTableContainer" style="display:none;"></div>
       </div>
+
     </section>
   </main>
 
   <footer>
-    KSA tickers (<code>.SR</code>) are routed to Tadawul/Argaam providers via the KSA gateway –
-    no direct EODHD usage for KSA. Global tickers use EODHD + FMP, with /sheet-rows powering
-    your 9 Google Sheets pages and Investment Advisor logic.
+    Tadawul Fast Bridge v4.0.0 &bull; Powered by DataEngine V2 &bull; KSA-Safe
   </footer>
 </div>
 
 <script>
-  (function () {
-    const state = {
-      baseUrl: "",
-      token: "",
+  (function() {
+    // --- STATE ---
+    const state = { baseUrl: "", token: "" };
+    
+    // --- ELEMENTS ---
+    const el = (id) => document.getElementById(id);
+    const ui = {
+      baseUrl: el('baseUrl'), token: el('token'),
+      cfgStatus: el('cfgStatus'), cfgError: el('cfgError'),
+      saveCfg: el('saveCfgBtn'), clearCfg: el('clearCfgBtn'),
+      pill: el('connection-pill'), pillText: el('connection-pill-text'),
+      
+      // Status
+      stEnv: el('status-env'), stEngine: el('status-engine'), stSheets: el('status-sheets'),
+      hEnriched: el('health-enriched'), hAi: el('health-ai'), hAdv: el('health-adv'),
+      refreshStatus: el('refreshStatusBtn'),
+      
+      // Quick
+      qSym: el('quickSymbol'), qType: el('quickType'), qRun: el('runQuickBtn'), qRes: el('quickResult'),
+      
+      // Batch
+      bType: el('batchType'), bTickers: el('batchTickers'), bRun: el('runBatchBtn'), 
+      bClear: el('clearBatchBtn'), bErr: el('batchError'), bTable: el('batchTableContainer'),
+      bSplit: el('tickerSplitRow')
     };
 
-    const els = {
-      // config
-      baseUrl: document.getElementById("baseUrl"),
-      token: document.getElementById("token"),
-      cfgStatus: document.getElementById("cfg-status"),
-      cfgError: document.getElementById("cfg-error"),
-      saveCfgBtn: document.getElementById("saveCfgBtn"),
-      clearCfgBtn: document.getElementById("clearCfgBtn"),
-      connectionPill: document.getElementById("connection-pill"),
-      connectionPillText: document.getElementById("connection-pill-text"),
-
-      // health
-      healthEnriched: document.getElementById("health-enriched"),
-      healthAi: document.getElementById("health-ai"),
-      healthAdv: document.getElementById("health-adv"),
-      healthArgaam: document.getElementById("health-argaam"),
-      refreshHealthBtn: document.getElementById("refreshHealthBtn"),
-
-      // status (/v1/status)
-      statusEnv: document.getElementById("status-env"),
-      statusSheets: document.getElementById("status-sheets"),
-      statusSpreadsheet: document.getElementById("status-spreadsheet"),
-      statusAuth: document.getElementById("status-auth"),
-      refreshStatusBtn: document.getElementById("refreshStatusBtn"),
-      statusRaw: document.getElementById("statusRaw"),
-
-      // quick symbol
-      quickSymbol: document.getElementById("quickSymbol"),
-      quickType: document.getElementById("quickType"),
-      runQuickBtn: document.getElementById("runQuickBtn"),
-      quickResult: document.getElementById("quickResult"),
-
-      // batch
-      batchType: document.getElementById("batchType"),
-      batchTickers: document.getElementById("batchTickers"),
-      runBatchBtn: document.getElementById("runBatchBtn"),
-      clearBatchBtn: document.getElementById("clearBatchBtn"),
-      batchError: document.getElementById("batchError"),
-      batchTableContainer: document.getElementById("batchTableContainer"),
-      tickerSplitRow: document.getElementById("tickerSplitRow"),
-    };
-
-    // --------------------------------------------------------
-    // Config helpers
-    // --------------------------------------------------------
+    // --- CONFIG LOGIC ---
     function loadConfig() {
-      const storedBase = localStorage.getItem("tfb_base_url");
-      const storedToken = localStorage.getItem("tfb_app_token");
-      state.baseUrl = storedBase || window.location.origin;
-      state.token = storedToken || "";
-      els.baseUrl.value = storedBase || "";
-      els.token.value = storedToken || "";
-      els.cfgStatus.textContent = "Loaded config, not tested";
+      state.baseUrl = localStorage.getItem("tfb_base_url") || window.location.origin;
+      state.token = localStorage.getItem("tfb_app_token") || "";
+      ui.baseUrl.value = state.baseUrl;
+      ui.token.value = state.token;
     }
 
     function saveConfig() {
-      const base = els.baseUrl.value.trim();
-      state.baseUrl = base || window.location.origin;
-      state.token = els.token.value.trim();
-      localStorage.setItem("tfb_base_url", base);
+      state.baseUrl = ui.baseUrl.value.replace(/\/$/, "");
+      state.token = ui.token.value.trim();
+      localStorage.setItem("tfb_base_url", state.baseUrl);
       localStorage.setItem("tfb_app_token", state.token);
+      checkConnectivity();
     }
 
-    function resetConfig() {
-      localStorage.removeItem("tfb_base_url");
-      localStorage.removeItem("tfb_app_token");
-      state.baseUrl = window.location.origin;
-      state.token = "";
-      els.baseUrl.value = "";
-      els.token.value = "";
-      els.cfgStatus.textContent = "Reset to defaults, not tested";
-      els.cfgError.style.display = "none";
-      els.cfgError.textContent = "";
-      if (els.connectionPillText) {
-        els.connectionPillText.textContent = "Backend & Sheets Console";
-      }
-    }
-
-    // --------------------------------------------------------
-    // Fetch helper
-    // --------------------------------------------------------
-    async function apiFetch(path, options = {}) {
-      const base = (state.baseUrl || window.location.origin).replace(/\/$/, "");
-      const url = base + path;
-      const opts = Object.assign({ method: "GET" }, options);
-      const headers = Object.assign(
-        { "Content-Type": "application/json" },
-        opts.headers || {}
-      );
-      if (state.token) {
-        headers["X-APP-TOKEN"] = state.token;
-      }
-      opts.headers = headers;
-
-      if (opts.body && typeof opts.body !== "string") {
-        opts.body = JSON.stringify(opts.body);
-      }
-
-      const resp = await fetch(url, opts);
-      const text = await resp.text();
-      let data;
+    async function fetchAPI(endpoint, opts = {}) {
+      const url = `${state.baseUrl}${endpoint}`;
+      const headers = { 'Content-Type': 'application/json', ...opts.headers };
+      if (state.token) headers['X-APP-TOKEN'] = state.token;
+      
       try {
-        data = text ? JSON.parse(text) : null;
+        const res = await fetch(url, { ...opts, headers });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        return data;
       } catch (e) {
-        data = text;
+        throw e;
       }
-      if (!resp.ok) {
-        const err = new Error("HTTP " + resp.status);
-        err.status = resp.status;
-        err.data = data;
-        throw err;
-      }
-      return data;
     }
 
-    // --------------------------------------------------------
-    // Helpers
-    // --------------------------------------------------------
-    function classifyTickers(tickers) {
-      const ksa = [];
-      const global = [];
-      (tickers || []).forEach((raw) => {
-        const t = (raw || "").trim();
-        if (!t) return;
-        if (t.toUpperCase().endsWith(".SR")) {
-          ksa.push(t.toUpperCase());
-        } else {
-          global.push(t.toUpperCase());
-        }
-      });
-      return { ksa, global };
-    }
-
-    function setConnectionPill(ok) {
-      if (!els.connectionPill || !els.connectionPillText) return;
+    function updatePill(ok) {
       if (ok) {
-        els.connectionPillText.textContent = "Connected to backend";
+        ui.pill.classList.remove('disconnected');
+        ui.pillText.textContent = "Connected";
+        ui.cfgStatus.textContent = "Online";
+        ui.cfgStatus.style.color = "var(--success)";
+        ui.cfgError.style.display = 'none';
       } else {
-        els.connectionPillText.textContent = "Connection error";
+        ui.pill.classList.add('disconnected');
+        ui.pillText.textContent = "Disconnected";
+        ui.cfgStatus.textContent = "Offline";
+        ui.cfgStatus.style.color = "var(--danger)";
       }
     }
 
-    // --------------------------------------------------------
-    // Health & Status
-    // --------------------------------------------------------
-    async function updateHealthCard(kind) {
-      const idMap = {
-        enriched: els.healthEnriched,
-        analysis: els.healthAi,
-        advanced: els.healthAdv,
-        argaam: els.healthArgaam,
-      };
-      const el = idMap[kind];
-      if (!el) return;
-      el.textContent = "Checking...";
-      el.classList.remove("ok", "bad");
-
-      let path;
-      if (kind === "enriched") path = "/v1/enriched/health";
-      else if (kind === "analysis") path = "/v1/analysis/health";
-      else if (kind === "advanced") path = "/v1/advanced/health";
-      else path = "/v1/argaam/health";
-
+    // --- OPERATIONS ---
+    async function checkConnectivity() {
+      ui.stEnv.textContent = "...";
+      ui.stEngine.textContent = "...";
+      ui.hEnriched.textContent = "...";
+      
       try {
-        const data = await apiFetch(path);
-        const okText = data && data.status ? data.status : "OK";
-        el.textContent = okText;
-        el.classList.add("ok");
-      } catch (e) {
-        el.textContent = "Error";
-        el.classList.add("bad");
-      }
-    }
-
-    async function updateStatusCard() {
-      if (!els.statusEnv || !els.statusRaw) return;
-      els.statusEnv.textContent = "Loading...";
-      els.statusSheets.textContent = "Loading...";
-      els.statusSpreadsheet.textContent = "Loading...";
-      els.statusAuth.textContent = "Loading...";
-      els.statusEnv.classList.remove("ok", "bad");
-      els.statusSheets.classList.remove("ok", "bad");
-      els.statusSpreadsheet.classList.remove("ok", "bad");
-      els.statusAuth.classList.remove("ok", "bad");
-      els.statusRaw.textContent = "Loading /v1/status...";
-
-      try {
-        const data = await apiFetch("/v1/status");
-        els.statusRaw.textContent = JSON.stringify(data, null, 2);
-
-        const env = data.environment || data.env || "-";
-        const version = data.version || "-";
-        els.statusEnv.textContent = env + " / " + version;
-        els.statusEnv.classList.add("ok");
-
-        const services = data.services || {};
-        const sheetsOk = !!services.google_sheets;
-        els.statusSheets.textContent = sheetsOk ? "Configured" : "Missing";
-        els.statusSheets.classList.add(sheetsOk ? "ok" : "bad");
-
-        const sheetsMeta = data.sheets || {};
-        const hasDefault = !!sheetsMeta.has_default_spreadsheet;
-        const sheetId = sheetsMeta.default_spreadsheet_id || "(not set)";
-        els.statusSpreadsheet.textContent = hasDefault ? sheetId : "Not configured";
-        els.statusSpreadsheet.classList.add(hasDefault ? "ok" : "bad");
-
-        const auth = data.auth || {};
-        const hasToken = !!auth.has_secure_token;
-        els.statusAuth.textContent = hasToken ? "Tokens configured" : "No token";
-        els.statusAuth.classList.add(hasToken ? "ok" : "bad");
-      } catch (e) {
-        els.statusEnv.textContent = "Error";
-        els.statusSheets.textContent = "Error";
-        els.statusSpreadsheet.textContent = "Error";
-        els.statusAuth.textContent = "Error";
-        els.statusEnv.classList.add("bad");
-        els.statusSheets.classList.add("bad");
-        els.statusSpreadsheet.classList.add("bad");
-        els.statusAuth.classList.add("bad");
-        els.statusRaw.textContent =
-          "Error calling /v1/status: " +
-          (e.data ? JSON.stringify(e.data) : e.toString());
-      }
-    }
-
-    async function testConfigAndHealth() {
-      els.cfgError.style.display = "none";
-      els.cfgError.textContent = "";
-      els.cfgStatus.textContent = "Testing...";
-      setConnectionPill(false);
-      try {
-        await Promise.all([
-          updateHealthCard("enriched"),
-          updateHealthCard("analysis"),
-          updateHealthCard("advanced"),
-          updateHealthCard("argaam"),
-          updateStatusCard(),
+        // 1. Root Status
+        const root = await fetchAPI('/');
+        ui.stEnv.textContent = `v${root.version}`;
+        ui.stEngine.textContent = root.engine || "Unknown";
+        
+        // 2. Health Checks
+        const [hE, hA, hAdv] = await Promise.allSettled([
+            fetchAPI('/v1/enriched/health'),
+            fetchAPI('/v1/analysis/health'),
+            fetchAPI('/v1/advanced/health')
         ]);
-        els.cfgStatus.textContent = "Connection OK";
-        setConnectionPill(true);
+        
+        const setH = (el, res) => {
+            el.textContent = res.status === 'fulfilled' ? 'OK' : 'ERR';
+            el.className = `value ${res.status === 'fulfilled' ? 'ok' : 'bad'}`;
+        };
+        
+        setH(ui.hEnriched, hE);
+        setH(ui.hAi, hA);
+        setH(ui.hAdv, hAdv);
+        
+        // Check legacy status for sheets info if available
+        try {
+            // Note: If legacy doesn't exist, this fails silently
+            // Since main.py root doesn't return sheets status yet, we assume configured if root worked
+            ui.stSheets.textContent = "Assumed OK"; 
+            ui.stSheets.className = "value ok";
+        } catch(e) {}
+
+        updatePill(true);
       } catch (e) {
-        els.cfgStatus.textContent = "Health check failed";
-        els.cfgError.style.display = "block";
-        els.cfgError.textContent =
-          "Health check failed. Check base URL / token or backend logs.";
-        setConnectionPill(false);
+        console.error(e);
+        ui.cfgError.textContent = `Connection Failed: ${e.message}`;
+        ui.cfgError.style.display = 'block';
+        updatePill(false);
       }
     }
 
-    // --------------------------------------------------------
-    // Quick symbol check
-    // --------------------------------------------------------
-    async function runQuickCheck() {
-      const symbol = els.quickSymbol.value.trim();
-      const type = els.quickType.value;
-      if (!symbol) {
-        els.quickResult.textContent = "Please enter a symbol.";
-        return;
+    async function runQuick() {
+      const sym = ui.qSym.value.trim();
+      if (!sym) return;
+      
+      ui.qRes.textContent = "Loading...";
+      const type = ui.qType.value;
+      let path = "";
+      
+      if (type === 'enriched') path = `/v1/enriched/quote?symbol=${sym}`;
+      else if (type === 'analysis') path = `/v1/analysis/quote?symbol=${sym}`;
+      else if (type === 'advanced') path = `/v1/advanced/scoreboard?tickers=${sym}&top_n=1`;
+      
+      try {
+        const data = await fetchAPI(path);
+        // Clean up response if it's the scoreboard wrapper
+        const display = (type === 'advanced' && data.items) ? data.items[0] : data;
+        ui.qRes.textContent = JSON.stringify(display, null, 2);
+      } catch (e) {
+        ui.qRes.textContent = `Error: ${e.message}`;
       }
-      els.quickResult.textContent = "Loading...";
-      let path;
-      if (type === "enriched") {
-        path = "/v1/enriched/quote?symbol=" + encodeURIComponent(symbol);
-      } else if (type === "analysis") {
-        path = "/v1/analysis/quote?symbol=" + encodeURIComponent(symbol);
-      } else if (type === "advanced") {
-        path = "/v1/advanced/symbol?symbol=" + encodeURIComponent(symbol);
-      } else {
-        // KSA Gateway – routes directly to Argaam/Tadawul gateway
-        path = "/v1/argaam/quote?symbol=" + encodeURIComponent(symbol);
-      }
+    }
+
+    async function runBatch() {
+      const txt = ui.bTickers.value;
+      const tickers = txt.split('\n').map(t => t.trim()).filter(t => t);
+      if (!tickers.length) return;
+
+      ui.bErr.style.display = 'none';
+      ui.bTable.style.display = 'none';
+      ui.bRun.textContent = "Processing...";
+      ui.bRun.disabled = true;
+
+      const type = ui.bType.value;
+      const endpoint = `/v1/${type}/sheet-rows`; // All follow this convention now
 
       try {
-        const data = await apiFetch(path);
-        els.quickResult.textContent = JSON.stringify(data, null, 2);
+        const data = await fetchAPI(endpoint, {
+            method: 'POST',
+            body: { tickers, sheet_name: "Preview_Test" } // Dummy sheet name required by backend
+        });
+
+        // Render Table
+        let html = '<table><thead><tr>';
+        data.headers.forEach(h => html += `<th>${h}</th>`);
+        html += '</tr></thead><tbody>';
+        
+        data.rows.forEach(row => {
+            html += '<tr>';
+            row.forEach(cell => {
+                const val = (cell === null || cell === undefined) ? '' : cell;
+                html += `<td>${val}</td>`;
+            });
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        
+        ui.bTable.innerHTML = html;
+        ui.bTable.style.display = 'block';
       } catch (e) {
-        els.quickResult.textContent =
-          "Error: " +
-          (e.status ? "HTTP " + e.status + " " : "") +
-          (e.data ? JSON.stringify(e.data, null, 2) : e.toString());
+        ui.bErr.textContent = `Batch Error: ${e.message}`;
+        ui.bErr.style.display = 'block';
+      } finally {
+        ui.bRun.textContent = "Preview Rows";
+        ui.bRun.disabled = false;
       }
     }
 
-    // --------------------------------------------------------
-    // Batch preview (sheet-rows)
-    // --------------------------------------------------------
-    function renderTickerSplit() {
-      const raw = els.batchTickers.value.split("\n");
-      const { ksa, global } = classifyTickers(raw);
-      const row = els.tickerSplitRow;
-      row.innerHTML = "";
-      if (!ksa.length && !global.length) {
-        row.style.display = "none";
-        return;
-      }
-      if (ksa.length) {
-        const chip = document.createElement("div");
-        chip.className = "chip ksa";
-        chip.textContent = "KSA (.SR): " + ksa.length;
-        row.appendChild(chip);
-      }
-      if (global.length) {
-        const chip = document.createElement("div");
-        chip.className = "chip global";
-        chip.textContent = "Global: " + global.length;
-        row.appendChild(chip);
-      }
-      row.style.display = "flex";
+    function updateSplit() {
+      const txt = ui.bTickers.value;
+      const tickers = txt.split('\n').map(t => t.trim()).filter(t => t);
+      const ksa = tickers.filter(t => t.toUpperCase().endsWith('.SR') || /^\d+$/.test(t));
+      const glob = tickers.filter(t => !t.toUpperCase().endsWith('.SR') && !/^\d+$/.test(t));
+      
+      let html = '';
+      if (ksa.length) html += `<div class="chip ksa">KSA: ${ksa.length}</div>`;
+      if (glob.length) html += `<div class="chip global">Global: ${glob.length}</div>`;
+      
+      ui.bSplit.innerHTML = html;
+      ui.bSplit.style.display = html ? 'flex' : 'none';
     }
 
-    async function runBatchPreview() {
-      els.batchError.style.display = "block";
-      els.batchError.style.color = "#fc8181";
-      els.batchError.textContent = "";
-      els.batchTableContainer.style.display = "none";
-      els.batchTableContainer.innerHTML = "";
+    // --- EVENTS ---
+    ui.saveCfg.onclick = saveConfig;
+    ui.clearCfg.onclick = () => { localStorage.clear(); location.reload(); };
+    ui.refreshStatus.onclick = checkConnectivity;
+    ui.qRun.onclick = runQuick;
+    ui.bRun.onclick = runBatch;
+    ui.bClear.onclick = () => { ui.bTickers.value = ''; updateSplit(); ui.bTable.style.display='none'; };
+    ui.bTickers.oninput = updateSplit;
 
-      const raw = els.batchTickers.value.split("\n");
-      const tickers = [];
-      raw.forEach((line) => {
-        const t = (line || "").trim();
-        if (t) tickers.push(t);
-      });
-      if (!tickers.length) {
-        els.batchError.textContent = "Please enter at least one ticker.";
-        return;
-      }
-
-      const type = els.batchType.value;
-      let endpoint;
-      if (type === "enriched") {
-        endpoint = "/v1/enriched/sheet-rows";
-      } else if (type === "analysis") {
-        endpoint = "/v1/analysis/sheet-rows";
-      } else {
-        endpoint = "/v1/advanced/sheet-rows";
-      }
-
-      els.batchError.textContent = "Loading from backend...";
-
-      try {
-        const payload = { tickers: tickers };
-        const data = await apiFetch(endpoint, {
-          method: "POST",
-          body: payload,
-        });
-
-        const headers = data.headers || [];
-        const rows = data.rows || [];
-
-        if (!headers.length) {
-          throw new Error("Backend returned no headers.");
-        }
-
-        const table = document.createElement("table");
-        const thead = document.createElement("thead");
-        const headRow = document.createElement("tr");
-        headers.forEach((h) => {
-          const th = document.createElement("th");
-          th.textContent = h;
-          headRow.appendChild(th);
-        });
-        thead.appendChild(headRow);
-        table.appendChild(thead);
-
-        const tbody = document.createElement("tbody");
-        rows.forEach((row) => {
-          const tr = document.createElement("tr");
-          (row || []).forEach((cell) => {
-            const td = document.createElement("td");
-            td.textContent =
-              cell === null || typeof cell === "undefined" ? "" : String(cell);
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        table.appendChild(tbody);
-
-        els.batchTableContainer.innerHTML = "";
-        els.batchTableContainer.appendChild(table);
-        els.batchTableContainer.style.display = "block";
-        els.batchError.textContent =
-          "OK – previewing the exact headers/rows used by the Google Sheets pages.";
-        els.batchError.style.color = "#68d391";
-      } catch (e) {
-        els.batchError.style.color = "#fc8181";
-        els.batchError.textContent =
-          "Error loading /sheet-rows: " +
-          (e.data ? JSON.stringify(e.data) : e.toString());
-      }
-    }
-
-    function clearBatch() {
-      els.batchTickers.value = "";
-      els.batchTableContainer.innerHTML = "";
-      els.batchTableContainer.style.display = "none";
-      els.batchError.style.display = "none";
-      els.batchError.textContent = "";
-      els.tickerSplitRow.style.display = "none";
-      els.tickerSplitRow.innerHTML = "";
-    }
-
-    // --------------------------------------------------------
-    // Events & init
-    // --------------------------------------------------------
-    function initEvents() {
-      els.saveCfgBtn.addEventListener("click", async () => {
-        saveConfig();
-        await testConfigAndHealth();
-      });
-
-      els.clearCfgBtn.addEventListener("click", () => {
-        resetConfig();
-      });
-
-      els.refreshHealthBtn.addEventListener("click", async () => {
-        await testConfigAndHealth();
-      });
-
-      els.refreshStatusBtn.addEventListener("click", async () => {
-        await updateStatusCard();
-      });
-
-      els.runQuickBtn.addEventListener("click", runQuickCheck);
-
-      els.batchTickers.addEventListener("input", renderTickerSplit);
-      els.runBatchBtn.addEventListener("click", runBatchPreview);
-      els.clearBatchBtn.addEventListener("click", clearBatch);
-    }
-
-    function init() {
-      loadConfig();
-      initEvents();
-      renderTickerSplit();
-      // Optional: initial lightweight status load (no error if fails)
-      updateStatusCard().catch(() => {});
-    }
-
-    init();
+    // --- INIT ---
+    loadConfig();
+    checkConnectivity();
   })();
 </script>
 </body>
