@@ -1,249 +1,256 @@
 """
-run_market_scan.py
-===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER & ANALYZER (v2.0.0)
-===========================================================
+core/data_engine.py
+===============================================================
+LEGACY WRAPPER AROUND DATAENGINE v2 – v3.2.0
 
-What it does:
-1. Initializes the Unified Data Engine (V2).
-2. Fetches real-time data + fundamentals for a watchlist.
-3. Applies the AI Scoring Engine (Value, Quality, Momentum).
-4. Generates a ranked "Opportunity Scoreboard" in the console.
-5. Exports a full detailed CSV report compatible with Excel/Sheets.
+PURPOSE
+- Provide a *backwards-compatible* module-level API for the original
+  "v1 core data engine" while delegating all real work to the new
+  class-based engine in `core.data_engine_v2`.
+- Keep old imports working, such as:
+      from core import data_engine
+      from core.data_engine import get_enriched_quotes, UnifiedQuote, DataEngine
+- Ensure KSA safety and provider logic are defined ONLY once in
+  `core.data_engine_v2` (single source of truth).
 
-Usage:
-    python run_market_scan.py
+MAIN BEHAVIOR
+- Tries to import:
+      from core.data_engine_v2 import DataEngine, UnifiedQuote
+- If successful:
+      • DataEngine (here) is an alias of the v2 DataEngine.
+      • get_enriched_quote(s) simply forward to the v2 engine instance.
+      • UnifiedQuote is re-exported from v2.
+      • QuoteSource is polyfilled if missing in v2 to satisfy legacy imports.
+- If v2 cannot be imported:
+      • Falls back to a very small stub engine that always returns
+        MISSING UnifiedQuote objects (no crashes, but clearly marked).
+      • This keeps the app importable even in emergency / partial setups.
 
-Configuration (Env Vars):
-    SCAN_TICKERS="1120.SR,2222.SR,AAPL,MSFT"
-    SCAN_TICKERS_FILE="watchlist.txt"  # Path to file with one ticker per line
-    SCAN_TOP_N="20"                    # How many top picks to show
-    SCAN_MIN_OPP_SCORE="60"            # Minimum score filter
+NOTES
+- EODHD is NEVER called for KSA (.SR) tickers – that logic lives in
+  `core.data_engine_v2`.
 """
 
 from __future__ import annotations
 
-import asyncio
-import csv
 import logging
-import os
-import sys
-import time
+import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
-# --- SETUP PATH ---
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# --- IMPORTS ---
-try:
-    from env import settings
-    from core.data_engine_v2 import DataEngine, UnifiedQuote
-    from core.enriched_quote import EnrichedQuote
-    from core.scoring_engine import enrich_with_scores
-except ImportError as e:
-    print(f"CRITICAL ERROR: Could not import core modules. Run from project root.\nError: {e}")
-    sys.exit(1)
-
-# Optional pretty printing
-try:
-    from tabulate import tabulate
-    HAS_TABULATE = True
-except ImportError:
-    HAS_TABULATE = False
-
-# --- LOGGING ---
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("MarketScan")
-
-# --- DEFAULTS ---
-DEFAULT_KSA = ["1120.SR", "1180.SR", "2222.SR", "2010.SR", "7010.SR", "4030.SR", "7202.SR", "5110.SR"]
-DEFAULT_GLOBAL = ["AAPL", "NVDA", "MSFT", "TSLA", "AMZN", "GOOGL", "EURUSD=X", "BTC-USD", "GC=F"]
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def load_watchlist() -> List[str]:
-    """
-    Load tickers from File > Env Var > Defaults.
-    """
-    # 1. File
-    fname = os.getenv("SCAN_TICKERS_FILE", "")
-    if fname and os.path.exists(fname):
-        logger.info(f"Loading watchlist from {fname}...")
-        with open(fname, 'r', encoding='utf-8') as f:
-            # Handle CSV or plain text
-            lines = [line.strip().split(',')[0] for line in f if line.strip() and not line.startswith("#")]
-        return list(dict.fromkeys(lines)) # Dedupe
-
-    # 2. Env Var
-    env_tickers = os.getenv("SCAN_TICKERS", "")
-    if env_tickers:
-        logger.info("Loading watchlist from SCAN_TICKERS env var...")
-        return [t.strip() for t in env_tickers.split(",") if t.strip()]
-
-    # 3. Defaults
-    logger.info("Using default KSA + Global watchlist...")
-    return DEFAULT_KSA + DEFAULT_GLOBAL
-
-def format_currency(val: float | None, symbol: str) -> str:
-    if val is None: return "-"
-    return f"{val:,.2f} {symbol}"
-
-def format_pct(val: float | None) -> str:
-    if val is None: return "-"
-    prefix = "+" if val > 0 else ""
-    return f"{prefix}{val:.2f}%"
-
-def get_badge(reco: str | None) -> str:
-    r = (reco or "").upper()
-    if r == "STRONG BUY": return "🔥 STRONG BUY"
-    if r == "BUY": return "✅ BUY"
-    if r == "SELL": return "🛑 SELL"
-    if r == "REDUCE": return "⚠️ REDUCE"
-    return "⏸ HOLD"
-
-# =============================================================================
-# MAIN LOGIC
-# =============================================================================
-
-async def main():
-    start_time = time.time()
-    
-    # 1. Configuration
-    tickers = load_watchlist()
-    top_n = int(os.getenv("SCAN_TOP_N", "25"))
-    min_score = float(os.getenv("SCAN_MIN_OPP_SCORE", "0"))
-    
-    print("\n" + "="*60)
-    print(f" 🚀 MARKET SCANNER v2.0")
-    print(f" 📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f" 🎯 Targets: {len(tickers)} symbols")
-    print(f" 🧠 Engine: Core V2 + AI Scoring")
-    print("="*60 + "\n")
-
-    # 2. Initialize Engine
-    engine = DataEngine()
-    
-    # 3. Fetch Data
-    logger.info("Fetching data... (this may take a moment)")
-    unified_quotes = await engine.get_enriched_quotes(tickers)
-    
-    # 4. Enrich & Score
-    analyzed_data: List[EnrichedQuote] = []
-    
-    for uq in unified_quotes:
-        # Convert to Enriched schema
-        eq = EnrichedQuote.from_unified(uq)
-        # Apply Scoring Engine logic (Value, Quality, Momentum)
-        scored = enrich_with_scores(eq)
-        analyzed_data.append(scored)
-
-    # 5. Sort by Opportunity Score
-    ranked = sorted(
-        analyzed_data, 
-        key=lambda x: (x.opportunity_score or 0, x.data_quality != "MISSING"), 
-        reverse=True
+logger = logging.getLogger("core.data_engine")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    valid_results = [x for x in ranked if x.data_quality != "MISSING"]
-    missing_results = [x for x in ranked if x.data_quality == "MISSING"]
+# ---------------------------------------------------------------------------
+# Polyfill for QuoteSource (Legacy Compatibility)
+# ---------------------------------------------------------------------------
+try:
+    from pydantic import BaseModel, Field
+except ImportError:
+    class BaseModel: # type: ignore
+        def __init__(self, **kwargs): self.__dict__.update(kwargs)
+    def Field(default=None, **kwargs): return default
 
-    # 6. Display Report
-    print(f"\n🏆 TOP OPPORTUNITIES (Score >= {min_score})")
-    print("-" * 80)
-    
-    display_rows = []
-    for q in valid_results:
-        if (q.opportunity_score or 0) < min_score: continue
+class QuoteSource(BaseModel):
+    """
+    Legacy provider metadata model.
+    Re-defined here to ensure 'from core.data_engine import QuoteSource' works
+    even if v2 dropped it.
+    """
+    provider: str
+    latency_ms: Optional[float] = None
+    timestamp_utc: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+# ---------------------------------------------------------------------------
+# Try to import the "real" v2 engine + models
+# ---------------------------------------------------------------------------
+
+_ENGINE_MODE: str = "stub"
+_ENGINE_IS_STUB: bool = True
+
+try:
+    # Primary, modern engine
+    from core.data_engine_v2 import (  # type: ignore
+        DataEngine as _V2DataEngine,
+        UnifiedQuote,
+    )
+
+    # Check if UnifiedQuote has 'sources' field compatibility
+    # V2 UnifiedQuote might not have 'sources' defined as List[QuoteSource]
+    # We accept this; legacy code usually checks dicts or attributes loosely.
+
+    _ENGINE_MODE = "v2"
+    _ENGINE_IS_STUB = False
+    logger.info("core.data_engine: Delegating to core.data_engine_v2.DataEngine.")
+
+except Exception as exc:  # pragma: no cover - defensive fallback
+    logger.warning(
+        "core.data_engine: Failed to import core.data_engine_v2. "
+        "Falling back to stub engine. Error: %s",
+        exc,
+    )
+    _ENGINE_MODE = "stub"
+    _ENGINE_IS_STUB = True
+
+    # -----------------------------------------------------------------------
+    # Minimal local models for stub mode
+    # -----------------------------------------------------------------------
+    class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
+        """
+        Minimal UnifiedQuote placeholder used in stub mode.
+        """
+        symbol: str
+        price: Optional[float] = None
+        current_price: Optional[float] = None # V2 alias
+        data_quality: str = "MISSING"
+        last_updated_utc: Optional[datetime] = None
+        market: Optional[str] = None
+        market_region: Optional[str] = None
+        currency: Optional[str] = None
+        error: Optional[str] = None
+        sources: List[QuoteSource] = Field(default_factory=list)
         
-        display_rows.append([
-            q.symbol,
-            format_currency(q.current_price, q.currency or ""),
-            format_pct(q.percent_change),
-            f"{q.opportunity_score or 0:.1f}",
-            get_badge(q.recommendation),
-            format_pct(q.upside_percent),
-            f"{q.value_score or 0:.0f}/{q.quality_score or 0:.0f}/{q.momentum_score or 0:.0f}"
-        ])
-    
-    # Limit display
-    final_display = display_rows[:top_n]
+        # Compatibility fields
+        change: Optional[float] = None
+        percent_change: Optional[float] = None
+        volume: Optional[float] = None
 
-    if HAS_TABULATE:
-        headers = ["Symbol", "Price", "Change", "Opp Score", "Recommendation", "Upside", "V/Q/M Scores"]
-        print(tabulate(final_display, headers=headers, tablefmt="simple_grid"))
-    else:
-        # Simple fallback
-        print(f"{'SYMBOL':<10} {'PRICE':<15} {'SCORE':<6} {'RECO':<12} {'UPSIDE':<8}")
-        for row in final_display:
-            print(f"{row[0]:<10} {row[1]:<15} {row[3]:<6} {row[4]:<12} {row[5]:<8}")
+        def finalize(self): return self
 
-    # 7. KSA Specific Snapshot
-    print(f"\n🇸🇦 KSA SNAPSHOT")
-    print("-" * 80)
-    ksa_rows = [row for row in display_rows if ".SR" in row[0]]
-    if ksa_rows:
-        if HAS_TABULATE:
-            print(tabulate(ksa_rows[:10], headers=["Symbol", "Price", "Change", "Opp", "Reco", "Upside", "Scores"], tablefmt="simple"))
-        else:
-            for r in ksa_rows[:5]: print(f"{r[0]}: {r[1]} ({r[2]}) - {r[4]}")
-    else:
-        print("No KSA data found in valid results.")
+    class _V2DataEngine:  # type: ignore[no-redef]
+        """
+        Stub engine implementation used ONLY when core.data_engine_v2
+        is not available.
+        """
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            logger.error("core.data_engine: Using stub DataEngine.")
 
-    if missing_results:
-        print(f"\n⚠️ MISSING DATA: {len(missing_results)} symbols (Check logs/tickers)")
-        if len(missing_results) < 10:
-            print(", ".join([m.symbol for m in missing_results]))
+        async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
+            sym = (symbol or "").strip().upper()
+            now = datetime.now(timezone.utc)
+            return UnifiedQuote(
+                symbol=sym or "",
+                current_price=None,
+                data_quality="MISSING",
+                last_updated_utc=now,
+                error="Unified engine v2 unavailable (stub mode).",
+                sources=[QuoteSource(provider="stub", timestamp_utc=now)]
+            )
 
-    # 8. CSV Export
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"scan_results_{timestamp}.csv"
-    
-    logger.info(f"Exporting full report to {filename}...")
-    
-    csv_headers = [
-        "Symbol", "Name", "Market", "Sector", "Price", "Change %", "Opportunity Score", 
-        "Recommendation", "Value Score", "Quality Score", "Momentum Score",
-        "Fair Value", "Upside %", "PE (TTM)", "PB", "Div Yield %", "ROE %", 
-        "Data Quality", "Error"
-    ]
-    
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(csv_headers)
-        
-        for q in ranked:
-            writer.writerow([
-                q.symbol,
-                q.name,
-                q.market,
-                q.sector,
-                q.current_price,
-                q.percent_change,
-                q.opportunity_score,
-                q.recommendation,
-                q.value_score,
-                q.quality_score,
-                q.momentum_score,
-                q.fair_value,
-                q.upside_percent,
-                q.pe_ttm,
-                q.pb,
-                q.dividend_yield,
-                q.roe,
-                q.data_quality,
-                q.error
-            ])
+        async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
+            if not symbols: return []
+            return [await self.get_enriched_quote(s) for s in symbols]
 
-    print(f"\n✅ Done in {time.time() - start_time:.2f}s")
 
-if __name__ == "__main__":
-    if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+# ---------------------------------------------------------------------------
+# Engine instance & compatibility alias
+# ---------------------------------------------------------------------------
+
+# Expose DataEngine as the class type
+DataEngine = _V2DataEngine  # type: ignore[assignment]
+
+# Shared singleton instance
+_engine_instance = None
+
+def _get_engine():
+    global _engine_instance
+    if _engine_instance is None:
+        try:
+            _engine_instance = _V2DataEngine()
+        except Exception as e:
+            logger.error(f"Failed to initialize DataEngine: {e}")
+            # Crash-proof stub
+            class CrashStub:
+                async def get_enriched_quote(self, s): 
+                    return UnifiedQuote(symbol=s, error=f"Engine Init Failed: {e}")
+                async def get_enriched_quotes(self, s): 
+                    return [await self.get_enriched_quote(x) for x in s]
+            _engine_instance = CrashStub()
+    return _engine_instance
+
+# ---------------------------------------------------------------------------
+# Module-level convenience functions (v1-style API)
+# ---------------------------------------------------------------------------
+
+async def get_enriched_quote(symbol: str) -> UnifiedQuote:
+    """
+    Backwards-compatible convenience wrapper:
+        from core.data_engine import get_enriched_quote
+    """
+    eng = _get_engine()
+    try:
+        return await eng.get_enriched_quote(symbol)  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.exception("core.data_engine: Error in get_enriched_quote(%s)", symbol)
+        return UnifiedQuote(
+            symbol=(symbol or "").strip().upper(),
+            data_quality="ERROR",
+            error=f"Unhandled error: {exc}",
+        )
+
+
+async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
+    """
+    Backwards-compatible batch wrapper:
+        from core.data_engine import get_enriched_quotes
+    """
+    clean: List[str] = [s.strip() for s in (symbols or []) if s and s.strip()]
+    if not clean:
+        return []
+
+    eng = _get_engine()
+    try:
+        results = await eng.get_enriched_quotes(clean)  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.exception("core.data_engine: Error in get_enriched_quotes batch")
+        return [
+            UnifiedQuote(
+                symbol=sym.upper(),
+                data_quality="ERROR",
+                error=f"Unhandled error: {exc}",
+            )
+            for sym in clean
+        ]
+
+    # Ensure list
+    if not isinstance(results, list):
+        return [
+            UnifiedQuote(symbol=s, data_quality="ERROR", error="Engine return type mismatch") 
+            for s in clean
+        ]
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Introspection helpers
+# ---------------------------------------------------------------------------
+
+def get_engine_meta() -> Dict[str, Any]:
+    eng = _get_engine()
+    enabled_providers: Optional[List[str]] = None
+    try:
+        enabled_providers = list(getattr(eng, "enabled_providers", []))  # type: ignore
+    except Exception:
+        enabled_providers = None
+
+    return {
+        "engine_mode": _ENGINE_MODE,
+        "engine_is_stub": _ENGINE_IS_STUB,
+        "enabled_providers": enabled_providers,
+    }
+
+
+__all__ = [
+    "UnifiedQuote",
+    "QuoteSource",
+    "DataEngine",
+    "get_enriched_quote",
+    "get_enriched_quotes",
+    "get_engine_meta",
+]
