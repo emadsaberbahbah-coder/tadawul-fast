@@ -8,12 +8,11 @@ Single source of truth for:
 - Public helper: get_headers_for_sheet(sheet_name)
 
 Author: Emad Bahbah (with GPT-5)
-Version: 1.3.0
+Version: 1.4.0
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 # =============================================================================
@@ -39,6 +38,7 @@ CANONICAL_SHEET_ORDER: List[str] = [
 # NOTE:
 # - Keep this stable across KSA / Global / Mutual Funds / Commodities-FX.
 # - Apps Script and backend should both align to this order.
+# - These headers MAP PRECISELY to core.enriched_quote._HEADER_FIELD_MAP
 
 UNIVERSAL_MARKET_HEADERS_V59: List[str] = [
     # Identity
@@ -191,6 +191,8 @@ SHEET_NAME_ALIASES: Dict[str, List[str]] = {
         "My Portfolio",
         "Portfolio",
         "My_Portfolio",
+        "Holdings",
+        "Positions",
     ],
     "Insights_Analysis": [
         "Insights",
@@ -214,7 +216,7 @@ SHEET_NAME_ALIASES: Dict[str, List[str]] = {
 # 5) INTERNAL NORMALIZATION + LOOKUPS
 # =============================================================================
 
-def _norm(s: str) -> str:
+def _norm(s: Optional[str]) -> str:
     """Normalize sheet name for alias matching (case/space/underscore tolerant)."""
     if s is None:
         return ""
