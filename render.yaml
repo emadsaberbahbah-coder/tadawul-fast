@@ -6,8 +6,6 @@ services:
     autoDeploy: true
 
     buildCommand: pip install -r requirements.txt
-
-    # Render expects the app to bind to $PORT
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
 
     healthCheckPath: /health
@@ -18,23 +16,17 @@ services:
 
       - key: APP_NAME
         value: Tadawul Fast Bridge
+      - key: APP_VERSION
+        value: 4.6.0
       - key: APP_ENV
         value: production
       - key: LOG_LEVEL
         value: INFO
 
-      # Providers (adjust as you like)
+      # IMPORTANT: KSA-safe provider policy (informational list)
       - key: ENABLED_PROVIDERS
         value: "fmp,yfinance"
       - key: PRIMARY_PROVIDER
         value: "fmp"
       - key: KSA_DISALLOW_EODHD
         value: "true"
-
-      # Secrets (set these in Render dashboard as "Secret", not in YAML)
-      # - EODHD_API_KEY
-      # - FMP_API_KEY
-      # - FINNHUB_API_KEY
-      # - APP_TOKEN
-      # - GOOGLE_SHEETS_CREDENTIALS
-      # - DEFAULT_SPREADSHEET_ID
