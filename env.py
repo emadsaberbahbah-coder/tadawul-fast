@@ -1,16 +1,16 @@
 """
 env.py
 ------------------------------------------------------------
-Centralized environment configuration for Tadawul Fast Bridge (v4.0.0).
+Centralized environment configuration for Tadawul Fast Bridge (Hardened)
 
 Goals
 - Zero-crash config loading (Render/.env/local).
-- Strong defaults + safe parsing for bool/int/list/JSON.
-- Single source of truth for Tuning Parameters (Batch sizes, Timeouts).
-
-Usage
-- from env import settings
-- print(settings.eodhd_api_key)
+- Strong defaults + safe parsing for bool/int/float/list/JSON.
+- Backwards compatible attribute names used across the codebase:
+    settings.backend_base_url
+    settings.enriched_batch_size / timeout / concurrency
+    settings.google_sheets_credentials_raw / google_sheets_credentials
+    settings.sheet_* names
 """
 
 from __future__ import annotations
@@ -18,21 +18,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Sequence, Union
 
-try:
-    from pydantic import BaseModel, Field
-except ImportError:
-    # Fallback for minimal environments, though pydantic is required
-    class BaseModel: # type: ignore
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-    def Field(default=None, **kwargs):
-        return default
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# ----------------------------------------------------------------------
-# Optional: load from .env during local development
-# ----------------------------------------------------------------------
+# Optional: load from .env during local dev (safe if python-dotenv not installed)
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
@@ -41,196 +33,324 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-
-# ----------------------------------------------------------------------
-# Helpers (safe parsing)
-# ----------------------------------------------------------------------
 _TRUTHY = {"1", "true", "yes", "on", "y"}
 _FALSY = {"0", "false", "no", "off", "n"}
 
 
-def _get_str(key: str, default: str = "") -> str:
-    v = os.getenv(key)
+def _as_str(v: Any, default: str = "") -> str:
     if v is None:
         return default
-    return str(v).strip()
+    s = str(v).strip()
+    return s if s else default
 
 
-def _get_int(key: str, default: int) -> int:
-    raw = os.getenv(key)
-    if raw is None:
-        return default
+def _as_opt_str(v: Any) -> Optional[str]:
+    s = _as_str(v, "")
+    return s if s else None
+
+
+def _as_int(v: Any, default: int) -> int:
     try:
-        return int(str(raw).strip())
-    except Exception:
-        logger.warning("[env] Invalid int for %s=%r, using default=%s", key, raw, default)
-        return default
-
-
-def _get_float(key: str, default: float) -> float:
-    raw = os.getenv(key)
-    if raw is None:
-        return default
-    try:
-        return float(str(raw).strip())
+        if v is None:
+            return default
+        return int(str(v).strip())
     except Exception:
         return default
 
 
-def _get_bool(key: str, default: bool) -> bool:
-    raw = os.getenv(key)
-    if raw is None:
+def _as_float(v: Any, default: float) -> float:
+    try:
+        if v is None:
+            return default
+        return float(str(v).strip())
+    except Exception:
         return default
-    s = str(raw).strip().lower()
+
+
+def _as_bool(v: Any, default: bool) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
     if s in _TRUTHY:
         return True
     if s in _FALSY:
         return False
-    # Fallback
     return default
 
 
-def _split_list(value: Optional[str]) -> List[str]:
-    if not value:
+def _dedupe_preserve_lower(items: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        x = (x or "").strip().lower()
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _parse_list(v: Union[str, List[str], None]) -> List[str]:
+    """
+    Accepts:
+      - None
+      - ["eodhd","fmp"]
+      - '["eodhd","fmp"]'
+      - 'eodhd,fmp,yfinance'
+      - 'eodhd fmp yfinance'
+    Returns: lowercased, deduped list.
+    """
+    if v is None:
         return []
-    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+    if isinstance(v, list):
+        return _dedupe_preserve_lower([str(x) for x in v])
+
+    s = str(v).strip()
+    if not s:
+        return []
+
+    # JSON list
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            raw = json.loads(s)
+            if isinstance(raw, list):
+                return _dedupe_preserve_lower([str(x) for x in raw])
+        except Exception:
+            pass
+
+    # Comma-separated
+    if "," in s:
+        return _dedupe_preserve_lower([p.strip() for p in s.split(",")])
+
+    # Space-separated fallback
+    return _dedupe_preserve_lower([p.strip() for p in s.split()])
 
 
-def _split_list_lower(value: Optional[str]) -> List[str]:
-    return [v.lower() for v in _split_list(value)]
+def _load_json_object(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    # Unwrap one layer of quotes if env value is wrapped
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # Must look like JSON object
+    if not (s.startswith("{") and s.endswith("}")):
+        return None
+
+    try:
+        d = json.loads(s)
+        if not isinstance(d, dict):
+            return None
+        # Fix Render newline escaping for private_key
+        pk = d.get("private_key")
+        if isinstance(pk, str):
+            d["private_key"] = pk.replace("\\n", "\n")
+        return d
+    except Exception:
+        return None
 
 
 def _masked(value: Optional[str]) -> str:
     if not value:
         return "<empty>"
     s = str(value)
-    n = len(s)
-    if n <= 4:
-        return "*" * n
-    return f"{s[:2]}***{s[-2:]} (len={n})"
+    if len(s) <= 6:
+        return "*" * len(s)
+    return f"{s[:2]}***{s[-2:]} (len={len(s)})"
 
 
-def _load_json(value: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not value:
-        return None
-    raw = str(value).strip()
-    # If it looks like it's wrapped in quotes, unwrap once
-    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
-        raw = raw[1:-1].strip()
-    if not raw.startswith("{"):
-        return None
-    try:
-        return json.loads(raw)
-    except Exception as exc:
-        logger.warning("[env] Failed to parse JSON env value: %s", exc)
-        return None
-
-
-# ----------------------------------------------------------------------
-# Settings Model
-# ----------------------------------------------------------------------
-class Settings(BaseModel):
+class Settings(BaseSettings):
     # --------------------------------------------------------------
     # Application Meta
     # --------------------------------------------------------------
-    app_name: str = Field(default_factory=lambda: _get_str("APP_NAME", "Tadawul Fast Bridge"))
-    app_env: str = Field(default_factory=lambda: _get_str("APP_ENV", "production"))
-    app_version: str = Field(default_factory=lambda: _get_str("APP_VERSION", "4.0.0"))
-    log_level: str = Field(default_factory=lambda: _get_str("LOG_LEVEL", "INFO").upper())
+    app_name: str = Field(default="Tadawul Fast Bridge", alias="APP_NAME")
+    app_env: str = Field(default="production", alias="APP_ENV")
+    app_version: str = Field(default="4.0.0", alias="APP_VERSION")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # --------------------------------------------------------------
     # Connectivity
     # --------------------------------------------------------------
     backend_base_url: str = Field(
-        default_factory=lambda: _get_str("BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com")
+        default="https://tadawul-fast-bridge.onrender.com",
+        alias="BACKEND_BASE_URL",
     )
-    http_timeout_sec: float = Field(default_factory=lambda: _get_float("HTTP_TIMEOUT_SEC", 25.0))
-    
+    http_timeout_sec: float = Field(default=25.0, alias="HTTP_TIMEOUT_SEC")
+
     # --------------------------------------------------------------
     # Auth (Optional / Legacy)
     # --------------------------------------------------------------
-    app_token: Optional[str] = Field(default_factory=lambda: os.getenv("APP_TOKEN"))
-    backup_app_token: Optional[str] = Field(default_factory=lambda: os.getenv("BACKUP_APP_TOKEN"))
+    app_token: Optional[str] = Field(default=None, alias="APP_TOKEN")
+    backup_app_token: Optional[str] = Field(default=None, alias="BACKUP_APP_TOKEN")
 
     # --------------------------------------------------------------
     # Providers Configuration
     # --------------------------------------------------------------
-    enabled_providers: List[str] = Field(
-        default_factory=lambda: _split_list_lower(_get_str("ENABLED_PROVIDERS", "eodhd,fmp,yfinance"))
-    )
-    primary_provider: str = Field(default_factory=lambda: _get_str("PRIMARY_PROVIDER", "eodhd").lower())
+    enabled_providers: List[str] = Field(default_factory=lambda: ["eodhd", "fmp", "yfinance"], alias="ENABLED_PROVIDERS")
+    primary_provider: str = Field(default="eodhd", alias="PRIMARY_PROVIDER")
 
     # EODHD (Global)
-    eodhd_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("EODHD_API_KEY"))
-    eodhd_base_url: str = Field(default_factory=lambda: _get_str("EODHD_BASE_URL", "https://eodhd.com/api"))
-    eodhd_fetch_fundamentals: bool = Field(default_factory=lambda: _get_bool("EODHD_FETCH_FUNDAMENTALS", True))
+    eodhd_api_key: Optional[str] = Field(default=None, alias="EODHD_API_KEY")
+    eodhd_base_url: str = Field(default="https://eodhd.com/api", alias="EODHD_BASE_URL")
+    eodhd_fetch_fundamentals: bool = Field(default=True, alias="EODHD_FETCH_FUNDAMENTALS")
 
     # FMP (Global/Fundamentals)
-    fmp_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("FMP_API_KEY"))
-    fmp_base_url: str = Field(default_factory=lambda: _get_str("FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"))
+    fmp_api_key: Optional[str] = Field(default=None, alias="FMP_API_KEY")
+    fmp_base_url: str = Field(default="https://financialmodelingprep.com/api/v3", alias="FMP_BASE_URL")
 
     # YFinance (Fallback)
-    enable_yfinance: bool = Field(default_factory=lambda: _get_bool("ENABLE_YFINANCE", True))
+    enable_yfinance: bool = Field(default=True, alias="ENABLE_YFINANCE")
 
-    # KSA Legacy (Argaam Gateway - now mostly internal to Engine V2, but kept for legacy routes)
-    argaam_gateway_url: Optional[str] = Field(default_factory=lambda: os.getenv("ARGAAM_GATEWAY_URL"))
+    # Optional legacy/bridge
+    argaam_gateway_url: Optional[str] = Field(default=None, alias="ARGAAM_GATEWAY_URL")
 
     # --------------------------------------------------------------
-    # Caching
+    # Caching (used by some modules)
     # --------------------------------------------------------------
-    cache_ttl_sec: float = Field(default_factory=lambda: _get_float("CACHE_TTL_SEC", 20.0))
-    argaam_snapshot_ttl_sec: float = Field(default_factory=lambda: _get_float("ARGAAM_SNAPSHOT_TTL_SEC", 30.0))
-    fundamentals_ttl_sec: float = Field(default_factory=lambda: _get_float("FUNDAMENTALS_TTL_SEC", 21600.0)) # 6 hours
-    quote_ttl_sec: float = Field(default_factory=lambda: _get_float("QUOTE_TTL_SEC", 30.0))
+    cache_ttl_sec: float = Field(default=20.0, alias="CACHE_TTL_SEC")
+    argaam_snapshot_ttl_sec: float = Field(default=30.0, alias="ARGAAM_SNAPSHOT_TTL_SEC")
+    fundamentals_ttl_sec: float = Field(default=21600.0, alias="FUNDAMENTALS_TTL_SEC")
+    quote_ttl_sec: float = Field(default=30.0, alias="QUOTE_TTL_SEC")
 
     # --------------------------------------------------------------
     # Batch Processing Limits (Critical for Google Sheets stability)
     # --------------------------------------------------------------
-    # Advanced Analysis Route
-    adv_batch_size: int = Field(default_factory=lambda: _get_int("ADV_BATCH_SIZE", 20))
-    adv_batch_timeout_sec: float = Field(default_factory=lambda: _get_float("ADV_BATCH_TIMEOUT_SEC", 45.0))
-    adv_max_tickers: int = Field(default_factory=lambda: _get_int("ADV_MAX_TICKERS", 500))
-    adv_batch_concurrency: int = Field(default_factory=lambda: _get_int("ADV_BATCH_CONCURRENCY", 5))
+    adv_batch_size: int = Field(default=20, alias="ADV_BATCH_SIZE")
+    adv_batch_timeout_sec: float = Field(default=45.0, alias="ADV_BATCH_TIMEOUT_SEC")
+    adv_max_tickers: int = Field(default=500, alias="ADV_MAX_TICKERS")
+    adv_batch_concurrency: int = Field(default=5, alias="ADV_BATCH_CONCURRENCY")
 
-    # AI Analysis Route
-    ai_batch_size: int = Field(default_factory=lambda: _get_int("AI_BATCH_SIZE", 20))
-    ai_batch_timeout_sec: float = Field(default_factory=lambda: _get_float("AI_BATCH_TIMEOUT_SEC", 45.0))
-    ai_max_tickers: int = Field(default_factory=lambda: _get_int("AI_MAX_TICKERS", 500))
-    ai_batch_concurrency: int = Field(default_factory=lambda: _get_int("AI_BATCH_CONCURRENCY", 5))
+    ai_batch_size: int = Field(default=20, alias="AI_BATCH_SIZE")
+    ai_batch_timeout_sec: float = Field(default=45.0, alias="AI_BATCH_TIMEOUT_SEC")
+    ai_max_tickers: int = Field(default=500, alias="AI_MAX_TICKERS")
+    ai_batch_concurrency: int = Field(default=5, alias="AI_BATCH_CONCURRENCY")
 
-    # Enriched Quotes Route
-    enriched_batch_size: int = Field(default_factory=lambda: _get_int("ENRICHED_BATCH_SIZE", 40))
-    enriched_batch_timeout_sec: float = Field(default_factory=lambda: _get_float("ENRICHED_BATCH_TIMEOUT_SEC", 45.0))
-    enriched_max_tickers: int = Field(default_factory=lambda: _get_int("ENRICHED_MAX_TICKERS", 250))
-    enriched_batch_concurrency: int = Field(default_factory=lambda: _get_int("ENRICHED_BATCH_CONCURRENCY", 5))
+    enriched_batch_size: int = Field(default=40, alias="ENRICHED_BATCH_SIZE")
+    enriched_batch_timeout_sec: float = Field(default=45.0, alias="ENRICHED_BATCH_TIMEOUT_SEC")
+    enriched_max_tickers: int = Field(default=250, alias="ENRICHED_MAX_TICKERS")
+    enriched_batch_concurrency: int = Field(default=5, alias="ENRICHED_BATCH_CONCURRENCY")
 
     # --------------------------------------------------------------
-    # Sheet Names (Legacy/Reference)
+    # Sheet Names (Reference)
     # --------------------------------------------------------------
-    sheet_ksa_tadawul: str = Field(default_factory=lambda: _get_str("SHEET_KSA_TADAWUL", "KSA_Tadawul_Market"))
-    sheet_global_markets: str = Field(default_factory=lambda: _get_str("SHEET_GLOBAL_MARKETS", "Global_Markets"))
-    sheet_mutual_funds: str = Field(default_factory=lambda: _get_str("SHEET_MUTUAL_FUNDS", "Mutual_Funds"))
-    sheet_commodities_fx: str = Field(default_factory=lambda: _get_str("SHEET_COMMODITIES_FX", "Commodities_FX"))
-    sheet_market_leaders: str = Field(default_factory=lambda: _get_str("SHEET_MARKET_LEADERS", "Market_Leaders"))
-    sheet_my_portfolio: str = Field(default_factory=lambda: _get_str("SHEET_MY_PORTFOLIO", "My_Portfolio"))
-    sheet_insights_analysis: str = Field(default_factory=lambda: _get_str("SHEET_INSIGHTS_ANALYSIS", "Insights_Analysis"))
-    sheet_investment_advisor: str = Field(default_factory=lambda: _get_str("SHEET_INVESTMENT_ADVISOR", "Investment_Advisor"))
-    sheet_economic_calendar: str = Field(default_factory=lambda: _get_str("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar"))
-    sheet_investment_income: str = Field(default_factory=lambda: _get_str("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement"))
+    sheet_ksa_tadawul: str = Field(default="KSA_Tadawul_Market", alias="SHEET_KSA_TADAWUL")
+    sheet_global_markets: str = Field(default="Global_Markets", alias="SHEET_GLOBAL_MARKETS")
+    sheet_mutual_funds: str = Field(default="Mutual_Funds", alias="SHEET_MUTUAL_FUNDS")
+    sheet_commodities_fx: str = Field(default="Commodities_FX", alias="SHEET_COMMODITIES_FX")
+    sheet_market_leaders: str = Field(default="Market_Leaders", alias="SHEET_MARKET_LEADERS")
+    sheet_my_portfolio: str = Field(default="My_Portfolio", alias="SHEET_MY_PORTFOLIO")
+    sheet_insights_analysis: str = Field(default="Insights_Analysis", alias="SHEET_INSIGHTS_ANALYSIS")
+    sheet_investment_advisor: str = Field(default="Investment_Advisor", alias="SHEET_INVESTMENT_ADVISOR")
+    sheet_economic_calendar: str = Field(default="Economic_Calendar", alias="SHEET_ECONOMIC_CALENDAR")
+    sheet_investment_income: str = Field(default="Investment_Income_Statement", alias="SHEET_INVESTMENT_INCOME")
 
     # --------------------------------------------------------------
     # Google Integration
     # --------------------------------------------------------------
-    google_sheets_credentials_raw: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_SHEETS_CREDENTIALS"))
-    google_apps_script_backup_url: Optional[str] = Field(default_factory=lambda: os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL"))
-    default_spreadsheet_id: Optional[str] = Field(default_factory=lambda: os.getenv("DEFAULT_SPREADSHEET_ID"))
+    google_sheets_credentials_raw: Optional[str] = Field(default=None, alias="GOOGLE_SHEETS_CREDENTIALS")
+    google_apps_script_backup_url: Optional[str] = Field(default=None, alias="GOOGLE_APPS_SCRIPT_BACKUP_URL")
+    default_spreadsheet_id: Optional[str] = Field(default=None, alias="DEFAULT_SPREADSHEET_ID")
 
     # Misc
-    enable_cors_all_origins: bool = Field(default_factory=lambda: _get_bool("ENABLE_CORS_ALL_ORIGINS", True))
+    enable_cors_all_origins: bool = Field(default=True, alias="ENABLE_CORS_ALL_ORIGINS")
 
+    # -------------------------
+    # Validators / coercion
+    # -------------------------
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _v_log_level(cls, v: Any) -> str:
+        s = _as_str(v, "INFO").upper()
+        return "WARNING" if s == "WARN" else s
+
+    @field_validator("app_env", mode="before")
+    @classmethod
+    def _v_app_env(cls, v: Any) -> str:
+        s = _as_str(v, "production").lower()
+        if s == "prod":
+            return "production"
+        if s == "dev":
+            return "development"
+        return s or "production"
+
+    @field_validator("http_timeout_sec", mode="before")
+    @classmethod
+    def _v_timeout(cls, v: Any) -> float:
+        x = _as_float(v, 25.0)
+        return 25.0 if x <= 0 else x
+
+    @field_validator("enabled_providers", mode="before")
+    @classmethod
+    def _v_providers(cls, v: Any) -> List[str]:
+        lst = _parse_list(v)
+        return lst or ["eodhd", "fmp", "yfinance"]
+
+    @field_validator("primary_provider", mode="before")
+    @classmethod
+    def _v_primary(cls, v: Any) -> str:
+        return _as_str(v, "eodhd").lower()
+
+    @field_validator(
+        "adv_batch_size",
+        "ai_batch_size",
+        "enriched_batch_size",
+        "adv_batch_concurrency",
+        "ai_batch_concurrency",
+        "enriched_batch_concurrency",
+        "adv_max_tickers",
+        "ai_max_tickers",
+        "enriched_max_tickers",
+        mode="before",
+    )
+    @classmethod
+    def _v_ints_positive(cls, v: Any) -> int:
+        x = _as_int(v, 1)
+        return max(1, x)
+
+    @field_validator(
+        "adv_batch_timeout_sec",
+        "ai_batch_timeout_sec",
+        "enriched_batch_timeout_sec",
+        "cache_ttl_sec",
+        "argaam_snapshot_ttl_sec",
+        "fundamentals_ttl_sec",
+        "quote_ttl_sec",
+        mode="before",
+    )
+    @classmethod
+    def _v_floats_positive(cls, v: Any) -> float:
+        x = _as_float(v, 0.0)
+        return max(1.0, x)
+
+    @field_validator(
+        "eodhd_fetch_fundamentals",
+        "enable_yfinance",
+        "enable_cors_all_origins",
+        mode="before",
+    )
+    @classmethod
+    def _v_bools(cls, v: Any) -> bool:
+        return _as_bool(v, True)
+
+    @field_validator("backend_base_url", mode="before")
+    @classmethod
+    def _v_backend_url(cls, v: Any) -> str:
+        s = _as_str(v, "https://tadawul-fast-bridge.onrender.com")
+        return s.rstrip("/")
+
+    # -------------------------
+    # Convenience properties
+    # -------------------------
     @property
     def google_sheets_credentials(self) -> Optional[Dict[str, Any]]:
-        return _load_json(self.google_sheets_credentials_raw)
+        return _load_json_object(self.google_sheets_credentials_raw)
 
     @property
     def is_production(self) -> bool:
@@ -238,37 +358,57 @@ class Settings(BaseModel):
 
     @property
     def primary_or_default_provider(self) -> str:
-        enabled = [p for p in self.enabled_providers if p]
-        primary = self.primary_provider
+        enabled = [p for p in (self.enabled_providers or []) if p]
+        primary = (self.primary_provider or "").strip().lower()
         if primary and primary in enabled:
             return primary
         return (enabled or ["eodhd"])[0]
 
     def post_init_warnings(self) -> None:
-        """Safe startup logging"""
         logger.info("[env] App=%s | Env=%s | Version=%s", self.app_name, self.app_env, self.app_version)
-        logger.info("[env] Providers=%s", ",".join(self.enabled_providers))
-        
-        # Warnings for missing keys
+        logger.info("[env] Providers=%s | Primary=%s", ",".join(self.enabled_providers), self.primary_or_default_provider)
+
         if "eodhd" in self.enabled_providers and not self.eodhd_api_key:
             logger.warning("[env] EODHD enabled but EODHD_API_KEY missing.")
         if "fmp" in self.enabled_providers and not self.fmp_api_key:
             logger.warning("[env] FMP enabled but FMP_API_KEY missing.")
 
+        if self.app_token:
+            logger.info("[env] APP_TOKEN=%s", _masked(self.app_token))
+        if self.default_spreadsheet_id:
+            logger.info("[env] DEFAULT_SPREADSHEET_ID=%s", _masked(self.default_spreadsheet_id))
 
-# ----------------------------------------------------------------------
-# Global settings instance
-# ----------------------------------------------------------------------
-def _init_settings() -> Settings:
+
+    # Pydantic settings config
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_env_settings() -> Settings:
+    """
+    Cached settings instance; never crashes the app.
+    """
     try:
         s = Settings()
-        s.post_init_warnings()
+        try:
+            s.post_init_warnings()
+        except Exception:
+            pass
         return s
     except Exception as exc:
         logger.error("[env] Failed to initialize Settings: %s", exc)
-        return Settings.model_validate({}) # type: ignore
+        # Last-resort: return defaults
+        return Settings.model_validate({})  # type: ignore[arg-type]
 
-settings: Settings = _init_settings()
+
+# Global singleton (backwards compatible)
+settings: Settings = get_env_settings()
 
 # ----------------------------------------------------------------------
 # Convenience Exports (Backwards Compatibility)
@@ -304,6 +444,17 @@ LOG_LEVEL = settings.log_level
 IS_PRODUCTION = settings.is_production
 
 __all__ = [
-    "Settings", "settings", "APP_ENV", "APP_NAME", "BACKEND_BASE_URL", 
-    "APP_TOKEN", "ENABLED_PROVIDERS", "EODHD_API_KEY", "FMP_API_KEY"
+    "Settings",
+    "settings",
+    "get_env_settings",
+    "APP_ENV",
+    "APP_NAME",
+    "BACKEND_BASE_URL",
+    "APP_TOKEN",
+    "BACKUP_APP_TOKEN",
+    "ENABLED_PROVIDERS",
+    "PRIMARY_PROVIDER",
+    "HTTP_TIMEOUT",
+    "EODHD_API_KEY",
+    "FMP_API_KEY",
 ]
