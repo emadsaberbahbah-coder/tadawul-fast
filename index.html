@@ -44,56 +44,65 @@
     .title-block p { margin: 0; color: var(--muted); font-size: 0.92rem; max-width: 600px; line-height: 1.5; }
     .pill {
       display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
-      font-size: 0.8rem; font-weight: 500; background: rgba(72, 187, 120, 0.1); color: var(--success);
-      border: 1px solid rgba(72, 187, 120, 0.25); transition: all 0.3s ease;
+      font-size: 0.8rem; font-weight: 500; background: rgba(72, 187, 120, 0.1);
+      color: var(--success); border: 1px solid rgba(72, 187, 120, 0.25);
+      transition: all 0.3s ease;
     }
-    .pill.disconnected { background: rgba(252, 129, 129, 0.1); color: var(--danger); border-color: rgba(252, 129, 129, 0.25); }
+    .pill.disconnected {
+      background: rgba(252, 129, 129, 0.1);
+      color: var(--danger);
+      border-color: rgba(252, 129, 129, 0.25);
+    }
     .pill span.dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
     main { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(0, 3.2fr); gap: 20px; }
     @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
     .card {
       background: linear-gradient(145deg, #181f3b, #0f1426);
-      border-radius: var(--radius-lg); border: 1px solid var(--border);
-      box-shadow: var(--shadow-soft); padding: 20px; margin-bottom: 20px;
-      position: relative; overflow: hidden;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-soft);
+      padding: 20px;
+      margin-bottom: 20px;
+      position: relative;
+      overflow: hidden;
     }
     .card::before {
-      content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 4px;
-      background: linear-gradient(90deg, var(--accent), transparent); opacity: 0.5;
+      content: "";
+      position: absolute; top: 0; left: 0; width: 100%; height: 4px;
+      background: linear-gradient(90deg, var(--accent), transparent);
+      opacity: 0.5;
     }
     .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
     .card-header h2 { margin: 0; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
     .card-header small { font-size: 0.75rem; color: var(--muted); opacity: 0.8; }
-
     label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 6px; font-weight: 500; }
     input, textarea, select {
       width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
       background: rgba(11, 16, 32, 0.6); color: var(--text); font-size: 0.9rem; font-family: inherit;
       transition: border-color 0.2s;
     }
-    input:focus, textarea:focus, select:focus {
-      outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft);
-    }
+    input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
     .row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
     .row > div { flex: 1 1 140px; }
     .btn {
-      display: inline-flex; align-items: center; justify-content: center; padding: 8px 16px;
-      border-radius: 8px; border: 1px solid var(--accent-strong); background: rgba(56, 178, 172, 0.15);
-      color: var(--accent); font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 8px 16px; border-radius: 8px; border: 1px solid var(--accent-strong);
+      background: rgba(56, 178, 172, 0.15); color: var(--accent);
+      font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s;
     }
     .btn:hover { background: var(--accent-strong); color: #000; transform: translateY(-1px); }
     .btn.secondary { background: transparent; border-color: var(--border); color: var(--muted); }
     .btn.secondary:hover { border-color: var(--muted); color: var(--text); }
     .btn.sm { padding: 6px 12px; font-size: 0.8rem; }
     .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
-    .status-card { padding: 12px; border-radius: 10px; background: rgba(0, 0, 0, 0.2); border: 1px solid var(--border); }
+    .status-card { padding: 12px; border-radius: 10px; background: rgba(0,0,0,0.2); border: 1px solid var(--border); }
     .status-card h3 { margin: 0 0 6px; font-size: 0.75rem; color: var(--muted); text-transform: uppercase; }
     .status-card .value { font-size: 0.9rem; font-weight: 600; color: var(--text); }
     .status-card .value.ok { color: var(--success); }
     .status-card .value.bad { color: var(--danger); }
     pre {
       background: #080c17; border-radius: 8px; padding: 12px;
-      font-family: 'Menlo', 'Monaco', monospace; font-size: 0.8rem; color: #a0aec0;
+      font-family: 'Menlo','Monaco', monospace; font-size: 0.8rem; color: #a0aec0;
       overflow-x: auto; border: 1px solid var(--border); margin-top: 10px; max-height: 300px;
     }
     .table-container { overflow-x: auto; border-radius: 8px; border: 1px solid var(--border); margin-top: 10px; }
@@ -101,9 +110,9 @@
     th, td { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; }
     th { background: #151b33; color: var(--accent); position: sticky; top: 0; }
     tr:last-child td { border-bottom: none; }
-    tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
+    tr:nth-child(even) { background: rgba(255,255,255,0.02); }
     .chip-row { display: flex; gap: 8px; margin-top: 8px; }
-    .chip { font-size: 0.75rem; padding: 4px 10px; border-radius: 99px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border); }
+    .chip { font-size: 0.75rem; padding: 4px 10px; border-radius: 99px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); }
     .chip.ksa { color: var(--ksa); border-color: rgba(246, 173, 85, 0.3); }
     .chip.global { color: var(--global); border-color: rgba(99, 179, 237, 0.3); }
     .error-text { color: var(--danger); font-size: 0.85rem; margin-top: 8px; display: block; }
@@ -171,10 +180,18 @@
         <div style="margin-top:15px">
           <label>Route Health</label>
           <div class="status-grid">
-            <div class="status-card"><h3>Enriched</h3><div class="value" id="health-enriched">-</div></div>
-            <div class="status-card"><h3>AI Analysis</h3><div class="value" id="health-ai">-</div></div>
-            <div class="status-card"><h3>Advanced</h3><div class="value" id="health-adv">-</div></div>
-            <div class="status-card"><h3>Argaam</h3><div class="value" id="health-argaam">-</div></div>
+            <div class="status-card">
+              <h3>Enriched</h3>
+              <div class="value" id="health-enriched">-</div>
+            </div>
+            <div class="status-card">
+              <h3>AI Analysis</h3>
+              <div class="value" id="health-ai">-</div>
+            </div>
+            <div class="status-card">
+              <h3>Advanced</h3>
+              <div class="value" id="health-adv">-</div>
+            </div>
           </div>
         </div>
       </div>
@@ -196,7 +213,6 @@
               <option value="enriched">Enriched Quote (/v1/enriched)</option>
               <option value="analysis">AI Analysis (/v1/analysis)</option>
               <option value="advanced">Advanced Score (/v1/advanced)</option>
-              <option value="argaam">Argaam KSA (/v1/argaam)</option>
             </select>
           </div>
           <div style="flex: 0;">
@@ -210,23 +226,21 @@
       <div class="card">
         <div class="card-header">
           <h2>Sheet Rows Preview</h2>
-          <small>Batch processing</small>
+          <small>Batch processing & sorting</small>
         </div>
-
         <div class="row">
           <div>
             <label>Target Sheet Type</label>
             <select id="batchType">
-              <option value="enriched">Enriched (/v1/enriched/sheet-rows)</option>
-              <option value="analysis">AI Analysis (/v1/analysis/sheet-rows)</option>
-              <option value="advanced">Advanced (/v1/advanced/sheet-rows)</option>
-              <option value="argaam">Argaam (/v1/argaam/sheet-rows)</option>
+              <option value="enriched">Global/KSA/Funds (Enriched)</option>
+              <option value="analysis">Insights (AI Analysis)</option>
+              <option value="advanced">Advanced Analysis</option>
             </select>
           </div>
         </div>
-
         <label>Tickers (One per line)</label>
         <textarea id="batchTickers" rows="5" placeholder="1120.SR&#10;1180.SR&#10;AAPL&#10;MSFT"></textarea>
+
         <div class="chip-row" id="tickerSplitRow" style="display:none;"></div>
 
         <div class="row" style="justify-content: flex-end; margin-top:10px;">
@@ -241,57 +255,56 @@
   </main>
 
   <footer>
-    Tadawul Fast Bridge • Control Panel • Engine v2 • KSA-safe
+    Tadawul Fast Bridge &bull; Powered by DataEngine V2 &bull; KSA-Safe
   </footer>
 </div>
 
 <script>
-(function() {
+(function () {
   const state = { baseUrl: "", token: "" };
-
   const el = (id) => document.getElementById(id);
+
   const ui = {
-    baseUrl: el("baseUrl"),
-    token: el("token"),
-    cfgStatus: el("cfg-status"),
-    cfgError: el("cfg-error"),
-    saveCfg: el("saveCfgBtn"),
-    clearCfg: el("clearCfgBtn"),
-    pill: el("connection-pill"),
-    pillText: el("connection-pill-text"),
+    baseUrl: el('baseUrl'),
+    token: el('token'),
+    cfgStatus: el('cfg-status'),
+    cfgError: el('cfg-error'),
+    saveCfg: el('saveCfgBtn'),
+    clearCfg: el('clearCfgBtn'),
+    pill: el('connection-pill'),
+    pillText: el('connection-pill-text'),
 
-    stEnv: el("status-env"),
-    stEngine: el("status-engine"),
-    stSheets: el("status-sheets"),
-    hEnriched: el("health-enriched"),
-    hAi: el("health-ai"),
-    hAdv: el("health-adv"),
-    hArgaam: el("health-argaam"),
-    refreshStatus: el("refreshStatusBtn"),
+    stEnv: el('status-env'),
+    stEngine: el('status-engine'),
+    stSheets: el('status-sheets'),
+    hEnriched: el('health-enriched'),
+    hAi: el('health-ai'),
+    hAdv: el('health-adv'),
+    refreshStatus: el('refreshStatusBtn'),
 
-    qSym: el("quickSymbol"),
-    qType: el("quickType"),
-    qRun: el("runQuickBtn"),
-    qRes: el("quickResult"),
+    qSym: el('quickSymbol'),
+    qType: el('quickType'),
+    qRun: el('runQuickBtn'),
+    qRes: el('quickResult'),
 
-    bType: el("batchType"),
-    bTickers: el("batchTickers"),
-    bRun: el("runBatchBtn"),
-    bClear: el("clearBatchBtn"),
-    bErr: el("batchError"),
-    bTable: el("batchTableContainer"),
-    bSplit: el("tickerSplitRow")
+    bType: el('batchType'),
+    bTickers: el('batchTickers'),
+    bRun: el('runBatchBtn'),
+    bClear: el('clearBatchBtn'),
+    bErr: el('batchError'),
+    bTable: el('batchTableContainer'),
+    bSplit: el('tickerSplitRow')
   };
 
   function loadConfig() {
     state.baseUrl = (localStorage.getItem("tfb_base_url") || window.location.origin).replace(/\/$/, "");
-    state.token = (localStorage.getItem("tfb_app_token") || "").trim();
+    state.token = localStorage.getItem("tfb_app_token") || "";
     ui.baseUrl.value = state.baseUrl;
     ui.token.value = state.token;
   }
 
   function saveConfig() {
-    state.baseUrl = ui.baseUrl.value.trim().replace(/\/$/, "");
+    state.baseUrl = ui.baseUrl.value.replace(/\/$/, "");
     state.token = ui.token.value.trim();
     localStorage.setItem("tfb_base_url", state.baseUrl);
     localStorage.setItem("tfb_app_token", state.token);
@@ -300,80 +313,80 @@
 
   async function fetchAPI(endpoint, opts = {}) {
     const url = `${state.baseUrl}${endpoint}`;
-    const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+    const headers = { ...(opts.headers || {}) };
+    if (opts.method && opts.method.toUpperCase() !== "GET") {
+      headers["Content-Type"] = "application/json";
+    }
     if (state.token) headers["X-APP-TOKEN"] = state.token;
 
-    const method = (opts.method || "GET").toUpperCase();
-    let body = opts.body;
+    const init = { ...opts, headers };
 
-    // If body is an object, stringify it.
-    if (body && typeof body === "object" && !(body instanceof FormData)) {
-      body = JSON.stringify(body);
+    if (init.body && typeof init.body === "object" && !(init.body instanceof FormData)) {
+      init.body = JSON.stringify(init.body);
     }
 
-    const res = await fetch(url, { ...opts, method, headers, body });
-    const text = await res.text();
+    const res = await fetch(url, init);
 
+    // Some endpoints might return empty body for HEAD or plain text on errors
+    const text = await res.text();
     let data = null;
-    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+    try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
 
     if (!res.ok) {
-      const detail = (data && (data.detail || data.error)) ? (data.detail || data.error) : `HTTP ${res.status}`;
-      throw new Error(detail);
+      const msg = (data && (data.detail || data.error)) ? (data.detail || data.error) : `HTTP ${res.status}`;
+      throw new Error(msg);
     }
     return data;
   }
 
   function updatePill(ok) {
     if (ok) {
-      ui.pill.classList.remove("disconnected");
+      ui.pill.classList.remove('disconnected');
       ui.pillText.textContent = "Connected";
       ui.cfgStatus.textContent = "Online";
       ui.cfgStatus.style.color = "var(--success)";
-      ui.cfgError.style.display = "none";
+      ui.cfgError.style.display = 'none';
     } else {
-      ui.pill.classList.add("disconnected");
+      ui.pill.classList.add('disconnected');
       ui.pillText.textContent = "Disconnected";
       ui.cfgStatus.textContent = "Offline";
       ui.cfgStatus.style.color = "var(--danger)";
     }
   }
 
-  function setHealth(elm, settled) {
-    const ok = settled.status === "fulfilled";
-    elm.textContent = ok ? "OK" : "ERR";
-    elm.className = `value ${ok ? "ok" : "bad"}`;
-  }
-
   async function checkConnectivity() {
     ui.stEnv.textContent = "...";
     ui.stEngine.textContent = "...";
-    ui.stSheets.textContent = "...";
+    ui.hEnriched.textContent = "...";
+    ui.hAi.textContent = "...";
+    ui.hAdv.textContent = "...";
 
     try {
-      const root = await fetchAPI("/");
+      const root = await fetchAPI('/');
       ui.stEnv.textContent = `v${root.version || "?"}`;
-      ui.stEngine.textContent = root.engine || root.app || "Unknown";
+      ui.stEngine.textContent = root.engine || "Unknown";
 
-      const [hE, hA, hAdv, hK] = await Promise.allSettled([
-        fetchAPI("/v1/enriched/health"),
-        fetchAPI("/v1/analysis/health"),
-        fetchAPI("/v1/advanced/health"),
-        fetchAPI("/v1/argaam/health")
+      const [hE, hA, hAdv] = await Promise.allSettled([
+        fetchAPI('/v1/enriched/health', { method: 'GET' }),
+        fetchAPI('/v1/analysis/health', { method: 'GET' }),
+        fetchAPI('/v1/advanced/health', { method: 'GET' })
       ]);
 
-      setHealth(ui.hEnriched, hE);
-      setHealth(ui.hAi, hA);
-      setHealth(ui.hAdv, hAdv);
-      setHealth(ui.hArgaam, hK);
+      const setH = (elem, res) => {
+        elem.textContent = res.status === 'fulfilled' ? 'OK' : 'ERR';
+        elem.className = `value ${res.status === 'fulfilled' ? 'ok' : 'bad'}`;
+      };
+      setH(ui.hEnriched, hE);
+      setH(ui.hAi, hA);
+      setH(ui.hAdv, hAdv);
 
-      ui.stSheets.textContent = "Configured (server-side)";
+      ui.stSheets.textContent = "Configured (server OK)";
       ui.stSheets.className = "value ok";
 
       updatePill(true);
     } catch (e) {
       ui.cfgError.textContent = `Connection Failed: ${e.message}`;
-      ui.cfgError.style.display = "block";
+      ui.cfgError.style.display = 'block';
       updatePill(false);
     }
   }
@@ -386,37 +399,49 @@
     const type = ui.qType.value;
 
     let path = "";
-    if (type === "enriched") path = `/v1/enriched/quote?symbol=${encodeURIComponent(sym)}`;
-    else if (type === "analysis") path = `/v1/analysis/quote?symbol=${encodeURIComponent(sym)}`;
-    else if (type === "advanced") path = `/v1/advanced/scoreboard?tickers=${encodeURIComponent(sym)}&top_n=1`;
-    else if (type === "argaam") path = `/v1/argaam/quote?symbol=${encodeURIComponent(sym)}`;
+    if (type === 'enriched') path = `/v1/enriched/quote?symbol=${encodeURIComponent(sym)}`;
+    else if (type === 'analysis') path = `/v1/analysis/quote?symbol=${encodeURIComponent(sym)}`;
+    else path = `/v1/advanced/scoreboard?tickers=${encodeURIComponent(sym)}&top_n=1`;
 
     try {
-      const data = await fetchAPI(path);
-      const display = (type === "advanced" && data.items) ? (data.items[0] || data) : data;
+      const data = await fetchAPI(path, { method: "GET" });
+      const display = (type === 'advanced' && data && data.items) ? data.items[0] : data;
       ui.qRes.textContent = JSON.stringify(display, null, 2);
     } catch (e) {
       ui.qRes.textContent = `Error: ${e.message}`;
     }
   }
 
+  function updateSplit() {
+    const tickers = ui.bTickers.value.split('\n').map(t => t.trim()).filter(Boolean);
+    const ksa = tickers.filter(t => t.toUpperCase().endsWith('.SR') || /^\d+$/.test(t));
+    const glob = tickers.filter(t => !t.toUpperCase().endsWith('.SR') && !/^\d+$/.test(t));
+
+    let html = '';
+    if (ksa.length) html += `<div class="chip ksa">KSA: ${ksa.length}</div>`;
+    if (glob.length) html += `<div class="chip global">Global: ${glob.length}</div>`;
+
+    ui.bSplit.innerHTML = html;
+    ui.bSplit.style.display = html ? 'flex' : 'none';
+  }
+
   async function runBatch() {
-    const tickers = ui.bTickers.value.split("\n").map(t => t.trim()).filter(Boolean);
+    const tickers = ui.bTickers.value.split('\n').map(t => t.trim()).filter(Boolean);
     if (!tickers.length) return;
 
-    ui.bErr.style.display = "none";
-    ui.bTable.style.display = "none";
+    ui.bErr.style.display = 'none';
+    ui.bTable.style.display = 'none';
     ui.bRun.textContent = "Processing...";
     ui.bRun.disabled = true;
 
     const type = ui.bType.value;
     const endpoint = `/v1/${type}/sheet-rows`;
 
-    // Different routers accept different request keys; we keep both for maximum compatibility.
-    const payload = { tickers, symbols: tickers, sheet_name: "Preview_Test" };
-
     try {
-      const data = await fetchAPI(endpoint, { method: "POST", body: payload });
+      const data = await fetchAPI(endpoint, {
+        method: 'POST',
+        body: { tickers, sheet_name: "Preview_Test" }
+      });
 
       let html = '<table><thead><tr>';
       (data.headers || []).forEach(h => html += `<th>${h}</th>`);
@@ -425,43 +450,30 @@
       (data.rows || []).forEach(row => {
         html += '<tr>';
         (row || []).forEach(cell => {
-          const val = (cell === null || cell === undefined) ? '' : cell;
-          html += `<td>${String(val)}</td>`;
+          const val = (cell === null || cell === undefined) ? '' : String(cell);
+          html += `<td>${val}</td>`;
         });
         html += '</tr>';
       });
       html += '</tbody></table>';
 
       ui.bTable.innerHTML = html;
-      ui.bTable.style.display = "block";
+      ui.bTable.style.display = 'block';
     } catch (e) {
       ui.bErr.textContent = `Batch Error: ${e.message}`;
-      ui.bErr.style.display = "block";
+      ui.bErr.style.display = 'block';
     } finally {
       ui.bRun.textContent = "Preview Rows";
       ui.bRun.disabled = false;
     }
   }
 
-  function updateSplit() {
-    const tickers = ui.bTickers.value.split("\n").map(t => t.trim()).filter(Boolean);
-    const ksa = tickers.filter(t => t.toUpperCase().endsWith(".SR") || /^\d+$/.test(t));
-    const glob = tickers.filter(t => !t.toUpperCase().endsWith(".SR") && !/^\d+$/.test(t));
-
-    let html = "";
-    if (ksa.length) html += `<div class="chip ksa">KSA: ${ksa.length}</div>`;
-    if (glob.length) html += `<div class="chip global">Global: ${glob.length}</div>`;
-
-    ui.bSplit.innerHTML = html;
-    ui.bSplit.style.display = html ? "flex" : "none";
-  }
-
   ui.saveCfg.onclick = saveConfig;
-  ui.clearCfg.onclick = () => { localStorage.clear(); location.reload(); };
+  ui.clearCfg.onclick = () => { localStorage.removeItem("tfb_base_url"); localStorage.removeItem("tfb_app_token"); location.reload(); };
   ui.refreshStatus.onclick = checkConnectivity;
   ui.qRun.onclick = runQuick;
   ui.bRun.onclick = runBatch;
-  ui.bClear.onclick = () => { ui.bTickers.value = ""; updateSplit(); ui.bTable.style.display = "none"; };
+  ui.bClear.onclick = () => { ui.bTickers.value = ''; updateSplit(); ui.bTable.style.display = 'none'; };
   ui.bTickers.oninput = updateSplit;
 
   loadConfig();
