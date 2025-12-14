@@ -1,23 +1,24 @@
 """
 core/enriched_quote.py
 ===============================================
-Enriched Quote schema & Sheet Row Adapter - v1.6
+Enriched Quote schema & Google Sheets Row Adapter - v1.7 (HARDENED)
 
 Purpose
 -------
-- Provide a unified, sheet-friendly EnrichedQuote model built on top of
-  core.data_engine_v2.UnifiedQuote.
-- Convert UnifiedQuote -> EnrichedQuote.
+- Keep backend + AI analysis + Google Sheets (59-col) perfectly aligned.
+- Convert UnifiedQuote (or dict) -> EnrichedQuote
 - Convert EnrichedQuote -> Google Sheets row based on a header list.
-- Keep backend + AI analysis + 9-page Google Sheets dashboard aligned.
 
-Key Improvements (v1.6)
------------------------
-- STRICT alignment with core.data_engine_v2.UnifiedQuote (Pydantic v2).
-- Robust header normalization (%, (), 52W, 30D, Arabic digits).
-- Deterministic header->field mapping + safe fallback to model fields.
-- Defensive serialization for Google Sheets (NaN/Inf => None, dict/list => JSON).
-- Cached field resolution for speed (supports 59-column template).
+Key upgrades (v1.7)
+-------------------
+- Works with BOTH naming styles in engines:
+    * current_price  vs last_price
+    * percent_change vs change_percent
+    * price_change   vs change
+- Computes "Last Updated (Riyadh)" safely from UTC when missing.
+- Uses one-time model_dump() for speed + supports Pydantic extras.
+- Strong header normalization (%, (), 52W, 30D, Arabic digits, punctuation).
+- Safe cell serialization (NaN/Inf -> None, dict/list -> JSON, datetime -> ISO).
 """
 
 from __future__ import annotations
@@ -25,14 +26,75 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import ConfigDict
 
-from .data_engine_v2 import UnifiedQuote
+# ---- UnifiedQuote import (defensive) ----
+try:
+    from .data_engine_v2 import UnifiedQuote  # preferred
+except Exception:  # pragma: no cover
+    try:
+        from pydantic import BaseModel as UnifiedQuote  # fallback
+    except Exception:  # pragma: no cover
+        class UnifiedQuote:  # type: ignore
+            pass
+
+
+# =============================================================================
+# Timezone helpers
+# =============================================================================
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+    _RIYADH_TZ = ZoneInfo("Asia/Riyadh")
+except Exception:  # pragma: no cover
+    _RIYADH_TZ = timezone.utc  # last resort
+
+
+def _parse_iso_dt(value: Any) -> Optional[datetime]:
+    """Parse common ISO strings safely to datetime (UTC-aware if possible)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and not math.isnan(value) and not math.isinf(value):
+        # treat as unix seconds if reasonable
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s:
+        return None
+
+    # normalize Z suffix
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    # fromisoformat handles "YYYY-MM-DDTHH:MM:SS(.ffffff)(+HH:MM)"
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _to_riyadh_iso(dt_utc: Optional[datetime]) -> Optional[str]:
+    if not dt_utc:
+        return None
+    try:
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone(_RIYADH_TZ).isoformat()
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -40,6 +102,9 @@ from .data_engine_v2 import UnifiedQuote
 # =============================================================================
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+# common unicode dashes & separators
+_DASHES = {"–": "-", "—": "-", "−": "-"}
 
 @lru_cache(maxsize=4096)
 def _normalize_header_name(name: str) -> str:
@@ -57,13 +122,14 @@ def _normalize_header_name(name: str) -> str:
         return ""
 
     s = s.translate(_ARABIC_DIGITS).lower()
+    for k, v in _DASHES.items():
+        s = s.replace(k, v)
 
     # Preserve percent meaning
     s = s.replace("%", " percent ")
 
     # Common replacements
     s = s.replace("&", " and ")
-    s = s.replace("–", "-").replace("—", "-")
 
     # Remove brackets
     s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
@@ -73,11 +139,11 @@ def _normalize_header_name(name: str) -> str:
     s = s.replace("30d", "30_day")
     s = s.replace("ttm", "ttm")
 
-    # Punctuations
-    s = re.sub(r"[,:;]", " ", s)
-    s = s.replace("/", " ").replace("\\", " ").replace("-", " ")
+    # punctuation to spaces
+    s = re.sub(r"[,:;|]", " ", s)
+    s = s.replace("/", " ").replace("\\", " ").replace("-", " ").replace(".", " ")
 
-    # Collapse spaces -> underscore
+    # collapse spaces -> underscore
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"_+", "_", s)
     return s.strip("_")
@@ -86,15 +152,12 @@ def _normalize_header_name(name: str) -> str:
 # =============================================================================
 # Header -> Field mapping
 # =============================================================================
-
 # IMPORTANT:
 # Keys MUST be normalized-form keys (output of _normalize_header_name).
-# Values MUST be UnifiedQuote attribute names found in core/data_engine_v2.py.
+# Values are the *preferred* attribute names (we also try aliases at runtime).
 
 _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
-    # -------------------------
-    # Identity (59-col template)
-    # -------------------------
+    # Identity
     ("symbol", "symbol"),
     ("ticker", "symbol"),
     ("company_name", "name"),
@@ -109,10 +172,8 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("currency", "currency"),
     ("listing_date", "listing_date"),
 
-    # -------------------------
-    # Prices (59-col template)
-    # -------------------------
-    ("last_price", "current_price"),
+    # Prices
+    ("last_price", "current_price"),          # will also try last_price via alias map
     ("current_price", "current_price"),
     ("price", "current_price"),
     ("previous_close", "previous_close"),
@@ -122,11 +183,10 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("day_low", "day_low"),
     ("high", "day_high"),
     ("low", "day_low"),
-    ("price_change", "price_change"),
+    ("price_change", "price_change"),         # will also try "change"
     ("change", "price_change"),
-    ("percent_change", "percent_change"),
+    ("percent_change", "percent_change"),     # will also try "change_percent"
     ("change_percent", "percent_change"),
-    ("change_percent_percent", "percent_change"),  # defensive (rare)
     ("high_52_week", "high_52w"),
     ("low_52_week", "low_52w"),
     ("52_week_high", "high_52w"),
@@ -136,9 +196,7 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("52_week_position_percent", "position_52w_percent"),
     ("52w_position_percent", "position_52w_percent"),
 
-    # -------------------------
-    # Volume / Liquidity (59-col template)
-    # -------------------------
+    # Volume / Liquidity
     ("volume", "volume"),
     ("avg_volume_30_day", "avg_volume_30d"),
     ("avg_volume_30d", "avg_volume_30d"),
@@ -149,18 +207,14 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("turnover", "turnover_percent"),
     ("liquidity_score", "liquidity_score"),
 
-    # -------------------------
-    # Capital structure (59-col template)
-    # -------------------------
+    # Capital structure
     ("shares_outstanding", "shares_outstanding"),
     ("free_float_percent", "free_float"),
     ("free_float", "free_float"),
     ("market_cap", "market_cap"),
     ("free_float_market_cap", "free_float_market_cap"),
 
-    # -------------------------
-    # Fundamentals / Ratios (59-col template)
-    # -------------------------
+    # Fundamentals / Ratios
     ("eps_ttm", "eps_ttm"),
     ("eps", "eps_ttm"),
     ("forward_eps", "forward_eps"),
@@ -197,9 +251,7 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("volatility_30_day", "volatility_30d"),
     ("volatility_30d", "volatility_30d"),
 
-    # -------------------------
     # Technicals
-    # -------------------------
     ("rsi_14", "rsi_14"),
     ("rsi_14_day", "rsi_14"),
     ("rsi", "rsi_14"),
@@ -207,9 +259,7 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("ma20", "ma20"),
     ("ma50", "ma50"),
 
-    # -------------------------
     # Valuation / Scores
-    # -------------------------
     ("fair_value", "fair_value"),
     ("upside_percent", "upside_percent"),
     ("upside", "upside_percent"),
@@ -225,9 +275,7 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("risk_score", "risk_score"),
     ("confidence", "confidence"),
 
-    # -------------------------
     # Meta
-    # -------------------------
     ("data_source", "data_source"),
     ("data_quality", "data_quality"),
     ("last_updated_utc", "last_updated_utc"),
@@ -239,57 +287,37 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
 
 _HEADER_FIELD_MAP: Dict[str, str] = dict(sorted(_HEADER_FIELD_PAIRS, key=lambda kv: kv[0]))
 
+# Field aliases: if the preferred field doesn't exist in the data, try these.
+_FIELD_ALIASES: Dict[str, List[str]] = {
+    # prices
+    "current_price": ["last_price", "price", "last", "close"],
+    "price_change": ["change", "delta", "price_delta"],
+    "percent_change": ["change_percent", "pct_change", "percent", "delta_percent"],
 
-# =============================================================================
-# Header -> field resolver
-# =============================================================================
+    # 52w
+    "high_52w": ["high52w", "fifty_two_week_high", "52w_high"],
+    "low_52w": ["low52w", "fifty_two_week_low", "52w_low"],
+    "position_52w_percent": ["52w_position", "position_52w", "fifty_two_week_position_percent"],
+
+    # timestamps
+    "last_updated_utc": ["updated_at_utc", "timestamp_utc", "last_update_utc", "last_updated"],
+    "last_updated_riyadh": ["updated_at_riyadh", "timestamp_riyadh", "last_updated_local"],
+}
 
 @lru_cache(maxsize=4096)
-def _known_fields() -> frozenset[str]:
-    try:
-        return frozenset(UnifiedQuote.model_fields.keys())  # Pydantic v2
-    except Exception:
-        # ultra-defensive fallback
-        return frozenset(dir(UnifiedQuote))
-
-@lru_cache(maxsize=8192)
 def _field_name_for_header(header: str) -> str:
     """
-    Determine the UnifiedQuote/EnrichedQuote field name for a given header.
+    Determine the field name for a given header.
 
     Resolution order:
-    1) Normalized header -> explicit mapping (_HEADER_FIELD_MAP)
-    2) Normalized header matches an actual model field
-    3) Heuristic cleanup (remove common suffixes) then check again
+    1) Normalized header -> explicit mapping
+    2) Normalized header as-is (caller may pass raw field)
     """
     norm = _normalize_header_name(header)
     if not norm:
         return ""
-
-    # 1) explicit mapping
     mapped = _HEADER_FIELD_MAP.get(norm)
-    if mapped:
-        return mapped
-
-    fields = _known_fields()
-
-    # 2) direct match to field
-    if norm in fields:
-        return norm
-
-    # 3) heuristics: remove units / tokens
-    # Example: "avg_volume_30_day" -> "avg_volume_30d" (already mapped, but keep)
-    heuristic = norm
-    heuristic = heuristic.replace("_percent", "")
-    heuristic = heuristic.replace("_pct", "")
-    heuristic = heuristic.replace("_usd", "").replace("_sar", "")
-    heuristic = re.sub(r"_\d+_day$", "", heuristic)  # drop trailing period tokens
-    heuristic = re.sub(r"_\d+d$", "", heuristic)
-
-    if heuristic in fields:
-        return heuristic
-
-    return ""
+    return mapped or norm
 
 
 # =============================================================================
@@ -309,15 +337,22 @@ def _serialize_value(value: Any) -> Any:
     - Decimal -> float
     - NaN/Inf -> None
     - dict/list/tuple -> JSON string
+    - bool -> TRUE/FALSE (Sheets-friendly)
     """
     if value is None:
         return None
+
+    if isinstance(value, bool):
+        return True if value else False
 
     if isinstance(value, (datetime, date)):
         return value.isoformat()
 
     if isinstance(value, Decimal):
-        return float(value)
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
 
     if isinstance(value, float):
         if math.isnan(value) or math.isinf(value):
@@ -327,7 +362,6 @@ def _serialize_value(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         return _safe_json_dumps(value)
 
-    # bytes -> string
     if isinstance(value, (bytes, bytearray)):
         try:
             return value.decode("utf-8", errors="ignore")
@@ -335,6 +369,20 @@ def _serialize_value(value: Any) -> Any:
             return str(value)
 
     return value
+
+
+def _get_from_data(data: Dict[str, Any], key: str) -> Any:
+    if not key:
+        return None
+    if key in data:
+        return data.get(key)
+
+    # alias lookup
+    for alt in _FIELD_ALIASES.get(key, []):
+        if alt in data:
+            return data.get(alt)
+
+    return None
 
 
 # =============================================================================
@@ -347,49 +395,76 @@ class EnrichedQuote(UnifiedQuote):
 
     - Inherits ALL fields from UnifiedQuote.
     - Adds:
-        • from_unified() -> create EnrichedQuote from a UnifiedQuote (or dict).
-        • to_row(headers) -> map to Google Sheets row based on a header list.
+        • from_unified() -> build from UnifiedQuote or dict
+        • to_row(headers) -> convert to Google Sheets row aligned with headers
     """
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
-        extra="allow",  # defensive: tolerate new provider keys without breaking
+        extra="allow",  # tolerate new provider keys without breaking
     )
 
     @classmethod
-    def from_unified(cls, quote: Union[UnifiedQuote, Dict[str, Any]]) -> "EnrichedQuote":
-        """Build EnrichedQuote from UnifiedQuote (or dict)."""
+    def from_unified(cls, quote: Union["EnrichedQuote", UnifiedQuote, Dict[str, Any]]) -> "EnrichedQuote":
         if isinstance(quote, cls):
             return quote
-
         if isinstance(quote, dict):
             return cls(**quote)
 
-        # Pydantic v2 objects have model_dump
         try:
             data = quote.model_dump()  # type: ignore[attr-defined]
         except Exception:
-            # very defensive fallback
-            data = {"symbol": getattr(quote, "symbol", "UNKNOWN"), "error": "Unable to convert quote to dict"}
-
+            data = dict(getattr(quote, "__dict__", {}) or {})
+            data.setdefault("symbol", getattr(quote, "symbol", "UNKNOWN"))
+            data.setdefault("error", "Unable to convert quote to dict")
         return cls(**data)
+
+    def _dump_for_row(self) -> Dict[str, Any]:
+        """Single dump to support Pydantic extras + consistent access."""
+        try:
+            data = self.model_dump(exclude_none=False)  # type: ignore[attr-defined]
+        except Exception:
+            data = dict(getattr(self, "__dict__", {}) or {})
+
+        # If Pydantic v2 extras exist, merge them
+        extra = getattr(self, "__pydantic_extra__", None)
+        if isinstance(extra, dict):
+            # do not overwrite explicit fields
+            for k, v in extra.items():
+                data.setdefault(k, v)
+
+        # Compute Riyadh timestamp if missing but UTC is present
+        if "last_updated_riyadh" not in data or not data.get("last_updated_riyadh"):
+            dt_utc = _parse_iso_dt(
+                data.get("last_updated_utc")
+                or data.get("updated_at_utc")
+                or data.get("timestamp_utc")
+                or data.get("last_updated")
+            )
+            riy = _to_riyadh_iso(dt_utc)
+            if riy:
+                data["last_updated_riyadh"] = riy
+
+        return data
 
     def to_row(self, headers: Sequence[str]) -> List[Any]:
         """
         Convert this EnrichedQuote into a row aligned with the given headers.
-        Unknown headers return None. Never raises.
+        Unknown headers => None. Never raises.
         """
+        data = self._dump_for_row()
         row: List[Any] = []
+
         for header in headers:
             h = "" if header is None else str(header)
-            field_name = _field_name_for_header(h)
+            field = _field_name_for_header(h)
 
-            if field_name and hasattr(self, field_name):
-                value = getattr(self, field_name, None)
-            else:
-                # fallback: if someone passed the raw field name as header
+            value = _get_from_data(data, field)
+
+            # fallback: sometimes header itself equals a model key after normalization
+            if value is None:
                 raw = _normalize_header_name(h)
-                value = getattr(self, raw, None) if raw and hasattr(self, raw) else None
+                value = _get_from_data(data, raw)
 
             row.append(_serialize_value(value))
 
