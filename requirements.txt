@@ -1,34 +1,50 @@
 # ============================================================
-# Tadawul Fast Bridge - Dependencies (v4.0.0)
+# Tadawul Fast Bridge — requirements.txt (v4.0.x) — Hardened
+# ============================================================
+# Goals:
+# - Stable builds on Render
+# - Compatible with Pydantic v2 + FastAPI
+# - Covers Google Sheets integration + async + scraping
+# - Avoids common missing deps (certifi, tzdata, python-multipart, etc.)
 # ============================================================
 
 # --- Core Web Framework ---
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-python-dotenv>=1.0.0
-slowapi>=0.1.9
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.29.0,<1.0.0
+python-dotenv>=1.0.0,<2.0.0
+slowapi>=0.1.9,<1.0.0
+python-multipart>=0.0.9,<1.0.0
 
-# --- Data Validation & Settings ---
-pydantic>=2.7.0
-pydantic-settings>=2.2.0
+# --- Data Validation & Settings (Pydantic v2) ---
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
 
-# --- HTTP Clients & Scraping (Engine V2) ---
-httpx>=0.27.0
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=5.1.0
+# --- Async / HTTP / Parsing ---
+httpx>=0.27.0,<1.0.0
+requests>=2.31.0,<3.0.0
+aiohttp>=3.9.0,<4.0.0
+
+# --- Scraping (KSA / Argaam style parsing) ---
+beautifulsoup4>=4.12.0,<5.0.0
+lxml>=5.1.0,<6.0.0
 
 # --- Market Data Providers ---
-yfinance>=0.2.37
+yfinance>=0.2.37,<1.0.0
 
 # --- Google Integration (Sheets Service) ---
-google-api-python-client>=2.120.0
-google-auth>=2.29.0
+google-api-python-client>=2.120.0,<3.0.0
+google-auth>=2.29.0,<3.0.0
+google-auth-httplib2>=0.2.0,<1.0.0
+google-api-core>=2.11.0,<3.0.0
 
-# --- Performance & Utilities ---
-orjson>=3.10.0
-cachetools>=5.3.0
+# --- Performance / Serialization / Caching ---
+orjson>=3.10.0,<4.0.0
+cachetools>=5.3.0,<6.0.0
 
-# --- Legacy Support (Optional) ---
-# Included if older v1 engine code is still present
-aiohttp>=3.9.0
+# --- Timezones / SSL / Reliability (common Render misses) ---
+tzdata>=2024.1
+certifi>=2024.2.2
+urllib3>=2.2.0,<3.0.0
+
+# --- Optional (recommended for better logs in production) ---
+rich>=13.7.0,<14.0.0
