@@ -1,343 +1,360 @@
 """
-routes_argaam.py
+routes/ai_analysis.py
 ------------------------------------------------------------
-KSA / Argaam Gateway – v2.6.0 (Aligned with Core DataEngine v2)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.9.0)
 
-Purpose
-- KSA-only router that normalizes Tadawul symbols (1120 / 1120.SR).
-- Uses DataEngine.get_quote / get_quotes (the methods that actually exist).
-- Returns EnrichedQuote (UnifiedQuote + sheet mapping + scoring enrichment).
-- Provides /sheet-rows for Google Sheets (headers + rows).
+- Uses core.data_engine_v2.DataEngine only (no direct provider calls).
+- Defensive batching: chunking + timeout + bounded concurrency.
+- Sheets-safe: /sheet-rows always returns 200 with headers + rows.
 
-Key Fixes vs old file
-- Removed calls to non-existent engine methods: get_enriched_quote(s).
-- Engine resolution is safe:
-    1) Use FastAPI app.state.engine if available (created in main lifespan)
-    2) Fallback to a local singleton (for standalone router usage)
-- Stronger input validation + batch limits.
-- More defensive meta/health output (no reliance on engine.enabled_providers).
+Author: Emad Bahbah (with GPT-5.2 Thinking)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
+from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
-from core.config import get_settings
+from env import settings
 from core.data_engine_v2 import DataEngine, UnifiedQuote
 from core.enriched_quote import EnrichedQuote
 from core.scoring_engine import enrich_with_scores
-from core.schemas import get_headers_for_sheet
 
-logger = logging.getLogger("routes_argaam")
+logger = logging.getLogger("routes.ai_analysis")
+AI_ANALYSIS_VERSION = "2.9.0"
 
-settings = get_settings()
-APP_VERSION = os.getenv("APP_VERSION", getattr(settings, "APP_VERSION", "4.0.0"))
+DEFAULT_BATCH_SIZE = int(settings.ai_batch_size)
+DEFAULT_BATCH_TIMEOUT = float(settings.ai_batch_timeout_sec)
+DEFAULT_CONCURRENCY = int(settings.ai_batch_concurrency)
+DEFAULT_MAX_TICKERS = int(settings.ai_max_tickers)
 
-MAX_BATCH = int(os.getenv("ARGAAM_MAX_BATCH", "250"))
-
-
-# ---------------------------------------------------------------------------
-# Engine resolution
-# ---------------------------------------------------------------------------
-
+# ----------------------------------------------------------------------
+# ENGINE SINGLETON
+# ----------------------------------------------------------------------
 @lru_cache(maxsize=1)
-def _engine_singleton() -> DataEngine:
-    logger.info("routes_argaam: initializing local DataEngine singleton (fallback)")
+def _get_engine_singleton() -> DataEngine:
+    logger.info("routes.ai_analysis: initializing DataEngine v2 singleton")
     return DataEngine()
 
-def get_engine(request: Request) -> DataEngine:
-    """
-    Prefer the engine created in main.py lifespan (request.app.state.engine).
-    Fall back to a local singleton if not present.
-    """
-    eng = getattr(request.app.state, "engine", None)
-    if isinstance(eng, DataEngine):
-        return eng
-    return _engine_singleton()
+# ----------------------------------------------------------------------
+# ROUTER
+# ----------------------------------------------------------------------
+router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
+# ----------------------------------------------------------------------
+# MODELS
+# ----------------------------------------------------------------------
+class _ExtraIgnoreBase(BaseModel):
+    class Config:
+        extra = "ignore"
 
-# ---------------------------------------------------------------------------
-# Symbol Logic (KSA Specific)
-# ---------------------------------------------------------------------------
+class SingleAnalysisResponse(_ExtraIgnoreBase):
+    symbol: str
+    name: Optional[str] = None
+    market_region: Optional[str] = None
 
-def _normalize_ksa_symbol(symbol: str) -> str:
-    """
-    Enforces KSA formatting:
-    - 1120 -> 1120.SR
-    - TADAWUL:1120 -> 1120.SR
-    - 1120.TADAWUL -> 1120.SR
-    - 1120.SR -> 1120.SR
-    Returns "" if invalid/non-KSA.
-    """
+    price: Optional[float] = None
+    change_pct: Optional[float] = None
+    market_cap: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    pb: Optional[float] = None
+
+    dividend_yield: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+
+    data_quality: str = "MISSING"
+
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
+    opportunity_score: Optional[float] = None
+    overall_score: Optional[float] = None
+    recommendation: Optional[str] = None
+
+    fair_value: Optional[float] = None
+    upside_percent: Optional[float] = None
+    valuation_label: Optional[str] = None
+
+    last_updated_utc: Optional[str] = None
+    sources: List[str] = Field(default_factory=list)
+
+    notes: Optional[str] = None
+    error: Optional[str] = None
+
+class BatchAnalysisRequest(_ExtraIgnoreBase):
+    tickers: List[str] = Field(default_factory=list)
+    sheet_name: Optional[str] = None
+
+class BatchAnalysisResponse(_ExtraIgnoreBase):
+    results: List[SingleAnalysisResponse]
+
+class SheetAnalysisResponse(_ExtraIgnoreBase):
+    headers: List[str]
+    rows: List[List[Any]]
+
+# ----------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _normalize_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s:
         return ""
-
-    # Common vendor prefixes/suffixes
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
-
     if s.endswith(".TADAWUL"):
-        s = s[:-7].strip()  # remove ".TADAWUL"
-
-    # If already .SR, ensure numeric base
-    if s.endswith(".SR"):
-        base = s[:-3]
-        return s if base.isdigit() else ""
-
-    # If numeric only
+        s = s.replace(".TADAWUL", ".SR")
     if s.isdigit():
-        return f"{s}.SR"
-
-    return ""
-
-def _ensure_ksa(symbol: str) -> str:
-    s = _normalize_ksa_symbol(symbol)
-    if not s:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid KSA symbol '{symbol}'. Must be numeric or end in .SR",
-        )
+        s = f"{s}.SR"
     return s
 
-def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
+def _clean_tickers(items: Sequence[str]) -> List[str]:
+    raw = [_normalize_symbol(x) for x in (items or [])]
+    raw = [x for x in raw if x]
     seen = set()
     out: List[str] = []
-    for x in items or []:
-        if not x:
-            continue
+    for x in raw:
         if x in seen:
             continue
         seen.add(x)
         out.append(x)
     return out
 
+def _chunk(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
-class ArgaamBatchRequest(BaseModel):
-    symbols: List[str] = Field(default_factory=list, description="KSA symbols (e.g. ['1120', '1180.SR'])")
-    tickers: Optional[List[str]] = Field(default=None, description="Alias for symbols (legacy compat)")
-    sheet_name: Optional[str] = Field(default=None, description="Sheet name for header selection")
-
-class KSASheetResponse(BaseModel):
-    headers: List[str]
-    rows: List[List[Any]]
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Transformation Logic
-# ---------------------------------------------------------------------------
-
-def _to_enriched(uq: UnifiedQuote, fallback_symbol: str) -> EnrichedQuote:
-    """
-    Convert UnifiedQuote -> EnrichedQuote -> Scored EnrichedQuote.
-    Ensures KSA metadata in this router.
-    """
-    sym = _normalize_ksa_symbol(fallback_symbol) or (fallback_symbol or "").strip().upper() or "UNKNOWN"
-
-    try:
-        eq = EnrichedQuote.from_unified(uq)
-        eq = enrich_with_scores(eq)
-
-        # Force KSA metadata (router contract)
-        update_data: Dict[str, Any] = {}
-        if not getattr(eq, "market", None) or getattr(eq, "market", "").upper() == "UNKNOWN":
-            update_data["market"] = "KSA"
-        if not getattr(eq, "currency", None):
-            update_data["currency"] = "SAR"
-        if not getattr(eq, "data_source", None) or getattr(eq, "data_source", "") in ("none", ""):
-            update_data["data_source"] = "argaam_gateway"
-
-        if update_data and hasattr(eq, "model_copy"):
-            eq = eq.model_copy(update=update_data)
-
-        # Always ensure symbol is the normalized one
-        if getattr(eq, "symbol", None) != sym and hasattr(eq, "model_copy"):
-            eq = eq.model_copy(update={"symbol": sym})
-
-        return eq
-
-    except Exception as exc:
-        logger.exception("routes_argaam: conversion error for %s", sym, exc_info=exc)
-        return EnrichedQuote(
-            symbol=sym,
-            market="KSA",
-            currency="SAR",
-            data_source="argaam_gateway",
-            data_quality="MISSING",
-            error=f"Conversion error: {exc}",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Router
-# ---------------------------------------------------------------------------
-
-router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
-
-@router.get("/health")
-async def argaam_health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "module": "routes_argaam",
-        "version": APP_VERSION,
-        "engine": "DataEngineV2",
-        "providers": {
-            "argaam_scrape": True,
-            "eodhd_enabled": bool(getattr(settings, "EODHD_API_KEY", None)),
-            "fmp_enabled": bool(getattr(settings, "FMP_API_KEY", None)),
-            "yfinance_enabled": bool(getattr(settings, "ENABLE_YFINANCE", False)),
-        },
-        "limits": {"max_batch": MAX_BATCH},
-    }
-
-@router.get("/quote", response_model=EnrichedQuote)
-async def ksa_single_quote(
-    request: Request,
-    symbol: str = Query(..., description="KSA symbol (1120 or 1120.SR)"),
-    engine: DataEngine = Depends(get_engine),
-) -> EnrichedQuote:
-    ksa_symbol = _ensure_ksa(symbol)
-
-    try:
-        uq = await engine.get_quote(ksa_symbol)
-        return _to_enriched(uq, ksa_symbol)
-    except Exception as exc:
-        logger.exception("routes_argaam: engine error for %s", ksa_symbol, exc_info=exc)
-        return EnrichedQuote(
-            symbol=ksa_symbol,
-            market="KSA",
-            currency="SAR",
-            data_source="argaam_gateway",
-            data_quality="MISSING",
-            error=str(exc),
-        )
-
-@router.post("/quotes", response_model=List[EnrichedQuote])
-async def ksa_batch_quotes(
-    request: Request,
-    body: ArgaamBatchRequest,
-    engine: DataEngine = Depends(get_engine),
-) -> List[EnrichedQuote]:
-    raw_list = body.symbols or body.tickers or []
-    if not raw_list:
-        raise HTTPException(status_code=400, detail="No symbols provided")
-
-    # Normalize + dedupe (KSA only)
-    targets: List[str] = []
-    skipped: List[str] = []
-    for s in raw_list:
-        norm = _normalize_ksa_symbol(s)
-        if norm:
-            targets.append(norm)
-        else:
-            skipped.append(s)
-
-    targets = _dedupe_preserve_order(targets)
-
-    if not targets:
-        return []
-
-    if len(targets) > MAX_BATCH:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Too many symbols. Max {MAX_BATCH}. Provided {len(targets)}.",
-        )
-
-    uqs = await engine.get_quotes(targets)
-    uq_map = {q.symbol.upper(): q for q in uqs}
-
-    results: List[EnrichedQuote] = []
-    for t in targets:
-        uq = uq_map.get(t.upper()) or UnifiedQuote(symbol=t, data_quality="MISSING", error="No data returned")
-        results.append(_to_enriched(uq, t))
-
-    # Note: skipped are not returned here to keep response_model clean
-    return results
-
-@router.post("/sheet-rows", response_model=KSASheetResponse)
-async def ksa_sheet_rows(
-    request: Request,
-    body: ArgaamBatchRequest,
-    engine: DataEngine = Depends(get_engine),
-) -> KSASheetResponse:
-    """
-    Returns headers + rows for Google Sheets.
-    Forces KSA normalization on inputs.
-    """
-    raw_list = body.symbols or body.tickers or []
-    sheet_name = body.sheet_name or "KSA_Tadawul_Market"
-
-    headers = get_headers_for_sheet(sheet_name)
-
-    # Normalize inputs
-    valid_targets: List[str] = []
-    skipped: List[str] = []
-    for s in raw_list:
-        norm = _normalize_ksa_symbol(s)
-        if norm:
-            valid_targets.append(norm)
-        else:
-            skipped.append(s)
-
-    valid_targets = _dedupe_preserve_order(valid_targets)
-
-    if not valid_targets:
-        return KSASheetResponse(
-            headers=headers,
-            rows=[],
-            meta={"note": "No valid KSA symbols provided", "skipped": skipped, "sheet_name": sheet_name},
-        )
-
-    if len(valid_targets) > MAX_BATCH:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Too many symbols. Max {MAX_BATCH}. Provided {len(valid_targets)}.",
-        )
-
-    # Fetch data
-    uqs = await engine.get_quotes(valid_targets)
-    uq_map = {q.symbol.upper(): q for q in uqs}
-
-    rows: List[List[Any]] = []
-    row_errors: List[str] = []
-
-    for t in valid_targets:
-        uq = uq_map.get(t.upper()) or UnifiedQuote(symbol=t, data_quality="MISSING", error="No data")
-        eq = _to_enriched(uq, t)
-
+def _extract_sources(q: EnrichedQuote) -> List[str]:
+    if getattr(q, "sources", None):
         try:
-            row = eq.to_row(headers)
-            if len(row) < len(headers):
-                row += [None] * (len(headers) - len(row))
-            elif len(row) > len(headers):
-                row = row[: len(headers)]
-            rows.append(row)
-        except Exception as e:
-            logger.exception("routes_argaam: row mapping failed for %s", t, exc_info=e)
-            row_errors.append(f"{t}: {e}")
-            rows.append([t] + [None] * (len(headers) - 1))
+            return [s.provider for s in q.sources]  # type: ignore
+        except Exception:
+            pass
+    ds = getattr(q, "data_source", None)
+    return [ds] if ds else []
 
-    return KSASheetResponse(
-        headers=headers,
-        rows=rows,
-        meta={
-            "count": len(rows),
-            "skipped_non_ksa": len(skipped),
-            "skipped": skipped[:50],  # keep response small
-            "sheet_name": sheet_name,
-            "row_errors": row_errors[:50],
-        },
+# ----------------------------------------------------------------------
+# ENGINE CALLS
+# ----------------------------------------------------------------------
+async def _get_quotes_chunked(
+    symbols: List[str],
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
+    max_concurrency: int = DEFAULT_CONCURRENCY,
+) -> Dict[str, UnifiedQuote]:
+    clean = _clean_tickers(symbols)
+    if not clean:
+        return {}
+
+    engine = _get_engine_singleton()
+    chunks = _chunk(clean, batch_size)
+    sem = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
+        async with sem:
+            try:
+                res = await asyncio.wait_for(engine.get_enriched_quotes(chunk_syms), timeout=timeout_sec)
+                return chunk_syms, res
+            except Exception as e:
+                return chunk_syms, e
+
+    results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
+
+    out: Dict[str, UnifiedQuote] = {}
+    for chunk_syms, res in results:
+        if isinstance(res, Exception):
+            msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
+            logger.warning("ai_analysis: %s for chunk(size=%d)", msg, len(chunk_syms))
+            for s in chunk_syms:
+                out[s] = UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error=msg).finalize()
+            continue
+
+        returned = list(res or [])
+        chunk_map = {q.symbol.upper(): q for q in returned}
+
+        for s in chunk_syms:
+            s_norm = s.upper()
+            out[s] = chunk_map.get(s_norm) or UnifiedQuote(symbol=s_norm, data_quality="MISSING", error="No data returned").finalize()
+
+    return out
+
+# ----------------------------------------------------------------------
+# TRANSFORM
+# ----------------------------------------------------------------------
+def _quote_to_analysis(raw_symbol: str, uq: UnifiedQuote) -> SingleAnalysisResponse:
+    eq = EnrichedQuote.from_unified(uq)
+    eq = enrich_with_scores(eq)
+
+    return SingleAnalysisResponse(
+        symbol=eq.symbol or _normalize_symbol(raw_symbol) or raw_symbol,
+        name=getattr(eq, "name", None),
+        market_region=getattr(eq, "market", None) or getattr(eq, "market_region", None),
+
+        price=getattr(eq, "current_price", None) or getattr(eq, "last_price", None),
+        change_pct=getattr(eq, "percent_change", None) or getattr(eq, "change_percent", None),
+        market_cap=getattr(eq, "market_cap", None),
+        pe_ttm=getattr(eq, "pe_ttm", None),
+        pb=getattr(eq, "pb", None),
+
+        dividend_yield=getattr(eq, "dividend_yield", None),
+        roe=getattr(eq, "roe", None),
+        roa=getattr(eq, "roa", None),
+
+        data_quality=getattr(eq, "data_quality", "MISSING"),
+
+        value_score=getattr(eq, "value_score", None),
+        quality_score=getattr(eq, "quality_score", None),
+        momentum_score=getattr(eq, "momentum_score", None),
+        opportunity_score=getattr(eq, "opportunity_score", None),
+        overall_score=getattr(eq, "overall_score", None),
+        recommendation=getattr(eq, "recommendation", None),
+
+        fair_value=getattr(eq, "fair_value", None),
+        upside_percent=getattr(eq, "upside_percent", None),
+        valuation_label=getattr(eq, "valuation_label", None),
+
+        last_updated_utc=getattr(eq, "last_updated_utc", None),
+        sources=_extract_sources(eq),
+
+        error=getattr(eq, "error", None),
     )
 
-__all__ = ["router"]
+# ----------------------------------------------------------------------
+# SHEET HELPERS
+# ----------------------------------------------------------------------
+def _build_sheet_headers() -> List[str]:
+    return [
+        "Symbol", "Company Name", "Market / Region", "Price", "Change %",
+        "Market Cap", "P/E (TTM)", "P/B",
+        "Dividend Yield %", "ROE %", "ROA %",
+        "Data Quality",
+        "Value Score", "Quality Score", "Momentum Score", "Opportunity Score", "Overall Score",
+        "Recommendation",
+        "Last Updated (UTC)", "Sources",
+        "Fair Value", "Upside %", "Valuation Label",
+        "Error",
+    ]
+
+def _pad_row(row: List[Any], length: int) -> List[Any]:
+    if len(row) < length:
+        return row + [None] * (length - len(row))
+    return row[:length]
+
+def _pct_display(v: Optional[float]) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if abs(v) <= 1.0 and v != 0.0:
+            return v * 100.0
+        return v
+    except Exception:
+        return v
+
+def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[Any]:
+    row = [
+        a.symbol,
+        a.name or "",
+        a.market_region or "",
+        a.price,
+        a.change_pct,
+        a.market_cap,
+        a.pe_ttm,
+        a.pb,
+        _pct_display(a.dividend_yield),
+        _pct_display(a.roe),
+        _pct_display(a.roa),
+        a.data_quality,
+        a.value_score,
+        a.quality_score,
+        a.momentum_score,
+        a.opportunity_score,
+        a.overall_score,
+        a.recommendation or "",
+        a.last_updated_utc,
+        ", ".join(a.sources) if a.sources else "",
+        a.fair_value,
+        a.upside_percent,
+        a.valuation_label or "",
+        a.error or "",
+    ]
+    return _pad_row(row, header_len)
+
+# ----------------------------------------------------------------------
+# ROUTES
+# ----------------------------------------------------------------------
+@router.get("/health")
+@router.get("/ping")
+async def analysis_health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "module": "routes.ai_analysis",
+        "version": AI_ANALYSIS_VERSION,
+        "engine_mode": "v2",
+        "batch_size": DEFAULT_BATCH_SIZE,
+        "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
+        "batch_concurrency": DEFAULT_CONCURRENCY,
+        "max_tickers": DEFAULT_MAX_TICKERS,
+        "timestamp_utc": _now_utc_iso(),
+    }
+
+@router.get("/quote", response_model=SingleAnalysisResponse)
+async def analyze_single_quote(symbol: str = Query(..., alias="symbol")) -> SingleAnalysisResponse:
+    t = (symbol or "").strip()
+    if not t:
+        return SingleAnalysisResponse(symbol="", data_quality="MISSING", error="Symbol is required")
+
+    try:
+        m = await _get_quotes_chunked([t], batch_size=1)
+        key = _normalize_symbol(t) or t.upper()
+        q = m.get(key) or UnifiedQuote(symbol=key, data_quality="MISSING", error="No data returned").finalize()
+        return _quote_to_analysis(t, q)
+    except Exception as exc:
+        logger.exception("ai_analysis: exception in /quote for %s", t)
+        return SingleAnalysisResponse(symbol=_normalize_symbol(t) or t.upper(), data_quality="MISSING", error=f"Exception in analysis: {exc}")
+
+@router.post("/quotes", response_model=BatchAnalysisResponse)
+async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisResponse:
+    tickers = _clean_tickers(body.tickers or [])
+    if not tickers:
+        return BatchAnalysisResponse(results=[])
+
+    if len(tickers) > DEFAULT_MAX_TICKERS:
+        tickers = tickers[:DEFAULT_MAX_TICKERS]
+
+    try:
+        m = await _get_quotes_chunked(tickers)
+    except Exception as exc:
+        logger.exception("ai_analysis: batch failure: %s", exc)
+        return BatchAnalysisResponse(results=[SingleAnalysisResponse(symbol=t, data_quality="MISSING", error=f"Batch failure: {exc}") for t in tickers])
+
+    results: List[SingleAnalysisResponse] = []
+    for t in tickers:
+        q = m.get(t) or UnifiedQuote(symbol=t.upper(), data_quality="MISSING", error="No data returned").finalize()
+        try:
+            results.append(_quote_to_analysis(t, q))
+        except Exception as exc:
+            logger.exception("ai_analysis: transform failure for %s: %s", t, exc)
+            results.append(SingleAnalysisResponse(symbol=t, data_quality="MISSING", error=f"Transform failure: {exc}"))
+
+    return BatchAnalysisResponse(results=results)
+
+@router.post("/sheet-rows", response_model=SheetAnalysisResponse)
+async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse:
+    headers = _build_sheet_headers()
+    header_len = len(headers)
+    batch = await analyze_batch_quotes(body)
+    rows = [_analysis_to_sheet_row(r, header_len) for r in batch.results]
+    return SheetAnalysisResponse(headers=headers, rows=rows)
+
+__all__ = ["router", "SingleAnalysisResponse", "BatchAnalysisRequest", "BatchAnalysisResponse", "SheetAnalysisResponse"]
