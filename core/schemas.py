@@ -47,3 +47,42 @@ class ScoredQuote(BaseSchema):
 class BatchProcessRequest(BaseSchema):
     symbols: List[str]
     operation: str = "full_scan"  # full_scan, quick_price, ai_analysis
+
+# --- Google Sheets Helpers (The Missing Function) ---
+
+def get_headers_for_sheet() -> List[str]:
+    """
+    Returns the standard column headers for the Google Sheet.
+    Used by the Sheets Service to ensure alignment.
+    """
+    return [
+        "Symbol",
+        "Company Name",
+        "Market",
+        "Currency",
+        "Current Price",
+        "Previous Close",
+        "Price Change",
+        "Percent Change",
+        "Day High",
+        "Day Low",
+        "52W High",
+        "52W Low",
+        "Volume",
+        "Avg Volume (30D)",
+        "Market Cap",
+        "P/E (TTM)",
+        "EPS (TTM)",
+        "Dividend Yield",
+        "P/B",
+        "ROE",
+        "Net Margin",
+        "RSI (14)",
+        "MACD",
+        "Overall Score",
+        "Recommendation",
+        "Data Source",
+        "Data Quality",
+        "Last Updated (UTC)",
+        "Error"
+    ]
