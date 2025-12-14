@@ -1,10 +1,13 @@
 """
 symbols_reader.py
 ===========================================================
-Central symbol reader for ALL dashboard pages.
+Central symbol reader for ALL dashboard Google Sheets pages.
 
-- Reads symbol column from Sheets reliably (auto-detect header index).
-- Splits KSA (.SR / numeric) vs Global.
+Fixes / Enhancements
+- Works with google_sheets_service.read_range()
+- Stronger symbol column detection
+- Adds missing pages (economic_calendar, investment_income) safely
+- Better normalization for KSA numeric symbols -> .SR
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     from env import settings
-except Exception:  # pragma: no cover
+except Exception:
     import os
     class MockSettings:
         default_spreadsheet_id = os.getenv("DEFAULT_SPREADSHEET_ID", "")
@@ -27,6 +30,8 @@ except Exception:  # pragma: no cover
         sheet_my_portfolio = "My_Portfolio"
         sheet_insights_analysis = "Insights_Analysis"
         sheet_investment_advisor = "Investment_Advisor"
+        sheet_economic_calendar = "Economic_Calendar"
+        sheet_investment_income = "Investment_Income_Statement"
     settings = MockSettings()  # type: ignore
 
 from google_sheets_service import read_range, split_tickers_by_market
@@ -38,7 +43,7 @@ class PageConfig:
     key: str
     sheet_name: str
     header_row: int = 5
-    max_columns: int = 30
+    max_columns: int = 52  # scan wider (A-AZ)
 
 PAGE_REGISTRY: Dict[str, PageConfig] = {
     "KSA_TADAWUL": PageConfig("KSA_TADAWUL", settings.sheet_ksa_tadawul),
@@ -49,9 +54,12 @@ PAGE_REGISTRY: Dict[str, PageConfig] = {
     "INSIGHTS_ANALYSIS": PageConfig("INSIGHTS_ANALYSIS", settings.sheet_insights_analysis),
     "MARKET_LEADERS": PageConfig("MARKET_LEADERS", settings.sheet_market_leaders),
     "INVESTMENT_ADVISOR": PageConfig("INVESTMENT_ADVISOR", settings.sheet_investment_advisor),
+    "ECONOMIC_CALENDAR": PageConfig("ECONOMIC_CALENDAR", getattr(settings, "sheet_economic_calendar", "Economic_Calendar")),
+    "INVESTMENT_INCOME": PageConfig("INVESTMENT_INCOME", getattr(settings, "sheet_investment_income", "Investment_Income_Statement")),
 }
 
 def _col_idx_to_a1(n: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA"""
     s = ""
     n += 1
     while n > 0:
@@ -60,7 +68,9 @@ def _col_idx_to_a1(n: int) -> str:
     return s
 
 def _normalize_cell(cell: Any) -> str:
-    return "" if cell is None else str(cell).strip().upper()
+    if cell is None:
+        return ""
+    return str(cell).strip().upper()
 
 def _find_symbol_column(spreadsheet_id: str, sheet_name: str, header_row: int, max_cols: int) -> Optional[int]:
     last_col = _col_idx_to_a1(max_cols - 1)
@@ -72,32 +82,44 @@ def _find_symbol_column(spreadsheet_id: str, sheet_name: str, header_row: int, m
             return None
 
         headers = [_normalize_cell(h) for h in rows[0]]
-        for candidate in ["SYMBOL", "TICKER", "CODE", "STOCK", "ASSET"]:
-            if candidate in headers:
-                idx = headers.index(candidate)
-                logger.info("[SymbolsReader] Found %s at %s in %s", candidate, _col_idx_to_a1(idx), sheet_name)
+
+        # Strict priority list
+        candidates = [
+            "SYMBOL", "TICKER", "STOCK", "CODE",
+            "ASSET", "SECURITY", "INSTRUMENT"
+        ]
+        for c in candidates:
+            if c in headers:
+                idx = headers.index(c)
+                logger.info("[SymbolsReader] Found %s at %s in %s", c, _col_idx_to_a1(idx), sheet_name)
                 return idx
 
-        return 0  # fallback
+        # Heuristic: if first header is empty but column A contains symbols
+        if headers and headers[0] in ("", " "):
+            return 0
+
+        logger.warning("[SymbolsReader] No symbol column detected in %s. Headers=%s", sheet_name, headers[:20])
+        return None
     except Exception as e:
-        logger.error("[SymbolsReader] Header detection error: %s", e)
+        logger.error("[SymbolsReader] Column detect failed in %s: %s", sheet_name, e)
         return None
 
 def get_symbols_from_sheet(spreadsheet_id: str, sheet_name: str, header_row: int = 5) -> Dict[str, List[str]]:
-    sid = spreadsheet_id or settings.default_spreadsheet_id
+    sid = (spreadsheet_id or settings.default_spreadsheet_id or "").strip()
     if not sid:
-        logger.error("[SymbolsReader] DEFAULT_SPREADSHEET_ID is missing.")
+        logger.error("[SymbolsReader] No Spreadsheet ID configured.")
         return {"all": [], "ksa": [], "global": []}
 
-    col_idx = _find_symbol_column(sid, sheet_name, header_row, 30)
+    col_idx = _find_symbol_column(sid, sheet_name, header_row, 52)
     target_col = col_idx if col_idx is not None else 0
     col_letter = _col_idx_to_a1(target_col)
 
-    data_range = f"'{sheet_name}'!{col_letter}{header_row + 1}:{col_letter}"
+    # Read from row below header to end
+    data_rng = f"'{sheet_name}'!{col_letter}{header_row + 1}:{col_letter}"
     try:
-        raw_rows = read_range(sid, data_range)
+        raw_rows = read_range(sid, data_rng)
     except Exception as e:
-        logger.error("[SymbolsReader] Read failed %s: %s", data_range, e)
+        logger.error("[SymbolsReader] Failed reading %s: %s", data_rng, e)
         return {"all": [], "ksa": [], "global": []}
 
     all_symbols: List[str] = []
@@ -107,25 +129,15 @@ def get_symbols_from_sheet(spreadsheet_id: str, sheet_name: str, header_row: int
         if not row:
             continue
         val = _normalize_cell(row[0])
-        if not val or val in {"-", "N/A", "SYMBOL", "TICKER"}:
+
+        if not val or val in {"-", "N/A", "NA", "SYMBOL", "TICKER"}:
             continue
+
+        # Normalize KSA numeric -> .SR
         if val.isdigit():
             val = f"{val}.SR"
+
+        # Normalize whitespace/dots
+        val = val.replace(" ", "")
         if val not in seen:
             seen.add(val)
-            all_symbols.append(val)
-
-    split = split_tickers_by_market(all_symbols)
-    return {"all": all_symbols, "ksa": split["ksa"], "global": split["global"]}
-
-def get_page_symbols(page_key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, List[str]]:
-    cfg = PAGE_REGISTRY.get((page_key or "").upper())
-    if not cfg:
-        logger.error("[SymbolsReader] Invalid page key: %s", page_key)
-        return {"all": [], "ksa": [], "global": []}
-    return get_symbols_from_sheet(spreadsheet_id=spreadsheet_id, sheet_name=cfg.sheet_name, header_row=cfg.header_row)
-
-def get_all_pages_symbols(spreadsheet_id: Optional[str] = None) -> Dict[str, Dict[str, List[str]]]:
-    return {k: get_page_symbols(k, spreadsheet_id) for k in PAGE_REGISTRY.keys()}
-
-__all__ = ["get_symbols_from_sheet", "get_page_symbols", "get_all_pages_symbols", "PAGE_REGISTRY"]
