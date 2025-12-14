@@ -29,10 +29,13 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     ENABLE_CORS_ALL_ORIGINS: bool = True
-    ENABLED_PROVIDERS: Union[str, List[str]] = "fmp,yfinance"
+
+    # Providers (informational / routing)
+    ENABLED_PROVIDERS: Union[str, List[str]] = "eodhd,finnhub"
     PRIMARY_PROVIDER: str = "fmp"
     KSA_DISALLOW_EODHD: bool = True
 
+    # Google Sheets
     GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None
     DEFAULT_SPREADSHEET_ID: Optional[str] = None
 
