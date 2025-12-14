@@ -1,18 +1,14 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – FastAPI App Entrypoint (v4.5.0)
+TADAWUL FAST BRIDGE – FastAPI App Entrypoint (v4.5.1)
 
-Goals
-- Deploy-safe for Render (uvicorn main:app).
-- Centralized:
-    • CORS
-    • Token auth (X-APP-TOKEN) with public health endpoints
-    • Rate limiting (slowapi) if installed
-    • Router mounting (Enriched, AI, Advanced, Argaam, Legacy)
-- Never hard-crash if an optional router is missing (logs + continues).
-
-Author: Emad Bahbah (with GPT-5.2 Thinking)
+Fixes vs v4.5.0
+- Accept HEAD / (Render port detection uses HEAD)
+- Mount legacy router from either:
+    • routes.legacy_service (if you created it)
+    • legacy_service (root module in your repo)
+- Router mounting stays defensive (never crashes deploy)
 """
 
 from __future__ import annotations
@@ -20,11 +16,12 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterable
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter
 
 from env import settings
 
@@ -68,10 +65,7 @@ if limiter is not None:
 
     @app.exception_handler(RateLimitExceeded)  # type: ignore[arg-type]
     async def _rate_limit_handler(request: Request, exc: Exception):
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Rate limit exceeded"},
-        )
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
 
 # ---------------------------------------------------------------------
 # CORS
@@ -86,7 +80,6 @@ if settings.enable_cors_all_origins:
         expose_headers=["*"],
     )
 else:
-    # If you later want allowlist mode, add env var parsing here.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[],
@@ -98,14 +91,7 @@ else:
 # ---------------------------------------------------------------------
 # Auth Middleware (X-APP-TOKEN)
 # ---------------------------------------------------------------------
-PUBLIC_PATH_PREFIXES = (
-    "/health",
-    "/docs",
-    "/redoc",
-    "/openapi.json",
-    "/favicon.ico",
-    "/ui",
-)
+PUBLIC_PATH_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/favicon.ico", "/ui")
 PUBLIC_EXACT_PATHS = {
     "/",
     "/health",
@@ -123,10 +109,7 @@ PUBLIC_EXACT_PATHS = {
 def _is_public_path(path: str) -> bool:
     if path in PUBLIC_EXACT_PATHS:
         return True
-    for p in PUBLIC_PATH_PREFIXES:
-        if path.startswith(p):
-            return True
-    return False
+    return any(path.startswith(p) for p in PUBLIC_PATH_PREFIXES)
 
 def _valid_token(token: Optional[str]) -> bool:
     if not token:
@@ -142,30 +125,24 @@ def _valid_token(token: Optional[str]) -> bool:
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """
-    Protect all non-public endpoints using X-APP-TOKEN.
-    """
     path = request.url.path or "/"
     if _is_public_path(path):
         return await call_next(request)
 
     token = request.headers.get("X-APP-TOKEN") or request.headers.get("x-app-token")
     if not _valid_token(token):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized: missing or invalid X-APP-TOKEN"},
-        )
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized: missing or invalid X-APP-TOKEN"})
 
     return await call_next(request)
 
 # ---------------------------------------------------------------------
-# Global Exception Handler (defensive for Sheets callers)
+# Global Exception Handler (Sheets-safe)
 # ---------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception at %s: %s", request.url.path, exc)
     return JSONResponse(
-        status_code=200,  # Sheets-safe: avoid breaking refresh pipelines
+        status_code=200,  # Sheets-safe
         content={
             "status": "error",
             "error": str(exc),
@@ -177,25 +154,51 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ---------------------------------------------------------------------
 # Routers (defensive imports)
 # ---------------------------------------------------------------------
-def _include_router_safely(import_path: str, attr: str = "router"):
+def _include_router_safely(import_path: str, attrs: Iterable[str] = ("router",)) -> bool:
+    """
+    Tries importing a module and including its router.
+    Returns True if mounted.
+    """
     try:
-        module = __import__(import_path, fromlist=[attr])
-        router = getattr(module, attr)
-        app.include_router(router)
-        logger.info("Mounted router: %s.%s", import_path, attr)
+        module = __import__(import_path, fromlist=list(attrs))
     except Exception as e:
         logger.warning("Router not mounted (%s): %s", import_path, e)
+        return False
 
-# Enriched routes
+    for attr in attrs:
+        try:
+            candidate = getattr(module, attr, None)
+            if isinstance(candidate, APIRouter):
+                app.include_router(candidate)
+                logger.info("Mounted router: %s.%s", import_path, attr)
+                return True
+        except Exception as e:
+            logger.warning("Failed mounting %s.%s: %s", import_path, attr, e)
+
+    # Optional pattern: module.register(app)
+    try:
+        reg = getattr(module, "register", None)
+        if callable(reg):
+            reg(app)
+            logger.info("Mounted via register(): %s.register(app)", import_path)
+            return True
+    except Exception as e:
+        logger.warning("Failed register() in %s: %s", import_path, e)
+
+    logger.warning("Router not mounted (%s): no router found", import_path)
+    return False
+
+# Preferred routers
 _include_router_safely("routes.enriched_quote")
-# AI routes
 _include_router_safely("routes.ai_analysis")
-# Advanced routes
 _include_router_safely("routes.advanced_analysis")
-# KSA Argaam gateway
 _include_router_safely("routes_argaam")
-# Legacy routes (has absolute paths inside)
-_include_router_safely("routes.legacy_service")
+
+# Legacy router: support BOTH module locations
+# 1) routes/legacy_service.py
+# 2) legacy_service.py (repo root)
+if not _include_router_safely("routes.legacy_service"):
+    _include_router_safely("legacy_service")
 
 # ---------------------------------------------------------------------
 # Root + Health + UI
@@ -211,6 +214,11 @@ async def root() -> Dict[str, Any]:
         "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
+# IMPORTANT: Render sends HEAD / sometimes -> avoid 405 noise
+@app.head("/")
+async def root_head() -> Response:
+    return Response(status_code=200)
+
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {
@@ -221,18 +229,16 @@ async def health() -> Dict[str, Any]:
         "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
+@app.head("/health")
+async def health_head() -> Response:
+    return Response(status_code=200)
+
 @app.get("/ui")
 async def ui():
-    """
-    Serves local index.html if present (Render will include it if in repo root).
-    """
     path = os.path.join(os.path.dirname(__file__), "index.html")
     if os.path.exists(path):
         return FileResponse(path, media_type="text/html")
-    return JSONResponse(
-        status_code=404,
-        content={"detail": "index.html not found in service root"},
-    )
+    return JSONResponse(status_code=404, content={"detail": "index.html not found in service root"})
 
 # ---------------------------------------------------------------------
 # Startup log
