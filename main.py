@@ -1,174 +1,168 @@
-# routes/enriched_quote.py
+"""
+main.py
+------------------------------------------------------------
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE)
+
+IMPORTANT:
+- Render runs: uvicorn main:app --host 0.0.0.0 --port $PORT
+- Therefore this module MUST expose: `app = FastAPI(...)`
+
+This file:
+- Loads settings (config.get_settings)
+- Enables CORS (optionally all origins)
+- Enables SlowAPI rate limiting (if available)
+- Mounts routers defensively (won’t crash if optional modules missing)
+- Exposes / and /health endpoints
+"""
+
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+import logging
+import os
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+# -------------------------
+# Logging
+# -------------------------
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format=LOG_FORMAT)
+logger = logging.getLogger("main")
+
+# -------------------------
+# Settings
+# -------------------------
 try:
     from config import get_settings
-except Exception:  # pragma: no cover
-    get_settings = None  # type: ignore
+except Exception as e:  # ultra-safe: never crash import path
+    get_settings = None
+    logger.warning("Settings loader not available (config.py). Using env only. Error: %s", e)
 
 
-router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
-
-
-def _settings():
-    if get_settings:
-        return get_settings()
-    class _S:
-        ENRICHED_MAX_TICKERS = 250
-        ENRICHED_BATCH_CONCURRENCY = 5
-    return _S()
-
-
-settings = _settings()
-
-
-class QuotesBatchRequest(BaseModel):
-    symbols: List[str] = Field(..., min_length=1)
-
-
-def _normalize_symbol(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    # Keep case stable (most providers accept upper; .SR remains)
-    return s.upper()
-
-
-def _as_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        return obj
-    # Pydantic v2
-    if hasattr(obj, "model_dump"):
-        return obj.model_dump()
-    # Pydantic v1
-    if hasattr(obj, "dict"):
-        return obj.dict()
-    # last resort
-    return {"value": obj}
-
-
-async def _engine_get_quote(symbol: str) -> Dict[str, Any]:
+def _mount_router(app_: FastAPI, module_path: str, attr: str = "router", prefix: str = "") -> None:
     """
-    Tries v2 engine first, then legacy v1 engine.
-    Always returns a dict and NEVER raises to the caller.
+    Import and mount a FastAPI router without crashing the app if missing.
     """
-    # 1) v2 engine
     try:
-        from core.data_engine_v2 import DataEngine  # type: ignore
-        eng = DataEngine()
-        res = await eng.get_enriched_quote(symbol)
-        d = _as_dict(res)
-        if d:
-            return d
+        mod = __import__(module_path, fromlist=[attr])
+        router = getattr(mod, attr)
+        app_.include_router(router, prefix=prefix)
+        logger.info("Mounted router: %s.%s", module_path, attr)
+    except Exception as e:
+        logger.warning("Router not mounted (%s): %s", module_path, e)
+
+
+def create_app() -> FastAPI:
+    settings = get_settings() if get_settings else None
+
+    app_ = FastAPI(
+        title=(settings.APP_NAME if settings else os.getenv("APP_NAME", "Tadawul Fast Bridge")),
+        version=(settings.APP_VERSION if settings else os.getenv("APP_VERSION", "0.0.0")),
+    )
+
+    # Keep settings accessible to routers/services
+    app_.state.settings = settings
+
+    # -------------------------
+    # CORS
+    # -------------------------
+    cors_all = True
+    if settings:
+        cors_all = bool(settings.ENABLE_CORS_ALL_ORIGINS)
+
+    if cors_all:
+        allow_origins = ["*"]
+    else:
+        # You can later restrict by setting CORS_ORIGINS env var to comma-separated values
+        allow_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()] or ["*"]
+
+    app_.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # -------------------------
+    # SlowAPI (rate limit)
+    # -------------------------
+    try:
+        from slowapi import Limiter
+        from slowapi.errors import RateLimitExceeded
+        from slowapi.middleware import SlowAPIMiddleware
+        from slowapi.util import get_remote_address
+        from starlette.responses import JSONResponse
+
+        limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
+        app_.state.limiter = limiter
+        app_.add_middleware(SlowAPIMiddleware)
+
+        @app_.exception_handler(RateLimitExceeded)
+        async def _rate_limit_handler(request, exc):  # noqa: ANN001
+            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
+        logger.info("SlowAPI limiter enabled (default 240/minute).")
+    except Exception as e:
+        logger.warning("SlowAPI not enabled: %s", e)
+
+    # -------------------------
+    # Routes
+    # -------------------------
+    _mount_router(app_, "routes.enriched_quote", "router")
+    _mount_router(app_, "routes.ai_analysis", "router")
+    _mount_router(app_, "routes.advanced_analysis", "router")
+    _mount_router(app_, "routes_argaam", "router")
+
+    # Optional legacy route module path (some projects used routes.legacy_service)
+    _mount_router(app_, "routes.legacy_service", "router")
+    # Current legacy router (based on your logs)
+    _mount_router(app_, "legacy_service", "router")
+
+    # -------------------------
+    # Health & Root
+    # -------------------------
+    @app_.get("/", tags=["system"])
+    async def root():
+        return {"status": "ok", "app": app_.title, "version": app_.version}
+
+    @app_.get("/health", tags=["system"])
+    async def health():
+        providers = None
+        engine = os.getenv("ENGINE", "DataEngineV2")
+        if settings:
+            providers = ",".join(settings.ENABLED_PROVIDERS) if isinstance(settings.ENABLED_PROVIDERS, list) else str(settings.ENABLED_PROVIDERS)
+
+        return {
+            "status": "ok",
+            "app": app_.title,
+            "version": app_.version,
+            "env": (settings.APP_ENV if settings else os.getenv("APP_ENV", "production")),
+            "engine": engine,
+            "providers": providers,
+        }
+
+    # Startup banner
+    try:
+        env = settings.APP_ENV if settings else os.getenv("APP_ENV", "production")
+        prov = (
+            ",".join(settings.ENABLED_PROVIDERS)
+            if settings and isinstance(settings.ENABLED_PROVIDERS, list)
+            else (str(settings.ENABLED_PROVIDERS) if settings else os.getenv("ENABLED_PROVIDERS", ""))
+        )
+        logger.info("==============================================")
+        logger.info("🚀 Tadawul Fast Bridge starting")
+        logger.info("   Env: %s | Version: %s", env, app_.version)
+        logger.info("   Providers: %s", prov)
+        logger.info("   CORS all origins: %s", cors_all)
+        logger.info("==============================================")
     except Exception:
         pass
 
-    # 2) legacy v1 engine (module-level or class wrapper)
-    try:
-        from core import data_engine as de  # type: ignore
-
-        if hasattr(de, "get_enriched_quote"):
-            res = await de.get_enriched_quote(symbol)
-            d = _as_dict(res)
-            if d:
-                return d
-
-        if hasattr(de, "DataEngine"):
-            eng = de.DataEngine()
-            if hasattr(eng, "get_enriched_quote"):
-                res = await eng.get_enriched_quote(symbol)
-                d = _as_dict(res)
-                if d:
-                    return d
-    except Exception:
-        pass
-
-    # Safe fallback
-    return {
-        "symbol": symbol,
-        "market": "KSA" if symbol.endswith(".SR") or symbol.isdigit() else None,
-        "error": "MISSING: quote engine returned no data",
-        "data_quality": "MISSING",
-        "last_updated_utc": datetime.now(timezone.utc).isoformat(),
-    }
+    return app_
 
 
-@router.get("/health")
-async def enriched_health():
-    return {
-        "status": "ok",
-        "time_utc": datetime.now(timezone.utc).isoformat(),
-        "max_tickers": int(getattr(settings, "ENRICHED_MAX_TICKERS", 250)),
-        "batch_concurrency": int(getattr(settings, "ENRICHED_BATCH_CONCURRENCY", 5)),
-    }
-
-
-@router.get("/quote")
-async def enriched_quote(symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. 1120.SR or AAPL")):
-    sym = _normalize_symbol(symbol)
-    if not sym:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    return await _engine_get_quote(sym)
-
-
-@router.get("/quotes")
-async def enriched_quotes_get(
-    symbols: str = Query(..., description="Comma-separated symbols, e.g. 1120.SR,AAPL,MSFT"),
-):
-    raw = [x.strip() for x in (symbols or "").split(",")]
-    syms = [_normalize_symbol(x) for x in raw if _normalize_symbol(x)]
-    return await _batch_fetch(syms)
-
-
-@router.post("/quotes")
-async def enriched_quotes_post(body: QuotesBatchRequest):
-    syms = [_normalize_symbol(x) for x in body.symbols if _normalize_symbol(x)]
-    return await _batch_fetch(syms)
-
-
-async def _batch_fetch(symbols: List[str]) -> Dict[str, Any]:
-    if not symbols:
-        raise HTTPException(status_code=400, detail="No symbols provided")
-
-    max_tickers = int(getattr(settings, "ENRICHED_MAX_TICKERS", 250))
-    if len(symbols) > max_tickers:
-        raise HTTPException(status_code=400, detail=f"Too many symbols. Max={max_tickers}")
-
-    concurrency = max(1, int(getattr(settings, "ENRICHED_BATCH_CONCURRENCY", 5)))
-    sem = asyncio.Semaphore(concurrency)
-
-    async def _one(sym: str) -> Dict[str, Any]:
-        async with sem:
-            return await _engine_get_quote(sym)
-
-    results = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
-
-    out: List[Dict[str, Any]] = []
-    for sym, r in zip(symbols, results):
-        if isinstance(r, Exception):
-            out.append(
-                {
-                    "symbol": sym,
-                    "error": f"ERROR: {type(r).__name__}",
-                    "data_quality": "MISSING",
-                    "last_updated_utc": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-        else:
-            out.append(r)
-
-    return {
-        "count": len(out),
-        "symbols": symbols,
-        "items": out,
-        "time_utc": datetime.now(timezone.utc).isoformat(),
-    }
+# ✅ REQUIRED BY RENDER START COMMAND: uvicorn main:app
+app = create_app()
