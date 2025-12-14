@@ -18,22 +18,25 @@ from core.config import get_settings
 
 # Optional deps (graceful fallback)
 try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup  # type: ignore
 except Exception:  # pragma: no cover
     BeautifulSoup = None
 
 try:
-    import yfinance as yf
+    import yfinance as yf  # type: ignore
 except Exception:  # pragma: no cover
     yf = None
 
 
+# =============================================================================
+# Settings + Logger
+# =============================================================================
 settings = get_settings()
 logger = logging.getLogger("core.data_engine_v2")
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Provider URLs
-# -----------------------------------------------------------------------------
+# =============================================================================
 EODHD_RT_URL = "https://eodhd.com/api/real-time/{symbol}"
 EODHD_FUND_URL = "https://eodhd.com/api/fundamentals/{symbol}"
 FMP_QUOTE_URL = "https://financialmodelingprep.com/api/v3/quote/{symbol}"
@@ -44,8 +47,8 @@ FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
 
 # Argaam (best-effort; HTML can change)
 ARGAAM_PRICES_URLS = [
-    "https://www.argaam.com/ar/company/companies-prices/3",  # TASI (Arabic)
-    "https://www.argaam.com/en/company/companies-prices/3",  # TASI (English)
+    "https://www.argaam.com/ar/company/companies-prices/3",
+    "https://www.argaam.com/en/company/companies-prices/3",
 ]
 ARGAAM_VOLUME_URLS = [
     "https://www.argaam.com/ar/company/companies-volume/14",
@@ -61,9 +64,12 @@ USER_AGENT = (
 # Riyadh is UTC+3 (no DST)
 RIYADH_TZ = timezone(timedelta(hours=3))
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Helpers (env/settings adapters)
+# =============================================================================
+_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+_FALSY = {"0", "false", "no", "off", "n", "f"}
+
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
@@ -75,6 +81,77 @@ def _now_riyadh_iso() -> str:
     return datetime.now(RIYADH_TZ).isoformat()
 
 
+def _get_attr_or_env(names: Sequence[str], default: Any = None) -> Any:
+    """
+    Tries: settings.<name> then env <name> (case-insensitive).
+    Returns first non-None, else default.
+    """
+    for n in names:
+        if hasattr(settings, n):
+            v = getattr(settings, n)
+            if v is not None:
+                return v
+    for n in names:
+        v = os.getenv(n) or os.getenv(n.upper()) or os.getenv(n.lower())
+        if v is not None:
+            return v
+    return default
+
+
+def _get_bool(names: Sequence[str], default: bool) -> bool:
+    raw = _get_attr_or_env(names, None)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
+    return default
+
+
+def _get_int(names: Sequence[str], default: int) -> int:
+    raw = _get_attr_or_env(names, None)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+def _get_float(names: Sequence[str], default: float) -> float:
+    raw = _get_attr_or_env(names, None)
+    if raw is None:
+        return default
+    try:
+        v = float(str(raw).strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _split_csv_lower_dedup(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = [str(x).strip().lower() for x in value if str(x).strip()]
+    else:
+        s = str(value).strip()
+        if not s:
+            return []
+        items = [p.strip().lower() for p in s.split(",") if p.strip()]
+    out: List[str] = []
+    seen = set()
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
+
 def _safe_str(x: Any) -> Optional[str]:
     if x is None:
         return None
@@ -83,6 +160,13 @@ def _safe_str(x: Any) -> Optional[str]:
 
 
 def _safe_float(val: Any) -> Optional[float]:
+    """
+    Robust numeric parser:
+    - supports Arabic digits
+    - strips %, +, currency tokens, commas
+    - supports suffix K/M/B (e.g. 1.2B)
+    - supports (1.23) negatives
+    """
     if val is None:
         return None
     try:
@@ -96,19 +180,36 @@ def _safe_float(val: Any) -> Optional[float]:
         if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
             return None
 
-        # Normalize Arabic digits and separators
         s = s.translate(_ARABIC_DIGITS)
         s = s.replace("٬", ",").replace("٫", ".")  # Arabic thousands/decimal
-        s = s.replace(",", "")
-        s = s.replace("%", "")
-        s = s.replace("+", "")
-        s = s.replace("SAR", "").replace("USD", "").strip()
+        s = s.replace("SAR", "").replace("USD", "").replace("ريال", "").strip()
+        s = s.replace("+", "").strip()
 
-        # Handle parentheses negatives: (1.23)
+        # Parentheses negatives
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
 
-        f = float(s)
+        # Percent symbol
+        s = s.replace("%", "").strip()
+
+        # Thousand separators
+        s = s.replace(",", "")
+
+        # Suffix multipliers
+        mult = 1.0
+        m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
+        if m:
+            num = m.group(1)
+            suf = m.group(3).upper()
+            if suf == "K":
+                mult = 1_000.0
+            elif suf == "M":
+                mult = 1_000_000.0
+            elif suf == "B":
+                mult = 1_000_000_000.0
+            s = num
+
+        f = float(s) * mult
         if math.isnan(f) or math.isinf(f):
             return None
         return f
@@ -133,28 +234,24 @@ def normalize_symbol(raw: str) -> str:
 
     - KSA numeric => 1120.SR
     - If already contains a dot suffix => keep as-is (upper)
-    - Special Yahoo-style symbols (^GSPC, GC=F, EURUSD=X) => keep as-is (upper)
+    - Yahoo-style symbols (^GSPC, GC=F, EURUSD=X) => keep as-is (upper)
     - Otherwise => default to .US (AAPL => AAPL.US)
     """
     s = (raw or "").strip().upper()
     if not s:
         return ""
 
-    # Common prefixes
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
 
-    # Yahoo-style symbols or pairs
     if any(ch in s for ch in ("=", "^")):
         return s
 
-    # Saudi numeric
     if s.isdigit():
         return f"{s}.SR"
 
-    # Already has suffix (.US, .SR, .L, BRK.B, etc.)
     if "." in s:
         return s
 
@@ -167,18 +264,25 @@ def is_ksa_symbol(symbol: str) -> bool:
 
 
 def _fmp_symbol(symbol: str) -> str:
-    """
-    FMP often expects tickers without '.US' if we auto-added it.
-    Keep other dots (e.g. BRK.B) untouched.
-    """
     s = (symbol or "").strip().upper()
     return s[:-3] if s.endswith(".US") else s
 
 
 def _finnhub_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+    if any(ch in s for ch in ("=", "^")):
+        return s
+    if s.endswith(".US"):
+        return s[:-3]
+    return s
+
+
+def _yahoo_symbol(symbol: str) -> str:
     """
-    Finnhub expects plain tickers like AAPL, MSFT (no .US).
-    Keep KSA out of Finnhub; keep special Yahoo symbols unchanged.
+    yfinance is generally happier with plain tickers (AAPL not AAPL.US).
+    Keep special symbols unchanged.
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -190,51 +294,13 @@ def _finnhub_symbol(symbol: str) -> str:
     return s
 
 
-def _get_timeout_sec() -> float:
-    # config.py may not have http_timeout_sec; use env fallbacks.
-    for attr in ("http_timeout_sec", "HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
-        v = getattr(settings, attr, None)
-        if v is not None:
-            try:
-                fv = float(v)
-                if fv > 0:
-                    return fv
-            except Exception:
-                pass
-    for key in ("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
-        raw = os.getenv(key)
-        if raw:
-            try:
-                fv = float(raw.strip())
-                if fv > 0:
-                    return fv
-            except Exception:
-                pass
-    return 25.0
-
-
-def _get_bool_setting(name: str, default: bool) -> bool:
-    v = getattr(settings, name, None)
-    if isinstance(v, bool):
-        return v
-    raw = os.getenv(name.upper()) or os.getenv(name)
-    if not raw:
-        return default
-    s = str(raw).strip().lower()
-    if s in {"1", "true", "yes", "on", "y"}:
-        return True
-    if s in {"0", "false", "no", "off", "n"}:
-        return False
-    return default
-
-
 def _get_enabled_providers() -> List[str]:
     """
     Compatible with BOTH:
       - config.py: settings.providers (CSV) + settings.providers_list property
-      - env.py style: ENABLED_PROVIDERS, PROVIDERS env var
+      - env.py style: ENABLED_PROVIDERS / PROVIDERS env var
     """
-    # 1) config.py preferred
+    # config.py style
     pl = getattr(settings, "providers_list", None)
     if isinstance(pl, list) and pl:
         return [str(x).strip().lower() for x in pl if str(x).strip()]
@@ -243,8 +309,8 @@ def _get_enabled_providers() -> List[str]:
     if isinstance(p_csv, str) and p_csv.strip():
         return [p.strip().lower() for p in p_csv.split(",") if p.strip()]
 
-    # 2) env fallbacks
-    env_csv = os.getenv("PROVIDERS") or os.getenv("ENABLED_PROVIDERS") or ""
+    # env.py / Render style
+    env_csv = os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or ""
     if env_csv.strip():
         return [p.strip().lower() for p in env_csv.split(",") if p.strip()]
 
@@ -263,12 +329,12 @@ def _get_key(*names: str) -> Optional[str]:
     return None
 
 
-# -----------------------------------------------------------------------------
-# Data model (Pydantic v2)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Data model (Pydantic v2) — aligned with 59-column schema
+# =============================================================================
 class UnifiedQuote(BaseModel):
     """
-    UnifiedQuote: master model aligned with the dashboard.
+    UnifiedQuote: master model aligned with the dashboard (59-column template).
     """
 
     model_config = ConfigDict(populate_by_name=True, from_attributes=True, validate_assignment=True)
@@ -362,19 +428,19 @@ class UnifiedQuote(BaseModel):
     error: Optional[str] = None
 
     def finalize(self) -> "UnifiedQuote":
-        # Timestamps
+        # timestamps
         if not self.last_updated_utc:
             self.last_updated_utc = _now_utc_iso()
         if not self.last_updated_riyadh:
             self.last_updated_riyadh = _now_riyadh_iso()
 
-        # Market/currency defaults
+        # market/currency defaults
         if not self.market or self.market == "UNKNOWN":
             self.market = "KSA" if is_ksa_symbol(self.symbol) else "GLOBAL"
         if not self.currency:
             self.currency = "SAR" if self.market == "KSA" else "USD"
 
-        # Change fields
+        # change fields
         if self.current_price is not None and self.previous_close is not None:
             if self.price_change is None:
                 self.price_change = _safe_float(self.current_price - self.previous_close)
@@ -394,18 +460,20 @@ class UnifiedQuote(BaseModel):
             if rng and rng > 0:
                 self.position_52w_percent = _safe_float((self.current_price - self.low_52w) / rng * 100.0)
 
-        # Value traded
+        # value traded
         if self.value_traded is None and self.current_price is not None and self.volume is not None:
             self.value_traded = _safe_float(self.current_price * self.volume)
 
-        # Quality heuristic
+        # data quality heuristic
         if self.current_price is None:
             self.data_quality = "MISSING"
         else:
-            have_core = all(x is not None for x in (self.current_price, self.previous_close, self.day_high, self.day_low))
+            have_core = all(
+                x is not None for x in (self.current_price, self.previous_close, self.day_high, self.day_low)
+            )
             self.data_quality = "FULL" if have_core else "PARTIAL"
 
-        # Ensure recommendation exists
+        # ensure recommendation exists
         if self.overall_score is None:
             self._calculate_simple_scores()
 
@@ -438,20 +506,20 @@ class UnifiedQuote(BaseModel):
             self.recommendation = "HOLD"
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Engine
-# -----------------------------------------------------------------------------
+# =============================================================================
 class DataEngine:
     """
-    Async multi-provider engine with KSA-safe routing:
+    Async multi-provider engine with KSA-safe routing.
 
     KSA (.SR):
       1) Best-effort legacy KSA delegate if available (core.data_engine)
       2) Argaam snapshot (HTML best-effort)
-      3) Optional yfinance last resort
+      3) Optional yfinance last resort (often blocked/401 — handled clearly)
 
     GLOBAL:
-      provider order from settings.providers_list / PROVIDERS env:
+      provider order from settings/providers:
         - eodhd (quote + optional fundamentals)
         - finnhub (quote + profile/metrics)
         - fmp (quote)
@@ -459,9 +527,14 @@ class DataEngine:
     """
 
     def __init__(self) -> None:
+        # Providers + feature flags
         self.enabled_providers: List[str] = _get_enabled_providers()
 
-        self._timeout_sec: float = _get_timeout_sec()
+        # Timeouts + limits
+        self._timeout_sec: float = _get_float(["HTTP_TIMEOUT_SEC", "http_timeout_sec", "HTTP_TIMEOUT"], 25.0)
+        max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
+        max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
+
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._timeout_sec),
             follow_redirects=True,
@@ -470,20 +543,35 @@ class DataEngine:
                 "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
             },
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
+            limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
 
-        # Feature flags
-        self.enable_yfinance = _get_bool_setting("ENABLE_YFINANCE", True)
+        self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
+
+        # TTLs (Render/env.py aligned)
+        quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
+        cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
+        fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
+        snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 30.0)
 
         # Caches
-        self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=20)     # live-ish
-        self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)    # fallback for outages
-        self.fund_cache: TTLCache = TTLCache(maxsize=2000, ttl=21600)   # 6 hours
-        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=25)    # argaam snapshots
+        # - quote_cache: short TTL for live-ish requests
+        # - stale_cache: longer TTL to survive provider outages without breaking Sheets
+        self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, quote_ttl))
+        self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, cache_ttl * 10.0))
+        self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, fund_ttl))
+        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, snap_ttl))
 
-        # Concurrency guard
-        self._sem = asyncio.Semaphore(10)
+        # Concurrency guard (engine internal)
+        self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
+
+        # Optional: log once per engine instance
+        logger.info(
+            "DataEngine v2.3 init | providers=%s | yfinance=%s | timeout=%.1fs",
+            ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
+            self.enable_yfinance,
+            self._timeout_sec,
+        )
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -550,7 +638,6 @@ class DataEngine:
         try:
             from core import data_engine as legacy  # type: ignore
 
-            # legacy may expose module-level async function
             if hasattr(legacy, "get_enriched_quote"):
                 raw = await legacy.get_enriched_quote(symbol)  # type: ignore
                 q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
@@ -565,7 +652,6 @@ class DataEngine:
         base = symbol.split(".", 1)[0].strip()
         snap = await self._argaam_snapshot()
         row = snap.get(base)
-
         if row:
             return UnifiedQuote(
                 symbol=symbol,
@@ -581,8 +667,8 @@ class DataEngine:
                 data_quality="PARTIAL",
             )
 
-        # 3) Last resort: yfinance (can be unreliable for .SR)
-        if self.enable_yfinance and "yfinance" in self.enabled_providers and yf:
+        # 3) Last resort: yfinance (often blocked for some regions/accounts; handle clearly)
+        if self.enable_yfinance and ("yfinance" in self.enabled_providers or "yahoo" in self.enabled_providers) and yf:
             q = await self._fetch_yfinance(symbol, market="KSA")
             if q.current_price is not None:
                 q.data_source = q.data_source or "yfinance"
@@ -605,10 +691,6 @@ class DataEngine:
         currency: str,
         source: str,
     ) -> UnifiedQuote:
-        """
-        Convert unknown legacy/dict/pydantic objects into UnifiedQuote safely.
-        Handles common alternate field names (last_price vs current_price, etc.).
-        """
         data: Dict[str, Any] = {}
 
         if raw is None:
@@ -631,12 +713,12 @@ class DataEngine:
             else:
                 data = {}
 
-        # Map common variants -> our fields
-        mapped: Dict[str, Any] = {}
-        mapped["symbol"] = symbol
-        mapped["market"] = data.get("market") or market
-        mapped["currency"] = data.get("currency") or currency
-        mapped["name"] = data.get("name") or data.get("company_name")
+        mapped: Dict[str, Any] = {
+            "symbol": symbol,
+            "market": data.get("market") or market,
+            "currency": data.get("currency") or currency,
+            "name": data.get("name") or data.get("company_name"),
+        }
 
         # Price variants
         mapped["current_price"] = data.get("current_price")
@@ -652,7 +734,7 @@ class DataEngine:
         mapped["price_change"] = data.get("price_change") or data.get("change")
         mapped["percent_change"] = data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
 
-        # Copy a few fundamentals if present
+        # Copy selected fundamentals if present
         for k in (
             "market_cap",
             "shares_outstanding",
@@ -678,12 +760,9 @@ class DataEngine:
         return q
 
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Returns cached map: code -> {name, price, change, change_percent, volume, value_traded}
-        """
         key = "argaam_snapshot_v2"
         cached = self.snapshot_cache.get(key)
-        if isinstance(cached, dict) and cached:
+        if isinstance(cached, dict):
             return cached
 
         merged: Dict[str, Dict[str, Any]] = {}
@@ -700,29 +779,32 @@ class DataEngine:
             for k, v in part.items():
                 merged.setdefault(k, {}).update(v)
 
-        # Cache even if empty to avoid hammering
         self.snapshot_cache[key] = merged
         return merged
 
     async def _http_get_first_text(self, urls: Sequence[str]) -> Optional[str]:
-        # Fire in parallel and pick the first "good" page.
         tasks = [self._http_get_text(u) for u in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        def _looks_ok(txt: str) -> bool:
+            t = txt.lower()
+            if len(txt) < 500:
+                return False
+            if "access denied" in t:
+                return False
+            if "cloudflare" in t:
+                return False
+            return True
+
         for r in results:
-            if isinstance(r, str) and len(r) > 500 and "Access Denied" not in r and "cloudflare" not in r.lower():
+            if isinstance(r, str) and _looks_ok(r):
                 return r
-        # fallback: any non-empty
         for r in results:
             if isinstance(r, str) and r.strip():
                 return r
         return None
 
     def _parse_argaam_table(self, html: str) -> Dict[str, Dict[str, Any]]:
-        """
-        Best-effort parser:
-        - finds rows containing a numeric Tadawul code (3-6 digits)
-        - tries to extract: name, price, change, change%, and optional volume/value
-        """
         out: Dict[str, Dict[str, Any]] = {}
         if not BeautifulSoup or not html:
             return out
@@ -735,7 +817,7 @@ class DataEngine:
                 continue
 
             txt = [c.get_text(" ", strip=True) for c in cols]
-            # find code anywhere in first 3 cols
+
             code = None
             code_idx = None
             for i in range(min(3, len(txt))):
@@ -744,47 +826,30 @@ class DataEngine:
                     code = cand
                     code_idx = i
                     break
-            if not code:
+            if not code or code_idx is None:
                 continue
 
-            # Heuristic positions
-            name = None
-            price = None
-            change = None
-            chg_p = None
+            name = _safe_str(txt[code_idx + 1]) if (code_idx + 1) < len(txt) else None
 
-            if code_idx is not None and code_idx + 1 < len(txt):
-                name = _safe_str(txt[code_idx + 1])
-
-            # next numeric values after name/code
             nums: List[Optional[float]] = []
-            for j in range(code_idx + 2 if code_idx is not None else 0, len(txt)):
+            for j in range(code_idx + 2, len(txt)):
                 nums.append(_safe_float(txt[j]))
 
-            # Common layout: price, change, change%
-            if len(nums) >= 1:
-                price = nums[0]
-            if len(nums) >= 2:
-                change = nums[1]
-            if len(nums) >= 3:
-                chg_p = nums[2]
+            price = nums[0] if len(nums) >= 1 else None
+            change = nums[1] if len(nums) >= 2 else None
+            chg_p = nums[2] if len(nums) >= 3 else None
 
-            # Volume/value sometimes near end
             volume = None
             value_traded = None
             if len(txt) >= 8:
-                # try last 3 numeric-like cells
                 tail = [txt[-k] for k in range(1, min(6, len(txt)))]
                 tail_nums = [_safe_float(x) for x in tail]
-                # pick plausible
                 for v in tail_nums:
                     if v is not None and v > 0:
                         volume = volume or v
-                # value traded often bigger than volume; best-effort:
-                # if we have price and volume and one tail is huge, treat as value_traded
+
                 if price and volume:
                     vt_guess = price * volume
-                    # If any tail number is within 0.2x..5x of vt_guess, use it
                     for v in tail_nums:
                         if v is not None and vt_guess > 0 and (0.2 * vt_guess) <= v <= (5.0 * vt_guess):
                             value_traded = v
@@ -807,7 +872,7 @@ class DataEngine:
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
         # Yahoo-style special symbols: prefer yfinance
         if any(ch in symbol for ch in ("=", "^")):
-            if self.enable_yfinance and "yfinance" in self.enabled_providers and yf:
+            if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yfinance"
@@ -823,7 +888,6 @@ class DataEngine:
 
         errors: List[str] = []
 
-        # Provider order from enabled list
         for prov in self.enabled_providers:
             p = (prov or "").strip().lower()
             if not p:
@@ -836,8 +900,7 @@ class DataEngine:
                     continue
                 q = await self._fetch_eodhd_realtime(symbol, api_key)
                 if q.current_price is not None:
-                    # Optional fundamentals toggle (env or settings attr)
-                    fetch_fund = _get_bool_setting("EODHD_FETCH_FUNDAMENTALS", False)
+                    fetch_fund = _get_bool(["EODHD_FETCH_FUNDAMENTALS"], False)
                     if fetch_fund:
                         fund = await self._fetch_eodhd_fundamentals(symbol, api_key)
                         if fund:
@@ -856,7 +919,6 @@ class DataEngine:
                     continue
                 q = await self._fetch_finnhub_quote(symbol, api_key)
                 if q.current_price is not None:
-                    # Add profile/metrics (cached) for richer fields
                     try:
                         prof, met = await self._fetch_finnhub_profile_and_metrics(symbol, api_key)
                         upd: Dict[str, Any] = {}
@@ -897,7 +959,7 @@ class DataEngine:
                 else:
                     errors.append("yfinance:disabled_or_missing")
 
-        # Final fallback if yfinance not in list but enabled
+        # Final fallback: yfinance if enabled and installed
         if self.enable_yfinance and yf:
             q = await self._fetch_yfinance(symbol, market="GLOBAL")
             if q.current_price is not None:
@@ -926,12 +988,17 @@ class DataEngine:
         except Exception:
             return None
 
-    async def _http_get_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    async def _http_get_json(
+        self, url: str, params: Optional[Dict[str, Any]] = None
+    ) -> Optional[Union[Dict[str, Any], List[Any]]]:
         try:
             r = await self.client.get(url, params=params)
             if r.status_code >= 400:
                 return None
-            return r.json()
+            try:
+                return r.json()
+            except Exception:
+                return None
         except Exception:
             return None
 
@@ -1021,7 +1088,6 @@ class DataEngine:
             if not data or not isinstance(data, dict):
                 return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error="Finnhub empty response")
 
-            # Finnhub: c=current, pc=prev close, o=open, h=high, l=low, d=change, dp=change%
             cp = _safe_float(data.get("c"))
             pc = _safe_float(data.get("pc"))
 
@@ -1082,11 +1148,15 @@ class DataEngine:
                     "ps": _safe_float(m.get("psTTM") or m.get("psAnnual")),
                     "eps_ttm": _safe_float(m.get("epsTTM")),
                     "beta": _safe_float(m.get("beta")),
-                    "dividend_yield": _pct_if_fraction(m.get("dividendYieldIndicatedAnnual") or m.get("dividendYieldAnnual")),
+                    "dividend_yield": _pct_if_fraction(
+                        m.get("dividendYieldIndicatedAnnual") or m.get("dividendYieldAnnual")
+                    ),
                     "roe": _pct_if_fraction(m.get("roeTTM") or m.get("roeAnnual")),
                     "roa": _pct_if_fraction(m.get("roaTTM") or m.get("roaAnnual")),
                     "net_margin": _pct_if_fraction(m.get("netMarginTTM") or m.get("netMarginAnnual")),
-                    "debt_to_equity": _safe_float(m.get("totalDebt/totalEquityAnnual") or m.get("totalDebt/totalEquityQuarterly")),
+                    "debt_to_equity": _safe_float(
+                        m.get("totalDebt/totalEquityAnnual") or m.get("totalDebt/totalEquityQuarterly")
+                    ),
                     "current_ratio": _safe_float(m.get("currentRatioAnnual") or m.get("currentRatioQuarterly")),
                     "quick_ratio": _safe_float(m.get("quickRatioAnnual") or m.get("quickRatioQuarterly")),
                 }
@@ -1140,8 +1210,10 @@ class DataEngine:
         if not yf:
             return UnifiedQuote(symbol=symbol, market=market, error="yfinance not installed", data_quality="MISSING")
 
+        ysym = _yahoo_symbol(symbol)
+
         def _sync() -> Dict[str, Any]:
-            t = yf.Ticker(symbol)
+            t = yf.Ticker(ysym)
             try:
                 fi = t.fast_info
                 if isinstance(fi, dict):
@@ -1157,7 +1229,7 @@ class DataEngine:
                 }
             except Exception:
                 hist = t.history(period="5d", interval="1d")
-                if hist is None or hist.empty:
+                if hist is None or getattr(hist, "empty", True):
                     return {}
                 last = hist.iloc[-1]
                 prev = hist.iloc[-2] if len(hist) >= 2 else last
@@ -1176,6 +1248,16 @@ class DataEngine:
             if not info:
                 return UnifiedQuote(symbol=symbol, market=market, error="yfinance empty response", data_quality="MISSING")
 
+            # Detect common Yahoo blocking patterns
+            err_txt = str(info)[:500].lower()
+            if "unauthorized" in err_txt or "unable to access this feature" in err_txt or "401" in err_txt:
+                return UnifiedQuote(
+                    symbol=symbol,
+                    market=market,
+                    error="yfinance blocked/Unauthorized (Yahoo 401). Disable ENABLE_YFINANCE or use other providers.",
+                    data_quality="MISSING",
+                )
+
             cp = _safe_float(info.get("last_price"))
             pc = _safe_float(info.get("previous_close"))
             return UnifiedQuote(
@@ -1192,7 +1274,10 @@ class DataEngine:
                 data_quality="PARTIAL" if cp is not None else "MISSING",
             )
         except Exception as exc:
-            return UnifiedQuote(symbol=symbol, market=market, error=f"yfinance error: {exc}", data_quality="MISSING")
+            msg = str(exc)
+            if "unauthorized" in msg.lower() or "401" in msg:
+                msg = "yfinance blocked/Unauthorized (Yahoo 401)."
+            return UnifiedQuote(symbol=symbol, market=market, error=f"yfinance error: {msg}", data_quality="MISSING")
 
 
 __all__ = ["UnifiedQuote", "DataEngine", "normalize_symbol", "is_ksa_symbol"]
