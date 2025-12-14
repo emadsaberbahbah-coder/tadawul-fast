@@ -1,183 +1,247 @@
+"""
+main.py
+===========================================================
+TADAWUL FAST BRIDGE – FastAPI App Entrypoint (v4.5.0)
+
+Goals
+- Deploy-safe for Render (uvicorn main:app).
+- Centralized:
+    • CORS
+    • Token auth (X-APP-TOKEN) with public health endpoints
+    • Rate limiting (slowapi) if installed
+    • Router mounting (Enriched, AI, Advanced, Argaam, Legacy)
+- Never hard-crash if an optional router is missing (logs + continues).
+
+Author: Emad Bahbah (with GPT-5.2 Thinking)
+"""
+
+from __future__ import annotations
+
 import logging
 import os
-from contextlib import asynccontextmanager
-from importlib import import_module
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
-from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote
+from env import settings
 
-settings = get_settings()
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Logging
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+LOG_LEVEL = (settings.log_level or "INFO").upper()
 logging.basicConfig(
-    level=settings.LOG_LEVEL,
-    format="%(asctime)s - [%(name)s] - %(levelname)s - %(message)s",
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("tadawul_fast_bridge")
+logger = logging.getLogger("main")
 
-# -----------------------------------------------------------------------------
-# Lifespan: create one shared engine (used by /api/v1/market-data).
-# Routers may also create their own engine singletons; that's okay.
-# -----------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION} [{settings.APP_ENV}]")
-    app.state.engine = DataEngine()
-    logger.info("Data Engine initialized successfully.")
-    try:
-        yield
-    finally:
-        logger.info("Shutting down application...")
-        if hasattr(app.state, "engine"):
-            try:
-                await app.state.engine.aclose()
-                logger.info("Data Engine connections closed.")
-            except Exception as exc:
-                logger.warning(f"Error closing Data Engine: {exc}")
+# ---------------------------------------------------------------------
+# Optional Rate Limiting (slowapi)
+# ---------------------------------------------------------------------
+limiter = None
+RateLimitExceeded = None
+try:
+    from slowapi import Limiter  # type: ignore
+    from slowapi.util import get_remote_address  # type: ignore
+    from slowapi.errors import RateLimitExceeded as _RLE  # type: ignore
 
-# -----------------------------------------------------------------------------
+    RateLimitExceeded = _RLE
+    limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
+    logger.info("SlowAPI limiter enabled (default 240/minute).")
+except Exception:
+    logger.info("SlowAPI limiter not enabled (slowapi not available or import failed).")
+
+# ---------------------------------------------------------------------
 # App
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
-    lifespan=lifespan,
-    docs_url="/docs" if settings.APP_ENV != "production" else None,
-    redoc_url=None,
+    title=settings.app_name or "Tadawul Fast Bridge",
+    version=settings.app_version or "0.0.0",
+    description="Unified KSA + Global market data + Google Sheets integration (Engine v2).",
 )
 
-# -----------------------------------------------------------------------------
-# Rate limiting
-# -----------------------------------------------------------------------------
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if limiter is not None:
+    app.state.limiter = limiter  # slowapi convention
 
-# -----------------------------------------------------------------------------
+    @app.exception_handler(RateLimitExceeded)  # type: ignore[arg-type]
+    async def _rate_limit_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"},
+        )
+
+# ---------------------------------------------------------------------
 # CORS
-# -----------------------------------------------------------------------------
-if settings.ENABLE_CORS_ALL_ORIGINS:
+# ---------------------------------------------------------------------
+if settings.enable_cors_all_origins:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+else:
+    # If you later want allowlist mode, add env var parsing here.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[],
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    logger.info("CORS enabled for all origins.")
 
-# -----------------------------------------------------------------------------
-# Simple API token protection (optional)
-# If APP_TOKEN is set, require header X-APP-TOKEN on all non-system endpoints.
-# -----------------------------------------------------------------------------
-def require_app_token(x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN")) -> None:
-    if not settings.APP_TOKEN:
-        return
-    if not x_app_token or x_app_token != settings.APP_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized (missing/invalid X-APP-TOKEN)")
+# ---------------------------------------------------------------------
+# Auth Middleware (X-APP-TOKEN)
+# ---------------------------------------------------------------------
+PUBLIC_PATH_PREFIXES = (
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/favicon.ico",
+    "/ui",
+)
+PUBLIC_EXACT_PATHS = {
+    "/",
+    "/health",
+    "/v1/enriched/health",
+    "/v1/analysis/health",
+    "/v1/advanced/health",
+    "/v1/argaam/health",
+    "/v1/legacy/health",
+    "/v1/analysis/ping",
+    "/v1/advanced/ping",
+    "/v1/enriched/ping",
+    "/v1/argaam/ping",
+}
 
-# -----------------------------------------------------------------------------
-# Dependency: engine from app state
-# -----------------------------------------------------------------------------
-def get_engine(request: Request) -> DataEngine:
-    return request.app.state.engine
+def _is_public_path(path: str) -> bool:
+    if path in PUBLIC_EXACT_PATHS:
+        return True
+    for p in PUBLIC_PATH_PREFIXES:
+        if path.startswith(p):
+            return True
+    return False
 
-# -----------------------------------------------------------------------------
-# System endpoints
-# -----------------------------------------------------------------------------
-@app.get("/health", tags=["System"])
-@app.head("/health", tags=["System"])
-async def health_check() -> Dict[str, Any]:
-    engine = getattr(app.state, "engine", None)
-    enabled = getattr(engine, "enabled_providers", None)
+def _valid_token(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    token = token.strip()
+    if not token:
+        return False
+    if settings.app_token and token == settings.app_token.strip():
+        return True
+    if settings.backup_app_token and token == settings.backup_app_token.strip():
+        return True
+    return False
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """
+    Protect all non-public endpoints using X-APP-TOKEN.
+    """
+    path = request.url.path or "/"
+    if _is_public_path(path):
+        return await call_next(request)
+
+    token = request.headers.get("X-APP-TOKEN") or request.headers.get("x-app-token")
+    if not _valid_token(token):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized: missing or invalid X-APP-TOKEN"},
+        )
+
+    return await call_next(request)
+
+# ---------------------------------------------------------------------
+# Global Exception Handler (defensive for Sheets callers)
+# ---------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception at %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=200,  # Sheets-safe: avoid breaking refresh pipelines
+        content={
+            "status": "error",
+            "error": str(exc),
+            "path": request.url.path,
+            "time_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+# ---------------------------------------------------------------------
+# Routers (defensive imports)
+# ---------------------------------------------------------------------
+def _include_router_safely(import_path: str, attr: str = "router"):
+    try:
+        module = __import__(import_path, fromlist=[attr])
+        router = getattr(module, attr)
+        app.include_router(router)
+        logger.info("Mounted router: %s.%s", import_path, attr)
+    except Exception as e:
+        logger.warning("Router not mounted (%s): %s", import_path, e)
+
+# Enriched routes
+_include_router_safely("routes.enriched_quote")
+# AI routes
+_include_router_safely("routes.ai_analysis")
+# Advanced routes
+_include_router_safely("routes.advanced_analysis")
+# KSA Argaam gateway
+_include_router_safely("routes_argaam")
+# Legacy routes (has absolute paths inside)
+_include_router_safely("routes.legacy_service")
+
+# ---------------------------------------------------------------------
+# Root + Health + UI
+# ---------------------------------------------------------------------
+@app.get("/")
+async def root() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "app": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "env": settings.APP_ENV,
-        "primary_provider": settings.PRIMARY_PROVIDER,
-        "enabled_providers": enabled or settings.ENABLED_PROVIDERS,
+        "app": settings.app_name,
+        "version": settings.app_version,
+        "env": settings.app_env,
+        "engine": "DataEngineV2",
+        "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-@app.get("/", tags=["System"])
-@limiter.limit("10/minute")
-async def root(request: Request) -> Dict[str, Any]:
+@app.get("/health")
+async def health() -> Dict[str, Any]:
     return {
-        "service": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "status": "online",
-        "docs": "disabled" if settings.APP_ENV == "production" else "/docs",
+        "status": "ok",
+        "app": settings.app_name,
+        "version": settings.app_version,
+        "env": settings.app_env,
+        "time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-@app.head("/", tags=["System"])
-async def root_head() -> Response:
-    # Render may send HEAD / to verify service
-    return Response(status_code=200)
-
-# -----------------------------------------------------------------------------
-# Main market data endpoint (backward compatible)
-# -----------------------------------------------------------------------------
-@app.get("/api/v1/market-data", response_model=UnifiedQuote, tags=["Market Data"])
-@limiter.limit("60/minute")
-async def get_market_data(
-    request: Request,
-    ticker: str,
-    engine: DataEngine = Depends(get_engine),
-    _auth: None = Depends(require_app_token),
-) -> UnifiedQuote:
-    if not ticker or not str(ticker).strip():
-        raise HTTPException(status_code=400, detail="Ticker symbol is required")
-
-    sym = str(ticker).strip()
-
-    try:
-        q = await engine.get_enriched_quote(sym)
-        if q.data_quality == "MISSING":
-            logger.warning(f"No data found for {sym}: {q.error or 'unknown'}")
-        return q
-    except Exception as exc:
-        logger.exception("Error fetching data for %s", sym, exc_info=exc)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-# -----------------------------------------------------------------------------
-# Include modular routers (if present)
-# -----------------------------------------------------------------------------
-def _try_include(module_paths: list[str]) -> None:
-    for mp in module_paths:
-        try:
-            mod = import_module(mp)
-            r = getattr(mod, "router", None)
-            if r is not None:
-                app.include_router(r, dependencies=[Depends(require_app_token)])
-                logger.info(f"Router included: {mp}")
-            return
-        except Exception:
-            continue
-
-_try_include(["routes.enriched_quote", "enriched_quote"])
-_try_include(["routes_argaam", "routes.routes_argaam"])
-_try_include(["routes.advanced_analysis", "advanced_analysis"])
-_try_include(["routes.ai_analysis", "ai_analysis"])
-_try_include(["legacy_service", "routes.legacy_service"])
-
-# -----------------------------------------------------------------------------
-# Local entry point
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
-        log_level=settings.LOG_LEVEL.lower(),
-        reload=True,
+@app.get("/ui")
+async def ui():
+    """
+    Serves local index.html if present (Render will include it if in repo root).
+    """
+    path = os.path.join(os.path.dirname(__file__), "index.html")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="text/html")
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "index.html not found in service root"},
     )
+
+# ---------------------------------------------------------------------
+# Startup log
+# ---------------------------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    logger.info("==============================================")
+    logger.info("🚀 %s starting", settings.app_name)
+    logger.info("   Env: %s | Version: %s", settings.app_env, settings.app_version)
+    logger.info("   Providers: %s", ",".join(settings.enabled_providers or []))
+    logger.info("   CORS all origins: %s", settings.enable_cors_all_origins)
+    logger.info("==============================================")
