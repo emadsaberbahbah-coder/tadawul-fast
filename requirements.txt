@@ -1,26 +1,43 @@
 # ============================================================
 # Tadawul Fast Bridge - Dependencies (Pinned for stability)
+# Target runtime: Python 3.11.x (see runtime.txt)
+#
+# Notes:
+# - We pin a few key transitive deps (starlette/limits/pandas/numpy/httplib2)
+#   to keep Render builds reproducible across redeploys.
 # ============================================================
 
+# --- Core Web Framework ---
 fastapi==0.124.4
+starlette==0.50.0
 uvicorn[standard]==0.38.0
 python-dotenv==1.2.1
 slowapi==0.1.9
+limits==5.6.0
 
+# --- Validation / Settings / Performance ---
 pydantic==2.12.5
 pydantic-settings==2.12.0
+orjson==3.11.5
+cachetools==6.2.3
+typing-extensions==4.15.0
 
+# --- HTTP Clients ---
 httpx==0.28.1
 requests==2.32.5
+aiohttp==3.13.2
+
+# --- Scraping / Parsing ---
 beautifulsoup4==4.14.3
 lxml==6.0.2
 
+# --- Market Data (Global fallback / utilities) ---
 yfinance==0.2.66
+pandas==2.3.3
+numpy==2.3.5
 
+# --- Google Integration (Sheets Service Account) ---
 google-api-python-client==2.187.0
 google-auth==2.43.0
-
-orjson==3.11.5
-cachetools==6.2.3
-
-aiohttp==3.13.2
+google-auth-httplib2==0.2.1
+httplib2==0.31.0
