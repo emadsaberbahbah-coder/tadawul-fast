@@ -141,3 +141,22 @@ def get_symbols_from_sheet(spreadsheet_id: str, sheet_name: str, header_row: int
         val = val.replace(" ", "")
         if val not in seen:
             seen.add(val)
+            all_symbols.append(val)
+
+    split = split_tickers_by_market(all_symbols)
+    return {"all": all_symbols, "ksa": split["ksa"], "global": split["global"]}
+
+def get_page_symbols(page_key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, List[str]]:
+    cfg = PAGE_REGISTRY.get((page_key or "").upper())
+    if not cfg:
+        logger.error("[SymbolsReader] Invalid page key: %s", page_key)
+        return {"all": [], "ksa": [], "global": []}
+    return get_symbols_from_sheet(spreadsheet_id or "", cfg.sheet_name, cfg.header_row)
+
+def get_all_pages_symbols(spreadsheet_id: Optional[str] = None) -> Dict[str, Dict[str, List[str]]]:
+    results: Dict[str, Dict[str, List[str]]] = {}
+    for key in PAGE_REGISTRY:
+        results[key] = get_page_symbols(key, spreadsheet_id)
+    return results
+
+__all__ = ["get_symbols_from_sheet", "get_page_symbols", "get_all_pages_symbols", "PAGE_REGISTRY"]
