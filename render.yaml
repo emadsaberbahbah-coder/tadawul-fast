@@ -1,6 +1,5 @@
 # ============================================================
 # Tadawul Fast Bridge – Render Blueprint (Aligned with env.py)
-# KSA-safe + Global providers + Google Sheets integration
 # ============================================================
 
 services:
@@ -11,10 +10,8 @@ services:
     region: frankfurt
     autoDeploy: true
 
-    # Build
     buildCommand: pip install -r requirements.txt
 
-    # Start (matches Procfile behavior + reverse-proxy safety)
     startCommand: >
       uvicorn main:app
       --host 0.0.0.0
@@ -24,164 +21,94 @@ services:
       --timeout-keep-alive 75
       --log-level info
 
-    # Health check
     healthCheckPath: /health
 
     envVars:
-      # ------------------------------------------------------
-      # App Meta
-      # ------------------------------------------------------
       - key: APP_NAME
         value: "Tadawul Fast Bridge"
-
       - key: APP_ENV
         value: production
-
       - key: APP_VERSION
         value: "4.4.0"
-
-      # Optional hint (not required by Render, but ok to keep)
-      - key: PYTHON_VERSION
-        value: "3.11.9"
-
       - key: LOG_LEVEL
         value: "INFO"
 
-      # ------------------------------------------------------
-      # Backend URL (used by google_sheets_service / integrations)
-      # ------------------------------------------------------
       - key: BACKEND_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
 
-      # ------------------------------------------------------
-      # Auth Tokens (optional, but recommended)
-      # ------------------------------------------------------
       - key: APP_TOKEN
         generateValue: true
-
       - key: BACKUP_APP_TOKEN
         value: ""
 
-      # ------------------------------------------------------
-      # Providers (env.py reads ENABLED_PROVIDERS + PRIMARY_PROVIDER)
-      # NOTE: KSA (.SR) must NEVER use EODHD. Engine enforces this.
-      # ------------------------------------------------------
       - key: ENABLED_PROVIDERS
         value: "eodhd,fmp,yfinance"
-
       - key: PRIMARY_PROVIDER
         value: "eodhd"
 
-      # Feature flags (supported by env.py)
+      - key: HTTP_TIMEOUT_SEC
+        value: "25"
+
+      - key: CACHE_TTL_SEC
+        value: "20"
+      - key: QUOTE_TTL_SEC
+        value: "30"
+      - key: FUNDAMENTALS_TTL_SEC
+        value: "21600"
+      - key: ARGAAM_SNAPSHOT_TTL_SEC
+        value: "30"
+
       - key: ENABLE_YFINANCE
         value: "true"
-
       - key: EODHD_FETCH_FUNDAMENTALS
         value: "true"
 
-      # ------------------------------------------------------
-      # Provider Keys (Secrets)
-      # ------------------------------------------------------
       - key: EODHD_API_KEY
         sync: false
-
       - key: EODHD_BASE_URL
         value: "https://eodhd.com/api"
 
       - key: FMP_API_KEY
         sync: false
-
       - key: FMP_BASE_URL
         value: "https://financialmodelingprep.com/api/v3"
 
-      # (Optional future providers; safe to keep as placeholders)
-      - key: FINNHUB_API_KEY
+      - key: ARGAAM_GATEWAY_URL
+        value: "https://tadawul-fast-bridge.onrender.com/v1/argaam"
+
+      - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
-
-      - key: ALPHA_VANTAGE_API_KEY
+      - key: DEFAULT_SPREADSHEET_ID
         sync: false
+      - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
+        value: ""
 
-      # ------------------------------------------------------
-      # HTTP / Timeouts (env.py reads HTTP_TIMEOUT_SEC)
-      # ------------------------------------------------------
-      - key: HTTP_TIMEOUT_SEC
-        value: "25"
-
-      # ------------------------------------------------------
-      # Cache TTLs (env.py reads these exact names)
-      # ------------------------------------------------------
-      - key: CACHE_TTL_SEC
-        value: "20"
-
-      - key: QUOTE_TTL_SEC
-        value: "30"
-
-      - key: FUNDAMENTALS_TTL_SEC
-        value: "21600" # 6 hours
-
-      - key: ARGAAM_SNAPSHOT_TTL_SEC
-        value: "30"
-
-      # ------------------------------------------------------
-      # Batch / Concurrency tuning (env.py reads these exact names)
-      # ------------------------------------------------------
       - key: ADV_BATCH_SIZE
         value: "20"
-
       - key: ADV_BATCH_TIMEOUT_SEC
         value: "45"
-
       - key: ADV_MAX_TICKERS
         value: "500"
-
       - key: ADV_BATCH_CONCURRENCY
         value: "5"
 
       - key: AI_BATCH_SIZE
         value: "20"
-
       - key: AI_BATCH_TIMEOUT_SEC
         value: "45"
-
       - key: AI_MAX_TICKERS
         value: "500"
-
       - key: AI_BATCH_CONCURRENCY
         value: "5"
 
       - key: ENRICHED_BATCH_SIZE
         value: "40"
-
       - key: ENRICHED_BATCH_TIMEOUT_SEC
         value: "45"
-
       - key: ENRICHED_MAX_TICKERS
         value: "250"
-
       - key: ENRICHED_BATCH_CONCURRENCY
         value: "5"
 
-      # ------------------------------------------------------
-      # KSA / Argaam (optional; env.py supports ARGAAM_GATEWAY_URL)
-      # If your engine uses internal routing, you can leave this empty.
-      # ------------------------------------------------------
-      - key: ARGAAM_GATEWAY_URL
-        value: "https://tadawul-fast-bridge.onrender.com/v1/argaam"
-
-      # ------------------------------------------------------
-      # Google Sheets Integration (Secrets)
-      # ------------------------------------------------------
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
-
-      - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
-        value: ""
-
-      # ------------------------------------------------------
-      # CORS
-      # ------------------------------------------------------
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
