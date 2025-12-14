@@ -1,6 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Union
+import json
 
 class Settings(BaseSettings):
     """
@@ -21,6 +23,7 @@ class Settings(BaseSettings):
     HTTP_TIMEOUT_SEC: int = 25
 
     # --- Market Data Providers ---
+    # Validates comma-separated strings (e.g., "eodhd,fmp") from Render
     ENABLED_PROVIDERS: List[str] = ["eodhd", "fmp", "yfinance"]
     PRIMARY_PROVIDER: str = "eodhd"
     
@@ -38,7 +41,6 @@ class Settings(BaseSettings):
     GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = None
 
     # --- Batch Processing (Performance Tuning) ---
-    # These control how many stocks we process at once to avoid timeouts
     ADV_BATCH_SIZE: int = 20
     ADV_BATCH_TIMEOUT_SEC: int = 60
     ENRICHED_BATCH_SIZE: int = 40
@@ -46,6 +48,31 @@ class Settings(BaseSettings):
     AI_BATCH_SIZE: int = 10
     AI_BATCH_TIMEOUT_SEC: int = 60
     ADV_BATCH_CONCURRENCY: int = 5
+
+    # --- Validators ---
+    
+    @field_validator("ENABLED_PROVIDERS", mode="before")
+    @classmethod
+    def parse_providers_list(cls, v: Union[str, List[str]]) -> List[str]:
+        """
+        Fixes the Render env var issue. 
+        Converts 'eodhd,fmp,yfinance' string into a real Python list.
+        """
+        if isinstance(v, str):
+            # Check if empty
+            if not v.strip():
+                return []
+            # Check if it's already JSON (starts with [)
+            if v.strip().startswith("["):
+                try:
+                    return json.loads(v)
+                except json.JSONDecodeError:
+                    pass # Fallback to split if JSON fails
+            
+            # Default: Split by comma
+            return [item.strip() for item in v.split(",") if item.strip()]
+            
+        return v
 
     # --- Pydantic V2 Configuration ---
     model_config = SettingsConfigDict(
@@ -59,6 +86,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     Returns a cached instance of the Settings class.
-    This prevents reading the environment variables on every request.
     """
     return Settings()
