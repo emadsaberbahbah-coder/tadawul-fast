@@ -1,253 +1,174 @@
-"""
-main.py
-===========================================================
-TADAWUL FAST BRIDGE – FastAPI App Entrypoint (v4.5.1)
-
-Fixes vs v4.5.0
-- Accept HEAD / (Render port detection uses HEAD)
-- Mount legacy router from either:
-    • routes.legacy_service (if you created it)
-    • legacy_service (root module in your repo)
-- Router mounting stays defensive (never crashes deploy)
-"""
-
+# routes/enriched_quote.py
 from __future__ import annotations
 
-import logging
-import os
+import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Iterable
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, FileResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from env import settings
-
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
-LOG_LEVEL = (settings.log_level or "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("main")
-
-# ---------------------------------------------------------------------
-# Optional Rate Limiting (slowapi)
-# ---------------------------------------------------------------------
-limiter = None
-RateLimitExceeded = None
 try:
-    from slowapi import Limiter  # type: ignore
-    from slowapi.util import get_remote_address  # type: ignore
-    from slowapi.errors import RateLimitExceeded as _RLE  # type: ignore
+    from config import get_settings
+except Exception:  # pragma: no cover
+    get_settings = None  # type: ignore
 
-    RateLimitExceeded = _RLE
-    limiter = Limiter(key_func=get_remote_address, default_limits=["240/minute"])
-    logger.info("SlowAPI limiter enabled (default 240/minute).")
-except Exception:
-    logger.info("SlowAPI limiter not enabled (slowapi not available or import failed).")
 
-# ---------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------
-app = FastAPI(
-    title=settings.app_name or "Tadawul Fast Bridge",
-    version=settings.app_version or "0.0.0",
-    description="Unified KSA + Global market data + Google Sheets integration (Engine v2).",
-)
+router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
-if limiter is not None:
-    app.state.limiter = limiter  # slowapi convention
 
-    @app.exception_handler(RateLimitExceeded)  # type: ignore[arg-type]
-    async def _rate_limit_handler(request: Request, exc: Exception):
-        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+def _settings():
+    if get_settings:
+        return get_settings()
+    class _S:
+        ENRICHED_MAX_TICKERS = 250
+        ENRICHED_BATCH_CONCURRENCY = 5
+    return _S()
 
-# ---------------------------------------------------------------------
-# CORS
-# ---------------------------------------------------------------------
-if settings.enable_cors_all_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
-# ---------------------------------------------------------------------
-# Auth Middleware (X-APP-TOKEN)
-# ---------------------------------------------------------------------
-PUBLIC_PATH_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json", "/favicon.ico", "/ui")
-PUBLIC_EXACT_PATHS = {
-    "/",
-    "/health",
-    "/v1/enriched/health",
-    "/v1/analysis/health",
-    "/v1/advanced/health",
-    "/v1/argaam/health",
-    "/v1/legacy/health",
-    "/v1/analysis/ping",
-    "/v1/advanced/ping",
-    "/v1/enriched/ping",
-    "/v1/argaam/ping",
-}
+settings = _settings()
 
-def _is_public_path(path: str) -> bool:
-    if path in PUBLIC_EXACT_PATHS:
-        return True
-    return any(path.startswith(p) for p in PUBLIC_PATH_PREFIXES)
 
-def _valid_token(token: Optional[str]) -> bool:
-    if not token:
-        return False
-    token = token.strip()
-    if not token:
-        return False
-    if settings.app_token and token == settings.app_token.strip():
-        return True
-    if settings.backup_app_token and token == settings.backup_app_token.strip():
-        return True
-    return False
+class QuotesBatchRequest(BaseModel):
+    symbols: List[str] = Field(..., min_length=1)
 
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    path = request.url.path or "/"
-    if _is_public_path(path):
-        return await call_next(request)
 
-    token = request.headers.get("X-APP-TOKEN") or request.headers.get("x-app-token")
-    if not _valid_token(token):
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized: missing or invalid X-APP-TOKEN"})
+def _normalize_symbol(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    # Keep case stable (most providers accept upper; .SR remains)
+    return s.upper()
 
-    return await call_next(request)
 
-# ---------------------------------------------------------------------
-# Global Exception Handler (Sheets-safe)
-# ---------------------------------------------------------------------
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception at %s: %s", request.url.path, exc)
-    return JSONResponse(
-        status_code=200,  # Sheets-safe
-        content={
-            "status": "error",
-            "error": str(exc),
-            "path": request.url.path,
-            "time_utc": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+def _as_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    # Pydantic v2
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    # Pydantic v1
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    # last resort
+    return {"value": obj}
 
-# ---------------------------------------------------------------------
-# Routers (defensive imports)
-# ---------------------------------------------------------------------
-def _include_router_safely(import_path: str, attrs: Iterable[str] = ("router",)) -> bool:
+
+async def _engine_get_quote(symbol: str) -> Dict[str, Any]:
     """
-    Tries importing a module and including its router.
-    Returns True if mounted.
+    Tries v2 engine first, then legacy v1 engine.
+    Always returns a dict and NEVER raises to the caller.
     """
+    # 1) v2 engine
     try:
-        module = __import__(import_path, fromlist=list(attrs))
-    except Exception as e:
-        logger.warning("Router not mounted (%s): %s", import_path, e)
-        return False
+        from core.data_engine_v2 import DataEngine  # type: ignore
+        eng = DataEngine()
+        res = await eng.get_enriched_quote(symbol)
+        d = _as_dict(res)
+        if d:
+            return d
+    except Exception:
+        pass
 
-    for attr in attrs:
-        try:
-            candidate = getattr(module, attr, None)
-            if isinstance(candidate, APIRouter):
-                app.include_router(candidate)
-                logger.info("Mounted router: %s.%s", import_path, attr)
-                return True
-        except Exception as e:
-            logger.warning("Failed mounting %s.%s: %s", import_path, attr, e)
-
-    # Optional pattern: module.register(app)
+    # 2) legacy v1 engine (module-level or class wrapper)
     try:
-        reg = getattr(module, "register", None)
-        if callable(reg):
-            reg(app)
-            logger.info("Mounted via register(): %s.register(app)", import_path)
-            return True
-    except Exception as e:
-        logger.warning("Failed register() in %s: %s", import_path, e)
+        from core import data_engine as de  # type: ignore
 
-    logger.warning("Router not mounted (%s): no router found", import_path)
-    return False
+        if hasattr(de, "get_enriched_quote"):
+            res = await de.get_enriched_quote(symbol)
+            d = _as_dict(res)
+            if d:
+                return d
 
-# Preferred routers
-_include_router_safely("routes.enriched_quote")
-_include_router_safely("routes.ai_analysis")
-_include_router_safely("routes.advanced_analysis")
-_include_router_safely("routes_argaam")
+        if hasattr(de, "DataEngine"):
+            eng = de.DataEngine()
+            if hasattr(eng, "get_enriched_quote"):
+                res = await eng.get_enriched_quote(symbol)
+                d = _as_dict(res)
+                if d:
+                    return d
+    except Exception:
+        pass
 
-# Legacy router: support BOTH module locations
-# 1) routes/legacy_service.py
-# 2) legacy_service.py (repo root)
-if not _include_router_safely("routes.legacy_service"):
-    _include_router_safely("legacy_service")
-
-# ---------------------------------------------------------------------
-# Root + Health + UI
-# ---------------------------------------------------------------------
-@app.get("/")
-async def root() -> Dict[str, Any]:
+    # Safe fallback
     return {
-        "status": "ok",
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "env": settings.app_env,
-        "engine": "DataEngineV2",
-        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "market": "KSA" if symbol.endswith(".SR") or symbol.isdigit() else None,
+        "error": "MISSING: quote engine returned no data",
+        "data_quality": "MISSING",
+        "last_updated_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-# IMPORTANT: Render sends HEAD / sometimes -> avoid 405 noise
-@app.head("/")
-async def root_head() -> Response:
-    return Response(status_code=200)
 
-@app.get("/health")
-async def health() -> Dict[str, Any]:
+@router.get("/health")
+async def enriched_health():
     return {
         "status": "ok",
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "env": settings.app_env,
         "time_utc": datetime.now(timezone.utc).isoformat(),
+        "max_tickers": int(getattr(settings, "ENRICHED_MAX_TICKERS", 250)),
+        "batch_concurrency": int(getattr(settings, "ENRICHED_BATCH_CONCURRENCY", 5)),
     }
 
-@app.head("/health")
-async def health_head() -> Response:
-    return Response(status_code=200)
 
-@app.get("/ui")
-async def ui():
-    path = os.path.join(os.path.dirname(__file__), "index.html")
-    if os.path.exists(path):
-        return FileResponse(path, media_type="text/html")
-    return JSONResponse(status_code=404, content={"detail": "index.html not found in service root"})
+@router.get("/quote")
+async def enriched_quote(symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. 1120.SR or AAPL")):
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    return await _engine_get_quote(sym)
 
-# ---------------------------------------------------------------------
-# Startup log
-# ---------------------------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
-    logger.info("==============================================")
-    logger.info("🚀 %s starting", settings.app_name)
-    logger.info("   Env: %s | Version: %s", settings.app_env, settings.app_version)
-    logger.info("   Providers: %s", ",".join(settings.enabled_providers or []))
-    logger.info("   CORS all origins: %s", settings.enable_cors_all_origins)
-    logger.info("==============================================")
+
+@router.get("/quotes")
+async def enriched_quotes_get(
+    symbols: str = Query(..., description="Comma-separated symbols, e.g. 1120.SR,AAPL,MSFT"),
+):
+    raw = [x.strip() for x in (symbols or "").split(",")]
+    syms = [_normalize_symbol(x) for x in raw if _normalize_symbol(x)]
+    return await _batch_fetch(syms)
+
+
+@router.post("/quotes")
+async def enriched_quotes_post(body: QuotesBatchRequest):
+    syms = [_normalize_symbol(x) for x in body.symbols if _normalize_symbol(x)]
+    return await _batch_fetch(syms)
+
+
+async def _batch_fetch(symbols: List[str]) -> Dict[str, Any]:
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No symbols provided")
+
+    max_tickers = int(getattr(settings, "ENRICHED_MAX_TICKERS", 250))
+    if len(symbols) > max_tickers:
+        raise HTTPException(status_code=400, detail=f"Too many symbols. Max={max_tickers}")
+
+    concurrency = max(1, int(getattr(settings, "ENRICHED_BATCH_CONCURRENCY", 5)))
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(sym: str) -> Dict[str, Any]:
+        async with sem:
+            return await _engine_get_quote(sym)
+
+    results = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
+
+    out: List[Dict[str, Any]] = []
+    for sym, r in zip(symbols, results):
+        if isinstance(r, Exception):
+            out.append(
+                {
+                    "symbol": sym,
+                    "error": f"ERROR: {type(r).__name__}",
+                    "data_quality": "MISSING",
+                    "last_updated_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        else:
+            out.append(r)
+
+    return {
+        "count": len(out),
+        "symbols": symbols,
+        "items": out,
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+    }
