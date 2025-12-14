@@ -1,5 +1,14 @@
-# render.yaml
-# Tadawul Fast Bridge – Render Blueprint (aligned with env.py v4.6.0+)
+# ============================================================
+# render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
+# Aligned with env.py / config.py (v4.6.0+)
+# ============================================================
+# Key design:
+# - Use Render's runtime.txt as source of Python version.
+# - Keep startCommand minimal & stable (Procfile is optional on Render,
+#   but we keep both consistent).
+# - Explicit healthCheckPath for Render health checks.
+# - All secrets use sync:false (set them in Render Dashboard).
+# ============================================================
 
 services:
   - type: web
@@ -9,12 +18,16 @@ services:
     autoDeploy: true
 
     buildCommand: pip install -r requirements.txt
+
     startCommand: >
       uvicorn main:app
       --host 0.0.0.0
       --port $PORT
       --proxy-headers
       --forwarded-allow-ips="*"
+      --timeout-keep-alive ${UVICORN_KEEPALIVE:-75}
+      --log-level ${LOG_LEVEL:-info}
+      --workers ${WEB_CONCURRENCY:-1}
 
     healthCheckPath: /health
 
@@ -22,10 +35,14 @@ services:
       # -------------------------
       # Runtime
       # -------------------------
-      - key: PYTHON_VERSION
-        value: 3.11.9
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: UVICORN_KEEPALIVE
+        value: "75"
+      - key: LOG_LEVEL
+        value: "info"
 
       # -------------------------
       # App identity
@@ -36,8 +53,6 @@ services:
         value: 4.6.0
       - key: APP_ENV
         value: production
-      - key: LOG_LEVEL
-        value: INFO
 
       # If your Sheets/clients call the same service, keep it explicit:
       - key: BACKEND_BASE_URL
@@ -54,11 +69,17 @@ services:
       # -------------------------
       # Providers policy
       # -------------------------
-      # Keep EODHD disabled for KSA (engine already enforces KSA-safe routing)
+      # IMPORTANT:
+      # - KSA (.SR / numeric) must be routed to Tadawul/Argaam only
+      # - Avoid relying on Yahoo for KSA (often blocked / incomplete)
       - key: ENABLED_PROVIDERS
-        value: "fmp,yfinance"
+        value: "eodhd,finnhub"
       - key: PRIMARY_PROVIDER
-        value: "fmp"
+        value: "finnhub"
+      - key: KSA_PROVIDERS
+        value: "tadawul,argaam"
+      - key: KSA_DISALLOW_EODHD
+        value: "true"
       - key: ENABLE_YFINANCE
         value: "true"
 
@@ -72,15 +93,11 @@ services:
       - key: ALPHA_VANTAGE_API_KEY
         sync: false
 
-      # Optional Argaam gateway (only if you later add a separate gateway/service)
+      # Argaam (optional)
       - key: ARGAAM_GATEWAY_URL
         value: ""
       - key: ARGAAM_API_KEY
         sync: false
-
-      # Informational flag (not required if code already blocks EODHD for .SR)
-      - key: KSA_DISALLOW_EODHD
-        value: "true"
 
       # -------------------------
       # HTTP + caching
@@ -155,7 +172,7 @@ services:
         value: "true"
 
       # -------------------------
-      # Sheet names (keep aligned with your GAS pages)
+      # Sheet names (align with GAS)
       # -------------------------
       - key: SHEET_KSA_TADAWUL
         value: KSA_Tadawul_Market
