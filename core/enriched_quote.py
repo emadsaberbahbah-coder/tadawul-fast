@@ -1,7 +1,8 @@
+# core/enriched_quote.py
 """
 core/enriched_quote.py
 ===============================================
-Enriched Quote schema & Google Sheets Row Adapter - v1.7 (HARDENED)
+Enriched Quote schema & Google Sheets Row Adapter - v1.8 (PROD SAFE)
 
 Purpose
 -------
@@ -9,16 +10,14 @@ Purpose
 - Convert UnifiedQuote (or dict) -> EnrichedQuote
 - Convert EnrichedQuote -> Google Sheets row based on a header list.
 
-Key upgrades (v1.7)
+Key upgrades (v1.8)
 -------------------
-- Works with BOTH naming styles in engines:
-    * current_price  vs last_price
-    * percent_change vs change_percent
-    * price_change   vs change
-- Computes "Last Updated (Riyadh)" safely from UTC when missing.
-- Uses one-time model_dump() for speed + supports Pydantic extras.
-- Strong header normalization (%, (), 52W, 30D, Arabic digits, punctuation).
-- Safe cell serialization (NaN/Inf -> None, dict/list -> JSON, datetime -> ISO).
+- Riyadh timezone fallback is UTC+3 (not UTC).
+- Stronger ISO parsing (supports "Z", space separator, unix seconds).
+- One-time model_dump() + merges Pydantic extras safely.
+- Header normalization hardened for punctuation, Arabic digits, 52W/30D tokens.
+- Alias lookup supports both engine naming styles (current_price vs last_price, etc.).
+- Safe cell serialization for Sheets (NaN/Inf -> None, dict/list -> JSON, datetime -> ISO).
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -52,21 +51,28 @@ try:
     from zoneinfo import ZoneInfo  # py3.9+
     _RIYADH_TZ = ZoneInfo("Asia/Riyadh")
 except Exception:  # pragma: no cover
-    _RIYADH_TZ = timezone.utc  # last resort
+    _RIYADH_TZ = timezone(timedelta(hours=3))  # ✅ last resort: UTC+3
 
 
 def _parse_iso_dt(value: Any) -> Optional[datetime]:
     """Parse common ISO strings safely to datetime (UTC-aware if possible)."""
     if value is None:
         return None
+
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, (int, float)) and not math.isnan(value) and not math.isinf(value):
-        # treat as unix seconds if reasonable
+
+    # unix seconds (or ms if too large)
+    if isinstance(value, (int, float)) and not math.isnan(float(value)) and not math.isinf(float(value)):
         try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            v = float(value)
+            # heuristic: ms timestamps
+            if v > 2_000_000_000_000:
+                v = v / 1000.0
+            return datetime.fromtimestamp(v, tz=timezone.utc)
         except Exception:
             return None
+
     if not isinstance(value, str):
         return None
 
@@ -74,11 +80,14 @@ def _parse_iso_dt(value: Any) -> Optional[datetime]:
     if not s:
         return None
 
-    # normalize Z suffix
+    # normalize "Z"
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
 
-    # fromisoformat handles "YYYY-MM-DDTHH:MM:SS(.ffffff)(+HH:MM)"
+    # support "YYYY-MM-DD HH:MM:SS" by converting space to "T"
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+
     try:
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -102,8 +111,6 @@ def _to_riyadh_iso(dt_utc: Optional[datetime]) -> Optional[str]:
 # =============================================================================
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-
-# common unicode dashes & separators
 _DASHES = {"–": "-", "—": "-", "−": "-"}
 
 @lru_cache(maxsize=4096)
@@ -125,21 +132,18 @@ def _normalize_header_name(name: str) -> str:
     for k, v in _DASHES.items():
         s = s.replace(k, v)
 
-    # Preserve percent meaning
     s = s.replace("%", " percent ")
-
-    # Common replacements
     s = s.replace("&", " and ")
 
-    # Remove brackets
+    # remove brackets
     s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
 
-    # Normalize common tokens
+    # normalize common tokens
     s = s.replace("52w", "52_week")
     s = s.replace("30d", "30_day")
     s = s.replace("ttm", "ttm")
 
-    # punctuation to spaces
+    # punctuation -> spaces
     s = re.sub(r"[,:;|]", " ", s)
     s = s.replace("/", " ").replace("\\", " ").replace("-", " ").replace(".", " ")
 
@@ -152,9 +156,6 @@ def _normalize_header_name(name: str) -> str:
 # =============================================================================
 # Header -> Field mapping
 # =============================================================================
-# IMPORTANT:
-# Keys MUST be normalized-form keys (output of _normalize_header_name).
-# Values are the *preferred* attribute names (we also try aliases at runtime).
 
 _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     # Identity
@@ -173,7 +174,7 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("listing_date", "listing_date"),
 
     # Prices
-    ("last_price", "current_price"),          # will also try last_price via alias map
+    ("last_price", "current_price"),
     ("current_price", "current_price"),
     ("price", "current_price"),
     ("previous_close", "previous_close"),
@@ -183,9 +184,9 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
     ("day_low", "day_low"),
     ("high", "day_high"),
     ("low", "day_low"),
-    ("price_change", "price_change"),         # will also try "change"
+    ("price_change", "price_change"),
     ("change", "price_change"),
-    ("percent_change", "percent_change"),     # will also try "change_percent"
+    ("percent_change", "percent_change"),
     ("change_percent", "percent_change"),
     ("high_52_week", "high_52w"),
     ("low_52_week", "low_52w"),
@@ -287,37 +288,25 @@ _HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
 
 _HEADER_FIELD_MAP: Dict[str, str] = dict(sorted(_HEADER_FIELD_PAIRS, key=lambda kv: kv[0]))
 
-# Field aliases: if the preferred field doesn't exist in the data, try these.
+# Preferred field -> acceptable aliases in data dict
 _FIELD_ALIASES: Dict[str, List[str]] = {
-    # prices
     "current_price": ["last_price", "price", "last", "close"],
     "price_change": ["change", "delta", "price_delta"],
     "percent_change": ["change_percent", "pct_change", "percent", "delta_percent"],
-
-    # 52w
     "high_52w": ["high52w", "fifty_two_week_high", "52w_high"],
     "low_52w": ["low52w", "fifty_two_week_low", "52w_low"],
     "position_52w_percent": ["52w_position", "position_52w", "fifty_two_week_position_percent"],
-
-    # timestamps
     "last_updated_utc": ["updated_at_utc", "timestamp_utc", "last_update_utc", "last_updated"],
     "last_updated_riyadh": ["updated_at_riyadh", "timestamp_riyadh", "last_updated_local"],
 }
 
+
 @lru_cache(maxsize=4096)
 def _field_name_for_header(header: str) -> str:
-    """
-    Determine the field name for a given header.
-
-    Resolution order:
-    1) Normalized header -> explicit mapping
-    2) Normalized header as-is (caller may pass raw field)
-    """
     norm = _normalize_header_name(header)
     if not norm:
         return ""
-    mapped = _HEADER_FIELD_MAP.get(norm)
-    return mapped or norm
+    return _HEADER_FIELD_MAP.get(norm) or norm
 
 
 # =============================================================================
@@ -330,15 +319,8 @@ def _safe_json_dumps(value: Any) -> str:
     except Exception:
         return str(value)
 
+
 def _serialize_value(value: Any) -> Any:
-    """
-    Prepare a value for Google Sheets:
-    - datetime/date -> ISO string
-    - Decimal -> float
-    - NaN/Inf -> None
-    - dict/list/tuple -> JSON string
-    - bool -> TRUE/FALSE (Sheets-friendly)
-    """
     if value is None:
         return None
 
@@ -377,7 +359,6 @@ def _get_from_data(data: Dict[str, Any], key: str) -> Any:
     if key in data:
         return data.get(key)
 
-    # alias lookup
     for alt in _FIELD_ALIASES.get(key, []):
         if alt in data:
             return data.get(alt)
@@ -392,16 +373,11 @@ def _get_from_data(data: Dict[str, Any], key: str) -> Any:
 class EnrichedQuote(UnifiedQuote):
     """
     Sheet-friendly view of UnifiedQuote.
-
-    - Inherits ALL fields from UnifiedQuote.
-    - Adds:
-        • from_unified() -> build from UnifiedQuote or dict
-        • to_row(headers) -> convert to Google Sheets row aligned with headers
     """
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
-        extra="allow",  # tolerate new provider keys without breaking
+        extra="allow",
     )
 
     @classmethod
@@ -417,24 +393,27 @@ class EnrichedQuote(UnifiedQuote):
             data = dict(getattr(quote, "__dict__", {}) or {})
             data.setdefault("symbol", getattr(quote, "symbol", "UNKNOWN"))
             data.setdefault("error", "Unable to convert quote to dict")
+
         return cls(**data)
 
     def _dump_for_row(self) -> Dict[str, Any]:
-        """Single dump to support Pydantic extras + consistent access."""
+        # One-time dump (includes standard fields)
         try:
-            data = self.model_dump(exclude_none=False)  # type: ignore[attr-defined]
+            data: Dict[str, Any] = self.model_dump(exclude_none=False)  # type: ignore[attr-defined]
         except Exception:
             data = dict(getattr(self, "__dict__", {}) or {})
 
-        # If Pydantic v2 extras exist, merge them
+        # Merge Pydantic v2 extras if present (don’t overwrite explicit)
         extra = getattr(self, "__pydantic_extra__", None)
         if isinstance(extra, dict):
-            # do not overwrite explicit fields
             for k, v in extra.items():
                 data.setdefault(k, v)
 
-        # Compute Riyadh timestamp if missing but UTC is present
-        if "last_updated_riyadh" not in data or not data.get("last_updated_riyadh"):
+        # Ensure symbol at least
+        data.setdefault("symbol", getattr(self, "symbol", None) or "UNKNOWN")
+
+        # Compute Riyadh timestamp if missing but UTC exists
+        if not data.get("last_updated_riyadh"):
             dt_utc = _parse_iso_dt(
                 data.get("last_updated_utc")
                 or data.get("updated_at_utc")
@@ -448,10 +427,6 @@ class EnrichedQuote(UnifiedQuote):
         return data
 
     def to_row(self, headers: Sequence[str]) -> List[Any]:
-        """
-        Convert this EnrichedQuote into a row aligned with the given headers.
-        Unknown headers => None. Never raises.
-        """
         data = self._dump_for_row()
         row: List[Any] = []
 
@@ -461,7 +436,6 @@ class EnrichedQuote(UnifiedQuote):
 
             value = _get_from_data(data, field)
 
-            # fallback: sometimes header itself equals a model key after normalization
             if value is None:
                 raw = _normalize_header_name(h)
                 value = _get_from_data(data, raw)
