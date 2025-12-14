@@ -1,12 +1,13 @@
 """
 core/schemas.py
 =================================================
-Core Schemas + Google Sheets Header Templates – v4.0.1
+Core Schemas + Google Sheets Header Templates – v4.1.0 (HARDENED)
 
 Goals
 - Keep a stable, dashboard-friendly header schema (59 columns).
 - Provide lightweight Pydantic models used across routes/services.
 - Keep `get_headers_for_sheet(sheet_name)` signature (required by routes).
+- Add safer normalization + Riyadh time helper without breaking callers.
 """
 
 from __future__ import annotations
@@ -15,6 +16,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, ConfigDict
+
+# Riyadh is UTC+3 with no DST (safe fixed offset)
+try:
+    from datetime import timedelta
+    RIYADH_TZ = timezone(timedelta(hours=3), name="Asia/Riyadh")
+except Exception:  # ultra-defensive
+    RIYADH_TZ = timezone.utc
 
 
 # =============================================================================
@@ -34,6 +42,47 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def riyadh_now() -> datetime:
+    return datetime.now(RIYADH_TZ)
+
+
+def to_riyadh(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(RIYADH_TZ)
+    except Exception:
+        return None
+
+
+def normalize_sheet_name(name: Optional[str]) -> str:
+    """
+    Normalize sheet names so callers can pass:
+      - different casing
+      - extra spaces
+      - hyphen/space variants
+
+    We keep your canonical names (e.g. Global_Markets) but normalize input.
+    """
+    if not name:
+        return ""
+    s = str(name).strip()
+    if not s:
+        return ""
+    # unify whitespace
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_symbol(sym: Optional[str]) -> str:
+    if not sym:
+        return ""
+    s = str(sym).strip().upper()
+    return s
+
+
 # =============================================================================
 # Common Request / Response Models
 # =============================================================================
@@ -45,6 +94,11 @@ class TickerRequest(BaseSchema):
         description="Optional provider hint (engine still auto-routes).",
     )
 
+    # Convenience property (non-breaking)
+    @property
+    def symbol(self) -> str:
+        return normalize_symbol(self.ticker)
+
 
 class MarketData(BaseSchema):
     symbol: str
@@ -55,6 +109,10 @@ class MarketData(BaseSchema):
     volume: Optional[float] = None
     timestamp_utc: datetime = Field(default_factory=utc_now)
 
+    @property
+    def timestamp_riyadh(self) -> Optional[datetime]:
+        return to_riyadh(self.timestamp_utc)
+
 
 class AIAnalysisResponse(BaseSchema):
     symbol: str
@@ -62,6 +120,10 @@ class AIAnalysisResponse(BaseSchema):
     confidence_score: float = Field(..., ge=0, le=100)
     reasoning: str
     generated_at_utc: datetime = Field(default_factory=utc_now)
+
+    @property
+    def generated_at_riyadh(self) -> Optional[datetime]:
+        return to_riyadh(self.generated_at_utc)
 
 
 class ScoredQuote(BaseSchema):
@@ -80,6 +142,17 @@ class BatchProcessRequest(BaseSchema):
     symbols: List[str] = Field(default_factory=list)
     operation: str = Field(default="full_scan", description="full_scan, quick_price, ai_analysis")
     sheet_name: Optional[str] = Field(default=None, description="Optional sheet name for header selection")
+
+    @property
+    def normalized_symbols(self) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for s in self.symbols or []:
+            ns = normalize_symbol(s)
+            if ns and ns not in seen:
+                seen.add(ns)
+                out.append(ns)
+        return out
 
 
 # =============================================================================
@@ -149,6 +222,27 @@ DEFAULT_HEADERS_59: List[str] = [
     "Last Updated (Riyadh)",
 ]
 
+# Aliases map: normalize common variations to canonical keys
+_SHEET_ALIASES: Dict[str, str] = {
+    # canonical / common
+    "KSA_Tadawul": "KSA_Tadawul",
+    "KSA_Tadawul_Market": "KSA_Tadawul_Market",
+    "Global_Markets": "Global_Markets",
+    "Mutual_Funds": "Mutual_Funds",
+    "Commodities_FX": "Commodities_FX",
+    "My_Portfolio": "My_Portfolio",
+    "My_Portfolio_Investment": "My_Portfolio_Investment",
+    "Market_Leaders": "Market_Leaders",
+    # spacing / hyphen variants (input only)
+    "KSA Tadawul": "KSA_Tadawul",
+    "KSA Tadawul Market": "KSA_Tadawul_Market",
+    "Global Markets": "Global_Markets",
+    "Mutual Funds": "Mutual_Funds",
+    "Commodities FX": "Commodities_FX",
+    "My Portfolio": "My_Portfolio",
+    "Market Leaders": "Market_Leaders",
+}
+
 # Sheet-specific variants (currently all share the same canonical template).
 SHEET_HEADERS: Dict[str, List[str]] = {
     "KSA_Tadawul": DEFAULT_HEADERS_59,
@@ -168,7 +262,7 @@ def get_headers_for_sheet(sheet_name: str | None = None) -> List[str]:
 
     Required by:
     - routes_argaam.py
-    - enriched_quote.py
+    - routes/enriched_quote.py (and others)
 
     Unknown sheet names fall back to the canonical 59-column template.
     Returned list is a COPY (safe for callers to mutate).
@@ -176,9 +270,29 @@ def get_headers_for_sheet(sheet_name: str | None = None) -> List[str]:
     if not sheet_name:
         return list(DEFAULT_HEADERS_59)
 
-    key = str(sheet_name).strip()
+    raw = normalize_sheet_name(sheet_name)
+    key = _SHEET_ALIASES.get(raw, raw)
+
     return list(SHEET_HEADERS.get(key, DEFAULT_HEADERS_59))
 
 
 # Backward-compat alias (some older code may import this name)
 get_sheet_headers = get_headers_for_sheet
+
+__all__ = [
+    "BaseSchema",
+    "TickerRequest",
+    "MarketData",
+    "AIAnalysisResponse",
+    "ScoredQuote",
+    "BatchProcessRequest",
+    "DEFAULT_HEADERS_59",
+    "SHEET_HEADERS",
+    "get_headers_for_sheet",
+    "get_sheet_headers",
+    "utc_now",
+    "riyadh_now",
+    "to_riyadh",
+    "normalize_sheet_name",
+    "normalize_symbol",
+]
