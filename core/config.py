@@ -1,8 +1,9 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
-from functools import lru_cache
-from typing import List, Optional, Union
 import json
+from typing import List, Optional, Union
+from functools import lru_cache
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """
@@ -18,13 +19,14 @@ class Settings(BaseSettings):
     PYTHON_VERSION: str = "3.11.9"
 
     # --- Security & Connectivity ---
-    APP_TOKEN: Optional[str] = None  # Secret token for internal auth
+    APP_TOKEN: Optional[str] = None
     ENABLE_CORS_ALL_ORIGINS: bool = True
     HTTP_TIMEOUT_SEC: int = 25
 
     # --- Market Data Providers ---
-    # Validates comma-separated strings (e.g., "eodhd,fmp") from Render
-    ENABLED_PROVIDERS: List[str] = ["eodhd", "fmp", "yfinance"]
+    # CRITICAL FIX: We use Union[str, List[str]] to prevent Pydantic 
+    # from crashing when it sees a comma-separated string in Render.
+    ENABLED_PROVIDERS: Union[str, List[str]] = ["eodhd", "fmp", "yfinance"]
     PRIMARY_PROVIDER: str = "eodhd"
     
     # API Keys (Secrets)
@@ -55,21 +57,25 @@ class Settings(BaseSettings):
     @classmethod
     def parse_providers_list(cls, v: Union[str, List[str]]) -> List[str]:
         """
-        Fixes the Render env var issue. 
-        Converts 'eodhd,fmp,yfinance' string into a real Python list.
+        Parses the environment variable into a list.
+        Handles:
+        1. JSON strings: '["a", "b"]'
+        2. Comma-separated strings: 'a,b,c'
+        3. Existing lists
         """
         if isinstance(v, str):
-            # Check if empty
-            if not v.strip():
+            v = v.strip()
+            if not v:
                 return []
-            # Check if it's already JSON (starts with [)
-            if v.strip().startswith("["):
+            
+            # Try JSON first (e.g. if user entered ["eodhd", "fmp"])
+            if v.startswith("[") and v.endswith("]"):
                 try:
                     return json.loads(v)
                 except json.JSONDecodeError:
-                    pass # Fallback to split if JSON fails
+                    pass
             
-            # Default: Split by comma
+            # Fallback: Split by comma (e.g. eodhd,fmp)
             return [item.strip() for item in v.split(",") if item.strip()]
             
         return v
