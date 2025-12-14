@@ -4,46 +4,52 @@ core/scoring_engine.py
 Lightweight scoring engine for assets in the
 Ultimate Investment Dashboard.
 
-Produces:
+Produces (0–100):
 - Value Score
 - Quality Score
 - Momentum Score
 - Opportunity Score
 - Overall Score
 - Recommendation
-- Confidence
+- Confidence (0–100)
 
-All scores are 0–100.
+Design goals
+------------
+- Extremely defensive: NEVER raises due to missing fields.
+- Provider-agnostic: normalizes decimals vs percents (0.05 vs 5.0).
+- Aligned with core.data_engine_v2 / core.enriched_quote field names.
+- Transparent heuristics (easy to adjust).
 
 Usage
 -----
-    from core.enriched_quote import EnrichedQuote
-    from core.scoring_engine import enrich_with_scores, compute_scores
+from core.enriched_quote import EnrichedQuote
+from core.scoring_engine import enrich_with_scores
 
-    q = EnrichedQuote(symbol="1120.SR", current_price=100.0, ...)
-    q_with_scores = enrich_with_scores(q)
-    # q_with_scores.value_score, q_with_scores.recommendation, ...
-
-This module is intentionally simple & transparent so we
-can easily adjust the logic as you see real results.
+q = EnrichedQuote(symbol="1120.SR", current_price=100.0, pe_ttm=12, roe=0.18)
+q2 = enrich_with_scores(q)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 try:
+    # Works for pydantic v2 as well
     from pydantic import BaseModel, Field
-except ImportError:
-    # Fallback for environments without pydantic installed
-    class BaseModel:
+except Exception:  # pragma: no cover
+    # Minimal fallback if pydantic is unavailable (avoid crash)
+    class BaseModel:  # type: ignore
         pass
-    def Field(default, **kwargs):
+
+    def Field(default, **kwargs):  # type: ignore
         return default
 
 from .enriched_quote import EnrichedQuote
 
 
+# =============================================================================
+# Output model
+# =============================================================================
 class AssetScores(BaseModel):
     value_score: float = Field(50.0, ge=0, le=100)
     quality_score: float = Field(50.0, ge=0, le=100)
@@ -54,78 +60,192 @@ class AssetScores(BaseModel):
     confidence: float = Field(50.0, ge=0, le=100)
 
 
+# =============================================================================
+# Small helpers (defensive)
+# =============================================================================
 def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    """Clamp numeric value into [lo, hi]."""
-    return max(lo, min(hi, value))
+    try:
+        return max(lo, min(hi, float(value)))
+    except Exception:
+        return 50.0
+
+
+def _get(q: Any, field: str, default=None):
+    try:
+        return getattr(q, field)
+    except Exception:
+        return default
+
+
+def _as_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        # handle "5%" / "1,234" etc.
+        if isinstance(v, str):
+            s = v.strip().replace(",", "").replace("%", "")
+            if s == "" or s == "-" or s.lower() == "na":
+                return None
+            return float(s)
+        return float(v)
+    except Exception:
+        return None
 
 
 def _to_percent(val: Optional[float]) -> Optional[float]:
     """
-    Normalize value to a percentage (0-100 scale).
+    Normalize value into percent scale (0–100).
     Heuristic:
-    - If None, return None.
-    - If abs(val) <= 1.0 (e.g. 0.15), treat as decimal -> return 15.0
-    - If abs(val) > 1.0 (e.g. 15.0), treat as percent -> return 15.0
-    
-    This handles inconsistencies between providers (FMP often returns 0.05, EODHD 5.0).
+    - None -> None
+    - abs(val) <= 1.0 : treat as decimal fraction (0.15 -> 15.0)
+    - abs(val) > 1.0  : treat as already percent (15.0 -> 15.0)
     """
     if val is None:
         return None
-    if abs(val) <= 1.0 and val != 0.0:
-        return val * 100.0
-    return val
+    try:
+        v = float(val)
+    except Exception:
+        return None
+    # keep exact zero as zero
+    if v == 0.0:
+        return 0.0
+    if abs(v) <= 1.0:
+        return v * 100.0
+    return v
 
 
+def _normalize_pct_like(val: Optional[float]) -> Optional[float]:
+    """
+    Same as _to_percent, but allows small daily changes like 0.4 (meaning 0.4%)
+    to pass unchanged if you consider it already percent.
+    Many feeds give daily % as percent already (e.g., 0.42 means 0.42%).
+    We treat <= 1.0 as decimal ONLY if it's clearly a fraction (like 0.05 for 5%).
+    So:
+      0.05 -> 5.0
+      0.4  -> 0.4  (likely already percent)
+    """
+    if val is None:
+        return None
+    v = _as_float(val)
+    if v is None:
+        return None
+    if v == 0.0:
+        return 0.0
+    # if very small, assume fraction (0.01=1%)
+    if abs(v) < 0.2:
+        return v * 100.0
+    return v
+
+
+def _compute_upside_percent(q: EnrichedQuote) -> Optional[float]:
+    """
+    If upside_percent is missing but fair_value and current_price exist,
+    compute upside%.
+    """
+    up = _as_float(_get(q, "upside_percent", None))
+    if up is not None:
+        # normalize fraction if needed
+        return _to_percent(up) if abs(up) <= 1.0 else up
+
+    fv = _as_float(_get(q, "fair_value", None))
+    cp = _as_float(_get(q, "current_price", None)) or _as_float(_get(q, "last_price", None))
+    if fv is None or cp is None or cp == 0:
+        return None
+    return ((fv - cp) / cp) * 100.0
+
+
+def _data_quality_to_confidence_cap(label: Optional[str]) -> float:
+    """
+    Caps confidence based on data_quality label.
+    """
+    if not label:
+        return 80.0
+    dq = str(label).strip().upper()
+    if dq == "FULL":
+        return 100.0
+    if dq == "PARTIAL":
+        return 70.0
+    if dq == "STALE":
+        return 55.0
+    if dq == "MISSING":
+        return 0.0
+    return 80.0
+
+
+# =============================================================================
+# Main scoring
+# =============================================================================
 def compute_scores(q: EnrichedQuote) -> AssetScores:
     """
     Basic heuristic scoring for one asset.
-    Strictly aligned with core.data_engine_v2.UnifiedQuote fields.
+    Uses only fields that may exist; never raises if fields are missing.
     """
+
+    # Pull fields defensively
+    pe_ttm = _as_float(_get(q, "pe_ttm", None))
+    pb = _as_float(_get(q, "pb", None))
+    dividend_yield = _as_float(_get(q, "dividend_yield", None))
+    roe = _as_float(_get(q, "roe", None))
+    roa = _as_float(_get(q, "roa", None))
+    net_margin = _as_float(_get(q, "net_margin", None))
+    debt_to_equity = _as_float(_get(q, "debt_to_equity", None))
+    revenue_growth = _as_float(_get(q, "revenue_growth", None))
+    net_income_growth = _as_float(_get(q, "net_income_growth", None))
+
+    current_price = _as_float(_get(q, "current_price", None)) or _as_float(_get(q, "last_price", None))
+    percent_change = _as_float(_get(q, "percent_change", None)) or _as_float(_get(q, "change_percent", None))
+
+    ma20 = _as_float(_get(q, "ma20", None))
+    ma50 = _as_float(_get(q, "ma50", None))
+
+    high_52w = _as_float(_get(q, "high_52w", None))
+    low_52w = _as_float(_get(q, "low_52w", None))
+
+    rsi_14 = _as_float(_get(q, "rsi_14", None))
+    volatility_30d = _as_float(_get(q, "volatility_30d", None))
+
+    data_quality = str(_get(q, "data_quality", "MISSING") or "MISSING").strip().upper()
+
+    upside_percent = _compute_upside_percent(q)
 
     # ------------------------------------------------------------------
     # VALUE SCORE
     # ------------------------------------------------------------------
     value_score = 50.0
 
-    # P/E Ratio (pe_ttm)
-    # Lower is typically better (but > 0)
-    if q.pe_ttm is not None and q.pe_ttm > 0:
-        pe = q.pe_ttm
-        if pe < 10:
+    # P/E
+    if pe_ttm is not None and pe_ttm > 0:
+        if pe_ttm < 10:
             value_score += 20
-        elif pe < 20:
+        elif pe_ttm < 20:
             value_score += 10
-        elif pe > 40:
+        elif pe_ttm > 40:
             value_score -= 15
-        elif pe > 25:
+        elif pe_ttm > 25:
             value_score -= 5
-    
-    # P/B Ratio (pb)
-    if q.pb is not None and q.pb > 0:
-        if q.pb < 1.0:
+
+    # P/B
+    if pb is not None and pb > 0:
+        if pb < 1.0:
             value_score += 10
-        elif q.pb > 5.0:
+        elif pb > 5.0:
             value_score -= 5
 
     # Dividend yield
-    dy = _to_percent(q.dividend_yield)
+    dy = _to_percent(dividend_yield)
     if dy is not None and dy > 0:
         if 2.0 <= dy <= 6.0:
             value_score += 10
         elif dy > 6.0:
-            value_score += 5 # High yield, good but maybe risky
+            value_score += 5
         elif dy < 1.0:
             value_score -= 2
 
-    # Upside vs fair value (if provided)
-    # Note: upside_percent is usually pre-calculated in data engine V2 if target prices exist
-    if q.upside_percent is not None:
-        up = q.upside_percent # Assuming this is already a percentage-like number (e.g. 20 for 20%) or decimal
-        # Normalize if decimal
-        if abs(up) < 1.0 and up != 0: up = up * 100.0
-        
+    # Upside contribution
+    if upside_percent is not None:
+        up = float(upside_percent)
         if up > 0:
-            value_score += min(20.0, up / 2.0) # Cap contribution
+            value_score += min(20.0, up / 2.0)
         elif up < 0:
             value_score -= min(15.0, abs(up) / 2.0)
 
@@ -136,31 +256,29 @@ def compute_scores(q: EnrichedQuote) -> AssetScores:
     # ------------------------------------------------------------------
     quality_score = 50.0
 
-    # ROE (Return on Equity)
-    roe = _to_percent(q.roe)
-    if roe is not None:
-        if roe > 20:
+    roe_p = _to_percent(roe)
+    if roe_p is not None:
+        if roe_p > 20:
             quality_score += 20
-        elif roe > 15:
+        elif roe_p > 15:
             quality_score += 15
-        elif roe > 10:
+        elif roe_p > 10:
             quality_score += 5
-        elif roe < 0:
+        elif roe_p < 0:
             quality_score -= 15
 
-    # Net Margin
-    nm = _to_percent(q.net_margin)
-    if nm is not None:
-        if nm > 20:
+    nm_p = _to_percent(net_margin)
+    if nm_p is not None:
+        if nm_p > 20:
             quality_score += 10
-        elif nm > 10:
+        elif nm_p > 10:
             quality_score += 5
-        elif nm < 0:
+        elif nm_p < 0:
             quality_score -= 10
 
-    # Debt to Equity
-    if q.debt_to_equity is not None:
-        dte = q.debt_to_equity
+    # Debt/Equity
+    if debt_to_equity is not None:
+        dte = float(debt_to_equity)
         if dte > 2.5:
             quality_score -= 15
         elif dte > 1.5:
@@ -168,16 +286,28 @@ def compute_scores(q: EnrichedQuote) -> AssetScores:
         elif 0 <= dte < 0.5:
             quality_score += 10
 
-    # Growth (Revenue & Net Income)
-    rev_g = _to_percent(q.revenue_growth)
+    # Growth
+    rev_g = _to_percent(revenue_growth)
     if rev_g is not None:
-        if rev_g > 15: quality_score += 5
-        elif rev_g < 0: quality_score -= 5
-        
-    ni_g = _to_percent(q.net_income_growth)
+        if rev_g > 15:
+            quality_score += 5
+        elif rev_g < 0:
+            quality_score -= 5
+
+    ni_g = _to_percent(net_income_growth)
     if ni_g is not None:
-        if ni_g > 15: quality_score += 5
-        elif ni_g < 0: quality_score -= 5
+        if ni_g > 15:
+            quality_score += 5
+        elif ni_g < 0:
+            quality_score -= 5
+
+    # ROA small bonus (optional)
+    roa_p = _to_percent(roa)
+    if roa_p is not None:
+        if roa_p > 8:
+            quality_score += 3
+        elif roa_p < 0:
+            quality_score -= 3
 
     quality_score = _clamp(quality_score)
 
@@ -186,74 +316,69 @@ def compute_scores(q: EnrichedQuote) -> AssetScores:
     # ------------------------------------------------------------------
     momentum_score = 50.0
 
-    # Percent Change (Daily)
-    # data_engine_v2 uses 'percent_change'
-    if q.percent_change is not None:
-        pc = q.percent_change
-        if pc > 3: momentum_score += 5
-        elif pc > 0: momentum_score += 2
-        elif pc < -3: momentum_score -= 5
+    pc = _normalize_pct_like(percent_change)
+    if pc is not None:
+        if pc > 3:
+            momentum_score += 5
+        elif pc > 0:
+            momentum_score += 2
+        elif pc < -3:
+            momentum_score -= 5
 
-    # Price vs Moving Averages (MA20, MA50)
-    cp = q.current_price
-    if cp is not None:
-        if q.ma20 is not None:
-            if cp > q.ma20: momentum_score += 5
-            else: momentum_score -= 5
-        
-        if q.ma50 is not None:
-            if cp > q.ma50: momentum_score += 5
-            else: momentum_score -= 5
-            
-        # 52 Week Position
-        if q.high_52w is not None and q.low_52w is not None and q.high_52w != q.low_52w:
-            pos = (cp - q.low_52w) / (q.high_52w - q.low_52w)
-            if pos > 0.8: momentum_score += 10
-            elif pos < 0.2: momentum_score -= 10
+    if current_price is not None:
+        cp = float(current_price)
 
-    # RSI (Relative Strength Index)
-    if q.rsi_14 is not None:
-        rsi = q.rsi_14
+        if ma20 is not None and ma20 != 0:
+            momentum_score += 5 if cp > ma20 else -5
+
+        if ma50 is not None and ma50 != 0:
+            momentum_score += 5 if cp > ma50 else -5
+
+        # 52w position
+        if high_52w is not None and low_52w is not None and high_52w != low_52w:
+            pos = (cp - low_52w) / (high_52w - low_52w)
+            if pos > 0.8:
+                momentum_score += 10
+            elif pos < 0.2:
+                momentum_score -= 10
+
+    if rsi_14 is not None:
+        rsi = float(rsi_14)
         if rsi > 75:
-            momentum_score -= 10 # Overbought
+            momentum_score -= 10
         elif rsi < 25:
-            momentum_score += 10 # Oversold (mean reversion potential)
+            momentum_score += 10
         elif 50 < rsi < 70:
-            momentum_score += 5  # Strong trend
+            momentum_score += 5
 
     momentum_score = _clamp(momentum_score)
 
     # ------------------------------------------------------------------
-    # RISK & OPPORTUNITY
+    # RISK PENALTY (via volatility)
     # ------------------------------------------------------------------
-    # Risk penalty using volatility
     risk_penalty = 0.0
-    if q.volatility_30d is not None:
-        vol = _to_percent(q.volatility_30d)
-        if vol is not None:
-            if vol > 50: risk_penalty = 15.0
-            elif vol > 30: risk_penalty = 8.0
-            elif vol < 15: risk_penalty = -5.0
+    vol_p = _to_percent(volatility_30d)
+    if vol_p is not None:
+        if vol_p > 50:
+            risk_penalty = 15.0
+        elif vol_p > 30:
+            risk_penalty = 8.0
+        elif vol_p < 15:
+            risk_penalty = -5.0
 
-    # Opportunity = Weighted blend minus risk
-    opportunity_score = (
-        0.4 * value_score
-        + 0.4 * momentum_score
-        + 0.2 * quality_score
-        - risk_penalty
+    # ------------------------------------------------------------------
+    # OPPORTUNITY + OVERALL
+    # ------------------------------------------------------------------
+    opportunity_score = _clamp(
+        0.4 * value_score + 0.4 * momentum_score + 0.2 * quality_score - risk_penalty
     )
-    opportunity_score = _clamp(opportunity_score)
 
-    # Overall score
     overall_score = _clamp(
-        0.3 * value_score
-        + 0.3 * quality_score
-        + 0.3 * momentum_score
-        + 0.1 * opportunity_score
+        0.3 * value_score + 0.3 * quality_score + 0.3 * momentum_score + 0.1 * opportunity_score
     )
 
     # ------------------------------------------------------------------
-    # RECOMMENDATION & CONFIDENCE
+    # RECOMMENDATION
     # ------------------------------------------------------------------
     if overall_score >= 80:
         recommendation = "STRONG BUY"
@@ -266,21 +391,31 @@ def compute_scores(q: EnrichedQuote) -> AssetScores:
     else:
         recommendation = "HOLD"
 
-    # Confidence based on data completeness
-    confidence = 100.0
-    missing_count = 0
-    # Key fields to check
-    check_list = [q.pe_ttm, q.market_cap, q.roe, q.volatility_30d, q.current_price]
-    for field in check_list:
-        if field is None:
-            missing_count += 1
-    
-    confidence -= (missing_count * 15.0)
-    
-    if q.data_quality == "MISSING":
+    # ------------------------------------------------------------------
+    # CONFIDENCE (data completeness + data_quality cap)
+    # ------------------------------------------------------------------
+    # Key fields that make scoring reliable:
+    key_fields = {
+        "current_price": current_price,
+        "market_cap": _as_float(_get(q, "market_cap", None)),
+        "pe_ttm": pe_ttm,
+        "roe": roe,
+        "volatility_30d": volatility_30d,
+        "percent_change": percent_change,
+    }
+    present = sum(1 for _, v in key_fields.items() if v is not None)
+    total = len(key_fields)
+
+    # Base confidence: 40–100 depending on completeness
+    base_conf = 40.0 + (60.0 * (present / total if total else 0.0))
+
+    # Extra penalty if the quote is explicitly missing
+    if data_quality == "MISSING":
         confidence = 0.0
-    elif q.data_quality == "PARTIAL":
-        confidence = min(confidence, 70.0)
+    else:
+        # Cap by quality label
+        cap = _data_quality_to_confidence_cap(data_quality)
+        confidence = min(base_conf, cap)
 
     confidence = _clamp(confidence)
 
@@ -299,22 +434,35 @@ def enrich_with_scores(q: EnrichedQuote) -> EnrichedQuote:
     """
     Return a NEW EnrichedQuote with score fields and recommendation filled.
 
-    This uses Pydantic v2 'model_copy' if available, or 'copy' fallback.
+    - Uses Pydantic v2 'model_copy' when available.
+    - Falls back to v1 '.copy' when needed.
+    - Extra fields are allowed by EnrichedQuote config (extra="allow").
     """
     scores = compute_scores(q)
-    
-    update_data = {
+
+    update_data: Dict[str, Any] = {
         "value_score": scores.value_score,
         "quality_score": scores.quality_score,
         "momentum_score": scores.momentum_score,
         "opportunity_score": scores.opportunity_score,
         "overall_score": scores.overall_score,
         "recommendation": scores.recommendation,
-        # 'confidence' is typically internal, but could be added to 'error' or 'data_quality' logic if needed
+        # This is useful for routers; EnrichedQuote allows extra fields.
+        "confidence": scores.confidence,
     }
-    
+
     if hasattr(q, "model_copy"):
         return q.model_copy(update=update_data)
-    else:
-        # Pydantic v1 fallback or dict
-        return q.copy(update=update_data)
+    if hasattr(q, "copy"):
+        return q.copy(update=update_data)  # type: ignore[attr-defined]
+
+    # last resort: mutate (should rarely happen)
+    for k, v in update_data.items():
+        try:
+            setattr(q, k, v)
+        except Exception:
+            pass
+    return q
+
+
+__all__ = ["AssetScores", "compute_scores", "enrich_with_scores"]
