@@ -1,154 +1,40 @@
-# ============================================================
-# Tadawul Fast Bridge – Render Blueprint Configuration (v4.6.0)
-# Unified KSA + Global market data + Google Sheets integration
-# ============================================================
-
 services:
   - type: web
     name: tadawul-fast-bridge
     env: python
-    plan: starter
-    region: frankfurt
+    plan: free
     autoDeploy: true
 
-    # Build
     buildCommand: pip install -r requirements.txt
 
-    # Start (production-safe behind Render proxy)
-    startCommand: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port $PORT
-      --proxy-headers
-      --forwarded-allow-ips "*"
-      --timeout-keep-alive 75
-      --log-level info
+    # Render expects the app to bind to $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
 
-    # Render health check
     healthCheckPath: /health
 
     envVars:
-      # ------------------------------------------------------
-      # Core application meta (read by config.py / env.py / main.py)
-      # ------------------------------------------------------
-      - key: APP_ENV
-        value: production
-
-      - key: APP_VERSION
-        value: "4.6.0"
+      - key: PYTHON_VERSION
+        value: 3.11.9
 
       - key: APP_NAME
-        value: "Tadawul Fast Bridge"
-
-      # Python version hint for Render (optional; runtime.txt is primary)
-      - key: PYTHON_VERSION
-        value: "3.11.9"
-
-      # Backend base URL used by Sheets/Apps Script
-      - key: BACKEND_BASE_URL
-        value: "https://tadawul-fast-bridge.onrender.com"
-
-      # ------------------------------------------------------
-      # Auth Tokens – used by main.py (require_app_token)
-      # ------------------------------------------------------
-      - key: APP_TOKEN
-        generateValue: true
-
-      - key: BACKUP_APP_TOKEN
-        value: ""
-
-      # If true, API will require X-APP-TOKEN (recommended)
-      - key: HAS_SECURE_TOKEN
-        value: "true"
-
-      # ------------------------------------------------------
-      # Provider configuration – core.data_engine / data_engine_v2
-      # Notes:
-      # - KSA (.SR) must NEVER depend on EODHD.
-      # - EODHD/FMP/Finnhub are for GLOBAL use; KSA uses Argaam/Tadawul logic.
-      # ------------------------------------------------------
-      - key: ENABLED_PROVIDERS
-        value: "eodhd,fmp,yfinance,finnhub"
-
-      - key: PRIMARY_PROVIDER
-        value: "eodhd"
-
-      # Timeouts / retries
-      - key: HTTP_TIMEOUT
-        value: "25"
-
-      - key: MAX_RETRIES
-        value: "2"
-
-      # Engine cache / provider timeouts
-      - key: ENGINE_CACHE_TTL_SECONDS
-        value: "60"
-
-      - key: ENGINE_PROVIDER_TIMEOUT_SECONDS
-        value: "20"
-
-      - key: KSA_ENGINE_CACHE_TTL_SECONDS
-        value: "60"
-
-      - key: ENGINE_ENABLE_ADVANCED_ANALYSIS
-        value: "true"
-
-      # ------------------------------------------------------
-      # EODHD (GLOBAL only — never for .SR)
-      # ------------------------------------------------------
-      - key: EODHD_API_KEY
-        sync: false
-
-      - key: EODHD_BASE_URL
-        value: "https://eodhd.com/api"
-
-      # ------------------------------------------------------
-      # FMP (GLOBAL fundamentals / extra quotes)
-      # ------------------------------------------------------
-      - key: FMP_API_KEY
-        sync: false
-
-      - key: FMP_BASE_URL
-        value: "https://financialmodelingprep.com/api/v3"
-
-      # ------------------------------------------------------
-      # KSA / Argaam gateway (.SR only)
-      # ------------------------------------------------------
-      - key: ARGAAM_GATEWAY_URL
-        value: "https://tadawul-fast-bridge.onrender.com/v1/argaam"
-
-      - key: ARGAAM_API_KEY
-        sync: false
-
-      # ------------------------------------------------------
-      # Optional extra providers (future)
-      # ------------------------------------------------------
-      - key: FINNHUB_API_KEY
-        sync: false
-
-      - key: ALPHA_VANTAGE_API_KEY
-        sync: false
-
-      # ------------------------------------------------------
-      # Google Sheets / Apps Script integration
-      # ------------------------------------------------------
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
-
-      - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
-        value: ""
-
-      - key: GOOGLE_PROJECT_ID
-        value: ""
-
-      # ------------------------------------------------------
-      # CORS / Logging
-      # ------------------------------------------------------
-      - key: ENABLE_CORS_ALL_ORIGINS
-        value: "true"
-
+        value: Tadawul Fast Bridge
+      - key: APP_ENV
+        value: production
       - key: LOG_LEVEL
-        value: "INFO"
+        value: INFO
+
+      # Providers (adjust as you like)
+      - key: ENABLED_PROVIDERS
+        value: "fmp,yfinance"
+      - key: PRIMARY_PROVIDER
+        value: "fmp"
+      - key: KSA_DISALLOW_EODHD
+        value: "true"
+
+      # Secrets (set these in Render dashboard as "Secret", not in YAML)
+      # - EODHD_API_KEY
+      # - FMP_API_KEY
+      # - FINNHUB_API_KEY
+      # - APP_TOKEN
+      # - GOOGLE_SHEETS_CREDENTIALS
+      # - DEFAULT_SPREADSHEET_ID
