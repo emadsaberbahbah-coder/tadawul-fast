@@ -1,5 +1,5 @@
 # ============================================================
-# Tadawul Fast Bridge – Render Blueprint (Aligned with env.py)
+# Tadawul Fast Bridge – Render Blueprint Configuration (v4.6.0)
 # ============================================================
 
 services:
@@ -12,6 +12,7 @@ services:
 
     buildCommand: pip install -r requirements.txt
 
+    # Use proxy headers + keep-alive for Render
     startCommand: >
       uvicorn main:app
       --host 0.0.0.0
@@ -24,14 +25,14 @@ services:
     healthCheckPath: /health
 
     envVars:
-      - key: APP_NAME
-        value: "Tadawul Fast Bridge"
       - key: APP_ENV
         value: production
       - key: APP_VERSION
-        value: "4.4.0"
-      - key: LOG_LEVEL
-        value: "INFO"
+        value: "4.6.0"
+      - key: APP_NAME
+        value: "Tadawul Fast Bridge"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
 
       - key: BACKEND_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
@@ -41,27 +42,20 @@ services:
       - key: BACKUP_APP_TOKEN
         value: ""
 
-      - key: ENABLED_PROVIDERS
-        value: "eodhd,fmp,yfinance"
-      - key: PRIMARY_PROVIDER
-        value: "eodhd"
-
+      # Keep BOTH keys supported (env.py accepts both)
+      - key: HTTP_TIMEOUT
+        value: "25"
       - key: HTTP_TIMEOUT_SEC
         value: "25"
 
-      - key: CACHE_TTL_SEC
-        value: "20"
-      - key: QUOTE_TTL_SEC
-        value: "30"
-      - key: FUNDAMENTALS_TTL_SEC
-        value: "21600"
-      - key: ARGAAM_SNAPSHOT_TTL_SEC
-        value: "30"
+      - key: ENABLED_PROVIDERS
+        value: "eodhd,fmp,yfinance"
 
-      - key: ENABLE_YFINANCE
-        value: "true"
-      - key: EODHD_FETCH_FUNDAMENTALS
-        value: "true"
+      - key: PRIMARY_PROVIDER
+        value: "eodhd"
+
+      - key: ENGINE_CACHE_TTL_SECONDS
+        value: "60"
 
       - key: EODHD_API_KEY
         sync: false
@@ -75,6 +69,13 @@ services:
 
       - key: ARGAAM_GATEWAY_URL
         value: "https://tadawul-fast-bridge.onrender.com/v1/argaam"
+      - key: ARGAAM_API_KEY
+        sync: false
+
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false
 
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
@@ -83,32 +84,7 @@ services:
       - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
         value: ""
 
-      - key: ADV_BATCH_SIZE
-        value: "20"
-      - key: ADV_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: ADV_MAX_TICKERS
-        value: "500"
-      - key: ADV_BATCH_CONCURRENCY
-        value: "5"
-
-      - key: AI_BATCH_SIZE
-        value: "20"
-      - key: AI_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: AI_MAX_TICKERS
-        value: "500"
-      - key: AI_BATCH_CONCURRENCY
-        value: "5"
-
-      - key: ENRICHED_BATCH_SIZE
-        value: "40"
-      - key: ENRICHED_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: ENRICHED_MAX_TICKERS
-        value: "250"
-      - key: ENRICHED_BATCH_CONCURRENCY
-        value: "5"
-
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
+      - key: LOG_LEVEL
+        value: "INFO"
