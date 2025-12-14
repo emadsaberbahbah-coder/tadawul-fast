@@ -1,95 +1,63 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.1.0)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v2.9.0)
 
-Preferred backend:
-  - core.data_engine_v2.DataEngine (class-based unified engine)
+- Uses core.data_engine_v2.DataEngine only (no direct provider calls).
+- Defensive batching: chunking + timeout + bounded concurrency.
+- Sheets-safe: /sheet-rows always returns 200 with headers + rows.
 
-Provides:
-  - GET  /v1/analysis/health   (alias: /ping)
-  - GET  /v1/analysis/quote?symbol=...
-  - POST /v1/analysis/quotes
-  - POST /v1/analysis/sheet-rows   (headers + rows for Google Sheets)
-
-Design goals:
-  - KSA-safe: router never calls providers directly.
-  - Extremely defensive: bounded batch size, chunking, timeout, concurrency.
-  - Never throws 502 for Sheets endpoints; returns headers + rows (maybe empty).
-  - Alignment: Uses core.scoring_engine to ensure score fields match other routes.
-
-CRITICAL FIXES vs old versions:
-  - Uses engine.get_quote / engine.get_quotes (these exist).
-  - Removes calls to non-existent methods: get_enriched_quote(s), finalize().
-  - Uses FastAPI app.state.engine if present (created by main.py lifespan),
-    otherwise falls back to local singleton (safe standalone import).
-  - Works with the current UnifiedQuote fields in core/data_engine_v2.py.
+Author: Emad Bahbah (with GPT-5.2 Thinking)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel, Field, ConfigDict
+from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field
 
-from core.config import get_settings
+from env import settings
 from core.data_engine_v2 import DataEngine, UnifiedQuote
 from core.enriched_quote import EnrichedQuote
 from core.scoring_engine import enrich_with_scores
 
 logger = logging.getLogger("routes.ai_analysis")
-settings = get_settings()
+AI_ANALYSIS_VERSION = "2.9.0"
 
-AI_ANALYSIS_VERSION = "3.1.0"
-
-# ----------------------------------------------------------------------
-# Runtime limits (env overrides)
-# ----------------------------------------------------------------------
-DEFAULT_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "25"))
-DEFAULT_BATCH_TIMEOUT = float(os.getenv("AI_BATCH_TIMEOUT_SEC", "45"))
-DEFAULT_CONCURRENCY = int(os.getenv("AI_BATCH_CONCURRENCY", "6"))
-DEFAULT_MAX_TICKERS = int(os.getenv("AI_MAX_TICKERS", "500"))
+DEFAULT_BATCH_SIZE = int(settings.ai_batch_size)
+DEFAULT_BATCH_TIMEOUT = float(settings.ai_batch_timeout_sec)
+DEFAULT_CONCURRENCY = int(settings.ai_batch_concurrency)
+DEFAULT_MAX_TICKERS = int(settings.ai_max_tickers)
 
 # ----------------------------------------------------------------------
-# Engine resolution
+# ENGINE SINGLETON
 # ----------------------------------------------------------------------
 @lru_cache(maxsize=1)
-def _engine_singleton() -> DataEngine:
-    logger.info("routes.ai_analysis: initializing local DataEngine singleton (fallback)")
+def _get_engine_singleton() -> DataEngine:
+    logger.info("routes.ai_analysis: initializing DataEngine v2 singleton")
     return DataEngine()
 
-def get_engine(request: Request) -> DataEngine:
-    """
-    Prefer the engine created in main.py lifespan (request.app.state.engine).
-    Fall back to a local singleton if not present.
-    """
-    eng = getattr(request.app.state, "engine", None)
-    if isinstance(eng, DataEngine):
-        return eng
-    return _engine_singleton()
-
 # ----------------------------------------------------------------------
-# Router
+# ROUTER
 # ----------------------------------------------------------------------
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 # ----------------------------------------------------------------------
-# Models (Pydantic v2) - ignore extras to avoid 422 from Sheets clients
+# MODELS
 # ----------------------------------------------------------------------
 class _ExtraIgnoreBase(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    class Config:
+        extra = "ignore"
 
 class SingleAnalysisResponse(_ExtraIgnoreBase):
     symbol: str
     name: Optional[str] = None
-    market: Optional[str] = None
-    currency: Optional[str] = None
+    market_region: Optional[str] = None
 
     price: Optional[float] = None
     change_pct: Optional[float] = None
@@ -97,9 +65,9 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
 
-    dividend_yield: Optional[float] = None  # may be fraction or percent; sheet normalizes
+    dividend_yield: Optional[float] = None
     roe: Optional[float] = None
-    net_margin: Optional[float] = None
+    roa: Optional[float] = None
 
     data_quality: str = "MISSING"
 
@@ -122,32 +90,43 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
 
 class BatchAnalysisRequest(_ExtraIgnoreBase):
     tickers: List[str] = Field(default_factory=list)
-    sheet_name: Optional[str] = None  # reserved for future use (safe for Sheets client)
+    sheet_name: Optional[str] = None
 
 class BatchAnalysisResponse(_ExtraIgnoreBase):
-    results: List[SingleAnalysisResponse] = Field(default_factory=list)
+    results: List[SingleAnalysisResponse]
 
 class SheetAnalysisResponse(_ExtraIgnoreBase):
-    headers: List[str] = Field(default_factory=list)
-    rows: List[List[Any]] = Field(default_factory=list)
+    headers: List[str]
+    rows: List[List[Any]]
 
 # ----------------------------------------------------------------------
-# Helpers
+# HELPERS
 # ----------------------------------------------------------------------
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", ".SR")
+    if s.isdigit():
+        s = f"{s}.SR"
+    return s
+
 def _clean_tickers(items: Sequence[str]) -> List[str]:
-    raw = [(x or "").strip() for x in (items or [])]
+    raw = [_normalize_symbol(x) for x in (items or [])]
     raw = [x for x in raw if x]
     seen = set()
     out: List[str] = []
     for x in raw:
-        ux = x.upper()
-        if ux in seen:
+        if x in seen:
             continue
-        seen.add(ux)
-        out.append(x)  # keep original casing; engine normalizes internally
+        seen.add(x)
+        out.append(x)
     return out
 
 def _chunk(items: List[str], size: int) -> List[List[str]]:
@@ -155,37 +134,37 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
 
-def _extract_sources(eq: EnrichedQuote) -> List[str]:
-    # Current UnifiedQuote exposes data_source string only
-    ds = getattr(eq, "data_source", None)
+def _extract_sources(q: EnrichedQuote) -> List[str]:
+    if getattr(q, "sources", None):
+        try:
+            return [s.provider for s in q.sources]  # type: ignore
+        except Exception:
+            pass
+    ds = getattr(q, "data_source", None)
     return [ds] if ds else []
 
 # ----------------------------------------------------------------------
-# Engine calls (chunked + bounded concurrency)
+# ENGINE CALLS
 # ----------------------------------------------------------------------
 async def _get_quotes_chunked(
-    engine: DataEngine,
     symbols: List[str],
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     timeout_sec: float = DEFAULT_BATCH_TIMEOUT,
     max_concurrency: int = DEFAULT_CONCURRENCY,
 ) -> Dict[str, UnifiedQuote]:
-    """
-    Returns a map keyed by UPPERCASE SYMBOL as returned by the engine.
-    Extremely defensive: never raises.
-    """
     clean = _clean_tickers(symbols)
     if not clean:
         return {}
 
+    engine = _get_engine_singleton()
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
     async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
         async with sem:
             try:
-                res = await asyncio.wait_for(engine.get_quotes(chunk_syms), timeout=timeout_sec)
+                res = await asyncio.wait_for(engine.get_enriched_quotes(chunk_syms), timeout=timeout_sec)
                 return chunk_syms, res
             except Exception as e:
                 return chunk_syms, e
@@ -196,55 +175,43 @@ async def _get_quotes_chunked(
     for chunk_syms, res in results:
         if isinstance(res, Exception):
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
-            logger.warning("ai_analysis: %s for chunk(size=%d): %s", msg, len(chunk_syms), chunk_syms)
+            logger.warning("ai_analysis: %s for chunk(size=%d)", msg, len(chunk_syms))
             for s in chunk_syms:
-                uq = UnifiedQuote(symbol=str(s).upper(), data_quality="MISSING", error=msg)
-                out[uq.symbol.upper()] = uq
+                out[s] = UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error=msg).finalize()
             continue
 
         returned = list(res or [])
-        for q in returned:
-            out[(q.symbol or "").upper()] = q
+        chunk_map = {q.symbol.upper(): q for q in returned}
 
-        # Ensure every requested symbol has a placeholder (best-effort by key match)
-        # NOTE: Engine may normalize (e.g., 1120 -> 1120.SR). We can't perfectly map
-        # without reusing engine.normalize_symbol, so we just ensure "something" exists.
-        # Caller will fallback to single fetch if needed.
         for s in chunk_syms:
-            s_up = str(s).upper()
-            if s_up not in out:
-                out[s_up] = UnifiedQuote(symbol=s_up, data_quality="MISSING", error="No data returned")
+            s_norm = s.upper()
+            out[s] = chunk_map.get(s_norm) or UnifiedQuote(symbol=s_norm, data_quality="MISSING", error="No data returned").finalize()
 
     return out
 
 # ----------------------------------------------------------------------
-# Transform: UnifiedQuote -> SingleAnalysisResponse
+# TRANSFORM
 # ----------------------------------------------------------------------
 def _quote_to_analysis(raw_symbol: str, uq: UnifiedQuote) -> SingleAnalysisResponse:
-    # Convert to EnrichedQuote then compute scores (consistent across routes)
     eq = EnrichedQuote.from_unified(uq)
     eq = enrich_with_scores(eq)
 
-    # Prefer engine-normalized symbol, fallback to user input
-    sym = (getattr(eq, "symbol", None) or raw_symbol or "").strip().upper()
-
     return SingleAnalysisResponse(
-        symbol=sym,
+        symbol=eq.symbol or _normalize_symbol(raw_symbol) or raw_symbol,
         name=getattr(eq, "name", None),
-        market=getattr(eq, "market", None),
-        currency=getattr(eq, "currency", None),
+        market_region=getattr(eq, "market", None) or getattr(eq, "market_region", None),
 
-        price=getattr(eq, "current_price", None),
-        change_pct=getattr(eq, "percent_change", None),
+        price=getattr(eq, "current_price", None) or getattr(eq, "last_price", None),
+        change_pct=getattr(eq, "percent_change", None) or getattr(eq, "change_percent", None),
         market_cap=getattr(eq, "market_cap", None),
         pe_ttm=getattr(eq, "pe_ttm", None),
         pb=getattr(eq, "pb", None),
 
         dividend_yield=getattr(eq, "dividend_yield", None),
         roe=getattr(eq, "roe", None),
-        net_margin=getattr(eq, "net_margin", None),
+        roa=getattr(eq, "roa", None),
 
-        data_quality=getattr(eq, "data_quality", "MISSING") or "MISSING",
+        data_quality=getattr(eq, "data_quality", "MISSING"),
 
         value_score=getattr(eq, "value_score", None),
         quality_score=getattr(eq, "quality_score", None),
@@ -260,75 +227,53 @@ def _quote_to_analysis(raw_symbol: str, uq: UnifiedQuote) -> SingleAnalysisRespo
         last_updated_utc=getattr(eq, "last_updated_utc", None),
         sources=_extract_sources(eq),
 
-        notes=None,
         error=getattr(eq, "error", None),
     )
 
 # ----------------------------------------------------------------------
-# Sheet helpers
+# SHEET HELPERS
 # ----------------------------------------------------------------------
 def _build_sheet_headers() -> List[str]:
-    # Fixed schema for "AI Analysis" tabs in Sheets
     return [
-        "Symbol",
-        "Company Name",
-        "Market",
-        "Currency",
-        "Price",
-        "Change %",
-        "Market Cap",
-        "P/E (TTM)",
-        "P/B",
-        "Dividend Yield %",
-        "ROE %",
-        "Net Margin %",
+        "Symbol", "Company Name", "Market / Region", "Price", "Change %",
+        "Market Cap", "P/E (TTM)", "P/B",
+        "Dividend Yield %", "ROE %", "ROA %",
         "Data Quality",
-        "Value Score",
-        "Quality Score",
-        "Momentum Score",
-        "Opportunity Score",
-        "Overall Score",
+        "Value Score", "Quality Score", "Momentum Score", "Opportunity Score", "Overall Score",
         "Recommendation",
-        "Last Updated (UTC)",
-        "Sources",
-        "Fair Value",
-        "Upside %",
-        "Valuation Label",
+        "Last Updated (UTC)", "Sources",
+        "Fair Value", "Upside %", "Valuation Label",
         "Error",
     ]
 
 def _pad_row(row: List[Any], length: int) -> List[Any]:
-    if len(row) == length:
-        return row
     if len(row) < length:
         return row + [None] * (length - len(row))
     return row[:length]
 
-def _as_percent_maybe(x: Optional[float]) -> Optional[float]:
-    # Convert 0.05 -> 5.0 but keep 5.0 as 5.0
-    if x is None:
+def _pct_display(v: Optional[float]) -> Optional[float]:
+    if v is None:
         return None
     try:
-        if abs(x) <= 1.0 and x != 0:
-            return x * 100.0
-        return x
+        if abs(v) <= 1.0 and v != 0.0:
+            return v * 100.0
+        return v
     except Exception:
-        return x
+        return v
 
 def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[Any]:
     row = [
         a.symbol,
         a.name or "",
-        a.market or "",
-        a.currency or "",
+        a.market_region or "",
         a.price,
         a.change_pct,
         a.market_cap,
         a.pe_ttm,
         a.pb,
-        _as_percent_maybe(a.dividend_yield),
-        _as_percent_maybe(a.roe),
-        _as_percent_maybe(a.net_margin),
+        _pct_display(a.dividend_yield),
+        _pct_display(a.roe),
+        _pct_display(a.roa),
         a.data_quality,
         a.value_score,
         a.quality_score,
@@ -346,7 +291,7 @@ def _analysis_to_sheet_row(a: SingleAnalysisResponse, header_len: int) -> List[A
     return _pad_row(row, header_len)
 
 # ----------------------------------------------------------------------
-# Routes
+# ROUTES
 # ----------------------------------------------------------------------
 @router.get("/health")
 @router.get("/ping")
@@ -360,38 +305,26 @@ async def analysis_health() -> Dict[str, Any]:
         "batch_timeout_sec": DEFAULT_BATCH_TIMEOUT,
         "batch_concurrency": DEFAULT_CONCURRENCY,
         "max_tickers": DEFAULT_MAX_TICKERS,
-        "providers": {
-            "eodhd_enabled": bool(getattr(settings, "EODHD_API_KEY", None)),
-            "fmp_enabled": bool(getattr(settings, "FMP_API_KEY", None)),
-            "yfinance_enabled": bool(getattr(settings, "ENABLE_YFINANCE", False)),
-            "ksa_argaam_scrape": True,
-        },
         "timestamp_utc": _now_utc_iso(),
     }
 
 @router.get("/quote", response_model=SingleAnalysisResponse)
-async def analyze_single_quote(
-    request: Request,
-    symbol: str = Query(..., alias="symbol"),
-    engine: DataEngine = Depends(get_engine),
-) -> SingleAnalysisResponse:
+async def analyze_single_quote(symbol: str = Query(..., alias="symbol")) -> SingleAnalysisResponse:
     t = (symbol or "").strip()
     if not t:
         return SingleAnalysisResponse(symbol="", data_quality="MISSING", error="Symbol is required")
 
     try:
-        uq = await engine.get_quote(t)
-        return _quote_to_analysis(t, uq)
+        m = await _get_quotes_chunked([t], batch_size=1)
+        key = _normalize_symbol(t) or t.upper()
+        q = m.get(key) or UnifiedQuote(symbol=key, data_quality="MISSING", error="No data returned").finalize()
+        return _quote_to_analysis(t, q)
     except Exception as exc:
         logger.exception("ai_analysis: exception in /quote for %s", t)
-        return SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Exception in analysis: {exc}")
+        return SingleAnalysisResponse(symbol=_normalize_symbol(t) or t.upper(), data_quality="MISSING", error=f"Exception in analysis: {exc}")
 
 @router.post("/quotes", response_model=BatchAnalysisResponse)
-async def analyze_batch_quotes(
-    request: Request,
-    body: BatchAnalysisRequest,
-    engine: DataEngine = Depends(get_engine),
-) -> BatchAnalysisResponse:
+async def analyze_batch_quotes(body: BatchAnalysisRequest) -> BatchAnalysisResponse:
     tickers = _clean_tickers(body.tickers or [])
     if not tickers:
         return BatchAnalysisResponse(results=[])
@@ -399,60 +332,29 @@ async def analyze_batch_quotes(
     if len(tickers) > DEFAULT_MAX_TICKERS:
         tickers = tickers[:DEFAULT_MAX_TICKERS]
 
-    # Chunked fetch (defensive)
     try:
-        m = await _get_quotes_chunked(engine, tickers)
+        m = await _get_quotes_chunked(tickers)
     except Exception as exc:
         logger.exception("ai_analysis: batch failure: %s", exc)
-        return BatchAnalysisResponse(
-            results=[SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Batch failure: {exc}") for t in tickers]
-        )
+        return BatchAnalysisResponse(results=[SingleAnalysisResponse(symbol=t, data_quality="MISSING", error=f"Batch failure: {exc}") for t in tickers])
 
     results: List[SingleAnalysisResponse] = []
     for t in tickers:
-        # Best-effort lookup:
-        # - Try exact key
-        # - If missing, do a single fetch (keeps accuracy when engine normalizes symbols)
-        uq = m.get(t.upper())
-        if uq is None:
-            try:
-                uq = await engine.get_quote(t)
-            except Exception as e:
-                uq = UnifiedQuote(symbol=t.upper(), data_quality="MISSING", error=str(e))
-
+        q = m.get(t) or UnifiedQuote(symbol=t.upper(), data_quality="MISSING", error="No data returned").finalize()
         try:
-            results.append(_quote_to_analysis(t, uq))
+            results.append(_quote_to_analysis(t, q))
         except Exception as exc:
             logger.exception("ai_analysis: transform failure for %s: %s", t, exc)
-            results.append(SingleAnalysisResponse(symbol=t.upper(), data_quality="MISSING", error=f"Transform failure: {exc}"))
+            results.append(SingleAnalysisResponse(symbol=t, data_quality="MISSING", error=f"Transform failure: {exc}"))
 
     return BatchAnalysisResponse(results=results)
 
 @router.post("/sheet-rows", response_model=SheetAnalysisResponse)
-async def analyze_for_sheet(
-    request: Request,
-    body: BatchAnalysisRequest,
-    engine: DataEngine = Depends(get_engine),
-) -> SheetAnalysisResponse:
-    """
-    Dedicated endpoint for AI Analysis sheet tab.
-    Must be "Sheets-safe": never raises, always returns headers + rows.
-    """
+async def analyze_for_sheet(body: BatchAnalysisRequest) -> SheetAnalysisResponse:
     headers = _build_sheet_headers()
     header_len = len(headers)
+    batch = await analyze_batch_quotes(body)
+    rows = [_analysis_to_sheet_row(r, header_len) for r in batch.results]
+    return SheetAnalysisResponse(headers=headers, rows=rows)
 
-    try:
-        batch = await analyze_batch_quotes(request, body, engine)
-        rows = [_analysis_to_sheet_row(r, header_len) for r in (batch.results or [])]
-        return SheetAnalysisResponse(headers=headers, rows=rows)
-    except Exception as exc:
-        logger.exception("ai_analysis: /sheet-rows failure: %s", exc)
-        return SheetAnalysisResponse(headers=headers, rows=[])
-
-__all__ = [
-    "router",
-    "SingleAnalysisResponse",
-    "BatchAnalysisRequest",
-    "BatchAnalysisResponse",
-    "SheetAnalysisResponse",
-]
+__all__ = ["router", "SingleAnalysisResponse", "BatchAnalysisRequest", "BatchAnalysisResponse", "SheetAnalysisResponse"]
