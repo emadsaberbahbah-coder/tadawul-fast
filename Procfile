@@ -1,11 +1,16 @@
 # ============================================================
 # Procfile — Tadawul Fast Bridge (FastAPI)
-# Render/Heroku compatible
+# Render compatible
 # ============================================================
-# Notes:
-# - Use WEB_CONCURRENCY if you want multiple workers (Render supports it).
-# - Keep-alive tuned for Google Sheets / batch calls.
-# - Proxy headers enabled for Render/Heroku routing.
+# Goals:
+# - Deterministic startup on Render
+# - Safe defaults for Google Sheets batch calls
+# - Supports scaling via WEB_CONCURRENCY (Render can set it)
+#
+# Env vars you may set in Render:
+# - WEB_CONCURRENCY=1..4   (start with 1 on free tiers)
+# - UVICORN_KEEPALIVE=75
+# - LOG_LEVEL=info
 # ============================================================
 
 web: sh -c 'exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips "*" --timeout-keep-alive ${UVICORN_KEEPALIVE:-75} --log-level ${LOG_LEVEL:-info} --workers ${WEB_CONCURRENCY:-1}'
