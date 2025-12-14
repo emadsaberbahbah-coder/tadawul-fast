@@ -64,7 +64,7 @@
       margin: 0;
       color: var(--muted);
       font-size: 0.92rem;
-      max-width: 600px;
+      max-width: 650px;
       line-height: 1.5;
     }
 
@@ -75,11 +75,12 @@
       padding: 6px 12px;
       border-radius: 999px;
       font-size: 0.8rem;
-      font-weight: 500;
+      font-weight: 600;
       background: rgba(72, 187, 120, 0.1);
       color: var(--success);
       border: 1px solid rgba(72, 187, 120, 0.25);
-      transition: all 0.3s ease;
+      transition: all 0.25s ease;
+      user-select: none;
     }
 
     .pill.disconnected {
@@ -130,6 +131,8 @@
       justify-content: space-between;
       align-items: center;
       margin-bottom: 16px;
+      gap: 10px;
+      flex-wrap: wrap;
     }
 
     .card-header h2 {
@@ -138,17 +141,17 @@
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--muted);
-      font-weight: 600;
+      font-weight: 700;
     }
 
-    .card-header small { font-size: 0.75rem; color: var(--muted); opacity: 0.8; }
+    .card-header small { font-size: 0.78rem; color: var(--muted); opacity: 0.9; }
 
     label {
       display: block;
       font-size: 0.8rem;
       color: var(--muted);
       margin-bottom: 6px;
-      font-weight: 500;
+      font-weight: 600;
     }
 
     input, textarea, select {
@@ -160,7 +163,7 @@
       color: var(--text);
       font-size: 0.9rem;
       font-family: inherit;
-      transition: border-color 0.2s;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
 
     input:focus, textarea:focus, select:focus {
@@ -186,16 +189,24 @@
       border: 1px solid var(--accent-strong);
       background: rgba(56, 178, 172, 0.15);
       color: var(--accent);
-      font-weight: 600;
+      font-weight: 700;
       font-size: 0.85rem;
       cursor: pointer;
-      transition: all 0.2s;
+      transition: all 0.18s ease;
+      gap: 8px;
+      user-select: none;
     }
 
     .btn:hover {
       background: var(--accent-strong);
       color: #000;
       transform: translateY(-1px);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
     }
 
     .btn.secondary {
@@ -206,6 +217,7 @@
     .btn.secondary:hover {
       border-color: var(--muted);
       color: var(--text);
+      background: rgba(255,255,255,0.04);
     }
 
     .btn.sm { padding: 6px 12px; font-size: 0.8rem; }
@@ -228,27 +240,31 @@
       font-size: 0.75rem;
       color: var(--muted);
       text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 700;
     }
 
     .status-card .value {
-      font-size: 0.9rem;
-      font-weight: 600;
+      font-size: 0.92rem;
+      font-weight: 800;
       color: var(--text);
+      word-break: break-word;
     }
     .status-card .value.ok { color: var(--success); }
     .status-card .value.bad { color: var(--danger); }
+    .status-card .value.warn { color: var(--warning); }
 
     pre {
       background: #080c17;
       border-radius: 8px;
       padding: 12px;
-      font-family: 'Menlo', 'Monaco', monospace;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size: 0.8rem;
       color: #a0aec0;
       overflow-x: auto;
       border: 1px solid var(--border);
       margin-top: 10px;
-      max-height: 300px;
+      max-height: 340px;
     }
 
     .table-container {
@@ -276,6 +292,7 @@
       color: var(--accent);
       position: sticky;
       top: 0;
+      z-index: 1;
     }
 
     tr:last-child td { border-bottom: none; }
@@ -285,6 +302,7 @@
       display: flex;
       gap: 8px;
       margin-top: 8px;
+      flex-wrap: wrap;
     }
 
     .chip {
@@ -293,18 +311,28 @@
       border-radius: 99px;
       background: rgba(255, 255, 255, 0.05);
       border: 1px solid var(--border);
+      font-weight: 700;
+      user-select: none;
     }
     .chip.ksa { color: var(--ksa); border-color: rgba(246, 173, 85, 0.3); }
     .chip.global { color: var(--global); border-color: rgba(99, 179, 237, 0.3); }
+    .chip.muted { color: var(--muted); }
 
     .error-text { color: var(--danger); font-size: 0.85rem; margin-top: 8px; display: block; }
-    
+
+    .mini-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
     footer {
       margin-top: 40px;
       text-align: center;
       font-size: 0.8rem;
       color: var(--muted);
-      opacity: 0.6;
+      opacity: 0.65;
     }
   </style>
 </head>
@@ -325,29 +353,35 @@
   <main>
     <!-- LEFT COLUMN -->
     <section>
-      
+
       <!-- CONFIGURATION -->
       <div class="card">
         <div class="card-header">
           <h2>API Connection</h2>
           <small id="cfg-status">Not tested</small>
         </div>
+
         <div class="row">
           <div>
             <label>Backend URL</label>
             <input id="baseUrl" type="text" placeholder="http://127.0.0.1:8000" />
           </div>
         </div>
+
         <div class="row">
           <div>
             <label>App Token (Optional)</label>
             <input id="token" type="password" placeholder="X-APP-TOKEN" />
           </div>
         </div>
+
         <div class="row" style="justify-content: flex-end;">
-          <button class="btn secondary sm" id="clearCfgBtn">Reset</button>
-          <button class="btn sm" id="saveCfgBtn">Connect</button>
+          <div class="mini-actions">
+            <button class="btn secondary sm" id="resetCfgBtn">Reset</button>
+            <button class="btn sm" id="saveCfgBtn">Connect</button>
+          </div>
         </div>
+
         <div id="cfg-error" class="error-text" style="display:none;"></div>
       </div>
 
@@ -355,8 +389,11 @@
       <div class="card">
         <div class="card-header">
           <h2>System Status</h2>
-          <button class="btn secondary sm" id="refreshStatusBtn">Refresh</button>
+          <div class="mini-actions">
+            <button class="btn secondary sm" id="refreshStatusBtn">Refresh</button>
+          </div>
         </div>
+
         <div class="status-grid">
           <div class="status-card">
             <h3>Backend</h3>
@@ -367,39 +404,53 @@
             <div class="value" id="status-engine">-</div>
           </div>
           <div class="status-card">
+            <h3>Time (UTC)</h3>
+            <div class="value" id="status-time">-</div>
+          </div>
+          <div class="status-card">
             <h3>Google Sheets</h3>
             <div class="value" id="status-sheets">-</div>
           </div>
         </div>
+
         <div style="margin-top:15px">
-            <label>Route Health</label>
-            <div class="status-grid">
-                <div class="status-card">
-                    <h3>Enriched</h3>
-                    <div class="value" id="health-enriched">-</div>
-                </div>
-                <div class="status-card">
-                    <h3>AI Analysis</h3>
-                    <div class="value" id="health-ai">-</div>
-                </div>
-                <div class="status-card">
-                    <h3>Advanced</h3>
-                    <div class="value" id="health-adv">-</div>
-                </div>
+          <label>Route Health</label>
+          <div class="status-grid">
+            <div class="status-card">
+              <h3>Enriched</h3>
+              <div class="value" id="health-enriched">-</div>
             </div>
+            <div class="status-card">
+              <h3>AI Analysis</h3>
+              <div class="value" id="health-ai">-</div>
+            </div>
+            <div class="status-card">
+              <h3>Advanced</h3>
+              <div class="value" id="health-adv">-</div>
+            </div>
+            <div class="status-card">
+              <h3>KSA / Argaam</h3>
+              <div class="value" id="health-ksa">-</div>
+            </div>
+          </div>
         </div>
+
       </div>
 
     </section>
 
     <!-- RIGHT COLUMN -->
     <section>
-      
+
       <!-- QUICK CHECK -->
       <div class="card">
         <div class="card-header">
           <h2>Quick Symbol Check</h2>
+          <div class="mini-actions">
+            <button class="btn secondary sm" id="copyQuickBtn">Copy JSON</button>
+          </div>
         </div>
+
         <div class="row">
           <div style="flex: 2;">
             <label>Symbol</label>
@@ -411,6 +462,7 @@
               <option value="enriched">Enriched Quote (/v1/enriched)</option>
               <option value="analysis">AI Analysis (/v1/analysis)</option>
               <option value="advanced">Advanced Score (/v1/advanced)</option>
+              <option value="argaam">KSA Argaam Quote (/v1/argaam)</option>
             </select>
           </div>
           <div style="flex: 0;">
@@ -418,6 +470,7 @@
             <button class="btn sm" id="runQuickBtn">Fetch</button>
           </div>
         </div>
+
         <pre id="quickResult">// Response will appear here...</pre>
       </div>
 
@@ -427,26 +480,36 @@
           <h2>Sheet Rows Preview</h2>
           <small>Batch processing & sorting</small>
         </div>
+
         <div class="row">
-            <div>
-                <label>Target Sheet Type</label>
-                <select id="batchType">
-                    <option value="enriched">Global/KSA/Funds (Enriched)</option>
-                    <option value="analysis">Insights (AI Analysis)</option>
-                    <option value="advanced">Advanced Analysis</option>
-                </select>
-            </div>
+          <div>
+            <label>Target Sheet Type</label>
+            <select id="batchType">
+              <option value="enriched">Enriched (/v1/enriched/sheet-rows)</option>
+              <option value="analysis">AI Analysis (/v1/analysis/sheet-rows)</option>
+              <option value="advanced">Advanced Analysis (/v1/advanced/sheet-rows)</option>
+              <option value="argaam">KSA Argaam (/v1/argaam/sheet-rows)</option>
+            </select>
+          </div>
+          <div>
+            <label>Sheet Name (Schema)</label>
+            <input id="batchSheetName" type="text" value="Preview_Test" />
+          </div>
         </div>
+
         <label>Tickers (One per line)</label>
         <textarea id="batchTickers" rows="5" placeholder="1120.SR&#10;1180.SR&#10;AAPL&#10;MSFT"></textarea>
-        
+
         <div class="chip-row" id="tickerSplitRow" style="display:none;"></div>
-        
+
         <div class="row" style="justify-content: flex-end; margin-top:10px;">
+          <div class="mini-actions">
+            <button class="btn secondary sm" id="sampleBatchBtn">Sample</button>
             <button class="btn secondary sm" id="clearBatchBtn">Clear</button>
             <button class="btn sm" id="runBatchBtn">Preview Rows</button>
+          </div>
         </div>
-        
+
         <div id="batchError" class="error-text" style="display:none;"></div>
         <div class="table-container" id="batchTableContainer" style="display:none;"></div>
       </div>
@@ -454,223 +517,430 @@
     </section>
   </main>
 
-  <footer>
-    Tadawul Fast Bridge v4.0.0 &bull; Powered by DataEngine V2 &bull; KSA-Safe
+  <footer id="footerText">
+    Tadawul Fast Bridge • Powered by DataEngine V2 • KSA-Safe
   </footer>
 </div>
 
 <script>
-  (function() {
-    // --- STATE ---
-    const state = { baseUrl: "", token: "" };
-    
-    // --- ELEMENTS ---
-    const el = (id) => document.getElementById(id);
-    const ui = {
-      baseUrl: el('baseUrl'), token: el('token'),
-      cfgStatus: el('cfgStatus'), cfgError: el('cfgError'),
-      saveCfg: el('saveCfgBtn'), clearCfg: el('clearCfgBtn'),
-      pill: el('connection-pill'), pillText: el('connection-pill-text'),
-      
-      // Status
-      stEnv: el('status-env'), stEngine: el('status-engine'), stSheets: el('status-sheets'),
-      hEnriched: el('health-enriched'), hAi: el('health-ai'), hAdv: el('health-adv'),
-      refreshStatus: el('refreshStatusBtn'),
-      
-      // Quick
-      qSym: el('quickSymbol'), qType: el('quickType'), qRun: el('runQuickBtn'), qRes: el('quickResult'),
-      
-      // Batch
-      bType: el('batchType'), bTickers: el('batchTickers'), bRun: el('runBatchBtn'), 
-      bClear: el('clearBatchBtn'), bErr: el('batchError'), bTable: el('batchTableContainer'),
-      bSplit: el('tickerSplitRow')
-    };
+(function () {
+  // -----------------------------
+  // State
+  // -----------------------------
+  const LS_BASE = "tfb_base_url";
+  const LS_TOKEN = "tfb_app_token";
 
-    // --- CONFIG LOGIC ---
-    function loadConfig() {
-      state.baseUrl = localStorage.getItem("tfb_base_url") || window.location.origin;
-      state.token = localStorage.getItem("tfb_app_token") || "";
-      ui.baseUrl.value = state.baseUrl;
-      ui.token.value = state.token;
-    }
+  const state = {
+    baseUrl: "",
+    token: "",
+    timeoutMs: 25000
+  };
 
-    function saveConfig() {
-      state.baseUrl = ui.baseUrl.value.replace(/\/$/, "");
-      state.token = ui.token.value.trim();
-      localStorage.setItem("tfb_base_url", state.baseUrl);
-      localStorage.setItem("tfb_app_token", state.token);
-      checkConnectivity();
-    }
+  // -----------------------------
+  // DOM helpers
+  // -----------------------------
+  const el = (id) => document.getElementById(id);
 
-    async function fetchAPI(endpoint, opts = {}) {
-      const url = `${state.baseUrl}${endpoint}`;
-      const headers = { 'Content-Type': 'application/json', ...opts.headers };
-      if (state.token) headers['X-APP-TOKEN'] = state.token;
-      
-      try {
-        const res = await fetch(url, { ...opts, headers });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-        return data;
-      } catch (e) {
-        throw e;
-      }
-    }
+  const ui = {
+    // Config
+    baseUrl: el("baseUrl"),
+    token: el("token"),
+    cfgStatus: el("cfg-status"),
+    cfgError: el("cfg-error"),
+    saveCfg: el("saveCfgBtn"),
+    resetCfg: el("resetCfgBtn"),
+    pill: el("connection-pill"),
+    pillText: el("connection-pill-text"),
 
-    function updatePill(ok) {
-      if (ok) {
-        ui.pill.classList.remove('disconnected');
-        ui.pillText.textContent = "Connected";
-        ui.cfgStatus.textContent = "Online";
-        ui.cfgStatus.style.color = "var(--success)";
-        ui.cfgError.style.display = 'none';
-      } else {
-        ui.pill.classList.add('disconnected');
-        ui.pillText.textContent = "Disconnected";
-        ui.cfgStatus.textContent = "Offline";
-        ui.cfgStatus.style.color = "var(--danger)";
-      }
-    }
+    // Status
+    stEnv: el("status-env"),
+    stEngine: el("status-engine"),
+    stTime: el("status-time"),
+    stSheets: el("status-sheets"),
+    hEnriched: el("health-enriched"),
+    hAi: el("health-ai"),
+    hAdv: el("health-adv"),
+    hKsa: el("health-ksa"),
+    refreshStatus: el("refreshStatusBtn"),
 
-    // --- OPERATIONS ---
-    async function checkConnectivity() {
-      ui.stEnv.textContent = "...";
-      ui.stEngine.textContent = "...";
-      ui.hEnriched.textContent = "...";
-      
-      try {
-        // 1. Root Status
-        const root = await fetchAPI('/');
-        ui.stEnv.textContent = `v${root.version}`;
-        ui.stEngine.textContent = root.engine || "Unknown";
-        
-        // 2. Health Checks
-        const [hE, hA, hAdv] = await Promise.allSettled([
-            fetchAPI('/v1/enriched/health'),
-            fetchAPI('/v1/analysis/health'),
-            fetchAPI('/v1/advanced/health')
-        ]);
-        
-        const setH = (el, res) => {
-            el.textContent = res.status === 'fulfilled' ? 'OK' : 'ERR';
-            el.className = `value ${res.status === 'fulfilled' ? 'ok' : 'bad'}`;
-        };
-        
-        setH(ui.hEnriched, hE);
-        setH(ui.hAi, hA);
-        setH(ui.hAdv, hAdv);
-        
-        // Check legacy status for sheets info if available
-        try {
-            // Note: If legacy doesn't exist, this fails silently
-            // Since main.py root doesn't return sheets status yet, we assume configured if root worked
-            ui.stSheets.textContent = "Assumed OK"; 
-            ui.stSheets.className = "value ok";
-        } catch(e) {}
+    // Quick
+    qSym: el("quickSymbol"),
+    qType: el("quickType"),
+    qRun: el("runQuickBtn"),
+    qRes: el("quickResult"),
+    qCopy: el("copyQuickBtn"),
 
-        updatePill(true);
-      } catch (e) {
-        console.error(e);
-        ui.cfgError.textContent = `Connection Failed: ${e.message}`;
-        ui.cfgError.style.display = 'block';
-        updatePill(false);
-      }
-    }
+    // Batch
+    bType: el("batchType"),
+    bSheet: el("batchSheetName"),
+    bTickers: el("batchTickers"),
+    bRun: el("runBatchBtn"),
+    bClear: el("clearBatchBtn"),
+    bSample: el("sampleBatchBtn"),
+    bErr: el("batchError"),
+    bTable: el("batchTableContainer"),
+    bSplit: el("tickerSplitRow"),
 
-    async function runQuick() {
-      const sym = ui.qSym.value.trim();
-      if (!sym) return;
-      
-      ui.qRes.textContent = "Loading...";
-      const type = ui.qType.value;
-      let path = "";
-      
-      if (type === 'enriched') path = `/v1/enriched/quote?symbol=${sym}`;
-      else if (type === 'analysis') path = `/v1/analysis/quote?symbol=${sym}`;
-      else if (type === 'advanced') path = `/v1/advanced/scoreboard?tickers=${sym}&top_n=1`;
-      
-      try {
-        const data = await fetchAPI(path);
-        // Clean up response if it's the scoreboard wrapper
-        const display = (type === 'advanced' && data.items) ? data.items[0] : data;
-        ui.qRes.textContent = JSON.stringify(display, null, 2);
-      } catch (e) {
-        ui.qRes.textContent = `Error: ${e.message}`;
-      }
-    }
+    footer: el("footerText")
+  };
 
-    async function runBatch() {
-      const txt = ui.bTickers.value;
-      const tickers = txt.split('\n').map(t => t.trim()).filter(t => t);
-      if (!tickers.length) return;
+  function escapeHtml(str) {
+    return String(str)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
 
-      ui.bErr.style.display = 'none';
-      ui.bTable.style.display = 'none';
-      ui.bRun.textContent = "Processing...";
-      ui.bRun.disabled = true;
+  function normalizeTicker(t) {
+    const s = String(t || "").trim();
+    if (!s) return "";
+    // Keep case for non-KSA symbols but standardize .SR uppercase
+    const u = s.toUpperCase();
+    // allow TADAWUL:1120 or 1120.TADAWUL
+    if (u.startsWith("TADAWUL:")) return u.split(":", 2)[1].trim() + ".SR";
+    if (u.endsWith(".TADAWUL")) return u.replace(".TADAWUL", ".SR");
+    if (/^\d+$/.test(u)) return u + ".SR";
+    return u;
+  }
 
-      const type = ui.bType.value;
-      const endpoint = `/v1/${type}/sheet-rows`; // All follow this convention now
+  // -----------------------------
+  // Config
+  // -----------------------------
+  function loadConfig() {
+    state.baseUrl = (localStorage.getItem(LS_BASE) || window.location.origin).replace(/\/$/, "");
+    state.token = (localStorage.getItem(LS_TOKEN) || "").trim();
+    ui.baseUrl.value = state.baseUrl;
+    ui.token.value = state.token;
+  }
 
-      try {
-        const data = await fetchAPI(endpoint, {
-            method: 'POST',
-            body: { tickers, sheet_name: "Preview_Test" } // Dummy sheet name required by backend
-        });
+  function saveConfig() {
+    state.baseUrl = (ui.baseUrl.value || "").trim().replace(/\/$/, "");
+    state.token = (ui.token.value || "").trim();
+    localStorage.setItem(LS_BASE, state.baseUrl);
+    localStorage.setItem(LS_TOKEN, state.token);
+    checkConnectivity();
+  }
 
-        // Render Table
-        let html = '<table><thead><tr>';
-        data.headers.forEach(h => html += `<th>${h}</th>`);
-        html += '</tr></thead><tbody>';
-        
-        data.rows.forEach(row => {
-            html += '<tr>';
-            row.forEach(cell => {
-                const val = (cell === null || cell === undefined) ? '' : cell;
-                html += `<td>${val}</td>`;
-            });
-            html += '</tr>';
-        });
-        html += '</tbody></table>';
-        
-        ui.bTable.innerHTML = html;
-        ui.bTable.style.display = 'block';
-      } catch (e) {
-        ui.bErr.textContent = `Batch Error: ${e.message}`;
-        ui.bErr.style.display = 'block';
-      } finally {
-        ui.bRun.textContent = "Preview Rows";
-        ui.bRun.disabled = false;
-      }
-    }
-
-    function updateSplit() {
-      const txt = ui.bTickers.value;
-      const tickers = txt.split('\n').map(t => t.trim()).filter(t => t);
-      const ksa = tickers.filter(t => t.toUpperCase().endsWith('.SR') || /^\d+$/.test(t));
-      const glob = tickers.filter(t => !t.toUpperCase().endsWith('.SR') && !/^\d+$/.test(t));
-      
-      let html = '';
-      if (ksa.length) html += `<div class="chip ksa">KSA: ${ksa.length}</div>`;
-      if (glob.length) html += `<div class="chip global">Global: ${glob.length}</div>`;
-      
-      ui.bSplit.innerHTML = html;
-      ui.bSplit.style.display = html ? 'flex' : 'none';
-    }
-
-    // --- EVENTS ---
-    ui.saveCfg.onclick = saveConfig;
-    ui.clearCfg.onclick = () => { localStorage.clear(); location.reload(); };
-    ui.refreshStatus.onclick = checkConnectivity;
-    ui.qRun.onclick = runQuick;
-    ui.bRun.onclick = runBatch;
-    ui.bClear.onclick = () => { ui.bTickers.value = ''; updateSplit(); ui.bTable.style.display='none'; };
-    ui.bTickers.oninput = updateSplit;
-
-    // --- INIT ---
+  function resetConfig() {
+    localStorage.removeItem(LS_BASE);
+    localStorage.removeItem(LS_TOKEN);
     loadConfig();
     checkConnectivity();
-  })();
+  }
+
+  function updatePill(ok, msg) {
+    if (ok) {
+      ui.pill.classList.remove("disconnected");
+      ui.pillText.textContent = "Connected";
+      ui.cfgStatus.textContent = msg || "Online";
+      ui.cfgStatus.style.color = "var(--success)";
+      ui.cfgError.style.display = "none";
+    } else {
+      ui.pill.classList.add("disconnected");
+      ui.pillText.textContent = "Disconnected";
+      ui.cfgStatus.textContent = msg || "Offline";
+      ui.cfgStatus.style.color = "var(--danger)";
+    }
+  }
+
+  // -----------------------------
+  // HTTP
+  // -----------------------------
+  async function request(endpoint, opts = {}) {
+    const method = (opts.method || "GET").toUpperCase();
+    const url = `${state.baseUrl}${endpoint}`;
+    const headers = Object.assign({}, opts.headers || {});
+
+    if (state.token) headers["X-APP-TOKEN"] = state.token;
+
+    let body = undefined;
+    if (opts.json !== undefined) {
+      headers["Content-Type"] = "application/json; charset=utf-8";
+      body = JSON.stringify(opts.json);
+    }
+
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), opts.timeoutMs || state.timeoutMs);
+
+    try {
+      const res = await fetch(url, {
+        method,
+        headers,
+        body,
+        signal: controller.signal
+      });
+
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+
+      if (!res.ok) {
+        const detail =
+          (data && (data.detail || data.error || data.message)) ||
+          text ||
+          `HTTP ${res.status}`;
+        throw new Error(detail);
+      }
+
+      return data !== null ? data : text;
+    } finally {
+      clearTimeout(id);
+    }
+  }
+
+  function setHealth(elm, ok, labelOk = "OK", labelBad = "ERR") {
+    elm.textContent = ok ? labelOk : labelBad;
+    elm.className = `value ${ok ? "ok" : "bad"}`;
+  }
+
+  // -----------------------------
+  // Connectivity & Status
+  // -----------------------------
+  async function checkConnectivity() {
+    // Reset status placeholders
+    ui.stEnv.textContent = "...";
+    ui.stEngine.textContent = "...";
+    ui.stTime.textContent = "...";
+    ui.stSheets.textContent = "...";
+
+    setHealth(ui.hEnriched, false, "OK", "...");
+    setHealth(ui.hAi, false, "OK", "...");
+    setHealth(ui.hAdv, false, "OK", "...");
+    setHealth(ui.hKsa, false, "OK", "...");
+
+    try {
+      // Use /health (safe even if / serves index.html)
+      const root = await request("/health", { method: "GET" });
+
+      const version = root?.version || root?.app_version || root?.APP_VERSION || "unknown";
+      const env = root?.env || root?.app_env || root?.APP_ENV || "unknown";
+      const engine = root?.engine || root?.engine_mode || root?.mode || "v2";
+      const timeUtc = root?.time_utc || root?.timestamp_utc || root?.time || "";
+
+      ui.stEnv.textContent = `${env} • v${version}`;
+      ui.stEngine.textContent = String(engine);
+      ui.stTime.textContent = String(timeUtc || new Date().toISOString());
+
+      // We cannot reliably detect sheets config from root; show "Configured?" based on server reachability.
+      ui.stSheets.textContent = "Backend OK";
+      ui.stSheets.className = "value ok";
+
+      // Route health (settled)
+      const settled = await Promise.allSettled([
+        request("/v1/enriched/health", { method: "GET" }),
+        request("/v1/analysis/health", { method: "GET" }),
+        request("/v1/advanced/health", { method: "GET" }),
+        request("/v1/argaam/health", { method: "GET" }),
+      ]);
+
+      setHealth(ui.hEnriched, settled[0].status === "fulfilled");
+      setHealth(ui.hAi, settled[1].status === "fulfilled");
+      setHealth(ui.hAdv, settled[2].status === "fulfilled");
+      setHealth(ui.hKsa, settled[3].status === "fulfilled");
+
+      // Footer
+      ui.footer.textContent = `Tadawul Fast Bridge • ${env} • v${version} • Engine ${engine}`;
+
+      updatePill(true, "Online");
+    } catch (e) {
+      console.error(e);
+      ui.cfgError.textContent = `Connection Failed: ${e.message || e}`;
+      ui.cfgError.style.display = "block";
+      ui.stEnv.textContent = "-";
+      ui.stEngine.textContent = "-";
+      ui.stTime.textContent = "-";
+      ui.stSheets.textContent = "-";
+      ui.stSheets.className = "value bad";
+      updatePill(false, "Offline");
+    }
+  }
+
+  // -----------------------------
+  // Quick
+  // -----------------------------
+  async function runQuick() {
+    const symRaw = ui.qSym.value.trim();
+    if (!symRaw) return;
+
+    const sym = normalizeTicker(symRaw);
+    ui.qRes.textContent = "Loading...";
+
+    const type = ui.qType.value;
+    let path = "";
+
+    if (type === "enriched") path = `/v1/enriched/quote?symbol=${encodeURIComponent(sym)}`;
+    else if (type === "analysis") path = `/v1/analysis/quote?symbol=${encodeURIComponent(sym)}`;
+    else if (type === "argaam") path = `/v1/argaam/quote?symbol=${encodeURIComponent(sym)}`;
+    else if (type === "advanced") path = `/v1/advanced/scoreboard?tickers=${encodeURIComponent(sym)}&top_n=1`;
+
+    try {
+      const data = await request(path, { method: "GET" });
+      const display = (type === "advanced" && data && data.items) ? (data.items[0] || data) : data;
+      ui.qRes.textContent = JSON.stringify(display, null, 2);
+    } catch (e) {
+      ui.qRes.textContent = `Error: ${e.message || e}`;
+    }
+  }
+
+  async function copyQuick() {
+    const txt = ui.qRes.textContent || "";
+    try {
+      await navigator.clipboard.writeText(txt);
+      ui.qCopy.textContent = "Copied";
+      setTimeout(() => ui.qCopy.textContent = "Copy JSON", 900);
+    } catch {
+      ui.qCopy.textContent = "Copy failed";
+      setTimeout(() => ui.qCopy.textContent = "Copy JSON", 1200);
+    }
+  }
+
+  // -----------------------------
+  // Batch
+  // -----------------------------
+  function updateSplit() {
+    const tickersRaw = ui.bTickers.value.split("\n").map(s => s.trim()).filter(Boolean);
+
+    const normalized = tickersRaw.map(normalizeTicker).filter(Boolean);
+
+    const seen = new Set();
+    let duplicates = 0;
+    normalized.forEach(t => { if (seen.has(t)) duplicates++; else seen.add(t); });
+
+    const ksa = normalized.filter(t => t.endsWith(".SR") || /^\d+\.SR$/.test(t));
+    const glob = normalized.filter(t => !t.endsWith(".SR"));
+
+    let html = "";
+    if (normalized.length) html += `<div class="chip muted">Total: ${normalized.length}</div>`;
+    if (duplicates) html += `<div class="chip muted">Duplicates: ${duplicates}</div>`;
+    if (ksa.length) html += `<div class="chip ksa">KSA: ${ksa.length}</div>`;
+    if (glob.length) html += `<div class="chip global">Global: ${glob.length}</div>`;
+
+    ui.bSplit.innerHTML = html;
+    ui.bSplit.style.display = html ? "flex" : "none";
+  }
+
+  function endpointForBatch(type) {
+    if (type === "enriched") return "/v1/enriched/sheet-rows";
+    if (type === "analysis") return "/v1/analysis/sheet-rows";
+    if (type === "advanced") return "/v1/advanced/sheet-rows";
+    if (type === "argaam") return "/v1/argaam/sheet-rows";
+    return "/v1/enriched/sheet-rows";
+  }
+
+  async function runBatch() {
+    const tickersRaw = ui.bTickers.value.split("\n").map(s => s.trim()).filter(Boolean);
+    if (!tickersRaw.length) return;
+
+    const tickers = tickersRaw.map(normalizeTicker).filter(Boolean);
+
+    ui.bErr.style.display = "none";
+    ui.bTable.style.display = "none";
+    ui.bRun.textContent = "Processing...";
+    ui.bRun.disabled = true;
+
+    const type = ui.bType.value;
+    const endpoint = endpointForBatch(type);
+    const sheetName = (ui.bSheet.value || "Preview_Test").trim() || "Preview_Test";
+
+    // Backend payload compatibility:
+    // - enriched/analysis/advanced use {"tickers":[...], "sheet_name": "..."}
+    // - argaam route accepts {"symbols":[...]} or {"tickers":[...]} (we send tickers for compatibility)
+    const payload = { tickers, sheet_name: sheetName };
+
+    try {
+      const data = await request(endpoint, { method: "POST", json: payload });
+
+      const headers = Array.isArray(data?.headers) ? data.headers : [];
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+
+      if (!headers.length) {
+        ui.bErr.textContent = "Batch Error: Backend returned no headers.";
+        ui.bErr.style.display = "block";
+        return;
+      }
+
+      // Render table (escape)
+      let html = "<table><thead><tr>";
+      headers.forEach(h => html += `<th>${escapeHtml(h)}</th>`);
+      html += "</tr></thead><tbody>";
+
+      const maxRowsToRender = 50; // UI safety
+      const slice = rows.slice(0, maxRowsToRender);
+
+      slice.forEach(row => {
+        html += "<tr>";
+        (row || []).slice(0, headers.length).forEach(cell => {
+          const val = (cell === null || cell === undefined) ? "" : String(cell);
+          html += `<td>${escapeHtml(val)}</td>`;
+        });
+        // pad if row shorter
+        const missing = headers.length - (row ? row.length : 0);
+        if (missing > 0) {
+          for (let i = 0; i < missing; i++) html += "<td></td>";
+        }
+        html += "</tr>";
+      });
+
+      html += "</tbody></table>";
+
+      if (rows.length > maxRowsToRender) {
+        html = `<div style="padding:10px;color:var(--muted);font-size:.78rem">
+          Showing first ${maxRowsToRender} of ${rows.length} rows (UI limit).
+        </div>` + html;
+      }
+
+      ui.bTable.innerHTML = html;
+      ui.bTable.style.display = "block";
+    } catch (e) {
+      ui.bErr.textContent = `Batch Error: ${e.message || e}`;
+      ui.bErr.style.display = "block";
+    } finally {
+      ui.bRun.textContent = "Preview Rows";
+      ui.bRun.disabled = false;
+    }
+  }
+
+  function fillSample() {
+    ui.bTickers.value = "1120.SR\n1180.SR\n2222.SR\nAAPL\nMSFT\nNVDA";
+    updateSplit();
+  }
+
+  // -----------------------------
+  // Events
+  // -----------------------------
+  ui.saveCfg.addEventListener("click", saveConfig);
+  ui.resetCfg.addEventListener("click", resetConfig);
+
+  ui.refreshStatus.addEventListener("click", checkConnectivity);
+
+  ui.qRun.addEventListener("click", runQuick);
+  ui.qCopy.addEventListener("click", copyQuick);
+
+  ui.qSym.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") runQuick();
+  });
+
+  ui.bRun.addEventListener("click", runBatch);
+  ui.bClear.addEventListener("click", () => {
+    ui.bTickers.value = "";
+    updateSplit();
+    ui.bTable.style.display = "none";
+    ui.bErr.style.display = "none";
+  });
+  ui.bSample.addEventListener("click", fillSample);
+
+  ui.bTickers.addEventListener("input", updateSplit);
+
+  // -----------------------------
+  // Init
+  // -----------------------------
+  loadConfig();
+  updateSplit();
+  checkConnectivity();
+})();
 </script>
+
 </body>
 </html>
