@@ -3,23 +3,19 @@ main.py
 ------------------------------------------------------------
 Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE)
 
-IMPORTANT:
-- Render runs: uvicorn main:app --host 0.0.0.0 --port $PORT
-- Therefore this module MUST expose: `app = FastAPI(...)`
+Render runs:
+  uvicorn main:app --host 0.0.0.0 --port $PORT
 
-This file:
-- Loads settings (config.get_settings)
-- Enables CORS (optionally all origins)
-- Enables SlowAPI rate limiting (if available)
-- Mounts routers defensively (won’t crash if optional modules missing)
-- Exposes / and /health endpoints
+So this module MUST expose:
+  app = FastAPI(...)
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+import json
+from typing import Any, Optional, List
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,51 +28,76 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format=LOG_FORMAT)
 logger = logging.getLogger("main")
 
 # -------------------------
-# Settings
+# Optional Settings Sources
+# Priority: config.py (typed) -> env.py (project defaults) -> OS env
 # -------------------------
+settings = None
+env_mod = None
+
 try:
-    from config import get_settings
-except Exception as e:  # ultra-safe: never crash import path
-    get_settings = None
-    logger.warning("Settings loader not available (config.py). Using env only. Error: %s", e)
+    from config import get_settings  # type: ignore
+    settings = get_settings()
+    logger.info("Settings loaded from config.py")
+except Exception as e:
+    logger.warning("Settings loader not available (config.py). Using env.py / OS env. Error: %s", e)
+
+try:
+    import env as env_mod  # type: ignore
+except Exception:
+    env_mod = None
 
 
-def _mount_router(app_: FastAPI, module_path: str, attr: str = "router", prefix: str = "") -> None:
-    """
-    Import and mount a FastAPI router without crashing the app if missing.
-    """
+def _get(name: str, default: Any = None) -> Any:
+    if settings is not None and hasattr(settings, name):
+        return getattr(settings, name)
+    if env_mod is not None and hasattr(env_mod, name):
+        return getattr(env_mod, name)
+    return os.getenv(name, default)
+
+
+def _parse_providers(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip().lower() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    # JSON array?
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [str(x).strip().lower() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    return [p.strip().lower() for p in s.split(",") if p.strip()]
+
+
+def _mount_router(app_: FastAPI, module_path: str, attr: str = "router") -> None:
     try:
         mod = __import__(module_path, fromlist=[attr])
         router = getattr(mod, attr)
-        app_.include_router(router, prefix=prefix)
+        app_.include_router(router)
         logger.info("Mounted router: %s.%s", module_path, attr)
     except Exception as e:
         logger.warning("Router not mounted (%s): %s", module_path, e)
 
 
 def create_app() -> FastAPI:
-    settings = get_settings() if get_settings else None
+    title = _get("APP_NAME", "Tadawul Fast Bridge")
+    version = _get("APP_VERSION", "4.6.0")  # ✅ fallback avoids 0.0.0
+    app_env = _get("APP_ENV", "production")
 
-    app_ = FastAPI(
-        title=(settings.APP_NAME if settings else os.getenv("APP_NAME", "Tadawul Fast Bridge")),
-        version=(settings.APP_VERSION if settings else os.getenv("APP_VERSION", "0.0.0")),
-    )
-
-    # Keep settings accessible to routers/services
+    app_ = FastAPI(title=title, version=version)
     app_.state.settings = settings
+    app_.state.app_env = app_env
 
     # -------------------------
     # CORS
     # -------------------------
-    cors_all = True
-    if settings:
-        cors_all = bool(settings.ENABLE_CORS_ALL_ORIGINS)
-
-    if cors_all:
-        allow_origins = ["*"]
-    else:
-        # You can later restrict by setting CORS_ORIGINS env var to comma-separated values
-        allow_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()] or ["*"]
+    cors_all = str(_get("ENABLE_CORS_ALL_ORIGINS", "true")).strip().lower() in ("1", "true", "yes", "y", "on")
+    allow_origins = ["*"] if cors_all else [o.strip() for o in str(_get("CORS_ORIGINS", "")).split(",") if o.strip()] or ["*"]
 
     app_.add_middleware(
         CORSMiddleware,
@@ -87,7 +108,7 @@ def create_app() -> FastAPI:
     )
 
     # -------------------------
-    # SlowAPI (rate limit)
+    # SlowAPI rate limiting
     # -------------------------
     try:
         from slowapi import Limiter
@@ -109,60 +130,46 @@ def create_app() -> FastAPI:
         logger.warning("SlowAPI not enabled: %s", e)
 
     # -------------------------
-    # Routes
+    # Routes (defensive mounting)
     # -------------------------
-    _mount_router(app_, "routes.enriched_quote", "router")
-    _mount_router(app_, "routes.ai_analysis", "router")
-    _mount_router(app_, "routes.advanced_analysis", "router")
-    _mount_router(app_, "routes_argaam", "router")
-
-    # Optional legacy route module path (some projects used routes.legacy_service)
-    _mount_router(app_, "routes.legacy_service", "router")
-    # Current legacy router (based on your logs)
-    _mount_router(app_, "legacy_service", "router")
+    _mount_router(app_, "routes.enriched_quote")
+    _mount_router(app_, "routes.ai_analysis")
+    _mount_router(app_, "routes.advanced_analysis")
+    _mount_router(app_, "routes_argaam")
+    _mount_router(app_, "legacy_service")  # your log confirms this exists
 
     # -------------------------
-    # Health & Root
+    # System endpoints
+    # (explicit HEAD avoids the Render internal HEAD / 405 noise)
     # -------------------------
-    @app_.get("/", tags=["system"])
+    @app_.api_route("/", methods=["GET", "HEAD"], tags=["system"])
     async def root():
-        return {"status": "ok", "app": app_.title, "version": app_.version}
+        return {"status": "ok", "app": app_.title, "version": app_.version, "env": app_env}
 
     @app_.get("/health", tags=["system"])
     async def health():
-        providers = None
-        engine = os.getenv("ENGINE", "DataEngineV2")
-        if settings:
-            providers = ",".join(settings.ENABLED_PROVIDERS) if isinstance(settings.ENABLED_PROVIDERS, list) else str(settings.ENABLED_PROVIDERS)
-
+        providers = _parse_providers(_get("ENABLED_PROVIDERS", ""))  # informational only
+        engine = _get("ENGINE", "DataEngineV2")
         return {
             "status": "ok",
             "app": app_.title,
             "version": app_.version,
-            "env": (settings.APP_ENV if settings else os.getenv("APP_ENV", "production")),
+            "env": app_env,
             "engine": engine,
             "providers": providers,
         }
 
     # Startup banner
-    try:
-        env = settings.APP_ENV if settings else os.getenv("APP_ENV", "production")
-        prov = (
-            ",".join(settings.ENABLED_PROVIDERS)
-            if settings and isinstance(settings.ENABLED_PROVIDERS, list)
-            else (str(settings.ENABLED_PROVIDERS) if settings else os.getenv("ENABLED_PROVIDERS", ""))
-        )
-        logger.info("==============================================")
-        logger.info("🚀 Tadawul Fast Bridge starting")
-        logger.info("   Env: %s | Version: %s", env, app_.version)
-        logger.info("   Providers: %s", prov)
-        logger.info("   CORS all origins: %s", cors_all)
-        logger.info("==============================================")
-    except Exception:
-        pass
+    providers = _parse_providers(_get("ENABLED_PROVIDERS", ""))
+    logger.info("==============================================")
+    logger.info("🚀 Tadawul Fast Bridge starting")
+    logger.info("   Env: %s | Version: %s", app_env, app_.version)
+    logger.info("   Providers: %s", ",".join(providers) if providers else "(not set)")
+    logger.info("   CORS all origins: %s", cors_all)
+    logger.info("==============================================")
 
     return app_
 
 
-# ✅ REQUIRED BY RENDER START COMMAND: uvicorn main:app
+# ✅ REQUIRED BY RENDER: uvicorn main:app
 app = create_app()
