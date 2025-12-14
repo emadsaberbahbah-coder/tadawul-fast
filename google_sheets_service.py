@@ -2,25 +2,29 @@
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.6.0 (QA-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.7.0 (Aligned + production-hardened)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
 - Calls Tadawul Fast Bridge backend endpoints that return {headers, rows}.
 - Writes data to Sheets in chunked mode to avoid request size limits.
 
-Key Improvements (vs v3.2.0)
-- Much safer credentials parsing (handles escaped \\n private_key, quoted JSON).
-- Safer backend client:
+Key Improvements (vs v3.6.0)
+- Even safer credentials parsing:
+    • supports quoted JSON, escaped \\n private_key, and accidental whitespace
+- Backend client hardening:
     • retries + exponential backoff + jitter
-    • switches to BACKUP_APP_TOKEN on 401/403
-    • robust HTTPError body capture
-    • safe JSON decode fallback
-- Safer sheet-name quoting (escapes single quotes).
-- Safer A1 parsing (defaults to A1 if invalid).
-- Chunked writes optionally use batchUpdate (fewer API calls).
-- Better “Sheets-safe” fallback payloads (never crash callers).
-- Backward-compatible exports kept.
+    • switches to BACKUP_APP_TOKEN on 401/403 automatically
+    • captures HTTPError response body safely
+    • safe JSON decode fallback with deterministic Sheets-safe payload
+- Range safety:
+    • robust A1 parsing (defaults to A1)
+    • safer sheet-name quoting (escapes single quotes)
+    • configurable clear end-col/end-row
+- Write performance:
+    • optional values.batchUpdate for fewer API calls
+    • safe fallback to sequential updates
+- Never crashes callers: returns Sheets-safe status payloads for backend failures
 
 Dependencies
 - google-api-python-client, google-auth (service account)
@@ -106,9 +110,11 @@ _MAX_ROWS_PER_WRITE = int(os.getenv("SHEETS_MAX_ROWS_PER_WRITE", "500") or "500"
 _USE_BATCH_UPDATE = str(os.getenv("SHEETS_USE_BATCH_UPDATE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # Clear range defaults
-_CLEAR_END_COL = os.getenv("SHEETS_CLEAR_END_COL", "ZZ").strip() or "ZZ"
+_CLEAR_END_COL = (os.getenv("SHEETS_CLEAR_END_COL", "ZZ") or "ZZ").strip()
 _CLEAR_END_ROW = int(os.getenv("SHEETS_CLEAR_END_ROW", "100000") or "100000")
 
+# Request headers
+_USER_AGENT = os.getenv("SHEETS_USER_AGENT", "TadawulFastBridge-SheetsService/3.7").strip() or "TadawulFastBridge-SheetsService/3.7"
 
 # =============================================================================
 # LOW-LEVEL HELPERS
@@ -147,15 +153,22 @@ def _coerce_private_key(creds_info: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _parse_credentials_from_env(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    Accepts:
+      - raw JSON object string
+      - same JSON wrapped in single/double quotes
+    Rejects anything not starting with '{' after stripping.
+    """
     if not raw:
         return None
+
     cleaned = str(raw).strip()
 
     # strip wrapping quotes if present
     if (cleaned.startswith("'") and cleaned.endswith("'")) or (cleaned.startswith('"') and cleaned.endswith('"')):
         cleaned = cleaned[1:-1].strip()
 
-    # must look like JSON
+    # must look like JSON object
     if not cleaned.startswith("{"):
         return None
 
@@ -167,7 +180,8 @@ def _parse_credentials_from_env(raw: str) -> Optional[Dict[str, Any]]:
 
 def _safe_sheet_name(sheet_name: str) -> str:
     """
-    Sheets API ranges accept 'Sheet Name'!A1. Single quotes inside must be doubled.
+    Sheets API ranges accept 'Sheet Name'!A1.
+    Single quotes inside names must be doubled.
     """
     name = (sheet_name or "").strip()
     name = name.replace("'", "''")
@@ -215,6 +229,13 @@ def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
     return {"ksa": ksa, "global": glob}
 
 
+def _require_spreadsheet_id(spreadsheet_id: str) -> str:
+    sid = (spreadsheet_id or _DEFAULT_SHEET_ID or "").strip()
+    if not sid:
+        raise ValueError("No Spreadsheet ID provided (DEFAULT_SPREADSHEET_ID missing).")
+    return sid
+
+
 # =============================================================================
 # GOOGLE SHEETS SERVICE INITIALIZATION
 # =============================================================================
@@ -231,7 +252,7 @@ def get_sheets_service():
             "Install: pip install google-api-python-client google-auth"
         )
 
-    creds_info = None
+    creds_info: Optional[Dict[str, Any]] = None
 
     # 1) Prefer parsed dict from env.py if available
     if isinstance(_CREDS_DICT, dict) and _CREDS_DICT:
@@ -284,10 +305,7 @@ def _retry_sheet_op(operation_name: str, func, *args, **kwargs):
 
 def read_range(spreadsheet_id: str, range_name: str) -> List[List[Any]]:
     service = get_sheets_service()
-
-    sid = (spreadsheet_id or _DEFAULT_SHEET_ID or "").strip()
-    if not sid:
-        raise ValueError("No Spreadsheet ID provided (DEFAULT_SPREADSHEET_ID missing).")
+    sid = _require_spreadsheet_id(spreadsheet_id)
 
     def _do_read():
         result = (
@@ -303,10 +321,7 @@ def read_range(spreadsheet_id: str, range_name: str) -> List[List[Any]]:
 
 def write_range(spreadsheet_id: str, range_name: str, values: List[List[Any]], value_input: str = "RAW") -> int:
     service = get_sheets_service()
-
-    sid = (spreadsheet_id or _DEFAULT_SHEET_ID or "").strip()
-    if not sid:
-        raise ValueError("No Spreadsheet ID provided (DEFAULT_SPREADSHEET_ID missing).")
+    sid = _require_spreadsheet_id(spreadsheet_id)
 
     body = {"values": values or [[]]}
 
@@ -329,10 +344,7 @@ def write_range(spreadsheet_id: str, range_name: str, values: List[List[Any]], v
 
 def clear_range(spreadsheet_id: str, range_name: str) -> None:
     service = get_sheets_service()
-
-    sid = (spreadsheet_id or _DEFAULT_SHEET_ID or "").strip()
-    if not sid:
-        raise ValueError("No Spreadsheet ID provided (DEFAULT_SPREADSHEET_ID missing).")
+    sid = _require_spreadsheet_id(spreadsheet_id)
 
     def _do_clear():
         service.spreadsheets().values().clear(spreadsheetId=sid, range=range_name).execute()
@@ -350,9 +362,7 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
     if not grid:
         return 0
 
-    sid = (spreadsheet_id or _DEFAULT_SHEET_ID or "").strip()
-    if not sid:
-        raise ValueError("No Spreadsheet ID provided (DEFAULT_SPREADSHEET_ID missing).")
+    sid = _require_spreadsheet_id(spreadsheet_id)
 
     start_col, start_row = _parse_a1_cell(start_cell)
     sheet_a1 = _safe_sheet_name(sheet_name)
@@ -422,12 +432,25 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
 def _backend_headers(token: str) -> Dict[str, str]:
     h = {
         "Content-Type": "application/json; charset=utf-8",
-        "User-Agent": "TadawulFastBridge-SheetsService/3.6",
+        "User-Agent": _USER_AGENT,
         "Accept": "application/json",
     }
     if token:
         h["X-APP-TOKEN"] = token
     return h
+
+
+def _backend_base_url() -> str:
+    return (_BACKEND_URL or "http://127.0.0.1:8000").rstrip("/")
+
+
+def _sheets_safe_error_payload(tickers: List[str], err: str) -> Dict[str, Any]:
+    return {
+        "headers": ["Symbol", "Error"],
+        "rows": [[t, err] for t in (tickers or [])],
+        "status": "error",
+        "error": err,
+    }
 
 
 def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -438,10 +461,9 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     Returns a dict that ALWAYS contains at least:
       - headers: [...]
       - rows: [...]
-      - status: "success" | "error"
+      - status: "success" | "error" | "skipped" | "partial"
     """
-    base = (_BACKEND_URL or "http://127.0.0.1:8000").rstrip("/")
-    url = f"{base}{endpoint}"
+    url = f"{_backend_base_url()}{endpoint}"
 
     tickers = payload.get("tickers") or payload.get("symbols") or []
     tickers = [str(t).strip() for t in (tickers or []) if str(t).strip()]
@@ -451,7 +473,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    tokens_to_try = []
+    tokens_to_try: List[str] = []
     if (_APP_TOKEN or "").strip():
         tokens_to_try.append((_APP_TOKEN or "").strip())
     if (_BACKUP_TOKEN or "").strip() and (_BACKUP_TOKEN or "").strip() != (_APP_TOKEN or "").strip():
@@ -461,30 +483,28 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     last_err: Optional[Exception] = None
     last_status: Optional[int] = None
+    last_body_preview: Optional[str] = None
 
-    # Retry loop
     attempts = max(1, _BACKEND_RETRIES + 1)
+
     for attempt in range(attempts):
         for tok_idx, tok in enumerate(tokens_to_try):
             try:
                 req = urllib.request.Request(url, data=body, headers=_backend_headers(tok), method="POST")
                 with urllib.request.urlopen(req, timeout=_BACKEND_TIMEOUT, context=_SSL_CONTEXT) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
-                    if 200 <= resp.status < 300:
+                    last_status = int(getattr(resp, "status", 0) or 0)
+                    last_body_preview = raw[:300]
+
+                    if 200 <= last_status < 300:
                         parsed = _safe_json_loads(raw)
                         if isinstance(parsed, dict):
                             parsed.setdefault("status", "success")
                             return parsed
-                        # Non-json but 2xx
-                        return {
-                            "headers": ["Symbol", "Error"],
-                            "rows": [[t, "Backend returned non-JSON response"] for t in tickers],
-                            "status": "error",
-                            "error": "Backend returned non-JSON response",
-                            "raw_preview": raw[:300],
-                        }
-                    last_status = int(resp.status)
-                    raise RuntimeError(f"Backend HTTP {resp.status}: {raw[:300]}")
+                        return _sheets_safe_error_payload(tickers, "Backend returned non-JSON response")
+
+                    raise RuntimeError(f"Backend HTTP {last_status}: {raw[:300]}")
+
             except urllib.error.HTTPError as e:
                 last_err = e
                 last_status = int(getattr(e, "code", 0) or 0)
@@ -492,33 +512,39 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     raw = e.read().decode("utf-8", errors="replace")  # type: ignore
                 except Exception:
                     raw = str(e)
+                last_body_preview = raw[:300]
 
                 # If unauthorized and this was primary token, try backup token next
                 if last_status in (401, 403) and tok_idx < len(tokens_to_try) - 1:
-                    logger.warning("[GoogleSheets] Backend auth failed (HTTP %s) on token #%s; trying next token.", last_status, tok_idx + 1)
+                    logger.warning(
+                        "[GoogleSheets] Backend auth failed (HTTP %s) on token #%s; trying next token.",
+                        last_status,
+                        tok_idx + 1,
+                    )
                     continue
 
-                # For other HTTP errors, break token loop and go to retry backoff
-                logger.warning("[GoogleSheets] Backend HTTPError %s: %s", last_status, raw[:300])
+                logger.warning("[GoogleSheets] Backend HTTPError %s: %s", last_status, last_body_preview)
+
             except Exception as e:
                 last_err = e
-                logger.warning("[GoogleSheets] Backend call failed (%s/%s) endpoint=%s: %s", attempt + 1, attempts, endpoint, e)
+                logger.warning(
+                    "[GoogleSheets] Backend call failed (%s/%s) endpoint=%s: %s",
+                    attempt + 1,
+                    attempts,
+                    endpoint,
+                    e,
+                )
 
-        # Backoff between retries (unless last attempt)
         if attempt < attempts - 1:
             _sleep_backoff(_BACKEND_RETRY_SLEEP, attempt, cap=8.0)
 
-    # Safe fallback (never crash callers)
     err_msg = f"{last_err}" if last_err else "Unknown backend error"
     if last_status:
         err_msg = f"HTTP {last_status}: {err_msg}"
+    if last_body_preview and (last_status in (400, 401, 403, 404, 500, 502, 503)):
+        err_msg = f"{err_msg} | body: {last_body_preview}"
 
-    return {
-        "headers": ["Symbol", "Error"],
-        "rows": [[t, err_msg] for t in tickers],
-        "status": "error",
-        "error": err_msg,
-    }
+    return _sheets_safe_error_payload(tickers, err_msg)
 
 
 # =============================================================================
@@ -553,9 +579,7 @@ def _refresh_logic(
     if not tickers:
         return {"status": "skipped", "reason": "No tickers provided"}
 
-    sid = (spreadsheet_id or _DEFAULT_SHEET_ID or "").strip()
-    if not sid:
-        raise ValueError("No Spreadsheet ID provided (DEFAULT_SPREADSHEET_ID missing).")
+    sid = _require_spreadsheet_id(spreadsheet_id)
 
     sh = (sheet_name or "").strip()
     if not sh:
@@ -575,11 +599,7 @@ def _refresh_logic(
     # Ensure rows align with headers
     fixed_rows: List[List[Any]] = []
     for r in rows:
-        if isinstance(r, (list, tuple)):
-            rr = list(r)
-        else:
-            rr = [r]
-
+        rr = list(r) if isinstance(r, (list, tuple)) else [r]
         if len(rr) < len(headers):
             rr += [None] * (len(headers) - len(rr))
         elif len(rr) > len(headers):
@@ -600,13 +620,20 @@ def _refresh_logic(
 
     updated_cells = write_grid_chunked(sid, sh, start_cell, grid)
 
+    backend_status = response.get("status")
+    status = "success"
+    if backend_status == "error":
+        status = "partial"  # still wrote error rows
+    elif backend_status == "skipped":
+        status = "skipped"
+
     return {
-        "status": "success" if response.get("status") != "error" else "partial",
+        "status": status,
         "rows_written": len(fixed_rows),
         "cells_updated": int(updated_cells or 0),
         "sheet": sh,
         "headers_count": len(headers),
-        "backend_status": response.get("status"),
+        "backend_status": backend_status,
         "backend_error": response.get("error"),
     }
 
