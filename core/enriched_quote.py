@@ -2,19 +2,21 @@
 """
 core/enriched_quote.py
 ===========================================================
-EnrichedQuote Mapper + Sheets Row Builder – v2.2 (PROD SAFE)
+EnrichedQuote Mapper + Sheets Row Builder – v2.3.0 (PROD SAFE)
 
 Purpose
 - Provide a stable, Sheets-friendly representation of UnifiedQuote.
 - Convert UnifiedQuote -> EnrichedQuote (same field names).
-- Convert EnrichedQuote -> Google Sheets row aligned to headers returned by:
-    core.schemas.get_headers_for_sheet(sheet_name)
+- Convert EnrichedQuote -> Google Sheets row aligned to provided headers.
 
 Design
 - Defensive: never throws during row build.
-- Header-driven: supports multiple header naming conventions (Symbol vs Ticker,
-  Company Name vs Name, Last Price vs Current Price, etc.)
+- Header-driven: supports multiple header naming conventions.
 - Sheets-safe values: None / NaN / inf -> "" (blank cell)
+- No risky % conversions for price changes (providers already vary).
+  Only conservative ratio->percent conversion is applied to:
+    dividend_yield, payout_ratio, roe, roa, net_margin, ebitda_margin,
+    revenue_growth, net_income_growth
 """
 
 from __future__ import annotations
@@ -23,12 +25,12 @@ import math
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from core.data_engine_v2 import UnifiedQuote
 
 
-ENRICHED_VERSION = "2.2.0"
+ENRICHED_VERSION = "2.3.0"
 
 
 # =============================================================================
@@ -37,7 +39,8 @@ ENRICHED_VERSION = "2.2.0"
 def _is_bad_number(x: Any) -> bool:
     try:
         if isinstance(x, (int, float)):
-            return math.isnan(float(x)) or math.isinf(float(x))
+            f = float(x)
+            return math.isnan(f) or math.isinf(f)
     except Exception:
         return True
     return False
@@ -46,7 +49,7 @@ def _is_bad_number(x: Any) -> bool:
 def _clean_value(x: Any) -> Any:
     """
     Google Sheets values API is happiest with:
-      - str, int/float, bool, ""
+      - str, int/float, bool, "" (blank)
     """
     if x is None:
         return ""
@@ -67,14 +70,30 @@ def _norm_header(h: str) -> str:
     return s
 
 
-def _pct(x: Any) -> Optional[float]:
+def _snake_from_header(h: str) -> str:
+    """
+    Convert header label to snake_case candidate:
+      "Last Updated (Riyadh)" -> "last_updated_riyadh"
+    """
+    raw = (h or "").strip().lower()
+    raw = re.sub(r"[\(\)\[\]]", " ", raw)
+    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    return raw
+
+
+def _ratio_to_percent(v: Any) -> Optional[float]:
+    """
+    Conservative conversion for ratio-like fundamentals:
+    - If provider returns 0.15 => 15.0
+    - If provider returns 15.0 => 15.0
+    """
+    if v is None:
+        return None
     try:
-        if x is None:
+        f = float(v)
+        if _is_bad_number(f):
             return None
-        v = float(x)
-        if _is_bad_number(v):
-            return None
-        return v
+        return f * 100.0 if -1.0 <= f <= 1.0 else f
     except Exception:
         return None
 
@@ -97,9 +116,9 @@ def _safe_upside(current: Any, target: Any) -> Optional[float]:
 # =============================================================================
 class EnrichedQuote(BaseModel):
     """
-    A stable “public” quote shape for API + Google Sheets.
+    Stable “public” quote shape for API + Google Sheets.
 
-    NOTE: Field names intentionally match UnifiedQuote (engine output).
+    Field names intentionally match UnifiedQuote (engine output).
     """
     model_config = ConfigDict(
         populate_by_name=True,
@@ -192,8 +211,8 @@ class EnrichedQuote(BaseModel):
     # Meta
     data_source: str = "none"
     data_quality: str = "MISSING"
-    last_updated_utc: str = Field(default_factory=lambda: "")
-    last_updated_riyadh: str = Field(default_factory=lambda: "")
+    last_updated_utc: str = ""
+    last_updated_riyadh: str = ""
     error: Optional[str] = None
 
     # -------------------------------------------------------------------------
@@ -227,7 +246,6 @@ class EnrichedQuote(BaseModel):
         except Exception:
             data = {}
 
-        # Ensure symbol
         sym = (data.get("symbol") or data.get("ticker") or data.get("Symbol") or "").strip()
         if not sym and hasattr(q, "symbol"):
             try:
@@ -237,7 +255,7 @@ class EnrichedQuote(BaseModel):
 
         obj = cls(**{**data, "symbol": sym})
 
-        # Compute upside if missing (prefer fair_value, else target_price)
+        # Compute upside if missing (prefer target_price, else fair_value)
         if obj.upside_percent is None:
             tgt = obj.target_price if obj.target_price is not None else obj.fair_value
             obj.upside_percent = _safe_upside(obj.current_price, tgt)
@@ -251,16 +269,23 @@ class EnrichedQuote(BaseModel):
         """
         Build a row aligned to an arbitrary headers list.
         Unknown headers => blank.
+        Never raises.
         """
-        # Convenience locals (avoid getattr overhead)
-        d = self.model_dump(exclude_none=False)
+        try:
+            d = self.model_dump(exclude_none=False)
+        except Exception:
+            d = dict(getattr(self, "__dict__", {}) or {})
 
-        # Header-key -> extractor
         def g(*keys: str) -> Any:
             for k in keys:
                 if k in d:
                     return d.get(k)
             return None
+
+        # Conservative ratio->% conversions for specific fundamentals only
+        def pct_field(key: str) -> Any:
+            v = g(key)
+            return _ratio_to_percent(v)
 
         mapping: Dict[str, Callable[[], Any]] = {
             # Identity
@@ -271,15 +296,13 @@ class EnrichedQuote(BaseModel):
             "sector": lambda: g("sector"),
             "industry": lambda: g("industry"),
             "subsector": lambda: g("sub_sector"),
-            "subsectorname": lambda: g("sub_sector"),
             "market": lambda: g("market"),
             "currency": lambda: g("currency"),
             "listingdate": lambda: g("listing_date"),
 
-            # Shares / float / cap
+            # Shares / Float / Cap
             "sharesoutstanding": lambda: g("shares_outstanding"),
             "freefloat": lambda: g("free_float"),
-            "freefloatpercent": lambda: g("free_float"),
             "marketcap": lambda: g("market_cap"),
             "freefloatmarketcap": lambda: g("free_float_market_cap"),
 
@@ -290,68 +313,47 @@ class EnrichedQuote(BaseModel):
             "previousclose": lambda: g("previous_close"),
             "open": lambda: g("open"),
             "dayhigh": lambda: g("day_high"),
-            "high": lambda: g("day_high"),
             "daylow": lambda: g("day_low"),
-            "low": lambda: g("day_low"),
             "52whigh": lambda: g("high_52w"),
-            "yearhigh": lambda: g("high_52w"),
             "52wlow": lambda: g("low_52w"),
-            "yearlow": lambda: g("low_52w"),
+            "52wposition": lambda: g("position_52w_percent"),
             "52wpositionpercent": lambda: g("position_52w_percent"),
-            "position52wpercent": lambda: g("position_52w_percent"),
             "pricechange": lambda: g("price_change"),
-            "change": lambda: g("price_change"),
             "percentchange": lambda: g("percent_change"),
-            "changepercent": lambda: g("percent_change"),
-            "change%": lambda: g("percent_change"),
 
             # Volume / Liquidity
             "volume": lambda: g("volume"),
             "avgvolume30d": lambda: g("avg_volume_30d"),
-            "avgvolume": lambda: g("avg_volume_30d"),
             "valuetraded": lambda: g("value_traded"),
+            "turnover": lambda: g("turnover_percent"),
             "turnoverpercent": lambda: g("turnover_percent"),
-            "turnover%": lambda: g("turnover_percent"),
             "liquidityscore": lambda: g("liquidity_score"),
 
             # Fundamentals
             "epsttm": lambda: g("eps_ttm"),
-            "eps": lambda: g("eps_ttm"),
             "forwardeps": lambda: g("forward_eps"),
             "pettm": lambda: g("pe_ttm"),
-            "pe": lambda: g("pe_ttm"),
             "forwardpe": lambda: g("forward_pe"),
             "pb": lambda: g("pb"),
             "ps": lambda: g("ps"),
             "evebitda": lambda: g("ev_ebitda"),
-            "dividendyield": lambda: g("dividend_yield"),
-            "dividendyieldpercent": lambda: g("dividend_yield"),
+            "dividendyield": lambda: pct_field("dividend_yield"),
             "dividendrate": lambda: g("dividend_rate"),
-            "payoutratio": lambda: g("payout_ratio"),
-            "payoutratiopercent": lambda: g("payout_ratio"),
-            "roe": lambda: g("roe"),
-            "roepercent": lambda: g("roe"),
-            "roa": lambda: g("roa"),
-            "roapercent": lambda: g("roa"),
-            "netmargin": lambda: g("net_margin"),
-            "netmarginpercent": lambda: g("net_margin"),
-            "ebitdamargin": lambda: g("ebitda_margin"),
-            "ebitdamarginpercent": lambda: g("ebitda_margin"),
-            "revenuegrowth": lambda: g("revenue_growth"),
-            "revenuegrowthpercent": lambda: g("revenue_growth"),
-            "netincomegrowth": lambda: g("net_income_growth"),
-            "netincomegrowthpercent": lambda: g("net_income_growth"),
+            "payoutratio": lambda: pct_field("payout_ratio"),
+            "roe": lambda: pct_field("roe"),
+            "roa": lambda: pct_field("roa"),
+            "netmargin": lambda: pct_field("net_margin"),
+            "ebitdamargin": lambda: pct_field("ebitda_margin"),
+            "revenuegrowth": lambda: pct_field("revenue_growth"),
+            "netincomegrowth": lambda: pct_field("net_income_growth"),
             "beta": lambda: g("beta"),
-            "debtequity": lambda: g("debt_to_equity"),
             "debttoequity": lambda: g("debt_to_equity"),
             "currentratio": lambda: g("current_ratio"),
             "quickratio": lambda: g("quick_ratio"),
 
             # Technicals
             "rsi14": lambda: g("rsi_14"),
-            "rsi": lambda: g("rsi_14"),
             "volatility30d": lambda: g("volatility_30d"),
-            "volatility": lambda: g("volatility_30d"),
             "macd": lambda: g("macd"),
             "ma20": lambda: g("ma20"),
             "ma50": lambda: g("ma50"),
@@ -359,6 +361,7 @@ class EnrichedQuote(BaseModel):
             # Valuation / targets
             "fairvalue": lambda: g("fair_value"),
             "targetprice": lambda: g("target_price"),
+            "upside": lambda: g("upside_percent") if g("upside_percent") is not None else _safe_upside(g("current_price"), g("target_price") or g("fair_value")),
             "upsidepercent": lambda: g("upside_percent") if g("upside_percent") is not None else _safe_upside(g("current_price"), g("target_price") or g("fair_value")),
             "valuationlabel": lambda: g("valuation_label"),
             "analystrating": lambda: g("analyst_rating"),
@@ -376,9 +379,7 @@ class EnrichedQuote(BaseModel):
             # Meta
             "datasource": lambda: g("data_source"),
             "dataquality": lambda: g("data_quality"),
-            "lastupdated": lambda: g("last_updated_utc"),
             "lastupdatedutc": lambda: g("last_updated_utc"),
-            "lastupdatedlocal": lambda: g("last_updated_riyadh"),
             "lastupdatedriyadh": lambda: g("last_updated_riyadh"),
             "error": lambda: g("error"),
         }
@@ -387,24 +388,22 @@ class EnrichedQuote(BaseModel):
         for h in (headers or []):
             key = _norm_header(h)
 
-            # Also support patterns like "Change %" where normalization removes %
-            if key not in mapping:
-                # Try another normalization that keeps % removed but keyword preserved
-                if "change" in key and "percent" in key:
-                    key = "percentchange"
+            # Small compatibility shims
+            if key == "52wposition":
+                key = "52wpositionpercent"
+            if key == "turnover":
+                key = "turnoverpercent"
+            if key == "lastupdatedlocal":
+                key = "lastupdatedriyadh"
 
-            val = ""
+            val: Any = ""
             try:
                 fn = mapping.get(key)
                 if fn is not None:
                     val = fn()
                 else:
-                    # Fallback: attempt snake_case attr from header
-                    # e.g. "Last Updated (Riyadh)" -> last_updated_riyadh
-                    raw = (h or "").strip().lower()
-                    raw = re.sub(r"[\(\)\[\]]", " ", raw)
-                    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-                    val = d.get(raw, "")
+                    # Fallback: attempt snake_case lookup
+                    val = d.get(_snake_from_header(h), "")
             except Exception:
                 val = ""
 
