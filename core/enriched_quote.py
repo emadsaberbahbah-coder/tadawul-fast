@@ -1,448 +1,268 @@
-# core/enriched_quote.py
+# routes/enriched_quote.py
 """
-core/enriched_quote.py
-===============================================
-Enriched Quote schema & Google Sheets Row Adapter - v1.8 (PROD SAFE)
+routes/enriched_quote.py
+===========================================================
+Enriched Quote Routes (Google Sheets + API) - v2.0 (PROD SAFE)
 
-Purpose
--------
-- Keep backend + AI analysis + Google Sheets (59-col) perfectly aligned.
-- Convert UnifiedQuote (or dict) -> EnrichedQuote
-- Convert EnrichedQuote -> Google Sheets row based on a header list.
-
-Key upgrades (v1.8)
--------------------
-- Riyadh timezone fallback is UTC+3 (not UTC).
-- Stronger ISO parsing (supports "Z", space separator, unix seconds).
-- One-time model_dump() + merges Pydantic extras safely.
-- Header normalization hardened for punctuation, Arabic digits, 52W/30D tokens.
-- Alias lookup supports both engine naming styles (current_price vs last_price, etc.).
-- Safe cell serialization for Sheets (NaN/Inf -> None, dict/list -> JSON, datetime -> ISO).
+Goals
+- Provide stable endpoints for Google Sheets / Apps Script:
+    GET  /v1/enriched/quote?symbol=1120.SR
+    POST /v1/enriched/quotes   {symbols:[...]}
+- Return:
+    - quote JSON (UnifiedQuote / EnrichedQuote fields)
+    - optional Google Sheets row aligned to 59-column headers
+    - headers helper endpoint
+- Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
+- Defensive limits (ENRICHED_MAX_TICKERS, ENRICHED_BATCH_SIZE).
 """
 
 from __future__ import annotations
 
-import json
-import math
-import re
-from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+import asyncio
+import logging
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Literal
 
-from pydantic import ConfigDict
+from fastapi import APIRouter, Body, Header, HTTPException, Query
 
-# ---- UnifiedQuote import (defensive) ----
-try:
-    from .data_engine_v2 import UnifiedQuote  # preferred
-except Exception:  # pragma: no cover
-    try:
-        from pydantic import BaseModel as UnifiedQuote  # fallback
-    except Exception:  # pragma: no cover
-        class UnifiedQuote:  # type: ignore
-            pass
+from core.config import get_settings
+from core.data_engine_v2 import DataEngine, UnifiedQuote
+from core.enriched_quote import EnrichedQuote
+from core.schemas import BatchProcessRequest, get_headers_for_sheet
+
+logger = logging.getLogger("routes.enriched_quote")
+
+router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 
 # =============================================================================
-# Timezone helpers
+# Engine singleton (safe, shared)
 # =============================================================================
 
-try:
-    from zoneinfo import ZoneInfo  # py3.9+
-    _RIYADH_TZ = ZoneInfo("Asia/Riyadh")
-except Exception:  # pragma: no cover
-    _RIYADH_TZ = timezone(timedelta(hours=3))  # ✅ last resort: UTC+3
+_ENGINE: Optional[DataEngine] = None
+_ENGINE_LOCK = asyncio.Lock()
 
 
-def _parse_iso_dt(value: Any) -> Optional[datetime]:
-    """Parse common ISO strings safely to datetime (UTC-aware if possible)."""
-    if value is None:
-        return None
+async def _get_engine() -> DataEngine:
+    global _ENGINE
+    if _ENGINE is not None:
+        return _ENGINE
+    async with _ENGINE_LOCK:
+        if _ENGINE is None:
+            _ENGINE = DataEngine()
+            logger.info("[enriched] DataEngine initialized (singleton).")
+    return _ENGINE
 
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
-    # unix seconds (or ms if too large)
-    if isinstance(value, (int, float)) and not math.isnan(float(value)) and not math.isinf(float(value)):
-        try:
-            v = float(value)
-            # heuristic: ms timestamps
-            if v > 2_000_000_000_000:
-                v = v / 1000.0
-            return datetime.fromtimestamp(v, tz=timezone.utc)
-        except Exception:
-            return None
+# =============================================================================
+# Auth (X-APP-TOKEN)
+# =============================================================================
 
-    if not isinstance(value, str):
-        return None
-
-    s = value.strip()
-    if not s:
-        return None
-
-    # normalize "Z"
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-
-    # support "YYYY-MM-DD HH:MM:SS" by converting space to "T"
-    if " " in s and "T" not in s:
-        s = s.replace(" ", "T", 1)
-
+@lru_cache(maxsize=1)
+def _allowed_tokens() -> List[str]:
+    tokens: List[str] = []
     try:
-        dt = datetime.fromisoformat(s)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        s = get_settings()
+        for attr in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
+            v = getattr(s, attr, None)
+            if isinstance(v, str) and v.strip():
+                tokens.append(v.strip())
     except Exception:
-        return None
+        pass
 
-
-def _to_riyadh_iso(dt_utc: Optional[datetime]) -> Optional[str]:
-    if not dt_utc:
-        return None
+    # Also support env.py exports if present
     try:
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        return dt_utc.astimezone(_RIYADH_TZ).isoformat()
+        import env as env_mod  # type: ignore
+        for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
+            v = getattr(env_mod, attr, None)
+            if isinstance(v, str) and v.strip():
+                tokens.append(v.strip())
     except Exception:
-        return None
+        pass
+
+    # de-dup preserve order
+    out: List[str] = []
+    seen = set()
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+
+    if not out:
+        logger.warning("[enriched] No APP_TOKEN configured -> endpoints are OPEN (no auth).")
+    return out
+
+
+def _require_token(x_app_token: Optional[str]) -> None:
+    allowed = _allowed_tokens()
+    if not allowed:
+        return  # open mode if no token configured
+
+    if not x_app_token or x_app_token.strip() not in allowed:
+        raise HTTPException(status_code=401, detail="Unauthorized (invalid or missing X-APP-TOKEN).")
 
 
 # =============================================================================
-# Header normalization
+# Limits / helpers
 # =============================================================================
 
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_DASHES = {"–": "-", "—": "-", "−": "-"}
-
-@lru_cache(maxsize=4096)
-def _normalize_header_name(name: str) -> str:
-    """
-    Normalize a header string into a canonical key:
-    - Lowercase
-    - Convert "%" into "percent"
-    - Normalize Arabic digits
-    - Remove brackets (), [], {}
-    - Replace separators with underscores
-    - Collapse repeated underscores
-    """
-    s = (name or "").strip()
-    if not s:
-        return ""
-
-    s = s.translate(_ARABIC_DIGITS).lower()
-    for k, v in _DASHES.items():
-        s = s.replace(k, v)
-
-    s = s.replace("%", " percent ")
-    s = s.replace("&", " and ")
-
-    # remove brackets
-    s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
-
-    # normalize common tokens
-    s = s.replace("52w", "52_week")
-    s = s.replace("30d", "30_day")
-    s = s.replace("ttm", "ttm")
-
-    # punctuation -> spaces
-    s = re.sub(r"[,:;|]", " ", s)
-    s = s.replace("/", " ").replace("\\", " ").replace("-", " ").replace(".", " ")
-
-    # collapse spaces -> underscore
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"_+", "_", s)
-    return s.strip("_")
-
-
-# =============================================================================
-# Header -> Field mapping
-# =============================================================================
-
-_HEADER_FIELD_PAIRS: List[Tuple[str, str]] = [
-    # Identity
-    ("symbol", "symbol"),
-    ("ticker", "symbol"),
-    ("company_name", "name"),
-    ("company", "name"),
-    ("name", "name"),
-    ("sector", "sector"),
-    ("sub_sector", "sub_sector"),
-    ("subsector", "sub_sector"),
-    ("industry", "industry"),
-    ("market", "market"),
-    ("exchange", "market"),
-    ("currency", "currency"),
-    ("listing_date", "listing_date"),
-
-    # Prices
-    ("last_price", "current_price"),
-    ("current_price", "current_price"),
-    ("price", "current_price"),
-    ("previous_close", "previous_close"),
-    ("prev_close", "previous_close"),
-    ("open", "open"),
-    ("day_high", "day_high"),
-    ("day_low", "day_low"),
-    ("high", "day_high"),
-    ("low", "day_low"),
-    ("price_change", "price_change"),
-    ("change", "price_change"),
-    ("percent_change", "percent_change"),
-    ("change_percent", "percent_change"),
-    ("high_52_week", "high_52w"),
-    ("low_52_week", "low_52w"),
-    ("52_week_high", "high_52w"),
-    ("52_week_low", "low_52w"),
-    ("52w_high", "high_52w"),
-    ("52w_low", "low_52w"),
-    ("52_week_position_percent", "position_52w_percent"),
-    ("52w_position_percent", "position_52w_percent"),
-
-    # Volume / Liquidity
-    ("volume", "volume"),
-    ("avg_volume_30_day", "avg_volume_30d"),
-    ("avg_volume_30d", "avg_volume_30d"),
-    ("avg_volume_30", "avg_volume_30d"),
-    ("average_volume_30_day", "avg_volume_30d"),
-    ("value_traded", "value_traded"),
-    ("turnover_percent", "turnover_percent"),
-    ("turnover", "turnover_percent"),
-    ("liquidity_score", "liquidity_score"),
-
-    # Capital structure
-    ("shares_outstanding", "shares_outstanding"),
-    ("free_float_percent", "free_float"),
-    ("free_float", "free_float"),
-    ("market_cap", "market_cap"),
-    ("free_float_market_cap", "free_float_market_cap"),
-
-    # Fundamentals / Ratios
-    ("eps_ttm", "eps_ttm"),
-    ("eps", "eps_ttm"),
-    ("forward_eps", "forward_eps"),
-    ("p_e_ttm", "pe_ttm"),
-    ("pe_ttm", "pe_ttm"),
-    ("p_e", "pe_ttm"),
-    ("pe", "pe_ttm"),
-    ("forward_p_e", "forward_pe"),
-    ("forward_pe", "forward_pe"),
-    ("p_b", "pb"),
-    ("pb", "pb"),
-    ("p_s", "ps"),
-    ("ps", "ps"),
-    ("ev_ebitda", "ev_ebitda"),
-    ("ev_to_ebitda", "ev_ebitda"),
-    ("dividend_yield_percent", "dividend_yield"),
-    ("dividend_yield", "dividend_yield"),
-    ("dividend_rate", "dividend_rate"),
-    ("payout_ratio_percent", "payout_ratio"),
-    ("payout_ratio", "payout_ratio"),
-    ("roe_percent", "roe"),
-    ("roe", "roe"),
-    ("roa_percent", "roa"),
-    ("roa", "roa"),
-    ("net_margin_percent", "net_margin"),
-    ("net_margin", "net_margin"),
-    ("ebitda_margin_percent", "ebitda_margin"),
-    ("ebitda_margin", "ebitda_margin"),
-    ("revenue_growth_percent", "revenue_growth"),
-    ("revenue_growth", "revenue_growth"),
-    ("net_income_growth_percent", "net_income_growth"),
-    ("net_income_growth", "net_income_growth"),
-    ("beta", "beta"),
-    ("volatility_30_day", "volatility_30d"),
-    ("volatility_30d", "volatility_30d"),
-
-    # Technicals
-    ("rsi_14", "rsi_14"),
-    ("rsi_14_day", "rsi_14"),
-    ("rsi", "rsi_14"),
-    ("macd", "macd"),
-    ("ma20", "ma20"),
-    ("ma50", "ma50"),
-
-    # Valuation / Scores
-    ("fair_value", "fair_value"),
-    ("upside_percent", "upside_percent"),
-    ("upside", "upside_percent"),
-    ("valuation_label", "valuation_label"),
-    ("target_price", "target_price"),
-    ("analyst_rating", "analyst_rating"),
-    ("value_score", "value_score"),
-    ("quality_score", "quality_score"),
-    ("momentum_score", "momentum_score"),
-    ("opportunity_score", "opportunity_score"),
-    ("overall_score", "overall_score"),
-    ("recommendation", "recommendation"),
-    ("risk_score", "risk_score"),
-    ("confidence", "confidence"),
-
-    # Meta
-    ("data_source", "data_source"),
-    ("data_quality", "data_quality"),
-    ("last_updated_utc", "last_updated_utc"),
-    ("last_updated_riyadh", "last_updated_riyadh"),
-    ("last_updated_local", "last_updated_riyadh"),
-    ("last_updated", "last_updated_utc"),
-    ("error", "error"),
-]
-
-_HEADER_FIELD_MAP: Dict[str, str] = dict(sorted(_HEADER_FIELD_PAIRS, key=lambda kv: kv[0]))
-
-# Preferred field -> acceptable aliases in data dict
-_FIELD_ALIASES: Dict[str, List[str]] = {
-    "current_price": ["last_price", "price", "last", "close"],
-    "price_change": ["change", "delta", "price_delta"],
-    "percent_change": ["change_percent", "pct_change", "percent", "delta_percent"],
-    "high_52w": ["high52w", "fifty_two_week_high", "52w_high"],
-    "low_52w": ["low52w", "fifty_two_week_low", "52w_low"],
-    "position_52w_percent": ["52w_position", "position_52w", "fifty_two_week_position_percent"],
-    "last_updated_utc": ["updated_at_utc", "timestamp_utc", "last_update_utc", "last_updated"],
-    "last_updated_riyadh": ["updated_at_riyadh", "timestamp_riyadh", "last_updated_local"],
-}
-
-
-@lru_cache(maxsize=4096)
-def _field_name_for_header(header: str) -> str:
-    norm = _normalize_header_name(header)
-    if not norm:
-        return ""
-    return _HEADER_FIELD_MAP.get(norm) or norm
-
-
-# =============================================================================
-# Serialization to Google Sheets-safe cells
-# =============================================================================
-
-def _safe_json_dumps(value: Any) -> str:
+def _get_int_setting(name: str, default: int) -> int:
     try:
-        return json.dumps(value, ensure_ascii=False, default=str)
+        s = get_settings()
+        v = getattr(s, name, None)
+        if isinstance(v, int) and v > 0:
+            return v
     except Exception:
-        return str(value)
+        pass
+    try:
+        import env as env_mod  # type: ignore
+        v = getattr(env_mod, name, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    except Exception:
+        pass
+    return default
 
 
-def _serialize_value(value: Any) -> Any:
-    if value is None:
-        return None
-
-    if isinstance(value, bool):
-        return True if value else False
-
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-
-    if isinstance(value, Decimal):
-        try:
-            return float(value)
-        except Exception:
-            return str(value)
-
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return value
-
-    if isinstance(value, (dict, list, tuple)):
-        return _safe_json_dumps(value)
-
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            return value.decode("utf-8", errors="ignore")
-        except Exception:
-            return str(value)
-
-    return value
+def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    for x in symbols or []:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        out.append(s)
+    return out
 
 
-def _get_from_data(data: Dict[str, Any], key: str) -> Any:
-    if not key:
-        return None
-    if key in data:
-        return data.get(key)
+def _quote_to_dict(q: UnifiedQuote) -> Dict[str, Any]:
+    try:
+        return q.model_dump(exclude_none=False)  # pydantic v2
+    except Exception:
+        return dict(getattr(q, "__dict__", {}) or {})
 
-    for alt in _FIELD_ALIASES.get(key, []):
-        if alt in data:
-            return data.get(alt)
 
-    return None
+def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
+    eq = EnrichedQuote.from_unified(q)
+    return {
+        "headers": list(headers),
+        "row": eq.to_row(headers),
+        "quote": _quote_to_dict(eq),
+    }
 
 
 # =============================================================================
-# EnrichedQuote model
+# Endpoints
 # =============================================================================
 
-class EnrichedQuote(UnifiedQuote):
+@router.get("/health", tags=["system"])
+async def enriched_health() -> Dict[str, Any]:
     """
-    Sheet-friendly view of UnifiedQuote.
+    Lightweight health endpoint for Apps Script & Render checks.
     """
-
-    model_config = ConfigDict(
-        arbitrary_types_allowed=True,
-        extra="allow",
-    )
-
-    @classmethod
-    def from_unified(cls, quote: Union["EnrichedQuote", UnifiedQuote, Dict[str, Any]]) -> "EnrichedQuote":
-        if isinstance(quote, cls):
-            return quote
-        if isinstance(quote, dict):
-            return cls(**quote)
-
-        try:
-            data = quote.model_dump()  # type: ignore[attr-defined]
-        except Exception:
-            data = dict(getattr(quote, "__dict__", {}) or {})
-            data.setdefault("symbol", getattr(quote, "symbol", "UNKNOWN"))
-            data.setdefault("error", "Unable to convert quote to dict")
-
-        return cls(**data)
-
-    def _dump_for_row(self) -> Dict[str, Any]:
-        # One-time dump (includes standard fields)
-        try:
-            data: Dict[str, Any] = self.model_dump(exclude_none=False)  # type: ignore[attr-defined]
-        except Exception:
-            data = dict(getattr(self, "__dict__", {}) or {})
-
-        # Merge Pydantic v2 extras if present (don’t overwrite explicit)
-        extra = getattr(self, "__pydantic_extra__", None)
-        if isinstance(extra, dict):
-            for k, v in extra.items():
-                data.setdefault(k, v)
-
-        # Ensure symbol at least
-        data.setdefault("symbol", getattr(self, "symbol", None) or "UNKNOWN")
-
-        # Compute Riyadh timestamp if missing but UTC exists
-        if not data.get("last_updated_riyadh"):
-            dt_utc = _parse_iso_dt(
-                data.get("last_updated_utc")
-                or data.get("updated_at_utc")
-                or data.get("timestamp_utc")
-                or data.get("last_updated")
-            )
-            riy = _to_riyadh_iso(dt_utc)
-            if riy:
-                data["last_updated_riyadh"] = riy
-
-        return data
-
-    def to_row(self, headers: Sequence[str]) -> List[Any]:
-        data = self._dump_for_row()
-        row: List[Any] = []
-
-        for header in headers:
-            h = "" if header is None else str(header)
-            field = _field_name_for_header(h)
-
-            value = _get_from_data(data, field)
-
-            if value is None:
-                raw = _normalize_header_name(h)
-                value = _get_from_data(data, raw)
-
-            row.append(_serialize_value(value))
-
-        return row
+    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
+    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
+    eng = await _get_engine()
+    return {
+        "status": "ok",
+        "module": "routes.enriched_quote",
+        "engine": "DataEngineV2",
+        "providers": list(getattr(eng, "enabled_providers", []) or []),
+        "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
+        "auth": "open" if not _allowed_tokens() else "token",
+    }
 
 
-__all__ = ["EnrichedQuote", "_field_name_for_header", "_normalize_header_name"]
+@router.get("/headers")
+async def get_headers(
+    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name to resolve headers."),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+) -> Dict[str, Any]:
+    _require_token(x_app_token)
+    headers = get_headers_for_sheet(sheet_name)
+    return {"sheet_name": sheet_name, "headers": headers, "count": len(headers)}
+
+
+@router.get("/quote")
+async def enriched_quote(
+    symbol: str = Query(..., description="Ticker symbol (e.g., 1120.SR, AAPL, ^GSPC)."),
+    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name for header/row alignment."),
+    format: Literal["quote", "row", "both"] = Query(default="quote", description="Return quote, row, or both."),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+) -> Dict[str, Any]:
+    _require_token(x_app_token)
+
+    eng = await _get_engine()
+    q = await eng.get_quote(symbol)
+
+    if format == "quote":
+        return _quote_to_dict(EnrichedQuote.from_unified(q))
+
+    headers = get_headers_for_sheet(sheet_name)
+    payload = _build_row_payload(q, headers)
+
+    if format == "row":
+        return {"symbol": payload["quote"].get("symbol", symbol), "headers": payload["headers"], "row": payload["row"]}
+
+    # both
+    payload["sheet_name"] = sheet_name
+    return payload
+
+
+@router.post("/quotes")
+async def enriched_quotes(
+    req: BatchProcessRequest = Body(...),
+    format: Literal["rows", "quotes", "both"] = Query(default="rows", description="Return rows, quotes, or both."),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+) -> Dict[str, Any]:
+    _require_token(x_app_token)
+
+    symbols = _clean_symbols(req.symbols)
+    if not symbols:
+        return {"count": 0, "symbols": [], "headers": get_headers_for_sheet(req.sheet_name), "rows": []}
+
+    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
+    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
+
+    if len(symbols) > max_t:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many symbols ({len(symbols)}). Max allowed is {max_t}.",
+        )
+
+    headers = get_headers_for_sheet(req.sheet_name)
+
+    eng = await _get_engine()
+
+    # Soft batching (keeps memory stable)
+    rows_out: List[List[Any]] = []
+    quotes_out: List[Dict[str, Any]] = []
+
+    for i in range(0, len(symbols), batch_sz):
+        chunk = symbols[i : i + batch_sz]
+        quotes = await eng.get_quotes(chunk)
+
+        if format in ("rows", "both"):
+            for q in quotes:
+                eq = EnrichedQuote.from_unified(q)
+                rows_out.append(eq.to_row(headers))
+
+        if format in ("quotes", "both"):
+            for q in quotes:
+                quotes_out.append(_quote_to_dict(EnrichedQuote.from_unified(q)))
+
+    resp: Dict[str, Any] = {
+        "operation": req.operation,
+        "sheet_name": req.sheet_name,
+        "count": len(symbols),
+        "symbols": symbols,
+        "headers": headers,
+    }
+
+    if format in ("rows", "both"):
+        resp["rows"] = rows_out
+    if format in ("quotes", "both"):
+        resp["quotes"] = quotes_out
+
+    return resp
