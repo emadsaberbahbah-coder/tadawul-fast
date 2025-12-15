@@ -1,4 +1,30 @@
 # core/data_engine_v2.py
+"""
+core/data_engine_v2.py
+------------------------------------------------------------
+Core Data & Analysis Engine (Async) – v2.5.0
+
+Goals
+- KSA-safe routing: NEVER call global providers (EODHD/FMP/Finnhub) for .SR / numeric symbols.
+- Robust global multi-provider loop with graceful fallbacks.
+- Backward-compatible exports: module-level get_enriched_quote(s) used by legacy routes.
+- Defensive by default: never crash callers; return UnifiedQuote with error + data_quality.
+
+KSA order
+1) Legacy delegate (core.data_engine) if present (expected to use Tadawul/Argaam KSA-safe logic)
+2) Argaam snapshot (best-effort HTML)
+3) yfinance (OPTIONAL + OFF by default for KSA, due to frequent Yahoo 401 blocks)
+
+GLOBAL provider loop
+- provider order from settings/env (enabled_providers/providers/providers_list), default: finnhub,fmp,eodhd
+- yfinance always a last-resort fallback if enabled
+
+Notes
+- Settings loader supports both:
+    • root config.py: get_settings()
+    • core.config: get_settings()
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +41,13 @@ import httpx
 from cachetools import TTLCache
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.config import get_settings
+# -----------------------------------------------------------------------------
+# Settings (supports either root config.py or core.config.py)
+# -----------------------------------------------------------------------------
+try:
+    from config import get_settings  # type: ignore
+except Exception:  # pragma: no cover
+    from core.config import get_settings  # type: ignore
 
 # Optional deps (graceful fallback)
 try:
@@ -29,7 +61,7 @@ except Exception:  # pragma: no cover
     yf = None
 
 
-ENGINE_VERSION = "2.4.0"
+ENGINE_VERSION = "2.5.0"
 
 # =============================================================================
 # Settings + Logger
@@ -204,6 +236,10 @@ def _pct_if_fraction(x: Any) -> Optional[float]:
     return v * 100.0 if abs(v) <= 1.0 else v
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
 def normalize_symbol(raw: str) -> str:
     """
     - KSA numeric => 1120.SR
@@ -271,15 +307,16 @@ def _yahoo_symbol(symbol: str) -> str:
 def _get_enabled_providers() -> List[str]:
     """
     Reads provider order from (first match wins):
+      - settings.enabled_providers (list)
       - settings.providers_list (list)
       - settings.providers (csv)
       - env ENABLED_PROVIDERS / PROVIDERS (csv)
-    Defaults to: finnhub, fmp, eodhd (and yfinance as fallback if enabled).
+    Defaults: finnhub, fmp, eodhd
     """
-    pl = getattr(settings, "providers_list", None)
-    if isinstance(pl, list) and pl:
-        out = [str(x).strip().lower() for x in pl if str(x).strip()]
-        return out
+    for attr in ("enabled_providers", "providers_list"):
+        pl = getattr(settings, attr, None)
+        if isinstance(pl, list) and pl:
+            return [str(x).strip().lower() for x in pl if str(x).strip()]
 
     p_csv = getattr(settings, "providers", None)
     if isinstance(p_csv, str) and p_csv.strip():
@@ -292,6 +329,17 @@ def _get_enabled_providers() -> List[str]:
     return ["finnhub", "fmp", "eodhd"]
 
 
+def _get_enabled_ksa_providers() -> List[str]:
+    """
+    KSA provider list for diagnostics (does NOT automatically implement them here).
+    Typically: ["tadawul","argaam"] from config/env.
+    """
+    kp = getattr(settings, "enabled_ksa_providers", None)
+    if isinstance(kp, list) and kp:
+        return [str(x).strip().lower() for x in kp if str(x).strip()]
+    return ["tadawul", "argaam"]
+
+
 def _get_key(*names: str) -> Optional[str]:
     for n in names:
         v = getattr(settings, n, None)
@@ -302,10 +350,6 @@ def _get_key(*names: str) -> Optional[str]:
         if v and v.strip():
             return v.strip()
     return None
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
 
 
 # =============================================================================
@@ -487,28 +531,16 @@ class UnifiedQuote(BaseModel):
 class DataEngine:
     """
     Async multi-provider engine with KSA-safe routing.
-
-    KSA (.SR):
-      1) Legacy KSA delegate if available (core.data_engine)
-      2) Argaam snapshot (HTML best-effort)
-      3) Optional yfinance last resort (often blocked/401)
-
-    GLOBAL:
-      provider order from settings/providers:
-        - eodhd (quote + optional fundamentals)
-        - finnhub (quote + profile/metrics)
-        - fmp (quote)
-        - yfinance (fallback)
     """
 
     def __init__(self) -> None:
         self.enabled_providers: List[str] = _get_enabled_providers()
+        self.ksa_providers: List[str] = _get_enabled_ksa_providers()
 
         self._timeout_sec: float = _get_float(["HTTP_TIMEOUT_SEC", "http_timeout_sec", "HTTP_TIMEOUT"], 25.0)
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
         max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
 
-        # Fine-grained timeout (connect/read/write/pool)
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
 
         self.client = httpx.AsyncClient(
@@ -522,7 +554,10 @@ class DataEngine:
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
 
+        # yfinance is often blocked; keep globally toggleable
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
+        # ✅ KSA yfinance: OFF by default (Yahoo 401 is common)
+        self.enable_yfinance_ksa = _get_bool(["ENABLE_YFINANCE_KSA", "enable_yfinance_ksa"], False)
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
@@ -537,10 +572,12 @@ class DataEngine:
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | ksa_providers=%s | yfinance=%s (ksa=%s) | timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
+            ",".join(self.ksa_providers) if self.ksa_providers else "(none)",
             self.enable_yfinance,
+            self.enable_yfinance_ksa,
             self._timeout_sec,
         )
 
@@ -604,20 +641,20 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        # 1) Prefer legacy KSA engine
+        # 1) Prefer legacy KSA engine (expected to be Tadawul/Argaam KSA-safe)
         try:
             from core import data_engine as legacy  # type: ignore
+
             if hasattr(legacy, "get_enriched_quote"):
                 raw = await legacy.get_enriched_quote(symbol)  # type: ignore
                 q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
                 if q.current_price is not None:
                     q.data_source = q.data_source or "legacy"
-                    q.data_quality = "PARTIAL"
                     return q
         except Exception:
             pass
 
-        # 2) Argaam snapshot
+        # 2) Argaam snapshot (HTML best-effort)
         base = symbol.split(".", 1)[0].strip()
         snap = await self._argaam_snapshot()
         row = snap.get(base)
@@ -634,22 +671,27 @@ class DataEngine:
                 value_traded=row.get("value_traded"),
                 data_source="argaam",
                 data_quality="PARTIAL",
-            )
+            ).finalize()
 
-        # 3) yfinance last resort
-        if self.enable_yfinance and ("yfinance" in self.enabled_providers or "yahoo" in self.enabled_providers) and yf:
+        # 3) yfinance last resort (OFF by default for KSA)
+        if (
+            self.enable_yfinance
+            and self.enable_yfinance_ksa
+            and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers))
+            and yf
+        ):
             q = await self._fetch_yfinance(symbol, market="KSA")
             if q.current_price is not None:
                 q.data_source = q.data_source or "yfinance"
                 q.data_quality = "PARTIAL"
-                return q
+                return q.finalize()
 
         return UnifiedQuote(
             symbol=symbol,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="No KSA provider data (legacy+argaam+yfinance failed)",
+            error="No KSA provider data (legacy+argaam failed; yfinance_ksa disabled or blocked).",
         ).finalize()
 
     def _coerce_to_unified_quote(
@@ -721,7 +763,7 @@ class DataEngine:
         q = UnifiedQuote(**{k: v for k, v in mapped.items() if v is not None})
         q.data_source = data.get("data_source") or source
         q.error = data.get("error")
-        return q
+        return q.finalize()
 
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
         key = "argaam_snapshot_v2"
@@ -771,7 +813,6 @@ class DataEngine:
         if not BeautifulSoup or not html:
             return out
 
-        # lxml may not exist; fallback safely
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception:
@@ -836,6 +877,7 @@ class DataEngine:
     # GLOBAL: provider loop
     # -------------------------------------------------------------------------
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
+        # Special Yahoo-style symbols require yfinance
         if any(ch in symbol for ch in ("=", "^")):
             if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
@@ -848,10 +890,14 @@ class DataEngine:
                 market="GLOBAL",
                 currency="USD",
                 data_quality="MISSING",
-                error="Special symbol requires yfinance (disabled/unavailable)",
+                error="Special symbol requires yfinance (disabled/unavailable).",
             ).finalize()
 
         errors: List[str] = []
+
+        # Hard safety: never treat KSA as global (should never happen, but keep safe)
+        if is_ksa_symbol(symbol):
+            return await self._fetch_ksa(symbol)
 
         for prov in self.enabled_providers:
             p = (prov or "").strip().lower()
@@ -924,6 +970,7 @@ class DataEngine:
                 else:
                     errors.append("yfinance:disabled_or_missing")
 
+        # Final fallback to yfinance if globally enabled
         if self.enable_yfinance and yf:
             q = await self._fetch_yfinance(symbol, market="GLOBAL")
             if q.current_price is not None:
@@ -949,7 +996,7 @@ class DataEngine:
                 r = await self.client.get(url, params=params)
                 if r.status_code in (429,) or 500 <= r.status_code < 600:
                     if attempt < 2:
-                        await asyncio.sleep(0.25 + random.random() * 0.35)
+                        await asyncio.sleep(0.25 + random.random() * 0.45)
                         continue
                     return None
                 if r.status_code >= 400:
@@ -957,7 +1004,7 @@ class DataEngine:
                 return r.text
             except Exception:
                 if attempt < 2:
-                    await asyncio.sleep(0.25 + random.random() * 0.35)
+                    await asyncio.sleep(0.25 + random.random() * 0.45)
                     continue
                 return None
         return None
@@ -970,7 +1017,7 @@ class DataEngine:
                 r = await self.client.get(url, params=params)
                 if r.status_code in (429,) or 500 <= r.status_code < 600:
                     if attempt < 2:
-                        await asyncio.sleep(0.25 + random.random() * 0.35)
+                        await asyncio.sleep(0.25 + random.random() * 0.45)
                         continue
                     return None
                 if r.status_code >= 400:
@@ -981,15 +1028,19 @@ class DataEngine:
                     return None
             except Exception:
                 if attempt < 2:
-                    await asyncio.sleep(0.25 + random.random() * 0.35)
+                    await asyncio.sleep(0.25 + random.random() * 0.45)
                     continue
                 return None
         return None
 
     # -------------------------------------------------------------------------
-    # Provider: EODHD
+    # Provider: EODHD (GLOBAL ONLY)
     # -------------------------------------------------------------------------
     async def _fetch_eodhd_realtime(self, symbol: str, api_key: str) -> UnifiedQuote:
+        # Safety: never for KSA
+        if is_ksa_symbol(symbol):
+            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error="EODHD blocked for KSA symbols", data_quality="MISSING")
+
         url = EODHD_RT_URL.format(symbol=symbol)
         params = {"api_token": api_key, "fmt": "json"}
         t0 = time.perf_counter()
@@ -1018,6 +1069,10 @@ class DataEngine:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"EODHD error ({dt}ms): {exc}")
 
     async def _fetch_eodhd_fundamentals(self, symbol: str, api_key: str) -> Dict[str, Any]:
+        # Safety: never for KSA
+        if is_ksa_symbol(symbol):
+            return {}
+
         cache_key = f"eodhd_fund::{symbol}"
         hit = self.fund_cache.get(cache_key)
         if isinstance(hit, dict):
@@ -1065,6 +1120,10 @@ class DataEngine:
     # Provider: Finnhub
     # -------------------------------------------------------------------------
     async def _fetch_finnhub_quote(self, symbol: str, api_key: str) -> UnifiedQuote:
+        # Safety: never for KSA
+        if is_ksa_symbol(symbol):
+            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error="Finnhub blocked for KSA symbols", data_quality="MISSING")
+
         sym = _finnhub_symbol(symbol)
         params = {"symbol": sym, "token": api_key}
         try:
@@ -1152,6 +1211,10 @@ class DataEngine:
     # Provider: FMP
     # -------------------------------------------------------------------------
     async def _fetch_fmp_quote(self, symbol: str, api_key: str) -> UnifiedQuote:
+        # Safety: never for KSA
+        if is_ksa_symbol(symbol):
+            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error="FMP blocked for KSA symbols", data_quality="MISSING")
+
         sym = _fmp_symbol(symbol)
         url = FMP_QUOTE_URL.format(symbol=sym)
         params = {"apikey": api_key}
@@ -1237,7 +1300,7 @@ class DataEngine:
                 return UnifiedQuote(
                     symbol=symbol,
                     market=market,
-                    error="yfinance blocked/Unauthorized (Yahoo 401). Disable ENABLE_YFINANCE or use other providers.",
+                    error="yfinance blocked/Unauthorized (Yahoo 401).",
                     data_quality="MISSING",
                 )
 
@@ -1263,4 +1326,40 @@ class DataEngine:
             return UnifiedQuote(symbol=symbol, market=market, error=f"yfinance error: {msg}", data_quality="MISSING")
 
 
-__all__ = ["UnifiedQuote", "DataEngine", "normalize_symbol", "is_ksa_symbol"]
+# =============================================================================
+# Module-level singleton + backward-compatible functions
+# =============================================================================
+_ENGINE_SINGLETON: Optional[DataEngine] = None
+_ENGINE_LOCK = asyncio.Lock()
+
+
+async def get_engine() -> DataEngine:
+    global _ENGINE_SINGLETON
+    if _ENGINE_SINGLETON is not None:
+        return _ENGINE_SINGLETON
+    async with _ENGINE_LOCK:
+        if _ENGINE_SINGLETON is None:
+            _ENGINE_SINGLETON = DataEngine()
+    return _ENGINE_SINGLETON
+
+
+async def get_enriched_quote(symbol: str) -> UnifiedQuote:
+    eng = await get_engine()
+    return await eng.get_enriched_quote(symbol)
+
+
+async def get_enriched_quotes(symbols: Sequence[str]) -> List[UnifiedQuote]:
+    eng = await get_engine()
+    return await eng.get_enriched_quotes(symbols)
+
+
+__all__ = [
+    "ENGINE_VERSION",
+    "UnifiedQuote",
+    "DataEngine",
+    "normalize_symbol",
+    "is_ksa_symbol",
+    "get_engine",
+    "get_enriched_quote",
+    "get_enriched_quotes",
+]
