@@ -1,7 +1,6 @@
+# routes/advanced_analysis.py
 """
-routes/advanced_analysis.py
-================================================
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.3.0)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.3.1)
 
 Design goals
 - 100% engine-driven (core.data_engine_v2.DataEngine). No direct provider calls.
@@ -14,9 +13,9 @@ Design goals
     • prefer request.app.state.engine (created by main.py lifespan), else fallback singleton.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
 
-Note about “repeating patterns”
-- Yes, it’s intentional: each router stays self-contained (auth + engine fallback + sheets-safe behavior),
-  avoiding circular imports and making deployment/debugging much easier.
+Why patterns repeat?
+- Auth + engine fallback are intentionally kept inside each router to avoid circular imports
+  and to make deployment/debugging safer.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, Query, Request
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.config import get_settings
 from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol
@@ -43,15 +42,13 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.3.0"
-
+ADVANCED_ANALYSIS_VERSION = "3.3.1"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
 # =============================================================================
-# Auth (X-APP-TOKEN) — same contract as routes/enriched_quote.py and routes/ai_analysis.py
+# Auth (X-APP-TOKEN)
 # =============================================================================
-
 @lru_cache(maxsize=1)
 def _allowed_tokens() -> List[str]:
     tokens: List[str] = []
@@ -67,6 +64,7 @@ def _allowed_tokens() -> List[str]:
     # Also support env.py exports if present
     try:
         import env as env_mod  # type: ignore
+
         for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
             v = getattr(env_mod, attr, None)
             if isinstance(v, str) and v.strip():
@@ -97,7 +95,6 @@ def _is_authorized(x_app_token: Optional[str]) -> bool:
 # =============================================================================
 # Engine resolution (prefer app.state.engine; else module singleton)
 # =============================================================================
-
 _ENGINE: Optional[DataEngine] = None
 _ENGINE_LOCK = asyncio.Lock()
 
@@ -106,7 +103,7 @@ def _get_app_engine(request: Request) -> Optional[DataEngine]:
     """
     Prefer engine created in main.py lifespan:
       request.app.state.engine
-    Also accept a few common aliases just in case.
+    Also accept common aliases to be robust.
     """
     try:
         st = getattr(getattr(request, "app", None), "state", None)
@@ -146,7 +143,6 @@ async def resolve_engine(request: Request) -> Optional[DataEngine]:
 # =============================================================================
 # Safe config helpers
 # =============================================================================
-
 def _safe_int(x: Any, default: int) -> int:
     try:
         v = int(x)
@@ -192,7 +188,6 @@ def _get_cfg() -> Dict[str, Any]:
 # =============================================================================
 # Utilities
 # =============================================================================
-
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -274,8 +269,25 @@ def _data_age_minutes(as_of_utc: Any) -> Optional[float]:
 
 
 # =============================================================================
-# Core Async Fetch Logic (Chunked + bounded concurrency)
+# Engine calls (compat shim + chunking)
 # =============================================================================
+async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[UnifiedQuote]:
+    """
+    Compatibility shim:
+    - Prefer engine.get_enriched_quotes
+    - Else engine.get_quotes
+    - Else per-symbol engine.get_quote
+    """
+    if hasattr(engine, "get_enriched_quotes"):
+        return await engine.get_enriched_quotes(syms)  # type: ignore
+    if hasattr(engine, "get_quotes"):
+        return await engine.get_quotes(syms)  # type: ignore
+
+    out: List[UnifiedQuote] = []
+    for s in syms:
+        out.append(await engine.get_quote(s))  # type: ignore
+    return out
+
 
 async def _get_quotes_chunked(
     engine: Optional[DataEngine],
@@ -303,7 +315,7 @@ async def _get_quotes_chunked(
     async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
         async with sem:
             try:
-                res = await asyncio.wait_for(engine.get_enriched_quotes(chunk_syms), timeout=timeout_sec)
+                res = await asyncio.wait_for(_engine_get_quotes(engine, chunk_syms), timeout=timeout_sec)
                 return chunk_syms, res
             except Exception as e:
                 return chunk_syms, e
@@ -334,7 +346,6 @@ async def _get_quotes_chunked(
 # =============================================================================
 # Response Models
 # =============================================================================
-
 class _ExtraIgnore(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -389,7 +400,7 @@ class AdvancedScoreboardResponse(_ExtraIgnore):
 class AdvancedSheetRequest(_ExtraIgnore):
     tickers: List[str] = Field(default_factory=list)
     top_n: Optional[int] = Field(default=50, ge=1, le=500)
-    sheet_name: Optional[str] = None  # optional (for header selection)
+    sheet_name: Optional[str] = None
 
 
 class AdvancedSheetResponse(_ExtraIgnore):
@@ -400,11 +411,10 @@ class AdvancedSheetResponse(_ExtraIgnore):
 
 
 # =============================================================================
-# Transform logic
+# Transform + mapping
 # =============================================================================
-
 def _to_advanced_item(raw_symbol: str, uq: UnifiedQuote) -> AdvancedItem:
-    # Ensure scoring best-effort (engine may already do this, but we keep it safe here)
+    # Ensure scoring best-effort (engine may already do it)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
         uq = enrich_with_scores(uq)  # type: ignore
@@ -412,7 +422,6 @@ def _to_advanced_item(raw_symbol: str, uq: UnifiedQuote) -> AdvancedItem:
         pass
 
     eq = EnrichedQuote.from_unified(uq)
-
     symbol = (getattr(eq, "symbol", None) or normalize_symbol(raw_symbol) or raw_symbol or "").strip().upper()
 
     dq = getattr(eq, "data_quality", None)
@@ -457,7 +466,6 @@ def _to_advanced_item(raw_symbol: str, uq: UnifiedQuote) -> AdvancedItem:
 
 
 def _sort_key(it: AdvancedItem) -> float:
-    # Priority: opportunity, then confidence, then upside, then overall
     def f(x: Any) -> float:
         try:
             return float(x or 0.0)
@@ -470,10 +478,6 @@ def _sort_key(it: AdvancedItem) -> float:
     ov = f(it.overall_score)
     return (opp * 1_000_000.0) + (conf * 1_000.0) + (up * 10.0) + ov
 
-
-# =============================================================================
-# Sheets mapping
-# =============================================================================
 
 def _default_advanced_headers() -> List[str]:
     return [
@@ -502,24 +506,24 @@ def _default_advanced_headers() -> List[str]:
     ]
 
 
-def _select_sheet_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
+def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
     """
-    Returns (headers, mode)
-    mode:
-      - "quote_59": use EnrichedQuote.to_row(headers)
-      - "advanced": use AdvancedItem mapping
+    Returns (headers, mode):
+      - "quote_59": return EnrichedQuote.to_row(headers) sorted by opportunity
+      - "advanced": return AdvancedItem mapped rows
+    Heuristic:
+      - If sheet_name contains 'advanced' -> use advanced headers.
+      - Else, if schemas provides a header list -> use it (likely 59 columns).
     """
+    nm = (sheet_name or "").strip().lower()
+    if "advanced" in nm:
+        return _default_advanced_headers(), "advanced"
+
     if sheet_name and get_headers_for_sheet:
         try:
             h = get_headers_for_sheet(sheet_name)
             if isinstance(h, list) and h and any(str(x).strip().lower() == "symbol" for x in h):
-                headers = [str(x) for x in h]
-                # If it looks like canonical 59 headers, map with EnrichedQuote rows.
-                if any(str(x).strip().lower() == "data source" for x in headers) and any(
-                    str(x).strip().lower() == "data quality" for x in headers
-                ):
-                    return headers, "quote_59"
-                return headers, "advanced"
+                return [str(x) for x in h], "quote_59"
         except Exception:
             pass
 
@@ -570,7 +574,6 @@ def _row_for_headers(it: AdvancedItem, headers: List[str]) -> List[Any]:
 # =============================================================================
 # Routes
 # =============================================================================
-
 @router.get("/health")
 @router.get("/ping")
 async def advanced_health(request: Request) -> Dict[str, Any]:
@@ -671,18 +674,24 @@ async def advanced_sheet_rows(
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> AdvancedSheetResponse:
     """
-    Sheets-safe: never raises for normal usage.
-    Returns {status, headers, rows, error?}.
+    Sheets-safe: ALWAYS returns {status, headers, rows, error?}.
     """
-    headers, mode = _select_sheet_headers(body.sheet_name)
+    headers, mode = _select_headers(body.sheet_name)
 
     # sheets-safe auth (never raise)
     if not _is_authorized(x_app_token):
         requested = _clean_tickers(body.tickers or [])
         rows = []
         for s in requested:
-            it = AdvancedItem(symbol=s.upper(), data_quality="MISSING", data_quality_score=0.0, risk_bucket="LOW_CONFIDENCE",
-                              provider="none", as_of_utc=_now_utc_iso(), error="Unauthorized (invalid or missing X-APP-TOKEN).")
+            it = AdvancedItem(
+                symbol=s.upper(),
+                data_quality="MISSING",
+                data_quality_score=0.0,
+                risk_bucket="LOW_CONFIDENCE",
+                provider="none",
+                as_of_utc=_now_utc_iso(),
+                error="Unauthorized (invalid or missing X-APP-TOKEN).",
+            )
             rows.append(_row_for_headers(it, headers))
         return AdvancedSheetResponse(status="error", error="Unauthorized (invalid or missing X-APP-TOKEN).", headers=headers, rows=rows)
 
@@ -699,6 +708,7 @@ async def advanced_sheet_rows(
 
     try:
         engine = await resolve_engine(request)
+
         unified_map = await _get_quotes_chunked(
             engine,
             requested,
@@ -717,21 +727,15 @@ async def advanced_sheet_rows(
         if len(items_sorted) > top_n:
             items_sorted = items_sorted[:top_n]
 
-        # Rows
         rows: List[List[Any]] = []
+
         if mode == "quote_59":
-            # Use canonical 59-column mapping (EnrichedQuote rows), but still SORTED by opportunity.
+            # Canonical headers row build (sorted by opportunity)
             for it in items_sorted:
                 uq = unified_map.get(it.symbol) or UnifiedQuote(symbol=it.symbol, data_quality="MISSING", error="No data returned").finalize()
-                try:
-                    from core.scoring_engine import enrich_with_scores  # type: ignore
-                    uq = enrich_with_scores(uq)  # type: ignore
-                except Exception:
-                    pass
                 eq = EnrichedQuote.from_unified(uq)
                 rows.append(eq.to_row(headers))
         else:
-            # Advanced custom mapping
             rows = [_row_for_headers(it, headers) for it in items_sorted]
 
         # status = partial if any row has an Error column populated
