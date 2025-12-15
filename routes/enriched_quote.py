@@ -2,454 +2,345 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quotes Router (v2.6.0) – Engine v2 aligned, Sheets-safe
+Enriched Quote Routes (Google Sheets + API) - v2.2.0 (PROD SAFE)
 
 Goals
-- Stable /v1/enriched endpoints for Sheets + UI
-- KSA-safe (engine decides provider; never force EODHD for .SR)
-- /sheet-rows always returns {headers, rows} and NEVER crashes
-- Uses DataEngine v2 when available; falls back to legacy adapter safely
-- Uses core.schemas.get_headers_for_sheet(sheet_name) if available to keep headers aligned
-  with your 9-page dashboard, otherwise falls back to the stable default headers below.
-
-Key Fixes
-- Engine singleton via lru_cache + safe close hook readiness
-- Normalization delegated to core.data_engine_v2.normalize_symbol when available
-- Batching uses bounded concurrency + timeout + placeholders
-- Row-mapping is tolerant and guarantees row length == headers length
-- No "rank" dependency (kept if present, else blank)
+- Stable endpoints for Google Sheets / Apps Script:
+    GET  /v1/enriched/quote?symbol=1120.SR
+    POST /v1/enriched/quotes   {symbols:[...], sheet_name?: "..."}
+- Return:
+    - quote JSON (EnrichedQuote fields)
+    - optional Google Sheets row aligned to headers (typically 59 columns)
+    - headers helper endpoint
+- Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
+- Defensive limits (ENRICHED_MAX_TICKERS, ENRICHED_BATCH_SIZE).
+- Engine resolution:
+    • prefer request.app.state.engine (created by main.py lifespan), else a safe singleton here.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Literal
 
-from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 
-# Prefer env.settings (project standard). Fallback is safe.
-try:
-    from env import settings  # type: ignore
-except Exception:  # pragma: no cover
-    settings = None  # type: ignore
+from core.config import get_settings
+from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol
+from core.enriched_quote import EnrichedQuote
+from core.schemas import BatchProcessRequest, get_headers_for_sheet
 
 logger = logging.getLogger("routes.enriched_quote")
+
+ROUTE_VERSION = "2.2.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
-ROUTE_VERSION = "2.6.0"
 
-# ---------------------------------------------------------------------
-# Optional schema helper (preferred)
-# ---------------------------------------------------------------------
-try:
-    from core.schemas import get_headers_for_sheet  # type: ignore
-except Exception:  # pragma: no cover
-    get_headers_for_sheet = None  # type: ignore
 
-# ---------------------------------------------------------------------
-# Prefer normalization from v2 engine
-# ---------------------------------------------------------------------
-try:
-    from core.data_engine_v2 import normalize_symbol as _normalize_any  # type: ignore
-except Exception:  # pragma: no cover
-    def _normalize_any(sym: str) -> str:
-        s = (sym or "").strip().upper()
-        if not s:
-            return ""
-        if s.startswith("TADAWUL:"):
-            s = s.split(":", 1)[1].strip()
-        if s.endswith(".TADAWUL"):
-            s = s.replace(".TADAWUL", ".SR")
-        if s.isdigit():
-            return f"{s}.SR"
-        return s
+# =============================================================================
+# Engine resolution (prefer app.state.engine; else singleton)
+# =============================================================================
 
-# ---------------------------------------------------------------------
-# Engine singleton (defensive)
-# ---------------------------------------------------------------------
-@lru_cache(maxsize=1)
-def _get_engine():
-    # Prefer v2 engine
+_ENGINE: Optional[DataEngine] = None
+_ENGINE_LOCK = asyncio.Lock()
+
+
+def _get_app_engine(request: Request) -> Optional[DataEngine]:
+    """
+    Prefer engine created in main.py lifespan:
+      request.app.state.engine
+    Also accept a few aliases if you used different names in main.py.
+    """
     try:
-        from core.data_engine_v2 import DataEngine  # type: ignore
-        eng = DataEngine()
-        logger.info("[enriched] Using core.data_engine_v2.DataEngine")
-        return eng
-    except Exception as e:
-        logger.warning("[enriched] data_engine_v2 not available: %s", e)
-
-    # Fallback legacy engine adapter (core.data_engine bridges to v2 if present)
-    try:
-        from core.data_engine import DataEngine  # type: ignore
-        eng = DataEngine()
-        logger.info("[enriched] Using legacy core.data_engine.DataEngine")
-        return eng
-    except Exception as e:
-        logger.error("[enriched] No engine available: %s", e)
+        st = getattr(getattr(request, "app", None), "state", None)
+        if not st:
+            return None
+        for attr in ("engine", "data_engine", "data_engine_v2"):
+            eng = getattr(st, attr, None)
+            if isinstance(eng, DataEngine):
+                return eng
         return None
+    except Exception:
+        return None
+
+
+async def _get_singleton_engine() -> DataEngine:
+    global _ENGINE
+    if _ENGINE is not None:
+        return _ENGINE
+    async with _ENGINE_LOCK:
+        if _ENGINE is None:
+            _ENGINE = DataEngine()
+            logger.info("[enriched] DataEngine initialized (routes singleton).")
+    return _ENGINE
+
+
+async def _resolve_engine(request: Request) -> DataEngine:
+    eng = _get_app_engine(request)
+    if eng is not None:
+        return eng
+    return await _get_singleton_engine()
+
+
+# =============================================================================
+# Auth (X-APP-TOKEN)
+# =============================================================================
+
+@lru_cache(maxsize=1)
+def _allowed_tokens() -> List[str]:
+    tokens: List[str] = []
+    try:
+        s = get_settings()
+        for attr in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
+            v = getattr(s, attr, None)
+            if isinstance(v, str) and v.strip():
+                tokens.append(v.strip())
+    except Exception:
+        pass
+
+    # Also support env.py exports if present
+    try:
+        import env as env_mod  # type: ignore
+        for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
+            v = getattr(env_mod, attr, None)
+            if isinstance(v, str) and v.strip():
+                tokens.append(v.strip())
+    except Exception:
+        pass
+
+    # env vars last resort
+    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
+        v = os.getenv(k)
+        if v and v.strip():
+            tokens.append(v.strip())
+
+    # de-dup preserve order
+    out: List[str] = []
+    seen = set()
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+
+    if not out:
+        logger.warning("[enriched] No APP_TOKEN configured -> endpoints are OPEN (no auth).")
+    return out
+
+
+def _require_token(x_app_token: Optional[str]) -> None:
+    allowed = _allowed_tokens()
+    if not allowed:
+        return  # open mode
+    if not x_app_token or x_app_token.strip() not in allowed:
+        raise HTTPException(status_code=401, detail="Unauthorized (invalid or missing X-APP-TOKEN).")
+
+
+# =============================================================================
+# Limits helpers
+# =============================================================================
+
+def _get_int_setting(name: str, default: int) -> int:
+    # settings first
+    try:
+        s = get_settings()
+        v = getattr(s, name, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    except Exception:
+        pass
+
+    # env.py next
+    try:
+        import env as env_mod  # type: ignore
+        v = getattr(env_mod, name, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    except Exception:
+        pass
+
+    # env vars last
+    try:
+        ev = os.getenv(name)
+        if ev:
+            n = int(ev)
+            if n > 0:
+                return n
+    except Exception:
+        pass
+
+    return default
+
+
+def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in symbols or []:
+        if x is None:
+            continue
+        s = normalize_symbol(str(x).strip())
+        if not s:
+            continue
+        su = s.upper()
+        if su in seen:
+            continue
+        seen.add(su)
+        out.append(su)
+    return out
+
 
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
     # pydantic v2
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump()
-        except Exception:
-            pass
+    try:
+        return obj.model_dump(exclude_none=False)  # type: ignore
+    except Exception:
+        pass
     # pydantic v1
-    if hasattr(obj, "dict"):
-        try:
-            return obj.dict()
-        except Exception:
-            pass
-    if isinstance(obj, dict):
-        return obj
-    return {"value": obj}
-
-def _safe_int(x: Any, default: int) -> int:
     try:
-        return int(x)
+        return obj.dict()  # type: ignore
     except Exception:
-        return default
-
-def _safe_float(x: Any) -> Optional[float]:
+        pass
+    # raw
     try:
-        if x in (None, "", "NA", "N/A", "-", "—"):
-            return None
-        return float(x)
+        return dict(getattr(obj, "__dict__", {}) or {})
     except Exception:
-        return None
+        return {}
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
-# ---------------------------------------------------------------------
-# Default Sheet schema (stable fallback)
-# ---------------------------------------------------------------------
-DEFAULT_ENRICHED_HEADERS: List[str] = [
-    "Symbol",
-    "Company Name",
-    "Sector",
-    "Sub-Sector",
-    "Market",
-    "Currency",
-    "Listing Date",
-    "Last Price",
-    "Previous Close",
-    "Open",
-    "Day High",
-    "Day Low",
-    "Price Change",
-    "Percent Change",
-    "52W High",
-    "52W Low",
-    "52W Position %",
-    "Volume",
-    "Avg Volume (30D)",
-    "Value Traded",
-    "Turnover %",
-    "Shares Outstanding",
-    "Free Float %",
-    "Market Cap",
-    "Free Float Market Cap",
-    "Liquidity Score",
-    "EPS (TTM)",
-    "Forward EPS",
-    "P/E (TTM)",
-    "Forward P/E",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "Dividend Yield %",
-    "Dividend Rate",
-    "Payout Ratio %",
-    "ROE %",
-    "ROA %",
-    "Net Margin %",
-    "EBITDA Margin %",
-    "Revenue Growth %",
-    "Net Income Growth %",
-    "Beta",
-    "Volatility (30D)",
-    "RSI (14)",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Opportunity Score",
-    "Overall Score",
-    "Recommendation",
-    "Data Source",
-    "Data Quality",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-    "Error",
-]
-
-def _headers_for_sheet(sheet_name: Optional[str]) -> List[str]:
-    """
-    Prefer core.schemas.get_headers_for_sheet(sheet_name) if present.
-    Ensure 'Symbol' exists. Otherwise use DEFAULT_ENRICHED_HEADERS.
-    """
-    if sheet_name and get_headers_for_sheet:
-        try:
-            h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and h and any(str(x).strip().lower() == "symbol" for x in h):
-                return [str(x) for x in h]
-        except Exception:
-            pass
-    return list(DEFAULT_ENRICHED_HEADERS)
-
-def _pick(d: Dict[str, Any], *keys: str) -> Any:
-    for k in keys:
-        if k in d and d[k] not in (None, "", "NA", "N/A"):
-            return d[k]
-    return None
-
-def _to_row_for_headers(symbol: str, d: Dict[str, Any], headers: List[str], error: Optional[str]) -> List[Any]:
-    """
-    Header-driven row mapping (robust + future-proof).
-    Any unknown header => None.
-    Guarantees len(row)==len(headers).
-    """
-    # Build a tolerant field map from possible keys across UnifiedQuote / EnrichedQuote / legacy
-    last_price = _pick(d, "current_price", "last_price", "price", "close")
-    prev_close = _pick(d, "previous_close", "prev_close", "previousClose")
-    day_high = _pick(d, "day_high", "high", "dayHigh")
-    day_low  = _pick(d, "day_low", "low", "dayLow")
-    open_p   = _pick(d, "open")
-
-    change = _pick(d, "price_change", "change")
-    change_pct = _pick(d, "percent_change", "change_percent", "change_pct")
-
-    high_52w = _pick(d, "high_52w", "fifty_two_week_high", "52w_high", "52WeekHigh")
-    low_52w = _pick(d, "low_52w", "fifty_two_week_low", "52w_low", "52WeekLow")
-    pos_52w = _pick(d, "position_52w_percent", "52w_position_percent", "fifty_two_week_position_pct")
-
-    # common metadata
-    data_quality = _pick(d, "data_quality")
-    data_source = _pick(d, "data_source", "provider")
-
-    last_updated_utc = _pick(d, "last_updated_utc", "time_utc", "updated_at")
-    last_updated_riyadh = _pick(d, "last_updated_riyadh", "time_riyadh")
-
-    # scoring
-    value_score = _pick(d, "value_score")
-    quality_score = _pick(d, "quality_score")
-    momentum_score = _pick(d, "momentum_score")
-    opportunity_score = _pick(d, "opportunity_score")
-    overall_score = _pick(d, "overall_score")
-
-    # compute value_traded if missing
-    volume = _pick(d, "volume")
-    value_traded = _pick(d, "value_traded")
-    if value_traded is None:
-        cp = _safe_float(last_price)
-        vol = _safe_float(volume)
-        if cp is not None and vol is not None:
-            value_traded = cp * vol
-
-    field_map: Dict[str, Any] = {
-        "Symbol": symbol,
-        "Company Name": _pick(d, "name", "company_name"),
-        "Sector": _pick(d, "sector"),
-        "Sub-Sector": _pick(d, "sub_sector", "industry"),
-        "Market": _pick(d, "market", "market_region"),
-        "Currency": _pick(d, "currency"),
-        "Listing Date": _pick(d, "listing_date"),
-
-        "Last Price": last_price,
-        "Previous Close": prev_close,
-        "Open": open_p,
-        "Day High": day_high,
-        "Day Low": day_low,
-        "Price Change": change,
-        "Percent Change": change_pct,
-
-        "52W High": high_52w,
-        "52W Low": low_52w,
-        "52W Position %": pos_52w,
-
-        "Volume": volume,
-        "Avg Volume (30D)": _pick(d, "avg_volume_30d", "avg_volume"),
-        "Value Traded": value_traded,
-        "Turnover %": _pick(d, "turnover_percent", "turnover"),
-
-        "Shares Outstanding": _pick(d, "shares_outstanding"),
-        "Free Float %": _pick(d, "free_float", "free_float_percent"),
-        "Market Cap": _pick(d, "market_cap"),
-        "Free Float Market Cap": _pick(d, "free_float_market_cap"),
-        "Liquidity Score": _pick(d, "liquidity_score"),
-
-        "EPS (TTM)": _pick(d, "eps_ttm", "eps"),
-        "Forward EPS": _pick(d, "forward_eps"),
-        "P/E (TTM)": _pick(d, "pe_ttm", "pe", "pe_ratio"),
-        "Forward P/E": _pick(d, "forward_pe"),
-        "P/B": _pick(d, "pb", "price_to_book"),
-        "P/S": _pick(d, "ps", "price_to_sales"),
-        "EV/EBITDA": _pick(d, "ev_ebitda", "ev_to_ebitda"),
-
-        "Dividend Yield %": _pick(d, "dividend_yield", "dividend_yield_percent"),
-        "Dividend Rate": _pick(d, "dividend_rate"),
-        "Payout Ratio %": _pick(d, "payout_ratio"),
-
-        "ROE %": _pick(d, "roe"),
-        "ROA %": _pick(d, "roa"),
-        "Net Margin %": _pick(d, "net_margin", "profit_margin"),
-        "EBITDA Margin %": _pick(d, "ebitda_margin"),
-        "Revenue Growth %": _pick(d, "revenue_growth"),
-        "Net Income Growth %": _pick(d, "net_income_growth"),
-
-        "Beta": _pick(d, "beta"),
-        "Volatility (30D)": _pick(d, "volatility_30d", "volatility"),
-        "RSI (14)": _pick(d, "rsi_14", "rsi"),
-
-        "Value Score": value_score,
-        "Quality Score": quality_score,
-        "Momentum Score": momentum_score,
-        "Opportunity Score": opportunity_score,
-        "Overall Score": overall_score,
-        "Recommendation": _pick(d, "recommendation"),
-
-        "Data Source": data_source,
-        "Data Quality": data_quality,
-        "Last Updated (UTC)": last_updated_utc,
-        "Last Updated (Riyadh)": last_updated_riyadh,
-        "Error": error or _pick(d, "error") or "",
+def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
+    eq = EnrichedQuote.from_unified(q)
+    return {
+        "headers": list(headers),
+        "row": eq.to_row(headers),
+        "quote": _model_to_dict(eq),
     }
 
-    row = [field_map.get(h, None) for h in headers]
-    if len(row) < len(headers):
-        row += [None] * (len(headers) - len(row))
-    return row[: len(headers)]
 
-# ---------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------
-class SheetRowsRequest(BaseModel):
-    tickers: List[str] = Field(default_factory=list)
-    sheet_name: Optional[str] = Field(default=None)
-
-class SheetRowsResponse(BaseModel):
-    headers: List[str]
-    rows: List[List[Any]]
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-# ---------------------------------------------------------------------
+# =============================================================================
 # Endpoints
-# ---------------------------------------------------------------------
-@router.get("/health")
-async def health() -> Dict[str, Any]:
-    prov = []
-    try:
-        prov = list(getattr(settings, "enabled_providers", []) or [])
-    except Exception:
-        prov = []
+# =============================================================================
+
+@router.get("/health", tags=["system"])
+async def enriched_health(request: Request) -> Dict[str, Any]:
+    """
+    Lightweight health endpoint for Apps Script & Render checks.
+    """
+    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
+    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
+
+    eng = await _resolve_engine(request)
+
     return {
         "status": "ok",
-        "router": "enriched",
+        "module": "routes.enriched_quote",
         "version": ROUTE_VERSION,
-        "provider_mode": ",".join([str(x) for x in prov]),
-        "timestamp_utc": _now_utc_iso(),
+        "engine": "DataEngineV2",
+        "providers": list(getattr(eng, "enabled_providers", []) or []),
+        "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
+        "auth": "open" if not _allowed_tokens() else "token",
     }
+
+
+@router.get("/headers")
+async def get_headers(
+    request: Request,
+    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name to resolve headers."),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+) -> Dict[str, Any]:
+    _require_token(x_app_token)
+    headers = get_headers_for_sheet(sheet_name)
+    return {"sheet_name": sheet_name, "headers": headers, "count": len(headers)}
+
 
 @router.get("/quote")
-async def quote(symbol: str = Query(..., description="Ticker, e.g. 1120.SR or AAPL")) -> Dict[str, Any]:
-    sym = _normalize_any(symbol)
-    engine = _get_engine()
-    if engine is None:
-        return {"symbol": sym, "status": "error", "error": "No engine available"}
+async def enriched_quote(
+    request: Request,
+    symbol: str = Query(..., description="Ticker symbol (e.g., 1120.SR, AAPL, ^GSPC)."),
+    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name for header/row alignment."),
+    format: Literal["quote", "row", "both"] = Query(default="quote", description="Return quote, row, or both."),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+) -> Dict[str, Any]:
+    _require_token(x_app_token)
 
-    try:
-        if hasattr(engine, "get_enriched_quote"):
-            result = await engine.get_enriched_quote(sym)  # type: ignore
-        elif hasattr(engine, "get_quote"):
-            result = await engine.get_quote(sym)  # type: ignore
-        else:
-            from core.data_engine import get_enriched_quote  # type: ignore
-            result = await get_enriched_quote(sym)  # type: ignore
+    sym = (symbol or "").strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol is required")
 
-        data = _model_to_dict(result)
-        data.setdefault("symbol", sym)
-        data.setdefault("status", "ok")
-        return data
+    eng = await _resolve_engine(request)
+    q = await eng.get_quote(sym)
 
-    except Exception as e:
-        logger.exception("quote failed for %s", sym)
-        return {"symbol": sym, "status": "error", "error": str(e)}
+    if format == "quote":
+        return _model_to_dict(EnrichedQuote.from_unified(q))
 
-@router.post("/sheet-rows", response_model=SheetRowsResponse)
-async def sheet_rows(req: SheetRowsRequest) -> Dict[str, Any]:
-    tickers = [_normalize_any(t) for t in (req.tickers or []) if str(t).strip()]
-    tickers = [t for t in tickers if t]
+    headers = get_headers_for_sheet(sheet_name)
+    payload = _build_row_payload(q, headers)
 
-    headers = _headers_for_sheet(req.sheet_name or "Enriched")
+    if format == "row":
+        return {
+            "symbol": payload["quote"].get("symbol", normalize_symbol(sym) or sym),
+            "headers": payload["headers"],
+            "row": payload["row"],
+        }
 
-    if not tickers:
-        return {"headers": headers, "rows": [], "meta": {"count": 0}}
+    payload["sheet_name"] = sheet_name
+    return payload
 
-    engine = _get_engine()
-    if engine is None:
-        rows = [_to_row_for_headers(t, {"symbol": t}, headers, "No engine available") for t in tickers]
-        return {"headers": headers, "rows": rows, "meta": {"count": len(rows), "error": "No engine available"}}
 
-    # Batch config (safe defaults)
-    batch_size = _safe_int(getattr(settings, "enriched_batch_size", 40) if settings else 40, 40)
-    batch_size = max(1, min(batch_size, 200))
+@router.post("/quotes")
+async def enriched_quotes(
+    request: Request,
+    req: BatchProcessRequest = Body(...),
+    format: Literal["rows", "quotes", "both"] = Query(default="rows", description="Return rows, quotes, or both."),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+) -> Dict[str, Any]:
+    _require_token(x_app_token)
 
-    timeout_sec = _safe_float(getattr(settings, "enriched_batch_timeout_sec", 45.0) if settings else 45.0, 45.0)
-    max_conc = _safe_int(getattr(settings, "enriched_batch_concurrency", 5) if settings else 5, 5)
-    sem = asyncio.Semaphore(max(1, max_conc))
+    symbols = _clean_symbols(req.symbols)
+    headers = get_headers_for_sheet(req.sheet_name)
 
-    async def fetch_one(sym: str) -> Tuple[str, Dict[str, Any], Optional[str]]:
-        async with sem:
-            try:
-                if hasattr(engine, "get_enriched_quote"):
-                    r = await asyncio.wait_for(engine.get_enriched_quote(sym), timeout=timeout_sec)  # type: ignore
-                elif hasattr(engine, "get_quote"):
-                    r = await asyncio.wait_for(engine.get_quote(sym), timeout=timeout_sec)  # type: ignore
-                else:
-                    from core.data_engine import get_enriched_quote  # type: ignore
-                    r = await asyncio.wait_for(get_enriched_quote(sym), timeout=timeout_sec)  # type: ignore
+    if not symbols:
+        return {"operation": req.operation, "sheet_name": req.sheet_name, "count": 0, "symbols": [], "headers": headers, "rows": []}
 
-                d = _model_to_dict(r)
-                d.setdefault("symbol", sym)
-                return sym, d, None
+    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
+    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
 
-            except Exception as e:
-                msg = "Timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
-                return sym, {"symbol": sym, "data_quality": "MISSING", "data_source": "none"}, msg
+    if len(symbols) > max_t:
+        raise HTTPException(status_code=400, detail=f"Too many symbols ({len(symbols)}). Max allowed is {max_t}.")
+
+    eng = await _resolve_engine(request)
 
     rows_out: List[List[Any]] = []
-    skipped: List[str] = []
+    quotes_out: List[Dict[str, Any]] = []
 
-    for i in range(0, len(tickers), batch_size):
-        chunk = tickers[i : i + batch_size]
-        try:
-            results = await asyncio.gather(*[fetch_one(s) for s in chunk])
-        except Exception as e:
-            # Extremely defensive: if gather itself fails
-            logger.exception("sheet_rows chunk gather failed")
-            for s in chunk:
-                rows_out.append(_to_row_for_headers(s, {"symbol": s}, headers, str(e)))
-            continue
+    # Soft batching (keeps memory stable)
+    for i in range(0, len(symbols), batch_sz):
+        chunk = symbols[i : i + batch_sz]
+        quotes = await eng.get_quotes(chunk)
 
-        for sym, d, err in results:
-            rows_out.append(_to_row_for_headers(sym, d, headers, err))
+        if format in ("rows", "both"):
+            for q in quotes:
+                eq = EnrichedQuote.from_unified(q)
+                rows_out.append(eq.to_row(headers))
 
-    return {
+        if format in ("quotes", "both"):
+            for q in quotes:
+                quotes_out.append(_model_to_dict(EnrichedQuote.from_unified(q)))
+
+    resp: Dict[str, Any] = {
+        "operation": req.operation,
+        "sheet_name": req.sheet_name,
+        "count": len(symbols),
+        "symbols": symbols,
         "headers": headers,
-        "rows": rows_out,
-        "meta": {
-            "count": len(rows_out),
-            "batch_size": batch_size,
-            "timeout_sec": timeout_sec,
-            "concurrency": max_conc,
-            "skipped": skipped,
-        },
     }
+
+    if format in ("rows", "both"):
+        resp["rows"] = rows_out
+    if format in ("quotes", "both"):
+        resp["quotes"] = quotes_out
+
+    return resp
+
 
 __all__ = ["router"]
