@@ -1,494 +1,416 @@
-# routes/enriched_quote.py
+# core/enriched_quote.py
 """
-routes/enriched_quote.py
+core/enriched_quote.py
 ===========================================================
-Enriched Quote Routes (Google Sheets + API) – v2.2 (PROD SAFE)
+EnrichedQuote Mapper + Sheets Row Builder – v2.2 (PROD SAFE)
 
-Stable endpoints (Sheets + Apps Script + API):
-- GET  /v1/enriched/health
-- GET  /v1/enriched/headers?sheet_name=KSA_Tadawul
-- GET  /v1/enriched/quote?symbol=1120.SR&format=quote|row|both
-- POST /v1/enriched/quotes      {symbols:[...], sheet_name?, operation?}  (format=rows|quotes|both)
-- POST /v1/enriched/sheet-rows  {tickers:[...] OR symbols:[...], sheet_name?}  ✅ used by google_sheets_service.py
+Purpose
+- Provide a stable, Sheets-friendly representation of UnifiedQuote.
+- Convert UnifiedQuote -> EnrichedQuote (same field names).
+- Convert EnrichedQuote -> Google Sheets row aligned to headers returned by:
+    core.schemas.get_headers_for_sheet(sheet_name)
 
-Contract for /sheet-rows (important):
-- Always returns: {headers:[], rows:[], status:"success|partial|error|skipped", error?:str}
-
-Auth:
-- X-APP-TOKEN checked against APP_TOKEN / BACKUP_APP_TOKEN (from settings/env)
-- If no tokens configured => OPEN mode (no auth)
-
-Defensive limits:
-- ENRICHED_MAX_TICKERS (default 250)
-- ENRICHED_BATCH_SIZE (default 40)
+Design
+- Defensive: never throws during row build.
+- Header-driven: supports multiple header naming conventions (Symbol vs Ticker,
+  Company Name vs Name, Last Price vs Current Price, etc.)
+- Sheets-safe values: None / NaN / inf -> "" (blank cell)
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import os
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Literal
+import math
+import re
+from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote
-
-# Optional (preferred) helpers
-try:
-    from core.enriched_quote import EnrichedQuote  # type: ignore
-except Exception:  # pragma: no cover
-    EnrichedQuote = None  # type: ignore
-
-try:
-    from core.schemas import BatchProcessRequest, get_headers_for_sheet  # type: ignore
-except Exception:  # pragma: no cover
-    BatchProcessRequest = None  # type: ignore
-    get_headers_for_sheet = None  # type: ignore
-
-logger = logging.getLogger("routes.enriched_quote")
-router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
-
-# =============================================================================
-# Engine singleton (shared)
-# =============================================================================
-_ENGINE: Optional[DataEngine] = None
-_ENGINE_LOCK = asyncio.Lock()
+from core.data_engine_v2 import UnifiedQuote
 
 
-async def _get_engine() -> DataEngine:
-    global _ENGINE
-    if _ENGINE is not None:
-        return _ENGINE
-    async with _ENGINE_LOCK:
-        if _ENGINE is None:
-            _ENGINE = DataEngine()
-            logger.info("[enriched] DataEngine initialized (singleton).")
-    return _ENGINE
+ENRICHED_VERSION = "2.2.0"
 
 
 # =============================================================================
-# Auth (X-APP-TOKEN)
+# Helpers
 # =============================================================================
-@lru_cache(maxsize=1)
-def _allowed_tokens() -> List[str]:
-    tokens: List[str] = []
-
-    # 1) settings
+def _is_bad_number(x: Any) -> bool:
     try:
-        s = get_settings()
-        for attr in ("app_token", "backup_app_token"):
-            v = getattr(s, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
+        if isinstance(x, (int, float)):
+            return math.isnan(float(x)) or math.isinf(float(x))
     except Exception:
-        pass
-
-    # 2) env vars
-    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
-        v = os.getenv(k, "")
-        if v and v.strip():
-            tokens.append(v.strip())
-
-    # de-dup preserve order
-    out: List[str] = []
-    seen = set()
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-
-    if not out:
-        logger.warning("[enriched] No APP_TOKEN configured -> endpoints are OPEN (no auth).")
-    return out
+        return True
+    return False
 
 
-def _require_token(x_app_token: Optional[str]) -> None:
-    allowed = _allowed_tokens()
-    if not allowed:
-        return  # open mode
+def _clean_value(x: Any) -> Any:
+    """
+    Google Sheets values API is happiest with:
+      - str, int/float, bool, ""
+    """
+    if x is None:
+        return ""
+    if _is_bad_number(x):
+        return ""
+    return x
 
-    if not x_app_token or x_app_token.strip() not in allowed:
-        raise HTTPException(status_code=401, detail="Unauthorized (invalid or missing X-APP-TOKEN).")
+
+def _norm_header(h: str) -> str:
+    """
+    Normalize header labels to a compact key:
+    - lowercase
+    - remove non-alphanumeric
+    Example: "Last Updated (Riyadh)" -> "lastupdatedriyadh"
+    """
+    s = (h or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
 
 
-# =============================================================================
-# Limits / helpers
-# =============================================================================
-def _get_int_setting(name: str, default: int) -> int:
+def _pct(x: Any) -> Optional[float]:
     try:
-        s = get_settings()
-        v = getattr(s, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    except Exception:
-        pass
-
-    # env override
-    try:
-        v2 = os.getenv(name, "")
-        if v2.strip():
-            n = int(v2.strip())
-            if n > 0:
-                return n
-    except Exception:
-        pass
-
-    return default
-
-
-def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
-    out: List[str] = []
-    for x in symbols or []:
         if x is None:
-            continue
-        s = str(x).strip()
-        if not s:
-            continue
-        out.append(s)
-    return out
-
-
-def _dedup_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for s in items:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-def _quote_to_dict(q: Any) -> Dict[str, Any]:
-    try:
-        return q.model_dump(exclude_none=False)  # pydantic v2
+            return None
+        v = float(x)
+        if _is_bad_number(v):
+            return None
+        return v
     except Exception:
-        try:
-            return dict(getattr(q, "__dict__", {}) or {})
-        except Exception:
-            return {}
+        return None
 
 
-def _default_headers_59() -> List[str]:
-    # Safe fallback order aligned to UnifiedQuote fields (human headers)
-    return [
-        "Symbol", "Company Name", "Sector", "Industry", "Sub-Sector", "Market", "Currency", "Listing Date",
-        "Shares Outstanding", "Free Float %", "Market Cap", "Free Float Market Cap",
-        "Current Price", "Previous Close", "Open", "Day High", "Day Low",
-        "52W High", "52W Low", "52W Position %",
-        "Price Change", "Percent Change",
-        "Volume", "Avg Volume (30D)", "Value Traded", "Turnover %", "Liquidity Score",
-        "EPS (TTM)", "Forward EPS", "P/E (TTM)", "Forward P/E", "P/B", "P/S", "EV/EBITDA",
-        "Dividend Yield %", "Dividend Rate", "Payout Ratio %",
-        "ROE %", "ROA %", "Net Margin %", "EBITDA Margin %",
-        "Revenue Growth %", "Net Income Growth %",
-        "Beta", "Debt/Equity", "Current Ratio", "Quick Ratio",
-        "RSI (14)", "Volatility (30D)", "MACD", "MA20", "MA50",
-        "Fair Value", "Target Price", "Upside %", "Valuation Label", "Analyst Rating",
-        "Value Score", "Quality Score", "Momentum Score", "Opportunity Score", "Overall Score",
-        "Recommendation", "Confidence", "Risk Score",
-        "Data Source", "Data Quality", "Last Updated (UTC)", "Last Updated (Riyadh)", "Error",
-    ]
-
-
-def _headers_for_sheet(sheet_name: Optional[str]) -> List[str]:
-    if get_headers_for_sheet:
-        try:
-            h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and h:
-                return [str(x).strip() for x in h if str(x).strip()]
-        except Exception:
-            pass
-    return _default_headers_59()
-
-
-def _row_from_unified_fallback(q: UnifiedQuote, headers: List[str]) -> List[Any]:
-    """
-    If core.enriched_quote.EnrichedQuote is missing, build a best-effort row
-    from UnifiedQuote.model_dump() using common header->field mappings.
-    """
-    d = _quote_to_dict(q)
-    m = {
-        "symbol": "symbol",
-        "company name": "name",
-        "name": "name",
-        "sector": "sector",
-        "industry": "industry",
-        "sub-sector": "sub_sector",
-        "sub sector": "sub_sector",
-        "market": "market",
-        "currency": "currency",
-        "listing date": "listing_date",
-        "shares outstanding": "shares_outstanding",
-        "free float %": "free_float",
-        "market cap": "market_cap",
-        "free float market cap": "free_float_market_cap",
-        "current price": "current_price",
-        "previous close": "previous_close",
-        "open": "open",
-        "day high": "day_high",
-        "day low": "day_low",
-        "52w high": "high_52w",
-        "52w low": "low_52w",
-        "52w position %": "position_52w_percent",
-        "price change": "price_change",
-        "percent change": "percent_change",
-        "volume": "volume",
-        "avg volume (30d)": "avg_volume_30d",
-        "value traded": "value_traded",
-        "turnover %": "turnover_percent",
-        "liquidity score": "liquidity_score",
-        "eps (ttm)": "eps_ttm",
-        "forward eps": "forward_eps",
-        "p/e (ttm)": "pe_ttm",
-        "forward p/e": "forward_pe",
-        "p/b": "pb",
-        "p/s": "ps",
-        "ev/ebitda": "ev_ebitda",
-        "dividend yield %": "dividend_yield",
-        "dividend rate": "dividend_rate",
-        "payout ratio %": "payout_ratio",
-        "roe %": "roe",
-        "roa %": "roa",
-        "net margin %": "net_margin",
-        "ebitda margin %": "ebitda_margin",
-        "revenue growth %": "revenue_growth",
-        "net income growth %": "net_income_growth",
-        "beta": "beta",
-        "debt/equity": "debt_to_equity",
-        "current ratio": "current_ratio",
-        "quick ratio": "quick_ratio",
-        "rsi (14)": "rsi_14",
-        "volatility (30d)": "volatility_30d",
-        "macd": "macd",
-        "ma20": "ma20",
-        "ma50": "ma50",
-        "fair value": "fair_value",
-        "target price": "target_price",
-        "upside %": "upside_percent",
-        "valuation label": "valuation_label",
-        "analyst rating": "analyst_rating",
-        "value score": "value_score",
-        "quality score": "quality_score",
-        "momentum score": "momentum_score",
-        "opportunity score": "opportunity_score",
-        "overall score": "overall_score",
-        "recommendation": "recommendation",
-        "confidence": "confidence",
-        "risk score": "risk_score",
-        "data source": "data_source",
-        "data quality": "data_quality",
-        "last updated (utc)": "last_updated_utc",
-        "last updated (riyadh)": "last_updated_riyadh",
-        "error": "error",
-    }
-
-    row: List[Any] = []
-    for h in headers:
-        key = (h or "").strip().lower()
-        field = m.get(key)
-        row.append(d.get(field) if field else None)
-    return row
-
-
-def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
-    if EnrichedQuote:
-        eq = EnrichedQuote.from_unified(q)  # type: ignore
-        return {"headers": list(headers), "row": eq.to_row(headers), "quote": _quote_to_dict(eq)}
-    return {"headers": list(headers), "row": _row_from_unified_fallback(q, headers), "quote": _quote_to_dict(q)}
-
-
-def _sheet_rows_error_payload(symbols: List[str], err: str, headers: Optional[List[str]] = None) -> Dict[str, Any]:
-    h = headers or ["Symbol", "Error"]
-    rows = []
-    for s in symbols:
-        if "Error" in h:
-            r = [None] * len(h)
-            r[h.index("Symbol")] = s if "Symbol" in h else s
-            r[h.index("Error")] = err
-            rows.append(r)
-        else:
-            rows.append([s, err])
-    return {"headers": h, "rows": rows, "status": "error", "error": err}
-
-
-# =============================================================================
-# Request Models
-# =============================================================================
-class SheetRowsRequest(BaseModel):
-    tickers: List[str] = Field(default_factory=list)
-    symbols: List[str] = Field(default_factory=list)
-    sheet_name: Optional[str] = None
-
-
-class _FallbackBatchProcessRequest(BaseModel):
-    symbols: List[str] = Field(default_factory=list)
-    sheet_name: Optional[str] = None
-    operation: Optional[str] = "enriched_quotes"
-
-
-# =============================================================================
-# Endpoints
-# =============================================================================
-@router.get("/health", tags=["system"])
-async def enriched_health() -> Dict[str, Any]:
-    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
-    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
-    eng = await _get_engine()
-    return {
-        "status": "ok",
-        "module": "routes.enriched_quote",
-        "engine": "DataEngineV2",
-        "providers": list(getattr(eng, "enabled_providers", []) or []),
-        "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
-        "auth": "open" if not _allowed_tokens() else "token",
-    }
-
-
-@router.get("/headers")
-async def get_headers(
-    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name to resolve headers."),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    _require_token(x_app_token)
-    headers = _headers_for_sheet(sheet_name)
-    return {"sheet_name": sheet_name, "headers": headers, "count": len(headers)}
-
-
-@router.get("/quote")
-async def enriched_quote(
-    symbol: str = Query(..., description="Ticker symbol (e.g., 1120.SR, AAPL, ^GSPC)."),
-    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name for header/row alignment."),
-    format: Literal["quote", "row", "both"] = Query(default="quote", description="Return quote, row, or both."),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    _require_token(x_app_token)
-
-    eng = await _get_engine()
-    q = await eng.get_quote(symbol)
-
-    if format == "quote":
-        return _quote_to_dict(EnrichedQuote.from_unified(q) if EnrichedQuote else q)  # type: ignore
-
-    headers = _headers_for_sheet(sheet_name)
-    payload = _build_row_payload(q, headers)
-
-    if format == "row":
-        return {"symbol": symbol, "headers": payload["headers"], "row": payload["row"]}
-
-    payload["sheet_name"] = sheet_name
-    return payload
-
-
-@router.post("/quotes")
-async def enriched_quotes(
-    req: Any = Body(...),
-    format: Literal["rows", "quotes", "both"] = Query(default="rows", description="Return rows, quotes, or both."),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    _require_token(x_app_token)
-
-    # Accept either core.schemas.BatchProcessRequest or fallback
-    if BatchProcessRequest and isinstance(req, dict):
-        req_obj = BatchProcessRequest(**req)  # type: ignore
-    elif BatchProcessRequest and not isinstance(req, dict):
-        req_obj = req  # already parsed
-    else:
-        req_obj = _FallbackBatchProcessRequest(**(req or {}))
-
-    symbols = _dedup_keep_order(_clean_symbols(getattr(req_obj, "symbols", []) or []))
-    sheet_name = getattr(req_obj, "sheet_name", None)
-    operation = getattr(req_obj, "operation", None) or "enriched_quotes"
-
-    headers = _headers_for_sheet(sheet_name)
-    if not symbols:
-        return {"operation": operation, "sheet_name": sheet_name, "count": 0, "symbols": [], "headers": headers, "rows": [], "status": "skipped"}
-
-    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
-    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
-    if len(symbols) > max_t:
-        raise HTTPException(status_code=400, detail=f"Too many symbols ({len(symbols)}). Max allowed is {max_t}.")
-
-    eng = await _get_engine()
-
-    rows_out: List[List[Any]] = []
-    quotes_out: List[Dict[str, Any]] = []
-
-    for i in range(0, len(symbols), batch_sz):
-        chunk = symbols[i : i + batch_sz]
-        quotes = await eng.get_quotes(chunk)
-
-        if format in ("rows", "both"):
-            for q in quotes:
-                payload = _build_row_payload(q, headers)
-                rows_out.append(payload["row"])
-
-        if format in ("quotes", "both"):
-            for q in quotes:
-                quotes_out.append(_quote_to_dict(EnrichedQuote.from_unified(q) if EnrichedQuote else q))  # type: ignore
-
-    resp: Dict[str, Any] = {
-        "operation": operation,
-        "sheet_name": sheet_name,
-        "count": len(symbols),
-        "symbols": symbols,
-        "headers": headers,
-        "status": "success",
-    }
-    if format in ("rows", "both"):
-        resp["rows"] = rows_out
-    if format in ("quotes", "both"):
-        resp["quotes"] = quotes_out
-    return resp
-
-
-@router.post("/sheet-rows")
-async def enriched_sheet_rows(
-    req: SheetRowsRequest = Body(...),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    """
-    ✅ Primary endpoint used by google_sheets_service.py
-    Expects: {tickers:[...], sheet_name:"KSA_Tadawul"} (or symbols:[...])
-    Returns: {headers, rows, status, error?}
-    """
-    _require_token(x_app_token)
-
-    symbols = _dedup_keep_order(_clean_symbols((req.tickers or []) + (req.symbols or [])))
-    headers = _headers_for_sheet(req.sheet_name)
-
-    if not symbols:
-        return {"headers": headers, "rows": [], "status": "skipped", "error": "No tickers provided"}
-
-    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
-    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
-    if len(symbols) > max_t:
-        return _sheet_rows_error_payload(symbols[:max_t], f"Too many tickers ({len(symbols)}). Max allowed is {max_t}.", headers=headers)
-
-    eng = await _get_engine()
-
-    rows: List[List[Any]] = []
-    any_error = False
-
+def _safe_upside(current: Any, target: Any) -> Optional[float]:
     try:
-        for i in range(0, len(symbols), batch_sz):
-            chunk = symbols[i : i + batch_sz]
-            quotes = await eng.get_quotes(chunk)
-            for q in quotes:
-                payload = _build_row_payload(q, headers)
-                rows.append(payload["row"])
-                if getattr(q, "error", None):
-                    any_error = True
-    except Exception as exc:
-        logger.exception("[enriched] /sheet-rows failed", exc_info=exc)
-        return _sheet_rows_error_payload(symbols, str(exc), headers=headers)
+        c = float(current) if current is not None else None
+        t = float(target) if target is not None else None
+        if c is None or t is None or c == 0:
+            return None
+        if _is_bad_number(c) or _is_bad_number(t):
+            return None
+        return (t / c - 1.0) * 100.0
+    except Exception:
+        return None
 
-    return {
-        "headers": headers,
-        "rows": rows,
-        "status": "partial" if any_error else "success",
-        "error": None,
-    }
+
+# =============================================================================
+# Model: EnrichedQuote
+# =============================================================================
+class EnrichedQuote(BaseModel):
+    """
+    A stable “public” quote shape for API + Google Sheets.
+
+    NOTE: Field names intentionally match UnifiedQuote (engine output).
+    """
+    model_config = ConfigDict(
+        populate_by_name=True,
+        from_attributes=True,
+        validate_assignment=True,
+        extra="ignore",
+    )
+
+    # Identity
+    symbol: str
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    sub_sector: Optional[str] = None
+    market: str = "UNKNOWN"
+    currency: Optional[str] = None
+    listing_date: Optional[str] = None
+
+    # Shares / Float / Cap
+    shares_outstanding: Optional[float] = None
+    free_float: Optional[float] = None
+    market_cap: Optional[float] = None
+    free_float_market_cap: Optional[float] = None
+
+    # Prices
+    current_price: Optional[float] = None
+    previous_close: Optional[float] = None
+    open: Optional[float] = None
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+    high_52w: Optional[float] = None
+    low_52w: Optional[float] = None
+    position_52w_percent: Optional[float] = None
+    price_change: Optional[float] = None
+    percent_change: Optional[float] = None
+
+    # Volume / Liquidity
+    volume: Optional[float] = None
+    avg_volume_30d: Optional[float] = None
+    value_traded: Optional[float] = None
+    turnover_percent: Optional[float] = None
+    liquidity_score: Optional[float] = None
+
+    # Fundamentals
+    eps_ttm: Optional[float] = None
+    forward_eps: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    forward_pe: Optional[float] = None
+    pb: Optional[float] = None
+    ps: Optional[float] = None
+    ev_ebitda: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    dividend_rate: Optional[float] = None
+    payout_ratio: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+    net_margin: Optional[float] = None
+    ebitda_margin: Optional[float] = None
+    revenue_growth: Optional[float] = None
+    net_income_growth: Optional[float] = None
+    beta: Optional[float] = None
+    debt_to_equity: Optional[float] = None
+    current_ratio: Optional[float] = None
+    quick_ratio: Optional[float] = None
+
+    # Technicals
+    rsi_14: Optional[float] = None
+    volatility_30d: Optional[float] = None
+    macd: Optional[float] = None
+    ma20: Optional[float] = None
+    ma50: Optional[float] = None
+
+    # Valuation / Targets
+    fair_value: Optional[float] = None
+    target_price: Optional[float] = None
+    upside_percent: Optional[float] = None
+    valuation_label: Optional[str] = None
+    analyst_rating: Optional[str] = None
+
+    # Scores / Recommendation
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
+    opportunity_score: Optional[float] = None
+    overall_score: Optional[float] = None
+    recommendation: Optional[str] = None
+    confidence: Optional[float] = None
+    risk_score: Optional[float] = None
+
+    # Meta
+    data_source: str = "none"
+    data_quality: str = "MISSING"
+    last_updated_utc: str = Field(default_factory=lambda: "")
+    last_updated_riyadh: str = Field(default_factory=lambda: "")
+    error: Optional[str] = None
+
+    # -------------------------------------------------------------------------
+    # Constructors
+    # -------------------------------------------------------------------------
+    @classmethod
+    def from_unified(cls, q: Any) -> "EnrichedQuote":
+        """
+        Accepts:
+          - UnifiedQuote
+          - EnrichedQuote
+          - dict-like
+          - object with attributes
+        """
+        if q is None:
+            return cls(symbol="", data_quality="MISSING", error="Empty quote input")
+
+        if isinstance(q, EnrichedQuote):
+            return q
+
+        data: Dict[str, Any] = {}
+        try:
+            if isinstance(q, UnifiedQuote):
+                data = q.model_dump(exclude_none=False)
+            elif isinstance(q, dict):
+                data = dict(q)
+            elif hasattr(q, "model_dump"):
+                data = q.model_dump(exclude_none=False)  # type: ignore
+            elif hasattr(q, "__dict__"):
+                data = dict(getattr(q, "__dict__", {}) or {})
+        except Exception:
+            data = {}
+
+        # Ensure symbol
+        sym = (data.get("symbol") or data.get("ticker") or data.get("Symbol") or "").strip()
+        if not sym and hasattr(q, "symbol"):
+            try:
+                sym = str(getattr(q, "symbol") or "").strip()
+            except Exception:
+                sym = ""
+
+        obj = cls(**{**data, "symbol": sym})
+
+        # Compute upside if missing (prefer fair_value, else target_price)
+        if obj.upside_percent is None:
+            tgt = obj.target_price if obj.target_price is not None else obj.fair_value
+            obj.upside_percent = _safe_upside(obj.current_price, tgt)
+
+        return obj
+
+    # -------------------------------------------------------------------------
+    # Sheets Row Builder
+    # -------------------------------------------------------------------------
+    def to_row(self, headers: List[str]) -> List[Any]:
+        """
+        Build a row aligned to an arbitrary headers list.
+        Unknown headers => blank.
+        """
+        # Convenience locals (avoid getattr overhead)
+        d = self.model_dump(exclude_none=False)
+
+        # Header-key -> extractor
+        def g(*keys: str) -> Any:
+            for k in keys:
+                if k in d:
+                    return d.get(k)
+            return None
+
+        mapping: Dict[str, Callable[[], Any]] = {
+            # Identity
+            "symbol": lambda: g("symbol"),
+            "ticker": lambda: g("symbol"),
+            "companyname": lambda: g("name"),
+            "name": lambda: g("name"),
+            "sector": lambda: g("sector"),
+            "industry": lambda: g("industry"),
+            "subsector": lambda: g("sub_sector"),
+            "subsectorname": lambda: g("sub_sector"),
+            "market": lambda: g("market"),
+            "currency": lambda: g("currency"),
+            "listingdate": lambda: g("listing_date"),
+
+            # Shares / float / cap
+            "sharesoutstanding": lambda: g("shares_outstanding"),
+            "freefloat": lambda: g("free_float"),
+            "freefloatpercent": lambda: g("free_float"),
+            "marketcap": lambda: g("market_cap"),
+            "freefloatmarketcap": lambda: g("free_float_market_cap"),
+
+            # Prices
+            "currentprice": lambda: g("current_price"),
+            "lastprice": lambda: g("current_price"),
+            "price": lambda: g("current_price"),
+            "previousclose": lambda: g("previous_close"),
+            "open": lambda: g("open"),
+            "dayhigh": lambda: g("day_high"),
+            "high": lambda: g("day_high"),
+            "daylow": lambda: g("day_low"),
+            "low": lambda: g("day_low"),
+            "52whigh": lambda: g("high_52w"),
+            "yearhigh": lambda: g("high_52w"),
+            "52wlow": lambda: g("low_52w"),
+            "yearlow": lambda: g("low_52w"),
+            "52wpositionpercent": lambda: g("position_52w_percent"),
+            "position52wpercent": lambda: g("position_52w_percent"),
+            "pricechange": lambda: g("price_change"),
+            "change": lambda: g("price_change"),
+            "percentchange": lambda: g("percent_change"),
+            "changepercent": lambda: g("percent_change"),
+            "change%": lambda: g("percent_change"),
+
+            # Volume / Liquidity
+            "volume": lambda: g("volume"),
+            "avgvolume30d": lambda: g("avg_volume_30d"),
+            "avgvolume": lambda: g("avg_volume_30d"),
+            "valuetraded": lambda: g("value_traded"),
+            "turnoverpercent": lambda: g("turnover_percent"),
+            "turnover%": lambda: g("turnover_percent"),
+            "liquidityscore": lambda: g("liquidity_score"),
+
+            # Fundamentals
+            "epsttm": lambda: g("eps_ttm"),
+            "eps": lambda: g("eps_ttm"),
+            "forwardeps": lambda: g("forward_eps"),
+            "pettm": lambda: g("pe_ttm"),
+            "pe": lambda: g("pe_ttm"),
+            "forwardpe": lambda: g("forward_pe"),
+            "pb": lambda: g("pb"),
+            "ps": lambda: g("ps"),
+            "evebitda": lambda: g("ev_ebitda"),
+            "dividendyield": lambda: g("dividend_yield"),
+            "dividendyieldpercent": lambda: g("dividend_yield"),
+            "dividendrate": lambda: g("dividend_rate"),
+            "payoutratio": lambda: g("payout_ratio"),
+            "payoutratiopercent": lambda: g("payout_ratio"),
+            "roe": lambda: g("roe"),
+            "roepercent": lambda: g("roe"),
+            "roa": lambda: g("roa"),
+            "roapercent": lambda: g("roa"),
+            "netmargin": lambda: g("net_margin"),
+            "netmarginpercent": lambda: g("net_margin"),
+            "ebitdamargin": lambda: g("ebitda_margin"),
+            "ebitdamarginpercent": lambda: g("ebitda_margin"),
+            "revenuegrowth": lambda: g("revenue_growth"),
+            "revenuegrowthpercent": lambda: g("revenue_growth"),
+            "netincomegrowth": lambda: g("net_income_growth"),
+            "netincomegrowthpercent": lambda: g("net_income_growth"),
+            "beta": lambda: g("beta"),
+            "debtequity": lambda: g("debt_to_equity"),
+            "debttoequity": lambda: g("debt_to_equity"),
+            "currentratio": lambda: g("current_ratio"),
+            "quickratio": lambda: g("quick_ratio"),
+
+            # Technicals
+            "rsi14": lambda: g("rsi_14"),
+            "rsi": lambda: g("rsi_14"),
+            "volatility30d": lambda: g("volatility_30d"),
+            "volatility": lambda: g("volatility_30d"),
+            "macd": lambda: g("macd"),
+            "ma20": lambda: g("ma20"),
+            "ma50": lambda: g("ma50"),
+
+            # Valuation / targets
+            "fairvalue": lambda: g("fair_value"),
+            "targetprice": lambda: g("target_price"),
+            "upsidepercent": lambda: g("upside_percent") if g("upside_percent") is not None else _safe_upside(g("current_price"), g("target_price") or g("fair_value")),
+            "valuationlabel": lambda: g("valuation_label"),
+            "analystrating": lambda: g("analyst_rating"),
+
+            # Scores / reco
+            "valuescore": lambda: g("value_score"),
+            "qualityscore": lambda: g("quality_score"),
+            "momentumscore": lambda: g("momentum_score"),
+            "opportunityscore": lambda: g("opportunity_score"),
+            "overallscore": lambda: g("overall_score"),
+            "recommendation": lambda: g("recommendation"),
+            "confidence": lambda: g("confidence"),
+            "riskscore": lambda: g("risk_score"),
+
+            # Meta
+            "datasource": lambda: g("data_source"),
+            "dataquality": lambda: g("data_quality"),
+            "lastupdated": lambda: g("last_updated_utc"),
+            "lastupdatedutc": lambda: g("last_updated_utc"),
+            "lastupdatedlocal": lambda: g("last_updated_riyadh"),
+            "lastupdatedriyadh": lambda: g("last_updated_riyadh"),
+            "error": lambda: g("error"),
+        }
+
+        row: List[Any] = []
+        for h in (headers or []):
+            key = _norm_header(h)
+
+            # Also support patterns like "Change %" where normalization removes %
+            if key not in mapping:
+                # Try another normalization that keeps % removed but keyword preserved
+                if "change" in key and "percent" in key:
+                    key = "percentchange"
+
+            val = ""
+            try:
+                fn = mapping.get(key)
+                if fn is not None:
+                    val = fn()
+                else:
+                    # Fallback: attempt snake_case attr from header
+                    # e.g. "Last Updated (Riyadh)" -> last_updated_riyadh
+                    raw = (h or "").strip().lower()
+                    raw = re.sub(r"[\(\)\[\]]", " ", raw)
+                    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+                    val = d.get(raw, "")
+            except Exception:
+                val = ""
+
+            row.append(_clean_value(val))
+
+        return row
+
+
+__all__ = ["EnrichedQuote", "ENRICHED_VERSION"]
