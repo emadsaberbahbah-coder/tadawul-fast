@@ -1,298 +1,231 @@
 """
-core/schemas.py
-=================================================
-Core Schemas + Google Sheets Header Templates – v4.1.0 (HARDENED)
+core/enriched_quote.py
+===========================================================
+EnrichedQuote (UnifiedQuote -> Google Sheets Row) – v2.2.0
 
-Goals
-- Keep a stable, dashboard-friendly header schema (59 columns).
-- Provide lightweight Pydantic models used across routes/services.
-- Keep `get_headers_for_sheet(sheet_name)` signature (required by routes).
-- Add safer normalization + Riyadh time helper without breaking callers.
+Purpose
+- Provide a stable conversion layer from core.data_engine_v2.UnifiedQuote
+  into:
+    1) API-friendly dict (same fields)
+    2) Google Sheets row aligned to headers (59-column schema)
+
+Design rules
+- Import-safe and production defensive (never crash on missing fields).
+- Header-driven row rendering:
+    EnrichedQuote.to_row(headers) returns exactly len(headers) columns.
+- Uses core.schemas.DEFAULT_HEADERS_59 / get_headers_for_sheet as source of truth.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import math
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict
 
-# Riyadh is UTC+3 with no DST (safe fixed offset)
-try:
-    from datetime import timedelta
-    RIYADH_TZ = timezone(timedelta(hours=3), name="Asia/Riyadh")
-except Exception:  # ultra-defensive
-    RIYADH_TZ = timezone.utc
+from core.data_engine_v2 import UnifiedQuote
 
 
-# =============================================================================
-# Base
-# =============================================================================
-
-class BaseSchema(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-        from_attributes=True,
-        validate_assignment=True,
-        extra="ignore",
-    )
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def riyadh_now() -> datetime:
-    return datetime.now(RIYADH_TZ)
-
-
-def to_riyadh(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None:
-        return None
+def _sf(x: Any) -> Optional[float]:
+    """Safe float coercion (never raises)."""
     try:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(RIYADH_TZ)
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            f = float(x)
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return f
+        s = str(x).strip()
+        if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
+            return None
+        f = float(s)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
     except Exception:
         return None
 
 
-def normalize_sheet_name(name: Optional[str]) -> str:
-    """
-    Normalize sheet names so callers can pass:
-      - different casing
-      - extra spaces
-      - hyphen/space variants
-
-    We keep your canonical names (e.g. Global_Markets) but normalize input.
-    """
-    if not name:
-        return ""
-    s = str(name).strip()
-    if not s:
-        return ""
-    # unify whitespace
-    s = " ".join(s.split())
-    return s
+def _compute_upside_percent(fair_value: Any, current_price: Any) -> Optional[float]:
+    fv = _sf(fair_value)
+    cp = _sf(current_price)
+    if fv is None or cp is None or cp == 0:
+        return None
+    return (fv / cp - 1.0) * 100.0
 
 
-def normalize_symbol(sym: Optional[str]) -> str:
-    if not sym:
-        return ""
-    s = str(sym).strip().upper()
-    return s
+# Canonical header -> UnifiedQuote attribute
+HEADER_TO_ATTR: Dict[str, str] = {
+    "Symbol": "symbol",
+    "Company Name": "name",
+    "Sector": "sector",
+    "Sub-Sector": "sub_sector",
+    "Market": "market",
+    "Currency": "currency",
+    "Listing Date": "listing_date",
+    "Last Price": "current_price",
+    "Previous Close": "previous_close",
+    "Price Change": "price_change",
+    "Percent Change": "percent_change",
+    "Day High": "day_high",
+    "Day Low": "day_low",
+    "52W High": "high_52w",
+    "52W Low": "low_52w",
+    "52W Position %": "position_52w_percent",
+    "Volume": "volume",
+    "Avg Volume (30D)": "avg_volume_30d",
+    "Value Traded": "value_traded",
+    "Turnover %": "turnover_percent",
+    "Shares Outstanding": "shares_outstanding",
+    "Free Float %": "free_float",
+    "Market Cap": "market_cap",
+    "Free Float Market Cap": "free_float_market_cap",
+    "Liquidity Score": "liquidity_score",
+    "EPS (TTM)": "eps_ttm",
+    "Forward EPS": "forward_eps",
+    "P/E (TTM)": "pe_ttm",
+    "Forward P/E": "forward_pe",
+    "P/B": "pb",
+    "P/S": "ps",
+    "EV/EBITDA": "ev_ebitda",
+    "Dividend Yield %": "dividend_yield",
+    "Dividend Rate": "dividend_rate",
+    "Payout Ratio %": "payout_ratio",
+    "ROE %": "roe",
+    "ROA %": "roa",
+    "Net Margin %": "net_margin",
+    "EBITDA Margin %": "ebitda_margin",
+    "Revenue Growth %": "revenue_growth",
+    "Net Income Growth %": "net_income_growth",
+    "Beta": "beta",
+    "Volatility (30D)": "volatility_30d",
+    "RSI (14)": "rsi_14",
+    "Fair Value": "fair_value",
+    "Upside %": "upside_percent",
+    "Valuation Label": "valuation_label",
+    "Value Score": "value_score",
+    "Quality Score": "quality_score",
+    "Momentum Score": "momentum_score",
+    "Opportunity Score": "opportunity_score",
+    "Risk Score": "risk_score",
+    "Overall Score": "overall_score",
+    "Error": "error",
+    "Recommendation": "recommendation",
+    "Data Source": "data_source",
+    "Data Quality": "data_quality",
+    "Last Updated (UTC)": "last_updated_utc",
+    "Last Updated (Riyadh)": "last_updated_riyadh",
+}
 
 
-# =============================================================================
-# Common Request / Response Models
-# =============================================================================
+class EnrichedQuote(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True, extra="ignore")
 
-class TickerRequest(BaseSchema):
-    ticker: str = Field(..., description="The stock symbol (e.g., 1120.SR, AAPL)")
-    provider: Optional[str] = Field(
-        default=None,
-        description="Optional provider hint (engine still auto-routes).",
-    )
-
-    # Convenience property (non-breaking)
-    @property
-    def symbol(self) -> str:
-        return normalize_symbol(self.ticker)
-
-
-class MarketData(BaseSchema):
+    # Keep fields aligned with UnifiedQuote + sheet headers
     symbol: str
-    price: Optional[float] = None
+
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    sub_sector: Optional[str] = None
+    market: Optional[str] = None
     currency: Optional[str] = None
-    change: Optional[float] = None
-    change_percent: Optional[float] = None
+    listing_date: Optional[str] = None
+
+    current_price: Optional[float] = None
+    previous_close: Optional[float] = None
+    price_change: Optional[float] = None
+    percent_change: Optional[float] = None
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+    high_52w: Optional[float] = None
+    low_52w: Optional[float] = None
+    position_52w_percent: Optional[float] = None
+
     volume: Optional[float] = None
-    timestamp_utc: datetime = Field(default_factory=utc_now)
+    avg_volume_30d: Optional[float] = None
+    value_traded: Optional[float] = None
+    turnover_percent: Optional[float] = None
+    shares_outstanding: Optional[float] = None
+    free_float: Optional[float] = None
+    market_cap: Optional[float] = None
+    free_float_market_cap: Optional[float] = None
+    liquidity_score: Optional[float] = None
 
-    @property
-    def timestamp_riyadh(self) -> Optional[datetime]:
-        return to_riyadh(self.timestamp_utc)
+    eps_ttm: Optional[float] = None
+    forward_eps: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    forward_pe: Optional[float] = None
+    pb: Optional[float] = None
+    ps: Optional[float] = None
+    ev_ebitda: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    dividend_rate: Optional[float] = None
+    payout_ratio: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+    net_margin: Optional[float] = None
+    ebitda_margin: Optional[float] = None
+    revenue_growth: Optional[float] = None
+    net_income_growth: Optional[float] = None
+    beta: Optional[float] = None
 
+    volatility_30d: Optional[float] = None
+    rsi_14: Optional[float] = None
 
-class AIAnalysisResponse(BaseSchema):
-    symbol: str
-    recommendation: str = Field(..., description="STRONG BUY, BUY, HOLD, SELL")
-    confidence_score: float = Field(..., ge=0, le=100)
-    reasoning: str
-    generated_at_utc: datetime = Field(default_factory=utc_now)
+    fair_value: Optional[float] = None
+    upside_percent: Optional[float] = None
+    valuation_label: Optional[str] = None
 
-    @property
-    def generated_at_riyadh(self) -> Optional[datetime]:
-        return to_riyadh(self.generated_at_utc)
-
-
-class ScoredQuote(BaseSchema):
-    symbol: str
-    market_data: MarketData
     value_score: Optional[float] = None
     quality_score: Optional[float] = None
     momentum_score: Optional[float] = None
     opportunity_score: Optional[float] = None
+    risk_score: Optional[float] = None
     overall_score: Optional[float] = None
+
     recommendation: Optional[str] = None
-    confidence: Optional[float] = None
+    data_source: Optional[str] = None
+    data_quality: Optional[str] = None
+    last_updated_utc: Optional[str] = None
+    last_updated_riyadh: Optional[str] = None
+    error: Optional[str] = None
+
+    @classmethod
+    def from_unified(cls, q: UnifiedQuote) -> "EnrichedQuote":
+        # Copy what we can, then patch computed values safely.
+        d = {}
+        try:
+            d = q.model_dump(exclude_none=False)  # pydantic v2
+        except Exception:
+            d = dict(getattr(q, "__dict__", {}) or {})
+
+        # Compute upside if missing
+        if d.get("upside_percent") is None:
+            d["upside_percent"] = _compute_upside_percent(d.get("fair_value"), d.get("current_price"))
+
+        return cls(**d)
+
+    def to_row(self, headers: List[str]) -> List[Any]:
+        """
+        Return an exact-length row matching provided headers.
+        Unknown headers -> blank cell (None).
+        """
+        # Build attr dict once
+        data: Dict[str, Any] = {}
+        try:
+            data = self.model_dump(exclude_none=False)
+        except Exception:
+            data = dict(getattr(self, "__dict__", {}) or {})
+
+        row: List[Any] = []
+        for h in headers or []:
+            attr = HEADER_TO_ATTR.get(h, None)
+            if not attr:
+                row.append(None)
+                continue
+            row.append(data.get(attr))
+        return row
 
 
-class BatchProcessRequest(BaseSchema):
-    symbols: List[str] = Field(default_factory=list)
-    operation: str = Field(default="full_scan", description="full_scan, quick_price, ai_analysis")
-    sheet_name: Optional[str] = Field(default=None, description="Optional sheet name for header selection")
-
-    @property
-    def normalized_symbols(self) -> List[str]:
-        out: List[str] = []
-        seen = set()
-        for s in self.symbols or []:
-            ns = normalize_symbol(s)
-            if ns and ns not in seen:
-                seen.add(ns)
-                out.append(ns)
-        return out
-
-
-# =============================================================================
-# Google Sheets Headers (59 columns)
-# =============================================================================
-# NOTE:
-# - Keep this stable to avoid breaking Apps Script / dashboard formatting.
-# - Use "Error" instead of "Rank" (more useful for debugging + data QA).
-
-DEFAULT_HEADERS_59: List[str] = [
-    "Symbol",
-    "Company Name",
-    "Sector",
-    "Sub-Sector",
-    "Market",
-    "Currency",
-    "Listing Date",
-    "Last Price",
-    "Previous Close",
-    "Price Change",
-    "Percent Change",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "52W Position %",
-    "Volume",
-    "Avg Volume (30D)",
-    "Value Traded",
-    "Turnover %",
-    "Shares Outstanding",
-    "Free Float %",
-    "Market Cap",
-    "Free Float Market Cap",
-    "Liquidity Score",
-    "EPS (TTM)",
-    "Forward EPS",
-    "P/E (TTM)",
-    "Forward P/E",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "Dividend Yield %",
-    "Dividend Rate",
-    "Payout Ratio %",
-    "ROE %",
-    "ROA %",
-    "Net Margin %",
-    "EBITDA Margin %",
-    "Revenue Growth %",
-    "Net Income Growth %",
-    "Beta",
-    "Volatility (30D)",
-    "RSI (14)",
-    "Fair Value",
-    "Upside %",
-    "Valuation Label",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Opportunity Score",
-    "Error",
-    "Recommendation",
-    "Data Source",
-    "Data Quality",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-]
-
-# Aliases map: normalize common variations to canonical keys
-_SHEET_ALIASES: Dict[str, str] = {
-    # canonical / common
-    "KSA_Tadawul": "KSA_Tadawul",
-    "KSA_Tadawul_Market": "KSA_Tadawul_Market",
-    "Global_Markets": "Global_Markets",
-    "Mutual_Funds": "Mutual_Funds",
-    "Commodities_FX": "Commodities_FX",
-    "My_Portfolio": "My_Portfolio",
-    "My_Portfolio_Investment": "My_Portfolio_Investment",
-    "Market_Leaders": "Market_Leaders",
-    # spacing / hyphen variants (input only)
-    "KSA Tadawul": "KSA_Tadawul",
-    "KSA Tadawul Market": "KSA_Tadawul_Market",
-    "Global Markets": "Global_Markets",
-    "Mutual Funds": "Mutual_Funds",
-    "Commodities FX": "Commodities_FX",
-    "My Portfolio": "My_Portfolio",
-    "Market Leaders": "Market_Leaders",
-}
-
-# Sheet-specific variants (currently all share the same canonical template).
-SHEET_HEADERS: Dict[str, List[str]] = {
-    "KSA_Tadawul": DEFAULT_HEADERS_59,
-    "KSA_Tadawul_Market": DEFAULT_HEADERS_59,
-    "Global_Markets": DEFAULT_HEADERS_59,
-    "Mutual_Funds": DEFAULT_HEADERS_59,
-    "Commodities_FX": DEFAULT_HEADERS_59,
-    "My_Portfolio": DEFAULT_HEADERS_59,
-    "My_Portfolio_Investment": DEFAULT_HEADERS_59,
-    "Market_Leaders": DEFAULT_HEADERS_59,
-}
-
-
-def get_headers_for_sheet(sheet_name: str | None = None) -> List[str]:
-    """
-    Returns the header list to be used for a given sheet.
-
-    Required by:
-    - routes_argaam.py
-    - routes/enriched_quote.py (and others)
-
-    Unknown sheet names fall back to the canonical 59-column template.
-    Returned list is a COPY (safe for callers to mutate).
-    """
-    if not sheet_name:
-        return list(DEFAULT_HEADERS_59)
-
-    raw = normalize_sheet_name(sheet_name)
-    key = _SHEET_ALIASES.get(raw, raw)
-
-    return list(SHEET_HEADERS.get(key, DEFAULT_HEADERS_59))
-
-
-# Backward-compat alias (some older code may import this name)
-get_sheet_headers = get_headers_for_sheet
-
-__all__ = [
-    "BaseSchema",
-    "TickerRequest",
-    "MarketData",
-    "AIAnalysisResponse",
-    "ScoredQuote",
-    "BatchProcessRequest",
-    "DEFAULT_HEADERS_59",
-    "SHEET_HEADERS",
-    "get_headers_for_sheet",
-    "get_sheet_headers",
-    "utc_now",
-    "riyadh_now",
-    "to_riyadh",
-    "normalize_sheet_name",
-    "normalize_symbol",
-]
+__all__ = ["EnrichedQuote", "HEADER_TO_ATTR"]
