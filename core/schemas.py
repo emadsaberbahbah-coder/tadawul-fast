@@ -1,231 +1,236 @@
+# core/schemas.py
 """
-core/enriched_quote.py
+core/schemas.py
 ===========================================================
-EnrichedQuote (UnifiedQuote -> Google Sheets Row) – v2.2.0
+CANONICAL SHEETS SCHEMAS + HEADERS – v3.0.0 (PROD SAFE)
 
 Purpose
-- Provide a stable conversion layer from core.data_engine_v2.UnifiedQuote
-  into:
-    1) API-friendly dict (same fields)
-    2) Google Sheets row aligned to headers (59-column schema)
+- Single source of truth for the canonical 59-column quote schema.
+- Provide get_headers_for_sheet(sheet_name) used by:
+    - routes/enriched_quote.py
+    - routes/ai_analysis.py
+    - routes/advanced_analysis.py
+    - Google Apps Script sheet builders
+- Provide shared request models (BatchProcessRequest) used by routers.
 
 Design rules
-- Import-safe and production defensive (never crash on missing fields).
-- Header-driven row rendering:
-    EnrichedQuote.to_row(headers) returns exactly len(headers) columns.
-- Uses core.schemas.DEFAULT_HEADERS_59 / get_headers_for_sheet as source of truth.
+- Import-safe: no DataEngine imports, no heavy dependencies.
+- Defensive: always returns a valid header list (never raises).
+- Stable: DEFAULT_HEADERS_59 order must not change lightly.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict
-
-from core.data_engine_v2 import UnifiedQuote
-
-
-def _sf(x: Any) -> Optional[float]:
-    """Safe float coercion (never raises)."""
-    try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            f = float(x)
-            if math.isnan(f) or math.isinf(f):
-                return None
-            return f
-        s = str(x).strip()
-        if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
-            return None
-        f = float(s)
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
-    except Exception:
-        return None
+# Pydantic v2 preferred, v1 fallback
+try:
+    from pydantic import BaseModel, Field, ConfigDict  # type: ignore
+    _PYDANTIC_V2 = True
+except Exception:  # pragma: no cover
+    from pydantic import BaseModel, Field  # type: ignore
+    ConfigDict = None  # type: ignore
+    _PYDANTIC_V2 = False
 
 
-def _compute_upside_percent(fair_value: Any, current_price: Any) -> Optional[float]:
-    fv = _sf(fair_value)
-    cp = _sf(current_price)
-    if fv is None or cp is None or cp == 0:
-        return None
-    return (fv / cp - 1.0) * 100.0
+SCHEMAS_VERSION = "3.0.0"
 
 
-# Canonical header -> UnifiedQuote attribute
-HEADER_TO_ATTR: Dict[str, str] = {
-    "Symbol": "symbol",
-    "Company Name": "name",
-    "Sector": "sector",
-    "Sub-Sector": "sub_sector",
-    "Market": "market",
-    "Currency": "currency",
-    "Listing Date": "listing_date",
-    "Last Price": "current_price",
-    "Previous Close": "previous_close",
-    "Price Change": "price_change",
-    "Percent Change": "percent_change",
-    "Day High": "day_high",
-    "Day Low": "day_low",
-    "52W High": "high_52w",
-    "52W Low": "low_52w",
-    "52W Position %": "position_52w_percent",
-    "Volume": "volume",
-    "Avg Volume (30D)": "avg_volume_30d",
-    "Value Traded": "value_traded",
-    "Turnover %": "turnover_percent",
-    "Shares Outstanding": "shares_outstanding",
-    "Free Float %": "free_float",
-    "Market Cap": "market_cap",
-    "Free Float Market Cap": "free_float_market_cap",
-    "Liquidity Score": "liquidity_score",
-    "EPS (TTM)": "eps_ttm",
-    "Forward EPS": "forward_eps",
-    "P/E (TTM)": "pe_ttm",
-    "Forward P/E": "forward_pe",
-    "P/B": "pb",
-    "P/S": "ps",
-    "EV/EBITDA": "ev_ebitda",
-    "Dividend Yield %": "dividend_yield",
-    "Dividend Rate": "dividend_rate",
-    "Payout Ratio %": "payout_ratio",
-    "ROE %": "roe",
-    "ROA %": "roa",
-    "Net Margin %": "net_margin",
-    "EBITDA Margin %": "ebitda_margin",
-    "Revenue Growth %": "revenue_growth",
-    "Net Income Growth %": "net_income_growth",
-    "Beta": "beta",
-    "Volatility (30D)": "volatility_30d",
-    "RSI (14)": "rsi_14",
-    "Fair Value": "fair_value",
-    "Upside %": "upside_percent",
-    "Valuation Label": "valuation_label",
-    "Value Score": "value_score",
-    "Quality Score": "quality_score",
-    "Momentum Score": "momentum_score",
-    "Opportunity Score": "opportunity_score",
-    "Risk Score": "risk_score",
-    "Overall Score": "overall_score",
-    "Error": "error",
-    "Recommendation": "recommendation",
-    "Data Source": "data_source",
-    "Data Quality": "data_quality",
-    "Last Updated (UTC)": "last_updated_utc",
-    "Last Updated (Riyadh)": "last_updated_riyadh",
+# =============================================================================
+# Canonical 59-column schema (SOURCE OF TRUTH)
+# =============================================================================
+
+DEFAULT_HEADERS_59: List[str] = [
+    # Identity
+    "Symbol",
+    "Company Name",
+    "Sector",
+    "Sub-Sector",
+    "Market",
+    "Currency",
+    "Listing Date",
+    # Prices
+    "Last Price",
+    "Previous Close",
+    "Price Change",
+    "Percent Change",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "52W Position %",
+    # Volume / Liquidity
+    "Volume",
+    "Avg Volume (30D)",
+    "Value Traded",
+    "Turnover %",
+    # Shares / Cap
+    "Shares Outstanding",
+    "Free Float %",
+    "Market Cap",
+    "Free Float Market Cap",
+    "Liquidity Score",
+    # Fundamentals
+    "EPS (TTM)",
+    "Forward EPS",
+    "P/E (TTM)",
+    "Forward P/E",
+    "P/B",
+    "P/S",
+    "EV/EBITDA",
+    "Dividend Yield %",
+    "Dividend Rate",
+    "Payout Ratio %",
+    "ROE %",
+    "ROA %",
+    "Net Margin %",
+    "EBITDA Margin %",
+    "Revenue Growth %",
+    "Net Income Growth %",
+    "Beta",
+    # Technicals
+    "Volatility (30D)",
+    "RSI (14)",
+    # Valuation / Targets
+    "Fair Value",
+    "Upside %",
+    "Valuation Label",
+    # Scores / Recommendation
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Opportunity Score",
+    "Risk Score",
+    "Overall Score",
+    "Error",
+    "Recommendation",
+    # Meta
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+]
+
+# Hard guard (prevents accidental edits)
+if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
+    raise RuntimeError(f"DEFAULT_HEADERS_59 must be 59 columns, got {len(DEFAULT_HEADERS_59)}")
+
+
+# =============================================================================
+# Sheet name normalization + mappings
+# =============================================================================
+
+def _norm_sheet_name(name: Optional[str]) -> str:
+    s = (name or "").strip().lower()
+    s = s.replace("-", "_").replace(" ", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s
+
+
+# Your 9-page dashboard sheets (aliases included). All use the canonical 59 by default.
+_SHEET_HEADERS: Dict[str, List[str]] = {
+    # KSA
+    "ksa_tadawul": DEFAULT_HEADERS_59,
+    "ksa_tadawul_market": DEFAULT_HEADERS_59,
+    "ksa_market": DEFAULT_HEADERS_59,
+    "tadawul": DEFAULT_HEADERS_59,
+
+    # Global
+    "global_markets": DEFAULT_HEADERS_59,
+    "global_market": DEFAULT_HEADERS_59,
+
+    # Mutual Funds
+    "mutual_funds": DEFAULT_HEADERS_59,
+    "mutualfunds": DEFAULT_HEADERS_59,
+
+    # Commodities & FX
+    "commodities_fx": DEFAULT_HEADERS_59,
+    "commodities_and_fx": DEFAULT_HEADERS_59,
+    "fx": DEFAULT_HEADERS_59,
+
+    # Portfolio
+    "my_portfolio": DEFAULT_HEADERS_59,
+    "my_portfolio_investment": DEFAULT_HEADERS_59,
+    "portfolio": DEFAULT_HEADERS_59,
+
+    # Insights / Analysis pages typically still want canonical quote rows when using /enriched or /analysis
+    "insights_analysis": DEFAULT_HEADERS_59,
+    "analysis": DEFAULT_HEADERS_59,
+    "investment_advisor": DEFAULT_HEADERS_59,
 }
 
 
-class EnrichedQuote(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, from_attributes=True, extra="ignore")
+def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
+    """
+    Returns a safe headers list for the given sheet.
+    - Always returns a list (never raises).
+    - Returns a COPY to prevent accidental mutation by callers.
+    """
+    try:
+        key = _norm_sheet_name(sheet_name)
+        if not key:
+            return list(DEFAULT_HEADERS_59)
 
-    # Keep fields aligned with UnifiedQuote + sheet headers
-    symbol: str
+        # direct match
+        if key in _SHEET_HEADERS:
+            return list(_SHEET_HEADERS[key])
 
-    name: Optional[str] = None
-    sector: Optional[str] = None
-    sub_sector: Optional[str] = None
-    market: Optional[str] = None
-    currency: Optional[str] = None
-    listing_date: Optional[str] = None
+        # prefix / contains matching (defensive)
+        for k, v in _SHEET_HEADERS.items():
+            if key == k or key.startswith(k) or k in key:
+                return list(v)
 
-    current_price: Optional[float] = None
-    previous_close: Optional[float] = None
-    price_change: Optional[float] = None
-    percent_change: Optional[float] = None
-    day_high: Optional[float] = None
-    day_low: Optional[float] = None
-    high_52w: Optional[float] = None
-    low_52w: Optional[float] = None
-    position_52w_percent: Optional[float] = None
+        return list(DEFAULT_HEADERS_59)
+    except Exception:
+        return list(DEFAULT_HEADERS_59)
 
-    volume: Optional[float] = None
-    avg_volume_30d: Optional[float] = None
-    value_traded: Optional[float] = None
-    turnover_percent: Optional[float] = None
-    shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
-    market_cap: Optional[float] = None
-    free_float_market_cap: Optional[float] = None
-    liquidity_score: Optional[float] = None
 
-    eps_ttm: Optional[float] = None
-    forward_eps: Optional[float] = None
-    pe_ttm: Optional[float] = None
-    forward_pe: Optional[float] = None
-    pb: Optional[float] = None
-    ps: Optional[float] = None
-    ev_ebitda: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    dividend_rate: Optional[float] = None
-    payout_ratio: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
-    net_margin: Optional[float] = None
-    ebitda_margin: Optional[float] = None
-    revenue_growth: Optional[float] = None
-    net_income_growth: Optional[float] = None
-    beta: Optional[float] = None
+def get_supported_sheets() -> List[str]:
+    """Useful for debugging / UI lists."""
+    try:
+        return sorted(list(_SHEET_HEADERS.keys()))
+    except Exception:
+        return []
 
-    volatility_30d: Optional[float] = None
-    rsi_14: Optional[float] = None
 
-    fair_value: Optional[float] = None
-    upside_percent: Optional[float] = None
-    valuation_label: Optional[str] = None
+# =============================================================================
+# Shared request models
+# =============================================================================
 
-    value_score: Optional[float] = None
-    quality_score: Optional[float] = None
-    momentum_score: Optional[float] = None
-    opportunity_score: Optional[float] = None
-    risk_score: Optional[float] = None
-    overall_score: Optional[float] = None
+class _ExtraIgnore(BaseModel):
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")  # type: ignore
+    else:  # pragma: no cover
+        class Config:
+            extra = "ignore"
 
-    recommendation: Optional[str] = None
-    data_source: Optional[str] = None
-    data_quality: Optional[str] = None
-    last_updated_utc: Optional[str] = None
-    last_updated_riyadh: Optional[str] = None
-    error: Optional[str] = None
 
-    @classmethod
-    def from_unified(cls, q: UnifiedQuote) -> "EnrichedQuote":
-        # Copy what we can, then patch computed values safely.
-        d = {}
-        try:
-            d = q.model_dump(exclude_none=False)  # pydantic v2
-        except Exception:
-            d = dict(getattr(q, "__dict__", {}) or {})
+class BatchProcessRequest(_ExtraIgnore):
+    """
+    Shared contract used by routes/enriched_quote.py (and can be reused elsewhere).
+    Supports both `symbols` and `tickers` to be client-robust.
+    """
+    operation: str = Field(default="refresh")
+    sheet_name: Optional[str] = Field(default=None)
+    symbols: List[str] = Field(default_factory=list)
+    tickers: List[str] = Field(default_factory=list)  # alias support
 
-        # Compute upside if missing
-        if d.get("upside_percent") is None:
-            d["upside_percent"] = _compute_upside_percent(d.get("fair_value"), d.get("current_price"))
-
-        return cls(**d)
-
-    def to_row(self, headers: List[str]) -> List[Any]:
-        """
-        Return an exact-length row matching provided headers.
-        Unknown headers -> blank cell (None).
-        """
-        # Build attr dict once
-        data: Dict[str, Any] = {}
-        try:
-            data = self.model_dump(exclude_none=False)
-        except Exception:
-            data = dict(getattr(self, "__dict__", {}) or {})
-
-        row: List[Any] = []
-        for h in headers or []:
-            attr = HEADER_TO_ATTR.get(h, None)
-            if not attr:
-                row.append(None)
+    def all_symbols(self) -> List[str]:
+        out: List[str] = []
+        for x in (self.symbols or []) + (self.tickers or []):
+            if x is None:
                 continue
-            row.append(data.get(attr))
-        return row
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
 
 
-__all__ = ["EnrichedQuote", "HEADER_TO_ATTR"]
+__all__ = [
+    "SCHEMAS_VERSION",
+    "DEFAULT_HEADERS_59",
+    "get_headers_for_sheet",
+    "get_supported_sheets",
+    "BatchProcessRequest",
+]
