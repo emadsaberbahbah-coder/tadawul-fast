@@ -29,11 +29,8 @@ except Exception:  # pragma: no cover
     yf = None
 
 
-ENGINE_VERSION = "2.5.0"
+ENGINE_VERSION = "2.6.0"
 
-# =============================================================================
-# Settings + Logger
-# =============================================================================
 settings = get_settings()
 logger = logging.getLogger("core.data_engine_v2")
 
@@ -57,7 +54,6 @@ ARGAAM_VOLUME_URLS = [
     "https://www.argaam.com/ar/company/companies-volume/14",
     "https://www.argaam.com/en/company/companies-volume/14",
 ]
-# Per-company detail (more fields: open/high/low/prev/value/marketcap/etc.)
 ARGAAM_COMPANY_OVERVIEW_AR = "https://www.argaam.com/ar/company/companyoverview/marketid/3/companyid/{companyid}"
 ARGAAM_COMPANY_OVERVIEW_EN = "https://www.argaam.com/en/company/companyoverview/marketid/3/companyid/{companyid}"
 
@@ -67,15 +63,10 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Riyadh is UTC+3 (no DST)
 RIYADH_TZ = timezone(timedelta(hours=3))
 
-# =============================================================================
-# Helpers (env/settings adapters)
-# =============================================================================
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 _FALSY = {"0", "false", "no", "off", "n", "f"}
-
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
@@ -87,11 +78,59 @@ def _now_riyadh_iso() -> str:
     return datetime.now(RIYADH_TZ).isoformat()
 
 
+def _contains_arabic(s: str) -> bool:
+    return any("\u0600" <= ch <= "\u06FF" for ch in s)
+
+
+def _fix_mojibake(s: Optional[str]) -> Optional[str]:
+    """
+    Robust mojibake fixer (handles truncated strings too):
+    - tries latin1/cp1252 -> utf-8 (strict then ignore)
+    - accepts decoded output only if it contains Arabic letters (for KSA names)
+    - allows 2 passes (sometimes double-encoded)
+    """
+    if not s or not isinstance(s, str):
+        return s
+
+    # If it already has Arabic, keep it
+    if _contains_arabic(s):
+        return s
+
+    # Only attempt if it looks like mojibake
+    if not any(ch in s for ch in ("Ø", "Ù", "Ã", "Â", "�")):
+        return s
+
+    cur = s
+    for _ in range(2):
+        best = None
+        for enc in ("latin1", "cp1252"):
+            # strict
+            try:
+                cand = cur.encode(enc, errors="strict").decode("utf-8", errors="strict")
+                if _contains_arabic(cand):
+                    best = cand
+                    break
+            except Exception:
+                pass
+            # tolerant
+            try:
+                cand = cur.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+                cand = cand.strip()
+                if cand and _contains_arabic(cand):
+                    best = cand
+                    break
+            except Exception:
+                pass
+
+        if best:
+            cur = best
+            continue
+        break
+
+    return cur
+
+
 def _get_attr_or_env(names: Sequence[str], default: Any = None) -> Any:
-    """
-    Tries: settings.<name> then env <name> (case-insensitive).
-    Returns first non-None, else default.
-    """
     for n in names:
         if hasattr(settings, n):
             v = getattr(settings, n)
@@ -147,31 +186,7 @@ def _safe_str(x: Any) -> Optional[str]:
     return s if s else None
 
 
-def _fix_mojibake(s: Optional[str]) -> Optional[str]:
-    """
-    Fix common UTF-8->Latin1 mojibake (e.g. Ø§ÙØ±Ø§Ø¬Ø­Ù -> الراجحي).
-    Safe: returns original if it can't decode.
-    """
-    if not s or not isinstance(s, str):
-        return s
-    # Heuristic: if it contains typical mojibake markers, try latin1/cp1252 -> utf-8
-    if any(ch in s for ch in ("Ø", "Ù", "Ã", "Â", "�")):
-        for enc in ("latin1", "cp1252"):
-            try:
-                return s.encode(enc, errors="strict").decode("utf-8", errors="strict")
-            except Exception:
-                continue
-    return s
-
-
 def _safe_float(val: Any) -> Optional[float]:
-    """
-    Robust numeric parser:
-    - supports Arabic digits
-    - strips %, +, currency tokens, commas
-    - supports suffix K/M/B (e.g. 1.2B)
-    - supports (1.23) negatives
-    """
     if val is None:
         return None
     try:
@@ -225,30 +240,19 @@ def _pct_if_fraction(x: Any) -> Optional[float]:
 
 
 def normalize_symbol(raw: str) -> str:
-    """
-    - KSA numeric => 1120.SR
-    - already has suffix => keep (upper)
-    - Yahoo-style (^GSPC, GC=F, EURUSD=X) => keep
-    - otherwise => .US (AAPL => AAPL.US)
-    """
     s = (raw or "").strip().upper()
     if not s:
         return ""
-
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
-
     if any(ch in s for ch in ("=", "^")):
         return s
-
     if s.isdigit():
         return f"{s}.SR"
-
     if "." in s:
         return s
-
     return f"{s}.US"
 
 
@@ -274,10 +278,6 @@ def _finnhub_symbol(symbol: str) -> str:
 
 
 def _yahoo_symbol(symbol: str) -> str:
-    """
-    yfinance is generally happier with plain tickers (AAPL not AAPL.US).
-    Keep special symbols unchanged.
-    """
     s = (symbol or "").strip().upper()
     if not s:
         return s
@@ -289,25 +289,15 @@ def _yahoo_symbol(symbol: str) -> str:
 
 
 def _get_enabled_providers() -> List[str]:
-    """
-    Reads provider order from (first match wins):
-      - settings.providers_list (list)
-      - settings.providers (csv)
-      - env ENABLED_PROVIDERS / PROVIDERS (csv)
-    Defaults to: finnhub, fmp, eodhd (and yfinance as fallback if enabled).
-    """
     pl = getattr(settings, "providers_list", None)
     if isinstance(pl, list) and pl:
         return [str(x).strip().lower() for x in pl if str(x).strip()]
-
     p_csv = getattr(settings, "providers", None)
     if isinstance(p_csv, str) and p_csv.strip():
         return [p.strip().lower() for p in p_csv.split(",") if p.strip()]
-
     env_csv = os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or ""
     if env_csv.strip():
         return [p.strip().lower() for p in env_csv.split(",") if p.strip()]
-
     return ["finnhub", "fmp", "eodhd"]
 
 
@@ -327,29 +317,23 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-# =============================================================================
-# Data model (Pydantic v2) — aligned with 59-column schema
-# =============================================================================
 class UnifiedQuote(BaseModel):
     model_config = ConfigDict(populate_by_name=True, from_attributes=True, validate_assignment=True)
 
-    # Identity
     symbol: str
     name: Optional[str] = None
     sector: Optional[str] = None
     industry: Optional[str] = None
     sub_sector: Optional[str] = None
-    market: str = "UNKNOWN"  # KSA / GLOBAL / UNKNOWN
+    market: str = "UNKNOWN"
     currency: Optional[str] = None
     listing_date: Optional[str] = None
 
-    # Shares / Float / Cap
     shares_outstanding: Optional[float] = None
     free_float: Optional[float] = None
     market_cap: Optional[float] = None
     free_float_market_cap: Optional[float] = None
 
-    # Prices
     current_price: Optional[float] = None
     previous_close: Optional[float] = None
     open: Optional[float] = None
@@ -361,14 +345,12 @@ class UnifiedQuote(BaseModel):
     price_change: Optional[float] = None
     percent_change: Optional[float] = None
 
-    # Volume / Liquidity
     volume: Optional[float] = None
     avg_volume_30d: Optional[float] = None
     value_traded: Optional[float] = None
     turnover_percent: Optional[float] = None
     liquidity_score: Optional[float] = None
 
-    # Fundamentals
     eps_ttm: Optional[float] = None
     forward_eps: Optional[float] = None
     pe_ttm: Optional[float] = None
@@ -390,21 +372,18 @@ class UnifiedQuote(BaseModel):
     current_ratio: Optional[float] = None
     quick_ratio: Optional[float] = None
 
-    # Technicals
     rsi_14: Optional[float] = None
     volatility_30d: Optional[float] = None
     macd: Optional[float] = None
     ma20: Optional[float] = None
     ma50: Optional[float] = None
 
-    # Valuation / Targets
     fair_value: Optional[float] = None
     target_price: Optional[float] = None
     upside_percent: Optional[float] = None
     valuation_label: Optional[str] = None
     analyst_rating: Optional[str] = None
 
-    # Scores / Recommendation
     value_score: Optional[float] = None
     quality_score: Optional[float] = None
     momentum_score: Optional[float] = None
@@ -414,15 +393,14 @@ class UnifiedQuote(BaseModel):
     confidence: Optional[float] = None
     risk_score: Optional[float] = None
 
-    # Meta
     data_source: str = "none"
-    data_quality: str = "MISSING"  # FULL / PARTIAL / MISSING
+    data_quality: str = "MISSING"
     last_updated_utc: str = Field(default_factory=_now_utc_iso)
     last_updated_riyadh: str = Field(default_factory=_now_riyadh_iso)
     error: Optional[str] = None
 
     def finalize(self) -> "UnifiedQuote":
-        # Fix text encoding issues globally (no matter the provider)
+        # Text fixes
         self.name = _fix_mojibake(self.name)
         self.sector = _fix_mojibake(self.sector)
         self.industry = _fix_mojibake(self.industry)
@@ -441,20 +419,30 @@ class UnifiedQuote(BaseModel):
         if not self.currency:
             self.currency = "SAR" if self.market == "KSA" else "USD"
 
-        if self.current_price is not None and self.previous_close is not None:
-            if self.price_change is None:
-                self.price_change = _safe_float(self.current_price - self.previous_close)
-            if self.percent_change is None and self.previous_close not in (0, None):
-                self.percent_change = _safe_float(
-                    (self.current_price - self.previous_close) / self.previous_close * 100.0
-                )
+        # ---- Fix inconsistent %/change by recomputing from price+prev_close
+        if self.current_price is not None and self.previous_close not in (None, 0):
+            computed_change = self.current_price - self.previous_close
+            computed_pct = (computed_change / self.previous_close) * 100.0
 
-        if (
-            self.position_52w_percent is None
-            and self.current_price is not None
-            and self.high_52w is not None
-            and self.low_52w is not None
-        ):
+            # override if missing OR clearly wrong (like your 10.0%)
+            if self.price_change is None or (abs(self.price_change - computed_change) > 0.10):
+                self.price_change = _safe_float(computed_change)
+
+            if self.percent_change is None or (abs(self.percent_change - computed_pct) > 1.0):
+                self.percent_change = _safe_float(computed_pct)
+
+        # ---- Fix impossible volume if we have value_traded + price
+        if self.value_traded is not None and self.current_price not in (None, 0):
+            inferred_vol = self.value_traded / self.current_price
+            if inferred_vol and inferred_vol > 0:
+                if self.volume is None:
+                    self.volume = _safe_float(inferred_vol)
+                else:
+                    # if mismatch by > 3x, trust inferred
+                    if self.volume > 0 and (inferred_vol / self.volume > 3.0 or self.volume / inferred_vol > 3.0):
+                        self.volume = _safe_float(inferred_vol)
+
+        if self.position_52w_percent is None and self.current_price is not None and self.high_52w is not None and self.low_52w is not None:
             rng = self.high_52w - self.low_52w
             if rng and rng > 0:
                 self.position_52w_percent = _safe_float((self.current_price - self.low_52w) / rng * 100.0)
@@ -465,13 +453,11 @@ class UnifiedQuote(BaseModel):
         if self.turnover_percent is None and self.volume is not None and self.shares_outstanding not in (None, 0):
             self.turnover_percent = _safe_float((self.volume / self.shares_outstanding) * 100.0)
 
-        # Liquidity score (0..100) based on value_traded log scale
         if self.liquidity_score is None and self.value_traded is not None and self.value_traded >= 0:
-            # 1e4 -> 0, 1e8 -> ~100
             ls = (math.log10(self.value_traded + 1.0) - 4.0) * 25.0
             self.liquidity_score = _safe_float(_clamp(ls, 0.0, 100.0))
 
-        # Data-quality (KSA: require open/high/low/prev + volume to call FULL)
+        # KSA FULL means we have OHLC + prev + volume
         if self.current_price is None:
             self.data_quality = "MISSING"
         else:
@@ -512,35 +498,13 @@ class UnifiedQuote(BaseModel):
             self.recommendation = "HOLD"
 
 
-# =============================================================================
-# Engine
-# =============================================================================
 class DataEngine:
-    """
-    Async multi-provider engine with KSA-safe routing.
-
-    KSA (.SR):
-      1) Legacy KSA delegate if available (core.data_engine)
-      2) Argaam market snapshot (fast)
-      3) Argaam per-company overview enrichment (fills open/high/low/prev/value/mcap/shares)
-      4) Optional yfinance last resort (often blocked/401)
-
-    GLOBAL:
-      provider order from settings/providers:
-        - eodhd (quote + optional fundamentals)
-        - finnhub (quote + profile/metrics)
-        - fmp (quote)
-        - yfinance (fallback)
-    """
-
     def __init__(self) -> None:
         self.enabled_providers: List[str] = _get_enabled_providers()
 
         self._timeout_sec: float = _get_float(["HTTP_TIMEOUT_SEC", "http_timeout_sec", "HTTP_TIMEOUT"], 25.0)
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
         max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
-
-        # Fine-grained timeout (connect/read/write/pool)
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
 
         self.client = httpx.AsyncClient(
@@ -555,10 +519,7 @@ class DataEngine:
         )
 
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
-
-        # Argaam detail enrichment
         self.enable_argaam_detail = _get_bool(["ARGAAM_DETAIL_ENABLED", "enable_argaam_detail"], True)
-        self._argaam_detail_timeout_sec = _get_float(["ARGAAM_DETAIL_TIMEOUT_SEC"], 10.0)
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
@@ -586,9 +547,6 @@ class DataEngine:
     async def aclose(self) -> None:
         await self.client.aclose()
 
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
     async def get_quote(self, symbol: str) -> UnifiedQuote:
         s = normalize_symbol(symbol)
         if not s:
@@ -609,7 +567,6 @@ class DataEngine:
 
             q = q.finalize()
 
-            # Optional scoring (no hard dependency)
             try:
                 from core.scoring_engine import enrich_with_scores  # type: ignore
                 q = enrich_with_scores(q)
@@ -631,9 +588,7 @@ class DataEngine:
         items = [s for s in (symbols or []) if s and str(s).strip()]
         if not items:
             return []
-
         results = await asyncio.gather(*(self.get_quote(s) for s in items), return_exceptions=True)
-
         out: List[UnifiedQuote] = []
         for raw_sym, res in zip(items, results):
             if isinstance(res, Exception):
@@ -653,7 +608,6 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        # 1) Prefer legacy KSA engine
         try:
             from core import data_engine as legacy  # type: ignore
             if hasattr(legacy, "get_enriched_quote"):
@@ -666,7 +620,6 @@ class DataEngine:
         except Exception:
             pass
 
-        # 2) Argaam snapshot (fast)
         base = symbol.split(".", 1)[0].strip()
         snap = await self._argaam_snapshot()
         row = snap.get(base)
@@ -682,17 +635,17 @@ class DataEngine:
                 percent_change=row.get("change_percent"),
                 volume=row.get("volume"),
                 value_traded=row.get("value_traded"),
+                high_52w=row.get("high_52w"),
+                low_52w=row.get("low_52w"),
                 data_source="argaam_snapshot",
                 data_quality="PARTIAL",
             )
 
-            # 3) Per-company Argaam overview enrichment (fills open/high/low/prev/value/marketcap/shares)
             companyid = row.get("companyid")
             if self.enable_argaam_detail and companyid:
                 det = await self._argaam_company_detail(str(companyid))
                 if det:
                     upd: Dict[str, Any] = {}
-                    # Only fill missing OR override clearly better fields (open/high/low/prev/value)
                     for k in (
                         "name",
                         "current_price",
@@ -704,11 +657,33 @@ class DataEngine:
                         "value_traded",
                         "market_cap",
                         "shares_outstanding",
+                        "high_52w",
+                        "low_52w",
+                        "eps_ttm",
+                        "pe_ttm",
+                        "dividend_yield",
+                        "pb",
+                        "ps",
                     ):
                         v = det.get(k)
                         if v is None:
                             continue
-                        if getattr(q, k, None) is None or k in ("previous_close", "open", "day_high", "day_low", "value_traded", "market_cap", "shares_outstanding"):
+                        if getattr(q, k, None) is None or k in (
+                            "previous_close",
+                            "open",
+                            "day_high",
+                            "day_low",
+                            "value_traded",
+                            "market_cap",
+                            "shares_outstanding",
+                            "high_52w",
+                            "low_52w",
+                            "eps_ttm",
+                            "pe_ttm",
+                            "dividend_yield",
+                            "pb",
+                            "ps",
+                        ):
                             upd[k] = v
 
                     if upd:
@@ -718,7 +693,6 @@ class DataEngine:
 
             return q.finalize()
 
-        # 4) yfinance last resort
         if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
             q = await self._fetch_yfinance(symbol, market="KSA")
             if q.current_price is not None:
@@ -734,16 +708,8 @@ class DataEngine:
             error="No KSA provider data (legacy+argaam+yfinance failed)",
         ).finalize()
 
-    def _coerce_to_unified_quote(
-        self,
-        symbol: str,
-        raw: Any,
-        market: str,
-        currency: str,
-        source: str,
-    ) -> UnifiedQuote:
+    def _coerce_to_unified_quote(self, symbol: str, raw: Any, market: str, currency: str, source: str) -> UnifiedQuote:
         data: Dict[str, Any] = {}
-
         if raw is None:
             data = {}
         elif isinstance(raw, UnifiedQuote):
@@ -781,25 +747,6 @@ class DataEngine:
         mapped["price_change"] = data.get("price_change") or data.get("change")
         mapped["percent_change"] = data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
 
-        for k in (
-            "market_cap",
-            "shares_outstanding",
-            "eps_ttm",
-            "pe_ttm",
-            "pb",
-            "dividend_yield",
-            "beta",
-            "roe",
-            "roa",
-            "net_margin",
-            "high_52w",
-            "low_52w",
-            "ma20",
-            "ma50",
-        ):
-            if k in data and data.get(k) is not None:
-                mapped[k] = data.get(k)
-
         q = UnifiedQuote(**{k: v for k, v in mapped.items() if v is not None})
         q.data_source = data.get("data_source") or source
         q.error = data.get("error")
@@ -809,7 +756,7 @@ class DataEngine:
     # Argaam snapshot + detail
     # -------------------------------------------------------------------------
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        key = "argaam_snapshot_v3"
+        key = "argaam_snapshot_v4"
         cached = self.snapshot_cache.get(key)
         if isinstance(cached, dict):
             return cached
@@ -832,10 +779,6 @@ class DataEngine:
         return merged
 
     async def _argaam_company_detail(self, companyid: str) -> Dict[str, Any]:
-        """
-        Fetch per-company overview and parse open/high/low/prev/value/marketcap/shares.
-        Cached with short TTL (intraday).
-        """
         cache_key = f"argaam_detail::{companyid}"
         hit = self.detail_cache.get(cache_key)
         if isinstance(hit, dict) and hit:
@@ -855,11 +798,6 @@ class DataEngine:
         return det or {}
 
     def _parse_argaam_companyoverview(self, html: str) -> Dict[str, Any]:
-        """
-        Best-effort parser using page text labels.
-        (Argaam shows key fields under 'أداء السهم' like:
-         آخر سعر / الافتتاح / الأعلى / الأدنى / الإغلاق السابق / حجم التداول / قيمة التداول / القيمة السوقية ...)
-        """
         out: Dict[str, Any] = {}
         if not BeautifulSoup or not html:
             return out
@@ -873,7 +811,6 @@ class DataEngine:
         if not txt:
             return out
 
-        # Name: first h1-ish header
         try:
             h1 = soup.find(["h1", "h2"])
             if h1:
@@ -881,24 +818,32 @@ class DataEngine:
         except Exception:
             pass
 
-        def _grab(label_variants: Sequence[str]) -> Optional[float]:
+        def grab(label_variants: Sequence[str]) -> Optional[float]:
             for lab in label_variants:
-                m = re.search(rf"{re.escape(lab)}\s*([0-9٠-٩][0-9٠-٩\.,]+)", txt)
+                m = re.search(rf"{re.escape(lab)}\s*([0-9٠-٩][0-9٠-٩\.,]+(?:[KMB])?)", txt, re.IGNORECASE)
                 if m:
                     return _safe_float(m.group(1))
             return None
 
-        # Arabic + English label variants
-        last = _grab(["آخر سعر", "Last Price", "Last price", "Last"])
-        opn = _grab(["الافتتاح", "Open"])
-        low = _grab(["الأدنى", "Low"])
-        high = _grab(["الأعلى", "High"])
-        prev = _grab(["الإغلاق السابق", "Previous Close", "Prev Close", "Previous close"])
-        vol = _grab(["حجم التداول", "Volume"])
-        val = _grab(["قيمة التداول", "Value Traded", "Value traded", "Traded Value", "Value"])
-        mcap = _grab(["القيمة السوقية", "Market Cap", "Market cap"])
+        last = grab(["آخر سعر", "Last Price", "Last price", "Last"])
+        opn = grab(["الافتتاح", "Open"])
+        low = grab(["الأدنى", "Low"])
+        high = grab(["الأعلى", "High"])
+        prev = grab(["الإغلاق السابق", "Previous Close", "Prev Close", "Previous close"])
+        vol = grab(["حجم التداول", "Volume"])
+        val = grab(["قيمة التداول", "Value Traded", "Value traded", "Traded Value", "Value"])
+        mcap = grab(["القيمة السوقية", "Market Cap", "Market cap"])
+
+        hi52 = grab(["أعلى 52 أسبوع", "أعلى 52 اسبوع", "52 Week High", "52-week high", "52WeekHigh"])
+        lo52 = grab(["أدنى 52 أسبوع", "أدنى 52 اسبوع", "52 Week Low", "52-week low", "52WeekLow"])
+
+        pe = grab(["مكرر الأرباح", "مكرر الربح", "P/E", "PE"])
+        eps = grab(["ربحية السهم", "EPS", "Earnings Per Share"])
+        dy = grab(["عائد التوزيع", "Dividend Yield", "Dividend yield"])
+        pb = grab(["مكرر القيمة الدفترية", "P/B", "PB"])
+        ps = grab(["مكرر المبيعات", "P/S", "PS"])
+
         shares_m = None
-        # shares appear like: "عدد الأسهم ( مليون ريال ) 4,000.00"
         try:
             ms = re.findall(r"عدد الأسهم[^0-9٠-٩]*([0-9٠-٩][0-9٠-٩\.,]+)", txt)
             if ms:
@@ -921,12 +866,24 @@ class DataEngine:
         if val is not None:
             out["value_traded"] = val
 
-        # Argaam shows many KSA quantities in "million" units (shares/cap), so scale safely:
-        # if we found shares as a "million" number, convert to absolute shares
+        if hi52 is not None:
+            out["high_52w"] = hi52
+        if lo52 is not None:
+            out["low_52w"] = lo52
+
+        if pe is not None:
+            out["pe_ttm"] = pe
+        if eps is not None:
+            out["eps_ttm"] = eps
+        if dy is not None:
+            out["dividend_yield"] = dy
+        if pb is not None:
+            out["pb"] = pb
+        if ps is not None:
+            out["ps"] = ps
+
         if shares_m is not None and shares_m > 0:
             out["shares_outstanding"] = shares_m * 1_000_000.0
-
-        # market cap also appears aligned with shares-in-million display; scale to absolute SAR
         if mcap is not None and mcap > 0:
             out["market_cap"] = mcap * 1_000_000.0
 
@@ -936,7 +893,7 @@ class DataEngine:
         tasks = [self._http_get_text(u) for u in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        def _looks_ok(txt: str) -> bool:
+        def looks_ok(txt: str) -> bool:
             t = txt.lower()
             if len(txt) < 500:
                 return False
@@ -945,7 +902,7 @@ class DataEngine:
             return True
 
         for r in results:
-            if isinstance(r, str) and _looks_ok(r):
+            if isinstance(r, str) and looks_ok(r):
                 return r
         for r in results:
             if isinstance(r, str) and r.strip():
@@ -953,10 +910,6 @@ class DataEngine:
         return None
 
     def _parse_argaam_table(self, html: str) -> Dict[str, Dict[str, Any]]:
-        """
-        Parse the market list tables and ALSO capture companyid (from row hyperlink),
-        so we can later enrich via per-company overview.
-        """
         out: Dict[str, Dict[str, Any]] = {}
         if not BeautifulSoup or not html:
             return out
@@ -986,7 +939,6 @@ class DataEngine:
 
             name = _fix_mojibake(_safe_str(txt[code_idx + 1])) if (code_idx + 1) < len(txt) else None
 
-            # Try to capture companyid from hyperlink in the row
             companyid = None
             try:
                 a = row.find("a", href=True)
@@ -1009,12 +961,12 @@ class DataEngine:
             volume = None
             value_traded = None
             if len(txt) >= 8:
-                tail = [txt[-k] for k in range(1, min(6, len(txt)))]
+                tail = [txt[-k] for k in range(1, min(8, len(txt)))]
                 tail_nums = [_safe_float(x) for x in tail]
+                # naive: pick biggest as traded value candidate; keep as-is
                 for v in tail_nums:
                     if v is not None and v > 0:
                         volume = volume or v
-
                 if price and volume:
                     vt_guess = price * volume
                     for v in tail_nums:
@@ -1035,7 +987,51 @@ class DataEngine:
         return out
 
     # -------------------------------------------------------------------------
-    # GLOBAL: provider loop
+    # HTTP helpers
+    # -------------------------------------------------------------------------
+    async def _http_get_text(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        for attempt in range(3):
+            try:
+                r = await self.client.get(url, params=params)
+                if r.status_code in (429,) or 500 <= r.status_code < 600:
+                    if attempt < 2:
+                        await asyncio.sleep(0.25 + random.random() * 0.35)
+                        continue
+                    return None
+                if r.status_code >= 400:
+                    return None
+                return r.text
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(0.25 + random.random() * 0.35)
+                    continue
+                return None
+        return None
+
+    async def _http_get_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Union[Dict[str, Any], List[Any]]]:
+        for attempt in range(3):
+            try:
+                r = await self.client.get(url, params=params)
+                if r.status_code in (429,) or 500 <= r.status_code < 600:
+                    if attempt < 2:
+                        await asyncio.sleep(0.25 + random.random() * 0.35)
+                        continue
+                    return None
+                if r.status_code >= 400:
+                    return None
+                try:
+                    return r.json()
+                except Exception:
+                    return None
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(0.25 + random.random() * 0.35)
+                    continue
+                return None
+        return None
+
+    # -------------------------------------------------------------------------
+    # GLOBAL providers (unchanged logic)
     # -------------------------------------------------------------------------
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
         if any(ch in symbol for ch in ("=", "^")):
@@ -1045,13 +1041,8 @@ class DataEngine:
                     q.data_source = "yfinance"
                     q.data_quality = "PARTIAL"
                     return q.finalize()
-            return UnifiedQuote(
-                symbol=symbol,
-                market="GLOBAL",
-                currency="USD",
-                data_quality="MISSING",
-                error="Special symbol requires yfinance (disabled/unavailable)",
-            ).finalize()
+            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", data_quality="MISSING",
+                               error="Special symbol requires yfinance (disabled/unavailable)").finalize()
 
         errors: List[str] = []
 
@@ -1143,58 +1134,11 @@ class DataEngine:
         ).finalize()
 
     # -------------------------------------------------------------------------
-    # HTTP helpers (with light retry)
-    # -------------------------------------------------------------------------
-    async def _http_get_text(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        for attempt in range(3):
-            try:
-                r = await self.client.get(url, params=params)
-                if r.status_code in (429,) or 500 <= r.status_code < 600:
-                    if attempt < 2:
-                        await asyncio.sleep(0.25 + random.random() * 0.35)
-                        continue
-                    return None
-                if r.status_code >= 400:
-                    return None
-                return r.text
-            except Exception:
-                if attempt < 2:
-                    await asyncio.sleep(0.25 + random.random() * 0.35)
-                    continue
-                return None
-        return None
-
-    async def _http_get_json(
-        self, url: str, params: Optional[Dict[str, Any]] = None
-    ) -> Optional[Union[Dict[str, Any], List[Any]]]:
-        for attempt in range(3):
-            try:
-                r = await self.client.get(url, params=params)
-                if r.status_code in (429,) or 500 <= r.status_code < 600:
-                    if attempt < 2:
-                        await asyncio.sleep(0.25 + random.random() * 0.35)
-                        continue
-                    return None
-                if r.status_code >= 400:
-                    return None
-                try:
-                    return r.json()
-                except Exception:
-                    return None
-            except Exception:
-                if attempt < 2:
-                    await asyncio.sleep(0.25 + random.random() * 0.35)
-                    continue
-                return None
-        return None
-
-    # -------------------------------------------------------------------------
-    # Provider: EODHD
+    # Provider: EODHD / Finnhub / FMP / yfinance (same as before)
     # -------------------------------------------------------------------------
     async def _fetch_eodhd_realtime(self, symbol: str, api_key: str) -> UnifiedQuote:
         url = EODHD_RT_URL.format(symbol=symbol)
         params = {"api_token": api_key, "fmt": "json"}
-        t0 = time.perf_counter()
         try:
             data = await self._http_get_json(url, params=params)
             if not data or not isinstance(data, dict):
@@ -1216,8 +1160,7 @@ class DataEngine:
                 data_quality="PARTIAL",
             )
         except Exception as exc:
-            dt = int((time.perf_counter() - t0) * 1000)
-            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"EODHD error ({dt}ms): {exc}")
+            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"EODHD error: {exc}")
 
     async def _fetch_eodhd_fundamentals(self, symbol: str, api_key: str) -> Dict[str, Any]:
         cache_key = f"eodhd_fund::{symbol}"
@@ -1263,9 +1206,6 @@ class DataEngine:
         self.fund_cache[cache_key] = out
         return out
 
-    # -------------------------------------------------------------------------
-    # Provider: Finnhub
-    # -------------------------------------------------------------------------
     async def _fetch_finnhub_quote(self, symbol: str, api_key: str) -> UnifiedQuote:
         sym = _finnhub_symbol(symbol)
         params = {"symbol": sym, "token": api_key}
@@ -1334,15 +1274,11 @@ class DataEngine:
                     "ps": _safe_float(m.get("psTTM") or m.get("psAnnual")),
                     "eps_ttm": _safe_float(m.get("epsTTM")),
                     "beta": _safe_float(m.get("beta")),
-                    "dividend_yield": _pct_if_fraction(
-                        m.get("dividendYieldIndicatedAnnual") or m.get("dividendYieldAnnual")
-                    ),
+                    "dividend_yield": _pct_if_fraction(m.get("dividendYieldIndicatedAnnual") or m.get("dividendYieldAnnual")),
                     "roe": _pct_if_fraction(m.get("roeTTM") or m.get("roeAnnual")),
                     "roa": _pct_if_fraction(m.get("roaTTM") or m.get("roaAnnual")),
                     "net_margin": _pct_if_fraction(m.get("netMarginTTM") or m.get("netMarginAnnual")),
-                    "debt_to_equity": _safe_float(
-                        m.get("totalDebt/totalEquityAnnual") or m.get("totalDebt/totalEquityQuarterly")
-                    ),
+                    "debt_to_equity": _safe_float(m.get("totalDebt/totalEquityAnnual") or m.get("totalDebt/totalEquityQuarterly")),
                     "current_ratio": _safe_float(m.get("currentRatioAnnual") or m.get("currentRatioQuarterly")),
                     "quick_ratio": _safe_float(m.get("quickRatioAnnual") or m.get("quickRatioQuarterly")),
                 }
@@ -1350,9 +1286,6 @@ class DataEngine:
         self.fund_cache[cache_key] = {"_combined": True, "profile": profile, "metrics": metrics}
         return profile, metrics
 
-    # -------------------------------------------------------------------------
-    # Provider: FMP
-    # -------------------------------------------------------------------------
     async def _fetch_fmp_quote(self, symbol: str, api_key: str) -> UnifiedQuote:
         sym = _fmp_symbol(symbol)
         url = FMP_QUOTE_URL.format(symbol=sym)
@@ -1389,9 +1322,6 @@ class DataEngine:
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"FMP error: {exc}")
 
-    # -------------------------------------------------------------------------
-    # Provider: yfinance
-    # -------------------------------------------------------------------------
     async def _fetch_yfinance(self, symbol: str, market: str) -> UnifiedQuote:
         if not yf:
             return UnifiedQuote(symbol=symbol, market=market, error="yfinance not installed", data_quality="MISSING")
