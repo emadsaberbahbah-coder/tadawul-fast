@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     yf = None
 
 
-ENGINE_VERSION = "2.4.1"
+ENGINE_VERSION = "2.4.2"
 
 # =============================================================================
 # Settings + Logger
@@ -291,6 +291,29 @@ def _get_enabled_providers() -> List[str]:
     return ["finnhub", "fmp", "eodhd"]
 
 
+def _get_ksa_providers() -> List[str]:
+    """
+    Reads KSA provider order from (first match wins):
+      - settings.ksa_providers_list (list)  [optional]
+      - settings.ksa_providers (csv)
+      - env KSA_PROVIDERS (csv)
+    Defaults to: tadawul, argaam (but note: tadawul may not be implemented).
+    """
+    pl = getattr(settings, "ksa_providers_list", None)
+    if isinstance(pl, list) and pl:
+        return [str(x).strip().lower() for x in pl if str(x).strip()]
+
+    p_csv = getattr(settings, "ksa_providers", None)
+    if isinstance(p_csv, str) and p_csv.strip():
+        return [p.strip().lower() for p in p_csv.split(",") if p.strip()]
+
+    env_csv = os.getenv("KSA_PROVIDERS") or ""
+    if env_csv.strip():
+        return [p.strip().lower() for p in env_csv.split(",") if p.strip()]
+
+    return ["tadawul", "argaam"]
+
+
 def _get_key(*names: str) -> Optional[str]:
     for n in names:
         v = getattr(settings, n, None)
@@ -487,10 +510,15 @@ class DataEngine:
     """
     Async multi-provider engine with KSA-safe routing.
 
+    IMPORTANT:
+    - KSA providers often require scraping / can be blocked.
+    - This engine enforces tight KSA time budgets to avoid request hangs.
+    - Legacy KSA delegate is OFF by default to prevent recursion loops.
+
     KSA (.SR):
-      1) Legacy KSA delegate if available (core.data_engine)
-      2) Argaam snapshot (HTML best-effort)
-      3) Optional yfinance last resort (often blocked/401)
+      provider order from settings.ksa_providers / env KSA_PROVIDERS:
+        - argaam  (HTML snapshot; best-effort)
+        - (optional) yfinance last resort (often blocked/401)
 
     GLOBAL:
       provider order from settings/providers:
@@ -502,6 +530,22 @@ class DataEngine:
 
     def __init__(self) -> None:
         self.enabled_providers: List[str] = _get_enabled_providers()
+        self.ksa_providers: List[str] = _get_ksa_providers()
+
+        # Hard KSA time budgets (so /v1/enriched/quote doesn't hang)
+        self.ksa_max_total_sec: float = _get_float(["KSA_MAX_TOTAL_SEC", "KSA_TIMEOUT_SEC"], 18.0)
+
+        # Argaam tuning (Render-friendly)
+        self.argaam_timeout_sec: float = _get_float(["ARGAAM_HTTP_TIMEOUT_SEC", "ARGAAM_TIMEOUT_SEC"], 8.0)
+        self.argaam_retries: int = _get_int(["ARGAAM_HTTP_RETRIES"], 1)
+        self.argaam_fetch_volume: bool = _get_bool(["ARGAAM_FETCH_VOLUME"], True)
+
+        # Optional (OFF by default): calling core.data_engine from v2 can recurse
+        self.enable_legacy_ksa_delegate: bool = _get_bool(["ENABLE_LEGACY_KSA_DELEGATE"], False)
+
+        # yfinance is frequently blocked; keep GLOBAL allowed, KSA OFF by default
+        self.enable_yfinance: bool = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
+        self.enable_yfinance_ksa: bool = _get_bool(["KSA_ENABLE_YFINANCE"], False)
 
         self._timeout_sec: float = _get_float(["HTTP_TIMEOUT_SEC", "http_timeout_sec", "HTTP_TIMEOUT"], 25.0)
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
@@ -521,8 +565,6 @@ class DataEngine:
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
 
-        self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
-
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
@@ -536,11 +578,15 @@ class DataEngine:
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | ksa_providers=%s | yfinance(global)=%s yfinance(ksa)=%s | "
+            "ksa_budget=%.1fs argaam_timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
+            ",".join(self.ksa_providers) if self.ksa_providers else "(none)",
             self.enable_yfinance,
-            self._timeout_sec,
+            self.enable_yfinance_ksa,
+            self.ksa_max_total_sec,
+            self.argaam_timeout_sec,
         )
 
     async def aclose(self) -> None:
@@ -580,6 +626,8 @@ class DataEngine:
             self.stale_cache[s] = q
             return q
 
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.exception("get_quote failed for %s", s, exc_info=exc)
             if stale is not None:
@@ -613,52 +661,97 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        # 1) Prefer legacy KSA engine
-        try:
-            from core import data_engine as legacy  # type: ignore
-            if hasattr(legacy, "get_enriched_quote"):
-                raw = await legacy.get_enriched_quote(symbol)  # type: ignore
-                q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
-                if q.current_price is not None:
-                    q.data_source = q.data_source or "legacy"
-                    q.data_quality = "PARTIAL"
-                    return q
-        except Exception:
-            pass
-
-        # 2) Argaam snapshot
+        """
+        KSA fetch is budgeted to avoid timeouts. If providers are slow/blocked,
+        return MISSING quickly rather than hanging.
+        """
         base = symbol.split(".", 1)[0].strip()
-        snap = await self._argaam_snapshot()
-        row = snap.get(base)
-        if row:
-            return UnifiedQuote(
-                symbol=symbol,
-                name=row.get("name"),
-                market="KSA",
-                currency="SAR",
-                current_price=row.get("price"),
-                price_change=row.get("change"),
-                percent_change=row.get("change_percent"),
-                volume=row.get("volume"),
-                value_traded=row.get("value_traded"),
-                data_source="argaam",
-                data_quality="PARTIAL",
-            )
 
-        # 3) yfinance last resort
-        if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
-            q = await self._fetch_yfinance(symbol, market="KSA")
-            if q.current_price is not None:
-                q.data_source = q.data_source or "yfinance"
-                q.data_quality = "PARTIAL"
-                return q
+        # 0) Optional legacy delegate (OFF by default; can recurse if legacy uses v2)
+        if self.enable_legacy_ksa_delegate:
+            try:
+                from core import data_engine as legacy  # type: ignore
+
+                if hasattr(legacy, "get_enriched_quote"):
+                    raw = await asyncio.wait_for(
+                        legacy.get_enriched_quote(symbol),  # type: ignore
+                        timeout=min(8.0, self.ksa_max_total_sec),
+                    )
+                    q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
+                    if q.current_price is not None:
+                        q.data_source = q.data_source or "legacy"
+                        q.data_quality = "PARTIAL"
+                        return q
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        errors: List[str] = []
+        for prov in (self.ksa_providers or ["argaam"]):
+            p = (prov or "").strip().lower()
+            if not p:
+                continue
+
+            if p == "argaam":
+                try:
+                    snap = await asyncio.wait_for(self._argaam_snapshot(), timeout=self.ksa_max_total_sec)
+                    row = snap.get(base)
+                    if row:
+                        return UnifiedQuote(
+                            symbol=symbol,
+                            name=row.get("name"),
+                            market="KSA",
+                            currency="SAR",
+                            current_price=row.get("price"),
+                            price_change=row.get("change"),
+                            percent_change=row.get("change_percent"),
+                            volume=row.get("volume"),
+                            value_traded=row.get("value_traded"),
+                            data_source="argaam",
+                            data_quality="PARTIAL",
+                        )
+                    errors.append("argaam:no_row")
+                except asyncio.TimeoutError:
+                    errors.append(f"argaam:timeout({self.ksa_max_total_sec:.0f}s)")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    errors.append(f"argaam:error({exc})")
+
+            elif p in {"yfinance", "yahoo"}:
+                if self.enable_yfinance_ksa and self.enable_yfinance and yf:
+                    try:
+                        q = await asyncio.wait_for(
+                            self._fetch_yfinance(symbol, market="KSA"),
+                            timeout=min(10.0, self.ksa_max_total_sec),
+                        )
+                        if q.current_price is not None:
+                            q.data_source = q.data_source or "yfinance"
+                            q.data_quality = "PARTIAL"
+                            return q
+                        errors.append(f"yfinance:{q.error or 'no_price'}")
+                    except asyncio.TimeoutError:
+                        errors.append("yfinance:timeout")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        errors.append(f"yfinance:error({exc})")
+                else:
+                    errors.append("yfinance:disabled_or_missing")
+
+            elif p == "tadawul":
+                # Placeholder: declared in config/health, but not implemented in this engine.
+                errors.append("tadawul:not_implemented")
 
         return UnifiedQuote(
             symbol=symbol,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="No KSA provider data (legacy+argaam+yfinance failed)",
+            error="No KSA provider data. " + (" | ".join(errors) if errors else "no_ksa_providers_enabled"),
         ).finalize()
 
     def _coerce_to_unified_quote(
@@ -698,7 +791,12 @@ class DataEngine:
             "name": data.get("name") or data.get("company_name"),
         }
 
-        mapped["current_price"] = data.get("current_price") or data.get("last_price") or data.get("lastPrice") or data.get("price")
+        mapped["current_price"] = (
+            data.get("current_price")
+            or data.get("last_price")
+            or data.get("lastPrice")
+            or data.get("price")
+        )
         mapped["previous_close"] = data.get("previous_close") or data.get("previousClose")
         mapped["open"] = data.get("open")
         mapped["day_high"] = data.get("day_high") or data.get("high")
@@ -706,7 +804,9 @@ class DataEngine:
         mapped["volume"] = data.get("volume")
 
         mapped["price_change"] = data.get("price_change") or data.get("change")
-        mapped["percent_change"] = data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
+        mapped["percent_change"] = (
+            data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
+        )
 
         for k in (
             "market_cap",
@@ -735,28 +835,39 @@ class DataEngine:
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
         key = "argaam_snapshot_v2"
         cached = self.snapshot_cache.get(key)
-        if isinstance(cached, dict):
+        if isinstance(cached, dict) and cached:
             return cached
 
         merged: Dict[str, Dict[str, Any]] = {}
 
-        prices_html = await self._http_get_first_text(ARGAAM_PRICES_URLS)
+        prices_html = await self._http_get_first_text(
+            ARGAAM_PRICES_URLS, timeout_sec=self.argaam_timeout_sec, retries=self.argaam_retries
+        )
         if prices_html:
             part = self._parse_argaam_table(prices_html)
             for k, v in part.items():
                 merged.setdefault(k, {}).update(v)
 
-        vol_html = await self._http_get_first_text(ARGAAM_VOLUME_URLS)
-        if vol_html:
-            part = self._parse_argaam_table(vol_html)
-            for k, v in part.items():
-                merged.setdefault(k, {}).update(v)
+        if self.argaam_fetch_volume:
+            vol_html = await self._http_get_first_text(
+                ARGAAM_VOLUME_URLS, timeout_sec=self.argaam_timeout_sec, retries=self.argaam_retries
+            )
+            if vol_html:
+                part = self._parse_argaam_table(vol_html)
+                for k, v in part.items():
+                    merged.setdefault(k, {}).update(v)
 
-        self.snapshot_cache[key] = merged
-        return merged
+        if merged:
+            self.snapshot_cache[key] = merged
+            return merged
 
-    async def _http_get_first_text(self, urls: Sequence[str]) -> Optional[str]:
-        tasks = [self._http_get_text(u) for u in urls]
+        self.snapshot_cache[key] = {}
+        return {}
+
+    async def _http_get_first_text(
+        self, urls: Sequence[str], timeout_sec: Optional[float] = None, retries: Optional[int] = None
+    ) -> Optional[str]:
+        tasks = [self._http_get_text(u, timeout_sec=timeout_sec, retries=retries) for u in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         def _looks_ok(txt: str) -> bool:
@@ -780,7 +891,6 @@ class DataEngine:
         if not BeautifulSoup or not html:
             return out
 
-        # lxml may not exist; fallback safely
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception:
@@ -846,7 +956,11 @@ class DataEngine:
     # -------------------------------------------------------------------------
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
         if any(ch in symbol for ch in ("=", "^")):
-            if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
+            if (
+                self.enable_yfinance
+                and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers))
+                and yf
+            ):
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yfinance"
@@ -950,35 +1064,53 @@ class DataEngine:
         ).finalize()
 
     # -------------------------------------------------------------------------
-    # HTTP helpers (with light retry)
+    # HTTP helpers (with light retry) - cancellation safe
     # -------------------------------------------------------------------------
-    async def _http_get_text(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        for attempt in range(3):
+    async def _http_get_text(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_sec: Optional[float] = None,
+        retries: Optional[int] = None,
+    ) -> Optional[str]:
+        max_tries = retries if retries is not None else 3
+        max_tries = max(1, int(max_tries))
+
+        for attempt in range(max_tries):
             try:
-                r = await self.client.get(url, params=params)
+                r = await self.client.get(url, params=params, timeout=timeout_sec)
                 if r.status_code in (429,) or 500 <= r.status_code < 600:
-                    if attempt < 2:
+                    if attempt < (max_tries - 1):
                         await asyncio.sleep(0.25 + random.random() * 0.35)
                         continue
                     return None
                 if r.status_code >= 400:
                     return None
                 return r.text
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                if attempt < 2:
+                if attempt < (max_tries - 1):
                     await asyncio.sleep(0.25 + random.random() * 0.35)
                     continue
                 return None
         return None
 
     async def _http_get_json(
-        self, url: str, params: Optional[Dict[str, Any]] = None
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_sec: Optional[float] = None,
+        retries: Optional[int] = None,
     ) -> Optional[Union[Dict[str, Any], List[Any]]]:
-        for attempt in range(3):
+        max_tries = retries if retries is not None else 3
+        max_tries = max(1, int(max_tries))
+
+        for attempt in range(max_tries):
             try:
-                r = await self.client.get(url, params=params)
+                r = await self.client.get(url, params=params, timeout=timeout_sec)
                 if r.status_code in (429,) or 500 <= r.status_code < 600:
-                    if attempt < 2:
+                    if attempt < (max_tries - 1):
                         await asyncio.sleep(0.25 + random.random() * 0.35)
                         continue
                     return None
@@ -988,8 +1120,10 @@ class DataEngine:
                     return r.json()
                 except Exception:
                     return None
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                if attempt < 2:
+                if attempt < (max_tries - 1):
                     await asyncio.sleep(0.25 + random.random() * 0.35)
                     continue
                 return None
@@ -1022,6 +1156,8 @@ class DataEngine:
                 data_source="eodhd",
                 data_quality="PARTIAL",
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             dt = int((time.perf_counter() - t0) * 1000)
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"EODHD error ({dt}ms): {exc}")
@@ -1098,10 +1234,14 @@ class DataEngine:
                 data_source="finnhub",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"Finnhub error: {exc}")
 
-    async def _fetch_finnhub_profile_and_metrics(self, symbol: str, api_key: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def _fetch_finnhub_profile_and_metrics(
+        self, symbol: str, api_key: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         sym = _finnhub_symbol(symbol)
         cache_key = f"finnhub_profile_metrics::{sym}"
         hit = self.fund_cache.get(cache_key)
@@ -1193,6 +1333,8 @@ class DataEngine:
                 data_source="fmp",
                 data_quality="PARTIAL",
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"FMP error: {exc}")
 
@@ -1265,6 +1407,8 @@ class DataEngine:
                 data_source="yfinance",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             msg = str(exc)
             if "unauthorized" in msg.lower() or "401" in msg:
