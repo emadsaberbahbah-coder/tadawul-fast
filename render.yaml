@@ -1,14 +1,14 @@
 # ============================================================
 # render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# Aligned with env.py / config.py (v4.6.0+)
+# UPDATED: production-safe defaults (KSA-safe, Yahoo-safe)
 # ============================================================
-# Key design:
-# - Use Render's runtime.txt as source of Python version.
-# - Keep startCommand minimal & stable (Procfile is optional on Render,
-#   but we keep both consistent).
-# - Explicit healthCheckPath for Render health checks.
-# - All secrets use sync:false (set them in Render Dashboard).
-# ============================================================
+#
+# Notes
+# - Python version comes from runtime.txt
+# - Keep WEB_CONCURRENCY=1 on free plan
+# - KSA (.SR / numeric) must NOT rely on EODHD/Yahoo
+# - Yahoo/yfinance is often blocked (401). Default OFF in production.
+#
 
 services:
   - type: web
@@ -17,7 +17,9 @@ services:
     plan: free
     autoDeploy: true
 
-    buildCommand: pip install -r requirements.txt
+    buildCommand: >
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
 
     startCommand: >
       uvicorn main:app
@@ -50,11 +52,9 @@ services:
       - key: APP_NAME
         value: Tadawul Fast Bridge
       - key: APP_VERSION
-        value: 4.6.0
+        value: "4.6.0"
       - key: APP_ENV
         value: production
-
-      # If your Sheets/clients call the same service, keep it explicit:
       - key: BACKEND_BASE_URL
         value: https://tadawul-fast-bridge.onrender.com
 
@@ -69,19 +69,23 @@ services:
       # -------------------------
       # Providers policy
       # -------------------------
-      # IMPORTANT:
-      # - KSA (.SR / numeric) must be routed to Tadawul/Argaam only
-      # - Avoid relying on Yahoo for KSA (often blocked / incomplete)
+      # Global providers (order matters in your app logic if you use it)
+      # Recommended: Finnhub + FMP (EODHD optional)
       - key: ENABLED_PROVIDERS
-        value: "eodhd,finnhub"
+        value: "finnhub,fmp,eodhd"
       - key: PRIMARY_PROVIDER
         value: "finnhub"
+
+      # KSA routing flags (your code should enforce KSA-safe providers)
       - key: KSA_PROVIDERS
         value: "tadawul,argaam"
       - key: KSA_DISALLOW_EODHD
         value: "true"
+
+      # Yahoo/yfinance often blocked (401). Keep OFF by default in production.
+      # Turn ON only if you confirm it works in your region/environment.
       - key: ENABLE_YFINANCE
-        value: "true"
+        value: "false"
 
       # Provider keys (SECRETS)
       - key: FMP_API_KEY
@@ -93,11 +97,18 @@ services:
       - key: ALPHA_VANTAGE_API_KEY
         sync: false
 
-      # Argaam (optional)
+      # -------------------------
+      # Argaam (KSA)
+      # -------------------------
+      # ARGAAM_GATEWAY_URL is optional (if you ever add your own gateway)
       - key: ARGAAM_GATEWAY_URL
         value: ""
       - key: ARGAAM_API_KEY
         sync: false
+
+      # Enable detail parsing (company overview page) to complete OHLC/prev close/etc.
+      - key: ARGAAM_DETAIL_ENABLED
+        value: "true"
 
       # -------------------------
       # HTTP + caching
@@ -112,9 +123,11 @@ services:
         value: "21600"
       - key: ARGAAM_SNAPSHOT_TTL_SEC
         value: "30"
+      - key: ARGAAM_DETAIL_TTL_SEC
+        value: "20"
 
       # -------------------------
-      # Batch controls (match env.py defaults)
+      # Batch controls
       # -------------------------
       - key: ENRICHED_BATCH_SIZE
         value: "40"
