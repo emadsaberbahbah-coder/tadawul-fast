@@ -2,32 +2,16 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quote Routes (Google Sheets + API) - v2.4.1 (PROD SAFE)
+Enriched Quote Routes (Google Sheets + API) - v2.5.0 (PROD SAFE)
 
-Goals
-- Stable endpoints for Google Sheets / Apps Script:
+Key upgrades (2.5.0)
+- Adds engine_version to /health so you can confirm Render deploy immediately.
+- Applies a final UTF-8 mojibake fixer to text fields at API output level
+  (defense-in-depth; even if upstream provider returns mojibake).
+- Keeps endpoints stable:
     GET  /v1/enriched/quote?symbol=1120.SR
     POST /v1/enriched/quotes   {symbols:[...], sheet_name?: "..."}
-
-- Return:
-    - quote JSON (EnrichedQuote fields)
-    - optional Google Sheets row aligned to headers
-
-- Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN).
-  If no token is set => open mode.
-
-- Defensive limits:
-    ENRICHED_MAX_TICKERS (default 250)
-    ENRICHED_BATCH_SIZE  (default 40)
-
-- Engine resolution:
-    • prefer request.app.state.engine (created by main.py lifespan), else singleton here.
-
-- PROD reliability improvements:
-    • UTF-8 JSON responses (fixes Arabic output in clients)
-    • Mojibake auto-fix (Ø…Ù… -> Arabic) for name/sector/industry/sub_sector
-    • Route-level timeouts for single/batch
-    • Optional KSA fallback to /v1/argaam/quote on timeout or missing price
+    GET  /v1/enriched/headers?sheet_name=...
 """
 
 from __future__ import annotations
@@ -39,13 +23,11 @@ import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Literal
 
-import httpx
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol, is_ksa_symbol
+from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol, ENGINE_VERSION as ENGINE_V2_VERSION
 from core.enriched_quote import EnrichedQuote
 
 # Optional core.schemas (preferred)
@@ -56,21 +38,51 @@ except Exception:  # pragma: no cover
     get_headers_for_sheet = None  # type: ignore
 
 logger = logging.getLogger("routes.enriched_quote")
-ROUTE_VERSION = "2.4.1"
+
+ROUTE_VERSION = "2.5.0"
+router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 
 # =============================================================================
-# UTF-8 JSON response (critical for Arabic text in clients like PowerShell)
+# UTF-8 mojibake fixer (defense in depth at API boundary)
 # =============================================================================
-class UTF8JSONResponse(JSONResponse):
-    media_type = "application/json; charset=utf-8"
+def _fix_mojibake(s: Optional[str]) -> Optional[str]:
+    if not s or not isinstance(s, str):
+        return s
+    if any(ch in s for ch in ("Ø", "Ù", "Ã", "Â", "�")):
+        for enc in ("latin1", "cp1252"):
+            try:
+                return s.encode(enc, errors="strict").decode("utf-8", errors="strict")
+            except Exception:
+                continue
+    return s
 
 
-router = APIRouter(prefix="/v1/enriched", tags=["enriched"], default_response_class=UTF8JSONResponse)
+def _fix_quote_text_fields(d: Dict[str, Any]) -> Dict[str, Any]:
+    # Fix known string fields if they exist
+    for k in (
+        "symbol",
+        "name",
+        "sector",
+        "industry",
+        "sub_sector",
+        "market",
+        "currency",
+        "listing_date",
+        "valuation_label",
+        "analyst_rating",
+        "recommendation",
+        "data_source",
+        "data_quality",
+        "error",
+    ):
+        if k in d and isinstance(d.get(k), str):
+            d[k] = _fix_mojibake(d.get(k))
+    return d
 
 
 # =============================================================================
-# Fallback request model + headers helper (keeps service alive even if schemas missing)
+# Fallback request model + headers helper
 # =============================================================================
 class _FallbackBatchProcessRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -200,13 +212,13 @@ def _allowed_tokens() -> List[str]:
 def _require_token(x_app_token: Optional[str]) -> None:
     allowed = _allowed_tokens()
     if not allowed:
-        return  # open mode
+        return
     if not x_app_token or x_app_token.strip() not in allowed:
         raise HTTPException(status_code=401, detail="Unauthorized (invalid or missing X-APP-TOKEN).")
 
 
 # =============================================================================
-# Settings helpers
+# Limits + settings helpers
 # =============================================================================
 def _get_int_setting(name: str, default: int) -> int:
     try:
@@ -216,6 +228,7 @@ def _get_int_setting(name: str, default: int) -> int:
             return v
     except Exception:
         pass
+
     try:
         import env as env_mod  # type: ignore
         v = getattr(env_mod, name, None)
@@ -223,6 +236,7 @@ def _get_int_setting(name: str, default: int) -> int:
             return v
     except Exception:
         pass
+
     try:
         ev = os.getenv(name)
         if ev:
@@ -231,6 +245,7 @@ def _get_int_setting(name: str, default: int) -> int:
                 return n
     except Exception:
         pass
+
     return default
 
 
@@ -238,13 +253,6 @@ def _get_float_setting(name: str, default: float) -> float:
     try:
         s = get_settings()
         v = getattr(s, name, None)
-        if isinstance(v, (int, float)) and float(v) > 0:
-            return float(v)
-    except Exception:
-        pass
-    try:
-        import env as env_mod  # type: ignore
-        v = getattr(env_mod, name, None)
         if isinstance(v, (int, float)) and float(v) > 0:
             return float(v)
     except Exception:
@@ -279,21 +287,6 @@ def _get_bool_setting(name: str, default: bool) -> bool:
     return default
 
 
-def _timeouts_meta() -> Dict[str, Any]:
-    return {
-        "single_timeout_sec": _get_float_setting("ENRICHED_SINGLE_TIMEOUT_SEC", 12.0),
-        "batch_timeout_sec": _get_float_setting("ENRICHED_BATCH_TIMEOUT_SEC", 22.0),
-        "ksa_single_timeout_sec": _get_float_setting("ENRICHED_KSA_SINGLE_TIMEOUT_SEC", 10.0),
-        "ksa_batch_timeout_sec": _get_float_setting("ENRICHED_KSA_BATCH_TIMEOUT_SEC", 20.0),
-        "ksa_fallback_enabled": _get_bool_setting("ENRICHED_KSA_FALLBACK_ENABLED", True),
-        "ksa_fallback_route": os.getenv("ENRICHED_KSA_FALLBACK_ROUTE", "/v1/argaam/quote").strip() or "/v1/argaam/quote",
-        "ksa_fallback_timeout_sec": _get_float_setting("ENRICHED_KSA_FALLBACK_TIMEOUT_SEC", 7.0),
-    }
-
-
-# =============================================================================
-# Data helpers
-# =============================================================================
 def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -326,108 +319,21 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
         return {}
 
 
-def _chunk(items: List[str], size: int) -> List[List[str]]:
-    if size <= 0:
-        return [items]
-    return [items[i: i + size] for i in range(0, len(items), size)]
-
-
-def _fix_mojibake_text(s: Optional[str]) -> Optional[str]:
-    """
-    Fix classic UTF-8 decoded as Latin-1 (e.g. Ø§Ù… -> Arabic).
-    Safe: only tries when mojibake markers exist.
-    """
-    if not s:
-        return s
-    if "Ø" in s or "Ù" in s:
-        try:
-            fixed = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore").strip()
-            return fixed or s
-        except Exception:
-            return s
-    return s
-
-
-def _postprocess_unified(q: UnifiedQuote) -> UnifiedQuote:
-    # Fix Arabic fields regardless of provider
-    try:
-        q.name = _fix_mojibake_text(q.name)
-        q.sector = _fix_mojibake_text(q.sector)
-        q.industry = _fix_mojibake_text(q.industry)
-        q.sub_sector = _fix_mojibake_text(q.sub_sector)
-    except Exception:
-        pass
-    return q
-
-
 def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
-    q = _postprocess_unified(q)
     eq = EnrichedQuote.from_unified(q)
+    quote_dict = _model_to_dict(eq)
+    quote_dict = _fix_quote_text_fields(quote_dict)
     return {
         "headers": list(headers),
         "row": eq.to_row(headers),
-        "quote": _model_to_dict(eq),
+        "quote": quote_dict,
     }
 
 
-# =============================================================================
-# KSA fallback (route-level) to /v1/argaam/quote
-# =============================================================================
-async def _ksa_fallback_quote(request: Request, symbol: str, timeout_sec: float) -> Optional[UnifiedQuote]:
-    """
-    Calls our own service endpoint /v1/argaam/quote as a fallback.
-    Expects it to return json with at least last_price/price/current_price or close.
-    """
-    try:
-        meta = _timeouts_meta()
-        route = meta["ksa_fallback_route"] or "/v1/argaam/quote"
-        base_url = str(getattr(request, "base_url", "") or "").rstrip("/")
-        if not base_url:
-            return None
-
-        # /v1/argaam/quote typically expects numeric code; accept 1120.SR too
-        code = (symbol or "").strip().upper().split(".", 1)[0]
-
-        url = f"{base_url}{route}"
-        params = {"symbol": code}
-
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_sec, connect=min(5.0, timeout_sec)),
-            follow_redirects=True,
-            headers={"User-Agent": "TadawulFastBridge/ksa-fallback"},
-        ) as client:
-            r = await client.get(url, params=params)
-            if r.status_code >= 400:
-                return None
-            data = r.json() if r.headers.get("content-type", "").lower().startswith("application/json") else None
-            if not isinstance(data, dict):
-                return None
-
-        # Coerce into UnifiedQuote
-        cp = data.get("current_price") or data.get("last_price") or data.get("price") or data.get("close")
-        pc = data.get("previous_close") or data.get("previousClose")
-
-        uq = UnifiedQuote(
-            symbol=normalize_symbol(symbol) or symbol,
-            market="KSA",
-            currency="SAR",
-            name=_fix_mojibake_text(data.get("name")),
-            current_price=float(cp) if cp is not None else None,
-            previous_close=float(pc) if pc is not None else None,
-            day_high=data.get("day_high") or data.get("high"),
-            day_low=data.get("day_low") or data.get("low"),
-            high_52w=data.get("high_52w") or data.get("high52w"),
-            low_52w=data.get("low_52w") or data.get("low52w"),
-            volume=data.get("volume"),
-            value_traded=data.get("value_traded") or data.get("valueTraded"),
-            price_change=data.get("price_change") or data.get("change"),
-            percent_change=data.get("percent_change") or data.get("change_percent"),
-            data_source="argaam_fallback",
-            data_quality="PARTIAL",
-        ).finalize()
-        return _postprocess_unified(uq)
-    except Exception:
-        return None
+def _chunk(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 # =============================================================================
@@ -437,16 +343,29 @@ async def _ksa_fallback_quote(request: Request, symbol: str, timeout_sec: float)
 async def enriched_health(request: Request) -> Dict[str, Any]:
     max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
     batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
+
     eng = await _resolve_engine(request)
+
+    # These are informational (for your logs/ops); safe defaults
+    timeouts = {
+        "single_timeout_sec": _get_float_setting("ENRICHED_SINGLE_TIMEOUT_SEC", 12.0),
+        "batch_timeout_sec": _get_float_setting("ENRICHED_BATCH_TIMEOUT_SEC", 22.0),
+        "ksa_single_timeout_sec": _get_float_setting("KSA_SINGLE_TIMEOUT_SEC", 10.0),
+        "ksa_batch_timeout_sec": _get_float_setting("KSA_BATCH_TIMEOUT_SEC", 20.0),
+        "ksa_fallback_enabled": _get_bool_setting("KSA_FALLBACK_ENABLED", True),
+        "ksa_fallback_route": os.getenv("KSA_FALLBACK_ROUTE", "/v1/argaam/quote"),
+        "ksa_fallback_timeout_sec": _get_float_setting("KSA_FALLBACK_TIMEOUT_SEC", 7.0),
+    }
 
     return {
         "status": "ok",
         "module": "routes.enriched_quote",
         "version": ROUTE_VERSION,
         "engine": "DataEngineV2",
+        "engine_version": ENGINE_V2_VERSION,
         "providers": list(getattr(eng, "enabled_providers", []) or []) if eng else [],
         "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
-        "timeouts": _timeouts_meta(),
+        "timeouts": timeouts,
         "auth": "open" if not _allowed_tokens() else "token",
     }
 
@@ -477,70 +396,46 @@ async def enriched_quote(
         raise HTTPException(status_code=400, detail="symbol is required")
 
     t0 = time.perf_counter()
-    tm = _timeouts_meta()
-    is_ksa = is_ksa_symbol(sym) or is_ksa_symbol(normalize_symbol(sym))
 
     eng = await _resolve_engine(request)
-    headers = _resolve_headers(sheet_name)
-
-    # Engine unavailable
     if eng is None:
-        uq = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error="Engine unavailable").finalize()
-        uq = _postprocess_unified(uq)
-        eq = EnrichedQuote.from_unified(uq)
-        resp = _model_to_dict(eq) if format == "quote" else None
-
-        elapsed = int((time.perf_counter() - t0) * 1000)
+        eq = EnrichedQuote.from_unified(
+            UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error="Engine unavailable").finalize()
+        )
+        out_quote = _fix_quote_text_fields(_model_to_dict(eq))
         if format == "quote":
-            resp["_meta"] = {"elapsed_ms": elapsed, "fallback_used": False}
-            return resp
-
+            return out_quote
+        headers = _resolve_headers(sheet_name)
         row = eq.to_row(headers)
         if format == "row":
-            return {"symbol": eq.symbol, "headers": headers, "row": row, "_meta": {"elapsed_ms": elapsed, "fallback_used": False}}
-
-        return {
-            "sheet_name": sheet_name,
-            "headers": headers,
-            "row": row,
-            "quote": _model_to_dict(eq),
-            "_meta": {"elapsed_ms": elapsed, "fallback_used": False},
-        }
-
-    # Normal engine fetch with timeout
-    timeout_sec = tm["ksa_single_timeout_sec"] if is_ksa else tm["single_timeout_sec"]
-    fallback_used = False
+            return {"symbol": out_quote.get("symbol", normalize_symbol(sym) or sym), "headers": headers, "row": row}
+        return {"sheet_name": sheet_name, "headers": headers, "row": row, "quote": out_quote, "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)}}
 
     try:
-        uq = await asyncio.wait_for(_engine_get_quote(eng, sym), timeout=timeout_sec)
-        uq = uq.finalize()
-    except asyncio.TimeoutError:
-        uq = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error=f"Timeout after {timeout_sec:.1f}s").finalize()
+        q = await _engine_get_quote(eng, sym)
     except Exception as exc:
-        uq = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error=str(exc)).finalize()
+        q = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error=str(exc)).finalize()
 
-    uq = _postprocess_unified(uq)
-
-    # Optional KSA fallback if missing price (or timeout)
-    if is_ksa and tm["ksa_fallback_enabled"] and uq.current_price is None:
-        fb = await _ksa_fallback_quote(request, sym, timeout_sec=tm["ksa_fallback_timeout_sec"])
-        if fb is not None and fb.current_price is not None:
-            uq = fb
-            fallback_used = True
+    eq = EnrichedQuote.from_unified(q)
+    quote_dict = _fix_quote_text_fields(_model_to_dict(eq))
 
     if format == "quote":
-        eq = EnrichedQuote.from_unified(uq)
-        out = _model_to_dict(eq)
-        out["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": fallback_used}
-        return out
+        quote_dict["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000)}
+        return quote_dict
 
-    payload = _build_row_payload(uq, headers)
-    payload["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": fallback_used}
+    headers = _resolve_headers(sheet_name)
+    payload = _build_row_payload(q, headers)
 
     if format == "row":
-        return {"symbol": payload["quote"].get("symbol", normalize_symbol(sym) or sym), "headers": payload["headers"], "row": payload["row"], "_meta": payload["_meta"]}
+        return {
+            "symbol": payload["quote"].get("symbol", normalize_symbol(sym) or sym),
+            "headers": payload["headers"],
+            "row": payload["row"],
+            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+        }
 
     payload["sheet_name"] = sheet_name
+    payload["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000)}
     return payload
 
 
@@ -552,6 +447,7 @@ async def enriched_quotes(
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> Dict[str, Any]:
     _require_token(x_app_token)
+
     t0 = time.perf_counter()
 
     Model = BatchProcessRequest or _FallbackBatchProcessRequest  # type: ignore
@@ -581,12 +477,11 @@ async def enriched_quotes(
             "headers": headers,
             "rows": [] if format in ("rows", "both") else None,
             "quotes": [] if format in ("quotes", "both") else None,
-            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": False},
+            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
         }
 
     max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
     batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
-    tm = _timeouts_meta()
 
     status = "success"
     error_msg: Optional[str] = None
@@ -603,13 +498,12 @@ async def enriched_quotes(
         rows_out: List[List[Any]] = []
         quotes_out: List[Dict[str, Any]] = []
         for s in symbols:
-            uq = UnifiedQuote(symbol=s, data_quality="MISSING", error="Engine unavailable").finalize()
-            uq = _postprocess_unified(uq)
-            eq = EnrichedQuote.from_unified(uq)
+            eq = EnrichedQuote.from_unified(UnifiedQuote(symbol=s, data_quality="MISSING", error="Engine unavailable").finalize())
             if format in ("rows", "both"):
                 rows_out.append(eq.to_row(headers))
             if format in ("quotes", "both"):
-                quotes_out.append(_model_to_dict(eq))
+                quotes_out.append(_fix_quote_text_fields(_model_to_dict(eq)))
+
         resp: Dict[str, Any] = {
             "status": status,
             "error": error_msg,
@@ -618,7 +512,7 @@ async def enriched_quotes(
             "count": len(symbols),
             "symbols": symbols,
             "headers": headers,
-            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": False},
+            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
         }
         if format in ("rows", "both"):
             resp["rows"] = rows_out
@@ -628,44 +522,24 @@ async def enriched_quotes(
 
     rows_out: List[List[Any]] = []
     quotes_out: List[Dict[str, Any]] = []
-    fallback_used_any = False
 
-    # Soft batching (keeps memory stable)
     for chunk in _chunk(symbols, batch_sz):
-        # Choose timeout: if chunk contains ANY KSA => use ksa batch timeout (safer)
-        chunk_has_ksa = any(is_ksa_symbol(s) for s in chunk)
-        timeout_sec = tm["ksa_batch_timeout_sec"] if chunk_has_ksa else tm["batch_timeout_sec"]
-
         try:
-            quotes = await asyncio.wait_for(_engine_get_quotes(eng, chunk), timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            status = "partial"
-            error_msg = (error_msg + " " if error_msg else "") + f"Batch timeout after {timeout_sec:.1f}s"
-            quotes = [UnifiedQuote(symbol=s, data_quality="MISSING", error=f"Timeout after {timeout_sec:.1f}s").finalize() for s in chunk]
+            quotes = await _engine_get_quotes(eng, chunk)
         except Exception as exc:
             status = "partial"
             error_msg = (error_msg + " " if error_msg else "") + f"Batch error: {exc}"
             quotes = [UnifiedQuote(symbol=s, data_quality="MISSING", error=str(exc)).finalize() for s in chunk]
 
-        # Preserve order by symbol
-        m = {getattr(q, "symbol", "").upper(): _postprocess_unified(q.finalize()) for q in (quotes or []) if getattr(q, "symbol", None)}
-
+        m = {getattr(q, "symbol", "").upper(): q for q in (quotes or []) if getattr(q, "symbol", None)}
         for s in chunk:
             uq = m.get(s.upper()) or UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error="No data returned").finalize()
-            uq = _postprocess_unified(uq)
-
-            # Optional per-symbol KSA fallback
-            if tm["ksa_fallback_enabled"] and is_ksa_symbol(s) and uq.current_price is None:
-                fb = await _ksa_fallback_quote(request, s, timeout_sec=tm["ksa_fallback_timeout_sec"])
-                if fb is not None and fb.current_price is not None:
-                    uq = fb
-                    fallback_used_any = True
-
             eq = EnrichedQuote.from_unified(uq)
+
             if format in ("rows", "both"):
                 rows_out.append(eq.to_row(headers))
             if format in ("quotes", "both"):
-                quotes_out.append(_model_to_dict(eq))
+                quotes_out.append(_fix_quote_text_fields(_model_to_dict(eq)))
 
     resp: Dict[str, Any] = {
         "status": status,
@@ -675,7 +549,7 @@ async def enriched_quotes(
         "count": len(symbols),
         "symbols": symbols,
         "headers": headers,
-        "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": fallback_used_any},
+        "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
     }
     if format in ("rows", "both"):
         resp["rows"] = rows_out
