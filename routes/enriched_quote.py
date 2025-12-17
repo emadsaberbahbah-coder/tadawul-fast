@@ -4,14 +4,19 @@ routes/enriched_quote.py
 ===========================================================
 Enriched Quote Routes (Google Sheets + API) - v2.5.0 (PROD SAFE)
 
-Key upgrades (2.5.0)
-- Adds engine_version to /health so you can confirm Render deploy immediately.
-- Applies a final UTF-8 mojibake fixer to text fields at API output level
-  (defense-in-depth; even if upstream provider returns mojibake).
-- Keeps endpoints stable:
-    GET  /v1/enriched/quote?symbol=1120.SR
-    POST /v1/enriched/quotes   {symbols:[...], sheet_name?: "..."}
-    GET  /v1/enriched/headers?sheet_name=...
+Endpoints
+- GET  /v1/enriched/health
+- GET  /v1/enriched/headers?sheet_name=...
+- GET  /v1/enriched/quote?symbol=1120.SR&format=quote|row|both&sheet_name=...
+- POST /v1/enriched/quotes?format=rows|quotes|both
+    body: {symbols:[...], tickers:[...], sheet_name?: "...", operation?: "refresh"}
+
+Key Improvements (v2.5.0)
+- Smart timeouts (single/batch + KSA-specific).
+- Optional KSA fallback via local route: /v1/argaam/quote (configurable).
+- Better meta: elapsed_ms + fallback_used.
+- Defensive batching and partial responses (Sheets-safe).
+- Engine resolution: prefer request.app.state.engine else a local singleton.
 """
 
 from __future__ import annotations
@@ -23,11 +28,12 @@ import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Literal
 
+import httpx
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol, ENGINE_VERSION as ENGINE_V2_VERSION
+from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol, is_ksa_symbol, _fix_mojibake  # type: ignore
 from core.enriched_quote import EnrichedQuote
 
 # Optional core.schemas (preferred)
@@ -42,45 +48,6 @@ logger = logging.getLogger("routes.enriched_quote")
 ROUTE_VERSION = "2.5.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
-
-# =============================================================================
-# UTF-8 mojibake fixer (defense in depth at API boundary)
-# =============================================================================
-def _fix_mojibake(s: Optional[str]) -> Optional[str]:
-    if not s or not isinstance(s, str):
-        return s
-    if any(ch in s for ch in ("Ø", "Ù", "Ã", "Â", "�")):
-        for enc in ("latin1", "cp1252"):
-            try:
-                return s.encode(enc, errors="strict").decode("utf-8", errors="strict")
-            except Exception:
-                continue
-    return s
-
-
-def _fix_quote_text_fields(d: Dict[str, Any]) -> Dict[str, Any]:
-    # Fix known string fields if they exist
-    for k in (
-        "symbol",
-        "name",
-        "sector",
-        "industry",
-        "sub_sector",
-        "market",
-        "currency",
-        "listing_date",
-        "valuation_label",
-        "analyst_rating",
-        "recommendation",
-        "data_source",
-        "data_quality",
-        "error",
-    ):
-        if k in d and isinstance(d.get(k), str):
-            d[k] = _fix_mojibake(d.get(k))
-    return d
-
-
 # =============================================================================
 # Fallback request model + headers helper
 # =============================================================================
@@ -91,10 +58,8 @@ class _FallbackBatchProcessRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     tickers: List[str] = Field(default_factory=list)  # alias support
 
-
 def _fallback_headers() -> List[str]:
     return ["Symbol", "Error"]
-
 
 def _resolve_headers(sheet_name: Optional[str]) -> List[str]:
     if get_headers_for_sheet:
@@ -106,13 +71,11 @@ def _resolve_headers(sheet_name: Optional[str]) -> List[str]:
             pass
     return _fallback_headers()
 
-
 # =============================================================================
 # Engine resolution (prefer app.state.engine; else singleton)
 # =============================================================================
 _ENGINE: Optional[DataEngine] = None
 _ENGINE_LOCK = asyncio.Lock()
-
 
 def _get_app_engine(request: Request) -> Optional[DataEngine]:
     try:
@@ -126,7 +89,6 @@ def _get_app_engine(request: Request) -> Optional[DataEngine]:
         return None
     except Exception:
         return None
-
 
 async def _get_singleton_engine() -> Optional[DataEngine]:
     global _ENGINE
@@ -142,31 +104,11 @@ async def _get_singleton_engine() -> Optional[DataEngine]:
                 _ENGINE = None
     return _ENGINE
 
-
 async def _resolve_engine(request: Request) -> Optional[DataEngine]:
     eng = _get_app_engine(request)
     if eng is not None:
         return eng
     return await _get_singleton_engine()
-
-
-async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[UnifiedQuote]:
-    if hasattr(engine, "get_enriched_quotes"):
-        return await engine.get_enriched_quotes(syms)  # type: ignore
-    if hasattr(engine, "get_quotes"):
-        return await engine.get_quotes(syms)  # type: ignore
-    out: List[UnifiedQuote] = []
-    for s in syms:
-        out.append(await engine.get_quote(s))  # type: ignore
-    return out
-
-
-async def _engine_get_quote(engine: DataEngine, sym: str) -> UnifiedQuote:
-    if hasattr(engine, "get_quote"):
-        return await engine.get_quote(sym)  # type: ignore
-    res = await _engine_get_quotes(engine, [sym])
-    return (res or [UnifiedQuote(symbol=sym, data_quality="MISSING", error="No data returned").finalize()])[0]
-
 
 # =============================================================================
 # Auth (X-APP-TOKEN)
@@ -183,6 +125,7 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
+    # env.py exports if present
     try:
         import env as env_mod  # type: ignore
         for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
@@ -192,11 +135,13 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
+    # env vars last resort
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
         v = os.getenv(k)
         if v and v.strip():
             tokens.append(v.strip())
 
+    # de-dup preserve order
     out: List[str] = []
     seen = set()
     for t in tokens:
@@ -208,17 +153,15 @@ def _allowed_tokens() -> List[str]:
         logger.warning("[enriched] No APP_TOKEN configured -> endpoints are OPEN (no auth).")
     return out
 
-
 def _require_token(x_app_token: Optional[str]) -> None:
     allowed = _allowed_tokens()
     if not allowed:
-        return
+        return  # open mode
     if not x_app_token or x_app_token.strip() not in allowed:
         raise HTTPException(status_code=401, detail="Unauthorized (invalid or missing X-APP-TOKEN).")
 
-
 # =============================================================================
-# Limits + settings helpers
+# Settings helpers
 # =============================================================================
 def _get_int_setting(name: str, default: int) -> int:
     try:
@@ -248,7 +191,6 @@ def _get_int_setting(name: str, default: int) -> int:
 
     return default
 
-
 def _get_float_setting(name: str, default: float) -> float:
     try:
         s = get_settings()
@@ -257,6 +199,15 @@ def _get_float_setting(name: str, default: float) -> float:
             return float(v)
     except Exception:
         pass
+
+    try:
+        import env as env_mod  # type: ignore
+        v = getattr(env_mod, name, None)
+        if isinstance(v, (int, float)) and float(v) > 0:
+            return float(v)
+    except Exception:
+        pass
+
     try:
         ev = os.getenv(name)
         if ev:
@@ -265,8 +216,8 @@ def _get_float_setting(name: str, default: float) -> float:
                 return f
     except Exception:
         pass
-    return default
 
+    return default
 
 def _get_bool_setting(name: str, default: bool) -> bool:
     try:
@@ -274,19 +225,30 @@ def _get_bool_setting(name: str, default: bool) -> bool:
         v = getattr(s, name, None)
         if isinstance(v, bool):
             return v
-        if isinstance(v, str):
-            return v.strip().lower() in ("1", "true", "yes", "on", "y")
     except Exception:
         pass
+
     try:
-        ev = os.getenv(name)
-        if ev is not None:
-            return str(ev).strip().lower() in ("1", "true", "yes", "on", "y")
+        import env as env_mod  # type: ignore
+        v = getattr(env_mod, name, None)
+        if isinstance(v, bool):
+            return v
     except Exception:
         pass
+
+    ev = os.getenv(name)
+    if not ev:
+        return default
+    ev = ev.strip().lower()
+    if ev in ("1", "true", "yes", "y", "on"):
+        return True
+    if ev in ("0", "false", "no", "n", "off"):
+        return False
     return default
 
-
+# =============================================================================
+# Symbol + response helpers
+# =============================================================================
 def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -303,7 +265,6 @@ def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
         out.append(su)
     return out
 
-
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
     try:
         return obj.model_dump(exclude_none=False)  # type: ignore
@@ -318,23 +279,137 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
-def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
-    eq = EnrichedQuote.from_unified(q)
-    quote_dict = _model_to_dict(eq)
-    quote_dict = _fix_quote_text_fields(quote_dict)
-    return {
-        "headers": list(headers),
-        "row": eq.to_row(headers),
-        "quote": quote_dict,
-    }
-
-
 def _chunk(items: List[str], size: int) -> List[List[str]]:
     if size <= 0:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
 
+def _timeout_for_single(sym: str) -> float:
+    single = _get_float_setting("ENRICHED_SINGLE_TIMEOUT_SEC", 12.0)
+    ksa_single = _get_float_setting("KSA_SINGLE_TIMEOUT_SEC", 10.0)
+    return ksa_single if is_ksa_symbol(sym) else single
+
+def _timeout_for_batch(symbols: List[str]) -> float:
+    batch = _get_float_setting("ENRICHED_BATCH_TIMEOUT_SEC", 22.0)
+    ksa_batch = _get_float_setting("KSA_BATCH_TIMEOUT_SEC", 20.0)
+    return ksa_batch if any(is_ksa_symbol(s) for s in (symbols or [])) else batch
+
+def _get_fallback_cfg() -> Dict[str, Any]:
+    return {
+        "enabled": _get_bool_setting("KSA_FALLBACK_ENABLED", True),
+        "route": os.getenv("KSA_FALLBACK_ROUTE") or "/v1/argaam/quote",
+        "timeout_sec": _get_float_setting("KSA_FALLBACK_TIMEOUT_SEC", 7.0),
+    }
+
+async def _engine_get_quote(engine: DataEngine, sym: str, timeout_sec: float) -> UnifiedQuote:
+    async def _call() -> UnifiedQuote:
+        if hasattr(engine, "get_quote"):
+            return await engine.get_quote(sym)  # type: ignore
+        if hasattr(engine, "get_enriched_quote"):
+            return await engine.get_enriched_quote(sym)  # type: ignore
+        raise RuntimeError("Engine has no get_quote/get_enriched_quote")
+
+    return await asyncio.wait_for(_call(), timeout=timeout_sec)
+
+async def _engine_get_quotes(engine: DataEngine, syms: List[str], timeout_sec: float) -> List[UnifiedQuote]:
+    async def _call() -> List[UnifiedQuote]:
+        if hasattr(engine, "get_enriched_quotes"):
+            return await engine.get_enriched_quotes(syms)  # type: ignore
+        if hasattr(engine, "get_quotes"):
+            return await engine.get_quotes(syms)  # type: ignore
+        # fallback: sequential
+        out: List[UnifiedQuote] = []
+        for s in syms:
+            out.append(await engine.get_quote(s))  # type: ignore
+        return out
+
+    return await asyncio.wait_for(_call(), timeout=timeout_sec)
+
+async def _try_ksa_fallback(request: Request, sym: str, x_app_token: Optional[str]) -> Optional[Dict[str, Any]]:
+    cfg = _get_fallback_cfg()
+    if not cfg.get("enabled"):
+        return None
+    if not is_ksa_symbol(sym):
+        return None
+
+    base = sym.split(".", 1)[0]  # 1120.SR -> 1120
+    url = str(request.base_url).rstrip("/") + str(cfg.get("route") or "/v1/argaam/quote")
+    params = {"symbol": base}
+
+    headers: Dict[str, str] = {}
+    if x_app_token:
+        headers["X-APP-TOKEN"] = x_app_token
+
+    try:
+        async with httpx.AsyncClient(timeout=float(cfg.get("timeout_sec") or 7.0)) as c:
+            r = await c.get(url, params=params, headers=headers)
+            if r.status_code >= 400:
+                return None
+            data = r.json()
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def _merge_fallback_into_quote(q: UnifiedQuote, fb: Dict[str, Any]) -> UnifiedQuote:
+    """
+    Merge fallback JSON into UnifiedQuote WITHOUT overwriting good data.
+    Accepts either EnrichedQuote-style keys or UnifiedQuote-style keys.
+    """
+    if not fb:
+        return q
+
+    upd: Dict[str, Any] = {}
+
+    def pick(dst: str, *cands: str) -> None:
+        cur = getattr(q, dst, None)
+        if cur is not None:
+            return
+        for k in cands:
+            v = fb.get(k)
+            if v is None:
+                continue
+            upd[dst] = v
+            return
+
+    # Common
+    pick("name", "name")
+    pick("current_price", "current_price", "last_price", "price")
+    pick("previous_close", "previous_close", "previousClose")
+    pick("open", "open")
+    pick("day_high", "day_high", "high")
+    pick("day_low", "day_low", "low")
+    pick("volume", "volume")
+    pick("value_traded", "value_traded", "valueTraded")
+
+    pick("shares_outstanding", "shares_outstanding", "sharesOutstanding")
+    pick("market_cap", "market_cap", "marketCap")
+
+    pick("high_52w", "high_52w", "high52w", "yearHigh")
+    pick("low_52w", "low_52w", "low52w", "yearLow")
+
+    pick("eps_ttm", "eps_ttm", "eps")
+    pick("pe_ttm", "pe_ttm", "pe")
+    pick("dividend_yield", "dividend_yield", "divYield")
+
+    if upd:
+        q2 = q.model_copy(update=upd)
+    else:
+        q2 = q
+
+    # Source labeling
+    ds = (getattr(q2, "data_source", None) or "").strip()
+    fb_ds = (fb.get("data_source") or fb.get("source") or "ksa_fallback").strip()
+    q2.data_source = ds if ds else fb_ds
+
+    return q2.finalize()
+
+def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
+    eq = EnrichedQuote.from_unified(q)
+    return {
+        "headers": list(headers),
+        "row": eq.to_row(headers),
+        "quote": _model_to_dict(eq),
+    }
 
 # =============================================================================
 # Endpoints
@@ -345,30 +420,26 @@ async def enriched_health(request: Request) -> Dict[str, Any]:
     batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
 
     eng = await _resolve_engine(request)
-
-    # These are informational (for your logs/ops); safe defaults
-    timeouts = {
-        "single_timeout_sec": _get_float_setting("ENRICHED_SINGLE_TIMEOUT_SEC", 12.0),
-        "batch_timeout_sec": _get_float_setting("ENRICHED_BATCH_TIMEOUT_SEC", 22.0),
-        "ksa_single_timeout_sec": _get_float_setting("KSA_SINGLE_TIMEOUT_SEC", 10.0),
-        "ksa_batch_timeout_sec": _get_float_setting("KSA_BATCH_TIMEOUT_SEC", 20.0),
-        "ksa_fallback_enabled": _get_bool_setting("KSA_FALLBACK_ENABLED", True),
-        "ksa_fallback_route": os.getenv("KSA_FALLBACK_ROUTE", "/v1/argaam/quote"),
-        "ksa_fallback_timeout_sec": _get_float_setting("KSA_FALLBACK_TIMEOUT_SEC", 7.0),
-    }
+    cfg = _get_fallback_cfg()
 
     return {
         "status": "ok",
         "module": "routes.enriched_quote",
         "version": ROUTE_VERSION,
         "engine": "DataEngineV2",
-        "engine_version": ENGINE_V2_VERSION,
         "providers": list(getattr(eng, "enabled_providers", []) or []) if eng else [],
         "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
-        "timeouts": timeouts,
+        "timeouts": {
+            "single_timeout_sec": _get_float_setting("ENRICHED_SINGLE_TIMEOUT_SEC", 12.0),
+            "batch_timeout_sec": _get_float_setting("ENRICHED_BATCH_TIMEOUT_SEC", 22.0),
+            "ksa_single_timeout_sec": _get_float_setting("KSA_SINGLE_TIMEOUT_SEC", 10.0),
+            "ksa_batch_timeout_sec": _get_float_setting("KSA_BATCH_TIMEOUT_SEC", 20.0),
+            "ksa_fallback_enabled": bool(cfg.get("enabled")),
+            "ksa_fallback_route": str(cfg.get("route") or "/v1/argaam/quote"),
+            "ksa_fallback_timeout_sec": float(cfg.get("timeout_sec") or 7.0),
+        },
         "auth": "open" if not _allowed_tokens() else "token",
     }
-
 
 @router.get("/headers")
 async def enriched_headers(
@@ -380,7 +451,6 @@ async def enriched_headers(
     headers = _resolve_headers(sheet_name)
     return {"sheet_name": sheet_name, "headers": headers, "count": len(headers)}
 
-
 @router.get("/quote")
 async def enriched_quote(
     request: Request,
@@ -391,53 +461,54 @@ async def enriched_quote(
 ) -> Dict[str, Any]:
     _require_token(x_app_token)
 
-    sym = (symbol or "").strip()
+    t0 = time.perf_counter()
+
+    sym = normalize_symbol((symbol or "").strip())
     if not sym:
         raise HTTPException(status_code=400, detail="symbol is required")
 
-    t0 = time.perf_counter()
-
     eng = await _resolve_engine(request)
+    fallback_used = False
+
     if eng is None:
-        eq = EnrichedQuote.from_unified(
-            UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error="Engine unavailable").finalize()
-        )
-        out_quote = _fix_quote_text_fields(_model_to_dict(eq))
-        if format == "quote":
-            return out_quote
-        headers = _resolve_headers(sheet_name)
-        row = eq.to_row(headers)
-        if format == "row":
-            return {"symbol": out_quote.get("symbol", normalize_symbol(sym) or sym), "headers": headers, "row": row}
-        return {"sheet_name": sheet_name, "headers": headers, "row": row, "quote": out_quote, "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)}}
+        uq = UnifiedQuote(symbol=sym, data_quality="MISSING", error="Engine unavailable").finalize()
+    else:
+        try:
+            uq = await _engine_get_quote(eng, sym, _timeout_for_single(sym))
+        except Exception as exc:
+            uq = UnifiedQuote(symbol=sym, data_quality="MISSING", error=str(exc)).finalize()
 
-    try:
-        q = await _engine_get_quote(eng, sym)
-    except Exception as exc:
-        q = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error=str(exc)).finalize()
+    # KSA fallback if still missing core
+    if is_ksa_symbol(sym) and (uq.current_price is None or uq.data_quality == "MISSING"):
+        fb = await _try_ksa_fallback(request, sym, x_app_token)
+        if fb:
+            uq = _merge_fallback_into_quote(uq, fb)
+            fallback_used = True
 
-    eq = EnrichedQuote.from_unified(q)
-    quote_dict = _fix_quote_text_fields(_model_to_dict(eq))
+    uq = uq.finalize()
+    uq.name = _fix_mojibake(uq.name)
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
     if format == "quote":
-        quote_dict["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000)}
-        return quote_dict
+        out = _model_to_dict(EnrichedQuote.from_unified(uq))
+        out["_meta"] = {"elapsed_ms": elapsed_ms, "fallback_used": fallback_used}
+        return out
 
     headers = _resolve_headers(sheet_name)
-    payload = _build_row_payload(q, headers)
+    payload = _build_row_payload(uq, headers)
 
     if format == "row":
         return {
-            "symbol": payload["quote"].get("symbol", normalize_symbol(sym) or sym),
+            "symbol": payload["quote"].get("symbol", sym),
             "headers": payload["headers"],
             "row": payload["row"],
-            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+            "_meta": {"elapsed_ms": elapsed_ms, "fallback_used": fallback_used},
         }
 
     payload["sheet_name"] = sheet_name
-    payload["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000)}
+    payload["_meta"] = {"elapsed_ms": elapsed_ms, "fallback_used": fallback_used}
     return payload
-
 
 @router.post("/quotes")
 async def enriched_quotes(
@@ -477,7 +548,7 @@ async def enriched_quotes(
             "headers": headers,
             "rows": [] if format in ("rows", "both") else None,
             "quotes": [] if format in ("quotes", "both") else None,
-            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": False},
         }
 
     max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
@@ -502,8 +573,7 @@ async def enriched_quotes(
             if format in ("rows", "both"):
                 rows_out.append(eq.to_row(headers))
             if format in ("quotes", "both"):
-                quotes_out.append(_fix_quote_text_fields(_model_to_dict(eq)))
-
+                quotes_out.append(_model_to_dict(eq))
         resp: Dict[str, Any] = {
             "status": status,
             "error": error_msg,
@@ -512,20 +582,23 @@ async def enriched_quotes(
             "count": len(symbols),
             "symbols": symbols,
             "headers": headers,
-            "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
         }
         if format in ("rows", "both"):
             resp["rows"] = rows_out
         if format in ("quotes", "both"):
             resp["quotes"] = quotes_out
+        resp["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": False}
         return resp
 
     rows_out: List[List[Any]] = []
     quotes_out: List[Dict[str, Any]] = []
+    fallback_used_any = False
+
+    batch_timeout = _timeout_for_batch(symbols)
 
     for chunk in _chunk(symbols, batch_sz):
         try:
-            quotes = await _engine_get_quotes(eng, chunk)
+            quotes = await _engine_get_quotes(eng, chunk, batch_timeout)
         except Exception as exc:
             status = "partial"
             error_msg = (error_msg + " " if error_msg else "") + f"Batch error: {exc}"
@@ -534,12 +607,22 @@ async def enriched_quotes(
         m = {getattr(q, "symbol", "").upper(): q for q in (quotes or []) if getattr(q, "symbol", None)}
         for s in chunk:
             uq = m.get(s.upper()) or UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error="No data returned").finalize()
-            eq = EnrichedQuote.from_unified(uq)
 
+            # KSA fallback if missing
+            if is_ksa_symbol(s) and (uq.current_price is None or uq.data_quality == "MISSING"):
+                fb = await _try_ksa_fallback(request, s, x_app_token)
+                if fb:
+                    uq = _merge_fallback_into_quote(uq, fb)
+                    fallback_used_any = True
+
+            uq = uq.finalize()
+            uq.name = _fix_mojibake(uq.name)
+
+            eq = EnrichedQuote.from_unified(uq)
             if format in ("rows", "both"):
                 rows_out.append(eq.to_row(headers))
             if format in ("quotes", "both"):
-                quotes_out.append(_fix_quote_text_fields(_model_to_dict(eq)))
+                quotes_out.append(_model_to_dict(eq))
 
     resp: Dict[str, Any] = {
         "status": status,
@@ -549,14 +632,13 @@ async def enriched_quotes(
         "count": len(symbols),
         "symbols": symbols,
         "headers": headers,
-        "_meta": {"elapsed_ms": int((time.perf_counter() - t0) * 1000)},
     }
     if format in ("rows", "both"):
         resp["rows"] = rows_out
     if format in ("quotes", "both"):
         resp["quotes"] = quotes_out
 
+    resp["_meta"] = {"elapsed_ms": int((time.perf_counter() - t0) * 1000), "fallback_used": fallback_used_any}
     return resp
-
 
 __all__ = ["router"]
