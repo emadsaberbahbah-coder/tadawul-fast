@@ -48,17 +48,18 @@ FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 FINNHUB_PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
 
-# Argaam snapshot pages (KSA market tables are here; includes volume/value_traded already)
+# Argaam
 ARGAAM_PRICES_URLS = [
     "https://www.argaam.com/ar/company/companies-prices/3",
     "https://www.argaam.com/en/company/companies-prices/3",
 ]
-
-# OPTIONAL: volume page is often slower/flaky; keep as optional toggle
 ARGAAM_VOLUME_URLS = [
     "https://www.argaam.com/ar/company/companies-volume/14",
     "https://www.argaam.com/en/company/companies-volume/14",
 ]
+# Per-company detail (more fields: open/high/low/prev/value/marketcap/etc.)
+ARGAAM_COMPANY_OVERVIEW_AR = "https://www.argaam.com/ar/company/companyoverview/marketid/3/companyid/{companyid}"
+ARGAAM_COMPANY_OVERVIEW_EN = "https://www.argaam.com/en/company/companyoverview/marketid/3/companyid/{companyid}"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -148,16 +149,18 @@ def _safe_str(x: Any) -> Optional[str]:
 
 def _fix_mojibake(s: Optional[str]) -> Optional[str]:
     """
-    Fix common mojibake where UTF-8 was decoded as latin-1 (e.g. Ø§Ù...).
-    If it doesn't look mojibake, return as-is.
+    Fix common UTF-8->Latin1 mojibake (e.g. Ø§ÙØ±Ø§Ø¬Ø­Ù -> الراجحي).
+    Safe: returns original if it can't decode.
     """
-    if not s:
+    if not s or not isinstance(s, str):
         return s
-    if "Ø" in s or "Ù" in s or "Ã" in s:
-        try:
-            return s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore").strip() or s
-        except Exception:
-            return s
+    # Heuristic: if it contains typical mojibake markers, try latin1/cp1252 -> utf-8
+    if any(ch in s for ch in ("Ø", "Ù", "Ã", "Â", "�")):
+        for enc in ("latin1", "cp1252"):
+            try:
+                return s.encode(enc, errors="strict").decode("utf-8", errors="strict")
+            except Exception:
+                continue
     return s
 
 
@@ -212,6 +215,13 @@ def _safe_float(val: Any) -> Optional[float]:
         return f
     except Exception:
         return None
+
+
+def _pct_if_fraction(x: Any) -> Optional[float]:
+    v = _safe_float(x)
+    if v is None:
+        return None
+    return v * 100.0 if abs(v) <= 1.0 else v
 
 
 def normalize_symbol(raw: str) -> str:
@@ -317,24 +327,6 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def _clean_code_key(code: str) -> str:
-    """
-    Make KSA code matching resilient:
-    - translate Arabic digits
-    - strip spaces
-    - drop leading zeros safely
-    """
-    c = (code or "").strip().translate(_ARABIC_DIGITS)
-    if not c:
-        return c
-    if c.isdigit():
-        try:
-            return str(int(c))
-        except Exception:
-            return c.lstrip("0") or c
-    return c
-
-
 # =============================================================================
 # Data model (Pydantic v2) — aligned with 59-column schema
 # =============================================================================
@@ -430,6 +422,15 @@ class UnifiedQuote(BaseModel):
     error: Optional[str] = None
 
     def finalize(self) -> "UnifiedQuote":
+        # Fix text encoding issues globally (no matter the provider)
+        self.name = _fix_mojibake(self.name)
+        self.sector = _fix_mojibake(self.sector)
+        self.industry = _fix_mojibake(self.industry)
+        self.sub_sector = _fix_mojibake(self.sub_sector)
+        self.valuation_label = _fix_mojibake(self.valuation_label)
+        self.analyst_rating = _fix_mojibake(self.analyst_rating)
+        self.recommendation = _fix_mojibake(self.recommendation)
+
         if not self.last_updated_utc:
             self.last_updated_utc = _now_utc_iso()
         if not self.last_updated_riyadh:
@@ -470,13 +471,14 @@ class UnifiedQuote(BaseModel):
             ls = (math.log10(self.value_traded + 1.0) - 4.0) * 25.0
             self.liquidity_score = _safe_float(_clamp(ls, 0.0, 100.0))
 
-        # Quality
+        # Data-quality (KSA: require open/high/low/prev + volume to call FULL)
         if self.current_price is None:
             self.data_quality = "MISSING"
         else:
-            have_core = all(x is not None for x in (self.current_price, self.previous_close))
-            # KSA snapshot doesn't always provide day_high/day_low -> accept as PARTIAL
-            self.data_quality = "FULL" if have_core and (self.day_high is not None and self.day_low is not None) else "PARTIAL"
+            have_core = all(
+                x is not None for x in (self.current_price, self.previous_close, self.open, self.day_high, self.day_low, self.volume)
+            )
+            self.data_quality = "FULL" if have_core else "PARTIAL"
 
         if self.overall_score is None:
             self._calculate_simple_scores()
@@ -519,8 +521,9 @@ class DataEngine:
 
     KSA (.SR):
       1) Legacy KSA delegate if available (core.data_engine)
-      2) Argaam snapshot (HTML best-effort)  <-- improved mapping & speed
-      3) Optional yfinance last resort (often blocked/401)
+      2) Argaam market snapshot (fast)
+      3) Argaam per-company overview enrichment (fills open/high/low/prev/value/mcap/shares)
+      4) Optional yfinance last resort (often blocked/401)
 
     GLOBAL:
       provider order from settings/providers:
@@ -537,6 +540,7 @@ class DataEngine:
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
         max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
 
+        # Fine-grained timeout (connect/read/write/pool)
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
 
         self.client = httpx.AsyncClient(
@@ -545,41 +549,38 @@ class DataEngine:
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+                "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
             },
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
 
-        # Yahoo is often blocked in server environments; keep enabled but safe
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
 
-        # Argaam volume page is OPTIONAL (prices page already contains volume/value_traded)
-        self.argaam_use_volume_page = _get_bool(["ARGAAM_USE_VOLUME_PAGE", "argaam_use_volume_page"], False)
+        # Argaam detail enrichment
+        self.enable_argaam_detail = _get_bool(["ARGAAM_DETAIL_ENABLED", "enable_argaam_detail"], True)
+        self._argaam_detail_timeout_sec = _get_float(["ARGAAM_DETAIL_TIMEOUT_SEC"], 10.0)
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
-
-        # KSA snapshot TTL (slightly longer default for stability/speed)
-        snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 60.0)
+        snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 30.0)
+        detail_ttl = _get_float(["ARGAAM_DETAIL_TTL_SEC", "argaam_detail_ttl_sec"], 20.0)
 
         self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, quote_ttl))
         self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, cache_ttl * 10.0))
         self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, fund_ttl))
-        self.snapshot_cache: TTLCache = TTLCache(maxsize=80, ttl=max(15.0, snap_ttl))
+        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, snap_ttl))
+        self.detail_cache: TTLCache = TTLCache(maxsize=400, ttl=max(5.0, detail_ttl))
 
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
-        # Prevent stampede: one snapshot fetch at a time
-        self._snapshot_lock = asyncio.Lock()
-
         logger.info(
-            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs | argaam_volume_page=%s",
+            "DataEngine v%s init | providers=%s | yfinance=%s | argaam_detail=%s | timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
             self.enable_yfinance,
+            self.enable_argaam_detail,
             self._timeout_sec,
-            self.argaam_use_volume_page,
         )
 
     async def aclose(self) -> None:
@@ -652,7 +653,7 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        # 1) Prefer legacy KSA engine (if present)
+        # 1) Prefer legacy KSA engine
         try:
             from core import data_engine as legacy  # type: ignore
             if hasattr(legacy, "get_enriched_quote"):
@@ -661,36 +662,63 @@ class DataEngine:
                 if q.current_price is not None:
                     q.data_source = q.data_source or "legacy"
                     q.data_quality = "PARTIAL"
-                    return q
+                    return q.finalize()
         except Exception:
             pass
 
-        # 2) Argaam snapshot (FAST path for many symbols)
-        base = _clean_code_key(symbol.split(".", 1)[0].strip())
+        # 2) Argaam snapshot (fast)
+        base = symbol.split(".", 1)[0].strip()
         snap = await self._argaam_snapshot()
         row = snap.get(base)
-        if not row and base.isdigit():
-            # try raw base without int-normalization
-            row = snap.get(symbol.split(".", 1)[0].strip())
+
         if row:
-            return UnifiedQuote(
+            q = UnifiedQuote(
                 symbol=symbol,
                 name=_fix_mojibake(row.get("name")),
                 market="KSA",
                 currency="SAR",
                 current_price=row.get("price"),
-                previous_close=row.get("previous_close"),
                 price_change=row.get("change"),
                 percent_change=row.get("change_percent"),
-                high_52w=row.get("high_52w"),
-                low_52w=row.get("low_52w"),
                 volume=row.get("volume"),
                 value_traded=row.get("value_traded"),
-                data_source="argaam",
+                data_source="argaam_snapshot",
                 data_quality="PARTIAL",
-            ).finalize()
+            )
 
-        # 3) yfinance last resort (often blocked/401 in servers)
+            # 3) Per-company Argaam overview enrichment (fills open/high/low/prev/value/marketcap/shares)
+            companyid = row.get("companyid")
+            if self.enable_argaam_detail and companyid:
+                det = await self._argaam_company_detail(str(companyid))
+                if det:
+                    upd: Dict[str, Any] = {}
+                    # Only fill missing OR override clearly better fields (open/high/low/prev/value)
+                    for k in (
+                        "name",
+                        "current_price",
+                        "previous_close",
+                        "open",
+                        "day_high",
+                        "day_low",
+                        "volume",
+                        "value_traded",
+                        "market_cap",
+                        "shares_outstanding",
+                    ):
+                        v = det.get(k)
+                        if v is None:
+                            continue
+                        if getattr(q, k, None) is None or k in ("previous_close", "open", "day_high", "day_low", "value_traded", "market_cap", "shares_outstanding"):
+                            upd[k] = v
+
+                    if upd:
+                        q = q.model_copy(update=upd)
+                        q.data_source = "argaam_detail"
+                        q.data_quality = "PARTIAL"
+
+            return q.finalize()
+
+        # 4) yfinance last resort
         if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
             q = await self._fetch_yfinance(symbol, market="KSA")
             if q.current_price is not None:
@@ -740,7 +768,7 @@ class DataEngine:
             "symbol": symbol,
             "market": data.get("market") or market,
             "currency": data.get("currency") or currency,
-            "name": _fix_mojibake(_safe_str(data.get("name") or data.get("company_name"))),
+            "name": _fix_mojibake(data.get("name") or data.get("company_name")),
         }
 
         mapped["current_price"] = data.get("current_price") or data.get("last_price") or data.get("lastPrice") or data.get("price")
@@ -768,7 +796,6 @@ class DataEngine:
             "low_52w",
             "ma20",
             "ma50",
-            "value_traded",
         ):
             if k in data and data.get(k) is not None:
                 mapped[k] = data.get(k)
@@ -778,35 +805,132 @@ class DataEngine:
         q.error = data.get("error")
         return q
 
+    # -------------------------------------------------------------------------
+    # Argaam snapshot + detail
+    # -------------------------------------------------------------------------
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
         key = "argaam_snapshot_v3"
         cached = self.snapshot_cache.get(key)
-        if isinstance(cached, dict) and cached:
+        if isinstance(cached, dict):
             return cached
 
-        async with self._snapshot_lock:
-            cached2 = self.snapshot_cache.get(key)
-            if isinstance(cached2, dict) and cached2:
-                return cached2
+        merged: Dict[str, Dict[str, Any]] = {}
 
-            merged: Dict[str, Dict[str, Any]] = {}
+        prices_html = await self._http_get_first_text(ARGAAM_PRICES_URLS)
+        if prices_html:
+            part = self._parse_argaam_table(prices_html)
+            for k, v in part.items():
+                merged.setdefault(k, {}).update(v)
 
-            prices_html = await self._http_get_first_text(ARGAAM_PRICES_URLS)
-            if prices_html:
-                part = self._parse_argaam_table(prices_html)
-                for k, v in part.items():
-                    merged.setdefault(k, {}).update(v)
+        vol_html = await self._http_get_first_text(ARGAAM_VOLUME_URLS)
+        if vol_html:
+            part = self._parse_argaam_table(vol_html)
+            for k, v in part.items():
+                merged.setdefault(k, {}).update(v)
 
-            # OPTIONAL volume page (default OFF for speed/stability)
-            if self.argaam_use_volume_page:
-                vol_html = await self._http_get_first_text(ARGAAM_VOLUME_URLS)
-                if vol_html:
-                    part = self._parse_argaam_table(vol_html)
-                    for k, v in part.items():
-                        merged.setdefault(k, {}).update(v)
+        self.snapshot_cache[key] = merged
+        return merged
 
-            self.snapshot_cache[key] = merged
-            return merged
+    async def _argaam_company_detail(self, companyid: str) -> Dict[str, Any]:
+        """
+        Fetch per-company overview and parse open/high/low/prev/value/marketcap/shares.
+        Cached with short TTL (intraday).
+        """
+        cache_key = f"argaam_detail::{companyid}"
+        hit = self.detail_cache.get(cache_key)
+        if isinstance(hit, dict) and hit:
+            return hit
+
+        urls = [
+            ARGAAM_COMPANY_OVERVIEW_AR.format(companyid=companyid),
+            ARGAAM_COMPANY_OVERVIEW_EN.format(companyid=companyid),
+        ]
+        html = await self._http_get_first_text(urls)
+        if not html:
+            self.detail_cache[cache_key] = {}
+            return {}
+
+        det = self._parse_argaam_companyoverview(html)
+        self.detail_cache[cache_key] = det or {}
+        return det or {}
+
+    def _parse_argaam_companyoverview(self, html: str) -> Dict[str, Any]:
+        """
+        Best-effort parser using page text labels.
+        (Argaam shows key fields under 'أداء السهم' like:
+         آخر سعر / الافتتاح / الأعلى / الأدنى / الإغلاق السابق / حجم التداول / قيمة التداول / القيمة السوقية ...)
+        """
+        out: Dict[str, Any] = {}
+        if not BeautifulSoup or not html:
+            return out
+
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
+
+        txt = soup.get_text("\n", strip=True)
+        if not txt:
+            return out
+
+        # Name: first h1-ish header
+        try:
+            h1 = soup.find(["h1", "h2"])
+            if h1:
+                out["name"] = _fix_mojibake(_safe_str(h1.get_text(" ", strip=True)))
+        except Exception:
+            pass
+
+        def _grab(label_variants: Sequence[str]) -> Optional[float]:
+            for lab in label_variants:
+                m = re.search(rf"{re.escape(lab)}\s*([0-9٠-٩][0-9٠-٩\.,]+)", txt)
+                if m:
+                    return _safe_float(m.group(1))
+            return None
+
+        # Arabic + English label variants
+        last = _grab(["آخر سعر", "Last Price", "Last price", "Last"])
+        opn = _grab(["الافتتاح", "Open"])
+        low = _grab(["الأدنى", "Low"])
+        high = _grab(["الأعلى", "High"])
+        prev = _grab(["الإغلاق السابق", "Previous Close", "Prev Close", "Previous close"])
+        vol = _grab(["حجم التداول", "Volume"])
+        val = _grab(["قيمة التداول", "Value Traded", "Value traded", "Traded Value", "Value"])
+        mcap = _grab(["القيمة السوقية", "Market Cap", "Market cap"])
+        shares_m = None
+        # shares appear like: "عدد الأسهم ( مليون ريال ) 4,000.00"
+        try:
+            ms = re.findall(r"عدد الأسهم[^0-9٠-٩]*([0-9٠-٩][0-9٠-٩\.,]+)", txt)
+            if ms:
+                shares_m = _safe_float(ms[-1])
+        except Exception:
+            shares_m = None
+
+        if last is not None:
+            out["current_price"] = last
+        if prev is not None:
+            out["previous_close"] = prev
+        if opn is not None:
+            out["open"] = opn
+        if high is not None:
+            out["day_high"] = high
+        if low is not None:
+            out["day_low"] = low
+        if vol is not None:
+            out["volume"] = vol
+        if val is not None:
+            out["value_traded"] = val
+
+        # Argaam shows many KSA quantities in "million" units (shares/cap), so scale safely:
+        # if we found shares as a "million" number, convert to absolute shares
+        if shares_m is not None and shares_m > 0:
+            out["shares_outstanding"] = shares_m * 1_000_000.0
+
+        # market cap also appears aligned with shares-in-million display; scale to absolute SAR
+        if mcap is not None and mcap > 0:
+            out["market_cap"] = mcap * 1_000_000.0
+
+        return out
 
     async def _http_get_first_text(self, urls: Sequence[str]) -> Optional[str]:
         tasks = [self._http_get_text(u) for u in urls]
@@ -814,7 +938,7 @@ class DataEngine:
 
         def _looks_ok(txt: str) -> bool:
             t = txt.lower()
-            if len(txt) < 800:
+            if len(txt) < 500:
                 return False
             if "access denied" in t or "cloudflare" in t:
                 return False
@@ -830,10 +954,8 @@ class DataEngine:
 
     def _parse_argaam_table(self, html: str) -> Dict[str, Dict[str, Any]]:
         """
-        Argaam companies-prices/3 table (Saudi Tadawul) rows typically map like:
-          code, name, last, low_52w, high_52w, nominal, price, change, chg%, prev_close, volume, value_traded, trades
-
-        This parser uses the existing TR/TD walk (stable) but maps indices correctly.
+        Parse the market list tables and ALSO capture companyid (from row hyperlink),
+        so we can later enrich via per-company overview.
         """
         out: Dict[str, Dict[str, Any]] = {}
         if not BeautifulSoup or not html:
@@ -846,60 +968,68 @@ class DataEngine:
 
         for row in soup.find_all("tr"):
             cols = row.find_all("td")
-            if len(cols) < 6:
+            if len(cols) < 4:
                 continue
 
-            txt = [_fix_mojibake(_safe_str(c.get_text(" ", strip=True))) or "" for c in cols]
+            txt = [c.get_text(" ", strip=True) for c in cols]
 
             code = None
             code_idx = None
             for i in range(min(3, len(txt))):
                 cand = (txt[i] or "").strip().translate(_ARABIC_DIGITS)
                 if re.match(r"^\d{3,6}$", cand):
-                    code = _clean_code_key(cand)
+                    code = cand
                     code_idx = i
                     break
             if not code or code_idx is None:
                 continue
 
-            # name is the next cell (often short name)
-            name = txt[code_idx + 1].strip() if (code_idx + 1) < len(txt) else None
-            name = _fix_mojibake(_safe_str(name))
+            name = _fix_mojibake(_safe_str(txt[code_idx + 1])) if (code_idx + 1) < len(txt) else None
+
+            # Try to capture companyid from hyperlink in the row
+            companyid = None
+            try:
+                a = row.find("a", href=True)
+                if a and a.get("href"):
+                    href = str(a.get("href"))
+                    m = re.search(r"companyid/(\d+)", href, re.IGNORECASE)
+                    if m:
+                        companyid = m.group(1)
+            except Exception:
+                companyid = None
 
             nums: List[Optional[float]] = []
             for j in range(code_idx + 2, len(txt)):
                 nums.append(_safe_float(txt[j]))
 
-            # Expected indexes after code+name:
-            # 0 last, 1 low52, 2 high52, 3 nominal, 4 price, 5 change, 6 chg%, 7 prevClose, 8 vol, 9 value, 10 trades
-            last = nums[0] if len(nums) > 0 else None
-            low_52w = nums[1] if len(nums) > 1 else None
-            high_52w = nums[2] if len(nums) > 2 else None
+            price = nums[0] if len(nums) >= 1 else None
+            change = nums[1] if len(nums) >= 2 else None
+            chg_p = nums[2] if len(nums) >= 3 else None
 
-            # Nominal = nums[3] (ignored)
-            price = nums[4] if len(nums) > 4 else last
-            change = nums[5] if len(nums) > 5 else None
-            chg_p = nums[6] if len(nums) > 6 else None
-            prev_close = nums[7] if len(nums) > 7 else None
-            volume = nums[8] if len(nums) > 8 else None
-            value_traded = nums[9] if len(nums) > 9 else None
+            volume = None
+            value_traded = None
+            if len(txt) >= 8:
+                tail = [txt[-k] for k in range(1, min(6, len(txt)))]
+                tail_nums = [_safe_float(x) for x in tail]
+                for v in tail_nums:
+                    if v is not None and v > 0:
+                        volume = volume or v
 
-            # Fallbacks if Argaam shifts slightly
-            if price is None and last is not None:
-                price = last
-            if prev_close is None and price is not None and change is not None:
-                prev_close = _safe_float(price - change)
+                if price and volume:
+                    vt_guess = price * volume
+                    for v in tail_nums:
+                        if v is not None and vt_guess > 0 and (0.2 * vt_guess) <= v <= (5.0 * vt_guess):
+                            value_traded = v
+                            break
 
             out[code] = {
                 "name": name,
                 "price": price,
-                "previous_close": prev_close,
                 "change": change,
                 "change_percent": chg_p,
                 "volume": volume,
                 "value_traded": value_traded,
-                "high_52w": high_52w,
-                "low_52w": low_52w,
+                "companyid": companyid,
             }
 
         return out
@@ -1108,16 +1238,10 @@ class DataEngine:
         technicals = data.get("Technicals") or {}
         shares = data.get("SharesStats") or {}
 
-        def _pct_if_fraction(x: Any) -> Optional[float]:
-            v = _safe_float(x)
-            if v is None:
-                return None
-            return v * 100.0 if abs(v) <= 1.0 else v
-
         out = {
-            "name": _safe_str(general.get("Name")),
-            "sector": _safe_str(general.get("Sector")),
-            "industry": _safe_str(general.get("Industry")),
+            "name": _fix_mojibake(_safe_str(general.get("Name"))),
+            "sector": _fix_mojibake(_safe_str(general.get("Sector"))),
+            "industry": _fix_mojibake(_safe_str(general.get("Industry"))),
             "listing_date": _safe_str(general.get("IPODate") or general.get("ListingDate")),
             "market_cap": _safe_float(highlights.get("MarketCapitalization") or general.get("MarketCapitalization")),
             "shares_outstanding": _safe_float(shares.get("SharesOutstanding") or general.get("SharesOutstanding")),
@@ -1188,12 +1312,6 @@ class DataEngine:
 
         profile: Dict[str, Any] = {}
         metrics: Dict[str, Any] = {}
-
-        def _pct_if_fraction(x: Any) -> Optional[float]:
-            v = _safe_float(x)
-            if v is None:
-                return None
-            return v * 100.0 if abs(v) <= 1.0 else v
 
         if isinstance(prof_data, dict) and prof_data:
             profile = {
