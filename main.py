@@ -15,12 +15,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import JSONResponse
 
 # ------------------------------------------------------------
@@ -31,22 +33,40 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "info").upper(), format=LOG_FOR
 logger = logging.getLogger("main")
 
 # ------------------------------------------------------------
-# Settings loader (prefer config.py; env.py stays backward compatible)
+# Settings loader (prefer root config.py; fallback to core.config; env.py remains supported)
 # ------------------------------------------------------------
 settings = None
 env_mod = None
 
-try:
-    from config import get_settings  # root config.py
-    settings = get_settings()
-    # Align root logger with settings (if present)
+def _load_settings():
+    # 1) root config.py
     try:
-        logging.getLogger().setLevel(str(getattr(settings, "log_level", "info")).upper())
+        from config import get_settings  # type: ignore
+        return get_settings()
     except Exception:
         pass
-    logger.info("Settings loaded from config.py")
+
+    # 2) core.config
+    try:
+        from core.config import get_settings  # type: ignore
+        return get_settings()
+    except Exception:
+        pass
+
+    return None
+
+try:
+    settings = _load_settings()
+    if settings is not None:
+        try:
+            logging.getLogger().setLevel(str(getattr(settings, "log_level", "info")).upper())
+        except Exception:
+            pass
+        logger.info("Settings loaded successfully (config/core.config).")
+    else:
+        logger.warning("Settings not available (config/core.config). Falling back to env.py / OS env.")
 except Exception as e:
-    logger.warning("Settings loader not available (config.py). Falling back to env.py / OS env. Error: %s", e)
+    logger.warning("Settings loader failed. Falling back to env.py / OS env. Error: %s", e)
 
 try:
     import env as env_mod  # backward-compatible exports
@@ -57,7 +77,7 @@ except Exception:
 def _get(name: str, default: Any = None) -> Any:
     """
     Lookup order:
-      1) settings.<name> (pydantic settings object)
+      1) settings.<name>
       2) env.<NAME> export (legacy constants)
       3) os.getenv(NAME)
     """
@@ -88,6 +108,7 @@ def _parse_providers(v: Any) -> List[str]:
 
 
 def _mount_router(app_: FastAPI, module_path: str, attr: str = "router") -> None:
+    """Defensive router mounting: never crash app startup if a module is missing."""
     try:
         mod = import_module(module_path)
         router = getattr(mod, attr)
@@ -98,7 +119,7 @@ def _mount_router(app_: FastAPI, module_path: str, attr: str = "router") -> None
 
 
 def _cors_allow_origins() -> List[str]:
-    # Prefer config.py computed list if available
+    # Prefer settings.cors_origins_list if available
     try:
         if settings is not None and hasattr(settings, "cors_origins_list"):
             lst = getattr(settings, "cors_origins_list")
@@ -142,10 +163,22 @@ def create_app() -> FastAPI:
     app_.state.app_env = str(app_env)
 
     # ------------------------------------------------------------
+    # Middleware: GZip + Request ID
+    # ------------------------------------------------------------
+    app_.add_middleware(GZipMiddleware, minimum_size=800)
+
+    @app_.middleware("http")
+    async def add_request_id(request: Request, call_next):  # noqa: ANN001
+        rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = rid
+        resp = await call_next(request)
+        resp.headers["X-Request-ID"] = rid
+        return resp
+
+    # ------------------------------------------------------------
     # CORS
     # ------------------------------------------------------------
     allow_origins = _cors_allow_origins()
-
     app_.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins if allow_origins else [],
@@ -153,6 +186,21 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ------------------------------------------------------------
+    # Global exception handler (safe JSON)
+    # ------------------------------------------------------------
+    @app_.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        rid = getattr(getattr(request, "state", None), "request_id", None)
+        logger.exception("Unhandled exception (request_id=%s): %s", rid, exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal server error",
+                "request_id": rid,
+            },
+        )
 
     # ------------------------------------------------------------
     # SlowAPI rate limiting (optional, defensive)
@@ -168,8 +216,9 @@ def create_app() -> FastAPI:
         app_.add_middleware(SlowAPIMiddleware)
 
         @app_.exception_handler(RateLimitExceeded)
-        async def _rate_limit_handler(request, exc):  # noqa: ANN001
-            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+        async def _rate_limit_handler(request: Request, exc):  # noqa: ANN001
+            rid = getattr(getattr(request, "state", None), "request_id", None)
+            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded", "request_id": rid})
 
         logger.info("SlowAPI limiter enabled (default %s).", _rate_limit_default())
     except Exception as e:
@@ -181,22 +230,53 @@ def create_app() -> FastAPI:
     _mount_router(app_, "routes.enriched_quote")
     _mount_router(app_, "routes.ai_analysis")
     _mount_router(app_, "routes.advanced_analysis")
+    _mount_router(app_, "routes.price_history")  # NEW
     _mount_router(app_, "routes_argaam")
     _mount_router(app_, "legacy_service")
+
+    # ------------------------------------------------------------
+    # Engine bootstrap (optional but recommended)
+    # - Allows routes to reuse app.state.engine (faster + consistent)
+    # ------------------------------------------------------------
+    @app_.on_event("startup")
+    async def _startup():  # noqa: ANN001
+        # Initialize DataEngine once (if available)
+        try:
+            from core.data_engine_v2 import DataEngine  # type: ignore
+
+            app_.state.engine = DataEngine()
+            logger.info("[startup] DataEngine initialized and stored in app.state.engine")
+        except Exception as e:
+            app_.state.engine = None
+            logger.warning("[startup] DataEngine not initialized: %s", e)
+
+        # Initialize history store once (if available)
+        try:
+            from core.price_history_store import get_price_history_store  # type: ignore
+
+            app_.state.price_history_store = get_price_history_store()
+            logger.info("[startup] PriceHistoryStore initialized and stored in app.state.price_history_store")
+        except Exception as e:
+            app_.state.price_history_store = None
+            logger.warning("[startup] PriceHistoryStore not initialized: %s", e)
+
+        logger.info("[startup] Completed.")
 
     # ------------------------------------------------------------
     # System endpoints
     # ------------------------------------------------------------
     @app_.api_route("/", methods=["GET", "HEAD"], tags=["system"])
     async def root():
-        return {"status": "ok", "app": app_.title, "version": app_.version, "env": app_.state.app_env}
+        return {
+            "status": "ok",
+            "app": app_.title,
+            "version": app_.version,
+            "env": app_.state.app_env,
+        }
 
     @app_.get("/health", tags=["system"])
     async def health():
-        enabled = []
-        ksa = []
-
-        # Prefer config.py computed lists
+        # Prefer config.py computed lists if available
         try:
             enabled = list(getattr(settings, "enabled_providers", [])) if settings is not None else []
         except Exception:
@@ -207,20 +287,22 @@ def create_app() -> FastAPI:
         except Exception:
             ksa = _parse_providers(_get("KSA_PROVIDERS", ""))
 
-        engine = _get("ENGINE", "DataEngineV2")
+        engine_name = _get("ENGINE", "DataEngineV2")
 
         return {
             "status": "ok",
             "app": app_.title,
             "version": app_.version,
             "env": app_.state.app_env,
-            "engine": engine,
+            "engine": engine_name,
+            "engine_ready": bool(getattr(app_.state, "engine", None)),
+            "history_store_ready": bool(getattr(app_.state, "price_history_store", None)),
             "providers": enabled,
             "ksa_providers": ksa,
             "time_utc": datetime.now(timezone.utc).isoformat(),
         }
 
-    # Startup banner
+    # Startup banner (log-only)
     try:
         enabled = list(getattr(settings, "enabled_providers", [])) if settings is not None else []
     except Exception:
