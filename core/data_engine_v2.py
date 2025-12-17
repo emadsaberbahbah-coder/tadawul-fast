@@ -49,13 +49,10 @@ FINNHUB_PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
 
 # Argaam (best-effort; HTML can change)
+# IMPORTANT: This page already includes price + change + % + prev close + volume + value + deals
 ARGAAM_PRICES_URLS = [
     "https://www.argaam.com/ar/company/companies-prices/3",
     "https://www.argaam.com/en/company/companies-prices/3",
-]
-ARGAAM_VOLUME_URLS = [
-    "https://www.argaam.com/ar/company/companies-volume/14",
-    "https://www.argaam.com/en/company/companies-volume/14",
 ]
 
 USER_AGENT = (
@@ -137,11 +134,30 @@ def _get_float(names: Sequence[str], default: float) -> float:
         return default
 
 
+def _fix_utf8_mojibake(s: str) -> str:
+    """
+    Fix common mojibake like: 'Ø§Ù...' caused by UTF-8 bytes decoded as latin1.
+    Safe: if it fails, returns original.
+    """
+    if not s:
+        return s
+    # Heuristic markers
+    if "Ø" in s or "Ù" in s:
+        try:
+            return s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            return s
+    return s
+
+
 def _safe_str(x: Any) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip()
-    return s if s else None
+    if not s:
+        return None
+    s2 = _fix_utf8_mojibake(s)
+    return s2.strip() if s2.strip() else None
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -173,7 +189,7 @@ def _safe_float(val: Any) -> Optional[float]:
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
 
-        s = s.replace("%", "").strip()
+        s = s.replace("%", "").replace("٪", "").strip()
         s = s.replace(",", "")
 
         mult = 1.0
@@ -289,29 +305,6 @@ def _get_enabled_providers() -> List[str]:
         return [p.strip().lower() for p in env_csv.split(",") if p.strip()]
 
     return ["finnhub", "fmp", "eodhd"]
-
-
-def _get_ksa_providers() -> List[str]:
-    """
-    Reads KSA provider order from (first match wins):
-      - settings.ksa_providers_list (list)  [optional]
-      - settings.ksa_providers (csv)
-      - env KSA_PROVIDERS (csv)
-    Defaults to: tadawul, argaam (but note: tadawul may not be implemented).
-    """
-    pl = getattr(settings, "ksa_providers_list", None)
-    if isinstance(pl, list) and pl:
-        return [str(x).strip().lower() for x in pl if str(x).strip()]
-
-    p_csv = getattr(settings, "ksa_providers", None)
-    if isinstance(p_csv, str) and p_csv.strip():
-        return [p.strip().lower() for p in p_csv.split(",") if p.strip()]
-
-    env_csv = os.getenv("KSA_PROVIDERS") or ""
-    if env_csv.strip():
-        return [p.strip().lower() for p in env_csv.split(",") if p.strip()]
-
-    return ["tadawul", "argaam"]
 
 
 def _get_key(*names: str) -> Optional[str]:
@@ -510,15 +503,9 @@ class DataEngine:
     """
     Async multi-provider engine with KSA-safe routing.
 
-    IMPORTANT:
-    - KSA providers often require scraping / can be blocked.
-    - This engine enforces tight KSA time budgets to avoid request hangs.
-    - Legacy KSA delegate is OFF by default to prevent recursion loops.
-
     KSA (.SR):
-      provider order from settings.ksa_providers / env KSA_PROVIDERS:
-        - argaam  (HTML snapshot; best-effort)
-        - (optional) yfinance last resort (often blocked/401)
+      1) Argaam snapshot (HTML best-effort)
+      2) Optional yfinance last resort (often blocked/401)
 
     GLOBAL:
       provider order from settings/providers:
@@ -530,28 +517,11 @@ class DataEngine:
 
     def __init__(self) -> None:
         self.enabled_providers: List[str] = _get_enabled_providers()
-        self.ksa_providers: List[str] = _get_ksa_providers()
-
-        # Hard KSA time budgets (so /v1/enriched/quote doesn't hang)
-        self.ksa_max_total_sec: float = _get_float(["KSA_MAX_TOTAL_SEC", "KSA_TIMEOUT_SEC"], 18.0)
-
-        # Argaam tuning (Render-friendly)
-        self.argaam_timeout_sec: float = _get_float(["ARGAAM_HTTP_TIMEOUT_SEC", "ARGAAM_TIMEOUT_SEC"], 8.0)
-        self.argaam_retries: int = _get_int(["ARGAAM_HTTP_RETRIES"], 1)
-        self.argaam_fetch_volume: bool = _get_bool(["ARGAAM_FETCH_VOLUME"], True)
-
-        # Optional (OFF by default): calling core.data_engine from v2 can recurse
-        self.enable_legacy_ksa_delegate: bool = _get_bool(["ENABLE_LEGACY_KSA_DELEGATE"], False)
-
-        # yfinance is frequently blocked; keep GLOBAL allowed, KSA OFF by default
-        self.enable_yfinance: bool = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
-        self.enable_yfinance_ksa: bool = _get_bool(["KSA_ENABLE_YFINANCE"], False)
 
         self._timeout_sec: float = _get_float(["HTTP_TIMEOUT_SEC", "http_timeout_sec", "HTTP_TIMEOUT"], 25.0)
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
         max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
 
-        # Fine-grained timeout (connect/read/write/pool)
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
 
         self.client = httpx.AsyncClient(
@@ -564,6 +534,8 @@ class DataEngine:
             },
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
+
+        self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
@@ -578,15 +550,11 @@ class DataEngine:
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | ksa_providers=%s | yfinance(global)=%s yfinance(ksa)=%s | "
-            "ksa_budget=%.1fs argaam_timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
-            ",".join(self.ksa_providers) if self.ksa_providers else "(none)",
             self.enable_yfinance,
-            self.enable_yfinance_ksa,
-            self.ksa_max_total_sec,
-            self.argaam_timeout_sec,
+            self._timeout_sec,
         )
 
     async def aclose(self) -> None:
@@ -626,8 +594,6 @@ class DataEngine:
             self.stale_cache[s] = q
             return q
 
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             logger.exception("get_quote failed for %s", s, exc_info=exc)
             if stale is not None:
@@ -661,218 +627,114 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        """
-        KSA fetch is budgeted to avoid timeouts. If providers are slow/blocked,
-        return MISSING quickly rather than hanging.
-        """
+        # NOTE:
+        # We intentionally DO NOT call core.data_engine legacy adapter here
+        # because the legacy adapter delegates back to v2 (infinite recursion).
+
         base = symbol.split(".", 1)[0].strip()
+        snap = await self._argaam_snapshot()
+        row = snap.get(base)
 
-        # 0) Optional legacy delegate (OFF by default; can recurse if legacy uses v2)
-        if self.enable_legacy_ksa_delegate:
-            try:
-                from core import data_engine as legacy  # type: ignore
+        if row:
+            # Prefer true "price" field; fallback to "last"
+            price = row.get("price") if row.get("price") is not None else row.get("last")
 
-                if hasattr(legacy, "get_enriched_quote"):
-                    raw = await asyncio.wait_for(
-                        legacy.get_enriched_quote(symbol),  # type: ignore
-                        timeout=min(8.0, self.ksa_max_total_sec),
-                    )
-                    q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
-                    if q.current_price is not None:
-                        q.data_source = q.data_source or "legacy"
-                        q.data_quality = "PARTIAL"
-                        return q
-            except asyncio.TimeoutError:
-                pass
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            return UnifiedQuote(
+                symbol=symbol,
+                name=row.get("name"),
+                market="KSA",
+                currency="SAR",
+                current_price=price,
+                previous_close=row.get("previous_close"),
+                price_change=row.get("change"),
+                percent_change=row.get("change_percent"),
+                volume=row.get("volume"),
+                value_traded=row.get("value_traded"),
+                high_52w=row.get("high_52w"),
+                low_52w=row.get("low_52w"),
+                data_source="argaam",
+                data_quality="PARTIAL" if price is not None else "MISSING",
+                error=None if price is not None else "Argaam row found but price missing",
+            )
 
-        errors: List[str] = []
-        for prov in (self.ksa_providers or ["argaam"]):
-            p = (prov or "").strip().lower()
-            if not p:
-                continue
-
-            if p == "argaam":
-                try:
-                    snap = await asyncio.wait_for(self._argaam_snapshot(), timeout=self.ksa_max_total_sec)
-                    row = snap.get(base)
-                    if row:
-                        return UnifiedQuote(
-                            symbol=symbol,
-                            name=row.get("name"),
-                            market="KSA",
-                            currency="SAR",
-                            current_price=row.get("price"),
-                            price_change=row.get("change"),
-                            percent_change=row.get("change_percent"),
-                            volume=row.get("volume"),
-                            value_traded=row.get("value_traded"),
-                            data_source="argaam",
-                            data_quality="PARTIAL",
-                        )
-                    errors.append("argaam:no_row")
-                except asyncio.TimeoutError:
-                    errors.append(f"argaam:timeout({self.ksa_max_total_sec:.0f}s)")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    errors.append(f"argaam:error({exc})")
-
-            elif p in {"yfinance", "yahoo"}:
-                if self.enable_yfinance_ksa and self.enable_yfinance and yf:
-                    try:
-                        q = await asyncio.wait_for(
-                            self._fetch_yfinance(symbol, market="KSA"),
-                            timeout=min(10.0, self.ksa_max_total_sec),
-                        )
-                        if q.current_price is not None:
-                            q.data_source = q.data_source or "yfinance"
-                            q.data_quality = "PARTIAL"
-                            return q
-                        errors.append(f"yfinance:{q.error or 'no_price'}")
-                    except asyncio.TimeoutError:
-                        errors.append("yfinance:timeout")
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        errors.append(f"yfinance:error({exc})")
-                else:
-                    errors.append("yfinance:disabled_or_missing")
-
-            elif p == "tadawul":
-                # Placeholder: declared in config/health, but not implemented in this engine.
-                errors.append("tadawul:not_implemented")
+        # yfinance last resort
+        if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
+            q = await self._fetch_yfinance(symbol, market="KSA")
+            if q.current_price is not None:
+                q.data_source = q.data_source or "yfinance"
+                q.data_quality = "PARTIAL"
+                return q
 
         return UnifiedQuote(
             symbol=symbol,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="No KSA provider data. " + (" | ".join(errors) if errors else "no_ksa_providers_enabled"),
+            error="No KSA provider data (argaam+yfinance failed)",
         ).finalize()
 
-    def _coerce_to_unified_quote(
-        self,
-        symbol: str,
-        raw: Any,
-        market: str,
-        currency: str,
-        source: str,
-    ) -> UnifiedQuote:
-        data: Dict[str, Any] = {}
+    # -------------------------------------------------------------------------
+    # Argaam snapshot
+    # -------------------------------------------------------------------------
+    def _clean_argaam_cell(self, s: str) -> str:
+        s = (s or "").strip()
+        if not s:
+            return ""
+        s = _fix_utf8_mojibake(s)
+        s = s.translate(_ARABIC_DIGITS)
+        s = s.replace("٬", ",").replace("٫", ".").replace("٪", "%")
+        s = re.sub(r"\s+", " ", s).strip()
 
-        if raw is None:
-            data = {}
-        elif isinstance(raw, UnifiedQuote):
-            return raw
-        elif isinstance(raw, dict):
-            data = dict(raw)
-        else:
-            if hasattr(raw, "model_dump"):
-                try:
-                    data = raw.model_dump()  # type: ignore
-                except Exception:
-                    data = {}
-            elif hasattr(raw, "dict"):
-                try:
-                    data = raw.dict()  # type: ignore
-                except Exception:
-                    data = {}
-            else:
-                data = {}
+        def _fix_paren(m: re.Match) -> str:
+            inner = (m.group(1) or "").replace(" ", "")
+            return f"({inner})"
 
-        mapped: Dict[str, Any] = {
-            "symbol": symbol,
-            "market": data.get("market") or market,
-            "currency": data.get("currency") or currency,
-            "name": data.get("name") or data.get("company_name"),
-        }
+        # normalize spaces inside parentheses, e.g. "(0.31 %)" -> "(0.31%)"
+        s = re.sub(r"\(\s*([^)]+?)\s*\)", _fix_paren, s)
+        return s
 
-        mapped["current_price"] = (
-            data.get("current_price")
-            or data.get("last_price")
-            or data.get("lastPrice")
-            or data.get("price")
-        )
-        mapped["previous_close"] = data.get("previous_close") or data.get("previousClose")
-        mapped["open"] = data.get("open")
-        mapped["day_high"] = data.get("day_high") or data.get("high")
-        mapped["day_low"] = data.get("day_low") or data.get("low")
-        mapped["volume"] = data.get("volume")
+    def _cell_numbers(self, cell_text: str) -> List[float]:
+        """
+        Extract numbers from a cell, preserving order.
+        Works for:
+          - "87.80 113.00"
+          - "(0.31%)"
+          - "506,636"
+        """
+        t = self._clean_argaam_cell(cell_text)
+        if not t:
+            return []
 
-        mapped["price_change"] = data.get("price_change") or data.get("change")
-        mapped["percent_change"] = (
-            data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
-        )
-
-        for k in (
-            "market_cap",
-            "shares_outstanding",
-            "eps_ttm",
-            "pe_ttm",
-            "pb",
-            "dividend_yield",
-            "beta",
-            "roe",
-            "roa",
-            "net_margin",
-            "high_52w",
-            "low_52w",
-            "ma20",
-            "ma50",
-        ):
-            if k in data and data.get(k) is not None:
-                mapped[k] = data.get(k)
-
-        q = UnifiedQuote(**{k: v for k, v in mapped.items() if v is not None})
-        q.data_source = data.get("data_source") or source
-        q.error = data.get("error")
-        return q
+        # Capture either "(...)" blocks or normal numeric tokens (optionally with %)
+        tokens = re.findall(r"\([^)]*\)|[-+]?\d[\d,]*\.?\d*(?:%?)", t)
+        out: List[float] = []
+        for tok in tokens:
+            v = _safe_float(tok)
+            if v is not None:
+                out.append(v)
+        return out
 
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        key = "argaam_snapshot_v2"
+        key = "argaam_snapshot_prices_v3"
         cached = self.snapshot_cache.get(key)
-        if isinstance(cached, dict) and cached:
+        if isinstance(cached, dict):
             return cached
 
         merged: Dict[str, Dict[str, Any]] = {}
+        html = await self._http_get_first_text(ARGAAM_PRICES_URLS)
+        if html:
+            merged = self._parse_argaam_table(html)
 
-        prices_html = await self._http_get_first_text(
-            ARGAAM_PRICES_URLS, timeout_sec=self.argaam_timeout_sec, retries=self.argaam_retries
-        )
-        if prices_html:
-            part = self._parse_argaam_table(prices_html)
-            for k, v in part.items():
-                merged.setdefault(k, {}).update(v)
+        self.snapshot_cache[key] = merged
+        return merged
 
-        if self.argaam_fetch_volume:
-            vol_html = await self._http_get_first_text(
-                ARGAAM_VOLUME_URLS, timeout_sec=self.argaam_timeout_sec, retries=self.argaam_retries
-            )
-            if vol_html:
-                part = self._parse_argaam_table(vol_html)
-                for k, v in part.items():
-                    merged.setdefault(k, {}).update(v)
-
-        if merged:
-            self.snapshot_cache[key] = merged
-            return merged
-
-        self.snapshot_cache[key] = {}
-        return {}
-
-    async def _http_get_first_text(
-        self, urls: Sequence[str], timeout_sec: Optional[float] = None, retries: Optional[int] = None
-    ) -> Optional[str]:
-        tasks = [self._http_get_text(u, timeout_sec=timeout_sec, retries=retries) for u in urls]
+    async def _http_get_first_text(self, urls: Sequence[str]) -> Optional[str]:
+        tasks = [self._http_get_text(u) for u in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         def _looks_ok(txt: str) -> bool:
             t = txt.lower()
-            if len(txt) < 500:
+            if len(txt) < 800:
                 return False
             if "access denied" in t or "cloudflare" in t:
                 return False
@@ -887,6 +749,18 @@ class DataEngine:
         return None
 
     def _parse_argaam_table(self, html: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Maps Argaam row to:
+          - last, low_52w, high_52w
+          - par_value
+          - price, change, change_percent, previous_close
+          - volume, value_traded, deals
+
+        The page often contains line breaks inside <td>.
+        We extract numeric sequences and map by shape:
+          A) With last + 52w: [last, low52, high52, par, price, chg, chg%, prev, vol, val, deals]
+          B) Without last + 52w: [par, price, chg, chg%, prev, vol, val, deals]
+        """
         out: Dict[str, Dict[str, Any]] = {}
         if not BeautifulSoup or not html:
             return out
@@ -902,11 +776,15 @@ class DataEngine:
                 continue
 
             txt = [c.get_text(" ", strip=True) for c in cols]
+            if not txt:
+                continue
 
+            # Find symbol code within first few cells
             code = None
             code_idx = None
-            for i in range(min(3, len(txt))):
+            for i in range(min(6, len(txt))):
                 cand = (txt[i] or "").strip().translate(_ARABIC_DIGITS)
+                cand = re.sub(r"\D", "", cand)
                 if re.match(r"^\d{3,6}$", cand):
                     code = cand
                     code_idx = i
@@ -914,39 +792,57 @@ class DataEngine:
             if not code or code_idx is None:
                 continue
 
-            name = _safe_str(txt[code_idx + 1]) if (code_idx + 1) < len(txt) else None
+            name = None
+            if (code_idx + 1) < len(txt):
+                name = _safe_str(txt[code_idx + 1])
 
-            nums: List[Optional[float]] = []
+            # Collect numbers in order from remaining cells
+            nums: List[float] = []
             for j in range(code_idx + 2, len(txt)):
-                nums.append(_safe_float(txt[j]))
+                nums.extend(self._cell_numbers(txt[j]))
 
-            price = nums[0] if len(nums) >= 1 else None
-            change = nums[1] if len(nums) >= 2 else None
-            chg_p = nums[2] if len(nums) >= 3 else None
+            last = low52 = high52 = par_value = price = chg = chg_p = prev_close = vol = val = deals = None
 
-            volume = None
-            value_traded = None
-            if len(txt) >= 8:
-                tail = [txt[-k] for k in range(1, min(6, len(txt)))]
-                tail_nums = [_safe_float(x) for x in tail]
-                for v in tail_nums:
-                    if v is not None and v > 0:
-                        volume = volume or v
-
-                if price and volume:
-                    vt_guess = price * volume
-                    for v in tail_nums:
-                        if v is not None and vt_guess > 0 and (0.2 * vt_guess) <= v <= (5.0 * vt_guess):
-                            value_traded = v
-                            break
+            if len(nums) >= 11:
+                # [last, low52, high52, par, price, chg, chg%, prev, vol, val, deals]
+                last = nums[0]
+                low52 = nums[1]
+                high52 = nums[2]
+                par_value = nums[3]
+                price = nums[4]
+                chg = nums[5]
+                chg_p = nums[6]
+                prev_close = nums[7]
+                vol = nums[8]
+                val = nums[9]
+                deals = nums[10]
+            elif len(nums) >= 8:
+                # [par, price, chg, chg%, prev, vol, val, deals]
+                par_value = nums[0]
+                price = nums[1]
+                chg = nums[2]
+                chg_p = nums[3]
+                prev_close = nums[4]
+                vol = nums[5]
+                val = nums[6]
+                deals = nums[7]
+            else:
+                # Too little data; skip
+                continue
 
             out[code] = {
                 "name": name,
-                "price": price,
-                "change": change,
-                "change_percent": chg_p,
-                "volume": volume,
-                "value_traded": value_traded,
+                "last": _safe_float(last),
+                "low_52w": _safe_float(low52),
+                "high_52w": _safe_float(high52),
+                "par_value": _safe_float(par_value),
+                "price": _safe_float(price),
+                "change": _safe_float(chg),
+                "change_percent": _safe_float(chg_p),
+                "previous_close": _safe_float(prev_close),
+                "volume": _safe_float(vol),
+                "value_traded": _safe_float(val),
+                "deals": _safe_float(deals),
             }
 
         return out
@@ -956,11 +852,7 @@ class DataEngine:
     # -------------------------------------------------------------------------
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
         if any(ch in symbol for ch in ("=", "^")):
-            if (
-                self.enable_yfinance
-                and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers))
-                and yf
-            ):
+            if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yfinance"
@@ -1064,53 +956,40 @@ class DataEngine:
         ).finalize()
 
     # -------------------------------------------------------------------------
-    # HTTP helpers (with light retry) - cancellation safe
+    # HTTP helpers (with light retry)
     # -------------------------------------------------------------------------
-    async def _http_get_text(
-        self,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout_sec: Optional[float] = None,
-        retries: Optional[int] = None,
-    ) -> Optional[str]:
-        max_tries = retries if retries is not None else 3
-        max_tries = max(1, int(max_tries))
-
-        for attempt in range(max_tries):
+    async def _http_get_text(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        for attempt in range(3):
             try:
-                r = await self.client.get(url, params=params, timeout=timeout_sec)
+                r = await self.client.get(url, params=params)
                 if r.status_code in (429,) or 500 <= r.status_code < 600:
-                    if attempt < (max_tries - 1):
+                    if attempt < 2:
                         await asyncio.sleep(0.25 + random.random() * 0.35)
                         continue
                     return None
                 if r.status_code >= 400:
                     return None
+
+                ct = (r.headers.get("content-type") or "").lower()
+                # Argaam HTML is UTF-8; force decode to avoid mojibake
+                if "argaam.com" in url or "text/html" in ct:
+                    return r.content.decode("utf-8", errors="ignore")
                 return r.text
-            except asyncio.CancelledError:
-                raise
             except Exception:
-                if attempt < (max_tries - 1):
+                if attempt < 2:
                     await asyncio.sleep(0.25 + random.random() * 0.35)
                     continue
                 return None
         return None
 
     async def _http_get_json(
-        self,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout_sec: Optional[float] = None,
-        retries: Optional[int] = None,
+        self, url: str, params: Optional[Dict[str, Any]] = None
     ) -> Optional[Union[Dict[str, Any], List[Any]]]:
-        max_tries = retries if retries is not None else 3
-        max_tries = max(1, int(max_tries))
-
-        for attempt in range(max_tries):
+        for attempt in range(3):
             try:
-                r = await self.client.get(url, params=params, timeout=timeout_sec)
+                r = await self.client.get(url, params=params)
                 if r.status_code in (429,) or 500 <= r.status_code < 600:
-                    if attempt < (max_tries - 1):
+                    if attempt < 2:
                         await asyncio.sleep(0.25 + random.random() * 0.35)
                         continue
                     return None
@@ -1120,10 +999,8 @@ class DataEngine:
                     return r.json()
                 except Exception:
                     return None
-            except asyncio.CancelledError:
-                raise
             except Exception:
-                if attempt < (max_tries - 1):
+                if attempt < 2:
                     await asyncio.sleep(0.25 + random.random() * 0.35)
                     continue
                 return None
@@ -1156,8 +1033,6 @@ class DataEngine:
                 data_source="eodhd",
                 data_quality="PARTIAL",
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             dt = int((time.perf_counter() - t0) * 1000)
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"EODHD error ({dt}ms): {exc}")
@@ -1234,14 +1109,10 @@ class DataEngine:
                 data_source="finnhub",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"Finnhub error: {exc}")
 
-    async def _fetch_finnhub_profile_and_metrics(
-        self, symbol: str, api_key: str
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def _fetch_finnhub_profile_and_metrics(self, symbol: str, api_key: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         sym = _finnhub_symbol(symbol)
         cache_key = f"finnhub_profile_metrics::{sym}"
         hit = self.fund_cache.get(cache_key)
@@ -1333,8 +1204,6 @@ class DataEngine:
                 data_source="fmp",
                 data_quality="PARTIAL",
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"FMP error: {exc}")
 
@@ -1407,8 +1276,6 @@ class DataEngine:
                 data_source="yfinance",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
             )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             msg = str(exc)
             if "unauthorized" in msg.lower() or "401" in msg:
