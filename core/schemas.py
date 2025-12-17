@@ -2,21 +2,24 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEETS SCHEMAS + HEADERS – v3.0.0 (PROD SAFE)
+CANONICAL SHEETS SCHEMAS + HEADERS – v3.1.0 (PROD SAFE)
 
 Purpose
-- Single source of truth for the canonical 59-column quote schema.
-- Provide get_headers_for_sheet(sheet_name) used by:
+- Single source of truth for sheet headers used by:
     - routes/enriched_quote.py
     - routes/ai_analysis.py
     - routes/advanced_analysis.py
     - Google Apps Script sheet builders
 - Provide shared request models (BatchProcessRequest) used by routers.
 
-Design rules
-- Import-safe: no DataEngine imports, no heavy dependencies.
-- Defensive: always returns a valid header list (never raises).
-- Stable: DEFAULT_HEADERS_59 order must not change lightly.
+Key update (v3.1.0)
+- Keep DEFAULT_HEADERS_59 unchanged for backward compatibility (global/canonical).
+- Introduce a KSA_TADAWUL_HEADERS_52 "future-looking" schema designed to minimize
+  missing columns by relying on:
+    • current market data (Argaam/Tadawul/etc.)
+    • computed metrics (ROI horizons, 52W stats, scores)
+    • master data (Company Name/Sector/Industry)
+- get_headers_for_sheet(sheet_name) returns the correct list based on sheet.
 """
 
 from __future__ import annotations
@@ -33,11 +36,11 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.0.0"
+SCHEMAS_VERSION = "3.1.0"
 
 
 # =============================================================================
-# Canonical 59-column schema (SOURCE OF TRUTH)
+# Canonical 59-column schema (SOURCE OF TRUTH – DO NOT BREAK)
 # =============================================================================
 
 DEFAULT_HEADERS_59: List[str] = [
@@ -117,6 +120,81 @@ if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
 
 
 # =============================================================================
+# KSA Tadawul schema (future-looking, minimal-missing)
+# =============================================================================
+# Notes:
+# - Company Name / Sector / Industry: should be filled from your master table.
+# - ROI / 52W / Health/Rank/Expected ROI: computed by backend (history + scoring).
+# - We intentionally remove rarely-available fields (e.g., Free Float Market Cap,
+#   Avg Volume 30D, etc.) unless you later prove stable capture.
+
+KSA_TADAWUL_HEADERS_52: List[str] = [
+    # Identity (master-driven, stable)
+    "Symbol",
+    "Company Name",
+    "Sector",
+    "Industry",
+    "Market",
+    "Currency",
+    # Current Market (provider-driven, stable)
+    "Last Price",
+    "Previous Close",
+    "Price Change",
+    "Percent Change",
+    "Open",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "52W Position %",
+    "Volume",
+    "Value Traded",
+    "Turnover %",
+    "Shares Outstanding",
+    "Market Cap",
+    "Liquidity Score",
+    # Trailing Performance (computed from stored history)
+    "ROI (3M) %",
+    "ROI (12M) %",
+    "Volatility (30D)",
+    "RSI (14)",
+    # Fundamentals / Health (prefer computed + master-friendly)
+    "Revenue Growth (YoY) %",
+    "Net Margin %",
+    "ROE %",
+    "Debt/Equity",
+    "Financial Health Score",
+    "Financial Health Rank (Sector)",
+    # Valuation / Forward (computed / derived)
+    "Fair Value",
+    "Upside %",
+    "Target Price (12M)",
+    "Expected ROI (1M) %",
+    "Expected ROI (3M) %",
+    "Expected ROI (12M) %",
+    "Expected Price Growth (12M) %",
+    # Scores / Recommendation (computed)
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Opportunity Score",
+    "Risk Score",
+    "Overall Score",
+    "Recommendation",
+    "Confidence",
+    # Meta (must exist)
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+    "Error",
+]
+
+if len(KSA_TADAWUL_HEADERS_52) != 52:  # pragma: no cover
+    raise RuntimeError(f"KSA_TADAWUL_HEADERS_52 must be 52 columns, got {len(KSA_TADAWUL_HEADERS_52)}")
+
+
+# =============================================================================
 # Sheet name normalization + mappings
 # =============================================================================
 
@@ -128,33 +206,30 @@ def _norm_sheet_name(name: Optional[str]) -> str:
     return s
 
 
-# Your 9-page dashboard sheets (aliases included). All use the canonical 59 by default.
+# Sheet header mappings (aliases included)
 _SHEET_HEADERS: Dict[str, List[str]] = {
-    # KSA
-    "ksa_tadawul": DEFAULT_HEADERS_59,
-    "ksa_tadawul_market": DEFAULT_HEADERS_59,
-    "ksa_market": DEFAULT_HEADERS_59,
-    "tadawul": DEFAULT_HEADERS_59,
+    # KSA (use the new optimized schema)
+    "ksa_tadawul": KSA_TADAWUL_HEADERS_52,
+    "ksa_tadawul_market": KSA_TADAWUL_HEADERS_52,
+    "ksa_market": KSA_TADAWUL_HEADERS_52,
+    "tadawul": KSA_TADAWUL_HEADERS_52,
+    "ksa": KSA_TADAWUL_HEADERS_52,
 
-    # Global
+    # Global / Other pages keep canonical 59 unless explicitly changed later
     "global_markets": DEFAULT_HEADERS_59,
     "global_market": DEFAULT_HEADERS_59,
 
-    # Mutual Funds
     "mutual_funds": DEFAULT_HEADERS_59,
     "mutualfunds": DEFAULT_HEADERS_59,
 
-    # Commodities & FX
     "commodities_fx": DEFAULT_HEADERS_59,
     "commodities_and_fx": DEFAULT_HEADERS_59,
     "fx": DEFAULT_HEADERS_59,
 
-    # Portfolio
     "my_portfolio": DEFAULT_HEADERS_59,
     "my_portfolio_investment": DEFAULT_HEADERS_59,
     "portfolio": DEFAULT_HEADERS_59,
 
-    # Insights / Analysis pages typically still want canonical quote rows when using /enriched or /analysis
     "insights_analysis": DEFAULT_HEADERS_59,
     "analysis": DEFAULT_HEADERS_59,
     "investment_advisor": DEFAULT_HEADERS_59,
@@ -194,6 +269,20 @@ def get_supported_sheets() -> List[str]:
         return []
 
 
+def get_schema_for_sheet(sheet_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Convenience helper for debugging:
+    returns {sheet_name_norm, version, headers, count}.
+    """
+    h = get_headers_for_sheet(sheet_name)
+    return {
+        "schema_version": SCHEMAS_VERSION,
+        "sheet_name_norm": _norm_sheet_name(sheet_name),
+        "count": len(h),
+        "headers": h,
+    }
+
+
 # =============================================================================
 # Shared request models
 # =============================================================================
@@ -230,7 +319,9 @@ class BatchProcessRequest(_ExtraIgnore):
 __all__ = [
     "SCHEMAS_VERSION",
     "DEFAULT_HEADERS_59",
+    "KSA_TADAWUL_HEADERS_52",
     "get_headers_for_sheet",
     "get_supported_sheets",
+    "get_schema_for_sheet",
     "BatchProcessRequest",
 ]
