@@ -2,7 +2,7 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v3.4.0)
+LEGACY COMPATIBILITY ADAPTER (v3.5.0)
 
 PURPOSE
 - Keeps older imports working: `from core.data_engine import ...`
@@ -10,18 +10,24 @@ PURPOSE
 - Provides a safe STUB mode if V2 cannot be imported (never crashes the app)
 
 MAPPING
-- get_enriched_quote(s)  -> v2.DataEngine.get_quote(s)
-- get_enriched_quotes(ss)-> v2.DataEngine.get_quotes(ss)
-- UnifiedQuote           -> re-export v2.UnifiedQuote (or stub)
-- DataEngine             -> re-export v2.DataEngine (or stub)
+- get_enriched_quote(s)   -> v2.DataEngine.get_quote(s)
+- get_enriched_quotes(ss) -> v2.DataEngine.get_quotes(ss)
+- UnifiedQuote            -> re-export v2.UnifiedQuote (or stub)
+- DataEngine              -> re-export v2.DataEngine (or stub)
+
+SAFETY (IMPORTANT)
+- To avoid recursion / timeouts on KSA (.SR), we apply safe defaults that
+  prevent V2 from delegating KSA back into this legacy module.
+  This is controlled by env: LEGACY_ADAPTER_FORCE_SAFE_DEFAULTS (default: true)
 
 NOTES
-- Import of V2 is LAZY to reduce startup failures and avoid hard import cycles.
+- Import of V2 is LAZY + cached.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -33,10 +39,52 @@ except Exception:  # pragma: no cover
     class BaseModel:  # type: ignore
         def __init__(self, **kwargs): self.__dict__.update(kwargs)
         def model_dump(self, *a, **k): return dict(self.__dict__)
-    def Field(default=None, **kwargs): return default  # type: ignore
-    def ConfigDict(**kwargs): return dict(kwargs)  # type: ignore
+        def dict(self, *a, **k): return dict(self.__dict__)
+    def Field(default=None, **kwargs):  # type: ignore
+        return default
+    def ConfigDict(**kwargs):  # type: ignore
+        return dict(kwargs)
 
 logger = logging.getLogger("core.data_engine")
+
+# ---------------------------------------------------------------------------
+# 0) Safety toggles (env)
+# ---------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+_FALSY = {"0", "false", "no", "off", "n", "f"}
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
+    return default
+
+# If true (default), we force safe defaults to avoid KSA recursion/hangs.
+_FORCE_SAFE_DEFAULTS = _env_bool("LEGACY_ADAPTER_FORCE_SAFE_DEFAULTS", True)
+
+def _apply_safe_defaults() -> None:
+    """
+    Applies safe defaults (only for THIS process) to avoid v2 delegating KSA
+    back into this legacy adapter, which can cause recursion/hangs.
+
+    You can disable by setting:
+      LEGACY_ADAPTER_FORCE_SAFE_DEFAULTS=false
+    """
+    if not _FORCE_SAFE_DEFAULTS:
+        return
+
+    # HARD SAFETY: do NOT allow v2 to call legacy for KSA (prevents recursion).
+    os.environ["ENABLE_LEGACY_KSA_DELEGATE"] = "0"
+
+    # KSA yfinance is often blocked (Yahoo 401). Keep it OFF for KSA unless explicitly needed.
+    if os.getenv("KSA_ENABLE_YFINANCE") is None:
+        os.environ["KSA_ENABLE_YFINANCE"] = "0"
+
 
 # ---------------------------------------------------------------------------
 # 1) QuoteSource Polyfill (Legacy Metadata Support)
@@ -67,24 +115,28 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
     Returns: (ok, error_message)
     """
     global _ENGINE_MODE, _V2, _V2_LOAD_ERR
+
     if _V2:
         return True, None
-    if _ENGINE_MODE == "stub" and _V2_LOAD_ERR:
-        return False, _V2_LOAD_ERR
 
     with _V2_LOAD_LOCK:
         if _V2:
             return True, None
+
         try:
+            _apply_safe_defaults()
+
             from core.data_engine_v2 import DataEngine as V2DataEngine, UnifiedQuote as V2UnifiedQuote  # type: ignore
 
             _V2["DataEngine"] = V2DataEngine
             _V2["UnifiedQuote"] = V2UnifiedQuote
             _ENGINE_MODE = "v2"
             _V2_LOAD_ERR = None
+
             logger.info("Legacy Adapter: linked to DataEngine V2 successfully.")
             return True, None
-        except Exception as exc:  # ImportError + runtime import issues
+
+        except Exception as exc:
             _ENGINE_MODE = "stub"
             _V2_LOAD_ERR = str(exc)
             logger.warning("Legacy Adapter: V2 import failed (%s). Using STUB mode.", exc)
@@ -125,7 +177,7 @@ class _StubUnifiedQuote(BaseModel):
             self.price_change = self.change
         return self
 
-    def dict(self, *args, **kwargs):  # legacy convenience
+    def dict(self, *args, **kwargs):
         if hasattr(self, "model_dump"):
             return self.model_dump(*args, **kwargs)  # type: ignore
         return dict(self.__dict__)
@@ -187,6 +239,7 @@ def _get_engine() -> Any:
         UnifiedQuote, DataEngine = _get_types()  # refresh public bindings
 
         try:
+            _apply_safe_defaults()
             _engine_instance = DataEngine()  # v2 or stub
             return _engine_instance
         except Exception as exc:
@@ -285,27 +338,43 @@ async def get_quotes(symbols: List[str]) -> List[Any]:
 # ---------------------------------------------------------------------------
 def get_engine_meta() -> Dict[str, Any]:
     ok, err = _load_v2()
-    prov = []
+
+    providers: List[str] = []
+    ksa_providers: List[str] = []
+
     try:
-        # try to read providers from core.config if available (best-effort)
         from core.config import get_settings as _gs  # type: ignore
         s = _gs()
+
         prov_list = getattr(s, "providers_list", None)
-        if isinstance(prov_list, list):
-            prov = prov_list
+        if isinstance(prov_list, list) and prov_list:
+            providers = [str(x).strip().lower() for x in prov_list if str(x).strip()]
         else:
             prov_csv = getattr(s, "providers", "") or ""
-            prov = [p.strip().lower() for p in str(prov_csv).split(",") if p.strip()]
+            providers = [p.strip().lower() for p in str(prov_csv).split(",") if p.strip()]
+
+        ksa_list = getattr(s, "ksa_providers_list", None)
+        if isinstance(ksa_list, list) and ksa_list:
+            ksa_providers = [str(x).strip().lower() for x in ksa_list if str(x).strip()]
+        else:
+            ksa_csv = getattr(s, "ksa_providers", "") or ""
+            ksa_providers = [p.strip().lower() for p in str(ksa_csv).split(",") if p.strip()]
+
     except Exception:
         pass
 
+    # Always include env-surface metadata (useful on Render)
     return {
         "mode": _ENGINE_MODE,
         "is_stub": _ENGINE_MODE == "stub",
-        "adapter_version": "3.4.0",
+        "adapter_version": "3.5.0",
         "v2_loaded": bool(ok),
         "v2_error": err or _V2_LOAD_ERR,
-        "providers": prov,
+        "providers": providers,
+        "ksa_providers": ksa_providers,
+        "legacy_adapter_force_safe_defaults": _FORCE_SAFE_DEFAULTS,
+        "enable_legacy_ksa_delegate_effective": os.getenv("ENABLE_LEGACY_KSA_DELEGATE"),
+        "ksa_enable_yfinance_effective": os.getenv("KSA_ENABLE_YFINANCE"),
     }
 
 
