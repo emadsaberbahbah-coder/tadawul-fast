@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     yf = None
 
 
-ENGINE_VERSION = "2.4.2"
+ENGINE_VERSION = "2.5.0"
 
 # =============================================================================
 # Settings + Logger
@@ -48,11 +48,16 @@ FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 FINNHUB_PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
 
-# Argaam (best-effort; HTML can change)
-# IMPORTANT: This page already includes price + change + % + prev close + volume + value + deals
+# Argaam snapshot pages (KSA market tables are here; includes volume/value_traded already)
 ARGAAM_PRICES_URLS = [
     "https://www.argaam.com/ar/company/companies-prices/3",
     "https://www.argaam.com/en/company/companies-prices/3",
+]
+
+# OPTIONAL: volume page is often slower/flaky; keep as optional toggle
+ARGAAM_VOLUME_URLS = [
+    "https://www.argaam.com/ar/company/companies-volume/14",
+    "https://www.argaam.com/en/company/companies-volume/14",
 ]
 
 USER_AGENT = (
@@ -134,30 +139,26 @@ def _get_float(names: Sequence[str], default: float) -> float:
         return default
 
 
-def _fix_utf8_mojibake(s: str) -> str:
-    """
-    Fix common mojibake like: 'Ø§Ù...' caused by UTF-8 bytes decoded as latin1.
-    Safe: if it fails, returns original.
-    """
-    if not s:
-        return s
-    # Heuristic markers
-    if "Ø" in s or "Ù" in s:
-        try:
-            return s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-        except Exception:
-            return s
-    return s
-
-
 def _safe_str(x: Any) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip()
+    return s if s else None
+
+
+def _fix_mojibake(s: Optional[str]) -> Optional[str]:
+    """
+    Fix common mojibake where UTF-8 was decoded as latin-1 (e.g. Ø§Ù...).
+    If it doesn't look mojibake, return as-is.
+    """
     if not s:
-        return None
-    s2 = _fix_utf8_mojibake(s)
-    return s2.strip() if s2.strip() else None
+        return s
+    if "Ø" in s or "Ù" in s or "Ã" in s:
+        try:
+            return s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore").strip() or s
+        except Exception:
+            return s
+    return s
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -189,7 +190,7 @@ def _safe_float(val: Any) -> Optional[float]:
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
 
-        s = s.replace("%", "").replace("٪", "").strip()
+        s = s.replace("%", "").strip()
         s = s.replace(",", "")
 
         mult = 1.0
@@ -211,13 +212,6 @@ def _safe_float(val: Any) -> Optional[float]:
         return f
     except Exception:
         return None
-
-
-def _pct_if_fraction(x: Any) -> Optional[float]:
-    v = _safe_float(x)
-    if v is None:
-        return None
-    return v * 100.0 if abs(v) <= 1.0 else v
 
 
 def normalize_symbol(raw: str) -> str:
@@ -321,6 +315,24 @@ def _get_key(*names: str) -> Optional[str]:
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _clean_code_key(code: str) -> str:
+    """
+    Make KSA code matching resilient:
+    - translate Arabic digits
+    - strip spaces
+    - drop leading zeros safely
+    """
+    c = (code or "").strip().translate(_ARABIC_DIGITS)
+    if not c:
+        return c
+    if c.isdigit():
+        try:
+            return str(int(c))
+        except Exception:
+            return c.lstrip("0") or c
+    return c
 
 
 # =============================================================================
@@ -458,11 +470,13 @@ class UnifiedQuote(BaseModel):
             ls = (math.log10(self.value_traded + 1.0) - 4.0) * 25.0
             self.liquidity_score = _safe_float(_clamp(ls, 0.0, 100.0))
 
+        # Quality
         if self.current_price is None:
             self.data_quality = "MISSING"
         else:
-            have_core = all(x is not None for x in (self.current_price, self.previous_close, self.day_high, self.day_low))
-            self.data_quality = "FULL" if have_core else "PARTIAL"
+            have_core = all(x is not None for x in (self.current_price, self.previous_close))
+            # KSA snapshot doesn't always provide day_high/day_low -> accept as PARTIAL
+            self.data_quality = "FULL" if have_core and (self.day_high is not None and self.day_low is not None) else "PARTIAL"
 
         if self.overall_score is None:
             self._calculate_simple_scores()
@@ -504,8 +518,9 @@ class DataEngine:
     Async multi-provider engine with KSA-safe routing.
 
     KSA (.SR):
-      1) Argaam snapshot (HTML best-effort)
-      2) Optional yfinance last resort (often blocked/401)
+      1) Legacy KSA delegate if available (core.data_engine)
+      2) Argaam snapshot (HTML best-effort)  <-- improved mapping & speed
+      3) Optional yfinance last resort (often blocked/401)
 
     GLOBAL:
       provider order from settings/providers:
@@ -530,31 +545,41 @@ class DataEngine:
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
+                "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
             },
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
 
+        # Yahoo is often blocked in server environments; keep enabled but safe
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
+
+        # Argaam volume page is OPTIONAL (prices page already contains volume/value_traded)
+        self.argaam_use_volume_page = _get_bool(["ARGAAM_USE_VOLUME_PAGE", "argaam_use_volume_page"], False)
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
-        snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 30.0)
+
+        # KSA snapshot TTL (slightly longer default for stability/speed)
+        snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 60.0)
 
         self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, quote_ttl))
         self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, cache_ttl * 10.0))
         self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, fund_ttl))
-        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, snap_ttl))
+        self.snapshot_cache: TTLCache = TTLCache(maxsize=80, ttl=max(15.0, snap_ttl))
 
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
+        # Prevent stampede: one snapshot fetch at a time
+        self._snapshot_lock = asyncio.Lock()
+
         logger.info(
-            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs | argaam_volume_page=%s",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
             self.enable_yfinance,
             self._timeout_sec,
+            self.argaam_use_volume_page,
         )
 
     async def aclose(self) -> None:
@@ -627,106 +652,161 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        # NOTE:
-        # We intentionally DO NOT call core.data_engine legacy adapter here
-        # because the legacy adapter delegates back to v2 (infinite recursion).
+        # 1) Prefer legacy KSA engine (if present)
+        try:
+            from core import data_engine as legacy  # type: ignore
+            if hasattr(legacy, "get_enriched_quote"):
+                raw = await legacy.get_enriched_quote(symbol)  # type: ignore
+                q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
+                if q.current_price is not None:
+                    q.data_source = q.data_source or "legacy"
+                    q.data_quality = "PARTIAL"
+                    return q
+        except Exception:
+            pass
 
-        base = symbol.split(".", 1)[0].strip()
+        # 2) Argaam snapshot (FAST path for many symbols)
+        base = _clean_code_key(symbol.split(".", 1)[0].strip())
         snap = await self._argaam_snapshot()
         row = snap.get(base)
-
+        if not row and base.isdigit():
+            # try raw base without int-normalization
+            row = snap.get(symbol.split(".", 1)[0].strip())
         if row:
-            # Prefer true "price" field; fallback to "last"
-            price = row.get("price") if row.get("price") is not None else row.get("last")
-
             return UnifiedQuote(
                 symbol=symbol,
-                name=row.get("name"),
+                name=_fix_mojibake(row.get("name")),
                 market="KSA",
                 currency="SAR",
-                current_price=price,
+                current_price=row.get("price"),
                 previous_close=row.get("previous_close"),
                 price_change=row.get("change"),
                 percent_change=row.get("change_percent"),
-                volume=row.get("volume"),
-                value_traded=row.get("value_traded"),
                 high_52w=row.get("high_52w"),
                 low_52w=row.get("low_52w"),
+                volume=row.get("volume"),
+                value_traded=row.get("value_traded"),
                 data_source="argaam",
-                data_quality="PARTIAL" if price is not None else "MISSING",
-                error=None if price is not None else "Argaam row found but price missing",
-            )
+                data_quality="PARTIAL",
+            ).finalize()
 
-        # yfinance last resort
+        # 3) yfinance last resort (often blocked/401 in servers)
         if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
             q = await self._fetch_yfinance(symbol, market="KSA")
             if q.current_price is not None:
                 q.data_source = q.data_source or "yfinance"
                 q.data_quality = "PARTIAL"
-                return q
+                return q.finalize()
 
         return UnifiedQuote(
             symbol=symbol,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="No KSA provider data (argaam+yfinance failed)",
+            error="No KSA provider data (legacy+argaam+yfinance failed)",
         ).finalize()
 
-    # -------------------------------------------------------------------------
-    # Argaam snapshot
-    # -------------------------------------------------------------------------
-    def _clean_argaam_cell(self, s: str) -> str:
-        s = (s or "").strip()
-        if not s:
-            return ""
-        s = _fix_utf8_mojibake(s)
-        s = s.translate(_ARABIC_DIGITS)
-        s = s.replace("٬", ",").replace("٫", ".").replace("٪", "%")
-        s = re.sub(r"\s+", " ", s).strip()
+    def _coerce_to_unified_quote(
+        self,
+        symbol: str,
+        raw: Any,
+        market: str,
+        currency: str,
+        source: str,
+    ) -> UnifiedQuote:
+        data: Dict[str, Any] = {}
 
-        def _fix_paren(m: re.Match) -> str:
-            inner = (m.group(1) or "").replace(" ", "")
-            return f"({inner})"
+        if raw is None:
+            data = {}
+        elif isinstance(raw, UnifiedQuote):
+            return raw
+        elif isinstance(raw, dict):
+            data = dict(raw)
+        else:
+            if hasattr(raw, "model_dump"):
+                try:
+                    data = raw.model_dump()  # type: ignore
+                except Exception:
+                    data = {}
+            elif hasattr(raw, "dict"):
+                try:
+                    data = raw.dict()  # type: ignore
+                except Exception:
+                    data = {}
+            else:
+                data = {}
 
-        # normalize spaces inside parentheses, e.g. "(0.31 %)" -> "(0.31%)"
-        s = re.sub(r"\(\s*([^)]+?)\s*\)", _fix_paren, s)
-        return s
+        mapped: Dict[str, Any] = {
+            "symbol": symbol,
+            "market": data.get("market") or market,
+            "currency": data.get("currency") or currency,
+            "name": _fix_mojibake(_safe_str(data.get("name") or data.get("company_name"))),
+        }
 
-    def _cell_numbers(self, cell_text: str) -> List[float]:
-        """
-        Extract numbers from a cell, preserving order.
-        Works for:
-          - "87.80 113.00"
-          - "(0.31%)"
-          - "506,636"
-        """
-        t = self._clean_argaam_cell(cell_text)
-        if not t:
-            return []
+        mapped["current_price"] = data.get("current_price") or data.get("last_price") or data.get("lastPrice") or data.get("price")
+        mapped["previous_close"] = data.get("previous_close") or data.get("previousClose")
+        mapped["open"] = data.get("open")
+        mapped["day_high"] = data.get("day_high") or data.get("high")
+        mapped["day_low"] = data.get("day_low") or data.get("low")
+        mapped["volume"] = data.get("volume")
 
-        # Capture either "(...)" blocks or normal numeric tokens (optionally with %)
-        tokens = re.findall(r"\([^)]*\)|[-+]?\d[\d,]*\.?\d*(?:%?)", t)
-        out: List[float] = []
-        for tok in tokens:
-            v = _safe_float(tok)
-            if v is not None:
-                out.append(v)
-        return out
+        mapped["price_change"] = data.get("price_change") or data.get("change")
+        mapped["percent_change"] = data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
+
+        for k in (
+            "market_cap",
+            "shares_outstanding",
+            "eps_ttm",
+            "pe_ttm",
+            "pb",
+            "dividend_yield",
+            "beta",
+            "roe",
+            "roa",
+            "net_margin",
+            "high_52w",
+            "low_52w",
+            "ma20",
+            "ma50",
+            "value_traded",
+        ):
+            if k in data and data.get(k) is not None:
+                mapped[k] = data.get(k)
+
+        q = UnifiedQuote(**{k: v for k, v in mapped.items() if v is not None})
+        q.data_source = data.get("data_source") or source
+        q.error = data.get("error")
+        return q
 
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
-        key = "argaam_snapshot_prices_v3"
+        key = "argaam_snapshot_v3"
         cached = self.snapshot_cache.get(key)
-        if isinstance(cached, dict):
+        if isinstance(cached, dict) and cached:
             return cached
 
-        merged: Dict[str, Dict[str, Any]] = {}
-        html = await self._http_get_first_text(ARGAAM_PRICES_URLS)
-        if html:
-            merged = self._parse_argaam_table(html)
+        async with self._snapshot_lock:
+            cached2 = self.snapshot_cache.get(key)
+            if isinstance(cached2, dict) and cached2:
+                return cached2
 
-        self.snapshot_cache[key] = merged
-        return merged
+            merged: Dict[str, Dict[str, Any]] = {}
+
+            prices_html = await self._http_get_first_text(ARGAAM_PRICES_URLS)
+            if prices_html:
+                part = self._parse_argaam_table(prices_html)
+                for k, v in part.items():
+                    merged.setdefault(k, {}).update(v)
+
+            # OPTIONAL volume page (default OFF for speed/stability)
+            if self.argaam_use_volume_page:
+                vol_html = await self._http_get_first_text(ARGAAM_VOLUME_URLS)
+                if vol_html:
+                    part = self._parse_argaam_table(vol_html)
+                    for k, v in part.items():
+                        merged.setdefault(k, {}).update(v)
+
+            self.snapshot_cache[key] = merged
+            return merged
 
     async def _http_get_first_text(self, urls: Sequence[str]) -> Optional[str]:
         tasks = [self._http_get_text(u) for u in urls]
@@ -750,16 +830,10 @@ class DataEngine:
 
     def _parse_argaam_table(self, html: str) -> Dict[str, Dict[str, Any]]:
         """
-        Maps Argaam row to:
-          - last, low_52w, high_52w
-          - par_value
-          - price, change, change_percent, previous_close
-          - volume, value_traded, deals
+        Argaam companies-prices/3 table (Saudi Tadawul) rows typically map like:
+          code, name, last, low_52w, high_52w, nominal, price, change, chg%, prev_close, volume, value_traded, trades
 
-        The page often contains line breaks inside <td>.
-        We extract numeric sequences and map by shape:
-          A) With last + 52w: [last, low52, high52, par, price, chg, chg%, prev, vol, val, deals]
-          B) Without last + 52w: [par, price, chg, chg%, prev, vol, val, deals]
+        This parser uses the existing TR/TD walk (stable) but maps indices correctly.
         """
         out: Dict[str, Dict[str, Any]] = {}
         if not BeautifulSoup or not html:
@@ -772,77 +846,60 @@ class DataEngine:
 
         for row in soup.find_all("tr"):
             cols = row.find_all("td")
-            if len(cols) < 4:
+            if len(cols) < 6:
                 continue
 
-            txt = [c.get_text(" ", strip=True) for c in cols]
-            if not txt:
-                continue
+            txt = [_fix_mojibake(_safe_str(c.get_text(" ", strip=True))) or "" for c in cols]
 
-            # Find symbol code within first few cells
             code = None
             code_idx = None
-            for i in range(min(6, len(txt))):
+            for i in range(min(3, len(txt))):
                 cand = (txt[i] or "").strip().translate(_ARABIC_DIGITS)
-                cand = re.sub(r"\D", "", cand)
                 if re.match(r"^\d{3,6}$", cand):
-                    code = cand
+                    code = _clean_code_key(cand)
                     code_idx = i
                     break
             if not code or code_idx is None:
                 continue
 
-            name = None
-            if (code_idx + 1) < len(txt):
-                name = _safe_str(txt[code_idx + 1])
+            # name is the next cell (often short name)
+            name = txt[code_idx + 1].strip() if (code_idx + 1) < len(txt) else None
+            name = _fix_mojibake(_safe_str(name))
 
-            # Collect numbers in order from remaining cells
-            nums: List[float] = []
+            nums: List[Optional[float]] = []
             for j in range(code_idx + 2, len(txt)):
-                nums.extend(self._cell_numbers(txt[j]))
+                nums.append(_safe_float(txt[j]))
 
-            last = low52 = high52 = par_value = price = chg = chg_p = prev_close = vol = val = deals = None
+            # Expected indexes after code+name:
+            # 0 last, 1 low52, 2 high52, 3 nominal, 4 price, 5 change, 6 chg%, 7 prevClose, 8 vol, 9 value, 10 trades
+            last = nums[0] if len(nums) > 0 else None
+            low_52w = nums[1] if len(nums) > 1 else None
+            high_52w = nums[2] if len(nums) > 2 else None
 
-            if len(nums) >= 11:
-                # [last, low52, high52, par, price, chg, chg%, prev, vol, val, deals]
-                last = nums[0]
-                low52 = nums[1]
-                high52 = nums[2]
-                par_value = nums[3]
-                price = nums[4]
-                chg = nums[5]
-                chg_p = nums[6]
-                prev_close = nums[7]
-                vol = nums[8]
-                val = nums[9]
-                deals = nums[10]
-            elif len(nums) >= 8:
-                # [par, price, chg, chg%, prev, vol, val, deals]
-                par_value = nums[0]
-                price = nums[1]
-                chg = nums[2]
-                chg_p = nums[3]
-                prev_close = nums[4]
-                vol = nums[5]
-                val = nums[6]
-                deals = nums[7]
-            else:
-                # Too little data; skip
-                continue
+            # Nominal = nums[3] (ignored)
+            price = nums[4] if len(nums) > 4 else last
+            change = nums[5] if len(nums) > 5 else None
+            chg_p = nums[6] if len(nums) > 6 else None
+            prev_close = nums[7] if len(nums) > 7 else None
+            volume = nums[8] if len(nums) > 8 else None
+            value_traded = nums[9] if len(nums) > 9 else None
+
+            # Fallbacks if Argaam shifts slightly
+            if price is None and last is not None:
+                price = last
+            if prev_close is None and price is not None and change is not None:
+                prev_close = _safe_float(price - change)
 
             out[code] = {
                 "name": name,
-                "last": _safe_float(last),
-                "low_52w": _safe_float(low52),
-                "high_52w": _safe_float(high52),
-                "par_value": _safe_float(par_value),
-                "price": _safe_float(price),
-                "change": _safe_float(chg),
-                "change_percent": _safe_float(chg_p),
-                "previous_close": _safe_float(prev_close),
-                "volume": _safe_float(vol),
-                "value_traded": _safe_float(val),
-                "deals": _safe_float(deals),
+                "price": price,
+                "previous_close": prev_close,
+                "change": change,
+                "change_percent": chg_p,
+                "volume": volume,
+                "value_traded": value_traded,
+                "high_52w": high_52w,
+                "low_52w": low_52w,
             }
 
         return out
@@ -969,11 +1026,6 @@ class DataEngine:
                     return None
                 if r.status_code >= 400:
                     return None
-
-                ct = (r.headers.get("content-type") or "").lower()
-                # Argaam HTML is UTF-8; force decode to avoid mojibake
-                if "argaam.com" in url or "text/html" in ct:
-                    return r.content.decode("utf-8", errors="ignore")
                 return r.text
             except Exception:
                 if attempt < 2:
@@ -1056,6 +1108,12 @@ class DataEngine:
         technicals = data.get("Technicals") or {}
         shares = data.get("SharesStats") or {}
 
+        def _pct_if_fraction(x: Any) -> Optional[float]:
+            v = _safe_float(x)
+            if v is None:
+                return None
+            return v * 100.0 if abs(v) <= 1.0 else v
+
         out = {
             "name": _safe_str(general.get("Name")),
             "sector": _safe_str(general.get("Sector")),
@@ -1130,6 +1188,12 @@ class DataEngine:
 
         profile: Dict[str, Any] = {}
         metrics: Dict[str, Any] = {}
+
+        def _pct_if_fraction(x: Any) -> Optional[float]:
+            v = _safe_float(x)
+            if v is None:
+                return None
+            return v * 100.0 if abs(v) <= 1.0 else v
 
         if isinstance(prof_data, dict) and prof_data:
             profile = {
