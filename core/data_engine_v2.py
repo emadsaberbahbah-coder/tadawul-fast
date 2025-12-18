@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover
     yf = None
 
 
-ENGINE_VERSION = "2.7.0"
+ENGINE_VERSION = "2.8.0"
 
 settings = get_settings()
 logger = logging.getLogger("core.data_engine_v2")
@@ -359,9 +359,48 @@ def _safe_turnover_percent(volume: Any, shares_outstanding: Any) -> Optional[flo
     return (v / so) * 100.0
 
 
+def _compute_financial_health_score(
+    roe_pct: Optional[float],
+    net_margin_pct: Optional[float],
+    debt_to_equity: Optional[float],
+    current_ratio: Optional[float],
+) -> Optional[float]:
+    """
+    Best-effort composite score 0..100 (not a scientific model).
+    Used mainly to avoid empty Sheets columns for the KSA schema.
+    """
+    parts: List[float] = []
+
+    if roe_pct is not None:
+        # 0%..25% maps to 0..100 (cap)
+        parts.append(_clamp((roe_pct / 25.0) * 100.0, 0.0, 100.0))
+
+    if net_margin_pct is not None:
+        # -10%..20% maps to 0..100
+        parts.append(_clamp(((net_margin_pct + 10.0) / 30.0) * 100.0, 0.0, 100.0))
+
+    if debt_to_equity is not None:
+        # lower is better, 0..3 maps to 100..0
+        parts.append(_clamp((1.0 - min(debt_to_equity, 3.0) / 3.0) * 100.0, 0.0, 100.0))
+
+    if current_ratio is not None:
+        # 0.5..2.5 maps to 0..100
+        parts.append(_clamp(((current_ratio - 0.5) / 2.0) * 100.0, 0.0, 100.0))
+
+    if not parts:
+        return None
+
+    return float(sum(parts) / len(parts))
+
+
 class UnifiedQuote(BaseModel):
+    """
+    UnifiedQuote is the SINGLE engine output shape.
+    IMPORTANT: This model must include all sheet schema fields you expect to output.
+    """
     model_config = ConfigDict(populate_by_name=True, from_attributes=True, validate_assignment=True)
 
+    # Identity
     symbol: str
     name: Optional[str] = None
     sector: Optional[str] = None
@@ -371,11 +410,13 @@ class UnifiedQuote(BaseModel):
     currency: Optional[str] = None
     listing_date: Optional[str] = None
 
+    # Shares / Float / Cap
     shares_outstanding: Optional[float] = None
     free_float: Optional[float] = None
     market_cap: Optional[float] = None
     free_float_market_cap: Optional[float] = None
 
+    # Prices
     current_price: Optional[float] = None
     previous_close: Optional[float] = None
     open: Optional[float] = None
@@ -387,12 +428,14 @@ class UnifiedQuote(BaseModel):
     price_change: Optional[float] = None
     percent_change: Optional[float] = None
 
+    # Volume / Liquidity
     volume: Optional[float] = None
     avg_volume_30d: Optional[float] = None
     value_traded: Optional[float] = None
     turnover_percent: Optional[float] = None
     liquidity_score: Optional[float] = None
 
+    # Fundamentals
     eps_ttm: Optional[float] = None
     forward_eps: Optional[float] = None
     pe_ttm: Optional[float] = None
@@ -400,7 +443,7 @@ class UnifiedQuote(BaseModel):
     pb: Optional[float] = None
     ps: Optional[float] = None
     ev_ebitda: Optional[float] = None
-    dividend_yield: Optional[float] = None
+    dividend_yield: Optional[float] = None  # keep provider scale; EnrichedQuote handles % conversions safely
     dividend_rate: Optional[float] = None
     payout_ratio: Optional[float] = None
     roe: Optional[float] = None
@@ -414,18 +457,21 @@ class UnifiedQuote(BaseModel):
     current_ratio: Optional[float] = None
     quick_ratio: Optional[float] = None
 
+    # Technicals
     rsi_14: Optional[float] = None
     volatility_30d: Optional[float] = None
     macd: Optional[float] = None
     ma20: Optional[float] = None
     ma50: Optional[float] = None
 
+    # Valuation / Targets
     fair_value: Optional[float] = None
     target_price: Optional[float] = None
     upside_percent: Optional[float] = None
     valuation_label: Optional[str] = None
     analyst_rating: Optional[str] = None
 
+    # Scores / Recommendation
     value_score: Optional[float] = None
     quality_score: Optional[float] = None
     momentum_score: Optional[float] = None
@@ -435,6 +481,21 @@ class UnifiedQuote(BaseModel):
     confidence: Optional[float] = None
     risk_score: Optional[float] = None
 
+    # =========================
+    # KSA schema extra fields
+    # =========================
+    roi_3m_percent: Optional[float] = None
+    roi_12m_percent: Optional[float] = None
+    revenue_growth_yoy_percent: Optional[float] = None
+    financial_health_score: Optional[float] = None
+    financial_health_rank_sector: Optional[float] = None  # engine cannot compute without sector peers
+    target_price_12m: Optional[float] = None
+    expected_roi_1m_percent: Optional[float] = None
+    expected_roi_3m_percent: Optional[float] = None
+    expected_roi_12m_percent: Optional[float] = None
+    expected_price_growth_12m_percent: Optional[float] = None
+
+    # Meta
     data_source: str = "none"
     data_quality: str = "MISSING"
     last_updated_utc: str = Field(default_factory=_now_utc_iso)
@@ -478,6 +539,7 @@ class UnifiedQuote(BaseModel):
                     if self.volume > 0 and (inferred_vol / self.volume > 3.0 or self.volume / inferred_vol > 3.0):
                         self.volume = _safe_float(inferred_vol)
 
+        # ---- 52W position
         if (
             self.position_52w_percent is None
             and self.current_price is not None
@@ -488,17 +550,68 @@ class UnifiedQuote(BaseModel):
             if rng and rng > 0:
                 self.position_52w_percent = _safe_float((self.current_price - self.low_52w) / rng * 100.0)
 
+        # ---- value traded
         if self.value_traded is None and self.current_price is not None and self.volume is not None:
             self.value_traded = _safe_float(self.current_price * self.volume)
 
+        # ---- turnover %
         if self.turnover_percent is None and self.volume is not None and self.shares_outstanding not in (None, 0):
             self.turnover_percent = _safe_float(_safe_turnover_percent(self.volume, self.shares_outstanding))
 
+        # ---- liquidity score (0..100)
         if self.liquidity_score is None and self.value_traded is not None and self.value_traded >= 0:
             ls = (math.log10(self.value_traded + 1.0) - 4.0) * 25.0
             self.liquidity_score = _safe_float(_clamp(ls, 0.0, 100.0))
 
-        # Quality: FULL if we have OHLC + prev + volume
+        # ---- Upside if missing and we have target/fair value
+        if self.upside_percent is None:
+            tgt = self.target_price if self.target_price is not None else self.fair_value
+            self.upside_percent = _safe_float(_safe_upside(self.current_price, tgt))
+
+        # =============================================================================
+        # KSA schema alignment (best-effort, computed placeholders where possible)
+        # =============================================================================
+
+        # Map "revenue_growth" -> "revenue_growth_yoy_percent" (if present)
+        if self.revenue_growth_yoy_percent is None and self.revenue_growth is not None:
+            # revenue_growth may be ratio or percent depending on provider; keep as-is (Sheets mapper handles)
+            self.revenue_growth_yoy_percent = _safe_float(self.revenue_growth)
+
+        # Target price 12M: prefer explicit, else copy target_price (common meaning)
+        if self.target_price_12m is None and self.target_price is not None:
+            self.target_price_12m = _safe_float(self.target_price)
+
+        # Expected ROI horizons: if we have upside_percent, distribute over 12M/3M/1M
+        # (This is a pragmatic filler until you add true forecast logic/history.)
+        if self.upside_percent is not None:
+            up = float(self.upside_percent)
+            if self.expected_roi_12m_percent is None:
+                self.expected_roi_12m_percent = _safe_float(up)
+            if self.expected_price_growth_12m_percent is None:
+                self.expected_price_growth_12m_percent = _safe_float(up)
+            if self.expected_roi_3m_percent is None:
+                self.expected_roi_3m_percent = _safe_float(up / 4.0)
+            if self.expected_roi_1m_percent is None:
+                self.expected_roi_1m_percent = _safe_float(up / 12.0)
+
+        # Financial health score (0..100) from available ratios (best-effort)
+        if self.financial_health_score is None:
+            # Inputs may be ratio or percent depending on provider
+            # Treat roe/net_margin as percent if they look small (<=1 => fraction)
+            roe_pct = _pct_if_fraction(self.roe)
+            nm_pct = _pct_if_fraction(self.net_margin)
+            self.financial_health_score = _safe_float(
+                _compute_financial_health_score(
+                    roe_pct=roe_pct,
+                    net_margin_pct=nm_pct,
+                    debt_to_equity=_safe_float(self.debt_to_equity),
+                    current_ratio=_safe_float(self.current_ratio),
+                )
+            )
+
+        # =============================================================================
+        # Quality label
+        # =============================================================================
         if self.current_price is None:
             self.data_quality = "MISSING"
         else:
@@ -507,11 +620,6 @@ class UnifiedQuote(BaseModel):
                 for x in (self.current_price, self.previous_close, self.open, self.day_high, self.day_low, self.volume)
             )
             self.data_quality = "FULL" if have_core else "PARTIAL"
-
-        # Upside if missing and we have target/fair value
-        if self.upside_percent is None:
-            tgt = self.target_price if self.target_price is not None else self.fair_value
-            self.upside_percent = _safe_float(_safe_upside(self.current_price, tgt))
 
         if self.overall_score is None:
             self._calculate_simple_scores()
@@ -528,7 +636,8 @@ class UnifiedQuote(BaseModel):
             elif self.pe_ttm > 35:
                 score -= 8
         if self.dividend_yield is not None and self.dividend_yield > 0:
-            score += min(6.0, self.dividend_yield * 2.0)
+            # dividend_yield might be percent already; this remains a heuristic
+            score += min(6.0, float(self.dividend_yield) * 0.5)
 
         score = max(0.0, min(100.0, score))
         self.overall_score = score
@@ -553,7 +662,6 @@ class DataEngine:
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
         max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
 
-        # We'll keep a client default timeout, but allow per-request overrides.
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
 
         self.client = httpx.AsyncClient(
@@ -699,7 +807,6 @@ class DataEngine:
                 if det:
                     upd: Dict[str, Any] = {}
 
-                    # Prefer detail for OHLC + prev close + fundamentals if present.
                     preferred_keys = (
                         "name",
                         "sector",
@@ -722,6 +829,13 @@ class DataEngine:
                         "dividend_yield",
                         "pb",
                         "ps",
+                        # ratios if you later parse them from Argaam:
+                        "roe",
+                        "roa",
+                        "net_margin",
+                        "debt_to_equity",
+                        "current_ratio",
+                        "quick_ratio",
                     )
 
                     for k in preferred_keys:
@@ -747,6 +861,12 @@ class DataEngine:
                             "industry",
                             "sub_sector",
                             "listing_date",
+                            "roe",
+                            "roa",
+                            "net_margin",
+                            "debt_to_equity",
+                            "current_ratio",
+                            "quick_ratio",
                         ):
                             upd[k] = v
 
@@ -815,6 +935,22 @@ class DataEngine:
 
         mapped["price_change"] = data.get("price_change") or data.get("change")
         mapped["percent_change"] = data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
+
+        # KSA extras if legacy ever returns them
+        for k in (
+            "roi_3m_percent",
+            "roi_12m_percent",
+            "revenue_growth_yoy_percent",
+            "financial_health_score",
+            "financial_health_rank_sector",
+            "target_price_12m",
+            "expected_roi_1m_percent",
+            "expected_roi_3m_percent",
+            "expected_roi_12m_percent",
+            "expected_price_growth_12m_percent",
+        ):
+            if k in data and data.get(k) is not None:
+                mapped[k] = data.get(k)
 
         q = UnifiedQuote(**{k: v for k, v in mapped.items() if v is not None})
         q.data_source = data.get("data_source") or source
@@ -888,10 +1024,8 @@ class DataEngine:
         except Exception:
             pass
 
-        # Helper: extract number with possible unit near label
         def grab_with_unit(label_variants: Sequence[str]) -> Optional[float]:
             for lab in label_variants:
-                # capture number and optional unit token close to it
                 m = re.search(
                     rf"{re.escape(lab)}\s*[:\-]?\s*([0-9٠-٩][0-9٠-٩\.,]+(?:[KMBkmb])?)\s*(مليار|مليون|ألف|الف|billion|million|thousand|bn|mn|k)?",
                     txt,
@@ -913,7 +1047,6 @@ class DataEngine:
                     return base * mult
             return None
 
-        # Sector / Industry / Sub-sector (best-effort)
         def grab_text(label_variants: Sequence[str]) -> Optional[str]:
             for lab in label_variants:
                 m = re.search(rf"{re.escape(lab)}\s*[:\-]?\s*([^\n]+)", txt, re.IGNORECASE)
@@ -926,11 +1059,8 @@ class DataEngine:
         out["sector"] = grab_text(["القطاع", "Sector"])
         out["industry"] = grab_text(["النشاط", "Industry", "Activity"])
         out["sub_sector"] = grab_text(["القطاع الفرعي", "Sub-Sector", "Sub sector", "Subsector"])
-
-        # Listing date (if present)
         out["listing_date"] = grab_text(["تاريخ الإدراج", "تاريخ الادراج", "Listing Date", "IPO Date", "IPO"])
 
-        # Prices / volume / value / market cap
         last = grab_with_unit(["آخر سعر", "Last Price", "Last price", "Last"])
         opn = grab_with_unit(["الافتتاح", "Open"])
         low = grab_with_unit(["الأدنى", "Low"])
@@ -949,8 +1079,6 @@ class DataEngine:
         pb = grab_with_unit(["مكرر القيمة الدفترية", "P/B", "PB"])
         ps = grab_with_unit(["مكرر المبيعات", "P/S", "PS"])
 
-        shares_out = None
-        # Common patterns: "عدد الأسهم" sometimes in millions
         shares_out = grab_with_unit(["عدد الأسهم", "عدد الاسهم", "Shares Outstanding", "Shares"])
         if shares_out is None:
             try:
@@ -974,6 +1102,8 @@ class DataEngine:
             out["volume"] = vol
         if val is not None:
             out["value_traded"] = val
+        if mcap is not None:
+            out["market_cap"] = mcap
 
         if hi52 is not None:
             out["high_52w"] = hi52
@@ -986,7 +1116,7 @@ class DataEngine:
             out["eps_ttm"] = eps
 
         if dy is not None:
-            # Argaam usually shows % already; keep as-is
+            # Argaam often shows % already; keep as-is
             out["dividend_yield"] = dy
 
         if pb is not None:
@@ -994,20 +1124,12 @@ class DataEngine:
         if ps is not None:
             out["ps"] = ps
 
-        # Shares / market cap: keep absolute numbers if already absolute; if value looks like "millions", it was scaled by grab_with_unit
         if shares_out is not None and shares_out > 0:
             out["shares_outstanding"] = shares_out
-        if mcap is not None and mcap > 0:
-            out["market_cap"] = mcap
 
         return out
 
     def _parse_argaam_table(self, html: str) -> Dict[str, Dict[str, Any]]:
-        """
-        Parse Argaam tables in a more stable way:
-        - tries to map columns by header text (Arabic/English)
-        - falls back to best-effort numeric heuristics
-        """
         out: Dict[str, Dict[str, Any]] = {}
         if not BeautifulSoup or not html:
             return out
@@ -1017,7 +1139,6 @@ class DataEngine:
         except Exception:
             soup = BeautifulSoup(html, "html.parser")
 
-        # Find the biggest table with rows
         tables = soup.find_all("table")
         table = None
         best_rows = 0
@@ -1030,7 +1151,6 @@ class DataEngine:
         if not table:
             return out
 
-        # Header mapping
         header_map: Dict[int, str] = {}
         try:
             header_row = table.find("tr")
@@ -1053,9 +1173,9 @@ class DataEngine:
                     header_map[idx] = "volume"
                 elif any(x in hn for x in ("قيمة", "value", "traded")):
                     header_map[idx] = "value_traded"
-                elif any(x in hn for x in ("52", "أعلى", "high")):
+                elif "52" in hn and any(x in hn for x in ("أعلى", "high")):
                     header_map[idx] = "high_52w"
-                elif any(x in hn for x in ("52", "أدنى", "low")):
+                elif "52" in hn and any(x in hn for x in ("أدنى", "low")):
                     header_map[idx] = "low_52w"
         except Exception:
             header_map = {}
@@ -1068,7 +1188,6 @@ class DataEngine:
 
             txt = [c.get_text(" ", strip=True) for c in cols]
 
-            # Determine code (3-6 digits) anywhere in first few cols
             code = None
             code_idx = None
             for i in range(min(4, len(txt))):
@@ -1095,8 +1214,8 @@ class DataEngine:
             except Exception:
                 companyid = None
 
-            # Start with header-mapped parse if we can
             parsed: Dict[str, Any] = {"name": name, "companyid": companyid}
+
             if header_map:
                 for idx, role in header_map.items():
                     if idx >= len(txt):
@@ -1106,19 +1225,10 @@ class DataEngine:
                         continue
                     parsed[role] = _safe_float(val)
 
-                # Normalize
-                if "price" in parsed and parsed.get("price") is not None:
-                    parsed["price"] = _safe_float(parsed.get("price"))
-                if "change_percent" in parsed and parsed.get("change_percent") is not None:
-                    parsed["change_percent"] = _safe_float(parsed.get("change_percent"))
-                if "change" in parsed and parsed.get("change") is not None:
-                    parsed["change"] = _safe_float(parsed.get("change"))
-                if "volume" in parsed and parsed.get("volume") is not None:
-                    parsed["volume"] = _safe_float(parsed.get("volume"))
-                if "value_traded" in parsed and parsed.get("value_traded") is not None:
-                    parsed["value_traded"] = _safe_float(parsed.get("value_traded"))
+                for k in ("price", "change_percent", "change", "volume", "value_traded", "high_52w", "low_52w"):
+                    if k in parsed and parsed.get(k) is not None:
+                        parsed[k] = _safe_float(parsed.get(k))
             else:
-                # Fallback heuristic: numbers after code+name
                 nums: List[Optional[float]] = []
                 for j in range(code_idx + 2, len(txt)):
                     nums.append(_safe_float(txt[j]))
@@ -1129,14 +1239,12 @@ class DataEngine:
 
                 parsed.update({"price": price, "change": change, "change_percent": chg_p})
 
-                # Guess volume/value by tail correlation with price (best-effort)
                 volume = None
                 value_traded = None
                 tail = txt[-8:] if len(txt) >= 8 else txt
                 tail_nums = [_safe_float(x) for x in tail]
                 tail_nums2 = [v for v in tail_nums if v is not None and v > 0]
                 if tail_nums2:
-                    # volume tends to be a big integer-ish; pick max as volume candidate
                     volume = max(tail_nums2)
                     if price and volume:
                         vt_guess = price * volume
@@ -1183,7 +1291,9 @@ class DataEngine:
     # -------------------------------------------------------------------------
     # HTTP helpers
     # -------------------------------------------------------------------------
-    async def _http_get_text(self, url: str, params: Optional[Dict[str, Any]] = None, timeout_sec: Optional[float] = None) -> Optional[str]:
+    async def _http_get_text(
+        self, url: str, params: Optional[Dict[str, Any]] = None, timeout_sec: Optional[float] = None
+    ) -> Optional[str]:
         for attempt in range(3):
             try:
                 r = await self.client.get(url, params=params, timeout=timeout_sec)
@@ -1203,10 +1313,7 @@ class DataEngine:
         return None
 
     async def _http_get_json(
-        self,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout_sec: Optional[float] = None,
+        self, url: str, params: Optional[Dict[str, Any]] = None, timeout_sec: Optional[float] = None
     ) -> Optional[Union[Dict[str, Any], List[Any]]]:
         for attempt in range(3):
             try:
