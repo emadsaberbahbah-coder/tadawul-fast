@@ -1,0 +1,67 @@
+title: "Financial Statements"
+region: "ksa"
+
+columns:
+  - name: symbol
+    label: "Symbol"
+    type: string
+    required: true
+    max_length: 32
+
+  - name: period_end
+    label: "Period End"
+    type: date
+    required: true
+
+  - name: period_type
+    label: "Period Type"
+    type: string
+    required: true
+    enum: ["Q", "FY"]
+
+  - name: revenue
+    label: "Revenue"
+    type: number
+    required: false
+
+  - name: gross_profit
+    label: "Gross Profit"
+    type: number
+    required: false
+
+  - name: net_income
+    label: "Net Income"
+    type: number
+    required: false
+
+  - name: total_assets
+    label: "Total Assets"
+    type: number
+    required: false
+    ge: 0
+
+  - name: total_liabilities
+    label: "Total Liabilities"
+    type: number
+    required: false
+    ge: 0
+
+  - name: equity
+    label: "Equity"
+    type: number
+    required: false
+
+  - name: operating_cash_flow
+    label: "Operating Cash Flow"
+    type: number
+    required: false
+
+  - name: eps
+    label: "EPS"
+    type: number
+    required: false
+
+  - name: last_updated
+    label: "Last Updated"
+    type: datetime
+    required: false
