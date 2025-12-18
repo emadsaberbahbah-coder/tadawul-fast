@@ -1,0 +1,64 @@
+title: "Market Summary (KSA)"
+region: "ksa"
+
+columns:
+  - name: symbol
+    label: "Symbol"
+    type: string
+    required: true
+    max_length: 32
+
+  - name: company_name
+    label: "Company Name"
+    type: string
+    required: false
+    max_length: 200
+
+  - name: sector
+    label: "Sector"
+    type: string
+    required: false
+    max_length: 120
+
+  - name: currency
+    label: "Currency"
+    type: string
+    required: false
+    enum: ["SAR"]
+
+  - name: last_price
+    label: "Last Price"
+    type: number
+    required: false
+
+  - name: previous_close
+    label: "Previous Close"
+    type: number
+    required: false
+
+  - name: change
+    label: "Change"
+    type: number
+    required: false
+
+  - name: change_percent
+    label: "Change %"
+    type: number
+    required: false
+
+  - name: volume
+    label: "Volume"
+    type: number
+    required: false
+    ge: 0
+
+  - name: market_cap
+    label: "Market Cap"
+    type: number
+    required: false
+    ge: 0
+
+  - name: last_updated
+    label: "Last Updated"
+    type: datetime
+    required: false
