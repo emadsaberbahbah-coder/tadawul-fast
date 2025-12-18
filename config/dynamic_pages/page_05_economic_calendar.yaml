@@ -1,0 +1,61 @@
+title: "Economic Calendar"
+region: "global"   # calendar is usually global by nature; keep separate from KSA market data
+
+columns:
+  - name: event_date
+    label: "Event Date"
+    type: date
+    required: true
+
+  - name: event_time
+    label: "Event Time"
+    type: string
+    required: false
+    max_length: 20
+
+  - name: country
+    label: "Country"
+    type: string
+    required: false
+    max_length: 60
+
+  - name: event_name
+    label: "Event"
+    type: string
+    required: true
+    max_length: 200
+
+  - name: importance
+    label: "Importance"
+    type: string
+    required: false
+    enum: ["Low", "Medium", "High"]
+
+  - name: actual
+    label: "Actual"
+    type: string
+    required: false
+    max_length: 80
+
+  - name: forecast
+    label: "Forecast"
+    type: string
+    required: false
+    max_length: 80
+
+  - name: previous
+    label: "Previous"
+    type: string
+    required: false
+    max_length: 80
+
+  - name: source
+    label: "Source"
+    type: string
+    required: false
+    max_length: 120
+
+  - name: last_updated
+    label: "Last Updated"
+    type: datetime
+    required: false
