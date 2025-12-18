@@ -1,0 +1,46 @@
+title: "Analyst Estimates"
+region: "global"
+
+columns:
+  - name: symbol
+    label: "Symbol"
+    type: string
+    required: true
+    max_length: 32
+
+  - name: as_of_date
+    label: "As of Date"
+    type: date
+    required: false
+
+  - name: target_price
+    label: "Target Price"
+    type: number
+    required: false
+
+  - name: rating
+    label: "Rating"
+    type: string
+    required: false
+    enum: ["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"]
+
+  - name: analysts_count
+    label: "Analysts Count"
+    type: int
+    required: false
+    ge: 0
+
+  - name: revenue_forecast
+    label: "Revenue Forecast"
+    type: number
+    required: false
+
+  - name: eps_forecast
+    label: "EPS Forecast"
+    type: number
+    required: false
+
+  - name: last_updated
+    label: "Last Updated"
+    type: datetime
+    required: false
