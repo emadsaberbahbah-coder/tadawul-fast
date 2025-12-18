@@ -2,19 +2,18 @@
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam Gateway – v2.8.0 (Engine v2 aligned, Sheets-safe)
+KSA / Argaam Gateway – v2.9.0 (Engine v2 aligned, Sheets-safe)
 
 Purpose
 - KSA-only router: accepts numeric or .SR symbols only.
 - Delegates ALL fetching to core.data_engine_v2.DataEngine (no direct provider calls).
-- Returns EnrichedQuote + Scores for parity with Global routes.
+- Returns EnrichedQuote (+ scores best-effort) for parity with Global routes.
 - Provides /sheet-rows (headers + rows) for Google Sheets.
 
 Design goals
 - Extremely defensive (Sheets-safe): prefer returning 200 + error payload instead of raising.
 - Strict KSA normalization: always respond with 1234.SR when possible.
 - Header-safe row building: never breaks if schemas/to_row mismatch.
-
 """
 
 from __future__ import annotations
@@ -26,12 +25,12 @@ from typing import Any, Dict, List, Optional, Sequence
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
-from env import settings
+from core.config import get_settings
 from core.data_engine_v2 import DataEngine, UnifiedQuote
 from core.enriched_quote import EnrichedQuote
 
 logger = logging.getLogger("routes.argaam")
-ROUTE_VERSION = "2.8.0"
+ROUTE_VERSION = "2.9.0"
 
 # ---------------------------------------------------------------------------
 # Optional schema helper (preferred)
@@ -39,8 +38,8 @@ ROUTE_VERSION = "2.8.0"
 try:
     from core.schemas import get_headers_for_sheet  # type: ignore
 except Exception:  # pragma: no cover
+
     def get_headers_for_sheet(sheet_name: str) -> List[str]:
-        # Minimal Sheets-safe fallback
         return [
             "Symbol",
             "Data Quality",
@@ -124,6 +123,7 @@ def _safe_headers(sheet_name: str) -> List[str]:
     Ensures headers are always usable:
     - non-empty
     - includes Symbol as first column (required for most Sheets mapping)
+    - includes Error column
     """
     try:
         headers = get_headers_for_sheet(sheet_name) or []
@@ -132,15 +132,12 @@ def _safe_headers(sheet_name: str) -> List[str]:
 
     headers = [str(h).strip() for h in headers if h and str(h).strip()]
     if not headers:
-        headers = get_headers_for_sheet("fallback")  # will hit fallback above
+        headers = get_headers_for_sheet("fallback")  # fallback above
 
-    # Guarantee Symbol first
     if not headers or headers[0].strip().lower() != "symbol":
-        # If Symbol exists elsewhere, remove it then insert at position 0
         headers = [h for h in headers if h.strip().lower() != "symbol"]
         headers.insert(0, "Symbol")
 
-    # Guarantee an Error column (useful for sheets)
     if not any(h.strip().lower() == "error" for h in headers):
         headers.append("Error")
 
@@ -148,9 +145,6 @@ def _safe_headers(sheet_name: str) -> List[str]:
 
 
 def _row_with_error(headers: List[str], symbol: str, error: str, data_quality: str = "MISSING") -> List[Any]:
-    """
-    Creates a row of correct length, populating Symbol / Error / Data Quality if present.
-    """
     row: List[Any] = [None] * len(headers)
 
     def _idx(name: str) -> Optional[int]:
@@ -201,28 +195,25 @@ class KSASheetResponse(BaseModel):
 def _to_scored_enriched(uq: UnifiedQuote, fallback_symbol: str) -> EnrichedQuote:
     sym = _normalize_ksa_symbol(fallback_symbol) or (fallback_symbol or "").strip().upper() or "UNKNOWN"
 
-    # Always force KSA for this gateway
-    forced: Dict[str, Any] = {
-        "symbol": sym,
-        "market": "KSA",
-        "currency": "SAR",
-    }
+    forced: Dict[str, Any] = {"symbol": sym, "market": "KSA", "currency": "SAR"}
 
     try:
         eq = EnrichedQuote.from_unified(uq)
 
         # Force minimal KSA metadata (don’t depend on provider output)
-        if hasattr(eq, "model_copy"):
-            eq = eq.model_copy(update={k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")})
-        else:
+        try:
+            eq = eq.model_copy(
+                update={k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")}
+            )
+        except Exception:
             eq = eq.copy(update={k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")})
 
         # Ensure data_source present
         if not getattr(eq, "data_source", None):
             ds = getattr(uq, "data_source", None) or "argaam_gateway"
-            if hasattr(eq, "model_copy"):
+            try:
                 eq = eq.model_copy(update={"data_source": ds})
-            else:
+            except Exception:
                 eq = eq.copy(update={"data_source": ds})
 
         # Scores best-effort (never fail the response)
@@ -230,11 +221,11 @@ def _to_scored_enriched(uq: UnifiedQuote, fallback_symbol: str) -> EnrichedQuote
             from core.scoring_engine import enrich_with_scores  # type: ignore
 
             try:
-                eq2 = enrich_with_scores(eq)  # preferred
+                eq2 = enrich_with_scores(eq)  # preferred path
                 if isinstance(eq2, EnrichedQuote):
                     eq = eq2
             except Exception:
-                # Fallback attempt: score UnifiedQuote then re-map
+                # Fallback: score UnifiedQuote then re-map
                 uq2 = enrich_with_scores(uq)  # type: ignore
                 eq = EnrichedQuote.from_unified(uq2)  # type: ignore
         except Exception:
@@ -242,9 +233,9 @@ def _to_scored_enriched(uq: UnifiedQuote, fallback_symbol: str) -> EnrichedQuote
 
         # Guarantee symbol correctness
         if getattr(eq, "symbol", None) != sym:
-            if hasattr(eq, "model_copy"):
+            try:
                 eq = eq.model_copy(update={"symbol": sym})
-            else:
+            except Exception:
                 eq = eq.copy(update={"symbol": sym})
 
         return eq
@@ -262,50 +253,83 @@ router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 @router.get("/health")
 async def argaam_health() -> Dict[str, Any]:
+    s = get_settings()
     engine = _get_engine()
+    default_sheet = getattr(s, "sheet_ksa_tadawul", None) or "KSA_Tadawul_Market"
+
     return {
         "status": "ok",
         "module": "routes_argaam",
         "route_version": ROUTE_VERSION,
-        "app_version": getattr(settings, "app_version", None) or getattr(settings, "version", None),
         "engine": "DataEngineV2",
-        "providers": getattr(engine, "enabled_providers", None) or getattr(settings, "enabled_providers", None),
+        "providers": getattr(engine, "enabled_providers", None) or [],
         "ksa_mode": "STRICT",
-        "default_sheet": getattr(settings, "sheet_ksa_tadawul", None) or "KSA_Tadawul_Market",
+        "default_sheet": default_sheet,
     }
 
 
-@router.get("/quote", response_model=EnrichedQuote)
-async def ksa_single_quote(symbol: str = Query(..., description="KSA symbol (1120 or 1120.SR)")) -> EnrichedQuote:
+@router.get("/quote")
+async def ksa_single_quote(
+    symbol: str = Query(..., description="KSA symbol (1120 or 1120.SR)"),
+    debug: int = Query(0, description="debug=1 includes _meta in response"),
+) -> Any:
+    """
+    Returns EnrichedQuote (or dict with _meta when debug=1).
+    Sheets-safe: never raises for normal usage.
+    """
     ksa_symbol = _normalize_ksa_symbol(symbol)
     if not ksa_symbol:
-        # Sheets-safe: return 200 with an error object (don’t raise)
-        return EnrichedQuote(
+        eq = EnrichedQuote(
             symbol=(symbol or "").strip().upper() or "UNKNOWN",
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
             error=f"Invalid KSA symbol '{symbol}'. Must be numeric or end in .SR",
         )
+        if debug:
+            d = eq.model_dump(exclude_none=False) if hasattr(eq, "model_dump") else eq.dict()
+            d["_meta"] = {"debug": 1, "route_version": ROUTE_VERSION}
+            return d
+        return eq
 
     try:
         engine = _get_engine()
         uq = await engine.get_enriched_quote(ksa_symbol)
-        return _to_scored_enriched(uq, ksa_symbol)
+        eq = _to_scored_enriched(uq, ksa_symbol)
+
+        if debug:
+            d = eq.model_dump(exclude_none=False) if hasattr(eq, "model_dump") else eq.dict()
+            d["_meta"] = {
+                "debug": 1,
+                "route_version": ROUTE_VERSION,
+                "engine": "DataEngineV2",
+                "provider": getattr(uq, "data_source", None),
+                "data_quality": getattr(uq, "data_quality", None),
+                "engine_error": getattr(uq, "error", None),
+            }
+            return d
+
+        return eq
+
     except Exception as exc:
         logger.exception("routes_argaam: engine error for %s", ksa_symbol)
-        return EnrichedQuote(symbol=ksa_symbol, market="KSA", currency="SAR", data_quality="MISSING", error=str(exc))
+        eq = EnrichedQuote(symbol=ksa_symbol, market="KSA", currency="SAR", data_quality="MISSING", error=str(exc))
+        if debug:
+            d = eq.model_dump(exclude_none=False) if hasattr(eq, "model_dump") else eq.dict()
+            d["_meta"] = {"debug": 1, "route_version": ROUTE_VERSION, "engine": "DataEngineV2", "exception": str(exc)}
+            return d
+        return eq
 
 
-@router.post("/quotes", response_model=List[EnrichedQuote])
+@router.post("/quotes")
 async def ksa_batch_quotes(body: ArgaamBatchRequest) -> List[EnrichedQuote]:
     raw_list = body.symbols or body.tickers or []
     if not raw_list:
-        # Sheets-safe: no raise
         return []
 
-    normalized = []
+    normalized: List[str] = []
     invalid: List[str] = []
+
     for s in raw_list:
         n = _normalize_ksa_symbol(s)
         if n:
@@ -316,22 +340,41 @@ async def ksa_batch_quotes(body: ArgaamBatchRequest) -> List[EnrichedQuote]:
 
     targets = _dedupe_preserve_order(normalized)
     if not targets:
-        return []
+        return [
+            EnrichedQuote(
+                symbol=bad.upper(),
+                market="KSA",
+                currency="SAR",
+                data_quality="MISSING",
+                error="Invalid KSA symbol (must be numeric or end in .SR)",
+            )
+            for bad in invalid
+        ]
 
     engine = _get_engine()
     try:
         uqs = await engine.get_enriched_quotes(targets)
-        uq_map = {q.symbol.upper(): q for q in (uqs or [])}
+        uq_map = {q.symbol.upper(): q for q in (uqs or []) if getattr(q, "symbol", None)}
     except Exception as exc:
         logger.exception("routes_argaam: batch engine error")
-        return [EnrichedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error=str(exc)) for t in targets]
+        out_err = [EnrichedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error=str(exc)) for t in targets]
+        for bad in invalid:
+            out_err.append(
+                EnrichedQuote(
+                    symbol=bad.upper(),
+                    market="KSA",
+                    currency="SAR",
+                    data_quality="MISSING",
+                    error="Invalid KSA symbol (must be numeric or end in .SR)",
+                )
+            )
+        return out_err
 
     out: List[EnrichedQuote] = []
     for t in targets:
         uq = uq_map.get(t.upper()) or UnifiedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error="No data returned")
         out.append(_to_scored_enriched(uq, t))
 
-    # Optionally include invalids as explicit error objects (keeps caller aware)
     for bad in invalid:
         out.append(
             EnrichedQuote(
@@ -346,14 +389,16 @@ async def ksa_batch_quotes(body: ArgaamBatchRequest) -> List[EnrichedQuote]:
     return out
 
 
-@router.post("/sheet-rows", response_model=KSASheetResponse)
+@router.post("/sheet-rows")
 async def ksa_sheet_rows(body: ArgaamBatchRequest) -> KSASheetResponse:
     """
     Returns headers + rows for Google Sheets.
     Never raises for normal usage; returns rows with Error column populated.
     """
     raw_list = body.symbols or body.tickers or []
-    sheet_name = body.sheet_name or getattr(settings, "sheet_ksa_tadawul", None) or "KSA_Tadawul_Market"
+
+    s = get_settings()
+    sheet_name = body.sheet_name or getattr(s, "sheet_ksa_tadawul", None) or "KSA_Tadawul_Market"
 
     headers = _safe_headers(sheet_name)
 
@@ -362,19 +407,17 @@ async def ksa_sheet_rows(body: ArgaamBatchRequest) -> KSASheetResponse:
 
     valid_targets: List[str] = []
     invalid: List[str] = []
-    for s in raw_list:
-        n = _normalize_ksa_symbol(s)
+    for x in raw_list:
+        n = _normalize_ksa_symbol(x)
         if n:
             valid_targets.append(n)
         else:
-            if s and str(s).strip():
-                invalid.append(str(s).strip())
+            if x and str(x).strip():
+                invalid.append(str(x).strip())
 
     valid_targets = _dedupe_preserve_order(valid_targets)
 
     rows: List[List[Any]] = []
-
-    # Add invalid inputs as error rows (so Sheets shows the issue)
     for bad in invalid:
         rows.append(_row_with_error(headers, bad.upper(), "Invalid KSA symbol (must be numeric or end in .SR)"))
 
@@ -388,16 +431,12 @@ async def ksa_sheet_rows(body: ArgaamBatchRequest) -> KSASheetResponse:
     engine = _get_engine()
     try:
         uqs = await engine.get_enriched_quotes(valid_targets)
-        uq_map = {q.symbol.upper(): q for q in (uqs or [])}
+        uq_map = {q.symbol.upper(): q for q in (uqs or []) if getattr(q, "symbol", None)}
     except Exception as exc:
         logger.exception("routes_argaam: sheet-rows engine error")
         for t in valid_targets:
             rows.append(_row_with_error(headers, t, f"Engine error: {exc}"))
-        return KSASheetResponse(
-            headers=headers,
-            rows=rows,
-            meta={"count": len(rows), "sheet_name": sheet_name, "engine_error": str(exc)},
-        )
+        return KSASheetResponse(headers=headers, rows=rows, meta={"count": len(rows), "sheet_name": sheet_name, "engine_error": str(exc)})
 
     for t in valid_targets:
         uq = uq_map.get(t.upper()) or UnifiedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error="No data")
@@ -411,7 +450,8 @@ async def ksa_sheet_rows(body: ArgaamBatchRequest) -> KSASheetResponse:
             rows.append(row[: len(headers)])
         except Exception as exc:
             logger.error("routes_argaam: row mapping failed for %s: %s", t, exc)
-            rows.append(_row_with_error(headers, t, f"Row mapping failed: {exc}", data_quality=getattr(eq, "data_quality", "MISSING") or "MISSING"))
+            dq = getattr(eq, "data_quality", None) or "MISSING"
+            rows.append(_row_with_error(headers, t, f"Row mapping failed: {exc}", data_quality=str(dq)))
 
     return KSASheetResponse(
         headers=headers,
