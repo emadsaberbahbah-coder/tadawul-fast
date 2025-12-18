@@ -2,40 +2,46 @@
 """
 core/enriched_quote.py
 ===========================================================
-EnrichedQuote Mapper + Sheets Row Builder – v2.3.0 (PROD SAFE)
+EnrichedQuote Mapper + Sheets Row Builder – v2.4.0 (HARDENED)
 
 Purpose
-- Provide a stable, Sheets-friendly representation of UnifiedQuote.
+- Stable, Sheets-friendly representation of UnifiedQuote.
 - Convert UnifiedQuote -> EnrichedQuote (same field names).
 - Convert EnrichedQuote -> Google Sheets row aligned to provided headers.
 
 Design
 - Defensive: never throws during row build.
-- Header-driven: supports multiple header naming conventions.
+- Header-driven: supports many English + Arabic header conventions.
 - Sheets-safe values: None / NaN / inf -> "" (blank cell)
-- No risky % conversions for price changes (providers already vary).
-  Only conservative ratio->percent conversion is applied to:
-    dividend_yield, payout_ratio, roe, roa, net_margin, ebitda_margin,
-    revenue_growth, net_income_growth
+- Conservative ratio->percent conversion only for fundamental ratios:
+  dividend_yield, payout_ratio, roe, roa, net_margin, ebitda_margin,
+  revenue_growth, net_income_growth
 """
 
 from __future__ import annotations
 
 import math
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 from core.data_engine_v2 import UnifiedQuote
 
+ENRICHED_VERSION = "2.4.0"
 
-ENRICHED_VERSION = "2.3.0"
-
+RIYADH_TZ = timezone(timedelta(hours=3))
 
 # =============================================================================
 # Helpers
 # =============================================================================
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _now_riyadh_iso() -> str:
+    return datetime.now(RIYADH_TZ).isoformat()
+
 def _is_bad_number(x: Any) -> bool:
     try:
         if isinstance(x, (int, float)):
@@ -44,7 +50,6 @@ def _is_bad_number(x: Any) -> bool:
     except Exception:
         return True
     return False
-
 
 def _clean_value(x: Any) -> Any:
     """
@@ -57,18 +62,20 @@ def _clean_value(x: Any) -> Any:
         return ""
     return x
 
+def _contains_arabic(s: str) -> bool:
+    return any("\u0600" <= ch <= "\u06FF" for ch in (s or ""))
 
-def _norm_header(h: str) -> str:
+def _norm_header_en(h: str) -> str:
     """
-    Normalize header labels to a compact key:
+    Normalize English-like header labels to a compact key:
     - lowercase
     - remove non-alphanumeric
     Example: "Last Updated (Riyadh)" -> "lastupdatedriyadh"
     """
     s = (h or "").strip().lower()
+    s = s.replace("٪", "%")
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
-
 
 def _snake_from_header(h: str) -> str:
     """
@@ -79,7 +86,6 @@ def _snake_from_header(h: str) -> str:
     raw = re.sub(r"[\(\)\[\]]", " ", raw)
     raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
     return raw
-
 
 def _ratio_to_percent(v: Any) -> Optional[float]:
     """
@@ -97,7 +103,6 @@ def _ratio_to_percent(v: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def _safe_upside(current: Any, target: Any) -> Optional[float]:
     try:
         c = float(current) if current is not None else None
@@ -110,6 +115,99 @@ def _safe_upside(current: Any, target: Any) -> Optional[float]:
     except Exception:
         return None
 
+# Arabic header mapping (best-effort)
+_AR_HEADER_MAP: Dict[str, str] = {
+    # Identity
+    "الرمز": "symbol",
+    "رمز": "symbol",
+    "الشركة": "name",
+    "اسم الشركة": "name",
+    "الاسم": "name",
+    "القطاع": "sector",
+    "النشاط": "industry",
+    "القطاع الفرعي": "sub_sector",
+    "السوق": "market",
+    "العملة": "currency",
+    "تاريخ الادراج": "listing_date",
+    "تاريخ الإدراج": "listing_date",
+
+    # Prices
+    "اخر سعر": "current_price",
+    "آخر سعر": "current_price",
+    "السعر": "current_price",
+    "سعر": "current_price",
+    "الاغلاق السابق": "previous_close",
+    "الإغلاق السابق": "previous_close",
+    "الافتتاح": "open",
+    "الأعلى": "day_high",
+    "الادنى": "day_low",
+    "الأدنى": "day_low",
+    "اعلى 52 اسبوع": "high_52w",
+    "أعلى 52 أسبوع": "high_52w",
+    "ادنى 52 اسبوع": "low_52w",
+    "أدنى 52 أسبوع": "low_52w",
+    "التغير": "price_change",
+    "التغير%": "percent_change",
+    "نسبة التغير": "percent_change",
+    "نسبة التغير%": "percent_change",
+
+    # Volume / Value
+    "حجم التداول": "volume",
+    "الكمية": "volume",
+    "قيمة التداول": "value_traded",
+    "القيمة": "value_traded",
+
+    # Market cap / Shares
+    "القيمة السوقية": "market_cap",
+    "عدد الاسهم": "shares_outstanding",
+    "عدد الأسهم": "shares_outstanding",
+
+    # Fundamentals
+    "مكرر الارباح": "pe_ttm",
+    "مكرر الأرباح": "pe_ttm",
+    "ربحية السهم": "eps_ttm",
+    "العائد على حقوق الملكية": "roe",
+    "العائد على الأصول": "roa",
+    "هامش الربح": "net_margin",
+    "عائد التوزيع": "dividend_yield",
+    "مكرر القيمة الدفترية": "pb",
+    "مكرر المبيعات": "ps",
+
+    # Meta
+    "مصدر البيانات": "data_source",
+    "جودة البيانات": "data_quality",
+    "آخر تحديث utc": "last_updated_utc",
+    "آخر تحديث": "last_updated_riyadh",
+    "خطأ": "error",
+    "الخطأ": "error",
+}
+
+def _ar_key(h: str) -> Optional[str]:
+    """
+    Attempt to map Arabic header text to an internal field key.
+    """
+    if not h:
+        return None
+    s = (h or "").strip()
+    if not s:
+        return None
+    # normalize arabic spacing/punct
+    s2 = s.replace("٪", "%")
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    # direct match
+    if s2 in _AR_HEADER_MAP:
+        return _AR_HEADER_MAP[s2]
+    # try stripping common decorations
+    s3 = s2.replace(":", "").replace("-", "").strip()
+    if s3 in _AR_HEADER_MAP:
+        return _AR_HEADER_MAP[s3]
+    # try without spaces (some sheets do that)
+    s4 = s3.replace(" ", "")
+    for k, v in _AR_HEADER_MAP.items():
+        if k.replace(" ", "") == s4:
+            return v
+    return None
+
 
 # =============================================================================
 # Model: EnrichedQuote
@@ -117,7 +215,6 @@ def _safe_upside(current: Any, target: Any) -> Optional[float]:
 class EnrichedQuote(BaseModel):
     """
     Stable “public” quote shape for API + Google Sheets.
-
     Field names intentionally match UnifiedQuote (engine output).
     """
     model_config = ConfigDict(
@@ -228,9 +325,16 @@ class EnrichedQuote(BaseModel):
           - object with attributes
         """
         if q is None:
-            return cls(symbol="", data_quality="MISSING", error="Empty quote input")
+            return cls(symbol="UNKNOWN", data_quality="MISSING", error="Empty quote input", last_updated_utc=_now_utc_iso(), last_updated_riyadh=_now_riyadh_iso())
 
         if isinstance(q, EnrichedQuote):
+            # Ensure timestamps exist
+            if not q.last_updated_utc:
+                q.last_updated_utc = _now_utc_iso()
+            if not q.last_updated_riyadh:
+                q.last_updated_riyadh = _now_riyadh_iso()
+            if not q.symbol:
+                q.symbol = "UNKNOWN"
             return q
 
         data: Dict[str, Any] = {}
@@ -253,7 +357,16 @@ class EnrichedQuote(BaseModel):
             except Exception:
                 sym = ""
 
+        if not sym:
+            sym = "UNKNOWN"
+
         obj = cls(**{**data, "symbol": sym})
+
+        # Ensure timestamps exist
+        if not obj.last_updated_utc:
+            obj.last_updated_utc = _now_utc_iso()
+        if not obj.last_updated_riyadh:
+            obj.last_updated_riyadh = _now_riyadh_iso()
 
         # Compute upside if missing (prefer target_price, else fair_value)
         if obj.upside_percent is None:
@@ -282,132 +395,262 @@ class EnrichedQuote(BaseModel):
                     return d.get(k)
             return None
 
-        # Conservative ratio->% conversions for specific fundamentals only
         def pct_field(key: str) -> Any:
             v = g(key)
             return _ratio_to_percent(v)
 
-        mapping: Dict[str, Callable[[], Any]] = {
+        # One canonical map: internal field name -> value function
+        field_getters: Dict[str, Callable[[], Any]] = {
             # Identity
             "symbol": lambda: g("symbol"),
-            "ticker": lambda: g("symbol"),
-            "companyname": lambda: g("name"),
             "name": lambda: g("name"),
             "sector": lambda: g("sector"),
             "industry": lambda: g("industry"),
-            "subsector": lambda: g("sub_sector"),
+            "sub_sector": lambda: g("sub_sector"),
             "market": lambda: g("market"),
             "currency": lambda: g("currency"),
-            "listingdate": lambda: g("listing_date"),
+            "listing_date": lambda: g("listing_date"),
 
-            # Shares / Float / Cap
-            "sharesoutstanding": lambda: g("shares_outstanding"),
-            "freefloat": lambda: g("free_float"),
-            "marketcap": lambda: g("market_cap"),
-            "freefloatmarketcap": lambda: g("free_float_market_cap"),
+            # Shares / Cap
+            "shares_outstanding": lambda: g("shares_outstanding"),
+            "free_float": lambda: g("free_float"),
+            "market_cap": lambda: g("market_cap"),
+            "free_float_market_cap": lambda: g("free_float_market_cap"),
 
             # Prices
-            "currentprice": lambda: g("current_price"),
-            "lastprice": lambda: g("current_price"),
-            "price": lambda: g("current_price"),
-            "previousclose": lambda: g("previous_close"),
+            "current_price": lambda: g("current_price"),
+            "previous_close": lambda: g("previous_close"),
             "open": lambda: g("open"),
-            "dayhigh": lambda: g("day_high"),
-            "daylow": lambda: g("day_low"),
-            "52whigh": lambda: g("high_52w"),
-            "52wlow": lambda: g("low_52w"),
-            "52wposition": lambda: g("position_52w_percent"),
-            "52wpositionpercent": lambda: g("position_52w_percent"),
-            "pricechange": lambda: g("price_change"),
-            "percentchange": lambda: g("percent_change"),
+            "day_high": lambda: g("day_high"),
+            "day_low": lambda: g("day_low"),
+            "high_52w": lambda: g("high_52w"),
+            "low_52w": lambda: g("low_52w"),
+            "position_52w_percent": lambda: g("position_52w_percent"),
+            "price_change": lambda: g("price_change"),
+            "percent_change": lambda: g("percent_change"),
 
             # Volume / Liquidity
             "volume": lambda: g("volume"),
-            "avgvolume30d": lambda: g("avg_volume_30d"),
-            "valuetraded": lambda: g("value_traded"),
-            "turnover": lambda: g("turnover_percent"),
-            "turnoverpercent": lambda: g("turnover_percent"),
-            "liquidityscore": lambda: g("liquidity_score"),
+            "avg_volume_30d": lambda: g("avg_volume_30d"),
+            "value_traded": lambda: g("value_traded"),
+            "turnover_percent": lambda: g("turnover_percent"),
+            "liquidity_score": lambda: g("liquidity_score"),
 
             # Fundamentals
-            "epsttm": lambda: g("eps_ttm"),
-            "forwardeps": lambda: g("forward_eps"),
-            "pettm": lambda: g("pe_ttm"),
-            "forwardpe": lambda: g("forward_pe"),
+            "eps_ttm": lambda: g("eps_ttm"),
+            "forward_eps": lambda: g("forward_eps"),
+            "pe_ttm": lambda: g("pe_ttm"),
+            "forward_pe": lambda: g("forward_pe"),
             "pb": lambda: g("pb"),
             "ps": lambda: g("ps"),
-            "evebitda": lambda: g("ev_ebitda"),
-            "dividendyield": lambda: pct_field("dividend_yield"),
-            "dividendrate": lambda: g("dividend_rate"),
-            "payoutratio": lambda: pct_field("payout_ratio"),
+            "ev_ebitda": lambda: g("ev_ebitda"),
+            "dividend_yield": lambda: pct_field("dividend_yield"),
+            "dividend_rate": lambda: g("dividend_rate"),
+            "payout_ratio": lambda: pct_field("payout_ratio"),
             "roe": lambda: pct_field("roe"),
             "roa": lambda: pct_field("roa"),
-            "netmargin": lambda: pct_field("net_margin"),
-            "ebitdamargin": lambda: pct_field("ebitda_margin"),
-            "revenuegrowth": lambda: pct_field("revenue_growth"),
-            "netincomegrowth": lambda: pct_field("net_income_growth"),
+            "net_margin": lambda: pct_field("net_margin"),
+            "ebitda_margin": lambda: pct_field("ebitda_margin"),
+            "revenue_growth": lambda: pct_field("revenue_growth"),
+            "net_income_growth": lambda: pct_field("net_income_growth"),
             "beta": lambda: g("beta"),
-            "debttoequity": lambda: g("debt_to_equity"),
-            "currentratio": lambda: g("current_ratio"),
-            "quickratio": lambda: g("quick_ratio"),
+            "debt_to_equity": lambda: g("debt_to_equity"),
+            "current_ratio": lambda: g("current_ratio"),
+            "quick_ratio": lambda: g("quick_ratio"),
 
             # Technicals
-            "rsi14": lambda: g("rsi_14"),
-            "volatility30d": lambda: g("volatility_30d"),
+            "rsi_14": lambda: g("rsi_14"),
+            "volatility_30d": lambda: g("volatility_30d"),
             "macd": lambda: g("macd"),
             "ma20": lambda: g("ma20"),
             "ma50": lambda: g("ma50"),
 
-            # Valuation / targets
-            "fairvalue": lambda: g("fair_value"),
-            "targetprice": lambda: g("target_price"),
-            "upside": lambda: g("upside_percent") if g("upside_percent") is not None else _safe_upside(g("current_price"), g("target_price") or g("fair_value")),
-            "upsidepercent": lambda: g("upside_percent") if g("upside_percent") is not None else _safe_upside(g("current_price"), g("target_price") or g("fair_value")),
-            "valuationlabel": lambda: g("valuation_label"),
-            "analystrating": lambda: g("analyst_rating"),
+            # Targets
+            "fair_value": lambda: g("fair_value"),
+            "target_price": lambda: g("target_price"),
+            "upside_percent": lambda: g("upside_percent")
+            if g("upside_percent") is not None
+            else _safe_upside(g("current_price"), g("target_price") or g("fair_value")),
+            "valuation_label": lambda: g("valuation_label"),
+            "analyst_rating": lambda: g("analyst_rating"),
 
-            # Scores / reco
-            "valuescore": lambda: g("value_score"),
-            "qualityscore": lambda: g("quality_score"),
-            "momentumscore": lambda: g("momentum_score"),
-            "opportunityscore": lambda: g("opportunity_score"),
-            "overallscore": lambda: g("overall_score"),
+            # Scores
+            "value_score": lambda: g("value_score"),
+            "quality_score": lambda: g("quality_score"),
+            "momentum_score": lambda: g("momentum_score"),
+            "opportunity_score": lambda: g("opportunity_score"),
+            "overall_score": lambda: g("overall_score"),
             "recommendation": lambda: g("recommendation"),
             "confidence": lambda: g("confidence"),
-            "riskscore": lambda: g("risk_score"),
+            "risk_score": lambda: g("risk_score"),
 
             # Meta
-            "datasource": lambda: g("data_source"),
-            "dataquality": lambda: g("data_quality"),
-            "lastupdatedutc": lambda: g("last_updated_utc"),
-            "lastupdatedriyadh": lambda: g("last_updated_riyadh"),
+            "data_source": lambda: g("data_source"),
+            "data_quality": lambda: g("data_quality"),
+            "last_updated_utc": lambda: g("last_updated_utc"),
+            "last_updated_riyadh": lambda: g("last_updated_riyadh"),
             "error": lambda: g("error"),
+        }
+
+        # English header aliases -> internal key
+        # NOTE: keys here should be _norm_header_en(...) outputs
+        en_alias: Dict[str, str] = {
+            # Identity
+            "symbol": "symbol",
+            "ticker": "symbol",
+            "companyname": "name",
+            "name": "name",
+            "sector": "sector",
+            "industry": "industry",
+            "subsector": "sub_sector",
+            "subsectorname": "sub_sector",
+            "market": "market",
+            "currency": "currency",
+            "listingdate": "listing_date",
+            "ipodate": "listing_date",
+
+            # Prices
+            "currentprice": "current_price",
+            "lastprice": "current_price",
+            "price": "current_price",
+            "last": "current_price",
+            "previousclose": "previous_close",
+            "prevclose": "previous_close",
+            "open": "open",
+            "dayhigh": "day_high",
+            "high": "day_high",
+            "daylow": "day_low",
+            "low": "day_low",
+            "52whigh": "high_52w",
+            "52weekhigh": "high_52w",
+            "52wlow": "low_52w",
+            "52weeklow": "low_52w",
+            "52wposition": "position_52w_percent",
+            "52wpositionpercent": "position_52w_percent",
+            "position52wpercent": "position_52w_percent",
+            "pricechange": "price_change",
+            "change": "price_change",
+            "percentchange": "percent_change",
+            "changepercent": "percent_change",
+            "chgpercent": "percent_change",
+            "change%": "percent_change",
+
+            # Volume / value
+            "volume": "volume",
+            "avgvolume": "avg_volume_30d",
+            "avgvolume30d": "avg_volume_30d",
+            "valuetraded": "value_traded",
+            "tradedvalue": "value_traded",
+            "turnover": "turnover_percent",
+            "turnoverpercent": "turnover_percent",
+            "liquidityscore": "liquidity_score",
+
+            # Shares / cap
+            "sharesoutstanding": "shares_outstanding",
+            "freefloat": "free_float",
+            "marketcap": "market_cap",
+            "freefloatmarketcap": "free_float_market_cap",
+
+            # Fundamentals
+            "epsttm": "eps_ttm",
+            "forwardeps": "forward_eps",
+            "pettm": "pe_ttm",
+            "pe": "pe_ttm",
+            "forwardpe": "forward_pe",
+            "pb": "pb",
+            "ps": "ps",
+            "evebitda": "ev_ebitda",
+            "dividendyield": "dividend_yield",
+            "dividendyield%": "dividend_yield",
+            "dividendrate": "dividend_rate",
+            "payoutratio": "payout_ratio",
+            "roe": "roe",
+            "roa": "roa",
+            "netmargin": "net_margin",
+            "ebitdamargin": "ebitda_margin",
+            "revenuegrowth": "revenue_growth",
+            "netincomegrowth": "net_income_growth",
+            "beta": "beta",
+            "debttoequity": "debt_to_equity",
+            "currentratio": "current_ratio",
+            "quickratio": "quick_ratio",
+
+            # Technicals
+            "rsi": "rsi_14",
+            "rsi14": "rsi_14",
+            "volatility": "volatility_30d",
+            "volatility30d": "volatility_30d",
+            "macd": "macd",
+            "ma20": "ma20",
+            "ma50": "ma50",
+
+            # Targets
+            "fairvalue": "fair_value",
+            "targetprice": "target_price",
+            "upside": "upside_percent",
+            "upsidepercent": "upside_percent",
+            "valuationlabel": "valuation_label",
+            "analystrating": "analyst_rating",
+
+            # Scores
+            "valuescore": "value_score",
+            "qualityscore": "quality_score",
+            "momentumscore": "momentum_score",
+            "opportunityscore": "opportunity_score",
+            "overallscore": "overall_score",
+            "recommendation": "recommendation",
+            "confidence": "confidence",
+            "riskscore": "risk_score",
+
+            # Meta
+            "datasource": "data_source",
+            "dataquality": "data_quality",
+            "lastupdatedutc": "last_updated_utc",
+            "lastupdatedriyadh": "last_updated_riyadh",
+            "lastupdatedlocal": "last_updated_riyadh",
+            "error": "error",
         }
 
         row: List[Any] = []
         for h in (headers or []):
-            key = _norm_header(h)
-
-            # Small compatibility shims
-            if key == "52wposition":
-                key = "52wpositionpercent"
-            if key == "turnover":
-                key = "turnoverpercent"
-            if key == "lastupdatedlocal":
-                key = "lastupdatedriyadh"
-
-            val: Any = ""
             try:
-                fn = mapping.get(key)
-                if fn is not None:
-                    val = fn()
-                else:
-                    # Fallback: attempt snake_case lookup
-                    val = d.get(_snake_from_header(h), "")
-            except Exception:
-                val = ""
+                raw_h = (h or "").strip()
+                # 1) Arabic mapping
+                if _contains_arabic(raw_h):
+                    ar_k = _ar_key(raw_h)
+                    if ar_k and ar_k in field_getters:
+                        row.append(_clean_value(field_getters[ar_k]()))
+                        continue
 
-            row.append(_clean_value(val))
+                # 2) English normalized alias mapping
+                k = _norm_header_en(raw_h)
+
+                # small shims
+                if k == "52wposition":
+                    k = "52wpositionpercent"
+                if k == "turnover":
+                    k = "turnoverpercent"
+                if k == "lastupdatedlocal":
+                    k = "lastupdatedriyadh"
+
+                internal = en_alias.get(k)
+                if internal and internal in field_getters:
+                    row.append(_clean_value(field_getters[internal]()))
+                    continue
+
+                # 3) Fallback: snake_case field name directly
+                snake = _snake_from_header(raw_h)
+                if snake and snake in field_getters:
+                    row.append(_clean_value(field_getters[snake]()))
+                    continue
+
+                # 4) Final fallback: direct dict access by snake key
+                if snake:
+                    row.append(_clean_value(d.get(snake, "")))
+                else:
+                    row.append("")
+            except Exception:
+                row.append("")
 
         return row
 
