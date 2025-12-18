@@ -1,485 +1,480 @@
-# routes/enriched_quote.py
+# core/data_engine.py
 """
-routes/enriched_quote.py
+core/data_engine.py
 ===========================================================
-Enriched Quote Routes (Google Sheets + API) - v2.4.0 (PROD SAFE)
+LEGACY KSA ENGINE (PROD SAFE) – v3.0.0
 
-Endpoints:
-  GET  /v1/enriched/quote?symbol=1120.SR
-  POST /v1/enriched/quotes   {symbols:[...], tickers:[...], sheet_name?: "..."}
-  GET  /v1/enriched/headers?sheet_name=...
+Purpose
+-------
+This module exists because core.data_engine_v2 delegates KSA symbols here first.
+If this file is missing/weak, KSA returns MISSING.
 
-Auth:
-  X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If none configured -> OPEN mode.
+Design goals
+------------
+- KSA-safe: never uses EODHD/FMP/Finnhub for .SR.
+- Avoid yfinance (Yahoo often 401/blocked on servers).
+- Best-effort multi-source:
+    1) Tadawul JSON endpoints (preferred if reachable)
+    2) Argaam tables scrape (fallback)
 
-Notes:
-- /quotes truncates to max instead of failing hard (Sheets-safe).
-- Adds _meta.elapsed_ms for debugging.
+Exports
+-------
+- async get_enriched_quote(symbol) -> dict
+- async get_enriched_quotes(symbols) -> list[dict]
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
-import time
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Literal
+import random
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+import httpx
 
-from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol
-from core.enriched_quote import EnrichedQuote
-
-# Optional core.schemas (preferred)
+# Optional HTML parsing
 try:
-    from core.schemas import BatchProcessRequest, get_headers_for_sheet  # type: ignore
+    from bs4 import BeautifulSoup  # type: ignore
 except Exception:  # pragma: no cover
-    BatchProcessRequest = None  # type: ignore
-    get_headers_for_sheet = None  # type: ignore
-
-logger = logging.getLogger("routes.enriched_quote")
-
-ROUTE_VERSION = "2.4.0"
-router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
+    BeautifulSoup = None
 
 
-# =============================================================================
-# Fallback request model + headers helper
-# =============================================================================
-class _FallbackBatchProcessRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    operation: str = "refresh"
-    sheet_name: Optional[str] = None
-    symbols: List[str] = Field(default_factory=list)
-    tickers: List[str] = Field(default_factory=list)  # alias support
+logger = logging.getLogger("core.data_engine")
+
+ENGINE_VERSION = "3.0.0"
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
 
-def _fallback_headers() -> List[str]:
-    return ["Symbol", "Error"]
+# ----------------------------
+# Helpers
+# ----------------------------
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _resolve_headers(sheet_name: Optional[str]) -> List[str]:
-    if get_headers_for_sheet:
-        try:
-            h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and h and any(str(x).strip().lower() == "symbol" for x in h):
-                return [str(x) for x in h]
-        except Exception:
-            pass
-    return _fallback_headers()
+def normalize_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper()
+    if not s:
+        return ""
+    if s.isdigit():
+        return f"{s}.SR"
+    if s.endswith(".SR") or s.endswith(".US") or "." in s:
+        return s
+    return f"{s}.US"
 
 
-# =============================================================================
-# Engine resolution (prefer app.state.engine; else singleton)
-# =============================================================================
-_ENGINE: Optional[DataEngine] = None
-_ENGINE_LOCK = asyncio.Lock()
+def is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    return s.endswith(".SR") or s.isdigit()
 
 
-def _get_app_engine(request: Request) -> Optional[Any]:
+def _safe_str(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
+
+def _safe_float(val: Any) -> Optional[float]:
+    if val is None:
+        return None
     try:
-        st = getattr(getattr(request, "app", None), "state", None)
-        if not st:
+        if isinstance(val, (int, float)):
+            f = float(val)
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return f
+
+        s = str(val).strip()
+        if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
             return None
-        for attr in ("engine", "data_engine", "data_engine_v2"):
-            eng = getattr(st, attr, None)
-            if eng and hasattr(eng, "get_quote"):
-                return eng
-        return None
+
+        s = s.translate(_ARABIC_DIGITS)
+        s = s.replace("٬", ",").replace("٫", ".")
+        s = s.replace("SAR", "").replace("ريال", "").strip()
+        s = s.replace("%", "").strip()
+        s = s.replace(",", "")
+
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1].strip()
+
+        return float(s)
     except Exception:
         return None
 
 
-async def _get_singleton_engine() -> Optional[DataEngine]:
-    global _ENGINE
-    if _ENGINE is not None:
-        return _ENGINE
-    async with _ENGINE_LOCK:
-        if _ENGINE is None:
-            try:
-                _ENGINE = DataEngine()
-                logger.info("[enriched] DataEngine initialized (routes singleton).")
-            except Exception as exc:
-                logger.exception("[enriched] Failed to init DataEngine: %s", exc)
-                _ENGINE = None
-    return _ENGINE
+def _env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in _TRUTHY
 
 
-async def _resolve_engine(request: Request) -> Optional[Any]:
-    eng = _get_app_engine(request)
-    if eng is not None:
-        return eng
-    return await _get_singleton_engine()
-
-
-async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[UnifiedQuote]:
-    if hasattr(engine, "get_enriched_quotes"):
-        return await engine.get_enriched_quotes(syms)  # type: ignore
-    if hasattr(engine, "get_quotes"):
-        return await engine.get_quotes(syms)  # type: ignore
-
-    out: List[UnifiedQuote] = []
-    for s in syms:
-        out.append(await engine.get_quote(s))  # type: ignore
-    return out
-
-
-async def _engine_get_quote(engine: Any, sym: str) -> UnifiedQuote:
-    if hasattr(engine, "get_quote"):
-        return await engine.get_quote(sym)  # type: ignore
-    res = await _engine_get_quotes(engine, [sym])
-    return (res or [UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error="No data returned").finalize()])[0]
-
-
-# =============================================================================
-# Auth (X-APP-TOKEN)
-# =============================================================================
-@lru_cache(maxsize=1)
-def _allowed_tokens() -> List[str]:
-    tokens: List[str] = []
+def _timeout() -> float:
     try:
-        s = get_settings()
-        for attr in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
-            v = getattr(s, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
+        v = float(os.getenv("HTTP_TIMEOUT_SEC", "20").strip())
+        return max(8.0, min(40.0, v))
     except Exception:
-        pass
-
-    try:
-        import env as env_mod  # type: ignore
-        for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
-            v = getattr(env_mod, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
-    except Exception:
-        pass
-
-    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
-        v = os.getenv(k)
-        if v and v.strip():
-            tokens.append(v.strip())
-
-    out: List[str] = []
-    seen = set()
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-
-    if not out:
-        logger.warning("[enriched] No APP_TOKEN configured -> endpoints are OPEN (no auth).")
-    return out
+        return 20.0
 
 
-def _require_token(x_app_token: Optional[str]) -> None:
-    allowed = _allowed_tokens()
-    if not allowed:
-        return  # open mode
-    if not x_app_token or x_app_token.strip() not in allowed:
-        raise HTTPException(status_code=401, detail="Unauthorized (invalid or missing X-APP-TOKEN).")
-
-
-# =============================================================================
-# Limits helpers
-# =============================================================================
-def _get_int_setting(name: str, default: int) -> int:
-    try:
-        s = get_settings()
-        v = getattr(s, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    except Exception:
-        pass
-
-    try:
-        import env as env_mod  # type: ignore
-        v = getattr(env_mod, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    except Exception:
-        pass
-
-    try:
-        ev = os.getenv(name)
-        if ev:
-            n = int(ev)
-            if n > 0:
-                return n
-    except Exception:
-        pass
-
-    return default
-
-
-def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in symbols or []:
-        if x is None:
-            continue
-        s = normalize_symbol(str(x).strip())
-        if not s:
-            continue
-        su = s.upper()
-        if su in seen:
-            continue
-        seen.add(su)
-        out.append(su)
-    return out
-
-
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    try:
-        return obj.model_dump(exclude_none=False)  # type: ignore
-    except Exception:
-        pass
-    try:
-        return obj.dict()  # type: ignore
-    except Exception:
-        pass
-    try:
-        return dict(getattr(obj, "__dict__", {}) or {})
-    except Exception:
-        return {}
-
-
-def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
-    eq = EnrichedQuote.from_unified(q)
-    return {
-        "headers": list(headers),
-        "row": eq.to_row(headers),
-        "quote": _model_to_dict(eq),
+def _headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    h = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar-SA,ar;q=0.9,en-US,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
     }
+    if extra:
+        h.update(extra)
+    return h
 
 
-def _chunk(items: List[str], size: int) -> List[List[str]]:
-    if size <= 0:
-        return [items]
-    return [items[i: i + size] for i in range(0, len(items), size)]
-
-
-# =============================================================================
-# Endpoints
-# =============================================================================
-@router.get("/health", tags=["system"])
-async def enriched_health(request: Request) -> Dict[str, Any]:
-    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
-    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
-
-    eng = await _resolve_engine(request)
-
-    return {
-        "status": "ok",
-        "module": "routes.enriched_quote",
-        "version": ROUTE_VERSION,
-        "engine": "DataEngineV2",
-        "providers": list(getattr(eng, "enabled_providers", []) or []) if eng else [],
-        "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
-        "auth": "open" if not _allowed_tokens() else "token",
-    }
-
-
-@router.get("/headers")
-async def enriched_headers(
-    request: Request,
-    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name to resolve headers."),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    _require_token(x_app_token)
-    headers = _resolve_headers(sheet_name)
-    return {"sheet_name": sheet_name, "headers": headers, "count": len(headers)}
-
-
-@router.get("/quote")
-async def enriched_quote(
-    request: Request,
-    symbol: str = Query(..., description="Ticker symbol (e.g., 1120.SR, AAPL, ^GSPC)."),
-    sheet_name: Optional[str] = Query(default=None, description="Optional sheet name for header/row alignment."),
-    format: Literal["quote", "row", "both"] = Query(default="quote", description="Return quote, row, or both."),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    _require_token(x_app_token)
-    t0 = time.perf_counter()
-
-    sym = (symbol or "").strip()
-    if not sym:
-        raise HTTPException(status_code=400, detail="symbol is required")
-
-    eng = await _resolve_engine(request)
-    if eng is None:
-        uq = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error="Engine unavailable").finalize()
-        eq = EnrichedQuote.from_unified(uq)
-        elapsed = int((time.perf_counter() - t0) * 1000)
-        if format == "quote":
-            d = _model_to_dict(eq)
-            d["_meta"] = {"elapsed_ms": elapsed, "engine": None}
-            return d
-
-        headers = _resolve_headers(sheet_name)
-        row = eq.to_row(headers)
-        if format == "row":
-            return {"symbol": eq.symbol, "headers": headers, "row": row, "_meta": {"elapsed_ms": elapsed, "engine": None}}
-
-        return {"sheet_name": sheet_name, "headers": headers, "row": row, "quote": _model_to_dict(eq), "_meta": {"elapsed_ms": elapsed, "engine": None}}
-
-    try:
-        q = await _engine_get_quote(eng, sym)
-    except Exception as exc:
-        q = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error=str(exc)).finalize()
-
-    elapsed = int((time.perf_counter() - t0) * 1000)
-
-    if format == "quote":
-        d = _model_to_dict(EnrichedQuote.from_unified(q))
-        d["_meta"] = {"elapsed_ms": elapsed}
-        return d
-
-    headers = _resolve_headers(sheet_name)
-    payload = _build_row_payload(q, headers)
-
-    if format == "row":
-        return {
-            "symbol": payload["quote"].get("symbol", normalize_symbol(sym) or sym),
-            "headers": payload["headers"],
-            "row": payload["row"],
-            "_meta": {"elapsed_ms": elapsed},
-        }
-
-    payload["sheet_name"] = sheet_name
-    payload["_meta"] = {"elapsed_ms": elapsed}
-    return payload
-
-
-@router.post("/quotes")
-async def enriched_quotes(
-    request: Request,
-    req: Any = Body(...),
-    format: Literal["rows", "quotes", "both"] = Query(default="rows", description="Return rows, quotes, or both."),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    _require_token(x_app_token)
-    t0 = time.perf_counter()
-
-    Model = BatchProcessRequest or _FallbackBatchProcessRequest  # type: ignore
-
-    # Flexible body: accept dict model OR list of symbols
-    parsed = None
-    if isinstance(req, list):
-        parsed = _FallbackBatchProcessRequest(symbols=[str(x) for x in req if x is not None])
-    else:
+async def _http_get_text(client: httpx.AsyncClient, url: str, params: Optional[Dict[str, Any]] = None, timeout_sec: float = 12.0) -> Optional[str]:
+    for attempt in range(3):
         try:
-            parsed = req if isinstance(req, Model) else Model.model_validate(req)  # type: ignore
+            r = await client.get(url, params=params, timeout=timeout_sec)
+            if r.status_code in (429,) or 500 <= r.status_code < 600:
+                if attempt < 2:
+                    await asyncio.sleep(0.35 + random.random() * 0.45)
+                    continue
+                return None
+            if r.status_code >= 400:
+                return None
+            return r.text
         except Exception:
-            try:
-                parsed = Model.parse_obj(req)  # type: ignore
-            except Exception:
-                parsed = _FallbackBatchProcessRequest()
+            if attempt < 2:
+                await asyncio.sleep(0.35 + random.random() * 0.45)
+                continue
+            return None
+    return None
 
-    symbols_in = list(getattr(parsed, "symbols", []) or []) + list(getattr(parsed, "tickers", []) or [])
-    sheet_name = getattr(parsed, "sheet_name", None)
-    operation = getattr(parsed, "operation", "refresh")
 
-    symbols = _clean_symbols(symbols_in)
-    headers = _resolve_headers(sheet_name)
+async def _http_get_json(client: httpx.AsyncClient, url: str, params: Optional[Dict[str, Any]] = None, timeout_sec: float = 12.0) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    txt = await _http_get_text(client, url, params=params, timeout_sec=timeout_sec)
+    if not txt:
+        return None
+    try:
+        return json.loads(txt)
+    except Exception:
+        return None
 
-    if not symbols:
-        elapsed = int((time.perf_counter() - t0) * 1000)
-        return {
-            "status": "skipped",
-            "error": "No symbols provided",
-            "operation": operation,
-            "sheet_name": sheet_name,
-            "count": 0,
-            "symbols": [],
-            "headers": headers,
-            "rows": [] if format in ("rows", "both") else None,
-            "quotes": [] if format in ("quotes", "both") else None,
-            "_meta": {"elapsed_ms": elapsed},
+
+# ----------------------------
+# Argaam fallback (scrape)
+# ----------------------------
+ARGAAM_PRICES_URLS = [
+    "https://www.argaam.com/ar/company/companies-prices/3",
+    "https://www.argaam.com/en/company/companies-prices/3",
+]
+ARGAAM_VOLUME_URLS = [
+    "https://www.argaam.com/ar/company/companies-volume/14",
+    "https://www.argaam.com/en/company/companies-volume/14",
+]
+
+
+def _parse_argaam_table(html: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not BeautifulSoup or not html:
+        return out
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    tables = soup.find_all("table")
+    table = None
+    best_rows = 0
+    for t in tables:
+        rs = t.find_all("tr")
+        if len(rs) > best_rows:
+            best_rows = len(rs)
+            table = t
+    if not table:
+        return out
+
+    rows = table.find_all("tr")
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 4:
+            continue
+        txt = [c.get_text(" ", strip=True) for c in cols]
+
+        code = None
+        code_idx = None
+        for i in range(min(4, len(txt))):
+            cand = (txt[i] or "").strip().translate(_ARABIC_DIGITS)
+            if re.match(r"^\d{3,6}$", cand):
+                code = cand
+                code_idx = i
+                break
+        if not code or code_idx is None:
+            continue
+
+        name = txt[code_idx + 1].strip() if code_idx + 1 < len(txt) else None
+
+        # Heuristic parse: after code+name, first numbers are price/change/%; later may contain volume/value
+        nums = [_safe_float(x) for x in txt[code_idx + 2:]]
+        price = nums[0] if len(nums) > 0 else None
+        change = nums[1] if len(nums) > 1 else None
+        chg_p = nums[2] if len(nums) > 2 else None
+
+        # volume/value: pick the biggest as volume-like, and the second-biggest as traded value-like
+        vol = None
+        val = None
+        tail = [v for v in nums if isinstance(v, (int, float)) and v is not None and v > 0]
+        if tail:
+            tail_sorted = sorted(tail, reverse=True)
+            vol = tail_sorted[0]
+            if len(tail_sorted) > 1:
+                val = tail_sorted[1]
+
+            # If val < vol and price exists, it likely swapped; try infer value
+            if price and vol and val and val < vol:
+                val = price * vol
+
+        out[code] = {
+            "name": _safe_str(name),
+            "price": price,
+            "change": change,
+            "change_percent": chg_p,
+            "volume": vol,
+            "value_traded": val,
         }
 
-    max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
-    batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
+    return out
 
-    status = "success"
-    error_msg: Optional[str] = None
 
-    if len(symbols) > max_t:
-        status = "partial"
-        error_msg = f"Too many symbols ({len(symbols)}). Truncated to max {max_t}."
-        symbols = symbols[:max_t]
+async def _argaam_snapshot(client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
 
-    eng = await _resolve_engine(request)
-    if eng is None:
-        status = "error"
-        error_msg = (error_msg + " " if error_msg else "") + "Engine unavailable"
-        rows_out: List[List[Any]] = []
-        quotes_out: List[Dict[str, Any]] = []
-        for s in symbols:
-            eq = EnrichedQuote.from_unified(UnifiedQuote(symbol=s, data_quality="MISSING", error="Engine unavailable").finalize())
-            if format in ("rows", "both"):
-                rows_out.append(eq.to_row(headers))
-            if format in ("quotes", "both"):
-                quotes_out.append(_model_to_dict(eq))
+    # stronger headers: some hosts behave better with referer
+    async def get_first_ok(urls: Sequence[str]) -> Optional[str]:
+        tasks = []
+        for u in urls:
+            tasks.append(_http_get_text(client, u, timeout_sec=14.0))
+        res = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in res:
+            if isinstance(r, str) and len(r) > 800:
+                low = r.lower()
+                if "access denied" in low or "cloudflare" in low:
+                    continue
+                return r
+        for r in res:
+            if isinstance(r, str) and r.strip():
+                return r
+        return None
 
-        elapsed = int((time.perf_counter() - t0) * 1000)
-        resp: Dict[str, Any] = {
-            "status": status,
-            "error": error_msg,
-            "operation": operation,
-            "sheet_name": sheet_name,
-            "count": len(symbols),
-            "symbols": symbols,
-            "headers": headers,
-            "_meta": {"elapsed_ms": elapsed},
-        }
-        if format in ("rows", "both"):
-            resp["rows"] = rows_out
-        if format in ("quotes", "both"):
-            resp["quotes"] = quotes_out
-        return resp
+    prices_html = await get_first_ok(ARGAAM_PRICES_URLS)
+    if prices_html:
+        part = _parse_argaam_table(prices_html)
+        for k, v in part.items():
+            merged.setdefault(k, {}).update(v)
 
-    rows_out: List[List[Any]] = []
-    quotes_out: List[Dict[str, Any]] = []
+    vol_html = await get_first_ok(ARGAAM_VOLUME_URLS)
+    if vol_html:
+        part = _parse_argaam_table(vol_html)
+        for k, v in part.items():
+            merged.setdefault(k, {}).update(v)
 
-    for chunk in _chunk(symbols, batch_sz):
-        try:
-            quotes = await _engine_get_quotes(eng, chunk)
-        except Exception as exc:
-            status = "partial"
-            error_msg = (error_msg + " " if error_msg else "") + f"Batch error: {exc}"
-            quotes = [UnifiedQuote(symbol=s, data_quality="MISSING", error=str(exc)).finalize() for s in chunk]
+    return merged
 
-        m = {getattr(q, "symbol", "").upper(): q for q in (quotes or []) if getattr(q, "symbol", None)}
-        for s in chunk:
-            uq = m.get(s.upper()) or UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error="No data returned").finalize()
-            eq = EnrichedQuote.from_unified(uq)
 
-            if format in ("rows", "both"):
-                rows_out.append(eq.to_row(headers))
-            if format in ("quotes", "both"):
-                quotes_out.append(_model_to_dict(eq))
+# ----------------------------
+# Tadawul best-effort (JSON)
+# ----------------------------
+# NOTE: Tadawul changes endpoints occasionally. We keep multiple candidates.
+TADAWUL_ENDPOINTS = [
+    # Common “market watch” JSON (candidate patterns)
+    "https://www.tadawul.com.sa/wps/portal/tadawul/markets/equities/market-watch/market-watch",
+    "https://www.tadawul.com.sa/wps/portal/tadawul/markets/equities/company-profile/company-profile",
+]
 
-    elapsed = int((time.perf_counter() - t0) * 1000)
-    resp: Dict[str, Any] = {
-        "status": status,
-        "error": error_msg,
-        "operation": operation,
-        "sheet_name": sheet_name,
-        "count": len(symbols),
-        "symbols": symbols,
-        "headers": headers,
-        "_meta": {"elapsed_ms": elapsed},
+# Some Tadawul pages embed data in script tags. We'll try to extract symbol numeric code matches.
+def _extract_first_json_like(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    # Try to find a JSON object in scripts (very defensive)
+    m = re.search(r"(\{.*\})", text, re.DOTALL)
+    if not m:
+        return None
+    blob = m.group(1).strip()
+    # trim absurdly large to avoid heavy parse
+    blob = blob[:300000]
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
+async def _tadawul_best_effort(client: httpx.AsyncClient, code: str) -> Dict[str, Any]:
+    """
+    Returns dict with some of:
+      current_price, previous_close, open, day_high, day_low, volume, value_traded, name, sector, market_cap
+    Best-effort only.
+    """
+    # Strategy A: try endpoints as HTML and look for code + nearby numbers
+    for url in TADAWUL_ENDPOINTS:
+        html = await _http_get_text(client, url, timeout_sec=14.0)
+        if not html or len(html) < 800:
+            continue
+
+        # If JSON is embedded, try parse
+        j = _extract_first_json_like(html)
+        if isinstance(j, dict) and j:
+            # try common keys
+            flat = json.dumps(j)
+            if code in flat:
+                # can't guarantee schema; keep fallback to regex extraction below
+                pass
+
+        # Regex extraction near code
+        txt = re.sub(r"\s+", " ", html)
+        if code not in txt:
+            continue
+
+        # Try capture price patterns near the code
+        # These are heuristic and may not hit; still worth trying.
+        price = None
+        prev = None
+        vol = None
+
+        # last price: pick first float after code within 300 chars
+        m1 = re.search(rf"{re.escape(code)}(.{{0,300}}?)(\d+\.\d+|\d+)", txt)
+        if m1:
+            price = _safe_float(m1.group(2))
+
+        # previous close: look for "Previous Close" labels
+        m2 = re.search(r"(Previous Close|الإغلاق السابق).{0,50}?(\d+\.\d+|\d+)", txt, re.IGNORECASE)
+        if m2:
+            prev = _safe_float(m2.group(2))
+
+        # volume label
+        m3 = re.search(r"(Volume|حجم التداول).{0,50}?(\d[\d,\.]+)", txt, re.IGNORECASE)
+        if m3:
+            vol = _safe_float(m3.group(2))
+
+        if price is not None or prev is not None or vol is not None:
+            return {
+                "current_price": price,
+                "previous_close": prev,
+                "volume": vol,
+                "data_source": "tadawul_best_effort",
+            }
+
+    return {}
+
+
+# ----------------------------
+# Public API
+# ----------------------------
+async def get_enriched_quote(symbol: str) -> Dict[str, Any]:
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return {"symbol": str(symbol or ""), "market": "KSA", "currency": "SAR", "error": "Empty symbol"}
+
+    if not is_ksa_symbol(sym):
+        # legacy module is only meant for KSA; return a clean error
+        return {"symbol": sym, "market": "GLOBAL", "currency": "USD", "error": "Legacy KSA engine only"}
+
+    code = sym.split(".", 1)[0].strip()
+
+    timeout = _timeout()
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
+        follow_redirects=True,
+        headers=_headers({"Referer": "https://www.tadawul.com.sa/"}),
+    ) as client:
+        # 1) Tadawul best-effort
+        td = await _tadawul_best_effort(client, code)
+        if isinstance(td, dict) and td and (td.get("current_price") is not None or td.get("previous_close") is not None):
+            return {
+                "symbol": sym,
+                "market": "KSA",
+                "currency": "SAR",
+                "current_price": _safe_float(td.get("current_price")),
+                "previous_close": _safe_float(td.get("previous_close")),
+                "open": _safe_float(td.get("open")),
+                "day_high": _safe_float(td.get("day_high")),
+                "day_low": _safe_float(td.get("day_low")),
+                "volume": _safe_float(td.get("volume")),
+                "value_traded": _safe_float(td.get("value_traded")),
+                "market_cap": _safe_float(td.get("market_cap")),
+                "name": _safe_str(td.get("name")),
+                "sector": _safe_str(td.get("sector")),
+                "industry": _safe_str(td.get("industry")),
+                "sub_sector": _safe_str(td.get("sub_sector")),
+                "data_source": td.get("data_source") or "tadawul_best_effort",
+                "last_updated_utc": _now_utc_iso(),
+            }
+
+        # 2) Argaam snapshot fallback
+        snap = await _argaam_snapshot(client)
+        row = snap.get(code) if isinstance(snap, dict) else None
+        if row:
+            return {
+                "symbol": sym,
+                "market": "KSA",
+                "currency": "SAR",
+                "name": _safe_str(row.get("name")),
+                "current_price": _safe_float(row.get("price")),
+                "price_change": _safe_float(row.get("change")),
+                "percent_change": _safe_float(row.get("change_percent")),
+                "volume": _safe_float(row.get("volume")),
+                "value_traded": _safe_float(row.get("value_traded")),
+                "data_source": "argaam_snapshot_legacy",
+                "last_updated_utc": _now_utc_iso(),
+            }
+
+    return {
+        "symbol": sym,
+        "market": "KSA",
+        "currency": "SAR",
+        "error": "No KSA provider data (tadawul+argaam failed)",
+        "data_source": "none",
+        "last_updated_utc": _now_utc_iso(),
     }
-    if format in ("rows", "both"):
-        resp["rows"] = rows_out
-    if format in ("quotes", "both"):
-        resp["quotes"] = quotes_out
-
-    return resp
 
 
-__all__ = ["router"]
+async def get_enriched_quotes(symbols: Sequence[str]) -> List[Dict[str, Any]]:
+    items = [s for s in (symbols or []) if s and str(s).strip()]
+    if not items:
+        return []
+
+    # Concurrency limit to protect Render
+    sem = asyncio.Semaphore(int(os.getenv("LEGACY_BATCH_CONCURRENCY", "8") or "8"))
+
+    async def one(s: str) -> Dict[str, Any]:
+        async with sem:
+            try:
+                return await get_enriched_quote(s)
+            except Exception as exc:
+                return {
+                    "symbol": normalize_symbol(s) or str(s),
+                    "market": "KSA",
+                    "currency": "SAR",
+                    "error": f"Legacy fetch error: {exc}",
+                    "data_source": "none",
+                    "last_updated_utc": _now_utc_iso(),
+                }
+
+    return await asyncio.gather(*(one(s) for s in items))
+
+
+__all__ = ["get_enriched_quote", "get_enriched_quotes", "normalize_symbol", "is_ksa_symbol", "ENGINE_VERSION"]
