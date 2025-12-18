@@ -2,20 +2,19 @@
 """
 core/enriched_quote.py
 ===========================================================
-EnrichedQuote Mapper + Sheets Row Builder – v2.4.0 (HARDENED)
+EnrichedQuote Mapper + Sheets Row Builder – v2.5.0 (KSA-SCHEMA ALIGNED)
 
-Purpose
-- Stable, Sheets-friendly representation of UnifiedQuote.
-- Convert UnifiedQuote -> EnrichedQuote (same field names).
-- Convert EnrichedQuote -> Google Sheets row aligned to provided headers.
+Why this update?
+- Your core/schemas.py defines KSA_TADAWUL_HEADERS_52 with fields like:
+  ROI (3M) %, Expected ROI (1M) %, Financial Health Score, Target Price (12M)...
+- Older EnrichedQuote had extra="ignore" and lacked these fields,
+  so they were silently dropped -> Sheets rows looked missing/wrong.
 
 Design
 - Defensive: never throws during row build.
 - Header-driven: supports many English + Arabic header conventions.
 - Sheets-safe values: None / NaN / inf -> "" (blank cell)
-- Conservative ratio->percent conversion only for fundamental ratios:
-  dividend_yield, payout_ratio, roe, roa, net_margin, ebitda_margin,
-  revenue_growth, net_income_growth
+- Conservative ratio->percent conversion for ratio-like fundamentals only.
 """
 
 from __future__ import annotations
@@ -29,12 +28,12 @@ from pydantic import BaseModel, ConfigDict
 
 from core.data_engine_v2 import UnifiedQuote
 
-ENRICHED_VERSION = "2.4.0"
-
+ENRICHED_VERSION = "2.5.0"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
+
 # =============================================================================
-# Helpers
+# Time helpers
 # =============================================================================
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -42,6 +41,10 @@ def _now_utc_iso() -> str:
 def _now_riyadh_iso() -> str:
     return datetime.now(RIYADH_TZ).isoformat()
 
+
+# =============================================================================
+# Numeric helpers
+# =============================================================================
 def _is_bad_number(x: Any) -> bool:
     try:
         if isinstance(x, (int, float)):
@@ -52,40 +55,11 @@ def _is_bad_number(x: Any) -> bool:
     return False
 
 def _clean_value(x: Any) -> Any:
-    """
-    Google Sheets values API is happiest with:
-      - str, int/float, bool, "" (blank)
-    """
     if x is None:
         return ""
     if _is_bad_number(x):
         return ""
     return x
-
-def _contains_arabic(s: str) -> bool:
-    return any("\u0600" <= ch <= "\u06FF" for ch in (s or ""))
-
-def _norm_header_en(h: str) -> str:
-    """
-    Normalize English-like header labels to a compact key:
-    - lowercase
-    - remove non-alphanumeric
-    Example: "Last Updated (Riyadh)" -> "lastupdatedriyadh"
-    """
-    s = (h or "").strip().lower()
-    s = s.replace("٪", "%")
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    return s
-
-def _snake_from_header(h: str) -> str:
-    """
-    Convert header label to snake_case candidate:
-      "Last Updated (Riyadh)" -> "last_updated_riyadh"
-    """
-    raw = (h or "").strip().lower()
-    raw = re.sub(r"[\(\)\[\]]", " ", raw)
-    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-    return raw
 
 def _ratio_to_percent(v: Any) -> Optional[float]:
     """
@@ -115,7 +89,35 @@ def _safe_upside(current: Any, target: Any) -> Optional[float]:
     except Exception:
         return None
 
-# Arabic header mapping (best-effort)
+
+# =============================================================================
+# Header normalization
+# =============================================================================
+def _contains_arabic(s: str) -> bool:
+    return any("\u0600" <= ch <= "\u06FF" for ch in (s or ""))
+
+def _norm_header_en(h: str) -> str:
+    """
+    Normalize header labels to a compact key:
+    - lowercase
+    - remove non-alphanumeric
+    Example: "Last Updated (Riyadh)" -> "lastupdatedriyadh"
+    """
+    s = (h or "").strip().lower()
+    s = s.replace("٪", "%")
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+def _snake_from_header(h: str) -> str:
+    raw = (h or "").strip().lower()
+    raw = re.sub(r"[\(\)\[\]]", " ", raw)
+    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    return raw
+
+
+# =============================================================================
+# Arabic header map (best-effort)
+# =============================================================================
 _AR_HEADER_MAP: Dict[str, str] = {
     # Identity
     "الرمز": "symbol",
@@ -135,7 +137,6 @@ _AR_HEADER_MAP: Dict[str, str] = {
     "اخر سعر": "current_price",
     "آخر سعر": "current_price",
     "السعر": "current_price",
-    "سعر": "current_price",
     "الاغلاق السابق": "previous_close",
     "الإغلاق السابق": "previous_close",
     "الافتتاح": "open",
@@ -147,31 +148,23 @@ _AR_HEADER_MAP: Dict[str, str] = {
     "ادنى 52 اسبوع": "low_52w",
     "أدنى 52 أسبوع": "low_52w",
     "التغير": "price_change",
-    "التغير%": "percent_change",
     "نسبة التغير": "percent_change",
     "نسبة التغير%": "percent_change",
 
-    # Volume / Value
+    # Volume / value
     "حجم التداول": "volume",
-    "الكمية": "volume",
     "قيمة التداول": "value_traded",
-    "القيمة": "value_traded",
-
-    # Market cap / Shares
     "القيمة السوقية": "market_cap",
-    "عدد الاسهم": "shares_outstanding",
-    "عدد الأسهم": "shares_outstanding",
 
-    # Fundamentals
+    # Ratios
     "مكرر الارباح": "pe_ttm",
-    "مكرر الأرباح": "pe_ttm",
     "ربحية السهم": "eps_ttm",
+    "عائد التوزيع": "dividend_yield",
     "العائد على حقوق الملكية": "roe",
     "العائد على الأصول": "roa",
     "هامش الربح": "net_margin",
-    "عائد التوزيع": "dividend_yield",
-    "مكرر القيمة الدفترية": "pb",
-    "مكرر المبيعات": "ps",
+    "مديونية/حقوق": "debt_to_equity",
+    "المديونية/حقوق": "debt_to_equity",
 
     # Meta
     "مصدر البيانات": "data_source",
@@ -183,25 +176,18 @@ _AR_HEADER_MAP: Dict[str, str] = {
 }
 
 def _ar_key(h: str) -> Optional[str]:
-    """
-    Attempt to map Arabic header text to an internal field key.
-    """
     if not h:
         return None
     s = (h or "").strip()
     if not s:
         return None
-    # normalize arabic spacing/punct
     s2 = s.replace("٪", "%")
     s2 = re.sub(r"\s+", " ", s2).strip()
-    # direct match
     if s2 in _AR_HEADER_MAP:
         return _AR_HEADER_MAP[s2]
-    # try stripping common decorations
     s3 = s2.replace(":", "").replace("-", "").strip()
     if s3 in _AR_HEADER_MAP:
         return _AR_HEADER_MAP[s3]
-    # try without spaces (some sheets do that)
     s4 = s3.replace(" ", "")
     for k, v in _AR_HEADER_MAP.items():
         if k.replace(" ", "") == s4:
@@ -216,6 +202,9 @@ class EnrichedQuote(BaseModel):
     """
     Stable “public” quote shape for API + Google Sheets.
     Field names intentionally match UnifiedQuote (engine output).
+
+    NOTE: This model explicitly includes KSA_TADAWUL_HEADERS_52 fields so
+    they are not dropped by extra="ignore".
     """
     model_config = ConfigDict(
         populate_by_name=True,
@@ -295,6 +284,23 @@ class EnrichedQuote(BaseModel):
     valuation_label: Optional[str] = None
     analyst_rating: Optional[str] = None
 
+    # =========================
+    # KSA schema extra fields
+    # =========================
+    roi_3m_percent: Optional[float] = None
+    roi_12m_percent: Optional[float] = None
+
+    revenue_growth_yoy_percent: Optional[float] = None
+
+    financial_health_score: Optional[float] = None
+    financial_health_rank_sector: Optional[float] = None
+
+    target_price_12m: Optional[float] = None
+    expected_roi_1m_percent: Optional[float] = None
+    expected_roi_3m_percent: Optional[float] = None
+    expected_roi_12m_percent: Optional[float] = None
+    expected_price_growth_12m_percent: Optional[float] = None
+
     # Scores / Recommendation
     value_score: Optional[float] = None
     quality_score: Optional[float] = None
@@ -313,22 +319,18 @@ class EnrichedQuote(BaseModel):
     error: Optional[str] = None
 
     # -------------------------------------------------------------------------
-    # Constructors
-    # -------------------------------------------------------------------------
     @classmethod
     def from_unified(cls, q: Any) -> "EnrichedQuote":
-        """
-        Accepts:
-          - UnifiedQuote
-          - EnrichedQuote
-          - dict-like
-          - object with attributes
-        """
         if q is None:
-            return cls(symbol="UNKNOWN", data_quality="MISSING", error="Empty quote input", last_updated_utc=_now_utc_iso(), last_updated_riyadh=_now_riyadh_iso())
+            return cls(
+                symbol="UNKNOWN",
+                data_quality="MISSING",
+                error="Empty quote input",
+                last_updated_utc=_now_utc_iso(),
+                last_updated_riyadh=_now_riyadh_iso(),
+            )
 
         if isinstance(q, EnrichedQuote):
-            # Ensure timestamps exist
             if not q.last_updated_utc:
                 q.last_updated_utc = _now_utc_iso()
             if not q.last_updated_riyadh:
@@ -356,19 +358,16 @@ class EnrichedQuote(BaseModel):
                 sym = str(getattr(q, "symbol") or "").strip()
             except Exception:
                 sym = ""
-
         if not sym:
             sym = "UNKNOWN"
 
         obj = cls(**{**data, "symbol": sym})
 
-        # Ensure timestamps exist
         if not obj.last_updated_utc:
             obj.last_updated_utc = _now_utc_iso()
         if not obj.last_updated_riyadh:
             obj.last_updated_riyadh = _now_riyadh_iso()
 
-        # Compute upside if missing (prefer target_price, else fair_value)
         if obj.upside_percent is None:
             tgt = obj.target_price if obj.target_price is not None else obj.fair_value
             obj.upside_percent = _safe_upside(obj.current_price, tgt)
@@ -376,14 +375,7 @@ class EnrichedQuote(BaseModel):
         return obj
 
     # -------------------------------------------------------------------------
-    # Sheets Row Builder
-    # -------------------------------------------------------------------------
     def to_row(self, headers: List[str]) -> List[Any]:
-        """
-        Build a row aligned to an arbitrary headers list.
-        Unknown headers => blank.
-        Never raises.
-        """
         try:
             d = self.model_dump(exclude_none=False)
         except Exception:
@@ -396,10 +388,9 @@ class EnrichedQuote(BaseModel):
             return None
 
         def pct_field(key: str) -> Any:
-            v = g(key)
-            return _ratio_to_percent(v)
+            return _ratio_to_percent(g(key))
 
-        # One canonical map: internal field name -> value function
+        # Canonical field getters
         field_getters: Dict[str, Callable[[], Any]] = {
             # Identity
             "symbol": lambda: g("symbol"),
@@ -411,29 +402,27 @@ class EnrichedQuote(BaseModel):
             "currency": lambda: g("currency"),
             "listing_date": lambda: g("listing_date"),
 
-            # Shares / Cap
-            "shares_outstanding": lambda: g("shares_outstanding"),
-            "free_float": lambda: g("free_float"),
-            "market_cap": lambda: g("market_cap"),
-            "free_float_market_cap": lambda: g("free_float_market_cap"),
-
             # Prices
             "current_price": lambda: g("current_price"),
             "previous_close": lambda: g("previous_close"),
+            "price_change": lambda: g("price_change"),
+            "percent_change": lambda: g("percent_change"),
             "open": lambda: g("open"),
             "day_high": lambda: g("day_high"),
             "day_low": lambda: g("day_low"),
             "high_52w": lambda: g("high_52w"),
             "low_52w": lambda: g("low_52w"),
             "position_52w_percent": lambda: g("position_52w_percent"),
-            "price_change": lambda: g("price_change"),
-            "percent_change": lambda: g("percent_change"),
 
-            # Volume / Liquidity
+            # Volume / cap
             "volume": lambda: g("volume"),
             "avg_volume_30d": lambda: g("avg_volume_30d"),
             "value_traded": lambda: g("value_traded"),
             "turnover_percent": lambda: g("turnover_percent"),
+            "shares_outstanding": lambda: g("shares_outstanding"),
+            "free_float": lambda: g("free_float"),
+            "market_cap": lambda: g("market_cap"),
+            "free_float_market_cap": lambda: g("free_float_market_cap"),
             "liquidity_score": lambda: g("liquidity_score"),
 
             # Fundamentals
@@ -459,13 +448,13 @@ class EnrichedQuote(BaseModel):
             "quick_ratio": lambda: g("quick_ratio"),
 
             # Technicals
-            "rsi_14": lambda: g("rsi_14"),
             "volatility_30d": lambda: g("volatility_30d"),
+            "rsi_14": lambda: g("rsi_14"),
             "macd": lambda: g("macd"),
             "ma20": lambda: g("ma20"),
             "ma50": lambda: g("ma50"),
 
-            # Targets
+            # Valuation / targets
             "fair_value": lambda: g("fair_value"),
             "target_price": lambda: g("target_price"),
             "upside_percent": lambda: g("upside_percent")
@@ -474,26 +463,37 @@ class EnrichedQuote(BaseModel):
             "valuation_label": lambda: g("valuation_label"),
             "analyst_rating": lambda: g("analyst_rating"),
 
-            # Scores
+            # KSA extras (already percent fields by spec)
+            "roi_3m_percent": lambda: g("roi_3m_percent"),
+            "roi_12m_percent": lambda: g("roi_12m_percent"),
+            "revenue_growth_yoy_percent": lambda: g("revenue_growth_yoy_percent"),
+            "financial_health_score": lambda: g("financial_health_score"),
+            "financial_health_rank_sector": lambda: g("financial_health_rank_sector"),
+            "target_price_12m": lambda: g("target_price_12m"),
+            "expected_roi_1m_percent": lambda: g("expected_roi_1m_percent"),
+            "expected_roi_3m_percent": lambda: g("expected_roi_3m_percent"),
+            "expected_roi_12m_percent": lambda: g("expected_roi_12m_percent"),
+            "expected_price_growth_12m_percent": lambda: g("expected_price_growth_12m_percent"),
+
+            # Scores / reco
             "value_score": lambda: g("value_score"),
             "quality_score": lambda: g("quality_score"),
             "momentum_score": lambda: g("momentum_score"),
             "opportunity_score": lambda: g("opportunity_score"),
+            "risk_score": lambda: g("risk_score"),
             "overall_score": lambda: g("overall_score"),
             "recommendation": lambda: g("recommendation"),
             "confidence": lambda: g("confidence"),
-            "risk_score": lambda: g("risk_score"),
 
             # Meta
             "data_source": lambda: g("data_source"),
             "data_quality": lambda: g("data_quality"),
-            "last_updated_utc": lambda: g("last_updated_utc"),
-            "last_updated_riyadh": lambda: g("last_updated_riyadh"),
+            "last_updated_utc": lambda: g("last_updated_utc") or _now_utc_iso(),
+            "last_updated_riyadh": lambda: g("last_updated_riyadh") or _now_riyadh_iso(),
             "error": lambda: g("error"),
         }
 
-        # English header aliases -> internal key
-        # NOTE: keys here should be _norm_header_en(...) outputs
+        # English aliases -> internal keys (normalized form)
         en_alias: Dict[str, str] = {
             # Identity
             "symbol": "symbol",
@@ -501,113 +501,138 @@ class EnrichedQuote(BaseModel):
             "companyname": "name",
             "name": "name",
             "sector": "sector",
-            "industry": "industry",
             "subsector": "sub_sector",
             "subsectorname": "sub_sector",
+            "industry": "industry",
             "market": "market",
             "currency": "currency",
             "listingdate": "listing_date",
-            "ipodate": "listing_date",
 
             # Prices
-            "currentprice": "current_price",
             "lastprice": "current_price",
-            "price": "current_price",
-            "last": "current_price",
+            "currentprice": "current_price",
             "previousclose": "previous_close",
-            "prevclose": "previous_close",
+            "pricechange": "price_change",
+            "percentchange": "percent_change",
             "open": "open",
             "dayhigh": "day_high",
-            "high": "day_high",
             "daylow": "day_low",
-            "low": "day_low",
             "52whigh": "high_52w",
-            "52weekhigh": "high_52w",
             "52wlow": "low_52w",
-            "52weeklow": "low_52w",
-            "52wposition": "position_52w_percent",
+            "52wposition%": "position_52w_percent",
             "52wpositionpercent": "position_52w_percent",
-            "position52wpercent": "position_52w_percent",
-            "pricechange": "price_change",
-            "change": "price_change",
-            "percentchange": "percent_change",
-            "changepercent": "percent_change",
-            "chgpercent": "percent_change",
-            "change%": "percent_change",
+            "52wposition": "position_52w_percent",
 
-            # Volume / value
+            # Volume / cap
             "volume": "volume",
-            "avgvolume": "avg_volume_30d",
             "avgvolume30d": "avg_volume_30d",
+            "avgvolume(30d)": "avg_volume_30d",
             "valuetraded": "value_traded",
-            "tradedvalue": "value_traded",
-            "turnover": "turnover_percent",
+            "turnover%": "turnover_percent",
             "turnoverpercent": "turnover_percent",
-            "liquidityscore": "liquidity_score",
-
-            # Shares / cap
             "sharesoutstanding": "shares_outstanding",
-            "freefloat": "free_float",
+            "freefloat%": "free_float",
             "marketcap": "market_cap",
             "freefloatmarketcap": "free_float_market_cap",
+            "liquidityscore": "liquidity_score",
 
             # Fundamentals
+            "eps(ttm)": "eps_ttm",
             "epsttm": "eps_ttm",
             "forwardeps": "forward_eps",
+            "p/e(ttm)": "pe_ttm",
             "pettm": "pe_ttm",
-            "pe": "pe_ttm",
+            "forwardp/e": "forward_pe",
             "forwardpe": "forward_pe",
+            "p/b": "pb",
             "pb": "pb",
+            "p/s": "ps",
             "ps": "ps",
+            "ev/ebitda": "ev_ebitda",
             "evebitda": "ev_ebitda",
-            "dividendyield": "dividend_yield",
             "dividendyield%": "dividend_yield",
+            "dividendyield": "dividend_yield",
             "dividendrate": "dividend_rate",
+            "payoutratio%": "payout_ratio",
             "payoutratio": "payout_ratio",
+            "roe%": "roe",
             "roe": "roe",
+            "roa%": "roa",
             "roa": "roa",
+            "netmargin%": "net_margin",
             "netmargin": "net_margin",
-            "ebitdamargin": "ebitda_margin",
-            "revenuegrowth": "revenue_growth",
-            "netincomegrowth": "net_income_growth",
-            "beta": "beta",
-            "debttoequity": "debt_to_equity",
-            "currentratio": "current_ratio",
-            "quickratio": "quick_ratio",
+            "ebitdamargin%": "ebitda_margin",
+            "revenuegrowth%": "revenue_growth",
+            "netincomegrowth%": "net_income_growth",
+            "debt/equity": "debt_to_equity",
+            "debtequity": "debt_to_equity",
 
             # Technicals
-            "rsi": "rsi_14",
-            "rsi14": "rsi_14",
-            "volatility": "volatility_30d",
+            "volatility(30d)": "volatility_30d",
             "volatility30d": "volatility_30d",
-            "macd": "macd",
-            "ma20": "ma20",
-            "ma50": "ma50",
+            "rsi(14)": "rsi_14",
+            "rsi14": "rsi_14",
 
-            # Targets
+            # Valuation / Targets
             "fairvalue": "fair_value",
-            "targetprice": "target_price",
-            "upside": "upside_percent",
+            "upside%": "upside_percent",
             "upsidepercent": "upside_percent",
             "valuationlabel": "valuation_label",
             "analystrating": "analyst_rating",
 
-            # Scores
+            # KSA schema fields
+            "roi(3m)%": "roi_3m_percent",
+            "roi3m%": "roi_3m_percent",
+            "roi3m": "roi_3m_percent",
+
+            "roi(12m)%": "roi_12m_percent",
+            "roi12m%": "roi_12m_percent",
+            "roi12m": "roi_12m_percent",
+
+            "revenuegrowth(yoy)%": "revenue_growth_yoy_percent",
+            "revenuegrowthyoy%": "revenue_growth_yoy_percent",
+            "revenuegrowthyoy": "revenue_growth_yoy_percent",
+
+            "financialhealthscore": "financial_health_score",
+            "financialhealthrank(sector)": "financial_health_rank_sector",
+            "financialhealthranksector": "financial_health_rank_sector",
+
+            "targetprice(12m)": "target_price_12m",
+            "targetprice12m": "target_price_12m",
+
+            "expectedroi(1m)%": "expected_roi_1m_percent",
+            "expectedroi1m%": "expected_roi_1m_percent",
+            "expectedroi1m": "expected_roi_1m_percent",
+
+            "expectedroi(3m)%": "expected_roi_3m_percent",
+            "expectedroi3m%": "expected_roi_3m_percent",
+            "expectedroi3m": "expected_roi_3m_percent",
+
+            "expectedroi(12m)%": "expected_roi_12m_percent",
+            "expectedroi12m%": "expected_roi_12m_percent",
+            "expectedroi12m": "expected_roi_12m_percent",
+
+            "expectedpricegrowth(12m)%": "expected_price_growth_12m_percent",
+            "expectedpricegrowth12m%": "expected_price_growth_12m_percent",
+            "expectedpricegrowth12m": "expected_price_growth_12m_percent",
+
+            # Scores / reco
             "valuescore": "value_score",
             "qualityscore": "quality_score",
             "momentumscore": "momentum_score",
             "opportunityscore": "opportunity_score",
+            "riskscore": "risk_score",
             "overallscore": "overall_score",
             "recommendation": "recommendation",
             "confidence": "confidence",
-            "riskscore": "risk_score",
 
             # Meta
             "datasource": "data_source",
             "dataquality": "data_quality",
+            "lastupdated(utc)": "last_updated_utc",
             "lastupdatedutc": "last_updated_utc",
+            "lastupdated(riyadh)": "last_updated_riyadh",
             "lastupdatedriyadh": "last_updated_riyadh",
-            "lastupdatedlocal": "last_updated_riyadh",
             "error": "error",
         }
 
@@ -615,17 +640,15 @@ class EnrichedQuote(BaseModel):
         for h in (headers or []):
             try:
                 raw_h = (h or "").strip()
-                # 1) Arabic mapping
                 if _contains_arabic(raw_h):
-                    ar_k = _ar_key(raw_h)
-                    if ar_k and ar_k in field_getters:
-                        row.append(_clean_value(field_getters[ar_k]()))
+                    ak = _ar_key(raw_h)
+                    if ak and ak in field_getters:
+                        row.append(_clean_value(field_getters[ak]()))
                         continue
 
-                # 2) English normalized alias mapping
                 k = _norm_header_en(raw_h)
 
-                # small shims
+                # extra shims
                 if k == "52wposition":
                     k = "52wpositionpercent"
                 if k == "turnover":
@@ -638,17 +661,12 @@ class EnrichedQuote(BaseModel):
                     row.append(_clean_value(field_getters[internal]()))
                     continue
 
-                # 3) Fallback: snake_case field name directly
                 snake = _snake_from_header(raw_h)
                 if snake and snake in field_getters:
                     row.append(_clean_value(field_getters[snake]()))
                     continue
 
-                # 4) Final fallback: direct dict access by snake key
-                if snake:
-                    row.append(_clean_value(d.get(snake, "")))
-                else:
-                    row.append("")
+                row.append(_clean_value(d.get(snake, "")) if snake else "")
             except Exception:
                 row.append("")
 
