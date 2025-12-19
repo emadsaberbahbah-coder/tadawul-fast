@@ -7,6 +7,7 @@ from config import get_settings
 from routes.health import router as health_router
 from routes.config_routes import router as config_router
 from routes.pages_routes import router as pages_router
+from routes.validate_routes import router as validate_router
 from domain.ksa.router import router as ksa_router
 from domain.global_mkt.router import router as global_router
 
@@ -31,6 +32,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(config_router)
     app.include_router(pages_router)
+    app.include_router(validate_router)
     app.include_router(ksa_router)
     app.include_router(global_router)
 
