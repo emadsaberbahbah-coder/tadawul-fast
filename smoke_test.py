@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import urllib.request
 import urllib.error
 
 
-def http_json(method: str, url: str, token: str, payload: object | None = None) -> dict:
-    headers = {
-        "Accept": "application/json",
-        "X-APP-TOKEN": token,
-    }
+def http_json(method: str, url: str, token: str | None = None, payload: object | None = None) -> dict:
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-APP-TOKEN"] = token
 
     data = None
     if payload is not None:
@@ -51,20 +49,20 @@ def main() -> int:
     print(f"BASE_URL = {base_url}")
     print("--------------------------------------------------")
 
-    # 1) Health (no token required in our current routes? health is open)
-    r = http_json("GET", f"{base_url}/health", token="dummy")  # token ignored by /health
+    # 1) Health (no token)
+    r = http_json("GET", f"{base_url}/health")
     print("GET /health =>", r["status"])
     print(json.dumps(r.get("json", r.get("error", r.get("raw"))), indent=2, ensure_ascii=False))
     print("--------------------------------------------------")
 
-    # 2) Fetch YAML-driven config
+    # 2) Config (token)
     page_ksa = "page_01_market_summary_ksa"
     r = http_json("GET", f"{base_url}/api/v1/config/{page_ksa}", token=token)
     print(f"GET /api/v1/config/{page_ksa} =>", r["status"])
     print(json.dumps(r.get("json", r.get("error", r.get("raw"))), indent=2, ensure_ascii=False))
     print("--------------------------------------------------")
 
-    # 3) Ingest KSA sample rows
+    # 3) KSA ingest (DB-free validate)
     sample_ksa_rows = [
         {
             "symbol": "1120.SR",
@@ -82,11 +80,42 @@ def main() -> int:
     ]
     r = http_json("POST", f"{base_url}/api/v1/ksa/ingest/{page_ksa}", token=token, payload=sample_ksa_rows)
     print(f"POST /api/v1/ksa/ingest/{page_ksa} =>", r["status"])
-    print(json.dumps(r.get("json", r.get("error", r.get("raw"))), indent=2, ensure_ascii=False))
+    body = r.get("json", r.get("error", r.get("raw")))
+    print(json.dumps(body, indent=2, ensure_ascii=False))
     print("--------------------------------------------------")
 
-    # 4) Global config + ingest sample
+    # 4) Global config + ingest
     page_global = "page_02_market_summary_global"
     r = http_json("GET", f"{base_url}/api/v1/config/{page_global}", token=token)
     print(f"GET /api/v1/config/{page_global} =>", r["status"])
-    print(json.dumps(r.g
+    print(json.dumps(r.get("json", r.get("error", r.get("raw"))), indent=2, ensure_ascii=False))
+    print("--------------------------------------------------")
+
+    sample_global_rows = [
+        {
+            "symbol": "AAPL",
+            "company_name": "Apple Inc.",
+            "exchange": "NASDAQ",
+            "currency": "USD",
+            "last_price": 200.1,
+            "previous_close": 198.7,
+            "change": 1.4,
+            "change_percent": 0.70,
+            "volume": 999999,
+            "market_cap": 3100000000000,
+            "last_updated": "2025-12-18T12:00:00Z",
+        }
+    ]
+    r = http_json("POST", f"{base_url}/api/v1/global/ingest/{page_global}", token=token, payload=sample_global_rows)
+    print(f"POST /api/v1/global/ingest/{page_global} =>", r["status"])
+    body = r.get("json", r.get("error", r.get("raw")))
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+    print("--------------------------------------------------")
+
+    print("✅ DB-free smoke test finished (validation only).")
+    print("Next step: Apps Script should append response.validated_rows into Google Sheets history tabs.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
