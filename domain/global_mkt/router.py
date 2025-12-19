@@ -1,51 +1,59 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.security import require_app_token
-from storage.database import get_session
-from domain.global_mkt.ingestion import GlobalIngestor
+from dynamic.registry import get_registered_page
 
-router = APIRouter(prefix="/api/v1/global", tags=["global"], dependencies=[Depends(require_app_token)])
+router = APIRouter(
+    prefix="/api/v1/global",
+    tags=["global"],
+    dependencies=[Depends(require_app_token)],
+)
 
 
 @router.post("/ingest/{page_id}")
-async def ingest_global(
-    page_id: str,
-    rows: List[Dict[str, Any]],
-    session: AsyncSession = Depends(get_session),
-    client_metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+async def ingest_global(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    POST /api/v1/global/ingest/{page_id}
-    Body: list of row objects (JSON)
-
-    Validates using YAML-driven dynamic Pydantic model, then saves snapshot to Postgres JSONB.
+    DB-FREE Global ingestion:
+    - Validates rows using YAML-driven dynamic Pydantic model
+    - Does NOT write to Postgres
+    - Returns validated_rows so Apps Script can append them to Google Sheets history
     """
-    ingestor = GlobalIngestor()
     try:
-        result = await ingestor.ingest(
-            page_id=page_id,
-            rows=rows,
-            session=session,
-            client_metadata=client_metadata,
-        )
-        return {
-            "ok": True,
-            "result": {
-                "page_id": result.page_id,
-                "region": result.region,
-                "schema_hash": result.schema_hash,
-                "accepted_count": result.accepted_count,
-                "rejected_count": result.rejected_count,
-                "snapshot_ids": result.snapshot_ids,
-                "errors": [e.__dict__ for e in result.errors],
-            },
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        reg = get_registered_page(page_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Global ingestion failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid page config: {e}")
+
+    if reg.page.region != "global":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Page '{page_id}' is region='{reg.page.region}', not 'global'.",
+        )
+
+    model = reg.row_model
+    accepted: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    for i, row in enumerate(rows):
+        try:
+            obj = model.model_validate(row)
+            accepted.append(obj.model_dump())
+        except Exception as e:
+            errors.append({"index": i, "field": "*", "message": str(e)})
+
+    return {
+        "ok": True,
+        "storage": "google_sheets",
+        "page_id": page_id,
+        "region": "global",
+        "schema_hash": reg.page.schema_hash,
+        "accepted_count": len(accepted),
+        "rejected_count": len(errors),
+        "validated_rows": accepted,   # <-- Apps Script will append this to History sheet
+        "errors": errors[:50],
+    }
