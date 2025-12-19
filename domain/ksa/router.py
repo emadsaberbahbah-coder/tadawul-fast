@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from core.security import require_app_token
 from dynamic.registry import get_registered_page
@@ -14,14 +15,19 @@ router = APIRouter(
 )
 
 
+class IngestRequest(BaseModel):
+    rows: List[Dict[str, Any]]
+
+
 @router.post("/ingest/{page_id}")
-async def ingest_ksa(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+async def ingest_ksa(page_id: str, payload: IngestRequest | List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    DB-FREE KSA ingestion:
-    - Validates rows using YAML-driven dynamic Pydantic model
-    - Does NOT write to Postgres
-    - Returns validated_rows so Apps Script can append them to Google Sheets history
+    Accepts BOTH:
+      - Raw JSON array: [ {row}, {row} ]
+      - Wrapped object: { "rows": [ {row}, {row} ] }
     """
+    rows = payload if isinstance(payload, list) else payload.rows
+
     try:
         reg = get_registered_page(page_id)
     except FileNotFoundError as e:
@@ -40,6 +46,9 @@ async def ingest_ksa(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]
     errors: List[Dict[str, Any]] = []
 
     for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            errors.append({"index": i, "field": "*", "message": "Row must be an object/dict"})
+            continue
         try:
             obj = model.model_validate(row)
             accepted.append(obj.model_dump())
@@ -54,6 +63,6 @@ async def ingest_ksa(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]
         "schema_hash": reg.page.schema_hash,
         "accepted_count": len(accepted),
         "rejected_count": len(errors),
-        "validated_rows": accepted,   # <-- Apps Script will append this to History sheet
+        "validated_rows": accepted,
         "errors": errors[:50],
     }
