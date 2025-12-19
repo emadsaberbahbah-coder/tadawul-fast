@@ -5,6 +5,3 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 
 PyYAML==6.0.2
-
-SQLAlchemy[asyncio]==2.0.36
-asyncpg==0.29.0
