@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from core.security import require_app_token
 from dynamic.registry import get_registered_page
@@ -15,13 +15,23 @@ router = APIRouter(
 
 
 @router.post("/ingest/{page_id}")
-async def ingest_global(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+async def ingest_global(page_id: str, payload: Any = Body(...)) -> Dict[str, Any]:
     """
-    DB-FREE Global ingestion:
-    - Validates rows using YAML-driven dynamic Pydantic model
-    - Does NOT write to Postgres
-    - Returns validated_rows so Apps Script can append them to Google Sheets history
+    Accept ANY JSON body to avoid 422:
+      - [ {...}, {...} ]
+      - { "rows": [ {...}, {...} ] }
     """
+    # Normalize payload -> rows
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        rows = payload["rows"]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid body. Send either a JSON array of rows, or {\"rows\": [...]}",
+        )
+
     try:
         reg = get_registered_page(page_id)
     except FileNotFoundError as e:
@@ -30,16 +40,16 @@ async def ingest_global(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, A
         raise HTTPException(status_code=400, detail=f"Invalid page config: {e}")
 
     if reg.page.region != "global":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Page '{page_id}' is region='{reg.page.region}', not 'global'.",
-        )
+        raise HTTPException(status_code=400, detail=f"Page '{page_id}' is region='{reg.page.region}', not 'global'.")
 
     model = reg.row_model
     accepted: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
 
     for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            errors.append({"index": i, "field": "*", "message": "Row must be an object/dict"})
+            continue
         try:
             obj = model.model_validate(row)
             accepted.append(obj.model_dump())
@@ -54,6 +64,6 @@ async def ingest_global(page_id: str, rows: List[Dict[str, Any]]) -> Dict[str, A
         "schema_hash": reg.page.schema_hash,
         "accepted_count": len(accepted),
         "rejected_count": len(errors),
-        "validated_rows": accepted,   # <-- Apps Script will append this to History sheet
+        "validated_rows": accepted,
         "errors": errors[:50],
     }
