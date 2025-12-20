@@ -1,33 +1,65 @@
 /**
  * TFB_Menu.gs
  * ------------------------------------------------------------
- * Simple one-click menu for Phase-1 bridge.
- * Requires: TFB_Phase1_Bridge.gs (already added)
+ * Enhanced Phase-1 Menu (stable)
  *
- * Adds menu:
- *   Tadawul Fast Bridge
- *     - List Pages (test)
- *     - Build (Active Sheet) -> choose page_id
- *     - Ingest (Active Sheet) -> KSA
- *     - Ingest (Active Sheet) -> Global
+ * Requires:
+ *  - TFB_Phase1_Bridge.gs
+ * Optional (if you added them):
+ *  - TFB_PageMap.gs
+ *  - TFB_Menu_Auto.gs   (provides tfbMenuAuto_addItems_())
+ *  - TFB_Settings_Wizard.gs
+ *  - TFB_History_Viewer.gs
  *
- * NOTE: We keep it minimal & stable for Phase-1.
+ * What’s improved:
+ *  - Adds Settings Wizard + History Viewer items (if present)
+ *  - Adds Auto menu items (if present) without breaking if missing
+ *  - Keeps original prompt-based actions
+ *  - Single onOpen() only (prevents conflicts)
  */
 
 function onOpen() {
-  SpreadsheetApp.getUi()
+  const ui = SpreadsheetApp.getUi();
+
+  const menu = ui
     .createMenu("Tadawul Fast Bridge")
     .addItem("List Pages (test)", "tfbUi_ListPages")
     .addSeparator()
     .addItem("Build Active Sheet (by page_id)", "tfbUi_BuildActive")
     .addSeparator()
     .addItem("Ingest Active Sheet -> KSA (by page_id)", "tfbUi_IngestKsaActive")
-    .addItem("Ingest Active Sheet -> Global (by page_id)", "tfbUi_IngestGlobalActive")
-    .addToUi();
+    .addItem("Ingest Active Sheet -> Global (by page_id)", "tfbUi_IngestGlobalActive");
+
+  // Optional: Settings Wizard (safe if script exists)
+  if (typeof tfbSettingsWizard_Run === "function") {
+    menu.addSeparator()
+      .addItem("Settings Wizard", "tfbSettingsWizard_Run")
+      .addItem("Show Settings", "tfbSettingsWizard_Show");
+  }
+
+  // Optional: History Viewer (safe if script exists)
+  if (typeof tfbUi_HistoryLatest === "function") {
+    menu.addSeparator()
+      .addItem("History Latest (prompt)", "tfbUi_HistoryLatest")
+      .addItem("History By Symbol (prompt)", "tfbUi_HistoryBySymbol")
+      .addItem("History By Page (prompt)", "tfbUi_HistoryByPage");
+  }
+
+  menu.addToUi();
+
+  // Optional: Add Auto menu in a second menu, if present
+  // (we avoid adding it inside the same menu to keep it clean)
+  try {
+    if (typeof tfbMenuAuto_addItems_ === "function") {
+      tfbMenuAuto_addItems_();
+    }
+  } catch (e) {
+    // Do nothing (menu should never break onOpen)
+  }
 }
 
 /** -------------------------
- *  UI Actions
+ *  UI Actions (Prompt-based)
  *  ------------------------- */
 
 function tfbUi_ListPages() {
@@ -36,7 +68,7 @@ function tfbUi_ListPages() {
     const res = tfbListPages();
     ui.alert("Backend OK", JSON.stringify(res, null, 2), ui.ButtonSet.OK);
   } catch (e) {
-    ui.alert("Error", String(e && e.message ? e.message : e), ui.ButtonSet.OK);
+    ui.alert("Error", tfbUi_Err_(e), ui.ButtonSet.OK);
   }
 }
 
@@ -49,7 +81,7 @@ function tfbUi_BuildActive() {
     const res = tfbBuildFromConfig(pageId);
     ui.alert("Build done", JSON.stringify(res, null, 2), ui.ButtonSet.OK);
   } catch (e) {
-    ui.alert("Build error", String(e && e.message ? e.message : e), ui.ButtonSet.OK);
+    ui.alert("Build error", tfbUi_Err_(e), ui.ButtonSet.OK);
   }
 }
 
@@ -62,7 +94,7 @@ function tfbUi_IngestKsaActive() {
     const res = tfbIngestActiveSheet("ksa", pageId);
     ui.alert("Ingest KSA done", JSON.stringify(res, null, 2), ui.ButtonSet.OK);
   } catch (e) {
-    ui.alert("Ingest KSA error", String(e && e.message ? e.message : e), ui.ButtonSet.OK);
+    ui.alert("Ingest KSA error", tfbUi_Err_(e), ui.ButtonSet.OK);
   }
 }
 
@@ -75,7 +107,7 @@ function tfbUi_IngestGlobalActive() {
     const res = tfbIngestActiveSheet("global", pageId);
     ui.alert("Ingest Global done", JSON.stringify(res, null, 2), ui.ButtonSet.OK);
   } catch (e) {
-    ui.alert("Ingest Global error", String(e && e.message ? e.message : e), ui.ButtonSet.OK);
+    ui.alert("Ingest Global error", tfbUi_Err_(e), ui.ButtonSet.OK);
   }
 }
 
@@ -93,4 +125,15 @@ function tfbUi_PromptPageId_(title, defaultValue) {
     return "";
   }
   return v;
+}
+
+function tfbUi_Err_(e) {
+  try {
+    if (!e) return "Unknown error";
+    if (typeof e === "string") return e;
+    if (e.message) return String(e.message);
+    return JSON.stringify(e, null, 2);
+  } catch (_) {
+    return String(e);
+  }
 }
