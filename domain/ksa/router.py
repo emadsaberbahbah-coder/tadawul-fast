@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from core.security import require_app_token
 from dynamic.registry import get_registered_page
@@ -15,18 +14,23 @@ router = APIRouter(
 )
 
 
-class IngestRequest(BaseModel):
-    rows: List[Dict[str, Any]]
-
-
 @router.post("/ingest/{page_id}")
-async def ingest_ksa(page_id: str, payload: IngestRequest | List[Dict[str, Any]]) -> Dict[str, Any]:
+async def ingest_ksa(page_id: str, payload: Any = Body(...)) -> Dict[str, Any]:
     """
-    Accepts BOTH:
-      - Raw JSON array: [ {row}, {row} ]
-      - Wrapped object: { "rows": [ {row}, {row} ] }
+    Accept ANY JSON body to avoid 422:
+      - [ {...}, {...} ]
+      - { "rows": [ {...}, {...} ] }
     """
-    rows = payload if isinstance(payload, list) else payload.rows
+    # Normalize payload -> rows
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        rows = payload["rows"]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid body. Send either a JSON array of rows, or {\"rows\": [...]}",
+        )
 
     try:
         reg = get_registered_page(page_id)
@@ -36,10 +40,7 @@ async def ingest_ksa(page_id: str, payload: IngestRequest | List[Dict[str, Any]]
         raise HTTPException(status_code=400, detail=f"Invalid page config: {e}")
 
     if reg.page.region != "ksa":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Page '{page_id}' is region='{reg.page.region}', not 'ksa'.",
-        )
+        raise HTTPException(status_code=400, detail=f"Page '{page_id}' is region='{reg.page.region}', not 'ksa'.")
 
     model = reg.row_model
     accepted: List[Dict[str, Any]] = []
