@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -14,23 +15,40 @@ router = APIRouter(
 )
 
 
+def _decode_if_string(payload: Any) -> Any:
+    # Handles double-encoded JSON (payload arrives as a string)
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except Exception:
+            return payload
+    return payload
+
+
+def _normalize_rows(payload: Any) -> List[Dict[str, Any]]:
+    payload = _decode_if_string(payload)
+
+    # Accept: [ {...}, {...} ]
+    if isinstance(payload, list):
+        return payload  # type: ignore[return-value]
+
+    # Accept: { "rows": [ {...}, {...} ] }
+    if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        return payload["rows"]  # type: ignore[return-value]
+
+    # Accept: single row object { ... }
+    if isinstance(payload, dict):
+        return [payload]  # type: ignore[return-value]
+
+    raise HTTPException(
+        status_code=400,
+        detail='Invalid body. Send JSON array [..] or {"rows":[..]} or single row object.',
+    )
+
+
 @router.post("/ingest/{page_id}")
 async def ingest_ksa(page_id: str, payload: Any = Body(...)) -> Dict[str, Any]:
-    """
-    Accept ANY JSON body to avoid 422:
-      - [ {...}, {...} ]
-      - { "rows": [ {...}, {...} ] }
-    """
-    # Normalize payload -> rows
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
-        rows = payload["rows"]
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid body. Send either a JSON array of rows, or {\"rows\": [...]}",
-        )
+    rows = _normalize_rows(payload)
 
     try:
         reg = get_registered_page(page_id)
@@ -40,7 +58,10 @@ async def ingest_ksa(page_id: str, payload: Any = Body(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Invalid page config: {e}")
 
     if reg.page.region != "ksa":
-        raise HTTPException(status_code=400, detail=f"Page '{page_id}' is region='{reg.page.region}', not 'ksa'.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Page '{page_id}' is region='{reg.page.region}', not 'ksa'.",
+        )
 
     model = reg.row_model
     accepted: List[Dict[str, Any]] = []
