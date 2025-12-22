@@ -1,4 +1,30 @@
 # app.py
+"""
+Emad Bahbah – Financial Engine (Sheets Analyzer)
+------------------------------------------------
+FULL UPDATED SCRIPT (ONE-SHOT) – v2.2.0
+
+Main fixes & upgrades:
+✅ Fixes common EODHD symbol issue: auto-normalizes GLOBAL tickers to ".US" when no exchange suffix
+   - Example: AAPL -> AAPL.US   |   COST -> COST.US
+   - KSA: 1120 or 1120.SR -> 1120.SR
+✅ Adds EODHD Symbol column (so you can SEE what was used for API calls)
+✅ Stronger error rows (no broken indices if headers change)
+✅ Top 7 never stays empty:
+   - Default: prefers Shariah-compliant picks
+   - If none available, falls back to best scores regardless of Shariah (still shows YES/NO)
+✅ Better data-quality output:
+   - Writes Data Quality Label + Data Quality Score + Flags (from ai_advanced)
+✅ Optional clearing of old leftover rows (avoids stale data below)
+
+ENV required:
+- GOOGLE_CREDENTIALS  (service account JSON as string)
+- EODHD_API_TOKEN     (your token; avoid "demo" in production)
+
+Run command (Procfile):
+  web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600
+"""
+
 import os
 import json
 import math
@@ -21,7 +47,7 @@ from portfolio_engine import (
 
 app = Flask(__name__)
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -65,6 +91,43 @@ def normalize_ticker(t: str) -> str:
     return (t or "").strip().upper()
 
 
+def is_ksa_ticker(ticker: str) -> bool:
+    t = normalize_ticker(ticker)
+    return t.endswith(".SR") or t.replace(".", "").isdigit()
+
+
+def to_eodhd_symbol(ticker: str) -> str:
+    """
+    EODHD commonly requires an exchange suffix for GLOBAL tickers (e.g., .US).
+    - KSA numeric: 1120 -> 1120.SR
+    - KSA .SR stays .SR
+    - Already has a suffix (contains "."): keep as-is
+    - Otherwise assume US: AAPL -> AAPL.US
+    """
+    t = normalize_ticker(ticker)
+    if not t:
+        return t
+
+    # KSA numeric
+    if t.replace(".", "").isdigit():
+        return f"{t}.SR" if not t.endswith(".SR") else t
+
+    # KSA explicit
+    if t.endswith(".SR"):
+        return t
+
+    # already includes exchange
+    if "." in t:
+        return t
+
+    # default global exchange
+    return f"{t}.US"
+
+
+def infer_market_from_ticker(ticker: str) -> str:
+    return "KSA" if is_ksa_ticker(ticker) else "GLOBAL"
+
+
 def _load_google_creds_dict() -> Dict[str, Any]:
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_json:
@@ -90,15 +153,18 @@ def get_google_client() -> gspread.Client:
 
 # Initialize Finance Engine
 EODHD_API_KEY = os.environ.get("EODHD_API_TOKEN", "demo")
+if not EODHD_API_KEY or EODHD_API_KEY.strip().lower() == "demo":
+    log.warning("EODHD_API_TOKEN is missing or set to 'demo'. Expect limited/blocked responses on EODHD.")
 engine = FinanceEngine(EODHD_API_KEY)
 
 
 # =============================================================================
-# Headers (must match setup_sheet.py)
+# Headers
 # =============================================================================
 
 MARKET_HEADERS: List[str] = [
     "Ticker",
+    "EODHD Symbol",
     "Name",
     "Market",
     "Currency",
@@ -127,14 +193,17 @@ MARKET_HEADERS: List[str] = [
     "AI Predicted Price 90D",
     "AI Expected ROI 90D %",
     "AI Confidence (0-100)",
-    "Shariah Compliant",
+    "Risk Bucket",
     "Score (0-100)",
     "Rank",
     "Recommendation",
+    "Why Selected",
     "AI Summary",
     "Updated At (UTC)",
     "Data Source",
-    "Data Quality",
+    "Data Quality Label",
+    "Data Quality Score",
+    "Data Quality Flags",
 ]
 
 TOP_HEADERS: List[str] = [
@@ -146,26 +215,36 @@ TOP_HEADERS: List[str] = [
     "AI Predicted Price 30D",
     "AI Expected ROI 30D %",
     "Score (0-100)",
+    "Risk Bucket",
     "Recommendation",
     "Shariah Compliant",
+    "Why Selected",
     "Updated At (UTC)",
 ]
 
 
-def data_quality_label(row: List[Any]) -> str:
-    vals = row[1:]
-    filled = sum(1 for v in vals if v not in (None, "", "N/A"))
-    ratio = filled / max(1, len(vals))
-    if ratio >= 0.85:
-        return "EXCELLENT"
-    if ratio >= 0.70:
-        return "GOOD"
-    if ratio >= 0.50:
-        return "FAIR"
-    return "POOR"
+def data_quality_label_from_row(row: List[Any], header_map: Dict[str, int]) -> str:
+    """
+    Simple completeness-based label (kept for readability).
+    We also store numeric/flags from ai_advanced separately.
+    """
+    try:
+        # ignore first 2 columns: Ticker, EODHD Symbol
+        vals = row[2:]
+        filled = sum(1 for v in vals if v not in (None, "", "N/A"))
+        ratio = filled / max(1, len(vals))
+        if ratio >= 0.85:
+            return "EXCELLENT"
+        if ratio >= 0.70:
+            return "GOOD"
+        if ratio >= 0.50:
+            return "FAIR"
+        return "POOR"
+    except Exception:
+        return "POOR"
 
 
-def ensure_worksheet(sh: gspread.Spreadsheet, name: str, rows: int = 2000, cols: int = 40) -> gspread.Worksheet:
+def ensure_worksheet(sh: gspread.Spreadsheet, name: str, rows: int = 2000, cols: int = 60) -> gspread.Worksheet:
     try:
         return sh.worksheet(name)
     except WorksheetNotFound:
@@ -178,10 +257,13 @@ def ensure_headers(ws: gspread.Worksheet, headers: List[str]) -> None:
         ws.update(values=[headers], range_name="A1")
 
 
-def infer_market_from_ticker(ticker: str) -> str:
-    if ticker.endswith(".SR") or ticker.replace(".", "").isdigit():
-        return "KSA"
-    return "GLOBAL"
+def _col_letter(n: int) -> str:
+    # A1 string like 'AN1' -> split '1' to get 'AN'
+    return gspread.utils.rowcol_to_a1(1, n).split("1")[0]
+
+
+def _make_empty_row(headers: List[str]) -> List[Any]:
+    return [""] * len(headers)
 
 
 @app.route("/")
@@ -197,7 +279,7 @@ def health():
 @app.route("/api/analyze", methods=["POST"])
 def analyze_portfolio():
     """
-    Reads tickers from Market Data col A (row2+),
+    Reads tickers from Market sheet col A (row2+),
     writes full enriched outputs, Top 7, and refreshes My Investment values.
     """
     try:
@@ -211,14 +293,19 @@ def analyze_portfolio():
         portfolio_sheet_name = payload.get("portfolio_sheet_name", "My Investment")
         max_tickers = int(payload.get("max_tickers", 1000))
 
+        # Optional behaviors
+        top_shariah_only = bool(payload.get("top_shariah_only", True))
+        clear_extra_rows = bool(payload.get("clear_extra_rows", True))
+
         gc = get_google_client()
         sh = gc.open_by_url(sheet_url)
 
-        ws_market = ensure_worksheet(sh, market_sheet_name, rows=4000, cols=max(40, len(MARKET_HEADERS) + 2))
-        ws_top = ensure_worksheet(sh, top_sheet_name, rows=300, cols=max(20, len(TOP_HEADERS) + 2))
+        ws_market = ensure_worksheet(sh, market_sheet_name, rows=4000, cols=max(60, len(MARKET_HEADERS) + 2))
+        ws_top = ensure_worksheet(sh, top_sheet_name, rows=300, cols=max(30, len(TOP_HEADERS) + 2))
+
         ws_port = None
         try:
-            ws_port = ensure_worksheet(sh, portfolio_sheet_name, rows=1000, cols=max(20, len(PORTFOLIO_HEADERS) + 2))
+            ws_port = ensure_worksheet(sh, portfolio_sheet_name, rows=1000, cols=max(30, len(PORTFOLIO_HEADERS) + 2))
         except Exception:
             ws_port = None
 
@@ -226,6 +313,8 @@ def analyze_portfolio():
         ensure_headers(ws_top, TOP_HEADERS)
         if ws_port:
             ensure_headers(ws_port, PORTFOLIO_HEADERS)
+
+        H = {h: i for i, h in enumerate(MARKET_HEADERS)}
 
         # Read tickers (A2:A)
         raw = ws_market.col_values(1)[1:]
@@ -243,17 +332,22 @@ def analyze_portfolio():
         log.info("Analyzing %s tickers...", len(tickers))
 
         rows: List[List[Any]] = []
-        picks: List[Dict[str, Any]] = []
+        picks_all: List[Dict[str, Any]] = []
+        picks_shariah: List[Dict[str, Any]] = []
 
         for ticker in tickers:
+            eod_symbol = to_eodhd_symbol(ticker)
+
             try:
-                fund, hist = engine.get_stock_data(ticker)
+                # IMPORTANT: call engine using normalized EODHD symbol
+                fund, hist = engine.get_stock_data(eod_symbol)
+
                 ai = engine.run_ai_forecasting(hist)
                 shariah = engine.check_shariah_compliance(fund)
                 base_score = engine.generate_score(fund, ai)
 
                 adv = advanced_analyze(
-                    ticker=ticker,
+                    ticker=ticker,          # keep original for analysis labels
                     fundamentals=fund,
                     hist_data=hist,
                     ai_forecast=ai,
@@ -261,10 +355,20 @@ def analyze_portfolio():
                     base_score=safe_float(base_score),
                 )
 
-                # Use advanced score + recommendation/summary (more powerful)
+                # Choose best score source
                 score = safe_float(adv.get("opportunity_score")) or safe_float(base_score) or 0.0
                 recommendation = adv.get("recommendation") or "WATCH"
                 ai_summary = adv.get("ai_summary") or ""
+                why_selected = adv.get("why_selected") or ""
+                risk_bucket = adv.get("risk_bucket") or "MODERATE"
+
+                # Data quality
+                dq_score = safe_float(adv.get("data_quality_score"))
+                dq_flags = adv.get("data_quality_flags")
+                if isinstance(dq_flags, list):
+                    dq_flags_str = ",".join(str(x) for x in dq_flags[:8])
+                else:
+                    dq_flags_str = ""
 
                 general = fund.get("General", {}) if isinstance(fund.get("General", {}), dict) else {}
                 highlights = fund.get("Highlights", {}) if isinstance(fund.get("Highlights", {}), dict) else {}
@@ -291,7 +395,11 @@ def analyze_portfolio():
                 volume = safe_float(ai.get("volume")) or safe_float(tech.get("Volume"))
 
                 # Fundamentals
-                market_cap = safe_float(ai.get("market_cap")) or safe_float(valuation.get("MarketCapitalization")) or safe_float(highlights.get("MarketCapitalization"))
+                market_cap = (
+                    safe_float(adv.get("market_cap"))
+                    or safe_float(valuation.get("MarketCapitalization"))
+                    or safe_float(highlights.get("MarketCapitalization"))
+                )
                 shares_out = safe_float(shares.get("SharesOutstanding")) or safe_float(ai.get("shares_outstanding"))
                 eps = safe_float(highlights.get("EarningsShare")) or safe_float(ai.get("eps_ttm"))
                 pe = safe_float(valuation.get("TrailingPE")) or safe_float(ai.get("pe_ttm"))
@@ -316,96 +424,142 @@ def analyze_portfolio():
 
                 compliant = bool(shariah.get("compliant", False))
 
-                row = [
-                    ticker,
-                    general.get("Name") or fund.get("name") or "N/A",
-                    market,
-                    currency,
-                    general.get("Sector") or "N/A",
-                    general.get("Industry") or "N/A",
-                    current_price,
-                    previous_close,
-                    change,
-                    change_pct_frac,
-                    day_high,
-                    day_low,
-                    high_52w,
-                    low_52w,
-                    volume,
-                    market_cap,
-                    shares_out,
-                    eps,
-                    pe,
-                    pb,
-                    divy_frac,
-                    beta,
-                    vol_ann,
-                    dd90,
-                    pred30,
-                    roi30_frac,
-                    pred90,
-                    roi90_frac,
-                    conf,
-                    "YES" if compliant else "NO",
-                    score,
-                    None,  # Rank (filled after sorting)
-                    recommendation,
-                    ai_summary,
-                    now_utc_str(),
-                    ai.get("data_source") or (fund.get("meta", {}) or {}).get("data_source") or "FinanceEngine",
-                    None,  # Data Quality
-                ]
+                row = _make_empty_row(MARKET_HEADERS)
+                row[H["Ticker"]] = ticker
+                row[H["EODHD Symbol"]] = eod_symbol
+                row[H["Name"]] = general.get("Name") or fund.get("name") or "N/A"
+                row[H["Market"]] = market
+                row[H["Currency"]] = currency
+                row[H["Sector"]] = general.get("Sector") or "N/A"
+                row[H["Industry"]] = general.get("Industry") or "N/A"
 
-                row[-1] = data_quality_label(row)
+                row[H["Current Price"]] = current_price
+                row[H["Previous Close"]] = previous_close
+                row[H["Change"]] = change
+                row[H["Change %"]] = change_pct_frac
+                row[H["Day High"]] = day_high
+                row[H["Day Low"]] = day_low
+                row[H["52W High"]] = high_52w
+                row[H["52W Low"]] = low_52w
+                row[H["Volume"]] = volume
+
+                row[H["Market Cap"]] = market_cap
+                row[H["Shares Outstanding"]] = shares_out
+                row[H["EPS (TTM)"]] = eps
+                row[H["P/E (TTM)"]] = pe
+                row[H["P/B"]] = pb
+                row[H["Dividend Yield %"]] = divy_frac
+                row[H["Beta"]] = beta
+                row[H["Volatility 30D (Ann.)"]] = vol_ann
+                row[H["Max Drawdown 90D"]] = dd90
+
+                row[H["AI Predicted Price 30D"]] = pred30
+                row[H["AI Expected ROI 30D %"]] = roi30_frac
+                row[H["AI Predicted Price 90D"]] = pred90
+                row[H["AI Expected ROI 90D %"]] = roi90_frac
+                row[H["AI Confidence (0-100)"]] = conf
+
+                row[H["Risk Bucket"]] = risk_bucket
+                row[H["Score (0-100)"]] = score
+                # Rank filled later
+                row[H["Recommendation"]] = recommendation
+                row[H["Why Selected"]] = why_selected
+                row[H["AI Summary"]] = ai_summary
+                row[H["Updated At (UTC)"]] = now_utc_str()
+
+                row[H["Data Source"]] = ai.get("data_source") or (fund.get("meta", {}) or {}).get("data_source") or f"EODHD({eod_symbol})"
+
+                # Data quality outputs
+                label = data_quality_label_from_row(row, H)
+                row[H["Data Quality Label"]] = label
+                row[H["Data Quality Score"]] = dq_score
+                row[H["Data Quality Flags"]] = dq_flags_str
+
                 rows.append(row)
 
-                if compliant and score >= 60:
-                    picks.append({
-                        "ticker": ticker,
-                        "name": row[1],
-                        "sector": row[4],
-                        "current_price": current_price,
-                        "pred30": pred30,
-                        "roi30": roi30,
-                        "score": score,
-                        "recommendation": recommendation,
-                        "updated_at": row[-3],
-                    })
+                # Candidate picks
+                pick_obj = {
+                    "ticker": ticker,
+                    "name": row[H["Name"]],
+                    "sector": row[H["Sector"]],
+                    "current_price": current_price,
+                    "pred30": pred30,
+                    "roi30": roi30,  # percent number
+                    "score": score,
+                    "risk_bucket": risk_bucket,
+                    "recommendation": recommendation,
+                    "compliant": compliant,
+                    "why_selected": why_selected,
+                    "updated_at": row[H["Updated At (UTC)"]],
+                }
+
+                if score >= 60:
+                    picks_all.append(pick_obj)
+                    if compliant:
+                        picks_shariah.append(pick_obj)
 
             except Exception as inner:
-                log.warning("Ticker failed (%s): %s", ticker, inner)
-                # Write an error row for visibility
-                err_row = [""] * len(MARKET_HEADERS)
-                err_row[0] = ticker
-                err_row[33] = f"ERROR: {inner}"  # AI Summary column
-                err_row[34] = now_utc_str()
-                err_row[35] = "FinanceEngine"
-                err_row[36] = "POOR"
+                msg = str(inner)
+
+                # Hint for the most common setup problems
+                if "403" in msg or "Forbidden" in msg:
+                    msg = (
+                        f"{msg} | HINT: Check EODHD_API_TOKEN and ensure GLOBAL symbols include exchange "
+                        f"(we auto-try .US). Also confirm your EODHD plan allows fundamentals/eod endpoints."
+                    )
+
+                log.warning("Ticker failed (%s -> %s): %s", ticker, eod_symbol, msg)
+
+                err_row = _make_empty_row(MARKET_HEADERS)
+                err_row[H["Ticker"]] = ticker
+                err_row[H["EODHD Symbol"]] = eod_symbol
+                err_row[H["AI Summary"]] = f"ERROR: {msg}"
+                err_row[H["Updated At (UTC)"]] = now_utc_str()
+                err_row[H["Data Source"]] = "FinanceEngine"
+                err_row[H["Data Quality Label"]] = "POOR"
+                err_row[H["Data Quality Score"]] = 0
+                err_row[H["Data Quality Flags"]] = "ERROR"
                 rows.append(err_row)
 
         # Sort by Score desc, then ROI30 desc
         def sort_key(r: List[Any]) -> Tuple[float, float]:
-            score = safe_float(r[30]) or 0.0
-            roi30_frac = safe_float(r[25])
+            s = safe_float(r[H["Score (0-100)"]]) or 0.0
+            roi30_frac = safe_float(r[H["AI Expected ROI 30D %"]])
             roi30_pct = (roi30_frac * 100.0) if roi30_frac is not None else -9999.0
-            return (score, roi30_pct)
+            return (s, roi30_pct)
 
         rows_sorted = sorted(rows, key=sort_key, reverse=True)
 
         # Assign Rank
         for i, r in enumerate(rows_sorted, start=1):
-            if len(r) > 31:
-                r[31] = i
+            r[H["Rank"]] = i
 
         # Write Market Data rows in one batch (A2:...)
+        end_col_letter = _col_letter(len(MARKET_HEADERS))
         if rows_sorted:
             end_row = 1 + len(rows_sorted)
-            end_col_letter = gspread.utils.rowcol_to_a1(1, len(MARKET_HEADERS)).split("1")[0]
             ws_market.update(values=rows_sorted, range_name=f"A2:{end_col_letter}{end_row}")
 
+            # Clear leftovers (so old tickers don't remain visible)
+            if clear_extra_rows:
+                last_row_to_clear_from = end_row + 1
+                if last_row_to_clear_from <= ws_market.row_count:
+                    # Clear only the area we might have previously written
+                    clear_range = f"A{last_row_to_clear_from}:{end_col_letter}{ws_market.row_count}"
+                    try:
+                        ws_market.batch_clear([clear_range])
+                    except Exception:
+                        # fallback: overwrite with blanks for a limited window
+                        pass
+
         # Build Top 7
-        picks.sort(key=lambda x: (x["score"], (x["roi30"] or -9999)), reverse=True)
-        top7 = picks[:7]
+        picks_preferred = picks_shariah if top_shariah_only else picks_all
+        if not picks_preferred:
+            # fallback to ensure top sheet is never empty
+            picks_preferred = picks_all
+
+        picks_preferred.sort(key=lambda x: (x["score"], (x["roi30"] if x["roi30"] is not None else -9999)), reverse=True)
+        top7 = picks_preferred[:7]
 
         top_rows: List[List[Any]] = []
         for idx, p in enumerate(top7, start=1):
@@ -418,14 +572,22 @@ def analyze_portfolio():
                 p["pred30"],
                 (p["roi30"] / 100.0) if p["roi30"] is not None else None,  # fraction for percent format
                 p["score"],
+                p["risk_bucket"],
                 p["recommendation"],
-                "YES",
+                "YES" if p["compliant"] else "NO",
+                p["why_selected"],
                 p["updated_at"],
             ])
 
         ws_top.update(values=[TOP_HEADERS], range_name="A1")
         if top_rows:
-            ws_top.update(values=top_rows, range_name=f"A2:K{1+len(top_rows)}")
+            ws_top.update(values=top_rows, range_name=f"A2:M{1+len(top_rows)}")
+        else:
+            # Clear old rows if no picks
+            try:
+                ws_top.batch_clear(["A2:M300"])
+            except Exception:
+                pass
 
         # Refresh My Investment using latest Market Data prices
         portfolio_kpi = None
@@ -434,17 +596,15 @@ def analyze_portfolio():
                 price_map = build_price_map_from_market_data(MARKET_HEADERS, rows_sorted)
                 pe = PortfolioEngine()
 
-                # read portfolio rows (data only)
                 port_values = ws_port.get_all_values()
                 port_rows = port_values[1:] if len(port_values) > 1 else []
 
                 updated_port_rows, kpi = pe.compute_table(port_rows, price_map)
 
-                # write back
-                end_col_letter = gspread.utils.rowcol_to_a1(1, len(PORTFOLIO_HEADERS)).split("1")[0]
+                end_port_col_letter = _col_letter(len(PORTFOLIO_HEADERS))
                 if updated_port_rows:
-                    end_row = 1 + len(updated_port_rows)
-                    ws_port.update(values=updated_port_rows, range_name=f"A2:{end_col_letter}{end_row}")
+                    end_port_row = 1 + len(updated_port_rows)
+                    ws_port.update(values=updated_port_rows, range_name=f"A2:{end_port_col_letter}{end_port_row}")
 
                 portfolio_kpi = {
                     "total_cost": kpi.total_cost,
@@ -467,9 +627,11 @@ def analyze_portfolio():
                 {
                     "rank": i + 1,
                     "ticker": p["ticker"],
-                    "score": round(p["score"], 2),
+                    "score": round(float(p["score"]), 2),
                     "roi_30d_pct": p["roi30"],
                     "recommendation": p["recommendation"],
+                    "risk_bucket": p["risk_bucket"],
+                    "shariah": "YES" if p["compliant"] else "NO",
                 }
                 for i, p in enumerate(top7)
             ],
@@ -500,8 +662,8 @@ def refresh_portfolio_only():
         gc = get_google_client()
         sh = gc.open_by_url(sheet_url)
 
-        ws_market = ensure_worksheet(sh, market_sheet_name, rows=4000, cols=max(40, len(MARKET_HEADERS) + 2))
-        ws_port = ensure_worksheet(sh, portfolio_sheet_name, rows=1000, cols=max(20, len(PORTFOLIO_HEADERS) + 2))
+        ws_market = ensure_worksheet(sh, market_sheet_name, rows=4000, cols=max(60, len(MARKET_HEADERS) + 2))
+        ws_port = ensure_worksheet(sh, portfolio_sheet_name, rows=1000, cols=max(30, len(PORTFOLIO_HEADERS) + 2))
 
         ensure_headers(ws_market, MARKET_HEADERS)
         ensure_headers(ws_port, PORTFOLIO_HEADERS)
@@ -515,7 +677,7 @@ def refresh_portfolio_only():
         port_rows = port_values[1:] if len(port_values) > 1 else []
         updated_port_rows, kpi = pe.compute_table(port_rows, price_map)
 
-        end_col_letter = gspread.utils.rowcol_to_a1(1, len(PORTFOLIO_HEADERS)).split("1")[0]
+        end_col_letter = _col_letter(len(PORTFOLIO_HEADERS))
         if updated_port_rows:
             end_row = 1 + len(updated_port_rows)
             ws_port.update(values=updated_port_rows, range_name=f"A2:{end_col_letter}{end_row}")
