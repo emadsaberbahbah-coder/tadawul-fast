@@ -8,8 +8,6 @@ from finance_engine import FinanceEngine
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# Load credentials from Render Environment Variable
-# Variable name must be: GOOGLE_CREDENTIALS
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -25,7 +23,7 @@ def get_google_client():
     return gspread.authorize(creds)
 
 # Initialize Finance Engine
-EODHD_API_KEY = os.environ.get('EODHD_API_TOKEN', 'demo') # Add your key to env vars
+EODHD_API_KEY = os.environ.get('EODHD_API_TOKEN', 'demo') 
 engine = FinanceEngine(EODHD_API_KEY)
 
 @app.route('/')
@@ -35,9 +33,7 @@ def home():
 @app.route('/api/analyze', methods=['POST'])
 def analyze_portfolio():
     """
-    Reads tickers from the Google Sheet, analyzes them using AI,
-    and writes back the results.
-    Expected JSON body: {"sheet_url": "..."}
+    Reads tickers from Col A, runs AI, writes results to Cols B-G.
     """
     try:
         data = request.json
@@ -48,49 +44,61 @@ def analyze_portfolio():
         
         # 1. Update Market Data Page
         worksheet = sh.worksheet("Market Data")
-        tickers = worksheet.col_values(1)[1:] # Assume tickers are in Col A, skip header
+        
+        # Get all tickers from Column A (skipping header)
+        tickers = worksheet.col_values(1)[1:] 
         
         results = []
         recommendations = []
 
+        print(f"Analyzing {len(tickers)} tickers...")
+
         for ticker in tickers:
-            if not ticker: continue
+            if not ticker: 
+                continue
+            
+            print(f"Processing: {ticker}")
             
             # Fetch Data
             fund, hist = engine.get_stock_data(ticker)
             
-            # Run AI
+            # Run AI Forecasting
             ai_result = engine.run_ai_forecasting(hist)
             
             # Check Shariah
             shariah = engine.check_shariah_compliance(fund)
             
-            # Score
+            # Generate Score
             score = engine.generate_score(fund, ai_result)
 
-            # Prepare row for 'Market Data'
+            # Prepare row data [Ticker, Price, Sector, Forecast, ROI, Compliant, Score]
+            # Note: We rewrite the ticker in Col A to ensure alignment
             row_data = [
                 ticker,
                 ai_result.get('current_price'),
-                fund.get('General', {}).get('Sector'),
+                fund.get('General', {}).get('Sector', 'N/A'),
                 ai_result.get('predicted_price_30d'),
-                ai_result.get('expected_roi_pct'),
-                shariah.get('compliant'),
+                f"{ai_result.get('expected_roi_pct')}%",
+                "YES" if shariah.get('compliant') else "NO",
                 score
             ]
             results.append(row_data)
 
             # Filter for Top 7 Recommendations
-            if shariah.get('compliant') and score > 70:
+            if shariah.get('compliant') and score > 60:
                 recommendations.append({
                     "ticker": ticker,
                     "score": score,
                     "roi": ai_result.get('expected_roi_pct')
                 })
 
-        # Update Market Data Sheet (Simplified batch update)
-        # Note: In production, map these list items to specific cell ranges
-        print("Analysis Complete. Update logic would go here.")
+        # --- CRITICAL UPDATE: WRITE DATA TO SHEET ---
+        if results:
+            # We update range A2 to G(end)
+            end_row = 1 + len(results)
+            range_name = f"A2:G{end_row}"
+            # This pushes the calculated data into the cells
+            worksheet.update(values=results, range_name=range_name)
         
         # Sort recommendations by ROI and take top 7
         recommendations.sort(key=lambda x: x['roi'], reverse=True)
@@ -103,6 +111,7 @@ def analyze_portfolio():
         })
 
     except Exception as e:
+        print(f"Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
