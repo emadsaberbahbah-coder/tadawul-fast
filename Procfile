@@ -1,1 +1,1 @@
-web: gunicorn app:app
+web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600 --graceful-timeout 30 --workers ${WEB_CONCURRENCY:-1} --worker-class gthread --threads ${GTHREADS:-4} --access-logfile - --error-logfile - --log-level info
