@@ -1,12 +1,26 @@
+# requirements.txt
+# Emad Bahbah Financial Engine – v2.0.0 (stable pins for Render)
+
 Flask==3.0.0
 gunicorn==21.2.0
+
+# HTTP + retries (urllib3 is used via requests + explicit Retry adapter)
 requests==2.31.0
+urllib3==2.1.0
+
+# Data + AI
 pandas==2.0.3
+numpy==1.24.3
+
+# Prophet forecasting (uses CmdStan via cmdstanpy)
 prophet==1.1.5
+cmdstanpy==1.2.0
+
+# Google Sheets
 gspread==5.12.0
 gspread-formatting==1.1.2
 google-auth==2.27.0
+
+# Env + optional calendars/holidays
 python-dotenv==1.0.1
 holidays==0.41
-cmdstanpy==1.2.0
-numpy==1.24.3
