@@ -8,113 +8,131 @@ from finance_engine import FinancialExpert
 
 app = Flask(__name__)
 
-# Config
+# --- Configuration ---
 GOOGLE_CREDS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = os.environ.get("SHEET_ID")
+
+# Connect to Google Sheets
 creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS), scopes=["https://www.googleapis.com/auth/spreadsheets"])
 client = gspread.authorize(creds)
+
+# Initialize the Advanced AI Engine
 engine = FinancialExpert()
 
-def format_sheet(ws):
-    apply_format(ws, "A:Z", cellFormat(textFormat=textFormat(fontFamily="Verdana", fontSize=10)))
+def apply_style(ws):
+    """Enforces Verdana font and clean styling"""
+    fmt = cellFormat(textFormat=textFormat(fontFamily="Verdana", fontSize=10))
+    format_cell_range(ws, 'A:Z', fmt)
 
 @app.route('/')
-def home(): return "Emad Financial Brain 2.0 Active"
+def home():
+    return "Emad Bahabh Financial Expert AI is Running."
 
 @app.route('/update_general', methods=)
 def update_general():
-    ws = client.open_by_key(SHEET_ID).worksheet("General Data")
-    tickers = ws.col_values(1)[1:] # Skip header
-    
-    updates =
-    for i, ticker in enumerate(tickers):
-        try:
-            analysis = engine.get_forecast_and_score(ticker)
-            # Row index is i + 2 (1-based + header)
-            # We assume columns: A=Ticker, B=Price, C=Trend, D=Exp Price, E=ROI, F=AI Score, G=Signal
-            row = i + 2
-            updates.append({
-                'range': f'B{row}:G{row}',
-                'values': [[
-                    analysis['current_price'],
-                    analysis['trend'],
-                    analysis['exp_price'],
-                    analysis['roi_30d'],
-                    analysis['ai_score'],
-                    analysis['signal']]
-            })
-        except: continue
+    """Reads tickers from Col A, runs AI Analysis, and updates cols B-G"""
+    try:
+        ws = client.open_by_key(SHEET_ID).worksheet("General Data")
+        tickers = ws.col_values(1)[1:] # Get all tickers, skipping header
         
-    if updates: ws.batch_update(updates)
-    format_sheet(ws)
-    
-    # Color Rules
-    rule_green = ConditionalFormatRule(
-        ranges=,
-        booleanRule=BooleanRule(condition=BooleanCondition('NUMBER_GREATER', ['60']), format=CellFormat(backgroundColor=Color(0.8,1,0.8)))
-    )
-    set_conditional_format_rules(ws, [rule_green])
-    
-    return jsonify({"message": "General Analysis Complete"})
+        updates =
+        for i, ticker in enumerate(tickers):
+            print(f"Analyzing {ticker}...")
+            data = engine.get_forecast_and_score(ticker)
+            
+            # Prepare row data:
+            row_idx = i + 2
+            updates.append({
+                'range': f'B{row_idx}:G{row_idx}',
+                'values': [[
+                    data['current_price'],
+                    data['trend'],
+                    data['exp_price'],
+                    data['roi_30d'],
+                    data['ai_score'],
+                    data['signal']]
+            })
+            
+        if updates: ws.batch_update(updates)
+        apply_style(ws)
+        return jsonify({"message": f"Updated analysis for {len(tickers)} stocks."})
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
 
 @app.route('/screen_shariah', methods=)
 def screen_shariah():
-    ws = client.open_by_key(SHEET_ID).worksheet("Recommendations")
-    ws.clear()
-    ws.append_row()
-    
-    # For demo, scanning a small list. In production, scan a full index.
-    candidates =
-    
-    results =
-    for ticker in candidates:
-        compliance = engine.screen_shariah(ticker)
-        if compliance['compliant']:
-            analysis = engine.get_forecast_and_score(ticker)
-            results.append([
-                ticker, 
-                "HALAL", 
-                compliance['ratios'], 
-                analysis['ai_score'], 
-                analysis['signal'], 
-                analysis['roi_30d'])
-            
-    # Sort by AI Score (Highest first) and take top 7
-    results.sort(key=lambda x: x[1], reverse=True)
-    
-    for row in results[:7]:
-        ws.append_row(row)
+    """Finds top 7 Halal stocks ranked by AI Score"""
+    try:
+        ws = client.open_by_key(SHEET_ID).worksheet("Recommendations")
+        ws.clear()
+        ws.append_row()
         
-    format_sheet(ws)
-    return jsonify({"message": "Top 7 Opportunities Generated"})
+        # In a real scenario, you'd loop through a full index (e.g., S&P 500).
+        # For this demo, we check a predefined list of popular tech/energy stocks.
+        candidates =
+        
+        compliant_list =
+        
+        for ticker in candidates:
+            compliance = engine.screen_shariah(ticker)
+            if compliance['compliant']:
+                # If Halal, get the AI Score
+                analysis = engine.get_forecast_and_score(ticker)
+                compliant_list.append([
+                    ticker,
+                    "HALAL",
+                    compliance['ratios'],
+                    analysis['ai_score'],
+                    analysis['signal'],
+                    analysis['roi_30d'])
+        
+        # Sort by AI Score (Highest first) and keep top 7
+        compliant_list.sort(key=lambda x: x[1], reverse=True)
+        top_7 = compliant_list[:7]
+        
+        for stock in top_7:
+            ws.append_row(stock)
+            
+        apply_style(ws)
+        return jsonify({"message": "Top 7 Shariah Opportunities Generated."})
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
 
 @app.route('/update_portfolio', methods=)
 def update_portfolio():
-    ws = client.open_by_key(SHEET_ID).worksheet("Portfolio")
-    data = ws.get_all_values()[1:] # Skip header
-    updates =
-    
-    for i, row in enumerate(data):
-        ticker = row
-        qty = float(row[2])
-        buy_price = float(row[1])
+    """Updates P/L for owned stocks"""
+    try:
+        ws = client.open_by_key(SHEET_ID).worksheet("Portfolio")
+        rows = ws.get_all_values()[1:] # Skip header
+        updates =
         
-        # Get live data
-        analysis = engine.get_forecast_and_score(ticker)
-        curr = analysis['current_price']
-        
-        pl = (curr - buy_price) * qty
-        pl_pct = ((curr - buy_price) / buy_price)
-        
-        r_idx = i + 2
-        updates.append({
-            'range': f'E{r_idx}:H{r_idx}',
-            'values': [[curr, pl, f"{pl_pct:.2%}", analysis['signal']]]
-        })
-        
-    if updates: ws.batch_update(updates)
-    format_sheet(ws)
-    return jsonify({"message": "Portfolio & Signals Updated"})
+        for i, row in enumerate(rows):
+            ticker = row
+            status = row
+            if status == "SOLD": continue
+            
+            qty = float(row[2])
+            cost = float(row[1])
+            
+            # Get live price via AI engine
+            analysis = engine.get_forecast_and_score(ticker)
+            curr_price = analysis['current_price']
+            
+            market_val = qty * curr_price
+            pl = market_val - (qty * cost)
+            pl_pct = (pl / (qty * cost))
+            
+            r = i + 2
+            updates.append({
+                'range': f'E{r}:H{r}',
+                'values': [[curr_price, market_val, f"{pl_pct:.2%}", analysis['signal']]]
+            })
+            
+        if updates: ws.batch_update(updates)
+        apply_style(ws)
+        return jsonify({"message": "Portfolio updated with real-time P/L."})
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
