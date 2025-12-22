@@ -2,36 +2,32 @@
 """
 FinanceEngine – Enhanced (EODHD + AI Forecast + Risk + Shariah)
 --------------------------------------------------------------
-FULL REPLACEMENT – v2.3.0 (HARDENED)
+FULL REPLACEMENT – v2.3.2 (ENV-FIRST, HARDENED)
 
-Fixes & Upgrades:
-✅ Correct EODHD domain: https://eodhistoricaldata.com/api
-✅ Symbol normalization:
-   - AAPL -> AAPL.US (DEFAULT_EOD_EXCHANGE configurable)
-   - 1120 -> 1120.SR
-   - Keeps 1120.SR / EURUSD.FOREX / BTC-USD.CC etc.
-✅ Clear 401/403 diagnostics (demo vs missing/invalid token)
-✅ Partial-data mode:
-   - If fundamentals fail but history works -> still returns technicals + AI
-   - If history fails but fundamentals works -> returns fundamentals + meta
-✅ Robust JSON handling (Cloudflare/HTML detection)
-✅ Prophet forecasting (nearest-date 30D/90D) + fallback linear forecast
-✅ Confidence scoring (0–100)
-✅ Shariah screening returns YES / NO / UNKNOWN (UNKNOWN if missing inputs)
-✅ Score model returns 0–100 and includes Value + Dividend + AI Momentum + Risk
-✅ Risk classification + AI narrative summary helper
+Goal (your request):
+✅ Avoid errors
+✅ Read configuration directly from Environment Variables (no secrets in code)
+✅ Support BOTH token env names (because your Render uses EODHD_API_KEY):
+   - EODHD_API_TOKEN (preferred)
+   - EODHD_API_KEY   (compatible)
 
-Public API (kept compatible):
+ENV used (optional unless noted):
+- EODHD_API_TOKEN (or EODHD_API_KEY)  [RECOMMENDED]
+- EODHD_BASE_URL=https://eodhistoricaldata.com/api
+- DEFAULT_EOD_EXCHANGE=US
+- HTTP_TIMEOUT=20
+- MAX_RETRIES=3
+- RETRY_DELAY=0.5
+- EOD_HISTORY_YEARS=2
+- EOD_USER_AGENT=Mozilla/5.0 (compatible; FinanceEngine/2.3.2)
+
+Public API (compatible):
   - get_stock_data(ticker) -> (fundamentals_dict, hist_data)
   - check_shariah_compliance(fundamentals) -> dict
   - run_ai_forecasting(hist_data) -> dict
   - generate_score(fundamentals, ai_data) -> float
   - classify_risk(fundamentals) -> str
   - generate_ai_summary(fundamentals, ai_data, shariah, score) -> str
-
-ENV (optional):
-  - DEFAULT_EOD_EXCHANGE=US
-  - HTTP_TIMEOUT=20
 """
 
 from __future__ import annotations
@@ -39,6 +35,7 @@ from __future__ import annotations
 import os
 import math
 import datetime as dt
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -56,9 +53,38 @@ except Exception:
 
 
 # =============================================================================
-# Helpers
+# Logging
 # =============================================================================
+log = logging.getLogger("finance-engine")
+if not log.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 
+
+# =============================================================================
+# ENV helpers
+# =============================================================================
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return (v if v is not None else default).strip()
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env_str(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env_str(name, str(default)))
+    except Exception:
+        return default
+
+
+# =============================================================================
+# General Helpers
+# =============================================================================
 def _utc_now_str() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat(sep=" ")
 
@@ -76,7 +102,6 @@ def _safe_float(x: Any) -> Optional[float]:
         if not s or s.lower() in {"na", "n/a", "none", "null", "-"}:
             return None
         if s.endswith("%"):
-            # Keep as numeric percent (e.g., "5%" -> 5.0)
             return float(s[:-1].strip())
         return float(s)
     except Exception:
@@ -84,7 +109,6 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    """(a-b)/b * 100"""
     if a is None or b is None or b == 0:
         return None
     return (a - b) / b * 100.0
@@ -106,10 +130,6 @@ def _latest_period_key(period_dict: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_hist_df(hist_data: Any) -> pd.DataFrame:
-    """
-    EOD endpoint returns list of dict:
-      {date, open, high, low, close, adjusted_close, volume}
-    """
     df = pd.DataFrame(hist_data or [])
     if df.empty:
         return df
@@ -195,7 +215,6 @@ def _compute_technicals_from_hist(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _linear_fallback_forecast(df: pd.DataFrame, horizon_days: int) -> Tuple[Optional[float], Optional[float]]:
-    """Fast fallback: linear regression close ~ day_index. Returns (pred, confidence 0-100)."""
     try:
         df2 = df.dropna(subset=["date", "close"]).tail(365).copy()
         if df2.empty or len(df2) < 30:
@@ -215,7 +234,6 @@ def _linear_fallback_forecast(df: pd.DataFrame, horizon_days: int) -> Tuple[Opti
         future_x = x.max() + float(horizon_days)
         pred = intercept + slope * future_x
 
-        # Confidence from residual std
         y_hat = intercept + slope * x
         resid = y - y_hat
         resid_std = float(resid.std()) if len(resid) > 5 else 0.0
@@ -229,7 +247,6 @@ def _linear_fallback_forecast(df: pd.DataFrame, horizon_days: int) -> Tuple[Opti
 
 
 def _nearest_pred(forecast: pd.DataFrame, target_date: pd.Timestamp) -> Optional[float]:
-    """Pick yhat for exact ds if exists, else nearest ds."""
     try:
         if forecast is None or forecast.empty:
             return None
@@ -250,19 +267,27 @@ def _nearest_pred(forecast: pd.DataFrame, target_date: pd.Timestamp) -> Optional
 # =============================================================================
 # FinanceEngine
 # =============================================================================
-
 class FinanceEngine:
-    def __init__(self, api_key: str):
-        self.api_key = (api_key or "").strip()
-        self.base_url = "https://eodhistoricaldata.com/api"
+    def __init__(self, api_key: Optional[str] = None):
+        # ✅ ENV-FIRST token (supports BOTH names)
+        env_token = _env_str("EODHD_API_TOKEN") or _env_str("EODHD_API_KEY")
+        self.api_key = (api_key or env_token or "demo").strip()
 
-        self.default_exchange = (os.getenv("DEFAULT_EOD_EXCHANGE", "US") or "US").strip().upper()
-        self.timeout = float(os.getenv("HTTP_TIMEOUT", "20"))
+        # ✅ Base URL from ENV (your Render already has EODHD_BASE_URL)
+        self.base_url = (_env_str("EODHD_BASE_URL", "https://eodhistoricaldata.com/api").rstrip("/"))
+
+        self.default_exchange = (_env_str("DEFAULT_EOD_EXCHANGE", "US") or "US").upper()
+        self.timeout = _env_float("HTTP_TIMEOUT", 20.0)
+
+        self.history_years = max(1, _env_int("EOD_HISTORY_YEARS", 2))
+
+        max_retries = max(0, _env_int("MAX_RETRIES", 3))
+        retry_delay = max(0.0, _env_float("RETRY_DELAY", 0.5))
 
         self.session = requests.Session()
         retries = Retry(
-            total=3,
-            backoff_factor=0.5,
+            total=max_retries,
+            backoff_factor=retry_delay,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=frozenset(["GET"]),
             raise_on_status=False,
@@ -271,16 +296,17 @@ class FinanceEngine:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-        # helpful headers (sometimes reduces blocks)
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; FinanceEngine/2.3.0; +https://render.com)"
-        })
+        ua = _env_str("EOD_USER_AGENT", "Mozilla/5.0 (compatible; FinanceEngine/2.3.2)")
+        self.session.headers.update({"User-Agent": ua})
+
+        if self._is_demo_key():
+            log.warning("EODHD token is DEMO/empty. Set EODHD_API_TOKEN or EODHD_API_KEY in Render env for real data.")
 
     def _normalize_symbol(self, ticker: str) -> str:
         """
         Normalize EODHD symbol:
           - numeric 1120 -> 1120.SR
-          - already has suffix -> keep (AAPL.US, 1120.SR, EURUSD.FOREX)
+          - already has suffix -> keep (AAPL.US, 1120.SR, EURUSD.FOREX, BTC-USD.CC)
           - plain equity -> add DEFAULT_EOD_EXCHANGE (AAPL -> AAPL.US)
         """
         t = (ticker or "").strip().upper()
@@ -298,35 +324,35 @@ class FinanceEngine:
     def _get_json(self, url: str) -> Any:
         r = self.session.get(url, timeout=self.timeout)
         ct = (r.headers.get("Content-Type") or "").lower()
+        body_snip = (r.text or "")[:220].replace("\n", " ").strip()
 
-        # clear auth hint
+        # Clear auth hint
         if r.status_code in (401, 403):
-            hint = "EODHD token missing/invalid or plan limitation."
+            hint = "Token missing/invalid or plan limitation."
             if self._is_demo_key():
-                hint = (
-                    "You are using DEMO token. DEMO works only for limited tickers. "
-                    "Set EODHD_API_TOKEN in Render env."
-                )
-            body = (r.text or "")[:200].replace("\n", " ").strip()
-            raise RuntimeError(f"EODHD HTTP {r.status_code} ({hint}) | body={body}")
+                hint = "DEMO token limitation. Set EODHD_API_TOKEN or EODHD_API_KEY in Render."
+            raise RuntimeError(f"EODHD HTTP {r.status_code} ({hint}) | url={url} | body={body_snip}")
 
-        # JSON only
-        if "json" not in ct:
-            body = (r.text or "")[:200].replace("\n", " ").strip()
-            raise RuntimeError(f"Non-JSON response ({r.status_code}) from EODHD | body={body}")
+        # Try JSON even if content-type is wrong (some proxies)
+        data: Any = None
+        try:
+            data = r.json()
+        except Exception:
+            if "json" not in ct:
+                raise RuntimeError(f"Non-JSON response ({r.status_code}) from EODHD | url={url} | body={body_snip}")
+            raise RuntimeError(f"JSON parse failed ({r.status_code}) | url={url} | body={body_snip}")
 
-        data = r.json()
-
-        # HTTP errors
         if r.status_code >= 400:
             msg = None
             if isinstance(data, dict):
                 msg = data.get("message") or data.get("error") or str(data)
-            raise RuntimeError(f"EODHD HTTP {r.status_code}: {msg or 'request failed'}")
+            raise RuntimeError(f"EODHD HTTP {r.status_code}: {msg or 'request failed'} | url={url}")
 
-        # sometimes returns {"code":..., "message":...} with 200
-        if isinstance(data, dict) and ("code" in data and "message" in data) and r.status_code == 200:
-            raise RuntimeError(f"EODHD error: {data.get('message')}")
+        # Sometimes returns {"code":..., "message":...} with 200
+        if isinstance(data, dict) and ("code" in data and "message" in data):
+            # Treat as error message if it looks like an error
+            if str(data.get("code")).strip():
+                raise RuntimeError(f"EODHD error: {data.get('message')} | url={url}")
 
         return data
 
@@ -342,7 +368,7 @@ class FinanceEngine:
           fundamentals["meta"] = {
             data_quality: OK|PARTIAL|ERROR,
             errors: [...],
-            symbol_used, updated_at_utc, provider, demo_key
+            symbol_used, updated_at_utc, provider, demo_key, base_url
           }
         """
         symbol = self._normalize_symbol(ticker)
@@ -361,10 +387,10 @@ class FinanceEngine:
         except Exception as e:
             errors.append(f"Fundamentals: {e}")
 
-        # History (2 years)
+        # History (N years)
         df = pd.DataFrame()
         try:
-            start = dt.date.today() - dt.timedelta(days=365 * 2)
+            start = dt.date.today() - dt.timedelta(days=365 * int(self.history_years))
             hist_url = f"{self.base_url}/eod/{symbol}?api_token={self.api_key}&fmt=json&from={start.isoformat()}"
             hist_data = self._get_json(hist_url)
             df = _extract_hist_df(hist_data)
@@ -385,7 +411,6 @@ class FinanceEngine:
                 if fund_data["Technicals"].get(k) is None:
                     fund_data["Technicals"][k] = v
 
-        # Meta quality
         ok_fund = bool(fund_data) and isinstance(fund_data, dict)
         ok_hist = (df is not None and not df.empty)
 
@@ -400,11 +425,12 @@ class FinanceEngine:
         if isinstance(fund_data["meta"], dict):
             fund_data["meta"].update({
                 "data_quality": dq,
-                "errors": errors[:8],
+                "errors": errors[:10],
                 "symbol_used": symbol,
                 "updated_at_utc": _utc_now_str(),
                 "provider": "EODHD",
                 "demo_key": self._is_demo_key(),
+                "base_url": self.base_url,
             })
 
         return fund_data, hist_data
@@ -448,7 +474,6 @@ class FinanceEngine:
                 or _safe_float(hi.get("MarketCapitalizationMln"))
             )
 
-            # convert mln if user only has mln field
             if market_cap is not None and market_cap < 1e6 and _safe_float(hi.get("MarketCapitalizationMln")) is not None:
                 market_cap = market_cap * 1_000_000
 
@@ -497,8 +522,9 @@ class FinanceEngine:
             return {"error": "Forecasting failed: empty history"}
 
         df = df.dropna(subset=["date", "close"]).copy()
+        tech = _compute_technicals_from_hist(df)
+
         if df.empty or len(df) < 60:
-            tech = _compute_technicals_from_hist(df)
             cur = _safe_float(tech.get("Price"))
             return {
                 "current_price": round(cur, 2) if cur is not None else None,
@@ -512,9 +538,7 @@ class FinanceEngine:
                 "data_source": "EODHD",
             }
 
-        tech = _compute_technicals_from_hist(df)
         current_price = float(df.iloc[-1]["close"])
-
         last_date = pd.to_datetime(df.iloc[-1]["date"]).normalize()
         target_30 = (last_date + pd.Timedelta(days=30)).normalize()
         target_90 = (last_date + pd.Timedelta(days=90)).normalize()
@@ -573,10 +597,9 @@ class FinanceEngine:
                     "data_source": "EODHD+Prophet",
                 }
             except Exception as e:
-                # Non-fatal; fall back
-                print(f"AI Error (Prophet): {e}")
+                log.warning("AI Prophet failed; fallback to linear. error=%s", e)
 
-        # Fallback
+        # Fallback linear
         pred30, conf30 = _linear_fallback_forecast(df, 30)
         pred90, conf90 = _linear_fallback_forecast(df, 90)
         conf = conf30 if conf30 is not None else conf90
@@ -601,13 +624,6 @@ class FinanceEngine:
     # Scoring (0–100)
     # -------------------------------------------------------------------------
     def generate_score(self, fundamentals: Dict[str, Any], ai_data: Dict[str, Any]) -> float:
-        """
-        Score model:
-          - Value: P/E, P/B
-          - Income: Dividend yield
-          - Momentum: AI ROI30 + trend + confidence
-          - Risk: Volatility + Drawdown (from Technicals)
-        """
         score = 50.0
         fundamentals = fundamentals or {}
         ai_data = ai_data or {}
@@ -619,7 +635,6 @@ class FinanceEngine:
         pe = _safe_float(val.get("TrailingPE")) or _safe_float(hi.get("PERatio"))
         pb = _safe_float(val.get("PriceBookMRQ")) or _safe_float(hi.get("PriceBook"))
 
-        # Value
         if pe is not None:
             if 0 < pe < 18:
                 score += 10
@@ -634,17 +649,15 @@ class FinanceEngine:
             elif pb >= 8:
                 score -= 6
 
-        # Dividend (DividendYield in EODHD often as fraction, sometimes percent; handle both)
+        # DividendYield may be fraction or percent
         div_y = _safe_float(hi.get("DividendYield"))
         if div_y is not None:
-            # If div_y is 0.03 treat as 3%; if 3 treat as 3%
             div_pct = div_y * 100.0 if div_y <= 1.0 else div_y
             if div_pct >= 4:
                 score += 6
             elif 2 <= div_pct < 4:
                 score += 3
 
-        # AI Momentum
         roi30 = _safe_float(ai_data.get("expected_roi_pct"))
         conf = _safe_float(ai_data.get("confidence"))
 
@@ -667,7 +680,6 @@ class FinanceEngine:
         if conf is not None:
             score += max(-3.0, min(5.0, (conf - 50.0) / 10.0))
 
-        # Risk
         vol_ann = _safe_float(tech.get("Volatility30D_Ann"))
         dd90 = _safe_float(tech.get("MaxDrawdown90D"))
 
@@ -706,7 +718,7 @@ class FinanceEngine:
         return "LOW"
 
     # -------------------------------------------------------------------------
-    # AI summary (short narrative string)
+    # AI summary
     # -------------------------------------------------------------------------
     def generate_ai_summary(
         self,
