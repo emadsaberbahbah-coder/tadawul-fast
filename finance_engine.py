@@ -7,153 +7,126 @@ from datetime import datetime, timedelta
 
 class FinancialExpert:
     def __init__(self):
-        # Load API key from environment variables for security
         self.api_token = os.environ.get("EODHD_API_TOKEN")
         self.base_url = "https://eodhd.com/api"
-        
-        if not self.api_token:
-            raise ValueError("EODHD_API_TOKEN environment variable not set.")
 
     def _fetch_json(self, endpoint, **kwargs):
-        """Helper to handle API requests"""
         params = {"api_token": self.api_token, "fmt": "json"}
         params.update(kwargs)
         try:
-            response = requests.get(f"{self.base_url}/{endpoint}", params=params)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"Error fetching {endpoint}: {str(e)}")
+            resp = requests.get(f"{self.base_url}/{endpoint}", params=params, timeout=10)
+            return resp.json() if resp.status_code == 200 else None
+        except:
             return None
+
+    def calculate_technicals(self, df):
+        """Calculates RSI and Moving Averages for Technical Score"""
+        if len(df) < 50: return 50 # Not enough data
+        
+        # RSI Calculation
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        current_rsi = df['rsi'].iloc[-1]
+
+        # Moving Averages
+        df['sma_50'] = df['close'].rolling(window=50).mean()
+        df['sma_200'] = df['close'].rolling(window=200).mean()
+        
+        # Scoring Logic
+        tech_score = 50
+        if current_rsi < 30: tech_score += 20 # Oversold (Buy Signal)
+        elif current_rsi > 70: tech_score -= 20 # Overbought (Sell Signal)
+        
+        if df['close'].iloc[-1] > df['sma_50'].iloc[-1]: tech_score += 15 # Bullish Trend
+        if df['sma_50'].iloc[-1] > df['sma_200'].iloc[-1]: tech_score += 15 # Golden Cross
+        
+        return min(max(tech_score, 0), 100)
+
+    def get_forecast_and_score(self, ticker):
+        """
+        Performs Deep AI Analysis:
+        1. Prophet Forecast (Future Price)
+        2. Technical Analysis (RSI, Trends)
+        3. Generates a Composite 'AI Score' (0-100)
+        """
+        # Fetch 2 years of history
+        data = self._fetch_json(f"eod/{ticker}", period="d", from_date=(datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d'))
+        
+        if not data or len(data) < 100:
+            return {"trend": "Neutral", "exp_price": 0, "score": 0, "signal": "No Data"}
+
+        df = pd.DataFrame(data)
+        
+        # --- 1. Prophet AI Forecast ---
+        df_prophet = df[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
+        m = Prophet(daily_seasonality=True)
+        m.fit(df_prophet)
+        future = m.make_future_dataframe(periods=30)
+        forecast = m.predict(future)
+        
+        current_price = df['close'].iloc[-1]
+        future_price = forecast['yhat'].iloc[-1]
+        roi_pred = ((future_price - current_price) / current_price) * 100
+        
+        # --- 2. Technical Score ---
+        tech_score = self.calculate_technicals(df)
+        
+        # --- 3. Composite AI Score ---
+        # Weighting: 40% AI Forecast, 60% Technicals
+        forecast_score = 50 + (roi_pred * 2) # +5% ROI adds 10 points
+        final_score = (forecast_score * 0.4) + (tech_score * 0.6)
+        final_score = int(min(max(final_score, 0), 100))
+        
+        signal = "STRONG BUY" if final_score > 80 else "BUY" if final_score > 60 else "SELL" if final_score < 40 else "HOLD"
+
+        return {
+            "trend": "Bullish" if roi_pred > 0 else "Bearish",
+            "exp_price": round(future_price, 2),
+            "roi_30d": f"{roi_pred:.2f}%",
+            "ai_score": final_score,
+            "signal": signal,
+            "current_price": current_price
+        }
 
     def screen_shariah(self, ticker):
         """
-        Performs AAOIFI Shariah Screening:
-        1. Sector Screening (Qualitative)
-        2. Financial Ratio Screening (Quantitative - 33% Rule)
+        Strict AAOIFI Shariah Compliance Check
         """
-        data = self._fetch_json(f"fundamentals/{ticker}")
-        if not data:
-            return {"compliant": False, "reason": "Data unavailable"}
-
-        # --- 1. Sector Screening ---
-        general = data.get("General", {})
-        sector = general.get("Sector", "").lower()
-        industry = general.get("Industry", "").lower()
+        fund = self._fetch_json(f"fundamentals/{ticker}")
+        if not fund: return {"compliant": False, "reason": "No Data"}
         
-        forbidden_terms = [
-            "bank", "tobacco", "alcohol", "gambling", "casino", 
-            "insurance", "beer", "defense", "weapon", "pork"
-        ]
-        
-        for term in forbidden_terms:
-            if term in sector or term in industry:
-                return {
-                    "compliant": False, 
-                    "reason": f"Sector violation: {sector} / {industry}"
-                }
-
-        # --- 2. Financial Ratio Screening (AAOIFI Standards) ---
-        # We need the latest quarterly balance sheet
         try:
-            financials = data.get("Financials", {}).get("Balance_Sheet", {}).get("quarterly", {})
-            if not financials:
-                return {"compliant": False, "reason": "Financial data missing"}
+            # 1. Business Activity Screen
+            sector = fund.get("General", {}).get("Sector", "").lower()
+            industry = fund.get("General", {}).get("Industry", "").lower()
+            forbidden = ['alcohol', 'tobacco', 'gambling', 'bank', 'insurance', 'defense', 'pork']
+            if any(x in sector or x in industry for x in forbidden):
+                return {"compliant": False, "reason": f"Sector: {sector}"}
+
+            # 2. Financial Ratios (AAOIFI < 33%)
+            bs = fund['Financials']['quarterly']
+            latest = next(iter(bs.values()))
             
-            # Get latest available quarter (dates are keys)
-            latest_date = sorted(financials.keys(), reverse=True)
-            balance_sheet = financials[latest_date]
+            assets = float(latest.get('totalAssets', 0))
+            debt = float(latest.get('shortLongTermDebtTotal', 0))
+            cash = float(latest.get('cashAndEquivalents', 0))
+            receivables = float(latest.get('netReceivables', 0))
             
-            # Parse values (handle None/Strings)
-            def get_val(key):
-                val = balance_sheet.get(key, 0)
-                return float(val) if val is not None else 0.0
-
-            total_assets = get_val("totalAssets")
-            if total_assets == 0:
-                return {"compliant": False, "reason": "Total Assets is 0"}
-
-            # Calculate Ratios
-            # Debt Ratio: Total Interest Bearing Debt / Total Assets
-            total_debt = get_val("shortLongTermDebtTotal") + get_val("longTermDebt")
-            debt_ratio = total_debt / total_assets
-
-            # Liquidity Ratio: (Cash + Interest Bearing Securities) / Total Assets
-            cash_total = get_val("cashAndEquivalents") + get_val("shortTermInvestments")
-            cash_ratio = cash_total / total_assets
-
-            # Receivables Ratio: Accounts Receivables / Total Assets
-            receivables = get_val("netReceivables")
-            receivables_ratio = receivables / total_assets
-
-            # Check Thresholds (33%)
-            is_compliant = (debt_ratio < 0.33) and (cash_ratio < 0.33) and (receivables_ratio < 0.33)
+            if assets == 0: return {"compliant": False, "reason": "Assets 0"}
+            
+            debt_r = debt / assets
+            cash_r = cash / assets
+            rec_r = receivables / assets
+            
+            is_halal = (debt_r < 0.33) and (cash_r < 0.33) and (rec_r < 0.33)
             
             return {
-                "compliant": is_compliant,
-                "debt_ratio": f"{debt_ratio:.2%}",
-                "cash_ratio": f"{cash_ratio:.2%}",
-                "receivables_ratio": f"{receivables_ratio:.2%}",
-                "reason": "Passed" if is_compliant else "Ratio Violation"
+                "compliant": is_halal,
+                "ratios": f"D:{debt_r:.2f} C:{cash_r:.2f} R:{rec_r:.2f}",
+                "reason": "Passed" if is_halal else "Ratios Failed"
             }
-
-        except Exception as e:
-            return {"compliant": False, "reason": f"Calculation Error: {str(e)}"}
-
-    def get_forecast(self, ticker, days=30):
-        """
-        Generates AI forecast using Facebook Prophet.
-        Returns trend direction and 30-day expected price.
-        """
-        # Fetch historical data (daily)
-        hist_data = self._fetch_json(f"eod/{ticker}", period="d", order="a")
-        
-        if not hist_data or len(hist_data) < 100:
-            return {"trend": "Insufficient Data", "expected_price": 0}
-
-        # Format for Prophet
-        df = pd.DataFrame(hist_data)
-        df['ds'] = pd.to_datetime(df['date'])
-        df['y'] = df['close']
-        df = df[['ds', 'y']]
-
-        # Initialize and train AI model
-        model = Prophet(daily_seasonality=True, yearly_seasonality=True)
-        model.fit(df)
-
-        # Predict future
-        future = model.make_future_dataframe(periods=days)
-        forecast = model.predict(future)
-
-        # Extract metrics
-        current_price = df['y'].iloc[-1]
-        future_price = forecast['yhat'].iloc[-1]
-        
-        trend = "Bullish (Positive Impact)" if future_price > current_price else "Bearish (Negative Impact)"
-        roi_forecast = ((future_price - current_price) / current_price) * 100
-
-        return {
-            "trend": trend,
-            "current_price": round(current_price, 2),
-            "expected_price_30d": round(future_price, 2),
-            "expected_roi_30d": f"{roi_forecast:.2f}%",
-            "confidence_lower": round(forecast['yhat_lower'].iloc[-1], 2),
-            "confidence_upper": round(forecast['yhat_upper'].iloc[-1], 2)
-        }
-
-    def get_market_data_batch(self, tickers):
-        """
-        Fetches real-time data for multiple tickers (for Portfolio page).
-        Optimized to use bulk request.
-        """
-        ticker_str = ",".join(tickers)
-        # Note: EODHD real-time endpoint usually takes one main ticker and 's' parameter for others
-        # We will split if list is too long, but here is simple implementation
-        if not tickers:
-            return
-            
-        main_ticker = tickers
-        others = ",".join(tickers[1:])
-        
-        data = self._fetch_json(f"real-time/{main_ticker}", s=others)
-        return data if isinstance(data, list) else [data]
+        except:
+            return {"compliant": False, "reason": "Calc Error"}
