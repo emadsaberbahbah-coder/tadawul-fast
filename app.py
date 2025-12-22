@@ -2,29 +2,28 @@
 """
 Emad Bahbah – Financial Engine (Sheets Analyzer)
 ------------------------------------------------
-FULL REPLACEMENT (ONE-SHOT) – v2.3.1
+FULL REPLACEMENT (ONE-SHOT) – v2.3.2 (HARDENED)
 
-What changed vs v2.3.0:
-✅ Reads EODHD token from ENV using BOTH names:
-   - EODHD_API_TOKEN (preferred)
-   - EODHD_API_KEY   (your current Render key)
-✅ Adds optional API auth using ENV:
+Key improvements vs your current v2.3.1:
+✅ No secrets in code (token never printed/returned/logged)
+✅ EODHD token read from ENV (EODHD_API_TOKEN preferred, or EODHD_API_KEY)
+✅ Engine is a lazy singleton; auto-reloads if token changes (uses SHA fingerprint)
+✅ Optional API auth via ENV:
    - REQUIRE_AUTH=true
    - APP_TOKEN or TFB_APP_TOKEN or BACKUP_APP_TOKEN
-   Request header: X-APP-TOKEN: <token>
-✅ Reads defaults from ENV (no secrets in code):
-   - HTTP_TIMEOUT, MAX_RETRIES, RETRY_DELAY, DEFAULT_EOD_EXCHANGE, LOG_LEVEL
-✅ Keeps Market headers alignment (base headers untouched; diagnostics appended at END)
+   Header: X-APP-TOKEN
+✅ Auto-detect header row (supports Row 1, Row 5, etc.)
+✅ Uses chunked sheet updates to avoid Google API payload limits
+✅ Advanced analysis import is optional + safe fallback
+✅ Keeps base headers unchanged; diagnostics appended only at END
 
 ENV used:
 - GOOGLE_CREDENTIALS (required)
 - EODHD_API_TOKEN or EODHD_API_KEY (required for real data)
-- REQUIRE_AUTH (optional)
-- APP_TOKEN / TFB_APP_TOKEN / BACKUP_APP_TOKEN (optional)
-- HTTP_TIMEOUT, MAX_RETRIES, RETRY_DELAY, DEFAULT_EOD_EXCHANGE, LOG_LEVEL (optional)
-
-Procfile:
-  web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600
+- REQUIRE_AUTH (optional) + APP_TOKEN / TFB_APP_TOKEN / BACKUP_APP_TOKEN
+- LOG_LEVEL (optional)
+- SHEET_HEADER_SCAN_MAX (optional, default 10)
+- SHEET_HEADER_ROW_DEFAULT (optional, default 1)
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ import os
 import json
 import math
 import logging
+import hashlib
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,18 +43,61 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import WorksheetNotFound
 
 from finance_engine import FinanceEngine
-from ai_advanced import analyze as advanced_analyze
-from portfolio_engine import (
-    PortfolioEngine,
-    PORTFOLIO_HEADERS as PORTFOLIO_HEADERS_LEGACY,
-    build_price_map_from_market_data,
-)
+
+# -----------------------------------------------------------------------------
+# Optional Advanced Analysis (safe import)
+# -----------------------------------------------------------------------------
+_ADVANCED_OK = False
+def _advanced_fallback(**kwargs) -> Dict[str, Any]:
+    # Minimal fallback so the app never crashes if ai_advanced is missing.
+    base_score = kwargs.get("base_score")
+    shariah = kwargs.get("shariah") or {}
+    ticker = kwargs.get("ticker") or ""
+    compliant = shariah.get("compliant", None)
+    sh_txt = "YES" if compliant is True else "NO" if compliant is False else "UNKNOWN"
+    rec = "BUY" if (base_score is not None and float(base_score) >= 75) else "WATCH"
+    return {
+        "opportunity_score": float(base_score) if base_score is not None else 50.0,
+        "recommendation": rec,
+        "risk_bucket": "MODERATE",
+        "ai_summary": f"{ticker} | Score={base_score} | Shariah={sh_txt}",
+        "why_selected": "Fallback analysis (ai_advanced not enabled)",
+        "data_quality_score": None,
+        "data_quality_flags": [],
+        "market_cap": None,
+        "vol_ann": None,
+        "max_dd_90d": None,
+    }
+
+try:
+    from ai_advanced import analyze as advanced_analyze  # type: ignore
+    _ADVANCED_OK = True
+except Exception:
+    advanced_analyze = _advanced_fallback  # type: ignore
+    _ADVANCED_OK = False
+
+# -----------------------------------------------------------------------------
+# Portfolio (keep as-is; if missing we degrade gracefully)
+# -----------------------------------------------------------------------------
+_PORTFOLIO_OK = False
+try:
+    from portfolio_engine import (  # type: ignore
+        PortfolioEngine,
+        PORTFOLIO_HEADERS as PORTFOLIO_HEADERS_LEGACY,
+        build_price_map_from_market_data,
+    )
+    _PORTFOLIO_OK = True
+except Exception:
+    PortfolioEngine = None  # type: ignore
+    PORTFOLIO_HEADERS_LEGACY = []  # type: ignore
+    build_price_map_from_market_data = None  # type: ignore
+    _PORTFOLIO_OK = False
 
 # -----------------------------------------------------------------------------
 # Try to import schema as Source of Truth (preferred)
 # -----------------------------------------------------------------------------
 try:
-    from sheet_schema import (
+    from sheet_schema import (  # type: ignore
         SHEET_MARKET_DATA,
         SHEET_TOP_7,
         SHEET_PORTFOLIO,
@@ -124,7 +167,7 @@ except Exception:
     BASE_PORTFOLIO_HEADERS: List[str] = list(PORTFOLIO_HEADERS_LEGACY)
 
 # -----------------------------------------------------------------------------
-# App config from ENV (NO secrets hardcoded)
+# ENV helpers (NO secrets hardcoded)
 # -----------------------------------------------------------------------------
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -142,28 +185,19 @@ def env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(env_str(name, str(default)))
-    except Exception:
-        return default
-
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 
 LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("financial-engine")
 
-HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 20.0)
-MAX_RETRIES = env_int("MAX_RETRIES", 3)
-RETRY_DELAY = env_float("RETRY_DELAY", 0.5)
-DEFAULT_EOD_EXCHANGE = env_str("DEFAULT_EOD_EXCHANGE", "US").upper()
-
-# ✅ Compatibility: token can be in either env var
-EODHD_TOKEN = env_str("EODHD_API_TOKEN") or env_str("EODHD_API_KEY") or "demo"
+SHEET_HEADER_SCAN_MAX = env_int("SHEET_HEADER_SCAN_MAX", 10)
+SHEET_HEADER_ROW_DEFAULT = env_int("SHEET_HEADER_ROW_DEFAULT", 1)
 
 REQUIRE_AUTH = env_bool("REQUIRE_AUTH", False)
 APP_TOKEN = env_str("APP_TOKEN") or env_str("TFB_APP_TOKEN") or env_str("BACKUP_APP_TOKEN")
+
+DEFAULT_EOD_EXCHANGE = env_str("DEFAULT_EOD_EXCHANGE", "US").upper()
 
 app = Flask(__name__)
 
@@ -261,14 +295,6 @@ def ensure_worksheet(sh: gspread.Spreadsheet, name: str, rows: int = 2000, cols:
     except WorksheetNotFound:
         return sh.add_worksheet(title=name, rows=rows, cols=cols)
 
-def ensure_headers(ws: gspread.Worksheet, headers: List[str], force: bool = True) -> None:
-    existing = ws.row_values(1)
-    if existing[: len(headers)] != headers:
-        if force:
-            ws.update(values=[headers], range_name="A1")
-        else:
-            raise ValueError(f"Header mismatch on sheet '{ws.title}'. Set force_headers=true to overwrite.")
-
 def _col_letter(n: int) -> str:
     return gspread.utils.rowcol_to_a1(1, n).split("1")[0]
 
@@ -294,6 +320,53 @@ def _dq_label_from_score(score: Optional[float]) -> str:
         return "FAIR"
     return "POOR"
 
+def detect_header_row(ws: gspread.Worksheet, headers: List[str], max_scan: int, default_row: int) -> int:
+    """
+    Find the row where headers exist (supports Row 1, Row 5, etc.).
+    If not found, return default_row.
+    """
+    want0 = headers[0] if headers else ""
+    for r in range(1, max(1, max_scan) + 1):
+        vals = ws.row_values(r)
+        if vals[: len(headers)] == headers:
+            return r
+        # tolerant quick match: first cell equals header[0]
+        if vals and want0 and vals[0].strip() == want0:
+            # if 3+ first cols match, accept
+            if len(headers) >= 3 and len(vals) >= 3:
+                if vals[1].strip() == headers[1] and vals[2].strip() == headers[2]:
+                    return r
+    return max(1, int(default_row))
+
+def ensure_headers_at(ws: gspread.Worksheet, headers: List[str], header_row: int, force: bool = True) -> None:
+    existing = ws.row_values(header_row)
+    if existing[: len(headers)] != headers:
+        if not force:
+            raise ValueError(f"Header mismatch on sheet '{ws.title}' at row {header_row}.")
+        end_col = _col_letter(len(headers))
+        ws.update(values=[headers], range_name=f"A{header_row}:{end_col}{header_row}")
+
+def chunked_update(ws: gspread.Worksheet, start_row: int, start_col: int, rows: List[List[Any]], total_cols: int, chunk_size: int = 300) -> None:
+    """
+    Writes rows in chunks to avoid Google API payload limits.
+    """
+    if not rows:
+        return
+    left = _col_letter(start_col)
+    right = _col_letter(start_col + total_cols - 1)
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i : i + chunk_size]
+        r1 = start_row + i
+        r2 = r1 + len(chunk) - 1
+        rng = f"{left}{r1}:{right}{r2}"
+        ws.update(values=chunk, range_name=rng)
+
+def safe_batch_clear(ws: gspread.Worksheet, ranges: List[str]) -> None:
+    try:
+        ws.batch_clear(ranges)
+    except Exception:
+        pass
+
 # -----------------------------------------------------------------------------
 # Optional API auth (ENV-controlled)
 # -----------------------------------------------------------------------------
@@ -303,7 +376,7 @@ def require_token(fn):
         if not REQUIRE_AUTH:
             return fn(*args, **kwargs)
         if not APP_TOKEN:
-            return jsonify({"status": "error", "message": "REQUIRE_AUTH is enabled but no APP_TOKEN/TFB_APP_TOKEN/BACKUP_APP_TOKEN set"}), 500
+            return jsonify({"status": "error", "message": "REQUIRE_AUTH enabled but no APP_TOKEN/TFB_APP_TOKEN/BACKUP_APP_TOKEN set"}), 500
         token = request.headers.get("X-APP-TOKEN", "").strip()
         if token != APP_TOKEN:
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
@@ -311,11 +384,34 @@ def require_token(fn):
     return wrapper
 
 # -----------------------------------------------------------------------------
-# Finance Engine init (NO secrets inside code)
+# Finance Engine singleton (token from ENV, never exposed)
 # -----------------------------------------------------------------------------
-if not EODHD_TOKEN or EODHD_TOKEN.lower() == "demo":
-    log.warning("EODHD token is missing or set to 'demo'. Set EODHD_API_TOKEN or EODHD_API_KEY in Render for real data.")
-engine = FinanceEngine(EODHD_TOKEN)
+_ENGINE: Optional[FinanceEngine] = None
+_ENGINE_FP: Optional[str] = None
+
+def _read_eodhd_token_from_env() -> str:
+    return env_str("EODHD_API_TOKEN") or env_str("EODHD_API_KEY") or "demo"
+
+def _fingerprint(s: str) -> str:
+    # Not reversible, does not leak token
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:12]
+
+def get_engine() -> FinanceEngine:
+    global _ENGINE, _ENGINE_FP
+    token = _read_eodhd_token_from_env()
+    fp = _fingerprint(token)
+    if _ENGINE is None or _ENGINE_FP != fp:
+        if not token or token.strip().lower() == "demo":
+            log.warning("EODHD token missing or 'demo'. Set EODHD_API_TOKEN or EODHD_API_KEY for real data.")
+        _ENGINE = FinanceEngine(token)
+        _ENGINE_FP = fp
+    return _ENGINE
+
+def eodhd_token_is_set() -> bool:
+    token = env_str("EODHD_API_TOKEN") or env_str("EODHD_API_KEY")
+    if not token:
+        return False
+    return token.strip().lower() != "demo"
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -331,8 +427,10 @@ def health():
         "version": APP_VERSION,
         "time_utc": now_utc_str(),
         "schema_ok": _SCHEMA_OK,
+        "advanced_ok": _ADVANCED_OK,
+        "portfolio_ok": _PORTFOLIO_OK,
         "require_auth": REQUIRE_AUTH,
-        "eodhd_token_set": (EODHD_TOKEN.lower() != "demo" and EODHD_TOKEN != ""),
+        "eodhd_token_set": eodhd_token_is_set(),
     })
 
 @app.route("/api/analyze", methods=["POST"])
@@ -365,14 +463,25 @@ def analyze_portfolio():
         except Exception:
             ws_port = None
 
-        ensure_headers(ws_market, MARKET_HEADERS, force=force_headers)
-        ensure_headers(ws_top, TOP_HEADERS, force=force_headers)
+        # Detect header rows (supports Row 1 or Row 5 etc.)
+        market_header_row = detect_header_row(ws_market, MARKET_HEADERS, SHEET_HEADER_SCAN_MAX, SHEET_HEADER_ROW_DEFAULT)
+        top_header_row = detect_header_row(ws_top, TOP_HEADERS, SHEET_HEADER_SCAN_MAX, 1)
+        port_header_row = detect_header_row(ws_port, PORTFOLIO_HEADERS, SHEET_HEADER_SCAN_MAX, 1) if ws_port else 1
+
+        ensure_headers_at(ws_market, MARKET_HEADERS, market_header_row, force=force_headers)
+        ensure_headers_at(ws_top, TOP_HEADERS, top_header_row, force=force_headers)
         if ws_port:
-            ensure_headers(ws_port, PORTFOLIO_HEADERS, force=force_headers)
+            ensure_headers_at(ws_port, PORTFOLIO_HEADERS, port_header_row, force=force_headers)
+
+        market_first_data_row = market_header_row + 1
+        top_first_data_row = top_header_row + 1
+        port_first_data_row = port_header_row + 1
 
         H = _header_map(MARKET_HEADERS)
 
-        raw = ws_market.col_values(1)[1:]
+        # Read tickers from column A starting from first data row
+        colA = ws_market.col_values(1)  # 1-indexed, returns list where index 0 is row 1
+        raw = colA[market_first_data_row - 1 :] if len(colA) >= market_first_data_row else []
         tickers: List[str] = []
         seen = set()
         for t in raw:
@@ -390,6 +499,8 @@ def analyze_portfolio():
         picks_all: List[Dict[str, Any]] = []
         picks_shariah: List[Dict[str, Any]] = []
 
+        engine = get_engine()
+
         for ticker in tickers:
             eod_symbol = to_eodhd_symbol(ticker)
 
@@ -406,7 +517,7 @@ def analyze_portfolio():
                     ai_forecast=ai,
                     shariah=shariah,
                     base_score=safe_float(base_score),
-                )
+                ) or {}
 
                 score = safe_float(adv.get("opportunity_score")) or safe_float(base_score) or 0.0
                 recommendation = adv.get("recommendation") or "WATCH"
@@ -542,8 +653,8 @@ def analyze_portfolio():
                     "sector": general.get("Sector") or "N/A",
                     "current_price": current_price,
                     "pred30": pred30,
-                    "roi30": roi30,
-                    "score": score,
+                    "roi30": roi30,   # percent
+                    "score": float(score),
                     "recommendation": recommendation,
                     "compliant": (compliant_val is True),
                     "why_selected": why_selected,
@@ -589,19 +700,18 @@ def analyze_portfolio():
                 if rank_col < len(r):
                     r[rank_col] = i
 
-        end_col_letter = _col_letter(len(MARKET_HEADERS))
+        # Write Market rows (chunked)
         if rows_sorted:
-            end_row = 1 + len(rows_sorted)
-            ws_market.update(values=rows_sorted, range_name=f"A2:{end_col_letter}{end_row}")
+            total_cols = len(MARKET_HEADERS)
+            start_row = market_first_data_row
+            chunked_update(ws_market, start_row=start_row, start_col=1, rows=rows_sorted, total_cols=total_cols, chunk_size=250)
 
             if clear_extra_rows:
+                end_row = start_row + len(rows_sorted) - 1
+                end_col_letter = _col_letter(total_cols)
                 start_clear = end_row + 1
                 if start_clear <= ws_market.row_count:
-                    clear_range = f"A{start_clear}:{end_col_letter}{ws_market.row_count}"
-                    try:
-                        ws_market.batch_clear([clear_range])
-                    except Exception:
-                        pass
+                    safe_batch_clear(ws_market, [f"A{start_clear}:{end_col_letter}{ws_market.row_count}"])
 
         picks_preferred = picks_shariah if top_shariah_only else picks_all
         if not picks_preferred:
@@ -613,6 +723,7 @@ def analyze_portfolio():
         )
         top7 = picks_preferred[:7]
 
+        # Build Top rows
         top_rows: List[List[Any]] = []
         for idx, p in enumerate(top7, start=1):
             base_row = [
@@ -634,26 +745,32 @@ def analyze_portfolio():
                 base_row.append(p.get("why_selected") or "")
             top_rows.append(base_row)
 
-        ws_top.update(values=[TOP_HEADERS], range_name="A1")
+        # Ensure top headers at detected row, then write data at top_first_data_row
+        ensure_headers_at(ws_top, TOP_HEADERS, top_header_row, force=True)
         if top_rows:
-            end_top_col_letter = _col_letter(len(TOP_HEADERS))
-            ws_top.update(values=top_rows, range_name=f"A2:{end_top_col_letter}{1+len(top_rows)}")
+            chunked_update(ws_top, start_row=top_first_data_row, start_col=1, rows=top_rows, total_cols=len(TOP_HEADERS), chunk_size=50)
+            # clear leftover rows below (optional, small sheet)
+            if clear_extra_rows:
+                end_row = top_first_data_row + len(top_rows) - 1
+                end_col_letter = _col_letter(len(TOP_HEADERS))
+                start_clear = end_row + 1
+                if start_clear <= ws_top.row_count:
+                    safe_batch_clear(ws_top, [f"A{start_clear}:{end_col_letter}{ws_top.row_count}"])
 
         portfolio_kpi = None
-        if ws_port:
+        if ws_port and _PORTFOLIO_OK and PortfolioEngine and build_price_map_from_market_data:
             try:
+                # Read market rows from sheet (we already have rows_sorted in memory)
                 price_map = build_price_map_from_market_data(MARKET_HEADERS, rows_sorted)
-                pe = PortfolioEngine()
 
+                pe = PortfolioEngine()
                 port_values = ws_port.get_all_values()
-                port_rows = port_values[1:] if len(port_values) > 1 else []
+                port_rows = port_values[port_header_row:] if len(port_values) > port_header_row else []
 
                 updated_port_rows, kpi = pe.compute_table(port_rows, price_map)
 
-                end_port_col_letter = _col_letter(len(PORTFOLIO_HEADERS))
                 if updated_port_rows:
-                    end_port_row = 1 + len(updated_port_rows)
-                    ws_port.update(values=updated_port_rows, range_name=f"A2:{end_port_col_letter}{end_port_row}")
+                    chunked_update(ws_port, start_row=port_first_data_row, start_col=1, rows=updated_port_rows, total_cols=len(PORTFOLIO_HEADERS), chunk_size=250)
 
                 portfolio_kpi = {
                     "total_cost": kpi.total_cost,
@@ -678,7 +795,7 @@ def analyze_portfolio():
                     "rank": i + 1,
                     "ticker": p["ticker"],
                     "score": round(float(p["score"]), 2),
-                    "roi_30d_pct": p["roi30"],
+                    "roi_30d_pct": p["roi30"],  # percent
                     "recommendation": p["recommendation"],
                     "risk_bucket": p.get("risk_bucket"),
                     "shariah": "YES" if p["compliant"] else "NO",
@@ -696,6 +813,9 @@ def analyze_portfolio():
 @require_token
 def refresh_portfolio_only():
     try:
+        if not (_PORTFOLIO_OK and PortfolioEngine and build_price_map_from_market_data):
+            return jsonify({"status": "error", "message": "portfolio_engine not available"}), 500
+
         payload = request.get_json(silent=True) or {}
         sheet_url = payload.get("sheet_url")
         if not sheet_url:
@@ -711,22 +831,25 @@ def refresh_portfolio_only():
         ws_market = ensure_worksheet(sh, market_sheet_name, rows=4000, cols=max(60, len(MARKET_HEADERS) + 10))
         ws_port = ensure_worksheet(sh, portfolio_sheet_name, rows=1000, cols=max(30, len(PORTFOLIO_HEADERS) + 10))
 
-        ensure_headers(ws_market, MARKET_HEADERS, force=force_headers)
-        ensure_headers(ws_port, PORTFOLIO_HEADERS, force=force_headers)
+        market_header_row = detect_header_row(ws_market, MARKET_HEADERS, SHEET_HEADER_SCAN_MAX, SHEET_HEADER_ROW_DEFAULT)
+        port_header_row = detect_header_row(ws_port, PORTFOLIO_HEADERS, SHEET_HEADER_SCAN_MAX, 1)
 
+        ensure_headers_at(ws_market, MARKET_HEADERS, market_header_row, force=force_headers)
+        ensure_headers_at(ws_port, PORTFOLIO_HEADERS, port_header_row, force=force_headers)
+
+        # Read market table
         market_values = ws_market.get_all_values()
-        market_rows = market_values[1:] if len(market_values) > 1 else []
+        market_rows = market_values[market_header_row:] if len(market_values) > market_header_row else []
         price_map = build_price_map_from_market_data(MARKET_HEADERS, market_rows)
 
         pe = PortfolioEngine()
         port_values = ws_port.get_all_values()
-        port_rows = port_values[1:] if len(port_values) > 1 else []
+        port_rows = port_values[port_header_row:] if len(port_values) > port_header_row else []
         updated_port_rows, kpi = pe.compute_table(port_rows, price_map)
 
-        end_col_letter = _col_letter(len(PORTFOLIO_HEADERS))
+        port_first_data_row = port_header_row + 1
         if updated_port_rows:
-            end_row = 1 + len(updated_port_rows)
-            ws_port.update(values=updated_port_rows, range_name=f"A2:{end_col_letter}{end_row}")
+            chunked_update(ws_port, start_row=port_first_data_row, start_col=1, rows=updated_port_rows, total_cols=len(PORTFOLIO_HEADERS), chunk_size=250)
 
         return jsonify({
             "status": "success",
