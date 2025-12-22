@@ -1,87 +1,71 @@
 import gspread
+from gspread_formatting import *
 import os
 import json
 from google.oauth2.service_account import Credentials
-from gspread_formatting import *
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-# Ensure you have your Google Cloud JSON key file in the same folder, named 'credentials.json'
-CREDENTIALS_FILE = 'credentials.json' 
+# --- CONFIGURATION ---
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-# Replace this with your actual Google Sheet ID (found in the URL of your sheet)
-# Example: docs.google.com/spreadsheets/d/1BxiMVs0XRA5nPO... -> "1BxiMVs0XRA5nPO..."
-SHEET_ID = 'YOUR_SHEET_ID_HERE'
-
-def setup_structure():
-    print("--- Starting Sheet Setup ---")
+def setup_google_sheet(sheet_url):
+    # Auth
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    creds_dict = json.loads(creds_json)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    gc = gspread.authorize(creds)
     
-    # 1. Authenticate
+    sh = gc.open_by_url(sheet_url)
+
+    # Define Header Format (Vendana, Bold, Blue Background)
+    header_fmt = cellFormat(
+        textFormat=textFormat(bold=True, fontFamily="Verdana", fontSize=10),
+        backgroundColor=color(0.8, 0.9, 1.0), # Light Blue
+        horizontalAlignment='CENTER'
+    )
+    
+    # Define Positive/Negative Conditional Logic
+    green_fmt = cellFormat(
+        textFormat=textFormat(foregroundColor=color(0, 0.5, 0), fontFamily="Verdana"),
+        backgroundColor=color(0.9, 1.0, 0.9)
+    )
+    red_fmt = cellFormat(
+        textFormat=textFormat(foregroundColor=color(0.8, 0, 0), fontFamily="Verdana"),
+        backgroundColor=color(1.0, 0.9, 0.9)
+    )
+
+    # --- 1. MARKET DATA PAGE ---
     try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        
-        # Open the sheet
-        sh = client.open_by_key(SHEET_ID)
-        print(f"Connected to: {sh.title}")
-    except Exception as e:
-        print(f"Error connecting: {e}")
-        print("Make sure 'credentials.json' is in the folder and you shared the sheet with the client_email inside it.")
-        return
-
-    # 2. Define Structures
-    tabs = {
-        "General Data":,
-        "Recommendations":,
-        "Portfolio":
-    }
-
-    # 3. Create/Reset Tabs
-    existing_titles = [ws.title for ws in sh.worksheets()]
+        ws1 = sh.add_worksheet(title="Market Data", rows=100, cols=20)
+    except:
+        ws1 = sh.worksheet("Market Data")
     
-    for tab_name, headers in tabs.items():
-        try:
-            # Check if exists
-            if tab_name in existing_titles:
-                ws = sh.worksheet(tab_name)
-                print(f"Updating existing tab: {tab_name}")
-                # Optional: ws.clear() # Uncomment if you want to wipe data
-            else:
-                ws = sh.add_worksheet(title=tab_name, rows=100, cols=20)
-                print(f"Created new tab: {tab_name}")
-            
-            # Update Headers (Row 1)
-            ws.update(range_name='A1', values=[headers])
-            
-            # Apply Formatting (Verdana, Bold Headers)
-            fmt_header = cellFormat(
-                textFormat=textFormat(fontFamily="Verdana", fontSize=10, bold=True),
-                backgroundColor=color(0.9, 0.9, 0.9), # Light Grey background
-                horizontalAlignment='CENTER'
-            )
-            format_cell_range(ws, 'A1:Z1', fmt_header)
-            
-            # Set Column Widths (Approx 150 pixels)
-            set_column_width(ws, 'A:H', 150)
+    headers_1 = ["Ticker", "Current Price", "Sector", "AI Forecast (30d)", "Exp. ROI %", "Shariah Compliant", "Score (0-100)"]
+    ws1.update('A1:G1', [headers_1])
+    format_cell_range(ws1, 'A1:G1', header_fmt)
 
-        except Exception as e:
-            print(f"Error on {tab_name}: {e}")
+    # --- 2. RECOMMENDATIONS (Top 7) ---
+    try:
+        ws2 = sh.add_worksheet(title="Recommendations", rows=50, cols=10)
+    except:
+        ws2 = sh.worksheet("Recommendations")
+        
+    headers_2 = ["Rank", "Ticker", "Deep Analysis", "Exp. Profit", "Why Selected?"]
+    ws2.update('A1:E1', [headers_2])
+    format_cell_range(ws2, 'A1:E1', header_fmt)
 
-    # 4. Cleanup
-    # Try to delete default 'Sheet1' if it's empty and unused
-    if "Sheet1" in existing_titles and len(sh.worksheets()) > 1:
-        try:
-            sh.del_worksheet(sh.worksheet("Sheet1"))
-            print("Deleted default 'Sheet1'")
-        except:
-            pass
+    # --- 3. MY INVESTMENT ---
+    try:
+        ws3 = sh.add_worksheet(title="My Investment", rows=50, cols=10)
+    except:
+        ws3 = sh.worksheet("My Investment")
+        
+    headers_3 = ["Stock", "Buy Price", "Qty", "Current Value", "P/L", "Status (Active/Sold)", "Last Update"]
+    ws3.update('A1:G1', [headers_3])
+    format_cell_range(ws3, 'A1:G1', header_fmt)
 
-    print("--- Setup Complete. Your Sheet is ready for the Python Brain. ---")
+    print("Sheet Structure Built Successfully with Verdana Font.")
 
 if __name__ == "__main__":
-    setup_structure()
+    # You would typically run this locally or trigger via a separate route
+    # setup_google_sheet("YOUR_SHEET_URL")
+    pass
