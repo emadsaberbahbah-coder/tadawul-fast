@@ -2,28 +2,26 @@
 """
 Emad Bahbah – Financial Engine (Sheets Analyzer)
 ------------------------------------------------
-FULL REPLACEMENT (ONE-SHOT) – v2.3.0
+FULL REPLACEMENT (ONE-SHOT) – v2.3.1
 
-PRIMARY GOAL (ALIGNMENT):
-✅ Keeps the FIRST columns exactly aligned with your setup_sheet.py / sheet_schema.py
-   so existing column-letter formatting (prices/percent) does NOT break.
+What changed vs v2.3.0:
+✅ Reads EODHD token from ENV using BOTH names:
+   - EODHD_API_TOKEN (preferred)
+   - EODHD_API_KEY   (your current Render key)
+✅ Adds optional API auth using ENV:
+   - REQUIRE_AUTH=true
+   - APP_TOKEN or TFB_APP_TOKEN or BACKUP_APP_TOKEN
+   Request header: X-APP-TOKEN: <token>
+✅ Reads defaults from ENV (no secrets in code):
+   - HTTP_TIMEOUT, MAX_RETRIES, RETRY_DELAY, DEFAULT_EOD_EXCHANGE, LOG_LEVEL
+✅ Keeps Market headers alignment (base headers untouched; diagnostics appended at END)
 
-OPTIONAL (EXTENDED DIAGNOSTICS):
-✅ Appends extra diagnostic columns at the END only (no shifting):
-   - EODHD Symbol
-   - Risk Bucket
-   - Why Selected
-   - Data Quality Label / Score / Flags
-
-Top 7:
-✅ Never empty (Shariah-first, fallback to best overall)
-
-Portfolio:
-✅ Refreshes "My Investment" using Market Data current prices
-
-ENV required:
-- GOOGLE_CREDENTIALS  (service account JSON string)
-- EODHD_API_TOKEN     (avoid "demo" in production)
+ENV used:
+- GOOGLE_CREDENTIALS (required)
+- EODHD_API_TOKEN or EODHD_API_KEY (required for real data)
+- REQUIRE_AUTH (optional)
+- APP_TOKEN / TFB_APP_TOKEN / BACKUP_APP_TOKEN (optional)
+- HTTP_TIMEOUT, MAX_RETRIES, RETRY_DELAY, DEFAULT_EOD_EXCHANGE, LOG_LEVEL (optional)
 
 Procfile:
   web: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600
@@ -36,6 +34,7 @@ import json
 import math
 import logging
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
@@ -70,7 +69,6 @@ except Exception:
     SHEET_TOP_7 = "Top 7 Opportunities"
     SHEET_PORTFOLIO = "My Investment"
 
-    # Fallback (must match setup_sheet.py exactly)
     BASE_MARKET_HEADERS: List[str] = [
         "Ticker",
         "Name",
@@ -110,7 +108,6 @@ except Exception:
         "Data Source",
         "Data Quality",
     ]
-
     BASE_TOP_HEADERS: List[str] = [
         "Rank",
         "Ticker",
@@ -124,33 +121,60 @@ except Exception:
         "Shariah Compliant",
         "Updated At (UTC)",
     ]
-
     BASE_PORTFOLIO_HEADERS: List[str] = list(PORTFOLIO_HEADERS_LEGACY)
 
-
 # -----------------------------------------------------------------------------
-# App config
+# App config from ENV (NO secrets hardcoded)
 # -----------------------------------------------------------------------------
-app = Flask(__name__)
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return (v if v is not None else default).strip()
 
-APP_VERSION = "2.3.0"
+def env_bool(name: str, default: bool = False) -> bool:
+    v = env_str(name, "")
+    if v == "":
+        return default
+    return v.lower() in ("1", "true", "yes", "y", "on")
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(env_str(name, str(default)))
+    except Exception:
+        return default
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(env_str(name, str(default)))
+    except Exception:
+        return default
+
+APP_VERSION = "2.3.1"
+
+LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("financial-engine")
+
+HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 20.0)
+MAX_RETRIES = env_int("MAX_RETRIES", 3)
+RETRY_DELAY = env_float("RETRY_DELAY", 0.5)
+DEFAULT_EOD_EXCHANGE = env_str("DEFAULT_EOD_EXCHANGE", "US").upper()
+
+# ✅ Compatibility: token can be in either env var
+EODHD_TOKEN = env_str("EODHD_API_TOKEN") or env_str("EODHD_API_KEY") or "demo"
+
+REQUIRE_AUTH = env_bool("REQUIRE_AUTH", False)
+APP_TOKEN = env_str("APP_TOKEN") or env_str("TFB_APP_TOKEN") or env_str("BACKUP_APP_TOKEN")
+
+app = Flask(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
 _GOOGLE_CLIENT: Optional[gspread.Client] = None
 
-
 # -----------------------------------------------------------------------------
-# Headers (base + appended diagnostics; appended ONLY to avoid shifting columns)
+# Headers (append diagnostics only at end, do NOT shift base columns)
 # -----------------------------------------------------------------------------
 EXTRA_MARKET_HEADERS: List[str] = [
     "EODHD Symbol",
@@ -160,28 +184,17 @@ EXTRA_MARKET_HEADERS: List[str] = [
     "Data Quality Score",
     "Data Quality Flags",
 ]
+EXTRA_TOP_HEADERS: List[str] = ["Risk Bucket", "Why Selected"]
 
-EXTRA_TOP_HEADERS: List[str] = [
-    "Risk Bucket",
-    "Why Selected",
-]
-
-# Final headers written to sheets (safe: appended at end)
-MARKET_HEADERS: List[str] = list(BASE_MARKET_HEADERS) + [
-    h for h in EXTRA_MARKET_HEADERS if h not in BASE_MARKET_HEADERS
-]
-TOP_HEADERS: List[str] = list(BASE_TOP_HEADERS) + [
-    h for h in EXTRA_TOP_HEADERS if h not in BASE_TOP_HEADERS
-]
+MARKET_HEADERS: List[str] = list(BASE_MARKET_HEADERS) + [h for h in EXTRA_MARKET_HEADERS if h not in BASE_MARKET_HEADERS]
+TOP_HEADERS: List[str] = list(BASE_TOP_HEADERS) + [h for h in EXTRA_TOP_HEADERS if h not in BASE_TOP_HEADERS]
 PORTFOLIO_HEADERS: List[str] = list(BASE_PORTFOLIO_HEADERS)
-
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
 
 def safe_float(x: Any) -> Optional[float]:
     try:
@@ -201,66 +214,46 @@ def safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def normalize_ticker(t: str) -> str:
     return (t or "").strip().upper()
-
 
 def is_ksa_ticker(ticker: str) -> bool:
     t = normalize_ticker(ticker)
     return t.endswith(".SR") or t.replace(".", "").isdigit()
 
-
 def infer_market_from_ticker(ticker: str) -> str:
     return "KSA" if is_ksa_ticker(ticker) else "GLOBAL"
 
-
 def to_eodhd_symbol(ticker: str) -> str:
-    """
-    - KSA numeric: 1120 -> 1120.SR
-    - KSA .SR stays
-    - If contains '.', keep (already has suffix)
-    - Otherwise append DEFAULT_EOD_EXCHANGE (default US): AAPL -> AAPL.US
-    """
     t = normalize_ticker(ticker)
     if not t:
         return t
-
     if t.replace(".", "").isdigit():
         return f"{t}.SR" if not t.endswith(".SR") else t
-
     if t.endswith(".SR"):
         return t
-
     if "." in t:
         return t
-
-    default_ex = os.getenv("DEFAULT_EOD_EXCHANGE", "US").strip().upper() or "US"
-    return f"{t}.{default_ex}"
-
+    return f"{t}.{DEFAULT_EOD_EXCHANGE}"
 
 def _load_google_creds_dict() -> Dict[str, Any]:
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_json:
         raise ValueError("Missing GOOGLE_CREDENTIALS environment variable")
-
     creds_dict = json.loads(creds_json)
     pk = creds_dict.get("private_key")
     if isinstance(pk, str) and "\\n" in pk:
         creds_dict["private_key"] = pk.replace("\\n", "\n")
     return creds_dict
 
-
 def get_google_client() -> gspread.Client:
     global _GOOGLE_CLIENT
     if _GOOGLE_CLIENT is not None:
         return _GOOGLE_CLIENT
-
     creds_dict = _load_google_creds_dict()
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     _GOOGLE_CLIENT = gspread.authorize(creds)
     return _GOOGLE_CLIENT
-
 
 def ensure_worksheet(sh: gspread.Spreadsheet, name: str, rows: int = 2000, cols: int = 60) -> gspread.Worksheet:
     try:
@@ -268,12 +261,7 @@ def ensure_worksheet(sh: gspread.Spreadsheet, name: str, rows: int = 2000, cols:
     except WorksheetNotFound:
         return sh.add_worksheet(title=name, rows=rows, cols=cols)
 
-
 def ensure_headers(ws: gspread.Worksheet, headers: List[str], force: bool = True) -> None:
-    """
-    force=True (default): always enforce our header row for alignment.
-    This is safest because app writes full rows by position.
-    """
     existing = ws.row_values(1)
     if existing[: len(headers)] != headers:
         if force:
@@ -281,24 +269,19 @@ def ensure_headers(ws: gspread.Worksheet, headers: List[str], force: bool = True
         else:
             raise ValueError(f"Header mismatch on sheet '{ws.title}'. Set force_headers=true to overwrite.")
 
-
 def _col_letter(n: int) -> str:
     return gspread.utils.rowcol_to_a1(1, n).split("1")[0]
-
 
 def _make_empty_row(headers: List[str]) -> List[Any]:
     return [""] * len(headers)
 
-
 def _header_map(headers: List[str]) -> Dict[str, int]:
     return {h: i for i, h in enumerate(headers)}
-
 
 def _set_if_exists(row: List[Any], H: Dict[str, int], col: str, value: Any) -> None:
     i = H.get(col)
     if i is not None and i < len(row):
         row[i] = value
-
 
 def _dq_label_from_score(score: Optional[float]) -> str:
     if score is None:
@@ -311,15 +294,28 @@ def _dq_label_from_score(score: Optional[float]) -> str:
         return "FAIR"
     return "POOR"
 
+# -----------------------------------------------------------------------------
+# Optional API auth (ENV-controlled)
+# -----------------------------------------------------------------------------
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not REQUIRE_AUTH:
+            return fn(*args, **kwargs)
+        if not APP_TOKEN:
+            return jsonify({"status": "error", "message": "REQUIRE_AUTH is enabled but no APP_TOKEN/TFB_APP_TOKEN/BACKUP_APP_TOKEN set"}), 500
+        token = request.headers.get("X-APP-TOKEN", "").strip()
+        if token != APP_TOKEN:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 # -----------------------------------------------------------------------------
-# Finance Engine init
+# Finance Engine init (NO secrets inside code)
 # -----------------------------------------------------------------------------
-EODHD_API_KEY = os.environ.get("EODHD_API_TOKEN", "demo").strip()
-if not EODHD_API_KEY or EODHD_API_KEY.lower() == "demo":
-    log.warning("EODHD_API_TOKEN is missing or set to 'demo'. Expect limited/blocked responses on EODHD.")
-engine = FinanceEngine(EODHD_API_KEY)
-
+if not EODHD_TOKEN or EODHD_TOKEN.lower() == "demo":
+    log.warning("EODHD token is missing or set to 'demo'. Set EODHD_API_TOKEN or EODHD_API_KEY in Render for real data.")
+engine = FinanceEngine(EODHD_TOKEN)
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -328,18 +324,20 @@ engine = FinanceEngine(EODHD_API_KEY)
 def home():
     return f"Emad Bahbah Financial Engine is Running. v{APP_VERSION}"
 
-
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": APP_VERSION, "time_utc": now_utc_str(), "schema_ok": _SCHEMA_OK})
-
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "time_utc": now_utc_str(),
+        "schema_ok": _SCHEMA_OK,
+        "require_auth": REQUIRE_AUTH,
+        "eodhd_token_set": (EODHD_TOKEN.lower() != "demo" and EODHD_TOKEN != ""),
+    })
 
 @app.route("/api/analyze", methods=["POST"])
+@require_token
 def analyze_portfolio():
-    """
-    Reads tickers from Market sheet column A (row2+),
-    writes Market Data, Top 7, and refreshes My Investment.
-    """
     try:
         payload = request.get_json(silent=True) or {}
         sheet_url = payload.get("sheet_url")
@@ -374,7 +372,6 @@ def analyze_portfolio():
 
         H = _header_map(MARKET_HEADERS)
 
-        # Read tickers (A2:A)
         raw = ws_market.col_values(1)[1:]
         tickers: List[str] = []
         seen = set()
@@ -397,9 +394,7 @@ def analyze_portfolio():
             eod_symbol = to_eodhd_symbol(ticker)
 
             try:
-                # IMPORTANT: call engine using normalized EODHD symbol
                 fund, hist = engine.get_stock_data(eod_symbol)
-
                 ai = engine.run_ai_forecasting(hist)
                 shariah = engine.check_shariah_compliance(fund)
                 base_score = engine.generate_score(fund, ai)
@@ -413,7 +408,6 @@ def analyze_portfolio():
                     base_score=safe_float(base_score),
                 )
 
-                # Prefer advanced score
                 score = safe_float(adv.get("opportunity_score")) or safe_float(base_score) or 0.0
                 recommendation = adv.get("recommendation") or "WATCH"
                 ai_summary = adv.get("ai_summary") or ""
@@ -422,21 +416,19 @@ def analyze_portfolio():
 
                 dq_score = safe_float(adv.get("data_quality_score"))
                 dq_flags = adv.get("data_quality_flags")
-                if isinstance(dq_flags, list):
-                    dq_flags_str = ",".join(str(x) for x in dq_flags[:10])
-                else:
-                    dq_flags_str = ""
+                dq_flags_str = ",".join(str(x) for x in dq_flags[:10]) if isinstance(dq_flags, list) else ""
+                dq_label = _dq_label_from_score(dq_score)
 
                 general = fund.get("General", {}) if isinstance(fund.get("General", {}), dict) else {}
                 highlights = fund.get("Highlights", {}) if isinstance(fund.get("Highlights", {}), dict) else {}
                 valuation = fund.get("Valuation", {}) if isinstance(fund.get("Valuation", {}), dict) else {}
                 shares = fund.get("SharesStats", {}) if isinstance(fund.get("SharesStats", {}), dict) else {}
                 tech = fund.get("Technicals", {}) if isinstance(fund.get("Technicals", {}), dict) else {}
+                meta = fund.get("meta", {}) if isinstance(fund.get("meta", {}), dict) else {}
 
                 market = fund.get("market") or infer_market_from_ticker(ticker)
                 currency = general.get("CurrencyCode") or fund.get("currency") or "N/A"
 
-                # Prices/trading
                 current_price = safe_float(ai.get("current_price")) or safe_float(tech.get("Price"))
                 previous_close = safe_float(ai.get("previous_close")) or safe_float(tech.get("PreviousClose"))
                 change = safe_float(ai.get("price_change")) or safe_float(tech.get("Change"))
@@ -452,7 +444,6 @@ def analyze_portfolio():
                 low_52w = safe_float(ai.get("low_52w")) or safe_float(tech.get("52WeekLow"))
                 volume = safe_float(ai.get("volume")) or safe_float(tech.get("Volume"))
 
-                # Fundamentals
                 market_cap = (
                     safe_float(adv.get("market_cap"))
                     or safe_float(valuation.get("MarketCapitalization"))
@@ -466,11 +457,9 @@ def analyze_portfolio():
                 divy_frac = (divy / 100.0) if divy is not None else None
                 beta = safe_float(highlights.get("Beta")) or safe_float(ai.get("beta")) or safe_float(tech.get("Beta"))
 
-                # Risk (already fraction)
                 vol_ann = safe_float(tech.get("Volatility30D_Ann")) or safe_float(adv.get("vol_ann"))
                 dd90 = safe_float(tech.get("MaxDrawdown90D")) or safe_float(adv.get("max_dd_90d"))
 
-                # AI forecasts
                 pred30 = safe_float(ai.get("predicted_price_30d"))
                 roi30 = safe_float(ai.get("expected_roi_pct"))
                 pred90 = safe_float(ai.get("predicted_price_90d"))
@@ -483,15 +472,12 @@ def analyze_portfolio():
                 compliant_val = shariah.get("compliant", None)
                 compliant_txt = "YES" if compliant_val is True else "NO" if compliant_val is False else "UNKNOWN"
 
-                # Data source / quality
-                meta = fund.get("meta", {}) if isinstance(fund.get("meta", {}), dict) else {}
-                provider_quality = meta.get("data_quality") or meta.get("provider") or ""
-                dq_label = _dq_label_from_score(dq_score)
-                data_quality_text = provider_quality or dq_label
+                data_source = ai.get("data_source") or meta.get("provider") or f"EODHD({eod_symbol})"
+                data_quality_text = meta.get("data_quality") or dq_label
 
                 row = _make_empty_row(MARKET_HEADERS)
 
-                # Base columns (must match setup_sheet.py ordering)
+                # Base columns
                 _set_if_exists(row, H, "Ticker", ticker)
                 _set_if_exists(row, H, "Name", general.get("Name") or fund.get("name") or "N/A")
                 _set_if_exists(row, H, "Market", market)
@@ -527,11 +513,9 @@ def analyze_portfolio():
 
                 _set_if_exists(row, H, "Shariah Compliant", compliant_txt)
                 _set_if_exists(row, H, "Score (0-100)", score)
-                # Rank assigned later
                 _set_if_exists(row, H, "Recommendation", recommendation)
 
-                # AI Summary (include compact “why” & risk without needing extra columns)
-                summary_compact = ai_summary or ""
+                summary_compact = (ai_summary or "").strip()
                 if why_selected:
                     summary_compact = f"{summary_compact} | Why: {why_selected}".strip(" |")
                 if risk_bucket:
@@ -539,12 +523,10 @@ def analyze_portfolio():
                 _set_if_exists(row, H, "AI Summary", summary_compact)
 
                 _set_if_exists(row, H, "Updated At (UTC)", now_utc_str())
-
-                data_source = ai.get("data_source") or meta.get("provider") or f"EODHD({eod_symbol})"
                 _set_if_exists(row, H, "Data Source", data_source)
                 _set_if_exists(row, H, "Data Quality", data_quality_text)
 
-                # Appended diagnostics (at END only)
+                # Diagnostics appended (safe)
                 _set_if_exists(row, H, "EODHD Symbol", eod_symbol)
                 _set_if_exists(row, H, "Risk Bucket", risk_bucket)
                 _set_if_exists(row, H, "Why Selected", why_selected)
@@ -554,20 +536,19 @@ def analyze_portfolio():
 
                 rows.append(row)
 
-                # Candidate picks
                 pick_obj = {
                     "ticker": ticker,
                     "name": general.get("Name") or fund.get("name") or "N/A",
                     "sector": general.get("Sector") or "N/A",
                     "current_price": current_price,
                     "pred30": pred30,
-                    "roi30": roi30,  # percent number
+                    "roi30": roi30,
                     "score": score,
                     "recommendation": recommendation,
                     "compliant": (compliant_val is True),
                     "why_selected": why_selected,
                     "risk_bucket": risk_bucket,
-                    "updated_at": row[H.get("Updated At (UTC)", H.get("Updated At (UTC)", 0))] if row else now_utc_str(),
+                    "updated_at": now_utc_str(),
                 }
 
                 if score >= 60:
@@ -577,56 +558,42 @@ def analyze_portfolio():
 
             except Exception as inner:
                 msg = str(inner)
-                if "403" in msg or "Forbidden" in msg:
-                    msg = (
-                        f"{msg} | HINT: Check EODHD_API_TOKEN and your EODHD plan permissions. "
-                        f"Also ensure symbols have exchange suffix (app auto-uses {to_eodhd_symbol(ticker)})."
-                    )
-
                 log.warning("Ticker failed (%s -> %s): %s", ticker, eod_symbol, msg)
 
                 err_row = _make_empty_row(MARKET_HEADERS)
                 _set_if_exists(err_row, H, "Ticker", ticker)
-                _set_if_exists(err_row, H, "Name", "N/A")
                 _set_if_exists(err_row, H, "Market", infer_market_from_ticker(ticker))
                 _set_if_exists(err_row, H, "AI Summary", f"ERROR: {msg}")
                 _set_if_exists(err_row, H, "Updated At (UTC)", now_utc_str())
                 _set_if_exists(err_row, H, "Data Source", "FinanceEngine")
                 _set_if_exists(err_row, H, "Data Quality", "ERROR")
 
-                # diagnostics
                 _set_if_exists(err_row, H, "EODHD Symbol", eod_symbol)
                 _set_if_exists(err_row, H, "Risk Bucket", "UNKNOWN")
-                _set_if_exists(err_row, H, "Why Selected", "")
                 _set_if_exists(err_row, H, "Data Quality Label", "POOR")
                 _set_if_exists(err_row, H, "Data Quality Score", 0)
                 _set_if_exists(err_row, H, "Data Quality Flags", "ERROR")
-
                 rows.append(err_row)
 
-        # Sort by Score desc then ROI30 desc
         def sort_key(r: List[Any]) -> Tuple[float, float]:
             s = safe_float(r[H.get("Score (0-100)", 0)]) or 0.0
-            roi30_frac = safe_float(r[H.get("AI Expected ROI 30D %", 0)])
-            roi30_pct = (roi30_frac * 100.0) if roi30_frac is not None else -9999.0
-            return (s, roi30_pct)
+            roi30_frac_val = safe_float(r[H.get("AI Expected ROI 30D %", 0)])
+            roi30_pct_val = (roi30_frac_val * 100.0) if roi30_frac_val is not None else -9999.0
+            return (s, roi30_pct_val)
 
         rows_sorted = sorted(rows, key=sort_key, reverse=True)
 
-        # Assign Rank
         rank_col = H.get("Rank")
         if rank_col is not None:
             for i, r in enumerate(rows_sorted, start=1):
                 if rank_col < len(r):
                     r[rank_col] = i
 
-        # Write Market Data rows (A2:..)
         end_col_letter = _col_letter(len(MARKET_HEADERS))
         if rows_sorted:
             end_row = 1 + len(rows_sorted)
             ws_market.update(values=rows_sorted, range_name=f"A2:{end_col_letter}{end_row}")
 
-            # Clear leftovers below
             if clear_extra_rows:
                 start_clear = end_row + 1
                 if start_clear <= ws_market.row_count:
@@ -636,7 +603,6 @@ def analyze_portfolio():
                     except Exception:
                         pass
 
-        # Build Top 7 (Shariah-first)
         picks_preferred = picks_shariah if top_shariah_only else picks_all
         if not picks_preferred:
             picks_preferred = picks_all
@@ -649,7 +615,6 @@ def analyze_portfolio():
 
         top_rows: List[List[Any]] = []
         for idx, p in enumerate(top7, start=1):
-            # TOP_HEADERS base alignment first, then appended extras (if present)
             base_row = [
                 idx,
                 p["ticker"],
@@ -657,38 +622,26 @@ def analyze_portfolio():
                 p["sector"],
                 p["current_price"],
                 p["pred30"],
-                (p["roi30"] / 100.0) if p["roi30"] is not None else None,  # fraction for percent format
+                (p["roi30"] / 100.0) if p["roi30"] is not None else None,
                 p["score"],
                 p["recommendation"],
                 "YES" if p["compliant"] else "NO",
                 p["updated_at"],
             ]
-
-            # If top sheet has extra columns appended (Risk Bucket / Why Selected), add them
-            # We append in the same order as TOP_HEADERS definition above.
             if "Risk Bucket" in TOP_HEADERS:
                 base_row.append(p.get("risk_bucket") or "")
             if "Why Selected" in TOP_HEADERS:
                 base_row.append(p.get("why_selected") or "")
-
             top_rows.append(base_row)
 
-        # Write Top sheet
         ws_top.update(values=[TOP_HEADERS], range_name="A1")
         if top_rows:
             end_top_col_letter = _col_letter(len(TOP_HEADERS))
             ws_top.update(values=top_rows, range_name=f"A2:{end_top_col_letter}{1+len(top_rows)}")
-        else:
-            try:
-                ws_top.batch_clear([f"A2:{_col_letter(len(TOP_HEADERS))}300"])
-            except Exception:
-                pass
 
-        # Refresh Portfolio from current Market prices
         portfolio_kpi = None
         if ws_port:
             try:
-                # price_map expects header names: "Ticker" and "Current Price"
                 price_map = build_price_map_from_market_data(MARKET_HEADERS, rows_sorted)
                 pe = PortfolioEngine()
 
@@ -706,7 +659,7 @@ def analyze_portfolio():
                     "total_cost": kpi.total_cost,
                     "current_value": kpi.current_value,
                     "unrealized_pl": kpi.unrealized_pl,
-                    "unrealized_pl_pct": kpi.unrealized_pl_pct,  # fraction
+                    "unrealized_pl_pct": kpi.unrealized_pl_pct,
                     "positions": kpi.positions,
                     "active_positions": kpi.active_positions,
                 }
@@ -719,6 +672,7 @@ def analyze_portfolio():
             "version": APP_VERSION,
             "tickers_analyzed": len(tickers),
             "rows_written": len(rows_sorted),
+            "require_auth": REQUIRE_AUTH,
             "top_picks": [
                 {
                     "rank": i + 1,
@@ -738,14 +692,9 @@ def analyze_portfolio():
         log.exception("Analyze error")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 @app.route("/api/portfolio/refresh", methods=["POST"])
+@require_token
 def refresh_portfolio_only():
-    """
-    Refresh My Investment only (uses current prices from Market Data).
-    Body:
-      { "sheet_url": "...", "market_sheet_name": "Market Data", "portfolio_sheet_name": "My Investment" }
-    """
     try:
         payload = request.get_json(silent=True) or {}
         sheet_url = payload.get("sheet_url")
@@ -795,7 +744,6 @@ def refresh_portfolio_only():
     except Exception as e:
         log.exception("Portfolio refresh error")
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
