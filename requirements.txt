@@ -1,0 +1,1 @@
+Flask==3.0.0 gunicorn==21.2.0 requests==2.31.0 pandas==1.5.3 prophet==1.1.5 gspread==5.12.0 gspread-formatting==1.1.2 google-auth==2.27.0 python-dotenv==1.0.1 holidays==0.39 cmdstanpy==1.2.0
