@@ -1,58 +1,48 @@
 # finance_engine.py
 """
-FinanceEngine – Hardened + Efficient (EODHD + Fallback History + Forecast + Risk + Shariah)
-------------------------------------------------------------------------------------------
-FULL UPDATED SCRIPT (ONE-SHOT) – v2.2.0
+FinanceEngine – Enhanced (EODHD + AI Forecast + Risk + Shariah)
+--------------------------------------------------------------
+FULL REPLACEMENT – v2.2.2 (Render-safe, app.py-compatible)
 
-Goals:
-✅ Reduce failures (especially 401/403 Non-JSON) with clearer error handling
-✅ Efficiency: shared requests.Session, retries, short timeouts, optional caching
-✅ Symbol normalization:
-   - AAPL -> AAPL.US
-   - AAPL.US stays
-   - 1120 -> 1120.SR
-   - 1120.SR stays
-✅ If EODHD blocks a GLOBAL ticker (403/401), fallback to STOOQ for price history
-   (still returns technicals + forecasting; fundamentals may be limited if EODHD blocked)
-✅ Injects derived Technicals from history into fundamentals
-✅ Forecasting:
-   - Prophet if available + enabled + enough data
-   - Otherwise fast linear fallback trend
-✅ Shariah: returns YES/NO/UNKNOWN (UNKNOWN if insufficient financials)
-✅ Score: 0–100 (value + income + momentum + risk)
-
-Public API (used by app.py):
-  get_stock_data(ticker) -> (fundamentals_dict, hist_list_of_dicts)
-  run_ai_forecasting(hist_data) -> dict
-  check_shariah_compliance(fundamentals) -> dict
-  generate_score(fundamentals, ai_data) -> float
+Fixes:
+✅ Correct EODHD domain: https://eodhistoricaldata.com/api
+✅ KSA normalization: 1120 -> 1120.SR, keeps .SR
+✅ Clear 401/403 messages + demo-token hints
+✅ Partial-data mode (fundamentals may fail; history/technicals still run)
+✅ run_ai_forecasting returns top-level keys expected by app.py
+✅ Prophet forecast uses 30D/90D target dates + nearest prediction
+✅ Linear fallback forecast + confidence if Prophet unavailable/fails
+✅ DataQuality in fundamentals["meta"]["data_quality"]: OK / PARTIAL / ERROR
 """
 
 from __future__ import annotations
 
 import os
-import io
 import math
 import datetime as dt
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Prophet is optional (fallback will work if missing or disabled)
+# Prophet optional
 try:
     from prophet import Prophet  # type: ignore
-    _PROPHET_INSTALLED = True
+    _PROPHET_AVAILABLE = True
 except Exception:
     Prophet = None  # type: ignore
-    _PROPHET_INSTALLED = False
+    _PROPHET_AVAILABLE = False
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def _utc_now_str() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat(sep=" ")
+
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -74,14 +64,12 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    """(a-b)/b * 100"""
     if a is None or b is None or b == 0:
         return None
     return (a - b) / b * 100.0
 
 
 def _latest_period_key(period_dict: Dict[str, Any]) -> Optional[str]:
-    """Return most recent key like '2025-09-30'."""
     if not isinstance(period_dict, dict) or not period_dict:
         return None
 
@@ -97,20 +85,15 @@ def _latest_period_key(period_dict: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_hist_df(hist_data: Any) -> pd.DataFrame:
-    """
-    Expects list of dict:
-      {date, open, high, low, close, adjusted_close, volume}
-    (works for EODHD and our STOOQ fallback after normalization)
-    """
     df = pd.DataFrame(hist_data or [])
     if df.empty:
         return df
 
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date")
-    else:
-        df["date"] = pd.NaT
+    if "date" not in df.columns:
+        return pd.DataFrame()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
 
     for c in ["open", "high", "low", "close", "adjusted_close", "volume"]:
         if c in df.columns:
@@ -123,7 +106,6 @@ def _extract_hist_df(hist_data: Any) -> pd.DataFrame:
 
 
 def _compute_technicals_from_hist(df: pd.DataFrame) -> Dict[str, Any]:
-    """Compute basic technicals (fast) from history dataframe."""
     if df is None or df.empty or "close" not in df.columns:
         return {}
 
@@ -148,7 +130,7 @@ def _compute_technicals_from_hist(df: pd.DataFrame) -> Dict[str, Any]:
     low_52w = float(window_52w["close"].min()) if not window_52w.empty else None
 
     vol = float(last["volume"]) if "volume" in df2.columns and pd.notna(last.get("volume")) else None
-    avg_vol_30d = float(df2["volume"].tail(30).mean()) if "volume" in df2.columns and len(df2["volume"].dropna()) else None
+    avg_vol_30d = float(df2["volume"].tail(30).mean()) if "volume" in df2.columns and not df2["volume"].tail(30).empty else None
 
     # Volatility (30D annualized)
     rets = df2["close"].pct_change().dropna()
@@ -165,9 +147,8 @@ def _compute_technicals_from_hist(df: pd.DataFrame) -> Dict[str, Any]:
         peak = float(closes_90.iloc[0])
         dd_min = 0.0
         for p in closes_90:
-            p = float(p)
-            peak = max(peak, p)
-            dd = (p / peak) - 1.0
+            peak = max(peak, float(p))
+            dd = (float(p) / peak) - 1.0
             dd_min = min(dd_min, dd)
         max_dd_90d = float(dd_min)
 
@@ -189,9 +170,9 @@ def _compute_technicals_from_hist(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _linear_fallback_forecast(df: pd.DataFrame, horizon_days: int) -> Tuple[Optional[float], Optional[float]]:
-    """Very fast fallback forecast: linear regression on close vs day index."""
+    """Simple linear regression fallback (fast, no dependencies). Returns (pred, confidence 0-100)."""
     try:
-        df2 = df.dropna(subset=["date", "close"]).tail(365).copy()
+        df2 = df.dropna(subset=["close", "date"]).tail(365).copy()
         if df2.empty or len(df2) < 30:
             return None, None
 
@@ -209,7 +190,7 @@ def _linear_fallback_forecast(df: pd.DataFrame, horizon_days: int) -> Tuple[Opti
         future_x = x.max() + float(horizon_days)
         pred = intercept + slope * future_x
 
-        # Confidence from relative residual error
+        # confidence from residuals
         y_hat = intercept + slope * x
         resid = y - y_hat
         resid_std = float(resid.std()) if len(resid) > 5 else 0.0
@@ -223,127 +204,134 @@ def _linear_fallback_forecast(df: pd.DataFrame, horizon_days: int) -> Tuple[Opti
 
 
 def _nearest_pred(forecast: pd.DataFrame, target_date: pd.Timestamp) -> Optional[float]:
-    """Pick yhat for exact ds if exists else nearest date."""
     try:
-        if forecast.empty or "ds" not in forecast.columns or "yhat" not in forecast.columns:
+        if forecast is None or forecast.empty:
             return None
-        exact = forecast.loc[forecast["ds"] == target_date]
+        if "ds" not in forecast.columns or "yhat" not in forecast.columns:
+            return None
+
+        ds = pd.to_datetime(forecast["ds"], errors="coerce")
+        if ds.isna().all():
+            return None
+
+        # exact match
+        exact = forecast.loc[ds == target_date]
         if not exact.empty:
             return float(exact.iloc[0]["yhat"])
-        idx = (forecast["ds"] - target_date).abs().idxmin()
+
+        # nearest
+        diffs = (ds - target_date).abs()
+        idx = diffs.idxmin()
         return float(forecast.loc[idx, "yhat"])
     except Exception:
         return None
 
 
+def _confidence_from_interval(forecast: pd.DataFrame, target_date: pd.Timestamp) -> Optional[float]:
+    """Confidence based on interval width around target date; 0-100."""
+    try:
+        if forecast is None or forecast.empty:
+            return None
+        if "ds" not in forecast.columns or "yhat" not in forecast.columns:
+            return None
+
+        ds = pd.to_datetime(forecast["ds"], errors="coerce")
+        diffs = (ds - target_date).abs()
+        idx = diffs.idxmin()
+
+        row = forecast.loc[idx]
+        yhat = _safe_float(row.get("yhat"))
+        low = _safe_float(row.get("yhat_lower", yhat))
+        up = _safe_float(row.get("yhat_upper", yhat))
+        if yhat is None or low is None or up is None:
+            return None
+
+        width = abs(up - low) / max(1e-6, abs(yhat))
+        width = min(1.0, max(0.0, width))
+        conf = max(5.0, min(95.0, 100.0 * (1.0 - width)))
+        return float(conf)
+    except Exception:
+        return None
+
+
 # =============================================================================
-# Finance Engine
+# FinanceEngine
 # =============================================================================
 
 class FinanceEngine:
     def __init__(self, api_key: str):
         self.api_key = (api_key or "").strip()
-        self.base_url = "https://eodhd.com/api"
 
+        # ✅ Correct base domain
+        self.base_url = "https://eodhistoricaldata.com/api"
+
+        self.default_exchange = os.getenv("DEFAULT_EOD_EXCHANGE", "US").strip().upper()
         self.timeout = float(os.getenv("HTTP_TIMEOUT", "20"))
-        self.hist_years = int(os.getenv("HIST_YEARS", "2"))
-        self.enable_prophet = str(os.getenv("ENABLE_PROPHET", "true")).strip().lower() in {"1", "true", "yes", "y"}
 
-        # If your EODHD plan blocks fundamentals, set EODHD_SKIP_FUNDAMENTALS=true
-        self.skip_fundamentals = str(os.getenv("EODHD_SKIP_FUNDAMENTALS", "false")).strip().lower() in {"1", "true", "yes", "y"}
-
-        # Session + retries
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "EmadBahbah-FinEngine/2.2.0",
-            "Accept": "application/json,text/plain,*/*",
-        })
         retries = Retry(
             total=3,
-            backoff_factor=0.6,
+            backoff_factor=0.5,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=frozenset(["GET"]),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=50)
+        adapter = HTTPAdapter(max_retries=retries)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-        # small in-memory cache (optional)
-        self._cache: Dict[str, Tuple[float, Any]] = {}
-        self.cache_ttl_sec = float(os.getenv("HTTP_CACHE_TTL_SEC", "0"))  # 0 disables
-
-    # -------------------------------------------------------------------------
+    # -------------------------
     # Symbol normalization
-    # -------------------------------------------------------------------------
+    # -------------------------
     def _normalize_symbol(self, ticker: str) -> str:
         """
-        Normalize for EODHD:
-          - AAPL -> AAPL.US
-          - AAPL.US stays
-          - 1120 -> 1120.SR
-          - 1120.SR stays
+        EODHD equities typically require exchange suffix:
+          COST -> COST.US
+          GOOGL -> GOOGL.US
+          1120 -> 1120.SR
+          1120.SR stays as-is
+          EURUSD.FOREX stays as-is
         """
         t = (ticker or "").strip().upper()
         if not t:
             return t
 
+        # numeric Tadawul style
         if t.isdigit():
             return f"{t}.SR"
 
+        # already has suffix
         if "." in t:
             return t
 
-        return f"{t}.US"
+        return f"{t}.{self.default_exchange}"
 
-    def _is_ksa(self, symbol: str) -> bool:
-        s = (symbol or "").strip().upper()
-        return s.endswith(".SR") or s.replace(".", "").isdigit()
+    def _is_demo_key(self) -> bool:
+        return self.api_key.lower() == "demo" or self.api_key == ""
 
-    # -------------------------------------------------------------------------
-    # HTTP helpers
-    # -------------------------------------------------------------------------
-    def _cache_get(self, key: str) -> Optional[Any]:
-        if self.cache_ttl_sec <= 0:
-            return None
-        hit = self._cache.get(key)
-        if not hit:
-            return None
-        ts, data = hit
-        if (dt.datetime.utcnow().timestamp() - ts) <= self.cache_ttl_sec:
-            return data
-        self._cache.pop(key, None)
-        return None
-
-    def _cache_set(self, key: str, data: Any) -> None:
-        if self.cache_ttl_sec <= 0:
-            return
-        self._cache[key] = (dt.datetime.utcnow().timestamp(), data)
-
+    # -------------------------
+    # HTTP JSON helper
+    # -------------------------
     def _get_json(self, url: str) -> Any:
-        cached = self._cache_get(url)
-        if cached is not None:
-            return cached
-
         r = self.session.get(url, timeout=self.timeout)
         ct = (r.headers.get("Content-Type") or "").lower()
-        text_snip = (r.text or "")[:240].replace("\n", " ").strip()
 
-        # Handle non-json replies (common with 401/403)
-        if "json" not in ct:
-            if r.status_code in (401, 403):
-                raise RuntimeError(
-                    f"EODHD {r.status_code} (Non-JSON). Token/plan likely blocked. "
-                    f"URL={url.split('?')[0]} | Body='{text_snip}'"
+        if r.status_code in (401, 403):
+            hint = "EODHD token missing/invalid or plan limitation."
+            if self._is_demo_key():
+                hint = (
+                    "You are using DEMO token. DEMO works only for limited tickers. "
+                    "Set EODHD_API_TOKEN in Render environment variables."
                 )
-            raise RuntimeError(f"Non-JSON response ({r.status_code}) from EODHD. Body='{text_snip}'")
+            text_snip = (r.text or "")[:200].replace("\n", " ").strip()
+            raise RuntimeError(f"EODHD HTTP {r.status_code} ({hint}) | body={text_snip}")
 
-        try:
-            data = r.json()
-        except Exception:
-            raise RuntimeError(f"Invalid JSON ({r.status_code}) from EODHD. Body='{text_snip}'")
+        if "json" not in ct:
+            text_snip = (r.text or "")[:200].replace("\n", " ").strip()
+            raise RuntimeError(f"Non-JSON response ({r.status_code}) from EODHD | body={text_snip}")
 
-        # HTTP error
+        data = r.json()
+
         if r.status_code >= 400:
             msg = None
             if isinstance(data, dict):
@@ -354,160 +342,89 @@ class FinanceEngine:
         if isinstance(data, dict) and ("code" in data and "message" in data):
             raise RuntimeError(f"EODHD error: {data.get('message')}")
 
-        self._cache_set(url, data)
         return data
 
     # -------------------------------------------------------------------------
-    # EODHD fetchers
+    # Data Fetch
     # -------------------------------------------------------------------------
-    def _fetch_eodhd_fundamentals(self, symbol: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/fundamentals/{symbol}?api_token={self.api_key}&fmt=json"
-        data = self._get_json(url)
-        return data if isinstance(data, dict) else {}
-
-    def _fetch_eodhd_history(self, symbol: str) -> List[Dict[str, Any]]:
-        start = dt.date.today() - dt.timedelta(days=365 * self.hist_years)
-        url = f"{self.base_url}/eod/{symbol}?api_token={self.api_key}&fmt=json&from={start.isoformat()}"
-        data = self._get_json(url)
-        return data if isinstance(data, list) else []
-
-    # -------------------------------------------------------------------------
-    # STOOQ fallback (GLOBAL only)
-    # -------------------------------------------------------------------------
-    def _to_stooq_symbol(self, symbol: str) -> Optional[str]:
+    def get_stock_data(self, ticker: str) -> Tuple[Dict[str, Any], Any]:
         """
-        STOOQ supports many US tickers with lower-case ".us"
-        Example: AAPL.US -> aapl.us
-        If not US, return None.
-        """
-        s = (symbol or "").strip().upper()
-        if not s or "." not in s:
-            return None
-        base, exch = s.rsplit(".", 1)
-        if exch != "US":
-            return None
-        return f"{base.lower()}.us"
+        Returns (fundamentals_dict, hist_data)
 
-    def _fetch_stooq_history(self, symbol: str) -> List[Dict[str, Any]]:
-        stooq_sym = self._to_stooq_symbol(symbol)
-        if not stooq_sym:
-            return []
-
-        # Daily data CSV
-        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
-        r = self.session.get(url, timeout=self.timeout)
-        txt = (r.text or "").strip()
-
-        if r.status_code >= 400 or "No data" in txt or len(txt) < 50:
-            return []
-
-        df = pd.read_csv(io.StringIO(txt))
-        # Expected columns: Date, Open, High, Low, Close, Volume
-        if df.empty or "Date" not in df.columns:
-            return []
-
-        # Keep last N years
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).sort_values("Date")
-        cutoff = pd.Timestamp(dt.date.today() - dt.timedelta(days=365 * self.hist_years))
-        df = df[df["Date"] >= cutoff]
-
-        out: List[Dict[str, Any]] = []
-        for _, row in df.iterrows():
-            out.append({
-                "date": row["Date"].strftime("%Y-%m-%d"),
-                "open": _safe_float(row.get("Open")),
-                "high": _safe_float(row.get("High")),
-                "low": _safe_float(row.get("Low")),
-                "close": _safe_float(row.get("Close")),
-                "adjusted_close": None,
-                "volume": _safe_float(row.get("Volume")),
-            })
-        return out
-
-    # -------------------------------------------------------------------------
-    # Public: get_stock_data
-    # -------------------------------------------------------------------------
-    def get_stock_data(self, ticker: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """
-        Fetch fundamentals + historical EOD.
-        If EODHD denies GLOBAL symbol (401/403), fallback to STOOQ history (prices only).
+        Adds:
+          fundamentals["meta"] = { data_quality, errors, symbol_used, updated_at_utc, provider, demo_key }
+          fundamentals["Technicals"] derived from history (injected)
         """
         symbol = self._normalize_symbol(ticker)
-        if not symbol:
-            return {}, []
-
-        # 1) HISTORY first (because the entire pipeline needs prices)
-        hist_data: List[Dict[str, Any]] = []
-        hist_source = "EODHD"
-
-        try:
-            hist_data = self._fetch_eodhd_history(symbol)
-        except Exception as e_hist:
-            # fallback only for GLOBAL
-            if not self._is_ksa(symbol):
-                fb = self._fetch_stooq_history(symbol)
-                if fb:
-                    hist_data = fb
-                    hist_source = "STOOQ"
-                else:
-                    raise RuntimeError(f"History fetch failed for {symbol}. EODHD error: {e_hist}") from e_hist
-            else:
-                raise
-
-        # 2) FUNDAMENTALS (optional)
+        errors: List[str] = []
         fund_data: Dict[str, Any] = {}
-        fund_source = "EODHD"
+        hist_data: Any = []
 
-        if self.skip_fundamentals:
-            fund_source = "SKIPPED"
-            fund_data = {}
-        else:
-            try:
-                fund_data = self._fetch_eodhd_fundamentals(symbol)
-            except Exception as e_fund:
-                # Keep pipeline alive if we still have history (GLOBAL only)
-                if hist_source == "STOOQ":
-                    fund_data = {}
-                    fund_source = "BLOCKED"
-                else:
-                    # If history is from EODHD but fundamentals blocked, we can still proceed with empty fundamentals
-                    fund_data = {}
-                    fund_source = f"ERROR:{type(e_fund).__name__}"
+        # Fundamentals
+        try:
+            fund_url = f"{self.base_url}/fundamentals/{symbol}?api_token={self.api_key}&fmt=json"
+            fd = self._get_json(fund_url)
+            if isinstance(fd, dict):
+                fund_data = fd
+            else:
+                errors.append("Fundamentals returned non-dict JSON")
+        except Exception as e:
+            errors.append(f"Fundamentals: {e}")
 
-        # 3) Inject technicals from history into fundamentals
+        # History (2 years)
+        try:
+            start = dt.date.today() - dt.timedelta(days=365 * 2)
+            hist_url = f"{self.base_url}/eod/{symbol}?api_token={self.api_key}&fmt=json&from={start.isoformat()}"
+            hist_data = self._get_json(hist_url)
+        except Exception as e:
+            errors.append(f"History: {e}")
+            hist_data = []
+
         df = _extract_hist_df(hist_data)
         tech = _compute_technicals_from_hist(df)
 
-        # Ensure structure
         if not isinstance(fund_data, dict):
             fund_data = {}
 
-        fund_data.setdefault("General", {})
         fund_data.setdefault("Technicals", {})
-        fund_data.setdefault("Highlights", {})
-        fund_data.setdefault("Valuation", {})
-        fund_data.setdefault("SharesStats", {})
-        fund_data.setdefault("Financials", {})
-        fund_data.setdefault("meta", {})
-
         if isinstance(fund_data["Technicals"], dict):
             for k, v in tech.items():
-                # Always prefer fresh derived technicals
-                fund_data["Technicals"][k] = v
+                if fund_data["Technicals"].get(k) is None:
+                    fund_data["Technicals"][k] = v
 
-        # Attach meta
+        ok_fund = bool(fund_data)
+        ok_hist = bool(df is not None and not df.empty)
+
+        if ok_fund and ok_hist:
+            dq = "OK"
+        elif ok_fund or ok_hist:
+            dq = "PARTIAL"
+        else:
+            dq = "ERROR"
+
+        fund_data.setdefault("meta", {})
         if isinstance(fund_data["meta"], dict):
-            fund_data["meta"]["data_source"] = f"{fund_source}+{hist_source}"
-            fund_data["meta"]["symbol_normalized"] = symbol
-            fund_data["meta"]["asof_date"] = tech.get("AsOfDate")
-            if hist_source == "STOOQ" and fund_source != "EODHD":
-                fund_data["meta"]["note"] = "Fundamentals unavailable (EODHD blocked). Using STOOQ for price history."
+            fund_data["meta"].update({
+                "data_quality": dq,
+                "errors": errors[:8],
+                "symbol_used": symbol,
+                "updated_at_utc": _utc_now_str(),
+                "provider": "EODHD",
+                "demo_key": self._is_demo_key(),
+            })
+
+        # lightweight convenience fields for app.py
+        if "market" not in fund_data:
+            fund_data["market"] = "KSA" if symbol.endswith(".SR") else "GLOBAL"
+        if "currency" not in fund_data:
+            # EODHD fundamentals usually provide currency in General.CurrencyCode
+            gen = fund_data.get("General", {}) if isinstance(fund_data.get("General", {}), dict) else {}
+            fund_data["currency"] = gen.get("CurrencyCode")
 
         return fund_data, hist_data
 
     # -------------------------------------------------------------------------
-    # Public: Shariah Compliance (approximation)
+    # Shariah Compliance (approximation)
     # -------------------------------------------------------------------------
     def check_shariah_compliance(self, fundamentals: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -515,12 +432,11 @@ class FinanceEngine:
         - Debt / MarketCap < 33%
         - Cash / MarketCap < 33%
 
-        Returns compliant:
-          True / False / None   (None = UNKNOWN due to missing data)
+        Returns:
+          compliant: True / False / None (None = UNKNOWN)
         """
         try:
             fundamentals = fundamentals or {}
-
             val = fundamentals.get("Valuation", {}) if isinstance(fundamentals.get("Valuation", {}), dict) else {}
             highlights = fundamentals.get("Highlights", {}) if isinstance(fundamentals.get("Highlights", {}), dict) else {}
             fin = fundamentals.get("Financials", {}) if isinstance(fundamentals.get("Financials", {}), dict) else {}
@@ -544,18 +460,18 @@ class FinanceEngine:
                 or _safe_float(highlights.get("MarketCapitalizationMln"))
             )
 
-            # Convert mln if needed
-            if _safe_float(highlights.get("MarketCapitalizationMln")) is not None and market_cap is not None and market_cap < 1e6:
+            # convert mln if needed
+            if market_cap is not None and market_cap < 1e6 and _safe_float(highlights.get("MarketCapitalizationMln")) is not None:
                 market_cap = market_cap * 1_000_000
 
             if market_cap is None or market_cap <= 0:
                 return {"compliant": None, "status": "UNKNOWN", "note": "Missing Market Cap", "period": last_q}
 
-            missing_components = []
+            missing = []
             if long_debt is None and short_debt is None:
-                missing_components.append("Debt")
+                missing.append("Debt")
             if cash is None:
-                missing_components.append("Cash")
+                missing.append("Cash")
 
             total_debt = (long_debt or 0.0) + (short_debt or 0.0)
             cash_v = (cash or 0.0)
@@ -563,11 +479,11 @@ class FinanceEngine:
             debt_ratio = (total_debt / market_cap) * 100.0
             cash_ratio = (cash_v / market_cap) * 100.0
 
-            if missing_components:
+            if missing:
                 return {
                     "compliant": None,
                     "status": "UNKNOWN",
-                    "note": f"Missing components: {', '.join(missing_components)}",
+                    "note": f"Missing components: {', '.join(missing)}",
                     "debt_ratio": round(debt_ratio, 2),
                     "cash_ratio": round(cash_ratio, 2),
                     "period": last_q,
@@ -581,45 +497,63 @@ class FinanceEngine:
                 "cash_ratio": round(cash_ratio, 2),
                 "period": last_q,
             }
-
         except Exception:
             return {"compliant": None, "status": "UNKNOWN", "note": "Insufficient Data"}
 
     # -------------------------------------------------------------------------
-    # Public: AI Forecasting
+    # AI Forecasting
     # -------------------------------------------------------------------------
     def run_ai_forecasting(self, hist_data: Any) -> Dict[str, Any]:
         """
-        Forecasts future prices (30D/90D).
-        - Prophet if installed+enabled and enough history
-        - Otherwise linear fallback
-
-        Returns keys expected by app.py:
-          current_price, previous_close, price_change, percent_change,
-          day_high, day_low, high_52w, low_52w, volume,
-          predicted_price_30d, expected_roi_pct,
+        Returns keys that app.py expects:
+          current_price, predicted_price_30d, expected_roi_pct,
           predicted_price_90d, expected_roi_90d_pct,
-          confidence (0-100), trend, data_source
+          confidence (0-100), trend,
+          previous_close, price_change, percent_change, day_high, day_low,
+          high_52w, low_52w, volume,
+          data_source
         """
         df = _extract_hist_df(hist_data)
         if df.empty or "close" not in df.columns:
-            return {"error": "Forecasting failed: empty history"}
+            return {
+                "error": "Forecasting failed: empty/invalid history",
+                "data_source": "EODHD",
+            }
 
         df = df.dropna(subset=["date", "close"]).copy()
-        if df.empty:
-            return {"error": "Forecasting failed: no valid close values"}
-
         tech = _compute_technicals_from_hist(df)
-        current_price = _safe_float(tech.get("Price"))
-        if current_price is None:
-            return {"error": "Forecasting failed: missing current price"}
 
+        if df.empty:
+            return {"error": "Forecasting failed: invalid history", "data_source": "EODHD"}
+
+        current_price = float(df.iloc[-1]["close"])
         last_date = pd.to_datetime(df.iloc[-1]["date"]).normalize()
         target_30 = (last_date + pd.Timedelta(days=30)).normalize()
         target_90 = (last_date + pd.Timedelta(days=90)).normalize()
 
-        # Prophet path
-        if self.enable_prophet and _PROPHET_INSTALLED and Prophet is not None and len(df) >= 160:
+        # Not enough rows? return current + technicals
+        if len(df) < 60:
+            return {
+                "current_price": round(current_price, 2),
+                "predicted_price_30d": None,
+                "expected_roi_pct": None,
+                "predicted_price_90d": None,
+                "expected_roi_90d_pct": None,
+                "confidence": None,
+                "trend": "UNKNOWN",
+                "previous_close": tech.get("PreviousClose"),
+                "price_change": tech.get("Change"),
+                "percent_change": tech.get("ChangePercent"),
+                "day_high": tech.get("DayHigh"),
+                "day_low": tech.get("DayLow"),
+                "high_52w": tech.get("52WeekHigh"),
+                "low_52w": tech.get("52WeekLow"),
+                "volume": tech.get("Volume"),
+                "data_source": "EODHD",
+            }
+
+        # Prophet
+        if _PROPHET_AVAILABLE and Prophet is not None and len(df) >= 120:
             try:
                 pdf = df[["date", "close"]].rename(columns={"date": "ds", "close": "y"}).copy()
                 pdf["ds"] = pd.to_datetime(pdf["ds"]).dt.normalize()
@@ -631,7 +565,7 @@ class FinanceEngine:
                     weekly_seasonality=True,
                     yearly_seasonality=True,
                     interval_width=0.8,
-                    changepoint_prior_scale=0.08,
+                    changepoint_prior_scale=float(os.getenv("PROPHET_CPS", "0.08")),
                 )
                 m.fit(pdf)
 
@@ -642,35 +576,22 @@ class FinanceEngine:
 
                 pred_30 = _nearest_pred(forecast, target_30)
                 pred_90 = _nearest_pred(forecast, target_90)
+                conf = _confidence_from_interval(forecast, target_30)
 
-                if pred_30 is not None:
-                    roi_30 = ((pred_30 - current_price) / current_price) * 100.0
-                else:
-                    roi_30 = None
+                if pred_30 is None or pred_90 is None:
+                    raise RuntimeError("Prophet forecast missing targets")
 
-                if pred_90 is not None:
-                    roi_90 = ((pred_90 - current_price) / current_price) * 100.0
-                else:
-                    roi_90 = None
-
-                # Confidence from interval width near 30D
-                row30 = forecast.loc[(forecast["ds"] - target_30).abs().idxmin()]
-                yhat = float(row30["yhat"])
-                lower = float(row30.get("yhat_lower", yhat))
-                upper = float(row30.get("yhat_upper", yhat))
-                width = abs(upper - lower) / max(1e-6, abs(yhat))
-                width = min(1.0, width)
-                conf = max(5.0, min(95.0, 100.0 * (1.0 - width)))
-
+                roi_30 = ((pred_30 - current_price) / current_price) * 100.0 if current_price else None
+                roi_90 = ((pred_90 - current_price) / current_price) * 100.0 if current_price else None
                 trend = "POSITIVE" if (roi_30 is not None and roi_30 > 0) else "NEGATIVE" if roi_30 is not None else "UNKNOWN"
 
                 return {
                     "current_price": round(current_price, 2),
-                    "predicted_price_30d": round(pred_30, 2) if pred_30 is not None else None,
-                    "expected_roi_pct": round(roi_30, 2) if roi_30 is not None else None,
-                    "predicted_price_90d": round(pred_90, 2) if pred_90 is not None else None,
-                    "expected_roi_90d_pct": round(roi_90, 2) if roi_90 is not None else None,
-                    "confidence": round(conf, 0),
+                    "predicted_price_30d": round(float(pred_30), 2),
+                    "expected_roi_pct": round(float(roi_30), 2) if roi_30 is not None else None,
+                    "predicted_price_90d": round(float(pred_90), 2),
+                    "expected_roi_90d_pct": round(float(roi_90), 2) if roi_90 is not None else None,
+                    "confidence": round(float(conf), 0) if conf is not None else None,
                     "trend": trend,
                     "previous_close": tech.get("PreviousClose"),
                     "price_change": tech.get("Change"),
@@ -680,28 +601,29 @@ class FinanceEngine:
                     "high_52w": tech.get("52WeekHigh"),
                     "low_52w": tech.get("52WeekLow"),
                     "volume": tech.get("Volume"),
-                    "data_source": "Prophet",
+                    "data_source": "EODHD+Prophet",
                 }
-            except Exception:
-                # fall through to linear
-                pass
+            except Exception as e:
+                # Prophet failed; fallback below
+                # (Don't crash the pipeline)
+                print(f"[FinanceEngine] Prophet failed: {e}")
 
-        # Linear fallback
+        # Fallback (linear)
         pred30, conf30 = _linear_fallback_forecast(df, 30)
         pred90, conf90 = _linear_fallback_forecast(df, 90)
         conf = conf30 if conf30 is not None else conf90
 
-        roi_30 = ((pred30 - current_price) / current_price) * 100.0 if pred30 is not None else None
-        roi_90 = ((pred90 - current_price) / current_price) * 100.0 if pred90 is not None else None
+        roi_30 = ((pred30 - current_price) / current_price) * 100.0 if pred30 is not None and current_price else None
+        roi_90 = ((pred90 - current_price) / current_price) * 100.0 if pred90 is not None and current_price else None
         trend = "POSITIVE" if (roi_30 is not None and roi_30 > 0) else "NEGATIVE" if roi_30 is not None else "UNKNOWN"
 
         return {
             "current_price": round(current_price, 2),
-            "predicted_price_30d": round(pred30, 2) if pred30 is not None else None,
-            "expected_roi_pct": round(roi_30, 2) if roi_30 is not None else None,
-            "predicted_price_90d": round(pred90, 2) if pred90 is not None else None,
-            "expected_roi_90d_pct": round(roi_90, 2) if roi_90 is not None else None,
-            "confidence": round(conf, 0) if conf is not None else None,
+            "predicted_price_30d": round(float(pred30), 2) if pred30 is not None else None,
+            "expected_roi_pct": round(float(roi_30), 2) if roi_30 is not None else None,
+            "predicted_price_90d": round(float(pred90), 2) if pred90 is not None else None,
+            "expected_roi_90d_pct": round(float(roi_90), 2) if roi_90 is not None else None,
+            "confidence": round(float(conf), 0) if conf is not None else None,
             "trend": trend,
             "previous_close": tech.get("PreviousClose"),
             "price_change": tech.get("Change"),
@@ -711,21 +633,15 @@ class FinanceEngine:
             "high_52w": tech.get("52WeekHigh"),
             "low_52w": tech.get("52WeekLow"),
             "volume": tech.get("Volume"),
-            "data_source": "LinearFallback",
+            "data_source": "EODHD+FallbackTrend",
         }
 
     # -------------------------------------------------------------------------
-    # Public: Scoring (0-100)
+    # Scoring (0-100)
     # -------------------------------------------------------------------------
     def generate_score(self, fundamentals: Dict[str, Any], ai_data: Dict[str, Any]) -> float:
         """
-        Scoring weights (fast, explainable):
-        - Value: P/E, P/B
-        - Income: Dividend yield
-        - Momentum: AI ROI30, trend, confidence
-        - Risk: volatility, drawdown (from Technicals)
-
-        Returns: 0..100
+        Value + Income + Momentum + Risk + Confidence (0–100)
         """
         score = 50.0
         fundamentals = fundamentals or {}
@@ -753,7 +669,7 @@ class FinanceEngine:
             elif pb >= 8:
                 score -= 6
 
-        # Dividend
+        # Income
         div_y = _safe_float(highlights.get("DividendYield"))
         if div_y is not None:
             if div_y >= 4:
@@ -775,10 +691,9 @@ class FinanceEngine:
             else:
                 score -= 10
 
-        trend = (ai_data.get("trend") or "").upper()
-        if trend == "POSITIVE":
+        if ai_data.get("trend") == "POSITIVE":
             score += 6
-        elif trend == "NEGATIVE":
+        elif ai_data.get("trend") == "NEGATIVE":
             score -= 6
 
         if conf is not None:
