@@ -1,8 +1,8 @@
-# routes_argaam.py
+# routes_argaam.py  (FULL REPLACEMENT)
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam Gateway – v3.0.0 (Engine v2 aligned, Sheets-safe, unified batching)
+KSA / Argaam Gateway – v3.0.0 (Engine v2 aligned, Sheets-safe)
 
 Purpose
 - KSA-only router: accepts numeric or .SR symbols only.
@@ -15,7 +15,6 @@ Design goals
 - Strict KSA normalization: always respond with 1234.SR when possible.
 - Render-safe mounting: never fail import-time if optional modules are missing.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token set => open mode.
-- Consistent batching behavior: chunking + timeout + bounded concurrency.
 """
 
 from __future__ import annotations
@@ -26,21 +25,10 @@ import os
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import import_module
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from fastapi import APIRouter, Body, Header, Query, Request
-
-# Pydantic v2/v1 compatibility
-try:
-    from pydantic import BaseModel, Field, ConfigDict  # type: ignore
-
-    _PYDANTIC_V2 = True
-except Exception:  # pragma: no cover
-    from pydantic import BaseModel, Field  # type: ignore
-
-    ConfigDict = None  # type: ignore
-    _PYDANTIC_V2 = False
-
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.argaam")
 ROUTE_VERSION = "3.0.0"
@@ -58,7 +46,7 @@ def _safe_import(path: str) -> Optional[Any]:
         return None
 
 
-# Settings getter (prefer core.config, fallback routes.config, then config)
+# Settings getter (prefer core.config, fallback config, then env vars)
 _get_settings = None
 for _p in ("core.config", "routes.config", "config"):
     _m = _safe_import(_p)
@@ -88,13 +76,13 @@ for _p in ("core.data_engine_v2", "core.data_engine"):
     DataEngine = DataEngine or getattr(_m, "DataEngine", None)
     UnifiedQuote = UnifiedQuote or getattr(_m, "UnifiedQuote", None)
     normalize_symbol = normalize_symbol or getattr(_m, "normalize_symbol", None)
-    if DataEngine and normalize_symbol:
+    if DataEngine and UnifiedQuote and normalize_symbol:
         break
 
 
 # EnrichedQuote model (preferred) — but never crash if missing
 EnrichedQuote = None
-for _p in ("core.enriched_quote", "routes.enriched_quote", "enriched_quote"):
+for _p in ("core.enriched_quote", "enriched_quote"):
     _m = _safe_import(_p)
     if _m and hasattr(_m, "EnrichedQuote"):
         EnrichedQuote = getattr(_m, "EnrichedQuote")
@@ -111,15 +99,8 @@ if _schemas and hasattr(_schemas, "get_headers_for_sheet"):
 # =============================================================================
 # Fallback models (only used if imports are missing)
 # =============================================================================
-class _ExtraIgnore(BaseModel):
-    if _PYDANTIC_V2:
-        model_config = ConfigDict(extra="ignore")  # type: ignore
-    else:  # pragma: no cover
-        class Config:
-            extra = "ignore"
-
-
-class _FallbackUnifiedQuote(_ExtraIgnore):
+class _FallbackUnifiedQuote(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     symbol: str = ""
     market: Optional[str] = None
     currency: Optional[str] = None
@@ -131,7 +112,8 @@ class _FallbackUnifiedQuote(_ExtraIgnore):
         return self
 
 
-class _FallbackEnrichedQuote(_ExtraIgnore):
+class _FallbackEnrichedQuote(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     symbol: str = ""
     name: Optional[str] = None
     market: Optional[str] = "KSA"
@@ -165,38 +147,28 @@ class _FallbackEnrichedQuote(_ExtraIgnore):
         d = _model_to_dict(uq)
         return cls(
             symbol=str(d.get("symbol") or d.get("ticker") or ""),
-            name=d.get("name") or d.get("company_name"),
             market=str(d.get("market") or "KSA"),
             currency=str(d.get("currency") or "SAR"),
-            current_price=d.get("current_price") or d.get("last_price") or d.get("price"),
-            percent_change=d.get("percent_change") or d.get("change_pct"),
+            current_price=d.get("current_price") or d.get("last_price"),
+            percent_change=d.get("percent_change"),
             volume=d.get("volume"),
             market_cap=d.get("market_cap"),
             pe_ttm=d.get("pe_ttm"),
             pb=d.get("pb"),
             dividend_yield=d.get("dividend_yield"),
             roe=d.get("roe"),
-            value_score=d.get("value_score"),
-            quality_score=d.get("quality_score"),
-            momentum_score=d.get("momentum_score"),
             opportunity_score=d.get("opportunity_score"),
-            risk_score=d.get("risk_score"),
-            overall_score=d.get("overall_score"),
             recommendation=d.get("recommendation"),
-            data_source=d.get("data_source") or d.get("provider") or d.get("source"),
+            data_source=d.get("data_source") or d.get("provider"),
             data_quality=str(d.get("data_quality") or "MISSING"),
-            last_updated_utc=d.get("last_updated_utc"),
-            last_updated_riyadh=d.get("last_updated_riyadh"),
             error=d.get("error"),
         )
 
     def to_row(self, headers: List[str]) -> List[Any]:
-        d = self.model_dump(exclude_none=False) if hasattr(self, "model_dump") else dict(self.__dict__)
+        d = self.model_dump(exclude_none=False)
         out: List[Any] = []
         for h in headers:
-            k = str(h or "").strip()
-            lk = k.lower()
-
+            lk = str(h or "").strip().lower()
             if lk in ("symbol", "ticker"):
                 out.append(self.symbol)
             elif lk in ("company name", "name"):
@@ -205,9 +177,9 @@ class _FallbackEnrichedQuote(_ExtraIgnore):
                 out.append(self.market or "")
             elif lk == "currency":
                 out.append(self.currency or "")
-            elif lk in ("last price", "current price", "price"):
+            elif lk in ("last price", "current price"):
                 out.append(self.current_price)
-            elif lk in ("change %", "percent change", "percent_change", "change_pct"):
+            elif lk in ("change %", "percent change", "percent_change"):
                 out.append(self.percent_change)
             elif lk == "volume":
                 out.append(self.volume)
@@ -236,8 +208,11 @@ class _FallbackEnrichedQuote(_ExtraIgnore):
             elif lk == "error":
                 out.append(self.error or "")
             else:
-                out.append(d.get(k) if k in d else d.get(lk))
-        return out
+                out.append(d.get(lk))
+        # pad safety
+        if len(out) < len(headers):
+            out += [None] * (len(headers) - len(out))
+        return out[: len(headers)]
 
 
 if UnifiedQuote is None:
@@ -274,12 +249,6 @@ _DEFAULT_SHEETS_HEADERS_FALLBACK: List[str] = [
 
 
 def _safe_headers(sheet_name: Optional[str]) -> List[str]:
-    """
-    Always returns a usable header list.
-    Guarantees:
-      - Symbol is first column
-      - Error column exists
-    """
     headers: List[str] = []
     if get_headers_for_sheet:
         try:
@@ -292,14 +261,12 @@ def _safe_headers(sheet_name: Optional[str]) -> List[str]:
     if not headers:
         headers = list(_DEFAULT_SHEETS_HEADERS_FALLBACK)
 
-    headers = [h for h in headers if h.strip()]
-
-    # ensure Symbol first
+    # Symbol first
     if not headers or headers[0].strip().lower() != "symbol":
         headers = [h for h in headers if h.strip().lower() != "symbol"]
         headers.insert(0, "Symbol")
 
-    # ensure Error exists
+    # Ensure Error exists
     if not any(h.strip().lower() == "error" for h in headers):
         headers.append("Error")
 
@@ -307,7 +274,7 @@ def _safe_headers(sheet_name: Optional[str]) -> List[str]:
 
 
 # =============================================================================
-# Auth (X-APP-TOKEN) — open mode if no token configured
+# Settings / auth (X-APP-TOKEN) — open mode if no token configured
 # =============================================================================
 def _settings_str_attr(s: Any, attr: str) -> Optional[str]:
     try:
@@ -322,8 +289,8 @@ def _settings_str_attr(s: Any, attr: str) -> Optional[str]:
 @lru_cache(maxsize=1)
 def _allowed_tokens() -> List[str]:
     tokens: List[str] = []
-
     s = _settings_obj()
+
     if s is not None:
         for a in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
             v = _settings_str_attr(s, a)
@@ -357,11 +324,13 @@ def _allowed_tokens() -> List[str]:
     return out
 
 
-def _is_authorized(x_app_token: Optional[str]) -> bool:
+def _auth_error(x_app_token: Optional[str]) -> Optional[str]:
     allowed = _allowed_tokens()
     if not allowed:
-        return True
-    return bool(x_app_token and x_app_token.strip() in allowed)
+        return None
+    if not x_app_token or x_app_token.strip() not in allowed:
+        return "Unauthorized (invalid or missing X-APP-TOKEN)."
+    return None
 
 
 # =============================================================================
@@ -384,22 +353,14 @@ def _safe_float_env(name: str, default: float) -> float:
 
 
 def _cfg() -> Dict[str, Any]:
-    max_t = _safe_int_env("ARGAAM_MAX_TICKERS", 400)
-    batch_sz = _safe_int_env("ARGAAM_BATCH_SIZE", 40)
-    conc = _safe_int_env("ARGAAM_CONCURRENCY", 6)
-    timeout_sec = _safe_float_env("ARGAAM_TIMEOUT_SEC", 45.0)
-
-    max_t = max(10, min(2000, max_t))
-    batch_sz = max(5, min(250, batch_sz))
-    conc = max(1, min(50, conc))
-    timeout_sec = max(5.0, min(180.0, timeout_sec))
-
+    # Default sheet aligns with env.py SHEET_KSA_TADAWUL if set
+    default_sheet = os.getenv("ARGAAM_DEFAULT_SHEET") or os.getenv("SHEET_KSA_TADAWUL") or "KSA_Tadawul_Market"
     return {
-        "max_tickers": max_t,
-        "batch_size": batch_sz,
-        "concurrency": conc,
-        "timeout_sec": timeout_sec,
-        "default_sheet": os.getenv("ARGAAM_DEFAULT_SHEET", "KSA_Tadawul_Market"),
+        "max_tickers": _safe_int_env("ARGAAM_MAX_TICKERS", 400),
+        "batch_size": _safe_int_env("ARGAAM_BATCH_SIZE", 40),
+        "concurrency": _safe_int_env("ARGAAM_CONCURRENCY", 6),
+        "timeout_sec": _safe_float_env("ARGAAM_TIMEOUT_SEC", 45.0),
+        "default_sheet": default_sheet,
     }
 
 
@@ -445,7 +406,7 @@ async def _get_singleton_engine() -> Optional[Any]:
             return None
 
         try:
-            _ENGINE = DataEngine()  # type: ignore[operator]
+            _ENGINE = DataEngine()  # type: ignore
             logger.info("[argaam] DataEngine initialized (singleton).")
         except Exception as exc:
             logger.exception("[argaam] Failed to init DataEngine: %s", exc)
@@ -484,7 +445,7 @@ def _normalize_ksa_symbol(symbol: Any) -> str:
         s = s[: -len(".TADAWUL")].strip()
 
     if s.endswith(".SR"):
-        base = s[:-3].strip()
+        base = s[:-3]
         return f"{base}.SR" if base.isdigit() else ""
 
     if s.isdigit():
@@ -514,11 +475,11 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
         return {}
     try:
-        return obj.model_dump(exclude_none=False)  # type: ignore[attr-defined]
+        return obj.model_dump(exclude_none=False)  # type: ignore
     except Exception:
         pass
     try:
-        return obj.dict()  # type: ignore[attr-defined]
+        return obj.dict()  # type: ignore
     except Exception:
         pass
     try:
@@ -543,10 +504,7 @@ def _row_with_error(headers: List[str], symbol: str, error: str, data_quality: s
 
     i_sym = _idx("symbol")
     i_err = _idx("error")
-    # try both "Data Quality" and "data_quality"
-    i_dq = _idx("data quality")
-    if i_dq is None:
-        i_dq = _idx("data_quality")
+    i_dq = _idx("data quality") or _idx("data_quality")
 
     if i_sym is not None:
         row[i_sym] = symbol
@@ -570,168 +528,119 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
     Never raises.
     """
     sym = _normalize_ksa_symbol(requested_symbol) or (str(requested_symbol or "").strip().upper() or "UNKNOWN")
-
     forced: Dict[str, Any] = {"symbol": sym, "market": "KSA", "currency": "SAR"}
 
-    # Make enriched (preferred) else fallback
     try:
-        eq = EnrichedQuote.from_unified(uq)  # type: ignore[attr-defined]
-    except Exception:
-        eq = _FallbackEnrichedQuote.from_unified(uq)
+        eq = EnrichedQuote.from_unified(uq)  # type: ignore
 
-    # Force KSA metadata
-    try:
-        upd = {}
-        for k, v in forced.items():
+        # Force KSA metadata if empty/unknown
+        try:
+            upd = {k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")}
+            if upd:
+                if hasattr(eq, "model_copy"):
+                    eq = eq.model_copy(update=upd)
+                else:
+                    eq = eq.copy(update=upd)
+        except Exception:
+            pass
+
+        # Ensure data_source at least
+        try:
+            if not getattr(eq, "data_source", None):
+                ds = getattr(uq, "data_source", None) or "argaam_gateway"
+                if hasattr(eq, "model_copy"):
+                    eq = eq.model_copy(update={"data_source": ds})
+                else:
+                    eq = eq.copy(update={"data_source": ds})
+        except Exception:
+            pass
+
+        # Scores best-effort
+        try:
+            from core.scoring_engine import enrich_with_scores  # type: ignore
             try:
-                cur = getattr(eq, k, None)
-                if cur in (None, "", "UNKNOWN"):
-                    upd[k] = v
+                eq2 = enrich_with_scores(eq)  # type: ignore
+                if eq2 is not None:
+                    eq = eq2
             except Exception:
-                upd[k] = v
-        if upd:
-            if hasattr(eq, "model_copy"):
-                eq = eq.model_copy(update=upd)
-            elif hasattr(eq, "copy"):
-                eq = eq.copy(update=upd)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    # Ensure data_source at least
-    try:
-        if not getattr(eq, "data_source", None):
-            ds = getattr(uq, "data_source", None) or "argaam_gateway"
-            if hasattr(eq, "model_copy"):
-                eq = eq.model_copy(update={"data_source": ds})
-            elif hasattr(eq, "copy"):
-                eq = eq.copy(update={"data_source": ds})  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    # Scores best-effort (never required)
-    try:
-        from core.scoring_engine import enrich_with_scores  # type: ignore
-
-        try:
-            eq2 = enrich_with_scores(eq)  # type: ignore
-            if eq2 is not None:
-                eq = eq2
+                pass
         except Exception:
             pass
-    except Exception:
-        pass
 
-    # Guarantee strict symbol
-    try:
-        if getattr(eq, "symbol", None) != sym:
-            if hasattr(eq, "model_copy"):
-                eq = eq.model_copy(update={"symbol": sym})
-            elif hasattr(eq, "copy"):
-                eq = eq.copy(update={"symbol": sym})  # type: ignore[attr-defined]
-    except Exception:
-        pass
+        # Guarantee strict symbol
+        try:
+            if getattr(eq, "symbol", None) != sym:
+                if hasattr(eq, "model_copy"):
+                    eq = eq.model_copy(update={"symbol": sym})
+                else:
+                    eq = eq.copy(update={"symbol": sym})
+        except Exception:
+            pass
 
-    return eq
+        return eq
+
+    except Exception as exc:
+        logger.exception("[argaam] transform error for %s", sym)
+        return EnrichedQuote(  # type: ignore
+            symbol=sym,
+            market="KSA",
+            currency="SAR",
+            data_quality="MISSING",
+            error=f"Transform error: {exc}",
+        )
 
 
 # =============================================================================
-# Engine calls (defensive batching)
+# Engine call shims (timeout + batching)
 # =============================================================================
-def _placeholder_uq(symbol: str, err: str) -> Any:
-    if UnifiedQuote is not None:
-        try:
-            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error=err).finalize()  # type: ignore
-        except Exception:
-            pass
-    return {"symbol": symbol, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": err}
-
-
-async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
-    """
-    Compatibility shim:
-    - Prefer engine.get_enriched_quotes if present
-    - Else engine.get_quotes
-    - Else per-symbol calls
-    """
-    if hasattr(engine, "get_enriched_quotes"):
-        return await engine.get_enriched_quotes(syms)  # type: ignore[attr-defined]
-    if hasattr(engine, "get_quotes"):
-        return await engine.get_quotes(syms)  # type: ignore[attr-defined]
-
-    out: List[Any] = []
-    for s in syms:
+async def _engine_get_quote(engine: Any, sym: str, timeout_sec: float) -> Any:
+    async def _call() -> Any:
         if hasattr(engine, "get_enriched_quote"):
-            out.append(await engine.get_enriched_quote(s))  # type: ignore[attr-defined]
-        elif hasattr(engine, "get_quote"):
-            out.append(await engine.get_quote(s))  # type: ignore[attr-defined]
-        else:
-            out.append(_placeholder_uq(s, "Engine missing quote methods"))
-    return out
+            return await engine.get_enriched_quote(sym)  # type: ignore
+        if hasattr(engine, "get_quote"):
+            return await engine.get_quote(sym)  # type: ignore
+        res = await _engine_get_quotes(engine, [sym], timeout_sec=timeout_sec, concurrency=1)
+        return res[0] if res else {"symbol": sym, "data_quality": "MISSING", "error": "No data returned"}
+
+    try:
+        return await asyncio.wait_for(_call(), timeout=timeout_sec)
+    except Exception as exc:
+        return {"symbol": sym, "data_quality": "MISSING", "error": f"Engine quote error: {exc}"}
 
 
-async def _get_quotes_chunked(
-    request: Request,
-    symbols: List[str],
-    *,
-    batch_size: int,
-    timeout_sec: float,
-    max_concurrency: int,
-) -> Dict[str, Any]:
-    clean = _dedupe_preserve_order([_normalize_ksa_symbol(s) for s in symbols if _normalize_ksa_symbol(s)])
-    if not clean:
-        return {}
+async def _engine_get_quotes(engine: Any, syms: List[str], *, timeout_sec: float, concurrency: int) -> List[Any]:
+    async def _call_batch() -> List[Any]:
+        if hasattr(engine, "get_enriched_quotes"):
+            return await engine.get_enriched_quotes(syms)  # type: ignore
+        if hasattr(engine, "get_quotes"):
+            return await engine.get_quotes(syms)  # type: ignore
 
-    eng = await _resolve_engine(request)
-    if eng is None:
-        return {s.upper(): _placeholder_uq(s.upper(), "Engine unavailable") for s in clean}
+        sem = asyncio.Semaphore(max(1, int(concurrency) if concurrency else 1))
 
-    chunks = [clean[i : i + batch_size] for i in range(0, len(clean), max(1, batch_size))]
-    sem = asyncio.Semaphore(max(1, max_concurrency))
+        async def _one(s: str) -> Any:
+            async with sem:
+                return await _engine_get_quote(engine, s, timeout_sec=timeout_sec)
 
-    async def _run_chunk(part: List[str]) -> Tuple[List[str], List[Any] | Exception]:
-        async with sem:
-            try:
-                res = await asyncio.wait_for(_engine_get_quotes(eng, part), timeout=timeout_sec)
-                return part, list(res or [])
-            except Exception as e:
-                return part, e
+        return list(await asyncio.gather(*[_one(s) for s in syms], return_exceptions=False))
 
-    results = await asyncio.gather(*[_run_chunk(c) for c in chunks], return_exceptions=False)
-
-    out: Dict[str, Any] = {}
-    for part, res in results:
-        if isinstance(res, Exception):
-            msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
-            logger.warning("[argaam] %s for chunk(size=%d)", msg, len(part))
-            for s in part:
-                out[s.upper()] = _placeholder_uq(s.upper(), msg)
-            continue
-
-        returned = list(res or [])
-        m: Dict[str, Any] = {}
-        for q in returned:
-            d = _model_to_dict(q)
-            k = str(d.get("symbol") or d.get("ticker") or "").strip().upper()
-            if k:
-                m[k] = q
-
-        for s in part:
-            su = s.upper()
-            out[su] = m.get(su) or _placeholder_uq(su, "No data returned")
-
-    return out
+    try:
+        return await asyncio.wait_for(_call_batch(), timeout=timeout_sec)
+    except Exception as exc:
+        return [{"symbol": s, "data_quality": "MISSING", "error": f"Engine batch error: {exc}"} for s in syms]
 
 
 # =============================================================================
 # Request / Response models
 # =============================================================================
-class ArgaamBatchRequest(_ExtraIgnore):
+class ArgaamBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     symbols: List[str] = Field(default_factory=list, description="KSA symbols (e.g. ['1120', '1180.SR'])")
     tickers: List[str] = Field(default_factory=list, description="Alias for symbols (legacy compat)")
     sheet_name: Optional[str] = Field(default=None, description="Sheet name for header selection")
 
 
-class KSASheetResponse(_ExtraIgnore):
+class KSASheetResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     status: str = "success"  # success | partial | error | skipped
     error: Optional[str] = None
     headers: List[str] = Field(default_factory=list)
@@ -743,11 +652,9 @@ class KSASheetResponse(_ExtraIgnore):
 # Routes
 # =============================================================================
 @router.get("/health")
-@router.get("/ping")
 async def argaam_health(request: Request) -> Dict[str, Any]:
     cfg = _cfg()
     eng = await _resolve_engine(request)
-
     providers: List[str] = []
     try:
         providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
@@ -786,17 +693,9 @@ async def argaam_headers(
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> Dict[str, Any]:
     headers = _safe_headers(sheet_name)
-
-    # sheets-safe auth: never raise
-    if not _is_authorized(x_app_token):
-        return {
-            "status": "error",
-            "error": "Unauthorized (invalid or missing X-APP-TOKEN).",
-            "headers": headers,
-            "count": len(headers),
-            "sheet_name": sheet_name,
-        }
-
+    err = _auth_error(x_app_token)
+    if err:
+        return {"status": "error", "error": err, "headers": headers, "count": len(headers), "sheet_name": sheet_name}
     return {"status": "success", "headers": headers, "count": len(headers), "sheet_name": sheet_name}
 
 
@@ -806,19 +705,19 @@ async def ksa_single_quote(
     symbol: str = Query(..., description="KSA symbol (1120 or 1120.SR)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> Any:
-    # sheets-safe auth: return error object instead of raising
-    if not _is_authorized(x_app_token):
-        return EnrichedQuote(  # type: ignore[call-arg]
+    err = _auth_error(x_app_token)
+    if err:
+        return EnrichedQuote(  # type: ignore
             symbol=(symbol or "").strip().upper() or "UNKNOWN",
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="Unauthorized (invalid or missing X-APP-TOKEN).",
+            error=err,
         )
 
     ksa_symbol = _normalize_ksa_symbol(symbol)
     if not ksa_symbol:
-        return EnrichedQuote(  # type: ignore[call-arg]
+        return EnrichedQuote(  # type: ignore
             symbol=(symbol or "").strip().upper() or "UNKNOWN",
             market="KSA",
             currency="SAR",
@@ -826,10 +725,9 @@ async def ksa_single_quote(
             error=f"Invalid KSA symbol '{symbol}'. Must be numeric or end in .SR",
         )
 
-    cfg = _cfg()
     eng = await _resolve_engine(request)
     if eng is None:
-        return EnrichedQuote(  # type: ignore[call-arg]
+        return EnrichedQuote(  # type: ignore
             symbol=ksa_symbol,
             market="KSA",
             currency="SAR",
@@ -837,14 +735,8 @@ async def ksa_single_quote(
             error="Engine unavailable",
         )
 
-    m = await _get_quotes_chunked(
-        request,
-        [ksa_symbol],
-        batch_size=1,
-        timeout_sec=cfg["timeout_sec"],
-        max_concurrency=1,
-    )
-    uq = m.get(ksa_symbol.upper()) or _placeholder_uq(ksa_symbol.upper(), "No data returned")
+    cfg = _cfg()
+    uq = await _engine_get_quote(eng, ksa_symbol, timeout_sec=cfg["timeout_sec"])
     return _to_scored_enriched(uq, ksa_symbol)
 
 
@@ -854,59 +746,71 @@ async def ksa_batch_quotes(
     body: ArgaamBatchRequest = Body(...),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> List[Any]:
+    err = _auth_error(x_app_token)
     raw_list = (body.symbols or []) + (body.tickers or [])
     if not raw_list:
         return []
 
-    # sheets-safe auth: return per-item errors (do not raise)
-    if not _is_authorized(x_app_token):
-        out: List[Any] = []
-        for r in raw_list:
-            out.append(
-                EnrichedQuote(  # type: ignore[call-arg]
-                    symbol=(str(r or "").strip().upper() or "UNKNOWN"),
-                    market="KSA",
-                    currency="SAR",
-                    data_quality="MISSING",
-                    error="Unauthorized (invalid or missing X-APP-TOKEN).",
-                )
-            )
-        return out
-
     cfg = _cfg()
 
-    valid: List[str] = []
+    # preserve first occurrence order (dedupe on normalized)
+    normalized: List[str] = []
     invalid: List[str] = []
     for s in raw_list:
         n = _normalize_ksa_symbol(s)
         if n:
-            valid.append(n)
+            normalized.append(n)
         else:
             if s and str(s).strip():
                 invalid.append(str(s).strip())
 
-    targets = _dedupe_preserve_order(valid)
+    targets = _dedupe_preserve_order(normalized)
     if len(targets) > cfg["max_tickers"]:
         targets = targets[: cfg["max_tickers"]]
 
-    eng = await _resolve_engine(request)
-    m = await _get_quotes_chunked(
-        request,
-        targets,
-        batch_size=cfg["batch_size"],
-        timeout_sec=cfg["timeout_sec"],
-        max_concurrency=cfg["concurrency"],
-    )
-
     out: List[Any] = []
-    for t in targets:
-        uq = m.get(t.upper()) or _placeholder_uq(t.upper(), "No data returned")
-        out.append(_to_scored_enriched(uq, t))
 
-    # include invalids as explicit error objects (caller visibility)
+    if err:
+        for t in targets:
+            out.append(
+                EnrichedQuote(  # type: ignore
+                    symbol=t,
+                    market="KSA",
+                    currency="SAR",
+                    data_quality="MISSING",
+                    error=err,
+                )
+            )
+    else:
+        eng = await _resolve_engine(request)
+        if eng is None:
+            for t in targets:
+                out.append(
+                    EnrichedQuote(  # type: ignore
+                        symbol=t,
+                        market="KSA",
+                        currency="SAR",
+                        data_quality="MISSING",
+                        error="Engine unavailable",
+                    )
+                )
+        else:
+            batch_size = max(1, int(cfg["batch_size"]))
+            for part in [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]:
+                got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
+                m: Dict[str, Any] = {}
+                for q in got or []:
+                    d = _model_to_dict(q)
+                    k = str(d.get("symbol") or d.get("ticker") or "").upper()
+                    if k:
+                        m[k] = q
+                for t in part:
+                    uq = m.get(t.upper()) or UnifiedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error="No data returned")  # type: ignore
+                    out.append(_to_scored_enriched(uq, t))
+
     for bad in invalid:
         out.append(
-            EnrichedQuote(  # type: ignore[call-arg]
+            EnrichedQuote(  # type: ignore
                 symbol=bad.upper(),
                 market="KSA",
                 currency="SAR",
@@ -914,7 +818,6 @@ async def ksa_batch_quotes(
                 error="Invalid KSA symbol (must be numeric or end in .SR)",
             )
         )
-
     return out
 
 
@@ -924,11 +827,6 @@ async def ksa_sheet_rows(
     body: ArgaamBatchRequest = Body(...),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> KSASheetResponse:
-    """
-    Sheets-safe:
-    - ALWAYS returns {status, headers, rows, meta, error?}
-    - Auth failure => error rows (no exception)
-    """
     cfg = _cfg()
     sheet_name = body.sheet_name or cfg["default_sheet"]
     headers = _safe_headers(sheet_name)
@@ -943,41 +841,37 @@ async def ksa_sheet_rows(
             meta={"sheet_name": sheet_name, "timestamp_utc": _now_utc_iso()},
         )
 
-    # sheets-safe auth (never raise)
-    if not _is_authorized(x_app_token):
-        rows = [
-            _row_with_error(headers, str(s or "").strip().upper() or "UNKNOWN", "Unauthorized (invalid or missing X-APP-TOKEN).")
-            for s in raw_list
-        ]
+    err = _auth_error(x_app_token)
+    if err:
+        rows = [_row_with_error(headers, str(s or "").strip().upper() or "UNKNOWN", err) for s in raw_list]
         return KSASheetResponse(
             status="error",
-            error="Unauthorized (invalid or missing X-APP-TOKEN).",
+            error=err,
             headers=headers,
             rows=rows,
             meta={"sheet_name": sheet_name, "timestamp_utc": _now_utc_iso()},
         )
 
-    valid: List[str] = []
+    valid_targets: List[str] = []
     invalid: List[str] = []
     for s in raw_list:
         n = _normalize_ksa_symbol(s)
         if n:
-            valid.append(n)
+            valid_targets.append(n)
         else:
             if s and str(s).strip():
                 invalid.append(str(s).strip())
 
-    targets = _dedupe_preserve_order(valid)
-    if len(targets) > cfg["max_tickers"]:
-        targets = targets[: cfg["max_tickers"]]
+    valid_targets = _dedupe_preserve_order(valid_targets)
+    if len(valid_targets) > cfg["max_tickers"]:
+        valid_targets = valid_targets[: cfg["max_tickers"]]
 
     rows: List[List[Any]] = []
 
-    # invalids first
     for bad in invalid:
         rows.append(_row_with_error(headers, bad.upper(), "Invalid KSA symbol (must be numeric or end in .SR)"))
 
-    if not targets:
+    if not valid_targets:
         return KSASheetResponse(
             status="partial" if rows else "skipped",
             error="No valid KSA symbols provided" if not rows else None,
@@ -994,7 +888,7 @@ async def ksa_sheet_rows(
 
     eng = await _resolve_engine(request)
     if eng is None:
-        for t in targets:
+        for t in valid_targets:
             rows.append(_row_with_error(headers, t, "Engine unavailable"))
         return KSASheetResponse(
             status="error",
@@ -1004,36 +898,38 @@ async def ksa_sheet_rows(
             meta={
                 "sheet_name": sheet_name,
                 "requested": len(raw_list),
-                "valid": len(targets),
+                "valid": len(valid_targets),
                 "invalid": len(invalid),
                 "timestamp_utc": _now_utc_iso(),
             },
         )
 
-    m = await _get_quotes_chunked(
-        request,
-        targets,
-        batch_size=cfg["batch_size"],
-        timeout_sec=cfg["timeout_sec"],
-        max_concurrency=cfg["concurrency"],
-    )
-
+    batch_size = max(1, int(cfg["batch_size"]))
     any_fail = False
-    for t in targets:
-        uq = m.get(t.upper()) or _placeholder_uq(t.upper(), "No data returned")
-        eq = _to_scored_enriched(uq, t)
 
-        try:
-            row = eq.to_row(headers)  # type: ignore[attr-defined]
-            if not isinstance(row, list):
-                raise ValueError("to_row did not return a list")
-            if len(row) < len(headers):
-                row += [None] * (len(headers) - len(row))
-            rows.append(row[: len(headers)])
-        except Exception as exc:
-            any_fail = True
-            dq = str(getattr(eq, "data_quality", "MISSING") or "MISSING")
-            rows.append(_row_with_error(headers, t, f"Row mapping failed: {exc}", data_quality=dq))
+    for part in [valid_targets[i : i + batch_size] for i in range(0, len(valid_targets), batch_size)]:
+        got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
+        m: Dict[str, Any] = {}
+        for q in got or []:
+            d = _model_to_dict(q)
+            k = str(d.get("symbol") or d.get("ticker") or "").upper()
+            if k:
+                m[k] = q
+
+        for t in part:
+            uq = m.get(t.upper()) or UnifiedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error="No data")  # type: ignore
+            eq = _to_scored_enriched(uq, t)
+            try:
+                row = eq.to_row(headers)  # type: ignore
+                if not isinstance(row, list):
+                    raise ValueError("to_row did not return a list")
+                if len(row) < len(headers):
+                    row += [None] * (len(headers) - len(row))
+                rows.append(row[: len(headers)])
+            except Exception as exc:
+                any_fail = True
+                dq = str(getattr(eq, "data_quality", "MISSING") or "MISSING")
+                rows.append(_row_with_error(headers, t, f"Row mapping failed: {exc}", data_quality=dq))
 
     status = "success"
     if invalid or any_fail:
@@ -1042,7 +938,7 @@ async def ksa_sheet_rows(
     # if Error column contains any values => partial
     try:
         err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
-        if any((r[err_idx] not in (None, "", "null", "None")) for r in rows if len(r) > err_idx):
+        if any((r[err_idx] not in (None, "", "null")) for r in rows if len(r) > err_idx):
             status = "partial"
     except Exception:
         pass
@@ -1054,7 +950,7 @@ async def ksa_sheet_rows(
         meta={
             "sheet_name": sheet_name,
             "requested": len(raw_list),
-            "valid": len(targets),
+            "valid": len(valid_targets),
             "invalid": len(invalid),
             "timestamp_utc": _now_utc_iso(),
         },
