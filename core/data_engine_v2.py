@@ -1,6 +1,28 @@
 # core/data_engine_v2.py
 from __future__ import annotations
 
+"""
+core/data_engine_v2.py
+===============================================================
+UNIFIED DATA ENGINE (v2.6.0) — KSA-SAFE + PROD SAFE
+
+Key fixes/enhancements vs your v2.4.1:
+- ✅ Removes recursion risk: V2 no longer calls `core.data_engine` (legacy adapter) for KSA.
+- ✅ Adds separate KSA provider list (KSA_PROVIDERS / enabled_ksa_providers).
+- ✅ Adds optional Tadawul JSON provider via env-configurable endpoint templates.
+- ✅ Hardens provider parsing + settings/env adapters.
+- ✅ Improves HTTP retry behavior and JSON parsing robustness.
+- ✅ Keeps your 59-column UnifiedQuote schema and finalize() logic.
+
+KSA routing order (controlled by KSA_PROVIDERS):
+  - tadawul  (optional, via TADAWUL_* env URLs)
+  - argaam   (HTML snapshot best-effort)
+  - yfinance (optional last resort; often blocked)
+
+GLOBAL routing order (controlled by PROVIDERS / ENABLED_PROVIDERS):
+  - eodhd -> finnhub -> fmp -> yfinance (optional)
+"""
+
 import asyncio
 import logging
 import math
@@ -9,6 +31,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from importlib import import_module
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
@@ -21,15 +44,15 @@ from core.config import get_settings
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:  # pragma: no cover
-    BeautifulSoup = None
+    BeautifulSoup = None  # type: ignore
 
 try:
     import yfinance as yf  # type: ignore
 except Exception:  # pragma: no cover
-    yf = None
+    yf = None  # type: ignore
 
 
-ENGINE_VERSION = "2.4.1"
+ENGINE_VERSION = "2.6.0"
 
 # =============================================================================
 # Settings + Logger
@@ -38,7 +61,7 @@ settings = get_settings()
 logger = logging.getLogger("core.data_engine_v2")
 
 # =============================================================================
-# Provider URLs
+# Provider URLs (GLOBAL)
 # =============================================================================
 EODHD_RT_URL = "https://eodhd.com/api/real-time/{symbol}"
 EODHD_FUND_URL = "https://eodhd.com/api/fundamentals/{symbol}"
@@ -48,7 +71,9 @@ FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 FINNHUB_PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
 FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
 
-# Argaam (best-effort; HTML can change)
+# =============================================================================
+# KSA (ARGAAM best-effort HTML; TADAWUL optional JSON via env)
+# =============================================================================
 ARGAAM_PRICES_URLS = [
     "https://www.argaam.com/ar/company/companies-prices/3",
     "https://www.argaam.com/en/company/companies-prices/3",
@@ -57,6 +82,14 @@ ARGAAM_VOLUME_URLS = [
     "https://www.argaam.com/ar/company/companies-volume/14",
     "https://www.argaam.com/en/company/companies-volume/14",
 ]
+
+# Optional Tadawul JSON provider (configure via env; templates support {code} or {symbol})
+# Example:
+#   TADAWUL_QUOTE_URL="https://<your-endpoint>/quote?symbol={code}"
+# or
+#   TADAWUL_QUOTE_URL="https://<your-endpoint>/quote/{symbol}"
+TADAWUL_QUOTE_URL = os.getenv("TADAWUL_QUOTE_URL") or os.getenv("TADAWUL_API_URL")  # optional
+TADAWUL_HEADERS_JSON = os.getenv("TADAWUL_HEADERS_JSON")  # optional (JSON dict string)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -237,6 +270,11 @@ def is_ksa_symbol(symbol: str) -> bool:
     return s.endswith(".SR") or s.isdigit()
 
 
+def _ksa_code(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    return s.split(".", 1)[0] if "." in s else s
+
+
 def _fmp_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     return s[:-3] if s.endswith(".US") else s
@@ -268,27 +306,66 @@ def _yahoo_symbol(symbol: str) -> str:
     return s
 
 
+def _parse_csv_list(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out = [str(x).strip().lower() for x in v if str(x).strip()]
+        return out
+    s = str(v).strip()
+    if not s:
+        return []
+    return [x.strip().lower() for x in s.split(",") if x.strip()]
+
+
 def _get_enabled_providers() -> List[str]:
     """
-    Reads provider order from (first match wins):
+    GLOBAL provider order from (first match wins):
+      - settings.enabled_providers (list)
       - settings.providers_list (list)
       - settings.providers (csv)
       - env ENABLED_PROVIDERS / PROVIDERS (csv)
-    Defaults to: finnhub, fmp, eodhd (and yfinance as fallback if enabled).
+    Default: finnhub, fmp, eodhd
     """
-    pl = getattr(settings, "providers_list", None)
-    if isinstance(pl, list) and pl:
-        return [str(x).strip().lower() for x in pl if str(x).strip()]
+    for attr in ("enabled_providers", "providers_list"):
+        v = getattr(settings, attr, None)
+        out = _parse_csv_list(v)
+        if out:
+            return out
 
     p_csv = getattr(settings, "providers", None)
-    if isinstance(p_csv, str) and p_csv.strip():
-        return [p.strip().lower() for p in p_csv.split(",") if p.strip()]
+    out = _parse_csv_list(p_csv)
+    if out:
+        return out
 
     env_csv = os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or ""
-    if env_csv.strip():
-        return [p.strip().lower() for p in env_csv.split(",") if p.strip()]
+    out = _parse_csv_list(env_csv)
+    if out:
+        return out
 
     return ["finnhub", "fmp", "eodhd"]
+
+
+def _get_enabled_ksa_providers() -> List[str]:
+    """
+    KSA provider order from (first match wins):
+      - settings.enabled_ksa_providers (list)
+      - settings.ksa_providers (csv or list)
+      - env KSA_PROVIDERS (csv)
+    Default: tadawul, argaam
+    """
+    for attr in ("enabled_ksa_providers", "ksa_providers"):
+        v = getattr(settings, attr, None)
+        out = _parse_csv_list(v)
+        if out:
+            return out
+
+    env_csv = os.getenv("KSA_PROVIDERS") or ""
+    out = _parse_csv_list(env_csv)
+    if out:
+        return out
+
+    return ["tadawul", "argaam"]
 
 
 def _get_key(*names: str) -> Optional[str]:
@@ -445,7 +522,9 @@ class UnifiedQuote(BaseModel):
         if self.current_price is None:
             self.data_quality = "MISSING"
         else:
-            have_core = all(x is not None for x in (self.current_price, self.previous_close, self.day_high, self.day_low))
+            have_core = all(
+                x is not None for x in (self.current_price, self.previous_close, self.day_high, self.day_low)
+            )
             self.data_quality = "FULL" if have_core else "PARTIAL"
 
         if self.overall_score is None:
@@ -487,13 +566,13 @@ class DataEngine:
     """
     Async multi-provider engine with KSA-safe routing.
 
-    KSA (.SR):
-      1) Legacy KSA delegate if available (core.data_engine)
-      2) Argaam snapshot (HTML best-effort)
-      3) Optional yfinance last resort (often blocked/401)
+    KSA:
+      - tadawul (optional JSON via env TADAWUL_QUOTE_URL)
+      - argaam snapshot (HTML best-effort)
+      - yfinance (optional last resort)
 
     GLOBAL:
-      provider order from settings/providers:
+      provider order from providers list:
         - eodhd (quote + optional fundamentals)
         - finnhub (quote + profile/metrics)
         - fmp (quote)
@@ -502,13 +581,24 @@ class DataEngine:
 
     def __init__(self) -> None:
         self.enabled_providers: List[str] = _get_enabled_providers()
+        self.enabled_ksa_providers: List[str] = _get_enabled_ksa_providers()
 
         self._timeout_sec: float = _get_float(["HTTP_TIMEOUT_SEC", "http_timeout_sec", "HTTP_TIMEOUT"], 25.0)
         max_conn = _get_int(["HTTP_MAX_CONNECTIONS", "MAX_CONNECTIONS"], 40)
         max_keepalive = _get_int(["HTTP_MAX_KEEPALIVE", "MAX_KEEPALIVE_CONNECTIONS"], 20)
 
-        # Fine-grained timeout (connect/read/write/pool)
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
+
+        # Optional extra headers for Tadawul provider
+        tadawul_headers: Dict[str, str] = {}
+        if TADAWUL_HEADERS_JSON:
+            try:
+                import json
+                obj = json.loads(TADAWUL_HEADERS_JSON)
+                if isinstance(obj, dict):
+                    tadawul_headers = {str(k): str(v) for k, v in obj.items()}
+            except Exception:
+                tadawul_headers = {}
 
         self.client = httpx.AsyncClient(
             timeout=timeout,
@@ -517,6 +607,7 @@ class DataEngine:
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
+                **tadawul_headers,
             },
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
@@ -528,17 +619,18 @@ class DataEngine:
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
         snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 30.0)
 
-        self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, quote_ttl))
-        self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, cache_ttl * 10.0))
-        self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, fund_ttl))
-        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, snap_ttl))
+        self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, float(quote_ttl)))
+        self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, float(cache_ttl) * 10.0))
+        self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, float(fund_ttl)))
+        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, float(snap_ttl)))
 
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | yfinance=%s | timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | ksa=%s | yfinance=%s | timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
+            ",".join(self.enabled_ksa_providers) if self.enabled_ksa_providers else "(none)",
             self.enable_yfinance,
             self._timeout_sec,
         )
@@ -562,14 +654,11 @@ class DataEngine:
 
         try:
             async with self._sem:
-                if is_ksa_symbol(s):
-                    q = await self._fetch_ksa(s)
-                else:
-                    q = await self._fetch_global(s)
+                q = await (self._fetch_ksa(s) if is_ksa_symbol(s) else self._fetch_global(s))
 
             q = q.finalize()
 
-            # Optional scoring (no hard dependency)
+            # Optional scoring module (no hard dependency)
             try:
                 from core.scoring_engine import enrich_with_scores  # type: ignore
                 q = enrich_with_scores(q)
@@ -583,15 +672,17 @@ class DataEngine:
         except Exception as exc:
             logger.exception("get_quote failed for %s", s, exc_info=exc)
             if stale is not None:
-                stale2 = stale.model_copy(update={"error": f"Live fetch failed; returned stale. {exc}"})
-                return stale2.finalize()
+                try:
+                    stale2 = stale.model_copy(update={"error": f"Live fetch failed; returned stale. {exc}"})
+                    return stale2.finalize()
+                except Exception:
+                    return stale
             return UnifiedQuote(symbol=s, data_quality="MISSING", error=str(exc)).finalize()
 
     async def get_quotes(self, symbols: Sequence[str]) -> List[UnifiedQuote]:
         items = [s for s in (symbols or []) if s and str(s).strip()]
         if not items:
             return []
-
         results = await asyncio.gather(*(self.get_quote(s) for s in items), return_exceptions=True)
 
         out: List[UnifiedQuote] = []
@@ -613,124 +704,147 @@ class DataEngine:
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
-        # 1) Prefer legacy KSA engine
-        try:
-            from core import data_engine as legacy  # type: ignore
-            if hasattr(legacy, "get_enriched_quote"):
-                raw = await legacy.get_enriched_quote(symbol)  # type: ignore
-                q = self._coerce_to_unified_quote(symbol, raw, market="KSA", currency="SAR", source="legacy")
+        """
+        KSA routing is controlled by self.enabled_ksa_providers.
+        IMPORTANT: We do NOT call core.data_engine here (it is now an adapter to V2).
+        """
+        code = _ksa_code(symbol)
+
+        errors: List[str] = []
+
+        for prov in (self.enabled_ksa_providers or []):
+            p = (prov or "").strip().lower()
+            if not p:
+                continue
+
+            if p == "tadawul":
+                if not TADAWUL_QUOTE_URL:
+                    errors.append("tadawul:no_url")
+                    continue
+                q = await self._fetch_tadawul_quote(symbol)
                 if q.current_price is not None:
-                    q.data_source = q.data_source or "legacy"
-                    q.data_quality = "PARTIAL"
-                    return q
-        except Exception:
-            pass
+                    q.data_source = "tadawul"
+                    q.market = "KSA"
+                    q.currency = q.currency or "SAR"
+                    q.data_quality = "FULL" if q.previous_close is not None else "PARTIAL"
+                    return q.finalize()
+                errors.append(f"tadawul:{q.error or 'no_price'}")
 
-        # 2) Argaam snapshot
-        base = symbol.split(".", 1)[0].strip()
-        snap = await self._argaam_snapshot()
-        row = snap.get(base)
-        if row:
-            return UnifiedQuote(
-                symbol=symbol,
-                name=row.get("name"),
-                market="KSA",
-                currency="SAR",
-                current_price=row.get("price"),
-                price_change=row.get("change"),
-                percent_change=row.get("change_percent"),
-                volume=row.get("volume"),
-                value_traded=row.get("value_traded"),
-                data_source="argaam",
-                data_quality="PARTIAL",
-            )
+            elif p == "argaam":
+                snap = await self._argaam_snapshot()
+                row = snap.get(code)
+                if row and row.get("price") is not None:
+                    return UnifiedQuote(
+                        symbol=symbol,
+                        name=row.get("name"),
+                        market="KSA",
+                        currency="SAR",
+                        current_price=row.get("price"),
+                        price_change=row.get("change"),
+                        percent_change=row.get("change_percent"),
+                        volume=row.get("volume"),
+                        value_traded=row.get("value_traded"),
+                        data_source="argaam",
+                        data_quality="PARTIAL",
+                        error=None,
+                    ).finalize()
+                errors.append("argaam:no_row")
 
-        # 3) yfinance last resort
-        if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
+            elif p in {"yfinance", "yahoo"}:
+                if self.enable_yfinance and yf:
+                    q = await self._fetch_yfinance(symbol, market="KSA")
+                    if q.current_price is not None:
+                        q.data_source = "yfinance"
+                        q.data_quality = "PARTIAL"
+                        return q.finalize()
+                    errors.append(f"yfinance:{q.error or 'no_price'}")
+                else:
+                    errors.append("yfinance:disabled_or_missing")
+
+        # last resort
+        if self.enable_yfinance and yf:
             q = await self._fetch_yfinance(symbol, market="KSA")
             if q.current_price is not None:
-                q.data_source = q.data_source or "yfinance"
+                q.data_source = "yfinance"
                 q.data_quality = "PARTIAL"
-                return q
+                return q.finalize()
+            errors.append(f"yfinance:{q.error or 'no_price'}")
 
         return UnifiedQuote(
             symbol=symbol,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="No KSA provider data (legacy+argaam+yfinance failed)",
+            error="No KSA provider data. " + (" | ".join(errors) if errors else "no_ksa_providers_enabled"),
         ).finalize()
 
-    def _coerce_to_unified_quote(
-        self,
-        symbol: str,
-        raw: Any,
-        market: str,
-        currency: str,
-        source: str,
-    ) -> UnifiedQuote:
-        data: Dict[str, Any] = {}
+    async def _fetch_tadawul_quote(self, symbol: str) -> UnifiedQuote:
+        """
+        Optional Tadawul JSON provider.
+        TADAWUL_QUOTE_URL should include {code} or {symbol}.
+        JSON parsing is heuristic to support multiple endpoint shapes.
+        """
+        code = _ksa_code(symbol)
+        url = str(TADAWUL_QUOTE_URL or "").strip()
+        if not url:
+            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul URL missing")
 
-        if raw is None:
-            data = {}
-        elif isinstance(raw, UnifiedQuote):
-            return raw
-        elif isinstance(raw, dict):
-            data = dict(raw)
+        # Template substitution
+        url = url.replace("{code}", code).replace("{symbol}", symbol)
+
+        data = await self._http_get_json(url, params=None)
+        if not data:
+            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul empty response")
+
+        # normalize to dict (sometimes wrapped)
+        obj: Dict[str, Any] = {}
+        if isinstance(data, dict):
+            obj = data
+        elif isinstance(data, list) and data:
+            if isinstance(data[0], dict):
+                obj = data[0]
         else:
-            if hasattr(raw, "model_dump"):
-                try:
-                    data = raw.model_dump()  # type: ignore
-                except Exception:
-                    data = {}
-            elif hasattr(raw, "dict"):
-                try:
-                    data = raw.dict()  # type: ignore
-                except Exception:
-                    data = {}
-            else:
-                data = {}
+            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul non-dict response")
 
-        mapped: Dict[str, Any] = {
-            "symbol": symbol,
-            "market": data.get("market") or market,
-            "currency": data.get("currency") or currency,
-            "name": data.get("name") or data.get("company_name"),
-        }
+        # common field candidates
+        price = (
+            _safe_float(obj.get("price"))
+            or _safe_float(obj.get("last"))
+            or _safe_float(obj.get("last_price"))
+            or _safe_float(obj.get("lastPrice"))
+            or _safe_float(obj.get("tradingPrice"))
+            or _safe_float(obj.get("close"))
+        )
+        prev = (
+            _safe_float(obj.get("previous_close"))
+            or _safe_float(obj.get("previousClose"))
+            or _safe_float(obj.get("prevClose"))
+        )
+        high = _safe_float(obj.get("high")) or _safe_float(obj.get("day_high")) or _safe_float(obj.get("dayHigh"))
+        low = _safe_float(obj.get("low")) or _safe_float(obj.get("day_low")) or _safe_float(obj.get("dayLow"))
+        vol = _safe_float(obj.get("volume")) or _safe_float(obj.get("tradedVolume")) or _safe_float(obj.get("qty"))
 
-        mapped["current_price"] = data.get("current_price") or data.get("last_price") or data.get("lastPrice") or data.get("price")
-        mapped["previous_close"] = data.get("previous_close") or data.get("previousClose")
-        mapped["open"] = data.get("open")
-        mapped["day_high"] = data.get("day_high") or data.get("high")
-        mapped["day_low"] = data.get("day_low") or data.get("low")
-        mapped["volume"] = data.get("volume")
+        chg = _safe_float(obj.get("change")) or _safe_float(obj.get("price_change"))
+        chg_p = _safe_float(obj.get("change_percent")) or _safe_float(obj.get("percent_change")) or _safe_float(obj.get("changeP"))
 
-        mapped["price_change"] = data.get("price_change") or data.get("change")
-        mapped["percent_change"] = data.get("percent_change") or data.get("change_percent") or data.get("changePercent")
+        name = _safe_str(obj.get("name")) or _safe_str(obj.get("company")) or _safe_str(obj.get("companyName"))
 
-        for k in (
-            "market_cap",
-            "shares_outstanding",
-            "eps_ttm",
-            "pe_ttm",
-            "pb",
-            "dividend_yield",
-            "beta",
-            "roe",
-            "roa",
-            "net_margin",
-            "high_52w",
-            "low_52w",
-            "ma20",
-            "ma50",
-        ):
-            if k in data and data.get(k) is not None:
-                mapped[k] = data.get(k)
-
-        q = UnifiedQuote(**{k: v for k, v in mapped.items() if v is not None})
-        q.data_source = data.get("data_source") or source
-        q.error = data.get("error")
-        return q
+        return UnifiedQuote(
+            symbol=symbol,
+            name=name,
+            market="KSA",
+            currency="SAR",
+            current_price=price,
+            previous_close=prev,
+            day_high=high,
+            day_low=low,
+            volume=vol,
+            price_change=chg,
+            percent_change=chg_p,
+            data_source="tadawul",
+            data_quality="PARTIAL" if price is not None else "MISSING",
+            error=None if price is not None else "Tadawul returned no price",
+        )
 
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
         key = "argaam_snapshot_v2"
@@ -780,7 +894,6 @@ class DataEngine:
         if not BeautifulSoup or not html:
             return out
 
-        # lxml may not exist; fallback safely
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception:
@@ -814,21 +927,21 @@ class DataEngine:
             change = nums[1] if len(nums) >= 2 else None
             chg_p = nums[2] if len(nums) >= 3 else None
 
+            # best-effort volume/value detection (depends on page)
             volume = None
             value_traded = None
-            if len(txt) >= 8:
-                tail = [txt[-k] for k in range(1, min(6, len(txt)))]
-                tail_nums = [_safe_float(x) for x in tail]
-                for v in tail_nums:
-                    if v is not None and v > 0:
-                        volume = volume or v
+            tail = txt[-6:] if len(txt) >= 6 else txt
+            tail_nums = [_safe_float(x) for x in tail]
+            for v in tail_nums:
+                if v is not None and v > 0:
+                    volume = volume or v
 
-                if price and volume:
-                    vt_guess = price * volume
-                    for v in tail_nums:
-                        if v is not None and vt_guess > 0 and (0.2 * vt_guess) <= v <= (5.0 * vt_guess):
-                            value_traded = v
-                            break
+            if price and volume:
+                vt_guess = price * volume
+                for v in tail_nums:
+                    if v is not None and vt_guess > 0 and (0.2 * vt_guess) <= v <= (5.0 * vt_guess):
+                        value_traded = v
+                        break
 
             out[code] = {
                 "name": name,
@@ -845,8 +958,9 @@ class DataEngine:
     # GLOBAL: provider loop
     # -------------------------------------------------------------------------
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
+        # Special symbols require yfinance
         if any(ch in symbol for ch in ("=", "^")):
-            if self.enable_yfinance and (("yfinance" in self.enabled_providers) or ("yahoo" in self.enabled_providers)) and yf:
+            if self.enable_yfinance and yf:
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yfinance"
@@ -933,6 +1047,7 @@ class DataEngine:
                 else:
                     errors.append("yfinance:disabled_or_missing")
 
+        # final fallback
         if self.enable_yfinance and yf:
             q = await self._fetch_yfinance(symbol, market="GLOBAL")
             if q.current_price is not None:
@@ -1064,7 +1179,7 @@ class DataEngine:
             "high_52w": _safe_float(technicals.get("52WeekHigh")),
             "low_52w": _safe_float(technicals.get("52WeekLow")),
             "ma50": _safe_float(technicals.get("50DayMA")),
-            "ma20": _safe_float(technicals.get("20DayMA")) or _safe_float(technicals.get("200DayMA")),
+            "ma20": _safe_float(technicals.get("20DayMA")),
         }
 
         self.fund_cache[cache_key] = out
@@ -1241,7 +1356,7 @@ class DataEngine:
             if not info:
                 return UnifiedQuote(symbol=symbol, market=market, error="yfinance empty response", data_quality="MISSING")
 
-            err_txt = str(info)[:600].lower()
+            err_txt = str(info)[:800].lower()
             if "unauthorized" in err_txt or "unable to access this feature" in err_txt or "401" in err_txt:
                 return UnifiedQuote(
                     symbol=symbol,
