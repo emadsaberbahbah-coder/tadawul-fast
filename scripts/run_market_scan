@@ -1,256 +1,611 @@
+#!/usr/bin/env python3
+# scripts/run_market_scan.py
 """
-core/data_engine.py
-===============================================================
-LEGACY WRAPPER AROUND DATAENGINE v2 – v3.2.0
+run_market_scan.py
+===========================================================
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.0.0) – Sheets-ready
+===========================================================
 
-PURPOSE
-- Provide a *backwards-compatible* module-level API for the original
-  "v1 core data engine" while delegating all real work to the new
-  class-based engine in `core.data_engine_v2`.
-- Keep old imports working, such as:
-      from core import data_engine
-      from core.data_engine import get_enriched_quotes, UnifiedQuote, DataEngine
-- Ensure KSA safety and provider logic are defined ONLY once in
-  `core.data_engine_v2` (single source of truth).
+What this script does
+- Reads symbols from one or more dashboard pages via symbols_reader.PAGE_REGISTRY
+- Calls backend AI Analysis endpoint in chunks:
+      POST /v1/analysis/quotes   { tickers:[...], symbols:[...] }
+- Produces a ranked "opportunities" table
+- Optionally writes the ranked table to a Google Sheet tab (chunked write)
 
-MAIN BEHAVIOR
-- Tries to import:
-      from core.data_engine_v2 import DataEngine, UnifiedQuote
-- If successful:
-      • DataEngine (here) is an alias of the v2 DataEngine.
-      • get_enriched_quote(s) simply forward to the v2 engine instance.
-      • UnifiedQuote is re-exported from v2.
-      • QuoteSource is polyfilled if missing in v2 to satisfy legacy imports.
-- If v2 cannot be imported:
-      • Falls back to a very small stub engine that always returns
-        MISSING UnifiedQuote objects (no crashes, but clearly marked).
-      • This keeps the app importable even in emergency / partial setups.
+Defaults (safe)
+- Reads from: MARKET_LEADERS + GLOBAL_MARKETS + KSA_TADAWUL
+- Ranks by: opportunity_score (desc) then overall_score (desc)
+- Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
 
-NOTES
-- EODHD is NEVER called for KSA (.SR) tickers – that logic lives in
-  `core.data_engine_v2`.
+Usage examples
+  python scripts/run_market_scan.py
+  python scripts/run_market_scan.py --keys MARKET_LEADERS GLOBAL_MARKETS
+  python scripts/run_market_scan.py --ksa-only
+  python scripts/run_market_scan.py --global-only
+  python scripts/run_market_scan.py --top 25 --min-quality OK
+  python scripts/run_market_scan.py --out-json market_scan.json
+  python scripts/run_market_scan.py --no-sheet
+
+Notes
+- Uses env.py settings when available:
+    backend_base_url, app_token, backup_app_token, default_spreadsheet_id
+- Uses google_sheets_service for sheet writing (service account required).
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
-import asyncio
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-logger = logging.getLogger("core.data_engine")
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+SCRIPT_VERSION = "1.0.0"
 
-# ---------------------------------------------------------------------------
-# Polyfill for QuoteSource (Legacy Compatibility)
-# ---------------------------------------------------------------------------
-try:
-    from pydantic import BaseModel, Field
-except ImportError:
-    class BaseModel: # type: ignore
-        def __init__(self, **kwargs): self.__dict__.update(kwargs)
-    def Field(default=None, **kwargs): return default
-
-class QuoteSource(BaseModel):
-    """
-    Legacy provider metadata model.
-    Re-defined here to ensure 'from core.data_engine import QuoteSource' works
-    even if v2 dropped it.
-    """
-    provider: str
-    latency_ms: Optional[float] = None
-    timestamp_utc: Optional[datetime] = None
-    raw: Optional[Dict[str, Any]] = None
-
-# ---------------------------------------------------------------------------
-# Try to import the "real" v2 engine + models
-# ---------------------------------------------------------------------------
-
-_ENGINE_MODE: str = "stub"
-_ENGINE_IS_STUB: bool = True
-
-try:
-    # Primary, modern engine
-    from core.data_engine_v2 import (  # type: ignore
-        DataEngine as _V2DataEngine,
-        UnifiedQuote,
-    )
-
-    # Check if UnifiedQuote has 'sources' field compatibility
-    # V2 UnifiedQuote might not have 'sources' defined as List[QuoteSource]
-    # We accept this; legacy code usually checks dicts or attributes loosely.
-
-    _ENGINE_MODE = "v2"
-    _ENGINE_IS_STUB = False
-    logger.info("core.data_engine: Delegating to core.data_engine_v2.DataEngine.")
-
-except Exception as exc:  # pragma: no cover - defensive fallback
-    logger.warning(
-        "core.data_engine: Failed to import core.data_engine_v2. "
-        "Falling back to stub engine. Error: %s",
-        exc,
-    )
-    _ENGINE_MODE = "stub"
-    _ENGINE_IS_STUB = True
-
-    # -----------------------------------------------------------------------
-    # Minimal local models for stub mode
-    # -----------------------------------------------------------------------
-    class UnifiedQuote(BaseModel):  # type: ignore[no-redef]
-        """
-        Minimal UnifiedQuote placeholder used in stub mode.
-        """
-        symbol: str
-        price: Optional[float] = None
-        current_price: Optional[float] = None # V2 alias
-        data_quality: str = "MISSING"
-        last_updated_utc: Optional[datetime] = None
-        market: Optional[str] = None
-        market_region: Optional[str] = None
-        currency: Optional[str] = None
-        error: Optional[str] = None
-        sources: List[QuoteSource] = Field(default_factory=list)
-        
-        # Compatibility fields
-        change: Optional[float] = None
-        percent_change: Optional[float] = None
-        volume: Optional[float] = None
-
-        def finalize(self): return self
-
-    class _V2DataEngine:  # type: ignore[no-redef]
-        """
-        Stub engine implementation used ONLY when core.data_engine_v2
-        is not available.
-        """
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            logger.error("core.data_engine: Using stub DataEngine.")
-
-        async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
-            sym = (symbol or "").strip().upper()
-            now = datetime.now(timezone.utc)
-            return UnifiedQuote(
-                symbol=sym or "",
-                current_price=None,
-                data_quality="MISSING",
-                last_updated_utc=now,
-                error="Unified engine v2 unavailable (stub mode).",
-                sources=[QuoteSource(provider="stub", timestamp_utc=now)]
-            )
-
-        async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
-            if not symbols: return []
-            return [await self.get_enriched_quote(s) for s in symbols]
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
+DATE_FORMAT = "%H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
+logger = logging.getLogger("MarketScan")
 
 
-# ---------------------------------------------------------------------------
-# Engine instance & compatibility alias
-# ---------------------------------------------------------------------------
-
-# Expose DataEngine as the class type
-DataEngine = _V2DataEngine  # type: ignore[assignment]
-
-# Shared singleton instance
-_engine_instance = None
-
-def _get_engine():
-    global _engine_instance
-    if _engine_instance is None:
-        try:
-            _engine_instance = _V2DataEngine()
-        except Exception as e:
-            logger.error(f"Failed to initialize DataEngine: {e}")
-            # Crash-proof stub
-            class CrashStub:
-                async def get_enriched_quote(self, s): 
-                    return UnifiedQuote(symbol=s, error=f"Engine Init Failed: {e}")
-                async def get_enriched_quotes(self, s): 
-                    return [await self.get_enriched_quote(x) for x in s]
-            _engine_instance = CrashStub()
-    return _engine_instance
-
-# ---------------------------------------------------------------------------
-# Module-level convenience functions (v1-style API)
-# ---------------------------------------------------------------------------
-
-async def get_enriched_quote(symbol: str) -> UnifiedQuote:
-    """
-    Backwards-compatible convenience wrapper:
-        from core.data_engine import get_enriched_quote
-    """
-    eng = _get_engine()
+# =============================================================================
+# Path safety
+# =============================================================================
+def _ensure_project_root_on_path() -> None:
     try:
-        return await eng.get_enriched_quote(symbol)  # type: ignore[attr-defined]
-    except Exception as exc:
-        logger.exception("core.data_engine: Error in get_enriched_quote(%s)", symbol)
-        return UnifiedQuote(
-            symbol=(symbol or "").strip().upper(),
-            data_quality="ERROR",
-            error=f"Unhandled error: {exc}",
-        )
-
-
-async def get_enriched_quotes(symbols: List[str]) -> List[UnifiedQuote]:
-    """
-    Backwards-compatible batch wrapper:
-        from core.data_engine import get_enriched_quotes
-    """
-    clean: List[str] = [s.strip() for s in (symbols or []) if s and s.strip()]
-    if not clean:
-        return []
-
-    eng = _get_engine()
-    try:
-        results = await eng.get_enriched_quotes(clean)  # type: ignore[attr-defined]
-    except Exception as exc:
-        logger.exception("core.data_engine: Error in get_enriched_quotes batch")
-        return [
-            UnifiedQuote(
-                symbol=sym.upper(),
-                data_quality="ERROR",
-                error=f"Unhandled error: {exc}",
-            )
-            for sym in clean
-        ]
-
-    # Ensure list
-    if not isinstance(results, list):
-        return [
-            UnifiedQuote(symbol=s, data_quality="ERROR", error="Engine return type mismatch") 
-            for s in clean
-        ]
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Introspection helpers
-# ---------------------------------------------------------------------------
-
-def get_engine_meta() -> Dict[str, Any]:
-    eng = _get_engine()
-    enabled_providers: Optional[List[str]] = None
-    try:
-        enabled_providers = list(getattr(eng, "enabled_providers", []))  # type: ignore
+        here = os.path.dirname(os.path.abspath(__file__))
+        parent = os.path.dirname(here)
+        project_root = os.path.dirname(parent)
+        for p in (here, parent, project_root):
+            if p and p not in sys.path:
+                sys.path.insert(0, p)
     except Exception:
-        enabled_providers = None
+        pass
 
-    return {
-        "engine_mode": _ENGINE_MODE,
-        "engine_is_stub": _ENGINE_IS_STUB,
-        "enabled_providers": enabled_providers,
+
+_ensure_project_root_on_path()
+
+
+# =============================================================================
+# Imports (project)
+# =============================================================================
+try:
+    from env import settings  # type: ignore
+except Exception:
+    settings = None  # type: ignore
+
+try:
+    import symbols_reader  # type: ignore
+except Exception as e:
+    logger.error("Import failed (symbols_reader): %s", e)
+    logger.error("Tip: run from project root where symbols_reader.py exists.")
+    sys.exit(1)
+
+# Sheets writing is optional
+try:
+    import google_sheets_service as sheets_service  # type: ignore
+except Exception:
+    sheets_service = None  # type: ignore
+
+
+# =============================================================================
+# Config helpers
+# =============================================================================
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _get_backend_base_url() -> str:
+    if settings is not None:
+        v = (getattr(settings, "backend_base_url", "") or "").strip()
+        if v:
+            return v.rstrip("/")
+    return (os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000") or "http://127.0.0.1:8000").rstrip("/")
+
+
+def _get_tokens() -> Tuple[str, str]:
+    primary = ""
+    backup = ""
+    if settings is not None:
+        primary = (getattr(settings, "app_token", None) or "").strip()
+        backup = (getattr(settings, "backup_app_token", None) or "").strip()
+    if not primary:
+        primary = (os.getenv("APP_TOKEN", "") or "").strip()
+    if not backup:
+        backup = (os.getenv("BACKUP_APP_TOKEN", "") or "").strip()
+    return primary, backup
+
+
+def _get_default_spreadsheet_id() -> str:
+    if settings is not None:
+        sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip()
+        if sid:
+            return sid
+    return (os.getenv("DEFAULT_SPREADSHEET_ID", "") or "").strip()
+
+
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _safe_float(x: Any, default: float) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _norm_symbol(s: str) -> str:
+    x = (s or "").strip().upper()
+    if not x:
+        return ""
+    # Normalize KSA numeric -> .SR
+    if x.isdigit() and 3 <= len(x) <= 5:
+        return f"{x}.SR"
+    if x.startswith("TADAWUL:"):
+        x = x.split(":", 1)[1].strip().upper()
+    if x.endswith(".TADAWUL"):
+        x = x.replace(".TADAWUL", "")
+        if x.isdigit():
+            return f"{x}.SR"
+    return x.replace(" ", "")
+
+
+def _dedupe(items: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for s in items or []:
+        x = _norm_symbol(str(s))
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+# =============================================================================
+# Backend client (urllib)
+# =============================================================================
+def _headers(token: str) -> Dict[str, str]:
+    h = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+        "User-Agent": f"TadawulFastBridge-MarketScan/{SCRIPT_VERSION}",
     }
+    if token:
+        h["X-APP-TOKEN"] = token
+    return h
 
 
-__all__ = [
-    "UnifiedQuote",
-    "QuoteSource",
-    "DataEngine",
-    "get_enriched_quote",
-    "get_enriched_quotes",
-    "get_engine_meta",
+def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: int) -> Dict[str, Any]:
+    primary, backup = _get_tokens()
+    tokens_to_try: List[str] = []
+    if primary:
+        tokens_to_try.append(primary)
+    if backup and backup != primary:
+        tokens_to_try.append(backup)
+    if not tokens_to_try:
+        tokens_to_try.append("")  # open mode
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    last_err: Optional[str] = None
+    last_body_preview: Optional[str] = None
+    last_status: Optional[int] = None
+
+    attempts = max(1, int(retries) + 1)
+    for attempt in range(attempts):
+        for tok_idx, tok in enumerate(tokens_to_try):
+            try:
+                req = urllib.request.Request(url, data=data, headers=_headers(tok), method="POST")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    last_status = status
+                    last_body_preview = raw[:500]
+
+                    if 200 <= status < 300:
+                        parsed = json.loads(raw) if raw else {}
+                        return parsed if isinstance(parsed, dict) else {"results": parsed}
+
+                    last_err = f"HTTP {status}"
+            except urllib.error.HTTPError as e:
+                last_status = int(getattr(e, "code", 0) or 0)
+                try:
+                    raw = e.read().decode("utf-8", errors="replace")  # type: ignore
+                except Exception:
+                    raw = str(e)
+                last_body_preview = (raw or "")[:500]
+                last_err = f"HTTP {last_status}"
+
+                # If unauthorized and we have another token to try -> continue
+                if last_status in (401, 403) and tok_idx < (len(tokens_to_try) - 1):
+                    continue
+            except Exception as e:
+                last_err = str(e)
+
+        if attempt < attempts - 1:
+            time.sleep(min(6.0, (attempt + 1) * 2.0))
+
+    # Always return a dict-like error payload
+    msg = last_err or "Unknown error"
+    if last_status:
+        msg = f"HTTP {last_status}: {msg}"
+    if last_body_preview:
+        msg = f"{msg} | body: {last_body_preview}"
+    return {"results": [], "error": msg}
+
+
+# =============================================================================
+# Symbols selection
+# =============================================================================
+@dataclass(frozen=True)
+class SymbolBucket:
+    key: str
+    symbols: List[str]
+    meta: Dict[str, Any]
+
+
+def _read_symbols_for_key(key: str) -> SymbolBucket:
+    data = symbols_reader.get_page_symbols(key)  # type: ignore
+
+    # symbols_reader returns {"all":[...], "ksa":[...], "global":[...]} (expected)
+    if isinstance(data, list):
+        syms = _dedupe([str(x) for x in data])
+        return SymbolBucket(key=key, symbols=syms, meta={"shape": "list", "count": len(syms)})
+
+    if not isinstance(data, dict):
+        return SymbolBucket(key=key, symbols=[], meta={"shape": str(type(data)), "count": 0})
+
+    all_syms = data.get("all") or data.get("tickers") or data.get("symbols") or []
+    all_syms = _dedupe([str(x) for x in (all_syms or [])])
+
+    meta = {
+        "shape": "dict",
+        "count": len(all_syms),
+        "ksa_count": len(data.get("ksa") or []) if isinstance(data.get("ksa"), list) else None,
+        "global_count": len(data.get("global") or []) if isinstance(data.get("global"), list) else None,
+    }
+    return SymbolBucket(key=key, symbols=all_syms, meta=meta)
+
+
+def _default_keys() -> List[str]:
+    # Safe defaults for a "market scan"
+    return ["MARKET_LEADERS", "GLOBAL_MARKETS", "KSA_TADAWUL"]
+
+
+# =============================================================================
+# Scan / rank
+# =============================================================================
+def _call_analysis_batch(
+    symbols: List[str],
+    *,
+    timeout: float,
+    retries: int,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    base = _get_backend_base_url()
+    url = f"{base}/v1/analysis/quotes"
+
+    out: List[Dict[str, Any]] = []
+    chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
+
+    for c in chunks:
+        payload = {"tickers": c, "symbols": []}
+        resp = _post_json(url, payload, timeout=timeout, retries=retries)
+        got = resp.get("results") if isinstance(resp, dict) else None
+        if isinstance(got, list):
+            out.extend([x for x in got if isinstance(x, dict)])
+        else:
+            # Keep at least error rows if backend failed
+            err = str(resp.get("error") or "Backend returned invalid response") if isinstance(resp, dict) else "Invalid response"
+            for s in c:
+                out.append({"symbol": s, "data_quality": "MISSING", "error": err})
+    return out
+
+
+def _score_num(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        return v
+    except Exception:
+        return None
+
+
+def _rank_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
+    # Primary: opportunity_score, then overall_score, then quality_score
+    opp = _score_num(r.get("opportunity_score"))
+    overall = _score_num(r.get("overall_score"))
+    qual = _score_num(r.get("quality_score"))
+    return (opp if opp is not None else -1e9, overall if overall is not None else -1e9, qual if qual is not None else -1e9)
+
+
+def _passes_quality(r: Dict[str, Any], min_quality: str) -> bool:
+    q = (r.get("data_quality") or "").strip().upper()
+    if not min_quality:
+        return True
+    min_quality = min_quality.strip().upper()
+    if min_quality == "ANY":
+        return True
+    # Typical values: OK, PARTIAL, MISSING, ERROR
+    order = {"OK": 3, "PARTIAL": 2, "MISSING": 1, "ERROR": 0}
+    return order.get(q, 0) >= order.get(min_quality, 0)
+
+
+# =============================================================================
+# Output shaping
+# =============================================================================
+DEFAULT_HEADERS: List[str] = [
+    "Symbol",
+    "Name",
+    "Market",
+    "Currency",
+    "Price",
+    "Change %",
+
+    "Market Cap",
+    "P/E (TTM)",
+    "P/B",
+    "Dividend Yield %",
+    "ROE %",
+    "ROA %",
+
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Risk Score",
+    "Opportunity Score",
+    "Overall Score",
+    "Recommendation",
+
+    "Fair Value",
+    "Upside %",
+    "Valuation Label",
+
+    "Data Quality",
+    "Sources",
+    "Last Updated (UTC)",
+    "Error",
 ]
+
+
+def _to_row(r: Dict[str, Any]) -> List[Any]:
+    def g(*keys: str) -> Any:
+        for k in keys:
+            if k in r:
+                return r.get(k)
+        return None
+
+    sources = r.get("sources")
+    if isinstance(sources, list):
+        sources_str = ", ".join([str(x) for x in sources if str(x).strip()])
+    else:
+        sources_str = str(sources or "")
+
+    return [
+        g("symbol", "ticker"),
+        g("name"),
+        g("market_region", "market"),
+        g("currency"),
+
+        g("price", "current_price"),
+        g("change_pct", "percent_change"),
+
+        g("market_cap"),
+        g("pe_ttm"),
+        g("pb"),
+        g("dividend_yield"),
+        g("roe"),
+        g("roa"),
+
+        g("value_score"),
+        g("quality_score"),
+        g("momentum_score"),
+        g("risk_score"),
+        g("opportunity_score"),
+        g("overall_score"),
+        g("recommendation"),
+
+        g("fair_value"),
+        g("upside_percent"),
+        g("valuation_label"),
+
+        g("data_quality"),
+        sources_str,
+        g("last_updated_utc"),
+        g("error"),
+    ]
+
+
+def _grid_from_results(results: List[Dict[str, Any]], headers: Optional[List[str]] = None) -> List[List[Any]]:
+    h = headers or list(DEFAULT_HEADERS)
+    rows = [_to_row(r) for r in (results or [])]
+    # Ensure width
+    fixed: List[List[Any]] = []
+    for rr in rows:
+        if len(rr) < len(h):
+            rr = rr + [None] * (len(h) - len(rr))
+        elif len(rr) > len(h):
+            rr = rr[: len(h)]
+        fixed.append(rr)
+    return [h] + fixed
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main() -> None:
+    p = argparse.ArgumentParser(description="Run a market scan (AI Analysis) and optionally write to Google Sheets.")
+    p.add_argument("--keys", nargs="*", default=None, help="PAGE_REGISTRY keys to scan (default: MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL)")
+    p.add_argument("--ksa-only", action="store_true", help="Keep only KSA (.SR or numeric) symbols")
+    p.add_argument("--global-only", action="store_true", help="Keep only Global (non-.SR) symbols")
+    p.add_argument("--max-symbols", type=int, default=0, help="Cap total symbols (0 = no cap)")
+    p.add_argument("--batch-size", type=int, default=200, help="Backend batch size for /v1/analysis/quotes")
+    p.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout per batch")
+    p.add_argument("--retries", type=int, default=2, help="HTTP retries per batch")
+    p.add_argument("--top", type=int, default=50, help="Keep top N results after ranking")
+    p.add_argument("--min-quality", default="ANY", help="ANY | OK | PARTIAL | MISSING | ERROR")
+    p.add_argument("--include-errors", action="store_true", help="Keep rows with error (default: filtered if quality too low)")
+    p.add_argument("--out-json", default="", help="Write results JSON to file path")
+    p.add_argument("--out-csv", default="", help="Write results CSV to file path (basic)")
+
+    # Sheets output
+    p.add_argument("--no-sheet", action="store_true", help="Do not write to Google Sheets; print summary only")
+    p.add_argument("--sheet-id", default="", help="Spreadsheet ID (default from env DEFAULT_SPREADSHEET_ID)")
+    p.add_argument("--sheet-name", default="Market_Scan", help="Target sheet/tab name (default: Market_Scan)")
+    p.add_argument("--start-cell", default="A5", help="Top-left cell for headers (default: A5)")
+    p.add_argument("--clear", action="store_true", help="Clear old values before writing")
+
+    # Logging
+    p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
+
+    args = p.parse_args()
+    try:
+        logging.getLogger().setLevel(getattr(logging, str(args.log_level).upper(), logging.INFO))
+    except Exception:
+        pass
+
+    base_url = _get_backend_base_url()
+    logger.info("MarketScan v%s | backend=%s | ts=%s", SCRIPT_VERSION, base_url, _utc_now_iso())
+
+    # Select keys
+    keys = [k.strip().upper() for k in (args.keys or []) if k and k.strip()]
+    if not keys:
+        keys = _default_keys()
+
+    # Read symbols from keys
+    all_symbols: List[str] = []
+    per_key_meta: Dict[str, Any] = {}
+
+    for k in keys:
+        b = _read_symbols_for_key(k)
+        per_key_meta[k] = b.meta
+        all_symbols.extend(b.symbols)
+
+    all_symbols = _dedupe(all_symbols)
+
+    if args.ksa_only and args.global_only:
+        logger.error("You cannot use --ksa-only and --global-only together.")
+        sys.exit(2)
+
+    if args.ksa_only:
+        all_symbols = [s for s in all_symbols if s.endswith(".SR") or s.replace(".SR", "").isdigit()]
+    if args.global_only:
+        all_symbols = [s for s in all_symbols if not (s.endswith(".SR") or s.replace(".SR", "").isdigit())]
+
+    if args.max_symbols and args.max_symbols > 0 and len(all_symbols) > int(args.max_symbols):
+        all_symbols = all_symbols[: int(args.max_symbols)]
+
+    if not all_symbols:
+        logger.warning("No symbols found after filtering. keys=%s meta=%s", keys, per_key_meta)
+        sys.exit(0)
+
+    logger.info("Symbols loaded: %s | keys=%s | meta=%s", len(all_symbols), keys, per_key_meta)
+
+    # Call backend
+    t0 = time.time()
+    results = _call_analysis_batch(
+        all_symbols,
+        timeout=_safe_float(args.timeout, 60.0),
+        retries=_safe_int(args.retries, 2),
+        batch_size=max(1, _safe_int(args.batch_size, 200)),
+    )
+    dt = time.time() - t0
+    logger.info("Backend returned results=%s in %.2fs", len(results), dt)
+
+    # Filter by quality
+    min_q = str(args.min_quality or "ANY").strip().upper()
+    if not args.include_errors and min_q != "ANY":
+        results = [r for r in results if _passes_quality(r, min_q)]
+    elif not args.include_errors:
+        # Even with ANY, remove pure error rows that have no symbol/score
+        tmp = []
+        for r in results:
+            if (r.get("error") or "") and (r.get("opportunity_score") is None) and (r.get("overall_score") is None):
+                continue
+            tmp.append(r)
+        results = tmp
+
+    # Rank + top N
+    results_sorted = sorted(results, key=_rank_key, reverse=True)
+    top_n = max(1, _safe_int(args.top, 50))
+    results_sorted = results_sorted[:top_n]
+
+    logger.info("Final rows: %s (top=%s, min_quality=%s)", len(results_sorted), top_n, min_q)
+
+    # Optional file outputs
+    if args.out_json:
+        try:
+            with open(args.out_json, "w", encoding="utf-8") as f:
+                json.dump({"generated_utc": _utc_now_iso(), "keys": keys, "results": results_sorted}, f, ensure_ascii=False, indent=2)
+            logger.info("Wrote JSON: %s", args.out_json)
+        except Exception as e:
+            logger.error("Failed writing JSON (%s): %s", args.out_json, e)
+
+    if args.out_csv:
+        try:
+            import csv  # stdlib
+
+            grid = _grid_from_results(results_sorted)
+            with open(args.out_csv, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                for row in grid:
+                    w.writerow(row)
+            logger.info("Wrote CSV: %s", args.out_csv)
+        except Exception as e:
+            logger.error("Failed writing CSV (%s): %s", args.out_csv, e)
+
+    # Sheets write (optional)
+    if args.no_sheet:
+        logger.info("Done (no-sheet). Top symbols: %s", [r.get("symbol") for r in results_sorted[:10]])
+        return
+
+    if sheets_service is None:
+        logger.error("google_sheets_service is not importable; cannot write to sheet. Use --no-sheet.")
+        sys.exit(2)
+
+    sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
+    if not sheet_id:
+        logger.error("Spreadsheet ID missing. Set DEFAULT_SPREADSHEET_ID or pass --sheet-id, or use --no-sheet.")
+        sys.exit(2)
+
+    sheet_name = (args.sheet_name or "Market_Scan").strip()
+    start_cell = (args.start_cell or "A5").strip()
+
+    grid = _grid_from_results(results_sorted)
+
+    # Optional clear
+    if args.clear:
+        try:
+            # Clear a safe large area starting from start_cell
+            # Reuse sheets_service internals if available, else a minimal clear via clear_range
+            start_col, start_row = sheets_service._parse_a1_cell(start_cell)  # type: ignore[attr-defined]
+            safe_rng = f"{sheets_service._safe_sheet_name(sheet_name)}!{sheets_service._a1(start_col, start_row)}:ZZ100000"  # type: ignore[attr-defined]
+            sheets_service.clear_range(sheet_id, safe_rng)  # type: ignore
+        except Exception as e:
+            logger.warning("Clear failed (continuing): %s", e)
+
+    try:
+        updated = sheets_service.write_grid_chunked(sheet_id, sheet_name, start_cell, grid)  # type: ignore
+        logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
+    except Exception as e:
+        logger.error("❌ Sheet write failed: %s", e)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
