@@ -1,0 +1,196 @@
+# ============================================================
+# render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
+# Aligned with env.py / config.py (v4.6.0+)
+# ============================================================
+# Key design:
+# - Use Render's runtime.txt as source of Python version.
+# - Keep startCommand minimal & stable (Procfile is optional on Render,
+#   but we keep both consistent).
+# - Explicit healthCheckPath for Render health checks.
+# - All secrets use sync:false (set them in Render Dashboard).
+# ============================================================
+
+services:
+  - type: web
+    name: tadawul-fast-bridge
+    env: python
+    plan: free
+    autoDeploy: true
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port $PORT
+      --proxy-headers
+      --forwarded-allow-ips="*"
+      --timeout-keep-alive ${UVICORN_KEEPALIVE:-75}
+      --log-level ${LOG_LEVEL:-info}
+      --workers ${WEB_CONCURRENCY:-1}
+
+    healthCheckPath: /health
+
+    envVars:
+      # -------------------------
+      # Runtime
+      # -------------------------
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: UVICORN_KEEPALIVE
+        value: "75"
+      - key: LOG_LEVEL
+        value: "info"
+
+      # -------------------------
+      # App identity
+      # -------------------------
+      - key: APP_NAME
+        value: Tadawul Fast Bridge
+      - key: APP_VERSION
+        value: 4.6.0
+      - key: APP_ENV
+        value: production
+
+      # If your Sheets/clients call the same service, keep it explicit:
+      - key: BACKEND_BASE_URL
+        value: https://tadawul-fast-bridge.onrender.com
+
+      # -------------------------
+      # Security tokens (SECRETS)
+      # -------------------------
+      - key: APP_TOKEN
+        sync: false
+      - key: BACKUP_APP_TOKEN
+        sync: false
+
+      # -------------------------
+      # Providers policy
+      # -------------------------
+      # IMPORTANT:
+      # - KSA (.SR / numeric) must be routed to Tadawul/Argaam only
+      # - Avoid relying on Yahoo for KSA (often blocked / incomplete)
+      - key: ENABLED_PROVIDERS
+        value: "eodhd,finnhub"
+      - key: PRIMARY_PROVIDER
+        value: "finnhub"
+      - key: KSA_PROVIDERS
+        value: "tadawul,argaam"
+      - key: KSA_DISALLOW_EODHD
+        value: "true"
+      - key: ENABLE_YFINANCE
+        value: "true"
+
+      # Provider keys (SECRETS)
+      - key: FMP_API_KEY
+        sync: false
+      - key: EODHD_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false
+
+      # Argaam (optional)
+      - key: ARGAAM_GATEWAY_URL
+        value: ""
+      - key: ARGAAM_API_KEY
+        sync: false
+
+      # -------------------------
+      # HTTP + caching
+      # -------------------------
+      - key: HTTP_TIMEOUT_SEC
+        value: "25"
+      - key: CACHE_TTL_SEC
+        value: "20"
+      - key: QUOTE_TTL_SEC
+        value: "30"
+      - key: FUNDAMENTALS_TTL_SEC
+        value: "21600"
+      - key: ARGAAM_SNAPSHOT_TTL_SEC
+        value: "30"
+
+      # -------------------------
+      # Batch controls (match env.py defaults)
+      # -------------------------
+      - key: ENRICHED_BATCH_SIZE
+        value: "40"
+      - key: ENRICHED_BATCH_TIMEOUT_SEC
+        value: "45"
+      - key: ENRICHED_MAX_TICKERS
+        value: "250"
+      - key: ENRICHED_BATCH_CONCURRENCY
+        value: "5"
+
+      - key: AI_BATCH_SIZE
+        value: "20"
+      - key: AI_BATCH_TIMEOUT_SEC
+        value: "45"
+      - key: AI_MAX_TICKERS
+        value: "500"
+      - key: AI_BATCH_CONCURRENCY
+        value: "5"
+
+      - key: ADV_BATCH_SIZE
+        value: "25"
+      - key: ADV_BATCH_TIMEOUT_SEC
+        value: "45"
+      - key: ADV_MAX_TICKERS
+        value: "500"
+      - key: ADV_BATCH_CONCURRENCY
+        value: "6"
+
+      # -------------------------
+      # Google Sheets integration (SECRETS)
+      # -------------------------
+      - key: DEFAULT_SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false
+
+      # Sheets client tuning (google_sheets_service.py)
+      - key: SHEETS_BACKEND_TIMEOUT_SEC
+        value: "120"
+      - key: SHEETS_BACKEND_RETRIES
+        value: "2"
+      - key: SHEETS_BACKEND_RETRY_SLEEP
+        value: "1.0"
+      - key: SHEETS_API_RETRIES
+        value: "3"
+      - key: SHEETS_API_RETRY_BASE_SLEEP
+        value: "1.0"
+      - key: SHEETS_MAX_ROWS_PER_WRITE
+        value: "500"
+
+      # -------------------------
+      # CORS
+      # -------------------------
+      - key: ENABLE_CORS_ALL_ORIGINS
+        value: "true"
+
+      # -------------------------
+      # Sheet names (align with GAS)
+      # -------------------------
+      - key: SHEET_KSA_TADAWUL
+        value: KSA_Tadawul_Market
+      - key: SHEET_GLOBAL_MARKETS
+        value: Global_Markets
+      - key: SHEET_MUTUAL_FUNDS
+        value: Mutual_Funds
+      - key: SHEET_COMMODITIES_FX
+        value: Commodities_FX
+      - key: SHEET_MARKET_LEADERS
+        value: Market_Leaders
+      - key: SHEET_MY_PORTFOLIO
+        value: My_Portfolio
+      - key: SHEET_INSIGHTS_ANALYSIS
+        value: Insights_Analysis
+      - key: SHEET_INVESTMENT_ADVISOR
+        value: Investment_Advisor
+      - key: SHEET_ECONOMIC_CALENDAR
+        value: Economic_Calendar
+      - key: SHEET_INVESTMENT_INCOME
+        value: Investment_Income_Statement

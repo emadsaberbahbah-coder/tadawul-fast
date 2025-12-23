@@ -1,0 +1,92 @@
+# =============================================================================
+# Tadawul Fast Bridge – Local Environment Configuration (v4.0.0)
+# =============================================================================
+# USAGE:
+# 1. Rename this file to .env (or keep as env.local if using python-dotenv)
+# 2. Fill in your real API keys.
+# 3. DO NOT commit this file to public repositories.
+# =============================================================================
+
+# --- APP METADATA ---
+APP_ENV=dev
+APP_VERSION=4.0.0
+APP_NAME=Tadawul Fast Bridge
+LOG_LEVEL=INFO
+
+# --- PROVIDER CONFIGURATION ---
+# Supported: eodhd, fmp, yfinance
+# Note: KSA (.SR) symbols are routed to Argaam scraper first, then EODHD/FMP fallback.
+ENABLED_PROVIDERS=eodhd,fmp,yfinance
+
+# Global timeout for any single provider HTTP request (seconds)
+HTTP_TIMEOUT_SEC=25
+# Connection pool limits
+HTTP_MAX_CONNECTIONS=50
+HTTP_MAX_KEEPALIVE=20
+
+# --- API KEYS (Fill these in) ---
+
+# 1. EODHD (Primary Global Data)
+# Get key: https://eodhd.com/
+EODHD_API_KEY=your_eodhd_key_here
+EODHD_BASE_URL=https://eodhd.com/api
+# Fetch fundamentals? (1 = Yes, 0 = No). set to 0 for faster speed, 1 for better scores.
+EODHD_FETCH_FUNDAMENTALS=1
+
+# 2. Financial Modeling Prep (Backup Global/Fundamentals)
+# Get key: https://site.financialmodelingprep.com/
+FMP_API_KEY=your_fmp_key_here
+FMP_BASE_URL=https://financialmodelingprep.com/api/v3
+
+# 3. Yahoo Finance (Fallback)
+# Set to 1 to enable yfinance library fallback
+ENABLE_YFINANCE=1
+
+# --- CACHE SETTINGS (TTL in Seconds) ---
+# General quote cache
+CACHE_TTL_SEC=20
+# Argaam market snapshot cache (KSA)
+ARGAAM_SNAPSHOT_TTL_SEC=45
+# Deep fundamentals cache (EODHD/FMP)
+FUNDAMENTALS_TTL_SEC=21600
+# Single quote persistence
+QUOTE_TTL_SEC=30
+
+# --- BATCH PROCESSING TUNING ---
+# These control the /sheet-rows and /scoreboard endpoints.
+# Lower concurrency/batch size if you hit API rate limits.
+
+# Advanced Analysis Route (/v1/advanced)
+ADV_BATCH_SIZE=20
+ADV_BATCH_TIMEOUT_SEC=60
+ADV_MAX_TICKERS=500
+ADV_BATCH_CONCURRENCY=5
+
+# AI Analysis Route (/v1/analysis)
+AI_BATCH_SIZE=20
+AI_BATCH_TIMEOUT_SEC=60
+AI_MAX_TICKERS=500
+AI_BATCH_CONCURRENCY=5
+
+# Enriched Quote Route (/v1/enriched)
+ENRICHED_BATCH_SIZE=40
+ENRICHED_BATCH_TIMEOUT_SEC=45
+ENRICHED_MAX_TICKERS=250
+ENRICHED_BATCH_CONCURRENCY=5
+
+# --- SHEET NAMES (Legacy Reference) ---
+# Used if you have legacy scripts checking env vars for sheet names
+SHEET_MARKET_LEADERS=Market_Leaders
+SHEET_KSA_TADAWUL=KSA_Tadawul_Market
+SHEET_GLOBAL_MARKETS=Global_Markets
+SHEET_MUTUAL_FUNDS=Mutual_Funds
+SHEET_COMMODITIES_FX=Commodities_FX
+SHEET_MY_PORTFOLIO=My_Portfolio
+SHEET_INSIGHTS_ANALYSIS=Insights_Analysis
+SHEET_ADVANCED_ANALYSIS=Advanced_Analysis
+SHEET_INVESTMENT_ADVISOR=Investment_Advisor
+
+# --- GOOGLE SHEETS AUTH (Optional) ---
+# Only needed if the Python app pushes TO Sheets (uncommon in this Pull architecture)
+# GOOGLE_SHEETS_CREDENTIALS={"type":"service_account", ...}
+# DEFAULT_SPREADSHEET_ID=...
