@@ -1,3 +1,0 @@
-# runtime.txt
-# Render Python runtime pin (recommended for your current dependency pins)
-python-3.11.9
