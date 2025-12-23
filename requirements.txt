@@ -1,17 +1,20 @@
+# requirements.txt  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge - Dependencies (Pinned for stability)
 # Target runtime: Python 3.11.x (see runtime.txt)
 #
 # Notes:
-# - We pin a few key transitive deps (starlette/limits/pandas/numpy/httplib2)
-#   to keep Render builds reproducible across redeploys.
+# - Pin only what matters for reproducible Render builds.
+# - Avoid pinning starlette separately (FastAPI pins a compatible range).
+# - Use existing, widely-available wheels for numpy/pandas to reduce build risk.
 # ============================================================
 
 # --- Core Web Framework ---
 fastapi==0.124.4
-starlette==0.50.0
 uvicorn[standard]==0.38.0
 python-dotenv==1.2.1
+
+# --- Rate limiting (optional) ---
 slowapi==0.1.9
 limits==5.6.0
 
@@ -32,12 +35,12 @@ beautifulsoup4==4.14.3
 lxml==6.0.2
 
 # --- Market Data (Global fallback / utilities) ---
-yfinance==0.2.66
-pandas==2.3.3
-numpy==2.3.5
+yfinance==0.2.36
+pandas==2.2.3
+numpy==2.4.0
 
 # --- Google Integration (Sheets Service Account) ---
 google-api-python-client==2.187.0
-google-auth==2.43.0
+google-auth==2.45.0
 google-auth-httplib2==0.2.1
 httplib2==0.31.0
