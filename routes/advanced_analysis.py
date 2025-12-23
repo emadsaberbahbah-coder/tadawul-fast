@@ -1,6 +1,6 @@
 # routes/advanced_analysis.py
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.4.0) – PROD SAFE
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.6.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (core.data_engine_v2.DataEngine). No direct provider calls.
@@ -24,7 +24,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Body, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,16 +44,25 @@ try:
 except Exception:  # pragma: no cover
     EnrichedQuote = None  # type: ignore
 
-
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.4.0"
+ADVANCED_ANALYSIS_VERSION = "3.6.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
 # =============================================================================
 # Auth (X-APP-TOKEN)
 # =============================================================================
+def _read_token_attr(obj: Any, attr: str) -> Optional[str]:
+    try:
+        v = getattr(obj, attr, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    except Exception:
+        pass
+    return None
+
+
 @lru_cache(maxsize=1)
 def _allowed_tokens() -> List[str]:
     tokens: List[str] = []
@@ -61,29 +70,29 @@ def _allowed_tokens() -> List[str]:
     # settings first
     try:
         s = get_settings()
-        for attr in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
-            v = getattr(s, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
+        for attr in ("app_token", "backup_app_token"):
+            v = _read_token_attr(s, attr)
+            if v:
+                tokens.append(v)
     except Exception:
         pass
 
-    # env.py exports if present
+    # env.py exports `settings` (common in your project)
     try:
-        import env as env_mod  # type: ignore
+        from env import settings as env_settings  # type: ignore
 
-        for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
-            v = getattr(env_mod, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
+        for attr in ("app_token", "backup_app_token"):
+            v = _read_token_attr(env_settings, attr)
+            if v:
+                tokens.append(v)
     except Exception:
         pass
 
     # environment variables last resort
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
-        v = os.getenv(k)
-        if v and v.strip():
-            tokens.append(v.strip())
+        v = (os.getenv(k) or "").strip()
+        if v:
+            tokens.append(v)
 
     # de-dup preserve order
     out: List[str] = []
@@ -182,7 +191,6 @@ def _cfg() -> Dict[str, Any]:
     except Exception:
         s = None
 
-    # settings (if present) else defaults
     batch_size = _safe_int(getattr(s, "adv_batch_size", None), 25)
     timeout_sec = _safe_float(getattr(s, "adv_batch_timeout_sec", None), 45.0)
     max_tickers = _safe_int(getattr(s, "adv_max_tickers", None), 500)
@@ -211,8 +219,30 @@ def _cfg() -> Dict[str, Any]:
 # =============================================================================
 # Utilities
 # =============================================================================
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _now_utc().isoformat()
+
+
+def _iso_or_none(x: Any) -> Optional[str]:
+    if x is None or x == "":
+        return None
+    try:
+        if isinstance(x, datetime):
+            dt = x
+        else:
+            dt = datetime.fromisoformat(str(x))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        try:
+            return str(x)
+        except Exception:
+            return None
 
 
 def _clean_tickers(items: Sequence[Any]) -> List[str]:
@@ -240,6 +270,8 @@ def _parse_tickers_csv(s: str) -> List[str]:
 
 
 def _chunk(items: List[str], size: int) -> List[List[str]]:
+    if not items:
+        return []
     if size <= 0:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
@@ -257,13 +289,14 @@ def _dq_score(label: Optional[str]) -> float:
         "STALE": 40.0,
         "POOR": 30.0,
         "MISSING": 0.0,
+        "ERROR": 0.0,
     }
     return float(mapping.get(dq, 30.0))
 
 
-def _risk_bucket(opportunity: Optional[float], dq_score: float) -> str:
+def _risk_bucket(opportunity: Optional[float], dq_score_value: float) -> str:
     opp = float(opportunity or 0.0)
-    conf = float(dq_score or 0.0)
+    conf = float(dq_score_value or 0.0)
 
     if conf < 40:
         return "LOW_CONFIDENCE"
@@ -288,10 +321,43 @@ def _data_age_minutes(as_of_utc: Any) -> Optional[float]:
             ts = datetime.fromisoformat(str(as_of_utc))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        diff = datetime.now(timezone.utc) - ts
+        diff = _now_utc() - ts
         return round(diff.total_seconds() / 60.0, 2)
     except Exception:
         return None
+
+
+def _finalize_quote(uq: UnifiedQuote) -> UnifiedQuote:
+    """
+    Some UnifiedQuote versions implement .finalize().
+    We call it if present, otherwise return uq.
+    """
+    try:
+        fn = getattr(uq, "finalize", None)
+        if callable(fn):
+            return fn()
+    except Exception:
+        pass
+    return uq
+
+
+def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data") -> UnifiedQuote:
+    """
+    Create a UnifiedQuote placeholder as safely as possible across model variants.
+    """
+    sym = (symbol or "").strip().upper() or "UNKNOWN"
+    try:
+        uq = UnifiedQuote(symbol=sym, data_quality=dq, error=err)  # type: ignore
+        return _finalize_quote(uq)
+    except Exception:
+        # last-resort: try minimal constructor
+        uq = UnifiedQuote(symbol=sym)  # type: ignore
+        try:
+            setattr(uq, "data_quality", dq)
+            setattr(uq, "error", err)
+        except Exception:
+            pass
+        return _finalize_quote(uq)
 
 
 # =============================================================================
@@ -302,7 +368,7 @@ async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[Unifie
     Compatibility shim:
     - Prefer engine.get_enriched_quotes
     - Else engine.get_quotes
-    - Else per-symbol engine.get_quote
+    - Else per-symbol engine.get_enriched_quote/get_quote
     """
     if hasattr(engine, "get_enriched_quotes"):
         return await engine.get_enriched_quotes(syms)  # type: ignore
@@ -311,7 +377,10 @@ async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[Unifie
 
     out: List[UnifiedQuote] = []
     for s in syms:
-        out.append(await engine.get_quote(s))  # type: ignore
+        if hasattr(engine, "get_enriched_quote"):
+            out.append(await engine.get_enriched_quote(s))  # type: ignore
+        else:
+            out.append(await engine.get_quote(s))  # type: ignore
     return out
 
 
@@ -332,13 +401,12 @@ async def _get_quotes_chunked(
         return {}
 
     if engine is None:
-        msg = "Engine unavailable"
-        return {s: UnifiedQuote(symbol=s, data_quality="MISSING", error=msg).finalize() for s in clean}
+        return {s: _make_placeholder(s, dq="MISSING", err="Engine unavailable") for s in clean}
 
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], List[UnifiedQuote] | Exception]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[List[UnifiedQuote], Exception]]:
         async with sem:
             try:
                 res = await asyncio.wait_for(_engine_get_quotes(engine, chunk_syms), timeout=timeout_sec)
@@ -354,15 +422,22 @@ async def _get_quotes_chunked(
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
             logger.warning("[advanced] %s for chunk(size=%d)", msg, len(chunk_syms))
             for s in chunk_syms:
-                out[s.upper()] = UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error=msg).finalize()
+                out[s.upper()] = _make_placeholder(s, dq="MISSING", err=msg)
             continue
 
         returned = list(res or [])
-        chunk_map = {q.symbol.upper(): q for q in returned if q and getattr(q, "symbol", None)}
+        chunk_map: Dict[str, UnifiedQuote] = {}
+        for q in returned:
+            try:
+                sym = (getattr(q, "symbol", None) or "").strip().upper()
+                if sym:
+                    chunk_map[sym] = _finalize_quote(q)
+            except Exception:
+                continue
 
         for s in chunk_syms:
             k = s.upper()
-            out[k] = chunk_map.get(k) or UnifiedQuote(symbol=k, data_quality="MISSING", error="No data returned").finalize()
+            out[k] = chunk_map.get(k) or _make_placeholder(k, dq="MISSING", err="No data returned")
 
     return out
 
@@ -443,21 +518,28 @@ def _to_advanced_item(raw_symbol: str, uq: UnifiedQuote) -> AdvancedItem:
     # scoring best-effort (engine may already do it)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
-
         uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
 
     symbol = (getattr(uq, "symbol", None) or normalize_symbol(raw_symbol) or raw_symbol or "").strip().upper()
-
     dq = getattr(uq, "data_quality", None)
     dq_s = _dq_score(dq)
 
-    as_of_utc = getattr(uq, "last_updated_utc", None)
-    age_min = _data_age_minutes(as_of_utc)
+    # Last updated
+    as_of = getattr(uq, "last_updated_utc", None) or getattr(uq, "as_of_utc", None)
+    as_of_iso = _iso_or_none(as_of)
+    age_min = _data_age_minutes(as_of)
 
     opp = getattr(uq, "opportunity_score", None)
     bucket = _risk_bucket(opp, dq_s)
+
+    # Price field normalization
+    last_price = getattr(uq, "current_price", None)
+    if last_price is None:
+        last_price = getattr(uq, "last_price", None)
+    if last_price is None:
+        last_price = getattr(uq, "price", None)
 
     return AdvancedItem(
         symbol=symbol,
@@ -465,7 +547,7 @@ def _to_advanced_item(raw_symbol: str, uq: UnifiedQuote) -> AdvancedItem:
         market=getattr(uq, "market", None),
         sector=getattr(uq, "sector", None),
         currency=getattr(uq, "currency", None),
-        last_price=getattr(uq, "current_price", None),
+        last_price=last_price,
         fair_value=getattr(uq, "fair_value", None),
         upside_percent=getattr(uq, "upside_percent", None),
         value_score=getattr(uq, "value_score", None),
@@ -479,8 +561,8 @@ def _to_advanced_item(raw_symbol: str, uq: UnifiedQuote) -> AdvancedItem:
         recommendation=getattr(uq, "recommendation", None),
         valuation_label=getattr(uq, "valuation_label", None),
         risk_bucket=bucket,
-        provider=getattr(uq, "data_source", None),
-        as_of_utc=as_of_utc,
+        provider=getattr(uq, "data_source", None) or getattr(uq, "provider", None),
+        as_of_utc=as_of_iso,
         data_age_minutes=age_min,
         error=getattr(uq, "error", None),
     )
@@ -679,7 +761,7 @@ async def advanced_scoreboard(
 
     items: List[AdvancedItem] = []
     for s in requested:
-        uq = unified_map.get(s.upper()) or UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error="No data returned").finalize()
+        uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
         items.append(_to_advanced_item(s, uq))
 
     items_sorted = sorted(items, key=_sort_key, reverse=True)
@@ -711,10 +793,11 @@ async def advanced_sheet_rows(
     """
     headers, mode = _select_headers(body.sheet_name)
 
+    requested = _clean_tickers((body.tickers or []) + (body.symbols or []))
+
     # Auth is sheets-safe: never raise
     if not _auth_ok(x_app_token):
-        requested = _clean_tickers((body.tickers or []) + (body.symbols or []))
-        rows = []
+        rows: List[List[Any]] = []
         for s in requested:
             it = AdvancedItem(
                 symbol=s.upper(),
@@ -733,7 +816,6 @@ async def advanced_sheet_rows(
             rows=rows,
         )
 
-    requested = _clean_tickers((body.tickers or []) + (body.symbols or []))
     if not requested:
         return AdvancedSheetResponse(status="skipped", error="No tickers provided", headers=headers, rows=[])
 
@@ -758,7 +840,7 @@ async def advanced_sheet_rows(
         # Build items + sort
         items: List[AdvancedItem] = []
         for s in requested:
-            uq = unified_map.get(s.upper()) or UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error="No data returned").finalize()
+            uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
             items.append(_to_advanced_item(s, uq))
 
         items_sorted = sorted(items, key=_sort_key, reverse=True)
@@ -774,9 +856,19 @@ async def advanced_sheet_rows(
                 rows = [_row_for_headers(it, headers) for it in items_sorted]
             else:
                 for it in items_sorted:
-                    uq = unified_map.get(it.symbol) or UnifiedQuote(symbol=it.symbol, data_quality="MISSING", error="No data returned").finalize()
+                    uq = unified_map.get(it.symbol) or _make_placeholder(it.symbol, dq="MISSING", err="No data returned")
                     eq = EnrichedQuote.from_unified(uq)  # type: ignore
-                    rows.append(eq.to_row(headers))  # type: ignore
+                    try:
+                        row = eq.to_row(headers)  # type: ignore
+                        if not isinstance(row, list):
+                            raise ValueError("to_row did not return a list")
+                        if len(row) < len(headers):
+                            row += [None] * (len(headers) - len(row))
+                        rows.append(row[: len(headers)])
+                    except Exception as exc:
+                        # Sheets-safe fallback: advanced row with error
+                        it2 = it.model_copy(update={"error": f"Row mapping failed: {exc}"})
+                        rows.append(_row_for_headers(it2, headers))
         else:
             rows = [_row_for_headers(it, headers) for it in items_sorted]
 
