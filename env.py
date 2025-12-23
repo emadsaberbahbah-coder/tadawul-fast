@@ -1,13 +1,14 @@
+# env.py  (FULL REPLACEMENT)
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v4.8.0) – PROD SAFE
+Backward-compatible environment exports for Tadawul Fast Bridge (v4.7.1)
 
 ✅ What this file does:
-- Uses SINGLE source of truth from core.config.get_settings() when available.
-- Exposes backward-compatible constants used across legacy modules (routes + engines).
+- Uses SINGLE source of truth from config/get_settings() when available.
+- Exposes backward-compatible constants used across legacy modules.
 - Prints a clean boot banner (providers + KSA providers) without leaking secrets.
-- Adds missing legacy limit exports used by older routers (ENRICHED_*, ARGAAM_*, AI_*, ADV_*).
+- Keeps KSA-safe behavior (actual routing/blocks must remain in config.py / engines).
 
 Important:
 - Do NOT duplicate parsing logic here in normal mode.
@@ -23,9 +24,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-ENV_MODULE_VERSION = "4.8.0"
-
-_SETTINGS: Any = None
+_SETTINGS = None
 _BANNER_PRINTED = False
 
 
@@ -41,8 +40,8 @@ def _mask(v: Optional[str]) -> Optional[str]:
     return s[:3] + "***" + s[-3:]
 
 
-def _safe_join(items: List[Any]) -> str:
-    return ",".join([str(x) for x in (items or []) if x is not None and str(x).strip()])
+def _safe_join(items: List[str]) -> str:
+    return ",".join([str(x) for x in items if x])
 
 
 def _safe_bool(v: Any, default: bool = False) -> bool:
@@ -74,34 +73,9 @@ def _safe_float(v: Any, default: float) -> float:
         return default
 
 
-def _env(name: str, default: Any = None) -> Any:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v = str(v).strip()
-    return v if v != "" else default
-
-
-def _get_attr(obj: Any, *names: str, default: Any = None) -> Any:
-    """
-    Best-effort attribute getter across different Settings versions.
-    """
-    if obj is None:
-        return default
-    for n in names:
-        try:
-            v = getattr(obj, n, None)
-            if v is not None:
-                return v
-        except Exception:
-            pass
-    return default
-
-
 def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
     """
     Fallback-only helper for GOOGLE_SHEETS_CREDENTIALS-like env JSON.
-    (Normal mode parsing should live in config.py.)
     """
     if raw is None:
         return None
@@ -119,46 +93,26 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _as_str_list(v: Any) -> List[str]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        out: List[str] = []
-        for x in v:
-            s = str(x).strip()
-            if s:
-                out.append(s)
-        return out
-    s = str(v).strip()
-    if not s:
-        return []
-    if "," in s:
-        return [p.strip() for p in s.split(",") if p.strip()]
-    return [s]
-
-
-def _dedupe_preserve_order(items: List[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in items or []:
-        k = (x or "").strip()
-        if not k:
-            continue
-        kk = k.lower()
-        if kk in seen:
-            continue
-        seen.add(kk)
-        out.append(k)
-    return out
+def _get_attr_any(obj: Any, names: List[str], default: Any = None) -> Any:
+    for n in names:
+        try:
+            if hasattr(obj, n):
+                v = getattr(obj, n)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+    return default
 
 
 # ------------------------------------------------------------
 # Settings loader (single source of truth)
 # ------------------------------------------------------------
-def _load_settings() -> Any:
+def _load_settings():
     """
-    Load settings from core.config (preferred), then root config.py.
-    If BOTH fail, fall back to a minimal env-only view to avoid crashing.
+    Load settings from config.py (preferred).
+    Tries core.config first, then root config.
+    If BOTH fail, fall back to a minimal env-only view.
     """
     global _SETTINGS
     if _SETTINGS is not None:
@@ -167,7 +121,6 @@ def _load_settings() -> Any:
     # Preferred: core.config
     try:
         from core.config import get_settings  # type: ignore
-
         _SETTINGS = get_settings()
         return _SETTINGS
     except Exception as exc:
@@ -176,115 +129,87 @@ def _load_settings() -> Any:
     # Secondary: root config.py
     try:
         from config import get_settings  # type: ignore
-
         _SETTINGS = get_settings()
         return _SETTINGS
     except Exception as exc:
         logger.error("[env] Failed to import config.get_settings(): %s", exc)
 
-    # -------------------------
-    # Minimal fallback (defensive)
-    # -------------------------
+    # Minimal fallback
     class _Fallback:
-        # App identity
-        app_name = _env("APP_NAME", "Tadawul Fast Bridge")
-        env = _env("APP_ENV", _env("ENVIRONMENT", "production"))
-        version = _env("APP_VERSION", "4.8.0")
+        app_name = os.getenv("APP_NAME", "Tadawul Fast Bridge")
+        env = os.getenv("APP_ENV", "production")
+        version = os.getenv("APP_VERSION", "4.7.1")
+        log_level = (os.getenv("LOG_LEVEL", "info") or "info").lower()
+        log_json = _safe_bool(os.getenv("LOG_JSON"), False)
 
-        log_level = (_env("LOG_LEVEL", "info") or "info").lower()
-        log_json = _safe_bool(_env("LOG_JSON"), False)
+        _prov_csv = os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "finnhub,fmp,eodhd"
+        providers_list = [x.strip().lower() for x in _prov_csv.split(",") if x.strip()]
+        enabled_providers = providers_list
+        enabled_ksa_providers = [x.strip().lower() for x in (os.getenv("KSA_PROVIDERS", "tadawul,argaam") or "").split(",") if x.strip()]
 
-        # Providers
-        _prov_csv = _env("ENABLED_PROVIDERS", _env("PROVIDERS", "finnhub,fmp,eodhd"))
-        enabled_providers = [x.strip().lower() for x in str(_prov_csv).split(",") if x.strip()]
-        enabled_ksa_providers = [x.strip().lower() for x in str(_env("KSA_PROVIDERS", "tadawul,argaam")).split(",") if x.strip()]
-        primary_provider = (_env("PRIMARY_PROVIDER", "") or (enabled_providers[0] if enabled_providers else "finnhub")).strip().lower()
-
-        # CORS
-        cors_all_origins = _safe_bool(_env("ENABLE_CORS_ALL_ORIGINS", _env("CORS_ALL_ORIGINS", "true")), True)
-        cors_origins = _env("CORS_ORIGINS")
-        cors_origins_list = ["*"] if cors_all_origins else (
-            [x.strip() for x in str(cors_origins or "").split(",") if x.strip()] if cors_origins else []
+        primary_provider = (
+            (os.getenv("PRIMARY_PROVIDER") or "").strip().lower()
+            or (enabled_providers[0] if enabled_providers else "finnhub")
         )
 
-        # Timeouts / TTLs
-        http_timeout_sec = _safe_float(_env("HTTP_TIMEOUT_SEC", _env("HTTP_TIMEOUT", 25.0)), 25.0)
-        cache_ttl_sec = _safe_float(_env("CACHE_TTL_SEC", 20.0), 20.0)
-        quote_ttl_sec = _safe_float(_env("QUOTE_TTL_SEC", 30.0), 30.0)
-        fundamentals_ttl_sec = _safe_float(_env("FUNDAMENTALS_TTL_SEC", 21600.0), 21600.0)
-        argaam_snapshot_ttl_sec = _safe_float(_env("ARGAAM_SNAPSHOT_TTL_SEC", 30.0), 30.0)
+        cors_all_origins = _safe_bool(os.getenv("ENABLE_CORS_ALL_ORIGINS") or os.getenv("CORS_ALL_ORIGINS") or "true", True)
+        cors_origins = os.getenv("CORS_ORIGINS")
+        cors_origins_list = ["*"] if cors_all_origins else (
+            [x.strip() for x in (cors_origins or "").split(",") if x.strip()] if cors_origins else []
+        )
 
-        # Tokens
-        app_token = _env("APP_TOKEN")
-        backup_app_token = _env("BACKUP_APP_TOKEN")
+        http_timeout_sec = _safe_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 25.0)
+        cache_ttl_sec = _safe_float(os.getenv("CACHE_TTL_SEC"), 20.0)
+        quote_ttl_sec = _safe_float(os.getenv("QUOTE_TTL_SEC"), 30.0)
+        fundamentals_ttl_sec = _safe_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0)
+        argaam_snapshot_ttl_sec = _safe_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0)
 
-        # Provider keys
-        eodhd_api_key = _env("EODHD_API_KEY")
-        finnhub_api_key = _env("FINNHUB_API_KEY")
-        fmp_api_key = _env("FMP_API_KEY")
-        alpha_vantage_api_key = _env("ALPHA_VANTAGE_API_KEY")
-        argaam_api_key = _env("ARGAAM_API_KEY")
+        app_token = os.getenv("APP_TOKEN")
+        backup_app_token = os.getenv("BACKUP_APP_TOKEN")
 
-        # Backend base URL
-        backend_base_url = str(_env("BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com")).rstrip("/")
+        eodhd_api_key = os.getenv("EODHD_API_KEY")
+        finnhub_api_key = os.getenv("FINNHUB_API_KEY")
+        fmp_api_key = os.getenv("FMP_API_KEY")
+        alpha_vantage_api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+        argaam_api_key = os.getenv("ARGAAM_API_KEY")
 
-        # Google Sheets (fallback parses only if config unavailable)
-        google_credentials_dict = _try_parse_json_dict(_env("GOOGLE_SHEETS_CREDENTIALS"))
-        default_spreadsheet_id = _env("DEFAULT_SPREADSHEET_ID", _env("GOOGLE_SHEET_ID"))
-        google_sheet_id = _env("GOOGLE_SHEET_ID")
-        google_sheet_range = _env("GOOGLE_SHEET_RANGE")
+        backend_base_url = (os.getenv("BACKEND_BASE_URL") or "https://tadawul-fast-bridge.onrender.com").rstrip("/")
+
+        google_credentials_dict = _try_parse_json_dict(os.getenv("GOOGLE_SHEETS_CREDENTIALS"))
+        default_spreadsheet_id = os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("GOOGLE_SHEET_ID")
+        google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        google_sheet_range = os.getenv("GOOGLE_SHEET_RANGE")
         has_google_sheets = bool(google_credentials_dict) and bool(default_spreadsheet_id or google_sheet_id)
 
-        # Sheet names
-        sheet_ksa_tadawul = _env("SHEET_KSA_TADAWUL", "KSA_Tadawul_Market")
-        sheet_global_markets = _env("SHEET_GLOBAL_MARKETS", "Global_Markets")
-        sheet_mutual_funds = _env("SHEET_MUTUAL_FUNDS", "Mutual_Funds")
-        sheet_commodities_fx = _env("SHEET_COMMODITIES_FX", "Commodities_FX")
-        sheet_market_leaders = _env("SHEET_MARKET_LEADERS", "Market_Leaders")
-        sheet_my_portfolio = _env("SHEET_MY_PORTFOLIO", "My_Portfolio")
-        sheet_insights_analysis = _env("SHEET_INSIGHTS_ANALYSIS", "Insights_Analysis")
-        sheet_investment_advisor = _env("SHEET_INVESTMENT_ADVISOR", "Investment_Advisor")
-        sheet_economic_calendar = _env("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar")
-        sheet_investment_income = _env("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement")
+        sheet_ksa_tadawul = os.getenv("SHEET_KSA_TADAWUL", "KSA_Tadawul_Market")
+        sheet_global_markets = os.getenv("SHEET_GLOBAL_MARKETS", "Global_Markets")
+        sheet_mutual_funds = os.getenv("SHEET_MUTUAL_FUNDS", "Mutual_Funds")
+        sheet_commodities_fx = os.getenv("SHEET_COMMODITIES_FX", "Commodities_FX")
+        sheet_market_leaders = os.getenv("SHEET_MARKET_LEADERS", "Market_Leaders")
+        sheet_my_portfolio = os.getenv("SHEET_MY_PORTFOLIO", "My_Portfolio")
+        sheet_insights_analysis = os.getenv("SHEET_INSIGHTS_ANALYSIS", "Insights_Analysis")
+        sheet_investment_advisor = os.getenv("SHEET_INVESTMENT_ADVISOR", "Investment_Advisor")
+        sheet_economic_calendar = os.getenv("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar")
+        sheet_investment_income = os.getenv("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement")
 
     _SETTINGS = _Fallback()
     return _SETTINGS
 
 
-def refresh_settings() -> Any:
-    """
-    Force reload settings (rarely needed; useful in tests).
-    """
-    global _SETTINGS
-    _SETTINGS = None
-    return _load_settings()
-
-
-def _print_banner_once(s: Any) -> None:
+def _print_banner_once(s) -> None:
     global _BANNER_PRINTED
     if _BANNER_PRINTED:
         return
-
-    # allow disabling banner (Render multi-workers can be noisy)
-    banner_on = _safe_bool(_env("ENV_BANNER", "true"), True)
-    if not banner_on:
-        _BANNER_PRINTED = True
-        return
-
     _BANNER_PRINTED = True
+
     try:
-        app = _get_attr(s, "app_name", "name", default="Tadawul Fast Bridge")
-        envv = _get_attr(s, "env", "environment", default="production")
-        ver = _get_attr(s, "version", "app_version", default=ENV_MODULE_VERSION)
-
-        providers = _dedupe_preserve_order([str(x).lower() for x in _as_str_list(_get_attr(s, "enabled_providers", "providers_list", default=[]))])
-        ksa_prov = _dedupe_preserve_order([str(x).lower() for x in _as_str_list(_get_attr(s, "enabled_ksa_providers", default=[]))])
-
-        logger.info("[env] App=%s | Env=%s | Version=%s", app, envv, ver)
-        logger.info("[env] Providers=%s", _safe_join(providers))
-        logger.info("[env] KSA Providers=%s", _safe_join(ksa_prov))
+        logger.info("[env] App=%s | Env=%s | Version=%s",
+                    _get_attr_any(s, ["app_name", "APP_NAME"], ""),
+                    _get_attr_any(s, ["env", "environment", "APP_ENV"], ""),
+                    _get_attr_any(s, ["version", "app_version", "APP_VERSION"], ""))
+        logger.info("[env] Providers=%s", _safe_join(list(_get_attr_any(s, ["enabled_providers"], []) or [])))
+        logger.info("[env] KSA Providers=%s", _safe_join(list(_get_attr_any(s, ["enabled_ksa_providers"], []) or [])))
     except Exception:
-        # never fail startup for banner
         pass
 
 
@@ -296,118 +221,68 @@ _print_banner_once(settings)
 # Backward compatible exports (DON'T BREAK IMPORTS)
 # ------------------------------------------------------------
 
-# App identity
-APP_NAME = str(_get_attr(settings, "app_name", "name", default="Tadawul Fast Bridge"))
-APP_ENV = str(_get_attr(settings, "env", "environment", default="production"))
-APP_VERSION = str(_get_attr(settings, "version", "app_version", "version_name", default=ENV_MODULE_VERSION))
+APP_NAME = _get_attr_any(settings, ["app_name", "APP_NAME"], "Tadawul Fast Bridge")
+APP_ENV = _get_attr_any(settings, ["env", "environment", "APP_ENV"], "production")
+APP_VERSION = _get_attr_any(settings, ["version", "app_version", "APP_VERSION"], "4.7.1")
 
-# Base URL
-BACKEND_BASE_URL = str(_get_attr(settings, "backend_base_url", "base_url", default=_env("BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com"))).rstrip("/")
+BACKEND_BASE_URL = (str(_get_attr_any(settings, ["backend_base_url", "BACKEND_BASE_URL"], os.getenv("BACKEND_BASE_URL", "https://tadawul-fast-bridge.onrender.com")))).rstrip("/")
 
-# Tokens
-APP_TOKEN = _get_attr(settings, "app_token", "APP_TOKEN", default=_env("APP_TOKEN"))
-BACKUP_APP_TOKEN = _get_attr(settings, "backup_app_token", "BACKUP_APP_TOKEN", default=_env("BACKUP_APP_TOKEN"))
+APP_TOKEN = _get_attr_any(settings, ["app_token", "APP_TOKEN"], None)
+BACKUP_APP_TOKEN = _get_attr_any(settings, ["backup_app_token", "BACKUP_APP_TOKEN"], None)
 
-# Providers
-ENABLED_PROVIDERS: List[str] = _dedupe_preserve_order(
-    [str(x).strip().lower() for x in _as_str_list(_get_attr(settings, "enabled_providers", "providers_list", default=[]))]
-) or _dedupe_preserve_order([x.strip().lower() for x in str(_env("ENABLED_PROVIDERS", _env("PROVIDERS", "finnhub,fmp,eodhd"))).split(",") if x.strip()])
-
-KSA_PROVIDERS: List[str] = _dedupe_preserve_order(
-    [str(x).strip().lower() for x in _as_str_list(_get_attr(settings, "enabled_ksa_providers", default=[]))]
-) or _dedupe_preserve_order([x.strip().lower() for x in str(_env("KSA_PROVIDERS", "tadawul,argaam")).split(",") if x.strip()])
-
+ENABLED_PROVIDERS: List[str] = list(_get_attr_any(settings, ["enabled_providers"], []) or [])
+KSA_PROVIDERS: List[str] = list(_get_attr_any(settings, ["enabled_ksa_providers"], []) or [])
 PRIMARY_PROVIDER = (
-    str(_get_attr(settings, "primary_provider", "primary", default=_env("PRIMARY_PROVIDER", "")) or "").strip().lower()
+    _get_attr_any(settings, ["primary_provider", "primary", "PRIMARY_PROVIDER"], None)
     or (ENABLED_PROVIDERS[0] if ENABLED_PROVIDERS else "finnhub")
 )
+PRIMARY_PROVIDER = str(PRIMARY_PROVIDER).strip().lower()
 
-# CSV alias some modules still expect
 PROVIDERS = _safe_join(ENABLED_PROVIDERS)
 
-# Timeouts / TTL
-HTTP_TIMEOUT_SEC = float(_get_attr(settings, "http_timeout_sec", default=_safe_float(_env("HTTP_TIMEOUT_SEC", _env("HTTP_TIMEOUT", 25.0)), 25.0)))
+HTTP_TIMEOUT_SEC = float(_get_attr_any(settings, ["http_timeout_sec"], 25.0))
 HTTP_TIMEOUT = int(HTTP_TIMEOUT_SEC)
 
-CACHE_TTL_SEC = float(_get_attr(settings, "cache_ttl_sec", default=_safe_float(_env("CACHE_TTL_SEC", 20.0), 20.0)))
-QUOTE_TTL_SEC = float(_get_attr(settings, "quote_ttl_sec", default=_safe_float(_env("QUOTE_TTL_SEC", 30.0), 30.0)))
-FUNDAMENTALS_TTL_SEC = float(_get_attr(settings, "fundamentals_ttl_sec", default=_safe_float(_env("FUNDAMENTALS_TTL_SEC", 21600.0), 21600.0)))
-ARGAAM_SNAPSHOT_TTL_SEC = float(_get_attr(settings, "argaam_snapshot_ttl_sec", default=_safe_float(_env("ARGAAM_SNAPSHOT_TTL_SEC", 30.0), 30.0)))
+CACHE_TTL_SEC = float(_get_attr_any(settings, ["cache_ttl_sec"], 20.0))
+QUOTE_TTL_SEC = float(_get_attr_any(settings, ["quote_ttl_sec"], 30.0))
+FUNDAMENTALS_TTL_SEC = float(_get_attr_any(settings, ["fundamentals_ttl_sec"], 21600.0))
+ARGAAM_SNAPSHOT_TTL_SEC = float(_get_attr_any(settings, ["argaam_snapshot_ttl_sec"], 30.0))
 
-# Provider keys (exported for backward compat — do NOT log)
-EODHD_API_KEY = _get_attr(settings, "eodhd_api_key", default=_env("EODHD_API_KEY"))
-FINNHUB_API_KEY = _get_attr(settings, "finnhub_api_key", default=_env("FINNHUB_API_KEY"))
-FMP_API_KEY = _get_attr(settings, "fmp_api_key", default=_env("FMP_API_KEY"))
-ALPHA_VANTAGE_API_KEY = _get_attr(settings, "alpha_vantage_api_key", default=_env("ALPHA_VANTAGE_API_KEY"))
-ARGAAM_API_KEY = _get_attr(settings, "argaam_api_key", default=_env("ARGAAM_API_KEY"))
+EODHD_API_KEY = _get_attr_any(settings, ["eodhd_api_key", "EODHD_API_KEY"], None)
+FINNHUB_API_KEY = _get_attr_any(settings, ["finnhub_api_key", "FINNHUB_API_KEY"], None)
+FMP_API_KEY = _get_attr_any(settings, ["fmp_api_key", "FMP_API_KEY"], None)
+ALPHA_VANTAGE_API_KEY = _get_attr_any(settings, ["alpha_vantage_api_key", "ALPHA_VANTAGE_API_KEY"], None)
+ARGAAM_API_KEY = _get_attr_any(settings, ["argaam_api_key", "ARGAAM_API_KEY"], None)
 
-# CORS
-ENABLE_CORS_ALL_ORIGINS = bool(_get_attr(settings, "cors_all_origins", default=_safe_bool(_env("ENABLE_CORS_ALL_ORIGINS", _env("CORS_ALL_ORIGINS", "true")), True)))
+ENABLE_CORS_ALL_ORIGINS = bool(_get_attr_any(settings, ["cors_all_origins", "ENABLE_CORS_ALL_ORIGINS"], True))
 CORS_ALL_ORIGINS = ENABLE_CORS_ALL_ORIGINS
-CORS_ORIGINS = _get_attr(settings, "cors_origins", default=_env("CORS_ORIGINS"))
-CORS_ORIGINS_LIST = list(_get_attr(settings, "cors_origins_list", default=(["*"] if ENABLE_CORS_ALL_ORIGINS else [])))
+CORS_ORIGINS = _get_attr_any(settings, ["cors_origins", "CORS_ORIGINS"], None)
+CORS_ORIGINS_LIST = list(_get_attr_any(settings, ["cors_origins_list"], ["*"] if ENABLE_CORS_ALL_ORIGINS else []))
 
-# Google Sheets
-GOOGLE_SHEETS_CREDENTIALS: Optional[Dict[str, Any]] = _get_attr(settings, "google_credentials_dict", default=None)
-if GOOGLE_SHEETS_CREDENTIALS is None:
-    # fallback-only (do not do this if config is healthy)
-    GOOGLE_SHEETS_CREDENTIALS = _try_parse_json_dict(_env("GOOGLE_SHEETS_CREDENTIALS"))
+GOOGLE_SHEETS_CREDENTIALS: Optional[Dict[str, Any]] = _get_attr_any(settings, ["google_credentials_dict"], None)
+DEFAULT_SPREADSHEET_ID = _get_attr_any(settings, ["default_spreadsheet_id", "DEFAULT_SPREADSHEET_ID"], None)
+GOOGLE_SHEET_ID = _get_attr_any(settings, ["google_sheet_id", "GOOGLE_SHEET_ID"], None)
+GOOGLE_SHEET_RANGE = _get_attr_any(settings, ["google_sheet_range", "GOOGLE_SHEET_RANGE"], None)
+HAS_GOOGLE_SHEETS = bool(_get_attr_any(settings, ["has_google_sheets"], False))
 
-DEFAULT_SPREADSHEET_ID = _get_attr(settings, "default_spreadsheet_id", default=_env("DEFAULT_SPREADSHEET_ID", _env("GOOGLE_SHEET_ID")))
-GOOGLE_SHEET_ID = _get_attr(settings, "google_sheet_id", default=_env("GOOGLE_SHEET_ID"))
-GOOGLE_SHEET_RANGE = _get_attr(settings, "google_sheet_range", default=_env("GOOGLE_SHEET_RANGE"))
-HAS_GOOGLE_SHEETS = bool(_get_attr(settings, "has_google_sheets", default=bool(GOOGLE_SHEETS_CREDENTIALS) and bool(DEFAULT_SPREADSHEET_ID or GOOGLE_SHEET_ID)))
+SHEET_KSA_TADAWUL = _get_attr_any(settings, ["sheet_ksa_tadawul", "SHEET_KSA_TADAWUL"], "KSA_Tadawul_Market")
+SHEET_GLOBAL_MARKETS = _get_attr_any(settings, ["sheet_global_markets", "SHEET_GLOBAL_MARKETS"], "Global_Markets")
+SHEET_MUTUAL_FUNDS = _get_attr_any(settings, ["sheet_mutual_funds", "SHEET_MUTUAL_FUNDS"], "Mutual_Funds")
+SHEET_COMMODITIES_FX = _get_attr_any(settings, ["sheet_commodities_fx", "SHEET_COMMODITIES_FX"], "Commodities_FX")
+SHEET_MARKET_LEADERS = _get_attr_any(settings, ["sheet_market_leaders", "SHEET_MARKET_LEADERS"], "Market_Leaders")
+SHEET_MY_PORTFOLIO = _get_attr_any(settings, ["sheet_my_portfolio", "SHEET_MY_PORTFOLIO"], "My_Portfolio")
+SHEET_INSIGHTS_ANALYSIS = _get_attr_any(settings, ["sheet_insights_analysis", "SHEET_INSIGHTS_ANALYSIS"], "Insights_Analysis")
+SHEET_INVESTMENT_ADVISOR = _get_attr_any(settings, ["sheet_investment_advisor", "SHEET_INVESTMENT_ADVISOR"], "Investment_Advisor")
+SHEET_ECONOMIC_CALENDAR = _get_attr_any(settings, ["sheet_economic_calendar", "SHEET_ECONOMIC_CALENDAR"], "Economic_Calendar")
+SHEET_INVESTMENT_INCOME = _get_attr_any(settings, ["sheet_investment_income", "SHEET_INVESTMENT_INCOME"], "Investment_Income_Statement")
 
-# Sheet names (Apps Script alignment)
-SHEET_KSA_TADAWUL = str(_get_attr(settings, "sheet_ksa_tadawul", default=_env("SHEET_KSA_TADAWUL", "KSA_Tadawul_Market")))
-SHEET_GLOBAL_MARKETS = str(_get_attr(settings, "sheet_global_markets", default=_env("SHEET_GLOBAL_MARKETS", "Global_Markets")))
-SHEET_MUTUAL_FUNDS = str(_get_attr(settings, "sheet_mutual_funds", default=_env("SHEET_MUTUAL_FUNDS", "Mutual_Funds")))
-SHEET_COMMODITIES_FX = str(_get_attr(settings, "sheet_commodities_fx", default=_env("SHEET_COMMODITIES_FX", "Commodities_FX")))
-SHEET_MARKET_LEADERS = str(_get_attr(settings, "sheet_market_leaders", default=_env("SHEET_MARKET_LEADERS", "Market_Leaders")))
-SHEET_MY_PORTFOLIO = str(_get_attr(settings, "sheet_my_portfolio", default=_env("SHEET_MY_PORTFOLIO", "My_Portfolio")))
-SHEET_INSIGHTS_ANALYSIS = str(_get_attr(settings, "sheet_insights_analysis", default=_env("SHEET_INSIGHTS_ANALYSIS", "Insights_Analysis")))
-SHEET_INVESTMENT_ADVISOR = str(_get_attr(settings, "sheet_investment_advisor", default=_env("SHEET_INVESTMENT_ADVISOR", "Investment_Advisor")))
-SHEET_ECONOMIC_CALENDAR = str(_get_attr(settings, "sheet_economic_calendar", default=_env("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar")))
-SHEET_INVESTMENT_INCOME = str(_get_attr(settings, "sheet_investment_income", default=_env("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement")))
-
-# Logging flags
-LOG_LEVEL = str(_get_attr(settings, "log_level", default=_env("LOG_LEVEL", "info")) or "info").upper()
-LOG_JSON = bool(_get_attr(settings, "log_json", default=_safe_bool(_env("LOG_JSON"), False)))
+LOG_LEVEL = (str(_get_attr_any(settings, ["log_level", "LOG_LEVEL"], "info")) or "info").upper()
+LOG_JSON = bool(_get_attr_any(settings, ["log_json", "LOG_JSON"], False))
 IS_PRODUCTION = str(APP_ENV).strip().lower() in {"prod", "production"}
 
 
-# ------------------------------------------------------------
-# Legacy limits exports (used by older routes via `import env as env_mod`)
-# ------------------------------------------------------------
-# Enriched router
-ENRICHED_MAX_TICKERS = _safe_int(_get_attr(settings, "enriched_max_tickers", default=_env("ENRICHED_MAX_TICKERS", 250)), 250)
-ENRICHED_BATCH_SIZE = _safe_int(_get_attr(settings, "enriched_batch_size", default=_env("ENRICHED_BATCH_SIZE", 40)), 40)
-ENRICHED_CONCURRENCY = _safe_int(_get_attr(settings, "enriched_concurrency", default=_env("ENRICHED_CONCURRENCY", 8)), 8)
-ENRICHED_TIMEOUT_SEC = float(_safe_float(_get_attr(settings, "enriched_timeout_sec", default=_env("ENRICHED_TIMEOUT_SEC", 45.0)), 45.0))
-
-# Argaam router
-ARGAAM_MAX_TICKERS = _safe_int(_get_attr(settings, "argaam_max_tickers", default=_env("ARGAAM_MAX_TICKERS", 400)), 400)
-ARGAAM_BATCH_SIZE = _safe_int(_get_attr(settings, "argaam_batch_size", default=_env("ARGAAM_BATCH_SIZE", 40)), 40)
-ARGAAM_CONCURRENCY = _safe_int(_get_attr(settings, "argaam_concurrency", default=_env("ARGAAM_CONCURRENCY", 6)), 6)
-ARGAAM_TIMEOUT_SEC = float(_safe_float(_get_attr(settings, "argaam_timeout_sec", default=_env("ARGAAM_TIMEOUT_SEC", 45.0)), 45.0))
-
-# AI Analysis router
-AI_BATCH_SIZE = _safe_int(_get_attr(settings, "ai_batch_size", default=_env("AI_BATCH_SIZE", 20)), 20)
-AI_BATCH_TIMEOUT_SEC = float(_safe_float(_get_attr(settings, "ai_batch_timeout_sec", default=_env("AI_BATCH_TIMEOUT_SEC", 45.0)), 45.0))
-AI_BATCH_CONCURRENCY = _safe_int(_get_attr(settings, "ai_batch_concurrency", default=_env("AI_BATCH_CONCURRENCY", 5)), 5)
-AI_MAX_TICKERS = _safe_int(_get_attr(settings, "ai_max_tickers", default=_env("AI_MAX_TICKERS", 500)), 500)
-
-# Advanced Analysis router
-ADV_BATCH_SIZE = _safe_int(_get_attr(settings, "adv_batch_size", default=_env("ADV_BATCH_SIZE", 25)), 25)
-ADV_BATCH_TIMEOUT_SEC = float(_safe_float(_get_attr(settings, "adv_batch_timeout_sec", default=_env("ADV_BATCH_TIMEOUT_SEC", 45.0)), 45.0))
-ADV_BATCH_CONCURRENCY = _safe_int(_get_attr(settings, "adv_batch_concurrency", default=_env("ADV_BATCH_CONCURRENCY", 6)), 6)
-ADV_MAX_TICKERS = _safe_int(_get_attr(settings, "adv_max_tickers", default=_env("ADV_MAX_TICKERS", 500)), 500)
-
-
-# Convenience: safe summary (no secrets)
 def safe_env_summary() -> Dict[str, Any]:
     return {
-        "env_module_version": ENV_MODULE_VERSION,
         "app": APP_NAME,
         "env": APP_ENV,
         "version": APP_VERSION,
@@ -424,11 +299,8 @@ def safe_env_summary() -> Dict[str, Any]:
 
 
 __all__ = [
-    "ENV_MODULE_VERSION",
     "settings",
-    "refresh_settings",
     "safe_env_summary",
-    # Back-compat exports
     "APP_NAME",
     "APP_ENV",
     "APP_VERSION",
@@ -472,21 +344,4 @@ __all__ = [
     "LOG_LEVEL",
     "LOG_JSON",
     "IS_PRODUCTION",
-    # Legacy limits (important for older routers)
-    "ENRICHED_MAX_TICKERS",
-    "ENRICHED_BATCH_SIZE",
-    "ENRICHED_CONCURRENCY",
-    "ENRICHED_TIMEOUT_SEC",
-    "ARGAAM_MAX_TICKERS",
-    "ARGAAM_BATCH_SIZE",
-    "ARGAAM_CONCURRENCY",
-    "ARGAAM_TIMEOUT_SEC",
-    "AI_BATCH_SIZE",
-    "AI_BATCH_TIMEOUT_SEC",
-    "AI_BATCH_CONCURRENCY",
-    "AI_MAX_TICKERS",
-    "ADV_BATCH_SIZE",
-    "ADV_BATCH_TIMEOUT_SEC",
-    "ADV_BATCH_CONCURRENCY",
-    "ADV_MAX_TICKERS",
 ]
