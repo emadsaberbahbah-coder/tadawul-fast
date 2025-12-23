@@ -1,69 +1,96 @@
-=======================================================
-
-Python / FastAPI
-
-=======================================================
-
-pycache/
+# =======================================================
+# Python / FastAPI
+# =======================================================
+__pycache__/
 *.py[cod]
 *$py.class
 
-=======================================================
+# Byte-compiled / optimized / DLL files
+*.pyd
 
-Virtual Environment
+# Caches / test / typecheck
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+*.cover
+*.py,cover
 
-=======================================================
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
 
+# Jupyter / IPython
+.ipynb_checkpoints/
+.profile_default/
+ipython_config.py
+
+# =======================================================
+# Virtual Environments
+# =======================================================
 venv/
 .venv/
 env/
+ENV/
+.ENV/
 
-=======================================================
-
-Environment & Secrets (NEVER COMMIT THESE)
-
-=======================================================
-
+# =======================================================
+# Environment & Secrets (NEVER COMMIT THESE)
+# =======================================================
 .env
-env.local
 .env.*
 !.env.example
+env.local
+*.pem
+*.key
 
-Google Service Account Keys
-
+# Google / OAuth / Service Account secrets (targeted; NOT all *.json)
 credentials.json
+credentials*.json
 token.json
 service_account.json
-*.json
+service_account*.json
+google_service_account*.json
+client_secret*.json
+oauth*.json
 
-=======================================================
+# If you sometimes download keys into a folder:
+secrets/
+keys/
 
-Logs & Databases
-
-=======================================================
-
+# =======================================================
+# Logs & Local Databases
+# =======================================================
 *.log
 *.sqlite
+*.sqlite3
 *.db
 
-=======================================================
-
-Editor / OS
-
-=======================================================
-
+# =======================================================
+# Editor / OS
+# =======================================================
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-=======================================================
+# =======================================================
+# Local tooling / temp
+# =======================================================
+*.tmp
+*.temp
+*.swp
 
-Deployment
-
-=======================================================
-
-If you use Docker locally
-
-Dockerfile
-docker-compose.yml
+# =======================================================
+# Optional: Docker (ignore ONLY if you truly don't use Docker in this repo)
+# =======================================================
+# Dockerfile
+# docker-compose.yml
+# docker-compose.*.yml
