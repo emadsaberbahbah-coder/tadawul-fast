@@ -2,54 +2,157 @@
 """
 routes/enriched_quote.py
 ===========================================================
-Enriched Quote Routes (Google Sheets + API) - v2.3.0 (PROD SAFE)
+Enriched Quote Routes (Google Sheets + API) - v2.4.0 (PROD SAFE)
 
-Goals
-- Stable endpoints for Google Sheets / Apps Script:
+Stable endpoints for Google Sheets / Apps Script:
     GET  /v1/enriched/quote?symbol=1120.SR
     POST /v1/enriched/quotes   {symbols:[...], sheet_name?: "..."}
     GET  /v1/enriched/headers?sheet_name=...
-- Return:
-    - quote JSON (EnrichedQuote fields)
-    - optional Google Sheets row aligned to headers (typically 59 columns)
-- Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
-- Defensive limits (ENRICHED_MAX_TICKERS, ENRICHED_BATCH_SIZE).
+    GET  /v1/enriched/health
+
+Design goals:
+- Router must MOUNT even if optional modules are missing (Render-safe).
+- Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token set => open mode.
+- Defensive limits (ENRICHED_MAX_TICKERS, ENRICHED_BATCH_SIZE, ENRICHED_CONCURRENCY).
 - Engine resolution:
-    • prefer request.app.state.engine (created by main.py lifespan), else a safe singleton here.
-- Avoid hard failures for Sheets usage:
-    • /quotes will truncate to max and return status="partial" rather than raising 400.
+    • prefer request.app.state.engine (or aliases), else safe singleton here.
+- /quotes truncates to max and returns status="partial" (Sheets-friendly).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Literal, Tuple
+from importlib import import_module
+from typing import Any, Dict, List, Optional, Sequence, Literal
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
-
-from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol
-from core.enriched_quote import EnrichedQuote
-
-# Optional core.schemas (preferred)
-try:
-    from core.schemas import BatchProcessRequest, get_headers_for_sheet  # type: ignore
-except Exception:  # pragma: no cover
-    BatchProcessRequest = None  # type: ignore
-    get_headers_for_sheet = None  # type: ignore
+from starlette.responses import JSONResponse
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTE_VERSION = "2.3.0"
+ROUTE_VERSION = "2.4.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 
 # =============================================================================
-# Fallback request model + headers helper (keeps service alive even if schemas missing)
+# Safe imports (do NOT break router mounting)
+# =============================================================================
+def _safe_import(path: str) -> Optional[Any]:
+    try:
+        return import_module(path)
+    except Exception:
+        return None
+
+
+# Settings: prefer core.config, fallback to config, then env vars
+_get_settings = None
+for _p in ("core.config", "config"):
+    _m = _safe_import(_p)
+    if _m and hasattr(_m, "get_settings"):
+        _get_settings = getattr(_m, "get_settings")
+        break
+
+
+def _settings_obj() -> Any:
+    if _get_settings:
+        try:
+            return _get_settings()
+        except Exception:
+            return None
+    return None
+
+
+# Data engine & symbol normalizer (try v2 then legacy)
+DataEngine = None
+UnifiedQuote = None
+normalize_symbol = None
+
+for _p in ("core.data_engine_v2", "core.data_engine"):
+    _m = _safe_import(_p)
+    if not _m:
+        continue
+    if DataEngine is None and hasattr(_m, "DataEngine"):
+        DataEngine = getattr(_m, "DataEngine")
+    if UnifiedQuote is None and hasattr(_m, "UnifiedQuote"):
+        UnifiedQuote = getattr(_m, "UnifiedQuote")
+    if normalize_symbol is None and hasattr(_m, "normalize_symbol"):
+        normalize_symbol = getattr(_m, "normalize_symbol")
+    if DataEngine and UnifiedQuote and normalize_symbol:
+        break
+
+
+def _norm(sym: str) -> str:
+    s = (sym or "").strip()
+    if not s:
+        return ""
+    if normalize_symbol:
+        try:
+            return str(normalize_symbol(s)).strip()
+        except Exception:
+            return s
+    return s
+
+
+# EnrichedQuote: try core.enriched_quote then root enriched_quote, else fallback
+EnrichedQuote = None
+for _p in ("core.enriched_quote", "enriched_quote"):
+    _m = _safe_import(_p)
+    if _m and hasattr(_m, "EnrichedQuote"):
+        EnrichedQuote = getattr(_m, "EnrichedQuote")
+        break
+
+
+class _FallbackEnrichedQuote(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    symbol: str = ""
+    data_quality: str = "MISSING"
+    error: Optional[str] = None
+
+    @classmethod
+    def from_unified(cls, uq: Any) -> "_FallbackEnrichedQuote":
+        d = _model_to_dict(uq)
+        return cls(
+            symbol=str(d.get("symbol") or d.get("ticker") or ""),
+            data_quality=str(d.get("data_quality") or "MISSING"),
+            error=d.get("error"),
+        )
+
+    def to_row(self, headers: List[str]) -> List[Any]:
+        d = self.model_dump()
+        row: List[Any] = []
+        for h in headers:
+            key = str(h).strip()
+            if not key:
+                row.append("")
+                continue
+            k = key.lower()
+            if k in ("symbol", "ticker"):
+                row.append(self.symbol)
+            elif k == "error":
+                row.append(self.error or "")
+            elif k == "data_quality":
+                row.append(self.data_quality)
+            else:
+                row.append(d.get(key) or d.get(k) or "")
+        return row
+
+
+# Optional core.schemas helpers
+BatchProcessRequest = None
+get_headers_for_sheet = None
+_m = _safe_import("core.schemas")
+if _m:
+    BatchProcessRequest = getattr(_m, "BatchProcessRequest", None)
+    get_headers_for_sheet = getattr(_m, "get_headers_for_sheet", None)
+
+
+# =============================================================================
+# Fallback request model + headers helper
 # =============================================================================
 class _FallbackBatchProcessRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -60,15 +163,18 @@ class _FallbackBatchProcessRequest(BaseModel):
 
 
 def _fallback_headers() -> List[str]:
-    return ["Symbol", "Error"]
+    # Minimal but safe. If you want more default columns, expand here.
+    return ["Symbol", "Data_Quality", "Error"]
 
 
 def _resolve_headers(sheet_name: Optional[str]) -> List[str]:
     if get_headers_for_sheet:
         try:
             h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and h and any(str(x).strip().lower() == "symbol" for x in h):
-                return [str(x) for x in h]
+            if isinstance(h, list) and h:
+                # Must include Symbol
+                if any(str(x).strip().lower() == "symbol" for x in h):
+                    return [str(x) for x in h]
         except Exception:
             pass
     return _fallback_headers()
@@ -77,103 +183,187 @@ def _resolve_headers(sheet_name: Optional[str]) -> List[str]:
 # =============================================================================
 # Engine resolution (prefer app.state.engine; else singleton)
 # =============================================================================
-_ENGINE: Optional[DataEngine] = None
+_ENGINE: Optional[Any] = None
 _ENGINE_LOCK = asyncio.Lock()
 
 
-def _get_app_engine(request: Request) -> Optional[DataEngine]:
-    """
-    Prefer engine created in main.py lifespan: request.app.state.engine
-    Also accept common aliases.
-    """
+def _looks_like_engine(obj: Any) -> bool:
+    if obj is None:
+        return False
+    return any(hasattr(obj, m) for m in ("get_enriched_quotes", "get_quotes", "get_quote", "get_enriched_quote"))
+
+
+def _get_app_engine(request: Request) -> Optional[Any]:
     try:
         st = getattr(getattr(request, "app", None), "state", None)
         if not st:
             return None
         for attr in ("engine", "data_engine", "data_engine_v2"):
             eng = getattr(st, attr, None)
-            if isinstance(eng, DataEngine):
+            if _looks_like_engine(eng):
                 return eng
         return None
     except Exception:
         return None
 
 
-async def _get_singleton_engine() -> Optional[DataEngine]:
+async def _get_singleton_engine() -> Optional[Any]:
     global _ENGINE
     if _ENGINE is not None:
         return _ENGINE
+
     async with _ENGINE_LOCK:
-        if _ENGINE is None:
-            try:
-                _ENGINE = DataEngine()
-                logger.info("[enriched] DataEngine initialized (routes singleton).")
-            except Exception as exc:
-                logger.exception("[enriched] Failed to init DataEngine: %s", exc)
-                _ENGINE = None
+        if _ENGINE is not None:
+            return _ENGINE
+
+        if DataEngine is None:
+            logger.error("[enriched] DataEngine import missing -> engine unavailable.")
+            _ENGINE = None
+            return None
+
+        try:
+            _ENGINE = DataEngine()  # type: ignore
+            logger.info("[enriched] Engine initialized (routes singleton).")
+        except Exception as exc:
+            logger.exception("[enriched] Failed to init engine: %s", exc)
+            _ENGINE = None
+
     return _ENGINE
 
 
-async def _resolve_engine(request: Request) -> Optional[DataEngine]:
+async def _resolve_engine(request: Request) -> Optional[Any]:
     eng = _get_app_engine(request)
     if eng is not None:
         return eng
     return await _get_singleton_engine()
 
 
-async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[UnifiedQuote]:
-    """
-    Compatibility shim:
-    - Prefer engine.get_enriched_quotes
-    - Else engine.get_quotes
-    - Else per-symbol engine.get_quote
-    """
-    if hasattr(engine, "get_enriched_quotes"):
-        return await engine.get_enriched_quotes(syms)  # type: ignore
-    if hasattr(engine, "get_quotes"):
-        return await engine.get_quotes(syms)  # type: ignore
+# =============================================================================
+# Helpers
+# =============================================================================
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    # pydantic v2
+    try:
+        return obj.model_dump(exclude_none=False)  # type: ignore
+    except Exception:
+        pass
+    # pydantic v1
+    try:
+        return obj.dict()  # type: ignore
+    except Exception:
+        pass
+    # dataclass-like / plain object
+    try:
+        return dict(getattr(obj, "__dict__", {}) or {})
+    except Exception:
+        return {}
 
-    out: List[UnifiedQuote] = []
-    for s in syms:
-        out.append(await engine.get_quote(s))  # type: ignore
+
+def _get_int_setting(name: str, default: int) -> int:
+    s = _settings_obj()
+    if s is not None:
+        try:
+            v = getattr(s, name, None)
+            if isinstance(v, int) and v > 0:
+                return v
+        except Exception:
+            pass
+
+    # env.py legacy exports if present
+    _envm = _safe_import("env")
+    if _envm is not None:
+        try:
+            v = getattr(_envm, name, None)
+            if isinstance(v, int) and v > 0:
+                return v
+        except Exception:
+            pass
+
+    try:
+        ev = os.getenv(name)
+        if ev:
+            n = int(ev)
+            if n > 0:
+                return n
+    except Exception:
+        pass
+
+    return default
+
+
+def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in symbols or []:
+        if x is None:
+            continue
+        s = _norm(str(x))
+        if not s:
+            continue
+        su = s.upper()
+        if su in seen:
+            continue
+        seen.add(su)
+        out.append(su)
     return out
 
 
-async def _engine_get_quote(engine: DataEngine, sym: str) -> UnifiedQuote:
-    if hasattr(engine, "get_quote"):
-        return await engine.get_quote(sym)  # type: ignore
-    # last resort: batch one
-    res = await _engine_get_quotes(engine, [sym])
-    return (res or [UnifiedQuote(symbol=sym, data_quality="MISSING", error="No data returned").finalize()])[0]
+def _chunk(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _make_eq(uq: Any) -> Any:
+    if EnrichedQuote:
+        try:
+            return EnrichedQuote.from_unified(uq)  # type: ignore
+        except Exception:
+            pass
+    # fallback
+    return _FallbackEnrichedQuote.from_unified(uq)
+
+
+def _eq_to_row(eq: Any, headers: List[str]) -> List[Any]:
+    try:
+        return eq.to_row(headers)  # type: ignore
+    except Exception:
+        return _FallbackEnrichedQuote(**_model_to_dict(eq)).to_row(headers)
+
+
+def _eq_to_dict(eq: Any) -> Dict[str, Any]:
+    return _model_to_dict(eq)
 
 
 # =============================================================================
-# Auth (X-APP-TOKEN)
+# Auth (X-APP-TOKEN) => open mode if no token configured
 # =============================================================================
 @lru_cache(maxsize=1)
 def _allowed_tokens() -> List[str]:
     tokens: List[str] = []
-    try:
-        s = get_settings()
+
+    s = _settings_obj()
+    if s is not None:
         for attr in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
-            v = getattr(s, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
-    except Exception:
-        pass
+            try:
+                v = getattr(s, attr, None)
+                if isinstance(v, str) and v.strip():
+                    tokens.append(v.strip())
+            except Exception:
+                pass
 
-    # env.py exports if present
-    try:
-        import env as env_mod  # type: ignore
-
+    _envm = _safe_import("env")
+    if _envm is not None:
         for attr in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
-            v = getattr(env_mod, attr, None)
-            if isinstance(v, str) and v.strip():
-                tokens.append(v.strip())
-    except Exception:
-        pass
+            try:
+                v = getattr(_envm, attr, None)
+                if isinstance(v, str) and v.strip():
+                    tokens.append(v.strip())
+            except Exception:
+                pass
 
-    # env vars last resort
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
         v = os.getenv(k)
         if v and v.strip():
@@ -201,89 +391,37 @@ def _require_token(x_app_token: Optional[str]) -> None:
 
 
 # =============================================================================
-# Limits helpers
+# Engine call shims
 # =============================================================================
-def _get_int_setting(name: str, default: int) -> int:
-    # settings first
-    try:
-        s = get_settings()
-        v = getattr(s, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    except Exception:
-        pass
+async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
+    # prefer batch methods
+    if hasattr(engine, "get_enriched_quotes"):
+        return await engine.get_enriched_quotes(syms)  # type: ignore
+    if hasattr(engine, "get_quotes"):
+        return await engine.get_quotes(syms)  # type: ignore
 
-    # env.py next
-    try:
-        import env as env_mod  # type: ignore
+    # fallback: gather per-symbol
+    conc = _get_int_setting("ENRICHED_CONCURRENCY", 8)
+    sem = asyncio.Semaphore(max(1, conc))
 
-        v = getattr(env_mod, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    except Exception:
-        pass
+    async def _one(s: str) -> Any:
+        async with sem:
+            return await _engine_get_quote(engine, s)
 
-    # env vars last
-    try:
-        ev = os.getenv(name)
-        if ev:
-            n = int(ev)
-            if n > 0:
-                return n
-    except Exception:
-        pass
-
-    return default
+    return list(await asyncio.gather(*[_one(s) for s in syms], return_exceptions=False))
 
 
-def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in symbols or []:
-        if x is None:
-            continue
-        s = normalize_symbol(str(x).strip())
-        if not s:
-            continue
-        su = s.upper()
-        if su in seen:
-            continue
-        seen.add(su)
-        out.append(su)
-    return out
-
-
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    # pydantic v2
-    try:
-        return obj.model_dump(exclude_none=False)  # type: ignore
-    except Exception:
-        pass
-    # pydantic v1
-    try:
-        return obj.dict()  # type: ignore
-    except Exception:
-        pass
-    # raw
-    try:
-        return dict(getattr(obj, "__dict__", {}) or {})
-    except Exception:
-        return {}
-
-
-def _build_row_payload(q: UnifiedQuote, headers: List[str]) -> Dict[str, Any]:
-    eq = EnrichedQuote.from_unified(q)
-    return {
-        "headers": list(headers),
-        "row": eq.to_row(headers),
-        "quote": _model_to_dict(eq),
-    }
-
-
-def _chunk(items: List[str], size: int) -> List[List[str]]:
-    if size <= 0:
-        return [items]
-    return [items[i : i + size] for i in range(0, len(items), size)]
+async def _engine_get_quote(engine: Any, sym: str) -> Any:
+    if hasattr(engine, "get_quote"):
+        return await engine.get_quote(sym)  # type: ignore
+    if hasattr(engine, "get_enriched_quote"):
+        return await engine.get_enriched_quote(sym)  # type: ignore
+    # last resort: batch one
+    res = await _engine_get_quotes(engine, [sym])
+    if res:
+        return res[0]
+    # construct minimal fallback UnifiedQuote-like dict
+    return {"symbol": _norm(sym) or sym, "data_quality": "MISSING", "error": "No data returned"}
 
 
 # =============================================================================
@@ -293,23 +431,28 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
 async def enriched_health(request: Request) -> Dict[str, Any]:
     max_t = _get_int_setting("ENRICHED_MAX_TICKERS", 250)
     batch_sz = _get_int_setting("ENRICHED_BATCH_SIZE", 40)
+    conc = _get_int_setting("ENRICHED_CONCURRENCY", 8)
 
     eng = await _resolve_engine(request)
+    providers = []
+    try:
+        providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
+    except Exception:
+        providers = []
 
     return {
         "status": "ok",
         "module": "routes.enriched_quote",
         "version": ROUTE_VERSION,
-        "engine": "DataEngineV2",
-        "providers": list(getattr(eng, "enabled_providers", []) or []) if eng else [],
-        "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz},
+        "engine_available": bool(eng),
+        "providers": providers,
+        "limits": {"enriched_max_tickers": max_t, "enriched_batch_size": batch_sz, "enriched_concurrency": conc},
         "auth": "open" if not _allowed_tokens() else "token",
     }
 
 
 @router.get("/headers")
 async def enriched_headers(
-    request: Request,
     sheet_name: Optional[str] = Query(default=None, description="Optional sheet name to resolve headers."),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> Dict[str, Any]:
@@ -328,41 +471,38 @@ async def enriched_quote(
 ) -> Dict[str, Any]:
     _require_token(x_app_token)
 
-    sym = (symbol or "").strip()
+    sym = _norm(symbol)
     if not sym:
         raise HTTPException(status_code=400, detail="symbol is required")
 
     eng = await _resolve_engine(request)
+    headers = _resolve_headers(sheet_name)
+
     if eng is None:
-        eq = EnrichedQuote.from_unified(UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error="Engine unavailable").finalize())
+        eq = _make_eq({"symbol": sym, "data_quality": "MISSING", "error": "Engine unavailable"})
         if format == "quote":
-            return _model_to_dict(eq)
-        headers = _resolve_headers(sheet_name)
-        row = eq.to_row(headers)
+            return _eq_to_dict(eq)
+        row = _eq_to_row(eq, headers)
         if format == "row":
-            return {"symbol": eq.symbol, "headers": headers, "row": row}
-        return {"sheet_name": sheet_name, "headers": headers, "row": row, "quote": _model_to_dict(eq)}
+            return {"symbol": sym, "headers": headers, "row": row}
+        return {"sheet_name": sheet_name, "headers": headers, "row": row, "quote": _eq_to_dict(eq)}
 
     try:
-        q = await _engine_get_quote(eng, sym)
+        uq = await _engine_get_quote(eng, sym)
     except Exception as exc:
-        q = UnifiedQuote(symbol=normalize_symbol(sym) or sym, data_quality="MISSING", error=str(exc)).finalize()
+        uq = {"symbol": sym, "data_quality": "MISSING", "error": str(exc)}
+
+    eq = _make_eq(uq)
 
     if format == "quote":
-        return _model_to_dict(EnrichedQuote.from_unified(q))
+        return _eq_to_dict(eq)
 
-    headers = _resolve_headers(sheet_name)
-    payload = _build_row_payload(q, headers)
+    row = _eq_to_row(eq, headers)
 
     if format == "row":
-        return {
-            "symbol": payload["quote"].get("symbol", normalize_symbol(sym) or sym),
-            "headers": payload["headers"],
-            "row": payload["row"],
-        }
+        return {"symbol": sym, "headers": headers, "row": row}
 
-    payload["sheet_name"] = sheet_name
-    return payload
+    return {"sheet_name": sheet_name, "headers": headers, "row": row, "quote": _eq_to_dict(eq)}
 
 
 @router.post("/quotes")
@@ -374,12 +514,13 @@ async def enriched_quotes(
 ) -> Dict[str, Any]:
     _require_token(x_app_token)
 
-    # Accept core.schemas.BatchProcessRequest if available, else fallback model
     Model = BatchProcessRequest or _FallbackBatchProcessRequest  # type: ignore
+
+    # parse request safely
+    parsed = None
     try:
         parsed = req if isinstance(req, Model) else Model.model_validate(req)  # type: ignore
     except Exception:
-        # v1 fallback
         try:
             parsed = Model.parse_obj(req)  # type: ignore
         except Exception:
@@ -417,17 +558,19 @@ async def enriched_quotes(
         symbols = symbols[:max_t]
 
     eng = await _resolve_engine(request)
+    rows_out: List[List[Any]] = []
+    quotes_out: List[Dict[str, Any]] = []
+
     if eng is None:
-        status = "error"
+        status = "error" if status == "success" else status
         error_msg = (error_msg + " " if error_msg else "") + "Engine unavailable"
-        rows_out: List[List[Any]] = []
-        quotes_out: List[Dict[str, Any]] = []
         for s in symbols:
-            eq = EnrichedQuote.from_unified(UnifiedQuote(symbol=s, data_quality="MISSING", error="Engine unavailable").finalize())
+            eq = _make_eq({"symbol": s, "data_quality": "MISSING", "error": "Engine unavailable"})
             if format in ("rows", "both"):
-                rows_out.append(eq.to_row(headers))
+                rows_out.append(_eq_to_row(eq, headers))
             if format in ("quotes", "both"):
-                quotes_out.append(_model_to_dict(eq))
+                quotes_out.append(_eq_to_dict(eq))
+
         resp: Dict[str, Any] = {
             "status": status,
             "error": error_msg,
@@ -443,30 +586,33 @@ async def enriched_quotes(
             resp["quotes"] = quotes_out
         return resp
 
-    rows_out: List[List[Any]] = []
-    quotes_out: List[Dict[str, Any]] = []
-
-    # Soft batching (keeps memory stable)
+    # batched retrieval
     for chunk in _chunk(symbols, batch_sz):
         try:
-            quotes = await _engine_get_quotes(eng, chunk)
+            got = await _engine_get_quotes(eng, chunk)
         except Exception as exc:
             status = "partial"
             error_msg = (error_msg + " " if error_msg else "") + f"Batch error: {exc}"
-            quotes = [UnifiedQuote(symbol=s, data_quality="MISSING", error=str(exc)).finalize() for s in chunk]
+            got = [{"symbol": s, "data_quality": "MISSING", "error": str(exc)} for s in chunk]
 
-        # Preserve order by symbol
-        m = {getattr(q, "symbol", "").upper(): q for q in (quotes or []) if getattr(q, "symbol", None)}
+        # map by symbol upper
+        m: Dict[str, Any] = {}
+        for q in got or []:
+            d = _model_to_dict(q)
+            k = str(d.get("symbol") or d.get("ticker") or "").upper()
+            if k:
+                m[k] = q
+
         for s in chunk:
-            uq = m.get(s.upper()) or UnifiedQuote(symbol=s.upper(), data_quality="MISSING", error="No data returned").finalize()
-            eq = EnrichedQuote.from_unified(uq)
+            uq = m.get(s.upper()) or {"symbol": s.upper(), "data_quality": "MISSING", "error": "No data returned"}
+            eq = _make_eq(uq)
 
             if format in ("rows", "both"):
-                rows_out.append(eq.to_row(headers))
+                rows_out.append(_eq_to_row(eq, headers))
             if format in ("quotes", "both"):
-                quotes_out.append(_model_to_dict(eq))
+                quotes_out.append(_eq_to_dict(eq))
 
-    resp: Dict[str, Any] = {
+    resp2: Dict[str, Any] = {
         "status": status,
         "error": error_msg,
         "operation": operation,
@@ -476,11 +622,11 @@ async def enriched_quotes(
         "headers": headers,
     }
     if format in ("rows", "both"):
-        resp["rows"] = rows_out
+        resp2["rows"] = rows_out
     if format in ("quotes", "both"):
-        resp["quotes"] = quotes_out
+        resp2["quotes"] = quotes_out
 
-    return resp
+    return resp2
 
 
 __all__ = ["router"]
