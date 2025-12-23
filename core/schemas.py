@@ -2,7 +2,7 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEETS SCHEMAS + HEADERS – v3.0.0 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.2.0 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
@@ -14,9 +14,11 @@ Purpose
 - Provide shared request models (BatchProcessRequest) used by routers.
 
 Design rules
-- Import-safe: no DataEngine imports, no heavy dependencies.
-- Defensive: always returns a valid header list (never raises).
-- Stable: DEFAULT_HEADERS_59 order must not change lightly.
+✅ Import-safe: no DataEngine imports, no heavy dependencies.
+✅ Defensive: always returns a valid header list (never raises).
+✅ Stable: DEFAULT_HEADERS_59 order must not change lightly.
+✅ No mutation leaks: always returns COPIES of header lists.
+✅ Better alignment: sheet aliases include your actual page names (Global_Markets, Insights_Analysis, etc).
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.0.0"
+SCHEMAS_VERSION = "3.2.0"
 
 
 # =============================================================================
@@ -121,43 +123,72 @@ if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
 # =============================================================================
 
 def _norm_sheet_name(name: Optional[str]) -> str:
+    """
+    Normalizes sheet names from Google Sheets (often with spaces/case).
+    Examples:
+      "Global_Markets" -> "global_markets"
+      "Insights Analysis" -> "insights_analysis"
+      "KSA-Tadawul" -> "ksa_tadawul"
+    """
     s = (name or "").strip().lower()
+    if not s:
+        return ""
     s = s.replace("-", "_").replace(" ", "_")
     while "__" in s:
         s = s.replace("__", "_")
     return s
 
 
-# Your 9-page dashboard sheets (aliases included). All use the canonical 59 by default.
+# Your 9-page dashboard sheets (aliases included).
+# All use canonical 59 by default unless you intentionally define exceptions.
 _SHEET_HEADERS: Dict[str, List[str]] = {
-    # KSA
+    # -------------------------
+    # KSA / Tadawul pages
+    # -------------------------
     "ksa_tadawul": DEFAULT_HEADERS_59,
     "ksa_tadawul_market": DEFAULT_HEADERS_59,
     "ksa_market": DEFAULT_HEADERS_59,
     "tadawul": DEFAULT_HEADERS_59,
+    "ksa": DEFAULT_HEADERS_59,
 
-    # Global
+    # -------------------------
+    # Global Markets pages
+    # (IMPORTANT: your real sheet is "Global_Markets")
+    # -------------------------
     "global_markets": DEFAULT_HEADERS_59,
     "global_market": DEFAULT_HEADERS_59,
+    "global": DEFAULT_HEADERS_59,
 
+    # -------------------------
     # Mutual Funds
+    # -------------------------
     "mutual_funds": DEFAULT_HEADERS_59,
     "mutualfunds": DEFAULT_HEADERS_59,
+    "funds": DEFAULT_HEADERS_59,
 
+    # -------------------------
     # Commodities & FX
+    # -------------------------
     "commodities_fx": DEFAULT_HEADERS_59,
     "commodities_and_fx": DEFAULT_HEADERS_59,
+    "commodities": DEFAULT_HEADERS_59,
     "fx": DEFAULT_HEADERS_59,
 
+    # -------------------------
     # Portfolio
+    # -------------------------
     "my_portfolio": DEFAULT_HEADERS_59,
     "my_portfolio_investment": DEFAULT_HEADERS_59,
+    "my_portfolio_investment_income_statement": DEFAULT_HEADERS_59,
     "portfolio": DEFAULT_HEADERS_59,
 
-    # Insights / Analysis pages typically still want canonical quote rows when using /enriched or /analysis
-    "insights_analysis": DEFAULT_HEADERS_59,
+    # -------------------------
+    # Insights / Analysis / Advisor
+    # -------------------------
+    "insights_analysis": DEFAULT_HEADERS_59,   # IMPORTANT: your real sheet is "Insights_Analysis"
     "analysis": DEFAULT_HEADERS_59,
     "investment_advisor": DEFAULT_HEADERS_59,
+    "advisor": DEFAULT_HEADERS_59,
 }
 
 
@@ -173,13 +204,20 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
             return list(DEFAULT_HEADERS_59)
 
         # direct match
-        if key in _SHEET_HEADERS:
-            return list(_SHEET_HEADERS[key])
+        v = _SHEET_HEADERS.get(key)
+        if isinstance(v, list) and v:
+            return list(v)
 
-        # prefix / contains matching (defensive)
-        for k, v in _SHEET_HEADERS.items():
+        # defensive matching: try common patterns
+        # 1) remove leading/trailing underscores
+        key2 = key.strip("_")
+        if key2 and key2 in _SHEET_HEADERS:
+            return list(_SHEET_HEADERS[key2])
+
+        # 2) prefix / contains matching
+        for k, vv in _SHEET_HEADERS.items():
             if key == k or key.startswith(k) or k in key:
-                return list(v)
+                return list(vv)
 
         return list(DEFAULT_HEADERS_59)
     except Exception:
@@ -208,8 +246,8 @@ class _ExtraIgnore(BaseModel):
 
 class BatchProcessRequest(_ExtraIgnore):
     """
-    Shared contract used by routes/enriched_quote.py (and can be reused elsewhere).
-    Supports both `symbols` and `tickers` to be client-robust.
+    Shared contract used by routes/enriched_quote.py (and reusable elsewhere).
+    Supports both `symbols` and `tickers` (client robustness).
     """
     operation: str = Field(default="refresh")
     sheet_name: Optional[str] = Field(default=None)
@@ -217,6 +255,10 @@ class BatchProcessRequest(_ExtraIgnore):
     tickers: List[str] = Field(default_factory=list)  # alias support
 
     def all_symbols(self) -> List[str]:
+        """
+        Returns combined symbols (symbols + tickers), trimmed, in original order,
+        without forcing uniqueness (caller may handle uniqueness/normalize).
+        """
         out: List[str] = []
         for x in (self.symbols or []) + (self.tickers or []):
             if x is None:
