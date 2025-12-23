@@ -1,6 +1,6 @@
 # routes/ai_analysis.py
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.3.0)
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.4.0)
 
 Key goals
 - Engine-driven only: core.data_engine_v2.DataEngine (no direct provider calls).
@@ -11,8 +11,9 @@ Key goals
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 
 Notes
-- Repeated patterns (auth + engine resolution) are intentionally compact here
-  to keep this module self-contained and avoid circular imports.
+- This module is intentionally self-contained (auth + engine resolution) to avoid circular imports.
+- If EnrichedQuote model is not importable for any reason, we still return 59-col rows via a
+  robust fallback mapping (never crash, never break Sheets).
 """
 
 from __future__ import annotations
@@ -29,16 +30,31 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.config import get_settings
 from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol
-from core.enriched_quote import EnrichedQuote
 
+# Canonical headers (59 cols) when available
 try:
-    from core.schemas import get_headers_for_sheet  # canonical 59 cols
+    from core.schemas import get_headers_for_sheet  # type: ignore
 except Exception:  # pragma: no cover
     get_headers_for_sheet = None  # type: ignore
 
+# Prefer EnrichedQuote if your project exposes it (best formatting & mapping)
+EnrichedQuote = None  # type: ignore
+try:
+    from core.enriched_quote import EnrichedQuote as _EQ  # type: ignore
+
+    EnrichedQuote = _EQ  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from routes.enriched_quote import EnrichedQuote as _EQ2  # type: ignore
+
+        EnrichedQuote = _EQ2  # type: ignore
+    except Exception:
+        EnrichedQuote = None  # type: ignore
+
+
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.3.0"
+AI_ANALYSIS_VERSION = "3.4.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -48,6 +64,8 @@ router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 @lru_cache(maxsize=1)
 def _allowed_tokens() -> List[str]:
     tokens: List[str] = []
+
+    # settings first
     try:
         s = get_settings()
         for attr in ("app_token", "backup_app_token", "APP_TOKEN", "BACKUP_APP_TOKEN"):
@@ -57,7 +75,7 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
-    # Also support env.py exports if present
+    # env.py exports if present
     try:
         import env as env_mod  # type: ignore
 
@@ -67,6 +85,12 @@ def _allowed_tokens() -> List[str]:
                 tokens.append(v.strip())
     except Exception:
         pass
+
+    # environment variables last resort
+    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
+        v = os.getenv(k)
+        if v and v.strip():
+            tokens.append(v.strip())
 
     # de-dup preserve order
     out: List[str] = []
@@ -90,36 +114,49 @@ def _require_token_or_401(x_app_token: Optional[str]) -> None:
 
 
 # =============================================================================
-# Engine resolution (prefer app.state.engine)
+# Engine resolution (prefer app.state.engine; else singleton)
 # =============================================================================
 _ENGINE: Optional[DataEngine] = None
 _ENGINE_LOCK = asyncio.Lock()
 
 
-async def _get_engine(request: Optional[Request] = None) -> Optional[DataEngine]:
-    # 1) prefer engine created in main.py lifespan
+def _get_app_engine(request: Optional[Request]) -> Optional[DataEngine]:
     try:
-        if request is not None:
-            st = getattr(getattr(request, "app", None), "state", None)
-            eng = getattr(st, "engine", None)
+        if request is None:
+            return None
+        st = getattr(getattr(request, "app", None), "state", None)
+        if not st:
+            return None
+        for attr in ("engine", "data_engine", "data_engine_v2"):
+            eng = getattr(st, attr, None)
             if isinstance(eng, DataEngine):
                 return eng
+        return None
     except Exception:
-        pass
+        return None
 
-    # 2) fallback singleton
+
+async def _get_singleton_engine() -> Optional[DataEngine]:
     global _ENGINE
     if _ENGINE is not None:
         return _ENGINE
+
     async with _ENGINE_LOCK:
         if _ENGINE is None:
             try:
                 _ENGINE = DataEngine()
-                logger.info("[analysis] DataEngine initialized (singleton).")
+                logger.info("[analysis] DataEngine initialized (fallback singleton).")
             except Exception as exc:
                 logger.exception("[analysis] Failed to init DataEngine: %s", exc)
                 _ENGINE = None
     return _ENGINE
+
+
+async def _resolve_engine(request: Optional[Request]) -> Optional[DataEngine]:
+    eng = _get_app_engine(request)
+    if eng is not None:
+        return eng
+    return await _get_singleton_engine()
 
 
 # =============================================================================
@@ -127,7 +164,7 @@ async def _get_engine(request: Optional[Request] = None) -> Optional[DataEngine]
 # =============================================================================
 def _safe_int(x: Any, default: int) -> int:
     try:
-        v = int(x)
+        v = int(str(x).strip())
         return v if v > 0 else default
     except Exception:
         return default
@@ -135,7 +172,7 @@ def _safe_int(x: Any, default: int) -> int:
 
 def _safe_float(x: Any, default: float) -> float:
     try:
-        v = float(x)
+        v = float(str(x).strip())
         return v if v > 0 else default
     except Exception:
         return default
@@ -153,11 +190,17 @@ def _cfg() -> Dict[str, Any]:
     concurrency = _safe_int(getattr(s, "ai_batch_concurrency", None), 5)
     max_tickers = _safe_int(getattr(s, "ai_max_tickers", None), 500)
 
-    # env overrides (optional)
+    # env overrides
     batch_size = _safe_int(os.getenv("AI_BATCH_SIZE", batch_size), batch_size)
     timeout_sec = _safe_float(os.getenv("AI_BATCH_TIMEOUT_SEC", timeout_sec), timeout_sec)
     concurrency = _safe_int(os.getenv("AI_BATCH_CONCURRENCY", concurrency), concurrency)
     max_tickers = _safe_int(os.getenv("AI_MAX_TICKERS", max_tickers), max_tickers)
+
+    # sanity clamps
+    batch_size = max(5, min(200, batch_size))
+    timeout_sec = max(5.0, min(180.0, timeout_sec))
+    concurrency = max(1, min(25, concurrency))
+    max_tickers = max(10, min(2000, max_tickers))
 
     return {
         "batch_size": batch_size,
@@ -232,17 +275,20 @@ class SheetAnalysisResponse(_ExtraIgnoreBase):
 # =============================================================================
 # Helpers
 # =============================================================================
-def _clean_symbols(items: Sequence[str]) -> List[str]:
-    raw = [normalize_symbol(x) for x in (items or [])]
-    raw = [x for x in raw if x]
+def _clean_symbols(items: Sequence[Any]) -> List[str]:
     seen = set()
     out: List[str] = []
-    for x in raw:
-        xu = x.upper()
-        if xu in seen:
+    for x in (items or []):
+        if x is None:
             continue
-        seen.add(xu)
-        out.append(xu)
+        s = normalize_symbol(str(x).strip())
+        if not s:
+            continue
+        su = s.upper()
+        if su in seen:
+            continue
+        seen.add(su)
+        out.append(su)
     return out
 
 
@@ -260,37 +306,109 @@ def _select_headers(sheet_name: Optional[str]) -> List[str]:
                 return [str(x) for x in h]
         except Exception:
             pass
-    # last-resort fallback
+    # last-resort fallback (Sheets will still render)
     return ["Symbol", "Error"]
+
+
+def _idx(headers: List[str], name: str) -> Optional[int]:
+    k = name.strip().lower()
+    for i, h in enumerate(headers):
+        if str(h).strip().lower() == k:
+            return i
+    return None
 
 
 def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
     row = [None] * len(headers)
-    try:
-        sym_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "symbol")
-        row[sym_idx] = symbol
-    except Exception:
-        pass
-    try:
-        err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
-        row[err_idx] = err
-    except Exception:
-        pass
+    i_sym = _idx(headers, "Symbol")
+    if i_sym is not None:
+        row[i_sym] = symbol
+    i_err = _idx(headers, "Error")
+    if i_err is not None:
+        row[i_err] = err
     return row
 
 
-def _extract_sources(eq: EnrichedQuote) -> List[str]:
-    ds = getattr(eq, "data_source", None)
-    return [ds] if ds else []
+def _extract_sources_from_any(x: Any) -> List[str]:
+    if not x:
+        return []
+    if isinstance(x, list):
+        return [str(a).strip() for a in x if str(a).strip()]
+    s = str(x).strip()
+    if not s:
+        return []
+    if "," in s:
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        return parts or [s]
+    return [s]
 
 
 def _ratio_to_percent(v: Optional[float]) -> Optional[float]:
+    """
+    Normalize common ratios that may come as decimals to percent scale:
+    If -1..1 => *100, else return as-is.
+    """
     if v is None:
         return None
     try:
-        return (v * 100.0) if -1.0 <= v <= 1.0 else v
+        return (float(v) * 100.0) if -1.0 <= float(v) <= 1.0 else float(v)
     except Exception:
         return v
+
+
+def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
+    i_err = _idx(headers, "Error")
+    if i_err is None:
+        return "success"
+    for r in rows:
+        if len(r) > i_err and (r[i_err] not in (None, "", "null", "None")):
+            return "partial"
+    return "success"
+
+
+def _safe_get(obj: Any, *names: str) -> Any:
+    for n in names:
+        try:
+            v = getattr(obj, n, None)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[float]:
+    try:
+        cp_f = float(cp)
+        lo = float(low_52w)
+        hi = float(high_52w)
+        if hi == lo:
+            return None
+        return round(((cp_f - lo) / (hi - lo)) * 100.0, 2)
+    except Exception:
+        return None
+
+
+def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
+    """
+    Best-effort conversion to Asia/Riyadh.
+    If parsing fails, returns None.
+    """
+    if not utc_any:
+        return None
+    try:
+        from zoneinfo import ZoneInfo  # py3.9+
+
+        tz = ZoneInfo("Asia/Riyadh")
+        if isinstance(utc_any, datetime):
+            dt = utc_any
+        else:
+            dt = datetime.fromisoformat(str(utc_any))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).isoformat()
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -301,7 +419,7 @@ async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[Unifie
     Compatibility shim:
     - Prefer engine.get_enriched_quotes if present
     - Else engine.get_quotes
-    - Else fall back per-symbol engine.get_quote
+    - Else per-symbol engine.get_quote
     """
     if hasattr(engine, "get_enriched_quotes"):
         return await engine.get_enriched_quotes(syms)  # type: ignore
@@ -326,7 +444,7 @@ async def _get_quotes_chunked(
     if not clean:
         return {}
 
-    engine = await _get_engine(request)
+    engine = await _resolve_engine(request)
     if engine is None:
         msg = "Engine unavailable"
         return {s: UnifiedQuote(symbol=s, data_quality="MISSING", error=msg).finalize() for s in clean}
@@ -358,9 +476,7 @@ async def _get_quotes_chunked(
 
         for s in chunk_syms:
             s_up = s.upper()
-            out[s_up] = chunk_map.get(s_up) or UnifiedQuote(
-                symbol=s_up, data_quality="MISSING", error="No data returned"
-            ).finalize()
+            out[s_up] = chunk_map.get(s_up) or UnifiedQuote(symbol=s_up, data_quality="MISSING", error="No data returned").finalize()
 
     return out
 
@@ -369,52 +485,154 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: UnifiedQuote) -> SingleAnalysisResponse:
-    # Unified -> Enriched -> (best-effort scoring)
-    eq = EnrichedQuote.from_unified(uq)
-
+    # best-effort scoring on UnifiedQuote itself (some engines already attach scores)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
 
-        eq = enrich_with_scores(eq)  # type: ignore
+        uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
 
-    sym = (getattr(eq, "symbol", None) or normalize_symbol(requested_symbol) or requested_symbol or "").upper()
+    sym = (getattr(uq, "symbol", None) or normalize_symbol(requested_symbol) or requested_symbol or "").upper()
 
     return SingleAnalysisResponse(
         symbol=sym,
-        name=getattr(eq, "name", None),
-        market_region=getattr(eq, "market", None),
+        name=_safe_get(uq, "name", "company_name"),
+        market_region=_safe_get(uq, "market", "market_region"),
 
-        price=getattr(eq, "current_price", None),
-        change_pct=getattr(eq, "percent_change", None),
-        market_cap=getattr(eq, "market_cap", None),
-        pe_ttm=getattr(eq, "pe_ttm", None),
-        pb=getattr(eq, "pb", None),
+        price=_safe_get(uq, "current_price", "last_price", "price"),
+        change_pct=_safe_get(uq, "percent_change", "change_pct"),
+        market_cap=_safe_get(uq, "market_cap"),
+        pe_ttm=_safe_get(uq, "pe_ttm"),
+        pb=_safe_get(uq, "pb"),
 
-        dividend_yield=_ratio_to_percent(getattr(eq, "dividend_yield", None)),
-        roe=_ratio_to_percent(getattr(eq, "roe", None)),
-        roa=_ratio_to_percent(getattr(eq, "roa", None)),
+        dividend_yield=_ratio_to_percent(_safe_get(uq, "dividend_yield")),
+        roe=_ratio_to_percent(_safe_get(uq, "roe")),
+        roa=_ratio_to_percent(_safe_get(uq, "roa")),
 
-        data_quality=getattr(eq, "data_quality", "MISSING") or "MISSING",
+        data_quality=str(_safe_get(uq, "data_quality") or "MISSING"),
 
-        value_score=getattr(eq, "value_score", None),
-        quality_score=getattr(eq, "quality_score", None),
-        momentum_score=getattr(eq, "momentum_score", None),
-        opportunity_score=getattr(eq, "opportunity_score", None),
-        risk_score=getattr(eq, "risk_score", None),
-        overall_score=getattr(eq, "overall_score", None),
-        recommendation=getattr(eq, "recommendation", None),
+        value_score=_safe_get(uq, "value_score"),
+        quality_score=_safe_get(uq, "quality_score"),
+        momentum_score=_safe_get(uq, "momentum_score"),
+        opportunity_score=_safe_get(uq, "opportunity_score"),
+        risk_score=_safe_get(uq, "risk_score"),
+        overall_score=_safe_get(uq, "overall_score"),
+        recommendation=_safe_get(uq, "recommendation"),
 
-        fair_value=getattr(eq, "fair_value", None),
-        upside_percent=getattr(eq, "upside_percent", None),
-        valuation_label=getattr(eq, "valuation_label", None),
+        fair_value=_safe_get(uq, "fair_value"),
+        upside_percent=_safe_get(uq, "upside_percent"),
+        valuation_label=_safe_get(uq, "valuation_label"),
 
-        last_updated_utc=getattr(eq, "last_updated_utc", None),
-        sources=_extract_sources(eq),
+        last_updated_utc=_safe_get(uq, "last_updated_utc"),
+        sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
 
-        error=getattr(eq, "error", None),
+        error=_safe_get(uq, "error"),
     )
+
+
+def _fallback_row_59(headers: List[str], uq: UnifiedQuote) -> List[Any]:
+    """
+    59-col fallback row builder when EnrichedQuote is unavailable.
+    Uses header names to pull values from UnifiedQuote with sensible conversions.
+    """
+    # attempt to compute 52W position if missing
+    cp = _safe_get(uq, "current_price", "last_price", "price")
+    low_52w = _safe_get(uq, "low_52w", "week_52_low")
+    high_52w = _safe_get(uq, "high_52w", "week_52_high")
+    pos_52w = _safe_get(uq, "position_52w", "position_52w_percent", "pos_52w")
+    if pos_52w is None and cp is not None and low_52w is not None and high_52w is not None:
+        pos_52w = _compute_52w_position_pct(cp, low_52w, high_52w)
+
+    last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
+    last_riy = _safe_get(uq, "last_updated_riyadh")
+    if last_riy is None:
+        last_riy = _to_riyadh_iso(last_utc)
+
+    # mapping by header label
+    m: Dict[str, Any] = {
+        # Identity
+        "Symbol": _safe_get(uq, "symbol"),
+        "Company Name": _safe_get(uq, "name", "company_name"),
+        "Sector": _safe_get(uq, "sector"),
+        "Sub-Sector": _safe_get(uq, "sub_sector", "subsector"),
+        "Market": _safe_get(uq, "market", "market_region"),
+        "Currency": _safe_get(uq, "currency"),
+        "Listing Date": _safe_get(uq, "listing_date"),
+
+        # Prices
+        "Last Price": cp,
+        "Previous Close": _safe_get(uq, "previous_close"),
+        "Price Change": _safe_get(uq, "price_change"),
+        "Percent Change": _safe_get(uq, "percent_change"),
+        "Day High": _safe_get(uq, "day_high"),
+        "Day Low": _safe_get(uq, "day_low"),
+        "52W High": high_52w,
+        "52W Low": low_52w,
+        "52W Position %": pos_52w,
+
+        # Volume / Liquidity
+        "Volume": _safe_get(uq, "volume"),
+        "Avg Volume (30D)": _safe_get(uq, "avg_volume_30d", "avg_volume"),
+        "Value Traded": _safe_get(uq, "value_traded"),
+        "Turnover %": _ratio_to_percent(_safe_get(uq, "turnover_percent", "turnover")),
+
+        # Shares / Cap
+        "Shares Outstanding": _safe_get(uq, "shares_outstanding"),
+        "Free Float %": _ratio_to_percent(_safe_get(uq, "free_float_percent", "free_float")),
+        "Market Cap": _safe_get(uq, "market_cap"),
+        "Free Float Market Cap": _safe_get(uq, "free_float_market_cap"),
+        "Liquidity Score": _safe_get(uq, "liquidity_score"),
+
+        # Fundamentals
+        "EPS (TTM)": _safe_get(uq, "eps_ttm", "eps"),
+        "Forward EPS": _safe_get(uq, "forward_eps"),
+        "P/E (TTM)": _safe_get(uq, "pe_ttm"),
+        "Forward P/E": _safe_get(uq, "forward_pe"),
+        "P/B": _safe_get(uq, "pb"),
+        "P/S": _safe_get(uq, "ps"),
+        "EV/EBITDA": _safe_get(uq, "ev_ebitda"),
+        "Dividend Yield %": _ratio_to_percent(_safe_get(uq, "dividend_yield")),
+        "Dividend Rate": _safe_get(uq, "dividend_rate"),
+        "Payout Ratio %": _ratio_to_percent(_safe_get(uq, "payout_ratio")),
+        "ROE %": _ratio_to_percent(_safe_get(uq, "roe")),
+        "ROA %": _ratio_to_percent(_safe_get(uq, "roa")),
+        "Net Margin %": _ratio_to_percent(_safe_get(uq, "net_margin")),
+        "EBITDA Margin %": _ratio_to_percent(_safe_get(uq, "ebitda_margin")),
+        "Revenue Growth %": _ratio_to_percent(_safe_get(uq, "revenue_growth")),
+        "Net Income Growth %": _ratio_to_percent(_safe_get(uq, "net_income_growth")),
+        "Beta": _safe_get(uq, "beta"),
+
+        # Technicals
+        "Volatility (30D)": _ratio_to_percent(_safe_get(uq, "volatility_30d")),
+        "RSI (14)": _safe_get(uq, "rsi_14"),
+
+        # Valuation / Targets
+        "Fair Value": _safe_get(uq, "fair_value"),
+        "Upside %": _ratio_to_percent(_safe_get(uq, "upside_percent")),
+        "Valuation Label": _safe_get(uq, "valuation_label"),
+
+        # Scores / Recommendation
+        "Value Score": _safe_get(uq, "value_score"),
+        "Quality Score": _safe_get(uq, "quality_score"),
+        "Momentum Score": _safe_get(uq, "momentum_score"),
+        "Opportunity Score": _safe_get(uq, "opportunity_score"),
+        "Risk Score": _safe_get(uq, "risk_score"),
+        "Overall Score": _safe_get(uq, "overall_score"),
+        "Error": _safe_get(uq, "error") or "",
+        "Recommendation": _safe_get(uq, "recommendation") or "",
+
+        # Meta
+        "Data Source": _safe_get(uq, "data_source"),
+        "Data Quality": _safe_get(uq, "data_quality"),
+        "Last Updated (UTC)": last_utc,
+        "Last Updated (Riyadh)": last_riy,
+    }
+
+    row = [m.get(h, None) for h in headers]
+    if len(row) < len(headers):
+        row += [None] * (len(headers) - len(row))
+    return row[: len(headers)]
 
 
 # =============================================================================
@@ -424,7 +642,7 @@ def _quote_to_analysis(requested_symbol: str, uq: UnifiedQuote) -> SingleAnalysi
 @router.get("/ping")
 async def analysis_health(request: Request) -> Dict[str, Any]:
     cfg = _cfg()
-    eng = await _get_engine(request)
+    eng = await _resolve_engine(request)
     return {
         "status": "ok",
         "module": "routes.ai_analysis",
@@ -463,9 +681,9 @@ async def analyze_single_quote(
         max_concurrency=1,
     )
 
-    key = normalize_symbol(t).upper() if normalize_symbol(t) else t.upper()
-    q = m.get(key) or UnifiedQuote(symbol=key, data_quality="MISSING", error="No data returned").finalize()
-    return _quote_to_analysis(t, q)
+    key = (normalize_symbol(t) or t).upper()
+    uq = m.get(key) or UnifiedQuote(symbol=key, data_quality="MISSING", error="No data returned").finalize()
+    return _quote_to_analysis(t, uq)
 
 
 @router.post("/quotes", response_model=BatchAnalysisResponse)
@@ -516,7 +734,7 @@ async def analyze_for_sheet(
     if not tickers:
         return SheetAnalysisResponse(headers=headers, rows=[], status="skipped", error="No tickers provided")
 
-    # Sheets-safe auth (never raise)
+    # Sheets-safe auth (never raise out)
     try:
         _require_token_or_401(x_app_token)
     except Exception as e:
@@ -539,18 +757,20 @@ async def analyze_for_sheet(
         rows: List[List[Any]] = []
         for t in tickers:
             uq = m.get(t) or UnifiedQuote(symbol=t, data_quality="MISSING", error="No data returned").finalize()
-            eq = EnrichedQuote.from_unified(uq)
-            rows.append(eq.to_row(headers))
 
-        # detect partial via "Error" column if present
-        status = "success"
-        try:
-            err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
-            if any((r[err_idx] not in (None, "", "null")) for r in rows if len(r) > err_idx):
-                status = "partial"
-        except Exception:
-            pass
+            # Best: EnrichedQuote row mapping if available
+            if EnrichedQuote is not None:
+                try:
+                    eq = EnrichedQuote.from_unified(uq)  # type: ignore
+                    rows.append(eq.to_row(headers))  # type: ignore
+                    continue
+                except Exception:
+                    # fallback to local mapping
+                    pass
 
+            rows.append(_fallback_row_59(headers, uq))
+
+        status = _status_from_rows(headers, rows)
         return SheetAnalysisResponse(headers=headers, rows=rows, status=status)
 
     except Exception as exc:
