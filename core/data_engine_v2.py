@@ -3,23 +3,27 @@ from __future__ import annotations
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.6.1) — KSA-SAFE + PROD SAFE (HARDENED)
+UNIFIED DATA ENGINE (v2.6.2) — KSA-SAFE + PROD SAFE (HARDENED)
 
-Key policy hardening vs v2.6.0:
-- ✅ GLOBAL default provider order is now EODHD-first (eodhd,finnhub,fmp).
-- ✅ KSA yfinance is DISABLED by default and will NOT run unless explicitly enabled.
-- ✅ KSA provider loop will never "auto-fallback" to yfinance unless ENABLE_YFINANCE_KSA=true.
-- ✅ Tadawul custom headers are applied only to Tadawul requests (no cross-provider leakage).
-- ✅ Provider lists de-duplicated while preserving order.
-- ✅ Slightly improved HTTP retry behavior (jitter + Retry-After support).
+✅ v2.6.2 enhancement (your missing KSA fix):
+- ✅ Adds a new **Yahoo Chart fallback** (direct endpoint) that works even when yfinance breaks on .SR
+  (fixes KeyError: 'currentTradingPeriod' and similar yfinance/Yahoo edge cases).
+- ✅ Keeps the HARD policy: yfinance for KSA remains OFF unless ENABLE_YFINANCE_KSA=true.
+- ✅ Yahoo Chart fallback for KSA is ON by default (can disable with ENABLE_YAHOO_CHART_KSA=false).
 
 KSA routing order (controlled by KSA_PROVIDERS):
   - tadawul  (optional, via TADAWUL_* env URLs)
   - argaam   (HTML snapshot best-effort)
   - yfinance (OPTIONAL last resort; OFF by default, enable with ENABLE_YFINANCE_KSA=true)
+  - yahoo_chart (OPTIONAL fallback; ON by default unless disabled)
 
 GLOBAL routing order (controlled by PROVIDERS / ENABLED_PROVIDERS):
   - eodhd -> finnhub -> fmp -> yfinance (optional fallback)
+
+Notes:
+- This module is self-contained (no external yahoo provider module required).
+- If you want STRICT KSA without any Yahoo fallback, set:
+    ENABLE_YAHOO_CHART_KSA=false
 """
 
 import asyncio
@@ -51,7 +55,7 @@ except Exception:  # pragma: no cover
     yf = None  # type: ignore
 
 
-ENGINE_VERSION = "2.6.1"
+ENGINE_VERSION = "2.6.2"
 
 # =============================================================================
 # Settings + Logger
@@ -85,6 +89,9 @@ ARGAAM_VOLUME_URLS = [
 # Optional Tadawul JSON provider (configure via env; templates support {code} or {symbol})
 TADAWUL_QUOTE_URL = os.getenv("TADAWUL_QUOTE_URL") or os.getenv("TADAWUL_API_URL")  # optional
 TADAWUL_HEADERS_JSON = os.getenv("TADAWUL_HEADERS_JSON")  # optional (JSON dict string)
+
+# Yahoo Chart (robust fallback vs yfinance)
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -288,8 +295,8 @@ def _finnhub_symbol(symbol: str) -> str:
 
 def _yahoo_symbol(symbol: str) -> str:
     """
-    yfinance is generally happier with plain tickers (AAPL not AAPL.US).
-    Keep special symbols unchanged.
+    Yahoo endpoints are generally happier with plain tickers (AAPL not AAPL.US).
+    Keep special symbols unchanged. Keep .SR unchanged.
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -333,7 +340,6 @@ def _get_enabled_providers() -> List[str]:
       - env ENABLED_PROVIDERS / PROVIDERS (csv)
 
     Default (HARDENED): eodhd, finnhub, fmp
-    (EODHD-first matches your production preference)
     """
     for attr in ("enabled_providers", "providers_list"):
         out = _parse_csv_list(getattr(settings, attr, None))
@@ -391,6 +397,20 @@ def _get_key(*names: str) -> Optional[str]:
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _last_non_none(seq: Any) -> Optional[float]:
+    """Return last non-None numeric item from a list-like."""
+    try:
+        if not isinstance(seq, list):
+            return None
+        for i in range(len(seq) - 1, -1, -1):
+            v = _safe_float(seq[i])
+            if v is not None:
+                return v
+    except Exception:
+        return None
+    return None
 
 
 # =============================================================================
@@ -579,6 +599,7 @@ class DataEngine:
       - tadawul (optional JSON via env TADAWUL_QUOTE_URL)
       - argaam snapshot (HTML best-effort)
       - yfinance (OPTIONAL last resort; OFF by default)
+      - yahoo_chart (OPTIONAL fallback; ON by default)
 
     GLOBAL:
       provider order from providers list:
@@ -631,6 +652,12 @@ class DataEngine:
             )
         )
 
+        # KSA Yahoo Chart fallback (ON by default)
+        self.enable_yahoo_chart_ksa = _get_bool(
+            ["ENABLE_YAHOO_CHART_KSA", "KSA_ENABLE_YAHOO_CHART", "KSA_ALLOW_YAHOO_CHART"],
+            True,
+        )
+
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
@@ -644,12 +671,13 @@ class DataEngine:
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | ksa=%s | yfinance_global=%s | yfinance_ksa=%s | timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | ksa=%s | yfinance_global=%s | yfinance_ksa=%s | yahoo_chart_ksa=%s | timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
             ",".join(self.enabled_ksa_providers) if self.enabled_ksa_providers else "(none)",
             self.enable_yfinance,
             self.enable_yfinance_ksa,
+            self.enable_yahoo_chart_ksa,
             self._timeout_sec,
         )
 
@@ -727,6 +755,9 @@ class DataEngine:
 
         HARD POLICY:
           - yfinance will NOT be used for KSA unless ENABLE_YFINANCE_KSA=true
+
+        v2.6.2:
+          - Yahoo Chart fallback runs AFTER KSA providers fail (enabled by default).
         """
         code = _ksa_code(symbol)
         errors: List[str] = []
@@ -781,6 +812,22 @@ class DataEngine:
                 else:
                     errors.append("yfinance:ksa_disabled_or_missing")
 
+            elif p in {"yahoo_chart", "yahoo-chart", "chart"}:
+                if self.enable_yahoo_chart_ksa:
+                    q = await self._fetch_yahoo_chart(symbol, market="KSA")
+                    if q.current_price is not None:
+                        return q.finalize()
+                    errors.append(f"yahoo_chart:{q.error or 'no_price'}")
+                else:
+                    errors.append("yahoo_chart:ksa_disabled")
+
+        # Final KSA fallback: Yahoo chart (robust vs yfinance)
+        if self.enable_yahoo_chart_ksa:
+            q = await self._fetch_yahoo_chart(symbol, market="KSA")
+            if q.current_price is not None:
+                return q.finalize()
+            errors.append(f"yahoo_chart:{q.error or 'no_price'}")
+
         return UnifiedQuote(
             symbol=symbol,
             market="KSA",
@@ -827,13 +874,21 @@ class DataEngine:
             or _safe_float(obj.get("tradingPrice"))
             or _safe_float(obj.get("close"))
         )
-        prev = _safe_float(obj.get("previous_close")) or _safe_float(obj.get("previousClose")) or _safe_float(obj.get("prevClose"))
+        prev = (
+            _safe_float(obj.get("previous_close"))
+            or _safe_float(obj.get("previousClose"))
+            or _safe_float(obj.get("prevClose"))
+        )
         high = _safe_float(obj.get("high")) or _safe_float(obj.get("day_high")) or _safe_float(obj.get("dayHigh"))
         low = _safe_float(obj.get("low")) or _safe_float(obj.get("day_low")) or _safe_float(obj.get("dayLow"))
         vol = _safe_float(obj.get("volume")) or _safe_float(obj.get("tradedVolume")) or _safe_float(obj.get("qty"))
 
         chg = _safe_float(obj.get("change")) or _safe_float(obj.get("price_change"))
-        chg_p = _safe_float(obj.get("change_percent")) or _safe_float(obj.get("percent_change")) or _safe_float(obj.get("changeP"))
+        chg_p = (
+            _safe_float(obj.get("change_percent"))
+            or _safe_float(obj.get("percent_change"))
+            or _safe_float(obj.get("changeP"))
+        )
 
         name = _safe_str(obj.get("name")) or _safe_str(obj.get("company")) or _safe_str(obj.get("companyName"))
 
@@ -1090,7 +1145,7 @@ class DataEngine:
                         if ra and ra.isdigit():
                             await asyncio.sleep(min(2.0, float(ra)))
                         else:
-                            await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
+                            await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.35)
                         continue
                     return None
                 if r.status_code >= 400:
@@ -1098,7 +1153,7 @@ class DataEngine:
                 return r.text
             except Exception:
                 if attempt < 2:
-                    await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
+                    await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.35)
                     continue
                 return None
         return None
@@ -1118,7 +1173,7 @@ class DataEngine:
                         if ra and ra.isdigit():
                             await asyncio.sleep(min(2.0, float(ra)))
                         else:
-                            await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
+                            await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.35)
                         continue
                     return None
                 if r.status_code >= 400:
@@ -1129,10 +1184,80 @@ class DataEngine:
                     return None
             except Exception:
                 if attempt < 2:
-                    await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
+                    await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.35)
                     continue
                 return None
         return None
+
+    # -------------------------------------------------------------------------
+    # Provider: Yahoo Chart (robust fallback)
+    # -------------------------------------------------------------------------
+    async def _fetch_yahoo_chart(self, symbol: str, market: str) -> UnifiedQuote:
+        """
+        Direct Yahoo chart endpoint (no yfinance). Robust for .SR.
+        Returns at least: price, prev_close, open, high, low, volume (when available).
+        """
+        ysym = _yahoo_symbol(symbol)
+        url = YAHOO_CHART_URL.format(symbol=ysym)
+        params = {
+            "interval": "1d",
+            "range": "5d",
+            "includePrePost": "false",
+        }
+
+        data = await self._http_get_json(url, params=params)
+        if not data or not isinstance(data, dict):
+            return UnifiedQuote(symbol=symbol, market=market, error="yahoo_chart empty response", data_quality="MISSING")
+
+        try:
+            chart = data.get("chart") or {}
+            res = (chart.get("result") or [None])[0] or {}
+            meta = res.get("meta") or {}
+
+            # main prices
+            cp = _safe_float(meta.get("regularMarketPrice"))
+            pc = _safe_float(meta.get("previousClose")) or _safe_float(meta.get("chartPreviousClose"))
+
+            # time-series indicators for open/high/low/volume (best effort)
+            indicators = (res.get("indicators") or {}).get("quote") or [{}]
+            q0 = indicators[0] or {}
+
+            op = _last_non_none(q0.get("open"))
+            hi = _last_non_none(q0.get("high"))
+            lo = _last_non_none(q0.get("low"))
+            vol = _safe_float(meta.get("regularMarketVolume")) or _last_non_none(q0.get("volume"))
+
+            currency = _safe_str(meta.get("currency")) or ("SAR" if market == "KSA" else "USD")
+
+            dq = "MISSING"
+            if cp is not None and pc is not None and hi is not None and lo is not None:
+                dq = "FULL"
+            elif cp is not None:
+                dq = "PARTIAL"
+
+            return UnifiedQuote(
+                symbol=symbol,
+                market=market,
+                currency=currency,
+                current_price=cp,
+                previous_close=pc,
+                open=op,
+                day_high=hi,
+                day_low=lo,
+                volume=vol,
+                data_source="yahoo_chart",
+                data_quality=dq,
+                error=None if cp is not None else "Yahoo chart returned no price",
+            )
+
+        except Exception as exc:
+            return UnifiedQuote(
+                symbol=symbol,
+                market=market,
+                error=f"yahoo_chart error: {exc}",
+                data_source="yahoo_chart",
+                data_quality="MISSING",
+            )
 
     # -------------------------------------------------------------------------
     # Provider: EODHD
