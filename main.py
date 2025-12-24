@@ -9,7 +9,7 @@ Goals
 - Provide a dumb health endpoint for Render checks: /healthz
 - Defer heavy work (router imports + engine init) after startup
 - Robust multi-candidate router mounting + clear diagnostics
-- Clean shutdown (lifespan) + optional engine close
+- Clean shutdown (lifespan) + best-effort engine close
 
 Render
 - Set Health Check Path to: /healthz
@@ -32,7 +32,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
 
@@ -62,7 +64,14 @@ def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
-def _parse_providers(v: Any) -> List[str]:
+def _parse_list_like(v: Any) -> List[str]:
+    """
+    Accepts:
+      - list
+      - "a,b,c"
+      - '["a","b"]'
+    Returns lowercase trimmed tokens.
+    """
     if v is None:
         return []
     if isinstance(v, list):
@@ -88,6 +97,7 @@ def _import_first(candidates: List[str]) -> Tuple[Optional[object], Optional[str
             return mod, mod_path, None
         except Exception:
             last_tb = traceback.format_exc()
+            continue
     return None, None, last_tb
 
 
@@ -186,6 +196,13 @@ def _load_env_module() -> Optional[object]:
 
 
 def _get(settings: Optional[object], env_mod: Optional[object], name: str, default: Any = None) -> Any:
+    """
+    Lookup order:
+      1) settings.<name>
+      2) env.<name>
+      3) os.getenv(name)
+      4) os.getenv(name.upper())
+    """
     if settings is not None and hasattr(settings, name):
         return getattr(settings, name)
     if env_mod is not None and hasattr(env_mod, name):
@@ -196,13 +213,37 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
     return os.getenv(name.upper(), default)
 
 
+def _normalize_version(v: Any) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    if s.lower() in ("unknown", "none", "null"):
+        return ""
+    return s
+
+
+def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> str:
+    # Prefer settings.version then APP_VERSION
+    v = _normalize_version(_get(settings, env_mod, "version", None))
+    if not v:
+        v = _normalize_version(_get(settings, env_mod, "APP_VERSION", None))
+
+    # If still empty, use commit short if available
+    if not v:
+        commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
+        if commit:
+            v = commit[:7]
+
+    return v or "dev"
+
+
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
     # Prefer computed list if present
     try:
         if settings is not None and hasattr(settings, "cors_origins_list"):
             lst = getattr(settings, "cors_origins_list")
             if isinstance(lst, list) and lst:
-                return lst
+                return [str(x).strip() for x in lst if str(x).strip()]
     except Exception:
         pass
 
@@ -224,6 +265,35 @@ def _rate_limit_default(settings: Optional[object]) -> str:
     return "240/minute"
 
 
+def _providers_from_settings(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[str], List[str]]:
+    """
+    Best-effort providers lists for /health output.
+    """
+    enabled: List[str] = []
+    ksa: List[str] = []
+
+    # Try settings first (if structured)
+    try:
+        if settings is not None and hasattr(settings, "enabled_providers"):
+            enabled = [str(x).strip().lower() for x in (getattr(settings, "enabled_providers") or []) if str(x).strip()]
+    except Exception:
+        pass
+
+    try:
+        if settings is not None and hasattr(settings, "enabled_ksa_providers"):
+            ksa = [str(x).strip().lower() for x in (getattr(settings, "enabled_ksa_providers") or []) if str(x).strip()]
+    except Exception:
+        pass
+
+    # Fallback to env strings
+    if not enabled:
+        enabled = _parse_list_like(_get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", "")))
+    if not ksa:
+        ksa = _parse_list_like(_get(settings, env_mod, "KSA_PROVIDERS", ""))
+
+    return enabled, ksa
+
+
 # =============================================================================
 # Router + Engine boot
 # =============================================================================
@@ -237,7 +307,6 @@ ROUTERS_TO_MOUNT: List[Tuple[str, List[str]]] = [
     ("legacy_service", ["core.legacy_service", "routes.legacy_service", "legacy_service"]),
 ]
 
-# Define which routers are REQUIRED for readiness
 REQUIRED_ROUTERS_DEFAULT = ["enriched_quote", "ai_analysis", "advanced_analysis"]
 
 
@@ -313,10 +382,9 @@ async def _background_boot(app_: FastAPI) -> None:
 
 
 async def _maybe_close_engine(app_: FastAPI) -> None:
-    eng = getattr(app.state, "engine", None)
+    eng = getattr(app_.state, "engine", None)
     if eng is None:
         return
-    # best-effort close for httpx client
     try:
         aclose = getattr(eng, "aclose", None)
         if callable(aclose):
@@ -336,7 +404,7 @@ def create_app() -> FastAPI:
     _safe_set_root_log_level(log_level)
 
     title = _get(settings, env_mod, "app_name", _get(settings, env_mod, "APP_NAME", "Tadawul Fast Bridge"))
-    version = _get(settings, env_mod, "version", _get(settings, env_mod, "APP_VERSION", "unknown"))
+    version = _resolve_version(settings, env_mod)
     app_env = _get(settings, env_mod, "env", _get(settings, env_mod, "APP_ENV", "production"))
 
     allow_origins = _cors_allow_origins(settings, env_mod)
@@ -361,7 +429,7 @@ def create_app() -> FastAPI:
 
         # required routers can be overridden by env:
         # REQUIRED_ROUTERS="enriched_quote,ai_analysis,advanced_analysis"
-        rr = _parse_providers(_get(settings, env_mod, "REQUIRED_ROUTERS", ""))
+        rr = _parse_list_like(_get(settings, env_mod, "REQUIRED_ROUTERS", ""))
         app_.state.required_routers = rr or REQUIRED_ROUTERS_DEFAULT
 
         logger.info("Settings loaded from %s", app_.state.settings_source or "(none)")
@@ -423,16 +491,28 @@ def create_app() -> FastAPI:
     except Exception as e:
         logger.warning("SlowAPI not enabled: %s", e)
 
-    # Global exception guard
+    # -----------------------------------------------------------------------------
+    # Exception handling (keep HTTPException semantics + always JSON)
+    # -----------------------------------------------------------------------------
+    @app_.exception_handler(StarletteHTTPException)
+    async def _http_exc_handler(request, exc: StarletteHTTPException):  # noqa: ANN001
+        return JSONResponse(status_code=exc.status_code, content={"status": "error", "detail": exc.detail})
+
+    @app_.exception_handler(RequestValidationError)
+    async def _validation_exc_handler(request, exc: RequestValidationError):  # noqa: ANN001
+        return JSONResponse(status_code=422, content={"status": "error", "detail": "Validation error", "errors": exc.errors()})
+
     @app_.exception_handler(Exception)
-    async def _unhandled_exc_handler(request, exc):  # noqa: ANN001
+    async def _unhandled_exc_handler(request, exc: Exception):  # noqa: ANN001
         logger.exception("Unhandled exception: %s", exc)
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": "Internal Server Error", "detail": str(exc)[:2000]},
         )
 
+    # -----------------------------------------------------------------------------
     # Very fast endpoints
+    # -----------------------------------------------------------------------------
     @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
         return {"status": "ok", "app": app_.title, "version": app_.version, "env": getattr(app_.state, "app_env", "unknown")}
@@ -459,8 +539,7 @@ def create_app() -> FastAPI:
 
     @app_.get("/health", tags=["system"])
     async def health():
-        enabled = _parse_providers(_get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", "")))
-        ksa = _parse_providers(_get(settings, env_mod, "KSA_PROVIDERS", ""))
+        enabled, ksa = _providers_from_settings(settings, env_mod)
 
         mounted = [r for r in getattr(app_.state, "mount_report", []) if r.get("mounted")]
         failed = [r for r in getattr(app_.state, "mount_report", []) if not r.get("mounted")]
@@ -507,6 +586,7 @@ def create_app() -> FastAPI:
             "sys_path_head": sys.path[:10],
             "python": sys.version,
             "env_mod_loaded": bool(getattr(app_.state, "env_mod_loaded", False)),
+            "render_git_commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:12],
         }
 
     @app_.get("/system/settings", tags=["system"])
