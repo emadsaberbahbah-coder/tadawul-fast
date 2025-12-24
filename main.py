@@ -2,17 +2,29 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE)
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT)
 
-Render runs:
+✅ Goals
+- Always start FAST on Render (avoid 15-min deploy timeouts)
+- Provide a "dumb" health endpoint for Render health checks: /healthz
+- Defer heavy work (router imports + engine init) to background after startup
+- Keep robust multi-candidate router mounting + safe diagnostics
+
+IMPORTANT (Render):
+- Set Health Check Path to: /healthz
+- If your Start Command uses --log-level from env, it MUST be lowercase.
+  Use:
+    --log-level ${UVICORN_LOG_LEVEL:-info}
+  And set UVICORN_LOG_LEVEL=info
+  (Keep LOG_LEVEL for Python app logging, can be INFO/DEBUG etc.)
+
+Render typical start command:
   uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
-
-This module MUST expose:
-  app = FastAPI(...)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -27,7 +39,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
-
 # -----------------------------------------------------------------------------
 # Ensure repo root is in sys.path
 # -----------------------------------------------------------------------------
@@ -35,77 +46,19 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-
 # -----------------------------------------------------------------------------
 # Logging (bootstrap)
 # -----------------------------------------------------------------------------
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("main")
 
 
-# -----------------------------------------------------------------------------
-# Settings loader (try config.py, then core.config)
-# -----------------------------------------------------------------------------
-settings = None
-settings_source = None
-env_mod = None
-
-
-def _try_load_settings() -> None:
-    global settings, settings_source
-
-    # 1) root config.py (preferred)
-    try:
-        from config import get_settings  # type: ignore
-        settings = get_settings()
-        settings_source = "config.get_settings"
-        return
-    except Exception:
-        pass
-
-    # 2) core.config (compat)
-    try:
-        from core.config import get_settings  # type: ignore
-        settings = get_settings()
-        settings_source = "core.config.get_settings"
-        return
-    except Exception:
-        pass
-
-    settings = None
-    settings_source = None
-
-
-_try_load_settings()
-
-if settings_source:
-    try:
-        logging.getLogger().setLevel(str(getattr(settings, "log_level", "INFO")).upper())
-    except Exception:
-        pass
-    logger.info("Settings loaded from %s", settings_source)
-else:
-    logger.warning("Settings not loaded (config/core.config). Falling back to env.py / OS env only.")
-
-try:
-    import env as env_mod  # type: ignore
-except Exception:
-    env_mod = None
-
-
-def _get(name: str, default: Any = None) -> Any:
-    """
-    Lookup order:
-      1) settings.<name>
-      2) env.<NAME> export
-      3) os.getenv(NAME)
-    """
-    if settings is not None and hasattr(settings, name):
-        return getattr(settings, name)
-    if env_mod is not None and hasattr(env_mod, name):
-        return getattr(env_mod, name)
-    return os.getenv(name, default)
+# =============================================================================
+# Helpers
+# =============================================================================
+def _truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _parse_providers(v: Any) -> List[str]:
@@ -126,36 +79,6 @@ def _parse_providers(v: Any) -> List[str]:
     return [p.strip().lower() for p in s.split(",") if p.strip()]
 
 
-def _cors_allow_origins() -> List[str]:
-    # Prefer config computed list if present
-    try:
-        if settings is not None and hasattr(settings, "cors_origins_list"):
-            lst = getattr(settings, "cors_origins_list")
-            if isinstance(lst, list) and lst:
-                return lst
-    except Exception:
-        pass
-
-    cors_all = str(_get("ENABLE_CORS_ALL_ORIGINS", _get("CORS_ALL_ORIGINS", "true"))).strip().lower() in (
-        "1", "true", "yes", "y", "on"
-    )
-    if cors_all:
-        return ["*"]
-
-    raw = str(_get("CORS_ORIGINS", "")).strip()
-    return [o.strip() for o in raw.split(",") if o.strip()] or []
-
-
-def _rate_limit_default() -> str:
-    try:
-        rpm = int(getattr(settings, "rate_limit_per_minute"))
-        if rpm > 0:
-            return f"{rpm}/minute"
-    except Exception:
-        pass
-    return "240/minute"
-
-
 def _import_first(candidates: List[str]) -> Tuple[Optional[object], Optional[str], Optional[str]]:
     last_tb = None
     for mod_path in candidates:
@@ -172,7 +95,7 @@ def _mount_router(
     app_: FastAPI,
     name: str,
     candidates: List[str],
-    attr_candidates: List[str] = ("router",),
+    attr_candidates: Tuple[str, ...] = ("router",),
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "name": name,
@@ -224,54 +147,214 @@ def _mount_router(
         return report
 
 
-def _init_engine_best_effort(app_: FastAPI) -> None:
-    """
-    Optional: create a shared engine instance and store it in app.state.engine
-    so all routers reuse it (performance + avoids duplicate init).
-    Never raises.
-    """
+def _safe_set_root_log_level(level: str) -> None:
     try:
-        # Prefer v2
-        mod = import_module("core.data_engine_v2")
-        Engine = getattr(mod, "DataEngine", None)
-        if Engine is None:
-            return
-        app_.state.engine = Engine()
-        logger.info("Engine initialized and stored in app.state.engine (DataEngine v2).")
-        return
+        logging.getLogger().setLevel(level.upper())
     except Exception:
         pass
 
+
+def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
+    # 1) root config.py (preferred)
+    try:
+        from config import get_settings  # type: ignore
+
+        s = get_settings()
+        return s, "config.get_settings"
+    except Exception:
+        pass
+
+    # 2) core.config (compat)
+    try:
+        from core.config import get_settings  # type: ignore
+
+        s = get_settings()
+        return s, "core.config.get_settings"
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _load_env_module() -> Optional[object]:
+    try:
+        import env as env_mod  # type: ignore
+
+        return env_mod
+    except Exception:
+        return None
+
+
+def _get(settings: Optional[object], env_mod: Optional[object], name: str, default: Any = None) -> Any:
+    """
+    Lookup order:
+      1) settings.<name>
+      2) env.<name>
+      3) os.getenv(name)  (exact)
+      4) os.getenv(upper name)
+    """
+    if settings is not None and hasattr(settings, name):
+        return getattr(settings, name)
+    if env_mod is not None and hasattr(env_mod, name):
+        return getattr(env_mod, name)
+    v = os.getenv(name, None)
+    if v is not None:
+        return v
+    return os.getenv(name.upper(), default)
+
+
+def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
+    # Prefer computed list if present
+    try:
+        if settings is not None and hasattr(settings, "cors_origins_list"):
+            lst = getattr(settings, "cors_origins_list")
+            if isinstance(lst, list) and lst:
+                return lst
+    except Exception:
+        pass
+
+    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
+    if cors_all:
+        return ["*"]
+
+    raw = str(_get(settings, env_mod, "CORS_ORIGINS", "")).strip()
+    return [o.strip() for o in raw.split(",") if o.strip()] or []
+
+
+def _rate_limit_default(settings: Optional[object]) -> str:
+    try:
+        rpm = int(getattr(settings, "rate_limit_per_minute"))
+        if rpm > 0:
+            return f"{rpm}/minute"
+    except Exception:
+        pass
+    return "240/minute"
+
+
+# =============================================================================
+# Background tasks: router mount + engine init (so startup stays fast)
+# =============================================================================
+ROUTERS_TO_MOUNT: List[Tuple[str, List[str]]] = [
+    ("enriched_quote", ["routes.enriched_quote", "enriched_quote", "core.enriched_quote"]),
+    ("ai_analysis", ["routes.ai_analysis", "ai_analysis", "core.ai_analysis"]),
+    ("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "core.advanced_analysis"]),
+    # FIX: routes_argaam module is ROOT file "routes_argaam.py" not "routes.routes_argaam"
+    ("routes_argaam", ["routes_argaam", "routes.routes_argaam", "core.routes_argaam"]),
+    ("legacy_service", ["routes.legacy_service", "legacy_service", "core.legacy_service"]),
+]
+
+
+def _init_engine_best_effort(app_: FastAPI) -> None:
+    """
+    Create shared engine instance and store it in app.state.engine.
+    Never raises.
+    """
+    # Prefer v2
+    try:
+        mod = import_module("core.data_engine_v2")
+        Engine = getattr(mod, "DataEngine", None)
+        if Engine is not None:
+            app_.state.engine = Engine()
+            app_.state.engine_ready = True
+            logger.info("Engine initialized and stored in app.state.engine (DataEngine v2).")
+            return
+    except Exception as e:
+        app_.state.engine_ready = False
+        app_.state.engine_error = str(e)[:2000]
+
+    # Fallback legacy
     try:
         mod = import_module("core.data_engine")
         Engine = getattr(mod, "DataEngine", None)
-        if Engine is None:
+        if Engine is not None:
+            app_.state.engine = Engine()
+            app_.state.engine_ready = True
+            logger.info("Engine initialized and stored in app.state.engine (legacy DataEngine).")
             return
-        app_.state.engine = Engine()
-        logger.info("Engine initialized and stored in app.state.engine (legacy DataEngine).")
-    except Exception:
-        pass
+    except Exception as e:
+        app_.state.engine_ready = False
+        app_.state.engine_error = str(e)[:2000]
 
 
+def _mount_all_routers(app_: FastAPI) -> None:
+    results: List[Dict[str, Any]] = []
+    for name, candidates in ROUTERS_TO_MOUNT:
+        rep = _mount_router(app_, name=name, candidates=candidates)
+        results.append(rep)
+
+    app_.state.mount_report = results
+    app_.state.routers_ready = all(r.get("mounted") for r in results if r["name"] != "legacy_service") or any(
+        r.get("mounted") for r in results
+    )
+    # legacy_service can fail safely — don’t block readiness on it
+    logger.info(
+        "Router mount finished: mounted=%s failed=%s",
+        [r["name"] for r in results if r.get("mounted")],
+        [r["name"] for r in results if not r.get("mounted")],
+    )
+
+
+async def _background_boot(app_: FastAPI) -> None:
+    """
+    Runs AFTER startup so Render health checks pass quickly.
+    """
+    try:
+        # 1) Mount routers (can be heavy)
+        await asyncio.to_thread(_mount_all_routers, app_)
+
+        # 2) Init engine (can be heavy)
+        init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
+        if init_engine:
+            await asyncio.to_thread(_init_engine_best_effort, app_)
+
+    except Exception as e:
+        logger.warning("Background boot failed: %s", e)
+
+
+# =============================================================================
+# App factory
+# =============================================================================
 def create_app() -> FastAPI:
-    title = _get("app_name", _get("APP_NAME", "Tadawul Fast Bridge"))
-    version = _get("version", _get("APP_VERSION", "4.7.1"))
-    app_env = _get("env", _get("APP_ENV", "production"))
+    settings, settings_source = _try_load_settings()
+    env_mod = _load_env_module()
+
+    # Logging level (app-side). This does NOT control uvicorn --log-level.
+    log_level = str(_get(settings, env_mod, "log_level", os.getenv("LOG_LEVEL", "INFO"))).upper()
+    _safe_set_root_log_level(log_level)
+
+    title = _get(settings, env_mod, "app_name", _get(settings, env_mod, "APP_NAME", "Tadawul Fast Bridge"))
+    version = _get(settings, env_mod, "version", _get(settings, env_mod, "APP_VERSION", "4.7.1"))
+    app_env = _get(settings, env_mod, "env", _get(settings, env_mod, "APP_ENV", "production"))
 
     app_ = FastAPI(title=str(title), version=str(version))
+
+    # state
     app_.state.settings = settings
     app_.state.settings_source = settings_source
     app_.state.app_env = str(app_env)
-    app_.state.mount_report = []
+    app_.state.env_mod_loaded = env_mod is not None
+
+    app_.state.mount_report = []          # will be populated after background boot
+    app_.state.routers_ready = False
+    app_.state.engine_ready = False
+    app_.state.engine_error = None
+
+    # Controls
+    app_.state.defer_router_mount = _truthy(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true"))
+    app_.state.init_engine_on_boot = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")
 
     # ------------------------------------------------------------
     # CORS
     # ------------------------------------------------------------
-    allow_origins = _cors_allow_origins()
+    allow_origins = _cors_allow_origins(settings, env_mod)
+
+    # If "*" is used, allow_credentials MUST be False for browser compliance
+    allow_credentials = False if allow_origins == ["*"] else True
+
     app_.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins if allow_origins else [],
-        allow_credentials=True,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -285,7 +368,7 @@ def create_app() -> FastAPI:
         from slowapi.middleware import SlowAPIMiddleware
         from slowapi.util import get_remote_address
 
-        limiter = Limiter(key_func=get_remote_address, default_limits=[_rate_limit_default()])
+        limiter = Limiter(key_func=get_remote_address, default_limits=[_rate_limit_default(settings)])
         app_.state.limiter = limiter
         app_.add_middleware(SlowAPIMiddleware)
 
@@ -293,7 +376,7 @@ def create_app() -> FastAPI:
         async def _rate_limit_handler(request, exc):  # noqa: ANN001
             return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
 
-        logger.info("SlowAPI limiter enabled (default %s).", _rate_limit_default())
+        logger.info("SlowAPI limiter enabled (default %s).", _rate_limit_default(settings))
     except Exception as e:
         logger.warning("SlowAPI not enabled: %s", e)
 
@@ -309,39 +392,29 @@ def create_app() -> FastAPI:
         )
 
     # ------------------------------------------------------------
-    # Routes (robust mounting with multiple candidates)
-    # FIX: routes_argaam module is ROOT file "routes_argaam.py" not "routes.routes_argaam"
+    # System endpoints (VERY FAST)
     # ------------------------------------------------------------
-    routers_to_mount = [
-        ("enriched_quote", ["routes.enriched_quote", "enriched_quote", "core.enriched_quote"]),
-        ("ai_analysis", ["routes.ai_analysis", "ai_analysis", "core.ai_analysis"]),
-        ("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "core.advanced_analysis"]),
-        ("routes_argaam", ["routes_argaam", "routes.routes_argaam", "core.routes_argaam"]),
-        ("legacy_service", ["routes.legacy_service", "legacy_service", "core.legacy_service"]),
-    ]
-
-    for name, candidates in routers_to_mount:
-        rep = _mount_router(app_, name=name, candidates=candidates)
-        app_.state.mount_report.append(rep)
-
-    # ------------------------------------------------------------
-    # System endpoints
-    # ------------------------------------------------------------
-    @app_.api_route("/", methods=["GET", "HEAD"], tags=["system"])
+    @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
+        # Keep root extremely fast (Render may probe this)
         return {"status": "ok", "app": app_.title, "version": app_.version, "env": app_.state.app_env}
+
+    @app_.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def healthz():
+        # Dumb health check endpoint for Render
+        return {"status": "ok"}
 
     @app_.get("/health", tags=["system"])
     async def health():
         try:
             enabled = list(getattr(settings, "enabled_providers", [])) if settings is not None else []
         except Exception:
-            enabled = _parse_providers(_get("ENABLED_PROVIDERS", _get("PROVIDERS", "")))
+            enabled = _parse_providers(_get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", "")))
 
         try:
             ksa = list(getattr(settings, "enabled_ksa_providers", [])) if settings is not None else []
         except Exception:
-            ksa = _parse_providers(_get("KSA_PROVIDERS", ""))
+            ksa = _parse_providers(_get(settings, env_mod, "KSA_PROVIDERS", ""))
 
         mounted = [r for r in app_.state.mount_report if r.get("mounted")]
         failed = [r for r in app_.state.mount_report if not r.get("mounted")]
@@ -354,6 +427,9 @@ def create_app() -> FastAPI:
             "providers": enabled,
             "ksa_providers": ksa,
             "settings_source": app_.state.settings_source,
+            "routers_ready": bool(app_.state.routers_ready),
+            "engine_ready": bool(app_.state.engine_ready),
+            "engine_error": app_.state.engine_error,
             "routers_mounted": [m["name"] for m in mounted],
             "routers_failed": [
                 {"name": f["name"], "loaded_from": f.get("loaded_from"), "error": (f.get("error") or "")[:4000]}
@@ -361,6 +437,16 @@ def create_app() -> FastAPI:
             ],
             "time_utc": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app_.get("/readyz", include_in_schema=False)
+    async def readyz():
+        # Optional “readiness” endpoint (returns 200 only when core components are ready)
+        if app_.state.routers_ready and (app_.state.engine_ready or not _truthy(app_.state.init_engine_on_boot)):
+            return {"status": "ready"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "routers_ready": app_.state.routers_ready, "engine_ready": app_.state.engine_ready},
+        )
 
     @app_.get("/system/routes", tags=["system"])
     async def system_routes():
@@ -377,40 +463,51 @@ def create_app() -> FastAPI:
 
     @app_.get("/system/settings", tags=["system"])
     async def system_settings():
-        # Safe view of settings / env summary
         try:
-            if env_mod and hasattr(env_mod, "safe_env_summary"):
+            if env_mod is not None and hasattr(env_mod, "safe_env_summary"):
                 return {"settings_source": app_.state.settings_source, "env": env_mod.safe_env_summary()}
         except Exception:
             pass
-        return {"settings_source": app_.state.settings_source, "env": {"app": app_.title, "version": app_.version, "env": app_.state.app_env}}
+        return {
+            "settings_source": app_.state.settings_source,
+            "env": {"app": app_.title, "version": app_.version, "env": app_.state.app_env},
+        }
 
     # ------------------------------------------------------------
-    # Startup: best-effort shared engine init
+    # Startup: FAST BOOT (no heavy imports unless you explicitly disable deferral)
     # ------------------------------------------------------------
     @app_.on_event("startup")
     async def _startup():  # noqa: ANN001
-        _init_engine_best_effort(app_)
+        logger.info("Settings loaded from %s", app_.state.settings_source or "(none)")
+        logger.info("Fast boot: defer_router_mount=%s init_engine_on_boot=%s", app_.state.defer_router_mount, app_.state.init_engine_on_boot)
 
-    # Startup banner
-    try:
-        enabled = list(getattr(settings, "enabled_providers", [])) if settings is not None else []
-    except Exception:
-        enabled = _parse_providers(_get("ENABLED_PROVIDERS", _get("PROVIDERS", "")))
+        if not app_.state.defer_router_mount:
+            # Mount routers synchronously (not recommended for Render unless you're sure it's fast)
+            await asyncio.to_thread(_mount_all_routers, app_)
+            if _truthy(app_.state.init_engine_on_boot):
+                await asyncio.to_thread(_init_engine_best_effort, app_)
+        else:
+            # Defer everything heavy
+            asyncio.create_task(_background_boot(app_))
 
-    try:
-        ksa = list(getattr(settings, "enabled_ksa_providers", [])) if settings is not None else []
-    except Exception:
-        ksa = _parse_providers(_get("KSA_PROVIDERS", ""))
+        # Startup banner (safe)
+        try:
+            enabled = list(getattr(settings, "enabled_providers", [])) if settings is not None else []
+        except Exception:
+            enabled = _parse_providers(_get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", "")))
 
-    logger.info("==============================================")
-    logger.info("🚀 Tadawul Fast Bridge starting")
-    logger.info("   Env: %s | Version: %s", app_.state.app_env, app_.version)
-    logger.info("   Settings source: %s", app_.state.settings_source or "(none)")
-    logger.info("   Providers: %s", ",".join(enabled) if enabled else "(not set)")
-    logger.info("   KSA Providers: %s", ",".join(ksa) if ksa else "(not set)")
-    logger.info("   CORS allow origins: %s", "ALL (*)" if allow_origins == ["*"] else str(allow_origins))
-    logger.info("==============================================")
+        try:
+            ksa = list(getattr(settings, "enabled_ksa_providers", [])) if settings is not None else []
+        except Exception:
+            ksa = _parse_providers(_get(settings, env_mod, "KSA_PROVIDERS", ""))
+
+        logger.info("==============================================")
+        logger.info("🚀 Tadawul Fast Bridge starting")
+        logger.info("   Env: %s | Version: %s", app_.state.app_env, app_.version)
+        logger.info("   Providers: %s", ",".join(enabled) if enabled else "(not set)")
+        logger.info("   KSA Providers: %s", ",".join(ksa) if ksa else "(not set)")
+        logger.info("   CORS allow origins: %s", "ALL (*)" if allow_origins == ["*"] else str(allow_origins))
+        logger.info("==============================================")
 
     return app_
 
