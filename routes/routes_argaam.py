@@ -1,12 +1,14 @@
-# routes_argaam.py  (FULL REPLACEMENT)
+# routes/routes_argaam.py  (FULL REPLACEMENT)
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam Gateway – v3.0.0 (Engine v2 aligned, Sheets-safe)
+KSA / Argaam Gateway – v3.1.0 (Engine v2 aligned, Sheets-safe)
 
 Purpose
 - KSA-only router: accepts numeric or .SR symbols only.
-- Delegates ALL fetching to core.data_engine_v2.DataEngine (no direct provider calls).
+- Delegates fetching to core.data_engine_v2.DataEngine when possible.
+- If KSA providers are not configured (e.g. tadawul:no_url | argaam:no_row),
+  it can FALL BACK to yfinance (optional, env-controlled) to avoid "all missing".
 - Returns EnrichedQuote (+ Scores best-effort) for parity with Global routes.
 - Provides /sheet-rows (headers + rows) for Google Sheets.
 
@@ -31,7 +33,7 @@ from fastapi import APIRouter, Body, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.argaam")
-ROUTE_VERSION = "3.0.0"
+ROUTE_VERSION = "3.1.0"
 
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
@@ -96,6 +98,10 @@ if _schemas and hasattr(_schemas, "get_headers_for_sheet"):
     get_headers_for_sheet = getattr(_schemas, "get_headers_for_sheet")
 
 
+# Optional: yfinance fallback (KSA-only)
+_yf = _safe_import("yfinance")
+
+
 # =============================================================================
 # Fallback models (only used if imports are missing)
 # =============================================================================
@@ -149,6 +155,7 @@ class _FallbackEnrichedQuote(BaseModel):
             symbol=str(d.get("symbol") or d.get("ticker") or ""),
             market=str(d.get("market") or "KSA"),
             currency=str(d.get("currency") or "SAR"),
+            name=d.get("name") or d.get("company_name"),
             current_price=d.get("current_price") or d.get("last_price"),
             percent_change=d.get("percent_change"),
             volume=d.get("volume"),
@@ -209,7 +216,6 @@ class _FallbackEnrichedQuote(BaseModel):
                 out.append(self.error or "")
             else:
                 out.append(d.get(lk))
-        # pad safety
         if len(out) < len(headers):
             out += [None] * (len(headers) - len(out))
         return out[: len(headers)]
@@ -261,12 +267,10 @@ def _safe_headers(sheet_name: Optional[str]) -> List[str]:
     if not headers:
         headers = list(_DEFAULT_SHEETS_HEADERS_FALLBACK)
 
-    # Symbol first
     if not headers or headers[0].strip().lower() != "symbol":
         headers = [h for h in headers if h.strip().lower() != "symbol"]
         headers.insert(0, "Symbol")
 
-    # Ensure Error exists
     if not any(h.strip().lower() == "error" for h in headers):
         headers.append("Error")
 
@@ -334,7 +338,7 @@ def _auth_error(x_app_token: Optional[str]) -> Optional[str]:
 
 
 # =============================================================================
-# Limits
+# Limits / config
 # =============================================================================
 def _safe_int_env(name: str, default: int) -> int:
     try:
@@ -352,15 +356,29 @@ def _safe_float_env(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
 def _cfg() -> Dict[str, Any]:
-    # Default sheet aligns with env.py SHEET_KSA_TADAWUL if set
     default_sheet = os.getenv("ARGAAM_DEFAULT_SHEET") or os.getenv("SHEET_KSA_TADAWUL") or "KSA_Tadawul_Market"
     return {
         "max_tickers": _safe_int_env("ARGAAM_MAX_TICKERS", 400),
         "batch_size": _safe_int_env("ARGAAM_BATCH_SIZE", 40),
         "concurrency": _safe_int_env("ARGAAM_CONCURRENCY", 6),
-        "timeout_sec": _safe_float_env("ARGAAM_TIMEOUT_SEC", 45.0),
+        "timeout_sec": _safe_float_env("ARGAAM_TIMEOUT_SEC", 30.0),
         "default_sheet": default_sheet,
+        # Fallback: if engine returns tadawul:no_url | argaam:no_row
+        "allow_yfinance_fallback": _env_bool("KSA_YFINANCE_FALLBACK", True),
+        "yf_concurrency": _safe_int_env("KSA_YFINANCE_CONCURRENCY", 3),
     }
 
 
@@ -426,14 +444,6 @@ async def _resolve_engine(request: Request) -> Optional[Any]:
 # Symbol logic (KSA strict)
 # =============================================================================
 def _normalize_ksa_symbol(symbol: Any) -> str:
-    """
-    Enforces KSA formatting:
-    - 1120 -> 1120.SR
-    - TADAWUL:1120 -> 1120.SR
-    - 1120.TADAWUL -> 1120.SR
-    - 1120.SR -> 1120.SR
-    Returns "" if invalid.
-    """
     s = str(symbol or "").strip().upper()
     if not s:
         return ""
@@ -474,6 +484,8 @@ def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
         return {}
+    if isinstance(obj, dict):
+        return obj
     try:
         return obj.model_dump(exclude_none=False)  # type: ignore
     except Exception:
@@ -522,18 +534,125 @@ def _row_with_error(headers: List[str], symbol: str, error: str, data_quality: s
     return row
 
 
+def _needs_ksa_fallback(uq: Any) -> bool:
+    d = _model_to_dict(uq)
+    dq = str(d.get("data_quality") or "").upper()
+    err = str(d.get("error") or "")
+    if dq == "MISSING":
+        return True
+    # your exact failure signature
+    if "tadawul:no_url" in err or "argaam:no_row" in err or "No KSA provider data" in err:
+        return True
+    return False
+
+
+async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
+    """
+    KSA fallback using yfinance (sync library -> run in thread).
+    Returns a UnifiedQuote-like dict.
+    """
+    if _yf is None:
+        return {"symbol": sym, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "data_source": "yfinance", "error": "yfinance not available"}
+
+    def _work() -> Dict[str, Any]:
+        try:
+            t = _yf.Ticker(sym)  # type: ignore
+            info = {}
+            try:
+                info = t.info or {}
+            except Exception:
+                info = {}
+
+            # fast_info is usually quicker & more reliable for price fields
+            fast = {}
+            try:
+                fast = getattr(t, "fast_info", None) or {}
+            except Exception:
+                fast = {}
+
+            price = None
+            prev = None
+            vol = None
+
+            # try fast_info keys first
+            for k in ("last_price", "lastPrice", "regularMarketPrice"):
+                if k in fast and fast.get(k) not in (None, ""):
+                    price = fast.get(k)
+                    break
+            for k in ("previous_close", "previousClose", "regularMarketPreviousClose"):
+                if k in fast and fast.get(k) not in (None, ""):
+                    prev = fast.get(k)
+                    break
+            for k in ("volume", "regularMarketVolume"):
+                if k in fast and fast.get(k) not in (None, ""):
+                    vol = fast.get(k)
+                    break
+
+            # fall back to info
+            if price is None:
+                price = info.get("regularMarketPrice") or info.get("currentPrice")
+            if prev is None:
+                prev = info.get("regularMarketPreviousClose") or info.get("previousClose")
+            if vol is None:
+                vol = info.get("regularMarketVolume") or info.get("volume")
+
+            pct = None
+            try:
+                if price is not None and prev not in (None, 0, 0.0):
+                    pct = (float(price) - float(prev)) / float(prev) * 100.0
+            except Exception:
+                pct = None
+
+            # some fundamentals (may be None)
+            mc = info.get("marketCap")
+            pe = info.get("trailingPE")
+            pb = info.get("priceToBook")
+            dy = info.get("dividendYield")
+            name = info.get("shortName") or info.get("longName")
+
+            # dividendYield might be fraction (0.02) -> convert to %
+            try:
+                if dy is not None and 0 < float(dy) < 1:
+                    dy = float(dy) * 100.0
+            except Exception:
+                pass
+
+            return {
+                "symbol": sym,
+                "name": name,
+                "market": "KSA",
+                "currency": "SAR",
+                "current_price": float(price) if price is not None else None,
+                "percent_change": float(pct) if pct is not None else None,
+                "volume": float(vol) if vol is not None else None,
+                "market_cap": float(mc) if mc is not None else None,
+                "pe_ttm": float(pe) if pe is not None else None,
+                "pb": float(pb) if pb is not None else None,
+                "dividend_yield": float(dy) if dy is not None else None,
+                "data_source": "yfinance",
+                "data_quality": "PARTIAL" if price is not None else "MISSING",
+                "error": None if price is not None else "yfinance returned no price",
+            }
+        except Exception as exc:
+            return {
+                "symbol": sym,
+                "market": "KSA",
+                "currency": "SAR",
+                "data_quality": "MISSING",
+                "data_source": "yfinance",
+                "error": f"yfinance error: {exc}",
+            }
+
+    return await asyncio.to_thread(_work)
+
+
 def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
-    """
-    UnifiedQuote -> EnrichedQuote (+ scores best-effort), with forced KSA metadata and strict symbol.
-    Never raises.
-    """
     sym = _normalize_ksa_symbol(requested_symbol) or (str(requested_symbol or "").strip().upper() or "UNKNOWN")
     forced: Dict[str, Any] = {"symbol": sym, "market": "KSA", "currency": "SAR"}
 
     try:
         eq = EnrichedQuote.from_unified(uq)  # type: ignore
 
-        # Force KSA metadata if empty/unknown
         try:
             upd = {k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")}
             if upd:
@@ -544,10 +663,10 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
-        # Ensure data_source at least
         try:
             if not getattr(eq, "data_source", None):
-                ds = getattr(uq, "data_source", None) or "argaam_gateway"
+                d = _model_to_dict(uq)
+                ds = d.get("data_source") or d.get("provider") or "argaam_gateway"
                 if hasattr(eq, "model_copy"):
                     eq = eq.model_copy(update={"data_source": ds})
                 else:
@@ -555,7 +674,6 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
-        # Scores best-effort
         try:
             from core.scoring_engine import enrich_with_scores  # type: ignore
             try:
@@ -567,7 +685,6 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
-        # Guarantee strict symbol
         try:
             if getattr(eq, "symbol", None) != sym:
                 if hasattr(eq, "model_copy"):
@@ -629,6 +746,25 @@ async def _engine_get_quotes(engine: Any, syms: List[str], *, timeout_sec: float
         return [{"symbol": s, "data_quality": "MISSING", "error": f"Engine batch error: {exc}"} for s in syms]
 
 
+async def _apply_yf_fallback_for_missing(targets: List[str], items: List[Any], cfg: Dict[str, Any]) -> List[Any]:
+    """
+    Given engine-returned items for targets (same order), replace missing ones using yfinance.
+    """
+    if not cfg.get("allow_yfinance_fallback", True):
+        return items
+
+    sem = asyncio.Semaphore(max(1, int(cfg.get("yf_concurrency", 3) or 3)))
+
+    async def _fix_one(i: int) -> Any:
+        uq = items[i]
+        if not _needs_ksa_fallback(uq):
+            return uq
+        async with sem:
+            return await _fetch_ksa_yfinance(targets[i])
+
+    return list(await asyncio.gather(*[_fix_one(i) for i in range(len(targets))], return_exceptions=False))
+
+
 # =============================================================================
 # Request / Response models
 # =============================================================================
@@ -676,6 +812,11 @@ async def argaam_health(request: Request) -> Dict[str, Any]:
         "providers": providers,
         "ksa_mode": "STRICT",
         "auth": "open" if not _allowed_tokens() else "token",
+        "fallbacks": {
+            "yfinance_available": bool(_yf),
+            "allow_yfinance_fallback": bool(cfg.get("allow_yfinance_fallback", True)),
+            "yfinance_concurrency": int(cfg.get("yf_concurrency", 3) or 3),
+        },
         "limits": {
             "ARGAAM_MAX_TICKERS": cfg["max_tickers"],
             "ARGAAM_BATCH_SIZE": cfg["batch_size"],
@@ -704,6 +845,7 @@ async def ksa_single_quote(
     request: Request,
     symbol: str = Query(..., description="KSA symbol (1120 or 1120.SR)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    debug: int = Query(default=0, description="debug=1 adds extra info in error field (best-effort)"),
 ) -> Any:
     err = _auth_error(x_app_token)
     if err:
@@ -725,18 +867,28 @@ async def ksa_single_quote(
             error=f"Invalid KSA symbol '{symbol}'. Must be numeric or end in .SR",
         )
 
-    eng = await _resolve_engine(request)
-    if eng is None:
-        return EnrichedQuote(  # type: ignore
-            symbol=ksa_symbol,
-            market="KSA",
-            currency="SAR",
-            data_quality="MISSING",
-            error="Engine unavailable",
-        )
-
     cfg = _cfg()
-    uq = await _engine_get_quote(eng, ksa_symbol, timeout_sec=cfg["timeout_sec"])
+    eng = await _resolve_engine(request)
+
+    uq: Any
+    if eng is None:
+        uq = {"symbol": ksa_symbol, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "Engine unavailable"}
+    else:
+        uq = await _engine_get_quote(eng, ksa_symbol, timeout_sec=cfg["timeout_sec"])
+
+    # If engine couldn't fetch KSA providers, try yfinance (optional)
+    if cfg.get("allow_yfinance_fallback", True) and _needs_ksa_fallback(uq):
+        yf_uq = await _fetch_ksa_yfinance(ksa_symbol)
+        # If yfinance succeeded, replace; otherwise keep original error and append debug
+        if str(yf_uq.get("data_quality") or "").upper() != "MISSING":
+            uq = yf_uq
+        elif debug:
+            d = _model_to_dict(uq)
+            e0 = str(d.get("error") or "")
+            e1 = str(yf_uq.get("error") or "")
+            uq = dict(d)
+            uq["error"] = (e0 + " | yfinance_fallback_failed: " + e1).strip(" |")
+
     return _to_scored_enriched(uq, ksa_symbol)
 
 
@@ -753,7 +905,6 @@ async def ksa_batch_quotes(
 
     cfg = _cfg()
 
-    # preserve first occurrence order (dedupe on normalized)
     normalized: List[str] = []
     invalid: List[str] = []
     for s in raw_list:
@@ -784,29 +935,41 @@ async def ksa_batch_quotes(
     else:
         eng = await _resolve_engine(request)
         if eng is None:
-            for t in targets:
-                out.append(
-                    EnrichedQuote(  # type: ignore
-                        symbol=t,
-                        market="KSA",
-                        currency="SAR",
-                        data_quality="MISSING",
-                        error="Engine unavailable",
+            # even if engine is down, we can still try yfinance
+            if cfg.get("allow_yfinance_fallback", True):
+                uq_list = await _apply_yf_fallback_for_missing(targets, [{"symbol": t, "data_quality": "MISSING", "error": "Engine unavailable"} for t in targets], cfg)
+                for i, t in enumerate(targets):
+                    out.append(_to_scored_enriched(uq_list[i], t))
+            else:
+                for t in targets:
+                    out.append(
+                        EnrichedQuote(  # type: ignore
+                            symbol=t,
+                            market="KSA",
+                            currency="SAR",
+                            data_quality="MISSING",
+                            error="Engine unavailable",
+                        )
                     )
-                )
         else:
             batch_size = max(1, int(cfg["batch_size"]))
             for part in [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]:
                 got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
+
+                # normalize map by symbol
                 m: Dict[str, Any] = {}
                 for q in got or []:
                     d = _model_to_dict(q)
                     k = str(d.get("symbol") or d.get("ticker") or "").upper()
                     if k:
                         m[k] = q
-                for t in part:
-                    uq = m.get(t.upper()) or UnifiedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error="No data returned")  # type: ignore
-                    out.append(_to_scored_enriched(uq, t))
+
+                # preserve part order, then apply fallback for missing (per item)
+                ordered = [m.get(t.upper()) or {"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "No data returned"} for t in part]
+                ordered = await _apply_yf_fallback_for_missing(part, ordered, cfg)
+
+                for i, t in enumerate(part):
+                    out.append(_to_scored_enriched(ordered[i], t))
 
     for bad in invalid:
         out.append(
@@ -887,28 +1050,17 @@ async def ksa_sheet_rows(
         )
 
     eng = await _resolve_engine(request)
-    if eng is None:
-        for t in valid_targets:
-            rows.append(_row_with_error(headers, t, "Engine unavailable"))
-        return KSASheetResponse(
-            status="error",
-            error="Engine unavailable",
-            headers=headers,
-            rows=rows,
-            meta={
-                "sheet_name": sheet_name,
-                "requested": len(raw_list),
-                "valid": len(valid_targets),
-                "invalid": len(invalid),
-                "timestamp_utc": _now_utc_iso(),
-            },
-        )
 
     batch_size = max(1, int(cfg["batch_size"]))
     any_fail = False
 
     for part in [valid_targets[i : i + batch_size] for i in range(0, len(valid_targets), batch_size)]:
-        got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
+        if eng is None:
+            got = [{"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "Engine unavailable"} for t in part]
+        else:
+            got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
+
+        # map by symbol
         m: Dict[str, Any] = {}
         for q in got or []:
             d = _model_to_dict(q)
@@ -916,8 +1068,11 @@ async def ksa_sheet_rows(
             if k:
                 m[k] = q
 
-        for t in part:
-            uq = m.get(t.upper()) or UnifiedQuote(symbol=t, market="KSA", currency="SAR", data_quality="MISSING", error="No data")  # type: ignore
+        ordered = [m.get(t.upper()) or {"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "No data"} for t in part]
+        ordered = await _apply_yf_fallback_for_missing(part, ordered, cfg)
+
+        for i, t in enumerate(part):
+            uq = ordered[i]
             eq = _to_scored_enriched(uq, t)
             try:
                 row = eq.to_row(headers)  # type: ignore
@@ -935,7 +1090,6 @@ async def ksa_sheet_rows(
     if invalid or any_fail:
         status = "partial"
 
-    # if Error column contains any values => partial
     try:
         err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
         if any((r[err_idx] not in (None, "", "null")) for r in rows if len(r) > err_idx):
@@ -953,6 +1107,7 @@ async def ksa_sheet_rows(
             "valid": len(valid_targets),
             "invalid": len(invalid),
             "timestamp_utc": _now_utc_iso(),
+            "fallback_yfinance": bool(cfg.get("allow_yfinance_fallback", True)),
         },
     )
 
