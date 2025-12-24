@@ -1,29 +1,29 @@
-# core/data_engine_v2.py
 from __future__ import annotations
 
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.6.0) — KSA-SAFE + PROD SAFE
+UNIFIED DATA ENGINE (v2.6.1) — KSA-SAFE + PROD SAFE (HARDENED)
 
-Key fixes/enhancements vs your v2.4.1:
-- ✅ Removes recursion risk: V2 no longer calls `core.data_engine` (legacy adapter) for KSA.
-- ✅ Adds separate KSA provider list (KSA_PROVIDERS / enabled_ksa_providers).
-- ✅ Adds optional Tadawul JSON provider via env-configurable endpoint templates.
-- ✅ Hardens provider parsing + settings/env adapters.
-- ✅ Improves HTTP retry behavior and JSON parsing robustness.
-- ✅ Keeps your 59-column UnifiedQuote schema and finalize() logic.
+Key policy hardening vs v2.6.0:
+- ✅ GLOBAL default provider order is now EODHD-first (eodhd,finnhub,fmp).
+- ✅ KSA yfinance is DISABLED by default and will NOT run unless explicitly enabled.
+- ✅ KSA provider loop will never "auto-fallback" to yfinance unless ENABLE_YFINANCE_KSA=true.
+- ✅ Tadawul custom headers are applied only to Tadawul requests (no cross-provider leakage).
+- ✅ Provider lists de-duplicated while preserving order.
+- ✅ Slightly improved HTTP retry behavior (jitter + Retry-After support).
 
 KSA routing order (controlled by KSA_PROVIDERS):
   - tadawul  (optional, via TADAWUL_* env URLs)
   - argaam   (HTML snapshot best-effort)
-  - yfinance (optional last resort; often blocked)
+  - yfinance (OPTIONAL last resort; OFF by default, enable with ENABLE_YFINANCE_KSA=true)
 
 GLOBAL routing order (controlled by PROVIDERS / ENABLED_PROVIDERS):
-  - eodhd -> finnhub -> fmp -> yfinance (optional)
+  - eodhd -> finnhub -> fmp -> yfinance (optional fallback)
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -31,7 +31,6 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from importlib import import_module
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
@@ -52,7 +51,7 @@ except Exception:  # pragma: no cover
     yf = None  # type: ignore
 
 
-ENGINE_VERSION = "2.6.0"
+ENGINE_VERSION = "2.6.1"
 
 # =============================================================================
 # Settings + Logger
@@ -84,10 +83,6 @@ ARGAAM_VOLUME_URLS = [
 ]
 
 # Optional Tadawul JSON provider (configure via env; templates support {code} or {symbol})
-# Example:
-#   TADAWUL_QUOTE_URL="https://<your-endpoint>/quote?symbol={code}"
-# or
-#   TADAWUL_QUOTE_URL="https://<your-endpoint>/quote/{symbol}"
 TADAWUL_QUOTE_URL = os.getenv("TADAWUL_QUOTE_URL") or os.getenv("TADAWUL_API_URL")  # optional
 TADAWUL_HEADERS_JSON = os.getenv("TADAWUL_HEADERS_JSON")  # optional (JSON dict string)
 
@@ -310,12 +305,23 @@ def _parse_csv_list(v: Any) -> List[str]:
     if v is None:
         return []
     if isinstance(v, list):
-        out = [str(x).strip().lower() for x in v if str(x).strip()]
-        return out
+        return [str(x).strip().lower() for x in v if str(x).strip()]
     s = str(v).strip()
     if not s:
         return []
     return [x.strip().lower() for x in s.split(",") if x.strip()]
+
+
+def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        t = (x or "").strip().lower()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
 
 
 def _get_enabled_providers() -> List[str]:
@@ -325,25 +331,27 @@ def _get_enabled_providers() -> List[str]:
       - settings.providers_list (list)
       - settings.providers (csv)
       - env ENABLED_PROVIDERS / PROVIDERS (csv)
-    Default: finnhub, fmp, eodhd
+
+    Default (HARDENED): eodhd, finnhub, fmp
+    (EODHD-first matches your production preference)
     """
     for attr in ("enabled_providers", "providers_list"):
-        v = getattr(settings, attr, None)
-        out = _parse_csv_list(v)
+        out = _parse_csv_list(getattr(settings, attr, None))
+        out = _dedupe_keep_order(out)
         if out:
             return out
 
-    p_csv = getattr(settings, "providers", None)
-    out = _parse_csv_list(p_csv)
+    out = _parse_csv_list(getattr(settings, "providers", None))
+    out = _dedupe_keep_order(out)
     if out:
         return out
 
     env_csv = os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or ""
-    out = _parse_csv_list(env_csv)
+    out = _dedupe_keep_order(_parse_csv_list(env_csv))
     if out:
         return out
 
-    return ["finnhub", "fmp", "eodhd"]
+    return ["eodhd", "finnhub", "fmp"]
 
 
 def _get_enabled_ksa_providers() -> List[str]:
@@ -352,16 +360,17 @@ def _get_enabled_ksa_providers() -> List[str]:
       - settings.enabled_ksa_providers (list)
       - settings.ksa_providers (csv or list)
       - env KSA_PROVIDERS (csv)
+
     Default: tadawul, argaam
     """
     for attr in ("enabled_ksa_providers", "ksa_providers"):
-        v = getattr(settings, attr, None)
-        out = _parse_csv_list(v)
+        out = _parse_csv_list(getattr(settings, attr, None))
+        out = _dedupe_keep_order(out)
         if out:
             return out
 
     env_csv = os.getenv("KSA_PROVIDERS") or ""
-    out = _parse_csv_list(env_csv)
+    out = _dedupe_keep_order(_parse_csv_list(env_csv))
     if out:
         return out
 
@@ -569,7 +578,7 @@ class DataEngine:
     KSA:
       - tadawul (optional JSON via env TADAWUL_QUOTE_URL)
       - argaam snapshot (HTML best-effort)
-      - yfinance (optional last resort)
+      - yfinance (OPTIONAL last resort; OFF by default)
 
     GLOBAL:
       provider order from providers list:
@@ -589,30 +598,38 @@ class DataEngine:
 
         timeout = httpx.Timeout(self._timeout_sec, connect=min(10.0, self._timeout_sec))
 
-        # Optional extra headers for Tadawul provider
-        tadawul_headers: Dict[str, str] = {}
+        # Tadawul custom headers (apply ONLY to Tadawul calls)
+        self._tadawul_headers: Dict[str, str] = {}
         if TADAWUL_HEADERS_JSON:
             try:
-                import json
                 obj = json.loads(TADAWUL_HEADERS_JSON)
                 if isinstance(obj, dict):
-                    tadawul_headers = {str(k): str(v) for k, v in obj.items()}
+                    self._tadawul_headers = {str(k): str(v) for k, v in obj.items()}
             except Exception:
-                tadawul_headers = {}
+                self._tadawul_headers = {}
 
         self.client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+                "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
-                **tadawul_headers,
             },
             limits=httpx.Limits(max_keepalive_connections=max_keepalive, max_connections=max_conn),
         )
 
+        # Global yfinance switch
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
+
+        # KSA yfinance policy (HARDENED): OFF by default
+        self.enable_yfinance_ksa = (
+            self.enable_yfinance
+            and _get_bool(
+                ["ENABLE_YFINANCE_KSA", "ENABLE_YFINANCE_FOR_KSA", "KSA_ENABLE_YFINANCE", "KSA_ALLOW_YFINANCE"],
+                False,
+            )
+        )
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
@@ -627,11 +644,12 @@ class DataEngine:
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | ksa=%s | yfinance=%s | timeout=%.1fs",
+            "DataEngine v%s init | providers=%s | ksa=%s | yfinance_global=%s | yfinance_ksa=%s | timeout=%.1fs",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
             ",".join(self.enabled_ksa_providers) if self.enabled_ksa_providers else "(none)",
             self.enable_yfinance,
+            self.enable_yfinance_ksa,
             self._timeout_sec,
         )
 
@@ -706,10 +724,11 @@ class DataEngine:
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
         """
         KSA routing is controlled by self.enabled_ksa_providers.
-        IMPORTANT: We do NOT call core.data_engine here (it is now an adapter to V2).
+
+        HARD POLICY:
+          - yfinance will NOT be used for KSA unless ENABLE_YFINANCE_KSA=true
         """
         code = _ksa_code(symbol)
-
         errors: List[str] = []
 
         for prov in (self.enabled_ksa_providers or []):
@@ -751,7 +770,8 @@ class DataEngine:
                 errors.append("argaam:no_row")
 
             elif p in {"yfinance", "yahoo"}:
-                if self.enable_yfinance and yf:
+                # Only if explicitly enabled for KSA
+                if self.enable_yfinance_ksa and yf:
                     q = await self._fetch_yfinance(symbol, market="KSA")
                     if q.current_price is not None:
                         q.data_source = "yfinance"
@@ -759,16 +779,7 @@ class DataEngine:
                         return q.finalize()
                     errors.append(f"yfinance:{q.error or 'no_price'}")
                 else:
-                    errors.append("yfinance:disabled_or_missing")
-
-        # last resort
-        if self.enable_yfinance and yf:
-            q = await self._fetch_yfinance(symbol, market="KSA")
-            if q.current_price is not None:
-                q.data_source = "yfinance"
-                q.data_quality = "PARTIAL"
-                return q.finalize()
-            errors.append(f"yfinance:{q.error or 'no_price'}")
+                    errors.append("yfinance:ksa_disabled_or_missing")
 
         return UnifiedQuote(
             symbol=symbol,
@@ -782,31 +793,32 @@ class DataEngine:
         """
         Optional Tadawul JSON provider.
         TADAWUL_QUOTE_URL should include {code} or {symbol}.
-        JSON parsing is heuristic to support multiple endpoint shapes.
         """
         code = _ksa_code(symbol)
         url = str(TADAWUL_QUOTE_URL or "").strip()
         if not url:
-            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul URL missing")
+            return UnifiedQuote(
+                symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul URL missing"
+            )
 
-        # Template substitution
         url = url.replace("{code}", code).replace("{symbol}", symbol)
 
-        data = await self._http_get_json(url, params=None)
+        data = await self._http_get_json(url, params=None, headers=self._tadawul_headers or None)
         if not data:
-            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul empty response")
+            return UnifiedQuote(
+                symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul empty response"
+            )
 
-        # normalize to dict (sometimes wrapped)
         obj: Dict[str, Any] = {}
         if isinstance(data, dict):
             obj = data
-        elif isinstance(data, list) and data:
-            if isinstance(data[0], dict):
-                obj = data[0]
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            obj = data[0]
         else:
-            return UnifiedQuote(symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul non-dict response")
+            return UnifiedQuote(
+                symbol=symbol, market="KSA", currency="SAR", data_quality="MISSING", error="Tadawul non-dict response"
+            )
 
-        # common field candidates
         price = (
             _safe_float(obj.get("price"))
             or _safe_float(obj.get("last"))
@@ -815,11 +827,7 @@ class DataEngine:
             or _safe_float(obj.get("tradingPrice"))
             or _safe_float(obj.get("close"))
         )
-        prev = (
-            _safe_float(obj.get("previous_close"))
-            or _safe_float(obj.get("previousClose"))
-            or _safe_float(obj.get("prevClose"))
-        )
+        prev = _safe_float(obj.get("previous_close")) or _safe_float(obj.get("previousClose")) or _safe_float(obj.get("prevClose"))
         high = _safe_float(obj.get("high")) or _safe_float(obj.get("day_high")) or _safe_float(obj.get("dayHigh"))
         low = _safe_float(obj.get("low")) or _safe_float(obj.get("day_low")) or _safe_float(obj.get("dayLow"))
         vol = _safe_float(obj.get("volume")) or _safe_float(obj.get("tradedVolume")) or _safe_float(obj.get("qty"))
@@ -927,7 +935,6 @@ class DataEngine:
             change = nums[1] if len(nums) >= 2 else None
             chg_p = nums[2] if len(nums) >= 3 else None
 
-            # best-effort volume/value detection (depends on page)
             volume = None
             value_traded = None
             tail = txt[-6:] if len(txt) >= 6 else txt
@@ -1047,7 +1054,7 @@ class DataEngine:
                 else:
                     errors.append("yfinance:disabled_or_missing")
 
-        # final fallback
+        # final fallback (GLOBAL only)
         if self.enable_yfinance and yf:
             q = await self._fetch_yfinance(symbol, market="GLOBAL")
             if q.current_price is not None:
@@ -1067,13 +1074,23 @@ class DataEngine:
     # -------------------------------------------------------------------------
     # HTTP helpers (with light retry)
     # -------------------------------------------------------------------------
-    async def _http_get_text(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    async def _http_get_text(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
         for attempt in range(3):
             try:
-                r = await self.client.get(url, params=params)
-                if r.status_code in (429,) or 500 <= r.status_code < 600:
+                r = await self.client.get(url, params=params, headers=headers)
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    # Respect Retry-After if present
+                    ra = r.headers.get("Retry-After")
                     if attempt < 2:
-                        await asyncio.sleep(0.25 + random.random() * 0.35)
+                        if ra and ra.isdigit():
+                            await asyncio.sleep(min(2.0, float(ra)))
+                        else:
+                            await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
                         continue
                     return None
                 if r.status_code >= 400:
@@ -1081,20 +1098,27 @@ class DataEngine:
                 return r.text
             except Exception:
                 if attempt < 2:
-                    await asyncio.sleep(0.25 + random.random() * 0.35)
+                    await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
                     continue
                 return None
         return None
 
     async def _http_get_json(
-        self, url: str, params: Optional[Dict[str, Any]] = None
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Optional[Union[Dict[str, Any], List[Any]]]:
         for attempt in range(3):
             try:
-                r = await self.client.get(url, params=params)
-                if r.status_code in (429,) or 500 <= r.status_code < 600:
+                r = await self.client.get(url, params=params, headers=headers)
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    ra = r.headers.get("Retry-After")
                     if attempt < 2:
-                        await asyncio.sleep(0.25 + random.random() * 0.35)
+                        if ra and ra.isdigit():
+                            await asyncio.sleep(min(2.0, float(ra)))
+                        else:
+                            await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
                         continue
                     return None
                 if r.status_code >= 400:
@@ -1105,7 +1129,7 @@ class DataEngine:
                     return None
             except Exception:
                 if attempt < 2:
-                    await asyncio.sleep(0.25 + random.random() * 0.35)
+                    await asyncio.sleep(0.25 * (2 ** attempt) + random.random() * 0.35)
                     continue
                 return None
         return None
