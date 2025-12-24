@@ -2,21 +2,20 @@
 """
 routes_argaam.py
 ------------------------------------------------------------
-KSA / Argaam Gateway – v3.1.0 (Engine v2 aligned, Sheets-safe)
+KSA / Argaam Gateway – v3.2.0 (Engine v2 aligned, Sheets-safe + YahooChart fallback)
 
-Purpose
-- KSA-only router: accepts numeric or .SR symbols only.
-- Delegates fetching to core.data_engine_v2.DataEngine when possible.
-- If KSA providers are not configured (e.g. tadawul:no_url | argaam:no_row),
-  it can FALL BACK to yfinance (optional, env-controlled) to avoid "all missing".
-- Returns EnrichedQuote (+ Scores best-effort) for parity with Global routes.
-- Provides /sheet-rows (headers + rows) for Google Sheets.
+Key upgrades vs v3.1.0:
+- ✅ Force timestamps (last_updated_utc / last_updated_riyadh) to NEVER be null.
+- ✅ Add KSA Yahoo Chart fallback (stable, avoids yfinance 'currentTradingPeriod' failures).
+- ✅ Keep yfinance fallback optional (env-controlled) as LAST resort.
+- ✅ Health endpoint exposes real KSA providers + fallback switches (yahoo_chart/yfinance).
 
-Design goals
-- Extremely defensive (Sheets-safe): prefer returning 200 + error payload instead of raising.
-- Strict KSA normalization: always respond with 1234.SR when possible.
-- Render-safe mounting: never fail import-time if optional modules are missing.
+Auth:
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token set => open mode.
+
+Notes:
+- This router is defensive: prefer returning 200 + error payload over raising.
+- Strict KSA normalization: accepts 1120 or 1120.SR only; responds as 1120.SR.
 """
 
 from __future__ import annotations
@@ -24,19 +23,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from importlib import import_module
 from typing import Any, Dict, List, Optional, Sequence
 
+import httpx
 from fastapi import APIRouter, Body, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.argaam")
-ROUTE_VERSION = "3.1.0"
 
+ROUTE_VERSION = "3.2.0"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
+RIYADH_TZ = timezone(timedelta(hours=3))
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # =============================================================================
 # Safe imports (never break router mount)
@@ -126,6 +132,10 @@ class _FallbackEnrichedQuote(BaseModel):
     currency: Optional[str] = "SAR"
 
     current_price: Optional[float] = None
+    previous_close: Optional[float] = None
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+
     percent_change: Optional[float] = None
     volume: Optional[float] = None
     market_cap: Optional[float] = None
@@ -157,6 +167,9 @@ class _FallbackEnrichedQuote(BaseModel):
             currency=str(d.get("currency") or "SAR"),
             name=d.get("name") or d.get("company_name"),
             current_price=d.get("current_price") or d.get("last_price"),
+            previous_close=d.get("previous_close"),
+            day_high=d.get("day_high"),
+            day_low=d.get("day_low"),
             percent_change=d.get("percent_change"),
             volume=d.get("volume"),
             market_cap=d.get("market_cap"),
@@ -168,6 +181,8 @@ class _FallbackEnrichedQuote(BaseModel):
             recommendation=d.get("recommendation"),
             data_source=d.get("data_source") or d.get("provider"),
             data_quality=str(d.get("data_quality") or "MISSING"),
+            last_updated_utc=d.get("last_updated_utc"),
+            last_updated_riyadh=d.get("last_updated_riyadh"),
             error=d.get("error"),
         )
 
@@ -186,6 +201,12 @@ class _FallbackEnrichedQuote(BaseModel):
                 out.append(self.currency or "")
             elif lk in ("last price", "current price"):
                 out.append(self.current_price)
+            elif lk in ("previous close", "previous_close"):
+                out.append(self.previous_close)
+            elif lk in ("day high", "high", "day_high"):
+                out.append(self.day_high)
+            elif lk in ("day low", "low", "day_low"):
+                out.append(self.day_low)
             elif lk in ("change %", "percent change", "percent_change"):
                 out.append(self.percent_change)
             elif lk == "volume":
@@ -237,6 +258,9 @@ _DEFAULT_SHEETS_HEADERS_FALLBACK: List[str] = [
     "Market",
     "Currency",
     "Last Price",
+    "Previous Close",
+    "Day High",
+    "Day Low",
     "Percent Change",
     "Volume",
     "Market Cap",
@@ -376,8 +400,11 @@ def _cfg() -> Dict[str, Any]:
         "concurrency": _safe_int_env("ARGAAM_CONCURRENCY", 6),
         "timeout_sec": _safe_float_env("ARGAAM_TIMEOUT_SEC", 30.0),
         "default_sheet": default_sheet,
-        # Fallback: if engine returns tadawul:no_url | argaam:no_row
-        "allow_yfinance_fallback": _env_bool("KSA_YFINANCE_FALLBACK", True),
+        # NEW: Yahoo Chart fallback (recommended default ON)
+        "allow_yahoo_chart_fallback": _env_bool("KSA_YAHOO_CHART_FALLBACK", True),
+        "yahoo_chart_concurrency": _safe_int_env("KSA_YAHOO_CHART_CONCURRENCY", 6),
+        # Legacy: yfinance fallback (default OFF; keep optional)
+        "allow_yfinance_fallback": _env_bool("KSA_YFINANCE_FALLBACK", False),
         "yf_concurrency": _safe_int_env("KSA_YFINANCE_CONCURRENCY", 3),
     }
 
@@ -504,6 +531,49 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _now_riyadh_iso() -> str:
+    return datetime.now(RIYADH_TZ).isoformat()
+
+
+def _ensure_timestamps(obj: Any) -> Any:
+    """
+    Make last_updated_utc + last_updated_riyadh NEVER null/empty.
+    Works for dict OR pydantic models.
+    """
+    utc = _now_utc_iso()
+    riy = _now_riyadh_iso()
+
+    if isinstance(obj, dict):
+        obj["last_updated_utc"] = obj.get("last_updated_utc") or utc
+        obj["last_updated_riyadh"] = obj.get("last_updated_riyadh") or riy
+        return obj
+
+    # pydantic v2
+    try:
+        lu = getattr(obj, "last_updated_utc", None)
+        lr = getattr(obj, "last_updated_riyadh", None)
+        upd = {
+            "last_updated_utc": (lu or utc),
+            "last_updated_riyadh": (lr or riy),
+        }
+        if hasattr(obj, "model_copy"):
+            return obj.model_copy(update=upd)
+        if hasattr(obj, "copy"):
+            return obj.copy(update=upd)
+    except Exception:
+        pass
+
+    # last-resort setattr
+    try:
+        if not getattr(obj, "last_updated_utc", None):
+            setattr(obj, "last_updated_utc", utc)
+        if not getattr(obj, "last_updated_riyadh", None):
+            setattr(obj, "last_updated_riyadh", riy)
+    except Exception:
+        pass
+    return obj
+
+
 def _row_with_error(headers: List[str], symbol: str, error: str, data_quality: str = "MISSING") -> List[Any]:
     row: List[Any] = [None] * len(headers)
 
@@ -538,32 +608,205 @@ def _needs_ksa_fallback(uq: Any) -> bool:
     d = _model_to_dict(uq)
     dq = str(d.get("data_quality") or "").upper()
     err = str(d.get("error") or "")
+
     if dq == "MISSING":
         return True
-    # your exact failure signature
-    if "tadawul:no_url" in err or "argaam:no_row" in err or "No KSA provider data" in err:
+
+    # signatures we know mean "no usable KSA data"
+    sigs = (
+        "tadawul:no_url",
+        "argaam:no_row",
+        "No KSA provider data",
+        "currentTradingPeriod",
+        "yfinance error",
+        "yfinance blocked",
+        "Unauthorized",
+    )
+    if any(s in err for s in sigs):
         return True
+
+    # engine might return placeholders with no price
+    cp = d.get("current_price")
+    if cp in (None, "", "null"):
+        return True
+
     return False
 
 
+# =============================================================================
+# KSA fallback: Yahoo Chart (stable)
+# =============================================================================
+_YCH_CLIENT: Optional[httpx.AsyncClient] = None
+_YCH_LOCK = asyncio.Lock()
+
+
+async def _get_yahoo_chart_client() -> httpx.AsyncClient:
+    global _YCH_CLIENT
+    if _YCH_CLIENT is not None:
+        return _YCH_CLIENT
+
+    async with _YCH_LOCK:
+        if _YCH_CLIENT is not None:
+            return _YCH_CLIENT
+        _YCH_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=6.0),
+            follow_redirects=True,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json,text/plain,*/*",
+                "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
+                "Connection": "keep-alive",
+            },
+        )
+        return _YCH_CLIENT
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip().replace(",", "")
+        if not s or s.lower() in ("nan", "none", "null", "n/a", "-"):
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+async def _fetch_ksa_yahoo_chart(sym: str) -> Dict[str, Any]:
+    """
+    KSA fallback via Yahoo Finance chart endpoint (no yfinance dependency).
+    """
+    try:
+        client = await _get_yahoo_chart_client()
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {
+            "interval": "1d",
+            "range": "5d",
+            "includePrePost": "false",
+            "events": "div,splits",
+        }
+        r = await client.get(url, params=params)
+        if r.status_code >= 400:
+            return {
+                "symbol": sym,
+                "market": "KSA",
+                "currency": "SAR",
+                "data_source": "yahoo_chart",
+                "data_quality": "MISSING",
+                "error": f"yahoo_chart http {r.status_code}",
+            }
+
+        data = r.json() if r.content else {}
+        chart = (data or {}).get("chart") or {}
+        result = (chart.get("result") or [])
+        if not result or not isinstance(result, list) or not isinstance(result[0], dict):
+            err = chart.get("error") or {}
+            msg = err.get("description") or err.get("message") or "yahoo_chart empty result"
+            return {
+                "symbol": sym,
+                "market": "KSA",
+                "currency": "SAR",
+                "data_source": "yahoo_chart",
+                "data_quality": "MISSING",
+                "error": str(msg),
+            }
+
+        res0 = result[0]
+        meta = res0.get("meta") or {}
+        ind = res0.get("indicators") or {}
+        quotes = (ind.get("quote") or [])
+        q0 = quotes[0] if quotes and isinstance(quotes[0], dict) else {}
+
+        closes = q0.get("close") or []
+        highs = q0.get("high") or []
+        lows = q0.get("low") or []
+        vols = q0.get("volume") or []
+
+        def _last_num(arr: Any) -> Optional[float]:
+            if not isinstance(arr, list):
+                return _safe_float(arr)
+            for v in reversed(arr):
+                fv = _safe_float(v)
+                if fv is not None:
+                    return fv
+            return None
+
+        current = _safe_float(meta.get("regularMarketPrice")) or _last_num(closes)
+        prev = _safe_float(meta.get("previousClose"))
+        day_high = _last_num(highs)
+        day_low = _last_num(lows)
+        volume = _last_num(vols)
+
+        pct = None
+        try:
+            if current is not None and prev not in (None, 0.0):
+                pct = (float(current) - float(prev)) / float(prev) * 100.0
+        except Exception:
+            pct = None
+
+        currency = meta.get("currency") or "SAR"
+        dq = "FULL" if (current is not None and prev is not None and day_high is not None and day_low is not None) else (
+            "PARTIAL" if current is not None else "MISSING"
+        )
+
+        return {
+            "symbol": sym,
+            "market": "KSA",
+            "currency": currency,
+            "current_price": current,
+            "previous_close": prev,
+            "day_high": day_high,
+            "day_low": day_low,
+            "volume": volume,
+            "percent_change": pct,
+            "data_source": "yahoo_chart",
+            "data_quality": dq,
+            "error": None if current is not None else "yahoo_chart returned no price",
+            "last_updated_utc": _now_utc_iso(),
+            "last_updated_riyadh": _now_riyadh_iso(),
+        }
+    except Exception as exc:
+        return {
+            "symbol": sym,
+            "market": "KSA",
+            "currency": "SAR",
+            "data_source": "yahoo_chart",
+            "data_quality": "MISSING",
+            "error": f"yahoo_chart error: {exc}",
+        }
+
+
+# =============================================================================
+# Legacy fallback: yfinance (optional)
+# =============================================================================
 async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
     """
     KSA fallback using yfinance (sync library -> run in thread).
     Returns a UnifiedQuote-like dict.
     """
     if _yf is None:
-        return {"symbol": sym, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "data_source": "yfinance", "error": "yfinance not available"}
+        return {
+            "symbol": sym,
+            "market": "KSA",
+            "currency": "SAR",
+            "data_quality": "MISSING",
+            "data_source": "yfinance",
+            "error": "yfinance not available",
+        }
 
     def _work() -> Dict[str, Any]:
         try:
             t = _yf.Ticker(sym)  # type: ignore
+
             info = {}
             try:
                 info = t.info or {}
             except Exception:
                 info = {}
 
-            # fast_info is usually quicker & more reliable for price fields
             fast = {}
             try:
                 fast = getattr(t, "fast_info", None) or {}
@@ -574,7 +817,6 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
             prev = None
             vol = None
 
-            # try fast_info keys first
             for k in ("last_price", "lastPrice", "regularMarketPrice"):
                 if k in fast and fast.get(k) not in (None, ""):
                     price = fast.get(k)
@@ -588,7 +830,6 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
                     vol = fast.get(k)
                     break
 
-            # fall back to info
             if price is None:
                 price = info.get("regularMarketPrice") or info.get("currentPrice")
             if prev is None:
@@ -603,14 +844,12 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
             except Exception:
                 pct = None
 
-            # some fundamentals (may be None)
             mc = info.get("marketCap")
             pe = info.get("trailingPE")
             pb = info.get("priceToBook")
             dy = info.get("dividendYield")
             name = info.get("shortName") or info.get("longName")
 
-            # dividendYield might be fraction (0.02) -> convert to %
             try:
                 if dy is not None and 0 < float(dy) < 1:
                     dy = float(dy) * 100.0
@@ -623,6 +862,7 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
                 "market": "KSA",
                 "currency": "SAR",
                 "current_price": float(price) if price is not None else None,
+                "previous_close": float(prev) if prev is not None else None,
                 "percent_change": float(pct) if pct is not None else None,
                 "volume": float(vol) if vol is not None else None,
                 "market_cap": float(mc) if mc is not None else None,
@@ -632,6 +872,8 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
                 "data_source": "yfinance",
                 "data_quality": "PARTIAL" if price is not None else "MISSING",
                 "error": None if price is not None else "yfinance returned no price",
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
             }
         except Exception as exc:
             return {
@@ -646,6 +888,9 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
     return await asyncio.to_thread(_work)
 
 
+# =============================================================================
+# Transformation + scoring
+# =============================================================================
 def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
     sym = _normalize_ksa_symbol(requested_symbol) or (str(requested_symbol or "").strip().upper() or "UNKNOWN")
     forced: Dict[str, Any] = {"symbol": sym, "market": "KSA", "currency": "SAR"}
@@ -653,6 +898,7 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
     try:
         eq = EnrichedQuote.from_unified(uq)  # type: ignore
 
+        # force missing identity fields
         try:
             upd = {k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")}
             if upd:
@@ -663,6 +909,7 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
+        # ensure data_source
         try:
             if not getattr(eq, "data_source", None):
                 d = _model_to_dict(uq)
@@ -674,8 +921,10 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
+        # scoring (best-effort)
         try:
             from core.scoring_engine import enrich_with_scores  # type: ignore
+
             try:
                 eq2 = enrich_with_scores(eq)  # type: ignore
                 if eq2 is not None:
@@ -685,6 +934,7 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
+        # force symbol normalized
         try:
             if getattr(eq, "symbol", None) != sym:
                 if hasattr(eq, "model_copy"):
@@ -694,17 +944,21 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
+        # ✅ force timestamps (never null)
+        eq = _ensure_timestamps(eq)
+
         return eq
 
     except Exception as exc:
         logger.exception("[argaam] transform error for %s", sym)
-        return EnrichedQuote(  # type: ignore
+        eq = EnrichedQuote(  # type: ignore
             symbol=sym,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
             error=f"Transform error: {exc}",
         )
+        return _ensure_timestamps(eq)
 
 
 # =============================================================================
@@ -746,21 +1000,54 @@ async def _engine_get_quotes(engine: Any, syms: List[str], *, timeout_sec: float
         return [{"symbol": s, "data_quality": "MISSING", "error": f"Engine batch error: {exc}"} for s in syms]
 
 
-async def _apply_yf_fallback_for_missing(targets: List[str], items: List[Any], cfg: Dict[str, Any]) -> List[Any]:
+# =============================================================================
+# Apply fallback(s) for missing KSA items
+# =============================================================================
+async def _apply_fallback_for_missing(targets: List[str], items: List[Any], cfg: Dict[str, Any]) -> List[Any]:
     """
-    Given engine-returned items for targets (same order), replace missing ones using yfinance.
+    Given engine-returned items for targets (same order), replace missing ones using:
+      1) yahoo_chart (if enabled)
+      2) yfinance (if enabled)
     """
-    if not cfg.get("allow_yfinance_fallback", True):
-        return items
+    allow_ych = bool(cfg.get("allow_yahoo_chart_fallback", True))
+    allow_yf = bool(cfg.get("allow_yfinance_fallback", False))
 
-    sem = asyncio.Semaphore(max(1, int(cfg.get("yf_concurrency", 3) or 3)))
+    ych_sem = asyncio.Semaphore(max(1, int(cfg.get("yahoo_chart_concurrency", 6) or 6)))
+    yf_sem = asyncio.Semaphore(max(1, int(cfg.get("yf_concurrency", 3) or 3)))
 
     async def _fix_one(i: int) -> Any:
         uq = items[i]
         if not _needs_ksa_fallback(uq):
             return uq
-        async with sem:
-            return await _fetch_ksa_yfinance(targets[i])
+
+        sym = targets[i]
+
+        # 1) Yahoo Chart
+        if allow_ych:
+            async with ych_sem:
+                ych = await _fetch_ksa_yahoo_chart(sym)
+            if str(ych.get("data_quality") or "").upper() != "MISSING":
+                return ych
+            # if still missing, keep error for debug chaining
+            uq_d = _model_to_dict(uq)
+            e0 = str(uq_d.get("error") or "")
+            e1 = str(ych.get("error") or "")
+            uq_d["error"] = (e0 + " | yahoo_chart_failed: " + e1).strip(" |")
+            uq = uq_d
+
+        # 2) yfinance
+        if allow_yf:
+            async with yf_sem:
+                yf_uq = await _fetch_ksa_yfinance(sym)
+            if str(yf_uq.get("data_quality") or "").upper() != "MISSING":
+                return yf_uq
+            uq_d = _model_to_dict(uq)
+            e0 = str(uq_d.get("error") or "")
+            e1 = str(yf_uq.get("error") or "")
+            uq_d["error"] = (e0 + " | yfinance_failed: " + e1).strip(" |")
+            return uq_d
+
+        return uq
 
     return list(await asyncio.gather(*[_fix_one(i) for i in range(len(targets))], return_exceptions=False))
 
@@ -791,16 +1078,43 @@ class KSASheetResponse(BaseModel):
 async def argaam_health(request: Request) -> Dict[str, Any]:
     cfg = _cfg()
     eng = await _resolve_engine(request)
+
     providers: List[str] = []
-    try:
-        providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
-    except Exception:
-        providers = []
+    ksa_providers: List[str] = []
+    flags: Dict[str, Any] = {}
+
+    if eng:
+        try:
+            providers = list(getattr(eng, "enabled_providers", []) or [])
+        except Exception:
+            providers = []
+        try:
+            ksa_providers = list(getattr(eng, "enabled_ksa_providers", []) or [])
+        except Exception:
+            ksa_providers = []
+
+        # expose engine flags if present
+        for attr in ("enable_yfinance", "enable_yfinance_ksa", "enable_yahoo_chart_ksa"):
+            try:
+                if hasattr(eng, attr):
+                    flags[attr] = bool(getattr(eng, attr))
+            except Exception:
+                pass
 
     s = _settings_obj()
     app_version = None
     if s is not None:
         app_version = getattr(s, "app_version", None) or getattr(s, "version", None)
+
+    # also reflect route fallback config
+    fallbacks = {
+        "yahoo_chart_available": True,  # route uses httpx, not optional
+        "allow_yahoo_chart_fallback": bool(cfg.get("allow_yahoo_chart_fallback", True)),
+        "yahoo_chart_concurrency": int(cfg.get("yahoo_chart_concurrency", 6) or 6),
+        "yfinance_available": bool(_yf),
+        "allow_yfinance_fallback": bool(cfg.get("allow_yfinance_fallback", False)),
+        "yfinance_concurrency": int(cfg.get("yf_concurrency", 3) or 3),
+    }
 
     return {
         "status": "ok",
@@ -810,13 +1124,11 @@ async def argaam_health(request: Request) -> Dict[str, Any]:
         "engine_available": bool(eng),
         "engine": "DataEngineV2" if bool(eng) else "unavailable",
         "providers": providers,
+        "ksa_providers": ksa_providers,
+        "engine_flags": flags,
         "ksa_mode": "STRICT",
         "auth": "open" if not _allowed_tokens() else "token",
-        "fallbacks": {
-            "yfinance_available": bool(_yf),
-            "allow_yfinance_fallback": bool(cfg.get("allow_yfinance_fallback", True)),
-            "yfinance_concurrency": int(cfg.get("yf_concurrency", 3) or 3),
-        },
+        "fallbacks": fallbacks,
         "limits": {
             "ARGAAM_MAX_TICKERS": cfg["max_tickers"],
             "ARGAAM_BATCH_SIZE": cfg["batch_size"],
@@ -845,51 +1157,48 @@ async def ksa_single_quote(
     request: Request,
     symbol: str = Query(..., description="KSA symbol (1120 or 1120.SR)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    debug: int = Query(default=0, description="debug=1 adds extra info in error field (best-effort)"),
+    debug: int = Query(default=0, description="debug=1 appends fallback trace into error (best-effort)"),
 ) -> Any:
     err = _auth_error(x_app_token)
     if err:
-        return EnrichedQuote(  # type: ignore
+        eq = EnrichedQuote(  # type: ignore
             symbol=(symbol or "").strip().upper() or "UNKNOWN",
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
             error=err,
         )
+        return _ensure_timestamps(eq)
 
     ksa_symbol = _normalize_ksa_symbol(symbol)
     if not ksa_symbol:
-        return EnrichedQuote(  # type: ignore
+        eq = EnrichedQuote(  # type: ignore
             symbol=(symbol or "").strip().upper() or "UNKNOWN",
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
             error=f"Invalid KSA symbol '{symbol}'. Must be numeric or end in .SR",
         )
+        return _ensure_timestamps(eq)
 
     cfg = _cfg()
     eng = await _resolve_engine(request)
 
-    uq: Any
     if eng is None:
-        uq = {"symbol": ksa_symbol, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "Engine unavailable"}
+        uq: Any = {"symbol": ksa_symbol, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "Engine unavailable"}
     else:
         uq = await _engine_get_quote(eng, ksa_symbol, timeout_sec=cfg["timeout_sec"])
 
-    # If engine couldn't fetch KSA providers, try yfinance (optional)
-    if cfg.get("allow_yfinance_fallback", True) and _needs_ksa_fallback(uq):
-        yf_uq = await _fetch_ksa_yfinance(ksa_symbol)
-        # If yfinance succeeded, replace; otherwise keep original error and append debug
-        if str(yf_uq.get("data_quality") or "").upper() != "MISSING":
-            uq = yf_uq
-        elif debug:
-            d = _model_to_dict(uq)
-            e0 = str(d.get("error") or "")
-            e1 = str(yf_uq.get("error") or "")
-            uq = dict(d)
-            uq["error"] = (e0 + " | yfinance_fallback_failed: " + e1).strip(" |")
+    # Apply fallback(s) if needed (yahoo_chart first, then optional yfinance)
+    if _needs_ksa_fallback(uq):
+        fixed = await _apply_fallback_for_missing([ksa_symbol], [uq], cfg)
+        uq = fixed[0] if fixed else uq
+        if debug:
+            # keep whatever error trace we built inside the fallback pipeline
+            pass
 
-    return _to_scored_enriched(uq, ksa_symbol)
+    eq = _to_scored_enriched(uq, ksa_symbol)
+    return _ensure_timestamps(eq)
 
 
 @router.post("/quotes")
@@ -923,40 +1232,29 @@ async def ksa_batch_quotes(
 
     if err:
         for t in targets:
-            out.append(
-                EnrichedQuote(  # type: ignore
-                    symbol=t,
-                    market="KSA",
-                    currency="SAR",
-                    data_quality="MISSING",
-                    error=err,
-                )
+            eq = EnrichedQuote(  # type: ignore
+                symbol=t,
+                market="KSA",
+                currency="SAR",
+                data_quality="MISSING",
+                error=err,
             )
+            out.append(_ensure_timestamps(eq))
     else:
         eng = await _resolve_engine(request)
+
         if eng is None:
-            # even if engine is down, we can still try yfinance
-            if cfg.get("allow_yfinance_fallback", True):
-                uq_list = await _apply_yf_fallback_for_missing(targets, [{"symbol": t, "data_quality": "MISSING", "error": "Engine unavailable"} for t in targets], cfg)
-                for i, t in enumerate(targets):
-                    out.append(_to_scored_enriched(uq_list[i], t))
-            else:
-                for t in targets:
-                    out.append(
-                        EnrichedQuote(  # type: ignore
-                            symbol=t,
-                            market="KSA",
-                            currency="SAR",
-                            data_quality="MISSING",
-                            error="Engine unavailable",
-                        )
-                    )
+            # build missing shells then apply fallback(s)
+            shells = [{"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "Engine unavailable"} for t in targets]
+            fixed = await _apply_fallback_for_missing(targets, shells, cfg)
+            for i, t in enumerate(targets):
+                out.append(_ensure_timestamps(_to_scored_enriched(fixed[i], t)))
         else:
             batch_size = max(1, int(cfg["batch_size"]))
             for part in [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]:
                 got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
 
-                # normalize map by symbol
+                # map by symbol
                 m: Dict[str, Any] = {}
                 for q in got or []:
                     d = _model_to_dict(q)
@@ -964,23 +1262,22 @@ async def ksa_batch_quotes(
                     if k:
                         m[k] = q
 
-                # preserve part order, then apply fallback for missing (per item)
                 ordered = [m.get(t.upper()) or {"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "No data returned"} for t in part]
-                ordered = await _apply_yf_fallback_for_missing(part, ordered, cfg)
+                ordered = await _apply_fallback_for_missing(part, ordered, cfg)
 
                 for i, t in enumerate(part):
-                    out.append(_to_scored_enriched(ordered[i], t))
+                    out.append(_ensure_timestamps(_to_scored_enriched(ordered[i], t)))
 
     for bad in invalid:
-        out.append(
-            EnrichedQuote(  # type: ignore
-                symbol=bad.upper(),
-                market="KSA",
-                currency="SAR",
-                data_quality="MISSING",
-                error="Invalid KSA symbol (must be numeric or end in .SR)",
-            )
+        eq = EnrichedQuote(  # type: ignore
+            symbol=bad.upper(),
+            market="KSA",
+            currency="SAR",
+            data_quality="MISSING",
+            error="Invalid KSA symbol (must be numeric or end in .SR)",
         )
+        out.append(_ensure_timestamps(eq))
+
     return out
 
 
@@ -1030,7 +1327,6 @@ async def ksa_sheet_rows(
         valid_targets = valid_targets[: cfg["max_tickers"]]
 
     rows: List[List[Any]] = []
-
     for bad in invalid:
         rows.append(_row_with_error(headers, bad.upper(), "Invalid KSA symbol (must be numeric or end in .SR)"))
 
@@ -1069,11 +1365,11 @@ async def ksa_sheet_rows(
                 m[k] = q
 
         ordered = [m.get(t.upper()) or {"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "No data"} for t in part]
-        ordered = await _apply_yf_fallback_for_missing(part, ordered, cfg)
+        ordered = await _apply_fallback_for_missing(part, ordered, cfg)
 
         for i, t in enumerate(part):
             uq = ordered[i]
-            eq = _to_scored_enriched(uq, t)
+            eq = _ensure_timestamps(_to_scored_enriched(uq, t))
             try:
                 row = eq.to_row(headers)  # type: ignore
                 if not isinstance(row, list):
@@ -1107,7 +1403,8 @@ async def ksa_sheet_rows(
             "valid": len(valid_targets),
             "invalid": len(invalid),
             "timestamp_utc": _now_utc_iso(),
-            "fallback_yfinance": bool(cfg.get("allow_yfinance_fallback", True)),
+            "fallback_yahoo_chart": bool(cfg.get("allow_yahoo_chart_fallback", True)),
+            "fallback_yfinance": bool(cfg.get("allow_yfinance_fallback", False)),
         },
     )
 
