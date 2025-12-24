@@ -400,10 +400,10 @@ def _cfg() -> Dict[str, Any]:
         "concurrency": _safe_int_env("ARGAAM_CONCURRENCY", 6),
         "timeout_sec": _safe_float_env("ARGAAM_TIMEOUT_SEC", 30.0),
         "default_sheet": default_sheet,
-        # NEW: Yahoo Chart fallback (recommended default ON)
+        # Yahoo chart fallback (recommended ON)
         "allow_yahoo_chart_fallback": _env_bool("KSA_YAHOO_CHART_FALLBACK", True),
         "yahoo_chart_concurrency": _safe_int_env("KSA_YAHOO_CHART_CONCURRENCY", 6),
-        # Legacy: yfinance fallback (default OFF; keep optional)
+        # yfinance fallback (default OFF; keep optional)
         "allow_yfinance_fallback": _env_bool("KSA_YFINANCE_FALLBACK", False),
         "yf_concurrency": _safe_int_env("KSA_YFINANCE_CONCURRENCY", 3),
     }
@@ -536,10 +536,6 @@ def _now_riyadh_iso() -> str:
 
 
 def _ensure_timestamps(obj: Any) -> Any:
-    """
-    Make last_updated_utc + last_updated_riyadh NEVER null/empty.
-    Works for dict OR pydantic models.
-    """
     utc = _now_utc_iso()
     riy = _now_riyadh_iso()
 
@@ -548,14 +544,10 @@ def _ensure_timestamps(obj: Any) -> Any:
         obj["last_updated_riyadh"] = obj.get("last_updated_riyadh") or riy
         return obj
 
-    # pydantic v2
     try:
         lu = getattr(obj, "last_updated_utc", None)
         lr = getattr(obj, "last_updated_riyadh", None)
-        upd = {
-            "last_updated_utc": (lu or utc),
-            "last_updated_riyadh": (lr or riy),
-        }
+        upd = {"last_updated_utc": (lu or utc), "last_updated_riyadh": (lr or riy)}
         if hasattr(obj, "model_copy"):
             return obj.model_copy(update=upd)
         if hasattr(obj, "copy"):
@@ -563,7 +555,6 @@ def _ensure_timestamps(obj: Any) -> Any:
     except Exception:
         pass
 
-    # last-resort setattr
     try:
         if not getattr(obj, "last_updated_utc", None):
             setattr(obj, "last_updated_utc", utc)
@@ -571,6 +562,7 @@ def _ensure_timestamps(obj: Any) -> Any:
             setattr(obj, "last_updated_riyadh", riy)
     except Exception:
         pass
+
     return obj
 
 
@@ -612,7 +604,6 @@ def _needs_ksa_fallback(uq: Any) -> bool:
     if dq == "MISSING":
         return True
 
-    # signatures we know mean "no usable KSA data"
     sigs = (
         "tadawul:no_url",
         "argaam:no_row",
@@ -620,12 +611,10 @@ def _needs_ksa_fallback(uq: Any) -> bool:
         "currentTradingPeriod",
         "yfinance error",
         "yfinance blocked",
-        "Unauthorized",
     )
     if any(s in err for s in sigs):
         return True
 
-    # engine might return placeholders with no price
     cp = d.get("current_price")
     if cp in (None, "", "null"):
         return True
@@ -676,19 +665,12 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 async def _fetch_ksa_yahoo_chart(sym: str) -> Dict[str, Any]:
-    """
-    KSA fallback via Yahoo Finance chart endpoint (no yfinance dependency).
-    """
     try:
         client = await _get_yahoo_chart_client()
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
-        params = {
-            "interval": "1d",
-            "range": "5d",
-            "includePrePost": "false",
-            "events": "div,splits",
-        }
+        params = {"interval": "1d", "range": "5d", "includePrePost": "false", "events": "div,splits"}
         r = await client.get(url, params=params)
+
         if r.status_code >= 400:
             return {
                 "symbol": sym,
@@ -697,6 +679,8 @@ async def _fetch_ksa_yahoo_chart(sym: str) -> Dict[str, Any]:
                 "data_source": "yahoo_chart",
                 "data_quality": "MISSING",
                 "error": f"yahoo_chart http {r.status_code}",
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
             }
 
         data = r.json() if r.content else {}
@@ -712,6 +696,8 @@ async def _fetch_ksa_yahoo_chart(sym: str) -> Dict[str, Any]:
                 "data_source": "yahoo_chart",
                 "data_quality": "MISSING",
                 "error": str(msg),
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
             }
 
         res0 = result[0]
@@ -776,6 +762,8 @@ async def _fetch_ksa_yahoo_chart(sym: str) -> Dict[str, Any]:
             "data_source": "yahoo_chart",
             "data_quality": "MISSING",
             "error": f"yahoo_chart error: {exc}",
+            "last_updated_utc": _now_utc_iso(),
+            "last_updated_riyadh": _now_riyadh_iso(),
         }
 
 
@@ -783,10 +771,6 @@ async def _fetch_ksa_yahoo_chart(sym: str) -> Dict[str, Any]:
 # Legacy fallback: yfinance (optional)
 # =============================================================================
 async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
-    """
-    KSA fallback using yfinance (sync library -> run in thread).
-    Returns a UnifiedQuote-like dict.
-    """
     if _yf is None:
         return {
             "symbol": sym,
@@ -795,6 +779,8 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
             "data_quality": "MISSING",
             "data_source": "yfinance",
             "error": "yfinance not available",
+            "last_updated_utc": _now_utc_iso(),
+            "last_updated_riyadh": _now_riyadh_iso(),
         }
 
     def _work() -> Dict[str, Any]:
@@ -844,31 +830,14 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
             except Exception:
                 pct = None
 
-            mc = info.get("marketCap")
-            pe = info.get("trailingPE")
-            pb = info.get("priceToBook")
-            dy = info.get("dividendYield")
-            name = info.get("shortName") or info.get("longName")
-
-            try:
-                if dy is not None and 0 < float(dy) < 1:
-                    dy = float(dy) * 100.0
-            except Exception:
-                pass
-
             return {
                 "symbol": sym,
-                "name": name,
                 "market": "KSA",
                 "currency": "SAR",
                 "current_price": float(price) if price is not None else None,
                 "previous_close": float(prev) if prev is not None else None,
                 "percent_change": float(pct) if pct is not None else None,
                 "volume": float(vol) if vol is not None else None,
-                "market_cap": float(mc) if mc is not None else None,
-                "pe_ttm": float(pe) if pe is not None else None,
-                "pb": float(pb) if pb is not None else None,
-                "dividend_yield": float(dy) if dy is not None else None,
                 "data_source": "yfinance",
                 "data_quality": "PARTIAL" if price is not None else "MISSING",
                 "error": None if price is not None else "yfinance returned no price",
@@ -883,6 +852,8 @@ async def _fetch_ksa_yfinance(sym: str) -> Dict[str, Any]:
                 "data_quality": "MISSING",
                 "data_source": "yfinance",
                 "error": f"yfinance error: {exc}",
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
             }
 
     return await asyncio.to_thread(_work)
@@ -898,7 +869,6 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
     try:
         eq = EnrichedQuote.from_unified(uq)  # type: ignore
 
-        # force missing identity fields
         try:
             upd = {k: v for k, v in forced.items() if getattr(eq, k, None) in (None, "", "UNKNOWN")}
             if upd:
@@ -909,7 +879,6 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
-        # ensure data_source
         try:
             if not getattr(eq, "data_source", None):
                 d = _model_to_dict(uq)
@@ -921,20 +890,15 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
-        # scoring (best-effort)
         try:
             from core.scoring_engine import enrich_with_scores  # type: ignore
 
-            try:
-                eq2 = enrich_with_scores(eq)  # type: ignore
-                if eq2 is not None:
-                    eq = eq2
-            except Exception:
-                pass
+            eq2 = enrich_with_scores(eq)  # type: ignore
+            if eq2 is not None:
+                eq = eq2
         except Exception:
             pass
 
-        # force symbol normalized
         try:
             if getattr(eq, "symbol", None) != sym:
                 if hasattr(eq, "model_copy"):
@@ -944,10 +908,7 @@ def _to_scored_enriched(uq: Any, requested_symbol: str) -> Any:
         except Exception:
             pass
 
-        # ✅ force timestamps (never null)
-        eq = _ensure_timestamps(eq)
-
-        return eq
+        return _ensure_timestamps(eq)
 
     except Exception as exc:
         logger.exception("[argaam] transform error for %s", sym)
@@ -1004,11 +965,6 @@ async def _engine_get_quotes(engine: Any, syms: List[str], *, timeout_sec: float
 # Apply fallback(s) for missing KSA items
 # =============================================================================
 async def _apply_fallback_for_missing(targets: List[str], items: List[Any], cfg: Dict[str, Any]) -> List[Any]:
-    """
-    Given engine-returned items for targets (same order), replace missing ones using:
-      1) yahoo_chart (if enabled)
-      2) yfinance (if enabled)
-    """
     allow_ych = bool(cfg.get("allow_yahoo_chart_fallback", True))
     allow_yf = bool(cfg.get("allow_yfinance_fallback", False))
 
@@ -1022,29 +978,22 @@ async def _apply_fallback_for_missing(targets: List[str], items: List[Any], cfg:
 
         sym = targets[i]
 
-        # 1) Yahoo Chart
         if allow_ych:
             async with ych_sem:
                 ych = await _fetch_ksa_yahoo_chart(sym)
             if str(ych.get("data_quality") or "").upper() != "MISSING":
                 return ych
-            # if still missing, keep error for debug chaining
             uq_d = _model_to_dict(uq)
-            e0 = str(uq_d.get("error") or "")
-            e1 = str(ych.get("error") or "")
-            uq_d["error"] = (e0 + " | yahoo_chart_failed: " + e1).strip(" |")
+            uq_d["error"] = (str(uq_d.get("error") or "") + " | yahoo_chart_failed: " + str(ych.get("error") or "")).strip(" |")
             uq = uq_d
 
-        # 2) yfinance
         if allow_yf:
             async with yf_sem:
                 yf_uq = await _fetch_ksa_yfinance(sym)
             if str(yf_uq.get("data_quality") or "").upper() != "MISSING":
                 return yf_uq
             uq_d = _model_to_dict(uq)
-            e0 = str(uq_d.get("error") or "")
-            e1 = str(yf_uq.get("error") or "")
-            uq_d["error"] = (e0 + " | yfinance_failed: " + e1).strip(" |")
+            uq_d["error"] = (str(uq_d.get("error") or "") + " | yfinance_failed: " + str(yf_uq.get("error") or "")).strip(" |")
             return uq_d
 
         return uq
@@ -1093,7 +1042,6 @@ async def argaam_health(request: Request) -> Dict[str, Any]:
         except Exception:
             ksa_providers = []
 
-        # expose engine flags if present
         for attr in ("enable_yfinance", "enable_yfinance_ksa", "enable_yahoo_chart_ksa"):
             try:
                 if hasattr(eng, attr):
@@ -1105,16 +1053,6 @@ async def argaam_health(request: Request) -> Dict[str, Any]:
     app_version = None
     if s is not None:
         app_version = getattr(s, "app_version", None) or getattr(s, "version", None)
-
-    # also reflect route fallback config
-    fallbacks = {
-        "yahoo_chart_available": True,  # route uses httpx, not optional
-        "allow_yahoo_chart_fallback": bool(cfg.get("allow_yahoo_chart_fallback", True)),
-        "yahoo_chart_concurrency": int(cfg.get("yahoo_chart_concurrency", 6) or 6),
-        "yfinance_available": bool(_yf),
-        "allow_yfinance_fallback": bool(cfg.get("allow_yfinance_fallback", False)),
-        "yfinance_concurrency": int(cfg.get("yf_concurrency", 3) or 3),
-    }
 
     return {
         "status": "ok",
@@ -1128,7 +1066,14 @@ async def argaam_health(request: Request) -> Dict[str, Any]:
         "engine_flags": flags,
         "ksa_mode": "STRICT",
         "auth": "open" if not _allowed_tokens() else "token",
-        "fallbacks": fallbacks,
+        "fallbacks": {
+            "yahoo_chart_available": True,
+            "allow_yahoo_chart_fallback": bool(cfg.get("allow_yahoo_chart_fallback", True)),
+            "yahoo_chart_concurrency": int(cfg.get("yahoo_chart_concurrency", 6) or 6),
+            "yfinance_available": bool(_yf),
+            "allow_yfinance_fallback": bool(cfg.get("allow_yfinance_fallback", False)),
+            "yfinance_concurrency": int(cfg.get("yf_concurrency", 3) or 3),
+        },
         "limits": {
             "ARGAAM_MAX_TICKERS": cfg["max_tickers"],
             "ARGAAM_BATCH_SIZE": cfg["batch_size"],
@@ -1189,16 +1134,13 @@ async def ksa_single_quote(
     else:
         uq = await _engine_get_quote(eng, ksa_symbol, timeout_sec=cfg["timeout_sec"])
 
-    # Apply fallback(s) if needed (yahoo_chart first, then optional yfinance)
     if _needs_ksa_fallback(uq):
         fixed = await _apply_fallback_for_missing([ksa_symbol], [uq], cfg)
         uq = fixed[0] if fixed else uq
         if debug:
-            # keep whatever error trace we built inside the fallback pipeline
             pass
 
-    eq = _to_scored_enriched(uq, ksa_symbol)
-    return _ensure_timestamps(eq)
+    return _ensure_timestamps(_to_scored_enriched(uq, ksa_symbol))
 
 
 @router.post("/quotes")
@@ -1244,7 +1186,6 @@ async def ksa_batch_quotes(
         eng = await _resolve_engine(request)
 
         if eng is None:
-            # build missing shells then apply fallback(s)
             shells = [{"symbol": t, "market": "KSA", "currency": "SAR", "data_quality": "MISSING", "error": "Engine unavailable"} for t in targets]
             fixed = await _apply_fallback_for_missing(targets, shells, cfg)
             for i, t in enumerate(targets):
@@ -1254,7 +1195,6 @@ async def ksa_batch_quotes(
             for part in [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]:
                 got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
 
-                # map by symbol
                 m: Dict[str, Any] = {}
                 for q in got or []:
                     d = _model_to_dict(q)
@@ -1346,7 +1286,6 @@ async def ksa_sheet_rows(
         )
 
     eng = await _resolve_engine(request)
-
     batch_size = max(1, int(cfg["batch_size"]))
     any_fail = False
 
@@ -1356,7 +1295,6 @@ async def ksa_sheet_rows(
         else:
             got = await _engine_get_quotes(eng, part, timeout_sec=cfg["timeout_sec"], concurrency=cfg["concurrency"])
 
-        # map by symbol
         m: Dict[str, Any] = {}
         for q in got or []:
             d = _model_to_dict(q)
