@@ -2,7 +2,7 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) – v1.3.0 (Hardened)
+Routes package initialization (PROD SAFE) – v1.4.0 (Hardened)
 
 Design rules
 - ZERO heavy imports here (no FastAPI, no routers, no app state).
@@ -14,21 +14,25 @@ Design rules
     • debug snapshot (Render logs friendly)
 
 Router mounting MUST remain in main.py (or your app factory).
+
+Update note (v1.4.0):
+- Track BOTH Argaam router locations:
+    • routes.routes_argaam  (main router inside package)
+    • routes_argaam         (repo-root shim for backward compatibility)
 """
 
 from __future__ import annotations
 
 import importlib.util
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-ROUTES_PACKAGE_VERSION = "1.3.0"
+ROUTES_PACKAGE_VERSION = "1.4.0"
 
 
 # -----------------------------------------------------------------------------
 # Public helpers
 # -----------------------------------------------------------------------------
-
 def get_routes_version() -> str:
     return ROUTES_PACKAGE_VERSION
 
@@ -39,13 +43,18 @@ def get_expected_router_modules() -> List[str]:
     Update this list when adding/removing route modules.
     """
     return [
-        # Core stable routes
+        # Core stable routes (within package)
         "routes.enriched_quote",
         "routes.ai_analysis",
         "routes.advanced_analysis",
         "routes.legacy_service",
-        # Optional / KSA gateway
+
+        # KSA gateway (main router inside package)
+        "routes.routes_argaam",
+
+        # KSA gateway (repo-root shim; keep for legacy deployments)
         "routes_argaam",
+
         # Optional shims
         "routes.config",
     ]
@@ -102,9 +111,14 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
     missing = [m for m in expected if m not in available]
 
     # Minimal environment hints (do NOT leak secrets)
-    # We only report whether a token is set.
     app_token_set = bool((os.getenv("APP_TOKEN") or "").strip())
     backup_token_set = bool((os.getenv("BACKUP_APP_TOKEN") or "").strip())
+
+    # Optional: detect which Argaam module(s) exist
+    argaam_layout = {
+        "routes.routes_argaam": module_exists("routes.routes_argaam"),
+        "routes_argaam": module_exists("routes_argaam"),
+    }
 
     return {
         "routes_pkg_version": ROUTES_PACKAGE_VERSION,
@@ -113,6 +127,7 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
         "missing_count": len(missing),
         "available": available,
         "missing": missing,
+        "argaam_layout": argaam_layout,
         "env_hints": {
             "app_token_set": app_token_set,
             "backup_app_token_set": backup_token_set,
