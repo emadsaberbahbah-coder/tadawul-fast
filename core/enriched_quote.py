@@ -2,22 +2,14 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router: Enriched Quote (PROD SAFE) – v2.3.2
+Compatibility Router: Enriched Quote (PROD SAFE) – v2.3.3
 
-Why this file exists:
-- main.py mounts routers from multiple candidate import paths:
-    ("enriched_quote", ["routes.enriched_quote", "enriched_quote", "core.enriched_quote"])
-- If routes/enriched_quote.py moves or fails import, this module keeps the API alive.
-
-Behavior:
-- Provides: router (APIRouter) + get_router()
-- Endpoints:
-    - GET /v1/enriched/quote?symbol=AAPL
-    - GET /v1/enriched/quotes?symbols=AAPL,MSFT,1120.SR
-- Uses app.state.engine when available, otherwise best-effort fallbacks
-- Always returns HTTP 200 with {"status": "..."} for client simplicity
-- Optional debug trace via env DEBUG_ERRORS=1 or query ?debug=1
-- Best-effort schema-fill (UnifiedQuote.model_fields) to prevent missing keys
+What’s improved vs v2.3.2:
+- ✅ Batch acceleration for /v1/enriched/quotes:
+    tries engine.get_enriched_quotes/get_quotes (single call) before falling back to per-symbol calls.
+- ✅ Still ALWAYS returns HTTP 200 with {"status": "..."} for client simplicity.
+- ✅ Optional debug trace via env DEBUG_ERRORS=1 or query ?debug=1
+- ✅ Best-effort schema-fill (UnifiedQuote.model_fields) to prevent missing keys
 """
 
 from __future__ import annotations
@@ -116,23 +108,20 @@ def _as_payload(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
         return jsonable_encoder(obj)
 
-    # Pydantic v2
-    md = getattr(obj, "model_dump", None)
+    md = getattr(obj, "model_dump", None)  # Pydantic v2
     if callable(md):
         try:
             return jsonable_encoder(md())
         except Exception:
             pass
 
-    # Pydantic v1
-    d = getattr(obj, "dict", None)
+    d = getattr(obj, "dict", None)  # Pydantic v1
     if callable(d):
         try:
             return jsonable_encoder(d())
         except Exception:
             pass
 
-    # dataclass-ish / object with __dict__
     od = getattr(obj, "__dict__", None)
     if isinstance(od, dict) and od:
         try:
@@ -239,6 +228,44 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
     return None, None
 
 
+async def _call_engine_batch_best_effort(
+    request: Request, symbols_norm: List[str]
+) -> Tuple[Optional[List[Any]], Optional[str], Optional[str]]:
+    """
+    Batch attempt (single call) for /quotes.
+
+    Returns (results_list, source_label, error_message)
+    - results_list: list of objects (UnifiedQuote/dict/etc) aligned with the request order when possible.
+    """
+    if not symbols_norm:
+        return None, None, "empty"
+
+    # 1) app.state.engine batch
+    eng = getattr(request.app.state, "engine", None)
+    if eng is not None:
+        for fn_name in ("get_enriched_quotes", "get_quotes"):
+            fn = getattr(eng, fn_name, None)
+            if callable(fn):
+                try:
+                    res = await _maybe_await(fn(symbols_norm))
+                    if isinstance(res, list):
+                        return res, f"app.state.engine.{fn_name}", None
+                except Exception as e:
+                    return None, f"app.state.engine.{fn_name}", _safe_error_message(e)
+
+    # 2) core.data_engine_v2 module-level batch
+    try:
+        from core.data_engine_v2 import get_enriched_quotes as v2_batch  # type: ignore
+
+        res2 = await _maybe_await(v2_batch(symbols_norm))
+        if isinstance(res2, list):
+            return res2, "core.data_engine_v2.get_enriched_quotes(singleton)", None
+    except Exception:
+        pass
+
+    return None, None, None
+
+
 def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: str) -> Dict[str, Any]:
     """
     Ensure required fields and consistent defaults + schema fill.
@@ -255,6 +282,7 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
     if payload.get("error") is None:
         payload["error"] = ""
 
+    # Preserve an existing provider label if set, otherwise use engine source label
     if not payload.get("data_source"):
         payload["data_source"] = source or "unknown"
 
@@ -339,7 +367,57 @@ async def enriched_quotes(
             },
         )
 
+    # Preserve order; normalize each
+    norms = [_normalize_symbol_safe(r) or (r or "").strip() for r in raw_list]
+    norms = [n for n in norms if n]
+
+    # 1) Try batch call first (FAST PATH)
+    batch_res, batch_source, batch_err = await _call_engine_batch_best_effort(request, norms)
+
     items: List[Dict[str, Any]] = []
+
+    if isinstance(batch_res, list) and batch_res:
+        # If engine returned fewer/more than requested, we still try to align best-effort by index.
+        for i, raw in enumerate(raw_list):
+            norm = _normalize_symbol_safe(raw) or raw
+            try:
+                obj = batch_res[i] if i < len(batch_res) else None
+                if obj is None:
+                    out = {
+                        "status": "error",
+                        "symbol": norm,
+                        "symbol_input": raw,
+                        "symbol_normalized": norm,
+                        "data_quality": "MISSING",
+                        "data_source": "none",
+                        "error": "Engine returned no item for this symbol.",
+                    }
+                    items.append(_schema_fill_best_effort(out))
+                    continue
+
+                payload = _as_payload(obj)
+                payload = _finalize_payload(payload, raw=raw, norm=norm, source=batch_source or "unknown")
+                items.append(payload)
+            except Exception as e:
+                tb = traceback.format_exc()
+                msg = _safe_error_message(e)
+                out = {
+                    "status": "error",
+                    "symbol": norm,
+                    "symbol_input": raw,
+                    "symbol_normalized": norm,
+                    "data_quality": "MISSING",
+                    "data_source": "none",
+                    "error": msg,
+                }
+                if dbg:
+                    out["traceback"] = tb[:8000]
+                items.append(_schema_fill_best_effort(out))
+
+        return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
+
+    # 2) If batch failed, fall back to per-symbol calls (SLOW PATH)
+    #    (We keep batch_err only for debug visibility)
     for raw in raw_list:
         norm = _normalize_symbol_safe(raw)
         try:
@@ -354,6 +432,8 @@ async def enriched_quotes(
                     "data_source": "none",
                     "error": "Engine not available for this symbol.",
                 }
+                if dbg and batch_err:
+                    out["batch_error_hint"] = str(batch_err)[:1200]
                 items.append(_schema_fill_best_effort(out))
                 continue
 
@@ -376,6 +456,8 @@ async def enriched_quotes(
             }
             if dbg:
                 out["traceback"] = tb[:8000]
+                if batch_err:
+                    out["batch_error_hint"] = str(batch_err)[:1200]
             items.append(_schema_fill_best_effort(out))
 
     return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
@@ -383,7 +465,7 @@ async def enriched_quotes(
 
 @router.get("/health", include_in_schema=False)
 async def enriched_health():
-    return {"status": "ok", "module": "core.enriched_quote", "version": "2.3.2"}
+    return {"status": "ok", "module": "core.enriched_quote", "version": "2.3.3"}
 
 
 def get_router() -> APIRouter:
