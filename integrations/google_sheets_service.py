@@ -2,16 +2,18 @@
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.9.2 (Aligned + production-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.10.0 (Aligned + production-hardened)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
 - Calls Tadawul Fast Bridge backend endpoints that return {headers, rows, status}.
 - Writes data to Sheets in chunked mode to avoid request size limits.
 
-Key upgrades (v3.9.2)
-- FIX: /v1/argaam/sheet-rows payload uses "symbols" (not "tickers") to match common router schemas.
-- Backward-compat: refresh_* accepts spreadsheet_id OR sid (no TypeError on older callers).
+Key upgrades (v3.10.0)
+- FIX (important): Always send BOTH "symbols" and "tickers" + sheet_name/sheetName to all sheet-rows endpoints.
+  (Prevents schema mismatch across routers and fixes many "refresh not reflected" cases.)
+- Robust adapter: if backend returns rows as dicts, convert to ordered list rows using headers.
+- Safe fallback headers: if backend headers missing, use core.schemas.get_headers_for_sheet(sheet_name) when available.
 - Keeps "never raise" policy for refresh_* (always returns a status dict).
 """
 
@@ -33,7 +35,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 
-SERVICE_VERSION = "3.9.2"
+SERVICE_VERSION = "3.10.0"
+
+# =============================================================================
+# OPTIONAL SAFE IMPORTS (NO HEAVY DEPENDENCIES)
+# =============================================================================
+try:
+    from core.schemas import get_headers_for_sheet  # type: ignore
+except Exception:
+    get_headers_for_sheet = None  # type: ignore
+
 
 # =============================================================================
 # CONFIG IMPORT (env.py preferred -> core.config -> env vars)
@@ -53,12 +64,6 @@ _get_settings = getattr(_core_cfg, "get_settings", None) if _core_cfg else None
 
 
 def _cfg_obj() -> Any:
-    """
-    Preferred config object:
-      1) env.settings (already loaded)
-      2) core.config.get_settings()
-      3) None
-    """
     if _settings_from_env is not None:
         return _settings_from_env
     if callable(_get_settings):
@@ -174,7 +179,10 @@ except Exception:
 _CREDS_RAW = ""
 try:
     s = _cfg_obj()
-    raw = _get_attr_any(s, ["google_sheets_credentials_raw", "google_sheets_credentials", "google_sheets_credentials_json"])
+    raw = _get_attr_any(
+        s,
+        ["google_sheets_credentials_raw", "google_sheets_credentials", "google_sheets_credentials_json"],
+    )
     if isinstance(raw, str) and raw.strip():
         _CREDS_RAW = raw.strip()
 except Exception:
@@ -616,10 +624,10 @@ def _backend_headers(token: str) -> Dict[str, str]:
     return h
 
 
-def _sheets_safe_error_payload(tickers: List[str], err: str) -> Dict[str, Any]:
+def _sheets_safe_error_payload(symbols: List[str], err: str) -> Dict[str, Any]:
     return {
         "headers": ["Symbol", "Error"],
-        "rows": [[t, err] for t in (tickers or [])],
+        "rows": [[t, err] for t in (symbols or [])],
         "status": "error",
         "error": err,
     }
@@ -628,11 +636,11 @@ def _sheets_safe_error_payload(tickers: List[str], err: str) -> Dict[str, Any]:
 def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{_backend_base_url()}{endpoint}"
 
-    tickers_any = payload.get("tickers") or payload.get("symbols") or []
-    tickers = [str(t).strip() for t in (tickers_any or []) if str(t).strip()]
+    syms_any = payload.get("symbols") or payload.get("tickers") or []
+    symbols = [str(t).strip() for t in (syms_any or []) if str(t).strip()]
 
-    if not tickers:
-        return {"headers": ["Symbol", "Error"], "rows": [], "status": "skipped", "error": "No tickers provided"}
+    if not symbols:
+        return {"headers": ["Symbol", "Error"], "rows": [], "status": "skipped", "error": "No symbols provided"}
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -667,7 +675,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                             parsed.setdefault("headers", [])
                             parsed.setdefault("rows", [])
                             return parsed
-                        return _sheets_safe_error_payload(tickers, "Backend returned non-JSON response")
+                        return _sheets_safe_error_payload(symbols, "Backend returned non-JSON response")
 
                     raise RuntimeError(f"Backend HTTP {last_status}: {last_body_preview}")
 
@@ -724,7 +732,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if last_body_preview and last_status in (400, 401, 403, 404, 429, 500, 502, 503, 504):
         err_msg = f"{err_msg} | body: {last_body_preview}"
 
-    return _sheets_safe_error_payload(tickers, err_msg)
+    return _sheets_safe_error_payload(symbols, err_msg)
 
 
 # =============================================================================
@@ -745,16 +753,55 @@ def _normalize_tickers(tickers: Sequence[str]) -> List[str]:
     return out
 
 
-def _payload_for_endpoint(endpoint: str, tickers_list: List[str], sheet_name: str) -> Dict[str, Any]:
+def _payload_for_endpoint(endpoint: str, symbols_list: List[str], sheet_name: str) -> Dict[str, Any]:
     """
-    Router schema differences:
-      - argaam sheet-rows commonly expects: {"symbols":[...], "sheet_name":...}
-      - enriched/analysis/advanced sheet-rows commonly expects: {"tickers":[...], "sheet_name":...}
+    ✅ Safe universal payload:
+      - Always send BOTH: symbols + tickers
+      - Always send BOTH: sheet_name + sheetName
+
+    This avoids router mismatch (some routes read 'symbols', some read 'tickers').
     """
-    ep = (endpoint or "").lower()
-    if "/argaam/" in ep:
-        return {"symbols": tickers_list, "sheet_name": sheet_name}
-    return {"tickers": tickers_list, "sheet_name": sheet_name}
+    return {
+        "symbols": symbols_list,
+        "tickers": symbols_list,
+        "sheet_name": sheet_name,
+        "sheetName": sheet_name,
+    }
+
+
+def _rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[Any]]]:
+    """
+    Normalize backend rows:
+    - if rows are list[list] -> keep
+    - if rows are list[dict] -> convert by header order
+    - else -> coerce
+    """
+    hdrs = [str(h).strip() for h in (headers or []) if h and str(h).strip()]
+    if not hdrs:
+        hdrs = ["Symbol", "Error"]
+
+    fixed_rows: List[List[Any]] = []
+
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        # dict rows -> ordered list rows
+        for d in rows:
+            dd = d if isinstance(d, dict) else {}
+            fixed_rows.append([dd.get(h, None) for h in hdrs])
+        return hdrs, fixed_rows
+
+    if isinstance(rows, list):
+        for r in rows:
+            rr = list(r) if isinstance(r, (list, tuple)) else [r]
+            if len(rr) < len(hdrs):
+                rr += [None] * (len(hdrs) - len(rr))
+            elif len(rr) > len(hdrs):
+                rr = rr[: len(hdrs)]
+            fixed_rows.append(rr)
+        return hdrs, fixed_rows
+
+    # unknown shape
+    fixed_rows.append([str(rows)])
+    return hdrs, fixed_rows
 
 
 def _refresh_logic(
@@ -774,8 +821,8 @@ def _refresh_logic(
     Never raises: always returns a status dict.
     """
     try:
-        tickers_list = _normalize_tickers(tickers)
-        if not tickers_list:
+        symbols_list = _normalize_tickers(tickers)
+        if not symbols_list:
             return {"status": "skipped", "reason": "No tickers provided", "endpoint": endpoint, "sheet": sheet_name}
 
         try:
@@ -789,36 +836,32 @@ def _refresh_logic(
 
         # 1) backend call (never raise outward)
         try:
-            response = _call_backend_api(endpoint, _payload_for_endpoint(endpoint, tickers_list, sh))
+            response = _call_backend_api(endpoint, _payload_for_endpoint(endpoint, symbols_list, sh))
         except Exception as e:
-            response = _sheets_safe_error_payload(tickers_list, f"Backend client error: {e}")
+            response = _sheets_safe_error_payload(symbols_list, f"Backend client error: {e}")
 
-        headers = response.get("headers") or ["Symbol", "Error"]
-        rows = response.get("rows") or []
         backend_status = response.get("status")
         backend_error = response.get("error")
 
-        headers = [str(h).strip() for h in (headers or []) if h and str(h).strip()]
-        if not headers:
-            headers = ["Symbol", "Error"]
+        headers = response.get("headers") or []
+        rows = response.get("rows") or []
 
-        fixed_rows: List[List[Any]] = []
-        for r in rows:
-            rr = list(r) if isinstance(r, (list, tuple)) else [r]
-            if len(rr) < len(headers):
-                rr += [None] * (len(headers) - len(rr))
-            elif len(rr) > len(headers):
-                rr = rr[: len(headers)]
-            fixed_rows.append(rr)
+        # fallback headers from canonical schemas if backend didn't provide
+        if (not headers) and callable(get_headers_for_sheet):
+            try:
+                headers = get_headers_for_sheet(sh)  # type: ignore
+            except Exception:
+                headers = []
 
-        grid = [headers] + fixed_rows
+        headers2, fixed_rows = _rows_to_grid(headers, rows)
+        grid = [headers2] + fixed_rows
 
         # 2) optional clear
         if clear:
             start_col, start_row = _parse_a1_cell(start_cell)
             end_col = _CLEAR_END_COL
             if _SMART_CLEAR:
-                end_col = _compute_clear_end_col(start_col, len(headers))
+                end_col = _compute_clear_end_col(start_col, len(headers2))
 
             clear_rng = f"{_safe_sheet_name(sh)}!{_a1(start_col, start_row)}:{end_col}{_CLEAR_END_ROW}"
             try:
@@ -836,25 +879,23 @@ def _refresh_logic(
                 sheet=sh,
                 endpoint=endpoint,
                 rows=len(fixed_rows),
-                headers_count=len(headers),
+                headers_count=len(headers2),
                 backend_status=backend_status,
                 backend_error=backend_error,
             )
 
         status = "success"
-        if backend_status == "error":
+        if backend_status in ("error", "partial"):
             status = "partial"
         elif backend_status == "skipped":
             status = "skipped"
-        elif backend_status == "partial":
-            status = "partial"
 
         return {
             "status": status,
             "sheet": sh,
             "endpoint": endpoint,
             "rows_written": len(fixed_rows),
-            "headers_count": len(headers),
+            "headers_count": len(headers2),
             "cells_updated": int(updated_cells or 0),
             "backend_status": backend_status,
             "backend_error": backend_error,
@@ -931,7 +972,7 @@ __all__ = [
     "refresh_sheet_with_enriched_quotes",
     "refresh_sheet_with_ai_analysis",
     "refresh_sheet_with_advanced_analysis",
-    "_refresh_logic",  # used by run_dashboard_sync KSA gateway
+    "_refresh_logic",
     "refresh_sheet_with_enriched_quotes_async",
     "refresh_sheet_with_ai_analysis_async",
     "refresh_sheet_with_advanced_analysis_async",
