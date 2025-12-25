@@ -13,8 +13,8 @@ Goals
 
 Render
 - Set Health Check Path to: /healthz
-- Uvicorn log-level env must be lowercase:
-    --log-level ${UVICORN_LOG_LEVEL:-info}
+- Uvicorn log-level env must be lowercase (Procfile):
+    --log-level ${LOG_LEVEL:-info}
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ if str(BASE_DIR) not in sys.path:
 # ---------------------------------------------------------------------
 # Logging (bootstrap)
 # ---------------------------------------------------------------------
-LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+LOG_FORMAT = os.getenv("LOG_FORMAT", "%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("main")
 
@@ -124,6 +124,7 @@ def _mount_router(
 
     router_obj = None
     router_attr = None
+
     for attr in attr_candidates:
         if hasattr(mod, attr):
             router_obj = getattr(mod, attr)
@@ -140,7 +141,9 @@ def _mount_router(
             return report
 
     if router_obj is None:
-        report["error"] = f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}"
+        report["error"] = (
+            f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}"
+        )
         logger.warning("Router not mounted (%s): no router found in %s", name, loaded_from)
         return report
 
@@ -207,6 +210,7 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
         return getattr(settings, name)
     if env_mod is not None and hasattr(env_mod, name):
         return getattr(env_mod, name)
+
     v = os.getenv(name, None)
     if v is not None:
         return v
@@ -223,8 +227,10 @@ def _normalize_version(v: Any) -> str:
 
 
 def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> str:
-    # Prefer settings.version then APP_VERSION
+    # Prefer settings.version then SERVICE_VERSION then APP_VERSION
     v = _normalize_version(_get(settings, env_mod, "version", None))
+    if not v:
+        v = _normalize_version(_get(settings, env_mod, "SERVICE_VERSION", None))
     if not v:
         v = _normalize_version(_get(settings, env_mod, "APP_VERSION", None))
 
@@ -247,7 +253,14 @@ def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -
     except Exception:
         pass
 
-    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
+    cors_all = _truthy(
+        _get(
+            settings,
+            env_mod,
+            "ENABLE_CORS_ALL_ORIGINS",
+            _get(settings, env_mod, "CORS_ALL_ORIGINS", "true"),
+        )
+    )
     if cors_all:
         return ["*"]
 
@@ -255,13 +268,29 @@ def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -
     return [o.strip() for o in raw.split(",") if o.strip()] or []
 
 
-def _rate_limit_default(settings: Optional[object]) -> str:
+def _rate_limit_default(settings: Optional[object], env_mod: Optional[object]) -> str:
+    """
+    Uses (in order):
+      - settings.rate_limit_per_minute
+      - env RATE_LIMIT_PER_MINUTE
+      - default 240/minute
+    """
+    # settings
     try:
         rpm = int(getattr(settings, "rate_limit_per_minute"))
         if rpm > 0:
             return f"{rpm}/minute"
     except Exception:
         pass
+
+    # env
+    try:
+        rpm2 = int(str(_get(settings, env_mod, "RATE_LIMIT_PER_MINUTE", "")).strip() or "0")
+        if rpm2 > 0:
+            return f"{rpm2}/minute"
+    except Exception:
+        pass
+
     return "240/minute"
 
 
@@ -275,13 +304,21 @@ def _providers_from_settings(settings: Optional[object], env_mod: Optional[objec
     # Try settings first (if structured)
     try:
         if settings is not None and hasattr(settings, "enabled_providers"):
-            enabled = [str(x).strip().lower() for x in (getattr(settings, "enabled_providers") or []) if str(x).strip()]
+            enabled = [
+                str(x).strip().lower()
+                for x in (getattr(settings, "enabled_providers") or [])
+                if str(x).strip()
+            ]
     except Exception:
         pass
 
     try:
         if settings is not None and hasattr(settings, "enabled_ksa_providers"):
-            ksa = [str(x).strip().lower() for x in (getattr(settings, "enabled_ksa_providers") or []) if str(x).strip()]
+            ksa = [
+                str(x).strip().lower()
+                for x in (getattr(settings, "enabled_ksa_providers") or [])
+                if str(x).strip()
+            ]
     except Exception:
         pass
 
@@ -294,20 +331,84 @@ def _providers_from_settings(settings: Optional[object], env_mod: Optional[objec
     return enabled, ksa
 
 
+def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key: str, default: bool = True) -> bool:
+    v = _get(settings, env_mod, key, None)
+    if v is None:
+        return default
+    return _truthy(v)
+
+
+def _mask(s: str, keep: int = 4) -> str:
+    s = str(s or "")
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "•" * len(s)
+    return ("•" * (len(s) - keep)) + s[-keep:]
+
+
+def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
+    """
+    Minimal, non-secret environment summary for /system/settings.
+    """
+    def _val(name: str, default: str = "") -> str:
+        return str(_get(settings, env_mod, name, default) or "")
+
+    enabled, ksa = _providers_from_settings(settings, env_mod)
+
+    snap: Dict[str, Any] = {
+        "APP_ENV": _val("APP_ENV", _val("ENVIRONMENT", "production")),
+        "LOG_LEVEL": _val("LOG_LEVEL", _val("log_level", "INFO")),
+        "BASE_URL": _val("BASE_URL", _val("BACKEND_BASE_URL", "")),
+        "ENABLED_PROVIDERS": enabled,
+        "KSA_PROVIDERS": ksa,
+        "RATE_LIMIT_PER_MINUTE": str(_get(settings, env_mod, "RATE_LIMIT_PER_MINUTE", "")),
+        "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true")),
+        "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")),
+        # show presence only (do not leak values)
+        "APP_TOKEN_SET": bool(_val("APP_TOKEN")),
+        "BACKUP_APP_TOKEN_SET": bool(_val("BACKUP_APP_TOKEN")),
+        "GOOGLE_SHEETS_CREDENTIALS_SET": bool(_val("GOOGLE_SHEETS_CREDENTIALS")),
+        "GOOGLE_CREDENTIALS_SET": bool(_val("GOOGLE_CREDENTIALS")),
+        "SPREADSHEET_ID_SET": bool(_val("SPREADSHEET_ID")),
+        "GOOGLE_APPS_SCRIPT_BACKUP_URL_SET": bool(_val("GOOGLE_APPS_SCRIPT_BACKUP_URL")),
+    }
+    return snap
+
+
 # =============================================================================
 # Router + Engine boot
 # =============================================================================
-ROUTERS_TO_MOUNT: List[Tuple[str, List[str]]] = [
-    ("enriched_quote", ["routes.enriched_quote", "enriched_quote", "core.enriched_quote"]),
-    ("ai_analysis", ["routes.ai_analysis", "ai_analysis", "core.ai_analysis"]),
-    ("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "core.advanced_analysis"]),
-    # supports both layouts:
-    ("routes_argaam", ["routes_argaam", "routes.routes_argaam", "core.routes_argaam"]),
-    # keep compat shim always available:
-    ("legacy_service", ["core.legacy_service", "routes.legacy_service", "legacy_service"]),
-]
+def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
+    """
+    Build the router mount plan based on feature flags.
+    """
+    ai_enabled = _feature_enabled(settings, env_mod, "AI_ANALYSIS_ENABLED", True)
+    adv_enabled = _feature_enabled(settings, env_mod, "ADVANCED_ANALYSIS_ENABLED", True)
 
-REQUIRED_ROUTERS_DEFAULT = ["enriched_quote", "ai_analysis", "advanced_analysis"]
+    routers: List[Tuple[str, List[str]]] = [
+        ("enriched_quote", ["routes.enriched_quote", "enriched_quote", "core.enriched_quote"]),
+    ]
+
+    if ai_enabled:
+        routers.append(("ai_analysis", ["routes.ai_analysis", "ai_analysis", "core.ai_analysis"]))
+
+    if adv_enabled:
+        routers.append(("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "core.advanced_analysis"]))
+
+    # supports both layouts:
+    routers.append(("routes_argaam", ["routes_argaam", "routes.routes_argaam", "core.routes_argaam"]))
+
+    # keep compat shim always available:
+    routers.append(("legacy_service", ["core.legacy_service", "routes.legacy_service", "legacy_service"]))
+
+    required = ["enriched_quote"]
+    if ai_enabled:
+        required.append("ai_analysis")
+    if adv_enabled:
+        required.append("advanced_analysis")
+
+    return routers, required
 
 
 def _init_engine_best_effort(app_: FastAPI) -> None:
@@ -345,17 +446,19 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
 
 
 def _mount_all_routers(app_: FastAPI) -> None:
+    routers = getattr(app_.state, "routers_to_mount", [])
     results: List[Dict[str, Any]] = []
-    for name, candidates in ROUTERS_TO_MOUNT:
+
+    for name, candidates in routers:
         rep = _mount_router(app_, name=name, candidates=candidates)
         results.append(rep)
 
     app_.state.mount_report = results
 
     mounted_names = {r["name"] for r in results if r.get("mounted")}
-    required = getattr(app_.state, "required_routers", REQUIRED_ROUTERS_DEFAULT)
+    required = getattr(app_.state, "required_routers", [])
 
-    # readiness is based on REQUIRED routers only (legacy_service never blocks readiness)
+    # readiness is based on REQUIRED routers only
     app_.state.routers_ready = all(r in mounted_names for r in required)
 
     logger.info(
@@ -400,15 +503,19 @@ def create_app() -> FastAPI:
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
 
-    log_level = str(_get(settings, env_mod, "log_level", os.getenv("LOG_LEVEL", "INFO"))).upper()
+    # log level
+    log_level = str(_get(settings, env_mod, "LOG_LEVEL", _get(settings, env_mod, "log_level", "INFO"))).upper()
     _safe_set_root_log_level(log_level)
 
-    title = _get(settings, env_mod, "app_name", _get(settings, env_mod, "APP_NAME", "Tadawul Fast Bridge"))
+    title = _get(settings, env_mod, "APP_NAME", _get(settings, env_mod, "app_name", "Tadawul Fast Bridge"))
     version = _resolve_version(settings, env_mod)
-    app_env = _get(settings, env_mod, "env", _get(settings, env_mod, "APP_ENV", "production"))
+    app_env = _get(settings, env_mod, "APP_ENV", _get(settings, env_mod, "ENVIRONMENT", "production"))
 
     allow_origins = _cors_allow_origins(settings, env_mod)
     allow_credentials = False if allow_origins == ["*"] else True
+
+    # router plan (feature flags aware)
+    routers_to_mount, required_default = _router_plan(settings, env_mod)
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
@@ -417,9 +524,14 @@ def create_app() -> FastAPI:
         app_.state.settings_source = settings_source
         app_.state.app_env = str(app_env)
         app_.state.env_mod_loaded = env_mod is not None
+        app_.state.start_time_utc = datetime.now(timezone.utc).isoformat()
 
+        # router plan is stored so /system can show it even before mount finishes
+        app_.state.routers_to_mount = routers_to_mount
         app_.state.mount_report = []
         app_.state.routers_ready = False
+
+        # engine state
         app_.state.engine_ready = False
         app_.state.engine_error = None
 
@@ -430,10 +542,11 @@ def create_app() -> FastAPI:
         # required routers can be overridden by env:
         # REQUIRED_ROUTERS="enriched_quote,ai_analysis,advanced_analysis"
         rr = _parse_list_like(_get(settings, env_mod, "REQUIRED_ROUTERS", ""))
-        app_.state.required_routers = rr or REQUIRED_ROUTERS_DEFAULT
+        app_.state.required_routers = rr or required_default
 
         logger.info("Settings loaded from %s", app_.state.settings_source or "(none)")
-        logger.info("Fast boot: defer_router_mount=%s init_engine_on_boot=%s", app_.state.defer_router_mount, app_.state.init_engine_on_boot)
+        logger.info("Fast boot: defer_router_mount=%s init_engine_on_boot=%s",
+                    app_.state.defer_router_mount, app_.state.init_engine_on_boot)
 
         # boot
         if app_.state.defer_router_mount:
@@ -443,11 +556,15 @@ def create_app() -> FastAPI:
             if _truthy(app_.state.init_engine_on_boot):
                 await asyncio.to_thread(_init_engine_best_effort, app_)
 
+        enabled, ksa = _providers_from_settings(settings, env_mod)
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
         logger.info("   Env: %s | Version: %s", app_.state.app_env, version)
+        logger.info("   Providers: %s", ",".join(enabled) if enabled else "(not set)")
+        logger.info("   KSA Providers: %s", ",".join(ksa) if ksa else "(not set)")
         logger.info("   Required routers: %s", ",".join(app_.state.required_routers))
         logger.info("   CORS allow origins: %s", "ALL (*)" if allow_origins == ["*"] else str(allow_origins))
+        logger.info("   Render commit: %s", (os.getenv("RENDER_GIT_COMMIT") or "")[:12])
         logger.info("==============================================")
 
         yield
@@ -473,34 +590,42 @@ def create_app() -> FastAPI:
     )
 
     # SlowAPI (optional)
-    try:
-        from slowapi import Limiter
-        from slowapi.errors import RateLimitExceeded
-        from slowapi.middleware import SlowAPIMiddleware
-        from slowapi.util import get_remote_address
+    enable_rl = _feature_enabled(settings, env_mod, "ENABLE_RATE_LIMITING", True)
+    if enable_rl:
+        try:
+            from slowapi import Limiter
+            from slowapi.errors import RateLimitExceeded
+            from slowapi.middleware import SlowAPIMiddleware
+            from slowapi.util import get_remote_address
 
-        limiter = Limiter(key_func=get_remote_address, default_limits=[_rate_limit_default(settings)])
-        app_.state.limiter = limiter
-        app_.add_middleware(SlowAPIMiddleware)
+            default_limit = _rate_limit_default(settings, env_mod)
+            limiter = Limiter(key_func=get_remote_address, default_limits=[default_limit])
+            app_.state.limiter = limiter
+            app_.add_middleware(SlowAPIMiddleware)
 
-        @app_.exception_handler(RateLimitExceeded)
-        async def _rate_limit_handler(request, exc):  # noqa: ANN001
-            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+            @app_.exception_handler(RateLimitExceeded)
+            async def _rate_limit_handler(request, exc):  # noqa: ANN001
+                return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
 
-        logger.info("SlowAPI limiter enabled (default %s).", _rate_limit_default(settings))
-    except Exception as e:
-        logger.warning("SlowAPI not enabled: %s", e)
+            logger.info("SlowAPI limiter enabled (default %s).", default_limit)
+        except Exception as e:
+            logger.warning("SlowAPI not enabled: %s", e)
+    else:
+        logger.info("Rate limiting disabled by ENABLE_RATE_LIMITING.")
 
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Exception handling (keep HTTPException semantics + always JSON)
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     @app_.exception_handler(StarletteHTTPException)
     async def _http_exc_handler(request, exc: StarletteHTTPException):  # noqa: ANN001
         return JSONResponse(status_code=exc.status_code, content={"status": "error", "detail": exc.detail})
 
     @app_.exception_handler(RequestValidationError)
     async def _validation_exc_handler(request, exc: RequestValidationError):  # noqa: ANN001
-        return JSONResponse(status_code=422, content={"status": "error", "detail": "Validation error", "errors": exc.errors()})
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "detail": "Validation error", "errors": exc.errors()},
+        )
 
     @app_.exception_handler(Exception)
     async def _unhandled_exc_handler(request, exc: Exception):  # noqa: ANN001
@@ -510,12 +635,17 @@ def create_app() -> FastAPI:
             content={"status": "error", "error": "Internal Server Error", "detail": str(exc)[:2000]},
         )
 
-    # -----------------------------------------------------------------------------
-    # Very fast endpoints
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Very fast endpoints (Render)
+    # -------------------------------------------------------------------------
     @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
-        return {"status": "ok", "app": app_.title, "version": app_.version, "env": getattr(app_.state, "app_env", "unknown")}
+        return {
+            "status": "ok",
+            "app": app_.title,
+            "version": app_.version,
+            "env": getattr(app_.state, "app_env", "unknown"),
+        }
 
     @app_.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
     async def healthz():
@@ -565,7 +695,7 @@ def create_app() -> FastAPI:
 
     @app_.get("/system/routes", tags=["system"])
     async def system_routes():
-        return {"mount_report": getattr(app_.state, "mount_report", [])}
+        return {"mount_report": getattr(app_.state, "mount_report", []), "plan": getattr(app_.state, "routers_to_mount", [])}
 
     @app_.get("/system/bootstrap", tags=["system"])
     async def system_bootstrap():
@@ -576,6 +706,7 @@ def create_app() -> FastAPI:
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
             "engine_error": getattr(app_.state, "engine_error", None),
             "required_routers": getattr(app_.state, "required_routers", []),
+            "start_time_utc": getattr(app_.state, "start_time_utc", None),
         }
 
     @app_.get("/system/info", tags=["system"])
@@ -591,12 +722,28 @@ def create_app() -> FastAPI:
 
     @app_.get("/system/settings", tags=["system"])
     async def system_settings():
+        # Prefer env.safe_env_summary if present, else our minimal snapshot
         try:
             if env_mod is not None and hasattr(env_mod, "safe_env_summary"):
                 return {"settings_source": getattr(app_.state, "settings_source", None), "env": env_mod.safe_env_summary()}
         except Exception:
             pass
-        return {"settings_source": getattr(app_.state, "settings_source", None), "env": {"app": app_.title, "version": app_.version}}
+        return {
+            "settings_source": getattr(app_.state, "settings_source", None),
+            "env": _safe_env_snapshot(settings, env_mod),
+        }
+
+    @app_.get("/system/secrets", tags=["system"])
+    async def system_secrets():
+        """
+        Shows ONLY masked tails to confirm secrets are set without leaking them.
+        """
+        app_token = str(_get(settings, env_mod, "APP_TOKEN", "") or "")
+        backup_token = str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "")
+        return {
+            "APP_TOKEN": _mask(app_token, keep=4) if app_token else "",
+            "BACKUP_APP_TOKEN": _mask(backup_token, keep=4) if backup_token else "",
+        }
 
     return app_
 
