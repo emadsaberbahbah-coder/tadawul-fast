@@ -1,4 +1,3 @@
-```python
 # core/data_engine_v2.py  (FULL REPLACEMENT)
 """
 core/data_engine_v2.py
@@ -6,27 +5,22 @@ core/data_engine_v2.py
 UNIFIED DATA ENGINE (v2.7.3) — KSA-SAFE + PROD SAFE (HARDENED)
 
 What’s improved vs v2.7.2:
-- ✅ Stronger Yahoo Chart parsing (meta fallbacks for OHLC/volume when series is sparse)
-- ✅ Adds lightweight Yahoo Chart response cache (reduces supplement overhead)
-- ✅ Adds optional provider trace + fetch latency fields for easier debugging
-- ✅ Safer EODHD current_price parsing (no longer “falls back” to previousClose as price)
-- ✅ Optional ENABLE_ARGAAM (default True) to disable Argaam quickly if blocked
-
-Key guarantees (kept):
-- Never crashes app startup (no core imports at module import-time beyond std deps)
-- Module-level async API functions exist: get_enriched_quote/get_enriched_quotes/get_quote/get_quotes
-- KSA HARD policy: yfinance for KSA OFF unless ENABLE_YFINANCE_KSA=true
-- Yahoo Chart SUPPLEMENT mode fills missing core fields without overriding chosen provider
+- ✅ Adds a small Yahoo Chart micro-cache (YAHOO_CHART_TTL_SEC) to reduce repeated chart calls
+  during supplement mode and batch requests.
+- ✅ Stronger Yahoo Chart parsing: uses meta regularMarketOpen/dayHigh/dayLow/dayVolume when present,
+  and captures Yahoo chart error messages cleanly.
+- ✅ Safer error aggregation (bounded length) to avoid oversized error strings.
+- ✅ Keeps module-level APIs for fallback compatibility:
+    get_enriched_quote/get_enriched_quotes/get_quote/get_quotes
 
 KSA routing order (KSA_PROVIDERS):
   - tadawul  (optional, via TADAWUL_QUOTE_URL + optional TADAWUL_HEADERS_JSON)
-  - argaam   (HTML snapshot best-effort) [can disable via ENABLE_ARGAAM=false]
+  - argaam   (HTML snapshot best-effort)
   - yfinance (OPTIONAL last resort; OFF by default)
   - yahoo_chart (OPTIONAL fallback; ON by default unless disabled)
 
 GLOBAL routing order (PROVIDERS / ENABLED_PROVIDERS):
-  - eodhd -> finnhub -> fmp -> yfinance (optional fallback)
-  - optional last-ditch yahoo_chart (global) if enabled
+  - eodhd -> finnhub -> fmp -> yfinance (optional fallback) -> yahoo_chart(optional last-ditch)
 
 Notes:
 - Self-contained (no external yahoo provider module required).
@@ -449,6 +443,18 @@ def _is_special_yahoo_symbol(s: str) -> bool:
     return any(ch in ss for ch in ("^", "="))
 
 
+def _join_errors(errors: Sequence[str], max_len: int = 900) -> str:
+    """
+    Join error strings but keep bounded to avoid oversized payloads/logs.
+    """
+    if not errors:
+        return ""
+    out = " | ".join([e for e in errors if e])
+    if len(out) <= max_len:
+        return out
+    return out[: max_len - 12] + " ...TRUNC..."
+
+
 # =============================================================================
 # Data model (Pydantic v2)
 # =============================================================================
@@ -547,10 +553,6 @@ class UnifiedQuote(BaseModel):
     symbol_input: Optional[str] = None
     symbol_normalized: Optional[str] = None
     status: str = "success"
-
-    # Debug (optional / non-breaking)
-    provider_trace: Optional[List[str]] = None
-    fetch_ms: Optional[int] = None
 
     def finalize(self) -> "UnifiedQuote":
         if not self.last_updated_utc:
@@ -684,9 +686,6 @@ class DataEngine:
             except Exception:
                 self._tadawul_headers = {}
 
-        # Optional Argaam switch (default ON)
-        self.enable_argaam = _get_bool(["ENABLE_ARGAAM", "ARGAAM_ENABLED"], True)
-
         # Global yfinance switch
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
 
@@ -718,25 +717,23 @@ class DataEngine:
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
         snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 30.0)
-        yahoo_chart_ttl = _get_float(["YAHOO_CHART_CACHE_TTL_SEC"], 20.0)
+
+        # Yahoo chart micro-cache (helps batch + supplement)
+        yahoo_ttl = _get_float(["YAHOO_CHART_TTL_SEC", "yahoo_chart_ttl_sec"], 20.0)
 
         self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, float(quote_ttl)))
         self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, float(cache_ttl) * 10.0))
         self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, float(fund_ttl)))
         self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, float(snap_ttl)))
-
-        # Yahoo chart cache (shared by fallback + supplement)
-        self.yahoo_chart_cache: TTLCache = TTLCache(maxsize=6000, ttl=max(5.0, float(yahoo_chart_ttl)))
+        self.yahoo_chart_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(5.0, float(yahoo_ttl)))
 
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | ksa=%s | argaam=%s | yfinance_global=%s | yfinance_ksa=%s | "
-            "yahoo_chart_ksa=%s | yahoo_chart_global=%s | supplement=%s | timeout=%.1fs | retries=%s",
+            "DataEngine v%s init | providers=%s | ksa=%s | yfinance_global=%s | yfinance_ksa=%s | yahoo_chart_ksa=%s | yahoo_chart_global=%s | supplement=%s | timeout=%.1fs | retries=%s",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
             ",".join(self.enabled_ksa_providers) if self.enabled_ksa_providers else "(none)",
-            self.enable_argaam,
             self.enable_yfinance,
             self.enable_yfinance_ksa,
             self.enable_yahoo_chart_ksa,
@@ -761,13 +758,11 @@ class DataEngine:
             return q.finalize()
 
     async def get_quote(self, symbol: str) -> UnifiedQuote:
-        t0 = time.perf_counter()
-
         raw_in = str(symbol or "").strip()
         s = normalize_symbol(raw_in)
 
         if not raw_in:
-            q = UnifiedQuote(
+            return UnifiedQuote(
                 symbol="",
                 symbol_input="",
                 symbol_normalized="",
@@ -775,11 +770,9 @@ class DataEngine:
                 error="Empty symbol",
                 status="error",
             ).finalize()
-            q.fetch_ms = int((time.perf_counter() - t0) * 1000)
-            return q
 
         if not s:
-            q = UnifiedQuote(
+            return UnifiedQuote(
                 symbol=raw_in,
                 symbol_input=raw_in,
                 symbol_normalized=raw_in,
@@ -787,14 +780,10 @@ class DataEngine:
                 error="Invalid symbol",
                 status="error",
             ).finalize()
-            q.fetch_ms = int((time.perf_counter() - t0) * 1000)
-            return q
 
         hit = self.quote_cache.get(s)
         if isinstance(hit, UnifiedQuote):
-            out = self._attach_io(hit, raw_in, s)
-            out.fetch_ms = int((time.perf_counter() - t0) * 1000)
-            return out
+            return self._attach_io(hit, raw_in, s)
 
         stale = self.stale_cache.get(s)
         stale_q = stale if isinstance(stale, UnifiedQuote) else None
@@ -815,10 +804,7 @@ class DataEngine:
 
             self.quote_cache[s] = q
             self.stale_cache[s] = q
-
-            out = self._attach_io(q, raw_in, s)
-            out.fetch_ms = int((time.perf_counter() - t0) * 1000)
-            return out
+            return self._attach_io(q, raw_in, s)
 
         except Exception as exc:
             logger.exception("get_quote failed for %s", s, exc_info=exc)
@@ -826,15 +812,10 @@ class DataEngine:
             if stale_q is not None:
                 try:
                     stale2 = stale_q.model_copy(update={"error": f"Live fetch failed; returned stale. {msg}"})
-                    out = self._attach_io(stale2, raw_in, s)
-                    out.fetch_ms = int((time.perf_counter() - t0) * 1000)
-                    return out
+                    return self._attach_io(stale2, raw_in, s)
                 except Exception:
-                    out = self._attach_io(stale_q, raw_in, s)
-                    out.fetch_ms = int((time.perf_counter() - t0) * 1000)
-                    return out
-
-            q = UnifiedQuote(
+                    return self._attach_io(stale_q, raw_in, s)
+            return UnifiedQuote(
                 symbol=s,
                 symbol_input=raw_in,
                 symbol_normalized=s,
@@ -842,8 +823,6 @@ class DataEngine:
                 error=msg,
                 status="error",
             ).finalize()
-            q.fetch_ms = int((time.perf_counter() - t0) * 1000)
-            return q
 
     async def get_quotes(self, symbols: Sequence[str]) -> List[UnifiedQuote]:
         items = [s for s in (symbols or []) if s and str(s).strip()]
@@ -881,7 +860,7 @@ class DataEngine:
     # -------------------------------------------------------------------------
     async def _supplement_from_yahoo_chart(self, q: UnifiedQuote, symbol: str, market: str) -> UnifiedQuote:
         """
-        If q already has price but is missing core fields (prev close / OHLC / volume / 52w / market cap),
+        If q already has price but is missing core fields (prev close / OHLC / volume / 52w / mcap),
         try to fill missing values from Yahoo Chart WITHOUT overriding existing values.
         """
         if not self.enable_yahoo_chart_supplement:
@@ -934,11 +913,7 @@ class DataEngine:
         if not upd:
             return q
         try:
-            qq = q.model_copy(update=upd)
-            # keep trace info if present
-            if q.provider_trace and not qq.provider_trace:
-                qq.provider_trace = q.provider_trace
-            return qq
+            return q.model_copy(update=upd)
         except Exception:
             for k, v in upd.items():
                 setattr(q, k, v)
@@ -956,8 +931,6 @@ class DataEngine:
         """
         code = _ksa_code(symbol)
         errors: List[str] = []
-        trace: List[str] = []
-
         attempted_yahoo_chart = False
 
         for prov in (self.enabled_ksa_providers or []):
@@ -968,25 +941,17 @@ class DataEngine:
             if p == "tadawul":
                 if not self.tadawul_quote_url:
                     errors.append("tadawul:no_url")
-                    trace.append("tadawul:no_url")
                     continue
                 q = await self._fetch_tadawul_quote(symbol)
                 if q.current_price is not None:
                     q.data_source = "tadawul"
                     q.market = "KSA"
                     q.currency = q.currency or "SAR"
-                    trace.append("tadawul:ok")
-                    q.provider_trace = trace
                     q = await self._supplement_from_yahoo_chart(q, symbol, "KSA")
                     return q.finalize()
                 errors.append(f"tadawul:{q.error or 'no_price'}")
-                trace.append(f"tadawul:fail:{q.error or 'no_price'}")
 
             elif p == "argaam":
-                if not self.enable_argaam:
-                    errors.append("argaam:disabled")
-                    trace.append("argaam:disabled")
-                    continue
                 snap = await self._argaam_snapshot()
                 row = snap.get(code)
                 if row and row.get("price") is not None:
@@ -1004,62 +969,46 @@ class DataEngine:
                         data_quality="PARTIAL",
                         error=None,
                     )
-                    trace.append("argaam:ok")
-                    q.provider_trace = trace
                     q = await self._supplement_from_yahoo_chart(q, symbol, "KSA")
                     return q.finalize()
                 errors.append("argaam:no_row")
-                trace.append("argaam:fail:no_row")
 
             elif p in {"yfinance", "yahoo"}:
                 if self.enable_yfinance_ksa and yf:
                     q = await self._fetch_yfinance(symbol, market="KSA")
                     if q.current_price is not None:
                         q.data_source = "yfinance"
-                        trace.append("yfinance:ok")
-                        q.provider_trace = trace
                         q = await self._supplement_from_yahoo_chart(q, symbol, "KSA")
                         return q.finalize()
                     errors.append(f"yfinance:{q.error or 'no_price'}")
-                    trace.append(f"yfinance:fail:{q.error or 'no_price'}")
                 else:
                     errors.append("yfinance:ksa_disabled_or_missing")
-                    trace.append("yfinance:ksa_disabled_or_missing")
 
             elif p in {"yahoo_chart", "yahoo-chart", "chart"}:
                 attempted_yahoo_chart = True
                 if self.enable_yahoo_chart_ksa:
                     q = await self._fetch_yahoo_chart(symbol, market="KSA")
                     if q.current_price is not None:
-                        trace.append("yahoo_chart:ok")
-                        q.provider_trace = trace
                         return q.finalize()
                     errors.append(f"yahoo_chart:{q.error or 'no_price'}")
-                    trace.append(f"yahoo_chart:fail:{q.error or 'no_price'}")
                 else:
                     errors.append("yahoo_chart:ksa_disabled")
-                    trace.append("yahoo_chart:ksa_disabled")
 
         # Final KSA fallback only if not already attempted
         if self.enable_yahoo_chart_ksa and not attempted_yahoo_chart:
             q = await self._fetch_yahoo_chart(symbol, market="KSA")
             if q.current_price is not None:
-                trace.append("yahoo_chart:fallback_ok")
-                q.provider_trace = trace
                 return q.finalize()
             errors.append(f"yahoo_chart:{q.error or 'no_price'}")
-            trace.append(f"yahoo_chart:fallback_fail:{q.error or 'no_price'}")
 
-        q = UnifiedQuote(
+        return UnifiedQuote(
             symbol=symbol,
             market="KSA",
             currency="SAR",
             data_quality="MISSING",
-            error="No KSA provider data. " + (" | ".join(errors) if errors else "no_ksa_providers_enabled"),
+            error="No KSA provider data. " + (_join_errors(errors) if errors else "no_ksa_providers_enabled"),
             status="error",
-            provider_trace=trace or None,
         ).finalize()
-        return q
 
     async def _fetch_tadawul_quote(self, symbol: str) -> UnifiedQuote:
         """
@@ -1117,7 +1066,6 @@ class DataEngine:
         prev = _safe_float(obj.get("previous_close")) or _safe_float(obj.get("previousClose")) or _safe_float(
             obj.get("prevClose")
         )
-        opn = _safe_float(obj.get("open")) or _safe_float(obj.get("day_open")) or _safe_float(obj.get("dayOpen"))
         high = _safe_float(obj.get("high")) or _safe_float(obj.get("day_high")) or _safe_float(obj.get("dayHigh"))
         low = _safe_float(obj.get("low")) or _safe_float(obj.get("day_low")) or _safe_float(obj.get("dayLow"))
         vol = _safe_float(obj.get("volume")) or _safe_float(obj.get("tradedVolume")) or _safe_float(obj.get("qty"))
@@ -1135,7 +1083,6 @@ class DataEngine:
             currency=currency,
             current_price=price,
             previous_close=prev,
-            open=opn,
             day_high=high,
             day_low=low,
             volume=vol,
@@ -1259,27 +1206,19 @@ class DataEngine:
     # GLOBAL: provider loop
     # -------------------------------------------------------------------------
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
-        trace: List[str] = []
-
         # Special symbols: try Yahoo Chart first (optional), else yfinance
         if _is_special_yahoo_symbol(symbol):
             if self.enable_yahoo_chart_special and self.enable_yahoo_chart_global:
                 q = await self._fetch_yahoo_chart(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yahoo_chart"
-                    trace.append("yahoo_chart:special_ok")
-                    q.provider_trace = trace
                     return q.finalize()
-                trace.append(f"yahoo_chart:special_fail:{q.error or 'no_price'}")
 
             if self.enable_yfinance and yf:
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yfinance"
-                    trace.append("yfinance:special_ok")
-                    q.provider_trace = trace
                     return q.finalize()
-                trace.append(f"yfinance:special_fail:{q.error or 'no_price'}")
 
             return UnifiedQuote(
                 symbol=symbol,
@@ -1288,7 +1227,6 @@ class DataEngine:
                 data_quality="MISSING",
                 error="Special symbol requires Yahoo Chart or yfinance (both disabled/unavailable)",
                 status="error",
-                provider_trace=trace or None,
             ).finalize()
 
         errors: List[str] = []
@@ -1303,7 +1241,6 @@ class DataEngine:
                 api_key = _get_key("eodhd_api_key", "EODHD_API_KEY")
                 if not api_key:
                     errors.append("eodhd:no_api_key")
-                    trace.append("eodhd:no_api_key")
                     continue
                 q = await self._fetch_eodhd_realtime(symbol, api_key)
                 if q.current_price is not None:
@@ -1315,18 +1252,14 @@ class DataEngine:
                     q.data_source = "eodhd"
                     q.market = "GLOBAL"
                     q.currency = q.currency or "USD"
-                    trace.append("eodhd:ok")
-                    q.provider_trace = trace
                     q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                     return q.finalize()
                 errors.append(f"eodhd:{q.error or 'no_price'}")
-                trace.append(f"eodhd:fail:{q.error or 'no_price'}")
 
             elif p == "finnhub":
                 api_key = _get_key("finnhub_api_key", "FINNHUB_API_KEY")
                 if not api_key:
                     errors.append("finnhub:no_api_key")
-                    trace.append("finnhub:no_api_key")
                     continue
                 q = await self._fetch_finnhub_quote(symbol, api_key)
                 if q.current_price is not None:
@@ -1341,30 +1274,23 @@ class DataEngine:
                     q.data_source = "finnhub"
                     q.market = "GLOBAL"
                     q.currency = q.currency or "USD"
-                    trace.append("finnhub:ok")
-                    q.provider_trace = trace
                     q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                     return q.finalize()
                 errors.append(f"finnhub:{q.error or 'no_price'}")
-                trace.append(f"finnhub:fail:{q.error or 'no_price'}")
 
             elif p == "fmp":
                 api_key = _get_key("fmp_api_key", "FMP_API_KEY")
                 if not api_key:
                     errors.append("fmp:no_api_key")
-                    trace.append("fmp:no_api_key")
                     continue
                 q = await self._fetch_fmp_quote(symbol, api_key)
                 if q.current_price is not None:
                     q.data_source = "fmp"
                     q.market = "GLOBAL"
                     q.currency = q.currency or "USD"
-                    trace.append("fmp:ok")
-                    q.provider_trace = trace
                     q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                     return q.finalize()
                 errors.append(f"fmp:{q.error or 'no_price'}")
-                trace.append(f"fmp:fail:{q.error or 'no_price'}")
 
             elif p in {"yfinance", "yahoo"}:
                 attempted_yfinance = True
@@ -1372,46 +1298,35 @@ class DataEngine:
                     q = await self._fetch_yfinance(symbol, market="GLOBAL")
                     if q.current_price is not None:
                         q.data_source = "yfinance"
-                        trace.append("yfinance:ok")
-                        q.provider_trace = trace
                         q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                         return q.finalize()
                     errors.append(f"yfinance:{q.error or 'no_price'}")
-                    trace.append(f"yfinance:fail:{q.error or 'no_price'}")
                 else:
                     errors.append("yfinance:disabled_or_missing")
-                    trace.append("yfinance:disabled_or_missing")
 
         # final fallback (GLOBAL only) if not already attempted
         if self.enable_yfinance and yf and not attempted_yfinance:
             q = await self._fetch_yfinance(symbol, market="GLOBAL")
             if q.current_price is not None:
                 q.data_source = "yfinance"
-                trace.append("yfinance:fallback_ok")
-                q.provider_trace = trace
                 q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                 return q.finalize()
             errors.append(f"yfinance:{q.error or 'no_price'}")
-            trace.append(f"yfinance:fallback_fail:{q.error or 'no_price'}")
 
         # optional last-ditch yahoo chart (global) if enabled
         if self.enable_yahoo_chart_global:
             q = await self._fetch_yahoo_chart(symbol, market="GLOBAL")
             if q.current_price is not None:
-                trace.append("yahoo_chart:last_ok")
-                q.provider_trace = trace
                 return q.finalize()
             errors.append(f"yahoo_chart:{q.error or 'no_price'}")
-            trace.append(f"yahoo_chart:last_fail:{q.error or 'no_price'}")
 
         return UnifiedQuote(
             symbol=symbol,
             market="GLOBAL",
             currency="USD",
             data_quality="MISSING",
-            error="No provider data. " + (" | ".join(errors) if errors else "no_providers_enabled"),
+            error="No provider data. " + (_join_errors(errors) if errors else "no_providers_enabled"),
             status="error",
-            provider_trace=trace or None,
         ).finalize()
 
     # -------------------------------------------------------------------------
@@ -1488,26 +1403,25 @@ class DataEngine:
     async def _fetch_yahoo_chart(self, symbol: str, market: str) -> UnifiedQuote:
         """
         Direct Yahoo chart endpoint (no yfinance). Robust for .SR and specials.
-        Returns best-effort: price, prev_close, open, high, low, volume,
-        plus 52w high/low and market cap (when available).
 
-        Uses a small TTL cache to reduce repeated supplement calls.
+        Returns at least: price, prev_close, open, high, low, volume (when available),
+        plus best-effort 52w high/low and market cap.
         """
         ysym = _yahoo_symbol(symbol)
 
-        interval = _safe_str(_get_attr_or_env(["YAHOO_CHART_INTERVAL"], "1d")) or "1d"
-        rng = _safe_str(_get_attr_or_env(["YAHOO_CHART_RANGE"], "5d")) or "5d"
-        cache_key = f"yc::{ysym}::{interval}::{rng}"
-
+        cache_key = f"{market}::{ysym}"
         cached = self.yahoo_chart_cache.get(cache_key)
         if isinstance(cached, UnifiedQuote):
-            # return a copy so callers can safely mutate
+            # return a copy to avoid accidental mutation
             try:
                 return cached.model_copy()
             except Exception:
                 return cached
 
         url = YAHOO_CHART_URL.format(symbol=ysym)
+
+        interval = _safe_str(_get_attr_or_env(["YAHOO_CHART_INTERVAL"], "1d")) or "1d"
+        rng = _safe_str(_get_attr_or_env(["YAHOO_CHART_RANGE"], "5d")) or "5d"
         params = {"interval": interval, "range": rng, "includePrePost": "false"}
 
         data = await self._http_get_json(url, params=params)
@@ -1518,12 +1432,31 @@ class DataEngine:
                 error="yahoo_chart empty response",
                 data_quality="MISSING",
                 status="error",
-                data_source="yahoo_chart",
             )
             return q
 
         try:
             chart = data.get("chart") or {}
+
+            # explicit yahoo error
+            ch_err = chart.get("error")
+            if ch_err:
+                msg = None
+                if isinstance(ch_err, dict):
+                    msg = _safe_str(ch_err.get("description")) or _safe_str(ch_err.get("message")) or _safe_str(ch_err.get("code"))
+                else:
+                    msg = _safe_str(ch_err)
+                q = UnifiedQuote(
+                    symbol=symbol,
+                    market=market,
+                    error=f"yahoo_chart error: {msg or 'unknown'}",
+                    data_source="yahoo_chart",
+                    data_quality="MISSING",
+                    status="error",
+                )
+                self.yahoo_chart_cache[cache_key] = q
+                return q
+
             res = (chart.get("result") or [None])[0] or {}
             meta = res.get("meta") or {}
 
@@ -1531,24 +1464,27 @@ class DataEngine:
             q0 = indicators[0] or {}
 
             close_series = q0.get("close")
-            open_series = q0.get("open")
-            high_series = q0.get("high")
-            low_series = q0.get("low")
-            vol_series = q0.get("volume")
 
-            cp = _safe_float(meta.get("regularMarketPrice")) or _last_non_none(close_series)
+            # price
+            cp = (
+                _safe_float(meta.get("regularMarketPrice"))
+                or _safe_float(meta.get("chartPreviousClose"))  # sometimes best available
+                or _last_non_none(close_series)
+            )
 
+            # prev close
             pc = (
                 _safe_float(meta.get("previousClose"))
                 or _safe_float(meta.get("chartPreviousClose"))
                 or _prev_from_close_series(close_series)
             )
 
-            # Prefer meta day fields if present (sometimes series is sparse)
-            op = _safe_float(meta.get("regularMarketOpen")) or _last_non_none(open_series)
-            hi = _safe_float(meta.get("regularMarketDayHigh")) or _last_non_none(high_series)
-            lo = _safe_float(meta.get("regularMarketDayLow")) or _last_non_none(low_series)
-            vol = _safe_float(meta.get("regularMarketVolume")) or _last_non_none(vol_series)
+            # OHLC: prefer meta if present, else series
+            op = _safe_float(meta.get("regularMarketOpen")) or _last_non_none(q0.get("open"))
+            hi = _safe_float(meta.get("regularMarketDayHigh")) or _last_non_none(q0.get("high"))
+            lo = _safe_float(meta.get("regularMarketDayLow")) or _last_non_none(q0.get("low"))
+
+            vol = _safe_float(meta.get("regularMarketVolume")) or _last_non_none(q0.get("volume"))
 
             high_52w = _safe_float(meta.get("fiftyTwoWeekHigh"))
             low_52w = _safe_float(meta.get("fiftyTwoWeekLow"))
@@ -1581,15 +1517,11 @@ class DataEngine:
                 status="success" if cp is not None else "error",
             )
 
-            try:
-                self.yahoo_chart_cache[cache_key] = q.model_copy()
-            except Exception:
-                self.yahoo_chart_cache[cache_key] = q
-
+            self.yahoo_chart_cache[cache_key] = q
             return q
 
         except Exception as exc:
-            return UnifiedQuote(
+            q = UnifiedQuote(
                 symbol=symbol,
                 market=market,
                 error=f"yahoo_chart error: {exc}",
@@ -1597,6 +1529,7 @@ class DataEngine:
                 data_quality="MISSING",
                 status="error",
             )
+            return q
 
     # -------------------------------------------------------------------------
     # Provider: EODHD
@@ -1612,16 +1545,12 @@ class DataEngine:
                     symbol=symbol, market="GLOBAL", currency="USD", error="EODHD empty response", status="error"
                 )
 
-            # ✅ safer: do NOT treat previousClose as current price
-            cp = _safe_float(data.get("close") or data.get("price"))
-            pc = _safe_float(data.get("previousClose"))
-
             return UnifiedQuote(
                 symbol=symbol,
                 market="GLOBAL",
                 currency="USD",
-                current_price=cp,
-                previous_close=pc,
+                current_price=_safe_float(data.get("close") or data.get("price") or data.get("previousClose")),
+                previous_close=_safe_float(data.get("previousClose")),
                 open=_safe_float(data.get("open")),
                 day_high=_safe_float(data.get("high")),
                 day_low=_safe_float(data.get("low")),
@@ -1629,9 +1558,8 @@ class DataEngine:
                 price_change=_safe_float(data.get("change")),
                 percent_change=_safe_float(data.get("change_p")),
                 data_source="eodhd",
-                data_quality="PARTIAL" if cp is not None else "MISSING",
-                status="success" if cp is not None else "error",
-                error=None if cp is not None else "EODHD returned no price",
+                data_quality="PARTIAL",
+                status="success",
             )
         except Exception as exc:
             dt = int((time.perf_counter() - t0) * 1000)
@@ -1717,15 +1645,10 @@ class DataEngine:
                 data_source="finnhub",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
                 status="success" if cp is not None else "error",
-                error=None if cp is not None else "Finnhub returned no price",
             )
         except Exception as exc:
             return UnifiedQuote(
-                symbol=symbol,
-                market="GLOBAL",
-                currency="USD",
-                error=f"Finnhub error: {exc}",
-                status="error",
+                symbol=symbol, market="GLOBAL", currency="USD", error=f"Finnhub error: {exc}", status="error"
             )
 
     async def _fetch_finnhub_profile_and_metrics(self, symbol: str, api_key: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -1820,9 +1743,8 @@ class DataEngine:
                 pe_ttm=_safe_float(item.get("pe")),
                 eps_ttm=_safe_float(item.get("eps")),
                 data_source="fmp",
-                data_quality="PARTIAL" if current is not None else "MISSING",
+                data_quality="PARTIAL",
                 status="success" if current is not None else "error",
-                error=None if current is not None else "FMP returned no price",
             )
         except Exception as exc:
             return UnifiedQuote(
@@ -1835,11 +1757,7 @@ class DataEngine:
     async def _fetch_yfinance(self, symbol: str, market: str) -> UnifiedQuote:
         if not yf:
             return UnifiedQuote(
-                symbol=symbol,
-                market=market,
-                error="yfinance not installed",
-                data_quality="MISSING",
-                status="error",
+                symbol=symbol, market=market, error="yfinance not installed", data_quality="MISSING", status="error"
             )
 
         ysym = _yahoo_symbol(symbol)
@@ -1879,11 +1797,7 @@ class DataEngine:
             info = await asyncio.to_thread(_sync)
             if not info:
                 return UnifiedQuote(
-                    symbol=symbol,
-                    market=market,
-                    error="yfinance empty response",
-                    data_quality="MISSING",
-                    status="error",
+                    symbol=symbol, market=market, error="yfinance empty response", data_quality="MISSING", status="error"
                 )
 
             err_txt = str(info)[:800].lower()
@@ -1911,18 +1825,13 @@ class DataEngine:
                 data_source="yfinance",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
                 status="success" if cp is not None else "error",
-                error=None if cp is not None else "yfinance returned no price",
             )
         except Exception as exc:
             msg = str(exc)
             if "unauthorized" in msg.lower() or "401" in msg:
                 msg = "yfinance blocked/Unauthorized (Yahoo 401)."
             return UnifiedQuote(
-                symbol=symbol,
-                market=market,
-                error=f"yfinance error: {msg}",
-                data_quality="MISSING",
-                status="error",
+                symbol=symbol, market=market, error=f"yfinance error: {msg}", data_quality="MISSING", status="error"
             )
 
 
@@ -1983,4 +1892,3 @@ __all__ = [
     "get_enriched_quote",
     "get_enriched_quotes",
 ]
-```
