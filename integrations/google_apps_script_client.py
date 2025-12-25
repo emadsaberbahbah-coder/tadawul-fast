@@ -1,7 +1,7 @@
 """
 google_apps_script_client.py
 ------------------------------------------------------------
-Google Apps Script client for Tadawul Fast Bridge – v2.4.0 (HARDENED)
+Google Apps Script client for Tadawul Fast Bridge – v2.5.0 (HARDENED)
 
 GOALS
 - Robust bridge for backend/tools to call your deployed Google Apps Script WebApp.
@@ -10,6 +10,15 @@ GOALS
       • Global                         -> Apps Script Global logic (EODHD/FMP/other)
 - Reads configuration from env.py / core.config / environment variables (in that order).
 - NEVER calls market providers directly (only talks to GAS).
+
+SECURITY NOTE (IMPORTANT)
+- Google Apps Script WebApp doPost(e) typically cannot access custom HTTP headers reliably.
+  So token-in-header alone may not work.
+- This client supports sending token via:
+    - query string (recommended for GAS)
+    - body (recommended for GAS)
+    - header (optional)
+  Controlled by APPS_SCRIPT_TOKEN_TRANSPORT.
 
 NOTES
 - Uses urllib only (max portability).
@@ -34,7 +43,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_apps_script_client")
 
-CLIENT_VERSION = "2.4.0"
+CLIENT_VERSION = "2.5.0"
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 
 # =============================================================================
@@ -102,11 +113,26 @@ def _get_float(*, attr: str, env_key: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in _TRUTHY
+
+
 _DEFAULT_URL = _get_str(attr="google_apps_script_backup_url", env_key="GOOGLE_APPS_SCRIPT_BACKUP_URL", default="")
 _DEFAULT_TOKEN = _get_str(attr="app_token", env_key="APP_TOKEN", default="")
 _BACKEND_URL = _get_str(attr="backend_base_url", env_key="BACKEND_BASE_URL", default="")
 
 _DEFAULT_TIMEOUT = _get_float(attr="apps_script_timeout_sec", env_key="APPS_SCRIPT_TIMEOUT_SEC", default=45.0)
+
+# Token transport for GAS compatibility:
+#   "query" (recommended), "body" (recommended), "header" (optional), or combos: "query,body"
+_TOKEN_TRANSPORT = (os.getenv("APPS_SCRIPT_TOKEN_TRANSPORT", "query,body") or "query,body").lower()
+_TOKEN_PARAM_NAME = (os.getenv("APPS_SCRIPT_TOKEN_PARAM_NAME", "token") or "token").strip()
+
+# Safety: avoid leaking huge HTML error pages into memory/logs
+_MAX_RAW_TEXT_CHARS = int(os.getenv("APPS_SCRIPT_MAX_RAW_TEXT_CHARS", "12000") or "12000")
 
 
 # =============================================================================
@@ -118,7 +144,6 @@ _SSL_CONTEXT_DEFAULT = ssl.create_default_context()
 def _make_ssl_context(verify_ssl: bool = True) -> ssl.SSLContext:
     if verify_ssl:
         return _SSL_CONTEXT_DEFAULT
-    # Not recommended, but useful for debugging certain environments
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -176,7 +201,6 @@ def _normalize_ksa_symbol(symbol: str) -> str:
         base = s[:-3]
         return f"{base}.SR" if base.isdigit() else ""
 
-    # allow 3–6 digits to be safe (some systems include 3-digit indices)
     if s.isdigit() and 3 <= len(s) <= 6:
         return f"{s}.SR"
 
@@ -220,6 +244,31 @@ def split_tickers_by_market(tickers: Sequence[str]) -> Tuple[List[str], List[str
 
 
 # =============================================================================
+# Utilities
+# =============================================================================
+def _redact_url_token(url: str, token_param: str) -> str:
+    try:
+        if not url:
+            return url
+        parts = list(urllib.parse.urlparse(url))
+        qs = urllib.parse.parse_qsl(parts[4], keep_blank_values=True)
+        out_qs = []
+        for k, v in qs:
+            if str(k) == str(token_param) and v:
+                out_qs.append((k, "***"))
+            else:
+                out_qs.append((k, v))
+        parts[4] = urllib.parse.urlencode(out_qs)
+        return urllib.parse.urlunparse(parts)
+    except Exception:
+        return url
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# =============================================================================
 # Client
 # =============================================================================
 class GoogleAppsScriptClient:
@@ -253,14 +302,17 @@ class GoogleAppsScriptClient:
     # URL + parsing
     # ------------------------------------------------------------------
     def _build_url(self, *, mode: str, extra_query: Optional[Dict[str, str]] = None) -> str:
-        mode = (mode or "").strip()
-        if not mode:
-            mode = "default"
+        mode = (mode or "").strip() or "default"
 
         url_parts = list(urllib.parse.urlparse(self.base_url))
         existing_qs = dict(urllib.parse.parse_qsl(url_parts[4] or ""))
 
         existing_qs["mode"] = mode
+
+        # Token in query (default) for GAS compatibility
+        if self.app_token and "query" in _TOKEN_TRANSPORT:
+            existing_qs[_TOKEN_PARAM_NAME] = self.app_token
+
         if extra_query:
             for k, v in extra_query.items():
                 if k and v is not None:
@@ -276,23 +328,28 @@ class GoogleAppsScriptClient:
         t = text.strip()
         if not t:
             return None
-        try:
-            return json.loads(t)
-        except Exception:
-            return {"raw": text}
+
+        # Fast path JSON
+        if t.startswith("{") or t.startswith("["):
+            try:
+                return json.loads(t)
+            except Exception:
+                pass
+
+        # GAS sometimes returns HTML (error page / permission issues)
+        # Return a structured wrapper so callers can debug without crashing.
+        return {"raw": text}
 
     # ------------------------------------------------------------------
     # Retry policy
     # ------------------------------------------------------------------
     @staticmethod
     def _is_retryable_status(code: int) -> bool:
-        # Retry common transient statuses
         return code in (408, 425, 429) or 500 <= code <= 599
 
     @staticmethod
     def _sleep_backoff(attempt: int) -> None:
-        # exponential backoff with jitter (max ~10s)
-        base = min(10.0, (2.0 ** attempt))
+        base = min(8.0, 0.35 * (2.0 ** attempt))
         jitter = random.uniform(0.0, 0.6)
         time.sleep(base + jitter)
 
@@ -313,18 +370,33 @@ class GoogleAppsScriptClient:
 
         method = (method or "POST").strip().upper()
         url = self._build_url(mode=mode, extra_query=extra_query)
+        url_redacted = _redact_url_token(url, _TOKEN_PARAM_NAME)
 
         req_headers: Dict[str, str] = {
             "Content-Type": "application/json; charset=utf-8",
             "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
             "User-Agent": f"TadawulFastBridge/AppsScriptClient/{CLIENT_VERSION}",
         }
-        if self.app_token:
+
+        # Token in header (optional)
+        if self.app_token and "header" in _TOKEN_TRANSPORT:
             req_headers["X-APP-TOKEN"] = self.app_token
+
         if headers:
             for k, v in headers.items():
                 if k and v is not None:
                     req_headers[str(k)] = str(v)
+
+        # Token in body (default) for GAS compatibility (doPost can read postData.contents)
+        if payload is None:
+            payload = {}
+        if self.app_token and "body" in _TOKEN_TRANSPORT:
+            # add without breaking existing schema (safe nesting)
+            auth = payload.get("auth")
+            if not isinstance(auth, dict):
+                auth = {}
+            auth.setdefault("token", self.app_token)
+            payload["auth"] = auth
 
         data_bytes: Optional[bytes] = None
 
@@ -334,15 +406,19 @@ class GoogleAppsScriptClient:
             for k, v in payload.items():
                 if v is None:
                     continue
+                # avoid injecting giant objects into query
+                if isinstance(v, (dict, list)):
+                    continue
                 q[str(k)] = str(v)
             url = self._build_url(mode=mode, extra_query=q)
-            payload = None
+            url_redacted = _redact_url_token(url, _TOKEN_PARAM_NAME)
+            payload = {}
 
-        if method != "GET" and payload is not None:
+        if method != "GET":
             try:
                 data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             except Exception as exc:
-                return AppsScriptResult(False, 0, None, f"JSON Encode Error: {exc}", url=url)
+                return AppsScriptResult(False, 0, None, f"JSON Encode Error: {exc}", url=url_redacted)
 
         last_err: Optional[str] = None
         started = time.time()
@@ -351,16 +427,17 @@ class GoogleAppsScriptClient:
             try:
                 req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method=method)
                 with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context) as resp:
-                    status_code = getattr(resp, "status", resp.getcode())
-                    raw = resp.read()
+                    status_code = int(getattr(resp, "status", resp.getcode()))
+                    raw = resp.read() or b""
                     text = raw.decode("utf-8", errors="replace")
+                    if len(text) > _MAX_RAW_TEXT_CHARS:
+                        text = text[:_MAX_RAW_TEXT_CHARS] + "...(truncated)"
                     parsed = self._parse_json_or_text(text)
 
-                    ok = 200 <= int(status_code) < 300
+                    ok = 200 <= status_code < 300
                     elapsed_ms = int((time.time() - started) * 1000)
 
-                    # retryable even if response is HTTP but transient
-                    if not ok and self._is_retryable_status(int(status_code)) and attempt < int(retries):
+                    if (not ok) and self._is_retryable_status(status_code) and attempt < int(retries):
                         last_err = f"HTTP {status_code}"
                         logger.warning(
                             "[AppsScriptClient] %s (attempt=%d/%d) -> retry",
@@ -373,23 +450,23 @@ class GoogleAppsScriptClient:
 
                     return AppsScriptResult(
                         ok=ok,
-                        status_code=int(status_code),
+                        status_code=status_code,
                         data=parsed,
                         error=None if ok else f"HTTP {status_code}",
                         raw_text=text,
-                        url=url,
+                        url=url_redacted,
                         elapsed_ms=elapsed_ms,
                     )
 
             except urllib.error.HTTPError as exc:
-                # We got an HTTP status (4xx/5xx). Decide to retry based on code.
                 code = int(getattr(exc, "code", 0) or 0)
                 text = ""
                 try:
-                    if exc.fp:
-                        text = exc.read().decode("utf-8", errors="replace")
+                    text = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     text = ""
+                if len(text) > _MAX_RAW_TEXT_CHARS:
+                    text = text[:_MAX_RAW_TEXT_CHARS] + "...(truncated)"
                 parsed = self._parse_json_or_text(text)
                 elapsed_ms = int((time.time() - started) * 1000)
 
@@ -404,13 +481,15 @@ class GoogleAppsScriptClient:
                     self._sleep_backoff(attempt)
                     continue
 
+                reason = str(getattr(exc, "reason", "") or "").strip()
+                err_msg = f"HTTP {code}" + (f": {reason}" if reason else "")
                 return AppsScriptResult(
                     ok=False,
                     status_code=code,
                     data=parsed,
-                    error=f"HTTP {code}: {getattr(exc, 'reason', '')}".strip() or f"HTTP {code}",
+                    error=err_msg,
                     raw_text=text,
-                    url=url,
+                    url=url_redacted,
                     elapsed_ms=elapsed_ms,
                 )
 
@@ -434,12 +513,11 @@ class GoogleAppsScriptClient:
                     data=None,
                     error=f"Max retries exceeded. Last error: {last_err}",
                     raw_text=None,
-                    url=url,
+                    url=url_redacted,
                     elapsed_ms=elapsed_ms,
                 )
 
-        # should not reach
-        return AppsScriptResult(False, 0, None, f"Max retries exceeded. Last error: {last_err}", url=url)
+        return AppsScriptResult(False, 0, None, f"Max retries exceeded. Last error: {last_err}", url=url_redacted)
 
     # ------------------------------------------------------------------
     # Async wrapper
@@ -469,10 +547,6 @@ class GoogleAppsScriptClient:
     # ------------------------------------------------------------------
     # Payload builders / operations
     # ------------------------------------------------------------------
-    @staticmethod
-    def _now_utc_iso() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
     def build_quotes_payload(
         self,
         sheet_id: str,
@@ -480,21 +554,12 @@ class GoogleAppsScriptClient:
         tickers: Sequence[str],
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Construct payload expected by GAS doPost.
-
-        We include:
-        - split tickers (ksa/global/all)
-        - sheet id/name
-        - backend base url (optional)
-        - meta: client version + timestamp + any extra
-        """
         ksa_tickers, global_tickers = split_tickers_by_market(list(tickers or []))
 
         meta: Dict[str, Any] = {
             "client": "tadawul_fast_bridge",
             "client_version": CLIENT_VERSION,
-            "generated_at_utc": self._now_utc_iso(),
+            "generated_at_utc": _now_utc_iso(),
         }
         if extra_meta:
             try:
@@ -523,7 +588,6 @@ class GoogleAppsScriptClient:
         payload = self.build_quotes_payload(sheet_id, sheet_name, tickers)
         return self.call_script(mode=mode, payload=payload, method="POST", retries=retries)
 
-    # Small convenience ping (if your GAS supports it)
     def ping(self, *, mode: str = "ping") -> AppsScriptResult:
         return self.call_script(mode=mode, payload=None, method="GET", retries=0)
 
