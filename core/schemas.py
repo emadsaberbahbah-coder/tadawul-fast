@@ -1,8 +1,9 @@
-# core/schemas.py
+```python
+# core/schemas.py  (FULL REPLACEMENT)
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.2.0 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.3.0 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
@@ -19,29 +20,34 @@ Design rules
 ✅ Stable: DEFAULT_HEADERS_59 order must not change lightly.
 ✅ No mutation leaks: always returns COPIES of header lists.
 ✅ Better alignment: sheet aliases include your actual page names (Global_Markets, Insights_Analysis, etc).
+✅ Convenience: provides HEADER<->FIELD mapping for UnifiedQuote-style payloads.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Pydantic v2 preferred, v1 fallback
 try:
-    from pydantic import BaseModel, Field, ConfigDict  # type: ignore
+    from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator  # type: ignore
+
     _PYDANTIC_V2 = True
 except Exception:  # pragma: no cover
-    from pydantic import BaseModel, Field  # type: ignore
+    from pydantic import BaseModel, Field, validator  # type: ignore
+
     ConfigDict = None  # type: ignore
+    field_validator = None  # type: ignore
+    model_validator = None  # type: ignore
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.2.0"
-
+SCHEMAS_VERSION = "3.3.0"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
 # =============================================================================
 
+# Keep as a list for backward-compat, but NEVER return this object directly.
 DEFAULT_HEADERS_59: List[str] = [
     # Identity
     "Symbol",
@@ -113,9 +119,114 @@ DEFAULT_HEADERS_59: List[str] = [
     "Last Updated (Riyadh)",
 ]
 
-# Hard guard (prevents accidental edits)
+
+def _ensure_len_59(headers: Sequence[str]) -> Tuple[str, ...]:
+    """
+    PROD-SAFE: never raises.
+    If headers length != 59, returns the canonical DEFAULT_HEADERS_59 as tuple.
+    """
+    try:
+        if isinstance(headers, (list, tuple)) and len(headers) == 59:
+            return tuple(str(x) for x in headers)
+    except Exception:
+        pass
+    return tuple(DEFAULT_HEADERS_59)
+
+
+# Freeze the canonical list as a tuple for internal use (prevents accidental mutation).
+_DEFAULT_59_TUPLE: Tuple[str, ...] = _ensure_len_59(DEFAULT_HEADERS_59)
+
+# Normalize exported list to canonical (if someone edited it accidentally)
 if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
-    raise RuntimeError(f"DEFAULT_HEADERS_59 must be 59 columns, got {len(DEFAULT_HEADERS_59)}")
+    DEFAULT_HEADERS_59 = list(_DEFAULT_59_TUPLE)
+
+# =============================================================================
+# Header <-> Field mapping (UnifiedQuote alignment helper)
+# =============================================================================
+# This is OPTIONAL for callers, but very useful to keep consistent translations.
+
+HEADER_TO_FIELD: Dict[str, str] = {
+    # Identity
+    "Symbol": "symbol",
+    "Company Name": "name",
+    "Sector": "sector",
+    "Sub-Sector": "sub_sector",
+    "Market": "market",
+    "Currency": "currency",
+    "Listing Date": "listing_date",
+    # Prices
+    "Last Price": "current_price",
+    "Previous Close": "previous_close",
+    "Price Change": "price_change",
+    "Percent Change": "percent_change",
+    "Day High": "day_high",
+    "Day Low": "day_low",
+    "52W High": "high_52w",
+    "52W Low": "low_52w",
+    "52W Position %": "position_52w_percent",
+    # Volume/Liquidity
+    "Volume": "volume",
+    "Avg Volume (30D)": "avg_volume_30d",
+    "Value Traded": "value_traded",
+    "Turnover %": "turnover_percent",
+    # Shares/Cap
+    "Shares Outstanding": "shares_outstanding",
+    "Free Float %": "free_float",
+    "Market Cap": "market_cap",
+    "Free Float Market Cap": "free_float_market_cap",
+    "Liquidity Score": "liquidity_score",
+    # Fundamentals
+    "EPS (TTM)": "eps_ttm",
+    "Forward EPS": "forward_eps",
+    "P/E (TTM)": "pe_ttm",
+    "Forward P/E": "forward_pe",
+    "P/B": "pb",
+    "P/S": "ps",
+    "EV/EBITDA": "ev_ebitda",
+    "Dividend Yield %": "dividend_yield",
+    "Dividend Rate": "dividend_rate",
+    "Payout Ratio %": "payout_ratio",
+    "ROE %": "roe",
+    "ROA %": "roa",
+    "Net Margin %": "net_margin",
+    "EBITDA Margin %": "ebitda_margin",
+    "Revenue Growth %": "revenue_growth",
+    "Net Income Growth %": "net_income_growth",
+    "Beta": "beta",
+    # Technicals
+    "Volatility (30D)": "volatility_30d",
+    "RSI (14)": "rsi_14",
+    # Valuation
+    "Fair Value": "fair_value",
+    "Upside %": "upside_percent",
+    "Valuation Label": "valuation_label",
+    # Scores/Rec
+    "Value Score": "value_score",
+    "Quality Score": "quality_score",
+    "Momentum Score": "momentum_score",
+    "Opportunity Score": "opportunity_score",
+    "Risk Score": "risk_score",
+    "Overall Score": "overall_score",
+    "Error": "error",
+    "Recommendation": "recommendation",
+    # Meta
+    "Data Source": "data_source",
+    "Data Quality": "data_quality",
+    "Last Updated (UTC)": "last_updated_utc",
+    "Last Updated (Riyadh)": "last_updated_riyadh",
+}
+
+FIELD_TO_HEADER: Dict[str, str] = {v: k for k, v in HEADER_TO_FIELD.items()}
+
+
+def header_to_field(header: str) -> str:
+    """Best-effort header -> UnifiedQuote field name."""
+    return HEADER_TO_FIELD.get(str(header or "").strip(), str(header or "").strip())
+
+
+def field_to_header(field: str) -> str:
+    """Best-effort UnifiedQuote field -> header label."""
+    return FIELD_TO_HEADER.get(str(field or "").strip(), str(field or "").strip())
 
 
 # =============================================================================
@@ -139,57 +250,75 @@ def _norm_sheet_name(name: Optional[str]) -> str:
     return s
 
 
-# Your 9-page dashboard sheets (aliases included).
-# All use canonical 59 by default unless you intentionally define exceptions.
-_SHEET_HEADERS: Dict[str, List[str]] = {
+# Store as tuples internally to prevent mutation.
+_SHEET_HEADERS: Dict[str, Tuple[str, ...]] = {
     # -------------------------
     # KSA / Tadawul pages
     # -------------------------
-    "ksa_tadawul": DEFAULT_HEADERS_59,
-    "ksa_tadawul_market": DEFAULT_HEADERS_59,
-    "ksa_market": DEFAULT_HEADERS_59,
-    "tadawul": DEFAULT_HEADERS_59,
-    "ksa": DEFAULT_HEADERS_59,
+    "ksa_tadawul": _DEFAULT_59_TUPLE,
+    "ksa_tadawul_market": _DEFAULT_59_TUPLE,
+    "ksa_market": _DEFAULT_59_TUPLE,
+    "tadawul": _DEFAULT_59_TUPLE,
+    "ksa": _DEFAULT_59_TUPLE,
+    "market_leaders": _DEFAULT_59_TUPLE,
+    "ksa_market_leaders": _DEFAULT_59_TUPLE,
 
     # -------------------------
     # Global Markets pages
     # (IMPORTANT: your real sheet is "Global_Markets")
     # -------------------------
-    "global_markets": DEFAULT_HEADERS_59,
-    "global_market": DEFAULT_HEADERS_59,
-    "global": DEFAULT_HEADERS_59,
+    "global_markets": _DEFAULT_59_TUPLE,
+    "global_market": _DEFAULT_59_TUPLE,
+    "global": _DEFAULT_59_TUPLE,
 
     # -------------------------
     # Mutual Funds
     # -------------------------
-    "mutual_funds": DEFAULT_HEADERS_59,
-    "mutualfunds": DEFAULT_HEADERS_59,
-    "funds": DEFAULT_HEADERS_59,
+    "mutual_funds": _DEFAULT_59_TUPLE,
+    "mutualfunds": _DEFAULT_59_TUPLE,
+    "funds": _DEFAULT_59_TUPLE,
 
     # -------------------------
     # Commodities & FX
     # -------------------------
-    "commodities_fx": DEFAULT_HEADERS_59,
-    "commodities_and_fx": DEFAULT_HEADERS_59,
-    "commodities": DEFAULT_HEADERS_59,
-    "fx": DEFAULT_HEADERS_59,
+    "commodities_fx": _DEFAULT_59_TUPLE,
+    "commodities_and_fx": _DEFAULT_59_TUPLE,
+    "commodities": _DEFAULT_59_TUPLE,
+    "fx": _DEFAULT_59_TUPLE,
 
     # -------------------------
-    # Portfolio
+    # Portfolio / Investment
     # -------------------------
-    "my_portfolio": DEFAULT_HEADERS_59,
-    "my_portfolio_investment": DEFAULT_HEADERS_59,
-    "my_portfolio_investment_income_statement": DEFAULT_HEADERS_59,
-    "portfolio": DEFAULT_HEADERS_59,
+    "my_portfolio": _DEFAULT_59_TUPLE,
+    "my_portfolio_investment": _DEFAULT_59_TUPLE,
+    "my_portfolio_investment_income_statement": _DEFAULT_59_TUPLE,
+    "investment_income_statement": _DEFAULT_59_TUPLE,
+    "portfolio": _DEFAULT_59_TUPLE,
 
     # -------------------------
     # Insights / Analysis / Advisor
     # -------------------------
-    "insights_analysis": DEFAULT_HEADERS_59,   # IMPORTANT: your real sheet is "Insights_Analysis"
-    "analysis": DEFAULT_HEADERS_59,
-    "investment_advisor": DEFAULT_HEADERS_59,
-    "advisor": DEFAULT_HEADERS_59,
+    "insights_analysis": _DEFAULT_59_TUPLE,  # IMPORTANT: your real sheet is "Insights_Analysis"
+    "insights": _DEFAULT_59_TUPLE,
+    "analysis": _DEFAULT_59_TUPLE,
+    "investment_advisor": _DEFAULT_59_TUPLE,
+    "advisor": _DEFAULT_59_TUPLE,
+
+    # -------------------------
+    # Additional dashboard pages (aliases)
+    # -------------------------
+    "economic_calendar": _DEFAULT_59_TUPLE,
+    "calendar": _DEFAULT_59_TUPLE,
+    "status": _DEFAULT_59_TUPLE,
 }
+
+
+def resolve_sheet_key(sheet_name: Optional[str]) -> str:
+    """
+    Returns the normalized key used for lookups.
+    Useful for debugging what your "Global_Markets" becomes internally.
+    """
+    return _norm_sheet_name(sheet_name)
 
 
 def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
@@ -201,27 +330,27 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
     try:
         key = _norm_sheet_name(sheet_name)
         if not key:
-            return list(DEFAULT_HEADERS_59)
+            return list(_DEFAULT_59_TUPLE)
 
         # direct match
         v = _SHEET_HEADERS.get(key)
-        if isinstance(v, list) and v:
+        if isinstance(v, tuple) and v:
             return list(v)
 
         # defensive matching: try common patterns
-        # 1) remove leading/trailing underscores
         key2 = key.strip("_")
-        if key2 and key2 in _SHEET_HEADERS:
-            return list(_SHEET_HEADERS[key2])
+        v2 = _SHEET_HEADERS.get(key2)
+        if isinstance(v2, tuple) and v2:
+            return list(v2)
 
-        # 2) prefix / contains matching
+        # contains / prefix matching
         for k, vv in _SHEET_HEADERS.items():
             if key == k or key.startswith(k) or k in key:
                 return list(vv)
 
-        return list(DEFAULT_HEADERS_59)
+        return list(_DEFAULT_59_TUPLE)
     except Exception:
-        return list(DEFAULT_HEADERS_59)
+        return list(_DEFAULT_59_TUPLE)
 
 
 def get_supported_sheets() -> List[str]:
@@ -235,6 +364,38 @@ def get_supported_sheets() -> List[str]:
 # =============================================================================
 # Shared request models
 # =============================================================================
+
+def _coerce_str_list(v: Any) -> List[str]:
+    """
+    Accept:
+      - ["AAPL","MSFT"]
+      - "AAPL,MSFT 1120.SR"
+      - None
+    and return a clean list of strings.
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: List[str] = []
+        for x in v:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
+
+    # single string
+    s = str(v).replace("\n", " ").replace("\t", " ").strip()
+    if not s:
+        return []
+    parts = []
+    if "," in s:
+        parts = [p.strip() for p in s.split(",")]
+    else:
+        parts = [p.strip() for p in s.split(" ")]
+    return [p for p in parts if p]
+
 
 class _ExtraIgnore(BaseModel):
     if _PYDANTIC_V2:
@@ -254,6 +415,32 @@ class BatchProcessRequest(_ExtraIgnore):
     symbols: List[str] = Field(default_factory=list)
     tickers: List[str] = Field(default_factory=list)  # alias support
 
+    # --- v2 validators
+    if _PYDANTIC_V2:  # type: ignore
+        @field_validator("symbols", mode="before")  # type: ignore
+        def _v2_symbols(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
+
+        @field_validator("tickers", mode="before")  # type: ignore
+        def _v2_tickers(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
+
+        @model_validator(mode="after")  # type: ignore
+        def _v2_post(self) -> "BatchProcessRequest":
+            # ensure list types (defensive)
+            self.symbols = _coerce_str_list(self.symbols)
+            self.tickers = _coerce_str_list(self.tickers)
+            return self
+
+    else:  # pragma: no cover
+        @validator("symbols", pre=True)  # type: ignore
+        def _v1_symbols(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
+
+        @validator("tickers", pre=True)  # type: ignore
+        def _v1_tickers(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
+
     def all_symbols(self) -> List[str]:
         """
         Returns combined symbols (symbols + tickers), trimmed, in original order,
@@ -272,7 +459,13 @@ class BatchProcessRequest(_ExtraIgnore):
 __all__ = [
     "SCHEMAS_VERSION",
     "DEFAULT_HEADERS_59",
+    "HEADER_TO_FIELD",
+    "FIELD_TO_HEADER",
+    "header_to_field",
+    "field_to_header",
+    "resolve_sheet_key",
     "get_headers_for_sheet",
     "get_supported_sheets",
     "BatchProcessRequest",
 ]
+```
