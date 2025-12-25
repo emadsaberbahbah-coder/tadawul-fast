@@ -1,3 +1,4 @@
+```python
 # main.py  (FULL REPLACEMENT)
 """
 main.py
@@ -47,16 +48,8 @@ if str(BASE_DIR) not in sys.path:
 
 
 # ---------------------------------------------------------------------
-# Logging (bootstrap)
+# Logging (bootstrap) — NEVER CRASH ON BAD LOG_FORMAT
 # ---------------------------------------------------------------------
-LOG_FORMAT = os.getenv("LOG_FORMAT", "%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("main")
-
-
-# =============================================================================
-# Helpers
-# =============================================================================
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 
@@ -64,6 +57,58 @@ def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
+def _resolve_log_format() -> str:
+    """
+    LOG_FORMAT must be a real logging format string.
+
+    Some platforms/users set LOG_FORMAT to labels like "detailed" or "simple".
+    That crashes Python logging with:
+        ValueError: Invalid format 'detailed' for '%' style
+
+    This resolver:
+    - accepts explicit fmt strings containing "%("
+    - maps known labels to safe defaults
+    - falls back to a safe default always
+    """
+    raw = str(os.getenv("LOG_FORMAT", "") or "").strip()
+    if not raw:
+        return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+    low = raw.lower()
+
+    # If user supplied a proper fmt string, use it
+    if "%(" in raw:
+        return raw
+
+    # Map common labels
+    if low in {"detailed", "detail", "full", "verbose"}:
+        return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+    if low in {"simple", "compact"}:
+        return "%(levelname)s | %(name)s | %(message)s"
+
+    if low in {"json"}:
+        # still must be a valid printf-style fmt
+        return "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+    # Unknown token => safe default
+    return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+
+LOG_FORMAT = _resolve_log_format()
+
+try:
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+except Exception:
+    # absolute last-resort fallback
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+logger = logging.getLogger("main")
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
 def _parse_list_like(v: Any) -> List[str]:
     """
     Accepts:
@@ -324,7 +369,9 @@ def _providers_from_settings(settings: Optional[object], env_mod: Optional[objec
 
     # Fallback to env strings
     if not enabled:
-        enabled = _parse_list_like(_get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", "")))
+        enabled = _parse_list_like(
+            _get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", ""))
+        )
     if not ksa:
         ksa = _parse_list_like(_get(settings, env_mod, "KSA_PROVIDERS", ""))
 
@@ -351,6 +398,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
     """
     Minimal, non-secret environment summary for /system/settings.
     """
+
     def _val(name: str, default: str = "") -> str:
         return str(_get(settings, env_mod, name, default) or "")
 
@@ -359,6 +407,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
     snap: Dict[str, Any] = {
         "APP_ENV": _val("APP_ENV", _val("ENVIRONMENT", "production")),
         "LOG_LEVEL": _val("LOG_LEVEL", _val("log_level", "INFO")),
+        "LOG_FORMAT": LOG_FORMAT,  # shows resolved safe format (not a secret)
         "BASE_URL": _val("BASE_URL", _val("BACKEND_BASE_URL", "")),
         "ENABLED_PROVIDERS": enabled,
         "KSA_PROVIDERS": ksa,
@@ -545,8 +594,11 @@ def create_app() -> FastAPI:
         app_.state.required_routers = rr or required_default
 
         logger.info("Settings loaded from %s", app_.state.settings_source or "(none)")
-        logger.info("Fast boot: defer_router_mount=%s init_engine_on_boot=%s",
-                    app_.state.defer_router_mount, app_.state.init_engine_on_boot)
+        logger.info(
+            "Fast boot: defer_router_mount=%s init_engine_on_boot=%s",
+            app_.state.defer_router_mount,
+            app_.state.init_engine_on_boot,
+        )
 
         # boot
         if app_.state.defer_router_mount:
@@ -654,7 +706,9 @@ def create_app() -> FastAPI:
     @app_.get("/readyz", include_in_schema=False)
     async def readyz():
         init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
-        if getattr(app_.state, "routers_ready", False) and (getattr(app_.state, "engine_ready", False) or not init_engine):
+        if getattr(app_.state, "routers_ready", False) and (
+            getattr(app_.state, "engine_ready", False) or not init_engine
+        ):
             return {"status": "ready"}
         return JSONResponse(
             status_code=503,
@@ -695,7 +749,10 @@ def create_app() -> FastAPI:
 
     @app_.get("/system/routes", tags=["system"])
     async def system_routes():
-        return {"mount_report": getattr(app_.state, "mount_report", []), "plan": getattr(app_.state, "routers_to_mount", [])}
+        return {
+            "mount_report": getattr(app_.state, "mount_report", []),
+            "plan": getattr(app_.state, "routers_to_mount", []),
+        }
 
     @app_.get("/system/bootstrap", tags=["system"])
     async def system_bootstrap():
@@ -750,3 +807,4 @@ def create_app() -> FastAPI:
 
 # REQUIRED BY RENDER
 app = create_app()
+```
