@@ -4,40 +4,26 @@ core/data_engine_v2.py
 ===============================================================
 UNIFIED DATA ENGINE (v2.7.2) — KSA-SAFE + PROD SAFE (HARDENED)
 
-Goal of v2.7.2:
-- Reduce "missing data" in enriched_quote responses, without violating KSA rules.
-
-Key upgrades vs v2.7.1:
-- ✅ Automatic "fill missing fields" step after any provider returns price
-  - GLOBAL: backfill identity/fundamentals via EODHD fundamentals (if key exists) and/or Finnhub profile+metrics
-  - KSA: backfill company_name from Argaam snapshot if available
-- ✅ Optional 52W High/Low fill from Yahoo Chart 1y (cached)
-- ✅ Optional Tadawul Profile endpoint support for KSA (if you provide TADAWUL_PROFILE_URL)
-- ✅ Better "zero price" guard (optional) to avoid BADSYMBOL -> 0.0 success
-- ✅ Preserves symbol_input / symbol_normalized / status behavior like your live output
+What’s improved vs v2.7.1:
+- ✅ Adds module-level API functions: get_enriched_quote/get_enriched_quotes/get_quote/get_quotes
+  (so routes/enriched_quote.py fallback path never breaks)
+- ✅ Adds Yahoo Chart "SUPPLEMENT" mode to reduce missing core fields:
+    If provider returns price but misses prev close / OHLC / volume / 52w high-low / market cap,
+    the engine fills missing fields from Yahoo Chart (without overriding your chosen provider).
+- ✅ Adds ENABLE_YAHOO_CHART_GLOBAL (default True) + ENABLE_YAHOO_CHART_SUPPLEMENT (default True)
+- ✅ Keeps KSA HARD policy: yfinance for KSA OFF unless ENABLE_YFINANCE_KSA=true
 
 KSA routing order (KSA_PROVIDERS):
-  - tadawul  (optional: TADAWUL_QUOTE_URL)
+  - tadawul  (optional, via TADAWUL_QUOTE_URL + optional TADAWUL_HEADERS_JSON)
   - argaam   (HTML snapshot best-effort)
-  - yfinance (OFF by default; enable with ENABLE_YFINANCE_KSA=true)
-  - yahoo_chart (ON by default unless disabled)
+  - yfinance (OPTIONAL last resort; OFF by default)
+  - yahoo_chart (OPTIONAL fallback; ON by default unless disabled)
 
-GLOBAL routing order (ENABLED_PROVIDERS / PROVIDERS):
+GLOBAL routing order (PROVIDERS / ENABLED_PROVIDERS):
   - eodhd -> finnhub -> fmp -> yfinance (optional fallback)
 
-Missing-data fill toggles (defaults are chosen to REDUCE missing data):
-  - ENRICH_FILL_MISSING_GLOBAL=true
-  - ENRICH_FILL_MISSING_KSA=true
-  - ENRICH_FILL_52W_FROM_YAHOO=true
-  - ENRICH_ZERO_PRICE_GUARD=true
-
-Optional KSA profile endpoint:
-  - TADAWUL_PROFILE_URL (supports {code} or {symbol})
-  - TADAWUL_PROFILE_HEADERS_JSON (optional)
-
 Notes:
-- Self-contained: no external yahoo provider module required.
-- Strict KSA: will not use EODHD/Finnhub/FMP for .SR
+- Self-contained (no external yahoo provider module required).
 """
 
 from __future__ import annotations
@@ -203,7 +189,7 @@ def _safe_float(val: Any) -> Optional[float]:
     Robust numeric parser:
     - supports Arabic digits
     - strips %, +, currency tokens, commas
-    - supports suffix K/M/B
+    - supports suffix K/M/B (e.g. 1.2B)
     - supports (1.23) negatives
     """
     if val is None:
@@ -384,7 +370,7 @@ def _get_enabled_ksa_providers() -> List[str]:
       - settings.ksa_providers (csv or list)
       - env KSA_PROVIDERS (csv)
 
-    Default: tadawul, argaam, yahoo_chart (so KSA won't be empty)
+    Default: tadawul, argaam
     """
     for attr in ("enabled_ksa_providers", "ksa_providers"):
         out = _dedupe_keep_order(_parse_csv_list(getattr(settings, attr, None)))
@@ -396,7 +382,7 @@ def _get_enabled_ksa_providers() -> List[str]:
     if out:
         return out
 
-    return ["tadawul", "argaam", "yahoo_chart"]
+    return ["tadawul", "argaam"]
 
 
 def _get_key(*names: str) -> Optional[str]:
@@ -416,6 +402,7 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _last_non_none(seq: Any) -> Optional[float]:
+    """Return last non-None numeric item from a list-like."""
     try:
         if not isinstance(seq, list):
             return None
@@ -429,6 +416,9 @@ def _last_non_none(seq: Any) -> Optional[float]:
 
 
 def _prev_from_close_series(close_series: Any) -> Optional[float]:
+    """
+    Return previous close from a close-series when meta.previousClose is missing.
+    """
     try:
         if not isinstance(close_series, list) or len(close_series) < 2:
             return None
@@ -453,39 +443,8 @@ def _is_special_yahoo_symbol(s: str) -> bool:
     return any(ch in ss for ch in ("^", "="))
 
 
-def _merge_missing(dst: "UnifiedQuote", src: Dict[str, Any]) -> "UnifiedQuote":
-    """
-    Merge only missing fields (None) from src into dst.
-    Never overwrites symbol, market, data_source unless dst is missing.
-    """
-    if not src:
-        return dst
-
-    upd: Dict[str, Any] = {}
-    for k, v in src.items():
-        if v is None:
-            continue
-        if not hasattr(dst, k):
-            continue
-        if getattr(dst, k) is None:
-            upd[k] = v
-
-    if not upd:
-        return dst
-
-    try:
-        return dst.model_copy(update=upd)
-    except Exception:
-        for k, v in upd.items():
-            try:
-                setattr(dst, k, v)
-            except Exception:
-                pass
-        return dst
-
-
 # =============================================================================
-# Data model (Pydantic v2) — aligned with 59-column schema (+ meta fields)
+# Data model (Pydantic v2)
 # =============================================================================
 class UnifiedQuote(BaseModel):
     model_config = ConfigDict(populate_by_name=True, from_attributes=True, validate_assignment=True)
@@ -626,6 +585,7 @@ class UnifiedQuote(BaseModel):
 
         # Liquidity score (0..100) based on value_traded log scale
         if self.liquidity_score is None and self.value_traded is not None and self.value_traded >= 0:
+            # 1e4 -> 0, 1e8 -> ~100
             ls = (math.log10(self.value_traded + 1.0) - 4.0) * 25.0
             self.liquidity_score = _safe_float(_clamp(ls, 0.0, 100.0))
 
@@ -714,22 +674,10 @@ class DataEngine:
             except Exception:
                 self._tadawul_headers = {}
 
-        # Optional Tadawul profile endpoint (for KSA missing fields)
-        self.tadawul_profile_url: Optional[str] = _safe_str(_get_attr_or_env(["TADAWUL_PROFILE_URL"], None))
-        self._tadawul_profile_headers: Dict[str, str] = {}
-        tad_prof_headers_json = _safe_str(_get_attr_or_env(["TADAWUL_PROFILE_HEADERS_JSON"], None))
-        if tad_prof_headers_json:
-            try:
-                obj = json.loads(tad_prof_headers_json)
-                if isinstance(obj, dict):
-                    self._tadawul_profile_headers = {str(k): str(v) for k, v in obj.items()}
-            except Exception:
-                self._tadawul_profile_headers = {}
-
         # Global yfinance switch
         self.enable_yfinance = _get_bool(["ENABLE_YFINANCE", "enable_yfinance"], True)
 
-        # KSA yfinance policy: OFF by default
+        # KSA yfinance policy (HARDENED): OFF by default
         self.enable_yfinance_ksa = (
             self.enable_yfinance
             and _get_bool(
@@ -744,40 +692,39 @@ class DataEngine:
             True,
         )
 
+        # Yahoo Chart for GLOBAL (ON by default) – used for supplement and special symbols
+        self.enable_yahoo_chart_global = _get_bool(["ENABLE_YAHOO_CHART_GLOBAL"], True)
+
+        # Supplement mode (ON by default): fill missing core fields from Yahoo Chart
+        self.enable_yahoo_chart_supplement = _get_bool(["ENABLE_YAHOO_CHART_SUPPLEMENT"], True)
+
         # Special symbol Yahoo Chart support (ON by default)
         self.enable_yahoo_chart_special = _get_bool(["ENABLE_YAHOO_CHART_SPECIAL"], True)
-
-        # Missing-data fill toggles (defaults TRUE to reduce missing)
-        self.enrich_fill_missing_global = _get_bool(["ENRICH_FILL_MISSING_GLOBAL"], True)
-        self.enrich_fill_missing_ksa = _get_bool(["ENRICH_FILL_MISSING_KSA"], True)
-        self.enrich_fill_52w_from_yahoo = _get_bool(["ENRICH_FILL_52W_FROM_YAHOO"], True)
-        self.enrich_zero_price_guard = _get_bool(["ENRICH_ZERO_PRICE_GUARD"], True)
 
         quote_ttl = _get_float(["QUOTE_TTL_SEC", "quote_ttl_sec"], 30.0)
         cache_ttl = _get_float(["CACHE_TTL_SEC", "cache_ttl_sec"], 20.0)
         fund_ttl = _get_float(["FUNDAMENTALS_TTL_SEC", "fundamentals_ttl_sec"], 21600.0)
         snap_ttl = _get_float(["ARGAAM_SNAPSHOT_TTL_SEC", "argaam_snapshot_ttl_sec"], 30.0)
-        chart_ttl = _get_float(["YAHOO_CHART_CACHE_TTL_SEC"], 21600.0)  # 6h
 
         self.quote_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(5.0, float(quote_ttl)))
         self.stale_cache: TTLCache = TTLCache(maxsize=5000, ttl=max(120.0, float(cache_ttl) * 10.0))
-        self.fund_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(300.0, float(fund_ttl)))
-        self.snapshot_cache: TTLCache = TTLCache(maxsize=80, ttl=max(10.0, float(snap_ttl)))
-        self.chart_cache: TTLCache = TTLCache(maxsize=3000, ttl=max(300.0, float(chart_ttl)))
+        self.fund_cache: TTLCache = TTLCache(maxsize=2500, ttl=max(300.0, float(fund_ttl)))
+        self.snapshot_cache: TTLCache = TTLCache(maxsize=50, ttl=max(10.0, float(snap_ttl)))
 
         self._sem = asyncio.Semaphore(_get_int(["ENGINE_CONCURRENCY", "ENRICHED_BATCH_CONCURRENCY"], 10))
 
         logger.info(
-            "DataEngine v%s init | providers=%s | ksa=%s | yfinance_global=%s | yfinance_ksa=%s | yahoo_chart_ksa=%s | fill_global=%s | fill_ksa=%s | fill_52w=%s",
+            "DataEngine v%s init | providers=%s | ksa=%s | yfinance_global=%s | yfinance_ksa=%s | yahoo_chart_ksa=%s | yahoo_chart_global=%s | supplement=%s | timeout=%.1fs | retries=%s",
             ENGINE_VERSION,
             ",".join(self.enabled_providers) if self.enabled_providers else "(none)",
             ",".join(self.enabled_ksa_providers) if self.enabled_ksa_providers else "(none)",
             self.enable_yfinance,
             self.enable_yfinance_ksa,
             self.enable_yahoo_chart_ksa,
-            self.enrich_fill_missing_global,
-            self.enrich_fill_missing_ksa,
-            self.enrich_fill_52w_from_yahoo,
+            self.enable_yahoo_chart_global,
+            self.enable_yahoo_chart_supplement,
+            self._timeout_sec,
+            self._retry_attempts,
         )
 
     async def aclose(self) -> None:
@@ -828,12 +775,6 @@ class DataEngine:
         try:
             async with self._sem:
                 q = await (self._fetch_ksa(s) if is_ksa_symbol(s) else self._fetch_global(s))
-
-            # Fill missing fields (best-effort) AFTER base provider returns
-            q = await self._fill_missing_fields(q)
-
-            # Zero price guard (optional): treat suspicious 0.0 as missing/error
-            q = self._zero_price_guard(q)
 
             q = q.finalize()
 
@@ -899,228 +840,82 @@ class DataEngine:
         return await self.get_quotes(symbols)
 
     # -------------------------------------------------------------------------
-    # Missing-data fill step (BEST-EFFORT)
+    # Supplement helper: fill missing core fields from Yahoo Chart
     # -------------------------------------------------------------------------
-    def _zero_price_guard(self, q: UnifiedQuote) -> UnifiedQuote:
+    async def _supplement_from_yahoo_chart(self, q: UnifiedQuote, symbol: str, market: str) -> UnifiedQuote:
         """
-        Many invalid symbols return 0.0 from some providers.
-        If enabled, treat "0 price + no name + no volume" as missing/error.
+        If q already has price but is missing core fields (prev close / OHLC / volume / 52w),
+        try to fill missing values from Yahoo Chart WITHOUT overriding existing values.
         """
-        if not self.enrich_zero_price_guard:
+        if not self.enable_yahoo_chart_supplement:
+            return q
+        if q.current_price is None:
+            return q
+        if (q.data_source or "").lower() == "yahoo_chart":
             return q
 
+        if market == "KSA" and not self.enable_yahoo_chart_ksa:
+            return q
+        if market == "GLOBAL" and not self.enable_yahoo_chart_global:
+            return q
+
+        need = any(
+            getattr(q, k) is None
+            for k in (
+                "previous_close",
+                "open",
+                "day_high",
+                "day_low",
+                "volume",
+                "high_52w",
+                "low_52w",
+                "market_cap",
+            )
+        )
+        if not need:
+            return q
+
+        yc = await self._fetch_yahoo_chart(symbol, market=market)
+        if yc.current_price is None:
+            return q
+
+        upd: Dict[str, Any] = {}
+        for k in (
+            "previous_close",
+            "open",
+            "day_high",
+            "day_low",
+            "volume",
+            "high_52w",
+            "low_52w",
+            "market_cap",
+            "currency",
+        ):
+            if getattr(q, k) is None and getattr(yc, k) is not None:
+                upd[k] = getattr(yc, k)
+
+        if not upd:
+            return q
         try:
-            cp = q.current_price
-            pc = q.previous_close
-            if cp is None:
-                return q
-
-            suspicious = (
-                cp == 0.0
-                and (pc is None or pc == 0.0)
-                and (q.volume is None or q.volume == 0.0)
-                and (q.name is None)
-            )
-            if suspicious:
-                msg = "Suspicious zero-price response (likely invalid symbol)."
-                q2 = q.model_copy(update={"error": q.error or msg, "data_quality": "MISSING", "status": "error"})
-                return q2
+            return q.model_copy(update=upd)
         except Exception:
-            return q
-        return q
-
-    async def _fill_missing_fields(self, q: UnifiedQuote) -> UnifiedQuote:
-        """
-        BEST-EFFORT fill:
-          - KSA: fill name from Argaam snapshot; optional Tadawul profile endpoint
-          - GLOBAL: fill identity/fundamentals from EODHD fundamentals and/or Finnhub profile+metrics
-          - Any: fill 52W high/low from Yahoo Chart 1y (cached) if enabled
-        """
-        if q is None:
-            return q
-
-        # Ensure market inferred early
-        market = q.market
-        if not market or market == "UNKNOWN":
-            market = "KSA" if is_ksa_symbol(q.symbol) else "GLOBAL"
-
-        # 1) KSA fill
-        if market == "KSA" and self.enrich_fill_missing_ksa:
-            q = await self._fill_missing_ksa(q)
-
-        # 2) GLOBAL fill
-        if market == "GLOBAL" and self.enrich_fill_missing_global:
-            q = await self._fill_missing_global(q)
-
-        # 3) 52W fill (both)
-        if self.enrich_fill_52w_from_yahoo:
-            if q.high_52w is None or q.low_52w is None:
-                q = await self._fill_52w_from_yahoo(q)
-
-        return q
-
-    async def _fill_missing_ksa(self, q: UnifiedQuote) -> UnifiedQuote:
-        # a) name from argaam snapshot
-        if q.name is None:
-            try:
-                snap = await self._argaam_snapshot()
-                row = snap.get(_ksa_code(q.symbol))
-                if row and row.get("name"):
-                    q = _merge_missing(q, {"name": row.get("name")})
-            except Exception:
-                pass
-
-        # b) optional tadawul profile endpoint (if you provide it)
-        if self.tadawul_profile_url:
-            need = any(
-                getattr(q, f) is None
-                for f in (
-                    "sector",
-                    "industry",
-                    "shares_outstanding",
-                    "free_float",
-                    "market_cap",
-                    "listing_date",
-                )
-            )
-            if need:
-                prof = await self._fetch_tadawul_profile(q.symbol)
-                if prof:
-                    q = _merge_missing(q, prof)
-
-        return q
-
-    async def _fill_missing_global(self, q: UnifiedQuote) -> UnifiedQuote:
-        # prefer EODHD fundamentals if key exists (best completeness)
-        eod_key = _get_key("eodhd_api_key", "EODHD_API_KEY")
-        if eod_key and not _is_special_yahoo_symbol(q.symbol):
-            need = any(
-                getattr(q, f) is None
-                for f in (
-                    "name",
-                    "sector",
-                    "industry",
-                    "listing_date",
-                    "market_cap",
-                    "shares_outstanding",
-                    "eps_ttm",
-                    "pe_ttm",
-                    "pb",
-                    "ps",
-                    "beta",
-                    "dividend_yield",
-                    "high_52w",
-                    "low_52w",
-                    "ma20",
-                    "ma50",
-                )
-            )
-            if need:
-                try:
-                    fund = await self._fetch_eodhd_fundamentals(q.symbol, eod_key)
-                    if fund:
-                        q = _merge_missing(q, fund)
-                except Exception:
-                    pass
-
-        # if still missing, try finnhub profile+metrics (if key exists)
-        fin_key = _get_key("finnhub_api_key", "FINNHUB_API_KEY")
-        if fin_key and not _is_special_yahoo_symbol(q.symbol):
-            need = any(
-                getattr(q, f) is None
-                for f in (
-                    "name",
-                    "industry",
-                    "listing_date",
-                    "market_cap",
-                    "shares_outstanding",
-                    "high_52w",
-                    "low_52w",
-                    "pe_ttm",
-                    "pb",
-                    "ps",
-                    "eps_ttm",
-                    "beta",
-                    "dividend_yield",
-                    "roe",
-                    "roa",
-                    "net_margin",
-                    "debt_to_equity",
-                    "current_ratio",
-                    "quick_ratio",
-                )
-            )
-            if need:
-                try:
-                    prof, met = await self._fetch_finnhub_profile_and_metrics(q.symbol, fin_key)
-                    merged: Dict[str, Any] = {}
-                    merged.update({k: v for k, v in (prof or {}).items() if v is not None})
-                    merged.update({k: v for k, v in (met or {}).items() if v is not None})
-                    if merged:
-                        q = _merge_missing(q, merged)
-                except Exception:
-                    pass
-
-        return q
-
-    async def _fill_52w_from_yahoo(self, q: UnifiedQuote) -> UnifiedQuote:
-        """
-        Uses Yahoo Chart 1y close series to compute 52w high/low if missing.
-        Cached to avoid repeated calls.
-        """
-        sym = q.symbol
-        ysym = _yahoo_symbol(sym)
-
-        # skip if yahoo chart disabled for KSA
-        if q.market == "KSA" and not self.enable_yahoo_chart_ksa:
-            return q
-        if _is_special_yahoo_symbol(sym) and not self.enable_yahoo_chart_special:
-            return q
-
-        cache_key = f"52w::{ysym}"
-        hit = self.chart_cache.get(cache_key)
-        if isinstance(hit, dict):
-            q = _merge_missing(q, hit)
-            return q
-
-        data = await self._fetch_yahoo_chart_raw(sym, interval="1d", rng="1y")
-        if not data:
-            return q
-
-        try:
-            chart = data.get("chart") or {}
-            res = (chart.get("result") or [None])[0] or {}
-            indicators = (res.get("indicators") or {}).get("quote") or [{}]
-            q0 = indicators[0] or {}
-
-            highs = q0.get("high") if isinstance(q0, dict) else None
-            lows = q0.get("low") if isinstance(q0, dict) else None
-
-            hi = None
-            lo = None
-            if isinstance(highs, list):
-                vals = [_safe_float(x) for x in highs if _safe_float(x) is not None]
-                if vals:
-                    hi = max(vals)
-            if isinstance(lows, list):
-                vals = [_safe_float(x) for x in lows if _safe_float(x) is not None]
-                if vals:
-                    lo = min(vals)
-
-            out = {"high_52w": hi, "low_52w": lo}
-            # cache even if None to reduce calls
-            self.chart_cache[cache_key] = out
-            q = _merge_missing(q, out)
-            return q
-        except Exception:
+            for k, v in upd.items():
+                setattr(q, k, v)
             return q
 
     # -------------------------------------------------------------------------
     # KSA
     # -------------------------------------------------------------------------
     async def _fetch_ksa(self, symbol: str) -> UnifiedQuote:
+        """
+        KSA routing is controlled by self.enabled_ksa_providers.
+
+        HARD POLICY:
+          - yfinance will NOT be used for KSA unless ENABLE_YFINANCE_KSA=true
+        """
         code = _ksa_code(symbol)
         errors: List[str] = []
+
         attempted_yahoo_chart = False
 
         for prov in (self.enabled_ksa_providers or []):
@@ -1137,7 +932,7 @@ class DataEngine:
                     q.data_source = "tadawul"
                     q.market = "KSA"
                     q.currency = q.currency or "SAR"
-                    q.data_quality = "FULL" if q.previous_close is not None else "PARTIAL"
+                    q = await self._supplement_from_yahoo_chart(q, symbol, "KSA")
                     return q.finalize()
                 errors.append(f"tadawul:{q.error or 'no_price'}")
 
@@ -1145,7 +940,7 @@ class DataEngine:
                 snap = await self._argaam_snapshot()
                 row = snap.get(code)
                 if row and row.get("price") is not None:
-                    return UnifiedQuote(
+                    q = UnifiedQuote(
                         symbol=symbol,
                         name=row.get("name"),
                         market="KSA",
@@ -1158,7 +953,9 @@ class DataEngine:
                         data_source="argaam",
                         data_quality="PARTIAL",
                         error=None,
-                    ).finalize()
+                    )
+                    q = await self._supplement_from_yahoo_chart(q, symbol, "KSA")
+                    return q.finalize()
                 errors.append("argaam:no_row")
 
             elif p in {"yfinance", "yahoo"}:
@@ -1166,7 +963,7 @@ class DataEngine:
                     q = await self._fetch_yfinance(symbol, market="KSA")
                     if q.current_price is not None:
                         q.data_source = "yfinance"
-                        q.data_quality = "PARTIAL"
+                        q = await self._supplement_from_yahoo_chart(q, symbol, "KSA")
                         return q.finalize()
                     errors.append(f"yfinance:{q.error or 'no_price'}")
                 else:
@@ -1199,6 +996,10 @@ class DataEngine:
         ).finalize()
 
     async def _fetch_tadawul_quote(self, symbol: str) -> UnifiedQuote:
+        """
+        Optional Tadawul JSON provider.
+        self.tadawul_quote_url should include {code} or {symbol}.
+        """
         code = _ksa_code(symbol)
         url = str(self.tadawul_quote_url or "").strip()
         if not url:
@@ -1247,7 +1048,9 @@ class DataEngine:
             or _safe_float(obj.get("tradingPrice"))
             or _safe_float(obj.get("close"))
         )
-        prev = _safe_float(obj.get("previous_close")) or _safe_float(obj.get("previousClose")) or _safe_float(obj.get("prevClose"))
+        prev = _safe_float(obj.get("previous_close")) or _safe_float(obj.get("previousClose")) or _safe_float(
+            obj.get("prevClose")
+        )
         high = _safe_float(obj.get("high")) or _safe_float(obj.get("day_high")) or _safe_float(obj.get("dayHigh"))
         low = _safe_float(obj.get("low")) or _safe_float(obj.get("day_low")) or _safe_float(obj.get("dayLow"))
         vol = _safe_float(obj.get("volume")) or _safe_float(obj.get("tradedVolume")) or _safe_float(obj.get("qty"))
@@ -1275,53 +1078,6 @@ class DataEngine:
             error=None if price is not None else "Tadawul returned no price",
             status="success" if price is not None else "error",
         )
-
-    async def _fetch_tadawul_profile(self, symbol: str) -> Dict[str, Any]:
-        """
-        OPTIONAL: depends on TADAWUL_PROFILE_URL.
-        Expected to return JSON dict or list[dict].
-        We map common fields if present.
-        """
-        if not self.tadawul_profile_url:
-            return {}
-
-        code = _ksa_code(symbol)
-        url = str(self.tadawul_profile_url).strip()
-        url = url.replace("{code}", code).replace("{symbol}", symbol)
-
-        cache_key = f"tadawul_profile::{code}"
-        hit = self.fund_cache.get(cache_key)
-        if isinstance(hit, dict):
-            return hit
-
-        data = await self._http_get_json(url, params=None, headers=self._tadawul_profile_headers or None)
-        if not data:
-            self.fund_cache[cache_key] = {}
-            return {}
-
-        obj: Dict[str, Any] = {}
-        if isinstance(data, dict):
-            obj = data
-        elif isinstance(data, list) and data and isinstance(data[0], dict):
-            obj = data[0]
-        else:
-            self.fund_cache[cache_key] = {}
-            return {}
-
-        out: Dict[str, Any] = {
-            "name": _safe_str(obj.get("name") or obj.get("company_name") or obj.get("companyName")),
-            "sector": _safe_str(obj.get("sector")),
-            "industry": _safe_str(obj.get("industry")),
-            "sub_sector": _safe_str(obj.get("sub_sector") or obj.get("subSector")),
-            "listing_date": _safe_str(obj.get("listing_date") or obj.get("ipoDate") or obj.get("ipo_date")),
-            "shares_outstanding": _safe_float(obj.get("shares_outstanding") or obj.get("sharesOutstanding")),
-            "free_float": _safe_float(obj.get("free_float") or obj.get("freeFloat")),
-            "market_cap": _safe_float(obj.get("market_cap") or obj.get("marketCap")),
-            "free_float_market_cap": _safe_float(obj.get("free_float_market_cap") or obj.get("freeFloatMarketCap")),
-        }
-
-        self.fund_cache[cache_key] = out
-        return out
 
     async def _argaam_snapshot(self) -> Dict[str, Dict[str, Any]]:
         key = "argaam_snapshot_v2"
@@ -1437,18 +1193,16 @@ class DataEngine:
     async def _fetch_global(self, symbol: str) -> UnifiedQuote:
         # Special symbols: try Yahoo Chart first (optional), else yfinance
         if _is_special_yahoo_symbol(symbol):
-            if self.enable_yahoo_chart_special:
+            if self.enable_yahoo_chart_special and self.enable_yahoo_chart_global:
                 q = await self._fetch_yahoo_chart(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yahoo_chart"
-                    q.data_quality = "FULL" if q.previous_close is not None else "PARTIAL"
                     return q.finalize()
 
             if self.enable_yfinance and yf:
                 q = await self._fetch_yfinance(symbol, market="GLOBAL")
                 if q.current_price is not None:
                     q.data_source = "yfinance"
-                    q.data_quality = "PARTIAL"
                     return q.finalize()
 
             return UnifiedQuote(
@@ -1475,10 +1229,15 @@ class DataEngine:
                     continue
                 q = await self._fetch_eodhd_realtime(symbol, api_key)
                 if q.current_price is not None:
+                    fetch_fund = _get_bool(["EODHD_FETCH_FUNDAMENTALS"], False)
+                    if fetch_fund:
+                        fund = await self._fetch_eodhd_fundamentals(symbol, api_key)
+                        if fund:
+                            q = q.model_copy(update={k: v for k, v in fund.items() if v is not None})
                     q.data_source = "eodhd"
-                    q.market = q.market or "GLOBAL"
+                    q.market = "GLOBAL"
                     q.currency = q.currency or "USD"
-                    q.data_quality = "FULL" if q.previous_close is not None else "PARTIAL"
+                    q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                     return q.finalize()
                 errors.append(f"eodhd:{q.error or 'no_price'}")
 
@@ -1489,10 +1248,18 @@ class DataEngine:
                     continue
                 q = await self._fetch_finnhub_quote(symbol, api_key)
                 if q.current_price is not None:
+                    try:
+                        prof, met = await self._fetch_finnhub_profile_and_metrics(symbol, api_key)
+                        upd: Dict[str, Any] = {}
+                        upd.update({k: v for k, v in prof.items() if v is not None})
+                        upd.update({k: v for k, v in met.items() if v is not None})
+                        q = q.model_copy(update=upd)
+                    except Exception:
+                        pass
                     q.data_source = "finnhub"
                     q.market = "GLOBAL"
                     q.currency = q.currency or "USD"
-                    q.data_quality = "FULL" if q.previous_close is not None else "PARTIAL"
+                    q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                     return q.finalize()
                 errors.append(f"finnhub:{q.error or 'no_price'}")
 
@@ -1506,7 +1273,7 @@ class DataEngine:
                     q.data_source = "fmp"
                     q.market = "GLOBAL"
                     q.currency = q.currency or "USD"
-                    q.data_quality = "FULL" if q.previous_close is not None else "PARTIAL"
+                    q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                     return q.finalize()
                 errors.append(f"fmp:{q.error or 'no_price'}")
 
@@ -1516,7 +1283,7 @@ class DataEngine:
                     q = await self._fetch_yfinance(symbol, market="GLOBAL")
                     if q.current_price is not None:
                         q.data_source = "yfinance"
-                        q.data_quality = "PARTIAL"
+                        q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                         return q.finalize()
                     errors.append(f"yfinance:{q.error or 'no_price'}")
                 else:
@@ -1527,9 +1294,16 @@ class DataEngine:
             q = await self._fetch_yfinance(symbol, market="GLOBAL")
             if q.current_price is not None:
                 q.data_source = "yfinance"
-                q.data_quality = "PARTIAL"
+                q = await self._supplement_from_yahoo_chart(q, symbol, "GLOBAL")
                 return q.finalize()
             errors.append(f"yfinance:{q.error or 'no_price'}")
+
+        # optional last-ditch yahoo chart (global) if enabled
+        if self.enable_yahoo_chart_global:
+            q = await self._fetch_yahoo_chart(symbol, market="GLOBAL")
+            if q.current_price is not None:
+                return q.finalize()
+            errors.append(f"yahoo_chart:{q.error or 'no_price'}")
 
         return UnifiedQuote(
             symbol=symbol,
@@ -1611,33 +1385,28 @@ class DataEngine:
     # -------------------------------------------------------------------------
     # Provider: Yahoo Chart (robust fallback)
     # -------------------------------------------------------------------------
-    async def _fetch_yahoo_chart_raw(self, symbol: str, interval: str, rng: str) -> Optional[Dict[str, Any]]:
-        ysym = _yahoo_symbol(symbol)
-        url = YAHOO_CHART_URL.format(symbol=ysym)
-        params = {"interval": interval, "range": rng, "includePrePost": "false"}
-
-        cache_key = f"raw::{ysym}::{interval}::{rng}"
-        hit = self.chart_cache.get(cache_key)
-        if isinstance(hit, dict):
-            return hit
-
-        data = await self._http_get_json(url, params=params)
-        if isinstance(data, dict):
-            self.chart_cache[cache_key] = data
-            return data
-        return None
-
     async def _fetch_yahoo_chart(self, symbol: str, market: str) -> UnifiedQuote:
         """
         Direct Yahoo chart endpoint (no yfinance). Robust for .SR and specials.
-        Default is short window (5d) for fast quote.
+        Returns at least: price, prev_close, open, high, low, volume (when available),
+        plus best-effort 52w high/low and market cap.
         """
+        ysym = _yahoo_symbol(symbol)
+        url = YAHOO_CHART_URL.format(symbol=ysym)
+
         interval = _safe_str(_get_attr_or_env(["YAHOO_CHART_INTERVAL"], "1d")) or "1d"
         rng = _safe_str(_get_attr_or_env(["YAHOO_CHART_RANGE"], "5d")) or "5d"
+        params = {"interval": interval, "range": rng, "includePrePost": "false"}
 
-        data = await self._fetch_yahoo_chart_raw(symbol, interval=interval, rng=rng)
-        if not data:
-            return UnifiedQuote(symbol=symbol, market=market, error="yahoo_chart empty response", data_quality="MISSING", status="error")
+        data = await self._http_get_json(url, params=params)
+        if not data or not isinstance(data, dict):
+            return UnifiedQuote(
+                symbol=symbol,
+                market=market,
+                error="yahoo_chart empty response",
+                data_quality="MISSING",
+                status="error",
+            )
 
         try:
             chart = data.get("chart") or {}
@@ -1661,6 +1430,10 @@ class DataEngine:
             lo = _last_non_none(q0.get("low"))
             vol = _safe_float(meta.get("regularMarketVolume")) or _last_non_none(q0.get("volume"))
 
+            high_52w = _safe_float(meta.get("fiftyTwoWeekHigh"))
+            low_52w = _safe_float(meta.get("fiftyTwoWeekLow"))
+            mcap = _safe_float(meta.get("marketCap"))
+
             currency = _safe_str(meta.get("currency")) or ("SAR" if market == "KSA" else "USD")
 
             if cp is None:
@@ -1679,6 +1452,9 @@ class DataEngine:
                 day_high=hi,
                 day_low=lo,
                 volume=vol,
+                high_52w=high_52w,
+                low_52w=low_52w,
+                market_cap=mcap,
                 data_source="yahoo_chart",
                 data_quality=dq,
                 error=None if cp is not None else "Yahoo chart returned no price",
@@ -1705,32 +1481,35 @@ class DataEngine:
         try:
             data = await self._http_get_json(url, params=params)
             if not data or not isinstance(data, dict):
-                return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error="EODHD empty response", status="error")
-
-            cp = _safe_float(data.get("close") or data.get("price"))
-            pc = _safe_float(data.get("previousClose"))
+                return UnifiedQuote(
+                    symbol=symbol, market="GLOBAL", currency="USD", error="EODHD empty response", status="error"
+                )
 
             return UnifiedQuote(
                 symbol=symbol,
                 market="GLOBAL",
                 currency="USD",
-                current_price=cp if cp is not None else pc,  # last-resort
-                previous_close=pc,
+                current_price=_safe_float(data.get("close") or data.get("price") or data.get("previousClose")),
+                previous_close=_safe_float(data.get("previousClose")),
                 open=_safe_float(data.get("open")),
                 day_high=_safe_float(data.get("high")),
                 day_low=_safe_float(data.get("low")),
                 volume=_safe_float(data.get("volume")),
                 price_change=_safe_float(data.get("change")),
                 percent_change=_safe_float(data.get("change_p")),
-                market_cap=_safe_float(data.get("market_cap") or data.get("marketCap")),
                 data_source="eodhd",
                 data_quality="PARTIAL",
-                status="success" if (cp is not None or pc is not None) else "error",
-                error=None if (cp is not None or pc is not None) else "EODHD returned no price",
+                status="success",
             )
         except Exception as exc:
             dt = int((time.perf_counter() - t0) * 1000)
-            return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"EODHD error ({dt}ms): {exc}", status="error")
+            return UnifiedQuote(
+                symbol=symbol,
+                market="GLOBAL",
+                currency="USD",
+                error=f"EODHD error ({dt}ms): {exc}",
+                status="error",
+            )
 
     async def _fetch_eodhd_fundamentals(self, symbol: str, api_key: str) -> Dict[str, Any]:
         cache_key = f"eodhd_fund::{symbol}"
@@ -1785,7 +1564,9 @@ class DataEngine:
         try:
             data = await self._http_get_json(FINNHUB_QUOTE_URL, params=params)
             if not data or not isinstance(data, dict):
-                return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error="Finnhub empty response", status="error")
+                return UnifiedQuote(
+                    symbol=symbol, market="GLOBAL", currency="USD", error="Finnhub empty response", status="error"
+                )
 
             cp = _safe_float(data.get("c"))
             pc = _safe_float(data.get("pc"))
@@ -1804,7 +1585,6 @@ class DataEngine:
                 data_source="finnhub",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
                 status="success" if cp is not None else "error",
-                error=None if cp is not None else "Finnhub returned no price",
             )
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"Finnhub error: {exc}", status="error")
@@ -1901,7 +1681,6 @@ class DataEngine:
                 data_source="fmp",
                 data_quality="PARTIAL",
                 status="success" if current is not None else "error",
-                error=None if current is not None else "FMP returned no price",
             )
         except Exception as exc:
             return UnifiedQuote(symbol=symbol, market="GLOBAL", currency="USD", error=f"FMP error: {exc}", status="error")
@@ -1976,7 +1755,6 @@ class DataEngine:
                 data_source="yfinance",
                 data_quality="PARTIAL" if cp is not None else "MISSING",
                 status="success" if cp is not None else "error",
-                error=None if cp is not None else "yfinance returned no price",
             )
         except Exception as exc:
             msg = str(exc)
@@ -1985,4 +1763,60 @@ class DataEngine:
             return UnifiedQuote(symbol=symbol, market=market, error=f"yfinance error: {msg}", data_quality="MISSING", status="error")
 
 
-__all__ = ["UnifiedQuote", "DataEngine", "normalize_symbol", "is_ksa_symbol", "ENGINE_VERSION"]
+# =============================================================================
+# Module-level singleton + API (prevents missing fallback functions)
+# =============================================================================
+_ENGINE_SINGLETON: Optional[DataEngine] = None
+_ENGINE_LOCK = asyncio.Lock()
+
+
+async def get_engine() -> DataEngine:
+    global _ENGINE_SINGLETON
+    if _ENGINE_SINGLETON is None:
+        async with _ENGINE_LOCK:
+            if _ENGINE_SINGLETON is None:
+                _ENGINE_SINGLETON = DataEngine()
+    return _ENGINE_SINGLETON
+
+
+async def aclose_engine() -> None:
+    global _ENGINE_SINGLETON
+    if _ENGINE_SINGLETON is None:
+        return
+    try:
+        await _ENGINE_SINGLETON.aclose()
+    finally:
+        _ENGINE_SINGLETON = None
+
+
+async def get_quote(symbol: str) -> UnifiedQuote:
+    eng = await get_engine()
+    return await eng.get_quote(symbol)
+
+
+async def get_quotes(symbols: Sequence[str]) -> List[UnifiedQuote]:
+    eng = await get_engine()
+    return await eng.get_quotes(symbols)
+
+
+async def get_enriched_quote(symbol: str) -> UnifiedQuote:
+    return await get_quote(symbol)
+
+
+async def get_enriched_quotes(symbols: Sequence[str]) -> List[UnifiedQuote]:
+    return await get_quotes(symbols)
+
+
+__all__ = [
+    "UnifiedQuote",
+    "DataEngine",
+    "normalize_symbol",
+    "is_ksa_symbol",
+    "ENGINE_VERSION",
+    "get_engine",
+    "aclose_engine",
+    "get_quote",
+    "get_quotes",
+    "get_enriched_quote",
+    "get_enriched_quotes",
+]
