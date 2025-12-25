@@ -1,18 +1,21 @@
-# routes/ai_analysis.py
+# routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.6.0) – ALIGNED / PROD SAFE
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.0) – PROD SAFE / LOW-MISSING
 
 Key goals
-- Engine-driven only: core.data_engine_v2.DataEngine (no direct provider calls).
-- Prefer main.py lifespan engine (request.app.state.engine), fallback to singleton.
+- Engine-driven only: prefer request.app.state.engine; fallback singleton.
+- PROD SAFE: avoid importing core.data_engine_v2 at module import-time.
 - Defensive batching: chunking + timeout + bounded concurrency.
 - Sheets-safe: /sheet-rows ALWAYS returns HTTP 200 with {headers, rows, status}.
 - Canonical headers: core.schemas.get_headers_for_sheet (59 columns) when available.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 
-Notes
-- Self-contained (auth + engine resolution) to avoid circular imports.
-- If EnrichedQuote is not importable, still returns 59-col rows via robust fallback mapping.
+Improvements vs prior:
+- ✅ Startup-safe lazy imports (won’t crash app boot if engine module fails import)
+- ✅ Engine detection by capability (methods) not isinstance(DataEngine)
+- ✅ Strong fallback headers (not just ["Symbol","Error"])
+- ✅ Header-driven row mapping + computed 52W position
+- ✅ Extra symbol-key matching (symbol / symbol_normalized / symbol_input normalization)
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -27,8 +31,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.config import get_settings
-from core.data_engine_v2 import DataEngine, UnifiedQuote, normalize_symbol
+# Settings shim (safe)
+try:
+    from core.config import get_settings  # type: ignore
+except Exception:  # pragma: no cover
+    def get_settings():  # type: ignore
+        return None
+
 
 # Canonical headers (59 cols) when available
 try:
@@ -36,25 +45,46 @@ try:
 except Exception:  # pragma: no cover
     get_headers_for_sheet = None  # type: ignore
 
-# Prefer EnrichedQuote if your project exposes it (best formatting & mapping)
-EnrichedQuote = None  # type: ignore
-try:
-    from core.enriched_quote import EnrichedQuote as _EQ  # type: ignore
-
-    EnrichedQuote = _EQ  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from routes.enriched_quote import EnrichedQuote as _EQ2  # type: ignore
-
-        EnrichedQuote = _EQ2  # type: ignore
-    except Exception:
-        EnrichedQuote = None  # type: ignore
-
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.6.0"
+AI_ANALYSIS_VERSION = "3.7.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
+
+
+# =============================================================================
+# Lazy imports: engine + models (PROD SAFE)
+# =============================================================================
+def _import_v2() -> Tuple[Any, Any, Any]:
+    """
+    Returns (DataEngine, UnifiedQuote, normalize_symbol) or (None,None,fallback_normalize).
+    """
+    def _fallback_normalize(raw: str) -> str:
+        s = (raw or "").strip().upper()
+        if not s:
+            return ""
+        if s.startswith("TADAWUL:"):
+            s = s.split(":", 1)[1].strip()
+        if s.endswith(".TADAWUL"):
+            s = s.replace(".TADAWUL", "")
+        if any(ch in s for ch in ("^", "=")):
+            return s
+        if s.isdigit():
+            return f"{s}.SR"
+        if "." in s:
+            return s
+        return f"{s}.US"
+
+    try:
+        from core.data_engine_v2 import DataEngine as _DE  # type: ignore
+        from core.data_engine_v2 import UnifiedQuote as _UQ  # type: ignore
+        from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
+        return _DE, _UQ, _NS
+    except Exception:
+        return None, None, _fallback_normalize
+
+
+DataEngine, UnifiedQuote, normalize_symbol = _import_v2()
 
 
 # =============================================================================
@@ -136,11 +166,20 @@ def _require_token_or_401(x_app_token: Optional[str]) -> None:
 # =============================================================================
 # Engine resolution (prefer app.state.engine; else singleton)
 # =============================================================================
-_ENGINE: Optional[DataEngine] = None
+_ENGINE: Optional[Any] = None
 _ENGINE_LOCK = asyncio.Lock()
 
 
-def _get_app_engine(request: Optional[Request]) -> Optional[DataEngine]:
+def _engine_capable(obj: Any) -> bool:
+    if obj is None:
+        return False
+    for fn in ("get_enriched_quote", "get_quote", "get_enriched_quotes", "get_quotes"):
+        if callable(getattr(obj, fn, None)):
+            return True
+    return False
+
+
+def _get_app_engine(request: Optional[Request]) -> Optional[Any]:
     try:
         if request is None:
             return None
@@ -149,14 +188,14 @@ def _get_app_engine(request: Optional[Request]) -> Optional[DataEngine]:
             return None
         for attr in ("engine", "data_engine", "data_engine_v2"):
             eng = getattr(st, attr, None)
-            if isinstance(eng, DataEngine):
+            if _engine_capable(eng):
                 return eng
         return None
     except Exception:
         return None
 
 
-async def _get_singleton_engine() -> Optional[DataEngine]:
+async def _get_singleton_engine() -> Optional[Any]:
     global _ENGINE
     if _ENGINE is not None:
         return _ENGINE
@@ -164,15 +203,20 @@ async def _get_singleton_engine() -> Optional[DataEngine]:
     async with _ENGINE_LOCK:
         if _ENGINE is None:
             try:
-                _ENGINE = DataEngine()
-                logger.info("[analysis] DataEngine initialized (fallback singleton).")
+                # re-import lazily (in case module became available later)
+                DE, _, _ = _import_v2()
+                if DE is None:
+                    _ENGINE = None
+                else:
+                    _ENGINE = DE()
+                    logger.info("[analysis] DataEngine initialized (fallback singleton).")
             except Exception as exc:
                 logger.exception("[analysis] Failed to init DataEngine: %s", exc)
                 _ENGINE = None
     return _ENGINE
 
 
-async def _resolve_engine(request: Optional[Request]) -> Optional[DataEngine]:
+async def _resolve_engine(request: Optional[Request]) -> Optional[Any]:
     eng = _get_app_engine(request)
     if eng is not None:
         return eng
@@ -317,6 +361,18 @@ class SheetAnalysisResponse(_ExtraIgnoreBase):
 # Helpers
 # =============================================================================
 def _safe_get(obj: Any, *names: str) -> Any:
+    """
+    getattr + dict-key compatible.
+    """
+    if obj is None:
+        return None
+
+    if isinstance(obj, dict):
+        for n in names:
+            if n in obj and obj[n] is not None:
+                return obj[n]
+        return None
+
     for n in names:
         try:
             v = getattr(obj, n, None)
@@ -327,7 +383,7 @@ def _safe_get(obj: Any, *names: str) -> Any:
     return None
 
 
-def _finalize_quote(uq: UnifiedQuote) -> UnifiedQuote:
+def _finalize_quote(uq: Any) -> Any:
     try:
         fn = getattr(uq, "finalize", None)
         if callable(fn):
@@ -337,19 +393,23 @@ def _finalize_quote(uq: UnifiedQuote) -> UnifiedQuote:
     return uq
 
 
-def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data") -> UnifiedQuote:
+def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data") -> Any:
     sym = (symbol or "").strip().upper() or "UNKNOWN"
-    try:
-        uq = UnifiedQuote(symbol=sym, data_quality=dq, error=err)  # type: ignore
-        return _finalize_quote(uq)
-    except Exception:
-        uq = UnifiedQuote(symbol=sym)  # type: ignore
+    if UnifiedQuote is not None:
         try:
-            setattr(uq, "data_quality", dq)
-            setattr(uq, "error", err)
+            uq = UnifiedQuote(symbol=sym, data_quality=dq, error=err, status="error")  # type: ignore
+            return _finalize_quote(uq)
         except Exception:
             pass
-        return _finalize_quote(uq)
+    # dict fallback
+    return {
+        "symbol": sym,
+        "data_quality": dq,
+        "data_source": "none",
+        "error": err,
+        "status": "error",
+        "last_updated_utc": _now_utc_iso(),
+    }
 
 
 def _clean_symbols(items: Sequence[Any]) -> List[str]:
@@ -377,6 +437,84 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+# ---- Fallback “59-ish” headers (used only if core.schemas not available)
+_DEFAULT_HEADERS = [
+    "Symbol",
+    "Company Name",
+    "Sector",
+    "Industry",
+    "Sub-Sector",
+    "Market",
+    "Currency",
+    "Listing Date",
+    "Last Price",
+    "Previous Close",
+    "Open",
+    "Price Change",
+    "Percent Change",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "52W Position %",
+    "Volume",
+    "Avg Volume (30D)",
+    "Value Traded",
+    "Turnover %",
+    "Shares Outstanding",
+    "Free Float %",
+    "Market Cap",
+    "Free Float Market Cap",
+    "Liquidity Score",
+    "EPS (TTM)",
+    "Forward EPS",
+    "P/E (TTM)",
+    "Forward P/E",
+    "P/B",
+    "P/S",
+    "EV/EBITDA",
+    "Dividend Yield %",
+    "Dividend Rate",
+    "Payout Ratio %",
+    "ROE %",
+    "ROA %",
+    "Net Margin %",
+    "EBITDA Margin %",
+    "Revenue Growth %",
+    "Net Income Growth %",
+    "Beta",
+    "Debt to Equity",
+    "Current Ratio",
+    "Quick Ratio",
+    "RSI (14)",
+    "Volatility (30D)",
+    "MACD",
+    "MA20",
+    "MA50",
+    "Fair Value",
+    "Target Price",
+    "Upside %",
+    "Valuation Label",
+    "Analyst Rating",
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Opportunity Score",
+    "Risk Score",
+    "Overall Score",
+    "Recommendation",
+    "Confidence",
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+    "Error",
+    "symbol_input",
+    "symbol_normalized",
+    "status",
+]
+
+
 def _select_headers(sheet_name: Optional[str]) -> List[str]:
     if get_headers_for_sheet:
         try:
@@ -385,7 +523,7 @@ def _select_headers(sheet_name: Optional[str]) -> List[str]:
                 return [str(x) for x in h]
         except Exception:
             pass
-    return ["Symbol", "Error"]
+    return list(_DEFAULT_HEADERS)
 
 
 def _idx(headers: List[str], name: str) -> Optional[int]:
@@ -404,6 +542,10 @@ def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
     i_err = _idx(headers, "Error")
     if i_err is not None:
         row[i_err] = err
+    # if sheet includes status
+    i_st = _idx(headers, "status")
+    if i_st is not None:
+        row[i_st] = "error"
     return row
 
 
@@ -422,10 +564,6 @@ def _extract_sources_from_any(x: Any) -> List[str]:
 
 
 def _ratio_to_percent(v: Any) -> Any:
-    """
-    Normalize ratios that may come as decimals to percent scale:
-    If -1..1 => *100, else return as-is.
-    """
     if v is None:
         return None
     try:
@@ -458,9 +596,6 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
 
 
 def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
-    """
-    Best-effort conversion to Asia/Riyadh.
-    """
     if not utc_any:
         return None
     try:
@@ -478,27 +613,228 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
 
 
+def _hkey(h: str) -> str:
+    s = str(h or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+# Header -> (candidate fields..., transform?)
+# transform is a callable(value)->value
+_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
+    "symbol": (("symbol",), None),
+    "company name": (("name", "company_name"), None),
+    "name": (("name", "company_name"), None),
+    "sector": (("sector",), None),
+    "industry": (("industry",), None),
+    "sub-sector": (("sub_sector", "subsector"), None),
+    "sub sector": (("sub_sector", "subsector"), None),
+    "market": (("market", "market_region"), None),
+    "currency": (("currency",), None),
+    "listing date": (("listing_date", "ipo"), None),
+
+    "last price": (("current_price", "last_price", "price"), None),
+    "current price": (("current_price", "last_price", "price"), None),
+    "previous close": (("previous_close",), None),
+    "open": (("open",), None),
+    "price change": (("price_change", "change"), None),
+    "percent change": (("percent_change", "change_percent", "change_pct"), None),
+    "day high": (("day_high",), None),
+    "day low": (("day_low",), None),
+    "52w high": (("high_52w",), None),
+    "52w low": (("low_52w",), None),
+    "52w position %": (("position_52w_percent", "position_52w"), None),
+
+    "volume": (("volume",), None),
+    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
+    "value traded": (("value_traded",), None),
+    "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
+
+    "shares outstanding": (("shares_outstanding",), None),
+    "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
+    "market cap": (("market_cap",), None),
+    "free float market cap": (("free_float_market_cap",), None),
+    "liquidity score": (("liquidity_score",), None),
+
+    "eps (ttm)": (("eps_ttm", "eps"), None),
+    "forward eps": (("forward_eps",), None),
+    "p/e (ttm)": (("pe_ttm",), None),
+    "forward p/e": (("forward_pe",), None),
+    "p/b": (("pb",), None),
+    "p/s": (("ps",), None),
+    "ev/ebitda": (("ev_ebitda",), None),
+
+    "dividend yield %": (("dividend_yield",), _ratio_to_percent),
+    "dividend rate": (("dividend_rate",), None),
+    "payout ratio %": (("payout_ratio",), _ratio_to_percent),
+    "roe %": (("roe",), _ratio_to_percent),
+    "roa %": (("roa",), _ratio_to_percent),
+
+    "net margin %": (("net_margin",), _ratio_to_percent),
+    "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
+    "revenue growth %": (("revenue_growth",), _ratio_to_percent),
+    "net income growth %": (("net_income_growth",), _ratio_to_percent),
+
+    "beta": (("beta",), None),
+    "debt to equity": (("debt_to_equity",), None),
+    "current ratio": (("current_ratio",), None),
+    "quick ratio": (("quick_ratio",), None),
+
+    "rsi (14)": (("rsi_14",), None),
+    "volatility (30d)": (("volatility_30d",), _ratio_to_percent),
+    "macd": (("macd",), None),
+    "ma20": (("ma20",), None),
+    "ma50": (("ma50",), None),
+
+    "fair value": (("fair_value",), None),
+    "target price": (("target_price",), None),
+    "upside %": (("upside_percent",), _ratio_to_percent),
+    "valuation label": (("valuation_label",), None),
+    "analyst rating": (("analyst_rating",), None),
+
+    "value score": (("value_score",), None),
+    "quality score": (("quality_score",), None),
+    "momentum score": (("momentum_score",), None),
+    "opportunity score": (("opportunity_score",), None),
+    "risk score": (("risk_score",), None),
+    "overall score": (("overall_score",), None),
+    "recommendation": (("recommendation",), None),
+    "confidence": (("confidence",), None),
+
+    "data source": (("data_source", "source"), None),
+    "data quality": (("data_quality",), None),
+    "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
+    "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
+    "error": (("error",), None),
+
+    "symbol_input": (("symbol_input",), None),
+    "symbol_normalized": (("symbol_normalized",), None),
+    "status": (("status",), None),
+}
+
+
+def _snake_guess(header: str) -> str:
+    """
+    Convert header like "P/E (TTM)" -> "pe_ttm" best-effort.
+    """
+    s = str(header or "").strip().lower()
+    s = s.replace("%", " percent ")
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _value_for_header(header: str, uq: Any) -> Any:
+    hk = _hkey(header)
+
+    # computed 52w position if needed
+    if hk in ("52w position %", "52w position"):
+        v = _safe_get(uq, "position_52w_percent", "position_52w")
+        if v is not None:
+            return v
+        cp = _safe_get(uq, "current_price", "last_price", "price")
+        lo = _safe_get(uq, "low_52w")
+        hi = _safe_get(uq, "high_52w")
+        return _compute_52w_position_pct(cp, lo, hi)
+
+    spec = _HEADER_MAP.get(hk)
+    if spec:
+        fields, transform = spec
+        val = _safe_get(uq, *fields)
+        if transform and val is not None:
+            try:
+                return transform(val)
+            except Exception:
+                return val
+        return val
+
+    # auto-guess by snake_case
+    guess = _snake_guess(header)
+    val = _safe_get(uq, guess)
+    if val is not None:
+        return val
+
+    return None
+
+
+def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
+    # fix Riyadh time if requested but missing
+    if _idx(headers, "Last Updated (Riyadh)") is not None:
+        last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
+        last_riy = _safe_get(uq, "last_updated_riyadh")
+        if not last_riy and last_utc:
+            try:
+                # set on object/dict best-effort
+                riy = _to_riyadh_iso(last_utc)
+                if isinstance(uq, dict):
+                    uq["last_updated_riyadh"] = riy
+                else:
+                    setattr(uq, "last_updated_riyadh", riy)
+            except Exception:
+                pass
+
+    row = [_value_for_header(h, uq) for h in headers]
+    if len(row) < len(headers):
+        row += [None] * (len(headers) - len(row))
+    return row[: len(headers)]
+
+
 # =============================================================================
 # Engine calls (defensive batching)
 # =============================================================================
-async def _engine_get_quotes(engine: DataEngine, syms: List[str]) -> List[UnifiedQuote]:
+async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
     """
     Compatibility shim:
     - Prefer engine.get_enriched_quotes if present
     - Else engine.get_quotes
     - Else per-symbol engine.get_enriched_quote/get_quote
     """
-    if hasattr(engine, "get_enriched_quotes"):
-        return await engine.get_enriched_quotes(syms)  # type: ignore
-    if hasattr(engine, "get_quotes"):
-        return await engine.get_quotes(syms)  # type: ignore
+    fn = getattr(engine, "get_enriched_quotes", None)
+    if callable(fn):
+        return await fn(syms)
 
-    out: List[UnifiedQuote] = []
+    fn2 = getattr(engine, "get_quotes", None)
+    if callable(fn2):
+        return await fn2(syms)
+
+    out: List[Any] = []
     for s in syms:
-        if hasattr(engine, "get_enriched_quote"):
-            out.append(await engine.get_enriched_quote(s))  # type: ignore
-        else:
-            out.append(await engine.get_quote(s))  # type: ignore
+        fn3 = getattr(engine, "get_enriched_quote", None)
+        if callable(fn3):
+            out.append(await fn3(s))
+            continue
+        fn4 = getattr(engine, "get_quote", None)
+        if callable(fn4):
+            out.append(await fn4(s))
+            continue
+        out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
+    return out
+
+
+def _index_keys_for_quote(q: Any) -> List[str]:
+    keys: List[str] = []
+    sym = (_safe_get(q, "symbol") or "").strip().upper()
+    if sym:
+        keys.append(sym)
+
+    sn = (_safe_get(q, "symbol_normalized") or "").strip().upper()
+    if sn:
+        keys.append(sn)
+
+    si = (_safe_get(q, "symbol_input") or "").strip()
+    if si:
+        try:
+            keys.append(normalize_symbol(si).upper())
+        except Exception:
+            keys.append(si.strip().upper())
+
+    # de-dup
+    out: List[str] = []
+    seen = set()
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
     return out
 
 
@@ -509,7 +845,7 @@ async def _get_quotes_chunked(
     batch_size: int,
     timeout_sec: float,
     max_concurrency: int,
-) -> Dict[str, UnifiedQuote]:
+) -> Dict[str, Any]:
     clean = _clean_symbols(symbols)
     if not clean:
         return {}
@@ -521,7 +857,7 @@ async def _get_quotes_chunked(
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[List[UnifiedQuote], Exception]]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[List[Any], Exception]]:
         async with sem:
             try:
                 res = await asyncio.wait_for(_engine_get_quotes(engine, chunk_syms), timeout=timeout_sec)
@@ -531,7 +867,7 @@ async def _get_quotes_chunked(
 
     results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
 
-    out: Dict[str, UnifiedQuote] = {}
+    out: Dict[str, Any] = {}
     for chunk_syms, res in results:
         if isinstance(res, Exception):
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
@@ -541,14 +877,12 @@ async def _get_quotes_chunked(
             continue
 
         returned = list(res or [])
-        chunk_map: Dict[str, UnifiedQuote] = {}
+        chunk_map: Dict[str, Any] = {}
+
         for q in returned:
-            try:
-                sym = (getattr(q, "symbol", None) or "").strip().upper()
-                if sym:
-                    chunk_map[sym] = _finalize_quote(q)
-            except Exception:
-                continue
+            q2 = _finalize_quote(q)
+            for k in _index_keys_for_quote(q2):
+                chunk_map.setdefault(k, q2)
 
         for s in chunk_syms:
             s_up = s.upper()
@@ -560,7 +894,7 @@ async def _get_quotes_chunked(
 # =============================================================================
 # Transform
 # =============================================================================
-def _quote_to_analysis(requested_symbol: str, uq: UnifiedQuote) -> SingleAnalysisResponse:
+def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
     # best-effort scoring (engine may already attach scores)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
@@ -569,10 +903,10 @@ def _quote_to_analysis(requested_symbol: str, uq: UnifiedQuote) -> SingleAnalysi
     except Exception:
         pass
 
-    sym = (getattr(uq, "symbol", None) or normalize_symbol(requested_symbol) or requested_symbol or "").upper()
+    sym = (_safe_get(uq, "symbol") or normalize_symbol(requested_symbol) or requested_symbol or "").upper()
 
     price = _safe_get(uq, "current_price", "last_price", "price")
-    change_pct = _safe_get(uq, "percent_change", "change_pct")
+    change_pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
 
     last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
     last_utc_iso = _iso_or_none(last_utc)
@@ -581,19 +915,15 @@ def _quote_to_analysis(requested_symbol: str, uq: UnifiedQuote) -> SingleAnalysi
         symbol=sym,
         name=_safe_get(uq, "name", "company_name"),
         market_region=_safe_get(uq, "market", "market_region"),
-
         price=price,
         change_pct=change_pct,
         market_cap=_safe_get(uq, "market_cap"),
         pe_ttm=_safe_get(uq, "pe_ttm"),
         pb=_safe_get(uq, "pb"),
-
         dividend_yield=_ratio_to_percent(_safe_get(uq, "dividend_yield")),
         roe=_ratio_to_percent(_safe_get(uq, "roe")),
         roa=_ratio_to_percent(_safe_get(uq, "roa")),
-
         data_quality=str(_safe_get(uq, "data_quality") or "MISSING"),
-
         value_score=_safe_get(uq, "value_score"),
         quality_score=_safe_get(uq, "quality_score"),
         momentum_score=_safe_get(uq, "momentum_score"),
@@ -601,111 +931,13 @@ def _quote_to_analysis(requested_symbol: str, uq: UnifiedQuote) -> SingleAnalysi
         risk_score=_safe_get(uq, "risk_score"),
         overall_score=_safe_get(uq, "overall_score"),
         recommendation=_safe_get(uq, "recommendation"),
-
         fair_value=_safe_get(uq, "fair_value"),
         upside_percent=_safe_get(uq, "upside_percent"),
         valuation_label=_safe_get(uq, "valuation_label"),
-
         last_updated_utc=last_utc_iso,
         sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
-
         error=_safe_get(uq, "error"),
     )
-
-
-def _fallback_row_59(headers: List[str], uq: UnifiedQuote) -> List[Any]:
-    """
-    59-col fallback row builder when EnrichedQuote is unavailable.
-    Uses header names to pull values from UnifiedQuote with sensible conversions.
-    """
-    cp = _safe_get(uq, "current_price", "last_price", "price")
-    low_52w = _safe_get(uq, "low_52w", "week_52_low")
-    high_52w = _safe_get(uq, "high_52w", "week_52_high")
-
-    pos_52w = _safe_get(uq, "position_52w", "position_52w_percent", "pos_52w")
-    if pos_52w is None and cp is not None and low_52w is not None and high_52w is not None:
-        pos_52w = _compute_52w_position_pct(cp, low_52w, high_52w)
-
-    last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
-    last_riy = _safe_get(uq, "last_updated_riyadh") or _to_riyadh_iso(last_utc)
-
-    m: Dict[str, Any] = {
-        "Symbol": _safe_get(uq, "symbol"),
-        "Company Name": _safe_get(uq, "name", "company_name"),
-        "Sector": _safe_get(uq, "sector"),
-        "Sub-Sector": _safe_get(uq, "sub_sector", "subsector"),
-        "Market": _safe_get(uq, "market", "market_region"),
-        "Currency": _safe_get(uq, "currency"),
-        "Listing Date": _safe_get(uq, "listing_date"),
-
-        "Last Price": cp,
-        "Previous Close": _safe_get(uq, "previous_close"),
-        "Price Change": _safe_get(uq, "price_change"),
-        "Percent Change": _safe_get(uq, "percent_change"),
-        "Day High": _safe_get(uq, "day_high"),
-        "Day Low": _safe_get(uq, "day_low"),
-        "52W High": high_52w,
-        "52W Low": low_52w,
-        "52W Position %": pos_52w,
-
-        "Volume": _safe_get(uq, "volume"),
-        "Avg Volume (30D)": _safe_get(uq, "avg_volume_30d", "avg_volume"),
-        "Value Traded": _safe_get(uq, "value_traded"),
-        "Turnover %": _ratio_to_percent(_safe_get(uq, "turnover_percent", "turnover")),
-
-        "Shares Outstanding": _safe_get(uq, "shares_outstanding"),
-        "Free Float %": _ratio_to_percent(_safe_get(uq, "free_float_percent", "free_float")),
-        "Market Cap": _safe_get(uq, "market_cap"),
-        "Free Float Market Cap": _safe_get(uq, "free_float_market_cap"),
-        "Liquidity Score": _safe_get(uq, "liquidity_score"),
-
-        "EPS (TTM)": _safe_get(uq, "eps_ttm", "eps"),
-        "Forward EPS": _safe_get(uq, "forward_eps"),
-        "P/E (TTM)": _safe_get(uq, "pe_ttm"),
-        "Forward P/E": _safe_get(uq, "forward_pe"),
-        "P/B": _safe_get(uq, "pb"),
-        "P/S": _safe_get(uq, "ps"),
-        "EV/EBITDA": _safe_get(uq, "ev_ebitda"),
-
-        "Dividend Yield %": _ratio_to_percent(_safe_get(uq, "dividend_yield")),
-        "Dividend Rate": _safe_get(uq, "dividend_rate"),
-        "Payout Ratio %": _ratio_to_percent(_safe_get(uq, "payout_ratio")),
-        "ROE %": _ratio_to_percent(_safe_get(uq, "roe")),
-        "ROA %": _ratio_to_percent(_safe_get(uq, "roa")),
-
-        "Net Margin %": _ratio_to_percent(_safe_get(uq, "net_margin")),
-        "EBITDA Margin %": _ratio_to_percent(_safe_get(uq, "ebitda_margin")),
-        "Revenue Growth %": _ratio_to_percent(_safe_get(uq, "revenue_growth")),
-        "Net Income Growth %": _ratio_to_percent(_safe_get(uq, "net_income_growth")),
-        "Beta": _safe_get(uq, "beta"),
-
-        "Volatility (30D)": _ratio_to_percent(_safe_get(uq, "volatility_30d")),
-        "RSI (14)": _safe_get(uq, "rsi_14"),
-
-        "Fair Value": _safe_get(uq, "fair_value"),
-        "Upside %": _ratio_to_percent(_safe_get(uq, "upside_percent")),
-        "Valuation Label": _safe_get(uq, "valuation_label"),
-
-        "Value Score": _safe_get(uq, "value_score"),
-        "Quality Score": _safe_get(uq, "quality_score"),
-        "Momentum Score": _safe_get(uq, "momentum_score"),
-        "Opportunity Score": _safe_get(uq, "opportunity_score"),
-        "Risk Score": _safe_get(uq, "risk_score"),
-        "Overall Score": _safe_get(uq, "overall_score"),
-        "Recommendation": _safe_get(uq, "recommendation") or "",
-
-        "Data Source": _safe_get(uq, "data_source"),
-        "Data Quality": _safe_get(uq, "data_quality"),
-        "Last Updated (UTC)": _iso_or_none(last_utc) or (str(last_utc) if last_utc else ""),
-        "Last Updated (Riyadh)": _iso_or_none(last_riy) or (str(last_riy) if last_riy else ""),
-
-        "Error": _safe_get(uq, "error") or "",
-    }
-
-    row = [m.get(h, None) for h in headers]
-    if len(row) < len(headers):
-        row += [None] * (len(headers) - len(row))
-    return row[: len(headers)]
 
 
 # =============================================================================
@@ -716,12 +948,19 @@ def _fallback_row_59(headers: List[str], uq: UnifiedQuote) -> List[Any]:
 async def analysis_health(request: Request) -> Dict[str, Any]:
     cfg = _cfg()
     eng = await _resolve_engine(request)
+
+    providers = []
+    try:
+        providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
+    except Exception:
+        providers = []
+
     return {
         "status": "ok",
         "module": "routes.ai_analysis",
         "version": AI_ANALYSIS_VERSION,
-        "engine": "DataEngineV2",
-        "providers": list(getattr(eng, "enabled_providers", []) or []) if eng else [],
+        "engine": "DataEngineV2" if eng else "none",
+        "providers": providers,
         "limits": {
             "batch_size": cfg["batch_size"],
             "batch_timeout_sec": cfg["timeout_sec"],
@@ -829,23 +1068,7 @@ async def analyze_for_sheet(
         rows: List[List[Any]] = []
         for t in tickers:
             uq = m.get(t) or _make_placeholder(t, dq="MISSING", err="No data returned")
-
-            # Best: EnrichedQuote row mapping if available
-            if EnrichedQuote is not None:
-                try:
-                    eq = EnrichedQuote.from_unified(uq)  # type: ignore
-                    row = eq.to_row(headers)  # type: ignore
-                    if not isinstance(row, list):
-                        raise ValueError("EnrichedQuote.to_row did not return a list")
-                    if len(row) < len(headers):
-                        row += [None] * (len(headers) - len(row))
-                    rows.append(row[: len(headers)])
-                    continue
-                except Exception:
-                    pass
-
-            # Fallback: header-driven mapping
-            rows.append(_fallback_row_59(headers, uq))
+            rows.append(_row_from_headers(headers, uq))
 
         status = _status_from_rows(headers, rows)
         return SheetAnalysisResponse(headers=headers, rows=rows, status=status)
