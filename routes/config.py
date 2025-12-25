@@ -49,6 +49,8 @@ except Exception:  # pragma: no cover
         # =============================================================================
         import os
 
+        _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
         def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
             v = os.getenv(name)
             if v is None:
@@ -60,7 +62,7 @@ except Exception:  # pragma: no cover
             v = _env_str(name, None)
             if v is None:
                 return default
-            return v.strip().lower() in ("1", "true", "yes", "y", "on", "t")
+            return v.strip().lower() in _TRUTHY
 
         class Settings(BaseModel):  # type: ignore
             """
@@ -76,6 +78,7 @@ except Exception:  # pragma: no cover
             # Auth
             app_token: Optional[str] = Field(default=None)
             backup_app_token: Optional[str] = Field(default=None)
+            require_auth: bool = Field(default=False)
 
             # App meta
             app_name: str = Field(default="Tadawul Fast Bridge")
@@ -84,21 +87,38 @@ except Exception:  # pragma: no cover
             debug: bool = Field(default=False)
             log_level: str = Field(default="info")
 
+            # Integrations (commonly referenced)
+            base_url: str = Field(default="")
+            backend_base_url: str = Field(default="")
+            spreadsheet_id: Optional[str] = Field(default=None)
+            google_apps_script_backup_url: str = Field(default="")
+
         _CACHED: Optional[Settings] = None
 
         def get_settings() -> Settings:  # type: ignore
+            """
+            Minimal env-backed settings.
+            This is only used if both core.config and root config.py are unavailable.
+            """
             global _CACHED
             if _CACHED is not None:
                 return _CACHED
 
             _CACHED = Settings(
-                app_token=_env_str("APP_TOKEN") or _env_str("app_token"),
+                app_token=_env_str("APP_TOKEN") or _env_str("TFB_APP_TOKEN") or _env_str("app_token"),
                 backup_app_token=_env_str("BACKUP_APP_TOKEN") or _env_str("backup_app_token"),
+                require_auth=_env_bool("REQUIRE_AUTH", False),
+
                 app_name=_env_str("APP_NAME", "Tadawul Fast Bridge") or "Tadawul Fast Bridge",
-                version=_env_str("APP_VERSION", "0.0.0") or "0.0.0",
-                env=_env_str("APP_ENV", "production") or "production",
+                version=_env_str("SERVICE_VERSION") or _env_str("APP_VERSION", "0.0.0") or "0.0.0",
+                env=_env_str("APP_ENV") or _env_str("ENVIRONMENT", "production") or "production",
                 debug=_env_bool("DEBUG", False),
                 log_level=(_env_str("LOG_LEVEL", "info") or "info").lower(),
+
+                base_url=(_env_str("BASE_URL", "") or "").strip(),
+                backend_base_url=(_env_str("BACKEND_BASE_URL", "") or "").strip(),
+                spreadsheet_id=_env_str("SPREADSHEET_ID") or _env_str("DEFAULT_SPREADSHEET_ID") or _env_str("GOOGLE_SHEETS_ID"),
+                google_apps_script_backup_url=(_env_str("GOOGLE_APPS_SCRIPT_BACKUP_URL", "") or "").strip(),
             )
             return _CACHED
 
