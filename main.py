@@ -1,5 +1,3 @@
-```python
-# main.py  (FULL REPLACEMENT)
 """
 main.py
 ------------------------------------------------------------
@@ -407,7 +405,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
     snap: Dict[str, Any] = {
         "APP_ENV": _val("APP_ENV", _val("ENVIRONMENT", "production")),
         "LOG_LEVEL": _val("LOG_LEVEL", _val("log_level", "INFO")),
-        "LOG_FORMAT": LOG_FORMAT,  # shows resolved safe format (not a secret)
+        "LOG_FORMAT": LOG_FORMAT,  # resolved safe format (not a secret)
         "BASE_URL": _val("BASE_URL", _val("BACKEND_BASE_URL", "")),
         "ENABLED_PROVIDERS": enabled,
         "KSA_PROVIDERS": ksa,
@@ -589,7 +587,6 @@ def create_app() -> FastAPI:
         app_.state.init_engine_on_boot = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")
 
         # required routers can be overridden by env:
-        # REQUIRED_ROUTERS="enriched_quote,ai_analysis,advanced_analysis"
         rr = _parse_list_like(_get(settings, env_mod, "REQUIRED_ROUTERS", ""))
         app_.state.required_routers = rr or required_default
 
@@ -782,7 +779,10 @@ def create_app() -> FastAPI:
         # Prefer env.safe_env_summary if present, else our minimal snapshot
         try:
             if env_mod is not None and hasattr(env_mod, "safe_env_summary"):
-                return {"settings_source": getattr(app_.state, "settings_source", None), "env": env_mod.safe_env_summary()}
+                return {
+                    "settings_source": getattr(app_.state, "settings_source", None),
+                    "env": env_mod.safe_env_summary(),
+                }
         except Exception:
             pass
         return {
@@ -807,4 +807,3 @@ def create_app() -> FastAPI:
 
 # REQUIRED BY RENDER
 app = create_app()
-```
