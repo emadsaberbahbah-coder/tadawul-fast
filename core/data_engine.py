@@ -1,8 +1,8 @@
-# core/data_engine.py
+# core/data_engine.py  (FULL REPLACEMENT)
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v3.6.0) — PROD SAFE
+LEGACY COMPATIBILITY ADAPTER (v3.6.1) — PROD SAFE (TRUE LAZY)
 
 PURPOSE
 - Keeps older imports working:
@@ -11,18 +11,19 @@ PURPOSE
 - Provides a safe STUB mode if V2 cannot be imported (never crashes the app)
 
 MAPPING (best-effort)
-- get_enriched_quote(symbol)    -> v2_engine.get_quote(symbol) OR v2_engine.get_enriched_quote(symbol)
-- get_enriched_quotes(symbols)  -> v2_engine.get_quotes(symbols) OR v2_engine.get_enriched_quotes(symbols)
+- get_enriched_quote(symbol)    -> v2_engine.get_enriched_quote(symbol) OR v2_engine.get_quote(symbol)
+- get_enriched_quotes(symbols)  -> v2_engine.get_enriched_quotes(symbols) OR v2_engine.get_quotes(symbols)
 - get_quote(s) / get_quotes(ss) -> aliases for enriched variants
 
 DESIGN
-- Lazy V2 import to avoid cold-start failures and circular-import issues.
+- TRUE lazy V2 import: does NOT attempt to import v2 at module import-time.
 - Stable module-level singleton engine (shared across calls).
-- Export DataEngine/UnifiedQuote symbols (V2 if available, else STUB).
+- Exports DataEngine/UnifiedQuote symbols (V2 if available, else STUB) via __getattr__ (PEP 562).
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from datetime import datetime, timezone
@@ -62,9 +63,18 @@ class QuoteSource(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 2) Lazy V2 Loader (never raises to caller)
+# 2) Async helper (defensive)
 # ---------------------------------------------------------------------------
-_ENGINE_MODE: str = "stub"
+async def _maybe_await(v: Any) -> Any:
+    if inspect.isawaitable(v):
+        return await v
+    return v
+
+
+# ---------------------------------------------------------------------------
+# 3) Lazy V2 Loader (never raises to caller)
+# ---------------------------------------------------------------------------
+_ENGINE_MODE: str = "unknown"  # unknown | v2 | stub
 _V2: Dict[str, Any] = {}
 _V2_LOAD_ERR: Optional[str] = None
 _V2_LOAD_LOCK = threading.Lock()
@@ -90,8 +100,10 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
 
         try:
             mod = import_module("core.data_engine_v2")
+
             v2_engine = getattr(mod, "DataEngine", None)
             v2_uq = getattr(mod, "UnifiedQuote", None)
+            v2_norm = getattr(mod, "normalize_symbol", None)
 
             # If UnifiedQuote is not in data_engine_v2, try schemas (optional)
             if v2_uq is None:
@@ -106,6 +118,9 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
 
             _V2["DataEngine"] = v2_engine
             _V2["UnifiedQuote"] = v2_uq
+            if callable(v2_norm):
+                _V2["normalize_symbol"] = v2_norm
+
             _ENGINE_MODE = "v2"
             _V2_LOAD_ERR = None
 
@@ -119,8 +134,22 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
             return False, _V2_LOAD_ERR
 
 
+def _get_uq_cls() -> Type[Any]:
+    ok, _ = _load_v2()
+    if ok and _V2.get("UnifiedQuote"):
+        return _V2["UnifiedQuote"]
+    return _StubUnifiedQuote  # type: ignore  # defined later
+
+
+def _get_engine_cls() -> Type[Any]:
+    ok, _ = _load_v2()
+    if ok and _V2.get("DataEngine"):
+        return _V2["DataEngine"]
+    return _StubEngine  # type: ignore  # defined later
+
+
 # ---------------------------------------------------------------------------
-# 3) STUB DEFINITIONS (Safe Mode)
+# 4) STUB DEFINITIONS (Safe Mode)
 # ---------------------------------------------------------------------------
 class _StubUnifiedQuote(BaseModel):
     """
@@ -182,7 +211,6 @@ class _StubUnifiedQuote(BaseModel):
     change: Optional[float] = None
 
     def finalize(self) -> "_StubUnifiedQuote":
-        # keep interface compatible with V2 models that provide finalize()
         if self.current_price is None and self.price is not None:
             self.current_price = self.price
         if self.price_change is None and self.change is not None:
@@ -200,12 +228,18 @@ class _StubUnifiedQuote(BaseModel):
         return dict(self.__dict__)
 
 
+_STUB_LOGGED = False
+
+
 class _StubEngine:
     """
     Stub engine that matches the V2 async interface closely enough for routes.
     """
     def __init__(self, *args, **kwargs) -> None:
-        logger.error("Legacy Adapter: initialized STUB engine (V2 missing/unavailable).")
+        global _STUB_LOGGED
+        if not _STUB_LOGGED:
+            _STUB_LOGGED = True
+            logger.error("Legacy Adapter: initialized STUB engine (V2 missing/unavailable).")
 
     async def get_quote(self, symbol: str) -> _StubUnifiedQuote:
         sym = str(symbol or "").strip()
@@ -219,7 +253,6 @@ class _StubEngine:
                 out.append(_StubUnifiedQuote(symbol=sym, error="Engine V2 Missing").finalize())
         return out
 
-    # legacy naming (some callers might use these)
     async def get_enriched_quote(self, symbol: str) -> _StubUnifiedQuote:
         return await self.get_quote(symbol)
 
@@ -228,19 +261,6 @@ class _StubEngine:
 
     async def aclose(self) -> None:
         return None
-
-
-# ---------------------------------------------------------------------------
-# 4) Public re-exports: UnifiedQuote + DataEngine (either V2 or STUB)
-# ---------------------------------------------------------------------------
-def _get_types() -> Tuple[Type[Any], Type[Any]]:
-    ok, _ = _load_v2()
-    if ok:
-        return _V2["UnifiedQuote"], _V2["DataEngine"]
-    return _StubUnifiedQuote, _StubEngine
-
-
-UnifiedQuote, DataEngine = _get_types()  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -260,14 +280,21 @@ def _instantiate_engine(EngineCls: Type[Any]) -> Any:
     except TypeError:
         pass
 
-    # 2) try passing settings (best-effort)
+    # 2) try keyword settings=
+    try:
+        from core.config import get_settings as _gs  # type: ignore
+        return EngineCls(settings=_gs())
+    except Exception:
+        pass
+
+    # 3) try positional settings
     try:
         from core.config import get_settings as _gs  # type: ignore
         return EngineCls(_gs())
     except Exception:
         pass
 
-    # 3) last resort: generic
+    # 4) last resort
     return EngineCls()
 
 
@@ -276,7 +303,7 @@ def _get_engine() -> Any:
     Singleton accessor for the underlying engine.
     Never raises; returns a stub engine on failure.
     """
-    global _engine_instance, UnifiedQuote, DataEngine
+    global _engine_instance
 
     if _engine_instance is not None:
         return _engine_instance
@@ -285,11 +312,13 @@ def _get_engine() -> Any:
         if _engine_instance is not None:
             return _engine_instance
 
+        # Load v2 if possible (still lazy: only here)
         _load_v2()
-        UnifiedQuote, DataEngine = _get_types()  # refresh public bindings
+        EngineCls = _get_engine_cls()
+        UQ = _get_uq_cls()
 
         try:
-            _engine_instance = _instantiate_engine(DataEngine)  # v2 or stub
+            _engine_instance = _instantiate_engine(EngineCls)
             return _engine_instance
         except Exception as exc:
             logger.critical("Legacy Adapter: engine init failed: %s", exc)
@@ -297,11 +326,20 @@ def _get_engine() -> Any:
             # Emergency crash-proof stub
             class _CrashStub:
                 async def get_quote(self, s):
-                    return UnifiedQuote(symbol=str(s or ""), error=str(exc)).finalize()
+                    try:
+                        return UQ(symbol=str(s or ""), error=str(exc)).finalize()
+                    except Exception:
+                        return _StubUnifiedQuote(symbol=str(s or ""), error=str(exc)).finalize()
 
                 async def get_quotes(self, ss):
                     clean = [str(x).strip() for x in (ss or []) if x and str(x).strip()]
-                    return [UnifiedQuote(symbol=x, error=str(exc)).finalize() for x in clean]
+                    out = []
+                    for x in clean:
+                        try:
+                            out.append(UQ(symbol=x, error=str(exc)).finalize())
+                        except Exception:
+                            out.append(_StubUnifiedQuote(symbol=x, error=str(exc)).finalize())
+                    return out
 
                 async def aclose(self):
                     return None
@@ -319,22 +357,76 @@ async def close_engine() -> None:
     _engine_instance = None
     try:
         if eng is not None and hasattr(eng, "aclose"):
-            await eng.aclose()
+            await _maybe_await(eng.aclose())
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# 6) Public API Functions (Compatibility Layer)
+# 6) Symbol normalization (exported)
+# ---------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
+
+def normalize_symbol(symbol: str) -> str:
+    """
+    Exported normalizer:
+    - Prefer core.data_engine_v2.normalize_symbol if available
+    - Else safe fallback:
+        * trims + uppercases
+        * keeps Yahoo special (^, =)
+        * numeric => 1120.SR
+        * alpha => AAPL.US
+        * if '.' exists => keep
+    """
+    s = (symbol or "").strip()
+    if not s:
+        return ""
+
+    ok, _ = _load_v2()
+    fn = _V2.get("normalize_symbol")
+    if ok and callable(fn):
+        try:
+            out = fn(s)
+            return (out or "").strip().upper()
+        except Exception:
+            pass
+
+    su = s.strip().upper()
+
+    if su.startswith("TADAWUL:"):
+        su = su.split(":", 1)[1].strip()
+    if su.endswith(".TADAWUL"):
+        su = su.replace(".TADAWUL", "")
+
+    if any(ch in su for ch in ("=", "^")):
+        return su
+    if "." in su:
+        return su
+    if su.isdigit():
+        return f"{su}.SR"
+    if su.isalpha():
+        return f"{su}.US"
+    return su
+
+
+# ---------------------------------------------------------------------------
+# 7) Public API Functions (Compatibility Layer)
 # ---------------------------------------------------------------------------
 def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
+    seen = set()
     out: List[str] = []
     for s in (symbols or []):
         if s is None:
             continue
         x = str(s).strip()
-        if x:
-            out.append(x)
+        if not x:
+            continue
+        xu = x.upper()
+        if xu in seen:
+            continue
+        seen.add(xu)
+        out.append(x)
     return out
 
 
@@ -342,20 +434,34 @@ async def get_enriched_quote(symbol: str) -> Any:
     """
     Legacy Wrapper: Fetches a single quote using the V2 engine.
     """
-    eng = _get_engine()
-    sym = str(symbol or "").strip()
-    if not sym:
-        return UnifiedQuote(symbol="", error="Empty symbol").finalize()
+    sym_in = str(symbol or "").strip()
+    UQ = _get_uq_cls()
 
+    if not sym_in:
+        try:
+            return UQ(symbol="", error="Empty symbol").finalize()
+        except Exception:
+            return _StubUnifiedQuote(symbol="", error="Empty symbol").finalize()
+
+    sym = normalize_symbol(sym_in) or sym_in
+
+    eng = _get_engine()
     try:
-        if hasattr(eng, "get_quote"):
-            return await eng.get_quote(sym)
+        # Prefer enriched if present, else quote
         if hasattr(eng, "get_enriched_quote"):
-            return await eng.get_enriched_quote(sym)
-        return UnifiedQuote(symbol=sym, error="Engine method mismatch: get_quote missing").finalize()
+            return await _maybe_await(eng.get_enriched_quote(sym))
+        if hasattr(eng, "get_quote"):
+            return await _maybe_await(eng.get_quote(sym))
+        try:
+            return UQ(symbol=sym, error="Engine method mismatch: no get_enriched_quote/get_quote").finalize()
+        except Exception:
+            return _StubUnifiedQuote(symbol=sym, error="Engine method mismatch").finalize()
     except Exception as exc:
         logger.error("Legacy Adapter Error (Single): %s", exc)
-        return UnifiedQuote(symbol=sym, error=str(exc)).finalize()
+        try:
+            return UQ(symbol=sym, error=str(exc)).finalize()
+        except Exception:
+            return _StubUnifiedQuote(symbol=sym, error=str(exc)).finalize()
 
 
 async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
@@ -367,11 +473,13 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
         return []
 
     eng = _get_engine()
+    UQ = _get_uq_cls()
+
     try:
-        if hasattr(eng, "get_quotes"):
-            return await eng.get_quotes(clean)
         if hasattr(eng, "get_enriched_quotes"):
-            return await eng.get_enriched_quotes(clean)
+            return await _maybe_await(eng.get_enriched_quotes([normalize_symbol(x) or x for x in clean]))
+        if hasattr(eng, "get_quotes"):
+            return await _maybe_await(eng.get_quotes([normalize_symbol(x) or x for x in clean]))
 
         # fallback: sequential
         out: List[Any] = []
@@ -380,7 +488,14 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
         return out
     except Exception as exc:
         logger.error("Legacy Adapter Error (Batch): %s", exc)
-        return [UnifiedQuote(symbol=s, error=str(exc)).finalize() for s in clean]
+        out: List[Any] = []
+        for s in clean:
+            sym = normalize_symbol(s) or s
+            try:
+                out.append(UQ(symbol=sym, error=str(exc)).finalize())
+            except Exception:
+                out.append(_StubUnifiedQuote(symbol=sym, error=str(exc)).finalize())
+        return out
 
 
 # Backward-compatible aliases some modules may use
@@ -393,7 +508,7 @@ async def get_quotes(symbols: List[str]) -> List[Any]:
 
 
 # ---------------------------------------------------------------------------
-# 7) Meta Info
+# 8) Meta Info
 # ---------------------------------------------------------------------------
 def get_engine_meta() -> Dict[str, Any]:
     ok, err = _load_v2()
@@ -402,10 +517,7 @@ def get_engine_meta() -> Dict[str, Any]:
 
     try:
         from core.config import get_settings as _gs  # type: ignore
-
         s = _gs()
-
-        # prefer computed lists if present
         providers = list(getattr(s, "enabled_providers", []) or []) or list(getattr(s, "PROVIDERS", []) or [])
         ksa_providers = list(getattr(s, "enabled_ksa_providers", []) or []) or list(getattr(s, "KSA_PROVIDERS", []) or [])
     except Exception:
@@ -414,7 +526,7 @@ def get_engine_meta() -> Dict[str, Any]:
     return {
         "mode": _ENGINE_MODE,
         "is_stub": _ENGINE_MODE == "stub",
-        "adapter_version": "3.6.0",
+        "adapter_version": "3.6.1",
         "v2_loaded": bool(ok),
         "v2_error": err or _V2_LOAD_ERR,
         "providers": providers,
@@ -422,9 +534,23 @@ def get_engine_meta() -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 9) Lazy re-exports (PEP 562)
+# ---------------------------------------------------------------------------
+def __getattr__(name: str) -> Any:  # pragma: no cover
+    if name == "UnifiedQuote":
+        return _get_uq_cls()
+    if name == "DataEngine":
+        return _get_engine_cls()
+    if name == "ENGINE_MODE":
+        return _ENGINE_MODE
+    raise AttributeError(name)
+
+
 __all__ = [
-    "UnifiedQuote",
     "QuoteSource",
+    "normalize_symbol",
+    "UnifiedQuote",
     "DataEngine",
     "get_quote",
     "get_quotes",
