@@ -2,7 +2,7 @@
 """
 core/config.py
 ------------------------------------------------------------
-Compatibility shim (PROD SAFE) – v1.3.0
+Compatibility shim (PROD SAFE) – v1.4.0
 
 Many modules import settings via:
   from core.config import Settings, get_settings
@@ -17,48 +17,44 @@ Design goals:
     - lower_case: app_name, env, version, log_level, ...
     - UPPER_CASE: APP_NAME, ENV, VERSION, LOG_LEVEL, ...
 
-v1.3.0 updates
-- Aligns with your Render env-group keys (APP_ENV/ENVIRONMENT, REQUIRE_AUTH, ENABLE_RATE_LIMITING, etc.)
-- Adds Google Sheets key alignment:
-    GOOGLE_SHEETS_CREDENTIALS (preferred), fallback GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
-    SPREADSHEET_ID (preferred), fallback DEFAULT_SPREADSHEET_ID / GOOGLE_SHEETS_ID
-- Adds common engine/runtime config knobs used across the repo:
-    ENABLED_PROVIDERS / KSA_PROVIDERS, PRIMARY_PROVIDER
-    HTTP_TIMEOUT_SEC, MAX_RETRIES, RETRY_DELAY_SEC
-    TTL keys: CACHE_TTL_SEC, QUOTE_TTL_SEC, FUNDAMENTALS_TTL_SEC, ARGAAM_SNAPSHOT_TTL_SEC
-    Feature flags: AI_ANALYSIS_ENABLED, ADVANCED_ANALYSIS_ENABLED
-    KSA flags: ENABLE_YFINANCE_KSA, ENABLE_YAHOO_CHART_KSA
+v1.4.0 updates
+- Improved "partial root config" support:
+    • If root exports Settings only -> build get_settings() around it
+    • If root exports get_settings only -> infer Settings from it
+- Adds knobs used by routers:
+    • ai_batch_size / ai_batch_timeout_sec / ai_batch_concurrency / ai_max_tickers
+    • adv_batch_size / adv_batch_timeout_sec / adv_batch_concurrency / adv_max_tickers
+- Adds resolved helpers for Google credentials / Spreadsheet ID (no secrets leaked).
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-# -----------------------------------------------------------------------------
-# Try to use repo-root config.py (preferred)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Root config prefer (repo-root config.py)
+# =============================================================================
 Settings = None  # type: ignore
 get_settings = None  # type: ignore
+
+_root_Settings = None
+_root_get_settings = None
 
 try:
     import config as _root_config  # type: ignore
 
-    if hasattr(_root_config, "Settings"):
-        Settings = getattr(_root_config, "Settings")
-
-    if hasattr(_root_config, "get_settings"):
-        get_settings = getattr(_root_config, "get_settings")
-
+    _root_Settings = getattr(_root_config, "Settings", None)
+    _root_get_settings = getattr(_root_config, "get_settings", None)
 except Exception:
-    Settings = None  # type: ignore
-    get_settings = None  # type: ignore
+    _root_Settings = None
+    _root_get_settings = None
 
 
-# -----------------------------------------------------------------------------
-# Fallback implementation (only used if root exports are unavailable)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Fallback helpers
+# =============================================================================
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 
@@ -78,13 +74,6 @@ def _env_str_any(names: List[str], default: Optional[str] = None) -> Optional[st
     return default
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env_str(name, None)
-    if v is None:
-        return default
-    return v.strip().lower() in _TRUTHY
-
-
 def _env_bool_any(names: List[str], default: bool = False) -> bool:
     for n in names:
         v = _env_str(n, None)
@@ -94,15 +83,11 @@ def _env_bool_any(names: List[str], default: bool = False) -> bool:
     return default
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_bool(name: str, default: bool = False) -> bool:
     v = _env_str(name, None)
     if v is None:
         return default
-    try:
-        n = int(v)
-        return n if n > 0 else default
-    except Exception:
-        return default
+    return v.strip().lower() in _TRUTHY
 
 
 def _env_int_any(names: List[str], default: int) -> int:
@@ -112,6 +97,21 @@ def _env_int_any(names: List[str], default: int) -> int:
             continue
         try:
             x = int(v)
+            # allow zero if explicitly desired? (keep old behavior: >0 only)
+            if x > 0:
+                return x
+        except Exception:
+            continue
+    return default
+
+
+def _env_float_any(names: List[str], default: float) -> float:
+    for n in names:
+        v = _env_str(n, None)
+        if v is None:
+            continue
+        try:
+            x = float(v)
             if x > 0:
                 return x
         except Exception:
@@ -173,6 +173,62 @@ def _mask_tail(s: Optional[str], keep: int = 4) -> str:
     return ("•" * (len(s2) - keep)) + s2[-keep:]
 
 
+def _resolve_google_credentials(
+    google_sheets_credentials: Optional[str],
+    google_credentials: Optional[str],
+    google_sa_json: Optional[str],
+) -> Tuple[Optional[str], str]:
+    """
+    Returns (value, source_label)
+    """
+    if google_sheets_credentials and google_sheets_credentials.strip():
+        return google_sheets_credentials.strip(), "GOOGLE_SHEETS_CREDENTIALS"
+    if google_credentials and google_credentials.strip():
+        return google_credentials.strip(), "GOOGLE_CREDENTIALS"
+    if google_sa_json and google_sa_json.strip():
+        return google_sa_json.strip(), "GOOGLE_SA_JSON"
+    return None, "none"
+
+
+def _resolve_spreadsheet_id(spreadsheet_id: Optional[str], google_sheets_id: Optional[str]) -> Tuple[Optional[str], str]:
+    if spreadsheet_id and spreadsheet_id.strip():
+        return spreadsheet_id.strip(), "SPREADSHEET_ID"
+    if google_sheets_id and google_sheets_id.strip():
+        return google_sheets_id.strip(), "GOOGLE_SHEETS_ID"
+    return None, "none"
+
+
+# =============================================================================
+# If root config exists (fully or partially), use it safely
+# =============================================================================
+if callable(_root_get_settings) and _root_Settings is not None:
+    # Best case: root has both
+    Settings = _root_Settings  # type: ignore
+    get_settings = _root_get_settings  # type: ignore
+
+elif _root_Settings is not None and not callable(_root_get_settings):
+    # Root has Settings only -> build get_settings() around it
+    Settings = _root_Settings  # type: ignore
+    _settings_singleton: Optional[Any] = None
+
+    def get_settings() -> Any:  # type: ignore
+        global _settings_singleton
+        if _settings_singleton is None:
+            _settings_singleton = Settings()  # type: ignore
+        return _settings_singleton
+
+elif callable(_root_get_settings) and _root_Settings is None:
+    # Root has get_settings only -> infer Settings type if possible
+    get_settings = _root_get_settings  # type: ignore
+    try:
+        _tmp = get_settings()  # type: ignore
+        Settings = _tmp.__class__ if _tmp is not None else None  # type: ignore
+    except Exception:
+        Settings = None  # type: ignore
+
+# =============================================================================
+# Fallback implementation (only used if root exports are unavailable)
+# =============================================================================
 if Settings is None or get_settings is None:
 
     class Settings:  # type: ignore
@@ -188,127 +244,147 @@ if Settings is None or get_settings is None:
         And common runtime knobs used by this repo.
         """
 
-        # ---------------------------------------------------------------------
-        # Identity
-        # ---------------------------------------------------------------------
-        app_name: str = _env_str_any(["APP_NAME", "SERVICE_NAME"], "Tadawul Fast Bridge") or "Tadawul Fast Bridge"
+        def __init__(self) -> None:
+            # -----------------------------------------------------------------
+            # Identity
+            # -----------------------------------------------------------------
+            self.app_name: str = (
+                _env_str_any(["APP_NAME", "SERVICE_NAME"], "Tadawul Fast Bridge") or "Tadawul Fast Bridge"
+            )
 
-        env: str = (
-            _env_str_any(["APP_ENV", "ENV", "ENVIRONMENT"], "production")
-            or "production"
-        )
+            self.env: str = (
+                _env_str_any(["APP_ENV", "ENV", "ENVIRONMENT"], "production") or "production"
+            )
 
-        version: str = (
-            _env_str_any(["SERVICE_VERSION", "APP_VERSION", "VERSION"], "dev")
-            or "dev"
-        )
+            self.version: str = (
+                _env_str_any(["SERVICE_VERSION", "APP_VERSION", "VERSION"], "dev") or "dev"
+            )
 
-        # ---------------------------------------------------------------------
-        # Logging
-        # ---------------------------------------------------------------------
-        log_level: str = (_env_str_any(["LOG_LEVEL", "UVICORN_LOG_LEVEL"], "info") or "info").lower()
-        log_format: str = _env_str("LOG_FORMAT", "%(asctime)s | %(levelname)s | %(name)s | %(message)s") or "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+            # -----------------------------------------------------------------
+            # Logging
+            # -----------------------------------------------------------------
+            self.log_level: str = (_env_str_any(["LOG_LEVEL", "UVICORN_LOG_LEVEL"], "info") or "info").lower()
+            self.log_format: str = (
+                _env_str("LOG_FORMAT", "%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+                or "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+            )
 
-        # ---------------------------------------------------------------------
-        # Auth / Security
-        # ---------------------------------------------------------------------
-        app_token: Optional[str] = _env_str_any(["APP_TOKEN", "TFB_APP_TOKEN"], None)
-        backup_app_token: Optional[str] = _env_str_any(["BACKUP_APP_TOKEN"], None)
+            # -----------------------------------------------------------------
+            # Auth / Security
+            # -----------------------------------------------------------------
+            self.app_token: Optional[str] = _env_str_any(["APP_TOKEN", "TFB_APP_TOKEN"], None)
+            self.backup_app_token: Optional[str] = _env_str_any(["BACKUP_APP_TOKEN"], None)
 
-        # REQUIRE_AUTH is explicit; default false to preserve "open mode" if not configured
-        require_auth: bool = _env_bool_any(["REQUIRE_AUTH"], False)
+            # REQUIRE_AUTH: when true, router auth logic SHOULD enforce token even if none set.
+            # (Routers must read this flag; config only exposes it.)
+            self.require_auth: bool = _env_bool_any(["REQUIRE_AUTH"], False)
 
-        # ---------------------------------------------------------------------
-        # Providers
-        # ---------------------------------------------------------------------
-        enabled_providers: List[str] = _parse_list(
-            _env_str_any(["ENABLED_PROVIDERS", "PROVIDERS"], "eodhd,finnhub,fmp,yahoo_chart")
-        )
-        enabled_ksa_providers: List[str] = _parse_list(_env_str("KSA_PROVIDERS", "tadawul,argaam,yahoo_chart"))
+            # -----------------------------------------------------------------
+            # Providers
+            # -----------------------------------------------------------------
+            self.enabled_providers: List[str] = _parse_list(
+                _env_str_any(["ENABLED_PROVIDERS", "PROVIDERS"], "eodhd,finnhub,fmp,yahoo_chart")
+            )
+            self.enabled_ksa_providers: List[str] = _parse_list(_env_str("KSA_PROVIDERS", "tadawul,argaam,yahoo_chart"))
 
-        primary_provider: str = (_env_str_any(["PRIMARY_PROVIDER"], "") or "").strip().lower()
+            self.primary_provider: str = (_env_str_any(["PRIMARY_PROVIDER"], "") or "").strip().lower()
 
-        # KSA policy flags
-        enable_yfinance_ksa: bool = _env_bool("ENABLE_YFINANCE_KSA", False)
-        enable_yahoo_chart_ksa: bool = _env_bool("ENABLE_YAHOO_CHART_KSA", True)
+            # KSA policy flags
+            self.enable_yfinance_ksa: bool = _env_bool("ENABLE_YFINANCE_KSA", False)
+            self.enable_yahoo_chart_ksa: bool = _env_bool("ENABLE_YAHOO_CHART_KSA", True)
 
-        # ---------------------------------------------------------------------
-        # HTTP / retry controls
-        # ---------------------------------------------------------------------
-        http_timeout_sec: int = _env_int_any(["HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"], 25)
-        max_retries: int = _env_int_any(["MAX_RETRIES"], 2)
-        retry_delay_sec: int = _env_int_any(["RETRY_DELAY_SEC", "RETRY_DELAY"], 1)
+            # -----------------------------------------------------------------
+            # HTTP / retry controls
+            # -----------------------------------------------------------------
+            self.http_timeout_sec: int = _env_int_any(["HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"], 25)
+            self.max_retries: int = _env_int_any(["MAX_RETRIES"], 2)
+            self.retry_delay_sec: int = _env_int_any(["RETRY_DELAY_SEC", "RETRY_DELAY"], 1)
 
-        # ---------------------------------------------------------------------
-        # Cache / TTL controls (seconds)
-        # ---------------------------------------------------------------------
-        cache_ttl_sec: int = _env_int_any(["CACHE_TTL_SEC"], 20)
-        quote_ttl_sec: int = _env_int_any(["QUOTE_TTL_SEC"], 30)
-        fundamentals_ttl_sec: int = _env_int_any(["FUNDAMENTALS_TTL_SEC"], 21600)
-        argaam_snapshot_ttl_sec: int = _env_int_any(["ARGAAM_SNAPSHOT_TTL_SEC"], 30)
+            # -----------------------------------------------------------------
+            # Cache / TTL controls (seconds)
+            # -----------------------------------------------------------------
+            self.cache_ttl_sec: int = _env_int_any(["CACHE_TTL_SEC"], 20)
+            self.quote_ttl_sec: int = _env_int_any(["QUOTE_TTL_SEC"], 30)
+            self.fundamentals_ttl_sec: int = _env_int_any(["FUNDAMENTALS_TTL_SEC"], 21600)
+            self.argaam_snapshot_ttl_sec: int = _env_int_any(["ARGAAM_SNAPSHOT_TTL_SEC"], 30)
 
-        # ---------------------------------------------------------------------
-        # Feature flags
-        # ---------------------------------------------------------------------
-        ai_analysis_enabled: bool = _env_bool("AI_ANALYSIS_ENABLED", True)
-        advanced_analysis_enabled: bool = _env_bool("ADVANCED_ANALYSIS_ENABLED", True)
+            # -----------------------------------------------------------------
+            # Feature flags
+            # -----------------------------------------------------------------
+            self.ai_analysis_enabled: bool = _env_bool("AI_ANALYSIS_ENABLED", True)
+            self.advanced_analysis_enabled: bool = _env_bool("ADVANCED_ANALYSIS_ENABLED", True)
 
-        # ---------------------------------------------------------------------
-        # CORS
-        # ---------------------------------------------------------------------
-        enable_cors_all_origins: bool = _env_bool_any(["ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"], True)
-        cors_origins_list: List[str] = (
-            ["*"]
-            if enable_cors_all_origins
-            else _parse_list(_env_str_any(["CORS_ORIGINS", "CORS_ALLOW_ORIGINS"], "") or "")
-        )
+            # Router knobs (align with routes/ai_analysis.py and routes/advanced_analysis.py)
+            self.ai_batch_size: int = _env_int_any(["AI_BATCH_SIZE"], 20)
+            self.ai_batch_timeout_sec: float = _env_float_any(["AI_BATCH_TIMEOUT_SEC"], 45.0)
+            self.ai_batch_concurrency: int = _env_int_any(["AI_BATCH_CONCURRENCY"], 5)
+            self.ai_max_tickers: int = _env_int_any(["AI_MAX_TICKERS"], 500)
 
-        # ---------------------------------------------------------------------
-        # Rate limiting (SlowAPI)
-        # ---------------------------------------------------------------------
-        enable_rate_limiting: bool = _env_bool_any(["ENABLE_RATE_LIMITING"], True)
-        rate_limit_per_minute: int = _env_int_any(["RATE_LIMIT_PER_MINUTE"], 240)
+            self.adv_batch_size: int = _env_int_any(["ADV_BATCH_SIZE"], 25)
+            self.adv_batch_timeout_sec: float = _env_float_any(["ADV_BATCH_TIMEOUT_SEC"], 45.0)
+            self.adv_batch_concurrency: int = _env_int_any(["ADV_BATCH_CONCURRENCY"], 6)
+            self.adv_max_tickers: int = _env_int_any(["ADV_MAX_TICKERS"], 500)
 
-        # Keep old names too (legacy compatibility)
-        slowapi_enabled: bool = _env_bool_any(["SLOWAPI_ENABLED"], True)
-        slowapi_default_limit: str = _env_str("SLOWAPI_DEFAULT_LIMIT", f"{rate_limit_per_minute}/minute") or f"{rate_limit_per_minute}/minute"
+            # -----------------------------------------------------------------
+            # CORS
+            # -----------------------------------------------------------------
+            self.enable_cors_all_origins: bool = _env_bool_any(["ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"], True)
+            self.cors_origins_list: List[str] = (
+                ["*"]
+                if self.enable_cors_all_origins
+                else _parse_list(_env_str_any(["CORS_ORIGINS", "CORS_ALLOW_ORIGINS"], "") or "")
+            )
 
-        # ---------------------------------------------------------------------
-        # API keys
-        # ---------------------------------------------------------------------
-        eodhd_api_key: Optional[str] = _env_str("EODHD_API_KEY", None)
-        finnhub_api_key: Optional[str] = _env_str("FINNHUB_API_KEY", None)
-        fmp_api_key: Optional[str] = _env_str("FMP_API_KEY", None)
-        alpha_vantage_api_key: Optional[str] = _env_str("ALPHA_VANTAGE_API_KEY", None)
-        twelvedata_api_key: Optional[str] = _env_str("TWELVEDATA_API_KEY", None)
-        marketstack_api_key: Optional[str] = _env_str("MARKETSTACK_API_KEY", None)
+            # -----------------------------------------------------------------
+            # Rate limiting (SlowAPI)
+            # -----------------------------------------------------------------
+            self.enable_rate_limiting: bool = _env_bool_any(["ENABLE_RATE_LIMITING"], True)
+            self.rate_limit_per_minute: int = _env_int_any(["RATE_LIMIT_PER_MINUTE"], 240)
 
-        # ---------------------------------------------------------------------
-        # URLs / Integration
-        # ---------------------------------------------------------------------
-        base_url: str = (_env_str_any(["BASE_URL", "BACKEND_BASE_URL"], "") or "").strip()
-        backend_base_url: str = (_env_str_any(["BACKEND_BASE_URL", "BASE_URL"], "") or "").strip()
+            # Keep old names too (legacy compatibility)
+            self.slowapi_enabled: bool = _env_bool_any(["SLOWAPI_ENABLED"], True)
+            self.slowapi_default_limit: str = _env_str("SLOWAPI_DEFAULT_LIMIT", f"{self.rate_limit_per_minute}/minute") or f"{self.rate_limit_per_minute}/minute"
 
-        google_apps_script_url: str = (_env_str("GOOGLE_APPS_SCRIPT_URL", "") or "").strip()
-        google_apps_script_backup_url: str = (_env_str("GOOGLE_APPS_SCRIPT_BACKUP_URL", "") or "").strip()
+            # -----------------------------------------------------------------
+            # API keys
+            # -----------------------------------------------------------------
+            self.eodhd_api_key: Optional[str] = _env_str("EODHD_API_KEY", None)
+            self.finnhub_api_key: Optional[str] = _env_str("FINNHUB_API_KEY", None)
+            self.fmp_api_key: Optional[str] = _env_str("FMP_API_KEY", None)
+            self.alpha_vantage_api_key: Optional[str] = _env_str("ALPHA_VANTAGE_API_KEY", None)
+            self.twelvedata_api_key: Optional[str] = _env_str("TWELVEDATA_API_KEY", None)
+            self.marketstack_api_key: Optional[str] = _env_str("MARKETSTACK_API_KEY", None)
 
-        # ---------------------------------------------------------------------
-        # Google / Sheets (critical alignment)
-        # ---------------------------------------------------------------------
-        # Preferred key in this repo:
-        google_sheets_credentials: Optional[str] = _env_str("GOOGLE_SHEETS_CREDENTIALS", None)
+            # -----------------------------------------------------------------
+            # URLs / Integration
+            # -----------------------------------------------------------------
+            self.base_url: str = (_env_str_any(["BASE_URL", "BACKEND_BASE_URL"], "") or "").strip()
+            self.backend_base_url: str = (_env_str_any(["BACKEND_BASE_URL", "BASE_URL"], "") or "").strip()
 
-        # Backward-compatible fallbacks (some earlier scripts used these):
-        google_credentials: Optional[str] = _env_str("GOOGLE_CREDENTIALS", None)
-        google_sa_json: Optional[str] = _env_str("GOOGLE_SA_JSON", None)
+            self.google_apps_script_url: str = (_env_str("GOOGLE_APPS_SCRIPT_URL", "") or "").strip()
+            self.google_apps_script_backup_url: str = (_env_str("GOOGLE_APPS_SCRIPT_BACKUP_URL", "") or "").strip()
 
-        spreadsheet_id: Optional[str] = _env_str_any(["SPREADSHEET_ID", "DEFAULT_SPREADSHEET_ID"], None)
-        google_sheets_id: Optional[str] = _env_str("GOOGLE_SHEETS_ID", None)
+            # -----------------------------------------------------------------
+            # Google / Sheets (critical alignment)
+            # -----------------------------------------------------------------
+            self.google_sheets_credentials: Optional[str] = _env_str("GOOGLE_SHEETS_CREDENTIALS", None)
+            self.google_credentials: Optional[str] = _env_str("GOOGLE_CREDENTIALS", None)
+            self.google_sa_json: Optional[str] = _env_str("GOOGLE_SA_JSON", None)
+
+            self.spreadsheet_id: Optional[str] = _env_str_any(["SPREADSHEET_ID", "DEFAULT_SPREADSHEET_ID"], None)
+            self.google_sheets_id: Optional[str] = _env_str("GOOGLE_SHEETS_ID", None)
 
         # ---------------------------------------------------------------------
         # Helpful “safe” summary for diagnostics (no secret leaks)
         # ---------------------------------------------------------------------
         def safe_summary(self) -> Dict[str, Any]:
+            creds, creds_src = _resolve_google_credentials(
+                self.google_sheets_credentials,
+                self.google_credentials,
+                self.google_sa_json,
+            )
+            sid, sid_src = _resolve_spreadsheet_id(self.spreadsheet_id, self.google_sheets_id)
+
             return {
                 "APP_ENV": self.env,
                 "APP_NAME": self.app_name,
@@ -323,6 +399,18 @@ if Settings is None or get_settings is None:
                 "PRIMARY_PROVIDER": self.primary_provider,
                 "AI_ANALYSIS_ENABLED": bool(self.ai_analysis_enabled),
                 "ADVANCED_ANALYSIS_ENABLED": bool(self.advanced_analysis_enabled),
+                "AI_LIMITS": {
+                    "batch_size": int(self.ai_batch_size),
+                    "timeout_sec": float(self.ai_batch_timeout_sec),
+                    "concurrency": int(self.ai_batch_concurrency),
+                    "max_tickers": int(self.ai_max_tickers),
+                },
+                "ADV_LIMITS": {
+                    "batch_size": int(self.adv_batch_size),
+                    "timeout_sec": float(self.adv_batch_timeout_sec),
+                    "concurrency": int(self.adv_batch_concurrency),
+                    "max_tickers": int(self.adv_max_tickers),
+                },
                 "ENABLE_YFINANCE_KSA": bool(self.enable_yfinance_ksa),
                 "ENABLE_YAHOO_CHART_KSA": bool(self.enable_yahoo_chart_ksa),
                 "HTTP_TIMEOUT_SEC": int(self.http_timeout_sec),
@@ -336,15 +424,33 @@ if Settings is None or get_settings is None:
                 "RATE_LIMIT_PER_MINUTE": int(self.rate_limit_per_minute),
                 "CORS_ALL": bool(self.enable_cors_all_origins),
                 "CORS_ORIGINS": ["*"] if self.enable_cors_all_origins else list(self.cors_origins_list),
-                "SPREADSHEET_ID_SET": bool(self.spreadsheet_id or self.google_sheets_id),
-                "GOOGLE_SHEETS_CREDENTIALS_SET": bool(self.google_sheets_credentials),
-                "GOOGLE_CREDENTIALS_SET": bool(self.google_credentials or self.google_sa_json),
+                "SPREADSHEET_ID_SET": bool(sid),
+                "SPREADSHEET_ID_SOURCE": sid_src,
+                "GOOGLE_CREDENTIALS_SET": bool(creds),
+                "GOOGLE_CREDENTIALS_SOURCE": creds_src,
                 "GOOGLE_APPS_SCRIPT_BACKUP_URL_SET": bool(self.google_apps_script_backup_url),
             }
 
         # ---------------------------------------------------------------------
+        # Resolved helpers (used by clients safely)
+        # ---------------------------------------------------------------------
+        def resolved_google_credentials(self) -> Tuple[Optional[str], str]:
+            return _resolve_google_credentials(self.google_sheets_credentials, self.google_credentials, self.google_sa_json)
+
+        def resolved_spreadsheet_id(self) -> Tuple[Optional[str], str]:
+            return _resolve_spreadsheet_id(self.spreadsheet_id, self.google_sheets_id)
+
+        # ---------------------------------------------------------------------
         # UPPERCASE aliases (legacy compatibility)
         # ---------------------------------------------------------------------
+        def __getattr__(self, name: str) -> Any:
+            # allow uppercase -> lowercase mapping automatically
+            if name.isupper():
+                low = name.lower()
+                if low != name and hasattr(self, low):
+                    return getattr(self, low)
+            raise AttributeError(name)
+
         @property
         def APP_NAME(self) -> str:  # noqa: N802
             return self.app_name
@@ -399,7 +505,8 @@ if Settings is None or get_settings is None:
 
         @property
         def SPREADSHEET_ID(self) -> Optional[str]:  # noqa: N802
-            return self.spreadsheet_id or self.google_sheets_id
+            sid, _ = self.resolved_spreadsheet_id()
+            return sid
 
     _settings_singleton: Optional[Settings] = None
 
