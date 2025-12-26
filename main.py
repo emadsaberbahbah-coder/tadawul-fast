@@ -1,13 +1,15 @@
+# main.py  (FULL REPLACEMENT)
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.0
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.2
 
-What changed vs your current file:
-- ✅ ENV OVERRIDES WIN over Settings defaults (fixes Version stuck at 3.7.0)
-- ✅ Still PROD SAFE (no heavy imports at module import time)
-- ✅ /healthz remains dumb-fast for Render
-- ✅ Deferred router mount + best-effort engine init after startup
+Fix in v5.0.2
+- ✅ Version is NO LONGER "stuck" by env.py defaults.
+- ✅ Version resolution order:
+    1) Render ENV (SERVICE_VERSION / APP_VERSION / VERSION / RELEASE)  [os.getenv ONLY]
+    2) Render commit short hash (RENDER_GIT_COMMIT / GIT_COMMIT)
+    3) settings/env.py fallback (version/app_version)
 """
 
 from __future__ import annotations
@@ -30,16 +32,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
-# ---------------------------------------------------------------------
-# Ensure repo root is in sys.path
-# ---------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# ---------------------------------------------------------------------
-# Logging (bootstrap) — NEVER CRASH ON BAD LOG_FORMAT
-# ---------------------------------------------------------------------
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 
@@ -53,19 +49,14 @@ def _resolve_log_format() -> str:
         return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
     low = raw.lower()
-
-    # If user supplied a proper fmt string, use it
     if "%(" in raw:
         return raw
-
-    # Map common labels
     if low in {"detailed", "detail", "full", "verbose"}:
         return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     if low in {"simple", "compact"}:
         return "%(levelname)s | %(name)s | %(message)s"
     if low in {"json"}:
         return "%(asctime)s %(levelname)s %(name)s %(message)s"
-
     return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
 
@@ -78,9 +69,18 @@ except Exception:
 
 logger = logging.getLogger("main")
 
-# =============================================================================
-# Helpers
-# =============================================================================
+APP_ENTRY_VERSION = "5.0.2"
+
+
+def _clamp_str(s: Any, max_len: int = 2000) -> str:
+    txt = (str(s) if s is not None else "").strip()
+    if not txt:
+        return ""
+    if len(txt) <= max_len:
+        return txt
+    return txt[: max_len - 12] + " ...TRUNC..."
+
+
 def _parse_list_like(v: Any) -> List[str]:
     if v is None:
         return []
@@ -128,7 +128,7 @@ def _mount_router(
 
     mod, loaded_from, err_tb = _import_first(candidates)
     if mod is None:
-        report["error"] = f"All imports failed. Last traceback:\n{err_tb or '(none)'}"
+        report["error"] = _clamp_str(f"All imports failed. Last traceback:\n{err_tb or '(none)'}")
         logger.warning("Router not mounted (%s): import failed for %s", name, candidates)
         return report
 
@@ -146,12 +146,12 @@ def _mount_router(
             router_obj = getattr(mod, "get_router")()
             router_attr = "get_router()"
         except Exception:
-            report["error"] = f"get_router() failed:\n{traceback.format_exc()}"
+            report["error"] = _clamp_str(f"get_router() failed:\n{traceback.format_exc()}")
             logger.warning("Router not mounted (%s): get_router() failed", name)
             return report
 
     if router_obj is None:
-        report["error"] = (
+        report["error"] = _clamp_str(
             f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}"
         )
         logger.warning("Router not mounted (%s): no router found in %s", name, loaded_from)
@@ -165,7 +165,7 @@ def _mount_router(
         logger.info("Mounted router: %s (%s.%s)", name, loaded_from, router_attr)
         return report
     except Exception:
-        report["error"] = f"include_router failed:\n{traceback.format_exc()}"
+        report["error"] = _clamp_str(f"include_router failed:\n{traceback.format_exc()}")
         logger.warning("Router not mounted (%s): include_router failed", name)
         return report
 
@@ -178,7 +178,6 @@ def _safe_set_root_log_level(level: str) -> None:
 
 
 def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
-    # 1) root config.py (preferred)
     try:
         from config import get_settings  # type: ignore
 
@@ -187,7 +186,6 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
     except Exception:
         pass
 
-    # 2) core.config (compat)
     try:
         from core.config import get_settings  # type: ignore
 
@@ -209,15 +207,6 @@ def _load_env_module() -> Optional[object]:
 
 
 def _get(settings: Optional[object], env_mod: Optional[object], name: str, default: Any = None) -> Any:
-    """
-    IMPORTANT: ENV MUST OVERRIDE settings defaults.
-
-    Lookup order:
-      1) os.getenv(name) / os.getenv(name.upper())
-      2) env.<name>
-      3) settings.<name>
-      4) default
-    """
     v = os.getenv(name, None)
     if v is None:
         v = os.getenv(name.upper(), None)
@@ -233,6 +222,16 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
     return default
 
 
+def _get_env_only(name: str) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None:
+        v = os.getenv(name.upper())
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
 def _normalize_version(v: Any) -> str:
     s = str(v or "").strip()
     if not s:
@@ -243,40 +242,31 @@ def _normalize_version(v: Any) -> str:
 
 
 def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> str:
-    """
-    Prefer explicit env keys first (so Render can override older defaults):
-      SERVICE_VERSION, APP_VERSION, VERSION, RELEASE
-    Then fall back to settings.version (etc).
-    """
-    # explicit env keys
+    # 1) ENV ONLY (do not allow env.py to “freeze” version)
     for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
-        vv = _normalize_version(_get(settings, env_mod, k, None))
+        vv = _normalize_version(_get_env_only(k))
         if vv:
             return vv
 
-    # settings fallback
+    # 2) Render commit short hash
+    commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
+    if commit:
+        return commit[:7]
+
+    # 3) Fallback to env.py/settings legacy keys
     for k in ("version", "app_version", "APP_VERSION"):
         vv = _normalize_version(_get(settings, env_mod, k, None))
         if vv:
             return vv
 
-    # commit short
-    commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
-    if commit:
-        return commit[:7]
-
     return "dev"
 
 
 def _resolve_title(settings: Optional[object], env_mod: Optional[object]) -> str:
-    """
-    Prefer explicit env keys first (so Render can override older defaults).
-    """
     for k in ("APP_NAME", "SERVICE_NAME", "APP_TITLE", "TITLE"):
         vv = str(_get(settings, env_mod, k, "") or "").strip()
         if vv:
             return vv
-    # settings fallback
     for k in ("app_name", "name"):
         vv = str(_get(settings, env_mod, k, "") or "").strip()
         if vv:
@@ -285,10 +275,11 @@ def _resolve_title(settings: Optional[object], env_mod: Optional[object]) -> str
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
-    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
+    cors_all = _truthy(
+        _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true"))
+    )
     if cors_all:
         return ["*"]
-
     raw = str(_get(settings, env_mod, "CORS_ORIGINS", "")).strip()
     return [o.strip() for o in raw.split(",") if o.strip()] or []
 
@@ -331,6 +322,8 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "APP_ENV": str(_get(settings, env_mod, "APP_ENV", _get(settings, env_mod, "ENVIRONMENT", "production"))),
         "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", _get(settings, env_mod, "log_level", "INFO"))),
         "LOG_FORMAT": LOG_FORMAT,
+        "ENTRY_VERSION": APP_ENTRY_VERSION,
+        "APP_VERSION_RESOLVED": _resolve_version(settings, env_mod),
         "ENABLED_PROVIDERS": enabled,
         "KSA_PROVIDERS": ksa,
         "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true")),
@@ -339,9 +332,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "BACKUP_APP_TOKEN_SET": bool(str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "").strip()),
     }
 
-# =============================================================================
-# Router + Engine boot
-# =============================================================================
+
 def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
     ai_enabled = _feature_enabled(settings, env_mod, "AI_ANALYSIS_ENABLED", True)
     adv_enabled = _feature_enabled(settings, env_mod, "ADVANCED_ANALYSIS_ENABLED", True)
@@ -362,7 +353,6 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
         required.append("ai_analysis")
     if adv_enabled:
         required.append("advanced_analysis")
-
     return routers, required
 
 
@@ -378,7 +368,7 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             return
     except Exception as e:
         app_.state.engine_ready = False
-        app_.state.engine_error = str(e)[:2000]
+        app_.state.engine_error = _clamp_str(e)
 
     try:
         mod = import_module("core.data_engine")
@@ -391,16 +381,14 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             return
     except Exception as e:
         app_.state.engine_ready = False
-        app_.state.engine_error = str(e)[:2000]
+        app_.state.engine_error = _clamp_str(e)
 
 
 def _mount_all_routers(app_: FastAPI) -> None:
     routers = getattr(app_.state, "routers_to_mount", [])
     results: List[Dict[str, Any]] = []
-
     for name, candidates in routers:
-        rep = _mount_router(app_, name=name, candidates=candidates)
-        results.append(rep)
+        results.append(_mount_router(app_, name=name, candidates=candidates))
 
     app_.state.mount_report = results
     mounted_names = {r["name"] for r in results if r.get("mounted")}
@@ -437,9 +425,6 @@ async def _maybe_close_engine(app_: FastAPI) -> None:
         pass
 
 
-# =============================================================================
-# App factory (lifespan)
-# =============================================================================
 def create_app() -> FastAPI:
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
@@ -494,7 +479,7 @@ def create_app() -> FastAPI:
         enabled, ksa = _providers_from_settings(settings, env_mod)
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
-        logger.info("   Env: %s | Version: %s", app_env, version)
+        logger.info("   Env: %s | Version: %s | Entry: %s", app_env, version, APP_ENTRY_VERSION)
         logger.info("   Providers: %s", ",".join(enabled) if enabled else "(not set)")
         logger.info("   KSA Providers: %s", ",".join(ksa) if ksa else "(not set)")
         logger.info("   Required routers: %s", ",".join(app_.state.required_routers))
@@ -523,7 +508,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # SlowAPI (optional)
     enable_rl = _feature_enabled(settings, env_mod, "ENABLE_RATE_LIMITING", True)
     if enable_rl:
         try:
@@ -539,13 +523,11 @@ def create_app() -> FastAPI:
 
             @app_.exception_handler(RateLimitExceeded)
             async def _rate_limit_handler(request, exc):  # noqa: ANN001
-                return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+                return JSONResponse(status_code=429, content={"status": "error", "detail": "Rate limit exceeded"})
 
             logger.info("SlowAPI limiter enabled (default %s).", default_limit)
         except Exception as e:
             logger.warning("SlowAPI not enabled: %s", e)
-    else:
-        logger.info("Rate limiting disabled by ENABLE_RATE_LIMITING.")
 
     @app_.exception_handler(StarletteHTTPException)
     async def _http_exc_handler(request, exc: StarletteHTTPException):  # noqa: ANN001
@@ -563,33 +545,22 @@ def create_app() -> FastAPI:
         logger.exception("Unhandled exception: %s", exc)
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "error": "Internal Server Error", "detail": str(exc)[:2000]},
+            content={"status": "error", "error": "Internal Server Error", "detail": _clamp_str(exc)},
         )
 
-    # Fast endpoints (Render)
     @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
-        return {"status": "ok", "app": app_.title, "version": app_.version, "env": getattr(app_.state, "app_env", "unknown")}
+        return {
+            "status": "ok",
+            "app": app_.title,
+            "version": app_.version,
+            "env": getattr(app_.state, "app_env", "unknown"),
+            "entry_version": APP_ENTRY_VERSION,
+        }
 
     @app_.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
     async def healthz():
         return {"status": "ok"}
-
-    @app_.get("/readyz", include_in_schema=False)
-    async def readyz():
-        init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
-        if getattr(app_.state, "routers_ready", False) and (getattr(app_.state, "engine_ready", False) or not init_engine):
-            return {"status": "ready"}
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "not_ready",
-                "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
-                "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
-                "engine_error": getattr(app_.state, "engine_error", None),
-                "required_routers": getattr(app_.state, "required_routers", []),
-            },
-        )
 
     @app_.get("/health", tags=["system"])
     async def health():
@@ -601,6 +572,7 @@ def create_app() -> FastAPI:
             "app": app_.title,
             "version": app_.version,
             "env": getattr(app_.state, "app_env", "unknown"),
+            "entry_version": APP_ENTRY_VERSION,
             "providers": enabled,
             "ksa_providers": ksa,
             "settings_source": getattr(app_.state, "settings_source", None),
@@ -608,17 +580,15 @@ def create_app() -> FastAPI:
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
             "engine_error": getattr(app_.state, "engine_error", None),
             "routers_mounted": [m["name"] for m in mounted],
-            "routers_failed": [{"name": f["name"], "loaded_from": f.get("loaded_from"), "error": (f.get("error") or "")[:2000]} for f in failed],
+            "routers_failed": [
+                {"name": f["name"], "loaded_from": f.get("loaded_from"), "error": _clamp_str(f.get("error") or "", 2000)}
+                for f in failed
+            ],
             "time_utc": datetime.now(timezone.utc).isoformat(),
         }
 
     @app_.get("/system/settings", tags=["system"])
     async def system_settings():
-        try:
-            if env_mod is not None and hasattr(env_mod, "safe_env_summary"):
-                return {"settings_source": getattr(app_.state, "settings_source", None), "env": env_mod.safe_env_summary()}
-        except Exception:
-            pass
         return {"settings_source": getattr(app_.state, "settings_source", None), "env": _safe_env_snapshot(settings, env_mod)}
 
     @app_.get("/system/secrets", tags=["system"])
@@ -630,5 +600,4 @@ def create_app() -> FastAPI:
     return app_
 
 
-# REQUIRED BY RENDER
 app = create_app()
