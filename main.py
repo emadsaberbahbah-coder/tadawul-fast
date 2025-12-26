@@ -1,18 +1,21 @@
-```python
-# main.py
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.3
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.4
 
-v5.0.3 improvements (aligned with your requirements)
-- ✅ Enforces DEFAULT provider priority (only if env not set):
-    • GLOBAL: EODHD first  -> ENABLED_PROVIDERS="eodhd,finnhub,fmp"
-    • KSA: Yahoo Chart first -> KSA_PROVIDERS="yahoo_chart,tadawul,argaam"
-- ✅ Keeps your v5.0.2 version-resolution order unchanged (ENV-only first)
-- ✅ Avoids "missing data" symptoms by:
-    • ensuring engines see consistent provider defaults early (before engine init)
-    • keeping routers PROD-safe with deferred mount option
+What this fixes
+- ✅ Removes any chance of Markdown fences being part of Python source.
+- ✅ Applies provider defaults EARLY (before any engine/router imports).
+- ✅ Router mounting is safe (won’t crash startup); optional deferred mount.
+- ✅ Engine init is best-effort (won’t crash startup).
+- ✅ Health endpoints always work, even if routers/engine fail.
+
+Provider defaults (only if env not set)
+- GLOBAL: ENABLED_PROVIDERS="eodhd,finnhub,fmp"
+- KSA:    KSA_PROVIDERS="yahoo_chart,tadawul,argaam"
+- Robust: ENABLE_YAHOO_CHART_KSA=true
+          ENABLE_YAHOO_CHART_SUPPLEMENT=true
+          ENABLE_YFINANCE_KSA=false
 """
 
 from __future__ import annotations
@@ -35,6 +38,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
+# ---------------------------------------------------------------------
+# Path safety (Render/uvicorn import)
+# ---------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -72,7 +78,7 @@ except Exception:
 
 logger = logging.getLogger("main")
 
-APP_ENTRY_VERSION = "5.0.3"
+APP_ENTRY_VERSION = "5.0.4"
 
 
 def _clamp_str(s: Any, max_len: int = 2000) -> str:
@@ -81,7 +87,8 @@ def _clamp_str(s: Any, max_len: int = 2000) -> str:
         return ""
     if len(txt) <= max_len:
         return txt
-    return txt[: max_len - 12] + " ...TRUNC..."
+    cut = max(0, max_len - 12)
+    return txt[:cut] + " ...TRUNC..."
 
 
 def _parse_list_like(v: Any) -> List[str]:
@@ -333,7 +340,6 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")),
         "APP_TOKEN_SET": bool(str(_get(settings, env_mod, "APP_TOKEN", "") or "").strip()),
         "BACKUP_APP_TOKEN_SET": bool(str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "").strip()),
-        # Helpful flags for engine behavior (reported only)
         "ENABLE_YAHOO_CHART_KSA": str(os.getenv("ENABLE_YAHOO_CHART_KSA", "")),
         "ENABLE_YAHOO_CHART_SUPPLEMENT": str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "")),
         "ENABLE_YFINANCE_KSA": str(os.getenv("ENABLE_YFINANCE_KSA", "")),
@@ -363,28 +369,16 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     return routers, required
 
 
-# -----------------------------------------------------------------------------
-# Provider Defaults (YOUR REQUIREMENT)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Provider Defaults (applied EARLY)
+# ---------------------------------------------------------------------
 def _apply_provider_defaults_if_missing() -> None:
     """
-    Enforce your intended priority WITHOUT overriding explicit env values.
-
-    GLOBAL priority:
-      ENABLED_PROVIDERS="eodhd,finnhub,fmp"  (EODHD primary)
-
-    KSA priority:
-      KSA_PROVIDERS="yahoo_chart,tadawul,argaam"  (Yahoo Chart primary)
-
-    Also sets sane defaults for robustness if not set:
-      ENABLE_YAHOO_CHART_KSA=true
-      ENABLE_YAHOO_CHART_SUPPLEMENT=true
-      ENABLE_YFINANCE_KSA=false   (keep KSA yfinance OFF unless explicitly enabled)
+    Enforce intended priority WITHOUT overriding explicit env values.
     """
     # GLOBAL
     if not (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS")):
         os.environ["ENABLED_PROVIDERS"] = "eodhd,finnhub,fmp"
-        # keep PROVIDERS aligned as a backup (some configs read PROVIDERS)
         os.environ.setdefault("PROVIDERS", os.environ["ENABLED_PROVIDERS"])
 
     # KSA
@@ -398,6 +392,7 @@ def _apply_provider_defaults_if_missing() -> None:
 
 
 def _init_engine_best_effort(app_: FastAPI) -> None:
+    # Prefer v2
     try:
         mod = import_module("core.data_engine_v2")
         Engine = getattr(mod, "DataEngine", None)
@@ -407,10 +402,11 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             app_.state.engine_error = None
             logger.info("Engine initialized (DataEngine v2).")
             return
-    except Exception as e:
+    except Exception:
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(e)
+        app_.state.engine_error = _clamp_str(traceback.format_exc())
 
+    # Fallback legacy
     try:
         mod = import_module("core.data_engine")
         Engine = getattr(mod, "DataEngine", None)
@@ -420,9 +416,9 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             app_.state.engine_error = None
             logger.info("Engine initialized (legacy DataEngine).")
             return
-    except Exception as e:
+    except Exception:
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(e)
+        app_.state.engine_error = _clamp_str(traceback.format_exc())
 
 
 def _mount_all_routers(app_: FastAPI) -> None:
@@ -467,7 +463,7 @@ async def _maybe_close_engine(app_: FastAPI) -> None:
 
 
 def create_app() -> FastAPI:
-    # Apply provider defaults EARLY so engines see the intended routing.
+    # Apply provider defaults EARLY so engines/routers see intended routing.
     _apply_provider_defaults_if_missing()
 
     settings, settings_source = _try_load_settings()
@@ -552,6 +548,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Optional rate limiting (won’t crash if slowapi missing)
     enable_rl = _feature_enabled(settings, env_mod, "ENABLE_RATE_LIMITING", True)
     if enable_rl:
         try:
@@ -611,6 +608,8 @@ def create_app() -> FastAPI:
         enabled, ksa = _providers_from_settings(settings, env_mod)
         mounted = [r for r in getattr(app_.state, "mount_report", []) if r.get("mounted")]
         failed = [r for r in getattr(app_.state, "mount_report", []) if not r.get("mounted")]
+        boot_task = getattr(app_.state, "boot_task", None)
+
         return {
             "status": "ok",
             "app": app_.title,
@@ -623,6 +622,7 @@ def create_app() -> FastAPI:
             "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
             "engine_error": getattr(app_.state, "engine_error", None),
+            "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "routers_mounted": [m["name"] for m in mounted],
             "routers_failed": [
                 {"name": f["name"], "loaded_from": f.get("loaded_from"), "error": _clamp_str(f.get("error") or "", 2000)}
@@ -647,5 +647,5 @@ def create_app() -> FastAPI:
     return app_
 
 
+# Uvicorn entrypoint: "main:app"
 app = create_app()
-```
