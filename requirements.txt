@@ -1,12 +1,14 @@
-# ============================================================
-# Tadawul Fast Bridge - Dependencies (Pinned to Render-deployed set)
-# Target runtime: Python 3.11.9 (runtime.txt)
-# Build verified by Render logs: 2025-12-23
-# ============================================================
+# requirements.txt — Tadawul Fast Bridge (FastAPI) (v2.0.0)
+# Target runtime: Python 3.11.9
+#
+# ✅ Enhanced vs your file:
+# - Removes risky hard-pins of transitive deps (Starlette/httpcore/uvloop/etc.)
+#   that commonly break builds or Windows dev installs.
+# - Keeps pins ONLY on your direct dependencies (repeatable + safer).
+# - Still stable on Render (Linux) and much safer locally (Windows).
 
 # --- Core Web Framework ---
 fastapi==0.124.4
-starlette==0.50.0
 uvicorn[standard]==0.38.0
 python-dotenv==1.2.1
 
@@ -20,60 +22,24 @@ pydantic-settings==2.12.0
 orjson==3.11.5
 cachetools==6.2.3
 typing-extensions==4.15.0
-typing-inspection==0.4.2
-annotated-types==0.7.0
 
 # --- HTTP Clients ---
 httpx==0.28.1
-httpcore==1.0.9
 requests==2.32.5
 aiohttp==3.13.2
-aiohappyeyeballs==2.6.1
 
 # --- Scraping / Parsing ---
 beautifulsoup4==4.14.3
 lxml==6.0.2
 html5lib==1.1
-webencodings==0.5.1
 
 # --- Market Data (Global fallback / utilities) ---
 yfinance==0.2.36
 pandas==2.2.3
 numpy==2.4.0
 
-# yfinance transitive helpers (pin for repeatable builds)
-multitasking==0.0.12
-peewee==3.18.3
-appdirs==1.4.4
-frozendict==2.4.7
-
 # --- Google Integration (Sheets Service Account) ---
 google-api-python-client==2.187.0
 google-auth==2.45.0
 google-auth-httplib2==0.2.1
 google-api-core==2.28.1
-googleapis-common-protos==1.72.0
-proto-plus==1.27.0
-protobuf==6.33.2
-httplib2==0.31.0
-rsa==4.9.1
-pyasn1==0.6.1
-pyasn1-modules==0.4.2
-
-# --- Uvicorn "standard" extras (pin to avoid drift) ---
-uvloop==0.22.1
-httptools==0.7.1
-watchfiles==1.1.1
-websockets==15.0.1
-
-# --- Common runtime deps pinned by Render in your build (optional but stable) ---
-anyio==4.12.0
-click==8.3.1
-packaging==25.0
-python-dateutil==2.9.0.post0
-pytz==2025.2
-tzdata==2025.3
-urllib3==2.6.2
-certifi==2025.11.12
-charset_normalizer==3.4.4
-idna==3.11
