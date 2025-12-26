@@ -1,17 +1,18 @@
 # Procfile — Tadawul Fast Bridge (FastAPI)
-# Render compatible — PROD SAFE (v1.2.0)
+# Render compatible — PROD SAFE (v1.3.0)
 # ------------------------------------------------------------
-# Key fixes vs v1.1:
-# - Ensures LOG_LEVEL is always lowercase (uvicorn requires lowercase values)
-# - Makes workers optional: only set when WEB_CONCURRENCY > 1 (avoids reload-like issues)
-# - Keeps deterministic "exec" startup
-# - Uses Render-friendly proxy headers
-# - Keeps keep-alive configurable
+# Key guarantees:
+# - LOG_LEVEL always lowercased (uvicorn expects lowercase)
+# - WORKERS only applied if WEB_CONCURRENCY > 1
+# - Deterministic "exec" startup
+# - Render-friendly proxy headers
+# - Keep-alive configurable
 #
 # Recommended Render env:
 #   WEB_CONCURRENCY=1
 #   UVICORN_KEEPALIVE=75
 #   LOG_LEVEL=info
+#   HEALTH_CHECK_PATH=/healthz  (Render UI setting)
 # ------------------------------------------------------------
 
 web: sh -c 'LOG_LEVEL_LC="$(echo "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")"; if [ "${WEB_CONCURRENCY:-1}" -gt 1 ]; then WORKERS="--workers ${WEB_CONCURRENCY}"; else WORKERS=""; fi; exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}" --proxy-headers --forwarded-allow-ips "*" --lifespan on --timeout-keep-alive "${UVICORN_KEEPALIVE:-75}" --log-level "$LOG_LEVEL_LC" $WORKERS --no-server-header'
