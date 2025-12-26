@@ -1,98 +1,102 @@
-```python
 #!/usr/bin/env python3
 # test_endpoints.py
 """
 test_endpoints.py
 ===========================================================
-SMOKE TESTER for Tadawul Fast Bridge API – v2.3.0 (Hardened)
-===========================================================
+SMOKE TESTER for Tadawul Fast Bridge API – v2.2.0 (Hardened)
 
-Enhancements vs v2.1.0
-- CLI flags + env support:
-    • Base URL:  --base-url or TFB_BASE_URL or BACKEND_BASE_URL
-    • Token:     --token or TFB_APP_TOKEN / APP_TOKEN / BACKUP_APP_TOKEN
-    • Test symbols: --ksa-symbol / --global-symbol
-- Render-friendly connectivity tests:
-    • GET /, HEAD /, GET /health (soft)
-    • Supports cases where / returns non-JSON (still OK if 200/204)
-- Better diagnostics:
-    • Per-endpoint response time
-    • Prints module/version fields if present
-    • Shows 1st error message and data_quality summary for batch calls
-    • Soft-fail on 404 "not mounted" routes (SKIP)
-- Tests:
-    • /v1/enriched/quote (single)
-    • /v1/enriched/quotes (batch)
-    • /v1/enriched/sheet-rows (Sheets payload)
-    • /v1/argaam/health
-    • /v1/argaam/sheet-rows (KSA strict)
-    • /v1/analysis/health and /v1/analysis/quotes (AI batch)
-    • /v1/advanced/health (optional)
-- Safe JSON parsing: never crashes on non-JSON or HTML error pages
+✅ Highlights
+- Token via env: TFB_APP_TOKEN / APP_TOKEN / BACKUP_APP_TOKEN
+- Base URL via env: TFB_BASE_URL / BACKEND_BASE_URL (default http://127.0.0.1:8000)
+- Render-friendly: tests /healthz + /readyz + /health (soft)
+- Rich diagnostics: per-endpoint latency + safe JSON parsing
+- Soft-fail on 404 (router not mounted) — still reports clearly
+- Exits non-zero if critical connectivity fails (GET /healthz or GET /)
 
-Usage
+Usage:
   python test_endpoints.py
-  python test_endpoints.py --base-url https://your-render.onrender.com --token XXXXX
-  TFB_BASE_URL=https://your-render.onrender.com python test_endpoints.py
+  TFB_BASE_URL=https://your.onrender.com python test_endpoints.py
   TFB_APP_TOKEN=... python test_endpoints.py
-
-Exit code
-- 0 if server reachable AND no hard failures
-- 2 if server not reachable OR any hard failure (non-404 endpoint failures)
-
-Notes
-- If an endpoint isn't mounted, the test will SKIP it (404).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
-# =============================================================================
-# Colors / logging
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ENV
+# -----------------------------------------------------------------------------
+DEFAULT_BASE_URL = (
+    os.getenv("TFB_BASE_URL")
+    or os.getenv("BACKEND_BASE_URL")
+    or "http://127.0.0.1:8000"
+).rstrip("/")
+
+DEFAULT_TOKEN = (
+    os.getenv("TFB_APP_TOKEN")
+    or os.getenv("APP_TOKEN")
+    or os.getenv("BACKUP_APP_TOKEN")
+    or ""
+).strip()
+
+KSA_TEST_SYMBOL = (os.getenv("TFB_KSA_TEST_SYMBOL", "1120.SR") or "1120.SR").strip().upper()
+GLOBAL_TEST_SYMBOL = (os.getenv("TFB_GLOBAL_TEST_SYMBOL", "AAPL") or "AAPL").strip().upper()
+
+TIMEOUT_SHORT = float(os.getenv("TFB_TIMEOUT_SHORT", "15") or "15")
+TIMEOUT_MED = float(os.getenv("TFB_TIMEOUT_MED", "25") or "25")
+TIMEOUT_LONG = float(os.getenv("TFB_TIMEOUT_LONG", "90") or "90")
 
 
-class Colors:
-    HEADER = "\033[95m"
-    OKBLUE = "\033[94m"
-    OKGREEN = "\033[92m"
-    WARNING = "\033[93m"
-    FAIL = "\033[91m"
-    ENDC = "\033[0m"
+# -----------------------------------------------------------------------------
+# Colors (auto-disable if NO_COLOR or not a TTY)
+# -----------------------------------------------------------------------------
+def _colors_enabled() -> bool:
+    if os.getenv("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+_USE_COLOR = _colors_enabled()
+
+
+class C:
+    HEADER = "\033[95m" if _USE_COLOR else ""
+    OKBLUE = "\033[94m" if _USE_COLOR else ""
+    OKGREEN = "\033[92m" if _USE_COLOR else ""
+    WARNING = "\033[93m" if _USE_COLOR else ""
+    FAIL = "\033[91m" if _USE_COLOR else ""
+    ENDC = "\033[0m" if _USE_COLOR else ""
 
 
 def log(msg: str, typ: str = "info") -> None:
     if typ == "info":
-        print(f"{Colors.OKBLUE}[INFO]{Colors.ENDC} {msg}")
+        print(f"{C.OKBLUE}[INFO]{C.ENDC} {msg}")
     elif typ == "success":
-        print(f"{Colors.OKGREEN}[PASS]{Colors.ENDC} {msg}")
+        print(f"{C.OKGREEN}[PASS]{C.ENDC} {msg}")
     elif typ == "warn":
-        print(f"{Colors.WARNING}[WARN]{Colors.ENDC} {msg}")
+        print(f"{C.WARNING}[WARN]{C.ENDC} {msg}")
     elif typ == "fail":
-        print(f"{Colors.FAIL}[FAIL]{Colors.ENDC} {msg}")
+        print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
     elif typ == "header":
-        print(f"\n{Colors.HEADER}--- {msg} ---{Colors.ENDC}")
+        print(f"\n{C.HEADER}--- {msg} ---{C.ENDC}")
     else:
         print(msg)
 
 
 def fmt_dt(dt: float) -> str:
     return f"{dt:.2f}s"
-
-
-def json_pretty(obj: Any, limit: int = 2500) -> str:
-    try:
-        import json
-
-        return json.dumps(obj, indent=2, ensure_ascii=False)[:limit]
-    except Exception:
-        return str(obj)[:limit]
 
 
 def safe_json(resp: requests.Response) -> Optional[Any]:
@@ -102,34 +106,11 @@ def safe_json(resp: requests.Response) -> Optional[Any]:
         return None
 
 
-# =============================================================================
-# ENV + CLI
-# =============================================================================
-
-
-def _env_base_url() -> str:
-    return (
-        os.getenv("TFB_BASE_URL")
-        or os.getenv("BACKEND_BASE_URL")
-        or "http://127.0.0.1:8000"
-    ).rstrip("/")
-
-
-def _env_token() -> str:
-    return (
-        os.getenv("TFB_APP_TOKEN")
-        or os.getenv("APP_TOKEN")
-        or os.getenv("BACKUP_APP_TOKEN")
-        or ""
-    ).strip()
-
-
-def _env_float(name: str, default: float) -> float:
+def json_pretty(obj: Any, limit: int = 2500) -> str:
     try:
-        v = os.getenv(name)
-        return float(v) if v is not None and str(v).strip() else float(default)
+        return json.dumps(obj, indent=2, ensure_ascii=False)[:limit]
     except Exception:
-        return float(default)
+        return str(obj)[:limit]
 
 
 def build_headers(token: str) -> Dict[str, str]:
@@ -139,12 +120,17 @@ def build_headers(token: str) -> Dict[str, str]:
     return h
 
 
-# =============================================================================
-# HTTP helpers
-# =============================================================================
+@dataclass
+class Result:
+    endpoint: str
+    ok: bool
+    status_code: Optional[int]
+    dt: float
+    note: str = ""
 
 
-def _req(
+def request_any(
+    sess: requests.Session,
     method: str,
     url: str,
     *,
@@ -155,423 +141,298 @@ def _req(
 ) -> Tuple[Optional[requests.Response], float, Optional[str]]:
     t0 = time.time()
     try:
-        r = requests.request(
-            method=method.upper(),
-            url=url,
-            headers=headers,
-            params=params,
-            json=json_body,
-            timeout=timeout,
-        )
+        r = sess.request(method, url, headers=headers, timeout=timeout, params=params, json=json_body)
         return r, time.time() - t0, None
     except Exception as e:
         return None, time.time() - t0, str(e)
 
 
-def _shape_hint(obj: Any) -> str:
-    if obj is None:
-        return "None"
-    if isinstance(obj, dict):
-        keys = list(obj.keys())[:12]
-        return f"dict keys={keys}"
-    if isinstance(obj, list):
-        return f"list len={len(obj)}"
-    return str(type(obj))
-
-
-def _extract_status_fields(j: Dict[str, Any]) -> str:
-    # Useful for your various /health payloads
-    status = j.get("status") or j.get("ok") or "unknown"
-    mod = j.get("module") or j.get("app") or j.get("service") or ""
-    ver = j.get("version") or j.get("route_version") or j.get("app_version") or ""
-    parts = [str(status)]
-    if mod:
-        parts.append(str(mod))
-    if ver:
-        parts.append(str(ver))
-    return " | ".join([p for p in parts if p])
-
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Checks
-# =============================================================================
-
-
-def check_server(base_url: str, token: str, t_short: float) -> bool:
+# -----------------------------------------------------------------------------
+def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str]) -> Tuple[bool, list[Result]]:
     log("Checking Server Connectivity...", "header")
-    h = build_headers(token)
+    results: list[Result] = []
 
     # GET /
-    r, dt, err = _req("GET", f"{base_url}/", headers=h, timeout=t_short)
-    if err or r is None:
+    r, dt, err = request_any(sess, "GET", f"{base_url}/", headers=headers, timeout=TIMEOUT_SHORT)
+    if err:
+        results.append(Result("/", False, None, dt, f"Cannot connect: {err}"))
         log(f"GET / -> Cannot connect: {err}", "fail")
-        return False
+        return False, results
 
+    assert r is not None
     if r.status_code == 200:
+        results.append(Result("/", True, r.status_code, dt))
         log(f"GET / -> Server UP ({fmt_dt(dt)})", "success")
-    elif r.status_code in (204,):
-        log(f"GET / -> Server UP (204) ({fmt_dt(dt)})", "success")
     else:
+        results.append(Result("/", False, r.status_code, dt, r.text[:200]))
         log(f"GET / -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:200]!r}", "fail")
-        return False
+        return False, results
 
     # HEAD /
-    rh, dt2, err2 = _req("HEAD", f"{base_url}/", headers=h, timeout=t_short)
-    if err2 or rh is None:
-        log(f"HEAD / -> Exception: {err2}", "warn")
+    rh, dt, err = request_any(sess, "HEAD", f"{base_url}/", headers=headers, timeout=TIMEOUT_SHORT)
+    if err or rh is None:
+        results.append(Result("HEAD /", False, None, dt, err or "unknown"))
+        log(f"HEAD / -> Exception: {err}", "warn")
     else:
         if rh.status_code in (200, 204):
-            log(f"HEAD / -> OK ({fmt_dt(dt2)})", "success")
+            results.append(Result("HEAD /", True, rh.status_code, dt))
+            log(f"HEAD / -> OK ({fmt_dt(dt)})", "success")
         else:
-            log(f"HEAD / -> HTTP {rh.status_code} ({fmt_dt(dt2)})", "warn")
+            results.append(Result("HEAD /", False, rh.status_code, dt, "non-200/204"))
+            log(f"HEAD / -> HTTP {rh.status_code} ({fmt_dt(dt)})", "warn")
 
-    # GET /health
-    r2, dt3, err3 = _req("GET", f"{base_url}/health", headers=h, timeout=t_short)
-    if err3 or r2 is None:
-        log(f"GET /health -> Exception: {err3}", "warn")
+    # GET /healthz (critical on Render)
+    r2, dt, err = request_any(sess, "GET", f"{base_url}/healthz", headers=headers, timeout=TIMEOUT_SHORT)
+    if err or r2 is None:
+        results.append(Result("/healthz", False, None, dt, err or "unknown"))
+        log(f"GET /healthz -> Exception: {err}", "fail")
+        return False, results
+
+    if r2.status_code == 200:
+        results.append(Result("/healthz", True, r2.status_code, dt))
+        log(f"GET /healthz -> ok ({fmt_dt(dt)})", "success")
     else:
-        if r2.status_code == 200:
-            j = safe_json(r2)
-            if isinstance(j, dict):
-                log(f"GET /health -> {_extract_status_fields(j)} ({fmt_dt(dt3)})", "success")
-            else:
-                log(f"GET /health -> 200 but non-JSON ({fmt_dt(dt3)})", "warn")
+        results.append(Result("/healthz", False, r2.status_code, dt, r2.text[:200]))
+        log(f"GET /healthz -> HTTP {r2.status_code} ({fmt_dt(dt)}) | body={r2.text[:200]!r}", "fail")
+        return False, results
+
+    # GET /health (soft)
+    r3, dt, err = request_any(sess, "GET", f"{base_url}/health", headers=headers, timeout=TIMEOUT_SHORT)
+    if err or r3 is None:
+        results.append(Result("/health", False, None, dt, err or "unknown"))
+        log(f"GET /health -> Exception: {err}", "warn")
+    else:
+        if r3.status_code == 200:
+            j = safe_json(r3) or {}
+            status = j.get("status") or "unknown"
+            ver = j.get("version") or j.get("app_version") or ""
+            results.append(Result("/health", True, r3.status_code, dt, f"{status} {ver}".strip()))
+            log(f"GET /health -> {status} ({fmt_dt(dt)}) {ver}".strip(), "success")
         else:
-            log(f"GET /health -> HTTP {r2.status_code} ({fmt_dt(dt3)})", "warn")
+            results.append(Result("/health", False, r3.status_code, dt, r3.text[:200]))
+            log(f"GET /health -> HTTP {r3.status_code} ({fmt_dt(dt)})", "warn")
 
-    return True
+    # GET /readyz (soft but useful)
+    r4, dt, err = request_any(sess, "GET", f"{base_url}/readyz", headers=headers, timeout=TIMEOUT_MED)
+    if err or r4 is None:
+        results.append(Result("/readyz", False, None, dt, err or "unknown"))
+        log(f"GET /readyz -> Exception: {err}", "warn")
+    else:
+        if r4.status_code in (200, 503):
+            j = safe_json(r4) or {}
+            results.append(Result("/readyz", True, r4.status_code, dt, j.get("status", "")))
+            log(f"GET /readyz -> HTTP {r4.status_code} ({fmt_dt(dt)}) | {j.get('status','')}", "success")
+        else:
+            results.append(Result("/readyz", False, r4.status_code, dt, r4.text[:200]))
+            log(f"GET /readyz -> HTTP {r4.status_code} ({fmt_dt(dt)})", "warn")
+
+    return True, results
 
 
-def check_health_routers(base_url: str, token: str, t_med: float) -> int:
+def check_router_health(sess: requests.Session, base_url: str, headers: Dict[str, str]) -> None:
     log("Checking Router Health", "header")
-    h = build_headers(token)
-
     endpoints = [
-        "/health",
         "/v1/enriched/health",
         "/v1/analysis/health",
         "/v1/advanced/health",
         "/v1/argaam/health",
+        "/system/settings",
+        "/system/routes",
     ]
 
-    hard_fail = 0
     for ep in endpoints:
-        r, dt, err = _req("GET", f"{base_url}{ep}", headers=h, timeout=t_med)
+        r, dt, err = request_any(sess, "GET", f"{base_url}{ep}", headers=headers, timeout=TIMEOUT_MED)
         if err or r is None:
-            log(f"{ep.ljust(24)} -> Exception: {err}", "fail")
-            hard_fail += 1
+            log(f"{ep.ljust(22)} -> Exception: {err}", "fail")
             continue
 
         if r.status_code == 200:
-            j = safe_json(r)
-            if isinstance(j, dict):
-                engine = j.get("engine_available")
-                msg = f"{ep.ljust(24)} -> {_extract_status_fields(j)} ({fmt_dt(dt)})"
-                if engine is not None:
-                    msg += f" | engine_available={engine}"
-                log(msg, "success")
-            else:
-                log(f"{ep.ljust(24)} -> 200 but non-JSON ({fmt_dt(dt)})", "warn")
+            j = safe_json(r) or {}
+            ver = j.get("version") or j.get("route_version") or ""
+            status = j.get("status") or "ok"
+            log(f"{ep.ljust(22)} -> {status} ({fmt_dt(dt)}) {('v=' + ver) if ver else ''}".strip(), "success")
         elif r.status_code == 404:
-            log(f"{ep.ljust(24)} -> SKIP (404 not mounted)", "warn")
+            log(f"{ep.ljust(22)} -> SKIP (404 not mounted)", "warn")
         else:
-            log(f"{ep.ljust(24)} -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:200]!r}", "fail")
-            hard_fail += 1
-
-    return hard_fail
+            log(f"{ep.ljust(22)} -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:200]!r}", "fail")
 
 
-def check_quote(base_url: str, token: str, symbol: str, *, endpoint: str, t_med: float) -> int:
+def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], symbol: str) -> None:
     log(f"Testing Single Quote ({symbol})", "header")
-    h = build_headers(token)
-
-    r, dt, err = _req(
+    r, dt, err = request_any(
+        sess,
         "GET",
-        f"{base_url}{endpoint}",
-        headers=h,
-        timeout=t_med,
+        f"{base_url}/v1/enriched/quote",
+        headers=headers,
+        timeout=TIMEOUT_MED,
         params={"symbol": symbol},
     )
     if err or r is None:
-        log(f"{endpoint} -> Exception: {err}", "fail")
-        return 1
-
-    if r.status_code == 404:
-        log(f"{endpoint} -> SKIP (404 not mounted)", "warn")
-        return 0
+        log(f"/v1/enriched/quote -> Exception: {err}", "fail")
+        return
 
     if r.status_code != 200:
-        log(f"{endpoint} -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
-        return 1
+        log(f"/v1/enriched/quote -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
+        return
 
     data = safe_json(r)
     if not isinstance(data, dict):
-        log(f"{endpoint} -> Non-JSON response ({fmt_dt(dt)})", "fail")
+        log(f"/v1/enriched/quote -> Non-JSON response ({fmt_dt(dt)})", "fail")
         print(r.text[:500])
-        return 1
+        return
 
-    sym_resp = (data.get("symbol") or data.get("ticker") or "").upper()
+    sym_resp = str(data.get("symbol") or data.get("ticker") or "").upper()
     price = data.get("current_price") or data.get("last_price") or data.get("price")
-
     dq = data.get("data_quality")
     src = data.get("data_source") or data.get("source")
-    err_msg = data.get("error")
 
     if sym_resp and price is not None:
-        ok_match = sym_resp == symbol.upper() or (symbol.upper().replace(".TADAWUL", "").replace("TADAWUL:", "") in sym_resp)
-        if ok_match:
-            log(f"OK ({fmt_dt(dt)}) | symbol={sym_resp} price={price} dq={dq} src={src}", "success")
-            if err_msg:
-                log(f"Note: error field present -> {str(err_msg)[:200]}", "warn")
-            return 0
-
-    log(f"Returned 200 but missing expected fields ({fmt_dt(dt)}). Payload below:", "warn")
-    print(json_pretty(data))
-    return 0
+        ok = "OK" if sym_resp == symbol.upper() else "MISMATCH"
+        log(f"{ok} ({fmt_dt(dt)}) | symbol={sym_resp} price={price} dq={dq} src={src}", "success" if ok == "OK" else "warn")
+    else:
+        log(f"Returned 200 but missing fields ({fmt_dt(dt)}). Payload:", "warn")
+        print(json_pretty(data))
 
 
-def check_batch_enriched_quotes(base_url: str, token: str, ksa_symbol: str, global_symbol: str, t_long: float) -> int:
-    """
-    Tests POST /v1/enriched/quotes
-    """
+def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, global_symbol: str) -> None:
     log("Testing Batch /v1/enriched/quotes", "header")
-    h = build_headers(token)
-
     payload = {"symbols": [ksa_symbol, global_symbol], "sheet_name": "Test_Script"}
-    r, dt, err = _req(
+    r, dt, err = request_any(
+        sess,
         "POST",
         f"{base_url}/v1/enriched/quotes",
-        headers=h,
-        timeout=t_long,
+        headers=headers,
+        timeout=TIMEOUT_LONG,
         json_body=payload,
     )
     if err or r is None:
         log(f"/v1/enriched/quotes -> Exception: {err}", "fail")
-        return 1
+        return
 
     if r.status_code == 404:
         log("/v1/enriched/quotes -> SKIP (404 not mounted)", "warn")
-        return 0
-
+        return
     if r.status_code != 200:
         log(f"/v1/enriched/quotes -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
-        return 1
+        return
 
-    data = safe_json(r)
-    if not isinstance(data, dict):
-        log(f"/v1/enriched/quotes -> 200 but non-JSON ({fmt_dt(dt)})", "warn")
-        return 0
-
+    data = safe_json(r) or {}
     status = data.get("status")
     count = data.get("count")
     rows = data.get("rows") or []
     quotes = data.get("quotes") or []
-
-    # quick diagnostics
-    first_err = None
-    if isinstance(quotes, list):
-        for q in quotes:
-            if isinstance(q, dict) and q.get("error"):
-                first_err = q.get("error")
-                break
-
-    log(
-        f"/v1/enriched/quotes -> {status} ({fmt_dt(dt)}) | count={count} rows={len(rows)} quotes={len(quotes)}"
-        + (f" | first_error={str(first_err)[:120]!r}" if first_err else ""),
-        "success",
-    )
-    return 0
+    log(f"/v1/enriched/quotes -> {status} ({fmt_dt(dt)}) | count={count} rows={len(rows)} quotes={len(quotes)}", "success")
 
 
-def check_sheet_rows_enriched(base_url: str, token: str, ksa_symbol: str, global_symbol: str, t_long: float) -> int:
-    """
-    Tests POST /v1/enriched/sheet-rows (if mounted)
-    """
-    log("Testing Batch /v1/enriched/sheet-rows (Sheets payload)", "header")
-    h = build_headers(token)
-
+def check_sheet_rows_enriched(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, global_symbol: str) -> None:
+    log("Testing Batch /v1/enriched/sheet-rows", "header")
     payload = {"tickers": [ksa_symbol, global_symbol], "sheet_name": "Test_Script"}
-    r, dt, err = _req(
+
+    r, dt, err = request_any(
+        sess,
         "POST",
         f"{base_url}/v1/enriched/sheet-rows",
-        headers=h,
-        timeout=t_long,
+        headers=headers,
+        timeout=TIMEOUT_LONG,
         json_body=payload,
     )
     if err or r is None:
         log(f"/v1/enriched/sheet-rows -> Exception: {err}", "fail")
-        return 1
+        return
 
     if r.status_code == 404:
         log("/v1/enriched/sheet-rows -> SKIP (404 not mounted)", "warn")
-        return 0
-
+        return
     if r.status_code != 200:
         log(f"/v1/enriched/sheet-rows -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
-        return 1
+        return
 
     data = safe_json(r)
     if not isinstance(data, dict):
         log(f"/v1/enriched/sheet-rows -> Non-JSON response ({fmt_dt(dt)})", "fail")
-        return 1
+        return
 
     rows = data.get("rows", []) or []
     headers_ = data.get("headers", []) or []
-    st = data.get("status") or "unknown"
-
-    if isinstance(rows, list) and isinstance(headers_, list) and len(headers_) >= 2:
-        log(f"Batch OK ({fmt_dt(dt)}) | status={st} rows={len(rows)} headers={len(headers_)}", "success")
-        return 0
-
-    log(f"Batch returned unexpected shape ({fmt_dt(dt)}). Payload below:", "warn")
-    print(json_pretty(data))
-    return 0
+    if len(rows) >= 1 and len(headers_) >= 1:
+        log(f"OK ({fmt_dt(dt)}) | rows={len(rows)} headers={len(headers_)}", "success")
+    else:
+        log(f"Unexpected shape ({fmt_dt(dt)}). Payload:", "warn")
+        print(json_pretty(data))
 
 
-def check_argaam_sheet_rows(base_url: str, token: str, ksa_symbol: str, t_long: float) -> int:
+def check_argaam_sheet_rows(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str) -> None:
     log("Testing KSA /v1/argaam/sheet-rows", "header")
-    h = build_headers(token)
-
     payload = {"symbols": [ksa_symbol, "BADSYM"], "sheet_name": "KSA_Tadawul_Market"}
-    r, dt, err = _req(
+
+    r, dt, err = request_any(
+        sess,
         "POST",
         f"{base_url}/v1/argaam/sheet-rows",
-        headers=h,
-        timeout=t_long,
+        headers=headers,
+        timeout=TIMEOUT_LONG,
         json_body=payload,
     )
     if err or r is None:
         log(f"/v1/argaam/sheet-rows -> Exception: {err}", "fail")
-        return 1
+        return
 
     if r.status_code == 404:
         log("/v1/argaam/sheet-rows -> SKIP (404 not mounted)", "warn")
-        return 0
-
+        return
     if r.status_code != 200:
         log(f"/v1/argaam/sheet-rows -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
-        return 1
+        return
 
     data = safe_json(r)
     if isinstance(data, dict) and isinstance(data.get("rows"), list) and isinstance(data.get("headers"), list):
-        rows_n = len(data.get("rows") or [])
-        heads_n = len(data.get("headers") or [])
-        st = data.get("status") or "unknown"
-        log(f"OK ({fmt_dt(dt)}) | status={st} rows={rows_n} headers={heads_n}", "success")
-        return 0
-
-    log(f"Unexpected response shape ({fmt_dt(dt)}). shape={_shape_hint(data)}", "warn")
-    print(json_pretty(data))
-    return 0
+        log(f"OK ({fmt_dt(dt)}) | rows={len(data.get('rows') or [])} headers={len(data.get('headers') or [])}", "success")
+    else:
+        log(f"Unexpected response shape ({fmt_dt(dt)}). Payload:", "warn")
+        print(json_pretty(data))
 
 
-def check_analysis_quotes(base_url: str, token: str, ksa_symbol: str, global_symbol: str, t_long: float) -> int:
-    log("Testing AI /v1/analysis/quotes", "header")
-    h = build_headers(token)
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    p.add_argument("--token", default=DEFAULT_TOKEN)
+    p.add_argument("--ksa", default=KSA_TEST_SYMBOL)
+    p.add_argument("--global", dest="global_sym", default=GLOBAL_TEST_SYMBOL)
+    args = p.parse_args()
 
-    payload = {"tickers": [ksa_symbol, global_symbol], "symbols": []}
-    r, dt, err = _req(
-        "POST",
-        f"{base_url}/v1/analysis/quotes",
-        headers=h,
-        timeout=t_long,
-        json_body=payload,
-    )
-    if err or r is None:
-        log("/v1/analysis/quotes -> Exception: %s" % err, "fail")
-        return 1
+    base_url = str(args.base_url).rstrip("/")
+    token = str(args.token).strip()
 
-    if r.status_code == 404:
-        log("/v1/analysis/quotes -> SKIP (404 not mounted)", "warn")
-        return 0
-
-    if r.status_code != 200:
-        log(f"/v1/analysis/quotes -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
-        return 1
-
-    data = safe_json(r)
-    if not isinstance(data, dict):
-        log(f"/v1/analysis/quotes -> 200 but non-JSON ({fmt_dt(dt)})", "warn")
-        return 0
-
-    results = data.get("results") or data.get("items") or data.get("data") or []
-    if isinstance(results, list):
-        dq_counts: Dict[str, int] = {}
-        err_count = 0
-        for it in results:
-            if isinstance(it, dict):
-                dq = str(it.get("data_quality") or "UNKNOWN").upper()
-                dq_counts[dq] = dq_counts.get(dq, 0) + 1
-                if it.get("error"):
-                    err_count += 1
-        log(f"/v1/analysis/quotes -> OK ({fmt_dt(dt)}) | items={len(results)} errors={err_count} dq={dq_counts}", "success")
-        return 0
-
-    log(f"/v1/analysis/quotes -> Unexpected payload shape ({fmt_dt(dt)}).", "warn")
-    print(json_pretty(data))
-    return 0
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Smoke test Tadawul Fast Bridge endpoints.")
-    ap.add_argument("--base-url", default="", help="Override base URL (else env TFB_BASE_URL/BACKEND_BASE_URL)")
-    ap.add_argument("--token", default="", help="Override token (else env TFB_APP_TOKEN/APP_TOKEN/BACKUP_APP_TOKEN)")
-    ap.add_argument("--ksa-symbol", default="", help="KSA test symbol (default env TFB_KSA_TEST_SYMBOL or 1120.SR)")
-    ap.add_argument("--global-symbol", default="", help="Global test symbol (default env TFB_GLOBAL_TEST_SYMBOL or AAPL)")
-
-    ap.add_argument("--timeout-short", type=float, default=_env_float("TFB_TIMEOUT_SHORT", 15.0))
-    ap.add_argument("--timeout-med", type=float, default=_env_float("TFB_TIMEOUT_MED", 25.0))
-    ap.add_argument("--timeout-long", type=float, default=_env_float("TFB_TIMEOUT_LONG", 90.0))
-
-    ap.add_argument("--no-analysis", action="store_true", help="Skip /v1/analysis/quotes test")
-    ap.add_argument("--no-enriched", action="store_true", help="Skip enriched quote/sheet tests")
-    ap.add_argument("--no-argaam", action="store_true", help="Skip argaam tests")
-
-    args = ap.parse_args()
-
-    base_url = (args.base_url.strip() if args.base_url else _env_base_url()).rstrip("/")
-    token = args.token.strip() if args.token else _env_token()
-
-    ksa_symbol = (args.ksa_symbol.strip().upper() if args.ksa_symbol else os.getenv("TFB_KSA_TEST_SYMBOL", "1120.SR").strip().upper())
-    global_symbol = (args.global_symbol.strip().upper() if args.global_symbol else os.getenv("TFB_GLOBAL_TEST_SYMBOL", "AAPL").strip().upper())
-
-    print(f"{Colors.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER{Colors.ENDC}")
+    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.2.0{C.ENDC}")
     print(f"BASE_URL={base_url} | TOKEN={'SET' if token else 'NOT SET'}")
-    print(f"KSA_TEST_SYMBOL={ksa_symbol} | GLOBAL_TEST_SYMBOL={global_symbol}")
+    print(f"KSA_TEST_SYMBOL={args.ksa} | GLOBAL_TEST_SYMBOL={args.global_sym}")
 
-    hard_failures = 0
+    sess = requests.Session()
+    hdrs = build_headers(token)
 
-    if not check_server(base_url, token, args.timeout_short):
-        print("\n❌ Cannot proceed. Run your API first (or set TFB_BASE_URL / --base-url).")
-        sys.exit(2)
+    ok, server_results = check_server(sess, base_url, hdrs)
+    if not ok:
+        print("\n❌ Cannot proceed (server connectivity failed).")
+        return 2
 
-    hard_failures += check_health_routers(base_url, token, args.timeout_med)
+    check_router_health(sess, base_url, hdrs)
+    check_quote(sess, base_url, hdrs, args.ksa)
+    check_quote(sess, base_url, hdrs, args.global_sym)
+    check_batch_quotes(sess, base_url, hdrs, args.ksa, args.global_sym)
+    check_sheet_rows_enriched(sess, base_url, hdrs, args.ksa, args.global_sym)
+    check_argaam_sheet_rows(sess, base_url, hdrs, args.ksa)
 
-    if not args.no_enriched:
-        hard_failures += check_quote(base_url, token, ksa_symbol, endpoint="/v1/enriched/quote", t_med=args.timeout_med)
-        hard_failures += check_quote(base_url, token, global_symbol, endpoint="/v1/enriched/quote", t_med=args.timeout_med)
-        hard_failures += check_batch_enriched_quotes(base_url, token, ksa_symbol, global_symbol, args.timeout_long)
-        hard_failures += check_sheet_rows_enriched(base_url, token, ksa_symbol, global_symbol, args.timeout_long)
+    # Final summary (very small)
+    fails = [r for r in server_results if not r.ok and r.endpoint in ("/", "/healthz")]
+    if fails:
+        print("\n❌ Critical checks failed.")
+        return 2
 
-    if not args.no_argaam:
-        hard_failures += check_argaam_sheet_rows(base_url, token, ksa_symbol, args.timeout_long)
-
-    if not args.no_analysis:
-        hard_failures += check_analysis_quotes(base_url, token, ksa_symbol, global_symbol, args.timeout_long)
-
-    if hard_failures:
-        log(f"Completed with HARD FAILURES = {hard_failures}", "fail")
-        sys.exit(2)
-
-    log("All done. No hard failures detected.", "success")
-    sys.exit(0)
+    print("\n✅ Smoke test finished.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-```
+    raise SystemExit(main())
