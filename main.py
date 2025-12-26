@@ -1,15 +1,18 @@
-# main.py  (FULL REPLACEMENT)
+```python
+# main.py
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.2
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.3
 
-Fix in v5.0.2
-- ✅ Version is NO LONGER "stuck" by env.py defaults.
-- ✅ Version resolution order:
-    1) Render ENV (SERVICE_VERSION / APP_VERSION / VERSION / RELEASE)  [os.getenv ONLY]
-    2) Render commit short hash (RENDER_GIT_COMMIT / GIT_COMMIT)
-    3) settings/env.py fallback (version/app_version)
+v5.0.3 improvements (aligned with your requirements)
+- ✅ Enforces DEFAULT provider priority (only if env not set):
+    • GLOBAL: EODHD first  -> ENABLED_PROVIDERS="eodhd,finnhub,fmp"
+    • KSA: Yahoo Chart first -> KSA_PROVIDERS="yahoo_chart,tadawul,argaam"
+- ✅ Keeps your v5.0.2 version-resolution order unchanged (ENV-only first)
+- ✅ Avoids "missing data" symptoms by:
+    • ensuring engines see consistent provider defaults early (before engine init)
+    • keeping routers PROD-safe with deferred mount option
 """
 
 from __future__ import annotations
@@ -69,7 +72,7 @@ except Exception:
 
 logger = logging.getLogger("main")
 
-APP_ENTRY_VERSION = "5.0.2"
+APP_ENTRY_VERSION = "5.0.3"
 
 
 def _clamp_str(s: Any, max_len: int = 2000) -> str:
@@ -330,6 +333,10 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")),
         "APP_TOKEN_SET": bool(str(_get(settings, env_mod, "APP_TOKEN", "") or "").strip()),
         "BACKUP_APP_TOKEN_SET": bool(str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "").strip()),
+        # Helpful flags for engine behavior (reported only)
+        "ENABLE_YAHOO_CHART_KSA": str(os.getenv("ENABLE_YAHOO_CHART_KSA", "")),
+        "ENABLE_YAHOO_CHART_SUPPLEMENT": str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "")),
+        "ENABLE_YFINANCE_KSA": str(os.getenv("ENABLE_YFINANCE_KSA", "")),
     }
 
 
@@ -354,6 +361,40 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     if adv_enabled:
         required.append("advanced_analysis")
     return routers, required
+
+
+# -----------------------------------------------------------------------------
+# Provider Defaults (YOUR REQUIREMENT)
+# -----------------------------------------------------------------------------
+def _apply_provider_defaults_if_missing() -> None:
+    """
+    Enforce your intended priority WITHOUT overriding explicit env values.
+
+    GLOBAL priority:
+      ENABLED_PROVIDERS="eodhd,finnhub,fmp"  (EODHD primary)
+
+    KSA priority:
+      KSA_PROVIDERS="yahoo_chart,tadawul,argaam"  (Yahoo Chart primary)
+
+    Also sets sane defaults for robustness if not set:
+      ENABLE_YAHOO_CHART_KSA=true
+      ENABLE_YAHOO_CHART_SUPPLEMENT=true
+      ENABLE_YFINANCE_KSA=false   (keep KSA yfinance OFF unless explicitly enabled)
+    """
+    # GLOBAL
+    if not (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS")):
+        os.environ["ENABLED_PROVIDERS"] = "eodhd,finnhub,fmp"
+        # keep PROVIDERS aligned as a backup (some configs read PROVIDERS)
+        os.environ.setdefault("PROVIDERS", os.environ["ENABLED_PROVIDERS"])
+
+    # KSA
+    if not os.getenv("KSA_PROVIDERS"):
+        os.environ["KSA_PROVIDERS"] = "yahoo_chart,tadawul,argaam"
+
+    # Robust defaults (do not override if user already set)
+    os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
+    os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
+    os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
 
 
 def _init_engine_best_effort(app_: FastAPI) -> None:
@@ -426,6 +467,9 @@ async def _maybe_close_engine(app_: FastAPI) -> None:
 
 
 def create_app() -> FastAPI:
+    # Apply provider defaults EARLY so engines see the intended routing.
+    _apply_provider_defaults_if_missing()
+
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
 
@@ -480,7 +524,7 @@ def create_app() -> FastAPI:
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
         logger.info("   Env: %s | Version: %s | Entry: %s", app_env, version, APP_ENTRY_VERSION)
-        logger.info("   Providers: %s", ",".join(enabled) if enabled else "(not set)")
+        logger.info("   Providers (GLOBAL): %s", ",".join(enabled) if enabled else "(not set)")
         logger.info("   KSA Providers: %s", ",".join(ksa) if ksa else "(not set)")
         logger.info("   Required routers: %s", ",".join(app_.state.required_routers))
         logger.info("   CORS allow origins: %s", "ALL (*)" if allow_origins == ["*"] else str(allow_origins))
@@ -595,9 +639,13 @@ def create_app() -> FastAPI:
     async def system_secrets():
         app_token = str(_get(settings, env_mod, "APP_TOKEN", "") or "")
         backup_token = str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "")
-        return {"APP_TOKEN": _mask(app_token, keep=4) if app_token else "", "BACKUP_APP_TOKEN": _mask(backup_token, keep=4) if backup_token else ""}
+        return {
+            "APP_TOKEN": _mask(app_token, keep=4) if app_token else "",
+            "BACKUP_APP_TOKEN": _mask(backup_token, keep=4) if backup_token else "",
+        }
 
     return app_
 
 
 app = create_app()
+```
