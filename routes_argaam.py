@@ -1,8 +1,9 @@
+```python
 # routes_argaam.py  (REPO ROOT SHIM)  - FULL REPLACEMENT
 """
 routes_argaam.py (repo root shim)
 ------------------------------------------------------------
-Argaam Router Shim – v1.2.0 (PROD SAFE)
+Argaam Router Shim – v1.3.0 (PROD SAFE)
 
 Purpose
 - Keep backward compatibility for deployments that import `routes_argaam.router`
@@ -10,7 +11,7 @@ Purpose
 - Delegate to the real package router: `routes.routes_argaam.router`
   (your v3.2.x implementation).
 - If delegation fails for any reason, expose a minimal fallback router that
-  returns 200 + error payload (never crashes app startup).
+  returns HTTP 200 + error payload (never crashes app startup).
 
 Design rules
 - Very small surface area.
@@ -25,11 +26,15 @@ from typing import Any, Optional
 
 logger = logging.getLogger("routes.argaam_shim")
 
-SHIM_VERSION = "1.2.0"
+SHIM_VERSION = "1.3.0"
 DELEGATE_MODULE = "routes.routes_argaam"
 
 
 def _try_import_delegate() -> Optional[Any]:
+    """
+    Try to import the real router from the packaged module.
+    Never raises.
+    """
     try:
         import importlib
 
@@ -39,6 +44,7 @@ def _try_import_delegate() -> Optional[Any]:
             raise AttributeError(f"{DELEGATE_MODULE}.router not found")
         return r
     except Exception as exc:
+        # IMPORTANT: never crash startup; log exception for diagnostics
         logger.exception("[argaam_shim] Failed to import delegate router from %s: %s", DELEGATE_MODULE, exc)
         return None
 
@@ -48,6 +54,7 @@ _delegate_router = _try_import_delegate()
 if _delegate_router is not None:
     # ✅ Happy path: expose the real router
     router = _delegate_router  # type: ignore
+
 else:
     # -------------------------------------------------------------------------
     # Fallback router: do not block startup; return informative error payloads.
@@ -68,11 +75,10 @@ else:
 
     @router.get("/quote")
     async def _shim_quote(
-        symbol: str = Query(...),
+        symbol: str = Query(..., description="Ticker symbol, e.g., 1120.SR"),
         x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-        debug: int = Query(default=0),
+        debug: int = Query(default=0, description="If 1, returns additional debug info."),
     ) -> dict:
-        # Keep the response shape friendly for callers
         return {
             "symbol": (symbol or "").strip().upper(),
             "market": "KSA",
@@ -84,6 +90,26 @@ else:
             "debug": {"token_provided": bool((x_app_token or "").strip()), "debug": debug} if debug else None,
         }
 
-    __all__ = ["router"]
+    @router.post("/sheet-rows")
+    async def _shim_sheet_rows(
+        sheet_name: str = Query(default="KSA_Tadawul_Market"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        debug: int = Query(default=0),
+    ) -> dict:
+        """
+        Minimal stub for clients expecting /v1/argaam/sheet-rows.
+        Always returns HTTP 200 with error details (no crash).
+        """
+        return {
+            "status": "error",
+            "sheet_name": sheet_name,
+            "headers": [],
+            "rows": [],
+            "data_source": "shim_fallback",
+            "error": "Delegate router import failed (routes.routes_argaam). Cannot build sheet rows.",
+            "shim_version": SHIM_VERSION,
+            "debug": {"token_provided": bool((x_app_token or "").strip()), "debug": debug} if debug else None,
+        }
 
 __all__ = ["router", "SHIM_VERSION", "DELEGATE_MODULE"]
+```
