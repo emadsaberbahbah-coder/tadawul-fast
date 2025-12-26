@@ -1,12 +1,10 @@
-# ============================================================
 # render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names
-# Aligned with: main.py (v4.9.0), env.py (v4.7.0+), routes/*
+# PROD-SAFE + Backward-Compatible env var names (v4.10.0 aligned)
 # ============================================================
-# Notes:
-# - Keep startCommand stable and deterministic.
-# - Keep BOTH old + new batch env var keys to avoid breaking older modules.
-# - Secrets use sync:false (set in Render Dashboard).
+# Key upgrades vs your file:
+# - healthCheckPath uses /healthz (fast, always-up)
+# - startCommand matches Procfile logic (lowercase log level + workers only if >1)
+# - Adds KSA Yahoo Chart fallback toggles (safe defaults)
 # ============================================================
 
 services:
@@ -19,16 +17,16 @@ services:
     buildCommand: pip install -r requirements.txt
 
     startCommand: >
-      uvicorn main:app
-      --host 0.0.0.0
-      --port $PORT
-      --proxy-headers
-      --forwarded-allow-ips="*"
-      --timeout-keep-alive ${UVICORN_KEEPALIVE:-75}
-      --log-level ${LOG_LEVEL:-info}
-      --workers ${WEB_CONCURRENCY:-1}
+      sh -c 'LOG_LEVEL_LC="$(echo "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
+      if [ "${WEB_CONCURRENCY:-1}" -gt 1 ]; then WORKERS="--workers ${WEB_CONCURRENCY}"; else WORKERS=""; fi;
+      exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
+      --proxy-headers --forwarded-allow-ips="*"
+      --lifespan on
+      --timeout-keep-alive "${UVICORN_KEEPALIVE:-75}"
+      --log-level "$LOG_LEVEL_LC" $WORKERS
+      --no-server-header'
 
-    healthCheckPath: /health
+    healthCheckPath: /healthz
 
     envVars:
       # -------------------------
@@ -48,16 +46,23 @@ services:
         value: "false"
 
       # -------------------------
+      # Fast boot controls
+      # -------------------------
+      - key: DEFER_ROUTER_MOUNT
+        value: "true"
+      - key: INIT_ENGINE_ON_BOOT
+        value: "true"
+
+      # -------------------------
       # App identity
       # -------------------------
       - key: APP_NAME
         value: Tadawul Fast Bridge
       - key: APP_VERSION
-        value: "4.9.0"
+        value: "4.10.0"
       - key: APP_ENV
         value: production
 
-      # If your Sheets/clients call the same service, keep it explicit:
       - key: BACKEND_BASE_URL
         value: https://tadawul-fast-bridge.onrender.com
 
@@ -72,18 +77,27 @@ services:
       # -------------------------
       # Providers policy
       # -------------------------
-      # IMPORTANT:
-      # - KSA (.SR / numeric) must be routed to Tadawul/Argaam only
-      # - Global can use enabled providers
       - key: ENABLED_PROVIDERS
         value: "eodhd,finnhub"
       - key: PRIMARY_PROVIDER
         value: "finnhub"
+
+      # KSA routing policy
       - key: KSA_PROVIDERS
-        value: "tadawul,argaam"
+        value: "tadawul,argaam,yahoo_chart"
       - key: KSA_DISALLOW_EODHD
         value: "true"
+
+      # yfinance
       - key: ENABLE_YFINANCE
+        value: "true"
+      - key: ENABLE_YFINANCE_KSA
+        value: "false"
+
+      # Yahoo Chart fallback for KSA (recommended)
+      - key: ENABLE_YAHOO_CHART_KSA
+        value: "true"
+      - key: ENABLE_YAHOO_CHART_GLOBAL
         value: "true"
 
       # Provider keys (SECRETS)
@@ -117,7 +131,7 @@ services:
         value: "30"
 
       # -------------------------
-      # Batch controls (NEW KEYS used by routes/enriched_quote.py)
+      # Batch controls
       # -------------------------
       - key: ENRICHED_BATCH_SIZE
         value: "40"
@@ -128,7 +142,6 @@ services:
       - key: ENRICHED_TIMEOUT_SEC
         value: "45"
 
-      # Backward-compat aliases (some older modules used these names)
       - key: ENRICHED_BATCH_TIMEOUT_SEC
         value: "45"
       - key: ENRICHED_BATCH_CONCURRENCY
@@ -143,7 +156,6 @@ services:
       - key: AI_TIMEOUT_SEC
         value: "45"
 
-      # Backward-compat aliases
       - key: AI_BATCH_TIMEOUT_SEC
         value: "45"
       - key: AI_BATCH_CONCURRENCY
@@ -158,7 +170,6 @@ services:
       - key: ADV_TIMEOUT_SEC
         value: "45"
 
-      # Backward-compat aliases
       - key: ADV_BATCH_TIMEOUT_SEC
         value: "45"
       - key: ADV_BATCH_CONCURRENCY
@@ -172,7 +183,7 @@ services:
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
 
-      # Sheets client tuning (google_sheets_service.py)
+      # Sheets client tuning
       - key: SHEETS_BACKEND_TIMEOUT_SEC
         value: "120"
       - key: SHEETS_BACKEND_RETRIES
@@ -191,9 +202,6 @@ services:
       # -------------------------
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
-      # Optional (only if you disable ALL origins):
-      # - key: CORS_ORIGINS
-      #   value: "https://script.google.com,https://docs.google.com"
 
       # -------------------------
       # Sheet names (align with GAS)
