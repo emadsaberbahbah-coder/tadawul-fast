@@ -1,10 +1,6 @@
-# render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v4.10.0 aligned)
 # ============================================================
-# Key upgrades vs your file:
-# - healthCheckPath uses /healthz (fast, always-up)
-# - startCommand matches Procfile logic (lowercase log level + workers only if >1)
-# - Adds KSA Yahoo Chart fallback toggles (safe defaults)
+# render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
+# PROD-SAFE + Backward-Compatible env var names
 # ============================================================
 
 services:
@@ -16,14 +12,21 @@ services:
 
     buildCommand: pip install -r requirements.txt
 
+    # IMPORTANT:
+    # - sh wrapper ensures proper env expansion and lowercase log level
+    # - workers are only added if WEB_CONCURRENCY > 1 (avoids free-plan memory issues)
     startCommand: >
       sh -c 'LOG_LEVEL_LC="$(echo "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
       if [ "${WEB_CONCURRENCY:-1}" -gt 1 ]; then WORKERS="--workers ${WEB_CONCURRENCY}"; else WORKERS=""; fi;
-      exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
-      --proxy-headers --forwarded-allow-ips="*"
+      exec uvicorn main:app
+      --host 0.0.0.0
+      --port "${PORT:-8000}"
+      --proxy-headers
+      --forwarded-allow-ips "*"
       --lifespan on
       --timeout-keep-alive "${UVICORN_KEEPALIVE:-75}"
-      --log-level "$LOG_LEVEL_LC" $WORKERS
+      --log-level "$LOG_LEVEL_LC"
+      $WORKERS
       --no-server-header'
 
     healthCheckPath: /healthz
@@ -46,22 +49,25 @@ services:
         value: "false"
 
       # -------------------------
-      # Fast boot controls
-      # -------------------------
-      - key: DEFER_ROUTER_MOUNT
-        value: "true"
-      - key: INIT_ENGINE_ON_BOOT
-        value: "true"
-
-      # -------------------------
-      # App identity
+      # App identity (SET MANY KEYS for compatibility)
       # -------------------------
       - key: APP_NAME
         value: Tadawul Fast Bridge
-      - key: APP_VERSION
-        value: "4.10.0"
+      - key: SERVICE_NAME
+        value: Tadawul Fast Bridge
+      - key: APP_TITLE
+        value: Tadawul Fast Bridge
+
       - key: APP_ENV
         value: production
+
+      # Version (set many keys for compatibility)
+      - key: APP_VERSION
+        value: "5.0.0"
+      - key: SERVICE_VERSION
+        value: "5.0.0"
+      - key: VERSION
+        value: "5.0.0"
 
       - key: BACKEND_BASE_URL
         value: https://tadawul-fast-bridge.onrender.com
@@ -82,22 +88,13 @@ services:
       - key: PRIMARY_PROVIDER
         value: "finnhub"
 
-      # KSA routing policy
+      # If you want ONLY Tadawul+Argaam, remove yahoo_chart here:
       - key: KSA_PROVIDERS
         value: "tadawul,argaam,yahoo_chart"
+
       - key: KSA_DISALLOW_EODHD
         value: "true"
-
-      # yfinance
       - key: ENABLE_YFINANCE
-        value: "true"
-      - key: ENABLE_YFINANCE_KSA
-        value: "false"
-
-      # Yahoo Chart fallback for KSA (recommended)
-      - key: ENABLE_YAHOO_CHART_KSA
-        value: "true"
-      - key: ENABLE_YAHOO_CHART_GLOBAL
         value: "true"
 
       # Provider keys (SECRETS)
@@ -142,11 +139,6 @@ services:
       - key: ENRICHED_TIMEOUT_SEC
         value: "45"
 
-      - key: ENRICHED_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: ENRICHED_BATCH_CONCURRENCY
-        value: "5"
-
       - key: AI_BATCH_SIZE
         value: "20"
       - key: AI_MAX_TICKERS
@@ -155,11 +147,6 @@ services:
         value: "5"
       - key: AI_TIMEOUT_SEC
         value: "45"
-
-      - key: AI_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: AI_BATCH_CONCURRENCY
-        value: "5"
 
       - key: ADV_BATCH_SIZE
         value: "25"
@@ -170,11 +157,6 @@ services:
       - key: ADV_TIMEOUT_SEC
         value: "45"
 
-      - key: ADV_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: ADV_BATCH_CONCURRENCY
-        value: "6"
-
       # -------------------------
       # Google Sheets integration (SECRETS)
       # -------------------------
@@ -183,46 +165,8 @@ services:
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
 
-      # Sheets client tuning
-      - key: SHEETS_BACKEND_TIMEOUT_SEC
-        value: "120"
-      - key: SHEETS_BACKEND_RETRIES
-        value: "2"
-      - key: SHEETS_BACKEND_RETRY_SLEEP
-        value: "1.0"
-      - key: SHEETS_API_RETRIES
-        value: "3"
-      - key: SHEETS_API_RETRY_BASE_SLEEP
-        value: "1.0"
-      - key: SHEETS_MAX_ROWS_PER_WRITE
-        value: "500"
-
       # -------------------------
       # CORS
       # -------------------------
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
-
-      # -------------------------
-      # Sheet names (align with GAS)
-      # -------------------------
-      - key: SHEET_KSA_TADAWUL
-        value: KSA_Tadawul_Market
-      - key: SHEET_GLOBAL_MARKETS
-        value: Global_Markets
-      - key: SHEET_MUTUAL_FUNDS
-        value: Mutual_Funds
-      - key: SHEET_COMMODITIES_FX
-        value: Commodities_FX
-      - key: SHEET_MARKET_LEADERS
-        value: Market_Leaders
-      - key: SHEET_MY_PORTFOLIO
-        value: My_Portfolio
-      - key: SHEET_INSIGHTS_ANALYSIS
-        value: Insights_Analysis
-      - key: SHEET_INVESTMENT_ADVISOR
-        value: Investment_Advisor
-      - key: SHEET_ECONOMIC_CALENDAR
-        value: Economic_Calendar
-      - key: SHEET_INVESTMENT_INCOME
-        value: Investment_Income_Statement
