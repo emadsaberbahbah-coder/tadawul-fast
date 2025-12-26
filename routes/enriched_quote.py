@@ -1,27 +1,28 @@
-# routes/enriched_quote.py  (FULL REPLACEMENT)
+```python
+# routes/enriched_quote.py
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.3.1)
+Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.3.2)
 
-Improvements vs v2.3.0:
-- ✅ Prefers v2 module-level API (singleton engine) BEFORE creating temp engines
-- ✅ Best-effort schema fill: ensures payload includes all UnifiedQuote fields
-  (prevents "missing columns" in Google Sheets when legacy engines return partial dicts)
+What’s improved vs v2.3.1:
+- ✅ Stronger “schema fill” + cached UnifiedQuote field list (less overhead, fewer missing keys)
+- ✅ Finalizer now forces symbol_input / symbol_normalized even if engine returns None
+- ✅ Status normalization: if `error` is non-empty => status="error"
+- ✅ Empty-symbol response is also schema-filled (prevents “missing columns” in Sheets)
+- ✅ Batch endpoint uses safe concurrency (ENRICHED_BATCH_CONCURRENCY) while preserving order
 
 Key guarantees
 - Never crashes app startup (no core imports at module import-time)
-- Always returns HTTP 200 with a status field (client simplicity)
-- Always returns a non-empty `error` on failure
+- Always returns HTTP 200 with a status field
+- Always returns non-empty `error` on failure
 - Always returns `symbol` (normalized or input)
-- Uses app.state.engine when available (preferred)
-- Falls back safely to v2 module-level, then temporary v2, then legacy
-- Optional debug trace via env DEBUG_ERRORS=1 or query ?debug=1
-- Adds batch endpoint /v1/enriched/quotes for convenience
+- Best-effort: always returns all UnifiedQuote keys (None if unavailable)
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import traceback
@@ -34,6 +35,9 @@ from starlette.responses import JSONResponse
 router = APIRouter(prefix="/v1/enriched", tags=["enriched_quote"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
+# Cached UnifiedQuote schema keys (best-effort)
+_UQ_KEYS: Optional[List[str]] = None
 
 
 def _truthy(v: Any) -> bool:
@@ -54,7 +58,7 @@ def _split_symbols(raw: str) -> List[str]:
 def _normalize_symbol_safe(raw: str) -> str:
     """
     Preferred normalization: core.data_engine_v2.normalize_symbol (if available).
-    Fallback normalization (safe + consistent):
+    Fallback normalization:
       - trims + uppercases
       - keeps Yahoo special symbols (^GSPC, GC=F, EURUSD=X)
       - numeric => 1120.SR
@@ -139,20 +143,39 @@ def _as_payload(obj: Any) -> Dict[str, Any]:
     return {"value": str(obj)}
 
 
-def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _get_uq_keys() -> List[str]:
     """
-    Ensure payload contains every UnifiedQuote field (best-effort),
-    so Sheets/clients never miss expected keys even if legacy engines return partial dicts.
+    Best-effort get UnifiedQuote field names (cached).
+    If import fails, returns [] (no schema-fill).
     """
+    global _UQ_KEYS
+    if isinstance(_UQ_KEYS, list):
+        return _UQ_KEYS
+
     try:
         from core.data_engine_v2 import UnifiedQuote as UQ  # type: ignore
 
         mf = getattr(UQ, "model_fields", None)
         if isinstance(mf, dict) and mf:
-            for k in mf.keys():
-                payload.setdefault(k, None)
+            _UQ_KEYS = list(mf.keys())
+            return _UQ_KEYS
     except Exception:
         pass
+
+    _UQ_KEYS = []
+    return _UQ_KEYS
+
+
+def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure payload contains every UnifiedQuote field (best-effort),
+    so Sheets/clients never miss expected keys even if legacy engines return partial dicts.
+    """
+    keys = _get_uq_keys()
+    if not keys:
+        return payload
+    for k in keys:
+        payload.setdefault(k, None)
     return payload
 
 
@@ -164,10 +187,13 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
       3) core.data_engine_v2.DataEngine() temporary
       4) core.data_engine.get_enriched_quote (legacy module-level)
       5) core.data_engine.DataEngine() temporary
-
-    Returns (result, source_label) or (None, None) if all attempts fail.
     """
-    eng = getattr(request.app.state, "engine", None)
+    # 1) app.state.engine
+    try:
+        eng = getattr(request.app.state, "engine", None)
+    except Exception:
+        eng = None
+
     if eng is not None:
         for fn_name in ("get_enriched_quote", "get_quote"):
             fn = getattr(eng, fn_name, None)
@@ -177,7 +203,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
                 except Exception:
                     pass
 
-    # v2 module-level singleton
+    # 2) v2 module-level singleton
     try:
         from core.data_engine_v2 import get_enriched_quote as v2_get  # type: ignore
 
@@ -185,7 +211,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
     except Exception:
         pass
 
-    # v2 temporary engine
+    # 3) v2 temporary engine
     try:
         from core.data_engine_v2 import DataEngine as V2Engine  # type: ignore
 
@@ -204,7 +230,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
     except Exception:
         pass
 
-    # legacy module-level
+    # 4) legacy module-level
     try:
         from core.data_engine import get_enriched_quote as v1_get  # type: ignore
 
@@ -212,7 +238,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
     except Exception:
         pass
 
-    # legacy temporary engine
+    # 5) legacy temporary engine
     try:
         from core.data_engine import DataEngine as V1Engine  # type: ignore
 
@@ -238,21 +264,38 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
     """
     Ensure required fields and consistent defaults + schema-fill best-effort.
     """
+    sym = (norm or raw or "").strip()
+
+    # Always ensure identity fields even if engine returned None
     if not payload.get("symbol"):
-        payload["symbol"] = norm or raw
+        payload["symbol"] = sym
 
-    payload.setdefault("symbol_input", raw)
-    payload.setdefault("symbol_normalized", norm or raw)
+    payload["symbol_input"] = payload.get("symbol_input") or raw
+    payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
 
-    if "status" not in payload:
-        payload["status"] = "success"
-
-    if payload.get("error") is None:
-        payload["error"] = ""
-
+    # Ensure data_source
     if not payload.get("data_source"):
         payload["data_source"] = source or "unknown"
 
+    # Ensure error is a string (never None)
+    if payload.get("error") is None:
+        payload["error"] = ""
+    if not isinstance(payload.get("error"), str):
+        payload["error"] = str(payload.get("error") or "")
+
+    # Ensure status is present + consistent with error
+    st = payload.get("status")
+    if not isinstance(st, str) or not st.strip():
+        payload["status"] = "success"
+
+    if str(payload.get("error") or "").strip():
+        payload["status"] = "error"
+
+    # Ensure data_quality exists (best-effort)
+    if not payload.get("data_quality"):
+        payload["data_quality"] = "MISSING" if payload.get("current_price") is None else "PARTIAL"
+
+    # Schema fill last (adds any missing keys as None)
     payload = _schema_fill_best_effort(payload)
     return payload
 
@@ -269,21 +312,21 @@ async def enriched_quote(
     norm = _normalize_symbol_safe(raw)
 
     if not raw:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "error",
-                "symbol": "",
-                "symbol_input": "",
-                "symbol_normalized": "",
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": "Empty symbol",
-            },
-        )
+        out = {
+            "status": "error",
+            "symbol": "",
+            "symbol_input": "",
+            "symbol_normalized": "",
+            "data_quality": "MISSING",
+            "data_source": "none",
+            "error": "Empty symbol",
+        }
+        out = _schema_fill_best_effort(out)
+        return JSONResponse(status_code=200, content=out)
 
     try:
         result, source = await _call_engine_best_effort(request, norm or raw)
+
         if result is None:
             out = {
                 "status": "error",
@@ -340,12 +383,22 @@ async def enriched_quotes(
             },
         )
 
-    items: List[Dict[str, Any]] = []
-    for raw in raw_list:
+    # Concurrency limit (safe default)
+    try:
+        conc = int(os.getenv("ENRICHED_BATCH_CONCURRENCY", "8"))
+        if conc <= 0:
+            conc = 8
+    except Exception:
+        conc = 8
+    sem = asyncio.Semaphore(conc)
+
+    async def _one(raw: str) -> Dict[str, Any]:
         norm = _normalize_symbol_safe(raw)
 
         try:
-            result, source = await _call_engine_best_effort(request, norm or raw)
+            async with sem:
+                result, source = await _call_engine_best_effort(request, norm or raw)
+
             if result is None:
                 out = {
                     "status": "error",
@@ -356,12 +409,11 @@ async def enriched_quotes(
                     "data_source": "none",
                     "error": "Engine not available for this symbol.",
                 }
-                items.append(_schema_fill_best_effort(out))
-                continue
+                return _schema_fill_best_effort(out)
 
             payload = _as_payload(result)
             payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
-            items.append(payload)
+            return payload
 
         except Exception as e:
             tb = traceback.format_exc()
@@ -378,14 +430,19 @@ async def enriched_quotes(
             }
             if dbg:
                 out["traceback"] = tb[:8000]
-            items.append(_schema_fill_best_effort(out))
+            return _schema_fill_best_effort(out)
+
+    # Preserve order
+    tasks = [_one(r.strip()) for r in raw_list if r and r.strip()]
+    items: List[Dict[str, Any]] = await asyncio.gather(*tasks)
 
     return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
 
 
 @router.get("/health", include_in_schema=False)
 async def enriched_health():
-    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.3.1"}
+    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.3.2"}
 
 
 __all__ = ["router"]
+```
