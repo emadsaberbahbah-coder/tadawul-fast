@@ -1,21 +1,19 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.4
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.5
 
-What this fixes
-- ✅ Removes any chance of Markdown fences being part of Python source.
-- ✅ Applies provider defaults EARLY (before any engine/router imports).
-- ✅ Router mounting is safe (won’t crash startup); optional deferred mount.
-- ✅ Engine init is best-effort (won’t crash startup).
-- ✅ Health endpoints always work, even if routers/engine fail.
+What’s improved vs v5.0.4
+- ✅ Extra “last-resort” runtime env alias export (FINNHUB/EODHD) even if config import fails.
+- ✅ Logging won’t double-configure if handlers already exist.
+- ✅ Adds /livez and /readyz (always 200, includes readiness flags).
+- ✅ Background boot now records boot_error (best-effort) for debugging.
 
-Provider defaults (only if env not set)
-- GLOBAL: ENABLED_PROVIDERS="eodhd,finnhub,fmp"
-- KSA:    KSA_PROVIDERS="yahoo_chart,tadawul,argaam"
-- Robust: ENABLE_YAHOO_CHART_KSA=true
-          ENABLE_YAHOO_CHART_SUPPLEMENT=true
-          ENABLE_YFINANCE_KSA=false
+Design goals unchanged
+- Never crash app startup.
+- Health endpoints always work.
+- Router mounting safe (won’t crash startup), optional deferred mount.
+- Engine init best-effort (won’t crash startup).
 """
 
 from __future__ import annotations
@@ -52,6 +50,42 @@ def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
+def _export_env_if_missing(key: str, value: Any) -> None:
+    if value is None:
+        return
+    v = str(value).strip()
+    if not v:
+        return
+    cur = os.getenv(key)
+    if cur is None or str(cur).strip() == "":
+        os.environ[key] = v
+
+
+def _apply_runtime_env_aliases_last_resort() -> None:
+    """
+    Extra safety: even if config.get_settings cannot be imported,
+    ensure provider modules that read *_API_TOKEN still work.
+
+    No overwrite if already set.
+    """
+    finnhub_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
+    eodhd_key = (os.getenv("EODHD_API_KEY") or "").strip()
+
+    if finnhub_key:
+        _export_env_if_missing("FINNHUB_API_TOKEN", finnhub_key)
+        _export_env_if_missing("FINNHUB_TOKEN", finnhub_key)
+
+    if eodhd_key:
+        _export_env_if_missing("EODHD_API_TOKEN", eodhd_key)
+        _export_env_if_missing("EODHD_TOKEN", eodhd_key)
+
+    # Common numeric aliases used elsewhere
+    if os.getenv("HTTP_TIMEOUT") and not os.getenv("HTTP_TIMEOUT_SEC"):
+        _export_env_if_missing("HTTP_TIMEOUT_SEC", os.getenv("HTTP_TIMEOUT"))
+    if os.getenv("RETRY_DELAY") and not os.getenv("RETRY_DELAY_SEC"):
+        _export_env_if_missing("RETRY_DELAY_SEC", os.getenv("RETRY_DELAY"))
+
+
 def _resolve_log_format() -> str:
     raw = str(os.getenv("LOG_FORMAT", "") or "").strip()
     if not raw:
@@ -71,14 +105,20 @@ def _resolve_log_format() -> str:
 
 LOG_FORMAT = _resolve_log_format()
 
+# Configure logging only if not already configured
 try:
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 except Exception:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    try:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    except Exception:
+        pass
 
 logger = logging.getLogger("main")
 
-APP_ENTRY_VERSION = "5.0.4"
+APP_ENTRY_VERSION = "5.0.5"
 
 
 def _clamp_str(s: Any, max_len: int = 2000) -> str:
@@ -446,8 +486,10 @@ async def _background_boot(app_: FastAPI) -> None:
         init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
         if init_engine:
             await asyncio.to_thread(_init_engine_best_effort, app_)
-    except Exception as e:
-        logger.warning("Background boot failed: %s", e)
+        app_.state.boot_error = None
+    except Exception:
+        app_.state.boot_error = _clamp_str(traceback.format_exc())
+        logger.warning("Background boot failed: %s", app_.state.boot_error)
 
 
 async def _maybe_close_engine(app_: FastAPI) -> None:
@@ -465,6 +507,9 @@ async def _maybe_close_engine(app_: FastAPI) -> None:
 def create_app() -> FastAPI:
     # Apply provider defaults EARLY so engines/routers see intended routing.
     _apply_provider_defaults_if_missing()
+
+    # Extra safety: ensure token aliases exist even if config import fails.
+    _apply_runtime_env_aliases_last_resort()
 
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
@@ -495,6 +540,7 @@ def create_app() -> FastAPI:
 
         app_.state.engine_ready = False
         app_.state.engine_error = None
+        app_.state.boot_error = None
 
         app_.state.defer_router_mount = _truthy(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true"))
         app_.state.init_engine_on_boot = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")
@@ -599,9 +645,26 @@ def create_app() -> FastAPI:
             "entry_version": APP_ENTRY_VERSION,
         }
 
+    # Liveness: always 200
     @app_.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
     async def healthz():
         return {"status": "ok"}
+
+    # Extra liveness alias (always 200)
+    @app_.api_route("/livez", methods=["GET", "HEAD"], include_in_schema=False)
+    async def livez():
+        return {"status": "ok"}
+
+    # Readiness: always 200 (report readiness flags)
+    @app_.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def readyz():
+        return {
+            "status": "ok",
+            "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
+            "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
+            "boot_task_running": bool(getattr(app_.state, "boot_task", None) is not None and not app_.state.boot_task.done()),
+            "boot_error": getattr(app_.state, "boot_error", None),
+        }
 
     @app_.get("/health", tags=["system"])
     async def health():
@@ -622,6 +685,7 @@ def create_app() -> FastAPI:
             "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
             "engine_error": getattr(app_.state, "engine_error", None),
+            "boot_error": getattr(app_.state, "boot_error", None),
             "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "routers_mounted": [m["name"] for m in mounted],
             "routers_failed": [
@@ -633,7 +697,10 @@ def create_app() -> FastAPI:
 
     @app_.get("/system/settings", tags=["system"])
     async def system_settings():
-        return {"settings_source": getattr(app_.state, "settings_source", None), "env": _safe_env_snapshot(settings, env_mod)}
+        return {
+            "settings_source": getattr(app_.state, "settings_source", None),
+            "env": _safe_env_snapshot(settings, env_mod),
+        }
 
     @app_.get("/system/secrets", tags=["system"])
     async def system_secrets():
