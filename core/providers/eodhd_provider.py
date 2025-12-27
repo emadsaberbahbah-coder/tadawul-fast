@@ -2,30 +2,31 @@
 """
 core/providers/eodhd_provider.py
 ------------------------------------------------------------
-EODHD Provider (GLOBAL primary) — v1.7.0 (ENV-ALIAS HARDENED)
+EODHD Provider (GLOBAL primary) — v1.7.2 (ENV-ALIAS + KSA-GUARD HARDENED)
 
-Why this revision (matches your Render env names)
-- ✅ Accepts EODHD_API_KEY (your current Render variable)
-- ✅ Still accepts EODHD_API_TOKEN / EODHD_TOKEN (legacy)
-- ✅ Fixes default host to the correct EODHD API domain:
+Aligned with your Render env variable names
+- ✅ Uses EODHD_API_KEY (preferred in your Render)
+- ✅ Also accepts EODHD_API_TOKEN / EODHD_TOKEN (legacy)
+- ✅ Correct default base URL:
       https://eodhistoricaldata.com/api
-  (your previous default https://eodhd.com/api commonly causes 401 confusion)
+- ✅ Never does network calls at import-time
+- ✅ Defensive JSON parsing + non-misleading errors
 
-Key goals
-- Provide reliable GLOBAL quote + fundamentals enrichment from EODHD.
-- Expose engine-compatible callables:
-    fetch_quote_patch
-    fetch_enriched_quote_patch
-    fetch_quote_and_enrichment_patch
-- Never crash startup; no network at import-time.
-- Async httpx; defensive parsing; no misleading error messages.
+KSA safety
+- ✅ If a KSA-style symbol is passed (e.g., 1120 or 1120.SR), provider returns
+  a clear "not supported" message (prevents accidental routing confusion).
+
+Exports (engine discovery)
+- fetch_quote_patch
+- fetch_enriched_quote_patch
+- fetch_quote_and_enrichment_patch
 
 Env vars (supported)
-- EODHD_API_KEY (preferred in your Render)
-- EODHD_API_TOKEN / EODHD_TOKEN (legacy aliases)
+- EODHD_API_KEY (preferred)
+- EODHD_API_TOKEN / EODHD_TOKEN (legacy)
 - EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
-- EODHD_TIMEOUT_S (default: 8.5)
+- EODHD_TIMEOUT_S (default: 8.5)  (fallbacks to HTTP_TIMEOUT if present)
 - EODHD_UA (optional)
 """
 
@@ -37,12 +38,31 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-PROVIDER_VERSION = "1.7.0"
+PROVIDER_VERSION = "1.7.2"
 PROVIDER_NAME = "eodhd"
 
 # ✅ Correct default base URL for EODHD
 BASE_URL = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").rstrip("/")
-TIMEOUT_S = float(os.getenv("EODHD_TIMEOUT_S") or "8.5")
+
+# Prefer provider-specific timeout; fall back to global HTTP_TIMEOUT if provided; then default.
+def _timeout_default() -> float:
+    v = (os.getenv("EODHD_TIMEOUT_S") or "").strip()
+    if v:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    v2 = (os.getenv("HTTP_TIMEOUT") or "").strip()
+    if v2:
+        try:
+            return float(v2)
+        except Exception:
+            pass
+    return 8.5
+
+
+TIMEOUT_S = _timeout_default()
+
 ENABLE_FUNDAMENTALS = (os.getenv("EODHD_ENABLE_FUNDAMENTALS") or "true").strip().lower() in {
     "1",
     "true",
@@ -58,6 +78,9 @@ UA = os.getenv(
 )
 
 
+# -----------------------------------------------------------------------------
+# Env + parsing helpers
+# -----------------------------------------------------------------------------
 def _token() -> Optional[str]:
     # ✅ Align with your Render name first, then legacy aliases
     for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
@@ -65,6 +88,19 @@ def _token() -> Optional[str]:
         if v:
             return v
     return None
+
+
+def _looks_like_ksa(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    # common KSA patterns in this project
+    if s.endswith(".SR"):
+        return True
+    # raw numeric Tadawul codes (e.g., 1120)
+    if s.isdigit():
+        return True
+    return False
 
 
 def _is_nan(x: Any) -> bool:
@@ -83,25 +119,28 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
-def _to_int(x: Any) -> Optional[int]:
-    try:
-        if _is_nan(x) or x is None:
-            return None
-        return int(float(x))
-    except Exception:
-        return None
-
-
 def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
     if cur is None or lo is None or hi is None:
         return None
     if hi == lo:
         return None
-    return (cur - lo) / (hi - lo) * 100.0
+    try:
+        return (cur - lo) / (hi - lo) * 100.0
+    except Exception:
+        return None
+
+
+def _pick(d: Any, *keys: str) -> Any:
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    return None
 
 
 def _base(symbol: str) -> Dict[str, Any]:
-    # Keep the same shape your engine/routers already merge safely
+    # Shape stays compatible with your merge logic
     return {
         "status": "success",
         "symbol": symbol,
@@ -118,7 +157,7 @@ def _base(symbol: str) -> Dict[str, Any]:
         "sub_sector": "",
         "listing_date": "",
         "shares_outstanding": None,
-        "free_float": None,
+        "free_float": None,               # percent
         "market_cap": None,
         "free_float_market_cap": None,
         # price / liquidity
@@ -158,31 +197,37 @@ def _base(symbol: str) -> Dict[str, Any]:
     }
 
 
-def _pick(d: dict, *keys: str) -> Any:
-    for k in keys:
-        if isinstance(d, dict) and k in d:
-            return d.get(k)
-    return None
-
-
 async def _get_json(url: str, params: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str]]:
+    headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
     try:
-        headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
         async with httpx.AsyncClient(timeout=TIMEOUT_S, headers=headers) as client:
             r = await client.get(url, params=params)
 
             if r.status_code != 200:
-                # Provide helpful but not noisy error details (no secrets)
                 hint = ""
                 if r.status_code in (401, 403):
                     hint = " (auth failed: check EODHD_API_KEY)"
+                # EODHD often returns helpful JSON even for errors; try to extract a message (without leaking params)
+                msg = ""
+                try:
+                    js = r.json()
+                    if isinstance(js, dict):
+                        msg = str(js.get("message") or js.get("error") or "").strip()
+                except Exception:
+                    msg = ""
+                if msg:
+                    return None, f"HTTP {r.status_code}{hint}: {msg}"
                 return None, f"HTTP {r.status_code}{hint}"
 
             try:
-                return r.json(), None
+                js = r.json()
             except Exception:
-                # Sometimes providers return text/html on errors
                 return None, "invalid JSON response"
+
+            if not isinstance(js, dict):
+                return None, "unexpected JSON type"
+            return js, None
+
     except Exception as e:
         return None, f"{e.__class__.__name__}: {e}"
 
@@ -197,7 +242,7 @@ async def _fetch_realtime(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     if js is None:
         return {}, f"realtime failed: {err}"
 
-    # EODHD fields can vary by casing (be defensive)
+    # field variants (defensive)
     close = _pick(js, "close", "Close")
     prev = _pick(js, "previous_close", "previousClose", "PreviousClose", "previousClosePrice")
     opn = _pick(js, "open", "Open")
@@ -206,7 +251,7 @@ async def _fetch_realtime(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     vol = _pick(js, "volume", "Volume")
 
     chg = _pick(js, "change", "Change")
-    chg_p = _pick(js, "change_p", "changePercent", "changePercentages", "ChangePercent", "change_p")
+    chg_p = _pick(js, "change_p", "ChangePercent", "changePercent", "changePercentages")
 
     patch: Dict[str, Any] = {
         "current_price": _to_float(close),
@@ -219,9 +264,7 @@ async def _fetch_realtime(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
         "percent_change": _to_float(chg_p),
     }
 
-    # Remove None keys
-    patch = {k: v for k, v in patch.items() if v is not None}
-    return patch, None
+    return {k: v for k, v in patch.items() if v is not None}, None
 
 
 async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -234,13 +277,13 @@ async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str
     if js is None:
         return {}, f"fundamentals failed: {err}"
 
-    patch: Dict[str, Any] = {}
-
     general = js.get("General") or {}
     highlights = js.get("Highlights") or {}
     valuation = js.get("Valuation") or {}
     technicals = js.get("Technicals") or {}
     shares = js.get("SharesStats") or {}
+
+    patch: Dict[str, Any] = {}
 
     patch["name"] = (general.get("Name") or general.get("LongName") or "") or ""
     patch["sector"] = (general.get("Sector") or "") or ""
@@ -249,7 +292,7 @@ async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str
     patch["currency"] = (general.get("CurrencyCode") or "") or ""
     patch["listing_date"] = (general.get("IPODate") or "") or ""
 
-    # Market cap: if Mln exists but not full, upscale
+    # market cap
     mc = _to_float(highlights.get("MarketCapitalization"))
     mc_mln = _to_float(highlights.get("MarketCapitalizationMln"))
     if mc is None and mc_mln is not None:
@@ -277,28 +320,34 @@ async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str
 
     patch["ma50"] = _to_float(technicals.get("50DayMA"))
     patch["ma20"] = _to_float(technicals.get("20DayMA") or technicals.get("10DayMA"))
-
     patch["avg_volume_30d"] = _to_float(technicals.get("AverageVolume"))
 
+    # shares outstanding
     so = _to_float(
         _pick(shares, "SharesOutstanding", "SharesOutstandingFloat", "SharesOutstandingEOD")
         or general.get("SharesOutstanding")
     )
     patch["shares_outstanding"] = so
 
-    # If float shares exist, compute free-float %
-    float_shares = _to_float(_pick(shares, "SharesFloat", "SharesOutstandingFloat", "FloatShares"))
+    # free-float % if float shares present
+    float_shares = _to_float(_pick(shares, "SharesFloat", "FloatShares", "SharesOutstandingFloat"))
     if so and float_shares and so > 0:
-        patch["free_float"] = float_shares / so * 100.0
+        patch["free_float"] = (float_shares / so) * 100.0
 
-    # debt/liquidity if present
     patch["debt_to_equity"] = _to_float(highlights.get("DebtToEquity"))
     patch["current_ratio"] = _to_float(highlights.get("CurrentRatio"))
     patch["quick_ratio"] = _to_float(highlights.get("QuickRatio"))
 
-    # Remove None keys
-    patch = {k: v for k, v in patch.items() if v is not None and v != ""}
-    return patch, None
+    # remove empty strings / None
+    clean: Dict[str, Any] = {}
+    for k, v in patch.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        clean[k] = v
+
+    return clean, None
 
 
 def _fill_derived(out: Dict[str, Any]) -> None:
@@ -318,7 +367,7 @@ def _fill_derived(out: Dict[str, Any]) -> None:
     if out.get("position_52w_percent") is None:
         out["position_52w_percent"] = _pos_52w(cur, _to_float(out.get("low_52w")), _to_float(out.get("high_52w")))
 
-    # free-float market cap if both exist
+    # free-float market cap
     mc = _to_float(out.get("market_cap"))
     ff = _to_float(out.get("free_float"))
     if out.get("free_float_market_cap") is None and mc is not None and ff is not None:
@@ -326,11 +375,13 @@ def _fill_derived(out: Dict[str, Any]) -> None:
 
 
 def _quality(out: Dict[str, Any]) -> None:
+    # Quote OK if these exist
     keys = ["current_price", "day_high", "day_low", "volume"]
     ok = all(_to_float(out.get(k)) is not None for k in keys)
+
+    # Rich if we have some ID/fundamental
     rich = bool((out.get("name") or "").strip()) or (_to_float(out.get("market_cap")) is not None)
 
-    # FULL = quote OK + has some identity/fundamental richness
     out["data_quality"] = "FULL" if (ok and rich) else ("OK" if ok else "BAD")
 
     if out.get("error"):
@@ -339,6 +390,13 @@ def _quality(out: Dict[str, Any]) -> None:
 
 async def _fetch(symbol: str, want_fundamentals: bool = True) -> Dict[str, Any]:
     out = _base(symbol)
+
+    # Prevent misleading calls for KSA symbols
+    if _looks_like_ksa(symbol):
+        out["status"] = "error"
+        out["data_quality"] = "BAD"
+        out["error"] = f"{PROVIDER_NAME}: KSA symbols not supported by EODHD (route via KSA providers)"
+        return out
 
     rt_patch, rt_err = await _fetch_realtime(symbol)
     if rt_err:
@@ -351,13 +409,12 @@ async def _fetch(symbol: str, want_fundamentals: bool = True) -> Dict[str, Any]:
     if want_fundamentals and ENABLE_FUNDAMENTALS:
         f_patch, f_err = await _fetch_fundamentals(symbol)
         if not f_err:
-            # Fill blanks; do not overwrite a good quote field
+            # Fill blanks; do not overwrite quote fields unless important
             for k, v in f_patch.items():
                 if v is None:
                     continue
                 if out.get(k) in (None, "", 0):
                     out[k] = v
-                # allow some important fields to update even if 0/None weirdness
                 if k in ("market_cap", "high_52w", "low_52w", "shares_outstanding", "free_float"):
                     out[k] = v
         else:
@@ -369,9 +426,9 @@ async def _fetch(symbol: str, want_fundamentals: bool = True) -> Dict[str, Any]:
     return out
 
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Engine-compatible exported callables (name-based discovery)
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=False)
 
