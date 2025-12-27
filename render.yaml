@@ -1,20 +1,15 @@
+# render.yaml — FULL REPLACEMENT
 # ============================================================
-# render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.1.0)
+# Tadawul Fast Bridge (FastAPI) — Render Blueprint
+# PROD-SAFE + Backward-Compatible env var names (v1.1.1)
 # ============================================================
 #
-# Key fixes vs your draft:
-# - Adds SAFE KSA toggles that match your engine defaults:
-#     ENABLE_YAHOO_CHART_KSA=true
-#     ENABLE_YAHOO_CHART_SUPPLEMENT=true
-#     ENABLE_YFINANCE_KSA=false
-# - Adds missing compatibility envs your code may read:
-#     HTTP_TIMEOUT (in addition to HTTP_TIMEOUT_SEC)
-#     CACHE_DEFAULT_TTL (in addition to CACHE_TTL_SEC)
-#     ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE
-# - Aligns batch env name for /v1/enriched/quotes:
-#     ENRICHED_BATCH_CONCURRENCY (in addition to ENRICHED_CONCURRENCY)
-# - Adds DEFER_ROUTER_MOUNT / INIT_ENGINE_ON_BOOT explicit defaults.
+# v1.1.1 changes vs v1.1.0
+# - ✅ Adds ENGINE_CACHE_TTL_SEC + ENRICHED_CONCURRENCY alias coverage (explicit)
+# - ✅ Adds ENABLE_SWAGGER / ENABLE_REDOC feature flags (used by config.py)
+# - ✅ Adds ADVANCED_ANALYSIS_ENABLED + AI_ANALYSIS_ENABLED flags (main.py reads)
+# - ✅ Keeps BOTH styles for compatibility: HTTP_TIMEOUT(_SEC), CACHE_TTL_SEC/CACHE_DEFAULT_TTL
+# - ✅ Keeps KSA yfinance OFF by default (ENABLE_YFINANCE_KSA=false)
 #
 
 services:
@@ -81,6 +76,8 @@ services:
         value: "Tadawul Fast Bridge"
       - key: APP_ENV
         value: "production"
+      - key: ENVIRONMENT
+        value: "production"
 
       # Version (compat keys)
       - key: APP_VERSION
@@ -92,6 +89,8 @@ services:
 
       # Public base url of this service
       - key: BACKEND_BASE_URL
+        value: "https://tadawul-fast-bridge.onrender.com"
+      - key: TFB_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
 
       # -------------------------
@@ -105,9 +104,24 @@ services:
         value: "false"
 
       # -------------------------
+      # Feature flags (FastAPI docs + routers)
+      # -------------------------
+      - key: ENABLE_SWAGGER
+        value: "true"
+      - key: ENABLE_REDOC
+        value: "true"
+
+      - key: AI_ANALYSIS_ENABLED
+        value: "true"
+      - key: ADVANCED_ANALYSIS_ENABLED
+        value: "true"
+
+      # -------------------------
       # Providers policy
       # -------------------------
       - key: ENABLED_PROVIDERS
+        value: "eodhd,finnhub"
+      - key: PROVIDERS
         value: "eodhd,finnhub"
       - key: PRIMARY_PROVIDER
         value: "finnhub"
@@ -148,6 +162,16 @@ services:
       - key: ARGAAM_API_KEY
         sync: false
 
+      # Optional explicit URLs (only if you use them in engine)
+      - key: TADAWUL_QUOTE_URL
+        value: ""
+      - key: TADAWUL_FUNDAMENTALS_URL
+        value: ""
+      - key: ARGAAM_QUOTE_URL
+        value: ""
+      - key: ARGAAM_PROFILE_URL
+        value: ""
+
       # -------------------------
       # HTTP + caching (set BOTH styles for compatibility)
       # -------------------------
@@ -159,6 +183,9 @@ services:
       - key: CACHE_TTL_SEC
         value: "20"
       - key: CACHE_DEFAULT_TTL
+        value: "20"
+
+      - key: ENGINE_CACHE_TTL_SEC
         value: "20"
 
       - key: QUOTE_TTL_SEC
