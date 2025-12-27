@@ -1,7 +1,21 @@
 # ============================================================
 # render.yaml — Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names
+# PROD-SAFE + Backward-Compatible env var names (v1.1.0)
 # ============================================================
+#
+# Key fixes vs your draft:
+# - Adds SAFE KSA toggles that match your engine defaults:
+#     ENABLE_YAHOO_CHART_KSA=true
+#     ENABLE_YAHOO_CHART_SUPPLEMENT=true
+#     ENABLE_YFINANCE_KSA=false
+# - Adds missing compatibility envs your code may read:
+#     HTTP_TIMEOUT (in addition to HTTP_TIMEOUT_SEC)
+#     CACHE_DEFAULT_TTL (in addition to CACHE_TTL_SEC)
+#     ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE
+# - Aligns batch env name for /v1/enriched/quotes:
+#     ENRICHED_BATCH_CONCURRENCY (in addition to ENRICHED_CONCURRENCY)
+# - Adds DEFER_ROUTER_MOUNT / INIT_ENGINE_ON_BOOT explicit defaults.
+#
 
 services:
   - type: web
@@ -12,9 +26,9 @@ services:
 
     buildCommand: pip install -r requirements.txt
 
-    # IMPORTANT:
-    # - sh wrapper ensures proper env expansion and lowercase log level
-    # - workers are only added if WEB_CONCURRENCY > 1 (avoids free-plan memory issues)
+    # Render-friendly deterministic startup:
+    # - lowercases LOG_LEVEL for uvicorn
+    # - only adds --workers if WEB_CONCURRENCY > 1
     startCommand: >
       sh -c 'LOG_LEVEL_LC="$(echo "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
       if [ "${WEB_CONCURRENCY:-1}" -gt 1 ]; then WORKERS="--workers ${WEB_CONCURRENCY}"; else WORKERS=""; fi;
@@ -37,6 +51,8 @@ services:
       # -------------------------
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: TZ
+        value: "Asia/Riyadh"
       - key: WEB_CONCURRENCY
         value: "1"
       - key: UVICORN_KEEPALIVE
@@ -48,20 +64,25 @@ services:
       - key: DEBUG
         value: "false"
 
+      # Fast-boot controls (match main.py defaults but explicit here)
+      - key: DEFER_ROUTER_MOUNT
+        value: "true"
+      - key: INIT_ENGINE_ON_BOOT
+        value: "true"
+
       # -------------------------
-      # App identity (SET MANY KEYS for compatibility)
+      # App identity (compat keys)
       # -------------------------
       - key: APP_NAME
-        value: Tadawul Fast Bridge
+        value: "Tadawul Fast Bridge"
       - key: SERVICE_NAME
-        value: Tadawul Fast Bridge
+        value: "Tadawul Fast Bridge"
       - key: APP_TITLE
-        value: Tadawul Fast Bridge
-
+        value: "Tadawul Fast Bridge"
       - key: APP_ENV
-        value: production
+        value: "production"
 
-      # Version (set many keys for compatibility)
+      # Version (compat keys)
       - key: APP_VERSION
         value: "5.0.0"
       - key: SERVICE_VERSION
@@ -69,8 +90,9 @@ services:
       - key: VERSION
         value: "5.0.0"
 
+      # Public base url of this service
       - key: BACKEND_BASE_URL
-        value: https://tadawul-fast-bridge.onrender.com
+        value: "https://tadawul-fast-bridge.onrender.com"
 
       # -------------------------
       # Security tokens (SECRETS)
@@ -79,6 +101,8 @@ services:
         sync: false
       - key: BACKUP_APP_TOKEN
         sync: false
+      - key: REQUIRE_AUTH
+        value: "false"
 
       # -------------------------
       # Providers policy
@@ -88,16 +112,27 @@ services:
       - key: PRIMARY_PROVIDER
         value: "finnhub"
 
-      # If you want ONLY Tadawul+Argaam, remove yahoo_chart here:
+      # KSA routing order
       - key: KSA_PROVIDERS
         value: "tadawul,argaam,yahoo_chart"
 
+      # Hard safety: never use EODHD for KSA
       - key: KSA_DISALLOW_EODHD
         value: "true"
-      - key: ENABLE_YFINANCE
+
+      # Yahoo Chart fallbacks (KSA-safe)
+      - key: ENABLE_YAHOO_CHART_KSA
+        value: "true"
+      - key: ENABLE_YAHOO_CHART_SUPPLEMENT
         value: "true"
 
-      # Provider keys (SECRETS)
+      # yfinance policy
+      - key: ENABLE_YFINANCE
+        value: "true"       # global fallback if your engine uses it
+      - key: ENABLE_YFINANCE_KSA
+        value: "false"      # IMPORTANT: keep KSA yfinance OFF unless you explicitly want it
+
+      # Provider keys (SECRETS) — keep Render names (config.py exports aliases)
       - key: FMP_API_KEY
         sync: false
       - key: EODHD_API_KEY
@@ -114,12 +149,18 @@ services:
         sync: false
 
       # -------------------------
-      # HTTP + caching
+      # HTTP + caching (set BOTH styles for compatibility)
       # -------------------------
       - key: HTTP_TIMEOUT_SEC
         value: "25"
+      - key: HTTP_TIMEOUT
+        value: "25"
+
       - key: CACHE_TTL_SEC
         value: "20"
+      - key: CACHE_DEFAULT_TTL
+        value: "20"
+
       - key: QUOTE_TTL_SEC
         value: "30"
       - key: FUNDAMENTALS_TTL_SEC
@@ -128,12 +169,22 @@ services:
         value: "30"
 
       # -------------------------
-      # Batch controls
+      # Rate limiting (SlowAPI)
+      # -------------------------
+      - key: ENABLE_RATE_LIMITING
+        value: "true"
+      - key: MAX_REQUESTS_PER_MINUTE
+        value: "240"
+
+      # -------------------------
+      # Batch controls (set BOTH names where code differs)
       # -------------------------
       - key: ENRICHED_BATCH_SIZE
         value: "40"
       - key: ENRICHED_MAX_TICKERS
         value: "250"
+      - key: ENRICHED_BATCH_CONCURRENCY
+        value: "5"
       - key: ENRICHED_CONCURRENCY
         value: "5"
       - key: ENRICHED_TIMEOUT_SEC
@@ -170,3 +221,7 @@ services:
       # -------------------------
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "true"
+      - key: CORS_ALL_ORIGINS
+        value: "true"
+      - key: CORS_ORIGINS
+        value: "*"
