@@ -1,13 +1,15 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.5
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.6
 
-What’s improved vs v5.0.4
-- ✅ Extra “last-resort” runtime env alias export (FINNHUB/EODHD) even if config import fails.
-- ✅ Logging won’t double-configure if handlers already exist.
-- ✅ Adds /livez and /readyz (always 200, includes readiness flags).
-- ✅ Background boot now records boot_error (best-effort) for debugging.
+v5.0.6:
+- ✅ Fully aligned with repo-root config.py (v5.3.1+):
+    • Version resolves from SERVICE_VERSION / APP_VERSION / VERSION (preferred)
+    • If missing → uses Settings.service_version (which may fall back to Render commit)
+    • Consistent startup banner output across env.py / config.py / main.py
+- ✅ Title/Env/Providers prefer Settings fields when available (more reliable).
+- ✅ Keeps all “never crash startup” guarantees.
 
 Design goals unchanged
 - Never crash app startup.
@@ -118,7 +120,7 @@ except Exception:
 
 logger = logging.getLogger("main")
 
-APP_ENTRY_VERSION = "5.0.5"
+APP_ENTRY_VERSION = "5.0.6"
 
 
 def _clamp_str(s: Any, max_len: int = 2000) -> str:
@@ -228,6 +230,9 @@ def _safe_set_root_log_level(level: str) -> None:
 
 
 def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
+    """
+    Prefer repo-root config.py. Fall back to core.config.
+    """
     try:
         from config import get_settings  # type: ignore
 
@@ -257,15 +262,18 @@ def _load_env_module() -> Optional[object]:
 
 
 def _get(settings: Optional[object], env_mod: Optional[object], name: str, default: Any = None) -> Any:
+    # ENV wins
     v = os.getenv(name, None)
     if v is None:
         v = os.getenv(name.upper(), None)
     if v is not None:
         return v
 
+    # env.py next
     if env_mod is not None and hasattr(env_mod, name):
         return getattr(env_mod, name)
 
+    # settings last
     if settings is not None and hasattr(settings, name):
         return getattr(settings, name)
 
@@ -292,18 +300,33 @@ def _normalize_version(v: Any) -> str:
 
 
 def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> str:
-    # 1) ENV ONLY (do not allow env.py to “freeze” version)
+    """
+    Version priority (aligned with config.py):
+      1) ENV ONLY: SERVICE_VERSION / APP_VERSION / VERSION / RELEASE
+      2) Settings (service_version/version/app_version)
+      3) Render commit short hash
+      4) Legacy env.py/settings fallbacks
+      5) "dev"
+    """
+    # 1) ENV ONLY
     for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
         vv = _normalize_version(_get_env_only(k))
         if vv:
             return vv
 
-    # 2) Render commit short hash
+    # 2) Settings preferred (config.get_settings() should already normalize)
+    if settings is not None:
+        for k in ("service_version", "version", "app_version", "APP_VERSION"):
+            vv = _normalize_version(getattr(settings, k, None))
+            if vv:
+                return vv
+
+    # 3) Render commit short hash
     commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
     if commit:
         return commit[:7]
 
-    # 3) Fallback to env.py/settings legacy keys
+    # 4) Legacy env.py/settings keys
     for k in ("version", "app_version", "APP_VERSION"):
         vv = _normalize_version(_get(settings, env_mod, k, None))
         if vv:
@@ -313,15 +336,34 @@ def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> s
 
 
 def _resolve_title(settings: Optional[object], env_mod: Optional[object]) -> str:
+    # Settings first (most reliable)
+    if settings is not None:
+        for k in ("service_name", "app_name", "APP_NAME", "SERVICE_NAME"):
+            vv = str(getattr(settings, k, "") or "").strip()
+            if vv:
+                return vv
+
+    # Then env/env.py
     for k in ("APP_NAME", "SERVICE_NAME", "APP_TITLE", "TITLE"):
         vv = str(_get(settings, env_mod, k, "") or "").strip()
         if vv:
             return vv
+
     for k in ("app_name", "name"):
         vv = str(_get(settings, env_mod, k, "") or "").strip()
         if vv:
             return vv
+
     return "Tadawul Fast Bridge"
+
+
+def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> str:
+    if settings is not None:
+        for k in ("environment", "env", "APP_ENV", "ENVIRONMENT"):
+            vv = str(getattr(settings, k, "") or "").strip()
+            if vv:
+                return vv
+    return str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip() or "production"
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
@@ -336,7 +378,7 @@ def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -
 
 def _rate_limit_default(settings: Optional[object], env_mod: Optional[object]) -> str:
     try:
-        rpm = int(str(_get(settings, env_mod, "RATE_LIMIT_PER_MINUTE", "")).strip() or "0")
+        rpm = int(str(_get(settings, env_mod, "MAX_REQUESTS_PER_MINUTE", _get(settings, env_mod, "RATE_LIMIT_PER_MINUTE", ""))).strip() or "0")
         if rpm > 0:
             return f"{rpm}/minute"
     except Exception:
@@ -345,6 +387,16 @@ def _rate_limit_default(settings: Optional[object], env_mod: Optional[object]) -
 
 
 def _providers_from_settings(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[str], List[str]]:
+    # Prefer computed lists from Settings (config.py provides these)
+    if settings is not None:
+        try:
+            enabled = getattr(settings, "enabled_providers", None)
+            ksa = getattr(settings, "ksa_providers", None)
+            if isinstance(enabled, list) and isinstance(ksa, list):
+                return [str(x).strip().lower() for x in enabled if str(x).strip()], [str(x).strip().lower() for x in ksa if str(x).strip()]
+        except Exception:
+            pass
+
     enabled = _parse_list_like(_get(settings, env_mod, "ENABLED_PROVIDERS", _get(settings, env_mod, "PROVIDERS", "")))
     ksa = _parse_list_like(_get(settings, env_mod, "KSA_PROVIDERS", ""))
     return enabled, ksa
@@ -369,8 +421,8 @@ def _mask(s: str, keep: int = 4) -> str:
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
     enabled, ksa = _providers_from_settings(settings, env_mod)
     return {
-        "APP_ENV": str(_get(settings, env_mod, "APP_ENV", _get(settings, env_mod, "ENVIRONMENT", "production"))),
-        "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", _get(settings, env_mod, "log_level", "INFO"))),
+        "APP_ENV": _resolve_env_name(settings, env_mod),
+        "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")),
         "LOG_FORMAT": LOG_FORMAT,
         "ENTRY_VERSION": APP_ENTRY_VERSION,
         "APP_VERSION_RESOLVED": _resolve_version(settings, env_mod),
@@ -514,12 +566,12 @@ def create_app() -> FastAPI:
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
 
-    log_level = str(_get(settings, env_mod, "LOG_LEVEL", _get(settings, env_mod, "log_level", "INFO"))).upper()
+    log_level = str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")).upper()
     _safe_set_root_log_level(log_level)
 
     title = _resolve_title(settings, env_mod)
     version = _resolve_version(settings, env_mod)
-    app_env = str(_get(settings, env_mod, "APP_ENV", _get(settings, env_mod, "ENVIRONMENT", "production")))
+    app_env = _resolve_env_name(settings, env_mod)
 
     allow_origins = _cors_allow_origins(settings, env_mod)
     allow_credentials = False if allow_origins == ["*"] else True
@@ -658,11 +710,12 @@ def create_app() -> FastAPI:
     # Readiness: always 200 (report readiness flags)
     @app_.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
     async def readyz():
+        boot_task = getattr(app_.state, "boot_task", None)
         return {
             "status": "ok",
             "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
-            "boot_task_running": bool(getattr(app_.state, "boot_task", None) is not None and not app_.state.boot_task.done()),
+            "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "boot_error": getattr(app_.state, "boot_error", None),
         }
 
