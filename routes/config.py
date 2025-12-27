@@ -1,4 +1,4 @@
-# config.py  (REPO ROOT) — FULL REPLACEMENT
+# config.py  (REPO ROOT) — FULL REPLACEMENT — v5.3.2
 """
 config.py
 ============================================================
@@ -7,8 +7,12 @@ Canonical Settings for Tadawul Fast Bridge (ROOT)
 ✅ Single source of truth for env vars (Render names).
 ✅ Runtime alias export (so legacy/provider modules keep working).
 ✅ No network at import-time. Minimal side effects at import-time.
+✅ Defensive: never crashes import-time even if pydantic-settings missing.
 
-Version: v5.3.1 (Render yaml alignment: *_SEC TTL + HTTP_TIMEOUT_SEC)
+Version: v5.3.2
+Notes:
+- Render yaml alignment: *_TTL_SEC + HTTP_TIMEOUT_SEC supported.
+- Exposes legacy-friendly aliases via environment exports (only if missing).
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
-
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
@@ -108,7 +111,7 @@ try:
     class Settings(BaseSettings):  # type: ignore
         """
         Canonical env-backed settings model.
-        Field aliases are aligned to YOUR Render env variable names.
+        Field aliases are aligned to your Render env variable names.
         """
 
         model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
@@ -309,7 +312,7 @@ try:
         _export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(s.http_timeout_sec)))
         _export_env_if_missing("HTTP_TIMEOUT", str(float(s.http_timeout_sec)))
 
-        # TTL aliases (Render uses *_TTL_SEC; some older code may read CACHE_DEFAULT_TTL)
+        # TTL aliases
         _export_env_if_missing("CACHE_TTL_SEC", str(float(s.cache_ttl_sec)))
         _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(s.cache_ttl_sec)))
 
@@ -321,11 +324,21 @@ try:
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
         _export_env_if_missing("FINNHUB_BASE_URL", s.finnhub_base_url)
 
+        # Providers lists (some older modules read these at runtime)
+        _export_env_if_missing("ENABLED_PROVIDERS", ",".join(s.enabled_providers))
+        _export_env_if_missing("KSA_PROVIDERS", ",".join(s.ksa_providers))
+        _export_env_if_missing("PRIMARY_PROVIDER", (s.primary_provider or "eodhd").strip().lower())
+
+        # Optional base URL alias
+        if s.backend_base_url:
+            _export_env_if_missing("BACKEND_BASE_URL", (s.backend_base_url or "").rstrip("/"))
+            _export_env_if_missing("BASE_URL", (s.backend_base_url or "").rstrip("/"))
+
     @lru_cache(maxsize=1)
     def get_settings() -> Settings:
         s = Settings()
 
-        # Normalize
+        # Normalize / coerce
         s.log_level = (s.log_level or "info").strip().lower()
         s.primary_provider = (s.primary_provider or "eodhd").strip().lower()
 
@@ -358,7 +371,13 @@ except Exception:  # pragma: no cover
     # =============================================================================
     # LAST-RESORT FALLBACK (no pydantic-settings available)
     # =============================================================================
-    from pydantic import BaseModel  # type: ignore
+    try:
+        from pydantic import BaseModel  # type: ignore
+    except Exception:  # pragma: no cover
+        class BaseModel:  # type: ignore
+            def __init__(self, **kwargs: Any):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
 
     class Settings(BaseModel):  # type: ignore
         service_name: str = "Tadawul Stock Analysis API"
@@ -432,7 +451,7 @@ except Exception:  # pragma: no cover
 
         @property
         def http_timeout_sec(self) -> float:
-            return float(self.http_timeout or 30.0)
+            return float(getattr(self, "http_timeout", 30.0) or 30.0)
 
     _CACHED: Optional[Settings] = None
 
@@ -448,39 +467,46 @@ except Exception:  # pragma: no cover
             tz=(os.getenv("TZ") or os.getenv("TIMEZONE") or "Asia/Riyadh").strip(),
             debug=_to_bool(os.getenv("DEBUG"), False),
             log_level=(os.getenv("LOG_LEVEL") or "info").strip().lower(),
-
             require_auth=_to_bool(os.getenv("REQUIRE_AUTH"), False),
             app_token=(os.getenv("APP_TOKEN") or "").strip() or None,
             backup_app_token=(os.getenv("BACKUP_APP_TOKEN") or "").strip() or None,
-
             enabled_providers_raw=(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub").strip(),
             primary_provider=(os.getenv("PRIMARY_PROVIDER") or "eodhd").strip().lower(),
             ksa_providers_raw=(os.getenv("KSA_PROVIDERS") or "yahoo_chart,tadawul,argaam").strip(),
-
             eodhd_api_key=(os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_TOKEN") or "").strip() or None,
             finnhub_api_key=(os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_TOKEN") or os.getenv("FINNHUB_TOKEN") or "").strip() or None,
-
-            backend_base_url=(os.getenv("BACKEND_BASE_URL") or "").strip() or None,
-
+            backend_base_url=(os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or os.getenv("BASE_URL") or "").strip() or None,
             http_timeout=_to_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0),
             max_retries=_to_int(os.getenv("MAX_RETRIES"), 2),
             retry_delay=_to_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5),
-
             cache_ttl_sec=_to_float(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20.0),
             quote_ttl_sec=_to_float(os.getenv("QUOTE_TTL_SEC"), 30.0),
             fundamentals_ttl_sec=_to_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0),
             argaam_snapshot_ttl_sec=_to_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0),
         )
 
-        # Export runtime aliases
+        # Export runtime aliases (best-effort)
         _export_env_if_missing("FINNHUB_API_TOKEN", _CACHED.finnhub_api_token)
+        _export_env_if_missing("FINNHUB_TOKEN", _CACHED.finnhub_api_token)
         _export_env_if_missing("EODHD_API_TOKEN", _CACHED.eodhd_api_token)
+        _export_env_if_missing("EODHD_TOKEN", _CACHED.eodhd_api_token)
+
         _export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(_CACHED.http_timeout_sec)))
+        _export_env_if_missing("HTTP_TIMEOUT", str(float(_CACHED.http_timeout_sec)))
+
         _export_env_if_missing("CACHE_TTL_SEC", str(float(_CACHED.cache_ttl_sec)))
         _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(_CACHED.cache_ttl_sec)))
         _export_env_if_missing("QUOTE_TTL_SEC", str(float(_CACHED.quote_ttl_sec)))
         _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(_CACHED.fundamentals_ttl_sec)))
         _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(_CACHED.argaam_snapshot_ttl_sec)))
+
+        _export_env_if_missing("ENABLED_PROVIDERS", ",".join(_CACHED.enabled_providers))
+        _export_env_if_missing("KSA_PROVIDERS", ",".join(_CACHED.ksa_providers))
+        _export_env_if_missing("PRIMARY_PROVIDER", (_CACHED.primary_provider or "eodhd").strip().lower())
+
+        if _CACHED.backend_base_url:
+            _export_env_if_missing("BACKEND_BASE_URL", (_CACHED.backend_base_url or "").rstrip("/"))
+            _export_env_if_missing("BASE_URL", (_CACHED.backend_base_url or "").rstrip("/"))
 
         return _CACHED
 
