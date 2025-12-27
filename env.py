@@ -4,17 +4,10 @@ env.py
 ------------------------------------------------------------
 Backward-compatible environment exports for Tadawul Fast Bridge (v4.9.2)
 
-✅ What this file does
-- SINGLE source of truth from core.config.get_settings() (preferred), then root config.get_settings()
-- Exposes backward-compatible constants used across legacy modules
-- Prints a clean boot banner (providers + KSA providers) WITHOUT leaking secrets
-- Provides a settings "view" with computed/aliased attributes expected by legacy modules
-
-Design rules
-- Do NOT duplicate business logic here (routing/blocks remain in engines)
-- Fallback exists ONLY to avoid crashing if config import fails
-- Robust against circular imports (recursion guard)
-- Must be SAFE to import at app startup (no network, no heavy imports)
+v4.9.2:
+- ✅ Adds exports:
+    ENGINE_CACHE_TTL_SEC (alias for ENGINE_CACHE_TTL_SEC / CACHE_TTL_SEC)
+    ENRICHED_BATCH_CONCURRENCY (used by some routers)
 """
 
 from __future__ import annotations
@@ -25,6 +18,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 ENV_VERSION = "4.9.2"
+
 logger = logging.getLogger("env")
 
 _SETTINGS_BASE: Optional[object] = None
@@ -32,15 +26,12 @@ settings: Optional[object] = None
 
 _BANNER_PRINTED = False
 _WARNED_SETTINGS_IMPORT = False
-_LOADING_SETTINGS = False  # circular import guard
+_LOADING_SETTINGS = False
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 _FALSY = {"0", "false", "no", "off", "n", "f"}
 
 
-# -----------------------------------------------------------------------------
-# Safe helpers
-# -----------------------------------------------------------------------------
 def _mask(v: Optional[str]) -> Optional[str]:
     if not v:
         return None
@@ -53,7 +44,7 @@ def _mask(v: Optional[str]) -> Optional[str]:
 
 
 def _safe_join(items: List[str]) -> str:
-    return ",".join([str(x) for x in items if str(x).strip()])
+    return ",".join([str(x) for x in items if x])
 
 
 def _safe_bool(v: Any, default: bool = False) -> bool:
@@ -80,17 +71,12 @@ def _safe_int(v: Any, default: int) -> int:
 def _safe_float(v: Any, default: float) -> float:
     try:
         x = float(str(v).strip())
-        # allow 0? usually timeout/ttl should be >0
         return x if x > 0 else default
     except Exception:
         return default
 
 
 def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
-    """
-    For GOOGLE_SHEETS_CREDENTIALS-like env JSON.
-    Accepts dict or JSON string (including double-quoted JSON).
-    """
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -110,18 +96,9 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 def _as_list_lower(v: Any) -> List[str]:
-    """
-    Accepts:
-      - list
-      - comma-separated string
-      - JSON list string
-    Returns: de-duplicated list (order preserved), lowercased.
-    """
     if v is None:
         return []
-
     items: List[str] = []
-
     if isinstance(v, list):
         items = [str(x).strip().lower() for x in v if str(x).strip()]
     else:
@@ -152,13 +129,10 @@ def _get_attr_any(obj: Any, names: List[str], default: Any = None) -> Any:
         try:
             if hasattr(obj, n):
                 v = getattr(obj, n)
-                if v is None:
-                    continue
-                if isinstance(v, str) and not v.strip():
-                    continue
-                return v
+                if v is not None and (not isinstance(v, str) or v.strip()):
+                    return v
         except Exception:
-            continue
+            pass
     return default
 
 
@@ -183,10 +157,6 @@ def _resolve_version(settings_obj: Any) -> str:
 
 
 def _maybe_configure_logging() -> None:
-    """
-    Avoid double-configuring logging if app already has handlers.
-    Useful for standalone scripts importing env.py directly.
-    """
     try:
         root = logging.getLogger()
         if root.handlers:
@@ -203,9 +173,6 @@ def _maybe_configure_logging() -> None:
 _maybe_configure_logging()
 
 
-# -----------------------------------------------------------------------------
-# Settings loader (single source of truth)
-# -----------------------------------------------------------------------------
 def _build_fallback_settings() -> object:
     class _Fallback:
         app_name = os.getenv("APP_NAME", "Tadawul Fast Bridge")
@@ -213,18 +180,11 @@ def _build_fallback_settings() -> object:
         version = os.getenv("SERVICE_VERSION") or os.getenv("APP_VERSION") or "dev"
         log_level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").lower()
 
-        enabled_providers = _as_list_lower(
-            os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "finnhub,fmp,eodhd,yahoo_chart"
-        )
+        enabled_providers = _as_list_lower(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "finnhub,fmp,eodhd,yahoo_chart")
         enabled_ksa_providers = _as_list_lower(os.getenv("KSA_PROVIDERS") or "tadawul,argaam,yahoo_chart")
+        primary_provider = (os.getenv("PRIMARY_PROVIDER") or "").strip().lower() or (enabled_providers[0] if enabled_providers else "finnhub")
 
-        primary_provider = (os.getenv("PRIMARY_PROVIDER") or "").strip().lower() or (
-            enabled_providers[0] if enabled_providers else "finnhub"
-        )
-
-        backend_base_url = (
-            os.getenv("TFB_BASE_URL") or os.getenv("BACKEND_BASE_URL") or os.getenv("BASE_URL") or ""
-        ).rstrip("/")
+        backend_base_url = (os.getenv("TFB_BASE_URL") or os.getenv("BACKEND_BASE_URL") or os.getenv("BASE_URL") or "").rstrip("/")
 
         app_token = os.getenv("TFB_APP_TOKEN") or os.getenv("APP_TOKEN") or ""
         backup_app_token = os.getenv("BACKUP_APP_TOKEN") or ""
@@ -241,7 +201,10 @@ def _build_fallback_settings() -> object:
         google_credentials_dict = _try_parse_json_dict(google_sheets_credentials_raw)
 
         default_spreadsheet_id = (
-            os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID") or os.getenv("GOOGLE_SHEETS_ID") or ""
+            os.getenv("DEFAULT_SPREADSHEET_ID")
+            or os.getenv("SPREADSHEET_ID")
+            or os.getenv("GOOGLE_SHEETS_ID")
+            or ""
         ).strip()
 
         google_apps_script_url = (os.getenv("GOOGLE_APPS_SCRIPT_URL") or "").strip()
@@ -258,12 +221,6 @@ def _build_fallback_settings() -> object:
         sheet_economic_calendar = os.getenv("SHEET_ECONOMIC_CALENDAR", "Economic_Calendar")
         sheet_investment_income = os.getenv("SHEET_INVESTMENT_INCOME", "Investment_Income_Statement")
 
-        # TTL defaults (legacy env exports)
-        cache_ttl_sec = _safe_float(os.getenv("CACHE_TTL_SEC"), 20.0)
-        quote_ttl_sec = _safe_float(os.getenv("QUOTE_TTL_SEC"), 30.0)
-        fundamentals_ttl_sec = _safe_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0)
-        argaam_snapshot_ttl_sec = _safe_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0)
-
     return _Fallback()
 
 
@@ -278,10 +235,8 @@ def _load_settings_base() -> object:
 
     _LOADING_SETTINGS = True
     try:
-        # Preferred: core.config.get_settings()
         try:
             from core.config import get_settings  # type: ignore
-
             _SETTINGS_BASE = get_settings()
             return _SETTINGS_BASE
         except Exception as exc:
@@ -289,10 +244,8 @@ def _load_settings_base() -> object:
                 _WARNED_SETTINGS_IMPORT = True
                 logger.warning("[env] Cannot import core.config.get_settings(): %s", exc)
 
-        # Fallback: repo-root config.get_settings()
         try:
             from config import get_settings  # type: ignore
-
             _SETTINGS_BASE = get_settings()
             return _SETTINGS_BASE
         except Exception as exc:
@@ -307,12 +260,6 @@ def _load_settings_base() -> object:
 
 
 class _SettingsView:
-    """
-    Read-through view:
-    - exposes computed aliases as real attributes
-    - falls back to base settings for everything else
-    """
-
     def __init__(self, base: object, extras: Dict[str, Any]):
         self._base = base
         for k, v in extras.items():
@@ -323,14 +270,8 @@ class _SettingsView:
 
 
 def _build_settings_view(base: object) -> _SettingsView:
-    app_name = str(
-        _get_attr_any(base, ["app_name", "APP_NAME"], os.getenv("APP_NAME", "Tadawul Fast Bridge"))
-        or "Tadawul Fast Bridge"
-    )
-    env_name = str(
-        _get_attr_any(base, ["env", "environment", "APP_ENV"], os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "production")
-        or "production"
-    )
+    app_name = str(_get_attr_any(base, ["app_name", "APP_NAME"], os.getenv("APP_NAME", "Tadawul Fast Bridge")) or "Tadawul Fast Bridge")
+    env_name = str(_get_attr_any(base, ["env", "environment", "APP_ENV"], os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "production") or "production")
     ver = _resolve_version(base)
 
     backend_base_url = str(
@@ -344,73 +285,36 @@ def _build_settings_view(base: object) -> _SettingsView:
 
     app_token = _get_attr_any(base, ["app_token", "APP_TOKEN"], os.getenv("TFB_APP_TOKEN") or os.getenv("APP_TOKEN") or "")
     backup_app_token = _get_attr_any(base, ["backup_app_token", "BACKUP_APP_TOKEN"], os.getenv("BACKUP_APP_TOKEN") or "")
+
     require_auth = _safe_bool(_get_attr_any(base, ["require_auth", "REQUIRE_AUTH"], os.getenv("REQUIRE_AUTH")), False)
 
-    # Providers (normalized to lower)
-    enabled = _get_attr_any(base, ["enabled_providers"], None)
-    enabled_norm = _as_list_lower(enabled) if enabled is not None else _as_list_lower(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))
-    if not enabled_norm:
-        enabled_norm = _as_list_lower("finnhub,fmp,eodhd,yahoo_chart")
+    enabled = list(_get_attr_any(base, ["enabled_providers"], []) or []) or _as_list_lower(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))
+    enabled_norm = _as_list_lower(enabled)
 
-    ksa = _get_attr_any(base, ["enabled_ksa_providers"], None)
-    ksa_norm = _as_list_lower(ksa) if ksa is not None else _as_list_lower(os.getenv("KSA_PROVIDERS"))
-    if not ksa_norm:
-        ksa_norm = _as_list_lower("tadawul,argaam,yahoo_chart")
+    ksa = list(_get_attr_any(base, ["enabled_ksa_providers"], []) or []) or _as_list_lower(os.getenv("KSA_PROVIDERS"))
+    ksa_norm = _as_list_lower(ksa)
 
     primary = _get_attr_any(base, ["primary_provider", "PRIMARY_PROVIDER"], os.getenv("PRIMARY_PROVIDER"))
     primary = (str(primary).strip().lower() if primary else "") or (enabled_norm[0] if enabled_norm else "finnhub")
 
-    # Timeouts / TTLs (robust parsing)
-    http_timeout_sec = _safe_float(
-        _get_attr_any(base, ["http_timeout_sec", "HTTP_TIMEOUT_SEC"], os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT")),
-        25.0,
-    )
+    http_timeout_sec = float(_get_attr_any(base, ["http_timeout_sec", "HTTP_TIMEOUT_SEC"], os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT") or 25.0))
     http_timeout_sec = max(5.0, float(http_timeout_sec or 25.0))
 
-    cache_ttl_sec = _safe_float(_get_attr_any(base, ["cache_ttl_sec", "CACHE_TTL_SEC"], os.getenv("CACHE_TTL_SEC")), 20.0)
-    quote_ttl_sec = _safe_float(_get_attr_any(base, ["quote_ttl_sec", "QUOTE_TTL_SEC"], os.getenv("QUOTE_TTL_SEC")), 30.0)
-    fundamentals_ttl_sec = _safe_float(
-        _get_attr_any(base, ["fundamentals_ttl_sec", "FUNDAMENTALS_TTL_SEC"], os.getenv("FUNDAMENTALS_TTL_SEC")),
-        21600.0,
-    )
-    argaam_snapshot_ttl_sec = _safe_float(
-        _get_attr_any(base, ["argaam_snapshot_ttl_sec", "ARGAAM_SNAPSHOT_TTL_SEC"], os.getenv("ARGAAM_SNAPSHOT_TTL_SEC")),
-        30.0,
-    )
+    cache_ttl_sec = float(_get_attr_any(base, ["cache_ttl_sec", "CACHE_TTL_SEC"], os.getenv("CACHE_TTL_SEC") or 20.0))
 
-    # Google creds (dict)
     creds_dict = _get_attr_any(base, ["google_credentials_dict"], None)
     creds_raw = _get_attr_any(
         base,
-        [
-            "google_sheets_credentials_raw",
-            "google_sheets_credentials",
-            "google_credentials",
-            "google_sa_json",
-            "GOOGLE_SHEETS_CREDENTIALS",
-        ],
+        ["google_sheets_credentials_raw", "google_sheets_credentials", "google_credentials", "google_sa_json", "GOOGLE_SHEETS_CREDENTIALS"],
         None,
     )
-
-    if creds_dict is None and isinstance(_get_attr_any(base, ["google_sheets_credentials"], None), dict):
-        creds_dict = _get_attr_any(base, ["google_sheets_credentials"], None)
-
     if creds_dict is None:
-        creds_dict = _try_parse_json_dict(creds_raw)
-
-    if creds_dict is None:
-        creds_dict = _try_parse_json_dict(os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_SA_JSON"))
+        creds_dict = _try_parse_json_dict(creds_raw) or _try_parse_json_dict(os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_SA_JSON"))
 
     if isinstance(creds_raw, dict):
         creds_raw = json.dumps(creds_raw)
-
     if not isinstance(creds_raw, str) or not creds_raw.strip():
-        creds_raw = (
-            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-            or os.getenv("GOOGLE_CREDENTIALS")
-            or os.getenv("GOOGLE_SA_JSON")
-            or ""
-        ).strip()
+        creds_raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_SA_JSON") or "").strip()
 
     spreadsheet_id = str(
         _get_attr_any(
@@ -442,10 +346,7 @@ def _build_settings_view(base: object) -> _SettingsView:
         "enabled_ksa_providers": ksa_norm,
         "primary_provider": primary,
         "http_timeout_sec": http_timeout_sec,
-        "cache_ttl_sec": cache_ttl_sec,
-        "quote_ttl_sec": quote_ttl_sec,
-        "fundamentals_ttl_sec": fundamentals_ttl_sec,
-        "argaam_snapshot_ttl_sec": argaam_snapshot_ttl_sec,
+        "cache_ttl_sec": float(cache_ttl_sec),
         "google_credentials_dict": creds_dict,
         "google_sheets_credentials_raw": creds_raw,
         "spreadsheet_id": spreadsheet_id,
@@ -481,7 +382,6 @@ def _print_banner_once(s: object) -> None:
         app_name = _get_attr_any(s, ["app_name", "APP_NAME"], "Tadawul Fast Bridge")
         env_name = _get_attr_any(s, ["env", "environment", "APP_ENV"], "production")
         ver = _resolve_version(s)
-
         providers = list(_get_attr_any(s, ["enabled_providers"], []) or [])
         ksa_providers = list(_get_attr_any(s, ["enabled_ksa_providers"], []) or [])
 
@@ -497,16 +397,10 @@ def _print_banner_once(s: object) -> None:
         pass
 
 
-# -----------------------------------------------------------------------------
-# Build final settings view
-# -----------------------------------------------------------------------------
 _SETTINGS_BASE = _load_settings_base()
 settings = _build_settings_view(_SETTINGS_BASE)
 _print_banner_once(settings)
 
-# -----------------------------------------------------------------------------
-# Backward compatible exports (DON'T BREAK IMPORTS)
-# -----------------------------------------------------------------------------
 APP_NAME = _get_attr_any(settings, ["app_name", "APP_NAME"], "Tadawul Fast Bridge")
 APP_ENV = _get_attr_any(settings, ["env", "environment", "APP_ENV"], "production")
 APP_VERSION = _resolve_version(settings)
@@ -524,14 +418,15 @@ PRIMARY_PROVIDER = _get_attr_any(settings, ["primary_provider", "PRIMARY_PROVIDE
 PRIMARY_PROVIDER = str(PRIMARY_PROVIDER).strip().lower()
 PROVIDERS = _safe_join(ENABLED_PROVIDERS)
 
-HTTP_TIMEOUT_SEC = float(_safe_float(_get_attr_any(settings, ["http_timeout_sec", "HTTP_TIMEOUT_SEC"], os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT")), 25.0))
+HTTP_TIMEOUT_SEC = float(_get_attr_any(settings, ["http_timeout_sec", "HTTP_TIMEOUT_SEC"], os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT") or 25.0))
 HTTP_TIMEOUT_SEC = max(5.0, HTTP_TIMEOUT_SEC)
 HTTP_TIMEOUT = _safe_int(_get_attr_any(settings, ["http_timeout", "HTTP_TIMEOUT"], int(HTTP_TIMEOUT_SEC)), int(HTTP_TIMEOUT_SEC))
 
-CACHE_TTL_SEC = float(_safe_float(_get_attr_any(settings, ["cache_ttl_sec", "CACHE_TTL_SEC"], os.getenv("CACHE_TTL_SEC")), 20.0))
-QUOTE_TTL_SEC = float(_safe_float(_get_attr_any(settings, ["quote_ttl_sec", "QUOTE_TTL_SEC"], os.getenv("QUOTE_TTL_SEC")), 30.0))
-FUNDAMENTALS_TTL_SEC = float(_safe_float(_get_attr_any(settings, ["fundamentals_ttl_sec", "FUNDAMENTALS_TTL_SEC"], os.getenv("FUNDAMENTALS_TTL_SEC")), 21600.0))
-ARGAAM_SNAPSHOT_TTL_SEC = float(_safe_float(_get_attr_any(settings, ["argaam_snapshot_ttl_sec", "ARGAAM_SNAPSHOT_TTL_SEC"], os.getenv("ARGAAM_SNAPSHOT_TTL_SEC")), 30.0))
+CACHE_TTL_SEC = float(_get_attr_any(settings, ["cache_ttl_sec", "CACHE_TTL_SEC"], os.getenv("CACHE_TTL_SEC") or 20.0))
+
+# Added
+ENGINE_CACHE_TTL_SEC = _safe_int(os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC") or int(CACHE_TTL_SEC), int(CACHE_TTL_SEC))
+ENRICHED_BATCH_CONCURRENCY = _safe_int(os.getenv("ENRICHED_BATCH_CONCURRENCY") or 8, 8)
 
 EODHD_API_KEY = _get_attr_any(settings, ["eodhd_api_key", "EODHD_API_KEY"], os.getenv("EODHD_API_KEY"))
 FINNHUB_API_KEY = _get_attr_any(settings, ["finnhub_api_key", "FINNHUB_API_KEY"], os.getenv("FINNHUB_API_KEY"))
@@ -539,44 +434,19 @@ FMP_API_KEY = _get_attr_any(settings, ["fmp_api_key", "FMP_API_KEY"], os.getenv(
 ALPHA_VANTAGE_API_KEY = _get_attr_any(settings, ["alpha_vantage_api_key", "ALPHA_VANTAGE_API_KEY"], os.getenv("ALPHA_VANTAGE_API_KEY"))
 ARGAAM_API_KEY = _get_attr_any(settings, ["argaam_api_key", "ARGAAM_API_KEY"], os.getenv("ARGAAM_API_KEY"))
 
-ENABLE_CORS_ALL_ORIGINS = bool(
-    _get_attr_any(
-        settings,
-        ["enable_cors_all_origins", "cors_all_origins", "ENABLE_CORS_ALL_ORIGINS"],
-        _safe_bool(os.getenv("ENABLE_CORS_ALL_ORIGINS") or os.getenv("CORS_ALL_ORIGINS"), True),
-    )
-)
+ENABLE_CORS_ALL_ORIGINS = bool(_get_attr_any(settings, ["enable_cors_all_origins", "cors_all_origins", "ENABLE_CORS_ALL_ORIGINS"], _safe_bool(os.getenv("ENABLE_CORS_ALL_ORIGINS") or os.getenv("CORS_ALL_ORIGINS"), True)))
 CORS_ALL_ORIGINS = ENABLE_CORS_ALL_ORIGINS
 CORS_ORIGINS = _get_attr_any(settings, ["cors_origins", "CORS_ORIGINS"], os.getenv("CORS_ORIGINS"))
 CORS_ORIGINS_LIST = list(_get_attr_any(settings, ["cors_origins_list", "CORS_ORIGINS_LIST"], ["*"] if ENABLE_CORS_ALL_ORIGINS else []))
 
-GOOGLE_SHEETS_CREDENTIALS: Optional[Dict[str, Any]] = (
-    _get_attr_any(settings, ["google_credentials_dict", "google_sheets_credentials"], None)
-    or _try_parse_json_dict(os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_SA_JSON"))
-)
+GOOGLE_SHEETS_CREDENTIALS: Optional[Dict[str, Any]] = _get_attr_any(settings, ["google_credentials_dict", "google_sheets_credentials"], None) or _try_parse_json_dict(os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_SA_JSON"))
 
 DEFAULT_SPREADSHEET_ID = str(_get_attr_any(settings, ["default_spreadsheet_id", "DEFAULT_SPREADSHEET_ID"], os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID") or "") or "").strip()
 SPREADSHEET_ID = DEFAULT_SPREADSHEET_ID
 GOOGLE_SHEETS_ID = str(_get_attr_any(settings, ["google_sheets_id", "GOOGLE_SHEETS_ID"], os.getenv("GOOGLE_SHEETS_ID") or "") or "").strip()
 
-GOOGLE_SHEET_ID = str(_get_attr_any(settings, ["google_sheet_id", "GOOGLE_SHEET_ID"], os.getenv("GOOGLE_SHEET_ID") or "") or "").strip()
-GOOGLE_SHEET_RANGE = _get_attr_any(settings, ["google_sheet_range", "GOOGLE_SHEET_RANGE"], os.getenv("GOOGLE_SHEET_RANGE"))
-
-HAS_GOOGLE_SHEETS = bool(_get_attr_any(settings, ["has_google_sheets", "HAS_GOOGLE_SHEETS"], bool(GOOGLE_SHEETS_CREDENTIALS) and bool(DEFAULT_SPREADSHEET_ID)))
-
 GOOGLE_APPS_SCRIPT_URL = str(_get_attr_any(settings, ["google_apps_script_url"], os.getenv("GOOGLE_APPS_SCRIPT_URL") or "") or "").strip()
 GOOGLE_APPS_SCRIPT_BACKUP_URL = str(_get_attr_any(settings, ["google_apps_script_backup_url"], os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "") or "").strip()
-
-SHEET_KSA_TADAWUL = _get_attr_any(settings, ["sheet_ksa_tadawul", "SHEET_KSA_TADAWUL"], "KSA_Tadawul_Market")
-SHEET_GLOBAL_MARKETS = _get_attr_any(settings, ["sheet_global_markets", "SHEET_GLOBAL_MARKETS"], "Global_Markets")
-SHEET_MUTUAL_FUNDS = _get_attr_any(settings, ["sheet_mutual_funds", "SHEET_MUTUAL_FUNDS"], "Mutual_Funds")
-SHEET_COMMODITIES_FX = _get_attr_any(settings, ["sheet_commodities_fx", "SHEET_COMMODITIES_FX"], "Commodities_FX")
-SHEET_MARKET_LEADERS = _get_attr_any(settings, ["sheet_market_leaders", "SHEET_MARKET_LEADERS"], "Market_Leaders")
-SHEET_MY_PORTFOLIO = _get_attr_any(settings, ["sheet_my_portfolio", "SHEET_MY_PORTFOLIO"], "My_Portfolio")
-SHEET_INSIGHTS_ANALYSIS = _get_attr_any(settings, ["sheet_insights_analysis", "SHEET_INSIGHTS_ANALYSIS"], "Insights_Analysis")
-SHEET_INVESTMENT_ADVISOR = _get_attr_any(settings, ["sheet_investment_advisor", "SHEET_INVESTMENT_ADVISOR"], "Investment_Advisor")
-SHEET_ECONOMIC_CALENDAR = _get_attr_any(settings, ["sheet_economic_calendar", "SHEET_ECONOMIC_CALENDAR"], "Economic_Calendar")
-SHEET_INVESTMENT_INCOME = _get_attr_any(settings, ["sheet_investment_income", "SHEET_INVESTMENT_INCOME"], "Investment_Income_Statement")
 
 LOG_LEVEL = (str(_get_attr_any(settings, ["log_level", "LOG_LEVEL"], os.getenv("LOG_LEVEL", "INFO"))) or "INFO").upper()
 LOG_JSON = bool(_get_attr_any(settings, ["log_json", "LOG_JSON"], _safe_bool(os.getenv("LOG_JSON"), False)))
@@ -597,9 +467,10 @@ def safe_env_summary() -> Dict[str, Any]:
         "cors_all": CORS_ALL_ORIGINS,
         "timeout_sec": HTTP_TIMEOUT_SEC,
         "cache_ttl_sec": CACHE_TTL_SEC,
-        "has_google_sheets": HAS_GOOGLE_SHEETS,
+        "engine_cache_ttl_sec": ENGINE_CACHE_TTL_SEC,
+        "enriched_batch_concurrency": ENRICHED_BATCH_CONCURRENCY,
+        "has_google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS) and bool(DEFAULT_SPREADSHEET_ID),
         "default_spreadsheet_id_set": bool(DEFAULT_SPREADSHEET_ID),
-        "google_sheet_id_set": bool(GOOGLE_SHEET_ID),
         "apps_script_backup_url_set": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
         "app_token": _mask(str(APP_TOKEN) if APP_TOKEN else None),
         "keys_present": {
@@ -612,16 +483,8 @@ def safe_env_summary() -> Dict[str, Any]:
     }
 
 
-def get_settings() -> object:
-    """
-    Convenience accessor for modules that used to do: from env import settings
-    """
-    return settings if settings is not None else _build_settings_view(_load_settings_base())
-
-
 __all__ = [
     "settings",
-    "get_settings",
     "safe_env_summary",
     "APP_NAME",
     "APP_ENV",
@@ -637,9 +500,8 @@ __all__ = [
     "HTTP_TIMEOUT",
     "HTTP_TIMEOUT_SEC",
     "CACHE_TTL_SEC",
-    "QUOTE_TTL_SEC",
-    "FUNDAMENTALS_TTL_SEC",
-    "ARGAAM_SNAPSHOT_TTL_SEC",
+    "ENGINE_CACHE_TTL_SEC",
+    "ENRICHED_BATCH_CONCURRENCY",
     "EODHD_API_KEY",
     "FINNHUB_API_KEY",
     "FMP_API_KEY",
@@ -653,21 +515,8 @@ __all__ = [
     "DEFAULT_SPREADSHEET_ID",
     "SPREADSHEET_ID",
     "GOOGLE_SHEETS_ID",
-    "GOOGLE_SHEET_ID",
-    "GOOGLE_SHEET_RANGE",
-    "HAS_GOOGLE_SHEETS",
     "GOOGLE_APPS_SCRIPT_URL",
     "GOOGLE_APPS_SCRIPT_BACKUP_URL",
-    "SHEET_KSA_TADAWUL",
-    "SHEET_GLOBAL_MARKETS",
-    "SHEET_MUTUAL_FUNDS",
-    "SHEET_COMMODITIES_FX",
-    "SHEET_MARKET_LEADERS",
-    "SHEET_MY_PORTFOLIO",
-    "SHEET_INSIGHTS_ANALYSIS",
-    "SHEET_INVESTMENT_ADVISOR",
-    "SHEET_ECONOMIC_CALENDAR",
-    "SHEET_INVESTMENT_INCOME",
     "LOG_LEVEL",
     "LOG_JSON",
     "IS_PRODUCTION",
