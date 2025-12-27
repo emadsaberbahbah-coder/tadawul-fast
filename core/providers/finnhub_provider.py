@@ -1,32 +1,46 @@
+# core/providers/finnhub_provider.py  (FULL REPLACEMENT)
 """
 core/providers/finnhub_provider.py
 ------------------------------------------------------------
-Finnhub Provider (GLOBAL fallback) — v1.3.0 (PROD SAFE)
+Finnhub Provider (GLOBAL enrichment fallback) — v1.4.0 (ENV-ALIAS HARDENED)
+
+Why this revision (matches your Render env names)
+- ✅ Accepts FINNHUB_API_KEY (your current Render variable)
+- ✅ Still accepts FINNHUB_API_TOKEN / FINNHUB_TOKEN (legacy aliases)
+- ✅ Uses Finnhub standard query param: token=<...> (works with all clients)
+- ✅ Optional header support for clients is NOT needed here because we call Finnhub directly.
 
 Exposes engine-compatible callables:
 - fetch_quote_patch
 - fetch_enriched_quote_patch
 - fetch_quote_and_enrichment_patch
 
-Env vars
-- FINNHUB_API_TOKEN (or FINNHUB_TOKEN)
+Env vars (supported)
+- FINNHUB_API_KEY (preferred in your Render)
+- FINNHUB_API_TOKEN / FINNHUB_TOKEN (legacy)
 - FINNHUB_BASE_URL (default: https://finnhub.io/api/v1)
 - FINNHUB_TIMEOUT_S (default: 8.0)
+- FINNHUB_ENABLE_PROFILE (default: true)
+
+Notes
+- Finnhub quote endpoint does NOT provide volume.
+- This provider focuses on quote + profile identity fields to fill blanks when EODHD is missing.
 """
 
 from __future__ import annotations
 
-import os
 import math
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-PROVIDER_VERSION = "1.3.0"
+PROVIDER_VERSION = "1.4.0"
 PROVIDER_NAME = "finnhub"
 
 BASE_URL = (os.getenv("FINNHUB_BASE_URL") or "https://finnhub.io/api/v1").rstrip("/")
 TIMEOUT_S = float(os.getenv("FINNHUB_TIMEOUT_S") or "8.0")
+ENABLE_PROFILE = (os.getenv("FINNHUB_ENABLE_PROFILE") or "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 UA = os.getenv(
     "FINNHUB_UA",
@@ -36,7 +50,8 @@ UA = os.getenv(
 
 
 def _token() -> Optional[str]:
-    for k in ("FINNHUB_API_TOKEN", "FINNHUB_TOKEN"):
+    # ✅ Align with your Render name first, then legacy aliases
+    for k in ("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"):
         v = (os.getenv(k) or "").strip()
         if v:
             return v
@@ -62,24 +77,32 @@ def _to_float(x: Any) -> Optional[float]:
 async def _get_json(path: str, params: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str]]:
     tok = _token()
     if not tok:
-        return None, "not configured (FINNHUB_API_TOKEN)"
-    params = dict(params)
-    params["token"] = tok
+        return None, "not configured (FINNHUB_API_KEY)"
 
     url = f"{BASE_URL}{path}"
     headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
 
+    q = dict(params)
+    q["token"] = tok
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_S, headers=headers) as client:
-            r = await client.get(url, params=params)
+            r = await client.get(url, params=q)
             if r.status_code != 200:
-                return None, f"HTTP {r.status_code}"
-            return r.json(), None
+                hint = ""
+                if r.status_code in (401, 403):
+                    hint = " (auth failed: check FINNHUB_API_KEY)"
+                return None, f"HTTP {r.status_code}{hint}"
+            try:
+                return r.json(), None
+            except Exception:
+                return None, "invalid JSON response"
     except Exception as e:
         return None, f"{e.__class__.__name__}: {e}"
 
 
 def _base(symbol: str) -> Dict[str, Any]:
+    # Keep shape consistent with your engine merge policy
     return {
         "status": "success",
         "symbol": symbol,
@@ -90,15 +113,19 @@ def _base(symbol: str) -> Dict[str, Any]:
         "provider_version": PROVIDER_VERSION,
         "currency": "",
         "name": "",
+        "sector": "",
+        "industry": "",
+        "sub_sector": "",
+        "listing_date": "",
         "current_price": None,
         "previous_close": None,
         "open": None,
         "day_high": None,
         "day_low": None,
-        "volume": None,
+        "volume": None,        # Finnhub quote doesn't return volume; kept for schema compatibility
         "price_change": None,
         "percent_change": None,
-        "value_traded": None,
+        "value_traded": None,  # computed if volume is later filled by another provider (unlikely)
     }
 
 
@@ -117,51 +144,76 @@ def _fill_derived(out: Dict[str, Any]) -> None:
         out["value_traded"] = cur * vol
 
 
-async def _fetch_quote(symbol: str) -> Dict[str, Any]:
-    out = _base(symbol)
-
-    # Finnhub quote endpoint
+async def _fetch_quote(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    # Finnhub quote endpoint:
+    # c=current, d=change, dp=percent change, h=high, l=low, o=open, pc=prev close
     js, err = await _get_json("/quote", {"symbol": symbol})
-    if js is None:
-        out["status"] = "error"
-        out["data_quality"] = "BAD"
-        out["error"] = f"{PROVIDER_NAME}: {err}"
-        return out
+    if js is None or not isinstance(js, dict):
+        return {}, err or "quote failed"
 
-    # Fields: c=current, pc=prev close, o=open, h=high, l=low
-    out["current_price"] = _to_float(js.get("c"))
-    out["previous_close"] = _to_float(js.get("pc"))
-    out["open"] = _to_float(js.get("o"))
-    out["day_high"] = _to_float(js.get("h"))
-    out["day_low"] = _to_float(js.get("l"))
+    patch: Dict[str, Any] = {
+        "current_price": _to_float(js.get("c")),
+        "previous_close": _to_float(js.get("pc")),
+        "open": _to_float(js.get("o")),
+        "day_high": _to_float(js.get("h")),
+        "day_low": _to_float(js.get("l")),
+    }
 
-    _fill_derived(out)
-    out["data_quality"] = "OK" if out.get("current_price") is not None else "BAD"
-    return out
+    # Prefer Finnhub direct change fields if present (no confusion about percent format)
+    d = _to_float(js.get("d"))
+    dp = _to_float(js.get("dp"))
+    if d is not None:
+        patch["price_change"] = d
+    if dp is not None:
+        patch["percent_change"] = dp
+
+    patch = {k: v for k, v in patch.items() if v is not None}
+    return patch, None
 
 
-async def _fetch_profile(symbol: str) -> Dict[str, Any]:
-    patch: Dict[str, Any] = {}
+async def _fetch_profile(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     js, err = await _get_json("/stock/profile2", {"symbol": symbol})
     if js is None or not isinstance(js, dict) or not js:
-        return patch
+        return {}, err
 
-    patch["name"] = (js.get("name") or "") or ""
-    patch["currency"] = (js.get("currency") or "") or ""
-    patch["industry"] = (js.get("finnhubIndustry") or "") or ""
-    return patch
+    patch: Dict[str, Any] = {
+        "name": (js.get("name") or "") or "",
+        "currency": (js.get("currency") or "") or "",
+        "industry": (js.get("finnhubIndustry") or "") or "",
+        "sector": (js.get("gsector") or "") or "",
+        "sub_sector": (js.get("gsubind") or "") or "",
+        "listing_date": (js.get("ipo") or "") or "",
+    }
+
+    patch = {k: v for k, v in patch.items() if isinstance(v, str) and v.strip()}
+    return patch, None
 
 
 async def _fetch(symbol: str, want_profile: bool = True) -> Dict[str, Any]:
-    out = await _fetch_quote(symbol)
-    if out.get("status") == "error":
+    out = _base(symbol)
+
+    q_patch, q_err = await _fetch_quote(symbol)
+    if q_err:
+        out["status"] = "error"
+        out["data_quality"] = "BAD"
+        out["error"] = f"{PROVIDER_NAME}: {q_err}"
         return out
 
-    if want_profile:
-        p = await _fetch_profile(symbol)
-        for k, v in p.items():
+    out.update(q_patch)
+    _fill_derived(out)
+
+    if want_profile and ENABLE_PROFILE:
+        p_patch, _ = await _fetch_profile(symbol)
+        # Only fill blanks (EODHD should be primary for richness)
+        for k, v in p_patch.items():
             if v and not out.get(k):
                 out[k] = v
+
+    # Quality: Finnhub quote must at least have current_price
+    out["data_quality"] = "OK" if _to_float(out.get("current_price")) is not None else "BAD"
+    if out["data_quality"] == "BAD":
+        out["status"] = "error"
+        out["error"] = out["error"] or f"{PROVIDER_NAME}: missing current_price"
 
     return out
 
