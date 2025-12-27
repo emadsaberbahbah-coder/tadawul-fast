@@ -8,7 +8,14 @@ Canonical Settings for Tadawul Fast Bridge (ROOT)
 ✅ Runtime alias export (so legacy/provider modules keep working).
 ✅ No network at import-time. Minimal side effects at import-time.
 
-Version: v5.3.1 (aligned: APP_VERSION / SERVICE_VERSION / VERSION + *_SEC TTL + HTTP_TIMEOUT_SEC)
+Version: v5.3.2 (aligned: APP_VERSION / SERVICE_VERSION / VERSION + *_SEC TTL + HTTP_TIMEOUT_SEC)
+
+v5.3.2 Enhancements (vs v5.3.1)
+- ✅ More robust version resolution (handles common "unset" strings)
+- ✅ Defensive int/float parsing (never negative/zero for TTL/timeout)
+- ✅ Adds missing runtime aliases (APP_NAME, APP_ENV, TZ, LOG_LEVEL)
+- ✅ Ensures base_url always safe string
+- ✅ Keeps FULL backward compatibility with legacy env var names
 """
 
 from __future__ import annotations
@@ -20,6 +27,8 @@ from typing import Any, Dict, List, Optional
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
+
+_UNSET_STRINGS = {"", "0.0.0", "unknown", "none", "null", "unset", "n/a", "na"}
 
 
 def _to_bool(v: Any, default: bool = False) -> bool:
@@ -88,6 +97,10 @@ def _export_env_if_missing(key: str, value: Optional[str]) -> None:
         os.environ[key] = v
 
 
+def _is_unset_string(s: str) -> bool:
+    return str(s or "").strip().lower() in _UNSET_STRINGS
+
+
 def _resolve_version_from_env_or_commit(service_version: str) -> str:
     """
     Version priority:
@@ -96,7 +109,7 @@ def _resolve_version_from_env_or_commit(service_version: str) -> str:
       3) "dev"
     """
     sv = (service_version or "").strip()
-    if sv and sv not in {"0.0.0", "unknown", "none", "null"}:
+    if sv and not _is_unset_string(sv):
         return sv
 
     commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
@@ -104,6 +117,16 @@ def _resolve_version_from_env_or_commit(service_version: str) -> str:
         return commit[:7]
 
     return "dev"
+
+
+def _positive_float(v: Any, default: float) -> float:
+    x = _to_float(v, default)
+    return x if x > 0 else default
+
+
+def _positive_int(v: Any, default: int) -> int:
+    x = _to_int(v, default)
+    return x if x > 0 else default
 
 
 # =============================================================================
@@ -185,8 +208,14 @@ try:
         # ---------------------------------------------------------------------
         # Provider keys/tokens (Render names locked)
         # ---------------------------------------------------------------------
-        eodhd_api_key: Optional[str] = Field(default=None, validation_alias=_alias("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"))
-        finnhub_api_key: Optional[str] = Field(default=None, validation_alias=_alias("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"))
+        eodhd_api_key: Optional[str] = Field(
+            default=None,
+            validation_alias=_alias("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"),
+        )
+        finnhub_api_key: Optional[str] = Field(
+            default=None,
+            validation_alias=_alias("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"),
+        )
 
         fmp_api_key: Optional[str] = Field(default=None, validation_alias=_alias("FMP_API_KEY"))
         alpha_vantage_api_key: Optional[str] = Field(default=None, validation_alias=_alias("ALPHA_VANTAGE_API_KEY"))
@@ -197,7 +226,10 @@ try:
         # ---------------------------------------------------------------------
         # Base URLs / Networking
         # ---------------------------------------------------------------------
-        backend_base_url: Optional[str] = Field(default=None, validation_alias=_alias("BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL"))
+        backend_base_url: Optional[str] = Field(
+            default=None,
+            validation_alias=_alias("BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL"),
+        )
 
         eodhd_base_url: str = Field(default="https://eodhistoricaldata.com/api", validation_alias=_alias("EODHD_BASE_URL"))
         finnhub_base_url: str = Field(default="https://finnhub.io/api/v1", validation_alias=_alias("FINNHUB_BASE_URL"))
@@ -393,13 +425,26 @@ try:
         """
         Make providers + legacy modules work with your Render env names WITHOUT changing Render.
         """
-        # --- Version keys (the ones you asked for) ---
+        # --- Version keys (APP_VERSION / SERVICE_VERSION / VERSION) ---
         ver = _resolve_version_from_env_or_commit(s.service_version)
         s.service_version = ver
 
         _export_env_if_missing("SERVICE_VERSION", ver)
         _export_env_if_missing("APP_VERSION", ver)
         _export_env_if_missing("VERSION", ver)
+
+        # --- App/name/env aliases ---
+        _export_env_if_missing("APP_NAME", s.service_name)
+        _export_env_if_missing("SERVICE_NAME", s.service_name)
+
+        _export_env_if_missing("APP_ENV", s.environment)
+        _export_env_if_missing("ENVIRONMENT", s.environment)
+        _export_env_if_missing("ENV", s.environment)
+
+        _export_env_if_missing("TZ", s.tz)
+        _export_env_if_missing("TIMEZONE", s.tz)
+
+        _export_env_if_missing("LOG_LEVEL", (s.log_level or "info").strip().lower())
 
         # Provider token aliases
         _export_env_if_missing("FINNHUB_API_TOKEN", s.finnhub_api_token)
@@ -430,8 +475,10 @@ try:
 
         # Backend base URL alias
         if s.backend_base_url:
-            _export_env_if_missing("BACKEND_BASE_URL", (s.backend_base_url or "").rstrip("/"))
-            _export_env_if_missing("TFB_BASE_URL", (s.backend_base_url or "").rstrip("/"))
+            base = (s.backend_base_url or "").rstrip("/")
+            _export_env_if_missing("BACKEND_BASE_URL", base)
+            _export_env_if_missing("TFB_BASE_URL", base)
+            _export_env_if_missing("BASE_URL", base)
 
         # Spreadsheet ID alias
         if s.default_spreadsheet_id:
@@ -439,14 +486,24 @@ try:
             _export_env_if_missing("SPREADSHEET_ID", s.default_spreadsheet_id)
             _export_env_if_missing("GOOGLE_SHEETS_ID", s.default_spreadsheet_id)
 
+        # Google creds alias
+        if s.google_sheets_credentials:
+            _export_env_if_missing("GOOGLE_SHEETS_CREDENTIALS", s.google_sheets_credentials)
+            _export_env_if_missing("GOOGLE_CREDENTIALS", s.google_sheets_credentials)
+            _export_env_if_missing("GOOGLE_SA_JSON", s.google_sheets_credentials)
+
     @lru_cache(maxsize=1)
     def get_settings() -> Settings:
         s = Settings()
 
-        # Normalize
+        # Normalize (strings)
         s.log_level = (s.log_level or "info").strip().lower()
         s.primary_provider = (s.primary_provider or "eodhd").strip().lower()
+        s.environment = (s.environment or "production").strip()
+        s.tz = (s.tz or "Asia/Riyadh").strip()
+        s.backend_base_url = (s.backend_base_url or "").strip() or None
 
+        # Normalize (bools)
         s.debug = _to_bool(s.debug, False)
         s.require_auth = _to_bool(s.require_auth, False)
         s.enable_rate_limiting = _to_bool(s.enable_rate_limiting, True)
@@ -457,23 +514,24 @@ try:
         s.defer_router_mount = _to_bool(s.defer_router_mount, True)
         s.init_engine_on_boot = _to_bool(s.init_engine_on_boot, True)
 
-        s.max_requests_per_minute = _to_int(s.max_requests_per_minute, 240)
-        s.max_retries = _to_int(s.max_retries, 2)
+        # Normalize (ints)
+        s.max_requests_per_minute = _positive_int(s.max_requests_per_minute, 240)
+        s.max_retries = _positive_int(s.max_retries, 2)
+        s.cache_max_size = _positive_int(s.cache_max_size, 5000)
+        s.cache_save_interval = _positive_int(s.cache_save_interval, 300)
+        s.enriched_batch_concurrency = _positive_int(s.enriched_batch_concurrency, 8)
 
-        s.http_timeout = _to_float(s.http_timeout, 30.0)
-        s.retry_delay = _to_float(s.retry_delay, 0.5)
+        # Normalize (floats)
+        s.http_timeout = _positive_float(s.http_timeout, 30.0)
+        s.retry_delay = _positive_float(s.retry_delay, 0.5)
 
-        s.cache_ttl_sec = _to_float(s.cache_ttl_sec, 20.0)
-        s.quote_ttl_sec = _to_float(s.quote_ttl_sec, 30.0)
-        s.fundamentals_ttl_sec = _to_float(s.fundamentals_ttl_sec, 21600.0)
-        s.argaam_snapshot_ttl_sec = _to_float(s.argaam_snapshot_ttl_sec, 30.0)
+        s.cache_ttl_sec = _positive_float(s.cache_ttl_sec, 20.0)
+        s.quote_ttl_sec = _positive_float(s.quote_ttl_sec, 30.0)
+        s.fundamentals_ttl_sec = _positive_float(s.fundamentals_ttl_sec, 21600.0)
+        s.argaam_snapshot_ttl_sec = _positive_float(s.argaam_snapshot_ttl_sec, 30.0)
 
         # NEW
-        s.engine_cache_ttl_sec = _to_float(s.engine_cache_ttl_sec, float(s.cache_ttl_sec or 20.0))
-        s.enriched_batch_concurrency = _to_int(s.enriched_batch_concurrency, 8)
-
-        s.cache_max_size = _to_int(s.cache_max_size, 5000)
-        s.cache_save_interval = _to_int(s.cache_save_interval, 300)
+        s.engine_cache_ttl_sec = _positive_float(s.engine_cache_ttl_sec, float(s.cache_ttl_sec or 20.0))
 
         _apply_runtime_env_aliases(s)
         return s
@@ -589,6 +647,10 @@ except Exception:  # pragma: no cover
         def base_url(self) -> str:
             return (self.backend_base_url or "").rstrip("/")
 
+        @property
+        def google_credentials(self) -> Optional[str]:
+            return self.google_sheets_credentials
+
     _CACHED: Optional[Settings] = None
 
     def get_settings() -> Settings:  # type: ignore
@@ -608,37 +670,42 @@ except Exception:  # pragma: no cover
             log_level=(os.getenv("LOG_LEVEL") or "info").strip().lower(),
             defer_router_mount=_to_bool(os.getenv("DEFER_ROUTER_MOUNT"), True),
             init_engine_on_boot=_to_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True),
-
             require_auth=_to_bool(os.getenv("REQUIRE_AUTH"), False),
             app_token=(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or "").strip() or None,
             backup_app_token=(os.getenv("BACKUP_APP_TOKEN") or "").strip() or None,
-
             enabled_providers_raw=(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub").strip(),
             primary_provider=(os.getenv("PRIMARY_PROVIDER") or "eodhd").strip().lower(),
             ksa_providers_raw=(os.getenv("KSA_PROVIDERS") or "yahoo_chart,tadawul,argaam").strip(),
-
             eodhd_api_key=(os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_TOKEN") or "").strip() or None,
             finnhub_api_key=(os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_TOKEN") or os.getenv("FINNHUB_TOKEN") or "").strip() or None,
-
             backend_base_url=(os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or os.getenv("BASE_URL") or "").strip() or None,
-
-            http_timeout=_to_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0),
-            max_retries=_to_int(os.getenv("MAX_RETRIES"), 2),
-            retry_delay=_to_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5),
-
-            cache_ttl_sec=_to_float(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20.0),
-            quote_ttl_sec=_to_float(os.getenv("QUOTE_TTL_SEC"), 30.0),
-            fundamentals_ttl_sec=_to_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0),
-            argaam_snapshot_ttl_sec=_to_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0),
-
-            engine_cache_ttl_sec=_to_float(os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC") or os.getenv("CACHE_TTL_SEC"), 20.0),
-            enriched_batch_concurrency=_to_int(os.getenv("ENRICHED_BATCH_CONCURRENCY") or os.getenv("ENRICHED_CONCURRENCY"), 8),
+            http_timeout=_positive_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0),
+            max_retries=_positive_int(os.getenv("MAX_RETRIES"), 2),
+            retry_delay=_positive_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5),
+            cache_ttl_sec=_positive_float(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20.0),
+            quote_ttl_sec=_positive_float(os.getenv("QUOTE_TTL_SEC"), 30.0),
+            fundamentals_ttl_sec=_positive_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0),
+            argaam_snapshot_ttl_sec=_positive_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0),
+            engine_cache_ttl_sec=_positive_float(os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC") or os.getenv("CACHE_TTL_SEC"), 20.0),
+            enriched_batch_concurrency=_positive_int(os.getenv("ENRICHED_BATCH_CONCURRENCY") or os.getenv("ENRICHED_CONCURRENCY"), 8),
         )
 
         # Export runtime aliases
         _export_env_if_missing("SERVICE_VERSION", _CACHED.service_version)
         _export_env_if_missing("APP_VERSION", _CACHED.service_version)
         _export_env_if_missing("VERSION", _CACHED.service_version)
+
+        _export_env_if_missing("APP_NAME", _CACHED.service_name)
+        _export_env_if_missing("SERVICE_NAME", _CACHED.service_name)
+
+        _export_env_if_missing("APP_ENV", _CACHED.environment)
+        _export_env_if_missing("ENVIRONMENT", _CACHED.environment)
+        _export_env_if_missing("ENV", _CACHED.environment)
+
+        _export_env_if_missing("TZ", _CACHED.tz)
+        _export_env_if_missing("TIMEZONE", _CACHED.tz)
+
+        _export_env_if_missing("LOG_LEVEL", (_CACHED.log_level or "info").strip().lower())
 
         _export_env_if_missing("FINNHUB_API_TOKEN", _CACHED.finnhub_api_token)
         _export_env_if_missing("EODHD_API_TOKEN", _CACHED.eodhd_api_token)
