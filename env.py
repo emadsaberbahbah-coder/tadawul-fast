@@ -1,18 +1,16 @@
-# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.5
+# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.6
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.5)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.6)
 
 Key goals
-- ✅ No noisy banner logs by default (quiet boot).
-- ✅ Version resolves from ENV FIRST: APP_VERSION / SERVICE_VERSION / VERSION.
-- ✅ Never crashes import-time (defensive).
-- ✅ Provides legacy exports used by older modules/routes.
-- ✅ Keeps ENGINE_CACHE_TTL_SEC + ENRICHED_BATCH_CONCURRENCY (and aligns with ENRICHED_CONCURRENCY).
-
-Enable optional banner log:
-- ENV_LOG_ON_BOOT=true
+- ✅ Quiet boot by default (no banner logs unless ENV_LOG_ON_BOOT=true)
+- ✅ Version resolves from ENV FIRST: APP_VERSION / SERVICE_VERSION / VERSION / RELEASE
+- ✅ Prefers repo-root config.get_settings() (canonical), but never crashes import-time
+- ✅ Provides legacy exports used by older modules/routes
+- ✅ Ensures token alias exports (FINNHUB_API_TOKEN / EODHD_API_TOKEN) for legacy modules
+- ✅ Keeps ENGINE_CACHE_TTL_SEC + ENRICHED_BATCH_CONCURRENCY (aligns with ENRICHED_CONCURRENCY)
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.0.5"
+ENV_VERSION = "5.0.6"
 logger = logging.getLogger("env")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -67,7 +65,11 @@ def _normalize_version(v: Any) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
-    if s.lower() in {"unknown", "none", "null"}:
+    low = s.lower()
+    if low in {"unknown", "none", "null"}:
+        return ""
+    # treat config default "0.0.0" as "not set" so Render commit can win
+    if low == "0.0.0":
         return ""
     return s
 
@@ -106,7 +108,6 @@ def _as_list_lower(v: Any) -> List[str]:
         else:
             raw = [p.strip().lower() for p in s.split(",") if p.strip()]
 
-    # de-dupe preserve order
     out: List[str] = []
     seen = set()
     for x in raw:
@@ -135,6 +136,17 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _export_env_if_missing(key: str, value: Any) -> None:
+    if value is None:
+        return
+    v = str(value).strip()
+    if not v:
+        return
+    cur = os.getenv(key)
+    if cur is None or str(cur).strip() == "":
+        os.environ[key] = v
+
+
 # ---------------------------------------------------------------------
 # Optional: try to load Settings (VERY DEFENSIVE)
 # ---------------------------------------------------------------------
@@ -152,7 +164,7 @@ def _try_load_settings_once() -> Optional[object]:
 
     _LOADING_SETTINGS = True
     try:
-        # Prefer config.py at repo root (your main.py prefers this too)
+        # Prefer repo-root config.py
         try:
             from config import get_settings  # type: ignore
 
@@ -203,6 +215,20 @@ def _get_first_env(*keys: str) -> Optional[str]:
     return None
 
 
+def _env_first_bool(settings_obj: Optional[object], env_key: str, settings_attr: str, default: bool) -> bool:
+    v = _get_first_env(env_key)
+    if v is not None:
+        return _safe_bool(v, default)
+    return _safe_bool(_get_attr(settings_obj, settings_attr, None), default)
+
+
+def _env_first_float(settings_obj: Optional[object], env_key: str, settings_attr: str, default: float) -> float:
+    v = _get_first_env(env_key)
+    if v is not None:
+        return _safe_float(v, default)
+    return _safe_float(_get_attr(settings_obj, settings_attr, None), default)
+
+
 def _resolve_version(settings_obj: Optional[object]) -> str:
     # 1) ENV FIRST (canonical)
     for k in ("APP_VERSION", "SERVICE_VERSION", "VERSION", "RELEASE"):
@@ -210,16 +236,16 @@ def _resolve_version(settings_obj: Optional[object]) -> str:
         if vv:
             return vv
 
-    # 2) Render commit short hash
-    commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
-    if commit:
-        return commit[:7]
-
-    # 3) Settings fallback
-    for k in ("version", "app_version", "APP_VERSION"):
+    # 2) Prefer Settings.service_version if present (config.py)
+    for k in ("service_version", "version", "app_version", "APP_VERSION"):
         vv = _normalize_version(_get_attr(settings_obj, k, ""))
         if vv:
             return vv
+
+    # 3) Render commit short hash
+    commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
+    if commit:
+        return commit[:7]
 
     return "dev"
 
@@ -229,15 +255,19 @@ def _resolve_version(settings_obj: Optional[object]) -> str:
 # ---------------------------------------------------------------------
 _base_settings = _try_load_settings_once()
 
+# Title/name (config.py uses service_name)
 APP_NAME = (
     _get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE")
+    or str(_get_attr(_base_settings, "service_name", "") or "").strip()
     or str(_get_attr(_base_settings, "app_name", "") or _get_attr(_base_settings, "APP_NAME", "") or "").strip()
     or "Tadawul Fast Bridge"
 )
 
+# Env (config.py uses environment)
 APP_ENV = (
     _get_first_env("APP_ENV", "ENVIRONMENT")
-    or str(_get_attr(_base_settings, "env", "") or _get_attr(_base_settings, "environment", "") or "").strip()
+    or str(_get_attr(_base_settings, "environment", "") or "").strip()
+    or str(_get_attr(_base_settings, "env", "") or "").strip()
     or "production"
 )
 
@@ -245,26 +275,32 @@ APP_VERSION = _resolve_version(_base_settings)
 
 BACKEND_BASE_URL = (
     (_get_first_env("BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL") or "").rstrip("/")
-    or str(_get_attr(_base_settings, "backend_base_url", "") or _get_attr(_base_settings, "base_url", "") or "").rstrip("/")
+    or str(_get_attr(_base_settings, "backend_base_url", "") or "").rstrip("/")
+    or ""
 )
 
 APP_TOKEN = _get_first_env("APP_TOKEN", "TFB_APP_TOKEN") or str(_get_attr(_base_settings, "app_token", "") or "").strip() or None
 BACKUP_APP_TOKEN = _get_first_env("BACKUP_APP_TOKEN") or str(_get_attr(_base_settings, "backup_app_token", "") or "").strip() or None
 
-REQUIRE_AUTH = _safe_bool(_get_first_env("REQUIRE_AUTH"), False) or _safe_bool(_get_attr(_base_settings, "require_auth", None), False)
+REQUIRE_AUTH = _env_first_bool(_base_settings, "REQUIRE_AUTH", "require_auth", False)
 
-# Providers
-ENABLED_PROVIDERS: List[str] = _as_list_lower(
-    _get_first_env("ENABLED_PROVIDERS", "PROVIDERS")
-    or _get_attr(_base_settings, "enabled_providers", None)
-    or "eodhd,finnhub"
-)
+# Providers (config.py exposes enabled_providers + ksa_providers properties)
+_enabled_from_env = _get_first_env("ENABLED_PROVIDERS", "PROVIDERS")
+if _enabled_from_env is not None:
+    ENABLED_PROVIDERS: List[str] = _as_list_lower(_enabled_from_env)
+else:
+    ENABLED_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "enabled_providers", None)) or _as_list_lower(
+        _get_attr(_base_settings, "enabled_providers_raw", None) or "eodhd,finnhub"
+    )
 
-KSA_PROVIDERS: List[str] = _as_list_lower(
-    _get_first_env("KSA_PROVIDERS")
-    or _get_attr(_base_settings, "enabled_ksa_providers", None)
-    or "yahoo_chart,tadawul,argaam"
-)
+_ksa_from_env = _get_first_env("KSA_PROVIDERS")
+if _ksa_from_env is not None:
+    KSA_PROVIDERS: List[str] = _as_list_lower(_ksa_from_env)
+else:
+    # IMPORTANT: config.py uses `ksa_providers` (not enabled_ksa_providers)
+    KSA_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "ksa_providers", None)) or _as_list_lower(
+        _get_attr(_base_settings, "ksa_providers_raw", None) or "yahoo_chart,tadawul,argaam"
+    )
 
 PRIMARY_PROVIDER = (
     (_get_first_env("PRIMARY_PROVIDER") or "").strip().lower()
@@ -275,44 +311,72 @@ PRIMARY_PROVIDER = (
 PROVIDERS = _safe_join(ENABLED_PROVIDERS)
 
 # HTTP / cache
-HTTP_TIMEOUT_SEC = _safe_float(_get_first_env("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"), 25.0)
+HTTP_TIMEOUT_SEC = _safe_float(_get_first_env("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT") or _get_attr(_base_settings, "http_timeout_sec", None), 25.0)
 HTTP_TIMEOUT_SEC = max(5.0, float(HTTP_TIMEOUT_SEC or 25.0))
-HTTP_TIMEOUT = _safe_int(_get_first_env("HTTP_TIMEOUT"), int(HTTP_TIMEOUT_SEC))
+HTTP_TIMEOUT = _safe_int(_get_first_env("HTTP_TIMEOUT") or int(HTTP_TIMEOUT_SEC), int(HTTP_TIMEOUT_SEC))
 
-CACHE_TTL_SEC = _safe_float(_get_first_env("CACHE_TTL_SEC"), 20.0)
+CACHE_TTL_SEC = _safe_float(_get_first_env("CACHE_TTL_SEC") or _get_attr(_base_settings, "cache_ttl_sec", None), 20.0)
 
 # Added (keep your legacy aliases)
-ENGINE_CACHE_TTL_SEC = _safe_int(_get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC"), int(CACHE_TTL_SEC))
+ENGINE_CACHE_TTL_SEC = _safe_int(_get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC") or _get_attr(_base_settings, "engine_cache_ttl_sec", None), int(CACHE_TTL_SEC))
+
 # Keep legacy name but also align with your blueprint "ENRICHED_CONCURRENCY"
-ENRICHED_BATCH_CONCURRENCY = _safe_int(_get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY"), 8)
+ENRICHED_BATCH_CONCURRENCY = _safe_int(_get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY") or _get_attr(_base_settings, "enriched_batch_concurrency", None), 8)
 
 # Provider keys
-EODHD_API_KEY = _get_first_env("EODHD_API_KEY") or _get_attr(_base_settings, "eodhd_api_key", None)
-FINNHUB_API_KEY = _get_first_env("FINNHUB_API_KEY") or _get_attr(_base_settings, "finnhub_api_key", None)
+EODHD_API_KEY = _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN") or _get_attr(_base_settings, "eodhd_api_key", None)
+FINNHUB_API_KEY = _get_first_env("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN") or _get_attr(_base_settings, "finnhub_api_key", None)
 FMP_API_KEY = _get_first_env("FMP_API_KEY") or _get_attr(_base_settings, "fmp_api_key", None)
 ALPHA_VANTAGE_API_KEY = _get_first_env("ALPHA_VANTAGE_API_KEY") or _get_attr(_base_settings, "alpha_vantage_api_key", None)
 ARGAAM_API_KEY = _get_first_env("ARGAAM_API_KEY") or _get_attr(_base_settings, "argaam_api_key", None)
 
+# Export token aliases for legacy provider modules (no overwrite)
+if FINNHUB_API_KEY:
+    _export_env_if_missing("FINNHUB_API_TOKEN", FINNHUB_API_KEY)
+    _export_env_if_missing("FINNHUB_TOKEN", FINNHUB_API_KEY)
+
+if EODHD_API_KEY:
+    _export_env_if_missing("EODHD_API_TOKEN", EODHD_API_KEY)
+    _export_env_if_missing("EODHD_TOKEN", EODHD_API_KEY)
+
+# Timeout aliases used by older code
+_export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(HTTP_TIMEOUT_SEC)))
+_export_env_if_missing("HTTP_TIMEOUT", str(float(HTTP_TIMEOUT_SEC)))
+
+# TTL aliases used by older code
+_export_env_if_missing("CACHE_TTL_SEC", str(float(CACHE_TTL_SEC)))
+_export_env_if_missing("CACHE_DEFAULT_TTL", str(float(CACHE_TTL_SEC)))
+
 # CORS
-ENABLE_CORS_ALL_ORIGINS = _safe_bool(_get_first_env("ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"), True)
+ENABLE_CORS_ALL_ORIGINS = _env_first_bool(_base_settings, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", True)
 CORS_ALL_ORIGINS = ENABLE_CORS_ALL_ORIGINS
-CORS_ORIGINS = _get_first_env("CORS_ORIGINS") or _get_attr(_base_settings, "cors_origins", None)
-CORS_ORIGINS_LIST = ["*"] if ENABLE_CORS_ALL_ORIGINS else _as_list_lower(CORS_ORIGINS or "")
+CORS_ORIGINS = _get_first_env("CORS_ORIGINS") or str(_get_attr(_base_settings, "cors_origins", "") or "").strip() or "*"
+if ENABLE_CORS_ALL_ORIGINS:
+    CORS_ORIGINS_LIST = ["*"]
+else:
+    CORS_ORIGINS_LIST = [x.strip() for x in (CORS_ORIGINS or "").split(",") if x.strip()] or []
 
-# Google Sheets
-_GOOGLE_SHEETS_CREDENTIALS_RAW = (
-    _get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON") or ""
+# Google Sheets (ENV first, then settings)
+_google_creds_raw = (
+    _get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON")
+    or str(_get_attr(_base_settings, "google_sheets_credentials", "") or "").strip()
+    or str(_get_attr(_base_settings, "google_credentials", "") or "").strip()
+    or ""
 ).strip()
-GOOGLE_SHEETS_CREDENTIALS: Optional[Dict[str, Any]] = _try_parse_json_dict(_GOOGLE_SHEETS_CREDENTIALS_RAW)
+GOOGLE_SHEETS_CREDENTIALS: Optional[Dict[str, Any]] = _try_parse_json_dict(_google_creds_raw)
 
-DEFAULT_SPREADSHEET_ID = (_get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID") or "").strip()
+DEFAULT_SPREADSHEET_ID = (
+    (_get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID") or "").strip()
+    or str(_get_attr(_base_settings, "default_spreadsheet_id", "") or "").strip()
+    or ""
+)
 SPREADSHEET_ID = DEFAULT_SPREADSHEET_ID
 GOOGLE_SHEETS_ID = (_get_first_env("GOOGLE_SHEETS_ID") or "").strip()
 
-GOOGLE_APPS_SCRIPT_URL = (_get_first_env("GOOGLE_APPS_SCRIPT_URL") or "").strip()
-GOOGLE_APPS_SCRIPT_BACKUP_URL = (_get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "").strip()
+GOOGLE_APPS_SCRIPT_URL = (_get_first_env("GOOGLE_APPS_SCRIPT_URL") or str(_get_attr(_base_settings, "google_apps_script_url", "") or "")).strip()
+GOOGLE_APPS_SCRIPT_BACKUP_URL = (_get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL") or str(_get_attr(_base_settings, "google_apps_script_backup_url", "") or "")).strip()
 
-# Sheet names (keep your legacy keys)
+# Sheet names (keep legacy keys)
 SHEET_KSA_TADAWUL = (_get_first_env("SHEET_KSA_TADAWUL") or "KSA_Tadawul_Market").strip()
 SHEET_GLOBAL_MARKETS = (_get_first_env("SHEET_GLOBAL_MARKETS") or "Global_Markets").strip()
 SHEET_MUTUAL_FUNDS = (_get_first_env("SHEET_MUTUAL_FUNDS") or "Mutual_Funds").strip()
@@ -325,7 +389,7 @@ SHEET_ECONOMIC_CALENDAR = (_get_first_env("SHEET_ECONOMIC_CALENDAR") or "Economi
 SHEET_INVESTMENT_INCOME = (_get_first_env("SHEET_INVESTMENT_INCOME") or "Investment_Income_Statement").strip()
 
 # Logging flags
-LOG_LEVEL = (_get_first_env("LOG_LEVEL") or "INFO").upper()
+LOG_LEVEL = (_get_first_env("LOG_LEVEL") or str(_get_attr(_base_settings, "log_level", "") or "") or "INFO").upper()
 LOG_JSON = _safe_bool(_get_first_env("LOG_JSON"), False)
 IS_PRODUCTION = str(APP_ENV).strip().lower() in {"prod", "production"}
 
@@ -334,21 +398,29 @@ IS_PRODUCTION = str(APP_ENV).strip().lower() in {"prod", "production"}
 # settings compatibility object (very lightweight)
 # ---------------------------------------------------------------------
 class _Settings:
+    # Keep common historical attribute names
     app_name = APP_NAME
     env = APP_ENV
+    environment = APP_ENV
     version = APP_VERSION
+    service_version = APP_VERSION
     backend_base_url = BACKEND_BASE_URL
     base_url = BACKEND_BASE_URL
+
     app_token = APP_TOKEN or ""
     backup_app_token = BACKUP_APP_TOKEN or ""
     require_auth = REQUIRE_AUTH
+
     enabled_providers = ENABLED_PROVIDERS
-    enabled_ksa_providers = KSA_PROVIDERS
+    ksa_providers = KSA_PROVIDERS  # canonical from config.py
+    enabled_ksa_providers = KSA_PROVIDERS  # legacy alias for older code
     primary_provider = PRIMARY_PROVIDER
+
     http_timeout_sec = HTTP_TIMEOUT_SEC
     cache_ttl_sec = CACHE_TTL_SEC
     engine_cache_ttl_sec = ENGINE_CACHE_TTL_SEC
     enriched_batch_concurrency = ENRICHED_BATCH_CONCURRENCY
+
     google_credentials_dict = GOOGLE_SHEETS_CREDENTIALS
     default_spreadsheet_id = DEFAULT_SPREADSHEET_ID
     spreadsheet_id = DEFAULT_SPREADSHEET_ID
