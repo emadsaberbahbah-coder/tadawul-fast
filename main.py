@@ -1,15 +1,22 @@
+# main.py — FULL REPLACEMENT
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.6
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.7
 
-v5.0.6:
+v5.0.7 improvements vs v5.0.6
 - ✅ Fully aligned with repo-root config.py (v5.3.1+):
-    • Version resolves from SERVICE_VERSION / APP_VERSION / VERSION (preferred)
+    • Version resolves from SERVICE_VERSION / APP_VERSION / VERSION (ENV wins)
     • If missing → uses Settings.service_version (which may fall back to Render commit)
-    • Consistent startup banner output across env.py / config.py / main.py
-- ✅ Title/Env/Providers prefer Settings fields when available (more reliable).
-- ✅ Keeps all “never crash startup” guarantees.
+    • Ensures runtime env aliases are applied (best-effort, never overwrite)
+- ✅ Safer + clearer boot state:
+    • boot_task_running / boot_completed flags
+    • routers_ready computed against REQUIRED_ROUTERS (or defaults)
+    • engine_ready + engine_error always present
+- ✅ Router mounting remains PROD-safe:
+    • No core imports at module import-time (only in functions)
+    • Mount failures never crash startup
+- ✅ Adds /system/info endpoint (non-sensitive diagnostics)
 
 Design goals unchanged
 - Never crash app startup.
@@ -46,10 +53,23 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_FALSY = {"0", "false", "no", "n", "off", "f"}
+
+APP_ENTRY_VERSION = "5.0.7"
 
 
 def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
+
+
+def _clamp_str(s: Any, max_len: int = 2000) -> str:
+    txt = (str(s) if s is not None else "").strip()
+    if not txt:
+        return ""
+    if len(txt) <= max_len:
+        return txt
+    cut = max(0, max_len - 12)
+    return txt[:cut] + " ...TRUNC..."
 
 
 def _export_env_if_missing(key: str, value: Any) -> None:
@@ -68,7 +88,7 @@ def _apply_runtime_env_aliases_last_resort() -> None:
     Extra safety: even if config.get_settings cannot be imported,
     ensure provider modules that read *_API_TOKEN still work.
 
-    No overwrite if already set.
+    Never overwrites explicit values.
     """
     finnhub_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
     eodhd_key = (os.getenv("EODHD_API_KEY") or "").strip()
@@ -81,7 +101,7 @@ def _apply_runtime_env_aliases_last_resort() -> None:
         _export_env_if_missing("EODHD_API_TOKEN", eodhd_key)
         _export_env_if_missing("EODHD_TOKEN", eodhd_key)
 
-    # Common numeric aliases used elsewhere
+    # Numeric aliases
     if os.getenv("HTTP_TIMEOUT") and not os.getenv("HTTP_TIMEOUT_SEC"):
         _export_env_if_missing("HTTP_TIMEOUT_SEC", os.getenv("HTTP_TIMEOUT"))
     if os.getenv("RETRY_DELAY") and not os.getenv("RETRY_DELAY_SEC"):
@@ -119,18 +139,6 @@ except Exception:
         pass
 
 logger = logging.getLogger("main")
-
-APP_ENTRY_VERSION = "5.0.6"
-
-
-def _clamp_str(s: Any, max_len: int = 2000) -> str:
-    txt = (str(s) if s is not None else "").strip()
-    if not txt:
-        return ""
-    if len(txt) <= max_len:
-        return txt
-    cut = max(0, max_len - 12)
-    return txt[:cut] + " ...TRUNC..."
 
 
 def _parse_list_like(v: Any) -> List[str]:
@@ -180,7 +188,7 @@ def _mount_router(
 
     mod, loaded_from, err_tb = _import_first(candidates)
     if mod is None:
-        report["error"] = _clamp_str(f"All imports failed. Last traceback:\n{err_tb or '(none)'}")
+        report["error"] = _clamp_str(f"All imports failed. Last traceback:\n{err_tb or '(none)'}", 8000)
         logger.warning("Router not mounted (%s): import failed for %s", name, candidates)
         return report
 
@@ -198,13 +206,14 @@ def _mount_router(
             router_obj = getattr(mod, "get_router")()
             router_attr = "get_router()"
         except Exception:
-            report["error"] = _clamp_str(f"get_router() failed:\n{traceback.format_exc()}")
+            report["error"] = _clamp_str(f"get_router() failed:\n{traceback.format_exc()}", 8000)
             logger.warning("Router not mounted (%s): get_router() failed", name)
             return report
 
     if router_obj is None:
         report["error"] = _clamp_str(
-            f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}"
+            f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}",
+            3000,
         )
         logger.warning("Router not mounted (%s): no router found in %s", name, loaded_from)
         return report
@@ -217,7 +226,7 @@ def _mount_router(
         logger.info("Mounted router: %s (%s.%s)", name, loaded_from, router_attr)
         return report
     except Exception:
-        report["error"] = _clamp_str(f"include_router failed:\n{traceback.format_exc()}")
+        report["error"] = _clamp_str(f"include_router failed:\n{traceback.format_exc()}", 8000)
         logger.warning("Router not mounted (%s): include_router failed", name)
         return report
 
@@ -305,28 +314,24 @@ def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> s
       1) ENV ONLY: SERVICE_VERSION / APP_VERSION / VERSION / RELEASE
       2) Settings (service_version/version/app_version)
       3) Render commit short hash
-      4) Legacy env.py/settings fallbacks
+      4) env.py legacy keys
       5) "dev"
     """
-    # 1) ENV ONLY
     for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
         vv = _normalize_version(_get_env_only(k))
         if vv:
             return vv
 
-    # 2) Settings preferred (config.get_settings() should already normalize)
     if settings is not None:
         for k in ("service_version", "version", "app_version", "APP_VERSION"):
             vv = _normalize_version(getattr(settings, k, None))
             if vv:
                 return vv
 
-    # 3) Render commit short hash
     commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
     if commit:
         return commit[:7]
 
-    # 4) Legacy env.py/settings keys
     for k in ("version", "app_version", "APP_VERSION"):
         vv = _normalize_version(_get(settings, env_mod, k, None))
         if vv:
@@ -336,14 +341,12 @@ def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> s
 
 
 def _resolve_title(settings: Optional[object], env_mod: Optional[object]) -> str:
-    # Settings first (most reliable)
     if settings is not None:
         for k in ("service_name", "app_name", "APP_NAME", "SERVICE_NAME"):
             vv = str(getattr(settings, k, "") or "").strip()
             if vv:
                 return vv
 
-    # Then env/env.py
     for k in ("APP_NAME", "SERVICE_NAME", "APP_TITLE", "TITLE"):
         vv = str(_get(settings, env_mod, k, "") or "").strip()
         if vv:
@@ -367,33 +370,23 @@ def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> 
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
-    cors_all = _truthy(
-        _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true"))
-    )
+    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
     if cors_all:
         return ["*"]
     raw = str(_get(settings, env_mod, "CORS_ORIGINS", "")).strip()
     return [o.strip() for o in raw.split(",") if o.strip()] or []
 
 
-def _rate_limit_default(settings: Optional[object], env_mod: Optional[object]) -> str:
-    try:
-        rpm = int(str(_get(settings, env_mod, "MAX_REQUESTS_PER_MINUTE", _get(settings, env_mod, "RATE_LIMIT_PER_MINUTE", ""))).strip() or "0")
-        if rpm > 0:
-            return f"{rpm}/minute"
-    except Exception:
-        pass
-    return "240/minute"
-
-
 def _providers_from_settings(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[str], List[str]]:
-    # Prefer computed lists from Settings (config.py provides these)
     if settings is not None:
         try:
             enabled = getattr(settings, "enabled_providers", None)
             ksa = getattr(settings, "ksa_providers", None)
             if isinstance(enabled, list) and isinstance(ksa, list):
-                return [str(x).strip().lower() for x in enabled if str(x).strip()], [str(x).strip().lower() for x in ksa if str(x).strip()]
+                return (
+                    [str(x).strip().lower() for x in enabled if str(x).strip()],
+                    [str(x).strip().lower() for x in ksa if str(x).strip()],
+                )
         except Exception:
             pass
 
@@ -409,15 +402,6 @@ def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key:
     return _truthy(v)
 
 
-def _mask(s: str, keep: int = 4) -> str:
-    s = str(s or "")
-    if not s:
-        return ""
-    if len(s) <= keep:
-        return "•" * len(s)
-    return ("•" * (len(s) - keep)) + s[-keep:]
-
-
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
     enabled, ksa = _providers_from_settings(settings, env_mod)
     return {
@@ -430,11 +414,10 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "KSA_PROVIDERS": ksa,
         "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true")),
         "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")),
-        "APP_TOKEN_SET": bool(str(_get(settings, env_mod, "APP_TOKEN", "") or "").strip()),
-        "BACKUP_APP_TOKEN_SET": bool(str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "").strip()),
         "ENABLE_YAHOO_CHART_KSA": str(os.getenv("ENABLE_YAHOO_CHART_KSA", "")),
         "ENABLE_YAHOO_CHART_SUPPLEMENT": str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "")),
         "ENABLE_YFINANCE_KSA": str(os.getenv("ENABLE_YFINANCE_KSA", "")),
+        "RENDER_GIT_COMMIT": (os.getenv("RENDER_GIT_COMMIT") or "")[:12],
     }
 
 
@@ -468,22 +451,26 @@ def _apply_provider_defaults_if_missing() -> None:
     """
     Enforce intended priority WITHOUT overriding explicit env values.
     """
-    # GLOBAL
     if not (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS")):
         os.environ["ENABLED_PROVIDERS"] = "eodhd,finnhub,fmp"
         os.environ.setdefault("PROVIDERS", os.environ["ENABLED_PROVIDERS"])
 
-    # KSA
     if not os.getenv("KSA_PROVIDERS"):
         os.environ["KSA_PROVIDERS"] = "yahoo_chart,tadawul,argaam"
 
-    # Robust defaults (do not override if user already set)
     os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
 
 
 def _init_engine_best_effort(app_: FastAPI) -> None:
+    """
+    Best-effort engine init. Never throws.
+    Sets:
+      - app.state.engine
+      - app.state.engine_ready
+      - app.state.engine_error
+    """
     # Prefer v2
     try:
         mod = import_module("core.data_engine_v2")
@@ -496,7 +483,7 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             return
     except Exception:
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(traceback.format_exc())
+        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
 
     # Fallback legacy
     try:
@@ -510,7 +497,7 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             return
     except Exception:
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(traceback.format_exc())
+        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
 
 
 def _mount_all_routers(app_: FastAPI) -> None:
@@ -540,8 +527,10 @@ async def _background_boot(app_: FastAPI) -> None:
             await asyncio.to_thread(_init_engine_best_effort, app_)
         app_.state.boot_error = None
     except Exception:
-        app_.state.boot_error = _clamp_str(traceback.format_exc())
+        app_.state.boot_error = _clamp_str(traceback.format_exc(), 8000)
         logger.warning("Background boot failed: %s", app_.state.boot_error)
+    finally:
+        app_.state.boot_completed = True
 
 
 async def _maybe_close_engine(app_: FastAPI) -> None:
@@ -566,6 +555,7 @@ def create_app() -> FastAPI:
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
 
+    # Prefer LOG_LEVEL from settings if possible
     log_level = str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")).upper()
     _safe_set_root_log_level(log_level)
 
@@ -580,6 +570,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
+        # State defaults (always present)
         app_.state.settings = settings
         app_.state.settings_source = settings_source
         app_.state.app_env = app_env
@@ -592,7 +583,9 @@ def create_app() -> FastAPI:
 
         app_.state.engine_ready = False
         app_.state.engine_error = None
+
         app_.state.boot_error = None
+        app_.state.boot_completed = False
 
         app_.state.defer_router_mount = _truthy(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true"))
         app_.state.init_engine_on_boot = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")
@@ -607,13 +600,16 @@ def create_app() -> FastAPI:
             app_.state.init_engine_on_boot,
         )
 
+        # Boot (deferred or immediate)
         if app_.state.defer_router_mount:
             app_.state.boot_task = asyncio.create_task(_background_boot(app_))
         else:
             await asyncio.to_thread(_mount_all_routers, app_)
             if _truthy(app_.state.init_engine_on_boot):
                 await asyncio.to_thread(_init_engine_best_effort, app_)
+            app_.state.boot_completed = True
 
+        # Startup banner
         enabled, ksa = _providers_from_settings(settings, env_mod)
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
@@ -627,6 +623,7 @@ def create_app() -> FastAPI:
 
         yield
 
+        # Shutdown
         try:
             task = getattr(app_.state, "boot_task", None)
             if task and not task.done():
@@ -638,6 +635,7 @@ def create_app() -> FastAPI:
 
     app_ = FastAPI(title=str(title), version=str(version), lifespan=lifespan)
 
+    # CORS
     app_.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins if allow_origins else [],
@@ -655,7 +653,13 @@ def create_app() -> FastAPI:
             from slowapi.middleware import SlowAPIMiddleware
             from slowapi.util import get_remote_address
 
-            default_limit = _rate_limit_default(settings, env_mod)
+            rpm = _get(settings, env_mod, "MAX_REQUESTS_PER_MINUTE", 240)
+            try:
+                rpm_i = int(str(rpm).strip())
+            except Exception:
+                rpm_i = 240
+            default_limit = f"{rpm_i}/minute"
+
             limiter = Limiter(key_func=get_remote_address, default_limits=[default_limit])
             app_.state.limiter = limiter
             app_.add_middleware(SlowAPIMiddleware)
@@ -668,6 +672,7 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.warning("SlowAPI not enabled: %s", e)
 
+    # Exception handlers
     @app_.exception_handler(StarletteHTTPException)
     async def _http_exc_handler(request, exc: StarletteHTTPException):  # noqa: ANN001
         return JSONResponse(status_code=exc.status_code, content={"status": "error", "detail": exc.detail})
@@ -687,6 +692,9 @@ def create_app() -> FastAPI:
             content={"status": "error", "error": "Internal Server Error", "detail": _clamp_str(exc)},
         )
 
+    # -----------------------------------------------------------------
+    # System routes (always available)
+    # -----------------------------------------------------------------
     @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
         return {
@@ -697,26 +705,25 @@ def create_app() -> FastAPI:
             "entry_version": APP_ENTRY_VERSION,
         }
 
-    # Liveness: always 200
     @app_.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
     async def healthz():
         return {"status": "ok"}
 
-    # Extra liveness alias (always 200)
     @app_.api_route("/livez", methods=["GET", "HEAD"], include_in_schema=False)
     async def livez():
         return {"status": "ok"}
 
-    # Readiness: always 200 (report readiness flags)
     @app_.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
     async def readyz():
         boot_task = getattr(app_.state, "boot_task", None)
         return {
             "status": "ok",
+            "boot_completed": bool(getattr(app_.state, "boot_completed", False)),
+            "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
-            "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "boot_error": getattr(app_.state, "boot_error", None),
+            "engine_error": getattr(app_.state, "engine_error", None),
         }
 
     @app_.get("/health", tags=["system"])
@@ -735,11 +742,12 @@ def create_app() -> FastAPI:
             "providers": enabled,
             "ksa_providers": ksa,
             "settings_source": getattr(app_.state, "settings_source", None),
+            "boot_completed": bool(getattr(app_.state, "boot_completed", False)),
+            "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
             "engine_ready": bool(getattr(app_.state, "engine_ready", False)),
             "engine_error": getattr(app_.state, "engine_error", None),
             "boot_error": getattr(app_.state, "boot_error", None),
-            "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "routers_mounted": [m["name"] for m in mounted],
             "routers_failed": [
                 {"name": f["name"], "loaded_from": f.get("loaded_from"), "error": _clamp_str(f.get("error") or "", 2000)}
@@ -750,18 +758,29 @@ def create_app() -> FastAPI:
 
     @app_.get("/system/settings", tags=["system"])
     async def system_settings():
+        safe = None
+        try:
+            if settings is not None and hasattr(settings, "as_safe_dict"):
+                safe = settings.as_safe_dict()  # type: ignore
+        except Exception:
+            safe = None
+
         return {
             "settings_source": getattr(app_.state, "settings_source", None),
-            "env": _safe_env_snapshot(settings, env_mod),
+            "env_snapshot": _safe_env_snapshot(settings, env_mod),
+            "settings_safe": safe,
         }
 
-    @app_.get("/system/secrets", tags=["system"])
-    async def system_secrets():
-        app_token = str(_get(settings, env_mod, "APP_TOKEN", "") or "")
-        backup_token = str(_get(settings, env_mod, "BACKUP_APP_TOKEN", "") or "")
+    @app_.get("/system/info", tags=["system"])
+    async def system_info():
         return {
-            "APP_TOKEN": _mask(app_token, keep=4) if app_token else "",
-            "BACKUP_APP_TOKEN": _mask(backup_token, keep=4) if backup_token else "",
+            "service": app_.title,
+            "version": app_.version,
+            "entry_version": APP_ENTRY_VERSION,
+            "environment": getattr(app_.state, "app_env", "unknown"),
+            "start_time_utc": getattr(app_.state, "start_time_utc", None),
+            "render_git_commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:40],
+            "python": sys.version.split(" ")[0],
         }
 
     return app_
