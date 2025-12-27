@@ -1,52 +1,20 @@
-# core/data_engine_v2.py  (FULL REPLACEMENT)
+# core/data_engine_v2.py
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.8.0) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.7.4) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-Goals
-- Never crash app startup (no network at import time).
-- Provide DataEngine used by routes/enriched_quote.py and analysis routers.
-- Provider routing:
-    GLOBAL: ENABLED_PROVIDERS or PROVIDERS (comma-separated)
-    KSA:    KSA_PROVIDERS (comma-separated)
-- If provider list is missing, uses safe defaults:
-    GLOBAL: eodhd -> finnhub -> fmp
-    KSA:    tadawul -> argaam -> yahoo_chart
-- Best-effort: if a provider module/function is missing, skip safely.
+What’s improved vs v2.7.1
+- ✅ Adds UnifiedQuote Pydantic model (enables schema-fill in routers)
+- ✅ Exposes normalize_symbol() (routers prefer it)
+- ✅ Provider fn-name alignment (yahoo_chart_provider now supported via *fetch_quote_patch*)
+- ✅ KSA routing safety: NEVER uses eodhd/fmp/finnhub for .SR unless explicitly listed in KSA_PROVIDERS
+- ✅ Better defaults: output dict includes core keys (stable for Sheets)
+- ✅ Derived fields computed (price_change/percent_change/value_traded/52w position)
+- ✅ Batch aliases: get_quote(s)/get_quotes(s)
 
-Env (optional)
-- ENABLED_PROVIDERS / PROVIDERS      e.g. "eodhd,finnhub,fmp"
-- KSA_PROVIDERS                      e.g. "tadawul,argaam,yahoo_chart"
-- PRIMARY_PROVIDER                   e.g. "eodhd" (forces first in GLOBAL list)
-- PRIMARY_KSA_PROVIDER               e.g. "tadawul" (forces first in KSA list)
-- ENGINE_CACHE_TTL_SEC               default: 10 (min: 3)
-
-Expected provider modules (optional)
-- core.providers.eodhd_provider
-- core.providers.finnhub_provider
-- core.providers.fmp_provider
-- core.providers.tadawul_provider
-- core.providers.argaam_provider
-- core.providers.yahoo_chart_provider
-
-Provider callable conventions (engine will try many names)
-- fetch_quote_patch(symbol) -> dict OR (dict, err)
-- fetch_enriched_quote_patch(symbol) -> dict OR (dict, err)
-- fetch_quote_and_enrichment_patch(symbol) -> dict OR (dict, err)
-- KSA-only (legacy names):
-    fetch_quote_and_fundamentals_patch(symbol) -> (dict, err)
-
-Return
-- UnifiedQuote-like dict (aligned keys):
-  symbol, market, currency, name,
-  current_price, previous_close, open, day_high, day_low,
-  price_change, percent_change, volume, value_traded,
-  high_52w, low_52w, position_52w_percent,
-  market_cap, shares_outstanding, free_float, free_float_market_cap,
-  eps_ttm, pe_ttm, pb, ps, dividend_yield, roe, roa, beta,
-  data_source, data_quality, last_updated_utc, error,
-  quality_score, value_score, momentum_score, risk_score, opportunity_score
+Return shape
+- Dict aligned to UnifiedQuote keys (safe for Sheets)
 """
 
 from __future__ import annotations
@@ -64,23 +32,135 @@ from cachetools import TTLCache
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.8.0"
+ENGINE_VERSION = "2.7.4"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pydantic (best-effort)
+# ---------------------------------------------------------------------------
+try:
+    from pydantic import BaseModel, ConfigDict, Field
+except Exception:  # pragma: no cover
+    class BaseModel:  # type: ignore
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def model_dump(self, *a, **k):
+            return dict(self.__dict__)
+
+    def Field(default=None, **kwargs):  # type: ignore
+        return default
+
+    def ConfigDict(**kwargs):  # type: ignore
+        return dict(kwargs)
+
+
+# ---------------------------------------------------------------------------
+# UnifiedQuote schema (for router schema-fill)
+# ---------------------------------------------------------------------------
+class UnifiedQuote(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    # Identity
+    symbol: str
+    name: Optional[str] = None
+    market: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+
+    # Price / Trading
+    current_price: Optional[float] = None
+    previous_close: Optional[float] = None
+    open: Optional[float] = None
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+
+    week_52_high: Optional[float] = None
+    week_52_low: Optional[float] = None
+    position_52w_percent: Optional[float] = None
+
+    volume: Optional[float] = None
+    avg_volume_30d: Optional[float] = None
+    value_traded: Optional[float] = None
+
+    price_change: Optional[float] = None
+    percent_change: Optional[float] = None
+
+    # Fundamentals (optional)
+    market_cap: Optional[float] = None
+    shares_outstanding: Optional[float] = None
+    free_float: Optional[float] = None  # percent or fraction (provider-dependent)
+    free_float_market_cap: Optional[float] = None
+
+    eps_ttm: Optional[float] = None
+    pe_ttm: Optional[float] = None
+    pb: Optional[float] = None
+    ps: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+    beta: Optional[float] = None
+
+    # Scores
+    quality_score: Optional[int] = None
+    value_score: Optional[int] = None
+    momentum_score: Optional[int] = None
+    risk_score: Optional[int] = None
+    opportunity_score: Optional[int] = None
+
+    # Provenance
+    data_source: Optional[str] = None
+    data_quality: Optional[str] = None
+    last_updated_utc: Optional[str] = None
+    error: Optional[str] = None
+
+    # Router helpers (optional)
+    symbol_input: Optional[str] = None
+    symbol_normalized: Optional[str] = None
+
+    def finalize(self) -> "UnifiedQuote":
+        # Derived fields, if missing
+        cur = _safe_float(self.current_price)
+        prev = _safe_float(self.previous_close)
+        vol = _safe_float(self.volume)
+
+        if self.price_change is None and cur is not None and prev is not None:
+            self.price_change = cur - prev
+
+        if self.percent_change is None and cur is not None and prev not in (None, 0.0):
+            try:
+                self.percent_change = (cur - prev) / prev * 100.0
+            except Exception:
+                pass
+
+        if self.value_traded is None and cur is not None and vol is not None:
+            self.value_traded = cur * vol
+
+        if self.position_52w_percent is None:
+            hi = _safe_float(self.week_52_high)
+            lo = _safe_float(self.week_52_low)
+            if cur is not None and hi is not None and lo is not None and hi != lo:
+                self.position_52w_percent = (cur - lo) / (hi - lo) * 100.0
+
+        # last_updated default
+        if not self.last_updated_utc:
+            self.last_updated_utc = _utc_iso()
+
+        # normalize error
+        if self.error is None:
+            self.error = ""
+
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_str(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s if s else None
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -120,13 +200,6 @@ def _safe_float(val: Any) -> Optional[float]:
         return None
 
 
-def _pct_if_fraction(x: Any) -> Optional[float]:
-    v = _safe_float(x)
-    if v is None:
-        return None
-    return v * 100.0 if abs(v) <= 1.0 else v
-
-
 def _parse_list_env(name: str, fallback: str = "") -> List[str]:
     raw = (os.getenv(name) or "").strip()
     if not raw and fallback:
@@ -136,9 +209,16 @@ def _parse_list_env(name: str, fallback: str = "") -> List[str]:
     return [p.strip().lower() for p in raw.split(",") if p.strip()]
 
 
+def _is_ksa(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    return s.endswith(".SR") or s.isdigit() or bool(re.fullmatch(r"\d{3,6}(\.SR)?", s))
+
+
 def normalize_symbol(symbol: str) -> str:
     """
-    Public normalizer (used by legacy adapter too).
+    Exported normalization.
+    - digits -> 1120.SR
+    - trims + uppercases
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -147,59 +227,32 @@ def normalize_symbol(symbol: str) -> str:
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
-
-    # digits -> KSA .SR
-    if s.isdigit():
+    if s.isdigit() or re.fullmatch(r"\d{3,6}", s):
         return f"{s}.SR"
-    if re.fullmatch(r"\d{3,6}", s):
-        return f"{s}.SR"
-
     return s
 
 
-def _is_ksa(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    return s.endswith(".SR") or s.isdigit() or bool(re.fullmatch(r"\d{3,6}(\.SR)?", s))
-
-
-def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
-    if cur is None or lo is None or hi is None:
-        return None
-    if hi == lo:
-        return None
-    try:
-        return (cur - lo) / (hi - lo) * 100.0
-    except Exception:
-        return None
-
-
 def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    """
-    Merge policy:
-    - never overwrite a non-empty dst value
-    - always ignore None from src
-    - ignore noisy provider status fields
-    """
-    if not isinstance(src, dict):
-        return
-    for k, v in src.items():
+    # Keep existing non-null; fill missing with src non-null
+    for k, v in (src or {}).items():
         if v is None:
-            continue
-        if k in {"status"}:
             continue
         if k not in dst or dst.get(k) is None or dst.get(k) == "":
             dst[k] = v
 
 
-async def _call_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     out = fn(*args, **kwargs)
     if asyncio.iscoroutine(out):
         return await out
     return out
 
 
-def _is_patch_tuple(res: Any) -> bool:
-    return isinstance(res, tuple) and len(res) == 2
+def _is_tuple2(x: Any) -> bool:
+    try:
+        return isinstance(x, tuple) and len(x) == 2
+    except Exception:
+        return False
 
 
 async def _try_provider_call(
@@ -209,49 +262,65 @@ async def _try_provider_call(
     **kwargs: Any,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """
-    Tries importing module and calling the first existing function in fn_names.
-    Accepts:
+    Import module and call first callable in fn_names.
+    Accepts returns:
       - dict
       - (dict, err)
     """
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
-        return {}, f"import failed: {e.__class__.__name__}"
+        return {}, f"{module_name}: import failed ({e})"
 
     fn = None
     used = None
     for n in fn_names:
         if hasattr(mod, n):
-            candidate = getattr(mod, n)
-            if callable(candidate):
-                fn = candidate
+            cand = getattr(mod, n)
+            if callable(cand):
+                fn = cand
                 used = n
                 break
 
     if fn is None:
-        return {}, f"no callable in {fn_names}"
+        return {}, f"{module_name}: no callable in {fn_names}"
 
     try:
-        res = await _call_async(fn, *args, **kwargs)
-
-        if _is_patch_tuple(res):
+        res = await _call_maybe_async(fn, *args, **kwargs)
+        if _is_tuple2(res):
             patch, err = res
-            if isinstance(patch, dict):
-                return patch, err
-            return {}, err or f"{used}: returned non-dict patch"
-
+            return (patch or {}) if isinstance(patch, dict) else {}, err
         if isinstance(res, dict):
             return res, None
-
-        return {}, f"{used}: unexpected return type ({type(res).__name__})"
+        return {}, f"{module_name}.{used}: unexpected return type"
     except Exception as e:
-        return {}, f"{used}: call failed ({e.__class__.__name__})"
+        return {}, f"{module_name}.{used}: call failed ({e})"
 
 
-# -----------------------------------------------------------------------------
-# Scoring (lightweight heuristics)
-# -----------------------------------------------------------------------------
+def _apply_derived(out: Dict[str, Any]) -> None:
+    cur = _safe_float(out.get("current_price"))
+    prev = _safe_float(out.get("previous_close"))
+    vol = _safe_float(out.get("volume"))
+
+    if out.get("price_change") is None and cur is not None and prev is not None:
+        out["price_change"] = cur - prev
+
+    if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
+        try:
+            out["percent_change"] = (cur - prev) / prev * 100.0
+        except Exception:
+            pass
+
+    if out.get("value_traded") is None and cur is not None and vol is not None:
+        out["value_traded"] = cur * vol
+
+    if out.get("position_52w_percent") is None:
+        hi = _safe_float(out.get("week_52_high"))
+        lo = _safe_float(out.get("week_52_low"))
+        if cur is not None and hi is not None and lo is not None and hi != lo:
+            out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
+
+
 def _score_quality(p: Dict[str, Any]) -> int:
     roe = _safe_float(p.get("roe"))
     margin = _safe_float(p.get("net_margin"))
@@ -300,89 +369,27 @@ def _score_risk(p: Dict[str, Any]) -> int:
     return int(max(0, min(100, score)))
 
 
-def _finalize_derived(out: Dict[str, Any]) -> None:
-    cur = _safe_float(out.get("current_price"))
-    prev = _safe_float(out.get("previous_close"))
-    vol = _safe_float(out.get("volume"))
-
-    if out.get("price_change") is None and cur is not None and prev is not None:
-        out["price_change"] = cur - prev
-
-    if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        out["percent_change"] = (cur - prev) / prev * 100.0
-
-    if out.get("value_traded") is None and cur is not None and vol is not None:
-        out["value_traded"] = cur * vol
-
-    if out.get("position_52w_percent") is None:
-        out["position_52w_percent"] = _pos_52w(
-            cur,
-            _safe_float(out.get("low_52w")),
-            _safe_float(out.get("high_52w")),
-        )
-
-    mc = _safe_float(out.get("market_cap"))
-    ff = _safe_float(out.get("free_float"))
-    if out.get("free_float_market_cap") is None and mc is not None and ff is not None:
-        out["free_float_market_cap"] = mc * (ff / 100.0)
-
-
-def _compute_data_quality(out: Dict[str, Any]) -> str:
-    cur = _safe_float(out.get("current_price"))
-    if cur is None:
+def _quality_label(out: Dict[str, Any]) -> str:
+    must = ["current_price", "previous_close", "day_high", "day_low", "volume"]
+    ok = all(_safe_float(out.get(k)) is not None for k in must)
+    if _safe_float(out.get("current_price")) is None:
         return "BAD"
-
-    # FULL if typical dashboard trading fields exist
-    must = ["previous_close", "day_high", "day_low", "volume"]
-    have_trading = all(_safe_float(out.get(k)) is not None for k in must)
-
-    have_identity = bool((out.get("name") or "").strip())
-    have_mcap = _safe_float(out.get("market_cap")) is not None
-
-    if have_trading and (have_identity or have_mcap):
-        return "FULL"
-    if have_trading:
-        return "OK"
-    return "PARTIAL"
+    return "FULL" if ok else "PARTIAL"
 
 
-def _reorder_primary(items: List[str], primary: Optional[str]) -> List[str]:
-    if not items:
-        return items
-    p = (primary or "").strip().lower()
-    if not p:
-        return items
-    if p in items:
-        return [p] + [x for x in items if x != p]
-    return items
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # DataEngine
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 class DataEngine:
     """
     Engine used by app.state.engine (preferred by routers).
     """
 
     def __init__(self) -> None:
-        global_list = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
-        ksa_list = _parse_list_env("KSA_PROVIDERS")
+        self.providers_global = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
+        self.providers_ksa = _parse_list_env("KSA_PROVIDERS")
 
-        # Safe defaults if nothing configured
-        if not global_list:
-            global_list = ["eodhd", "finnhub", "fmp"]
-        if not ksa_list:
-            ksa_list = ["tadawul", "argaam", "yahoo_chart"]
-
-        # Force primary first if set
-        global_list = _reorder_primary(global_list, os.getenv("PRIMARY_PROVIDER"))
-        ksa_list = _reorder_primary(ksa_list, os.getenv("PRIMARY_KSA_PROVIDER"))
-
-        self.providers_global = global_list
-        self.providers_ksa = ksa_list
-
-        # short cache to avoid hammering providers
+        # cache TTL
         ttl = 10
         try:
             ttl = int((os.getenv("ENGINE_CACHE_TTL_SEC") or "10").strip())
@@ -390,7 +397,6 @@ class DataEngine:
                 ttl = 3
         except Exception:
             ttl = 10
-
         self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
 
         logger.info(
@@ -402,31 +408,39 @@ class DataEngine:
         )
 
     async def aclose(self) -> None:
-        """
-        Best-effort provider client close hooks.
-        """
+        # Best-effort provider client close hooks
         for mod_name, closer in [
+            ("core.providers.finnhub_provider", "aclose_finnhub_client"),
             ("core.providers.tadawul_provider", "aclose_tadawul_client"),
-            ("core.providers.argaam_provider", "aclose_argaam_client"),
         ]:
             try:
                 mod = importlib.import_module(mod_name)
                 fn = getattr(mod, closer, None)
                 if callable(fn):
-                    await _call_async(fn)
+                    await _call_maybe_async(fn)
             except Exception:
                 continue
 
-    async def get_quote(self, symbol: str) -> Dict[str, Any]:
-        return await self.get_enriched_quote(symbol, enrich=False)
+    def _providers_for(self, sym: str) -> List[str]:
+        is_ksa = _is_ksa(sym)
 
-    async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        return await self.get_enriched_quotes(symbols, enrich=False)
+        if is_ksa:
+            # Strict KSA-only list
+            if self.providers_ksa:
+                return list(self.providers_ksa)
+
+            # If not configured, do a SAFE fallback: only KSA-safe providers from global
+            safe = [p for p in (self.providers_global or []) if p in {"tadawul", "argaam", "yahoo_chart"}]
+            return safe
+
+        # Global symbols
+        return list(self.providers_global or [])
 
     async def get_enriched_quote(self, symbol: str, *, enrich: bool = True) -> Dict[str, Any]:
         sym = normalize_symbol(symbol)
         if not sym:
-            return {"status": "error", "symbol": str(symbol or ""), "error": "empty symbol", "data_quality": "BAD"}
+            q = UnifiedQuote(symbol=str(symbol or ""), error="empty symbol").finalize()
+            return q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__)
 
         cache_key = f"q::{sym}::{int(bool(enrich))}"
         hit = self._cache.get(cache_key)
@@ -434,124 +448,80 @@ class DataEngine:
             return dict(hit)
 
         is_ksa = _is_ksa(sym)
-        providers = self.providers_ksa if is_ksa else self.providers_global
+        providers = self._providers_for(sym)
 
-        out: Dict[str, Any] = {
-            "status": "success",
-            "symbol": sym,
-            "market": "KSA" if is_ksa else "GLOBAL",
-            "currency": "SAR" if is_ksa else "",
-            "name": "",
-            "data_source": "",
-            "data_quality": "",
-            "last_updated_utc": _utc_iso(),
-            "error": "",
-        }
+        # stable output base (Sheets-safe)
+        out: Dict[str, Any] = UnifiedQuote(
+            symbol=sym,
+            market="KSA" if is_ksa else "GLOBAL",
+            last_updated_utc=_utc_iso(),
+            error="",
+        ).model_dump()
 
         if not providers:
             out["status"] = "error"
             out["data_quality"] = "BAD"
             out["error"] = "No providers configured"
+            self._cache[cache_key] = dict(out)
             return out
 
         errors: List[str] = []
         source_used: List[str] = []
-
-        # Choose function preference order based on enrich flag
-        def _fnset(*names: str) -> List[str]:
-            # prefer enriched or quote first depending on enrich flag
-            if enrich:
-                preferred = []
-                for n in names:
-                    if "enriched" in n or "enrichment" in n or "fundamentals" in n:
-                        preferred.append(n)
-                for n in names:
-                    if n not in preferred:
-                        preferred.append(n)
-                return preferred
-            return list(names)
 
         for p in providers:
             p = (p or "").strip().lower()
             if not p:
                 continue
 
+            # KSA safety: never call global-only providers for KSA unless explicitly in KSA providers list
+            if is_ksa and p in {"eodhd", "fmp", "finnhub"} and (p not in (self.providers_ksa or [])):
+                errors.append(f"{p}: skipped for KSA")
+                continue
+
             patch: Dict[str, Any] = {}
             err: Optional[str] = None
 
-            # ---------------- KSA providers ----------------
             if p == "tadawul":
                 patch, err = await _try_provider_call(
                     "core.providers.tadawul_provider",
-                    _fnset(
-                        "fetch_quote_and_fundamentals_patch",
-                        "fetch_quote_and_enrichment_patch",
-                        "fetch_enriched_quote_patch",
-                        "fetch_fundamentals_patch",
-                        "fetch_quote_patch",
-                    ),
+                    ["fetch_quote_and_fundamentals_patch", "fetch_fundamentals_patch", "fetch_quote_patch"],
                     sym,
                 )
 
             elif p == "argaam":
                 patch, err = await _try_provider_call(
                     "core.providers.argaam_provider",
-                    _fnset(
-                        "fetch_quote_patch",
-                        "fetch_quote_and_fundamentals_patch",
-                        "fetch_quote_and_enrichment_patch",
-                        "fetch_enriched_quote_patch",
-                    ),
+                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch"],
                     sym,
                 )
 
             elif p == "yahoo_chart":
                 patch, err = await _try_provider_call(
                     "core.providers.yahoo_chart_provider",
-                    _fnset(
-                        "fetch_quote_patch",
-                        "fetch_quote_and_enrichment_patch",
-                        "fetch_enriched_quote_patch",
-                        "fetch_quote",   # many versions export this
-                        "get_quote",     # alias in many versions
-                    ),
-                    sym,
-                )
-
-            # ---------------- GLOBAL providers ----------------
-            elif p == "eodhd":
-                patch, err = await _try_provider_call(
-                    "core.providers.eodhd_provider",
-                    _fnset(
-                        "fetch_quote_and_enrichment_patch",
-                        "fetch_enriched_quote_patch",
-                        "fetch_quote_and_fundamentals_patch",  # legacy
-                        "fetch_quote_patch",
-                    ),
+                    ["fetch_quote_patch", "fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote"],
                     sym,
                 )
 
             elif p == "finnhub":
-                # finnhub_provider reads FINNHUB_API_KEY internally (do NOT pass token as argument)
+                api_key = os.getenv("FINNHUB_API_KEY")
                 patch, err = await _try_provider_call(
                     "core.providers.finnhub_provider",
-                    _fnset(
-                        "fetch_quote_and_enrichment_patch",
-                        "fetch_enriched_quote_patch",
-                        "fetch_quote_patch",
-                    ),
+                    ["fetch_quote_and_enrichment_patch", "fetch_quote_patch", "fetch_quote"],
+                    sym,
+                    api_key,
+                )
+
+            elif p == "eodhd":
+                patch, err = await _try_provider_call(
+                    "core.providers.eodhd_provider",
+                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
                     sym,
                 )
 
             elif p == "fmp":
                 patch, err = await _try_provider_call(
                     "core.providers.fmp_provider",
-                    _fnset(
-                        "fetch_quote_and_fundamentals_patch",
-                        "fetch_quote_and_enrichment_patch",
-                        "fetch_enriched_quote_patch",
-                        "fetch_quote_patch",
-                    ),
+                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
                     sym,
                 )
 
@@ -564,40 +534,39 @@ class DataEngine:
                 source_used.append(p)
 
             if err:
-                # keep provider errors compact (avoid misleading giant traces)
                 errors.append(f"{p}: {err}")
 
-            # Stop early if we have core quote + some identity/fundamental richness
-            if _safe_float(out.get("current_price")) is not None and (
-                (out.get("name") or "").strip() or _safe_float(out.get("market_cap")) is not None
-            ):
+            # compute derived after each patch
+            _apply_derived(out)
+
+            # Stop early if we already have core price + identity/fundamental anchor
+            if _safe_float(out.get("current_price")) is not None and (out.get("name") or _safe_float(out.get("market_cap")) is not None):
                 break
 
-        # Fill derived fields and scores
-        _finalize_derived(out)
-
+        # Scoring
         out["quality_score"] = _score_quality(out)
         out["value_score"] = _score_value(out)
         out["momentum_score"] = _score_momentum(out)
         out["risk_score"] = _score_risk(out)
 
-        qs = _safe_float(out.get("quality_score")) or 50.0
-        vs = _safe_float(out.get("value_score")) or 50.0
-        ms = _safe_float(out.get("momentum_score")) or 50.0
-        rs = _safe_float(out.get("risk_score")) or 35.0
-        out["opportunity_score"] = int(
-            max(0, min(100, round((0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs))))
-        )
+        qs = float(out.get("quality_score") or 50)
+        vs = float(out.get("value_score") or 50)
+        ms = float(out.get("momentum_score") or 50)
+        rs = float(out.get("risk_score") or 35)
+        out["opportunity_score"] = int(max(0, min(100, round((0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs)))))
 
-        out["data_source"] = ",".join(source_used) if source_used else (out.get("data_source") or "")
-        out["data_quality"] = _compute_data_quality(out)
+        # data_source
+        out["data_source"] = ",".join(source_used) if source_used else (out.get("data_source") or None)
 
-        if out["data_quality"] == "BAD":
+        # data_quality + status
+        out["data_quality"] = _quality_label(out)
+        if _safe_float(out.get("current_price")) is None:
             out["status"] = "error"
-            out["error"] = " | ".join(errors) if errors else (out.get("error") or "No price returned")
+            out["error"] = " | ".join(errors) if errors else "No price returned"
         else:
-            # If we have partial success but some providers failed, keep as warning text
-            if errors and not (out.get("error") or "").strip():
+            out["status"] = "success" if not str(out.get("error") or "").strip() else "error"
+            # keep provider errors as warning text (non-empty) but do not break success if price exists
+            if errors and not str(out.get("error") or "").strip():
                 out["error"] = " | ".join(errors)
 
         # Cache
@@ -609,28 +578,24 @@ class DataEngine:
             return []
         tasks = [self.get_enriched_quote(s, enrich=enrich) for s in symbols]
         res = await asyncio.gather(*tasks, return_exceptions=True)
-
         out: List[Dict[str, Any]] = []
         for i, r in enumerate(res):
             if isinstance(r, Exception):
-                out.append(
-                    {
-                        "status": "error",
-                        "symbol": normalize_symbol(symbols[i]) or str(symbols[i] or ""),
-                        "market": "UNKNOWN",
-                        "data_quality": "BAD",
-                        "last_updated_utc": _utc_iso(),
-                        "error": f"{r.__class__.__name__}: {r}",
-                    }
-                )
+                q = UnifiedQuote(symbol=normalize_symbol(symbols[i]) or str(symbols[i] or ""), error=str(r)).finalize()
+                out.append(q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__))
             else:
                 out.append(r)
         return out
 
+    # Aliases expected by some legacy routers/services
+    async def get_quote(self, symbol: str) -> Dict[str, Any]:
+        return await self.get_enriched_quote(symbol, enrich=True)
 
-# -----------------------------------------------------------------------------
-# Convenience module-level (legacy-style)
-# -----------------------------------------------------------------------------
+    async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        return await self.get_enriched_quotes(symbols, enrich=True)
+
+
+# Convenience module-level singleton (legacy-style)
 _ENGINE_SINGLETON: Optional[DataEngine] = None
 _LOCK = asyncio.Lock()
 
@@ -652,3 +617,12 @@ async def get_enriched_quote(symbol: str) -> Dict[str, Any]:
 async def get_enriched_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
     e = await get_engine()
     return await e.get_enriched_quotes(symbols, enrich=True)
+
+
+# legacy aliases
+async def get_quote(symbol: str) -> Dict[str, Any]:
+    return await get_enriched_quote(symbol)
+
+
+async def get_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
+    return await get_enriched_quotes(symbols)
