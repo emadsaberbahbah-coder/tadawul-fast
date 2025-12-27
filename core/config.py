@@ -2,26 +2,33 @@
 """
 core/config.py
 ------------------------------------------------------------
-Compatibility shim (PROD SAFE) – v1.6.0 (ENV-ALIAS HARDENED)
+Compatibility shim (PROD SAFE) – v1.7.0 (RENDER-ENV LOCKED)
 
 Many modules import settings via:
   from core.config import Settings, get_settings
 
-Canonical source of truth is the repo-root `config.py`.
+Canonical source of truth is repo-root `config.py`.
 This module re-exports Settings/get_settings so older imports keep working.
 
-What this version fixes for your Render env names
-- ✅ Maps FINNHUB_API_KEY  -> finnhub_api_token (and finnhub_api_key alias)
-- ✅ Maps EODHD_API_KEY    -> eodhd_api_token   (and eodhd_api_key alias)
-- ✅ Reads ENABLED_PROVIDERS / PRIMARY_PROVIDER (as in your env list)
-- ✅ Never rejects "0" values for ints/floats (no misleading defaults)
+✅ HARD alignment with your Render env keys (you will NOT rename env vars):
+- FINNHUB_API_KEY
+- EODHD_API_KEY
+- ENABLED_PROVIDERS
+- PRIMARY_PROVIDER
+- HTTP_TIMEOUT
+- MAX_RETRIES
+- RETRY_DELAY
+- CACHE_DEFAULT_TTL / CACHE_MAX_SIZE / CACHE_BACKUP_ENABLED / CACHE_SAVE_INTERVAL
+- CORS_ORIGINS / ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE
+- DEFAULT_SPREADSHEET_ID / GOOGLE_* / GOOGLE_APPS_SCRIPT_*
+- SERVICE_NAME / SERVICE_VERSION / ENVIRONMENT / TZ / DEBUG / LOG_LEVEL / LOG_FORMAT
+- ADVANCED_ANALYSIS_ENABLED / TADAWUL_MARKET_ENABLED / ENABLE_SWAGGER / ENABLE_REDOC
 
-Design goals
-- Never crash app boot if root config.py is missing or mid-refactor.
-- Safe fallback Settings with common knobs used by routers.
-- Supports BOTH naming styles:
-    - lower_case: app_name, env, version, log_level, ...
-    - UPPER_CASE: APP_NAME, ENV, VERSION, LOG_LEVEL, ...
+Key guarantee:
+- If providers/modules expect FINNHUB_API_TOKEN / EODHD_API_TOKEN (token-style),
+  we export env aliases at runtime (inside get_settings), without requiring env renames.
+
+No network at import-time. No heavy imports required.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ import json
 import os
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
+
 
 # =============================================================================
 # Try importing root config.py (preferred)
@@ -59,7 +67,7 @@ def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
     if v is None:
         return default
     s = str(v).strip()
-    return s if s else default
+    return s if s != "" else default
 
 
 def _env_first(names: List[str], default: Optional[str] = None) -> Optional[str]:
@@ -70,11 +78,12 @@ def _env_first(names: List[str], default: Optional[str] = None) -> Optional[str]
     return default
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = _env_str(name, None)
+def _to_bool(v: Any, default: bool = False) -> bool:
     if v is None:
         return default
-    s = v.strip().lower()
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
     if s in _TRUTHY:
         return True
     if s in _FALSY:
@@ -82,37 +91,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-def _env_bool_first(names: List[str], default: bool = False) -> bool:
-    for n in names:
-        v = _env_str(n, None)
+def _to_int(v: Any, default: int) -> int:
+    try:
         if v is None:
-            continue
-        return _env_bool(n, default)
-    return default
+            return default
+        s = str(v).strip()
+        if s == "":
+            return default
+        return int(s)
+    except Exception:
+        return default
 
 
-def _env_int_first(names: List[str], default: int) -> int:
-    for n in names:
-        v = _env_str(n, None)
+def _to_float(v: Any, default: float) -> float:
+    try:
         if v is None:
-            continue
-        try:
-            return int(str(v).strip())
-        except Exception:
-            continue
-    return default
-
-
-def _env_float_first(names: List[str], default: float) -> float:
-    for n in names:
-        v = _env_str(n, None)
-        if v is None:
-            continue
-        try:
-            return float(str(v).strip())
-        except Exception:
-            continue
-    return default
+            return default
+        s = str(v).strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
 
 
 def _parse_list(value: Any) -> List[str]:
@@ -125,8 +125,8 @@ def _parse_list(value: Any) -> List[str]:
     """
     if value is None:
         return []
-    items: List[str] = []
 
+    items: List[str] = []
     if isinstance(value, list):
         items = [str(x).strip() for x in value if str(x).strip()]
     else:
@@ -148,11 +148,11 @@ def _parse_list(value: Any) -> List[str]:
     out: List[str] = []
     seen = set()
     for x in items:
-        yl = x.strip().lower()
-        if not yl or yl in seen:
+        y = x.strip().lower()
+        if not y or y in seen:
             continue
-        seen.add(yl)
-        out.append(yl)
+        seen.add(y)
+        out.append(y)
     return out
 
 
@@ -163,6 +163,44 @@ def _mask_tail(s: Optional[str], keep: int = 4) -> str:
     if len(s2) <= keep:
         return "•" * len(s2)
     return ("•" * (len(s2) - keep)) + s2[-keep:]
+
+
+def _export_env_if_missing(key: str, value: Optional[str]) -> None:
+    """
+    Export env alias only if target is missing/blank.
+    """
+    if value is None:
+        return
+    v = str(value).strip()
+    if not v:
+        return
+    cur = os.getenv(key)
+    if cur is None or str(cur).strip() == "":
+        os.environ[key] = v
+
+
+def _to_mapping(obj: Any) -> Dict[str, Any]:
+    """
+    Best-effort conversion for root settings object to a dict.
+    """
+    if obj is None:
+        return {}
+    try:
+        md = getattr(obj, "model_dump", None)
+        if callable(md):
+            return md()  # type: ignore
+    except Exception:
+        pass
+    try:
+        dct = getattr(obj, "dict", None)
+        if callable(dct):
+            return dct()  # type: ignore
+    except Exception:
+        pass
+    try:
+        return dict(getattr(obj, "__dict__", {}) or {})
+    except Exception:
+        return {}
 
 
 def _resolve_google_credentials(
@@ -182,156 +220,183 @@ def _resolve_spreadsheet_id(default_spreadsheet_id: Optional[str]) -> Tuple[Opti
     return None, "none"
 
 
-def _apply_compat_aliases(s: Any) -> Any:
+def _apply_runtime_env_aliases_from_render(s: Any) -> None:
     """
-    Ensure common legacy attribute names exist without requiring env renames.
-    We only set attributes that are missing or empty.
+    Your Render env uses *_API_KEY, but some provider modules read *_API_TOKEN.
+    Export aliases safely (no overwrite if already set).
     """
-    # --- tokens (Render has *_API_KEY; some code expects *_API_TOKEN) ---
-    finnhub = getattr(s, "finnhub_api_token", None) or getattr(s, "finnhub_api_key", None)
-    eodhd = getattr(s, "eodhd_api_token", None) or getattr(s, "eodhd_api_key", None)
+    # Read from settings (preferred), then env (fallback)
+    finnhub = (
+        getattr(s, "finnhub_api_token", None)
+        or getattr(s, "finnhub_api_key", None)
+        or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
+    )
+    eodhd = (
+        getattr(s, "eodhd_api_token", None)
+        or getattr(s, "eodhd_api_key", None)
+        or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
+    )
 
-    finnhub = finnhub or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
-    eodhd = eodhd or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
+    _export_env_if_missing("FINNHUB_API_TOKEN", finnhub)
+    _export_env_if_missing("FINNHUB_TOKEN", finnhub)
+    _export_env_if_missing("EODHD_API_TOKEN", eodhd)
+    _export_env_if_missing("EODHD_TOKEN", eodhd)
 
-    for name, val in [
-        ("finnhub_api_token", finnhub),
-        ("finnhub_api_key", finnhub),
-        ("FINNHUB_API_TOKEN", finnhub),
-        ("FINNHUB_API_KEY", finnhub),
-        ("eodhd_api_token", eodhd),
-        ("eodhd_api_key", eodhd),
-        ("EODHD_API_TOKEN", eodhd),
-        ("EODHD_API_KEY", eodhd),
-    ]:
-        try:
-            cur = getattr(s, name, None)
-            if (cur is None or cur == "") and val:
-                setattr(s, name, val)
-        except Exception:
-            pass
-
-    # --- app meta common aliases ---
-    try:
-        if getattr(s, "app_name", None) in (None, ""):
-            setattr(s, "app_name", getattr(s, "service_name", None) or _env_first(["SERVICE_NAME", "APP_NAME"], "Tadawul Stock Analysis API"))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "env", None) in (None, ""):
-            setattr(s, "env", getattr(s, "environment", None) or _env_first(["ENVIRONMENT", "APP_ENV", "ENV"], "production"))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "version", None) in (None, ""):
-            setattr(s, "version", getattr(s, "service_version", None) or _env_first(["SERVICE_VERSION", "APP_VERSION", "VERSION"], "0.0.0"))
-    except Exception:
-        pass
-
-    # --- providers aliases ---
-    try:
-        if not getattr(s, "enabled_providers", None):
-            raw = getattr(s, "enabled_providers_raw", None) or _env_first(["ENABLED_PROVIDERS", "PROVIDERS"], "eodhd,finnhub")
-            setattr(s, "enabled_providers", _parse_list(raw))
-    except Exception:
-        pass
-
-    try:
-        if not getattr(s, "enabled_ksa_providers", None):
-            raw = getattr(s, "ksa_providers_raw", None) or _env_first(["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam")
-            setattr(s, "enabled_ksa_providers", _parse_list(raw))
-    except Exception:
-        pass
-
-    # --- auth aliases ---
-    try:
-        if getattr(s, "app_token", None) in (None, ""):
-            setattr(s, "app_token", _env_first(["APP_TOKEN", "TFB_APP_TOKEN", "X_APP_TOKEN"], None))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "backup_app_token", None) in (None, ""):
-            setattr(s, "backup_app_token", _env_first(["BACKUP_APP_TOKEN"], None))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "require_auth", None) in (None, ""):
-            setattr(s, "require_auth", _env_bool("REQUIRE_AUTH", False))
-    except Exception:
-        pass
-
-    # --- sheet aliases ---
-    try:
-        if getattr(s, "default_spreadsheet_id", None) in (None, ""):
-            setattr(s, "default_spreadsheet_id", _env_first(["DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID"], None))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "spreadsheet_id", None) in (None, ""):
-            setattr(s, "spreadsheet_id", getattr(s, "default_spreadsheet_id", None))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "google_sheets_credentials", None) in (None, ""):
-            setattr(s, "google_sheets_credentials", _env_first(["GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"], None))
-    except Exception:
-        pass
-
-    # --- cache/timeouts common names ---
-    try:
-        if getattr(s, "cache_ttl_sec", None) in (None, ""):
-            setattr(s, "cache_ttl_sec", _env_int_first(["CACHE_DEFAULT_TTL", "CACHE_TTL_SEC"], 10))
-    except Exception:
-        pass
-
-    try:
-        if getattr(s, "http_timeout_sec", None) in (None, ""):
-            setattr(s, "http_timeout_sec", int(_env_float_first(["HTTP_TIMEOUT"], 30.0)))
-    except Exception:
-        pass
-
-    return s
+    # Keep common alt names consistent for older scripts
+    http_timeout = getattr(s, "http_timeout", None) or _env_first(["HTTP_TIMEOUT"], None)
+    retry_delay = getattr(s, "retry_delay", None) or _env_first(["RETRY_DELAY"], None)
+    if http_timeout is not None:
+        _export_env_if_missing("HTTP_TIMEOUT_SEC", str(_to_float(http_timeout, 30.0)))
+    if retry_delay is not None:
+        _export_env_if_missing("RETRY_DELAY_SEC", str(_to_float(retry_delay, 0.5)))
 
 
 # =============================================================================
-# Re-export logic (root config preferred)
+# Preferred path: Root config exists -> expose a compat Settings class + wrapper get_settings
 # =============================================================================
 Settings = None  # type: ignore
 get_settings = None  # type: ignore
 
-if _root_Settings is not None and callable(_root_get_settings):
-    Settings = _root_Settings  # type: ignore
+if _root_Settings is not None:
+    # Build a lightweight compat subclass to expose legacy attribute/property names
+    class Settings(_root_Settings):  # type: ignore
+        # --- Common legacy names used across older modules ---
+        @property
+        def app_name(self) -> str:
+            return (
+                getattr(self, "service_name", None)
+                or _env_first(["SERVICE_NAME", "APP_NAME"], "Tadawul Stock Analysis API")
+                or "Tadawul Stock Analysis API"
+            )
+
+        @property
+        def env(self) -> str:
+            return (
+                getattr(self, "environment", None)
+                or _env_first(["ENVIRONMENT", "APP_ENV", "ENV"], "production")
+                or "production"
+            )
+
+        @property
+        def version(self) -> str:
+            return (
+                getattr(self, "service_version", None)
+                or _env_first(["SERVICE_VERSION", "APP_VERSION", "VERSION"], "0.0.0")
+                or "0.0.0"
+            )
+
+        @property
+        def enabled_providers(self) -> List[str]:
+            # Prefer root's computed property if present
+            v = getattr(super(), "enabled_providers", None)  # type: ignore
+            try:
+                if callable(v):
+                    out = v()
+                    if isinstance(out, list) and out:
+                        return [str(x).strip().lower() for x in out if str(x).strip()]
+            except Exception:
+                pass
+
+            raw = getattr(self, "enabled_providers_raw", None) or _env_first(["ENABLED_PROVIDERS"], "eodhd,finnhub")
+            xs = _parse_list(raw)
+            return xs or ["eodhd", "finnhub"]
+
+        @property
+        def ksa_providers(self) -> List[str]:
+            v = getattr(super(), "ksa_providers", None)  # type: ignore
+            try:
+                if callable(v):
+                    out = v()
+                    if isinstance(out, list) and out:
+                        return [str(x).strip().lower() for x in out if str(x).strip()]
+            except Exception:
+                pass
+
+            raw = getattr(self, "ksa_providers_raw", None) or _env_first(["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam")
+            xs = _parse_list(raw)
+            return xs or ["yahoo_chart", "tadawul", "argaam"]
+
+        # --- token-style properties (some code expects *_api_token) ---
+        @property
+        def eodhd_api_token(self) -> Optional[str]:
+            v = getattr(self, "eodhd_api_key", None) or getattr(super(), "eodhd_api_token", None)  # type: ignore
+            v = v or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
+            return (str(v).strip() if v else None)
+
+        @property
+        def finnhub_api_token(self) -> Optional[str]:
+            v = getattr(self, "finnhub_api_key", None) or getattr(super(), "finnhub_api_token", None)  # type: ignore
+            v = v or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
+            return (str(v).strip() if v else None)
+
+        # --- safe summary (no secrets) ---
+        def safe_summary(self) -> Dict[str, Any]:
+            google_sheets_credentials = getattr(self, "google_sheets_credentials", None)
+            google_credentials = getattr(self, "google_credentials", None)
+            default_spreadsheet_id = getattr(self, "default_spreadsheet_id", None)
+
+            creds, creds_src = _resolve_google_credentials(google_sheets_credentials, google_credentials)
+            sid, sid_src = _resolve_spreadsheet_id(default_spreadsheet_id)
+
+            return {
+                "APP_NAME": self.app_name,
+                "ENV": self.env,
+                "VERSION": self.version,
+                "LOG_LEVEL": (getattr(self, "log_level", None) or "info").strip().lower(),
+                "REQUIRE_AUTH": bool(getattr(self, "require_auth", False)),
+                "APP_TOKEN_SET": bool((getattr(self, "app_token", None) or "").strip()),
+                "APP_TOKEN_MASK": _mask_tail(getattr(self, "app_token", None), 4),
+                "ENABLED_PROVIDERS": list(self.enabled_providers),
+                "PRIMARY_PROVIDER": (getattr(self, "primary_provider", None) or "eodhd").strip().lower(),
+                "KSA_PROVIDERS": list(self.ksa_providers),
+                "EODHD_TOKEN_SET": bool((self.eodhd_api_token or "").strip()),
+                "FINNHUB_TOKEN_SET": bool((self.finnhub_api_token or "").strip()),
+                "SPREADSHEET_ID_SET": bool(sid),
+                "SPREADSHEET_ID_SOURCE": sid_src,
+                "GOOGLE_CREDS_SET": bool(creds),
+                "GOOGLE_CREDS_SOURCE": creds_src,
+            }
+
+        # --- uppercase aliases (legacy) ---
+        def __getattr__(self, name: str) -> Any:
+            if name.isupper():
+                low = name.lower()
+                if hasattr(self, low):
+                    return getattr(self, low)
+                if name == "APP_NAME":
+                    return self.app_name
+                if name == "ENV":
+                    return self.env
+                if name == "VERSION":
+                    return self.version
+                if name == "EODHD_API_TOKEN":
+                    return self.eodhd_api_token
+                if name == "FINNHUB_API_TOKEN":
+                    return self.finnhub_api_token
+            raise AttributeError(name)
 
     @lru_cache(maxsize=1)
     def get_settings() -> Any:  # type: ignore
-        s = _root_get_settings()  # type: ignore
-        return _apply_compat_aliases(s)
+        # Use root get_settings if available; otherwise instantiate
+        if callable(_root_get_settings):
+            s0 = _root_get_settings()  # type: ignore
+        else:
+            s0 = Settings()  # type: ignore
 
-elif _root_Settings is not None and not callable(_root_get_settings):
-    Settings = _root_Settings  # type: ignore
+        # Convert to our compat class without mutating root instance (avoids Pydantic extra-attr issues)
+        if isinstance(s0, Settings):
+            s = s0
+        else:
+            data = _to_mapping(s0)
+            try:
+                s = Settings(**data)  # type: ignore
+            except Exception:
+                s = Settings()  # type: ignore
 
-    @lru_cache(maxsize=1)
-    def get_settings() -> Any:  # type: ignore
-        s = Settings()  # type: ignore
-        return _apply_compat_aliases(s)
+        # Runtime env alias export for providers
+        _apply_runtime_env_aliases_from_render(s)
 
-elif callable(_root_get_settings) and _root_Settings is None:
-    @lru_cache(maxsize=1)
-    def get_settings() -> Any:  # type: ignore
-        s = _root_get_settings()  # type: ignore
-        return _apply_compat_aliases(s)
-
-    try:
-        _tmp = get_settings()  # type: ignore
-        Settings = _tmp.__class__ if _tmp is not None else None  # type: ignore
-    except Exception:
-        Settings = None  # type: ignore
+        return s
 
 
 # =============================================================================
@@ -341,68 +406,98 @@ if Settings is None or get_settings is None:
 
     class Settings:  # type: ignore
         """
-        Minimal Settings fallback with env-alias alignment to your Render variables.
+        Minimal Settings fallback aligned to your Render env variable names.
         """
 
         def __init__(self) -> None:
             # App meta
-            self.app_name: str = _env_first(["SERVICE_NAME", "APP_NAME"], "Tadawul Stock Analysis API") or "Tadawul Stock Analysis API"
-            self.env: str = _env_first(["ENVIRONMENT", "APP_ENV", "ENV"], "production") or "production"
-            self.version: str = _env_first(["SERVICE_VERSION", "APP_VERSION", "VERSION"], "0.0.0") or "0.0.0"
+            self.service_name: str = _env_first(["SERVICE_NAME", "APP_NAME"], "Tadawul Stock Analysis API") or "Tadawul Stock Analysis API"
+            self.service_version: str = _env_first(["SERVICE_VERSION", "APP_VERSION", "VERSION"], "0.0.0") or "0.0.0"
+            self.environment: str = _env_first(["ENVIRONMENT", "APP_ENV", "ENV"], "production") or "production"
+            self.tz: str = _env_first(["TZ", "TIMEZONE"], "Asia/Riyadh") or "Asia/Riyadh"
+
+            self.debug: bool = _to_bool(_env_str("DEBUG", "false"), False)
             self.log_level: str = (_env_first(["LOG_LEVEL"], "info") or "info").lower()
-            self.debug: bool = _env_bool("DEBUG", False)
+            self.log_format: str = _env_first(["LOG_FORMAT"], "%(asctime)s | %(levelname)s | %(name)s | %(message)s") or "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
             # Auth
-            self.app_token: Optional[str] = _env_first(["APP_TOKEN", "TFB_APP_TOKEN", "X_APP_TOKEN"], None)
+            self.require_auth: bool = _to_bool(_env_str("REQUIRE_AUTH", "false"), False)
+            self.app_token: Optional[str] = _env_first(["APP_TOKEN"], None)
             self.backup_app_token: Optional[str] = _env_first(["BACKUP_APP_TOKEN"], None)
-            self.require_auth: bool = _env_bool("REQUIRE_AUTH", False)
 
             # Providers
-            self.enabled_providers: List[str] = _parse_list(_env_first(["ENABLED_PROVIDERS", "PROVIDERS"], "eodhd,finnhub"))
-            self.enabled_ksa_providers: List[str] = _parse_list(_env_first(["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam"))
+            self.enabled_providers_raw: str = _env_first(["ENABLED_PROVIDERS"], "eodhd,finnhub") or "eodhd,finnhub"
             self.primary_provider: str = (_env_first(["PRIMARY_PROVIDER"], "eodhd") or "eodhd").strip().lower()
+            self.ksa_providers_raw: str = _env_first(["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam") or "yahoo_chart,tadawul,argaam"
 
-            # Tokens (✅ align with Render names)
-            self.eodhd_api_token: Optional[str] = _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
-            self.finnhub_api_token: Optional[str] = _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
+            # Tokens (Render keys)
+            self.eodhd_api_key: Optional[str] = _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
+            self.finnhub_api_key: Optional[str] = _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
 
-            # Legacy key names (some modules still read *_api_key)
-            self.eodhd_api_key: Optional[str] = self.eodhd_api_token
-            self.finnhub_api_key: Optional[str] = self.finnhub_api_token
+            # URLs
+            self.backend_base_url: Optional[str] = _env_first(["BACKEND_BASE_URL"], None)
+            self.eodhd_base_url: str = _env_first(["EODHD_BASE_URL"], "https://eodhistoricaldata.com/api") or "https://eodhistoricaldata.com/api"
+            self.finnhub_base_url: str = _env_first(["FINNHUB_BASE_URL"], "https://finnhub.io/api/v1") or "https://finnhub.io/api/v1"
+            self.fmp_base_url: Optional[str] = _env_first(["FMP_BASE_URL"], None)
 
-            # HTTP / retry
-            self.http_timeout_sec: int = int(_env_float_first(["HTTP_TIMEOUT"], 30.0))
-            self.max_retries: int = _env_int_first(["MAX_RETRIES"], 2)
-            self.retry_delay_sec: float = _env_float_first(["RETRY_DELAY"], 0.5)
+            # HTTP/retry
+            self.http_timeout: float = _to_float(_env_first(["HTTP_TIMEOUT"], "30"), 30.0)
+            self.max_retries: int = _to_int(_env_first(["MAX_RETRIES"], "2"), 2)
+            self.retry_delay: float = _to_float(_env_first(["RETRY_DELAY"], "0.5"), 0.5)
 
             # Cache
-            self.cache_ttl_sec: int = _env_int_first(["CACHE_DEFAULT_TTL", "CACHE_TTL_SEC"], 10)
-            self.cache_max_size: int = _env_int_first(["CACHE_MAX_SIZE"], 5000)
+            self.cache_default_ttl: int = _to_int(_env_first(["CACHE_DEFAULT_TTL"], "10"), 10)
+            self.cache_max_size: int = _to_int(_env_first(["CACHE_MAX_SIZE"], "5000"), 5000)
+            self.cache_backup_enabled: bool = _to_bool(_env_first(["CACHE_BACKUP_ENABLED"], "false"), False)
+            self.cache_save_interval: int = _to_int(_env_first(["CACHE_SAVE_INTERVAL"], "300"), 300)
 
-            # Routers knobs (match your advanced routes)
-            self.ai_batch_size: int = _env_int_first(["AI_BATCH_SIZE"], 20)
-            self.ai_batch_timeout_sec: float = _env_float_first(["AI_BATCH_TIMEOUT_SEC"], 45.0)
-            self.ai_batch_concurrency: int = _env_int_first(["AI_BATCH_CONCURRENCY"], 5)
-            self.ai_max_tickers: int = _env_int_first(["AI_MAX_TICKERS"], 500)
+            # CORS / rate limit
+            self.cors_origins: str = _env_first(["CORS_ORIGINS"], "*") or "*"
+            self.enable_rate_limiting: bool = _to_bool(_env_first(["ENABLE_RATE_LIMITING"], "true"), True)
+            self.max_requests_per_minute: int = _to_int(_env_first(["MAX_REQUESTS_PER_MINUTE"], "240"), 240)
 
-            self.adv_batch_size: int = _env_int_first(["ADV_BATCH_SIZE"], 25)
-            self.adv_batch_timeout_sec: float = _env_float_first(["ADV_BATCH_TIMEOUT_SEC"], 45.0)
-            self.adv_batch_concurrency: int = _env_int_first(["ADV_BATCH_CONCURRENCY"], 6)
-            self.adv_max_tickers: int = _env_int_first(["ADV_MAX_TICKERS"], 500)
-
-            # Sheets / creds
-            self.default_spreadsheet_id: Optional[str] = _env_first(["DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID"], None)
-            self.spreadsheet_id: Optional[str] = self.default_spreadsheet_id
-            self.google_sheets_credentials: Optional[str] = _env_first(["GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"], None)
+            # Google
+            self.default_spreadsheet_id: Optional[str] = _env_first(["DEFAULT_SPREADSHEET_ID"], None)
+            self.google_sheets_credentials: Optional[str] = _env_first(["GOOGLE_SHEETS_CREDENTIALS"], None)
             self.google_credentials: Optional[str] = _env_first(["GOOGLE_CREDENTIALS"], None)
+            self.google_apps_script_url: Optional[str] = _env_first(["GOOGLE_APPS_SCRIPT_URL"], None)
+            self.google_apps_script_backup_url: Optional[str] = _env_first(["GOOGLE_APPS_SCRIPT_BACKUP_URL"], None)
 
-            # KSA URLs (optional)
-            self.tadawul_quote_url: Optional[str] = _env_str("TADAWUL_QUOTE_URL", None)
-            self.tadawul_fundamentals_url: Optional[str] = _env_str("TADAWUL_FUNDAMENTALS_URL", None)
-            self.argaam_quote_url: Optional[str] = _env_str("ARGAAM_QUOTE_URL", None)
-            self.argaam_profile_url: Optional[str] = _env_str("ARGAAM_PROFILE_URL", None)
+            # Feature flags
+            self.advanced_analysis_enabled: bool = _to_bool(_env_first(["ADVANCED_ANALYSIS_ENABLED"], "true"), True)
+            self.tadawul_market_enabled: bool = _to_bool(_env_first(["TADAWUL_MARKET_ENABLED"], "true"), True)
 
-        # Safe diagnostics (no secrets)
+        # Legacy names
+        @property
+        def app_name(self) -> str:
+            return self.service_name
+
+        @property
+        def env(self) -> str:
+            return self.environment
+
+        @property
+        def version(self) -> str:
+            return self.service_version
+
+        @property
+        def enabled_providers(self) -> List[str]:
+            xs = _parse_list(self.enabled_providers_raw)
+            return xs or ["eodhd", "finnhub"]
+
+        @property
+        def ksa_providers(self) -> List[str]:
+            xs = _parse_list(self.ksa_providers_raw)
+            return xs or ["yahoo_chart", "tadawul", "argaam"]
+
+        @property
+        def eodhd_api_token(self) -> Optional[str]:
+            return (self.eodhd_api_key or "").strip() or None
+
+        @property
+        def finnhub_api_token(self) -> Optional[str]:
+            return (self.finnhub_api_key or "").strip() or None
+
         def safe_summary(self) -> Dict[str, Any]:
             creds, creds_src = _resolve_google_credentials(self.google_sheets_credentials, self.google_credentials)
             sid, sid_src = _resolve_spreadsheet_id(self.default_spreadsheet_id)
@@ -412,54 +507,38 @@ if Settings is None or get_settings is None:
                 "VERSION": self.version,
                 "LOG_LEVEL": self.log_level,
                 "REQUIRE_AUTH": bool(self.require_auth),
-                "APP_TOKEN_SET": bool(self.app_token),
+                "APP_TOKEN_SET": bool((self.app_token or "").strip()),
                 "APP_TOKEN_MASK": _mask_tail(self.app_token, 4),
-                "PROVIDERS": list(self.enabled_providers),
-                "KSA_PROVIDERS": list(self.enabled_ksa_providers),
+                "ENABLED_PROVIDERS": list(self.enabled_providers),
                 "PRIMARY_PROVIDER": self.primary_provider,
-                "EODHD_TOKEN_SET": bool(self.eodhd_api_token),
-                "FINNHUB_TOKEN_SET": bool(self.finnhub_api_token),
+                "KSA_PROVIDERS": list(self.ksa_providers),
+                "EODHD_TOKEN_SET": bool((self.eodhd_api_token or "").strip()),
+                "FINNHUB_TOKEN_SET": bool((self.finnhub_api_token or "").strip()),
                 "SPREADSHEET_ID_SET": bool(sid),
                 "SPREADSHEET_ID_SOURCE": sid_src,
                 "GOOGLE_CREDS_SET": bool(creds),
                 "GOOGLE_CREDS_SOURCE": creds_src,
             }
 
-        # Uppercase aliases (legacy compatibility)
         def __getattr__(self, name: str) -> Any:
             if name.isupper():
-                low = name.lower()
-                if hasattr(self, low):
-                    return getattr(self, low)
+                if name == "APP_NAME":
+                    return self.app_name
+                if name == "ENV":
+                    return self.env
+                if name == "VERSION":
+                    return self.version
+                if name == "EODHD_API_TOKEN":
+                    return self.eodhd_api_token
+                if name == "FINNHUB_API_TOKEN":
+                    return self.finnhub_api_token
             raise AttributeError(name)
-
-        @property
-        def APP_NAME(self) -> str:  # noqa: N802
-            return self.app_name
-
-        @property
-        def ENV(self) -> str:  # noqa: N802
-            return self.env
-
-        @property
-        def VERSION(self) -> str:  # noqa: N802
-            return self.version
-
-        @property
-        def LOG_LEVEL(self) -> str:  # noqa: N802
-            return self.log_level
-
-        @property
-        def EODHD_API_KEY(self) -> Optional[str]:  # noqa: N802
-            return self.eodhd_api_key
-
-        @property
-        def FINNHUB_API_KEY(self) -> Optional[str]:  # noqa: N802
-            return self.finnhub_api_key
 
     @lru_cache(maxsize=1)
     def get_settings() -> Settings:  # type: ignore
-        return _apply_compat_aliases(Settings())
+        s = Settings()
+        _apply_runtime_env_aliases_from_render(s)
+        return s
 
 
 __all__ = ["Settings", "get_settings"]
