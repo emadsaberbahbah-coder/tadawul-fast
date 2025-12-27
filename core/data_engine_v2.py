@@ -2,16 +2,14 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.7.4) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.7.5) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-What’s improved vs v2.7.1
-- ✅ Adds UnifiedQuote Pydantic model (enables schema-fill in routers)
-- ✅ Exposes normalize_symbol() (routers prefer it)
-- ✅ Provider fn-name alignment (yahoo_chart_provider now supported via *fetch_quote_patch*)
-- ✅ KSA routing safety: NEVER uses eodhd/fmp/finnhub for .SR unless explicitly listed in KSA_PROVIDERS
-- ✅ Better defaults: output dict includes core keys (stable for Sheets)
-- ✅ Derived fields computed (price_change/percent_change/value_traded/52w position)
-- ✅ Batch aliases: get_quote(s)/get_quotes(s)
+Fix in v2.7.5
+- ✅ If current_price exists => status is ALWAYS "success"
+  (provider failures become warnings, do NOT flip status to error)
+- ✅ Auto-skip 'tadawul' provider when not configured
+  (missing TADAWUL_QUOTE_URL + TADAWUL_FUNDAMENTALS_URL)
+- ✅ Avoid duplicated error prefixes like "tadawul: tadawul: ..."
 
 Return shape
 - Dict aligned to UnifiedQuote keys (safe for Sheets)
@@ -32,7 +30,7 @@ from cachetools import TTLCache
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.7.4"
+ENGINE_VERSION = "2.7.5"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -377,6 +375,26 @@ def _quality_label(out: Dict[str, Any]) -> str:
     return "FULL" if ok else "PARTIAL"
 
 
+def _dedup_preserve(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in items:
+        s = (x or "").strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _tadawul_configured() -> bool:
+    tq = (os.getenv("TADAWUL_QUOTE_URL") or "").strip()
+    tf = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip()
+    return bool(tq or tf)
+
+
 # ---------------------------------------------------------------------------
 # DataEngine
 # ---------------------------------------------------------------------------
@@ -440,7 +458,10 @@ class DataEngine:
         sym = normalize_symbol(symbol)
         if not sym:
             q = UnifiedQuote(symbol=str(symbol or ""), error="empty symbol").finalize()
-            return q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__)
+            out0 = q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__)
+            out0["status"] = "error"
+            out0["data_quality"] = "BAD"
+            return out0
 
         cache_key = f"q::{sym}::{int(bool(enrich))}"
         hit = self._cache.get(cache_key)
@@ -456,6 +477,8 @@ class DataEngine:
             market="KSA" if is_ksa else "GLOBAL",
             last_updated_utc=_utc_iso(),
             error="",
+            symbol_input=str(symbol or ""),
+            symbol_normalized=sym,
         ).model_dump()
 
         if not providers:
@@ -465,7 +488,7 @@ class DataEngine:
             self._cache[cache_key] = dict(out)
             return out
 
-        errors: List[str] = []
+        warnings: List[str] = []
         source_used: List[str] = []
 
         for p in providers:
@@ -475,7 +498,12 @@ class DataEngine:
 
             # KSA safety: never call global-only providers for KSA unless explicitly in KSA providers list
             if is_ksa and p in {"eodhd", "fmp", "finnhub"} and (p not in (self.providers_ksa or [])):
-                errors.append(f"{p}: skipped for KSA")
+                warnings.append(f"{p}: skipped for KSA")
+                continue
+
+            # Auto-skip tadawul if not configured
+            if p == "tadawul" and not _tadawul_configured():
+                warnings.append("tadawul: skipped (missing TADAWUL_QUOTE_URL/TADAWUL_FUNDAMENTALS_URL)")
                 continue
 
             patch: Dict[str, Any] = {}
@@ -526,7 +554,7 @@ class DataEngine:
                 )
 
             else:
-                errors.append(f"{p}: unknown provider")
+                warnings.append(f"{p}: unknown provider")
                 continue
 
             if patch:
@@ -534,13 +562,20 @@ class DataEngine:
                 source_used.append(p)
 
             if err:
-                errors.append(f"{p}: {err}")
+                # Avoid duplicated prefixes like "tadawul: tadawul: ..."
+                low = str(err).strip().lower()
+                if low.startswith(f"{p}:"):
+                    warnings.append(str(err).strip())
+                else:
+                    warnings.append(f"{p}: {str(err).strip()}")
 
             # compute derived after each patch
             _apply_derived(out)
 
             # Stop early if we already have core price + identity/fundamental anchor
-            if _safe_float(out.get("current_price")) is not None and (out.get("name") or _safe_float(out.get("market_cap")) is not None):
+            if _safe_float(out.get("current_price")) is not None and (
+                out.get("name") or _safe_float(out.get("market_cap")) is not None
+            ):
                 break
 
         # Scoring
@@ -556,18 +591,31 @@ class DataEngine:
         out["opportunity_score"] = int(max(0, min(100, round((0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs)))))
 
         # data_source
-        out["data_source"] = ",".join(source_used) if source_used else (out.get("data_source") or None)
+        out["data_source"] = ",".join(_dedup_preserve(source_used)) if source_used else (out.get("data_source") or None)
 
         # data_quality + status
         out["data_quality"] = _quality_label(out)
-        if _safe_float(out.get("current_price")) is None:
+
+        has_price = _safe_float(out.get("current_price")) is not None
+        if not has_price:
             out["status"] = "error"
-            out["error"] = " | ".join(errors) if errors else "No price returned"
+            base_err = str(out.get("error") or "").strip()
+            parts = [base_err] if base_err else []
+            parts += warnings
+            parts = _dedup_preserve(parts)
+            out["error"] = " | ".join(parts) if parts else "No price returned"
         else:
-            out["status"] = "success" if not str(out.get("error") or "").strip() else "error"
-            # keep provider errors as warning text (non-empty) but do not break success if price exists
-            if errors and not str(out.get("error") or "").strip():
-                out["error"] = " | ".join(errors)
+            # ✅ 핵 الإصلاح: price exists => SUCCESS, provider issues become warnings
+            out["status"] = "success"
+
+            base_err = str(out.get("error") or "").strip()
+            parts: List[str] = []
+            if base_err:
+                parts.append(base_err)
+            parts += warnings
+            parts = _dedup_preserve(parts)
+
+            out["error"] = "" if not parts else ("warning: " + " | ".join(parts))
 
         # Cache
         self._cache[cache_key] = dict(out)
@@ -582,7 +630,10 @@ class DataEngine:
         for i, r in enumerate(res):
             if isinstance(r, Exception):
                 q = UnifiedQuote(symbol=normalize_symbol(symbols[i]) or str(symbols[i] or ""), error=str(r)).finalize()
-                out.append(q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__))
+                d = q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__)
+                d["status"] = "error"
+                d["data_quality"] = "BAD"
+                out.append(d)
             else:
                 out.append(r)
         return out
