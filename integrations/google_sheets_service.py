@@ -2,19 +2,22 @@
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.10.0 (Aligned + production-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.11.0 (Enhanced + production-hardened)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
-- Calls Tadawul Fast Bridge backend endpoints that return {headers, rows, status}.
+- Calls Tadawul Fast Bridge backend endpoints that return {headers, rows, status, error?}.
 - Writes data to Sheets in chunked mode to avoid request size limits.
 
-Key upgrades (v3.10.0)
-- FIX (important): Always send BOTH "symbols" and "tickers" + sheet_name/sheetName to all sheet-rows endpoints.
-  (Prevents schema mismatch across routers and fixes many "refresh not reflected" cases.)
-- Robust adapter: if backend returns rows as dicts, convert to ordered list rows using headers.
-- Safe fallback headers: if backend headers missing, use core.schemas.get_headers_for_sheet(sheet_name) when available.
-- Keeps "never raise" policy for refresh_* (always returns a status dict).
+Key guarantees
+- refresh_* functions NEVER raise (always return a status dict).
+- Always sends BOTH: symbols + tickers AND sheet_name + sheetName to sheet-rows endpoints.
+- Robust adapter:
+    • if backend returns rows as dicts -> converts to list rows using headers
+    • if backend returns partial/mismatched -> fills placeholders
+- Handles very large ticker lists:
+    • backend calls are chunked (SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL)
+    • merged deterministically back to requested order when possible
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 
-SERVICE_VERSION = "3.10.0"
+SERVICE_VERSION = "3.11.0"
 
 # =============================================================================
 # OPTIONAL SAFE IMPORTS (NO HEAVY DEPENDENCIES)
@@ -120,6 +123,20 @@ def _get_float(names: Sequence[str], env_keys: Sequence[str], default: float) ->
         return float(default)
 
 
+def _get_int(names: Sequence[str], env_keys: Sequence[str], default: int) -> int:
+    s = _cfg_obj()
+    v = _get_attr_any(s, names)
+    try:
+        if v is not None:
+            return int(float(v))
+    except Exception:
+        pass
+    try:
+        return int(float(str(_get_env_any(env_keys, default)).strip()))
+    except Exception:
+        return int(default)
+
+
 def _get_bool(names: Sequence[str], env_keys: Sequence[str], default: bool) -> bool:
     s = _cfg_obj()
     v = _get_attr_any(s, names)
@@ -191,6 +208,7 @@ except Exception:
 if not _CREDS_RAW:
     _CREDS_RAW = (os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or "").strip()
 
+
 # =============================================================================
 # GOOGLE API CLIENT IMPORT
 # =============================================================================
@@ -202,6 +220,7 @@ except Exception:
     Credentials = None  # type: ignore
     build = None  # type: ignore
     HttpError = None  # type: ignore
+
 
 # =============================================================================
 # SSL / CONSTANTS
@@ -223,13 +242,17 @@ _BACKEND_RETRY_SLEEP = float(os.getenv("SHEETS_BACKEND_RETRY_SLEEP", "1.0") or "
 
 _MAX_ROWS_PER_WRITE = max(50, int(os.getenv("SHEETS_MAX_ROWS_PER_WRITE", "500") or "500"))
 _USE_BATCH_UPDATE = _get_bool([], ["SHEETS_USE_BATCH_UPDATE"], True)
-
 _MAX_BATCH_RANGES = max(5, int(os.getenv("SHEETS_MAX_BATCH_RANGES", "25") or "25"))
 
 _CLEAR_END_COL = (os.getenv("SHEETS_CLEAR_END_COL", "ZZ") or "ZZ").strip().upper()
 _CLEAR_END_ROW = max(1000, int(os.getenv("SHEETS_CLEAR_END_ROW", "100000") or "100000"))
-
 _SMART_CLEAR = _get_bool([], ["SHEETS_SMART_CLEAR"], True)
+
+# backend chunking for very large lists (important)
+_BACKEND_MAX_SYMBOLS_PER_CALL = max(
+    25,
+    int(os.getenv("SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL", "") or _get_int([], ["SHEETS_BACKEND_BATCH_SIZE"], 200)),
+)
 
 _USER_AGENT = (
     (os.getenv("SHEETS_USER_AGENT", "") or "").strip()
@@ -387,6 +410,13 @@ def _safe_status_error(where: str, err: str, **extra) -> Dict[str, Any]:
     return out
 
 
+def _chunk_list(items: List[str], size: int) -> List[List[str]]:
+    if not items:
+        return []
+    size = max(1, int(size or 1))
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 # =============================================================================
 # GOOGLE SHEETS SERVICE INITIALIZATION
 # =============================================================================
@@ -499,7 +529,12 @@ def read_range(spreadsheet_id: str, range_name: str) -> List[List[Any]]:
     return _retry_sheet_op("Read Range", _do_read)
 
 
-def write_range(spreadsheet_id: str, range_name: str, values: List[List[Any]], value_input: str = "RAW") -> int:
+def write_range(
+    spreadsheet_id: str,
+    range_name: str,
+    values: List[List[Any]],
+    value_input: str = "RAW",
+) -> int:
     service = get_sheets_service()
     sid = _require_spreadsheet_id(spreadsheet_id)
 
@@ -532,7 +567,17 @@ def clear_range(spreadsheet_id: str, range_name: str) -> None:
     _retry_sheet_op("Clear Range", _do_clear)
 
 
-def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, grid: List[List[Any]]) -> int:
+def write_grid_chunked(
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    grid: List[List[Any]],
+    value_input: str = "RAW",
+) -> int:
+    """
+    Writes [header_row + data_rows] into the sheet starting at start_cell.
+    Data rows are chunked to avoid Sheets API size issues.
+    """
     if not grid:
         return 0
 
@@ -541,9 +586,11 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
     sheet_a1 = _safe_sheet_name(sheet_name)
 
     header = grid[0] if grid else []
+    header = list(header) if isinstance(header, (list, tuple)) else [header]
+
     data_rows = grid[1:] if len(grid) > 1 else []
 
-    hdr_len = len(header) if isinstance(header, list) else 0
+    hdr_len = len(header)
     if hdr_len > 0:
         fixed: List[List[Any]] = []
         for r in data_rows:
@@ -559,7 +606,7 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
 
     if not chunks:
         rng = f"{sheet_a1}!{_a1(start_col, start_row)}"
-        return write_range(sid, rng, [header])
+        return write_range(sid, rng, [header], value_input=value_input)
 
     if _USE_BATCH_UPDATE:
         try:
@@ -576,7 +623,7 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
                 current_row += len(chunks[idx])
 
             def _do_batch(batch_data: List[Dict[str, Any]]) -> int:
-                body = {"valueInputOption": "RAW", "data": batch_data}
+                body = {"valueInputOption": value_input, "data": batch_data}
                 result = service.spreadsheets().values().batchUpdate(spreadsheetId=sid, body=body).execute()
                 total = 0
                 for r in (result.get("responses") or []):
@@ -594,12 +641,12 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
 
     total_cells = 0
     rng0 = f"{sheet_a1}!{_a1(start_col, start_row)}"
-    total_cells += write_range(sid, rng0, [header] + chunks[0])
+    total_cells += write_range(sid, rng0, [header] + chunks[0], value_input=value_input)
 
     current_row = start_row + 1 + len(chunks[0])
     for idx in range(1, len(chunks)):
         rng = f"{sheet_a1}!{_a1(start_col, current_row)}"
-        total_cells += write_range(sid, rng, chunks[idx])
+        total_cells += write_range(sid, rng, chunks[idx], value_input=value_input)
         current_row += len(chunks[idx])
 
     return total_cells
@@ -633,7 +680,11 @@ def _sheets_safe_error_payload(symbols: List[str], err: str) -> Dict[str, Any]:
     }
 
 
-def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _call_backend_api_once(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Single POST call with retries + token fallback.
+    Returns a dict always (sheets-safe error payload on failure).
+    """
     url = f"{_backend_base_url()}{endpoint}"
 
     syms_any = payload.get("symbols") or payload.get("tickers") or []
@@ -650,7 +701,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if _BACKUP_TOKEN and _BACKUP_TOKEN != _APP_TOKEN:
         tokens_to_try.append(_BACKUP_TOKEN)
     if not tokens_to_try:
-        tokens_to_try.append("")
+        tokens_to_try.append("")  # open-mode backend
 
     last_err: Optional[Exception] = None
     last_status: Optional[int] = None
@@ -690,6 +741,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     raw = str(e)
                 last_body_preview = _safe_preview(raw, 400)
 
+                # token fallback on auth failures
                 if last_status in (401, 403) and tok_idx < len(tokens_to_try) - 1:
                     logger.warning(
                         "[GoogleSheets] Backend auth failed (HTTP %s) token#%s -> trying next token.",
@@ -698,6 +750,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     continue
 
+                # retry on transient backend errors
                 if last_status in (429, 500, 502, 503, 504):
                     ra = None
                     try:
@@ -735,6 +788,178 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return _sheets_safe_error_payload(symbols, err_msg)
 
 
+def _find_symbol_col(headers: List[str]) -> int:
+    for i, h in enumerate(headers or []):
+        if str(h).strip().lower() in ("symbol", "ticker"):
+            return i
+    return -1
+
+
+def _rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[Any]]]:
+    """
+    Normalize backend rows:
+    - list[list] -> keep (pad/trim to header length)
+    - list[dict] -> ordered list rows by headers
+    """
+    hdrs = [str(h).strip() for h in (headers or []) if h and str(h).strip()]
+    if not hdrs:
+        hdrs = ["Symbol", "Error"]
+
+    fixed_rows: List[List[Any]] = []
+
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        for d in rows:
+            dd = d if isinstance(d, dict) else {}
+            fixed_rows.append([dd.get(h, None) for h in hdrs])
+        return hdrs, fixed_rows
+
+    if isinstance(rows, list):
+        for r in rows:
+            rr = list(r) if isinstance(r, (list, tuple)) else [r]
+            if len(rr) < len(hdrs):
+                rr += [None] * (len(hdrs) - len(rr))
+            elif len(rr) > len(hdrs):
+                rr = rr[: len(hdrs)]
+            fixed_rows.append(rr)
+        return hdrs, fixed_rows
+
+    fixed_rows.append([str(rows)])
+    return hdrs, fixed_rows
+
+
+def _merge_backend_responses(
+    requested_symbols: List[str],
+    first_headers: List[str],
+    responses: List[Dict[str, Any]],
+) -> Tuple[List[str], List[List[Any]], str, Optional[str]]:
+    """
+    Merge chunked backend responses into one headers+rows in requested order when possible.
+    """
+    headers = first_headers[:] if first_headers else []
+    all_rows: List[List[Any]] = []
+    status = "success"
+    error_msg: Optional[str] = None
+
+    # pick best headers encountered (first non-empty)
+    if not headers:
+        for r in responses:
+            hh = r.get("headers") or []
+            if isinstance(hh, list) and hh:
+                headers = [str(x) for x in hh]
+                break
+    if not headers:
+        headers = ["Symbol", "Error"]
+
+    symbol_col = _find_symbol_col(headers)
+    row_map: Dict[str, List[Any]] = {}
+
+    for r in responses:
+        st = str(r.get("status") or "success")
+        if st in ("error", "partial"):
+            status = "partial"
+        if st == "error" and not error_msg:
+            error_msg = str(r.get("error") or "Backend error")
+
+        hh, rr = _rows_to_grid(r.get("headers") or headers, r.get("rows") or [])
+        # If headers mismatch, we still try to map by symbol; otherwise append
+        sym_idx = _find_symbol_col(hh)
+
+        if sym_idx >= 0:
+            for row in rr:
+                try:
+                    sym = str(row[sym_idx] or "").strip().upper()
+                except Exception:
+                    sym = ""
+                if sym:
+                    # align row to final headers if needed
+                    if hh != headers:
+                        # best-effort: dict-like remap by header names
+                        tmp = {str(hh[i]): (row[i] if i < len(row) else None) for i in range(len(hh))}
+                        aligned = [tmp.get(h, None) for h in headers]
+                        row_map.setdefault(sym, aligned)
+                    else:
+                        row_map.setdefault(sym, row)
+                else:
+                    all_rows.append(row)
+        else:
+            # cannot map; just append
+            all_rows.extend(rr)
+
+    # If we have a symbol_col, produce rows in requested order (placeholders if missing)
+    if symbol_col >= 0 and requested_symbols:
+        merged: List[List[Any]] = []
+        for s in requested_symbols:
+            key = str(s or "").strip().upper()
+            row = row_map.get(key)
+            if row is None:
+                placeholder = [None] * len(headers)
+                placeholder[symbol_col] = key
+                # try to place a useful error if "Error" exists
+                try:
+                    err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
+                    placeholder[err_idx] = "Missing row from backend"
+                except Exception:
+                    pass
+                merged.append(placeholder)
+                status = "partial" if status == "success" else status
+            else:
+                # pad/trim
+                if len(row) < len(headers):
+                    row = row + [None] * (len(headers) - len(row))
+                elif len(row) > len(headers):
+                    row = row[: len(headers)]
+                merged.append(row)
+        return headers, merged, status, error_msg
+
+    # otherwise, fall back to appended rows
+    # (ensure padding/trim)
+    fixed = []
+    for row in all_rows:
+        if len(row) < len(headers):
+            row = row + [None] * (len(headers) - len(row))
+        elif len(row) > len(headers):
+            row = row[: len(headers)]
+        fixed.append(row)
+
+    return headers, fixed, status, error_msg
+
+
+def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sheets-safe backend client:
+    - chunk symbols if very large (SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL)
+    - merge deterministically when possible
+    """
+    syms_any = payload.get("symbols") or payload.get("tickers") or []
+    symbols = [str(t).strip() for t in (syms_any or []) if str(t).strip()]
+    if not symbols:
+        return {"headers": ["Symbol", "Error"], "rows": [], "status": "skipped", "error": "No symbols provided"}
+
+    chunks = _chunk_list(symbols, _BACKEND_MAX_SYMBOLS_PER_CALL)
+
+    if len(chunks) <= 1:
+        return _call_backend_api_once(endpoint, payload)
+
+    responses: List[Dict[str, Any]] = []
+    first_headers: List[str] = []
+    for ch in chunks:
+        p2 = dict(payload)
+        p2["symbols"] = ch
+        p2["tickers"] = ch
+        res = _call_backend_api_once(endpoint, p2)
+        responses.append(res)
+        if not first_headers:
+            hh = res.get("headers") or []
+            if isinstance(hh, list) and hh:
+                first_headers = [str(x) for x in hh]
+
+    headers, rows, st, err = _merge_backend_responses(symbols, first_headers, responses)
+    out: Dict[str, Any] = {"headers": headers, "rows": rows, "status": st}
+    if err:
+        out["error"] = err
+    return out
+
+
 # =============================================================================
 # HIGH-LEVEL ORCHESTRATION
 # =============================================================================
@@ -755,11 +980,9 @@ def _normalize_tickers(tickers: Sequence[str]) -> List[str]:
 
 def _payload_for_endpoint(endpoint: str, symbols_list: List[str], sheet_name: str) -> Dict[str, Any]:
     """
-    ✅ Safe universal payload:
+    ✅ Universal payload:
       - Always send BOTH: symbols + tickers
       - Always send BOTH: sheet_name + sheetName
-
-    This avoids router mismatch (some routes read 'symbols', some read 'tickers').
     """
     return {
         "symbols": symbols_list,
@@ -769,41 +992,6 @@ def _payload_for_endpoint(endpoint: str, symbols_list: List[str], sheet_name: st
     }
 
 
-def _rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[Any]]]:
-    """
-    Normalize backend rows:
-    - if rows are list[list] -> keep
-    - if rows are list[dict] -> convert by header order
-    - else -> coerce
-    """
-    hdrs = [str(h).strip() for h in (headers or []) if h and str(h).strip()]
-    if not hdrs:
-        hdrs = ["Symbol", "Error"]
-
-    fixed_rows: List[List[Any]] = []
-
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        # dict rows -> ordered list rows
-        for d in rows:
-            dd = d if isinstance(d, dict) else {}
-            fixed_rows.append([dd.get(h, None) for h in hdrs])
-        return hdrs, fixed_rows
-
-    if isinstance(rows, list):
-        for r in rows:
-            rr = list(r) if isinstance(r, (list, tuple)) else [r]
-            if len(rr) < len(hdrs):
-                rr += [None] * (len(hdrs) - len(rr))
-            elif len(rr) > len(hdrs):
-                rr = rr[: len(hdrs)]
-            fixed_rows.append(rr)
-        return hdrs, fixed_rows
-
-    # unknown shape
-    fixed_rows.append([str(rows)])
-    return hdrs, fixed_rows
-
-
 def _refresh_logic(
     endpoint: str,
     spreadsheet_id: str,
@@ -811,6 +999,7 @@ def _refresh_logic(
     tickers: Sequence[str],
     start_cell: str = "A5",
     clear: bool = False,
+    value_input: str = "RAW",
 ) -> Dict[str, Any]:
     """
     Core logic:
@@ -834,7 +1023,7 @@ def _refresh_logic(
         if not sh:
             return _safe_status_error("sheet_name", "sheet_name is required", endpoint=endpoint)
 
-        # 1) backend call (never raise outward)
+        # 1) backend call (sheets-safe)
         try:
             response = _call_backend_api(endpoint, _payload_for_endpoint(endpoint, symbols_list, sh))
         except Exception as e:
@@ -871,7 +1060,7 @@ def _refresh_logic(
 
         # 3) write
         try:
-            updated_cells = write_grid_chunked(sid, sh, start_cell, grid)
+            updated_cells = write_grid_chunked(sid, sh, start_cell, grid, value_input=value_input)
         except Exception as e:
             return _safe_status_error(
                 "write_grid_chunked",
@@ -899,6 +1088,7 @@ def _refresh_logic(
             "cells_updated": int(updated_cells or 0),
             "backend_status": backend_status,
             "backend_error": backend_error,
+            "backend_chunk_size": _BACKEND_MAX_SYMBOLS_PER_CALL,
             "service_version": SERVICE_VERSION,
         }
 
