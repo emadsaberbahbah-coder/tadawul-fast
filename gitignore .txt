@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyd
+*.so
 
 # Caches / test / typecheck
 .pytest_cache/
@@ -53,12 +54,14 @@ ENV/
 env.local
 .env.local
 .envrc
+*.env
 
 # Keys / certs
 *.pem
 *.key
 *.crt
 *.pfx
+*.p12
 
 # Google / OAuth / Service Account secrets (targeted; NOT all *.json)
 credentials.json
@@ -114,15 +117,13 @@ yarn-error.log*
 pnpm-debug.log*
 
 # =======================================================
-# Optional: Docker (ignore ONLY if you truly don't use Docker)
-# =======================================================
-# Dockerfile
-# docker-compose.yml
-# docker-compose.*.yml
-
-# =======================================================
 # Optional: Local config overrides (safe to ignore)
 # =======================================================
 local_settings.json
 .env.production.local
 .env.development.local
+
+# =======================================================
+# Render / Deployment artifacts (optional)
+# =======================================================
+.render/
