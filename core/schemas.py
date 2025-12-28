@@ -1,9 +1,8 @@
-```python
 # core/schemas.py  (FULL REPLACEMENT)
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.3.0 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.3.1 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
@@ -21,6 +20,9 @@ Design rules
 ✅ No mutation leaks: always returns COPIES of header lists.
 ✅ Better alignment: sheet aliases include your actual page names (Global_Markets, Insights_Analysis, etc).
 ✅ Convenience: provides HEADER<->FIELD mapping for UnifiedQuote-style payloads.
+
+v3.3.1 note
+- More robust symbol list coercion: supports mixed separators "AAPL,MSFT 1120.SR"
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.3.0"
+SCHEMAS_VERSION = "3.3.1"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
@@ -143,7 +145,6 @@ if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
 # =============================================================================
 # Header <-> Field mapping (UnifiedQuote alignment helper)
 # =============================================================================
-# This is OPTIONAL for callers, but very useful to keep consistent translations.
 
 HEADER_TO_FIELD: Dict[str, str] = {
     # Identity
@@ -265,7 +266,6 @@ _SHEET_HEADERS: Dict[str, Tuple[str, ...]] = {
 
     # -------------------------
     # Global Markets pages
-    # (IMPORTANT: your real sheet is "Global_Markets")
     # -------------------------
     "global_markets": _DEFAULT_59_TUPLE,
     "global_market": _DEFAULT_59_TUPLE,
@@ -298,7 +298,7 @@ _SHEET_HEADERS: Dict[str, Tuple[str, ...]] = {
     # -------------------------
     # Insights / Analysis / Advisor
     # -------------------------
-    "insights_analysis": _DEFAULT_59_TUPLE,  # IMPORTANT: your real sheet is "Insights_Analysis"
+    "insights_analysis": _DEFAULT_59_TUPLE,
     "insights": _DEFAULT_59_TUPLE,
     "analysis": _DEFAULT_59_TUPLE,
     "investment_advisor": _DEFAULT_59_TUPLE,
@@ -343,7 +343,7 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
         if isinstance(v2, tuple) and v2:
             return list(v2)
 
-        # contains / prefix matching
+        # contains / prefix matching (best-effort)
         for k, vv in _SHEET_HEADERS.items():
             if key == k or key.startswith(k) or k in key:
                 return list(vv)
@@ -370,6 +370,7 @@ def _coerce_str_list(v: Any) -> List[str]:
     Accept:
       - ["AAPL","MSFT"]
       - "AAPL,MSFT 1120.SR"
+      - "AAPL MSFT,1120.SR"
       - None
     and return a clean list of strings.
     """
@@ -385,16 +386,12 @@ def _coerce_str_list(v: Any) -> List[str]:
                 out.append(s)
         return out
 
-    # single string
-    s = str(v).replace("\n", " ").replace("\t", " ").strip()
+    # single string: support mixed separators
+    s = str(v).replace("\n", " ").replace("\t", " ").replace(",", " ").strip()
     if not s:
         return []
-    parts = []
-    if "," in s:
-        parts = [p.strip() for p in s.split(",")]
-    else:
-        parts = [p.strip() for p in s.split(" ")]
-    return [p for p in parts if p]
+    parts = [p.strip() for p in s.split(" ") if p.strip()]
+    return parts
 
 
 class _ExtraIgnore(BaseModel):
@@ -468,4 +465,3 @@ __all__ = [
     "get_supported_sheets",
     "BatchProcessRequest",
 ]
-```
