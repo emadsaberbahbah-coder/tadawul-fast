@@ -6,9 +6,9 @@
 #
 # v1.1.3 changes vs v1.1.2
 # - ✅ KSA_PROVIDERS set to "yahoo_chart" (Option A: remove Tadawul/Argaam warnings, keep KSA stable)
-# - ✅ keeps integer-safe WEB_CONCURRENCY handling (no shell integer crash)
-# - ✅ keeps deterministic uvicorn argv building + optional tuning flags
-# - ✅ keeps full env compat (both *_SEC and legacy aliases)
+# - ✅ startCommand is integer-safe for WEB_CONCURRENCY (no shell integer crash)
+# - ✅ deterministic uvicorn argv building + optional tuning flags
+# - ✅ full env compat (both *_SEC and legacy aliases)
 #
 # NOTE:
 # - Do NOT hardcode your public URL if you use a different Render service name.
@@ -92,7 +92,7 @@ services:
       - key: DEBUG
         value: "false"
 
-      # Fast-boot controls (match main.py defaults but explicit here)
+      # Fast-boot controls
       - key: DEFER_ROUTER_MOUNT
         value: "true"
       - key: INIT_ENGINE_ON_BOOT
@@ -112,7 +112,7 @@ services:
       - key: ENVIRONMENT
         value: "production"
 
-      # Version (compat keys) — keep aligned with your deployed version
+      # Version (align with deployed)
       - key: APP_VERSION
         value: "5.3.1"
       - key: SERVICE_VERSION
@@ -120,30 +120,25 @@ services:
       - key: VERSION
         value: "5.3.1"
 
-      # Public base url of this service (adjust to your real Render URL)
+      # Base URLs
       - key: BACKEND_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
       - key: TFB_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
 
       # -------------------------
-      # Security tokens (SECRETS)
+      # Security / auth
       # -------------------------
-      - key: APP_TOKEN
-        sync: false
-      - key: BACKUP_APP_TOKEN
-        sync: false
       - key: REQUIRE_AUTH
         value: "false"
 
       # -------------------------
-      # Feature flags (FastAPI docs + routers)
+      # Feature flags
       # -------------------------
       - key: ENABLE_SWAGGER
         value: "true"
       - key: ENABLE_REDOC
         value: "true"
-
       - key: AI_ANALYSIS_ENABLED
         value: "true"
       - key: ADVANCED_ANALYSIS_ENABLED
@@ -157,9 +152,9 @@ services:
       - key: PROVIDERS
         value: "eodhd,finnhub"
       - key: PRIMARY_PROVIDER
-        value: "finnhub"
+        value: "eodhd"
 
-      # KSA routing order (Option A: stable + no "tadawul skipped" warning)
+      # KSA routing order (Option A)
       - key: KSA_PROVIDERS
         value: "yahoo_chart"
 
@@ -167,19 +162,21 @@ services:
       - key: KSA_DISALLOW_EODHD
         value: "true"
 
-      # Yahoo Chart fallbacks (KSA-safe)
+      # Yahoo Chart fallbacks
       - key: ENABLE_YAHOO_CHART_KSA
         value: "true"
       - key: ENABLE_YAHOO_CHART_SUPPLEMENT
         value: "true"
 
-      # yfinance policy
+      # yfinance policy (if engine references it)
       - key: ENABLE_YFINANCE
-        value: "true"       # global fallback if your engine uses it
+        value: "true"
       - key: ENABLE_YFINANCE_KSA
-        value: "false"      # IMPORTANT: keep KSA yfinance OFF unless explicitly desired
+        value: "false"
 
-      # Provider keys (SECRETS) — keep Render names (config.py exports aliases)
+      # -------------------------
+      # Provider keys (SECRETS)
+      # -------------------------
       - key: FMP_API_KEY
         sync: false
       - key: EODHD_API_KEY
@@ -189,13 +186,13 @@ services:
       - key: ALPHA_VANTAGE_API_KEY
         sync: false
 
-      # Argaam (optional)
+      # Optional Argaam (not used in Option A)
       - key: ARGAAM_GATEWAY_URL
         value: ""
       - key: ARGAAM_API_KEY
         sync: false
 
-      # Optional explicit URLs (only if you use them in engine)
+      # Optional explicit URLs (empty is fine)
       - key: TADAWUL_QUOTE_URL
         value: ""
       - key: TADAWUL_FUNDAMENTALS_URL
@@ -206,7 +203,7 @@ services:
         value: ""
 
       # -------------------------
-      # HTTP + caching (set BOTH styles for compatibility)
+      # HTTP + caching (compat)
       # -------------------------
       - key: HTTP_TIMEOUT_SEC
         value: "25"
@@ -237,7 +234,7 @@ services:
         value: "240"
 
       # -------------------------
-      # Batch controls (set BOTH names where code differs)
+      # Batch controls
       # -------------------------
       - key: ENRICHED_BATCH_SIZE
         value: "40"
