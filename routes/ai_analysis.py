@@ -1,21 +1,18 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.1) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton.
-- PROD SAFE: avoid importing core.data_engine_v2 at module import-time.
+- PROD SAFE: avoid importing core.data_engine_v2 at module import-time (lazy import).
 - Defensive batching: chunking + timeout + bounded concurrency.
 - Sheets-safe: /sheet-rows ALWAYS returns HTTP 200 with {headers, rows, status}.
 - Canonical headers: core.schemas.get_headers_for_sheet (59 columns) when available.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
+- Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 
-Improvements vs prior:
-- ✅ Startup-safe lazy imports (won’t crash app boot if engine module fails import)
-- ✅ Engine detection by capability (methods) not isinstance(DataEngine)
-- ✅ Strong fallback headers (not just ["Symbol","Error"])
-- ✅ Header-driven row mapping + computed 52W position
-- ✅ Extra symbol-key matching (symbol / symbol_normalized / symbol_input normalization)
+Compatible with engines returning:
+- list[UnifiedQuote|dict] OR dict[symbol->UnifiedQuote|dict]
 """
 
 from __future__ import annotations
@@ -31,7 +28,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+logger = logging.getLogger("routes.ai_analysis")
+
+AI_ANALYSIS_VERSION = "3.7.1"
+router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
+
+
+# =============================================================================
 # Settings shim (safe)
+# =============================================================================
 try:
     from core.config import get_settings  # type: ignore
 except Exception:  # pragma: no cover
@@ -39,17 +44,13 @@ except Exception:  # pragma: no cover
         return None
 
 
+# =============================================================================
 # Canonical headers (59 cols) when available
+# =============================================================================
 try:
     from core.schemas import get_headers_for_sheet  # type: ignore
 except Exception:  # pragma: no cover
     get_headers_for_sheet = None  # type: ignore
-
-
-logger = logging.getLogger("routes.ai_analysis")
-
-AI_ANALYSIS_VERSION = "3.7.0"
-router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
 # =============================================================================
@@ -71,6 +72,8 @@ def _import_v2() -> Tuple[Any, Any, Any]:
             return s
         if s.isdigit():
             return f"{s}.SR"
+        if s.endswith(".SR") or s.endswith(".US"):
+            return s
         if "." in s:
             return s
         return f"{s}.US"
@@ -124,7 +127,6 @@ def _allowed_tokens() -> List[str]:
     # 2) env.settings
     try:
         from env import settings as env_settings  # type: ignore
-
         for attr in ("app_token", "backup_app_token"):
             v = _read_token_attr(env_settings, attr)
             if v:
@@ -203,7 +205,6 @@ async def _get_singleton_engine() -> Optional[Any]:
     async with _ENGINE_LOCK:
         if _ENGINE is None:
             try:
-                # re-import lazily (in case module became available later)
                 DE, _, _ = _import_v2()
                 if DE is None:
                     _ENGINE = None
@@ -330,6 +331,7 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     risk_score: Optional[float] = None
     overall_score: Optional[float] = None
     recommendation: Optional[str] = None
+    confidence: Optional[float] = None
 
     fair_value: Optional[float] = None
     upside_percent: Optional[float] = None
@@ -361,9 +363,6 @@ class SheetAnalysisResponse(_ExtraIgnoreBase):
 # Helpers
 # =============================================================================
 def _safe_get(obj: Any, *names: str) -> Any:
-    """
-    getattr + dict-key compatible.
-    """
     if obj is None:
         return None
 
@@ -401,7 +400,6 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
             return _finalize_quote(uq)
         except Exception:
             pass
-    # dict fallback
     return {
         "symbol": sym,
         "data_quality": dq,
@@ -437,118 +435,6 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-# ---- Fallback “59-ish” headers (used only if core.schemas not available)
-_DEFAULT_HEADERS = [
-    "Symbol",
-    "Company Name",
-    "Sector",
-    "Industry",
-    "Sub-Sector",
-    "Market",
-    "Currency",
-    "Listing Date",
-    "Last Price",
-    "Previous Close",
-    "Open",
-    "Price Change",
-    "Percent Change",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "52W Position %",
-    "Volume",
-    "Avg Volume (30D)",
-    "Value Traded",
-    "Turnover %",
-    "Shares Outstanding",
-    "Free Float %",
-    "Market Cap",
-    "Free Float Market Cap",
-    "Liquidity Score",
-    "EPS (TTM)",
-    "Forward EPS",
-    "P/E (TTM)",
-    "Forward P/E",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "Dividend Yield %",
-    "Dividend Rate",
-    "Payout Ratio %",
-    "ROE %",
-    "ROA %",
-    "Net Margin %",
-    "EBITDA Margin %",
-    "Revenue Growth %",
-    "Net Income Growth %",
-    "Beta",
-    "Debt to Equity",
-    "Current Ratio",
-    "Quick Ratio",
-    "RSI (14)",
-    "Volatility (30D)",
-    "MACD",
-    "MA20",
-    "MA50",
-    "Fair Value",
-    "Target Price",
-    "Upside %",
-    "Valuation Label",
-    "Analyst Rating",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Opportunity Score",
-    "Risk Score",
-    "Overall Score",
-    "Recommendation",
-    "Confidence",
-    "Data Source",
-    "Data Quality",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-    "Error",
-    "symbol_input",
-    "symbol_normalized",
-    "status",
-]
-
-
-def _select_headers(sheet_name: Optional[str]) -> List[str]:
-    if get_headers_for_sheet:
-        try:
-            h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and h and any(str(x).strip().lower() == "symbol" for x in h):
-                return [str(x) for x in h]
-        except Exception:
-            pass
-    return list(_DEFAULT_HEADERS)
-
-
-def _idx(headers: List[str], name: str) -> Optional[int]:
-    k = name.strip().lower()
-    for i, h in enumerate(headers):
-        if str(h).strip().lower() == k:
-            return i
-    return None
-
-
-def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
-    row = [None] * len(headers)
-    i_sym = _idx(headers, "Symbol")
-    if i_sym is not None:
-        row[i_sym] = symbol
-    i_err = _idx(headers, "Error")
-    if i_err is not None:
-        row[i_err] = err
-    # if sheet includes status
-    i_st = _idx(headers, "status")
-    if i_st is not None:
-        row[i_st] = "error"
-    return row
-
-
 def _extract_sources_from_any(x: Any) -> List[str]:
     if not x:
         return []
@@ -573,14 +459,10 @@ def _ratio_to_percent(v: Any) -> Any:
         return v
 
 
-def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
-    i_err = _idx(headers, "Error")
-    if i_err is None:
-        return "success"
-    for r in rows:
-        if len(r) > i_err and (r[i_err] not in (None, "", "null", "None")):
-            return "partial"
-    return "success"
+def _hkey(h: str) -> str:
+    s = str(h or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
 def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[float]:
@@ -600,7 +482,6 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-
         tz = ZoneInfo("Asia/Riyadh")
         if isinstance(utc_any, datetime):
             dt = utc_any
@@ -613,30 +494,142 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
 
 
-def _hkey(h: str) -> str:
-    s = str(h or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
+# ---- Canonical 59 headers fallback (matches core.schemas.DEFAULT_HEADERS_59)
+_DEFAULT_HEADERS_59: List[str] = [
+    # Identity
+    "Symbol",
+    "Company Name",
+    "Sector",
+    "Sub-Sector",
+    "Market",
+    "Currency",
+    "Listing Date",
+    # Prices
+    "Last Price",
+    "Previous Close",
+    "Price Change",
+    "Percent Change",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "52W Position %",
+    # Volume / Liquidity
+    "Volume",
+    "Avg Volume (30D)",
+    "Value Traded",
+    "Turnover %",
+    # Shares / Cap
+    "Shares Outstanding",
+    "Free Float %",
+    "Market Cap",
+    "Free Float Market Cap",
+    "Liquidity Score",
+    # Fundamentals
+    "EPS (TTM)",
+    "Forward EPS",
+    "P/E (TTM)",
+    "Forward P/E",
+    "P/B",
+    "P/S",
+    "EV/EBITDA",
+    "Dividend Yield %",
+    "Dividend Rate",
+    "Payout Ratio %",
+    "ROE %",
+    "ROA %",
+    "Net Margin %",
+    "EBITDA Margin %",
+    "Revenue Growth %",
+    "Net Income Growth %",
+    "Beta",
+    # Technicals
+    "Volatility (30D)",
+    "RSI (14)",
+    # Valuation / Targets
+    "Fair Value",
+    "Upside %",
+    "Valuation Label",
+    # Scores / Recommendation
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Opportunity Score",
+    "Risk Score",
+    "Overall Score",
+    "Error",
+    "Recommendation",
+    # Meta
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+]
+
+
+def _select_headers(sheet_name: Optional[str]) -> List[str]:
+    if get_headers_for_sheet:
+        try:
+            h = get_headers_for_sheet(sheet_name)
+            if isinstance(h, list) and len(h) == 59 and any(str(x).strip().lower() == "symbol" for x in h):
+                return [str(x) for x in h]
+        except Exception:
+            pass
+    return list(_DEFAULT_HEADERS_59)
+
+
+def _idx(headers: List[str], name: str) -> Optional[int]:
+    k = name.strip().lower()
+    for i, h in enumerate(headers):
+        if str(h).strip().lower() == k:
+            return i
+    return None
+
+
+def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
+    row = [None] * len(headers)
+    i_sym = _idx(headers, "Symbol")
+    if i_sym is not None:
+        row[i_sym] = symbol
+    i_err = _idx(headers, "Error")
+    if i_err is not None:
+        row[i_err] = err
+    return row
+
+
+def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
+    i_err = _idx(headers, "Error")
+    if i_err is None:
+        return "success"
+    for r in rows:
+        if len(r) > i_err and (r[i_err] not in (None, "", "null", "None")):
+            return "partial"
+    return "success"
+
+
+def _snake_guess(header: str) -> str:
+    s = str(header or "").strip().lower()
+    s = s.replace("%", " percent ")
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
 # Header -> (candidate fields..., transform?)
-# transform is a callable(value)->value
 _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
+    # Identity
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
-    "name": (("name", "company_name"), None),
     "sector": (("sector",), None),
-    "industry": (("industry",), None),
     "sub-sector": (("sub_sector", "subsector"), None),
     "sub sector": (("sub_sector", "subsector"), None),
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo"), None),
 
+    # Prices
     "last price": (("current_price", "last_price", "price"), None),
-    "current price": (("current_price", "last_price", "price"), None),
     "previous close": (("previous_close",), None),
-    "open": (("open",), None),
     "price change": (("price_change", "change"), None),
     "percent change": (("percent_change", "change_percent", "change_pct"), None),
     "day high": (("day_high",), None),
@@ -645,17 +638,20 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "52w low": (("low_52w",), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
 
+    # Liquidity
     "volume": (("volume",), None),
     "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
     "value traded": (("value_traded",), None),
     "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
 
+    # Shares/Cap
     "shares outstanding": (("shares_outstanding",), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
     "market cap": (("market_cap",), None),
     "free float market cap": (("free_float_market_cap",), None),
     "liquidity score": (("liquidity_score",), None),
 
+    # Fundamentals
     "eps (ttm)": (("eps_ttm", "eps"), None),
     "forward eps": (("forward_eps",), None),
     "p/e (ttm)": (("pe_ttm",), None),
@@ -663,35 +659,27 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "p/b": (("pb",), None),
     "p/s": (("ps",), None),
     "ev/ebitda": (("ev_ebitda",), None),
-
     "dividend yield %": (("dividend_yield",), _ratio_to_percent),
     "dividend rate": (("dividend_rate",), None),
     "payout ratio %": (("payout_ratio",), _ratio_to_percent),
     "roe %": (("roe",), _ratio_to_percent),
     "roa %": (("roa",), _ratio_to_percent),
-
     "net margin %": (("net_margin",), _ratio_to_percent),
     "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
-
     "beta": (("beta",), None),
-    "debt to equity": (("debt_to_equity",), None),
-    "current ratio": (("current_ratio",), None),
-    "quick ratio": (("quick_ratio",), None),
 
-    "rsi (14)": (("rsi_14",), None),
+    # Technicals
     "volatility (30d)": (("volatility_30d",), _ratio_to_percent),
-    "macd": (("macd",), None),
-    "ma20": (("ma20",), None),
-    "ma50": (("ma50",), None),
+    "rsi (14)": (("rsi_14",), None),
 
+    # Valuation
     "fair value": (("fair_value",), None),
-    "target price": (("target_price",), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
-    "analyst rating": (("analyst_rating",), None),
 
+    # Scores/Rec
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
@@ -699,29 +687,14 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
     "recommendation": (("recommendation",), None),
-    "confidence": (("confidence",), None),
 
+    # Meta
     "data source": (("data_source", "source"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
     "error": (("error",), None),
-
-    "symbol_input": (("symbol_input",), None),
-    "symbol_normalized": (("symbol_normalized",), None),
-    "status": (("status",), None),
 }
-
-
-def _snake_guess(header: str) -> str:
-    """
-    Convert header like "P/E (TTM)" -> "pe_ttm" best-effort.
-    """
-    s = str(header or "").strip().lower()
-    s = s.replace("%", " percent ")
-    s = re.sub(r"[^\w]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s
 
 
 def _value_for_header(header: str, uq: Any) -> Any:
@@ -758,13 +731,12 @@ def _value_for_header(header: str, uq: Any) -> Any:
 
 
 def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
-    # fix Riyadh time if requested but missing
+    # fill Riyadh if requested but missing
     if _idx(headers, "Last Updated (Riyadh)") is not None:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
         last_riy = _safe_get(uq, "last_updated_riyadh")
         if not last_riy and last_utc:
             try:
-                # set on object/dict best-effort
                 riy = _to_riyadh_iso(last_utc)
                 if isinstance(uq, dict):
                     uq["last_updated_riyadh"] = riy
@@ -782,30 +754,43 @@ def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
 # =============================================================================
 # Engine calls (defensive batching)
 # =============================================================================
+async def _maybe_await(x: Any) -> Any:
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
+
 async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
     """
     Compatibility shim:
     - Prefer engine.get_enriched_quotes if present
     - Else engine.get_quotes
     - Else per-symbol engine.get_enriched_quote/get_quote
+    Accepts engines returning list OR dict.
     """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
-        return await fn(syms)
+        res = await _maybe_await(fn(syms))
+        if isinstance(res, dict):
+            return list(res.values())
+        return list(res or [])
 
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
-        return await fn2(syms)
+        res = await _maybe_await(fn2(syms))
+        if isinstance(res, dict):
+            return list(res.values())
+        return list(res or [])
 
     out: List[Any] = []
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
         if callable(fn3):
-            out.append(await fn3(s))
+            out.append(await _maybe_await(fn3(s)))
             continue
         fn4 = getattr(engine, "get_quote", None)
         if callable(fn4):
-            out.append(await fn4(s))
+            out.append(await _maybe_await(fn4(s)))
             continue
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
@@ -828,7 +813,6 @@ def _index_keys_for_quote(q: Any) -> List[str]:
         except Exception:
             keys.append(si.strip().upper())
 
-    # de-dup
     out: List[str] = []
     seen = set()
     for k in keys:
@@ -898,7 +882,6 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     # best-effort scoring (engine may already attach scores)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
-
         uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
@@ -931,6 +914,7 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         risk_score=_safe_get(uq, "risk_score"),
         overall_score=_safe_get(uq, "overall_score"),
         recommendation=_safe_get(uq, "recommendation"),
+        confidence=_safe_get(uq, "confidence"),
         fair_value=_safe_get(uq, "fair_value"),
         upside_percent=_safe_get(uq, "upside_percent"),
         valuation_label=_safe_get(uq, "valuation_label"),
@@ -949,7 +933,7 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
     cfg = _cfg()
     eng = await _resolve_engine(request)
 
-    providers = []
+    providers: List[str] = []
     try:
         providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
     except Exception:
