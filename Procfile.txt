@@ -1,14 +1,10 @@
 # Procfile — Tadawul Fast Bridge (FastAPI)
-# Render compatible — PROD SAFE (v1.4.0)
+# Render compatible — PROD SAFE (v1.4.1)
 # ------------------------------------------------------------
-# Improvements vs v1.3.0:
-# - WEB_CONCURRENCY validated as numeric (avoids shell "integer expression" crash)
-# - Optional tuning:
-#     UVICORN_ACCESS_LOG=1|0
-#     UVICORN_LIMIT_CONCURRENCY=...
-#     UVICORN_LIMIT_MAX_REQUESTS=...
-#     UVICORN_BACKLOG=...
-#     UVICORN_ROOT_PATH=...
+# v1.4.1 patch:
+# - Still validates WEB_CONCURRENCY numeric (prevents "integer expression expected")
+# - Adds WEB_THREADS optional (uvicorn has no threads flag; kept for future/gunicorn parity)
+# - Adds safe defaults + keeps all optional UVICORN_* tunings
 # - Uses argv building (safe quoting)
 # ------------------------------------------------------------
 
