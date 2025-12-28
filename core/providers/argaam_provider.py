@@ -2,24 +2,27 @@
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA optional enrichment) — v1.3.0
+Argaam Provider (KSA optional enrichment) — v1.4.0
 (PROD SAFE + ENGINE PATCH-STYLE + SILENT WHEN NOT CONFIGURED)
 
-Why v1.3.0
-- ✅ **Silent when not configured**: if ARGAAM_QUOTE_URL and ARGAAM_PROFILE_URL are both missing,
+Why v1.4.0
+- ✅ Silent when not configured: if ARGAAM_QUOTE_URL and ARGAAM_PROFILE_URL are both missing,
   returns empty patch with no error (prevents noisy warnings in DataEngineV2).
-- ✅ Engine-friendly: exports PATCH functions that return **(patch, err)** (DataEngineV2 supports both).
-- ✅ Returns ONLY patch fields (no "status"/"error" keys inside patch) to avoid polluting engine output.
-- ✅ Better numeric parsing (Arabic digits, commas, %, parentheses).
-- ✅ Defensive mapping for dict OR list payload shapes.
+- ✅ Import-safe even if cachetools is missing (has a tiny TTL cache fallback).
+- ✅ Engine-friendly: exports PATCH functions that return (patch, err) tuples (DataEngineV2 supports both).
+- ✅ Patch is CLEAN: no "status"/"error" keys in the patch; no meta keys that can overwrite canonical output.
+- ✅ Strict KSA-only: non-KSA symbols are silently ignored (prevents misrouting / pollution).
+- ✅ Better numeric parsing (Arabic digits, commas, %, parentheses, K/M/B).
+- ✅ Defensive mapping: supports dict OR list payload shapes; bounded deep-find for nested JSON.
 - ✅ No network calls at import-time; AsyncClient is created lazily.
+- ✅ Enriched call merges profile identity into quote patch (fills blanks only).
 
 Supported env vars (optional)
 - ARGAAM_QUOTE_URL              e.g. https://.../quote?symbol={symbol}  or .../{code}
 - ARGAAM_PROFILE_URL            e.g. https://.../profile?symbol={symbol}
 - ARGAAM_HEADERS_JSON           JSON dict for headers (optional)
 - ARGAAM_TIMEOUT_SEC            default: fallback to HTTP_TIMEOUT then 20
-- ARGAAM_RETRY_ATTEMPTS         default: 2
+- ARGAAM_RETRY_ATTEMPTS         default: 2 (min 1)
 - ARGAAM_TTL_SEC                default: 15 (min 5)
 
 Exports
@@ -38,16 +41,15 @@ import math
 import os
 import random
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, Union, List
+import time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import httpx
-from cachetools import TTLCache
 
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "1.3.0"
+PROVIDER_VERSION = "1.4.0"
 
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_RETRY_ATTEMPTS = 2
@@ -60,15 +62,24 @@ USER_AGENT = (
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
+# KSA symbol: 3-6 digits, optionally .SR
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
+_KSA_SYMBOL_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
+
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
 
+
+# -----------------------------------------------------------------------------
+# Env helpers (never crash)
+# -----------------------------------------------------------------------------
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None:
         return default
     s = str(v).strip()
     return s if s else default
+
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
@@ -79,6 +90,7 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
     if v is None:
@@ -88,22 +100,102 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
 def _ttl_seconds() -> float:
     ttl = _env_float("ARGAAM_TTL_SEC", 15.0)
     if ttl <= 0:
         ttl = 15.0
     return max(5.0, ttl)
 
+
+def _timeout_seconds() -> float:
+    t = _env_float("ARGAAM_TIMEOUT_SEC", 0.0)
+    if t > 0:
+        return t
+    t = _env_float("HTTP_TIMEOUT", 0.0)
+    if t > 0:
+        return t
+    t = _env_float("HTTP_TIMEOUT_SEC", 0.0)
+    if t > 0:
+        return t
+    return DEFAULT_TIMEOUT_SEC
+
+
+# -----------------------------------------------------------------------------
+# Tiny TTL cache fallback if cachetools missing (import-safe)
+# -----------------------------------------------------------------------------
+try:
+    from cachetools import TTLCache  # type: ignore
+
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1.0, float(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + self._ttl
+
+
 _CACHE: TTLCache = TTLCache(maxsize=5000, ttl=_ttl_seconds())
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
+# -----------------------------------------------------------------------------
+# General helpers
+# -----------------------------------------------------------------------------
 def _safe_str(x: Any) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip()
     return s or None
+
+
+def _is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    if s.endswith(".SR"):
+        code = s[:-3]
+        return bool(_KSA_CODE_RE.match(code))
+    return bool(_KSA_SYMBOL_RE.match(s) or _KSA_CODE_RE.match(s))
+
+
+def _normalize_ksa_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    if s.endswith(".SR"):
+        code = s[:-3]
+        return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
+    if _KSA_CODE_RE.match(s):
+        return f"{s}.SR"
+    return ""
+
 
 def _safe_float(val: Any) -> Optional[float]:
     if val is None:
@@ -126,7 +218,6 @@ def _safe_float(val: Any) -> Optional[float]:
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
 
-        # optional K/M/B suffix
         m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
         mult = 1.0
         if m:
@@ -142,13 +233,23 @@ def _safe_float(val: Any) -> Optional[float]:
     except Exception:
         return None
 
-def _pick(d: Any, *keys: str) -> Any:
-    if not isinstance(d, dict):
+
+def _pct_if_fraction(x: Any) -> Optional[float]:
+    v = _safe_float(x)
+    if v is None:
         return None
-    for k in keys:
-        if k in d:
-            return d.get(k)
-    return None
+    return v * 100.0 if abs(v) <= 1.0 else v
+
+
+def _format_url(tpl: str, symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    code = s[:-3] if s.endswith(".SR") else s
+    return (tpl or "").replace("{symbol}", s).replace("{code}", code)
+
+
+def _configured() -> bool:
+    return bool(_safe_str(os.getenv("ARGAAM_QUOTE_URL", "")) or _safe_str(os.getenv("ARGAAM_PROFILE_URL", "")))
+
 
 def _get_headers() -> Dict[str, str]:
     h = {
@@ -167,16 +268,23 @@ def _get_headers() -> Dict[str, str]:
             pass
     return h
 
+
 async def _get_client() -> httpx.AsyncClient:
     global _CLIENT
     if _CLIENT is None:
         async with _LOCK:
             if _CLIENT is None:
-                timeout_sec = _env_float("ARGAAM_TIMEOUT_SEC", _env_float("HTTP_TIMEOUT", DEFAULT_TIMEOUT_SEC))
+                timeout_sec = _timeout_seconds()
                 timeout = httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
                 _CLIENT = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_get_headers())
-                logger.info("Argaam client init v%s | timeout=%.1fs", PROVIDER_VERSION, timeout_sec)
+                logger.info(
+                    "Argaam client init v%s | timeout=%.1fs | cachetools=%s",
+                    PROVIDER_VERSION,
+                    timeout_sec,
+                    _HAS_CACHETOOLS,
+                )
     return _CLIENT
+
 
 async def aclose_argaam_client() -> None:
     global _CLIENT
@@ -188,40 +296,6 @@ async def aclose_argaam_client() -> None:
         except Exception:
             pass
 
-def _format_url(tpl: str, symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    code = s[:-3] if s.endswith(".SR") else s
-    return (tpl or "").replace("{symbol}", s).replace("{code}", code)
-
-def _configured() -> bool:
-    return bool(_safe_str(os.getenv("ARGAAM_QUOTE_URL", "")) or _safe_str(os.getenv("ARGAAM_PROFILE_URL", "")))
-
-def _base_patch(symbol: str) -> Dict[str, Any]:
-    """
-    PATCH-style only. Do NOT include 'status'/'error' here (engine handles warnings + status).
-    """
-    return {
-        "symbol": (symbol or "").strip().upper(),
-        "market": "KSA",
-        "currency": "SAR",
-        "data_source": PROVIDER_NAME,
-        "provider_version": PROVIDER_VERSION,
-        "last_updated_utc": _utc_iso(),
-        # quote-ish fields
-        "current_price": None,
-        "previous_close": None,
-        "open": None,
-        "day_high": None,
-        "day_low": None,
-        "volume": None,
-        "price_change": None,
-        "percent_change": None,
-        # identity (optional)
-        "name": None,
-        "sector": None,
-        "industry": None,
-        "sub_sector": None,
-    }
 
 def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -233,17 +307,86 @@ def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
         out[k] = v
     return out
 
+
+# -----------------------------------------------------------------------------
+# Bounded deep-find (nested JSON safe)
+# -----------------------------------------------------------------------------
+def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 6, max_nodes: int = 2500) -> Any:
+    if obj is None:
+        return None
+    keyset = {str(k).strip().lower() for k in keys if k}
+    if not keyset:
+        return None
+
+    q: List[Tuple[Any, int]] = [(obj, 0)]
+    seen: set[int] = set()
+    nodes = 0
+
+    while q:
+        x, d = q.pop(0)
+        if x is None:
+            continue
+
+        xid = id(x)
+        if xid in seen:
+            continue
+        seen.add(xid)
+
+        nodes += 1
+        if nodes > max_nodes:
+            return None
+        if d > max_depth:
+            continue
+
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if str(k).strip().lower() in keyset:
+                    return v
+            for v in x.values():
+                q.append((v, d + 1))
+            continue
+
+        if isinstance(x, list):
+            for it in x:
+                q.append((it, d + 1))
+            continue
+
+    return None
+
+
+def _pick_num(obj: Any, *keys: str) -> Optional[float]:
+    return _safe_float(_find_first_value(obj, keys))
+
+
+def _pick_pct(obj: Any, *keys: str) -> Optional[float]:
+    return _pct_if_fraction(_find_first_value(obj, keys))
+
+
+def _pick_str(obj: Any, *keys: str) -> Optional[str]:
+    return _safe_str(_find_first_value(obj, keys))
+
+
+def _coerce_dict(data: Union[dict, list]) -> dict:
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return {}
+
+
+# -----------------------------------------------------------------------------
+# HTTP
+# -----------------------------------------------------------------------------
 async def _http_get_json(url: str) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
     retries = max(1, _env_int("ARGAAM_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS))
     client = await _get_client()
 
     last_err: Optional[str] = None
-
     for attempt in range(retries):
         try:
             r = await client.get(url)
-
             sc = int(r.status_code)
+
             if sc == 429 or 500 <= sc < 600:
                 last_err = f"HTTP {sc}"
                 if attempt < retries - 1:
@@ -252,7 +395,6 @@ async def _http_get_json(url: str) -> Tuple[Optional[Union[dict, list]], Optiona
                 return None, last_err
 
             if sc >= 400:
-                # keep short error only
                 return None, f"HTTP {sc}"
 
             try:
@@ -274,56 +416,61 @@ async def _http_get_json(url: str) -> Tuple[Optional[Union[dict, list]], Optiona
 
     return None, last_err or "request failed"
 
-def _coerce_dict(data: Union[dict, list]) -> dict:
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0]
-    return {}
 
-def _map_quote_payload(data: dict) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Mapping
+# -----------------------------------------------------------------------------
+def _map_quote_payload(root: Any) -> Dict[str, Any]:
     """
     Best-effort mapping for common JSON payload shapes.
-    Only sets values when present.
+    Returns ONLY useful quote/identity fields (no status/error/meta).
     """
     patch: Dict[str, Any] = {}
 
-    patch["current_price"] = _safe_float(_pick(data, "last", "last_price", "price", "close", "c", "LastPrice"))
-    patch["previous_close"] = _safe_float(_pick(data, "previous_close", "prev_close", "pc", "PreviousClose"))
-    patch["open"] = _safe_float(_pick(data, "open", "o", "Open"))
-    patch["day_high"] = _safe_float(_pick(data, "high", "day_high", "h", "High"))
-    patch["day_low"] = _safe_float(_pick(data, "low", "day_low", "l", "Low"))
-    patch["volume"] = _safe_float(_pick(data, "volume", "v", "Volume"))
+    patch["current_price"] = _pick_num(root, "last", "last_price", "price", "close", "c", "LastPrice", "tradingPrice")
+    patch["previous_close"] = _pick_num(root, "previous_close", "prev_close", "pc", "PreviousClose", "prevClose")
+    patch["open"] = _pick_num(root, "open", "o", "Open", "openPrice")
+    patch["day_high"] = _pick_num(root, "high", "day_high", "h", "High", "dayHigh", "sessionHigh")
+    patch["day_low"] = _pick_num(root, "low", "day_low", "l", "Low", "dayLow", "sessionLow")
+    patch["volume"] = _pick_num(root, "volume", "v", "Volume", "tradedVolume", "qty", "quantity")
 
-    patch["price_change"] = _safe_float(_pick(data, "change", "d", "price_change", "Change"))
-    patch["percent_change"] = _safe_float(
-        _pick(data, "change_pct", "change_percent", "dp", "percent_change", "ChangePercent")
-    )
+    patch["price_change"] = _pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
+    patch["percent_change"] = _pick_pct(root, "change_pct", "change_percent", "dp", "percent_change", "ChangePercent", "pctChange")
 
-    name = _safe_str(_pick(data, "name", "company", "company_name", "CompanyName", "shortName", "longName"))
+    name = _pick_str(root, "name", "company", "company_name", "CompanyName", "shortName", "longName", "securityName", "issuerName")
     if name:
         patch["name"] = name
 
-    sector = _safe_str(_pick(data, "sector", "Sector"))
+    sector = _pick_str(root, "sector", "Sector", "sectorName")
     if sector:
         patch["sector"] = sector
 
-    industry = _safe_str(_pick(data, "industry", "Industry"))
+    industry = _pick_str(root, "industry", "Industry", "industryName")
     if industry:
         patch["industry"] = industry
 
-    sub_sector = _safe_str(_pick(data, "sub_sector", "subSector", "SubSector"))
+    sub_sector = _pick_str(root, "sub_sector", "subSector", "SubSector", "subSectorName", "subIndustry")
     if sub_sector:
         patch["sub_sector"] = sub_sector
 
+    # Keep only meaningful
     return _clean_patch(patch)
 
+
+# -----------------------------------------------------------------------------
+# Fetchers (PATCH + ERR)
+# -----------------------------------------------------------------------------
 async def _fetch_quote_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    sym = (symbol or "").strip().upper()
-    if not sym:
+    sym_in = (symbol or "").strip().upper()
+    if not sym_in:
         return {}, "argaam: empty symbol"
 
-    # ✅ Silent skip when not configured (prevents noisy warnings)
+    # KSA-only, silently skip globals
+    sym = _normalize_ksa_symbol(sym_in)
+    if not sym:
+        return {}, None
+
+    # Silent if not configured
     tpl = _safe_str(os.getenv("ARGAAM_QUOTE_URL", ""))
     if not tpl:
         return {}, None
@@ -341,26 +488,28 @@ async def _fetch_quote_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]
     root = _coerce_dict(js)
     mapped = _map_quote_payload(root)
 
-    # must have price to be considered useful
     if _safe_float(mapped.get("current_price")) is None:
         return {}, "argaam quote returned no price"
 
-    base = _base_patch(sym)
-    base.update(mapped)
-    base["last_updated_utc"] = _utc_iso()
-
-    patch = _clean_patch(base)
+    patch = dict(mapped)
     _CACHE[ck] = dict(patch)
     return patch, None
 
+
 async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    sym = (symbol or "").strip().upper()
-    if not sym:
+    sym_in = (symbol or "").strip().upper()
+    if not sym_in:
         return {}, "argaam: empty symbol"
 
+    # KSA-only, silently skip globals
+    sym = _normalize_ksa_symbol(sym_in)
+    if not sym:
+        return {}, None
+
+    # Silent if not configured
     tpl = _safe_str(os.getenv("ARGAAM_PROFILE_URL", ""))
     if not tpl:
-        return {}, None  # silent if not configured
+        return {}, None
 
     ck = f"profile::{sym}"
     hit = _CACHE.get(ck)
@@ -377,49 +526,59 @@ async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
 
     # identity-only
     identity: Dict[str, Any] = {}
-    for k in ("name", "sector", "industry", "sub_sector", "currency"):
-        if k in mapped:
-            identity[k] = mapped[k]
+    for k in ("name", "sector", "industry", "sub_sector"):
+        v = mapped.get(k)
+        if isinstance(v, str) and v.strip():
+            identity[k] = v
 
     if not identity:
         return {}, "argaam profile had no identity fields"
 
-    base = _base_patch(sym)
-    for k in ("current_price", "previous_close", "open", "day_high", "day_low", "volume", "price_change", "percent_change"):
-        base.pop(k, None)  # ensure profile doesn't claim quote fields
-    base.update(identity)
-    base["last_updated_utc"] = _utc_iso()
-
-    patch = _clean_patch(base)
+    patch = dict(identity)
     _CACHE[ck] = dict(patch)
     return patch, None
 
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Engine-compatible exported callables
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Tuple[Dict[str, Any], Optional[str]]:
     return await _fetch_quote_patch(symbol)
 
-async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Tuple[Dict[str, Any], Optional[str]]:
-    # quote first, then profile for identity (best-effort)
-    q_patch, q_err = await _fetch_quote_patch(symbol)
-    if q_patch:
-        return q_patch, q_err
 
+async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Quote first; if quote exists, merge profile identity into it (fill blanks only).
+    If both empty and not configured -> silent {} + None.
+    """
+    q_patch, q_err = await _fetch_quote_patch(symbol)
+
+    # If we have quote, try profile for identity and merge into quote (best-effort)
+    if q_patch:
+        p_patch, p_err = await _fetch_profile_patch(symbol)
+        if p_patch:
+            for k, v in p_patch.items():
+                if k not in q_patch and v is not None:
+                    q_patch[k] = v
+        # Prefer quote error if any; otherwise profile error if quote had none
+        return _clean_patch(q_patch), (q_err or p_err)
+
+    # No quote -> try profile
     p_patch, p_err = await _fetch_profile_patch(symbol)
     if p_patch:
         return p_patch, p_err
 
-    # If nothing and not configured => keep silent (no err) to avoid noisy warnings
+    # Silent if not configured at all
     if not _configured():
         return {}, None
 
-    # If configured but failed => return the more relevant error
+    # If configured but failed, return best available error
     return {}, (q_err or p_err or "argaam: unavailable")
+
 
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Tuple[Dict[str, Any], Optional[str]]:
     return await fetch_enriched_quote_patch(symbol)
+
 
 __all__ = [
     "fetch_quote_patch",
