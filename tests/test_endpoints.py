@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-# test_endpoints.py
+# test_endpoints.py  (FULL REPLACEMENT)
 """
 test_endpoints.py
 ===========================================================
-SMOKE TESTER for Tadawul Fast Bridge API – v2.2.0 (Hardened)
+SMOKE TESTER for Tadawul Fast Bridge API – v2.4.0 (Hardened+)
 
 ✅ Highlights
 - Token via env: TFB_APP_TOKEN / APP_TOKEN / BACKUP_APP_TOKEN
 - Base URL via env: TFB_BASE_URL / BACKEND_BASE_URL (default http://127.0.0.1:8000)
 - Render-friendly: tests /healthz + /readyz + /health (soft)
-- Rich diagnostics: per-endpoint latency + safe JSON parsing
+- Rich diagnostics: per-endpoint latency + safe JSON parsing + short body previews
 - Soft-fail on 404 (router not mounted) — still reports clearly
+- Sends BOTH symbols + tickers AND sheet_name + sheetName to sheet-rows endpoints
+- Better auth headers: X-APP-TOKEN + Authorization: Bearer
+- Optional strict mode: --strict (treat 404 as failures)
 - Exits non-zero if critical connectivity fails (GET /healthz or GET /)
 
 Usage:
   python test_endpoints.py
   TFB_BASE_URL=https://your.onrender.com python test_endpoints.py
   TFB_APP_TOKEN=... python test_endpoints.py
+  python test_endpoints.py --strict
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
@@ -54,6 +58,8 @@ GLOBAL_TEST_SYMBOL = (os.getenv("TFB_GLOBAL_TEST_SYMBOL", "AAPL") or "AAPL").str
 TIMEOUT_SHORT = float(os.getenv("TFB_TIMEOUT_SHORT", "15") or "15")
 TIMEOUT_MED = float(os.getenv("TFB_TIMEOUT_MED", "25") or "25")
 TIMEOUT_LONG = float(os.getenv("TFB_TIMEOUT_LONG", "90") or "90")
+
+USER_AGENT = os.getenv("TFB_USER_AGENT", "TadawulFastBridge-EndpointTester/2.4.0") or "TadawulFastBridge-EndpointTester/2.4.0"
 
 
 # -----------------------------------------------------------------------------
@@ -113,10 +119,22 @@ def json_pretty(obj: Any, limit: int = 2500) -> str:
         return str(obj)[:limit]
 
 
+def body_preview(resp: requests.Response, limit: int = 240) -> str:
+    try:
+        t = (resp.text or "").replace("\r", " ").replace("\n", " ")
+        return t[:limit]
+    except Exception:
+        return ""
+
+
 def build_headers(token: str) -> Dict[str, str]:
-    h: Dict[str, str] = {"Accept": "application/json"}
+    h: Dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     if token:
         h["X-APP-TOKEN"] = token
+        h["Authorization"] = f"Bearer {token}"
     return h
 
 
@@ -150,24 +168,23 @@ def request_any(
 # -----------------------------------------------------------------------------
 # Checks
 # -----------------------------------------------------------------------------
-def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str]) -> Tuple[bool, list[Result]]:
+def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str]) -> Tuple[bool, List[Result]]:
     log("Checking Server Connectivity...", "header")
-    results: list[Result] = []
+    results: List[Result] = []
 
     # GET /
     r, dt, err = request_any(sess, "GET", f"{base_url}/", headers=headers, timeout=TIMEOUT_SHORT)
-    if err:
+    if err or r is None:
         results.append(Result("/", False, None, dt, f"Cannot connect: {err}"))
         log(f"GET / -> Cannot connect: {err}", "fail")
         return False, results
 
-    assert r is not None
     if r.status_code == 200:
         results.append(Result("/", True, r.status_code, dt))
         log(f"GET / -> Server UP ({fmt_dt(dt)})", "success")
     else:
-        results.append(Result("/", False, r.status_code, dt, r.text[:200]))
-        log(f"GET / -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:200]!r}", "fail")
+        results.append(Result("/", False, r.status_code, dt, body_preview(r, 200)))
+        log(f"GET / -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={body_preview(r, 200)!r}", "fail")
         return False, results
 
     # HEAD /
@@ -194,8 +211,8 @@ def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str])
         results.append(Result("/healthz", True, r2.status_code, dt))
         log(f"GET /healthz -> ok ({fmt_dt(dt)})", "success")
     else:
-        results.append(Result("/healthz", False, r2.status_code, dt, r2.text[:200]))
-        log(f"GET /healthz -> HTTP {r2.status_code} ({fmt_dt(dt)}) | body={r2.text[:200]!r}", "fail")
+        results.append(Result("/healthz", False, r2.status_code, dt, body_preview(r2, 200)))
+        log(f"GET /healthz -> HTTP {r2.status_code} ({fmt_dt(dt)}) | body={body_preview(r2, 200)!r}", "fail")
         return False, results
 
     # GET /health (soft)
@@ -211,7 +228,7 @@ def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str])
             results.append(Result("/health", True, r3.status_code, dt, f"{status} {ver}".strip()))
             log(f"GET /health -> {status} ({fmt_dt(dt)}) {ver}".strip(), "success")
         else:
-            results.append(Result("/health", False, r3.status_code, dt, r3.text[:200]))
+            results.append(Result("/health", False, r3.status_code, dt, body_preview(r3, 200)))
             log(f"GET /health -> HTTP {r3.status_code} ({fmt_dt(dt)})", "warn")
 
     # GET /readyz (soft but useful)
@@ -222,16 +239,23 @@ def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str])
     else:
         if r4.status_code in (200, 503):
             j = safe_json(r4) or {}
-            results.append(Result("/readyz", True, r4.status_code, dt, j.get("status", "")))
+            results.append(Result("/readyz", True, r4.status_code, dt, str(j.get("status", ""))))
             log(f"GET /readyz -> HTTP {r4.status_code} ({fmt_dt(dt)}) | {j.get('status','')}", "success")
         else:
-            results.append(Result("/readyz", False, r4.status_code, dt, r4.text[:200]))
+            results.append(Result("/readyz", False, r4.status_code, dt, body_preview(r4, 200)))
             log(f"GET /readyz -> HTTP {r4.status_code} ({fmt_dt(dt)})", "warn")
 
     return True, results
 
 
-def check_router_health(sess: requests.Session, base_url: str, headers: Dict[str, str]) -> None:
+def _handle_404(strict: bool, ep: str) -> None:
+    if strict:
+        log(f"{ep.ljust(28)} -> FAIL (404 not mounted, strict mode)", "fail")
+    else:
+        log(f"{ep.ljust(28)} -> SKIP (404 not mounted)", "warn")
+
+
+def check_router_health(sess: requests.Session, base_url: str, headers: Dict[str, str], *, strict: bool) -> None:
     log("Checking Router Health", "header")
     endpoints = [
         "/v1/enriched/health",
@@ -245,18 +269,19 @@ def check_router_health(sess: requests.Session, base_url: str, headers: Dict[str
     for ep in endpoints:
         r, dt, err = request_any(sess, "GET", f"{base_url}{ep}", headers=headers, timeout=TIMEOUT_MED)
         if err or r is None:
-            log(f"{ep.ljust(22)} -> Exception: {err}", "fail")
+            log(f"{ep.ljust(28)} -> Exception: {err}", "fail")
             continue
 
         if r.status_code == 200:
             j = safe_json(r) or {}
             ver = j.get("version") or j.get("route_version") or ""
             status = j.get("status") or "ok"
-            log(f"{ep.ljust(22)} -> {status} ({fmt_dt(dt)}) {('v=' + ver) if ver else ''}".strip(), "success")
+            extra = f" v={ver}" if ver else ""
+            log(f"{ep.ljust(28)} -> {status} ({fmt_dt(dt)}){extra}", "success")
         elif r.status_code == 404:
-            log(f"{ep.ljust(22)} -> SKIP (404 not mounted)", "warn")
+            _handle_404(strict, ep)
         else:
-            log(f"{ep.ljust(22)} -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:200]!r}", "fail")
+            log(f"{ep.ljust(28)} -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={body_preview(r)!r}", "fail")
 
 
 def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], symbol: str) -> None:
@@ -274,7 +299,7 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
         return
 
     if r.status_code != 200:
-        log(f"/v1/enriched/quote -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
+        log(f"/v1/enriched/quote -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={body_preview(r)!r}", "fail")
         return
 
     data = safe_json(r)
@@ -287,18 +312,26 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
     price = data.get("current_price") or data.get("last_price") or data.get("price")
     dq = data.get("data_quality")
     src = data.get("data_source") or data.get("source")
+    err_msg = data.get("error")
 
     if sym_resp and price is not None:
         ok = "OK" if sym_resp == symbol.upper() else "MISMATCH"
-        log(f"{ok} ({fmt_dt(dt)}) | symbol={sym_resp} price={price} dq={dq} src={src}", "success" if ok == "OK" else "warn")
+        typ = "success" if ok == "OK" else "warn"
+        extra = f" err={err_msg}" if err_msg else ""
+        log(f"{ok} ({fmt_dt(dt)}) | symbol={sym_resp} price={price} dq={dq} src={src}{extra}", typ)
     else:
         log(f"Returned 200 but missing fields ({fmt_dt(dt)}). Payload:", "warn")
         print(json_pretty(data))
 
 
-def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, global_symbol: str) -> None:
+def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, global_symbol: str, *, strict: bool) -> None:
     log("Testing Batch /v1/enriched/quotes", "header")
-    payload = {"symbols": [ksa_symbol, global_symbol], "sheet_name": "Test_Script"}
+    payload = {
+        "symbols": [ksa_symbol, global_symbol],
+        "tickers": [ksa_symbol, global_symbol],
+        "sheet_name": "Test_Script",
+        "sheetName": "Test_Script",
+    }
     r, dt, err = request_any(
         sess,
         "POST",
@@ -312,10 +345,10 @@ def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str,
         return
 
     if r.status_code == 404:
-        log("/v1/enriched/quotes -> SKIP (404 not mounted)", "warn")
+        _handle_404(strict, "/v1/enriched/quotes")
         return
     if r.status_code != 200:
-        log(f"/v1/enriched/quotes -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
+        log(f"/v1/enriched/quotes -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={body_preview(r)!r}", "fail")
         return
 
     data = safe_json(r) or {}
@@ -326,9 +359,14 @@ def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str,
     log(f"/v1/enriched/quotes -> {status} ({fmt_dt(dt)}) | count={count} rows={len(rows)} quotes={len(quotes)}", "success")
 
 
-def check_sheet_rows_enriched(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, global_symbol: str) -> None:
+def check_sheet_rows_enriched(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, global_symbol: str, *, strict: bool) -> None:
     log("Testing Batch /v1/enriched/sheet-rows", "header")
-    payload = {"tickers": [ksa_symbol, global_symbol], "sheet_name": "Test_Script"}
+    payload = {
+        "tickers": [ksa_symbol, global_symbol],
+        "symbols": [ksa_symbol, global_symbol],
+        "sheet_name": "Test_Script",
+        "sheetName": "Test_Script",
+    }
 
     r, dt, err = request_any(
         sess,
@@ -343,10 +381,10 @@ def check_sheet_rows_enriched(sess: requests.Session, base_url: str, headers: Di
         return
 
     if r.status_code == 404:
-        log("/v1/enriched/sheet-rows -> SKIP (404 not mounted)", "warn")
+        _handle_404(strict, "/v1/enriched/sheet-rows")
         return
     if r.status_code != 200:
-        log(f"/v1/enriched/sheet-rows -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
+        log(f"/v1/enriched/sheet-rows -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={body_preview(r)!r}", "fail")
         return
 
     data = safe_json(r)
@@ -363,9 +401,14 @@ def check_sheet_rows_enriched(sess: requests.Session, base_url: str, headers: Di
         print(json_pretty(data))
 
 
-def check_argaam_sheet_rows(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str) -> None:
+def check_argaam_sheet_rows(sess: requests.Session, base_url: str, headers: Dict[str, str], ksa_symbol: str, *, strict: bool) -> None:
     log("Testing KSA /v1/argaam/sheet-rows", "header")
-    payload = {"symbols": [ksa_symbol, "BADSYM"], "sheet_name": "KSA_Tadawul_Market"}
+    payload = {
+        "symbols": [ksa_symbol, "BADSYM"],
+        "tickers": [ksa_symbol, "BADSYM"],
+        "sheet_name": "KSA_Tadawul_Market",
+        "sheetName": "KSA_Tadawul_Market",
+    }
 
     r, dt, err = request_any(
         sess,
@@ -380,10 +423,10 @@ def check_argaam_sheet_rows(sess: requests.Session, base_url: str, headers: Dict
         return
 
     if r.status_code == 404:
-        log("/v1/argaam/sheet-rows -> SKIP (404 not mounted)", "warn")
+        _handle_404(strict, "/v1/argaam/sheet-rows")
         return
     if r.status_code != 200:
-        log(f"/v1/argaam/sheet-rows -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={r.text[:240]!r}", "fail")
+        log(f"/v1/argaam/sheet-rows -> HTTP {r.status_code} ({fmt_dt(dt)}) | body={body_preview(r)!r}", "fail")
         return
 
     data = safe_json(r)
@@ -400,13 +443,15 @@ def main() -> int:
     p.add_argument("--token", default=DEFAULT_TOKEN)
     p.add_argument("--ksa", default=KSA_TEST_SYMBOL)
     p.add_argument("--global", dest="global_sym", default=GLOBAL_TEST_SYMBOL)
+    p.add_argument("--strict", action="store_true", help="Treat 404 (not mounted) as failures")
     args = p.parse_args()
 
     base_url = str(args.base_url).rstrip("/")
     token = str(args.token).strip()
+    strict = bool(args.strict)
 
-    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.2.0{C.ENDC}")
-    print(f"BASE_URL={base_url} | TOKEN={'SET' if token else 'NOT SET'}")
+    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.4.0{C.ENDC}")
+    print(f"BASE_URL={base_url} | TOKEN={'SET' if token else 'NOT SET'} | STRICT={'ON' if strict else 'OFF'}")
     print(f"KSA_TEST_SYMBOL={args.ksa} | GLOBAL_TEST_SYMBOL={args.global_sym}")
 
     sess = requests.Session()
@@ -417,14 +462,14 @@ def main() -> int:
         print("\n❌ Cannot proceed (server connectivity failed).")
         return 2
 
-    check_router_health(sess, base_url, hdrs)
+    check_router_health(sess, base_url, hdrs, strict=strict)
     check_quote(sess, base_url, hdrs, args.ksa)
     check_quote(sess, base_url, hdrs, args.global_sym)
-    check_batch_quotes(sess, base_url, hdrs, args.ksa, args.global_sym)
-    check_sheet_rows_enriched(sess, base_url, hdrs, args.ksa, args.global_sym)
-    check_argaam_sheet_rows(sess, base_url, hdrs, args.ksa)
+    check_batch_quotes(sess, base_url, hdrs, args.ksa, args.global_sym, strict=strict)
+    check_sheet_rows_enriched(sess, base_url, hdrs, args.ksa, args.global_sym, strict=strict)
+    check_argaam_sheet_rows(sess, base_url, hdrs, args.ksa, strict=strict)
 
-    # Final summary (very small)
+    # Critical summary
     fails = [r for r in server_results if not r.ok and r.endpoint in ("/", "/healthz")]
     if fails:
         print("\n❌ Critical checks failed.")
