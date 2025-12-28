@@ -2,21 +2,13 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.7
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.8
 
-v5.0.7 improvements vs v5.0.6
-- ✅ Fully aligned with repo-root config.py (v5.3.1+):
-    • Version resolves from SERVICE_VERSION / APP_VERSION / VERSION (ENV wins)
-    • If missing → uses Settings.service_version (which may fall back to Render commit)
-    • Ensures runtime env aliases are applied (best-effort, never overwrite)
-- ✅ Safer + clearer boot state:
-    • boot_task_running / boot_completed flags
-    • routers_ready computed against REQUIRED_ROUTERS (or defaults)
-    • engine_ready + engine_error always present
-- ✅ Router mounting remains PROD-safe:
-    • No core imports at module import-time (only in functions)
-    • Mount failures never crash startup
-- ✅ Adds /system/info endpoint (non-sensitive diagnostics)
+v5.0.8 improvements vs v5.0.7
+- ✅ CRITICAL: last-resort runtime aliasing now also exports auth env vars:
+    • APP_TOKEN / BACKUP_APP_TOKEN / TFB_APP_TOKEN
+  so routes that read APP_TOKEN directly (like routes/routes_argaam.py) still work
+  even if config.get_settings cannot be imported for any reason.
 
 Design goals unchanged
 - Never crash app startup.
@@ -55,7 +47,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.0.7"
+APP_ENTRY_VERSION = "5.0.8"
 
 
 def _truthy(v: Any) -> bool:
@@ -86,10 +78,27 @@ def _export_env_if_missing(key: str, value: Any) -> None:
 def _apply_runtime_env_aliases_last_resort() -> None:
     """
     Extra safety: even if config.get_settings cannot be imported,
-    ensure provider modules that read *_API_TOKEN still work.
+    ensure provider modules AND auth checks that read env directly still work.
 
     Never overwrites explicit values.
     """
+    # --- Auth aliases (CRITICAL for routes that read APP_TOKEN directly) ---
+    tfb_token = (os.getenv("TFB_APP_TOKEN") or "").strip()
+    app_token = (os.getenv("APP_TOKEN") or "").strip()
+    backup_token = (os.getenv("BACKUP_APP_TOKEN") or "").strip()
+
+    # If only TFB_APP_TOKEN is set, expose it as APP_TOKEN
+    if tfb_token and not app_token:
+        _export_env_if_missing("APP_TOKEN", tfb_token)
+
+    # Keep reverse alias too (harmless)
+    if app_token and not tfb_token:
+        _export_env_if_missing("TFB_APP_TOKEN", app_token)
+
+    if backup_token:
+        _export_env_if_missing("BACKUP_APP_TOKEN", backup_token)
+
+    # --- Provider token aliases ---
     finnhub_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
     eodhd_key = (os.getenv("EODHD_API_KEY") or "").strip()
 
@@ -101,7 +110,7 @@ def _apply_runtime_env_aliases_last_resort() -> None:
         _export_env_if_missing("EODHD_API_TOKEN", eodhd_key)
         _export_env_if_missing("EODHD_TOKEN", eodhd_key)
 
-    # Numeric aliases
+    # --- Numeric aliases ---
     if os.getenv("HTTP_TIMEOUT") and not os.getenv("HTTP_TIMEOUT_SEC"):
         _export_env_if_missing("HTTP_TIMEOUT_SEC", os.getenv("HTTP_TIMEOUT"))
     if os.getenv("RETRY_DELAY") and not os.getenv("RETRY_DELAY_SEC"):
@@ -549,7 +558,7 @@ def create_app() -> FastAPI:
     # Apply provider defaults EARLY so engines/routers see intended routing.
     _apply_provider_defaults_if_missing()
 
-    # Extra safety: ensure token aliases exist even if config import fails.
+    # Extra safety: ensure token/auth aliases exist even if config import fails.
     _apply_runtime_env_aliases_last_resort()
 
     settings, settings_source = _try_load_settings()
