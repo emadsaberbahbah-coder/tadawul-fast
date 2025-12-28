@@ -1,7 +1,8 @@
+# core/providers/yahoo_chart_provider.py  (FULL REPLACEMENT)
 """
 core/providers/yahoo_chart_provider.py
 ------------------------------------------------------------
-Yahoo Quote/Chart Provider (KSA-safe) — v1.5.0 (PATCH-ALIGNED + RETRY + CLIENT REUSE)
+Yahoo Quote/Chart Provider (KSA-safe) — v1.6.1 (PATCH-ALIGNED + RETRY + CLIENT REUSE + 52W GUARDS)
 
 Goals
 - Reliable quote source for KSA (.SR) without yfinance.
@@ -33,7 +34,7 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import httpx
 
-PROVIDER_VERSION = "1.5.0"
+PROVIDER_VERSION = "1.6.1"
 
 # ---------------------------
 # HTTP config
@@ -45,6 +46,7 @@ UA = os.getenv(
 )
 
 _ACCEPT_LANGUAGE = os.getenv("YAHOO_ACCEPT_LANGUAGE", "en-US,en;q=0.9")
+
 _TIMEOUT_S = float(os.getenv("YAHOO_TIMEOUT_S", "8.5") or "8.5")
 TIMEOUT = httpx.Timeout(timeout=_TIMEOUT_S, connect=min(5.0, _TIMEOUT_S))
 
@@ -55,24 +57,19 @@ _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # If quote is partial, supplement missing fields from chart (default ON)
 ENABLE_SUPPLEMENT = str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-    "t",
+    "1", "true", "yes", "y", "on", "t"
 }
 
 # Allow alternative hosts (comma-separated): query2.finance.yahoo.com, etc.
 _DEFAULT_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 _DEFAULT_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
 _ALT_HOSTS = [h.strip() for h in (os.getenv("YAHOO_ALT_HOSTS", "") or "").split(",") if h.strip()]
 
 QUOTE_URLS: List[str] = [_DEFAULT_QUOTE_URL]
 CHART_URLS: List[str] = [_DEFAULT_CHART_URL]
 
 for host in _ALT_HOSTS:
-    # host like "query2.finance.yahoo.com"
     if "://" in host:
         base = host.rstrip("/")
         QUOTE_URLS.append(f"{base}/v7/finance/quote")
@@ -90,7 +87,6 @@ _CLIENT_LOCK = asyncio.Lock()
 
 
 def _headers_for(symbol: str) -> Dict[str, str]:
-    # Referer helps sometimes with Yahoo endpoints
     sym = (symbol or "").strip().upper()
     ref = f"https://finance.yahoo.com/quote/{sym}"
     return {
@@ -138,7 +134,6 @@ def _to_float(x: Any) -> Optional[float]:
     try:
         if _is_nan(x) or x is None:
             return None
-        # Some arrays contain True/False; guard
         if isinstance(x, bool):
             return None
         return float(x)
@@ -168,73 +163,14 @@ def _position_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]
 
 
 def _normalize_symbol(symbol: str) -> str:
-    return (symbol or "").strip().upper()
-
-
-async def _http_get_json(
-    url: str,
-    symbol: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Single-URL GET with retry. Caller can loop over alternate URLs.
-    """
-    client = await _get_client(symbol)
-    headers = _headers_for(symbol)
-
-    last_err: Optional[str] = None
-    attempts = 1 + max(0, _RETRY_MAX)
-
-    for i in range(attempts):
-        try:
-            r = await client.get(url, params=params, headers=headers)
-            if r.status_code == 200:
-                try:
-                    return r.json(), None
-                except Exception as je:
-                    last_err = f"JSON decode failed: {je.__class__.__name__}"
-            else:
-                # transient?
-                if r.status_code in _RETRY_STATUSES and i < attempts - 1:
-                    last_err = f"HTTP {r.status_code}"
-                else:
-                    return None, f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = f"{e.__class__.__name__}: {e}"
-
-        # backoff before retry
-        if i < attempts - 1:
-            delay = (_RETRY_BACKOFF_MS / 1000.0) * (2**i)
-            # small jitter using time frac
-            jitter = (time.time() % 0.2)
-            await asyncio.sleep(min(2.0, delay + jitter))
-
-    return None, last_err or "request failed"
-
-
-async def _http_get_json_multi(
-    urls: List[str],
-    symbol: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
-    """
-    Try multiple base URLs (query1/query2...) until one works.
-    Returns: (json, err, used_url)
-    """
-    last_err = None
-    for u in urls:
-        js, err = await _http_get_json(u, symbol, params=params)
-        if js is not None:
-            return js, None, u
-        last_err = err
-    return None, last_err or "all hosts failed", None
+    s = (symbol or "").strip().upper()
+    # if user passes numeric Tadawul code, normalize to .SR
+    if s.isdigit():
+        return f"{s}.SR"
+    return s
 
 
 def _base_patch(symbol: str) -> Dict[str, Any]:
-    """
-    PATCH-style output aligned to DataEngineV2 keys.
-    Only include fields that we can provide; engine will fill rest.
-    """
     is_ksa = symbol.endswith(".SR")
     return {
         "symbol": symbol,
@@ -287,12 +223,85 @@ def _fill_derived(p: Dict[str, Any]) -> None:
 
 
 def _is_patch_partial(p: Dict[str, Any]) -> bool:
-    # If these are missing, chart supplement is useful
     need = ("day_high", "day_low", "volume", "previous_close")
     for k in need:
         if _to_float(p.get(k)) is None:
             return True
     return False
+
+
+def _guard_52w(p: Dict[str, Any]) -> None:
+    """
+    Yahoo sometimes returns fiftyTwoWeekLow = 0.0 for KSA.
+    If low==0 while price is normal, treat as missing (None).
+    """
+    cur = _to_float(p.get("current_price"))
+    hi = _to_float(p.get("week_52_high"))
+    lo = _to_float(p.get("week_52_low"))
+
+    if lo is not None and lo == 0.0 and cur is not None and cur > 1.0:
+        # almost certainly bogus for equities
+        p["week_52_low"] = None
+
+    # if hi exists but lo missing, don't compute position
+    # (engine may compute too; keep ours safe)
+    if _to_float(p.get("week_52_low")) is None:
+        p["position_52w_percent"] = None
+
+
+async def _http_get_json(
+    url: str,
+    symbol: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[dict], Optional[str]]:
+    client = await _get_client(symbol)
+    headers = _headers_for(symbol)
+
+    last_err: Optional[str] = None
+    attempts = 1 + max(0, _RETRY_MAX)
+
+    for i in range(attempts):
+        try:
+            r = await client.get(url, params=params, headers=headers)
+
+            if r.status_code == 200:
+                try:
+                    js = r.json()
+                    if isinstance(js, dict):
+                        return js, None
+                    last_err = "unexpected JSON type"
+                except Exception as je:
+                    last_err = f"JSON decode failed: {je.__class__.__name__}"
+
+            else:
+                if r.status_code in _RETRY_STATUSES and i < attempts - 1:
+                    last_err = f"HTTP {r.status_code}"
+                else:
+                    return None, f"HTTP {r.status_code}"
+
+        except Exception as e:
+            last_err = f"{e.__class__.__name__}: {e}"
+
+        if i < attempts - 1:
+            delay = (_RETRY_BACKOFF_MS / 1000.0) * (2 ** i)
+            jitter = (time.time() % 0.2)
+            await asyncio.sleep(min(2.0, delay + jitter))
+
+    return None, last_err or "request failed"
+
+
+async def _http_get_json_multi(
+    urls: List[str],
+    symbol: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    last_err = None
+    for u in urls:
+        js, err = await _http_get_json(u, symbol, params=params)
+        if js is not None:
+            return js, None, u
+        last_err = err
+    return None, last_err or "all hosts failed", None
 
 
 # ---------------------------
@@ -337,7 +346,7 @@ async def _fetch_from_quote(symbol: str, debug: bool = False) -> Tuple[Dict[str,
     patch["market_cap"] = _to_float(q.get("marketCap"))
 
     if debug:
-        patch["_debug_quote_fields"] = {
+        patch["_debug_quote"] = {
             "used_url": used,
             "quoteType": q.get("quoteType"),
             "exchange": q.get("exchange"),
@@ -345,6 +354,7 @@ async def _fetch_from_quote(symbol: str, debug: bool = False) -> Tuple[Dict[str,
             "marketState": q.get("marketState"),
         }
 
+    _guard_52w(patch)
     _fill_derived(patch)
     return patch, None
 
@@ -360,22 +370,31 @@ async def _fetch_from_chart(symbol: str, debug: bool = False) -> Tuple[Dict[str,
         "corsDomain": "finance.yahoo.com",
     }
 
+    js = None
     last_err = None
     used_url = None
-    js = None
 
     for templ in CHART_URLS:
         url = templ.format(symbol=symbol)
         js, err, used = await _http_get_json_multi([url], symbol, params=params)
+        used_url = used or url
         if js is not None:
-            used_url = used or url
             last_err = None
             break
         last_err = err
-        used_url = url
 
     if js is None:
         return patch, f"yahoo_chart failed: {last_err}"
+
+    # Yahoo chart can return chart.error
+    try:
+        chart = js.get("chart") or {}
+        if chart.get("error"):
+            e = chart.get("error") or {}
+            msg = str(e.get("description") or e.get("message") or "chart error").strip()
+            return patch, f"yahoo_chart error: {msg}"
+    except Exception:
+        pass
 
     try:
         res = ((js.get("chart") or {}).get("result") or [None])[0] or {}
@@ -393,11 +412,9 @@ async def _fetch_from_chart(symbol: str, debug: bool = False) -> Tuple[Dict[str,
 
     patch["currency"] = (meta.get("currency") or patch.get("currency") or None)
 
-    # Identity: often available from meta
     patch["exchange"] = (meta.get("exchangeName") or meta.get("fullExchangeName") or patch.get("exchange") or None)
     patch["name"] = (meta.get("longName") or meta.get("shortName") or patch.get("name") or None)
 
-    # Prices
     patch["current_price"] = _to_float(meta.get("regularMarketPrice")) or _last_non_null(closes)
     patch["previous_close"] = _to_float(meta.get("previousClose")) or _to_float(meta.get("chartPreviousClose"))
     patch["open"] = _to_float(meta.get("regularMarketOpen")) or _last_non_null(opens)
@@ -415,6 +432,7 @@ async def _fetch_from_chart(symbol: str, debug: bool = False) -> Tuple[Dict[str,
             "meta_keys_sample": sorted(list(meta.keys()))[:80],
         }
 
+    _guard_52w(patch)
     _fill_derived(patch)
     return patch, None
 
@@ -423,9 +441,6 @@ async def _fetch_from_chart(symbol: str, debug: bool = False) -> Tuple[Dict[str,
 # Engine-facing PATCH API
 # ---------------------------
 async def fetch_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Engine-facing PATCH function.
-    """
     sym = _normalize_symbol(symbol)
 
     # 1) quote endpoint
@@ -436,7 +451,6 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str,
         p2, e2 = await _fetch_from_chart(sym, debug=debug)
         if not e2 and _to_float(p2.get("current_price")) is not None:
             return p2, None
-        # return best-effort patch + combined error
         return p1, (e1 or e2 or "yahoo_chart fallback failed")
 
     # 3) optional supplement (quote partial -> fill missing from chart)
@@ -448,12 +462,12 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str,
                     continue
                 if p1.get(k) is None or p1.get(k) == "":
                     p1[k] = v
+            _guard_52w(p1)
             _fill_derived(p1)
 
     return p1, None
 
 
-# Aliases expected by DataEngineV2 fn-name list
 async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
     return await fetch_quote_patch(symbol, debug=debug)
 
