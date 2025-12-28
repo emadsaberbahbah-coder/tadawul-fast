@@ -2,11 +2,14 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.7.5) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.7.6) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-Fix in v2.7.5
-- ✅ If current_price exists => status is ALWAYS "success"
-  (provider failures become warnings, do NOT flip status to error)
+✅ Fixes in v2.7.6 (from your Phase-0 baseline):
+- ✅ If current_price exists => status ALWAYS "success"
+  (provider failures become warnings; NEVER flip to error when price is present)
+- ✅ Fix GLOBAL fundamentals missing (market_cap / pe_ttm NULL):
+  - Ensure EODHD enriched/fundamentals function is actually called
+  - Prevent early-break on just `name` (must wait for fundamentals when enrich=True)
 - ✅ Auto-skip 'tadawul' provider when not configured
   (missing TADAWUL_QUOTE_URL + TADAWUL_FUNDAMENTALS_URL)
 - ✅ Avoid duplicated error prefixes like "tadawul: tadawul: ..."
@@ -30,7 +33,7 @@ from cachetools import TTLCache
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.7.5"
+ENGINE_VERSION = "2.7.6"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -90,7 +93,7 @@ class UnifiedQuote(BaseModel):
     # Fundamentals (optional)
     market_cap: Optional[float] = None
     shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None  # percent or fraction (provider-dependent)
+    free_float: Optional[float] = None
     free_float_market_cap: Optional[float] = None
 
     eps_ttm: Optional[float] = None
@@ -120,7 +123,6 @@ class UnifiedQuote(BaseModel):
     symbol_normalized: Optional[str] = None
 
     def finalize(self) -> "UnifiedQuote":
-        # Derived fields, if missing
         cur = _safe_float(self.current_price)
         prev = _safe_float(self.previous_close)
         vol = _safe_float(self.volume)
@@ -143,11 +145,9 @@ class UnifiedQuote(BaseModel):
             if cur is not None and hi is not None and lo is not None and hi != lo:
                 self.position_52w_percent = (cur - lo) / (hi - lo) * 100.0
 
-        # last_updated default
         if not self.last_updated_utc:
             self.last_updated_utc = _utc_iso()
 
-        # normalize error
         if self.error is None:
             self.error = ""
 
@@ -213,11 +213,6 @@ def _is_ksa(symbol: str) -> bool:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    Exported normalization.
-    - digits -> 1120.SR
-    - trims + uppercases
-    """
     s = (symbol or "").strip().upper()
     if not s:
         return ""
@@ -231,7 +226,6 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    # Keep existing non-null; fill missing with src non-null
     for k, v in (src or {}).items():
         if v is None:
             continue
@@ -259,12 +253,6 @@ async def _try_provider_call(
     *args: Any,
     **kwargs: Any,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Import module and call first callable in fn_names.
-    Accepts returns:
-      - dict
-      - (dict, err)
-    """
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
@@ -395,6 +383,36 @@ def _tadawul_configured() -> bool:
     return bool(tq or tf)
 
 
+def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
+    # "Fundamentals anchor": if any of these exist, we can stop when enrich=True
+    for k in (
+        "market_cap",
+        "pe_ttm",
+        "eps_ttm",
+        "dividend_yield",
+        "pb",
+        "ps",
+        "shares_outstanding",
+        "free_float",
+        "roe",
+        "roa",
+        "beta",
+    ):
+        if _safe_float(out.get(k)) is not None:
+            return True
+    return False
+
+
+def _normalize_warning_prefix(msg: str) -> str:
+    m = (msg or "").strip()
+    if not m:
+        return ""
+    low = m.lower()
+    if low.startswith("warning:"):
+        return m[len("warning:"):].strip()
+    return m
+
+
 # ---------------------------------------------------------------------------
 # DataEngine
 # ---------------------------------------------------------------------------
@@ -407,7 +425,6 @@ class DataEngine:
         self.providers_global = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
         self.providers_ksa = _parse_list_env("KSA_PROVIDERS")
 
-        # cache TTL
         ttl = 10
         try:
             ttl = int((os.getenv("ENGINE_CACHE_TTL_SEC") or "10").strip())
@@ -426,7 +443,6 @@ class DataEngine:
         )
 
     async def aclose(self) -> None:
-        # Best-effort provider client close hooks
         for mod_name, closer in [
             ("core.providers.finnhub_provider", "aclose_finnhub_client"),
             ("core.providers.tadawul_provider", "aclose_tadawul_client"),
@@ -443,15 +459,11 @@ class DataEngine:
         is_ksa = _is_ksa(sym)
 
         if is_ksa:
-            # Strict KSA-only list
             if self.providers_ksa:
                 return list(self.providers_ksa)
-
-            # If not configured, do a SAFE fallback: only KSA-safe providers from global
             safe = [p for p in (self.providers_global or []) if p in {"tadawul", "argaam", "yahoo_chart"}]
             return safe
 
-        # Global symbols
         return list(self.providers_global or [])
 
     async def get_enriched_quote(self, symbol: str, *, enrich: bool = True) -> Dict[str, Any]:
@@ -471,7 +483,6 @@ class DataEngine:
         is_ksa = _is_ksa(sym)
         providers = self._providers_for(sym)
 
-        # stable output base (Sheets-safe)
         out: Dict[str, Any] = UnifiedQuote(
             symbol=sym,
             market="KSA" if is_ksa else "GLOBAL",
@@ -510,6 +521,7 @@ class DataEngine:
             err: Optional[str] = None
 
             if p == "tadawul":
+                # tadawul may provide fundamentals, but only if configured
                 patch, err = await _try_provider_call(
                     "core.providers.tadawul_provider",
                     ["fetch_quote_and_fundamentals_patch", "fetch_fundamentals_patch", "fetch_quote_patch"],
@@ -519,7 +531,7 @@ class DataEngine:
             elif p == "argaam":
                 patch, err = await _try_provider_call(
                     "core.providers.argaam_provider",
-                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch"],
+                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_enriched_quote_patch"],
                     sym,
                 )
 
@@ -532,24 +544,36 @@ class DataEngine:
 
             elif p == "finnhub":
                 api_key = os.getenv("FINNHUB_API_KEY")
+                # Finnhub provides quote + some profile fields, but fundamentals are limited unless you built it
                 patch, err = await _try_provider_call(
                     "core.providers.finnhub_provider",
-                    ["fetch_quote_and_enrichment_patch", "fetch_quote_patch", "fetch_quote"],
+                    ["fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"],
                     sym,
                     api_key,
                 )
 
             elif p == "eodhd":
+                # ✅ Critical: include the real enriched function used by your provider implementation
+                if enrich:
+                    fn_list = [
+                        "fetch_enriched_quote_patch",          # <- your provider uses this
+                        "fetch_quote_and_fundamentals_patch",  # <- some variants use this name
+                        "fetch_enriched_patch",
+                        "fetch_quote_patch",
+                        "fetch_quote",
+                    ]
+                else:
+                    fn_list = ["fetch_quote_patch", "fetch_quote"]
                 patch, err = await _try_provider_call(
                     "core.providers.eodhd_provider",
-                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
+                    fn_list,
                     sym,
                 )
 
             elif p == "fmp":
                 patch, err = await _try_provider_call(
                     "core.providers.fmp_provider",
-                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
+                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
                     sym,
                 )
 
@@ -562,21 +586,26 @@ class DataEngine:
                 source_used.append(p)
 
             if err:
-                # Avoid duplicated prefixes like "tadawul: tadawul: ..."
                 low = str(err).strip().lower()
                 if low.startswith(f"{p}:"):
                     warnings.append(str(err).strip())
                 else:
                     warnings.append(f"{p}: {str(err).strip()}")
 
-            # compute derived after each patch
             _apply_derived(out)
 
-            # Stop early if we already have core price + identity/fundamental anchor
-            if _safe_float(out.get("current_price")) is not None and (
-                out.get("name") or _safe_float(out.get("market_cap")) is not None
-            ):
-                break
+            # ✅ Stop rule:
+            # - If no price: keep trying
+            # - If enrich=False: stop once price exists
+            # - If enrich=True: stop only once price exists AND we have some fundamentals (or we exhausted providers)
+            has_price_now = _safe_float(out.get("current_price")) is not None
+            if has_price_now:
+                if not enrich:
+                    break
+                # When enrich=True, do NOT stop just because we have a name.
+                # We stop only when at least one fundamentals anchor exists.
+                if _has_any_fundamentals(out):
+                    break
 
         # Scoring
         out["quality_score"] = _score_quality(out)
@@ -593,28 +622,25 @@ class DataEngine:
         # data_source
         out["data_source"] = ",".join(_dedup_preserve(source_used)) if source_used else (out.get("data_source") or None)
 
-        # data_quality + status
+        # data_quality
         out["data_quality"] = _quality_label(out)
 
+        # ✅ Final status + error normalization (THIS is what will fix your KSA red rows)
         has_price = _safe_float(out.get("current_price")) is not None
+
+        base_err = str(out.get("error") or "").strip()
+        parts: List[str] = []
+        if base_err:
+            parts.append(_normalize_warning_prefix(base_err))
+        parts += [_normalize_warning_prefix(w) for w in warnings]
+        parts = _dedup_preserve([p for p in parts if p])
+
         if not has_price:
             out["status"] = "error"
-            base_err = str(out.get("error") or "").strip()
-            parts = [base_err] if base_err else []
-            parts += warnings
-            parts = _dedup_preserve(parts)
             out["error"] = " | ".join(parts) if parts else "No price returned"
         else:
-            # ✅ 핵 الإصلاح: price exists => SUCCESS, provider issues become warnings
+            # price exists => always success
             out["status"] = "success"
-
-            base_err = str(out.get("error") or "").strip()
-            parts: List[str] = []
-            if base_err:
-                parts.append(base_err)
-            parts += warnings
-            parts = _dedup_preserve(parts)
-
             out["error"] = "" if not parts else ("warning: " + " | ".join(parts))
 
         # Cache
