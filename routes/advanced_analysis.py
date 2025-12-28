@@ -1,10 +1,10 @@
 # routes/advanced_analysis.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.7.0) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.7.1) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
-- PROD SAFE: no core.data_engine_v2 imports at module import-time.
+- PROD SAFE: no hard dependency on core.data_engine_v2 at import-time (lazy + guarded).
 - Google Sheets–friendly:
     • /sheet-rows never raises for normal usage (always returns headers + rows + status).
 - Defensive batching:
@@ -13,8 +13,12 @@ Design goals
 
 Modes for /sheet-rows:
 - "advanced": returns Advanced headers (opportunity scoreboard style)
-- "quote_59": if schemas provides 59-col headers -> return quote rows (sorted by opp score)
-    • Uses EnrichedQuote if importable, else robust header-driven mapping fallback.
+- "quote_59": returns 59-col quote rows (sorted by opportunity score), using:
+    • EnrichedQuote.to_row(headers) if available and works
+    • else robust header-driven mapping fallback (computed 52W position, Riyadh timestamp fill)
+
+Compatibility:
+- Engines may return list[quote] OR dict[symbol->quote] for batch calls.
 """
 
 from __future__ import annotations
@@ -44,7 +48,7 @@ try:
 except Exception:  # pragma: no cover
     get_headers_for_sheet = None  # type: ignore
 
-# EnrichedQuote is used only for canonical 59-column quote rows
+# EnrichedQuote is used only for canonical 59-column quote rows (optional)
 try:
     from core.enriched_quote import EnrichedQuote  # type: ignore
 except Exception:  # pragma: no cover
@@ -53,7 +57,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.7.0"
+ADVANCED_ANALYSIS_VERSION = "3.7.1"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -109,7 +113,7 @@ def _read_token_attr(obj: Any, attr: str) -> Optional[str]:
 def _allowed_tokens() -> List[str]:
     tokens: List[str] = []
 
-    # settings first
+    # 1) settings
     try:
         s = get_settings()
         for attr in ("app_token", "backup_app_token"):
@@ -119,10 +123,9 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
-    # env.py exports `settings` (common in your project)
+    # 2) env.py exports `settings` (common in your project)
     try:
         from env import settings as env_settings  # type: ignore
-
         for attr in ("app_token", "backup_app_token"):
             v = _read_token_attr(env_settings, attr)
             if v:
@@ -130,7 +133,7 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
-    # environment variables last resort
+    # 3) environment variables
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
         v = (os.getenv(k) or "").strip()
         if v:
@@ -453,7 +456,6 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-
         tz = ZoneInfo("Asia/Riyadh")
         if isinstance(utc_any, datetime):
             dt = utc_any
@@ -466,27 +468,75 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
 
 
+def _index_keys_for_quote(q: Any) -> List[str]:
+    """
+    Builds multiple keys to match returned objects robustly:
+    symbol / symbol_normalized / normalize(symbol_input)
+    """
+    keys: List[str] = []
+    sym = (_safe_get(q, "symbol") or "").strip().upper()
+    if sym:
+        keys.append(sym)
+
+    sn = (_safe_get(q, "symbol_normalized") or "").strip().upper()
+    if sn:
+        keys.append(sn)
+
+    si = (_safe_get(q, "symbol_input") or "").strip()
+    if si:
+        try:
+            keys.append(normalize_symbol(si).upper())
+        except Exception:
+            keys.append(si.strip().upper())
+
+    out: List[str] = []
+    seen = set()
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
 # =============================================================================
 # Engine calls (compat shim + chunking)
 # =============================================================================
+async def _maybe_await(x: Any) -> Any:
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
+
 async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
+    """
+    - Prefer engine.get_enriched_quotes
+    - Else engine.get_quotes
+    - Else per-symbol methods
+    Accept list OR dict returns.
+    """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
-        return await fn(syms)
+        res = await _maybe_await(fn(syms))
+        if isinstance(res, dict):
+            return list(res.values())
+        return list(res or [])
 
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
-        return await fn2(syms)
+        res = await _maybe_await(fn2(syms))
+        if isinstance(res, dict):
+            return list(res.values())
+        return list(res or [])
 
     out: List[Any] = []
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
         if callable(fn3):
-            out.append(await fn3(s))
+            out.append(await _maybe_await(fn3(s)))
             continue
         fn4 = getattr(engine, "get_quote", None)
         if callable(fn4):
-            out.append(await fn4(s))
+            out.append(await _maybe_await(fn4(s)))
             continue
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
@@ -531,10 +581,11 @@ async def _get_quotes_chunked(
 
         returned = list(res or [])
         chunk_map: Dict[str, Any] = {}
+
         for q in returned:
-            sym = (_safe_get(q, "symbol") or "").strip().upper()
-            if sym:
-                chunk_map[sym] = _finalize_quote(q)
+            q2 = _finalize_quote(q)
+            for k in _index_keys_for_quote(q2):
+                chunk_map.setdefault(k, q2)
 
         for s in chunk_syms:
             k = s.upper()
@@ -709,9 +760,12 @@ def _default_advanced_headers() -> List[str]:
 
 def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
     nm = (sheet_name or "").strip().lower()
+
+    # explicit advanced-ish keywords -> advanced scoreboard
     if any(k in nm for k in ("advanced", "opportunity", "advisor", "best")):
         return _default_advanced_headers(), "advanced"
 
+    # if schemas provides a header list (your 59-col sheet layout), use it
     if sheet_name and get_headers_for_sheet:
         try:
             h = get_headers_for_sheet(sheet_name)
@@ -770,7 +824,7 @@ def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
 
 
 # =============================================================================
-# Quote-59 fallback mapping (when EnrichedQuote is missing)
+# Quote-59 fallback mapping (when EnrichedQuote is missing or fails)
 # =============================================================================
 def _hkey(h: str) -> str:
     s = str(h or "").strip().lower()
@@ -799,46 +853,31 @@ def _value_for_header(header: str, uq: Any) -> Any:
         hi = _safe_get(uq, "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
-    # common direct matches
-    common = {
-        "symbol": ("symbol",),
-        "company name": ("name", "company_name"),
-        "market": ("market", "market_region"),
-        "currency": ("currency",),
-        "last price": ("current_price", "last_price", "price"),
-        "previous close": ("previous_close",),
-        "price change": ("price_change", "change"),
-        "percent change": ("percent_change", "change_pct", "change_percent"),
-        "52w high": ("high_52w",),
-        "52w low": ("low_52w",),
-        "dividend yield %": ("dividend_yield",),
-        "roe %": ("roe",),
-        "roa %": ("roa",),
-        "data source": ("data_source", "source"),
-        "data quality": ("data_quality",),
-        "last updated (utc)": ("last_updated_utc", "as_of_utc"),
-        "last updated (riyadh)": ("last_updated_riyadh",),
-        "error": ("error",),
-        "status": ("status",),
-        "symbol_input": ("symbol_input",),
-        "symbol_normalized": ("symbol_normalized",),
-    }
-    if hk in common:
-        v = _safe_get(uq, *common[hk])
-        if hk in ("dividend yield %", "roe %", "roa %"):
-            return _ratio_to_percent(v)
-        if hk == "last updated (utc)":
-            return _iso_or_none(v) or v
-        if hk == "last updated (riyadh)":
-            if not v:
-                last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
-                v = _to_riyadh_iso(last_utc)
-            return _iso_or_none(v) or v
-        return v
+    # ensure Riyadh timestamp if sheet asks
+    if hk == "last updated (riyadh)":
+        v = _safe_get(uq, "last_updated_riyadh")
+        if not v:
+            last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
+            v = _to_riyadh_iso(last_utc)
+            try:
+                if isinstance(uq, dict):
+                    uq["last_updated_riyadh"] = v
+                else:
+                    setattr(uq, "last_updated_riyadh", v)
+            except Exception:
+                pass
+        return _iso_or_none(v) or v
 
-    # snake_case guess
+    # percent normalization for common percent headers
+    if hk in ("dividend yield %", "roe %", "roa %", "turnover %", "free float %", "volatility (30d)"):
+        guess = _snake_guess(header)
+        return _ratio_to_percent(_safe_get(uq, guess, guess.replace("_percent", "")))
+
+    # direct snake guess
     guess = _snake_guess(header)
     v = _safe_get(uq, guess)
+    if hk == "last updated (utc)":
+        return _iso_or_none(v) or v
     return v
 
 
@@ -858,7 +897,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     cfg = _cfg()
     eng = await _resolve_engine(request)
 
-    providers = []
+    providers: List[str] = []
     try:
         providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
     except Exception:
@@ -971,16 +1010,19 @@ async def advanced_sheet_rows(
     if not _auth_ok(x_app_token):
         rows: List[List[Any]] = []
         for s in requested[:top_n]:
-            it = AdvancedItem(
-                symbol=s.upper(),
-                data_quality="MISSING",
-                data_quality_score=0.0,
-                risk_bucket="LOW_CONFIDENCE",
-                provider="none",
-                as_of_utc=_now_utc_iso(),
-                error="Unauthorized (invalid or missing X-APP-TOKEN).",
-            )
-            rows.append(_row_for_headers(it, headers) if mode == "advanced" else _row_59_from_headers(headers, _make_placeholder(s, err="Unauthorized")))
+            if mode == "advanced":
+                it = AdvancedItem(
+                    symbol=s.upper(),
+                    data_quality="MISSING",
+                    data_quality_score=0.0,
+                    risk_bucket="LOW_CONFIDENCE",
+                    provider="none",
+                    as_of_utc=_now_utc_iso(),
+                    error="Unauthorized (invalid or missing X-APP-TOKEN).",
+                )
+                rows.append(_row_for_headers(it, headers))
+            else:
+                rows.append(_row_59_from_headers(headers, _make_placeholder(s, err="Unauthorized")))
         return AdvancedSheetResponse(
             status="error",
             error="Unauthorized (invalid or missing X-APP-TOKEN).",
@@ -1035,15 +1077,14 @@ async def advanced_sheet_rows(
                         continue
                     except Exception as exc:
                         # fallback mapping
-                        uq2 = uq
                         try:
-                            if isinstance(uq2, dict):
-                                uq2["error"] = f"Row mapping failed: {exc}"
+                            if isinstance(uq, dict):
+                                uq["error"] = f"Row mapping failed: {exc}"
                             else:
-                                setattr(uq2, "error", f"Row mapping failed: {exc}")
+                                setattr(uq, "error", f"Row mapping failed: {exc}")
                         except Exception:
                             pass
-                        rows.append(_row_59_from_headers(headers, uq2))
+                        rows.append(_row_59_from_headers(headers, uq))
                         continue
 
                 # If EnrichedQuote missing: header-driven fallback
@@ -1061,16 +1102,19 @@ async def advanced_sheet_rows(
 
         rows: List[List[Any]] = []
         for s in requested[:top_n]:
-            it = AdvancedItem(
-                symbol=s.upper(),
-                data_quality="MISSING",
-                data_quality_score=0.0,
-                risk_bucket="LOW_CONFIDENCE",
-                provider="none",
-                as_of_utc=_now_utc_iso(),
-                error=str(exc),
-            )
-            rows.append(_row_for_headers(it, headers) if mode == "advanced" else _row_59_from_headers(headers, _make_placeholder(s, err=str(exc))))
+            if mode == "advanced":
+                it = AdvancedItem(
+                    symbol=s.upper(),
+                    data_quality="MISSING",
+                    data_quality_score=0.0,
+                    risk_bucket="LOW_CONFIDENCE",
+                    provider="none",
+                    as_of_utc=_now_utc_iso(),
+                    error=str(exc),
+                )
+                rows.append(_row_for_headers(it, headers))
+            else:
+                rows.append(_row_59_from_headers(headers, _make_placeholder(s, err=str(exc))))
 
         return AdvancedSheetResponse(status="error", error=str(exc), headers=headers, rows=rows)
 
