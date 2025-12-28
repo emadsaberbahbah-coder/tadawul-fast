@@ -375,11 +375,16 @@ def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> 
             vv = str(getattr(settings, k, "") or "").strip()
             if vv:
                 return vv
-    return str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip() or "production"
+    return (
+        str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip()
+        or "production"
+    )
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
-    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
+    cors_all = _truthy(
+        _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true"))
+    )
     if cors_all:
         return ["*"]
     raw = str(_get(settings, env_mod, "CORS_ORIGINS", "")).strip()
@@ -415,7 +420,9 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
     enabled, ksa = _providers_from_settings(settings, env_mod)
     return {
         "APP_ENV": _resolve_env_name(settings, env_mod),
-        "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")),
+        "LOG_LEVEL": str(
+            _get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")
+        ),
         "LOG_FORMAT": LOG_FORMAT,
         "ENTRY_VERSION": APP_ENTRY_VERSION,
         "APP_VERSION_RESOLVED": _resolve_version(settings, env_mod),
@@ -565,7 +572,9 @@ def create_app() -> FastAPI:
     env_mod = _load_env_module()
 
     # Prefer LOG_LEVEL from settings if possible
-    log_level = str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")).upper()
+    log_level = str(
+        _get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")
+    ).upper()
     _safe_set_root_log_level(log_level)
 
     title = _resolve_title(settings, env_mod)
