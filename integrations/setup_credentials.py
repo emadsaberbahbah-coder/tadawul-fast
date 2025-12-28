@@ -1,9 +1,9 @@
-```python
+#!/usr/bin/env python3
 # setup_credentials.py  (FULL REPLACEMENT)
 """
 setup_credentials.py
 ===========================================================
-HELPER: Prepare Google Credentials for Deployment (v2.2.0)
+HELPER: Prepare Google Credentials for Deployment (v2.4.0)
 ===========================================================
 
 Why this exists
@@ -13,11 +13,14 @@ Why this exists
     1) Minified one-line JSON (safe for GOOGLE_SHEETS_CREDENTIALS)
     2) OPTIONAL Base64 version (often safer for deployment UIs)
 
-Extra safety (v2.2.0)
-- Supports reading credentials from a file OR from stdin (pipe) OR from an env var.
-- Optional output to files (so you don't have to copy/paste secrets).
-- Optional "masked preview" mode (prints only first/last chars) to reduce accidental leaks.
-- Strict validation of required fields + private key marker.
+Extra safety (v2.4.0)
+- Reads credentials from: file OR stdin (pipe) OR env var
+- Accepts JSON OR base64(JSON) OR "quoted JSON" in any source
+- Strict validation of required fields + private key marker
+- Optional sanitize of "\\n" -> "\n" inside private_key (common deployment issue)
+- Optional output to files to avoid copy/paste
+- Optional masked preview mode
+- Optional "print export command" helpers for Bash/PowerShell (masked by default)
 
 Usage (examples)
 1) File (default):
@@ -30,14 +33,14 @@ Usage (examples)
    (PowerShell):
       Get-Content credentials.json -Raw | python setup_credentials.py --stdin --both
 
-3) Read from env var that already contains JSON:
+3) Read from env var that already contains JSON/base64:
       python setup_credentials.py --from-env GOOGLE_SHEETS_CREDENTIALS --base64
 
 4) Write outputs to files (recommended):
       python setup_credentials.py --both --out-json creds.min.json --out-b64 creds.min.b64.txt
 
 Security note
-- This prints secrets if you don't use --mask or --out-*.
+- This prints secrets unless you use --mask or --out-*.
 - Do not paste the output value into chats/screenshots.
 """
 
@@ -52,6 +55,7 @@ from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_INPUT = "credentials.json"
 DEFAULT_ENV_NAME = "GOOGLE_SHEETS_CREDENTIALS"
+VERSION = "2.4.0"
 
 
 # =============================================================================
@@ -65,13 +69,11 @@ def _read_file(path: str) -> str:
 
 
 def _read_stdin() -> str:
-    data = sys.stdin.read()
-    return data or ""
+    return sys.stdin.read() or ""
 
 
 def _read_env(name: str) -> str:
-    v = os.getenv(name, "")
-    return v or ""
+    return os.getenv(name, "") or ""
 
 
 def _strip_wrapping_quotes(s: str) -> str:
@@ -81,43 +83,72 @@ def _strip_wrapping_quotes(s: str) -> str:
     return t
 
 
-def _maybe_b64_decode(s: str) -> str:
+def _is_probably_base64(raw: str) -> bool:
     """
-    If the string looks like base64 and decodes into JSON, return decoded JSON string.
-    Otherwise return original.
+    Heuristic: base64 strings are usually long, no spaces, mostly base64 alphabet.
     """
-    raw = (s or "").strip()
-    if not raw:
-        return raw
-    if raw.startswith("{"):
-        return raw
+    s = (raw or "").strip()
+    if not s:
+        return False
+    if s.startswith("{"):
+        return False
+    if len(s) < 120:
+        return False
+    if any(ch.isspace() for ch in s):
+        return False
+    # allow '=' padding, '+' '/', '-' '_' (URL-safe), alnum
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
+    bad = sum(1 for ch in s if ch not in allowed)
+    return bad == 0
 
-    # Heuristic: only try decoding if long-ish and no obvious JSON
-    if len(raw) < 120:
-        return raw
 
+def _try_b64_decode_to_json(raw: str) -> Optional[str]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if not _is_probably_base64(s):
+        return None
+
+    # Try standard base64 and urlsafe base64
+    for fn in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            decoded = fn(s).decode("utf-8", errors="strict").strip()
+            if decoded.startswith("{") and '"private_key"' in decoded:
+                return decoded
+        except Exception:
+            continue
+    return None
+
+
+# =============================================================================
+# Validation / normalization
+# =============================================================================
+def _coerce_private_key_newlines(data: Dict[str, Any], *, fix: bool) -> None:
+    """
+    If private_key contains literal '\\n' sequences, optionally convert to real newlines.
+    This is safe and commonly required if someone pasted JSON through env var UIs.
+    """
+    if not fix:
+        return
     try:
-        decoded = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
-        if decoded.startswith("{") and '"private_key"' in decoded:
-            return decoded
+        pk = data.get("private_key")
+        if isinstance(pk, str) and "\\n" in pk:
+            data["private_key"] = pk.replace("\\n", "\n")
     except Exception:
-        return raw
-
-    return raw
+        pass
 
 
-# =============================================================================
-# Validation / formatting
-# =============================================================================
 def _load_json_text(text: str) -> Dict[str, Any]:
     t = _strip_wrapping_quotes(text)
-    t = _maybe_b64_decode(t)
+    decoded = _try_b64_decode_to_json(t)
+    if decoded:
+        t = decoded
     t = _strip_wrapping_quotes(t).strip()
 
     if not t:
         raise ValueError("Empty input (no JSON found).")
     if not t.startswith("{"):
-        raise ValueError("Input is not JSON (expected '{' at start).")
+        raise ValueError("Input is not JSON (expected '{' at start), and it did not decode as base64 JSON.")
 
     data = json.loads(t)
     if not isinstance(data, dict) or not data:
@@ -131,9 +162,8 @@ def _validate_service_account(data: Dict[str, Any], strict_type: bool = False) -
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
 
-    if strict_type:
-        if str(data.get("type", "")).strip() != "service_account":
-            raise ValueError("Field 'type' is not 'service_account' (strict mode).")
+    if strict_type and str(data.get("type", "")).strip() != "service_account":
+        raise ValueError("Field 'type' is not 'service_account' (strict mode).")
 
     pk = data.get("private_key")
     if not isinstance(pk, str) or "BEGIN PRIVATE KEY" not in pk:
@@ -173,6 +203,18 @@ def _write_file(path: str, content: str) -> None:
         f.write(content)
 
 
+def _ps_setx(env_name: str, value: str, *, masked: bool) -> str:
+    v = _mask(value) if masked else value
+    # setx has length limits; this is "helper text", not guaranteed for huge values
+    return f'setx {env_name} "{v}"'
+
+
+def _bash_export(env_name: str, value: str, *, masked: bool) -> str:
+    v = _mask(value) if masked else value
+    # Quote with single quotes; if value contains single quote it's rare for JSON/base64
+    return f"export {env_name}='{v}'"
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -197,8 +239,10 @@ def main() -> int:
     out.add_argument("--env-name", default=DEFAULT_ENV_NAME, help="Env var name to display in instructions.")
     out.add_argument("--mask", action="store_true", help="Print masked previews instead of full secrets.")
     out.add_argument("--strict-type", action="store_true", help="Require type == service_account.")
+    out.add_argument("--fix-private-key", action="store_true", help="Convert literal '\\\\n' to real newlines in private_key before output.")
     out.add_argument("--out-json", default="", help="Write minified JSON output to this file.")
     out.add_argument("--out-b64", default="", help="Write base64 output to this file.")
+    out.add_argument("--print-export", action="store_true", help="Print helper export commands (masked by default).")
 
     args = p.parse_args()
 
@@ -215,6 +259,7 @@ def main() -> int:
             src_label = args.input
 
         data = _load_json_text(raw_text)
+        _coerce_private_key_newlines(data, fix=bool(args.fix_private_key))
         _validate_service_account(data, strict_type=bool(args.strict_type))
         flat, b64 = _make_outputs(data)
 
@@ -232,7 +277,7 @@ def main() -> int:
         if args.out_b64:
             _write_file(args.out_b64, b64)
 
-        print("\n--- Google Credentials Formatter (v2.2.0) ---\n")
+        print(f"\n--- Google Credentials Formatter (v{VERSION}) ---\n")
         print(f"Source: {src_label}")
 
         # Show outputs (masked or full)
@@ -254,6 +299,16 @@ def main() -> int:
             print("▲ ▲ ▲")
             print("-" * 70)
 
+        if args.print_export:
+            masked = True if args.mask or True else False  # always masked for safety
+            print("\nHelper commands (MASKED preview):")
+            if mode in ("json", "both"):
+                print("PowerShell:", _ps_setx(args.env_name, flat, masked=True))
+                print("Bash:     ", _bash_export(args.env_name, flat, masked=True))
+            if mode in ("base64", "both"):
+                print("PowerShell:", _ps_setx(args.env_name, b64, masked=True))
+                print("Bash:     ", _bash_export(args.env_name, b64, masked=True))
+
         print("\nRecommended:")
         if args.out_json or args.out_b64:
             if args.out_json:
@@ -266,6 +321,7 @@ def main() -> int:
             print("• Local .env: Prefer wrapping the value in single quotes if your parser supports it.")
             print("• Tip: Use --mask to avoid printing full secrets to terminal history.")
             print("• Tip: Use --out-json/--out-b64 to avoid copy/paste mistakes.")
+            print("• If your private_key breaks after paste, rerun with --fix-private-key")
 
         print("\nSecurity:")
         print("• Treat this output as a secret. Don’t share it in chats/screenshots.\n")
@@ -278,9 +334,9 @@ def main() -> int:
         print("1) Download the Service Account key JSON from Google Cloud Console.")
         print(f"2) Put it next to this script as '{DEFAULT_INPUT}' OR pass --input yourfile.json")
         print("3) Or pipe it using --stdin, or read it using --from-env ENVNAME")
+        print("4) If you stored base64 in env var, this tool can decode it automatically")
         return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-```
