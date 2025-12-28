@@ -2,14 +2,17 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.4.0)
+Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.4.1)
 
-Fix in v2.4.0 (CRITICAL)
-- ✅ Do NOT force status=error just because `error` is non-empty
-  (engine may return warnings in `error` while still success)
-- ✅ status logic:
-    - if current_price exists => success (even with warnings)
-    - if no price            => error
+Fixes / Improvements
+- ✅ v2.4.0 CRITICAL preserved:
+    - Do NOT force status=error just because `error` is non-empty
+    - status logic:
+        - if current_price exists => success (even with warnings)
+        - if no price            => error
+- ✅ v2.4.1 HARDENING:
+    - Accepts engine/provider accidental tuple returns like (payload_dict, err_str)
+      and converts them into a proper payload dict (prevents {"value":"(...)"})
 - ✅ Keeps schema-fill guarantees for Sheets (no missing columns)
 - ✅ Keeps PROD-safe import behavior (no core imports at module import-time)
 """
@@ -107,9 +110,31 @@ async def _maybe_await(value: Any) -> Any:
 def _as_payload(obj: Any) -> Dict[str, Any]:
     """
     Convert any return type into JSON-safe dict without throwing.
+
+    v2.4.1:
+    - If obj is a tuple like (dict_payload, err_str) => merge into dict.
     """
     if obj is None:
         return {}
+
+    # Harden: engine/provider might accidentally return (payload, err)
+    if isinstance(obj, tuple) and len(obj) == 2:
+        a, b = obj
+        if isinstance(a, dict):
+            payload = jsonable_encoder(a)
+            # if b looks like an error string, attach it if payload has no error
+            if b is not None:
+                try:
+                    b_str = str(b).strip()
+                except Exception:
+                    b_str = ""
+                if b_str:
+                    # do not overwrite an existing non-empty error
+                    cur_err = payload.get("error")
+                    if cur_err is None or (isinstance(cur_err, str) and not cur_err.strip()):
+                        payload["error"] = b_str
+            return payload
+
     if isinstance(obj, dict):
         return jsonable_encoder(obj)
 
@@ -188,8 +213,7 @@ def _safe_float(v: Any) -> Optional[float]:
 
 
 def _has_price(payload: Dict[str, Any]) -> bool:
-    f = _safe_float(payload.get("current_price"))
-    return f is not None
+    return _safe_float(payload.get("current_price")) is not None
 
 
 async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optional[Any], Optional[str]]:
@@ -303,25 +327,19 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         err_s = str(err).strip()
     payload["error"] = err_s
 
-    # Determine has_price
     has_price = _has_price(payload)
 
-    # Respect engine status when possible
-    st_raw = str(payload.get("status") or "").strip().lower()
-
     if has_price:
-        # If we have a price, we succeed even if warnings exist.
+        # succeed even with warnings
         payload["status"] = "success"
 
-        # If there is error text and it is not already prefixed, treat as warning text
+        # normalize warning prefix (do not double-prefix)
         if err_s and not err_s.lower().startswith("warning:"):
             payload["error"] = f"warning: {err_s}"
 
         if not payload.get("data_quality"):
             payload["data_quality"] = "PARTIAL"
-
     else:
-        # No price => error
         payload["status"] = "error"
         if not payload.get("data_quality"):
             payload["data_quality"] = "MISSING"
@@ -558,7 +576,7 @@ async def enriched_quotes(
 
 @router.get("/health", include_in_schema=False)
 async def enriched_health():
-    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.4.0"}
+    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.4.1"}
 
 
 __all__ = ["router"]
