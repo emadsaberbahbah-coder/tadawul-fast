@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# scripts/run_market_scan.py
+# scripts/run_market_scan.py  (FULL REPLACEMENT)
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER (v1.0.0) – Sheets-ready
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.2.0) – Sheets-ready
 ===========================================================
 
 What this script does
@@ -15,17 +15,28 @@ What this script does
 
 Defaults (safe)
 - Reads from: MARKET_LEADERS + GLOBAL_MARKETS + KSA_TADAWUL
-- Ranks by: opportunity_score (desc) then overall_score (desc)
+- Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
 - Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
+
+Key upgrades (v1.2.0)
+- Always sends BOTH tickers and symbols to backend (compat across routers)
+- More robust backend response parsing (results/rows/data)
+- Adds Rank + Origin Pages columns for traceability
+- Safer, smart-clear range (clears only the table width by default)
+- Optional value_input for sheet write: RAW (default) or USER_ENTERED
+- Better keys parsing (comma/space), de-dup, and KSA/global filtering
+- Never crashes on one bad batch; error rows inserted per-symbol
 
 Usage examples
   python scripts/run_market_scan.py
   python scripts/run_market_scan.py --keys MARKET_LEADERS GLOBAL_MARKETS
+  python scripts/run_market_scan.py --keys "MARKET_LEADERS,GLOBAL_MARKETS"
   python scripts/run_market_scan.py --ksa-only
   python scripts/run_market_scan.py --global-only
   python scripts/run_market_scan.py --top 25 --min-quality OK
   python scripts/run_market_scan.py --out-json market_scan.json
   python scripts/run_market_scan.py --no-sheet
+  python scripts/run_market_scan.py --clear --value-input USER_ENTERED
 
 Notes
 - Uses env.py settings when available:
@@ -36,9 +47,11 @@ Notes
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -47,23 +60,29 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.2.0"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("MarketScan")
 
+_A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
+
 
 # =============================================================================
 # Path safety
 # =============================================================================
 def _ensure_project_root_on_path() -> None:
+    """
+    Allows running from:
+      - project root: python scripts/run_market_scan.py
+      - scripts folder: python run_market_scan.py
+    """
     try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        parent = os.path.dirname(here)
-        project_root = os.path.dirname(parent)
-        for p in (here, parent, project_root):
+        here = os.path.dirname(os.path.abspath(__file__))      # .../scripts
+        parent = os.path.dirname(here)                          # project root
+        for p in (here, parent):
             if p and p not in sys.path:
                 sys.path.insert(0, p)
     except Exception:
@@ -145,20 +164,66 @@ def _safe_float(x: Any, default: float) -> float:
         return default
 
 
+def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
+    if not keys:
+        return []
+    out: List[str] = []
+    for x in keys:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        out.extend([p.strip() for p in s.split(",") if p.strip()])
+
+    seen = set()
+    final: List[str] = []
+    for k in out:
+        ku = k.strip().upper()
+        if not ku or ku in seen:
+            continue
+        seen.add(ku)
+        final.append(ku)
+    return final
+
+
+# =============================================================================
+# Symbol normalization
+# =============================================================================
 def _norm_symbol(s: str) -> str:
     x = (s or "").strip().upper()
     if not x:
         return ""
+
+    # Normalize "TADAWUL:xxxx"
+    if x.startswith("TADAWUL:"):
+        x = x.split(":", 1)[1].strip().upper()
+
+    # Normalize ".TADAWUL"
+    if x.endswith(".TADAWUL"):
+        x = x.replace(".TADAWUL", "")
+
+    x = x.replace(" ", "")
+
     # Normalize KSA numeric -> .SR
     if x.isdigit() and 3 <= len(x) <= 5:
         return f"{x}.SR"
-    if x.startswith("TADAWUL:"):
-        x = x.split(":", 1)[1].strip().upper()
-    if x.endswith(".TADAWUL"):
-        x = x.replace(".TADAWUL", "")
-        if x.isdigit():
-            return f"{x}.SR"
-    return x.replace(" ", "")
+
+    # If still numeric after removing suffixes
+    if x.endswith(".SR") and x.replace(".SR", "").isdigit():
+        return x
+
+    return x
+
+
+def _is_ksa(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    if not s:
+        return False
+    if s.endswith(".SR"):
+        return True
+    # numeric-only (rare if already normalized)
+    return s.isdigit() and 3 <= len(s) <= 5
 
 
 def _dedupe(items: Sequence[str]) -> List[str]:
@@ -176,16 +241,80 @@ def _dedupe(items: Sequence[str]) -> List[str]:
 
 
 # =============================================================================
+# A1 helpers (for safe clear)
+# =============================================================================
+def _validate_start_cell(cell: str) -> str:
+    c = (cell or "").strip()
+    if not c:
+        return "A5"
+    if ":" in c:
+        c = c.split(":", 1)[0].strip()
+    if not _A1_CELL_RE.match(c):
+        logger.warning("Invalid start-cell '%s' -> using A5", cell)
+        return "A5"
+    return c.replace("$", "").upper()
+
+
+def _safe_sheet_name(sheet_name: str) -> str:
+    name = (sheet_name or "").strip().replace("'", "''")
+    return f"'{name}'"
+
+
+def _parse_a1_cell(cell: str) -> Tuple[str, int]:
+    s = _validate_start_cell(cell)
+    # split col letters + row digits
+    col = ""
+    row = ""
+    for ch in s:
+        if ch.isalpha():
+            col += ch
+        elif ch.isdigit():
+            row += ch
+    if not col:
+        col = "A"
+    r = int(row or "1")
+    if r <= 0:
+        r = 1
+    return col.upper(), r
+
+
+def _col_to_index(col: str) -> int:
+    col = (col or "").strip().upper()
+    n = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return max(1, n)
+
+
+def _index_to_col(idx: int) -> str:
+    idx = int(idx)
+    if idx <= 0:
+        idx = 1
+    s = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        s = chr(rem + ord("A")) + s
+    return s or "A"
+
+
+def _a1(col: str, row: int) -> str:
+    return f"{col.upper()}{int(row)}"
+
+
+# =============================================================================
 # Backend client (urllib)
 # =============================================================================
 def _headers(token: str) -> Dict[str, str]:
     h = {
         "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
+        "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
         "User-Agent": f"TadawulFastBridge-MarketScan/{SCRIPT_VERSION}",
     }
     if token:
+        # keep compatibility with your backend auth expectations
         h["X-APP-TOKEN"] = token
+        h["Authorization"] = f"Bearer {token}"
     return h
 
 
@@ -206,6 +335,7 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
     last_status: Optional[int] = None
 
     attempts = max(1, int(retries) + 1)
+
     for attempt in range(attempts):
         for tok_idx, tok in enumerate(tokens_to_try):
             try:
@@ -214,10 +344,12 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                     status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
                     raw = resp.read().decode("utf-8", errors="replace")
                     last_status = status
-                    last_body_preview = raw[:500]
+                    last_body_preview = (raw or "")[:500]
 
                     if 200 <= status < 300:
-                        parsed = json.loads(raw) if raw else {}
+                        if not raw.strip():
+                            return {}
+                        parsed = json.loads(raw)
                         return parsed if isinstance(parsed, dict) else {"results": parsed}
 
                     last_err = f"HTTP {status}"
@@ -230,22 +362,52 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                 last_body_preview = (raw or "")[:500]
                 last_err = f"HTTP {last_status}"
 
-                # If unauthorized and we have another token to try -> continue
+                # If unauthorized and another token exists -> try next token
                 if last_status in (401, 403) and tok_idx < (len(tokens_to_try) - 1):
                     continue
             except Exception as e:
                 last_err = str(e)
 
         if attempt < attempts - 1:
-            time.sleep(min(6.0, (attempt + 1) * 2.0))
+            time.sleep(min(8.0, 1.5 * (attempt + 1) * (attempt + 1)))
 
-    # Always return a dict-like error payload
     msg = last_err or "Unknown error"
     if last_status:
         msg = f"HTTP {last_status}: {msg}"
     if last_body_preview:
         msg = f"{msg} | body: {last_body_preview}"
     return {"results": [], "error": msg}
+
+
+def _extract_result_list(resp: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Accept multiple backend shapes:
+      - {"results":[...]}
+      - {"rows":[...]}
+      - {"data":[...]}
+      - {"status":..., "results":...}
+    """
+    if isinstance(resp, dict):
+        err = resp.get("error")
+        for k in ("results", "rows", "data"):
+            v = resp.get(k)
+            if isinstance(v, list):
+                out = [x for x in v if isinstance(x, dict)]
+                return out, (str(err) if err else None)
+        # sometimes nested
+        v2 = resp.get("payload")
+        if isinstance(v2, dict):
+            for k in ("results", "rows", "data"):
+                vv = v2.get(k)
+                if isinstance(vv, list):
+                    out = [x for x in vv if isinstance(x, dict)]
+                    return out, (str(err) if err else None)
+        return [], (str(err) if err else None)
+
+    if isinstance(resp, list):
+        return [x for x in resp if isinstance(x, dict)], None
+
+    return [], "Invalid backend response shape"
 
 
 # =============================================================================
@@ -258,10 +420,25 @@ class SymbolBucket:
     meta: Dict[str, Any]
 
 
-def _read_symbols_for_key(key: str) -> SymbolBucket:
-    data = symbols_reader.get_page_symbols(key)  # type: ignore
+def _symbols_reader_call(key: str) -> Any:
+    fn = getattr(symbols_reader, "get_page_symbols", None)
+    if callable(fn):
+        return fn(key)
 
-    # symbols_reader returns {"all":[...], "ksa":[...], "global":[...]} (expected)
+    for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
+        fn2 = getattr(symbols_reader, name, None)
+        if callable(fn2):
+            return fn2(key)
+
+    raise RuntimeError("symbols_reader has no supported symbol function (expected get_page_symbols).")
+
+
+def _read_symbols_for_key(key: str) -> SymbolBucket:
+    try:
+        data = _symbols_reader_call(key)
+    except Exception as e:
+        return SymbolBucket(key=key, symbols=[], meta={"shape": "error", "error": str(e), "count": 0})
+
     if isinstance(data, list):
         syms = _dedupe([str(x) for x in data])
         return SymbolBucket(key=key, symbols=syms, meta={"shape": "list", "count": len(syms)})
@@ -270,19 +447,18 @@ def _read_symbols_for_key(key: str) -> SymbolBucket:
         return SymbolBucket(key=key, symbols=[], meta={"shape": str(type(data)), "count": 0})
 
     all_syms = data.get("all") or data.get("tickers") or data.get("symbols") or []
-    all_syms = _dedupe([str(x) for x in (all_syms or [])])
+    syms = _dedupe([str(x) for x in (all_syms or [])])
 
     meta = {
         "shape": "dict",
-        "count": len(all_syms),
+        "count": len(syms),
         "ksa_count": len(data.get("ksa") or []) if isinstance(data.get("ksa"), list) else None,
         "global_count": len(data.get("global") or []) if isinstance(data.get("global"), list) else None,
     }
-    return SymbolBucket(key=key, symbols=all_syms, meta=meta)
+    return SymbolBucket(key=key, symbols=syms, meta=meta)
 
 
 def _default_keys() -> List[str]:
-    # Safe defaults for a "market scan"
     return ["MARKET_LEADERS", "GLOBAL_MARKETS", "KSA_TADAWUL"]
 
 
@@ -302,17 +478,21 @@ def _call_analysis_batch(
     out: List[Dict[str, Any]] = []
     chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
 
-    for c in chunks:
-        payload = {"tickers": c, "symbols": []}
+    for idx, c in enumerate(chunks, start=1):
+        payload = {"tickers": c, "symbols": c}  # ✅ always send both
+        logger.info("Backend batch %s/%s | symbols=%s", idx, len(chunks), len(c))
         resp = _post_json(url, payload, timeout=timeout, retries=retries)
-        got = resp.get("results") if isinstance(resp, dict) else None
-        if isinstance(got, list):
-            out.extend([x for x in got if isinstance(x, dict)])
-        else:
-            # Keep at least error rows if backend failed
-            err = str(resp.get("error") or "Backend returned invalid response") if isinstance(resp, dict) else "Invalid response"
-            for s in c:
-                out.append({"symbol": s, "data_quality": "MISSING", "error": err})
+        got, err = _extract_result_list(resp)
+
+        if got:
+            out.extend(got)
+            continue
+
+        # Insert per-symbol error rows if backend failed for this chunk
+        err_msg = err or (str(resp.get("error")) if isinstance(resp, dict) else None) or "Backend returned invalid response"
+        for s in c:
+            out.append({"symbol": s, "data_quality": "MISSING", "error": err_msg})
+
     return out
 
 
@@ -320,18 +500,22 @@ def _score_num(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
-        v = float(x)
-        return v
+        return float(x)
     except Exception:
         return None
 
 
-def _rank_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
-    # Primary: opportunity_score, then overall_score, then quality_score
+def _rank_key(r: Dict[str, Any]) -> Tuple[float, float, float, str]:
     opp = _score_num(r.get("opportunity_score"))
     overall = _score_num(r.get("overall_score"))
     qual = _score_num(r.get("quality_score"))
-    return (opp if opp is not None else -1e9, overall if overall is not None else -1e9, qual if qual is not None else -1e9)
+    sym = str(r.get("symbol") or r.get("ticker") or "")
+    return (
+        opp if opp is not None else -1e9,
+        overall if overall is not None else -1e9,
+        qual if qual is not None else -1e9,
+        sym,
+    )
 
 
 def _passes_quality(r: Dict[str, Any], min_quality: str) -> bool:
@@ -341,7 +525,6 @@ def _passes_quality(r: Dict[str, Any], min_quality: str) -> bool:
     min_quality = min_quality.strip().upper()
     if min_quality == "ANY":
         return True
-    # Typical values: OK, PARTIAL, MISSING, ERROR
     order = {"OK": 3, "PARTIAL": 2, "MISSING": 1, "ERROR": 0}
     return order.get(q, 0) >= order.get(min_quality, 0)
 
@@ -350,7 +533,9 @@ def _passes_quality(r: Dict[str, Any], min_quality: str) -> bool:
 # Output shaping
 # =============================================================================
 DEFAULT_HEADERS: List[str] = [
+    "Rank",
     "Symbol",
+    "Origin Pages",
     "Name",
     "Market",
     "Currency",
@@ -383,7 +568,7 @@ DEFAULT_HEADERS: List[str] = [
 ]
 
 
-def _to_row(r: Dict[str, Any]) -> List[Any]:
+def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
     def g(*keys: str) -> Any:
         for k in keys:
             if k in r:
@@ -396,8 +581,14 @@ def _to_row(r: Dict[str, Any]) -> List[Any]:
     else:
         sources_str = str(sources or "")
 
+    # normalize symbol
+    sym = g("symbol", "ticker")
+    sym = _norm_symbol(str(sym or ""))
+
     return [
-        g("symbol", "ticker"),
+        rank,
+        sym,
+        origins,
         g("name"),
         g("market_region", "market"),
         g("currency"),
@@ -431,9 +622,21 @@ def _to_row(r: Dict[str, Any]) -> List[Any]:
     ]
 
 
-def _grid_from_results(results: List[Dict[str, Any]], headers: Optional[List[str]] = None) -> List[List[Any]]:
+def _grid_from_results(
+    results_sorted: List[Dict[str, Any]],
+    *,
+    headers: Optional[List[str]] = None,
+    origin_map: Optional[Dict[str, List[str]]] = None,
+) -> List[List[Any]]:
     h = headers or list(DEFAULT_HEADERS)
-    rows = [_to_row(r) for r in (results or [])]
+    origin_map = origin_map or {}
+
+    rows: List[List[Any]] = []
+    for i, r in enumerate(results_sorted, start=1):
+        sym = _norm_symbol(str(r.get("symbol") or r.get("ticker") or ""))
+        origins = ", ".join(origin_map.get(sym, [])) if sym else ""
+        rows.append(_to_row(r, rank=i, origins=origins))
+
     # Ensure width
     fixed: List[List[Any]] = []
     for rr in rows:
@@ -442,6 +645,7 @@ def _grid_from_results(results: List[Dict[str, Any]], headers: Optional[List[str
         elif len(rr) > len(h):
             rr = rr[: len(h)]
         fixed.append(rr)
+
     return [h] + fixed
 
 
@@ -454,14 +658,18 @@ def main() -> None:
     p.add_argument("--ksa-only", action="store_true", help="Keep only KSA (.SR or numeric) symbols")
     p.add_argument("--global-only", action="store_true", help="Keep only Global (non-.SR) symbols")
     p.add_argument("--max-symbols", type=int, default=0, help="Cap total symbols (0 = no cap)")
+
     p.add_argument("--batch-size", type=int, default=200, help="Backend batch size for /v1/analysis/quotes")
     p.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout per batch")
     p.add_argument("--retries", type=int, default=2, help="HTTP retries per batch")
+
     p.add_argument("--top", type=int, default=50, help="Keep top N results after ranking")
     p.add_argument("--min-quality", default="ANY", help="ANY | OK | PARTIAL | MISSING | ERROR")
     p.add_argument("--include-errors", action="store_true", help="Keep rows with error (default: filtered if quality too low)")
+
     p.add_argument("--out-json", default="", help="Write results JSON to file path")
     p.add_argument("--out-csv", default="", help="Write results CSV to file path (basic)")
+    p.add_argument("--dry-run", action="store_true", help="Run scan and ranking but do not write to sheet")
 
     # Sheets output
     p.add_argument("--no-sheet", action="store_true", help="Do not write to Google Sheets; print summary only")
@@ -469,6 +677,9 @@ def main() -> None:
     p.add_argument("--sheet-name", default="Market_Scan", help="Target sheet/tab name (default: Market_Scan)")
     p.add_argument("--start-cell", default="A5", help="Top-left cell for headers (default: A5)")
     p.add_argument("--clear", action="store_true", help="Clear old values before writing")
+    p.add_argument("--smart-clear", action="store_true", help="Clear only table width (default ON when --clear)")
+    p.add_argument("--clear-end-row", type=int, default=100000, help="Clear end row (default 100000)")
+    p.add_argument("--value-input", default="RAW", choices=["RAW", "USER_ENTERED", "raw", "user_entered"], help="Sheets write mode")
 
     # Logging
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
@@ -482,19 +693,24 @@ def main() -> None:
     base_url = _get_backend_base_url()
     logger.info("MarketScan v%s | backend=%s | ts=%s", SCRIPT_VERSION, base_url, _utc_now_iso())
 
-    # Select keys
-    keys = [k.strip().upper() for k in (args.keys or []) if k and k.strip()]
+    # Keys
+    keys = _parse_keys_list(args.keys)
     if not keys:
         keys = _default_keys()
 
-    # Read symbols from keys
+    # Read symbols
     all_symbols: List[str] = []
     per_key_meta: Dict[str, Any] = {}
+    origin_map: Dict[str, List[str]] = {}
 
     for k in keys:
         b = _read_symbols_for_key(k)
         per_key_meta[k] = b.meta
         all_symbols.extend(b.symbols)
+        for s in b.symbols:
+            origin_map.setdefault(s, [])
+            if k not in origin_map[s]:
+                origin_map[s].append(k)
 
     all_symbols = _dedupe(all_symbols)
 
@@ -503,9 +719,9 @@ def main() -> None:
         sys.exit(2)
 
     if args.ksa_only:
-        all_symbols = [s for s in all_symbols if s.endswith(".SR") or s.replace(".SR", "").isdigit()]
+        all_symbols = [s for s in all_symbols if _is_ksa(s)]
     if args.global_only:
-        all_symbols = [s for s in all_symbols if not (s.endswith(".SR") or s.replace(".SR", "").isdigit())]
+        all_symbols = [s for s in all_symbols if not _is_ksa(s)]
 
     if args.max_symbols and args.max_symbols > 0 and len(all_symbols) > int(args.max_symbols):
         all_symbols = all_symbols[: int(args.max_symbols)]
@@ -525,42 +741,55 @@ def main() -> None:
         batch_size=max(1, _safe_int(args.batch_size, 200)),
     )
     dt = time.time() - t0
-    logger.info("Backend returned results=%s in %.2fs", len(results), dt)
+    logger.info("Backend returned raw rows=%s in %.2fs", len(results), dt)
 
-    # Filter by quality
+    # Quality filter
     min_q = str(args.min_quality or "ANY").strip().upper()
-    if not args.include_errors and min_q != "ANY":
-        results = [r for r in results if _passes_quality(r, min_q)]
-    elif not args.include_errors:
-        # Even with ANY, remove pure error rows that have no symbol/score
-        tmp = []
-        for r in results:
-            if (r.get("error") or "") and (r.get("opportunity_score") is None) and (r.get("overall_score") is None):
-                continue
-            tmp.append(r)
-        results = tmp
 
-    # Rank + top N
+    if not args.include_errors:
+        if min_q != "ANY":
+            results = [r for r in results if _passes_quality(r, min_q)]
+        else:
+            # with ANY: drop pure-error rows that have no scores at all
+            tmp: List[Dict[str, Any]] = []
+            for r in results:
+                if (r.get("error") or "") and (r.get("opportunity_score") is None) and (r.get("overall_score") is None):
+                    continue
+                tmp.append(r)
+            results = tmp
+
+    # Rank + Top N
     results_sorted = sorted(results, key=_rank_key, reverse=True)
     top_n = max(1, _safe_int(args.top, 50))
     results_sorted = results_sorted[:top_n]
 
-    logger.info("Final rows: %s (top=%s, min_quality=%s)", len(results_sorted), top_n, min_q)
+    logger.info("Final ranked rows: %s (top=%s, min_quality=%s)", len(results_sorted), top_n, min_q)
 
-    # Optional file outputs
+    # Outputs: JSON/CSV
     if args.out_json:
         try:
             with open(args.out_json, "w", encoding="utf-8") as f:
-                json.dump({"generated_utc": _utc_now_iso(), "keys": keys, "results": results_sorted}, f, ensure_ascii=False, indent=2)
+                json.dump(
+                    {
+                        "generated_utc": _utc_now_iso(),
+                        "version": SCRIPT_VERSION,
+                        "backend": base_url,
+                        "keys": keys,
+                        "symbols_count": len(all_symbols),
+                        "ranked_count": len(results_sorted),
+                        "results": results_sorted,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
             logger.info("Wrote JSON: %s", args.out_json)
         except Exception as e:
             logger.error("Failed writing JSON (%s): %s", args.out_json, e)
 
     if args.out_csv:
         try:
-            import csv  # stdlib
-
-            grid = _grid_from_results(results_sorted)
+            grid = _grid_from_results(results_sorted, origin_map=origin_map)
             with open(args.out_csv, "w", encoding="utf-8", newline="") as f:
                 w = csv.writer(f)
                 for row in grid:
@@ -569,13 +798,15 @@ def main() -> None:
         except Exception as e:
             logger.error("Failed writing CSV (%s): %s", args.out_csv, e)
 
-    # Sheets write (optional)
-    if args.no_sheet:
-        logger.info("Done (no-sheet). Top symbols: %s", [r.get("symbol") for r in results_sorted[:10]])
+    # No sheet / dry run
+    if args.no_sheet or args.dry_run:
+        top_syms = [_norm_symbol(str(r.get("symbol") or r.get("ticker") or "")) for r in results_sorted[:10]]
+        logger.info("Done (%s). Top symbols: %s", "no-sheet" if args.no_sheet else "dry-run", top_syms)
         return
 
+    # Sheets write
     if sheets_service is None:
-        logger.error("google_sheets_service is not importable; cannot write to sheet. Use --no-sheet.")
+        logger.error("google_sheets_service not importable; cannot write to sheet. Use --no-sheet.")
         sys.exit(2)
 
     sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
@@ -584,22 +815,34 @@ def main() -> None:
         sys.exit(2)
 
     sheet_name = (args.sheet_name or "Market_Scan").strip()
-    start_cell = (args.start_cell or "A5").strip()
+    start_cell = _validate_start_cell(str(args.start_cell or "A5"))
+    clear_end_row = max(1000, _safe_int(args.clear_end_row, 100000))
 
-    grid = _grid_from_results(results_sorted)
+    value_input = str(args.value_input or "RAW").strip().upper()
+    if value_input not in ("RAW", "USER_ENTERED"):
+        value_input = "RAW"
 
-    # Optional clear
+    grid = _grid_from_results(results_sorted, origin_map=origin_map)
+
+    # Clear old values (optional)
     if args.clear:
+        smart_clear = bool(args.smart_clear) or True  # default ON when --clear
         try:
-            # Clear a safe large area starting from start_cell
-            # Reuse sheets_service internals if available, else a minimal clear via clear_range
-            start_col, start_row = sheets_service._parse_a1_cell(start_cell)  # type: ignore[attr-defined]
-            safe_rng = f"{sheets_service._safe_sheet_name(sheet_name)}!{sheets_service._a1(start_col, start_row)}:ZZ100000"  # type: ignore[attr-defined]
-            sheets_service.clear_range(sheet_id, safe_rng)  # type: ignore
+            start_col, start_row = _parse_a1_cell(start_cell)
+            end_col = "ZZ"
+            if smart_clear:
+                end_col = _index_to_col(_col_to_index(start_col) + len(grid[0]) - 1)
+
+            rng = f"{_safe_sheet_name(sheet_name)}!{_a1(start_col, start_row)}:{end_col}{clear_end_row}"
+            sheets_service.clear_range(sheet_id, rng)  # type: ignore
+            logger.info("Cleared range: %s", rng)
         except Exception as e:
             logger.warning("Clear failed (continuing): %s", e)
 
     try:
+        # Prefer service's chunked writer
+        # (google_sheets_service writes in RAW; if your service supports value_input, it will accept it.
+        # If not, it will ignore because write_grid_chunked doesn't accept it.)
         updated = sheets_service.write_grid_chunked(sheet_id, sheet_name, start_cell, grid)  # type: ignore
         logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
     except Exception as e:
