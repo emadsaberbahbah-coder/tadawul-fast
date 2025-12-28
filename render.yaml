@@ -1,16 +1,17 @@
-# render.yaml — FULL REPLACEMENT
+# render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.1.1)
+# PROD-SAFE + Backward-Compatible env var names (v1.1.2)
 # ============================================================
 #
-# v1.1.1 changes vs v1.1.0
-# - ✅ Adds ENGINE_CACHE_TTL_SEC + ENRICHED_CONCURRENCY alias coverage (explicit)
-# - ✅ Adds ENABLE_SWAGGER / ENABLE_REDOC feature flags (used by config.py)
-# - ✅ Adds ADVANCED_ANALYSIS_ENABLED + AI_ANALYSIS_ENABLED flags (main.py reads)
-# - ✅ Keeps BOTH styles for compatibility: HTTP_TIMEOUT(_SEC), CACHE_TTL_SEC/CACHE_DEFAULT_TTL
-# - ✅ Keeps KSA yfinance OFF by default (ENABLE_YFINANCE_KSA=false)
+# v1.1.2 changes vs v1.1.1
+# - ✅ startCommand is integer-safe for WEB_CONCURRENCY (no shell integer crash)
+# - ✅ keeps deterministic uvicorn argv building + optional tuning flags
+# - ✅ keeps full env compat (both *_SEC and legacy aliases)
 #
+# NOTE:
+# - Do NOT hardcode your public URL if you use a different Render service name.
+#   You can set BACKEND_BASE_URL in Render dashboard after first deploy.
 
 services:
   - type: web
@@ -21,22 +22,53 @@ services:
 
     buildCommand: pip install -r requirements.txt
 
-    # Render-friendly deterministic startup:
-    # - lowercases LOG_LEVEL for uvicorn
-    # - only adds --workers if WEB_CONCURRENCY > 1
+    # Deterministic + safe startup (no "integer expression" crash)
     startCommand: >
-      sh -c 'LOG_LEVEL_LC="$(echo "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
-      if [ "${WEB_CONCURRENCY:-1}" -gt 1 ]; then WORKERS="--workers ${WEB_CONCURRENCY}"; else WORKERS=""; fi;
-      exec uvicorn main:app
-      --host 0.0.0.0
-      --port "${PORT:-8000}"
-      --proxy-headers
-      --forwarded-allow-ips "*"
-      --lifespan on
-      --timeout-keep-alive "${UVICORN_KEEPALIVE:-75}"
-      --log-level "$LOG_LEVEL_LC"
-      $WORKERS
-      --no-server-header'
+      sh -c '
+      LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
+      PORT_VAL="${PORT:-8000}";
+      KEEPALIVE_VAL="${UVICORN_KEEPALIVE:-75}";
+      case "${WEB_CONCURRENCY:-1}" in (""|*[!0-9]*) CONC=1 ;; (*) CONC="${WEB_CONCURRENCY:-1}" ;; esac;
+
+      set -- uvicorn main:app
+        --host 0.0.0.0
+        --port "$PORT_VAL"
+        --proxy-headers
+        --forwarded-allow-ips "*"
+        --lifespan on
+        --timeout-keep-alive "$KEEPALIVE_VAL"
+        --log-level "$LOG_LEVEL_LC"
+        --no-server-header;
+
+      if [ "$CONC" -gt 1 ]; then
+        set -- "$@" --workers "$CONC";
+      fi;
+
+      case "${UVICORN_ACCESS_LOG:-1}" in
+        (0|false|no|off) set -- "$@" --no-access-log ;;
+        (*)              set -- "$@" --access-log ;;
+      esac;
+
+      case "${UVICORN_LIMIT_CONCURRENCY:-}" in
+        (""|*[!0-9]*) : ;;
+        (*) set -- "$@" --limit-concurrency "${UVICORN_LIMIT_CONCURRENCY}" ;;
+      esac;
+
+      case "${UVICORN_LIMIT_MAX_REQUESTS:-}" in
+        (""|*[!0-9]*) : ;;
+        (*) set -- "$@" --limit-max-requests "${UVICORN_LIMIT_MAX_REQUESTS}" ;;
+      esac;
+
+      case "${UVICORN_BACKLOG:-}" in
+        (""|*[!0-9]*) : ;;
+        (*) set -- "$@" --backlog "${UVICORN_BACKLOG}" ;;
+      esac;
+
+      if [ -n "${UVICORN_ROOT_PATH:-}" ]; then
+        set -- "$@" --root-path "${UVICORN_ROOT_PATH}";
+      fi;
+
+      exec "$@"'
 
     healthCheckPath: /healthz
 
@@ -87,7 +119,7 @@ services:
       - key: VERSION
         value: "5.0.0"
 
-      # Public base url of this service
+      # Public base url of this service (adjust to your real Render URL)
       - key: BACKEND_BASE_URL
         value: "https://tadawul-fast-bridge.onrender.com"
       - key: TFB_BASE_URL
@@ -144,7 +176,7 @@ services:
       - key: ENABLE_YFINANCE
         value: "true"       # global fallback if your engine uses it
       - key: ENABLE_YFINANCE_KSA
-        value: "false"      # IMPORTANT: keep KSA yfinance OFF unless you explicitly want it
+        value: "false"      # IMPORTANT: keep KSA yfinance OFF unless explicitly desired
 
       # Provider keys (SECRETS) — keep Render names (config.py exports aliases)
       - key: FMP_API_KEY
