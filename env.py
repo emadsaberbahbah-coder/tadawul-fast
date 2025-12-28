@@ -1,8 +1,8 @@
-# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.6
+# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.7
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.6)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.7)
 
 Key goals
 - ✅ Quiet boot by default (no banner logs unless ENV_LOG_ON_BOOT=true)
@@ -11,17 +11,22 @@ Key goals
 - ✅ Provides legacy exports used by older modules/routes
 - ✅ Ensures token alias exports (FINNHUB_API_TOKEN / EODHD_API_TOKEN) for legacy modules
 - ✅ Keeps ENGINE_CACHE_TTL_SEC + ENRICHED_BATCH_CONCURRENCY (aligns with ENRICHED_CONCURRENCY)
+- ✅ Robust GOOGLE_SHEETS_CREDENTIALS parsing: supports minified JSON OR base64(minified JSON)
+
+Notes
+- This file is intentionally defensive: it must never prevent app startup.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.0.6"
+ENV_VERSION = "5.0.7"
 logger = logging.getLogger("env")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -117,18 +122,62 @@ def _as_list_lower(v: Any) -> List[str]:
     return out
 
 
+def _strip_wrapping_quotes(s: str) -> str:
+    t = (s or "").strip()
+    if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
+        return t[1:-1].strip()
+    return t
+
+
+def _maybe_b64_decode(s: str) -> str:
+    """
+    If s looks like base64 and decodes to JSON, return decoded.
+    Otherwise return original.
+    """
+    raw = (s or "").strip()
+    if not raw:
+        return raw
+    if raw.startswith("{"):
+        return raw
+    if len(raw) < 120:
+        return raw
+    try:
+        dec = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
+        if dec.startswith("{") and '"private_key"' in dec:
+            return dec
+    except Exception:
+        return raw
+    return raw
+
+
 def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    Accepts:
+    - dict
+    - JSON string
+    - base64(JSON string)
+    - quoted JSON string
+    Returns dict or None
+    """
     if raw is None:
         return None
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str):
         return None
+
     s = raw.strip()
     if not s:
         return None
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1].strip()
+
+    s = _strip_wrapping_quotes(s)
+    s = _maybe_b64_decode(s)
+    s = _strip_wrapping_quotes(s).strip()
+    if not s:
+        return None
+    if not s.startswith("{"):
+        return None
+
     try:
         obj = json.loads(s)
         return obj if isinstance(obj, dict) else None
@@ -222,13 +271,6 @@ def _env_first_bool(settings_obj: Optional[object], env_key: str, settings_attr:
     return _safe_bool(_get_attr(settings_obj, settings_attr, None), default)
 
 
-def _env_first_float(settings_obj: Optional[object], env_key: str, settings_attr: str, default: float) -> float:
-    v = _get_first_env(env_key)
-    if v is not None:
-        return _safe_float(v, default)
-    return _safe_float(_get_attr(settings_obj, settings_attr, None), default)
-
-
 def _resolve_version(settings_obj: Optional[object]) -> str:
     # 1) ENV FIRST (canonical)
     for k in ("APP_VERSION", "SERVICE_VERSION", "VERSION", "RELEASE"):
@@ -279,8 +321,16 @@ BACKEND_BASE_URL = (
     or ""
 )
 
-APP_TOKEN = _get_first_env("APP_TOKEN", "TFB_APP_TOKEN") or str(_get_attr(_base_settings, "app_token", "") or "").strip() or None
-BACKUP_APP_TOKEN = _get_first_env("BACKUP_APP_TOKEN") or str(_get_attr(_base_settings, "backup_app_token", "") or "").strip() or None
+APP_TOKEN = (
+    _get_first_env("APP_TOKEN", "TFB_APP_TOKEN")
+    or str(_get_attr(_base_settings, "app_token", "") or "").strip()
+    or None
+)
+BACKUP_APP_TOKEN = (
+    _get_first_env("BACKUP_APP_TOKEN")
+    or str(_get_attr(_base_settings, "backup_app_token", "") or "").strip()
+    or None
+)
 
 REQUIRE_AUTH = _env_first_bool(_base_settings, "REQUIRE_AUTH", "require_auth", False)
 
@@ -311,17 +361,26 @@ PRIMARY_PROVIDER = (
 PROVIDERS = _safe_join(ENABLED_PROVIDERS)
 
 # HTTP / cache
-HTTP_TIMEOUT_SEC = _safe_float(_get_first_env("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT") or _get_attr(_base_settings, "http_timeout_sec", None), 25.0)
+HTTP_TIMEOUT_SEC = _safe_float(
+    _get_first_env("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT") or _get_attr(_base_settings, "http_timeout_sec", None),
+    25.0,
+)
 HTTP_TIMEOUT_SEC = max(5.0, float(HTTP_TIMEOUT_SEC or 25.0))
 HTTP_TIMEOUT = _safe_int(_get_first_env("HTTP_TIMEOUT") or int(HTTP_TIMEOUT_SEC), int(HTTP_TIMEOUT_SEC))
 
 CACHE_TTL_SEC = _safe_float(_get_first_env("CACHE_TTL_SEC") or _get_attr(_base_settings, "cache_ttl_sec", None), 20.0)
 
 # Added (keep your legacy aliases)
-ENGINE_CACHE_TTL_SEC = _safe_int(_get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC") or _get_attr(_base_settings, "engine_cache_ttl_sec", None), int(CACHE_TTL_SEC))
+ENGINE_CACHE_TTL_SEC = _safe_int(
+    _get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC") or _get_attr(_base_settings, "engine_cache_ttl_sec", None),
+    int(CACHE_TTL_SEC),
+)
 
 # Keep legacy name but also align with your blueprint "ENRICHED_CONCURRENCY"
-ENRICHED_BATCH_CONCURRENCY = _safe_int(_get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY") or _get_attr(_base_settings, "enriched_batch_concurrency", None), 8)
+ENRICHED_BATCH_CONCURRENCY = _safe_int(
+    _get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY") or _get_attr(_base_settings, "enriched_batch_concurrency", None),
+    8,
+)
 
 # Provider keys
 EODHD_API_KEY = _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN") or _get_attr(_base_settings, "eodhd_api_key", None)
@@ -373,8 +432,12 @@ DEFAULT_SPREADSHEET_ID = (
 SPREADSHEET_ID = DEFAULT_SPREADSHEET_ID
 GOOGLE_SHEETS_ID = (_get_first_env("GOOGLE_SHEETS_ID") or "").strip()
 
-GOOGLE_APPS_SCRIPT_URL = (_get_first_env("GOOGLE_APPS_SCRIPT_URL") or str(_get_attr(_base_settings, "google_apps_script_url", "") or "")).strip()
-GOOGLE_APPS_SCRIPT_BACKUP_URL = (_get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL") or str(_get_attr(_base_settings, "google_apps_script_backup_url", "") or "")).strip()
+GOOGLE_APPS_SCRIPT_URL = (
+    (_get_first_env("GOOGLE_APPS_SCRIPT_URL") or str(_get_attr(_base_settings, "google_apps_script_url", "") or "")).strip()
+)
+GOOGLE_APPS_SCRIPT_BACKUP_URL = (
+    (_get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL") or str(_get_attr(_base_settings, "google_apps_script_backup_url", "") or "")).strip()
+)
 
 # Sheet names (keep legacy keys)
 SHEET_KSA_TADAWUL = (_get_first_env("SHEET_KSA_TADAWUL") or "KSA_Tadawul_Market").strip()
