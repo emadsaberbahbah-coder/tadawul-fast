@@ -1,11 +1,12 @@
 # render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.1.2)
+# PROD-SAFE + Backward-Compatible env var names (v1.1.3)
 # ============================================================
 #
-# v1.1.2 changes vs v1.1.1
-# - ✅ startCommand is integer-safe for WEB_CONCURRENCY (no shell integer crash)
+# v1.1.3 changes vs v1.1.2
+# - ✅ KSA_PROVIDERS set to "yahoo_chart" (Option A: remove Tadawul/Argaam warnings, keep KSA stable)
+# - ✅ keeps integer-safe WEB_CONCURRENCY handling (no shell integer crash)
 # - ✅ keeps deterministic uvicorn argv building + optional tuning flags
 # - ✅ keeps full env compat (both *_SEC and legacy aliases)
 #
@@ -111,13 +112,13 @@ services:
       - key: ENVIRONMENT
         value: "production"
 
-      # Version (compat keys)
+      # Version (compat keys) — keep aligned with your deployed version
       - key: APP_VERSION
-        value: "5.0.0"
+        value: "5.3.1"
       - key: SERVICE_VERSION
-        value: "5.0.0"
+        value: "5.3.1"
       - key: VERSION
-        value: "5.0.0"
+        value: "5.3.1"
 
       # Public base url of this service (adjust to your real Render URL)
       - key: BACKEND_BASE_URL
@@ -158,9 +159,9 @@ services:
       - key: PRIMARY_PROVIDER
         value: "finnhub"
 
-      # KSA routing order
+      # KSA routing order (Option A: stable + no "tadawul skipped" warning)
       - key: KSA_PROVIDERS
-        value: "tadawul,argaam,yahoo_chart"
+        value: "yahoo_chart"
 
       # Hard safety: never use EODHD for KSA
       - key: KSA_DISALLOW_EODHD
