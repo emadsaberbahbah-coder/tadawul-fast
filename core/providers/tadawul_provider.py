@@ -2,7 +2,7 @@
 """
 core/providers/tadawul_provider.py
 ===============================================================
-Tadawul Provider / Client (KSA quote + fundamentals) — v1.9.0
+Tadawul Provider / Client (KSA quote + fundamentals) — v1.10.0
 PROD SAFE + Async + ENGINE-ALIGNED (DICT RETURNS)
 
 What this revision guarantees
@@ -13,9 +13,11 @@ What this revision guarantees
   (all return Dict[str, Any] — NO tuples)
 - ✅ Never crashes import; never does network at import-time
 - ✅ Clean "not configured" if TADAWUL_* URLs are missing
-- ✅ Defensive parsing + bounded deep-find
-- ✅ Aligns with your env style (HTTP_TIMEOUT, TADAWUL_REFRESH_INTERVAL, etc.)
-- ✅ Avoids misleading values: we only set fields we can actually parse
+- ✅ Strict KSA-only guard (prevents misrouting GLOBAL tickers into Tadawul)
+- ✅ Defensive parsing + bounded deep-find (prevents recursion blowups)
+- ✅ Retry/backoff on 429 + transient 5xx
+- ✅ Cache for quote + fundamentals (TTL from env)
+- ✅ Avoids misleading values: only sets fields we can parse
 
 Supported env vars (optional)
 - TADAWUL_MARKET_ENABLED          true/false (default true)
@@ -24,7 +26,7 @@ Supported env vars (optional)
   (also accepts TADAWUL_PROFILE_URL as fallback for fundamentals URL)
 - TADAWUL_HEADERS_JSON            JSON dict of headers (optional)
 - TADAWUL_TIMEOUT_SEC             default falls back to HTTP_TIMEOUT then 25
-- TADAWUL_RETRY_ATTEMPTS          default 3
+- TADAWUL_RETRY_ATTEMPTS          default 3 (min 1)
 - TADAWUL_REFRESH_INTERVAL        used as quote cache TTL if > 0 (seconds)
 - TADAWUL_QUOTE_TTL_SEC           explicit quote TTL override
 - TADAWUL_FUND_TTL_SEC            fundamentals TTL (default 6 hours)
@@ -32,7 +34,11 @@ Supported env vars (optional)
 Also reads (if present)
 - HTTP_TIMEOUT                    (Render env list)
 - HTTP_TIMEOUT_SEC                (legacy)
-- MAX_RETRIES / RETRY_DELAY       (not required here, but tolerated)
+- MAX_RETRIES / RETRY_DELAY       (tolerated)
+
+Notes
+- This provider expects you to supply your own Tadawul endpoints via env URLs.
+- The JSON schema of those endpoints can vary; parsing is best-effort via key search.
 """
 
 from __future__ import annotations
@@ -46,15 +52,14 @@ import random
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import httpx
-from cachetools import TTLCache
 
 logger = logging.getLogger("core.providers.tadawul_provider")
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "1.9.0"
+PROVIDER_VERSION = "1.10.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,22 +71,17 @@ DEFAULT_TIMEOUT_SEC = 25.0
 DEFAULT_RETRY_ATTEMPTS = 3
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_FALSY = {"0", "false", "no", "n", "off", "f"}
+
+# KSA symbol: 3-6 digits, optionally .SR
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
+_KSA_SYMBOL_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 
 # -----------------------------------------------------------------------------
-# Settings shim (PROD SAFE)
+# Safe helpers
 # -----------------------------------------------------------------------------
-try:
-    from core.config import get_settings  # type: ignore
-
-    _settings = get_settings()
-except Exception:  # pragma: no cover
-    class _FallbackSettings:
-        pass
-
-    _settings = _FallbackSettings()  # type: ignore
-
-
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -99,96 +99,86 @@ def _to_bool(v: Any, default: bool = False) -> bool:
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()
-    if s in {"1", "true", "yes", "y", "on", "t"}:
+    if s in _TRUTHY:
         return True
-    if s in {"0", "false", "no", "n", "off", "f"}:
+    if s in _FALSY:
         return False
     return default
 
 
-def _get_attr_or_env(name: str, default: Any = None) -> Any:
-    # Try settings attr first
-    try:
-        if hasattr(_settings, name):
-            v = getattr(_settings, name)
-            if v is not None:
-                return v
-    except Exception:
-        pass
-
-    # Then env in common variants
-    for k in (name, name.upper(), name.lower()):
-        v = os.getenv(k)
-        if v is not None:
-            s = str(v).strip()
-            if s != "":
-                return s
-            return v
-    return default
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
 
 
-def _get_int_allow0(name: str, default: int) -> int:
-    raw = _get_attr_or_env(name, None)
-    if raw is None:
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
         return default
     try:
-        return int(str(raw).strip())
+        return int(str(v).strip())
     except Exception:
         return default
 
 
-def _get_float_allow0(name: str, default: float) -> float:
-    raw = _get_attr_or_env(name, None)
-    if raw is None:
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None:
         return default
     try:
-        return float(str(raw).strip())
+        return float(str(v).strip())
     except Exception:
         return default
 
 
-def _get_timeout_sec() -> float:
-    # Prefer TADAWUL_TIMEOUT_SEC, then HTTP_TIMEOUT, then HTTP_TIMEOUT_SEC, then default
-    t = _get_float_allow0("TADAWUL_TIMEOUT_SEC", 0.0)
-    if t and t > 0:
-        return float(t)
-    t = _get_float_allow0("HTTP_TIMEOUT", 0.0)
-    if t and t > 0:
-        return float(t)
-    t = _get_float_allow0("HTTP_TIMEOUT_SEC", 0.0)
-    if t and t > 0:
-        return float(t)
-    return float(DEFAULT_TIMEOUT_SEC)
+def _timeout_sec() -> float:
+    t = _env_float("TADAWUL_TIMEOUT_SEC", 0.0)
+    if t > 0:
+        return t
+    t = _env_float("HTTP_TIMEOUT", 0.0)
+    if t > 0:
+        return t
+    t = _env_float("HTTP_TIMEOUT_SEC", 0.0)
+    if t > 0:
+        return t
+    return DEFAULT_TIMEOUT_SEC
 
 
-def _get_retry_attempts() -> int:
-    r = _get_int_allow0("TADAWUL_RETRY_ATTEMPTS", 0)
-    if r and r > 0:
-        return int(r)
-    r = _get_int_allow0("HTTP_RETRY_ATTEMPTS", 0)
-    if r and r > 0:
-        return int(r)
-    r = _get_int_allow0("MAX_RETRIES", 0)
-    if r and r > 0:
-        return int(r)
-    return int(DEFAULT_RETRY_ATTEMPTS)
+def _retry_attempts() -> int:
+    r = _env_int("TADAWUL_RETRY_ATTEMPTS", 0)
+    if r > 0:
+        return r
+    r = _env_int("HTTP_RETRY_ATTEMPTS", 0)
+    if r > 0:
+        return r
+    r = _env_int("MAX_RETRIES", 0)
+    if r > 0:
+        return r
+    return DEFAULT_RETRY_ATTEMPTS
+
+
+def _retry_delay_sec() -> float:
+    d = _env_float("TADAWUL_RETRY_DELAY_SEC", _env_float("RETRY_DELAY", _env_float("RETRY_DELAY_SEC", 0.35)))
+    return d if d > 0 else 0.35
 
 
 def _quote_ttl_sec() -> float:
-    # Prefer explicit quote TTL, otherwise use TADAWUL_REFRESH_INTERVAL, else default 15
-    ttl = _get_float_allow0("TADAWUL_QUOTE_TTL_SEC", 0.0)
-    if ttl and ttl > 0:
-        return max(5.0, float(ttl))
-    ri = _get_float_allow0("TADAWUL_REFRESH_INTERVAL", 0.0)
-    if ri and ri > 0:
-        return max(5.0, float(ri))
+    ttl = _env_float("TADAWUL_QUOTE_TTL_SEC", 0.0)
+    if ttl > 0:
+        return max(5.0, ttl)
+    ri = _env_float("TADAWUL_REFRESH_INTERVAL", 0.0)
+    if ri > 0:
+        return max(5.0, ri)
     return 15.0
 
 
 def _fund_ttl_sec() -> float:
-    ttl = _get_float_allow0("TADAWUL_FUND_TTL_SEC", 0.0)
-    if ttl and ttl > 0:
-        return max(120.0, float(ttl))
+    ttl = _env_float("TADAWUL_FUND_TTL_SEC", 0.0)
+    if ttl > 0:
+        return max(120.0, ttl)
     return 21600.0  # 6 hours
 
 
@@ -248,6 +238,13 @@ def _pct_if_fraction(x: Any) -> Optional[float]:
     return v * 100.0 if abs(v) <= 1.0 else v
 
 
+def _is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    return bool(_KSA_SYMBOL_RE.match(s) or _KSA_CODE_RE.match(s))
+
+
 def _ksa_code(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s:
@@ -263,73 +260,17 @@ def _normalize_ksa_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s:
         return ""
-    if s.isdigit():
-        return f"{s}.SR"
     if s.endswith(".SR"):
-        return s
-    if re.match(r"^\d{3,6}$", s):
+        code = s[:-3]
+        return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
+    if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
-    return s
+    return ""  # STRICT: prevent GLOBAL tickers
 
 
 def _format_url(template: str, symbol: str) -> str:
     code = _ksa_code(symbol)
     return (template or "").replace("{code}", code).replace("{symbol}", symbol)
-
-
-# -----------------------------------------------------------------------------
-# Deep-find helpers (bounded)
-# -----------------------------------------------------------------------------
-def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 5) -> Any:
-    if obj is None:
-        return None
-
-    keyset = {k.lower() for k in keys if k}
-    seen_ids = set()
-
-    def _walk(x: Any, depth: int) -> Any:
-        if x is None or depth < 0:
-            return None
-        xid = id(x)
-        if xid in seen_ids:
-            return None
-        seen_ids.add(xid)
-
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if str(k).strip().lower() in keyset:
-                    return v
-            for v in x.values():
-                r = _walk(v, depth - 1)
-                if r is not None:
-                    return r
-            return None
-
-        if isinstance(x, list):
-            for it in x:
-                r = _walk(it, depth - 1)
-                if r is not None:
-                    return r
-            return None
-
-        return None
-
-    return _walk(obj, max_depth)
-
-
-def _pick_num(obj: Any, *keys: str, max_depth: int = 5) -> Optional[float]:
-    v = _find_first_value(obj, keys, max_depth=max_depth)
-    return _safe_float(v)
-
-
-def _pick_pct(obj: Any, *keys: str, max_depth: int = 5) -> Optional[float]:
-    v = _find_first_value(obj, keys, max_depth=max_depth)
-    return _pct_if_fraction(v)
-
-
-def _pick_str(obj: Any, *keys: str, max_depth: int = 5) -> Optional[str]:
-    v = _find_first_value(obj, keys, max_depth=max_depth)
-    return _safe_str(v)
 
 
 def _coerce_dict(data: Any) -> Dict[str, Any]:
@@ -341,7 +282,122 @@ def _coerce_dict(data: Any) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Output schema (aligned with your other providers)
+# Bounded deep-find helpers (safe for unknown JSON shapes)
+# -----------------------------------------------------------------------------
+def _iter_children(x: Any) -> Iterable[Any]:
+    if isinstance(x, dict):
+        return x.values()
+    if isinstance(x, list):
+        return x
+    return []
+
+
+def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 6, max_nodes: int = 2500) -> Any:
+    """
+    Breadth-first bounded search over dict/list nodes.
+    Never raises; returns first matching value for any key in `keys`.
+    """
+    if obj is None:
+        return None
+    keyset = {str(k).strip().lower() for k in keys if k}
+    if not keyset:
+        return None
+
+    q: List[Tuple[Any, int]] = [(obj, 0)]
+    seen: set[int] = set()
+    nodes = 0
+
+    while q:
+        x, d = q.pop(0)
+        if x is None:
+            continue
+
+        xid = id(x)
+        if xid in seen:
+            continue
+        seen.add(xid)
+
+        nodes += 1
+        if nodes > max_nodes:
+            return None
+        if d > max_depth:
+            continue
+
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if str(k).strip().lower() in keyset:
+                    return v
+            for child in x.values():
+                q.append((child, d + 1))
+            continue
+
+        if isinstance(x, list):
+            for child in x:
+                q.append((child, d + 1))
+            continue
+
+    return None
+
+
+def _pick_num(obj: Any, *keys: str, max_depth: int = 6) -> Optional[float]:
+    v = _find_first_value(obj, keys, max_depth=max_depth)
+    return _safe_float(v)
+
+
+def _pick_pct(obj: Any, *keys: str, max_depth: int = 6) -> Optional[float]:
+    v = _find_first_value(obj, keys, max_depth=max_depth)
+    return _pct_if_fraction(v)
+
+
+def _pick_str(obj: Any, *keys: str, max_depth: int = 6) -> Optional[str]:
+    v = _find_first_value(obj, keys, max_depth=max_depth)
+    return _safe_str(v)
+
+
+# -----------------------------------------------------------------------------
+# Minimal TTL cache (fallback if cachetools isn't installed)
+# -----------------------------------------------------------------------------
+try:
+    from cachetools import TTLCache  # type: ignore
+
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1.0, float(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            # naive eviction
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + self._ttl
+
+
+# -----------------------------------------------------------------------------
+# Output schema (subset; engine merge remains safe)
 # -----------------------------------------------------------------------------
 def _base(symbol: str) -> Dict[str, Any]:
     return {
@@ -376,9 +432,12 @@ def _base(symbol: str) -> Dict[str, Any]:
         "volume": None,
         "avg_volume_30d": None,
         "value_traded": None,
+        "turnover_percent": None,
         # valuation / ratios (best-effort)
         "eps_ttm": None,
+        "forward_eps": None,
         "pe_ttm": None,
+        "forward_pe": None,
         "pb": None,
         "ps": None,
         "ev_ebitda": None,
@@ -388,6 +447,9 @@ def _base(symbol: str) -> Dict[str, Any]:
         "roe": None,
         "roa": None,
         "net_margin": None,
+        "ebitda_margin": None,
+        "revenue_growth": None,
+        "net_income_growth": None,
         "beta": None,
         "debt_to_equity": None,
         "current_ratio": None,
@@ -433,7 +495,6 @@ def _fill_derived(out: Dict[str, Any]) -> None:
 
 
 def _quality(out: Dict[str, Any]) -> None:
-    # Quote must have current_price to be usable
     has_price = _safe_float(out.get("current_price")) is not None
     rich = bool((out.get("name") or "").strip()) or (_safe_float(out.get("market_cap")) is not None)
 
@@ -442,7 +503,7 @@ def _quality(out: Dict[str, Any]) -> None:
     else:
         out["data_quality"] = "FULL" if rich else "OK"
 
-    if out.get("error"):
+    if (out.get("error") or "").strip():
         out["status"] = "error"
 
 
@@ -458,87 +519,111 @@ class TadawulClient:
         timeout_sec: Optional[float] = None,
         retry_attempts: Optional[int] = None,
     ) -> None:
-        self.quote_url = _safe_str(quote_url or _get_attr_or_env("TADAWUL_QUOTE_URL"))
+        self.quote_url = _safe_str(quote_url or _env_str("TADAWUL_QUOTE_URL", ""))
         self.fundamentals_url = _safe_str(
             fundamentals_url
-            or _get_attr_or_env("TADAWUL_FUNDAMENTALS_URL")
-            or _get_attr_or_env("TADAWUL_PROFILE_URL")
+            or _env_str("TADAWUL_FUNDAMENTALS_URL", "")
+            or _env_str("TADAWUL_PROFILE_URL", "")
         )
 
-        self.timeout_sec = float(timeout_sec) if (timeout_sec and timeout_sec > 0) else _get_timeout_sec()
-        self.retry_attempts = int(retry_attempts) if (retry_attempts and retry_attempts > 0) else _get_retry_attempts()
+        self.timeout_sec = float(timeout_sec) if (timeout_sec and timeout_sec > 0) else _timeout_sec()
+        self.retry_attempts = int(retry_attempts) if (retry_attempts and retry_attempts > 0) else _retry_attempts()
 
         timeout = httpx.Timeout(self.timeout_sec, connect=min(10.0, self.timeout_sec))
+        base_headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json,text/plain,text/html;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
+        }
+
+        # Optional custom headers from env JSON
+        hdrs: Dict[str, str] = {}
+        raw = _safe_str(_env_str("TADAWUL_HEADERS_JSON", ""))
+        if raw:
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    hdrs.update({str(k): str(v) for k, v in obj.items()})
+            except Exception:
+                pass
+
+        if headers:
+            hdrs.update({str(k): str(v) for k, v in headers.items()})
+
+        base_headers.update(hdrs)
+        self._headers = base_headers
+
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json,text/plain,text/html;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
-            },
+            headers=self._headers,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
         )
-
-        self._headers: Dict[str, str] = {}
-        if headers:
-            self._headers.update({str(k): str(v) for k, v in headers.items()})
-
-        hdr_json = _safe_str(_get_attr_or_env("TADAWUL_HEADERS_JSON"))
-        if hdr_json:
-            try:
-                obj = json.loads(hdr_json)
-                if isinstance(obj, dict):
-                    self._headers.update({str(k): str(v) for k, v in obj.items()})
-            except Exception:
-                pass
 
         self._quote_cache: TTLCache = TTLCache(maxsize=5000, ttl=_quote_ttl_sec())
         self._fund_cache: TTLCache = TTLCache(maxsize=3000, ttl=_fund_ttl_sec())
 
+        logger.info(
+            "Tadawul client init v%s | quote_url_set=%s | fund_url_set=%s | timeout=%.1fs | retries=%s | cachetools=%s",
+            PROVIDER_VERSION,
+            bool(self.quote_url),
+            bool(self.fundamentals_url),
+            self.timeout_sec,
+            self.retry_attempts,
+            _HAS_CACHETOOLS,
+        )
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _get_json(self, url: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
-        for attempt in range(max(1, self.retry_attempts)):
+    async def _get_json(self, url: str) -> Tuple[Optional[Union[Dict[str, Any], List[Any]]], Optional[str]]:
+        retries = max(1, int(self.retry_attempts))
+        base_delay = _retry_delay_sec()
+
+        for attempt in range(retries):
             try:
-                r = await self._client.get(url, headers=(self._headers or None))
+                r = await self._client.get(url)
 
                 # Retry on 429 + 5xx
                 if r.status_code == 429 or 500 <= r.status_code < 600:
-                    if attempt < (self.retry_attempts - 1):
-                        await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.35)
+                    if attempt < (retries - 1):
+                        await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.35)
                         continue
-                    return None
+                    return None, f"HTTP {r.status_code}"
 
                 if r.status_code >= 400:
-                    return None
+                    return None, f"HTTP {r.status_code}"
 
+                # Prefer json() but tolerate JSON-in-text
                 try:
-                    return r.json()
+                    return r.json(), None
                 except Exception:
                     txt = (r.text or "").strip()
                     if txt.startswith("{") or txt.startswith("["):
                         try:
-                            return json.loads(txt)
+                            return json.loads(txt), None
                         except Exception:
-                            return None
-                    return None
+                            return None, "invalid JSON"
+                    return None, "non-JSON response"
 
-            except Exception:
-                if attempt < (self.retry_attempts - 1):
-                    await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.35)
+            except Exception as e:
+                if attempt < (retries - 1):
+                    await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.35)
                     continue
-                return None
-        return None
+                return None, f"{e.__class__.__name__}: {e}"
+
+        return None, "unknown error"
+
+    def _enabled(self) -> bool:
+        v = os.getenv("TADAWUL_MARKET_ENABLED")
+        if v is None or str(v).strip() == "":
+            return True
+        return _to_bool(v, True)
 
     async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
         out = _base(symbol)
-        out["data_source"] = PROVIDER_NAME
-        out["provider_version"] = PROVIDER_VERSION
 
-        enabled = _to_bool(_get_attr_or_env("TADAWUL_MARKET_ENABLED", True), True)
-        if not enabled:
+        if not self._enabled():
             out["status"] = "error"
             out["data_quality"] = "BAD"
             out["error"] = "tadawul: disabled (TADAWUL_MARKET_ENABLED=false)"
@@ -548,7 +633,7 @@ class TadawulClient:
         if not sym:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = "tadawul: empty symbol"
+            out["error"] = "tadawul: not a KSA symbol (expected 3-6 digits or .SR)"
             return out
 
         if not self.quote_url:
@@ -564,23 +649,29 @@ class TadawulClient:
 
         url = _format_url(self.quote_url, sym)
         t0 = time.perf_counter()
-        data = await self._get_json(url)
+        data, err = await self._get_json(url)
         dt_ms = int((time.perf_counter() - t0) * 1000)
 
         if not data:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = f"tadawul: quote empty response ({dt_ms}ms)"
+            out["error"] = f"tadawul: quote empty ({err or 'no data'}) ({dt_ms}ms)"
             return out
 
         root = _coerce_dict(data)
 
-        price = _pick_num(root, "price", "last", "last_price", "lastPrice", "tradingPrice", "close", "currentPrice", "c")
-        prev = _pick_num(root, "previous_close", "previousClose", "prevClose", "prev_close", "pc")
+        # Quote fields (best-effort)
+        price = _pick_num(
+            root,
+            "price", "last", "last_price", "lastPrice", "tradingPrice", "close", "currentPrice", "c",
+            "trading_price", "lastTradePrice",
+        )
+        prev = _pick_num(root, "previous_close", "previousClose", "prevClose", "prev_close", "pc", "previousPrice")
         opn = _pick_num(root, "open", "openPrice", "o")
-        hi = _pick_num(root, "high", "day_high", "dayHigh", "h")
-        lo = _pick_num(root, "low", "day_low", "dayLow", "l")
-        vol = _pick_num(root, "volume", "tradedVolume", "qty", "volumeTraded", "v")
+        hi = _pick_num(root, "high", "day_high", "dayHigh", "h", "sessionHigh")
+        lo = _pick_num(root, "low", "day_low", "dayLow", "l", "sessionLow")
+        vol = _pick_num(root, "volume", "tradedVolume", "qty", "quantity", "volumeTraded", "v", "tradedQty")
+        val_traded = _pick_num(root, "valueTraded", "tradingValue", "turnoverValue", "tradedValue", "value")
 
         chg = _pick_num(root, "change", "price_change", "diff", "delta", "d")
         chg_p = _pick_pct(root, "change_percent", "percent_change", "changePercent", "pctChange", "dp")
@@ -591,7 +682,7 @@ class TadawulClient:
         if price is None:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = f"tadawul: quote returned no price ({dt_ms}ms)"
+            out["error"] = f"tadawul: quote missing price ({dt_ms}ms)"
             return out
 
         out.update(
@@ -606,6 +697,7 @@ class TadawulClient:
                 "day_high": hi,
                 "day_low": lo,
                 "volume": vol,
+                "value_traded": val_traded,
                 "price_change": chg,
                 "percent_change": chg_p,
                 "last_updated_utc": _utc_iso(),
@@ -620,11 +712,8 @@ class TadawulClient:
 
     async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
         out = _base(symbol)
-        out["data_source"] = PROVIDER_NAME
-        out["provider_version"] = PROVIDER_VERSION
 
-        enabled = _to_bool(_get_attr_or_env("TADAWUL_MARKET_ENABLED", True), True)
-        if not enabled:
+        if not self._enabled():
             out["status"] = "error"
             out["data_quality"] = "BAD"
             out["error"] = "tadawul: disabled (TADAWUL_MARKET_ENABLED=false)"
@@ -634,7 +723,7 @@ class TadawulClient:
         if not sym:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = "tadawul: empty symbol"
+            out["error"] = "tadawul: not a KSA symbol (expected 3-6 digits or .SR)"
             return out
 
         if not self.fundamentals_url:
@@ -649,11 +738,11 @@ class TadawulClient:
             return dict(hit)
 
         url = _format_url(self.fundamentals_url, sym)
-        data = await self._get_json(url)
+        data, err = await self._get_json(url)
         if not data:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = "tadawul: fundamentals empty response"
+            out["error"] = f"tadawul: fundamentals empty ({err or 'no data'})"
             return out
 
         root = _coerce_dict(data)
@@ -667,14 +756,17 @@ class TadawulClient:
 
         # Core fundamentals
         market_cap = _pick_num(root, "market_cap", "marketCap", "MarketCap", "mcap", "marketCapitalization")
-        shares_out = _pick_num(root, "shares_outstanding", "sharesOutstanding", "SharesOutstanding", "outstandingShares")
+        shares_out = _pick_num(root, "shares_outstanding", "sharesOutstanding", "SharesOutstanding", "outstandingShares", "issuedShares")
         free_float_pct = _pick_pct(root, "free_float", "freeFloat", "freeFloatPercent", "freeFloatPct", "freeFloatPercentage")
 
         # Ratios
         eps_ttm = _pick_num(root, "eps", "eps_ttm", "epsTTM", "earningsPerShare", "EarningsPerShare")
+        forward_eps = _pick_num(root, "forward_eps", "epsForward", "forwardEPS")
         pe_ttm = _pick_num(root, "pe", "pe_ttm", "peTTM", "priceEarnings", "PERatio")
+        forward_pe = _pick_num(root, "forward_pe", "forwardPE", "peForward")
         pb = _pick_num(root, "pb", "priceToBook", "PBRatio")
         ps = _pick_num(root, "ps", "priceToSales", "PSRatio")
+        ev_ebitda = _pick_num(root, "ev_ebitda", "evEbitda", "EVEBITDA")
 
         dividend_yield = _pick_pct(root, "dividend_yield", "dividendYield", "DividendYield")
         dividend_rate = _pick_num(root, "dividend_rate", "dividendRate", "DividendRate", "dividendPerShare")
@@ -682,6 +774,10 @@ class TadawulClient:
 
         roe = _pick_pct(root, "roe", "returnOnEquity", "ROE")
         roa = _pick_pct(root, "roa", "returnOnAssets", "ROA")
+        net_margin = _pick_pct(root, "net_margin", "netMargin", "NetMargin")
+        ebitda_margin = _pick_pct(root, "ebitda_margin", "ebitdaMargin", "EBITDAMargin")
+        revenue_growth = _pick_pct(root, "revenue_growth", "revenueGrowth", "RevenueGrowth")
+        net_income_growth = _pick_pct(root, "net_income_growth", "netIncomeGrowth", "NetIncomeGrowth")
 
         beta = _pick_num(root, "beta", "Beta")
         debt_to_equity = _pick_num(root, "debt_to_equity", "debtToEquity", "DebtToEquity")
@@ -706,16 +802,23 @@ class TadawulClient:
                 "market_cap": market_cap,
                 "shares_outstanding": shares_out,
                 "free_float": free_float_pct,
-                "free_float_market_cap": (market_cap * (free_float_pct / 100.0)) if (market_cap and free_float_pct is not None) else None,
+                "free_float_market_cap": (market_cap * (free_float_pct / 100.0)) if (market_cap is not None and free_float_pct is not None) else None,
                 "eps_ttm": eps_ttm,
+                "forward_eps": forward_eps,
                 "pe_ttm": pe_ttm,
+                "forward_pe": forward_pe,
                 "pb": pb,
                 "ps": ps,
+                "ev_ebitda": ev_ebitda,
                 "dividend_yield": dividend_yield,
                 "dividend_rate": dividend_rate,
                 "payout_ratio": payout_ratio,
                 "roe": roe,
                 "roa": roa,
+                "net_margin": net_margin,
+                "ebitda_margin": ebitda_margin,
+                "revenue_growth": revenue_growth,
+                "net_income_growth": net_income_growth,
                 "beta": beta,
                 "debt_to_equity": debt_to_equity,
                 "current_ratio": current_ratio,
@@ -728,16 +831,11 @@ class TadawulClient:
             }
         )
 
-        # If we truly got nothing useful, report cleanly (avoid misleading “success”)
-        useful = (
-            bool((out.get("name") or "").strip())
-            or (_safe_float(out.get("market_cap")) is not None)
-            or (_safe_float(out.get("shares_outstanding")) is not None)
-        )
+        useful = bool((out.get("name") or "").strip()) or (_safe_float(out.get("market_cap")) is not None) or (_safe_float(out.get("shares_outstanding")) is not None)
         if not useful:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = "tadawul: fundamentals present but no identity/mcap/shares fields found"
+            out["error"] = "tadawul: fundamentals parsed but no identity/mcap/shares found"
             return out
 
         _fill_derived(out)
@@ -747,41 +845,45 @@ class TadawulClient:
         return out
 
     async def fetch_quote_and_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
-        # Merge fundamentals first, then quote overwrites quote fields
+        """
+        Merge fundamentals first, then quote overwrites quote fields.
+        If quote succeeds but fundamentals fails → overall success with _warn.
+        If both fail → error.
+        """
         f_task = self.fetch_fundamentals_patch(symbol)
         q_task = self.fetch_quote_patch(symbol)
         f, q = await asyncio.gather(f_task, q_task)
 
         out = _base(symbol)
-        out["data_source"] = PROVIDER_NAME
-        out["provider_version"] = PROVIDER_VERSION
 
-        # Merge: keep only non-empty values; avoid overwriting good values with blanks
+        # Merge only meaningful values
         for src in (f, q):
-            if isinstance(src, dict):
-                for k, v in src.items():
-                    if v is None:
-                        continue
-                    if isinstance(v, str) and not v.strip():
-                        continue
-                    out[k] = v
+            if not isinstance(src, dict):
+                continue
+            for k, v in src.items():
+                if v is None:
+                    continue
+                if isinstance(v, str) and not v.strip():
+                    continue
+                out[k] = v
 
-        # Status/error policy: if both failed, error; if one succeeded, success but keep warnings
         f_err = (f.get("error") or "").strip() if isinstance(f, dict) else ""
         q_err = (q.get("error") or "").strip() if isinstance(q, dict) else ""
 
-        f_ok = isinstance(f, dict) and f.get("status") != "error" and _safe_float(f.get("current_price")) is not None or bool((f.get("name") or "").strip())
-        q_ok = isinstance(q, dict) and q.get("status") != "error" and _safe_float(q.get("current_price")) is not None
+        q_ok = isinstance(q, dict) and q.get("status") != "error" and (_safe_float(q.get("current_price")) is not None)
+        f_ok = isinstance(f, dict) and f.get("status") != "error" and (bool((f.get("name") or "").strip()) or (_safe_float(f.get("market_cap")) is not None))
 
         if not q_ok and not f_ok:
             out["status"] = "error"
             out["data_quality"] = "BAD"
-            out["error"] = "tadawul: " + " | ".join([e for e in [q_err, f_err] if e]) if (q_err or f_err) else "tadawul: unknown error"
+            joined = " | ".join([e for e in (q_err, f_err) if e])
+            out["error"] = joined or "tadawul: unknown error"
             return out
 
-        if q_err or f_err:
-            # Keep a non-fatal warning field for diagnostics (engine-safe)
-            out["_warn"] = " | ".join([e for e in [q_err, f_err] if e])
+        # Non-fatal warnings (do NOT populate `error`, because that flips status)
+        warns = " | ".join([e for e in (q_err, f_err) if e])
+        if warns:
+            out["_warn"] = warns
 
         _fill_derived(out)
         _quality(out)
@@ -795,39 +897,12 @@ _CLIENT_SINGLETON: Optional[TadawulClient] = None
 _CLIENT_LOCK = asyncio.Lock()
 
 
-def _load_headers() -> Dict[str, str]:
-    hdrs: Dict[str, str] = {}
-    raw = _safe_str(_get_attr_or_env("TADAWUL_HEADERS_JSON"))
-    if raw:
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                hdrs.update({str(k): str(v) for k, v in obj.items()})
-        except Exception:
-            pass
-    return hdrs
-
-
 async def get_tadawul_client() -> TadawulClient:
     global _CLIENT_SINGLETON
     if _CLIENT_SINGLETON is None:
         async with _CLIENT_LOCK:
             if _CLIENT_SINGLETON is None:
-                _CLIENT_SINGLETON = TadawulClient(
-                    quote_url=_safe_str(_get_attr_or_env("TADAWUL_QUOTE_URL")),
-                    fundamentals_url=_safe_str(_get_attr_or_env("TADAWUL_FUNDAMENTALS_URL") or _get_attr_or_env("TADAWUL_PROFILE_URL")),
-                    headers=_load_headers(),
-                    timeout_sec=_get_timeout_sec(),
-                    retry_attempts=_get_retry_attempts(),
-                )
-                logger.info(
-                    "Tadawul client init v%s | quote_url_set=%s | fund_url_set=%s | timeout=%.1fs | retries=%s",
-                    PROVIDER_VERSION,
-                    bool(_CLIENT_SINGLETON.quote_url),
-                    bool(_CLIENT_SINGLETON.fundamentals_url),
-                    _CLIENT_SINGLETON.timeout_sec,
-                    _CLIENT_SINGLETON.retry_attempts,
-                )
+                _CLIENT_SINGLETON = TadawulClient()
     return _CLIENT_SINGLETON
 
 
@@ -859,7 +934,7 @@ async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: An
     return await c.fetch_quote_and_fundamentals_patch(symbol)
 
 
-# Backwards-compatible aliases (some older code may call these)
+# Backwards-compatible aliases (older code may call these)
 async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     c = await get_tadawul_client()
     return await c.fetch_fundamentals_patch(symbol)
