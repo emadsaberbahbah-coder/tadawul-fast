@@ -1,25 +1,17 @@
-# routes/enriched_quote.py
+# routes/enriched_quote.py  (FULL REPLACEMENT)
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.3.3)
+Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.4.0)
 
-What’s improved vs v2.3.2
-- ✅ Aligns batch env vars with render.yaml:
-    - ENRICHED_CONCURRENCY (alias: ENRICHED_BATCH_CONCURRENCY)
-    - ENRICHED_MAX_TICKERS
-    - ENRICHED_TIMEOUT_SEC
-- ✅ Enforces max tickers WITHOUT breaking order (overflow symbols return error-items)
-- ✅ Adds per-request timeout guard (asyncio.wait_for) for /quote and /quotes
+Fix in v2.4.0 (CRITICAL)
+- ✅ Do NOT force status=error just because `error` is non-empty
+  (engine may return warnings in `error` while still success)
+- ✅ status logic:
+    - if current_price exists => success (even with warnings)
+    - if no price            => error
 - ✅ Keeps schema-fill guarantees for Sheets (no missing columns)
 - ✅ Keeps PROD-safe import behavior (no core imports at module import-time)
-
-Key guarantees
-- Never crashes app startup (no core imports at module import-time)
-- Always returns HTTP 200 with a status field
-- Always returns non-empty `error` on failure
-- Always returns `symbol` (normalized or input)
-- Best-effort: always returns all UnifiedQuote keys (None if unavailable)
 """
 
 from __future__ import annotations
@@ -181,6 +173,25 @@ def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return None
+        f = float(v)
+        if f != f:  # NaN
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def _has_price(payload: Dict[str, Any]) -> bool:
+    f = _safe_float(payload.get("current_price"))
+    return f is not None
+
+
 async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optional[Any], Optional[str]]:
     """
     Try in this order:
@@ -265,37 +276,57 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
 def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: str) -> Dict[str, Any]:
     """
     Ensure required fields and consistent defaults + schema-fill best-effort.
+
+    CRITICAL:
+    - Do NOT force status=error just because error text exists.
+    - If current_price exists -> status=success (error treated as warning text).
+    - If no current_price -> status=error.
     """
     sym = (norm or raw or "").strip()
 
-    # Always ensure identity fields even if engine returned None
     if not payload.get("symbol"):
         payload["symbol"] = sym
 
     payload["symbol_input"] = payload.get("symbol_input") or raw
     payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
 
-    # Ensure data_source
     if not payload.get("data_source"):
         payload["data_source"] = source or "unknown"
 
-    # Ensure error is a string (never None)
-    if payload.get("error") is None:
-        payload["error"] = ""
-    if not isinstance(payload.get("error"), str):
-        payload["error"] = str(payload.get("error") or "")
+    # Normalize error to string (never None)
+    err = payload.get("error")
+    if err is None:
+        err_s = ""
+    elif isinstance(err, str):
+        err_s = err.strip()
+    else:
+        err_s = str(err).strip()
+    payload["error"] = err_s
 
-    # Ensure status is present + consistent with error
-    st = payload.get("status")
-    if not isinstance(st, str) or not st.strip():
+    # Determine has_price
+    has_price = _has_price(payload)
+
+    # Respect engine status when possible
+    st_raw = str(payload.get("status") or "").strip().lower()
+
+    if has_price:
+        # If we have a price, we succeed even if warnings exist.
         payload["status"] = "success"
 
-    if str(payload.get("error") or "").strip():
-        payload["status"] = "error"
+        # If there is error text and it is not already prefixed, treat as warning text
+        if err_s and not err_s.lower().startswith("warning:"):
+            payload["error"] = f"warning: {err_s}"
 
-    # Ensure data_quality exists (best-effort)
-    if not payload.get("data_quality"):
-        payload["data_quality"] = "MISSING" if payload.get("current_price") is None else "PARTIAL"
+        if not payload.get("data_quality"):
+            payload["data_quality"] = "PARTIAL"
+
+    else:
+        # No price => error
+        payload["status"] = "error"
+        if not payload.get("data_quality"):
+            payload["data_quality"] = "MISSING"
+        if not payload.get("error"):
+            payload["error"] = "No price returned"
 
     # Schema fill last (adds any missing keys as None)
     payload = _schema_fill_best_effort(payload)
@@ -319,7 +350,6 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _enriched_concurrency() -> int:
-    # render.yaml uses ENRICHED_CONCURRENCY
     return _env_int("ENRICHED_CONCURRENCY", _env_int("ENRICHED_BATCH_CONCURRENCY", 8))
 
 
@@ -355,7 +385,6 @@ async def enriched_quote(
         out = _schema_fill_best_effort(out)
         return JSONResponse(status_code=200, content=out)
 
-    # Per-request timeout guard
     timeout_sec = _enriched_timeout_sec()
 
     try:
@@ -426,17 +455,12 @@ async def enriched_quotes(
     if not raw_list:
         return JSONResponse(
             status_code=200,
-            content={
-                "status": "error",
-                "error": "Empty symbols list",
-                "items": [],
-            },
+            content={"status": "error", "error": "Empty symbols list", "items": []},
         )
 
     max_allowed = _enriched_max_tickers()
     timeout_sec = _enriched_timeout_sec()
 
-    # Concurrency limit (render.yaml: ENRICHED_CONCURRENCY)
     conc = _enriched_concurrency()
     sem = asyncio.Semaphore(conc)
 
@@ -495,7 +519,6 @@ async def enriched_quotes(
                 out["traceback"] = tb[:8000]
             return _schema_fill_best_effort(out)
 
-    # Preserve order. For overflow beyond max_allowed, return error-items (no engine call).
     tasks: List[asyncio.Task] = []
     items: List[Dict[str, Any]] = []
 
@@ -535,7 +558,7 @@ async def enriched_quotes(
 
 @router.get("/health", include_in_schema=False)
 async def enriched_health():
-    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.3.3"}
+    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.4.0"}
 
 
 __all__ = ["router"]
