@@ -2,16 +2,34 @@
 """
 routes/routes_argaam.py
 ===============================================================
-Argaam Router (delegate) — v3.4.0 (PROD SAFE + Auth-Compat + Cleaner Errors)
+Argaam Router (delegate) — v3.5.0
+(PROD SAFE + Auth-Compat + Sheet-Rows + Cleaner Errors)
 
-Improvements in v3.4.0
-- ✅ Accepts token via X-APP-TOKEN OR Authorization: Bearer <token>
+✅ v3.5.0 improvements
+- ✅ Accepts token via:
+    • X-APP-TOKEN
+    • Authorization: Bearer <token>
+    • (optional) ?token=...   (disabled by default unless ALLOW_QUERY_TOKEN=1)
+- ✅ Adds POST /v1/argaam/sheet-rows (required by your dashboard sync + test_endpoints.py)
 - ✅ Cleaner "not configured" messaging when ARGAAM_QUOTE_URL is missing
-- ✅ Keeps PROD-safe import behavior (no network calls at import time)
 - ✅ Best-effort: engine -> provider module -> configured endpoint
+- ✅ Chunk-safe & concurrency-limited batch fetching for sheet-rows
+- ✅ Always returns HTTP 200 with {status, data_quality, error?} for client simplicity
 
-Behavior
-- Always returns HTTP 200 with {status, symbol, data_source, data_quality, error?}
+Expected env vars
+- APP_TOKEN / BACKUP_APP_TOKEN (optional; if none set, auth is disabled)
+- ARGAAM_QUOTE_URL (optional; if missing, endpoint mode will report "not configured")
+    Example templates supported:
+      https://.../quote?code={code}
+      https://.../{symbol}
+- ARGAAM_PROFILE_URL (optional; used to fetch/resolve company name if quote doesn’t contain it)
+- ARGAAM_HEADERS_JSON (optional; JSON dict for headers/cookies)
+- HTTP_TIMEOUT_SEC (default 25)
+- HTTP_RETRY_ATTEMPTS (default 3)
+- ARGAAM_QUOTE_TTL_SEC (default 20)
+- ARGAAM_META_TTL_SEC (default 21600)
+- DEBUG_ERRORS=1 (optional; include debug details on failures)
+- ALLOW_QUERY_TOKEN=1 (optional; allow ?token=... for quick manual testing)
 """
 
 from __future__ import annotations
@@ -30,10 +48,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
 from cachetools import TTLCache
 from fastapi import APIRouter, Header, Query, Request
+from pydantic import BaseModel
 
 logger = logging.getLogger("routes.routes_argaam")
 
-ROUTE_VERSION = "3.4.0"
+ROUTE_VERSION = "3.5.0"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 USER_AGENT = (
@@ -44,6 +63,8 @@ USER_AGENT = (
 
 DEFAULT_TIMEOUT_SEC = 25.0
 DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_SHEET_MAX = 500
+DEFAULT_CONCURRENCY = 12
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -105,9 +126,13 @@ def _normalize_ksa_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s:
         return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip().upper()
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", "")
     if s.isdigit() or re.match(r"^\d{3,6}$", s):
         return f"{s}.SR"
-    return s
+    return s.replace(" ", "")
 
 
 def _ksa_code(symbol: str) -> str:
@@ -124,25 +149,32 @@ def _format_url(template: str, symbol: str) -> str:
     return (template or "").replace("{code}", code).replace("{symbol}", symbol)
 
 
-# ---------------------------
+# =============================================================================
 # Auth helpers (APP_TOKEN / BACKUP_APP_TOKEN)
-# ---------------------------
-def _extract_token(x_app_token: Optional[str], authorization: Optional[str]) -> Optional[str]:
+# =============================================================================
+def _extract_token(
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    token_qs: Optional[str],
+) -> Optional[str]:
     t = (x_app_token or "").strip()
     if t:
         return t
 
     auth = (authorization or "").strip()
-    if not auth:
-        return None
+    if auth:
+        low = auth.lower()
+        if low.startswith("bearer "):
+            return auth.split(" ", 1)[1].strip() or None
+        return auth.strip() or None
 
-    # Bearer <token>
-    low = auth.lower()
-    if low.startswith("bearer "):
-        return auth.split(" ", 1)[1].strip() or None
+    # optional: allow query token only if explicitly enabled
+    if _truthy(os.getenv("ALLOW_QUERY_TOKEN", "0")):
+        tq = (token_qs or "").strip()
+        if tq:
+            return tq
 
-    # Raw token (rare but allow)
-    return auth or None
+    return None
 
 
 def _auth_ok(provided_token: Optional[str]) -> bool:
@@ -159,9 +191,9 @@ def _auth_ok(provided_token: Optional[str]) -> bool:
     return (required and pt == required) or (backup and pt == backup)
 
 
-# ---------------------------
+# =============================================================================
 # Optional endpoint config
-# ---------------------------
+# =============================================================================
 def _headers_from_env() -> Dict[str, str]:
     hdrs: Dict[str, str] = {}
     raw = (os.getenv("ARGAAM_HEADERS_JSON") or "").strip()
@@ -212,6 +244,22 @@ async def _get_client() -> httpx.AsyncClient:
                     limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
                 )
     return _client
+
+
+# Optional: close client on shutdown (best-effort)
+try:
+    @router.on_event("shutdown")  # type: ignore[attr-defined]
+    async def _shutdown() -> None:
+        global _client
+        c = _client
+        _client = None
+        try:
+            if c is not None:
+                await c.aclose()
+        except Exception:
+            pass
+except Exception:
+    pass
 
 
 async def _fetch_url(url: str) -> Tuple[Optional[Union[Dict[str, Any], List[Any]]], Optional[str], int]:
@@ -297,7 +345,7 @@ def _pick_num(obj: Any, *keys: str) -> Optional[float]:
                     return r
         return None
 
-    return _safe_float(walk(obj, 5))
+    return _safe_float(walk(obj, 6))
 
 
 def _pick_str(obj: Any, *keys: str) -> Optional[str]:
@@ -330,12 +378,25 @@ def _pick_str(obj: Any, *keys: str) -> Optional[str]:
                     return r
         return None
 
-    return _safe_str(walk(obj, 5))
+    return _safe_str(walk(obj, 6))
 
 
-# ---------------------------
+def _compute_change(price: Optional[float], prev: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    if price is None or prev in (None, 0):
+        return None, None
+    try:
+        ch = float(price) - float(prev)
+        pct = (ch / float(prev)) * 100.0
+        if math.isnan(pct) or math.isinf(pct):
+            return ch, None
+        return ch, pct
+    except Exception:
+        return None, None
+
+
+# =============================================================================
 # Engine/provider integration (best-effort)
-# ---------------------------
+# =============================================================================
 async def _try_engine_argaam(request: Request, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     eng = getattr(request.app.state, "engine", None)
     if eng is None:
@@ -384,6 +445,44 @@ async def _try_provider_module(symbol: str) -> Tuple[Dict[str, Any], Optional[st
         return {}, "argaam provider module not available"
 
 
+async def _try_profile_name(symbol: str) -> Optional[str]:
+    """
+    Optional best-effort profile fetch for company name (cached).
+    """
+    if not ARGAAM_PROFILE_URL:
+        return None
+
+    sym = _normalize_ksa_symbol(symbol)
+    if not sym:
+        return None
+
+    ck = f"m::{sym}"
+    hit = _meta_cache.get(ck)
+    if isinstance(hit, dict):
+        nm = _safe_str(hit.get("name"))
+        if nm:
+            return nm
+
+    url = _format_url(ARGAAM_PROFILE_URL, sym)
+    data, raw, sc = await _fetch_url(url)
+    if sc >= 400:
+        return None
+
+    name: Optional[str] = None
+    if isinstance(data, (dict, list)):
+        root = _coerce_dict(data)
+        name = _pick_str(root, "name", "company", "company_name", "companyName", "shortName", "longName")
+    elif raw:
+        # ultra-light HTML sniff (best-effort)
+        m = re.search(r"<title>\s*(.*?)\s*</title>", raw, re.IGNORECASE)
+        if m:
+            name = _safe_str(m.group(1))
+
+    if name:
+        _meta_cache[ck] = {"name": name, "ts": _utc_iso()}
+    return name
+
+
 async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     sym = _normalize_ksa_symbol(symbol)
     if not sym:
@@ -408,8 +507,13 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
         price = _pick_num(root, "price", "last", "last_price", "close", "current", "c", "regularMarketPrice")
         prev = _pick_num(root, "previous_close", "previousClose", "pc", "prevClose")
         vol = _pick_num(root, "volume", "vol", "tradedVolume")
+        mcap = _pick_num(root, "market_cap", "marketCap", "marketcap")
 
         name = _pick_str(root, "name", "company", "company_name", "companyName", "shortName", "longName")
+        if not name:
+            name = await _try_profile_name(sym)
+
+        ch, pct = _compute_change(price, prev)
 
         patch = {
             "market": "KSA",
@@ -417,7 +521,10 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
             "name": name,
             "current_price": price,
             "previous_close": prev,
+            "price_change": ch,
+            "percent_change": pct,
             "volume": vol,
+            "market_cap": mcap,
             "data_source": "argaam",
             "last_updated_utc": _utc_iso(),
         }
@@ -459,6 +566,22 @@ def _base_err(symbol: str, err: str, quality: str = "MISSING") -> Dict[str, Any]
     }
 
 
+def _debug_enabled(debug: int) -> bool:
+    return _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(int(debug or 0))
+
+
+# =============================================================================
+# Request models
+# =============================================================================
+class SheetRowsIn(BaseModel):
+    tickers: Optional[List[str]] = None
+    symbols: Optional[List[str]] = None
+    sheet_name: Optional[str] = None
+
+
+# =============================================================================
+# Endpoints
+# =============================================================================
 @router.get("/health")
 async def health(request: Request) -> Dict[str, Any]:
     eng = getattr(request.app.state, "engine", None)
@@ -476,22 +599,17 @@ async def health(request: Request) -> Dict[str, Any]:
     }
 
 
-@router.get("/quote")
-async def quote(
+async def _get_quote_payload(
     request: Request,
-    symbol: str = Query(..., description="KSA symbol (e.g., 1120.SR or 1120)"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    debug: int = Query(default=0, description="1 to include debug details"),
+    symbol: str,
+    *,
+    debug: int = 0,
 ) -> Dict[str, Any]:
     sym = _normalize_ksa_symbol(symbol)
     if not sym:
         return _base_err(symbol, "empty symbol")
 
-    token = _extract_token(x_app_token, authorization)
-    if not _auth_ok(token):
-        return _base_err(sym, "Unauthorized: invalid or missing token (X-APP-TOKEN or Authorization: Bearer)", quality="BLOCKED")
-
+    dbg = _debug_enabled(debug)
     debug_info: Dict[str, Any] = {}
 
     # Priority: engine -> provider -> configured endpoint
@@ -499,6 +617,11 @@ async def quote(
     if patch:
         out = _base_ok(sym)
         out.update({k: v for k, v in patch.items() if v is not None})
+        # ensure computed change if not provided
+        if out.get("percent_change") is None or out.get("price_change") is None:
+            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
+            out.setdefault("price_change", ch)
+            out.setdefault("percent_change", pct)
         return out
     debug_info["engine"] = err
 
@@ -506,6 +629,10 @@ async def quote(
     if patch:
         out = _base_ok(sym)
         out.update({k: v for k, v in patch.items() if v is not None})
+        if out.get("percent_change") is None or out.get("price_change") is None:
+            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
+            out.setdefault("price_change", ch)
+            out.setdefault("percent_change", pct)
         return out
     debug_info["provider"] = err
 
@@ -513,19 +640,42 @@ async def quote(
     if patch:
         out = _base_ok(sym)
         out.update({k: v for k, v in patch.items() if v is not None})
+        if out.get("percent_change") is None or out.get("price_change") is None:
+            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
+            out.setdefault("price_change", ch)
+            out.setdefault("percent_change", pct)
         return out
     debug_info["endpoint"] = err
 
-    # final
     msg = "Argaam quote unavailable."
     if not ARGAAM_QUOTE_URL:
         msg = "Argaam not configured (ARGAAM_QUOTE_URL not set)."
 
     out = _base_err(sym, msg, quality="MISSING")
-    if int(debug or 0) == 1:
+    if dbg:
         out["debug"] = debug_info
         out["hint"] = "Set ARGAAM_QUOTE_URL (and optional ARGAAM_HEADERS_JSON) OR add core.providers.argaam_provider."
     return out
+
+
+@router.get("/quote")
+async def quote(
+    request: Request,
+    symbol: str = Query(..., description="KSA symbol (e.g., 1120.SR or 1120)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    token: Optional[str] = Query(default=None, description="(optional) token via query if ALLOW_QUERY_TOKEN=1"),
+    debug: int = Query(default=0, description="1 to include debug details (or set DEBUG_ERRORS=1)"),
+) -> Dict[str, Any]:
+    sym = _normalize_ksa_symbol(symbol)
+    if not sym:
+        return _base_err(symbol, "empty symbol")
+
+    provided = _extract_token(x_app_token, authorization, token)
+    if not _auth_ok(provided):
+        return _base_err(sym, "Unauthorized: invalid or missing token (X-APP-TOKEN or Authorization: Bearer)", quality="BLOCKED")
+
+    return await _get_quote_payload(request, sym, debug=debug)
 
 
 @router.get("/quotes")
@@ -534,28 +684,144 @@ async def quotes(
     symbols: str = Query(..., description="Comma-separated KSA symbols e.g. 1120.SR,2222.SR"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    token: Optional[str] = Query(default=None),
     debug: int = Query(default=0),
 ) -> Dict[str, Any]:
-    token = _extract_token(x_app_token, authorization)
-    if not _auth_ok(token):
-        return {"status": "error", "error": "Unauthorized: invalid or missing token", "items": []}
+    provided = _extract_token(x_app_token, authorization, token)
+    if not _auth_ok(provided):
+        return {"status": "error", "error": "Unauthorized: invalid or missing token", "items": [], "route_version": ROUTE_VERSION}
 
     arr = [s.strip() for s in (symbols or "").split(",") if s.strip()]
+    arr = [_normalize_ksa_symbol(x) for x in arr if _normalize_ksa_symbol(x)]
+    # safety cap
     arr = arr[:50]
 
     items: List[Dict[str, Any]] = []
     for s in arr:
-        items.append(
-            await quote(
-                request,
-                symbol=s,
-                x_app_token=x_app_token,
-                authorization=authorization,
-                debug=debug,
-            )
-        )
+        items.append(await _get_quote_payload(request, s, debug=debug))
 
-    return {"status": "ok", "count": len(items), "items": items, "route_version": ROUTE_VERSION}
+    return {"status": "ok", "count": len(items), "items": items, "route_version": ROUTE_VERSION, "time_utc": _utc_iso()}
+
+
+# -----------------------------------------------------------------------------
+# Sheet Rows (required by your dashboard + smoke tests)
+# -----------------------------------------------------------------------------
+SHEET_HEADERS: List[str] = [
+    "Symbol",
+    "Name",
+    "Market",
+    "Currency",
+    "Current Price",
+    "Previous Close",
+    "Change",
+    "Change %",
+    "Volume",
+    "Market Cap",
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Error",
+]
+
+
+def _to_sheet_row(q: Dict[str, Any]) -> List[Any]:
+    def g(*keys: str) -> Any:
+        for k in keys:
+            if k in q:
+                return q.get(k)
+        return None
+
+    return [
+        g("symbol"),
+        g("name"),
+        g("market"),
+        g("currency"),
+        g("current_price", "price"),
+        g("previous_close"),
+        g("price_change", "change"),
+        g("percent_change"),
+        g("volume"),
+        g("market_cap"),
+        g("data_source"),
+        g("data_quality"),
+        g("last_updated_utc", "time_utc"),
+        g("error"),
+    ]
+
+
+@router.post("/sheet-rows")
+async def sheet_rows(
+    request: Request,
+    payload: SheetRowsIn,
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    token: Optional[str] = Query(default=None),
+    debug: int = Query(default=0),
+) -> Dict[str, Any]:
+    provided = _extract_token(x_app_token, authorization, token)
+    if not _auth_ok(provided):
+        return {
+            "status": "error",
+            "headers": SHEET_HEADERS,
+            "rows": [],
+            "count": 0,
+            "error": "Unauthorized: invalid or missing token",
+            "route_version": ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+        }
+
+    syms = (payload.tickers or []) + (payload.symbols or [])
+    normed: List[str] = []
+    seen = set()
+    for s in syms:
+        ns = _normalize_ksa_symbol(str(s or ""))
+        if not ns:
+            continue
+        if ns in seen:
+            continue
+        seen.add(ns)
+        normed.append(ns)
+
+    max_n = int(_safe_float(os.getenv("ARGAAM_SHEET_MAX")) or DEFAULT_SHEET_MAX)
+    normed = normed[: max(1, max_n)]
+
+    if not normed:
+        return {
+            "status": "ok",
+            "headers": SHEET_HEADERS,
+            "rows": [],
+            "count": 0,
+            "route_version": ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+        }
+
+    # concurrency-limited fetch
+    concurrency = int(_safe_float(os.getenv("ARGAAM_SHEET_CONCURRENCY")) or DEFAULT_CONCURRENCY)
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def one(sym: str) -> Dict[str, Any]:
+        async with sem:
+            return await _get_quote_payload(request, sym, debug=debug)
+
+    tasks = [asyncio.create_task(one(s)) for s in normed]
+    items: List[Dict[str, Any]] = await asyncio.gather(*tasks)
+
+    rows = [_to_sheet_row(it) for it in items]
+
+    # If argaam isn't configured, provide a clearer top-level message
+    top_err = ""
+    if not ARGAAM_QUOTE_URL:
+        top_err = "Argaam not configured (ARGAAM_QUOTE_URL not set)."
+
+    return {
+        "status": "ok",
+        "headers": SHEET_HEADERS,
+        "rows": rows,
+        "count": len(rows),
+        "route_version": ROUTE_VERSION,
+        "time_utc": _utc_iso(),
+        "error": top_err,
+    }
 
 
 __all__ = ["router"]
