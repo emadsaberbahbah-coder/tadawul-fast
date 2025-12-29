@@ -2,7 +2,7 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v3.7.0) — PROD SAFE (TRUE LAZY)
+LEGACY COMPATIBILITY ADAPTER (v3.8.0) — PROD SAFE (TRUE LAZY)
 
 What this module guarantees
 - ✅ Never crashes app startup (no hard dependency on data_engine_v2 at import-time).
@@ -15,19 +15,23 @@ What this module guarantees
     - get_engine_meta()
     - DataEngine wrapper class (lazy, safe)
 - ✅ Works whether V2 methods are async OR sync (auto await).
+- ✅ Handles V2 returning list OR dict OR (payload, err) tuples (defensive).
 - ✅ If V2 missing/broken -> returns stub quotes with data_quality="MISSING" and error.
+- ✅ Never leaks secrets in meta/health.
 
-Changes vs v3.6.2
-- ✅ TRUE-LAZY DataEngine wrapper class added (importing DataEngine no longer forces v2 import)
-- ✅ Safer UnifiedQuote finalize (only if finalize() exists)
-- ✅ Safer v2 resolution (UnifiedQuote from v2 OR core.schemas)
-- ✅ Optional async get_engine() that prefers v2.get_engine() if present
+v3.8.0 improvements vs v3.7.0
+- ✅ Better V2 linking: accepts UnifiedQuote from v2 OR core.schemas OR core.models.schemas fallback.
+- ✅ Better tuple-unwrapping (payload, err) for both single and batch.
+- ✅ Better symbol cleaning/dedup using normalize_symbol where possible.
+- ✅ Engine singleton init: safer signature probing (settings kwarg, settings positional, none).
+- ✅ get_engine_meta reads providers from env/settings safely and can show v2 module version if present.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from importlib import import_module
@@ -54,8 +58,7 @@ except Exception:  # pragma: no cover
         return dict(kwargs)
 
 
-ADAPTER_VERSION = "3.7.0"
-
+ADAPTER_VERSION = "3.8.0"
 logger = logging.getLogger("core.data_engine")
 
 
@@ -71,6 +74,9 @@ class QuoteSource(BaseModel):
     raw: Optional[Dict[str, Any]] = None
 
 
+# =============================================================================
+# Small helpers
+# =============================================================================
 async def _maybe_await(v: Any) -> Any:
     if inspect.isawaitable(v):
         return await v
@@ -82,10 +88,7 @@ def _utc_now_iso() -> str:
 
 
 def _finalize_quote(obj: Any) -> Any:
-    """
-    If the quote model provides finalize(), call it.
-    Otherwise return as-is.
-    """
+    """If the quote model provides finalize(), call it. Otherwise return as-is."""
     try:
         fn = getattr(obj, "finalize", None)
         if callable(fn):
@@ -93,6 +96,30 @@ def _finalize_quote(obj: Any) -> Any:
     except Exception:
         pass
     return obj
+
+
+def _unwrap_payload(x: Any) -> Any:
+    """
+    Some engines/providers might return (payload, err).
+    We always keep payload if present.
+    """
+    try:
+        if isinstance(x, tuple) and len(x) == 2:
+            return x[0]
+    except Exception:
+        pass
+    return x
+
+
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, dict):
+        # dict[symbol -> quote] style
+        return list(x.values())
+    return [x]
 
 
 # =============================================================================
@@ -129,17 +156,21 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
             v2_norm = getattr(mod, "normalize_symbol", None)
             v2_get_engine = getattr(mod, "get_engine", None)
 
-            # UnifiedQuote may live in core.schemas in some revisions
+            # UnifiedQuote may live elsewhere depending on repo evolution
             if v2_uq is None:
-                try:
-                    schemas = import_module("core.schemas")
-                    v2_uq = getattr(schemas, "UnifiedQuote", None)
-                except Exception:
-                    v2_uq = None
+                for path in ("core.schemas", "core.models.schemas", "schemas"):
+                    try:
+                        schemas = import_module(path)
+                        v2_uq = getattr(schemas, "UnifiedQuote", None)
+                        if v2_uq is not None:
+                            break
+                    except Exception:
+                        continue
 
             if v2_engine is None or v2_uq is None:
                 raise ImportError("core.data_engine_v2 missing DataEngine and/or UnifiedQuote")
 
+            _V2["module"] = mod
             _V2["DataEngine"] = v2_engine
             _V2["UnifiedQuote"] = v2_uq
             if callable(v2_norm):
@@ -297,7 +328,6 @@ def _instantiate_engine(EngineCls: Type[Any]) -> Any:
     # 2) settings kwarg
     try:
         from core.config import get_settings as _gs  # type: ignore
-
         return EngineCls(settings=_gs())
     except Exception:
         pass
@@ -305,7 +335,6 @@ def _instantiate_engine(EngineCls: Type[Any]) -> Any:
     # 3) settings positional
     try:
         from core.config import get_settings as _gs  # type: ignore
-
         return EngineCls(_gs())
     except Exception:
         pass
@@ -341,7 +370,7 @@ def _get_engine_sync() -> Any:
                 async def get_quote(self, s):
                     sym = str(s or "").strip()
                     try:
-                        q = UQ(symbol=sym, error=str(exc))
+                        q = UQ(symbol=sym, data_quality="MISSING", error=str(exc))
                         return _finalize_quote(q)
                     except Exception:
                         return _StubUnifiedQuote(symbol=sym, error=str(exc)).finalize()
@@ -351,7 +380,7 @@ def _get_engine_sync() -> Any:
                     out: List[Any] = []
                     for x in clean:
                         try:
-                            q = UQ(symbol=x, error=str(exc))
+                            q = UQ(symbol=x, data_quality="MISSING", error=str(exc))
                             out.append(_finalize_quote(q))
                         except Exception:
                             out.append(_StubUnifiedQuote(symbol=x, error=str(exc)).finalize())
@@ -381,7 +410,6 @@ async def get_engine() -> Any:
         if callable(fn):
             try:
                 eng = await _maybe_await(fn())
-                # cache in our singleton slot too
                 global _engine_instance
                 _engine_instance = eng
                 return eng
@@ -435,19 +463,23 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
+    """
+    Cleans + dedups while trying to normalize to stable keys,
+    but preserves original-ish form for engine calls.
+    """
     seen = set()
     out: List[str] = []
     for s in (symbols or []):
         if s is None:
             continue
-        x = str(s).strip()
-        if not x:
+        raw = str(s).strip()
+        if not raw:
             continue
-        xu = x.upper()
-        if xu in seen:
+        key = normalize_symbol(raw) or raw.strip().upper()
+        if key in seen:
             continue
-        seen.add(xu)
-        out.append(x)
+        seen.add(key)
+        out.append(raw)
     return out
 
 
@@ -460,7 +492,7 @@ async def get_enriched_quote(symbol: str) -> Any:
 
     if not sym_in:
         try:
-            q = UQ(symbol="", error="Empty symbol")
+            q = UQ(symbol="", data_quality="MISSING", error="Empty symbol")
             return _finalize_quote(q)
         except Exception:
             return _StubUnifiedQuote(symbol="", error="Empty symbol").finalize()
@@ -470,12 +502,14 @@ async def get_enriched_quote(symbol: str) -> Any:
     eng = await get_engine()
     try:
         if hasattr(eng, "get_enriched_quote"):
-            return await _maybe_await(eng.get_enriched_quote(sym))
+            res = await _maybe_await(eng.get_enriched_quote(sym))
+            return _finalize_quote(_unwrap_payload(res))
         if hasattr(eng, "get_quote"):
-            return await _maybe_await(eng.get_quote(sym))
+            res = await _maybe_await(eng.get_quote(sym))
+            return _finalize_quote(_unwrap_payload(res))
 
         try:
-            q = UQ(symbol=sym, error="Engine method mismatch: no get_enriched_quote/get_quote")
+            q = UQ(symbol=sym, data_quality="MISSING", error="Engine method mismatch: no get_enriched_quote/get_quote")
             return _finalize_quote(q)
         except Exception:
             return _StubUnifiedQuote(symbol=sym, error="Engine method mismatch").finalize()
@@ -483,7 +517,7 @@ async def get_enriched_quote(symbol: str) -> Any:
     except Exception as exc:
         logger.error("Legacy Adapter Error (Single): %s", exc)
         try:
-            q = UQ(symbol=sym, error=str(exc))
+            q = UQ(symbol=sym, data_quality="MISSING", error=str(exc))
             return _finalize_quote(q)
         except Exception:
             return _StubUnifiedQuote(symbol=sym, error=str(exc)).finalize()
@@ -501,9 +535,11 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
         normed = [normalize_symbol(x) or x for x in clean]
 
         if hasattr(eng, "get_enriched_quotes"):
-            return await _maybe_await(eng.get_enriched_quotes(normed))
+            res = await _maybe_await(eng.get_enriched_quotes(normed))
+            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
         if hasattr(eng, "get_quotes"):
-            return await _maybe_await(eng.get_quotes(normed))
+            res = await _maybe_await(eng.get_quotes(normed))
+            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
 
         # fallback: per-symbol
         out: List[Any] = []
@@ -517,7 +553,7 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
         for s in clean:
             sym = normalize_symbol(s) or s
             try:
-                q = UQ(symbol=sym, error=str(exc))
+                q = UQ(symbol=sym, data_quality="MISSING", error=str(exc))
                 out.append(_finalize_quote(q))
             except Exception:
                 out.append(_StubUnifiedQuote(symbol=sym, error=str(exc)).finalize())
@@ -554,25 +590,27 @@ class DataEngine:
     async def get_quote(self, symbol: str) -> Any:
         eng = await self._ensure()
         if hasattr(eng, "get_quote"):
-            return await _maybe_await(eng.get_quote(symbol))
+            return _finalize_quote(_unwrap_payload(await _maybe_await(eng.get_quote(symbol))))
         return await get_quote(symbol)
 
     async def get_quotes(self, symbols: List[str]) -> List[Any]:
         eng = await self._ensure()
         if hasattr(eng, "get_quotes"):
-            return await _maybe_await(eng.get_quotes(symbols))
+            res = await _maybe_await(eng.get_quotes(symbols))
+            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
         return await get_quotes(symbols)
 
     async def get_enriched_quote(self, symbol: str) -> Any:
         eng = await self._ensure()
         if hasattr(eng, "get_enriched_quote"):
-            return await _maybe_await(eng.get_enriched_quote(symbol))
+            return _finalize_quote(_unwrap_payload(await _maybe_await(eng.get_enriched_quote(symbol))))
         return await get_enriched_quote(symbol)
 
     async def get_enriched_quotes(self, symbols: List[str]) -> List[Any]:
         eng = await self._ensure()
         if hasattr(eng, "get_enriched_quotes"):
-            return await _maybe_await(eng.get_enriched_quotes(symbols))
+            res = await _maybe_await(eng.get_enriched_quotes(symbols))
+            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
         return await get_enriched_quotes(symbols)
 
     async def aclose(self) -> None:
@@ -583,20 +621,57 @@ class DataEngine:
 # =============================================================================
 # Diagnostics
 # =============================================================================
+def _safe_read_settings() -> Optional[object]:
+    try:
+        from config import get_settings as _gs  # type: ignore
+        return _gs()
+    except Exception:
+        pass
+    try:
+        from core.config import get_settings as _gs  # type: ignore
+        return _gs()
+    except Exception:
+        return None
+
+
+def _safe_parse_env_list(key: str) -> List[str]:
+    raw = (os.getenv(key) or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return parts
+
+
 def get_engine_meta() -> Dict[str, Any]:
     ok, err = _load_v2()
 
     providers: List[str] = []
     ksa_providers: List[str] = []
 
+    s = _safe_read_settings()
     try:
-        from core.config import get_settings as _gs  # type: ignore
-
-        s = _gs()
-        providers = list(getattr(s, "enabled_providers", []) or []) or list(getattr(s, "PROVIDERS", []) or [])
-        ksa_providers = list(getattr(s, "enabled_ksa_providers", []) or []) or list(getattr(s, "KSA_PROVIDERS", []) or [])
+        if s is not None:
+            p = getattr(s, "enabled_providers", None) or getattr(s, "providers", None)
+            k = getattr(s, "ksa_providers", None) or getattr(s, "providers_ksa", None)
+            if isinstance(p, list):
+                providers = [str(x).strip().lower() for x in p if str(x).strip()]
+            if isinstance(k, list):
+                ksa_providers = [str(x).strip().lower() for x in k if str(x).strip()]
     except Exception:
         pass
+
+    if not providers:
+        providers = _safe_parse_env_list("ENABLED_PROVIDERS") or _safe_parse_env_list("PROVIDERS")
+    if not ksa_providers:
+        ksa_providers = _safe_parse_env_list("KSA_PROVIDERS")
+
+    v2_mod = _V2.get("module")
+    v2_version = None
+    try:
+        if v2_mod is not None:
+            v2_version = getattr(v2_mod, "ENGINE_VERSION", None) or getattr(v2_mod, "VERSION", None)
+    except Exception:
+        v2_version = None
 
     return {
         "mode": _ENGINE_MODE,
@@ -604,6 +679,7 @@ def get_engine_meta() -> Dict[str, Any]:
         "adapter_version": ADAPTER_VERSION,
         "v2_loaded": bool(ok),
         "v2_error": err or _V2_LOAD_ERR,
+        "v2_version": v2_version,
         "providers": providers,
         "ksa_providers": ksa_providers,
     }
