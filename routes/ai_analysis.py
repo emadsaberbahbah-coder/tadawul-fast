@@ -1,11 +1,10 @@
-```python
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.2) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.3) – PROD SAFE / LOW-MISSING
 
 Key goals
-- Engine-driven only: prefer request.app.state.engine; fallback singleton.
-- PROD SAFE: avoid importing core.data_engine_v2 at module import-time (lazy import).
+- Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
+- PROD SAFE: DO NOT import core.data_engine_v2 at module import-time.
 - Defensive batching: chunking + timeout + bounded concurrency.
 - Sheets-safe: /sheet-rows ALWAYS returns HTTP 200 with {headers, rows, status}.
 - Canonical headers: core.schemas.get_headers_for_sheet (59 columns) when available.
@@ -13,12 +12,13 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 
 Compatible with engines returning:
-- list[UnifiedQuote|dict] OR dict[symbol->UnifiedQuote|dict]
+- list[dict|model] OR dict[symbol->dict|model] OR (payload, err)
 
-v3.7.2 notes
-- ✅ health endpoint: correctly reads providers from engine (providers_global/providers_ksa/providers)
-- ✅ safer normalize_symbol usage: never crashes if v2 import failed
-- ✅ accepts engine tuple returns (payload, err) in batch path
+v3.7.3 notes
+- ✅ No module-import crash if core.data_engine_v2 has syntax/import errors
+- ✅ 52W mapping aligned to DataEngineV2 keys: week_52_high/week_52_low
+- ✅ Placeholder rows do not depend on UnifiedQuote existing
+- ✅ /health reports engine_version/providers when available
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.7.2"
+AI_ANALYSIS_VERSION = "3.7.3"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -60,30 +60,32 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
-# Lazy imports: engine + models (PROD SAFE)
+# Lazy imports: V2 helpers (PROD SAFE)
 # =============================================================================
-def _import_v2() -> Tuple[Any, Any, Any]:
-    """
-    Returns (DataEngine, UnifiedQuote, normalize_symbol) or (None,None,fallback_normalize).
-    """
-    def _fallback_normalize(raw: str) -> str:
-        s = (raw or "").strip().upper()
-        if not s:
-            return ""
-        if s.startswith("TADAWUL:"):
-            s = s.split(":", 1)[1].strip()
-        if s.endswith(".TADAWUL"):
-            s = s.replace(".TADAWUL", "")
-        if any(ch in s for ch in ("^", "=")):
-            return s
-        if s.isdigit():
-            return f"{s}.SR"
-        if s.endswith(".SR") or s.endswith(".US"):
-            return s
-        if "." in s:
-            return s
-        return f"{s}.US"
+def _fallback_normalize(raw: str) -> str:
+    s = (raw or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", "")
+    if any(ch in s for ch in ("^", "=")):  # indices / formula-like
+        return s
+    if s.isdigit():
+        return f"{s}.SR"
+    if s.endswith(".SR") or s.endswith(".US"):
+        return s
+    if "." in s:
+        return s
+    return f"{s}.US"
 
+
+def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
+    """
+    Returns (DataEngine, UnifiedQuote, normalize_symbol_callable).
+    Never raises.
+    """
     try:
         from core.data_engine_v2 import DataEngine as _DE  # type: ignore
         from core.data_engine_v2 import UnifiedQuote as _UQ  # type: ignore
@@ -93,16 +95,14 @@ def _import_v2() -> Tuple[Any, Any, Any]:
         return None, None, _fallback_normalize
 
 
-DataEngine, UnifiedQuote, normalize_symbol = _import_v2()
-
-
 def _normalize_any(raw: str) -> str:
+    # Try v2 normalize_symbol at runtime; fallback if anything fails.
     try:
-        return (normalize_symbol(raw) or "").strip().upper()
-    except Exception:
-        # normalize_symbol could be fallback or could still fail on weird input
-        s = (raw or "").strip().upper()
+        _, _, ns = _try_import_v2_symbols()
+        s = (ns(raw) or "").strip().upper()
         return s
+    except Exception:
+        return (raw or "").strip().upper()
 
 
 # =============================================================================
@@ -220,7 +220,7 @@ async def _get_singleton_engine() -> Optional[Any]:
     async with _ENGINE_LOCK:
         if _ENGINE is None:
             try:
-                DE, _, _ = _import_v2()
+                DE, _, _ = _try_import_v2_symbols()
                 if DE is None:
                     _ENGINE = None
                 else:
@@ -276,7 +276,7 @@ def _cfg() -> Dict[str, Any]:
     concurrency = _safe_int(os.getenv("AI_BATCH_CONCURRENCY", concurrency), concurrency)
     max_tickers = _safe_int(os.getenv("AI_MAX_TICKERS", max_tickers), max_tickers)
 
-    # sanity clamps
+    # clamps
     batch_size = max(5, min(200, batch_size))
     timeout_sec = max(5.0, min(180.0, timeout_sec))
     concurrency = max(1, min(25, concurrency))
@@ -407,18 +407,31 @@ def _finalize_quote(uq: Any) -> Any:
     return uq
 
 
-def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data") -> Any:
+def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data") -> Dict[str, Any]:
     sym = (symbol or "").strip().upper() or "UNKNOWN"
-    if UnifiedQuote is not None:
-        try:
-            uq = UnifiedQuote(symbol=sym, data_quality=dq, error=err, status="error")  # type: ignore
-            return _finalize_quote(uq)
-        except Exception:
-            pass
     return {
         "symbol": sym,
-        "data_quality": dq,
+        "name": None,
+        "market": None,
+        "currency": None,
+        "current_price": None,
+        "previous_close": None,
+        "day_high": None,
+        "day_low": None,
+        "week_52_high": None,
+        "week_52_low": None,
+        "position_52w_percent": None,
+        "volume": None,
+        "avg_volume_30d": None,
+        "value_traded": None,
+        "market_cap": None,
+        "pe_ttm": None,
+        "pb": None,
+        "dividend_yield": None,
+        "roe": None,
+        "roa": None,
         "data_source": "none",
+        "data_quality": dq,
         "error": err,
         "status": "error",
         "last_updated_utc": _now_utc_iso(),
@@ -636,8 +649,9 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "percent change": (("percent_change", "change_percent", "change_pct"), None),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
-    "52w high": (("high_52w",), None),
-    "52w low": (("low_52w",), None),
+    # ✅ align to V2 keys
+    "52w high": (("week_52_high", "high_52w", "52w_high"), None),
+    "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
     "volume": (("volume",), None),
     "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
@@ -693,8 +707,8 @@ def _value_for_header(header: str, uq: Any) -> Any:
         if v is not None:
             return v
         cp = _safe_get(uq, "current_price", "last_price", "price")
-        lo = _safe_get(uq, "low_52w")
-        hi = _safe_get(uq, "high_52w")
+        lo = _safe_get(uq, "week_52_low", "low_52w")
+        hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
     spec = _HEADER_MAP.get(hk)
@@ -747,8 +761,7 @@ async def _maybe_await(x: Any) -> Any:
 
 
 def _unwrap_tuple_payload(x: Any) -> Any:
-    # Some engines/providers might return (payload, err)
-    if isinstance(x, tuple) and len(x) == 2 and isinstance(x[0], (dict, object)):
+    if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
 
@@ -759,21 +772,21 @@ async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
     - Prefer engine.get_enriched_quotes if present
     - Else engine.get_quotes
     - Else per-symbol engine.get_enriched_quote/get_quote
-    Accepts engines returning list OR dict.
+    Accepts engines returning list OR dict OR (payload, err).
     """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
-        res = await _maybe_await(fn(syms))
+        res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
         if isinstance(res, dict):
-            return [ _unwrap_tuple_payload(v) for v in list(res.values()) ]
-        return [ _unwrap_tuple_payload(v) for v in list(res or []) ]
+            return [_unwrap_tuple_payload(v) for v in list(res.values())]
+        return [_unwrap_tuple_payload(v) for v in list(res or [])]
 
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
-        res = await _maybe_await(fn2(syms))
+        res = _unwrap_tuple_payload(await _maybe_await(fn2(syms)))
         if isinstance(res, dict):
-            return [ _unwrap_tuple_payload(v) for v in list(res.values()) ]
-        return [ _unwrap_tuple_payload(v) for v in list(res or []) ]
+            return [_unwrap_tuple_payload(v) for v in list(res.values())]
+        return [_unwrap_tuple_payload(v) for v in list(res or [])]
 
     out: List[Any] = []
     for s in syms:
@@ -855,7 +868,6 @@ async def _get_quotes_chunked(
 
         returned = list(res or [])
         chunk_map: Dict[str, Any] = {}
-
         for q in returned:
             q2 = _finalize_quote(_unwrap_tuple_payload(q))
             for k in _index_keys_for_quote(q2):
@@ -872,7 +884,7 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
-    # best-effort scoring (engine may already attach scores)
+    # best-effort scoring enrichment (optional)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
         uq = enrich_with_scores(uq)  # type: ignore
@@ -927,14 +939,19 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
     eng = await _resolve_engine(request)
 
     providers: List[str] = []
+    engine_version: Optional[str] = None
+    engine_name: str = "none"
+
     try:
         if eng is not None:
+            engine_name = type(eng).__name__
+            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
             # support multiple engine styles
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
                     providers.extend([str(x) for x in v if str(x).strip()])
-            # dedup
+            # de-dup
             seen = set()
             providers = [p for p in providers if not (p in seen or seen.add(p))]
     except Exception:
@@ -944,7 +961,8 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
         "status": "ok",
         "module": "routes.ai_analysis",
         "version": AI_ANALYSIS_VERSION,
-        "engine": "DataEngineV2" if eng else "none",
+        "engine": engine_name,
+        "engine_version": engine_version,
         "providers": providers,
         "limits": {
             "batch_size": cfg["batch_size"],
@@ -1071,4 +1089,3 @@ __all__ = [
     "BatchAnalysisResponse",
     "SheetAnalysisResponse",
 ]
-```
