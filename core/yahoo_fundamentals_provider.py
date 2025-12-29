@@ -1,13 +1,14 @@
-# core/yahoo_fundamentals_provider.py
+# core/providers/yahoo_fundamentals_provider.py
 from __future__ import annotations
 
 """
 Yahoo Fundamentals Provider (NO yfinance) — v1.0.0 (PROD SAFE)
 
-Goal:
-- Fill missing fundamentals for KSA (.SR) (and works for GLOBAL too)
-- market_cap, pe_ttm, pb, dividend_yield, roe, roa
-- Best-effort, retry on 429/5xx
+Provides best-effort fundamentals for symbols (works for KSA .SR + GLOBAL):
+- market_cap, pe_ttm, pb, dividend_yield, roe, roa, currency
+
+This module is designed to be imported lazily by DataEngineV2 and should never
+crash the app on import.
 """
 
 import asyncio
@@ -59,9 +60,6 @@ def _yahoo_symbol(symbol: str) -> str:
 
 
 def _get_raw(obj: Any) -> Optional[float]:
-    """
-    Yahoo often returns: {"raw": 123, "fmt": "123"} or a plain number.
-    """
     if obj is None:
         return None
     if isinstance(obj, (int, float)):
@@ -144,12 +142,11 @@ async def yahoo_fundamentals(
         out["market_cap"] = _get_raw(price.get("marketCap")) or _get_raw(stats.get("marketCap"))
         out["pe_ttm"] = _get_raw(summ.get("trailingPE")) or _get_raw(stats.get("trailingPE"))
         out["pb"] = _get_raw(stats.get("priceToBook"))
-        out["dividend_yield"] = _get_raw(summ.get("dividendYield"))  # usually fraction
+        out["dividend_yield"] = _get_raw(summ.get("dividendYield"))  # fraction
         out["roe"] = _get_raw(fin.get("returnOnEquity"))
         out["roa"] = _get_raw(fin.get("returnOnAssets"))
 
     async def _try_quote_v7() -> None:
-        # fallback if quoteSummary is blocked
         r = await client.get(YAHOO_QUOTE_URL, params={"symbols": sym})
         if r.status_code >= 400:
             raise RuntimeError(f"quote v7 HTTP {r.status_code}")
@@ -174,10 +171,8 @@ async def yahoo_fundamentals(
                 break
             except Exception as e:
                 last_err = str(e)
-                # retry on rate limits / transient
                 await _sleep_backoff(attempt)
 
-        # fallback if still empty
         if (
             out["market_cap"] is None
             and out["pe_ttm"] is None
@@ -201,3 +196,24 @@ async def yahoo_fundamentals(
     finally:
         if close_client:
             await client.aclose()
+
+
+# --- Engine adapter (what DataEngineV2 calls) --------------------------------
+
+async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
+    """
+    Returns a patch aligned to UnifiedQuote keys.
+    """
+    d = await yahoo_fundamentals(symbol)
+    err = (d.get("error") or "").strip()
+    patch = {
+        "currency": d.get("currency"),
+        "market_cap": d.get("market_cap"),
+        "pe_ttm": d.get("pe_ttm"),
+        "pb": d.get("pb"),
+        "dividend_yield": d.get("dividend_yield"),
+        "roe": d.get("roe"),
+        "roa": d.get("roa"),
+    }
+    # keep patch clean
+    return {k: v for k, v in patch.items() if v is not None}
