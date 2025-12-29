@@ -1,15 +1,21 @@
+# core/data_engine_v2.py  (FULL REPLACEMENT)
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.7.7) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.7.8) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-✅ v2.7.7 enhancement (your missing KSA fundamentals fix):
-- ✅ Keep yahoo_chart for KSA price stability
-- ✅ Add optional Yahoo Fundamentals supplement (NO yfinance) to fill:
-    market_cap, pe_ttm, pb, dividend_yield, roe, roa
-  when KSA fundamentals are missing.
-- ✅ Default ON for KSA unless disabled via:
-    ENABLE_YAHOO_FUNDAMENTALS_KSA=false
+✅ v2.7.8 improvements vs v2.7.7 (fix KSA fundamentals visibility + reliability)
+- ✅ KSA price stays on yahoo_chart (stable).
+- ✅ Yahoo Fundamentals supplement is now DEBUGGABLE:
+    - prefers calling yahoo_fundamentals() (full dict includes "error")
+    - if returns empty fundamentals, emits warning (so we can see why)
+- ✅ Fundamentals cache (FUNDAMENTALS_TTL_SEC, default 21600s = 6h)
+- ✅ Better supplement trigger:
+    - runs when core fundamentals are missing (market_cap/pe/pb/div_yield/roe/roa/shares)
+- ✅ Derivations:
+    - compute shares_outstanding or market_cap if one exists + current_price
+    - compute free_float_market_cap when market_cap + free_float exist
+- ✅ PROD SAFE: never throws to callers; health stays up.
 
 Return shape
 - Dict aligned to UnifiedQuote keys (safe for Sheets)
@@ -30,7 +36,7 @@ from cachetools import TTLCache
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.7.7"
+ENGINE_VERSION = "2.7.8"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -91,14 +97,14 @@ class UnifiedQuote(BaseModel):
     # Fundamentals (optional)
     market_cap: Optional[float] = None
     shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
+    free_float: Optional[float] = None  # percent (0..100) per your AAPL output
     free_float_market_cap: Optional[float] = None
 
     eps_ttm: Optional[float] = None
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
     ps: Optional[float] = None
-    dividend_yield: Optional[float] = None
+    dividend_yield: Optional[float] = None  # fraction (0.0037 = 0.37%)
     roe: Optional[float] = None
     roa: Optional[float] = None
     beta: Optional[float] = None
@@ -316,6 +322,31 @@ def _apply_derived(out: Dict[str, Any]) -> None:
             out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
 
 
+def _apply_fundamental_derivations(out: Dict[str, Any]) -> None:
+    """
+    Helpful derivations once we have price + either market_cap or shares_outstanding.
+    Keeps everything best-effort; never throws.
+    """
+    try:
+        cur = _safe_float(out.get("current_price"))
+        mc = _safe_float(out.get("market_cap"))
+        sh = _safe_float(out.get("shares_outstanding"))
+
+        if cur is not None and mc is not None and sh is None and cur != 0:
+            out["shares_outstanding"] = mc / cur
+
+        if cur is not None and sh is not None and mc is None:
+            out["market_cap"] = sh * cur
+
+        ff = _safe_float(out.get("free_float"))
+        mc2 = _safe_float(out.get("market_cap"))
+        if mc2 is not None and ff is not None and out.get("free_float_market_cap") is None:
+            # free_float is treated as percent (0..100) per your AAPL example.
+            out["free_float_market_cap"] = mc2 * (ff / 100.0)
+    except Exception:
+        return
+
+
 def _score_quality(p: Dict[str, Any]) -> int:
     roe = _safe_float(p.get("roe"))
     margin = _safe_float(p.get("net_margin"))
@@ -411,6 +442,17 @@ def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
     return False
 
 
+def _has_core_fundamentals(out: Dict[str, Any]) -> bool:
+    """
+    Core fundamentals that matter for your dashboard scoring.
+    If none exist, we should try Yahoo fundamentals supplement.
+    """
+    for k in ("market_cap", "shares_outstanding", "pe_ttm", "pb", "dividend_yield", "roe", "roa"):
+        if _safe_float(out.get(k)) is not None:
+            return True
+    return False
+
+
 def _normalize_warning_prefix(msg: str) -> str:
     m = (msg or "").strip()
     if not m:
@@ -437,6 +479,7 @@ class DataEngine:
         self.enable_yahoo_fundamentals_ksa = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True)
         self.enable_yahoo_fundamentals_global = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", False)
 
+        # Quote cache TTL
         ttl = 10
         try:
             ttl = int((os.getenv("ENGINE_CACHE_TTL_SEC") or "10").strip())
@@ -446,12 +489,24 @@ class DataEngine:
             ttl = 10
         self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
 
+        # Fundamentals cache TTL (long)
+        fttl = 21600
+        try:
+            fttl = int((os.getenv("FUNDAMENTALS_TTL_SEC") or "21600").strip())
+            if fttl < 300:
+                fttl = 300
+        except Exception:
+            fttl = 21600
+        self._fund_cache: TTLCache = TTLCache(maxsize=12000, ttl=fttl)
+
         logger.info(
-            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss | yahoo_fund_ksa=%s yahoo_fund_global=%s",
+            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | quote_cache_ttl=%ss | fund_cache_ttl=%ss | "
+            "yahoo_fund_ksa=%s yahoo_fund_global=%s",
             ENGINE_VERSION,
             ",".join(self.providers_global) if self.providers_global else "(none)",
             ",".join(self.providers_ksa) if self.providers_ksa else "(none)",
             ttl,
+            fttl,
             self.enable_yahoo_fundamentals_ksa,
             self.enable_yahoo_fundamentals_global,
         )
@@ -479,6 +534,59 @@ class DataEngine:
             return safe
 
         return list(self.providers_global or [])
+
+    async def _yahoo_fundamentals_supplement(self, sym: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """
+        Returns (clean_patch, warning_or_error).
+        Uses fundamentals cache.
+        """
+        cache_key = f"fund::{sym}"
+        hit = self._fund_cache.get(cache_key)
+        if isinstance(hit, dict) and hit:
+            # cached patch, no warning
+            return dict(hit), None
+
+        # Prefer yahoo_fundamentals() first because it includes "error" in returned dict
+        patch2, err2 = await _try_provider_call(
+            "core.providers.yahoo_fundamentals_provider",
+            [
+                "yahoo_fundamentals",        # returns full dict including "error"
+                "fetch_fundamentals_patch",  # returns filtered patch only
+                "fetch_patch",
+                "fetch_fundamentals",
+            ],
+            sym,
+        )
+
+        # If yahoo_fundamentals() was used, patch2 includes many keys; we only keep what UnifiedQuote expects.
+        clean = {
+            k: patch2.get(k)
+            for k in (
+                "currency",
+                "market_cap",
+                "shares_outstanding",
+                "pe_ttm",
+                "pb",
+                "dividend_yield",
+                "roe",
+                "roa",
+            )
+            if patch2.get(k) is not None
+        }
+
+        # Pull error from either the engine err2 or the provider dict field (important!)
+        msg = (err2 or "") or str(patch2.get("error") or "").strip()
+        msg = msg.strip() if msg else ""
+
+        # If nothing returned and no error, still warn (this was your silent failure in v2.7.7)
+        if not clean and not msg:
+            msg = "yahoo fundamentals returned no usable fields"
+
+        # Cache only when we got something useful (avoid caching empties forever)
+        if clean:
+            self._fund_cache[cache_key] = dict(clean)
+
+        return clean, msg or None
 
     async def get_enriched_quote(self, symbol: str, *, enrich: bool = True) -> Dict[str, Any]:
         sym = normalize_symbol(symbol)
@@ -544,7 +652,12 @@ class DataEngine:
             elif p == "argaam":
                 patch, err = await _try_provider_call(
                     "core.providers.argaam_provider",
-                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_enriched_quote_patch"],
+                    [
+                        "fetch_quote_patch",
+                        "fetch_quote_and_fundamentals_patch",
+                        "fetch_enriched_patch",
+                        "fetch_enriched_quote_patch",
+                    ],
                     sym,
                 )
 
@@ -580,7 +693,13 @@ class DataEngine:
             elif p == "fmp":
                 patch, err = await _try_provider_call(
                     "core.providers.fmp_provider",
-                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
+                    [
+                        "fetch_quote_and_fundamentals_patch",
+                        "fetch_enriched_quote_patch",
+                        "fetch_enriched_patch",
+                        "fetch_quote_patch",
+                        "fetch_quote",
+                    ],
                     sym,
                 )
 
@@ -600,43 +719,37 @@ class DataEngine:
                     warnings.append(f"{p}: {str(err).strip()}")
 
             _apply_derived(out)
+            _apply_fundamental_derivations(out)
 
             # Stop rule:
             has_price_now = _safe_float(out.get("current_price")) is not None
             if has_price_now:
                 if not enrich:
                     break
+                # If we already have ANY fundamentals from a provider, we can stop.
+                # (Supplement step later may still run if core fundamentals missing.)
                 if _has_any_fundamentals(out):
                     break
 
-        # ✅ Post-loop: Yahoo Fundamentals supplement (fix KSA fundamentals when price is present)
+        # ✅ Post-loop: Yahoo Fundamentals supplement (fix KSA fundamentals when core fundamentals missing)
         try:
             has_price = _safe_float(out.get("current_price")) is not None
-            needs_fund = enrich and has_price and (not _has_any_fundamentals(out))
-
+            needs_core_fund = enrich and has_price and (not _has_core_fundamentals(out))
             allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
 
-            if needs_fund and allow:
-                patch2, err2 = await _try_provider_call(
-                    "core.providers.yahoo_fundamentals_provider",
-                    ["fetch_fundamentals_patch", "fetch_patch", "yahoo_fundamentals", "fetch_fundamentals"],
-                    sym,
-                )
+            if needs_core_fund and allow:
+                clean, msg = await self._yahoo_fundamentals_supplement(sym)
 
-                if patch2:
-                    clean = {
-                        k: patch2.get(k)
-                        for k in ("currency", "market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa")
-                        if patch2.get(k) is not None
-                    }
-                    if clean:
-                        _merge_patch(out, clean)
-                        source_used.append("yahoo_fundamentals")
+                if clean:
+                    _merge_patch(out, clean)
+                    source_used.append("yahoo_fundamentals")
 
-                if err2:
-                    warnings.append(f"yahoo_fundamentals: {str(err2).strip()}")
+                if msg:
+                    warnings.append(f"yahoo_fundamentals: {msg}")
 
                 _apply_derived(out)
+                _apply_fundamental_derivations(out)
+
         except Exception:
             pass  # PROD SAFE
 
