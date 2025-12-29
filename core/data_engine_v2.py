@@ -2,17 +2,15 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.7.6) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.7.7) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-✅ Fixes in v2.7.6 (from your Phase-0 baseline):
-- ✅ If current_price exists => status ALWAYS "success"
-  (provider failures become warnings; NEVER flip to error when price is present)
-- ✅ Fix GLOBAL fundamentals missing (market_cap / pe_ttm NULL):
-  - Ensure EODHD enriched/fundamentals function is actually called
-  - Prevent early-break on just `name` (must wait for fundamentals when enrich=True)
-- ✅ Auto-skip 'tadawul' provider when not configured
-  (missing TADAWUL_QUOTE_URL + TADAWUL_FUNDAMENTALS_URL)
-- ✅ Avoid duplicated error prefixes like "tadawul: tadawul: ..."
+✅ v2.7.7 enhancement (your missing KSA fundamentals fix):
+- ✅ Keep yahoo_chart for KSA price stability
+- ✅ Add optional Yahoo Fundamentals supplement (NO yfinance) to fill:
+    market_cap, pe_ttm, pb, dividend_yield, roe, roa
+  when KSA fundamentals are missing.
+- ✅ Default ON for KSA unless disabled via:
+    ENABLE_YAHOO_FUNDAMENTALS_KSA=false
 
 Return shape
 - Dict aligned to UnifiedQuote keys (safe for Sheets)
@@ -33,10 +31,11 @@ from cachetools import TTLCache
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.7.6"
+ENGINE_VERSION = "2.7.7"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_FALSEY = {"0", "false", "no", "n", "off", "f"}
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +158,17 @@ class UnifiedQuote(BaseModel):
 # ---------------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _FALSEY:
+        return False
+    if raw in _TRUTHY:
+        return True
+    return default
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -384,7 +394,6 @@ def _tadawul_configured() -> bool:
 
 
 def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
-    # "Fundamentals anchor": if any of these exist, we can stop when enrich=True
     for k in (
         "market_cap",
         "pe_ttm",
@@ -425,6 +434,10 @@ class DataEngine:
         self.providers_global = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
         self.providers_ksa = _parse_list_env("KSA_PROVIDERS")
 
+        # ✅ Fundamentals supplement toggles (default ON for KSA)
+        self.enable_yahoo_fundamentals_ksa = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True)
+        self.enable_yahoo_fundamentals_global = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", False)
+
         ttl = 10
         try:
             ttl = int((os.getenv("ENGINE_CACHE_TTL_SEC") or "10").strip())
@@ -435,11 +448,13 @@ class DataEngine:
         self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
 
         logger.info(
-            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss",
+            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss | yahoo_fund_ksa=%s yahoo_fund_global=%s",
             ENGINE_VERSION,
             ",".join(self.providers_global) if self.providers_global else "(none)",
             ",".join(self.providers_ksa) if self.providers_ksa else "(none)",
             ttl,
+            self.enable_yahoo_fundamentals_ksa,
+            self.enable_yahoo_fundamentals_global,
         )
 
     async def aclose(self) -> None:
@@ -521,7 +536,6 @@ class DataEngine:
             err: Optional[str] = None
 
             if p == "tadawul":
-                # tadawul may provide fundamentals, but only if configured
                 patch, err = await _try_provider_call(
                     "core.providers.tadawul_provider",
                     ["fetch_quote_and_fundamentals_patch", "fetch_fundamentals_patch", "fetch_quote_patch"],
@@ -544,7 +558,6 @@ class DataEngine:
 
             elif p == "finnhub":
                 api_key = os.getenv("FINNHUB_API_KEY")
-                # Finnhub provides quote + some profile fields, but fundamentals are limited unless you built it
                 patch, err = await _try_provider_call(
                     "core.providers.finnhub_provider",
                     ["fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"],
@@ -553,11 +566,10 @@ class DataEngine:
                 )
 
             elif p == "eodhd":
-                # ✅ Critical: include the real enriched function used by your provider implementation
                 if enrich:
                     fn_list = [
-                        "fetch_enriched_quote_patch",          # <- your provider uses this
-                        "fetch_quote_and_fundamentals_patch",  # <- some variants use this name
+                        "fetch_enriched_quote_patch",
+                        "fetch_quote_and_fundamentals_patch",
                         "fetch_enriched_patch",
                         "fetch_quote_patch",
                         "fetch_quote",
@@ -581,6 +593,7 @@ class DataEngine:
                 warnings.append(f"{p}: unknown provider")
                 continue
 
+            # Merge patch
             if patch:
                 _merge_patch(out, patch)
                 source_used.append(p)
@@ -597,15 +610,44 @@ class DataEngine:
             # ✅ Stop rule:
             # - If no price: keep trying
             # - If enrich=False: stop once price exists
-            # - If enrich=True: stop only once price exists AND we have some fundamentals (or we exhausted providers)
+            # - If enrich=True: stop only once price exists AND we have some fundamentals
             has_price_now = _safe_float(out.get("current_price")) is not None
             if has_price_now:
                 if not enrich:
                     break
-                # When enrich=True, do NOT stop just because we have a name.
-                # We stop only when at least one fundamentals anchor exists.
                 if _has_any_fundamentals(out):
                     break
+
+        # ✅ Post-loop: Yahoo Fundamentals supplement (fix KSA fundamentals when price is present)
+        try:
+            has_price = _safe_float(out.get("current_price")) is not None
+            needs_fund = enrich and has_price and (not _has_any_fundamentals(out))
+
+            allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
+            if needs_fund and allow:
+                patch2, err2 = await _try_provider_call(
+                    "core.providers.yahoo_fundamentals_provider",
+                    ["fetch_fundamentals_patch", "fetch_patch", "yahoo_fundamentals", "fetch_fundamentals"],
+                    sym,
+                )
+                # only merge known fundamentals keys (avoid extra noise keys)
+                if patch2:
+                    clean = {
+                        k: patch2.get(k)
+                        for k in ("currency", "market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa")
+                        if patch2.get(k) is not None
+                    }
+                    if clean:
+                        _merge_patch(out, clean)
+                        source_used.append("yahoo_fundamentals")
+
+                if err2:
+                    warnings.append(f"yahoo_fundamentals: {str(err2).strip()}")
+
+                _apply_derived(out)
+        except Exception:
+            # PROD SAFE: never break a quote because supplement failed
+            pass
 
         # Scoring
         out["quality_score"] = _score_quality(out)
@@ -625,7 +667,7 @@ class DataEngine:
         # data_quality
         out["data_quality"] = _quality_label(out)
 
-        # ✅ Final status + error normalization (THIS is what will fix your KSA red rows)
+        # ✅ Final status + error normalization
         has_price = _safe_float(out.get("current_price")) is not None
 
         base_err = str(out.get("error") or "").strip()
@@ -639,7 +681,6 @@ class DataEngine:
             out["status"] = "error"
             out["error"] = " | ".join(parts) if parts else "No price returned"
         else:
-            # price exists => always success
             out["status"] = "success"
             out["error"] = "" if not parts else ("warning: " + " | ".join(parts))
 
