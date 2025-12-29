@@ -1,38 +1,45 @@
 from __future__ import annotations
 
 """
-Yahoo Fundamentals Provider (NO yfinance) — v1.2.0 (PROD SAFE)
+Yahoo Fundamentals Provider (NO yfinance) — v1.1.0 (PROD SAFE)
 
-Best-effort fundamentals for symbols (works for KSA .SR + GLOBAL) using ONLY Yahoo
-public endpoints (quoteSummary + v7 quote), with defensive retries, throttling,
-and safe parsing.
+Goal:
+- Best-effort fundamentals for symbols (KSA .SR + GLOBAL)
+- Fill:
+    market_cap, pe_ttm, pb, dividend_yield, roe, roa, currency
+- NEVER crash the app on import
+- Works as supplement provider (after yahoo_chart price) inside DataEngineV2
 
-Fields returned (best-effort):
-- market_cap, pe_ttm, pb, dividend_yield, roe, roa, currency
+Why v1.1.0:
+- Yahoo quoteSummary is sometimes gated by cookie/crumb flows (common)
+- Adds cookie+crumb best-effort + fallback fundamentals-timeseries endpoint
 
-Design goals
-- Never crash the app on import (safe defaults).
-- Async-friendly, re-usable httpx client support.
-- Robust parsing across Yahoo field variants (raw/fmt and alternative keys).
-- Bounded jitter backoff to reduce transient 429/5xx issues.
-- Returns structured output with timestamps and error details (no exceptions leak).
-
-Notes
-- dividend_yield is a FRACTION (e.g., 0.035). Downstream can convert to %.
-- roe/roa are usually FRACTION (e.g., 0.12). Downstream can convert to %.
+Refs:
+- Crumb/cookie gating patterns are widely discussed in yfinance issues. (example) :contentReference[oaicite:3]{index=3}
+- fundamentals-timeseries endpoint format used in yfinance scrapers. :contentReference[oaicite:4]{index=4}
 """
 
 import asyncio
+import json
 import random
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-PROVIDER_VERSION = "1.2.0"
+PROVIDER_VERSION = "1.1.0"
 
 YAHOO_QUOTE_SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+
+# Timeseries endpoint used by yfinance for Yahoo datastores
+YAHOO_FUND_TIMESERIES_URL = (
+    "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
+)
+
+YAHOO_GETCRUMB_URL = "https://query1.finance.yahoo.com/v1/test/getcrumb"
+YAHOO_QUOTE_PAGE_URL = "https://finance.yahoo.com/quote/{symbol}?p={symbol}"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,19 +47,10 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Reasonable defaults (can be overridden by caller)
-DEFAULT_TIMEOUT_SEC = 12.0
-DEFAULT_RETRY_ATTEMPTS = 3
-
-# Some symbols are passed as AAPL.US in your system; Yahoo expects AAPL
-# KSA usually already uses .SR which Yahoo expects unchanged.
-def _yahoo_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return ""
-    if s.endswith(".US"):
-        return s[:-3]
-    return s
+# ---- crumb cache (best-effort) ----
+_CRUMB_LOCK = asyncio.Lock()
+_CRUMB_CACHE: Dict[str, Any] = {"crumb": None, "ts": 0.0}
+_CRUMB_TTL_SEC = 60 * 30  # 30 minutes
 
 
 def _now_utc_iso() -> str:
@@ -60,27 +58,12 @@ def _now_utc_iso() -> str:
 
 
 def _safe_float(x: Any) -> Optional[float]:
-    """
-    Parses numbers from:
-    - float/int
-    - strings with commas
-    - dicts like {"raw": ..., "fmt": ...}
-    Returns None for NaN, blanks, or non-numeric.
-    """
     try:
         if x is None or isinstance(x, bool):
             return None
         if isinstance(x, (int, float)):
             v = float(x)
-            return None if v != v else v  # NaN check
-        if isinstance(x, dict):
-            # Prefer raw, then fmt if raw missing
-            if "raw" in x:
-                return _safe_float(x.get("raw"))
-            if "fmt" in x:
-                return _safe_float(x.get("fmt"))
-            # any other shape
-            return None
+            return None if v != v else v
         s = str(x).strip().replace(",", "")
         if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
             return None
@@ -90,28 +73,29 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _yahoo_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    # internal convention: AAPL.US => AAPL
+    if s.endswith(".US"):
+        return s[:-3]
+    return s
+
+
 def _get_raw(obj: Any) -> Optional[float]:
-    """
-    Yahoo often returns objects like {"raw": 123, "fmt": "123"}.
-    This helper extracts numeric values safely.
-    """
     if obj is None:
         return None
     if isinstance(obj, (int, float)):
         return _safe_float(obj)
     if isinstance(obj, dict):
-        return _safe_float(obj.get("raw")) or _safe_float(obj.get("fmt"))
+        return _safe_float(obj.get("raw"))
     return _safe_float(obj)
 
 
-def _sleep_backoff(attempt: int) -> float:
-    """
-    Compute bounded exponential backoff with jitter.
-    Returns the seconds to sleep.
-    """
+async def _sleep_backoff(attempt: int) -> None:
     base = 0.25 * (2**attempt)
-    jitter = random.random() * 0.35
-    return min(2.5, base + jitter)
+    await asyncio.sleep(min(2.8, base + random.random() * 0.35))
 
 
 def _base(symbol: str) -> Dict[str, Any]:
@@ -123,256 +107,292 @@ def _base(symbol: str) -> Dict[str, Any]:
         "market_cap": None,
         "pe_ttm": None,
         "pb": None,
-        "dividend_yield": None,  # fraction
-        "roe": None,             # fraction
-        "roa": None,             # fraction
+        "dividend_yield": None,
+        "roe": None,
+        "roa": None,
         "currency": None,
         "error": None,
-        "status_code": None,
-        "source": None,  # "quoteSummary" | "quoteV7" | "quoteSummary+quoteV7"
+        "meta": {},
     }
 
 
-def _is_transient_status(code: Optional[int]) -> bool:
-    if code is None:
-        return True
-    return code in (408, 425, 429, 500, 502, 503, 504)
+def _has_any(out: Dict[str, Any]) -> bool:
+    for k in ("market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa"):
+        if _safe_float(out.get(k)) is not None:
+            return True
+    return False
 
 
-def _client_defaults(timeout: float) -> Dict[str, Any]:
-    return {
-        "headers": {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
-            "Referer": "https://finance.yahoo.com/",
-            "Connection": "keep-alive",
-        },
-        "follow_redirects": True,
-        "timeout": httpx.Timeout(timeout),
-        "limits": httpx.Limits(max_keepalive_connections=10, max_connections=20),
-    }
-
-
-def _merge_best_effort(out: Dict[str, Any], patch: Dict[str, Any]) -> None:
+async def _ensure_crumb(client: httpx.AsyncClient, symbol: str, timeout: float) -> Optional[str]:
     """
-    Only fill missing values in `out` from `patch`.
+    Best-effort cookie+crumb retrieval.
+    Never raises (PROD SAFE).
     """
-    for k, v in patch.items():
-        if v is None:
-            continue
-        if out.get(k) is None:
-            out[k] = v
+    now = time.time()
+    cached = _CRUMB_CACHE.get("crumb")
+    ts = float(_CRUMB_CACHE.get("ts") or 0.0)
 
+    if cached and (now - ts) < _CRUMB_TTL_SEC:
+        return str(cached)
 
-def _summarize_error(prefix: str, exc: Exception, status_code: Optional[int] = None) -> str:
-    msg = f"{prefix}: {type(exc).__name__}: {exc}"
-    if status_code is not None:
-        msg = f"{prefix} HTTP {status_code}: {type(exc).__name__}: {exc}"
-    # Keep error short-ish for Sheets
-    return msg[:5000]
+    async with _CRUMB_LOCK:
+        now2 = time.time()
+        cached2 = _CRUMB_CACHE.get("crumb")
+        ts2 = float(_CRUMB_CACHE.get("ts") or 0.0)
+        if cached2 and (now2 - ts2) < _CRUMB_TTL_SEC:
+            return str(cached2)
 
+        try:
+            # Step 1: load quote page to set cookies
+            client.timeout = httpx.Timeout(timeout)
+            await client.get(YAHOO_QUOTE_PAGE_URL.format(symbol=symbol))
 
-async def _fetch_json(
-    client: httpx.AsyncClient,
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[str]]:
-    """
-    Returns (json, status_code, error_str)
-    """
-    try:
-        r = await client.get(url, params=params)
-        code = r.status_code
-        if code >= 400:
-            return None, code, f"HTTP {code}"
-        j = r.json() or {}
-        if not isinstance(j, dict):
-            return None, code, "Non-dict JSON"
-        return j, code, None
-    except Exception as exc:
-        return None, None, _summarize_error("request failed", exc)
+            # Step 2: fetch crumb
+            r = await client.get(YAHOO_GETCRUMB_URL)
+            if r.status_code >= 400:
+                _CRUMB_CACHE["crumb"] = None
+                _CRUMB_CACHE["ts"] = time.time()
+                return None
 
+            crumb = (r.text or "").strip()
+            if not crumb:
+                _CRUMB_CACHE["crumb"] = None
+                _CRUMB_CACHE["ts"] = time.time()
+                return None
 
-async def _try_quote_summary(client: httpx.AsyncClient, sym: str) -> Tuple[Dict[str, Any], Optional[int], Optional[str]]:
-    url = YAHOO_QUOTE_SUMMARY_URL.format(symbol=sym)
-    params = {"modules": "price,summaryDetail,defaultKeyStatistics,financialData"}
-    j, code, err = await _fetch_json(client, url, params=params)
-    if err:
-        return {}, code, f"quoteSummary {err}"
-
-    res = (((j.get("quoteSummary") or {}).get("result")) or [])
-    if not res:
-        return {}, code, "quoteSummary empty result"
-
-    data = res[0] or {}
-    price = data.get("price") or {}
-    summ = data.get("summaryDetail") or {}
-    stats = data.get("defaultKeyStatistics") or {}
-    fin = data.get("financialData") or {}
-
-    patch: Dict[str, Any] = {}
-
-    # currency
-    patch["currency"] = price.get("currency")
-
-    # market cap
-    patch["market_cap"] = _get_raw(price.get("marketCap")) or _get_raw(stats.get("marketCap"))
-
-    # P/E (TTM)
-    patch["pe_ttm"] = (
-        _get_raw(summ.get("trailingPE"))
-        or _get_raw(stats.get("trailingPE"))
-        or _get_raw(stats.get("peRatio"))  # sometimes appears in variants
-    )
-
-    # P/B
-    patch["pb"] = _get_raw(stats.get("priceToBook"))
-
-    # dividend yield (fraction)
-    patch["dividend_yield"] = (
-        _get_raw(summ.get("dividendYield"))
-        or _get_raw(summ.get("trailingAnnualDividendYield"))
-    )
-
-    # ROE / ROA (fractions)
-    patch["roe"] = _get_raw(fin.get("returnOnEquity")) or _get_raw(stats.get("returnOnEquity"))
-    patch["roa"] = _get_raw(fin.get("returnOnAssets")) or _get_raw(stats.get("returnOnAssets"))
-
-    return patch, code, None
-
-
-async def _try_quote_v7(client: httpx.AsyncClient, sym: str) -> Tuple[Dict[str, Any], Optional[int], Optional[str]]:
-    j, code, err = await _fetch_json(client, YAHOO_QUOTE_URL, params={"symbols": sym})
-    if err:
-        return {}, code, f"quoteV7 {err}"
-
-    q = (((j.get("quoteResponse") or {}).get("result")) or [])
-    if not q:
-        return {}, code, "quoteV7 empty result"
-
-    q0 = q[0] or {}
-    patch: Dict[str, Any] = {}
-
-    patch["currency"] = q0.get("currency")
-
-    patch["market_cap"] = _safe_float(q0.get("marketCap"))
-    patch["pe_ttm"] = _safe_float(q0.get("trailingPE")) or _safe_float(q0.get("peRatio"))
-    patch["pb"] = _safe_float(q0.get("priceToBook"))
-
-    # Yahoo sometimes provides these in quoteV7:
-    patch["dividend_yield"] = (
-        _safe_float(q0.get("trailingAnnualDividendYield"))
-        or _safe_float(q0.get("dividendYield"))
-    )
-
-    # ROE/ROA are not reliably present in v7 quote; keep only if present
-    patch["roe"] = _safe_float(q0.get("returnOnEquity"))
-    patch["roa"] = _safe_float(q0.get("returnOnAssets"))
-
-    return patch, code, None
+            _CRUMB_CACHE["crumb"] = crumb
+            _CRUMB_CACHE["ts"] = time.time()
+            return crumb
+        except Exception:
+            _CRUMB_CACHE["crumb"] = None
+            _CRUMB_CACHE["ts"] = time.time()
+            return None
 
 
 async def yahoo_fundamentals(
     symbol: str,
     *,
-    timeout: float = DEFAULT_TIMEOUT_SEC,
-    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    timeout: float = 12.0,
+    retry_attempts: int = 3,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
-    """
-    Main provider function.
-
-    Always returns a dict with:
-      {symbol, provider, provider_version, last_updated_utc, fields..., error, status_code, source}
-    Never raises exceptions out.
-    """
     sym = _yahoo_symbol(symbol)
     out = _base(sym)
-
     if not sym:
         out["error"] = "Empty symbol"
         return out
 
     close_client = False
     if client is None:
-        client = httpx.AsyncClient(**_client_defaults(timeout))
+        client = httpx.AsyncClient(
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json,text/plain,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
+                "Referer": "https://finance.yahoo.com/",
+                "Connection": "keep-alive",
+            },
+            follow_redirects=True,
+            timeout=httpx.Timeout(timeout),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
         close_client = True
 
-    # Attempt quoteSummary first, then fallback to quoteV7 if still missing core fields
+    async def _try_quote_summary() -> None:
+        crumb = await _ensure_crumb(client, sym, timeout)
+        url = YAHOO_QUOTE_SUMMARY_URL.format(symbol=sym)
+        params = {"modules": "price,summaryDetail,defaultKeyStatistics,financialData"}
+        if crumb:
+            params["crumb"] = crumb
+
+        r = await client.get(url, params=params)
+        out["meta"]["quoteSummary_status"] = r.status_code
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"quoteSummary HTTP {r.status_code}")
+
+        # Yahoo can sometimes return HTML; protect JSON parse
+        try:
+            j = r.json() or {}
+        except Exception:
+            txt = (r.text or "")[:200].replace("\n", " ")
+            raise RuntimeError(f"quoteSummary non-JSON ({txt})")
+
+        qs = j.get("quoteSummary") or {}
+        if qs.get("error"):
+            raise RuntimeError(f"quoteSummary error: {qs.get('error')}")
+
+        res = (qs.get("result") or [])
+        if not res:
+            raise RuntimeError("quoteSummary empty result")
+
+        data = res[0] or {}
+
+        price = data.get("price") or {}
+        summ = data.get("summaryDetail") or {}
+        stats = data.get("defaultKeyStatistics") or {}
+        fin = data.get("financialData") or {}
+
+        out["currency"] = (price.get("currency") or out["currency"])
+
+        out["market_cap"] = _get_raw(price.get("marketCap")) or _get_raw(stats.get("marketCap"))
+        out["pe_ttm"] = _get_raw(summ.get("trailingPE")) or _get_raw(stats.get("trailingPE"))
+        out["pb"] = _get_raw(stats.get("priceToBook"))
+        out["dividend_yield"] = _get_raw(summ.get("dividendYield"))  # fraction
+        out["roe"] = _get_raw(fin.get("returnOnEquity"))
+        out["roa"] = _get_raw(fin.get("returnOnAssets"))
+
+    async def _try_quote_v7() -> None:
+        r = await client.get(YAHOO_QUOTE_URL, params={"symbols": sym})
+        out["meta"]["quoteV7_status"] = r.status_code
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"quote v7 HTTP {r.status_code}")
+
+        try:
+            j = r.json() or {}
+        except Exception:
+            txt = (r.text or "")[:200].replace("\n", " ")
+            raise RuntimeError(f"quote v7 non-JSON ({txt})")
+
+        q = (((j.get("quoteResponse") or {}).get("result")) or [])
+        if not q:
+            raise RuntimeError("quote v7 empty result")
+
+        q0 = q[0] or {}
+        out["currency"] = q0.get("currency") or out["currency"]
+        out["market_cap"] = _safe_float(q0.get("marketCap")) or out["market_cap"]
+        out["pe_ttm"] = _safe_float(q0.get("trailingPE")) or out["pe_ttm"]
+        out["pb"] = _safe_float(q0.get("priceToBook")) or out["pb"]
+        out["dividend_yield"] = _safe_float(q0.get("trailingAnnualDividendYield")) or out["dividend_yield"]
+
+    async def _try_timeseries() -> None:
+        """
+        Best-effort: pull latest values from fundamentals-timeseries endpoint.
+
+        NOTE: Yahoo naming is not always consistent across markets; we request a bundle of
+        common types and accept whichever are returned.
+        """
+        # common types seen in the wild
+        types = [
+            "trailingMarketCap",
+            "trailingPeRatio",
+            "trailingPbRatio",
+            "trailingAnnualDividendYield",
+            "returnOnEquity",
+            "returnOnAssets",
+        ]
+
+        # period window (Yahoo caps history anyway)
+        period1 = int(datetime(2016, 12, 31, tzinfo=timezone.utc).timestamp())
+        period2 = int(datetime.now(timezone.utc).timestamp())
+
+        url = YAHOO_FUND_TIMESERIES_URL.format(symbol=sym)
+        params = {
+            "symbol": sym,
+            "type": ",".join(types),
+            "period1": str(period1),
+            "period2": str(period2),
+        }
+
+        r = await client.get(url, params=params)
+        out["meta"]["timeseries_status"] = r.status_code
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"timeseries HTTP {r.status_code}")
+
+        try:
+            j = r.json() or {}
+        except Exception:
+            txt = (r.text or "")[:200].replace("\n", " ")
+            raise RuntimeError(f"timeseries non-JSON ({txt})")
+
+        res = ((j.get("timeseries") or {}).get("result") or [])
+        if not res:
+            raise RuntimeError("timeseries empty result")
+
+        # Usually first record carries metrics
+        rec = res[0] or {}
+
+        # Currency might exist in per-metric meta or top meta; keep best-effort only
+        # Pull latest metric point:
+        def _latest(metric_key: str) -> Optional[float]:
+            arr = rec.get(metric_key)
+            if not isinstance(arr, list) or not arr:
+                return None
+            # choose last element with reportedValue.raw
+            for item in reversed(arr):
+                try:
+                    rv = ((item or {}).get("reportedValue") or {}).get("raw")
+                    v = _safe_float(rv)
+                    if v is not None:
+                        return v
+                except Exception:
+                    continue
+            return None
+
+        # Map if available
+        out["market_cap"] = _latest("trailingMarketCap") or out["market_cap"]
+        out["pe_ttm"] = _latest("trailingPeRatio") or out["pe_ttm"]
+        out["pb"] = _latest("trailingPbRatio") or out["pb"]
+        out["dividend_yield"] = _latest("trailingAnnualDividendYield") or out["dividend_yield"]
+        out["roe"] = _latest("returnOnEquity") or out["roe"]
+        out["roa"] = _latest("returnOnAssets") or out["roa"]
+
     last_err: Optional[str] = None
-    last_code: Optional[int] = None
-    used_sources: List[str] = []
-
     try:
-        attempts = max(1, int(retry_attempts))
-
-        # 1) quoteSummary
-        for attempt in range(attempts):
+        # 1) quoteSummary (with crumb best-effort)
+        for attempt in range(max(1, int(retry_attempts))):
             try:
-                patch, code, err = await _try_quote_summary(client, sym)
-                last_code = code
-                if err:
-                    last_err = err
-                    if _is_transient_status(code) and attempt < attempts - 1:
-                        await asyncio.sleep(_sleep_backoff(attempt))
-                        continue
-                _merge_best_effort(out, patch)
-                used_sources.append("quoteSummary")
+                await _try_quote_summary()
                 last_err = None
                 break
-            except Exception as exc:
-                last_err = _summarize_error("quoteSummary failed", exc, last_code)
-                if attempt < attempts - 1:
-                    await asyncio.sleep(_sleep_backoff(attempt))
+            except Exception as e:
+                last_err = str(e)
+                await _sleep_backoff(attempt)
 
-        # 2) If key fields are still missing, try quoteV7
-        core_missing = (
-            out.get("market_cap") is None
-            and out.get("pe_ttm") is None
-            and out.get("pb") is None
-            and out.get("dividend_yield") is None
-        )
-
-        if core_missing:
-            for attempt in range(attempts):
+        # 2) v7 quote fallback
+        if not _has_any(out):
+            for attempt in range(max(1, int(retry_attempts))):
                 try:
-                    patch, code, err = await _try_quote_v7(client, sym)
-                    last_code = code
-                    if err:
-                        last_err = err
-                        if _is_transient_status(code) and attempt < attempts - 1:
-                            await asyncio.sleep(_sleep_backoff(attempt))
-                            continue
-                    _merge_best_effort(out, patch)
-                    used_sources.append("quoteV7")
+                    await _try_quote_v7()
                     last_err = None
                     break
-                except Exception as exc:
-                    last_err = _summarize_error("quoteV7 failed", exc, last_code)
-                    if attempt < attempts - 1:
-                        await asyncio.sleep(_sleep_backoff(attempt))
+                except Exception as e:
+                    last_err = str(e)
+                    await _sleep_backoff(attempt)
 
-        out["status_code"] = last_code
-        out["source"] = "+".join(used_sources) if used_sources else None
-        if last_err:
+        # 3) timeseries fallback
+        if not _has_any(out):
+            for attempt in range(max(1, int(retry_attempts))):
+                try:
+                    await _try_timeseries()
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    await _sleep_backoff(attempt)
+
+        # If still nothing usable -> clear error for engine warning
+        if not _has_any(out):
+            out["error"] = "yahoo fundamentals returned no usable fields"
+        elif last_err:
+            # Non-fatal: got something, but record last warning
             out["error"] = last_err
 
         return out
 
     finally:
         if close_client:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+            await client.aclose()
 
 
 # --- Engine adapter (what DataEngineV2 calls) --------------------------------
+
 async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
     """
     Returns a patch aligned to UnifiedQuote keys.
-    Only non-None values are returned (safe to .update()).
+    Only returns non-null fields.
     """
     d = await yahoo_fundamentals(symbol)
     patch = {
