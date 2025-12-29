@@ -20,7 +20,13 @@ from typing import Any, Optional
 # -----------------------------------------------------------------------------
 # Optional debug logging for import issues (set CORE_IMPORT_DEBUG=true)
 # -----------------------------------------------------------------------------
-_DEBUG_IMPORTS = str(os.getenv("CORE_IMPORT_DEBUG", "false")).strip().lower() in ("1", "true", "yes", "y", "on")
+_DEBUG_IMPORTS = str(os.getenv("CORE_IMPORT_DEBUG", "false")).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
 
 
 def _dbg(msg: str) -> None:
@@ -110,7 +116,11 @@ def _resolve_engine_exports() -> dict[str, Any]:
         if exports["normalize_symbol"] is None and hasattr(m, "normalize_symbol"):
             exports["normalize_symbol"] = getattr(m, "normalize_symbol")
 
-        if exports["DataEngine"] is not None and exports["UnifiedQuote"] is not None and exports["normalize_symbol"] is not None:
+        if (
+            exports["DataEngine"] is not None
+            and exports["UnifiedQuote"] is not None
+            and exports["normalize_symbol"] is not None
+        ):
             break
 
     # Last resort: UnifiedQuote from schemas
