@@ -1,4 +1,3 @@
-# core/providers/yahoo_fundamentals_provider.py
 from __future__ import annotations
 
 """
@@ -205,7 +204,6 @@ async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
     Returns a patch aligned to UnifiedQuote keys.
     """
     d = await yahoo_fundamentals(symbol)
-    err = (d.get("error") or "").strip()
     patch = {
         "currency": d.get("currency"),
         "market_cap": d.get("market_cap"),
@@ -215,5 +213,4 @@ async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
         "roe": d.get("roe"),
         "roa": d.get("roa"),
     }
-    # keep patch clean
     return {k: v for k, v in patch.items() if v is not None}
