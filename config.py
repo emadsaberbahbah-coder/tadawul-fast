@@ -1,4 +1,4 @@
-# config.py  (REPO ROOT) — FULL REPLACEMENT
+# config.py (REPO ROOT) — FULL REPLACEMENT — v5.3.5
 """
 config.py
 ============================================================
@@ -8,15 +8,24 @@ Canonical Settings for Tadawul Fast Bridge (ROOT)
 ✅ Runtime alias export (so legacy/provider modules keep working).
 ✅ No network at import-time. Minimal side effects at import-time.
 
-Version: v5.3.4 (FULL FALLBACK INCLUDED)
+Version: v5.3.5 (FULL FALLBACK INCLUDED)
 
 v5.3.3 Fix (kept)
 - ✅ Exports APP_TOKEN + BACKUP_APP_TOKEN as runtime env aliases
   (fixes routes that check os.getenv("APP_TOKEN") directly)
 
-v5.3.4 Patch
+v5.3.4 Patch (kept)
 - ✅ Provides a COMPLETE last-resort fallback Settings (no “omitted for brevity”)
   so the app still boots even if pydantic-settings import fails.
+
+v5.3.5 Patch
+- ✅ Adds canonical feature flags used by DataEngineV2:
+    ENABLE_YAHOO_CHART_KSA
+    ENABLE_YAHOO_CHART_SUPPLEMENT
+    ENABLE_YFINANCE_KSA
+    ENABLE_YAHOO_FUNDAMENTALS_KSA
+    ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
+  and exports them as env aliases (legacy modules read env directly).
 """
 
 from __future__ import annotations
@@ -114,10 +123,16 @@ def _is_unset_string(s: str) -> bool:
 def _resolve_version_from_env_or_commit(service_version: str) -> str:
     """
     Version priority:
-      1) SERVICE_VERSION / APP_VERSION / VERSION (already loaded by settings if set)
+      1) SERVICE_VERSION / APP_VERSION / VERSION / RELEASE
       2) Render commit short hash (RENDER_GIT_COMMIT / GIT_COMMIT)
       3) "dev"
     """
+    # env-first
+    for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
+        v = (os.getenv(k) or "").strip()
+        if v and not _is_unset_string(v):
+            return v
+
     sv = (service_version or "").strip()
     if sv and not _is_unset_string(sv):
         return sv
@@ -281,12 +296,21 @@ try:
         google_apps_script_backup_url: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_APPS_SCRIPT_BACKUP_URL"))
 
         # ---------------------------------------------------------------------
-        # Feature flags
+        # Feature flags (general)
         # ---------------------------------------------------------------------
         advanced_analysis_enabled: bool = Field(default=True, validation_alias=_alias("ADVANCED_ANALYSIS_ENABLED"))
         tadawul_market_enabled: bool = Field(default=True, validation_alias=_alias("TADAWUL_MARKET_ENABLED"))
         enable_swagger: bool = Field(default=True, validation_alias=_alias("ENABLE_SWAGGER"))
         enable_redoc: bool = Field(default=True, validation_alias=_alias("ENABLE_REDOC"))
+
+        # ---------------------------------------------------------------------
+        # Feature flags (engine/provider routing)
+        # ---------------------------------------------------------------------
+        enable_yahoo_chart_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_KSA"))
+        enable_yahoo_chart_supplement: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_SUPPLEMENT"))
+        enable_yfinance_ksa: bool = Field(default=False, validation_alias=_alias("ENABLE_YFINANCE_KSA"))
+        enable_yahoo_fundamentals_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_FUNDAMENTALS_KSA"))
+        enable_yahoo_fundamentals_global: bool = Field(default=False, validation_alias=_alias("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"))
 
         # Optional KSA routing URLs
         tadawul_quote_url: Optional[str] = Field(default=None, validation_alias=_alias("TADAWUL_QUOTE_URL"))
@@ -386,6 +410,13 @@ try:
                     "all_origins": bool(self.enable_cors_all_origins),
                     "origins_list": self.cors_origins_list,
                 },
+                "engine_flags": {
+                    "ENABLE_YAHOO_CHART_KSA": bool(self.enable_yahoo_chart_ksa),
+                    "ENABLE_YAHOO_CHART_SUPPLEMENT": bool(self.enable_yahoo_chart_supplement),
+                    "ENABLE_YFINANCE_KSA": bool(self.enable_yfinance_ksa),
+                    "ENABLE_YAHOO_FUNDAMENTALS_KSA": bool(self.enable_yahoo_fundamentals_ksa),
+                    "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL": bool(self.enable_yahoo_fundamentals_global),
+                },
                 "app_token_set": bool((self.app_token or "").strip()),
                 "backup_app_token_set": bool((self.backup_app_token or "").strip()),
                 "app_token_mask": _mask_tail(self.app_token, keep=4),
@@ -419,7 +450,6 @@ try:
         # --- Version keys ---
         ver = _resolve_version_from_env_or_commit(s.service_version)
         s.service_version = ver
-
         _export_env_if_missing("SERVICE_VERSION", ver)
         _export_env_if_missing("APP_VERSION", ver)
         _export_env_if_missing("VERSION", ver)
@@ -438,7 +468,7 @@ try:
 
         _export_env_if_missing("LOG_LEVEL", (s.log_level or "info").strip().lower())
 
-        # ✅ CRITICAL AUTH ALIASES (v5.3.3)
+        # ✅ CRITICAL AUTH ALIASES
         if (s.app_token or "").strip():
             _export_env_if_missing("APP_TOKEN", (s.app_token or "").strip())
         if (s.backup_app_token or "").strip():
@@ -458,7 +488,6 @@ try:
         # TTL aliases
         _export_env_if_missing("CACHE_TTL_SEC", str(float(s.cache_ttl_sec)))
         _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(s.cache_ttl_sec)))
-
         _export_env_if_missing("ENGINE_CACHE_TTL_SEC", str(float(s.engine_cache_ttl_sec)))
         _export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
         _export_env_if_missing("ENRICHED_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
@@ -466,6 +495,13 @@ try:
         _export_env_if_missing("QUOTE_TTL_SEC", str(float(s.quote_ttl_sec)))
         _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(s.fundamentals_ttl_sec)))
         _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(s.argaam_snapshot_ttl_sec)))
+
+        # Engine/provider flags (export so modules that read env directly stay consistent)
+        _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(bool(s.enable_yahoo_chart_ksa)).lower())
+        _export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(bool(s.enable_yahoo_chart_supplement)).lower())
+        _export_env_if_missing("ENABLE_YFINANCE_KSA", str(bool(s.enable_yfinance_ksa)).lower())
+        _export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_KSA", str(bool(s.enable_yahoo_fundamentals_ksa)).lower())
+        _export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", str(bool(s.enable_yahoo_fundamentals_global)).lower())
 
         # Base URLs for provider modules that read env at call-time
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
@@ -522,6 +558,13 @@ try:
         s.defer_router_mount = _to_bool(s.defer_router_mount, True)
         s.init_engine_on_boot = _to_bool(s.init_engine_on_boot, True)
 
+        # Engine/provider routing flags
+        s.enable_yahoo_chart_ksa = _to_bool(s.enable_yahoo_chart_ksa, True)
+        s.enable_yahoo_chart_supplement = _to_bool(s.enable_yahoo_chart_supplement, True)
+        s.enable_yfinance_ksa = _to_bool(s.enable_yfinance_ksa, False)
+        s.enable_yahoo_fundamentals_ksa = _to_bool(s.enable_yahoo_fundamentals_ksa, True)
+        s.enable_yahoo_fundamentals_global = _to_bool(s.enable_yahoo_fundamentals_global, False)
+
         # Normalize (ints)
         s.max_requests_per_minute = _positive_int(s.max_requests_per_minute, 240)
         s.max_retries = _positive_int(s.max_retries, 2)
@@ -537,7 +580,6 @@ try:
         s.quote_ttl_sec = _positive_float(s.quote_ttl_sec, 30.0)
         s.fundamentals_ttl_sec = _positive_float(s.fundamentals_ttl_sec, 21600.0)
         s.argaam_snapshot_ttl_sec = _positive_float(s.argaam_snapshot_ttl_sec, 30.0)
-
         s.engine_cache_ttl_sec = _positive_float(s.engine_cache_ttl_sec, float(s.cache_ttl_sec or 20.0))
 
         # Normalize version (env/commit can win)
@@ -621,11 +663,18 @@ except Exception:  # pragma: no cover
         google_apps_script_url: Optional[str]
         google_apps_script_backup_url: Optional[str]
 
-        # Feature flags
+        # Feature flags (general)
         advanced_analysis_enabled: bool
         tadawul_market_enabled: bool
         enable_swagger: bool
         enable_redoc: bool
+
+        # Feature flags (engine/provider routing)
+        enable_yahoo_chart_ksa: bool
+        enable_yahoo_chart_supplement: bool
+        enable_yfinance_ksa: bool
+        enable_yahoo_fundamentals_ksa: bool
+        enable_yahoo_fundamentals_global: bool
 
         # KSA routing URLs
         tadawul_quote_url: Optional[str]
@@ -710,11 +759,18 @@ except Exception:  # pragma: no cover
             self.google_apps_script_url = (os.getenv("GOOGLE_APPS_SCRIPT_URL") or "").strip() or None
             self.google_apps_script_backup_url = (os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "").strip() or None
 
-            # Features
+            # Features (general)
             self.advanced_analysis_enabled = _to_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
             self.tadawul_market_enabled = _to_bool(os.getenv("TADAWUL_MARKET_ENABLED"), True)
             self.enable_swagger = _to_bool(os.getenv("ENABLE_SWAGGER"), True)
             self.enable_redoc = _to_bool(os.getenv("ENABLE_REDOC"), True)
+
+            # Features (engine/provider routing)
+            self.enable_yahoo_chart_ksa = _to_bool(os.getenv("ENABLE_YAHOO_CHART_KSA"), True)
+            self.enable_yahoo_chart_supplement = _to_bool(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
+            self.enable_yfinance_ksa = _to_bool(os.getenv("ENABLE_YFINANCE_KSA"), False)
+            self.enable_yahoo_fundamentals_ksa = _to_bool(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA"), True)
+            self.enable_yahoo_fundamentals_global = _to_bool(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"), False)
 
             # KSA endpoints
             self.tadawul_quote_url = (os.getenv("TADAWUL_QUOTE_URL") or "").strip() or None
@@ -722,7 +778,7 @@ except Exception:  # pragma: no cover
             self.argaam_quote_url = (os.getenv("ARGAAM_QUOTE_URL") or "").strip() or None
             self.argaam_profile_url = (os.getenv("ARGAAM_PROFILE_URL") or "").strip() or None
 
-            # Resolve version + export aliases (same behavior as pydantic path)
+            # Resolve version + export aliases
             self.service_version = _resolve_version_from_env_or_commit(self.service_version)
             _apply_runtime_env_aliases_fallback(self)
 
@@ -786,45 +842,6 @@ except Exception:  # pragma: no cover
         def google_credentials(self) -> Optional[str]:
             return self.google_sheets_credentials
 
-        def as_safe_dict(self) -> Dict[str, Any]:
-            return {
-                "service_name": self.service_name,
-                "service_version": self.service_version,
-                "environment": self.environment,
-                "tz": self.tz,
-                "debug": bool(self.debug),
-                "log_level": (self.log_level or "info").strip().lower(),
-                "require_auth": bool(self.require_auth),
-                "enabled_providers": self.enabled_providers,
-                "primary_provider": (self.primary_provider or "").strip().lower(),
-                "ksa_providers": self.ksa_providers,
-                "http_timeout_sec": float(self.http_timeout_sec),
-                "max_retries": int(self.max_retries),
-                "retry_delay": float(self.retry_delay),
-                "cache_ttl_sec": float(self.cache_ttl_sec),
-                "engine_cache_ttl_sec": float(self.engine_cache_ttl_sec),
-                "enriched_batch_concurrency": int(self.enriched_batch_concurrency),
-                "quote_ttl_sec": float(self.quote_ttl_sec),
-                "fundamentals_ttl_sec": float(self.fundamentals_ttl_sec),
-                "argaam_snapshot_ttl_sec": float(self.argaam_snapshot_ttl_sec),
-                "cache_max_size": int(self.cache_max_size),
-                "rate_limiting": {
-                    "enabled": bool(self.enable_rate_limiting),
-                    "max_requests_per_minute": int(self.max_requests_per_minute),
-                },
-                "cors": {
-                    "all_origins": bool(self.enable_cors_all_origins),
-                    "origins_list": self.cors_origins_list,
-                },
-                "app_token_set": bool((self.app_token or "").strip()),
-                "backup_app_token_set": bool((self.backup_app_token or "").strip()),
-                "app_token_mask": _mask_tail(self.app_token, keep=4),
-                "eodhd_key_set": bool((self.eodhd_api_key or "").strip()),
-                "finnhub_key_set": bool((self.finnhub_api_key or "").strip()),
-                "default_spreadsheet_id_set": bool((self.default_spreadsheet_id or "").strip()),
-                "google_creds_set": bool((self.google_sheets_credentials or "").strip()),
-            }
-
         def __getattr__(self, name: str) -> Any:
             if name.isupper():
                 mapping = {
@@ -881,6 +898,13 @@ except Exception:  # pragma: no cover
         _export_env_if_missing("ENGINE_CACHE_TTL_SEC", str(float(s.engine_cache_ttl_sec)))
         _export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
         _export_env_if_missing("ENRICHED_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
+
+        # Engine/provider flags
+        _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(bool(s.enable_yahoo_chart_ksa)).lower())
+        _export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(bool(s.enable_yahoo_chart_supplement)).lower())
+        _export_env_if_missing("ENABLE_YFINANCE_KSA", str(bool(s.enable_yfinance_ksa)).lower())
+        _export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_KSA", str(bool(s.enable_yahoo_fundamentals_ksa)).lower())
+        _export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", str(bool(s.enable_yahoo_fundamentals_global)).lower())
 
         # URLs
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
