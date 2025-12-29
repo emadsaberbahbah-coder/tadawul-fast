@@ -1,8 +1,8 @@
-# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.7
+# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.8
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.7)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.8)
 
 Key goals
 - ✅ Quiet boot by default (no banner logs unless ENV_LOG_ON_BOOT=true)
@@ -12,9 +12,11 @@ Key goals
 - ✅ Ensures token alias exports (FINNHUB_API_TOKEN / EODHD_API_TOKEN) for legacy modules
 - ✅ Keeps ENGINE_CACHE_TTL_SEC + ENRICHED_BATCH_CONCURRENCY (aligns with ENRICHED_CONCURRENCY)
 - ✅ Robust GOOGLE_SHEETS_CREDENTIALS parsing: supports minified JSON OR base64(minified JSON)
+- ✅ Exposes feature toggles used by DataEngineV2 (Yahoo chart/fundamentals/yfinance KSA)
 
 Notes
 - This file is intentionally defensive: it must never prevent app startup.
+- It never overwrites existing os.environ keys (exports only if missing/blank).
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.0.7"
+ENV_VERSION = "5.0.8"
 logger = logging.getLogger("env")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -196,6 +198,14 @@ def _export_env_if_missing(key: str, value: Any) -> None:
         os.environ[key] = v
 
 
+def _get_first_env(*keys: str) -> Optional[str]:
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
 # ---------------------------------------------------------------------
 # Optional: try to load Settings (VERY DEFENSIVE)
 # ---------------------------------------------------------------------
@@ -223,7 +233,7 @@ def _try_load_settings_once() -> Optional[object]:
         except Exception:
             pass
 
-        # Fallback legacy
+        # Fallback legacy shim
         try:
             from core.config import get_settings  # type: ignore
 
@@ -256,14 +266,6 @@ def _get_attr(obj: Optional[object], name: str, default: Any = None) -> Any:
     return default
 
 
-def _get_first_env(*keys: str) -> Optional[str]:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    return None
-
-
 def _env_first_bool(settings_obj: Optional[object], env_key: str, settings_attr: str, default: bool) -> bool:
     v = _get_first_env(env_key)
     if v is not None:
@@ -278,7 +280,7 @@ def _resolve_version(settings_obj: Optional[object]) -> str:
         if vv:
             return vv
 
-    # 2) Prefer Settings.service_version if present (config.py)
+    # 2) Settings (config.py)
     for k in ("service_version", "version", "app_version", "APP_VERSION"):
         vv = _normalize_version(_get_attr(settings_obj, k, ""))
         if vv:
@@ -334,7 +336,7 @@ BACKUP_APP_TOKEN = (
 
 REQUIRE_AUTH = _env_first_bool(_base_settings, "REQUIRE_AUTH", "require_auth", False)
 
-# Providers (config.py exposes enabled_providers + ksa_providers properties)
+# Providers (config.py exposes enabled_providers + ksa_providers)
 _enabled_from_env = _get_first_env("ENABLED_PROVIDERS", "PROVIDERS")
 if _enabled_from_env is not None:
     ENABLED_PROVIDERS: List[str] = _as_list_lower(_enabled_from_env)
@@ -347,7 +349,6 @@ _ksa_from_env = _get_first_env("KSA_PROVIDERS")
 if _ksa_from_env is not None:
     KSA_PROVIDERS: List[str] = _as_list_lower(_ksa_from_env)
 else:
-    # IMPORTANT: config.py uses `ksa_providers` (not enabled_ksa_providers)
     KSA_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "ksa_providers", None)) or _as_list_lower(
         _get_attr(_base_settings, "ksa_providers_raw", None) or "yahoo_chart,tadawul,argaam"
     )
@@ -360,6 +361,26 @@ PRIMARY_PROVIDER = (
 
 PROVIDERS = _safe_join(ENABLED_PROVIDERS)
 
+# Export provider strings for older modules that read env directly
+_export_env_if_missing("ENABLED_PROVIDERS", _safe_join(ENABLED_PROVIDERS))
+_export_env_if_missing("PROVIDERS", _safe_join(ENABLED_PROVIDERS))
+_export_env_if_missing("KSA_PROVIDERS", _safe_join(KSA_PROVIDERS))
+_export_env_if_missing("PRIMARY_PROVIDER", PRIMARY_PROVIDER)
+
+# Feature toggles (used by DataEngineV2 / providers; env-first)
+ENABLE_YAHOO_CHART_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_KSA"), True)
+ENABLE_YAHOO_CHART_SUPPLEMENT = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
+ENABLE_YFINANCE_KSA = _safe_bool(_get_first_env("ENABLE_YFINANCE_KSA"), False)
+
+ENABLE_YAHOO_FUNDAMENTALS_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_FUNDAMENTALS_KSA"), True)
+ENABLE_YAHOO_FUNDAMENTALS_GLOBAL = _safe_bool(_get_first_env("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"), False)
+
+_export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(ENABLE_YAHOO_CHART_KSA).lower())
+_export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(ENABLE_YAHOO_CHART_SUPPLEMENT).lower())
+_export_env_if_missing("ENABLE_YFINANCE_KSA", str(ENABLE_YFINANCE_KSA).lower())
+_export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_KSA", str(ENABLE_YAHOO_FUNDAMENTALS_KSA).lower())
+_export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", str(ENABLE_YAHOO_FUNDAMENTALS_GLOBAL).lower())
+
 # HTTP / cache
 HTTP_TIMEOUT_SEC = _safe_float(
     _get_first_env("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT") or _get_attr(_base_settings, "http_timeout_sec", None),
@@ -370,17 +391,26 @@ HTTP_TIMEOUT = _safe_int(_get_first_env("HTTP_TIMEOUT") or int(HTTP_TIMEOUT_SEC)
 
 CACHE_TTL_SEC = _safe_float(_get_first_env("CACHE_TTL_SEC") or _get_attr(_base_settings, "cache_ttl_sec", None), 20.0)
 
-# Added (keep your legacy aliases)
 ENGINE_CACHE_TTL_SEC = _safe_int(
     _get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC") or _get_attr(_base_settings, "engine_cache_ttl_sec", None),
-    int(CACHE_TTL_SEC),
+    int(CACHE_TTL_SEC) if CACHE_TTL_SEC > 0 else 20,
 )
 
-# Keep legacy name but also align with your blueprint "ENRICHED_CONCURRENCY"
 ENRICHED_BATCH_CONCURRENCY = _safe_int(
-    _get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY") or _get_attr(_base_settings, "enriched_batch_concurrency", None),
+    _get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY")
+    or _get_attr(_base_settings, "enriched_batch_concurrency", None),
     8,
 )
+
+# Timeout aliases used by older code
+_export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(HTTP_TIMEOUT_SEC)))
+_export_env_if_missing("HTTP_TIMEOUT", str(float(HTTP_TIMEOUT_SEC)))
+
+# TTL aliases used by older code
+_export_env_if_missing("CACHE_TTL_SEC", str(float(CACHE_TTL_SEC)))
+_export_env_if_missing("CACHE_DEFAULT_TTL", str(float(CACHE_TTL_SEC)))
+_export_env_if_missing("ENGINE_CACHE_TTL_SEC", str(int(ENGINE_CACHE_TTL_SEC)))
+_export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(ENRICHED_BATCH_CONCURRENCY)))
 
 # Provider keys
 EODHD_API_KEY = _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN") or _get_attr(_base_settings, "eodhd_api_key", None)
@@ -397,14 +427,6 @@ if FINNHUB_API_KEY:
 if EODHD_API_KEY:
     _export_env_if_missing("EODHD_API_TOKEN", EODHD_API_KEY)
     _export_env_if_missing("EODHD_TOKEN", EODHD_API_KEY)
-
-# Timeout aliases used by older code
-_export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(HTTP_TIMEOUT_SEC)))
-_export_env_if_missing("HTTP_TIMEOUT", str(float(HTTP_TIMEOUT_SEC)))
-
-# TTL aliases used by older code
-_export_env_if_missing("CACHE_TTL_SEC", str(float(CACHE_TTL_SEC)))
-_export_env_if_missing("CACHE_DEFAULT_TTL", str(float(CACHE_TTL_SEC)))
 
 # CORS
 ENABLE_CORS_ALL_ORIGINS = _env_first_bool(_base_settings, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", True)
@@ -439,8 +461,8 @@ GOOGLE_APPS_SCRIPT_BACKUP_URL = (
     (_get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL") or str(_get_attr(_base_settings, "google_apps_script_backup_url", "") or "")).strip()
 )
 
-# Sheet names (keep legacy keys)
-SHEET_KSA_TADAWUL = (_get_first_env("SHEET_KSA_TADAWUL") or "KSA_Tadawul_Market").strip()
+# Sheet names (defaults aligned to your current API usage)
+SHEET_KSA_TADAWUL = (_get_first_env("SHEET_KSA_TADAWUL") or "KSA_Tadawul").strip()
 SHEET_GLOBAL_MARKETS = (_get_first_env("SHEET_GLOBAL_MARKETS") or "Global_Markets").strip()
 SHEET_MUTUAL_FUNDS = (_get_first_env("SHEET_MUTUAL_FUNDS") or "Mutual_Funds").strip()
 SHEET_COMMODITIES_FX = (_get_first_env("SHEET_COMMODITIES_FX") or "Commodities_FX").strip()
@@ -476,13 +498,19 @@ class _Settings:
 
     enabled_providers = ENABLED_PROVIDERS
     ksa_providers = KSA_PROVIDERS  # canonical from config.py
-    enabled_ksa_providers = KSA_PROVIDERS  # legacy alias for older code
+    enabled_ksa_providers = KSA_PROVIDERS  # legacy alias
     primary_provider = PRIMARY_PROVIDER
 
     http_timeout_sec = HTTP_TIMEOUT_SEC
     cache_ttl_sec = CACHE_TTL_SEC
     engine_cache_ttl_sec = ENGINE_CACHE_TTL_SEC
     enriched_batch_concurrency = ENRICHED_BATCH_CONCURRENCY
+
+    enable_yahoo_chart_ksa = ENABLE_YAHOO_CHART_KSA
+    enable_yahoo_chart_supplement = ENABLE_YAHOO_CHART_SUPPLEMENT
+    enable_yfinance_ksa = ENABLE_YFINANCE_KSA
+    enable_yahoo_fundamentals_ksa = ENABLE_YAHOO_FUNDAMENTALS_KSA
+    enable_yahoo_fundamentals_global = ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
 
     google_credentials_dict = GOOGLE_SHEETS_CREDENTIALS
     default_spreadsheet_id = DEFAULT_SPREADSHEET_ID
@@ -509,6 +537,13 @@ def safe_env_summary() -> Dict[str, Any]:
         "cache_ttl_sec": CACHE_TTL_SEC,
         "engine_cache_ttl_sec": ENGINE_CACHE_TTL_SEC,
         "enriched_batch_concurrency": ENRICHED_BATCH_CONCURRENCY,
+        "features": {
+            "yahoo_chart_ksa": ENABLE_YAHOO_CHART_KSA,
+            "yahoo_chart_supplement": ENABLE_YAHOO_CHART_SUPPLEMENT,
+            "yfinance_ksa": ENABLE_YFINANCE_KSA,
+            "yahoo_fundamentals_ksa": ENABLE_YAHOO_FUNDAMENTALS_KSA,
+            "yahoo_fundamentals_global": ENABLE_YAHOO_FUNDAMENTALS_GLOBAL,
+        },
         "has_google_sheets": bool(GOOGLE_SHEETS_CREDENTIALS) and bool(DEFAULT_SPREADSHEET_ID),
         "default_spreadsheet_id_set": bool(DEFAULT_SPREADSHEET_ID),
         "apps_script_backup_url_set": bool(GOOGLE_APPS_SCRIPT_BACKUP_URL),
@@ -553,6 +588,11 @@ __all__ = [
     "KSA_PROVIDERS",
     "PRIMARY_PROVIDER",
     "PROVIDERS",
+    "ENABLE_YAHOO_CHART_KSA",
+    "ENABLE_YAHOO_CHART_SUPPLEMENT",
+    "ENABLE_YFINANCE_KSA",
+    "ENABLE_YAHOO_FUNDAMENTALS_KSA",
+    "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL",
     "HTTP_TIMEOUT",
     "HTTP_TIMEOUT_SEC",
     "CACHE_TTL_SEC",
