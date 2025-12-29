@@ -1,575 +1,444 @@
-# routes/enriched_quote.py  (FULL REPLACEMENT)
+# routes/enriched_quote.py
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router – PROD SAFE + DEBUGGABLE (v2.4.1)
+Enriched Quote Router – PROD SAFE + DEBUG + KSA FUNDAMENTALS SUPPLEMENT
 
-Fixes / Improvements
-- ✅ v2.4.0 CRITICAL preserved:
-    - Do NOT force status=error just because `error` is non-empty
-    - status logic:
-        - if current_price exists => success (even with warnings)
-        - if no price            => error
-- ✅ v2.4.1 HARDENING:
-    - Accepts engine/provider accidental tuple returns like (payload_dict, err_str)
-      and converts them into a proper payload dict (prevents {"value":"(...)"}).
-- ✅ Keeps schema-fill guarantees for Sheets (no missing columns)
-- ✅ Keeps PROD-safe import behavior (no core imports at module import-time)
+✅ Always returns HTTP 200 with a status field.
+✅ Uses app.state.engine when available; safe fallbacks.
+✅ Supports debug=1 (adds a debug block, never leaks tokens).
+✅ KSA fundamentals supplement via Yahoo quoteSummary when enabled:
+   - ENABLE_YAHOO_FUNDAMENTALS_KSA=true  (default true in your main.py)
+   - Fills: market_cap, shares_outstanding, eps_ttm, pe_ttm, pb, dividend_yield, roe, roa
+✅ Batch endpoint: /v1/enriched/quotes?symbols=AAPL,1120.SR
 """
 
 from __future__ import annotations
 
-import asyncio
-import inspect
+import json
 import os
+import time
 import traceback
+from importlib import import_module
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Query, Request
-from fastapi.encoders import jsonable_encoder
-from starlette.responses import JSONResponse
+from fastapi import APIRouter, Request
 
-router = APIRouter(prefix="/v1/enriched", tags=["enriched_quote"])
+ROUTE_VERSION = "5.0.0"
+
+router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-
-# Cached UnifiedQuote schema keys (best-effort)
-_UQ_KEYS: Optional[List[str]] = None
 
 
 def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
-def _split_symbols(raw: str) -> List[str]:
-    s = (raw or "").replace("\n", " ").replace("\t", " ").strip()
-    if not s:
-        return []
-    if "," in s:
-        parts = [p.strip() for p in s.split(",")]
-    else:
-        parts = [p.strip() for p in s.split(" ")]
-    return [p for p in parts if p]
-
-
-def _normalize_symbol_safe(raw: str) -> str:
-    """
-    Preferred normalization: core.data_engine_v2.normalize_symbol (if available).
-    Fallback normalization:
-      - trims + uppercases
-      - keeps Yahoo special symbols (^GSPC, GC=F, EURUSD=X)
-      - numeric => 1120.SR
-      - alpha => AAPL.US
-      - has '.' suffix => keep as is
-    """
-    s = (raw or "").strip()
-    if not s:
+def _clamp(s: Any, n: int = 4000) -> str:
+    txt = (str(s) if s is not None else "").strip()
+    if not txt:
         return ""
-
-    try:
-        from core.data_engine_v2 import normalize_symbol as _norm  # type: ignore
-
-        ns = _norm(s)
-        return (ns or "").strip().upper()
-    except Exception:
-        pass
-
-    s = s.strip().upper()
-
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"):
-        s = s.replace(".TADAWUL", "")
-
-    # Yahoo special symbols / futures / FX
-    if any(ch in s for ch in ("=", "^")):
-        return s
-
-    if "." in s:
-        return s
-
-    if s.isdigit():
-        return f"{s}.SR"
-
-    if s.isalpha():
-        return f"{s}.US"
-
-    return s
+    return txt if len(txt) <= n else (txt[: n - 12] + " ...TRUNC...")
 
 
-def _safe_error_message(e: BaseException) -> str:
-    msg = str(e).strip()
-    return msg or e.__class__.__name__
-
-
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
-def _as_payload(obj: Any) -> Dict[str, Any]:
-    """
-    Convert any return type into JSON-safe dict without throwing.
-
-    v2.4.1:
-    - If obj is a tuple like (dict_payload, err_str) => merge into dict.
-    """
-    if obj is None:
+def _to_dict(x: Any) -> Dict[str, Any]:
+    if x is None:
         return {}
-
-    # Harden: engine/provider might accidentally return (payload, err)
-    if isinstance(obj, tuple) and len(obj) == 2:
-        a, b = obj
-        if isinstance(a, dict):
-            payload = jsonable_encoder(a)
-            if b is not None:
-                try:
-                    b_str = str(b).strip()
-                except Exception:
-                    b_str = ""
-                if b_str:
-                    cur_err = payload.get("error")
-                    if cur_err is None or (isinstance(cur_err, str) and not cur_err.strip()):
-                        payload["error"] = b_str
-            return payload
-
-    if isinstance(obj, dict):
-        return jsonable_encoder(obj)
-
-    md = getattr(obj, "model_dump", None)
+    if isinstance(x, dict):
+        return x
+    # pydantic v2
+    md = getattr(x, "model_dump", None)
     if callable(md):
         try:
-            return jsonable_encoder(md())
+            return md()
         except Exception:
             pass
-
-    d = getattr(obj, "dict", None)
+    # pydantic v1
+    d = getattr(x, "dict", None)
     if callable(d):
         try:
-            return jsonable_encoder(d())
+            return d()
         except Exception:
             pass
-
-    od = getattr(obj, "__dict__", None)
-    if isinstance(od, dict) and od:
-        try:
-            return jsonable_encoder(dict(od))
-        except Exception:
-            pass
-
-    return {"value": str(obj)}
-
-
-def _get_uq_keys() -> List[str]:
-    """
-    Best-effort get UnifiedQuote field names (cached).
-    If import fails, returns [] (no schema-fill).
-    """
-    global _UQ_KEYS
-    if isinstance(_UQ_KEYS, list):
-        return _UQ_KEYS
-
+    # best effort
     try:
-        from core.data_engine_v2 import UnifiedQuote as UQ  # type: ignore
+        return dict(x)  # type: ignore[arg-type]
+    except Exception:
+        return {"value": str(x)}
 
-        mf = getattr(UQ, "model_fields", None)
-        if isinstance(mf, dict) and mf:
-            _UQ_KEYS = list(mf.keys())
-            return _UQ_KEYS
+
+def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None:
+        v = os.getenv(name.upper())
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s or default
+
+
+def _get_auth_token_from_request(req: Request) -> Optional[str]:
+    # common patterns: X-API-Key or Authorization: Bearer <token>
+    h = req.headers
+    x = (h.get("x-api-key") or h.get("X-API-Key") or "").strip()
+    if x:
+        return x
+    auth = (h.get("authorization") or h.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return None
+
+
+def _auth_required(req: Request) -> bool:
+    # Prefer Settings if available
+    s = getattr(req.app.state, "settings", None)
+    for k in ("require_auth", "REQUIRE_AUTH"):
+        try:
+            v = getattr(s, k, None) if s is not None else None
+            if v is not None:
+                return _truthy(v) if isinstance(v, str) else bool(v)
+        except Exception:
+            pass
+    return _truthy(_get_env("REQUIRE_AUTH", "false"))
+
+
+def _check_auth(req: Request) -> Tuple[bool, Optional[str]]:
+    if not _auth_required(req):
+        return True, None
+
+    token = _get_auth_token_from_request(req)
+    if not token:
+        return False, "Missing API token"
+
+    valid = []
+    for k in ("APP_TOKEN", "TFB_APP_TOKEN", "BACKUP_APP_TOKEN"):
+        vv = (_get_env(k) or "").strip()
+        if vv:
+            valid.append(vv)
+
+    if not valid:
+        # If require_auth is true but no tokens are set, fail closed
+        return False, "Auth is enabled but no valid tokens are configured"
+
+    if token in valid:
+        return True, None
+
+    return False, "Invalid API token"
+
+
+def _get_engine(req: Request) -> Tuple[Optional[Any], str, Optional[str]]:
+    # 1) preferred: app.state.engine
+    try:
+        eng = getattr(req.app.state, "engine", None)
+        if eng is not None:
+            return eng, "app.state.engine", None
     except Exception:
         pass
 
-    _UQ_KEYS = []
-    return _UQ_KEYS
+    # 2) try v2 engine module
+    for mod_path in ("core.data_engine_v2", "data_engine_v2", "core.data_engine"):
+        try:
+            mod = import_module(mod_path)
+            Engine = getattr(mod, "DataEngine", None)
+            if Engine is not None:
+                return Engine(), mod_path + ".DataEngine()", None
+        except Exception:
+            last = traceback.format_exc()
+            continue
+
+    return None, "none", _clamp(last if "last" in locals() else "Engine import failed", 8000)
 
 
-def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure payload contains every UnifiedQuote field (best-effort),
-    so Sheets/clients never miss expected keys even if engines return partial dicts.
-    """
-    keys = _get_uq_keys()
-    if not keys:
-        return payload
-    for k in keys:
-        payload.setdefault(k, None)
-    return payload
+def _call_engine_quote(eng: Any, symbol: str, debug: bool) -> Dict[str, Any]:
+    # support multiple method names across versions
+    for m in ("get_enriched_quote", "enriched_quote", "quote", "get_quote"):
+        fn = getattr(eng, m, None)
+        if callable(fn):
+            try:
+                # some engines accept debug kw
+                return _to_dict(fn(symbol=symbol, debug=debug))  # type: ignore[misc]
+            except TypeError:
+                return _to_dict(fn(symbol))  # type: ignore[misc]
+    raise RuntimeError("Engine has no quote method")
 
 
-def _safe_float(v: Any) -> Optional[float]:
+def _call_engine_quotes(eng: Any, symbols: List[str], debug: bool) -> List[Dict[str, Any]]:
+    for m in ("get_enriched_quotes", "enriched_quotes", "quotes", "get_quotes"):
+        fn = getattr(eng, m, None)
+        if callable(fn):
+            try:
+                out = fn(symbols=symbols, debug=debug)  # type: ignore[misc]
+            except TypeError:
+                out = fn(symbols)  # type: ignore[misc]
+            if isinstance(out, dict) and "items" in out and isinstance(out["items"], list):
+                return [(_to_dict(x)) for x in out["items"]]
+            if isinstance(out, list):
+                return [(_to_dict(x)) for x in out]
+            return [_to_dict(out)]
+    # fallback: loop single
+    items: List[Dict[str, Any]] = []
+    for s in symbols:
+        try:
+            items.append(_call_engine_quote(eng, s, debug))
+        except Exception as e:
+            items.append(
+                {
+                    "status": "error",
+                    "symbol": s,
+                    "error": f"engine_error: {e}",
+                }
+            )
+    return items
+
+
+# -----------------------------------------------------------------------------
+# Yahoo fundamentals supplement (KSA)
+# -----------------------------------------------------------------------------
+_YF_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_YF_TTL_SEC = 6 * 60 * 60  # 6 hours
+
+
+def _yf_get_json(url: str, timeout: float = 12.0) -> Dict[str, Any]:
+    # Prefer httpx, fallback to requests, then urllib
     try:
-        if v is None:
-            return None
-        if isinstance(v, bool):
-            return None
-        f = float(v)
-        if f != f:  # NaN
-            return None
-        return f
+        import httpx  # type: ignore
+
+        with httpx.Client(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as c:
+            r = c.get(url)
+            r.raise_for_status()
+            return r.json()
     except Exception:
+        pass
+
+    try:
+        import requests  # type: ignore
+
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        pass
+
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        return json.loads(raw)
+
+
+def _pick_raw(node: Any) -> Optional[float]:
+    # yahoo returns {"raw": x, "fmt": "..."} style
+    if node is None:
         return None
+    if isinstance(node, (int, float)):
+        return float(node)
+    if isinstance(node, dict):
+        v = node.get("raw", None)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
 
 
-def _has_price(payload: Dict[str, Any]) -> bool:
-    return _safe_float(payload.get("current_price")) is not None
+def _yahoo_fundamentals(symbol: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    sym = (symbol or "").strip()
+    if not sym:
+        return None, "empty symbol"
 
+    now = time.time()
+    cached = _YF_CACHE.get(sym)
+    if cached and (now - cached[0]) < _YF_TTL_SEC:
+        return cached[1], None
 
-async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Try in this order:
-      1) app.state.engine (preferred)
-      2) core.data_engine_v2.get_enriched_quote (module-level singleton)
-      3) core.data_engine_v2.DataEngine() temporary
-      4) core.data_engine.get_enriched_quote (legacy module-level)
-      5) core.data_engine.DataEngine() temporary
-    """
-    # 1) app.state.engine
+    # quoteSummary endpoint
+    modules = "price,defaultKeyStatistics,summaryDetail,financialData"
+    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}?modules={modules}"
+
     try:
-        eng = getattr(request.app.state, "engine", None)
-    except Exception:
-        eng = None
+        js = _yf_get_json(url)
+        res = (((js or {}).get("quoteSummary") or {}).get("result") or [])
+        if not res:
+            return None, "yahoo quoteSummary empty result"
+        obj = res[0] or {}
 
-    if eng is not None:
-        for fn_name in ("get_enriched_quote", "get_quote"):
-            fn = getattr(eng, fn_name, None)
-            if callable(fn):
-                try:
-                    return await _maybe_await(fn(symbol)), f"app.state.engine.{fn_name}"
-                except Exception:
-                    pass
+        price = obj.get("price") or {}
+        dks = obj.get("defaultKeyStatistics") or {}
+        sd = obj.get("summaryDetail") or {}
+        fd = obj.get("financialData") or {}
 
-    # 2) v2 module-level singleton
-    try:
-        from core.data_engine_v2 import get_enriched_quote as v2_get  # type: ignore
+        out: Dict[str, Any] = {
+            "market_cap": _pick_raw(price.get("marketCap")) or _pick_raw(dks.get("marketCap")),
+            "shares_outstanding": _pick_raw(dks.get("sharesOutstanding")) or _pick_raw(price.get("sharesOutstanding")),
+            "eps_ttm": _pick_raw(dks.get("trailingEps")),
+            "pe_ttm": _pick_raw(dks.get("trailingPE")) or _pick_raw(sd.get("trailingPE")),
+            "pb": _pick_raw(dks.get("priceToBook")),
+            "dividend_yield": _pick_raw(sd.get("dividendYield")),
+            "roe": _pick_raw(fd.get("returnOnEquity")),
+            "roa": _pick_raw(fd.get("returnOnAssets")),
+        }
 
-        return await _maybe_await(v2_get(symbol)), "core.data_engine_v2.get_enriched_quote(singleton)"
-    except Exception:
-        pass
+        # strip None
+        out = {k: v for k, v in out.items() if v is not None}
 
-    # 3) v2 temporary engine
-    try:
-        from core.data_engine_v2 import DataEngine as V2Engine  # type: ignore
-
-        tmp = V2Engine()
-        try:
-            fn = getattr(tmp, "get_enriched_quote", None) or getattr(tmp, "get_quote", None)
-            if callable(fn):
-                return await _maybe_await(fn(symbol)), "core.data_engine_v2.DataEngine(temp)"
-        finally:
-            aclose = getattr(tmp, "aclose", None)
-            if callable(aclose):
-                try:
-                    await _maybe_await(aclose())
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 4) legacy module-level
-    try:
-        from core.data_engine import get_enriched_quote as v1_get  # type: ignore
-
-        return await _maybe_await(v1_get(symbol)), "core.data_engine.get_enriched_quote"
-    except Exception:
-        pass
-
-    # 5) legacy temporary engine
-    try:
-        from core.data_engine import DataEngine as V1Engine  # type: ignore
-
-        tmp2 = V1Engine()
-        try:
-            fn2 = getattr(tmp2, "get_enriched_quote", None) or getattr(tmp2, "get_quote", None)
-            if callable(fn2):
-                return await _maybe_await(fn2(symbol)), "core.data_engine.DataEngine(temp)"
-        finally:
-            aclose2 = getattr(tmp2, "aclose", None)
-            if callable(aclose2):
-                try:
-                    await _maybe_await(aclose2())
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    return None, None
+        _YF_CACHE[sym] = (now, out)
+        return out, None
+    except Exception as e:
+        return None, f"yahoo_fundamentals_error: {_clamp(e, 800)}"
 
 
-def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: str) -> Dict[str, Any]:
-    """
-    Ensure required fields and consistent defaults + schema-fill best-effort.
-
-    CRITICAL:
-    - Do NOT force status=error just because error text exists.
-    - If current_price exists -> status=success (error treated as warning text).
-    - If no current_price -> status=error.
-    """
-    sym = (norm or raw or "").strip()
-
-    if not payload.get("symbol"):
-        payload["symbol"] = sym
-
-    payload["symbol_input"] = payload.get("symbol_input") or raw
-    payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
-
-    if not payload.get("data_source"):
-        payload["data_source"] = source or "unknown"
-
-    # Normalize error to string (never None)
-    err = payload.get("error")
-    if err is None:
-        err_s = ""
-    elif isinstance(err, str):
-        err_s = err.strip()
-    else:
-        err_s = str(err).strip()
-    payload["error"] = err_s
-
-    has_price = _has_price(payload)
-
-    if has_price:
-        payload["status"] = "success"
-
-        # normalize warning prefix (do not double-prefix)
-        if err_s and not err_s.lower().startswith("warning:"):
-            payload["error"] = f"warning: {err_s}"
-
-        if not payload.get("data_quality"):
-            payload["data_quality"] = "PARTIAL"
-    else:
-        payload["status"] = "error"
-        if not payload.get("data_quality"):
-            payload["data_quality"] = "MISSING"
-        if not payload.get("error"):
-            payload["error"] = "No price returned"
-
-    return _schema_fill_best_effort(payload)
+def _needs_ksa_fundamentals(d: Dict[str, Any]) -> bool:
+    if not isinstance(d, dict):
+        return False
+    if str(d.get("market") or "").upper() != "KSA":
+        return False
+    # only if major fields missing
+    keys = ["market_cap", "shares_outstanding", "eps_ttm", "pe_ttm", "pb", "dividend_yield", "roe", "roa"]
+    missing = 0
+    for k in keys:
+        if d.get(k, None) in (None, "", 0):
+            missing += 1
+    return missing >= 4  # avoid calling yahoo if only 1 thing missing
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        v = int(str(os.getenv(name, "") or "").strip() or default)
-        return v if v > 0 else default
-    except Exception:
-        return default
+def _supplement_ksa_fundamentals_if_enabled(d: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str], bool]:
+    enabled = _truthy(_get_env("ENABLE_YAHOO_FUNDAMENTALS_KSA", "true"))
+    if not enabled:
+        return d, None, False
+
+    if not _needs_ksa_fundamentals(d):
+        return d, None, False
+
+    sym = str(d.get("symbol") or "").strip()
+    if not sym:
+        return d, "missing symbol for fundamentals supplement", False
+
+    fx, err = _yahoo_fundamentals(sym)
+    if not fx:
+        return d, err or "no fundamentals returned", False
+
+    # fill only missing fields
+    for k, v in fx.items():
+        if d.get(k, None) in (None, "", 0):
+            d[k] = v
+
+    # mark source
+    src = str(d.get("data_source") or "").strip()
+    if "yahoo_fundamentals" not in src.lower():
+        d["data_source"] = (src + ",yahoo_fundamentals").strip(",") if src else "yahoo_fundamentals"
+
+    return d, None, True
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        v = float(str(os.getenv(name, "") or "").strip() or default)
-        return v if v > 0 else default
-    except Exception:
-        return default
-
-
-def _enriched_concurrency() -> int:
-    return _env_int("ENRICHED_CONCURRENCY", _env_int("ENRICHED_BATCH_CONCURRENCY", 8))
-
-
-def _enriched_max_tickers() -> int:
-    return _env_int("ENRICHED_MAX_TICKERS", 250)
-
-
-def _enriched_timeout_sec() -> float:
-    return _env_float("ENRICHED_TIMEOUT_SEC", 45.0)
+def _normalize_symbols_csv(s: str) -> List[str]:
+    parts = [p.strip() for p in (s or "").split(",") if p.strip()]
+    # de-dup preserve
+    out: List[str] = []
+    seen = set()
+    for x in parts:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 @router.get("/quote")
-async def enriched_quote(
-    request: Request,
-    symbol: str = Query(..., description="Ticker symbol (AAPL, MSFT.US, 1120.SR, ^GSPC, GC=F)"),
-    debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
-):
-    dbg = _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(debug)
+async def enriched_quote(request: Request, symbol: str, debug: int = 0) -> Dict[str, Any]:
+    ok, err = _check_auth(request)
+    if not ok:
+        return {"status": "error", "symbol": symbol, "error": err}
 
-    raw = (symbol or "").strip()
-    norm = _normalize_symbol_safe(raw)
+    dbg = bool(debug)
+    eng, eng_src, eng_err = _get_engine(request)
 
-    if not raw:
-        out = {
-            "status": "error",
-            "symbol": "",
-            "symbol_input": "",
-            "symbol_normalized": "",
-            "data_quality": "MISSING",
-            "data_source": "none",
-            "error": "Empty symbol",
-        }
-        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
-
-    timeout_sec = _enriched_timeout_sec()
+    if eng is None:
+        out = {"status": "error", "symbol": symbol, "error": "engine_unavailable"}
+        if dbg:
+            out["debug"] = {
+                "route_version": ROUTE_VERSION,
+                "engine_source": eng_src,
+                "engine_error": eng_err,
+            }
+        return out
 
     try:
-        result, source = await asyncio.wait_for(
-            _call_engine_best_effort(request, norm or raw),
-            timeout=timeout_sec,
-        )
+        out = _call_engine_quote(eng, symbol, dbg)
+        if not isinstance(out, dict) or not out:
+            out = {"status": "error", "symbol": symbol, "error": "null_response"}
+        # KSA supplement
+        sup_err = None
+        sup_used = False
+        try:
+            out, sup_err, sup_used = _supplement_ksa_fundamentals_if_enabled(out)
+            if sup_err:
+                # append warning safely
+                cur = str(out.get("error") or "").strip()
+                warn = f"warning: {sup_err}"
+                out["error"] = (cur + " | " + warn).strip(" |") if cur else warn
+        except Exception:
+            pass
 
-        if result is None:
-            out = {
-                "status": "error",
-                "symbol": norm or raw,
-                "symbol_input": raw,
-                "symbol_normalized": norm or raw,
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": "Enriched quote engine not available (no working provider).",
-            }
-            return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
-
-        payload = _as_payload(result)
-        payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
-        return JSONResponse(status_code=200, content=payload)
-
-    except asyncio.TimeoutError:
-        out: Dict[str, Any] = {
-            "status": "error",
-            "symbol": norm or raw,
-            "symbol_input": raw,
-            "symbol_normalized": norm or raw,
-            "data_quality": "MISSING",
-            "data_source": "none",
-            "error": f"Timeout after {timeout_sec:.0f}s",
-        }
-        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        msg = _safe_error_message(e)
-
-        out = {
-            "status": "error",
-            "symbol": norm or raw,
-            "symbol_input": raw,
-            "symbol_normalized": norm or raw,
-            "data_quality": "MISSING",
-            "data_source": "none",
-            "error": msg,
-        }
         if dbg:
-            out["traceback"] = tb[:8000]
-
-        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
+            out["debug"] = {
+                "route_version": ROUTE_VERSION,
+                "engine_source": eng_src,
+                "engine_type": type(eng).__name__,
+                "engine_version": getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None),
+                "supplement_used": sup_used,
+            }
+        return out
+    except Exception:
+        tb = traceback.format_exc()
+        out = {"status": "error", "symbol": symbol, "error": "engine_exception"}
+        if dbg:
+            out["debug"] = {
+                "route_version": ROUTE_VERSION,
+                "engine_source": eng_src,
+                "traceback": _clamp(tb, 8000),
+            }
+        return out
 
 
 @router.get("/quotes")
-async def enriched_quotes(
-    request: Request,
-    symbols: str = Query(..., description="Comma/space-separated symbols, e.g. AAPL,MSFT,1120.SR"),
-    debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
-):
-    dbg = _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(debug)
+async def enriched_quotes(request: Request, symbols: str, debug: int = 0) -> Dict[str, Any]:
+    ok, err = _check_auth(request)
+    if not ok:
+        return {"status": "error", "count": 0, "items": [], "error": err}
 
-    raw_list = _split_symbols(symbols)
-    if not raw_list:
-        return JSONResponse(
-            status_code=200,
-            content={"status": "error", "error": "Empty symbols list", "items": []},
-        )
+    dbg = bool(debug)
+    sym_list = _normalize_symbols_csv(symbols)
+    if not sym_list:
+        return {"status": "error", "count": 0, "items": [], "error": "No symbols provided"}
 
-    max_allowed = _enriched_max_tickers()
-    timeout_sec = _enriched_timeout_sec()
+    eng, eng_src, eng_err = _get_engine(request)
+    if eng is None:
+        out = {"status": "error", "count": 0, "items": [], "error": "engine_unavailable"}
+        if dbg:
+            out["debug"] = {"route_version": ROUTE_VERSION, "engine_source": eng_src, "engine_error": eng_err}
+        return out
 
-    conc = _enriched_concurrency()
-    sem = asyncio.Semaphore(conc)
+    items = _call_engine_quotes(eng, sym_list, dbg)
 
-    async def _one(raw: str) -> Dict[str, Any]:
-        norm = _normalize_symbol_safe(raw)
-
+    # KSA supplement per item
+    sup_count = 0
+    for it in items:
         try:
-            async with sem:
-                result, source = await asyncio.wait_for(
-                    _call_engine_best_effort(request, norm or raw),
-                    timeout=timeout_sec,
-                )
+            it2, sup_err, sup_used = _supplement_ksa_fundamentals_if_enabled(it)
+            if sup_used:
+                sup_count += 1
+            if sup_err:
+                cur = str(it2.get("error") or "").strip()
+                warn = f"warning: {sup_err}"
+                it2["error"] = (cur + " | " + warn).strip(" |") if cur else warn
+        except Exception:
+            continue
 
-            if result is None:
-                out = {
-                    "status": "error",
-                    "symbol": norm or raw,
-                    "symbol_input": raw,
-                    "symbol_normalized": norm or raw,
-                    "data_quality": "MISSING",
-                    "data_source": "none",
-                    "error": "Engine not available for this symbol.",
-                }
-                return _schema_fill_best_effort(out)
-
-            payload = _as_payload(result)
-            payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
-            return payload
-
-        except asyncio.TimeoutError:
-            out = {
-                "status": "error",
-                "symbol": norm or raw,
-                "symbol_input": raw,
-                "symbol_normalized": norm or raw,
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": f"Timeout after {timeout_sec:.0f}s",
-            }
-            return _schema_fill_best_effort(out)
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            msg = _safe_error_message(e)
-
-            out: Dict[str, Any] = {
-                "status": "error",
-                "symbol": norm or raw,
-                "symbol_input": raw,
-                "symbol_normalized": norm or raw,
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": msg,
-            }
-            if dbg:
-                out["traceback"] = tb[:8000]
-            return _schema_fill_best_effort(out)
-
-    trimmed = [r.strip() for r in raw_list if r and r.strip()]
-
-    tasks: List[asyncio.Task] = []
-    items: List[Dict[str, Any]] = []
-
-    for idx, raw in enumerate(trimmed):
-        if idx < max_allowed:
-            tasks.append(asyncio.create_task(_one(raw)))
-        else:
-            norm = _normalize_symbol_safe(raw)
-            out = {
-                "status": "error",
-                "symbol": norm or raw,
-                "symbol_input": raw,
-                "symbol_normalized": norm or raw,
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": f"Too many symbols requested. Max allowed is {max_allowed}.",
-            }
-            items.append(_schema_fill_best_effort(out))
-
-    if tasks:
-        first_batch = await asyncio.gather(*tasks)
-        items = first_batch + items
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "count": len(items),
-            "max_allowed": max_allowed,
-            "concurrency": conc,
-            "timeout_sec": timeout_sec,
-            "items": items,
-        },
-    )
-
-
-@router.get("/health", include_in_schema=False)
-async def enriched_health():
-    return {"status": "ok", "module": "routes.enriched_quote", "version": "2.4.1"}
-
-
-__all__ = ["router"]
+    out = {"status": "success", "count": len(items), "items": items}
+    if dbg:
+        out["debug"] = {
+            "route_version": ROUTE_VERSION,
+            "engine_source": eng_src,
+            "engine_type": type(eng).__name__,
+            "supplement_used_count": sup_count,
+        }
+    return out
