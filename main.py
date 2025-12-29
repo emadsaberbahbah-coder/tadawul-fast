@@ -2,22 +2,14 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.0
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.1
 
-v5.1.0 improvements vs v5.0.8
-- ✅ Stronger env aliasing (auth + provider tokens) and safe diagnostics (never leaks tokens).
-- ✅ More reliable router mount + readiness: supports routers defined as `router` or `get_router()`.
-- ✅ Engine init hardened: prefers app.state.engine already set; then DataEngineV2; then legacy.
-- ✅ Health endpoints show engine type/version + provider lists from engine when available.
-- ✅ Background boot: uses safe to_thread wrappers; never blocks /readyz.
-- ✅ CORS defaults stay the same, but allow_credentials handled correctly with "*".
-- ✅ Avoids any crash even if config/env modules are broken.
-
-Design goals unchanged
-- Never crash app startup.
-- Health endpoints always work.
-- Router mounting safe (won’t crash startup), optional deferred mount.
-- Engine init best-effort (won’t crash startup).
+v5.1.1 patch vs v5.1.0
+- ✅ Engine init now detects DataEngineV2 *or* DataEngine (fixes class-name mismatch).
+- ✅ Provider defaults include ENABLE_YAHOO_FUNDAMENTALS_GLOBAL (default false).
+- ✅ /system/settings env snapshot includes ENABLE_YAHOO_FUNDAMENTALS_GLOBAL.
+- ✅ Engine init clears engine_error if legacy fallback succeeds.
+- ✅ Still: never crashes startup; health endpoints always work; safe deferred boot.
 """
 
 from __future__ import annotations
@@ -50,7 +42,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.1.0"
+APP_ENTRY_VERSION = "5.1.1"
 
 
 def _truthy(v: Any) -> bool:
@@ -256,6 +248,7 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
     """
     try:
         from config import get_settings  # type: ignore
+
         s = get_settings()
         return s, "config.get_settings"
     except Exception:
@@ -263,6 +256,7 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
 
     try:
         from core.config import get_settings  # type: ignore
+
         s = get_settings()
         return s, "core.config.get_settings"
     except Exception:
@@ -274,6 +268,7 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
 def _load_env_module() -> Optional[object]:
     try:
         import env as env_mod  # type: ignore
+
         return env_mod
     except Exception:
         return None
@@ -436,6 +431,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "ENABLE_YAHOO_CHART_SUPPLEMENT": str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "")),
         "ENABLE_YFINANCE_KSA": str(os.getenv("ENABLE_YFINANCE_KSA", "")),
         "ENABLE_YAHOO_FUNDAMENTALS_KSA": str(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA", "")),
+        "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL": str(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", "")),
         "AUTH_MODE": token_mode,
         "RENDER_GIT_COMMIT": (os.getenv("RENDER_GIT_COMMIT") or "")[:12],
     }
@@ -482,6 +478,7 @@ def _apply_provider_defaults_if_missing() -> None:
     os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
     os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_KSA", "true")
+    os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", "false")
 
 
 def _engine_info(eng: Any) -> Dict[str, Any]:
@@ -497,14 +494,13 @@ def _engine_info(eng: Any) -> Dict[str, Any]:
             pass
         return []
 
-    providers = []
-    ksa = []
+    providers: List[str] = []
+    ksa: List[str] = []
     for attr in ("providers_global", "enabled_providers", "providers"):
         providers.extend(_get_list_attr(eng, attr))
     for attr in ("providers_ksa", "ksa_providers"):
         ksa.extend(_get_list_attr(eng, attr))
 
-    # dedup preserve
     def _dedup(xs: List[str]) -> List[str]:
         out: List[str] = []
         seen = set()
@@ -532,7 +528,6 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
       - app.state.engine_ready
       - app.state.engine_error
     """
-    # If something already set it (rare), keep it
     try:
         existing = getattr(app_.state, "engine", None)
         if existing is not None:
@@ -544,9 +539,11 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
         pass
 
     # Prefer v2
+    v2_err = None
     try:
         mod = import_module("core.data_engine_v2")
-        Engine = getattr(mod, "DataEngine", None)
+        # Support multiple class names
+        Engine = getattr(mod, "DataEngineV2", None) or getattr(mod, "DataEngine", None)
         if Engine is not None:
             app_.state.engine = Engine()
             app_.state.engine_ready = True
@@ -554,8 +551,9 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             logger.info("Engine initialized (DataEngine v2).")
             return
     except Exception:
+        v2_err = _clamp_str(traceback.format_exc(), 8000)
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
+        app_.state.engine_error = v2_err
 
     # Fallback legacy
     try:
@@ -564,12 +562,12 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
         if Engine is not None:
             app_.state.engine = Engine()
             app_.state.engine_ready = True
-            app_.state.engine_error = None
+            app_.state.engine_error = None  # ✅ clear error on success
             logger.info("Engine initialized (legacy DataEngine).")
             return
     except Exception:
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
+        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000) if not v2_err else v2_err
 
 
 def _mount_all_routers(app_: FastAPI) -> None:
@@ -613,6 +611,13 @@ async def _maybe_close_engine(app_: FastAPI) -> None:
         aclose = getattr(eng, "aclose", None)
         if callable(aclose):
             await aclose()
+            return
+    except Exception:
+        pass
+    try:
+        close = getattr(eng, "close", None)
+        if callable(close):
+            close()
     except Exception:
         pass
 
