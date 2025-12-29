@@ -2,36 +2,46 @@
 """
 core/__init__.py
 ------------------------------------------------------------
-Core package initialization (PROD SAFE) – v1.2.0 (LAZY)
+Core package initialization (PROD SAFE) — v1.3.0 (LAZY + STABLE)
 
 Goals:
-- Keep imports light to avoid circular-import + cold-start issues on Render.
-- Export only stable entrypoints.
-- Allow optional exports (DataEngine/UnifiedQuote/etc.) without breaking app boot.
+- Keep imports LIGHT to avoid circular-import + cold-start issues on Render.
+- Export only stable entrypoints via LAZY resolution (PEP 562).
 - Prefer v2 engine, fallback to legacy, then schemas (last resort).
-- IMPORTANT: avoid importing heavy modules at import-time (lazy resolution).
+- Never crash app startup because of optional modules.
+- Provide optional debug traces when CORE_IMPORT_DEBUG=true.
+
+Exports (lazy):
+- get_settings
+- DataEngine, UnifiedQuote, normalize_symbol
+- get_engine (best-effort)
+- TickerRequest, MarketData, BatchProcessRequest, get_headers_for_sheet
+
+Notes:
+- Do NOT import heavy modules at import-time.
+- All imports are wrapped; failures only affect that attribute, not app boot.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Dict, Callable
 
 # -----------------------------------------------------------------------------
 # Optional debug logging for import issues (set CORE_IMPORT_DEBUG=true)
 # -----------------------------------------------------------------------------
-_DEBUG_IMPORTS = str(os.getenv("CORE_IMPORT_DEBUG", "false")).strip().lower() in (
+_DEBUG_IMPORTS = str(os.getenv("CORE_IMPORT_DEBUG", "false")).strip().lower() in {
     "1",
     "true",
     "yes",
     "y",
     "on",
-)
+}
 
 
 def _dbg(msg: str) -> None:
     if _DEBUG_IMPORTS:
-        # Avoid importing logging here to keep __init__ minimal
+        # Keep minimal: avoid importing logging here.
         print(f"[core.__init__] {msg}")  # noqa: T201
 
 
@@ -48,7 +58,7 @@ def _try_import(module_path: str) -> Optional[Any]:
 # -----------------------------------------------------------------------------
 # Tiny cache to avoid repeated imports / lookups
 # -----------------------------------------------------------------------------
-_CACHE: dict[str, Any] = {}
+_CACHE: Dict[str, Any] = {}
 
 
 def _cached(key: str) -> Any:
@@ -63,42 +73,53 @@ def _set_cache(key: str, value: Any) -> Any:
 # -----------------------------------------------------------------------------
 # Settings loader (prefer core.config shim; fallback to root config.py; then stub)
 # -----------------------------------------------------------------------------
-def _resolve_get_settings() -> Any:
-    gs = _cached("get_settings")
-    if gs is not None:
+def _resolve_get_settings_func() -> Callable[[], Any]:
+    gs = _cached("get_settings_func")
+    if callable(gs):
         return gs
 
+    # Prefer core.config (shim)
     m = _try_import("core.config")
-    if m is not None and hasattr(m, "get_settings"):
-        return _set_cache("get_settings", getattr(m, "get_settings"))
+    if m is not None and callable(getattr(m, "get_settings", None)):
+        return _set_cache("get_settings_func", getattr(m, "get_settings"))
 
+    # Fallback to repo-root config.py
     m2 = _try_import("config")
-    if m2 is not None and hasattr(m2, "get_settings"):
-        return _set_cache("get_settings", getattr(m2, "get_settings"))
+    if m2 is not None and callable(getattr(m2, "get_settings", None)):
+        return _set_cache("get_settings_func", getattr(m2, "get_settings"))
 
-    def _stub_get_settings() -> Any:  # type: ignore
-        """Last-resort stub. Keeps imports safe during refactors."""
+    # Last resort stub
+    def _stub_get_settings() -> Any:
         return None
 
-    return _set_cache("get_settings", _stub_get_settings)
+    return _set_cache("get_settings_func", _stub_get_settings)
 
 
-def get_settings() -> Any:  # type: ignore
-    return _resolve_get_settings()()
+def get_settings() -> Any:
+    """
+    Returns settings object if available, else None.
+    Safe: never raises.
+    """
+    try:
+        return _resolve_get_settings_func()()
+    except Exception as e:
+        _dbg(f"get_settings() failed -> {e}")
+        return None
 
 
 # -----------------------------------------------------------------------------
 # Engine + schema lazy resolvers
 # -----------------------------------------------------------------------------
-def _resolve_engine_exports() -> dict[str, Any]:
+def _resolve_engine_exports() -> Dict[str, Any]:
     cached = _cached("engine_exports")
     if isinstance(cached, dict):
         return cached
 
-    exports: dict[str, Any] = {
+    exports: Dict[str, Any] = {
         "DataEngine": None,
         "UnifiedQuote": None,
         "normalize_symbol": None,
+        "get_engine": None,
     }
 
     # Prefer: v2 -> legacy
@@ -110,34 +131,42 @@ def _resolve_engine_exports() -> dict[str, Any]:
         if exports["DataEngine"] is None and hasattr(m, "DataEngine"):
             exports["DataEngine"] = getattr(m, "DataEngine")
 
-        if exports["UnifiedQuote"] is None and hasattr(m, "UnifiedQuote"):
-            exports["UnifiedQuote"] = getattr(m, "UnifiedQuote")
+        # UnifiedQuote may be on module, or via __getattr__ in legacy adapter
+        if exports["UnifiedQuote"] is None:
+            try:
+                uq = getattr(m, "UnifiedQuote", None)
+                if uq is not None:
+                    exports["UnifiedQuote"] = uq
+            except Exception:
+                pass
 
         if exports["normalize_symbol"] is None and hasattr(m, "normalize_symbol"):
             exports["normalize_symbol"] = getattr(m, "normalize_symbol")
 
-        if (
-            exports["DataEngine"] is not None
-            and exports["UnifiedQuote"] is not None
-            and exports["normalize_symbol"] is not None
-        ):
+        # Optional async engine accessor (exists in legacy adapter, may exist in v2)
+        ge = getattr(m, "get_engine", None)
+        if exports["get_engine"] is None and callable(ge):
+            exports["get_engine"] = ge
+
+        # Stop early if we got the important ones
+        if exports["DataEngine"] and exports["UnifiedQuote"] and exports["normalize_symbol"]:
             break
 
     # Last resort: UnifiedQuote from schemas
     if exports["UnifiedQuote"] is None:
         ms = _try_import("core.schemas")
-        if ms and hasattr(ms, "UnifiedQuote"):
+        if ms is not None and hasattr(ms, "UnifiedQuote"):
             exports["UnifiedQuote"] = getattr(ms, "UnifiedQuote")
 
     return _set_cache("engine_exports", exports)
 
 
-def _resolve_schema_exports() -> dict[str, Any]:
+def _resolve_schema_exports() -> Dict[str, Any]:
     cached = _cached("schema_exports")
     if isinstance(cached, dict):
         return cached
 
-    exports: dict[str, Any] = {
+    exports: Dict[str, Any] = {
         "TickerRequest": None,
         "MarketData": None,
         "BatchProcessRequest": None,
@@ -159,9 +188,9 @@ def _resolve_schema_exports() -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 def __getattr__(name: str) -> Any:  # pragma: no cover
     if name == "get_settings":
-        return _resolve_get_settings()
+        return get_settings
 
-    if name in ("DataEngine", "UnifiedQuote", "normalize_symbol"):
+    if name in ("DataEngine", "UnifiedQuote", "normalize_symbol", "get_engine"):
         return _resolve_engine_exports().get(name)
 
     if name in ("TickerRequest", "MarketData", "BatchProcessRequest", "get_headers_for_sheet"):
@@ -175,6 +204,7 @@ __all__ = [
     "DataEngine",
     "UnifiedQuote",
     "normalize_symbol",
+    "get_engine",
     "TickerRequest",
     "MarketData",
     "BatchProcessRequest",
