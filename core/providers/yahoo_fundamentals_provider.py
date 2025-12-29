@@ -1,26 +1,21 @@
 from __future__ import annotations
 
 """
-Yahoo Fundamentals Provider (NO yfinance) — v1.1.0 (PROD SAFE)
+Yahoo Fundamentals Provider (NO yfinance) — v1.2.0 (PROD SAFE)
 
-Goal:
-- Best-effort fundamentals for symbols (KSA .SR + GLOBAL)
-- Fill:
-    market_cap, pe_ttm, pb, dividend_yield, roe, roa, currency
-- NEVER crash the app on import
-- Works as supplement provider (after yahoo_chart price) inside DataEngineV2
+Purpose
+- Best-effort fundamentals for symbols (works for KSA .SR + GLOBAL)
+- Fills (when available):
+  market_cap, pe_ttm, pb, dividend_yield, roe, roa, currency
 
-Why v1.1.0:
-- Yahoo quoteSummary is sometimes gated by cookie/crumb flows (common)
-- Adds cookie+crumb best-effort + fallback fundamentals-timeseries endpoint
-
-Refs:
-- Crumb/cookie gating patterns are widely discussed in yfinance issues. (example) :contentReference[oaicite:3]{index=3}
-- fundamentals-timeseries endpoint format used in yfinance scrapers. :contentReference[oaicite:4]{index=4}
+Key upgrades vs v1.0.0
+- Adds Yahoo fundamentals-timeseries fallback (often better for missing fields)
+- Returns (patch, err) from fetch_fundamentals_patch to allow engine warnings
+- Stronger key fallbacks + safer parsing
+- Never crashes app on import / never raises outward
 """
 
 import asyncio
-import json
 import random
 import time
 from datetime import datetime, timezone
@@ -28,18 +23,18 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-PROVIDER_VERSION = "1.1.0"
+PROVIDER_VERSION = "1.2.0"
 
+# Primary endpoints
 YAHOO_QUOTE_SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
-# Timeseries endpoint used by yfinance for Yahoo datastores
-YAHOO_FUND_TIMESERIES_URL = (
-    "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
-)
-
-YAHOO_GETCRUMB_URL = "https://query1.finance.yahoo.com/v1/test/getcrumb"
-YAHOO_QUOTE_PAGE_URL = "https://finance.yahoo.com/quote/{symbol}?p={symbol}"
+# Timeseries fallback (often helps when quoteSummary is sparse)
+# NOTE: Some regions work better on query2, so we try both.
+YAHOO_TIMESERIES_URLS = [
+    "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}",
+    "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}",
+]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,10 +42,7 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# ---- crumb cache (best-effort) ----
-_CRUMB_LOCK = asyncio.Lock()
-_CRUMB_CACHE: Dict[str, Any] = {"crumb": None, "ts": 0.0}
-_CRUMB_TTL_SEC = 60 * 30  # 30 minutes
+_NULL_STRINGS = {"-", "—", "N/A", "NA", "null", "None", ""}
 
 
 def _now_utc_iso() -> str:
@@ -63,9 +55,9 @@ def _safe_float(x: Any) -> Optional[float]:
             return None
         if isinstance(x, (int, float)):
             v = float(x)
-            return None if v != v else v
+            return None if v != v else v  # NaN
         s = str(x).strip().replace(",", "")
-        if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
+        if s in _NULL_STRINGS:
             return None
         v = float(s)
         return None if v != v else v
@@ -77,7 +69,7 @@ def _yahoo_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s:
         return ""
-    # internal convention: AAPL.US => AAPL
+    # Your system sometimes uses .US, Yahoo doesn't need it
     if s.endswith(".US"):
         return s[:-3]
     return s
@@ -89,7 +81,13 @@ def _get_raw(obj: Any) -> Optional[float]:
     if isinstance(obj, (int, float)):
         return _safe_float(obj)
     if isinstance(obj, dict):
-        return _safe_float(obj.get("raw"))
+        # Yahoo style: {"raw": ..., "fmt": ...}
+        if "raw" in obj:
+            return _safe_float(obj.get("raw"))
+        # sometimes: {"value": {"raw":...}}
+        if "value" in obj and isinstance(obj.get("value"), dict):
+            return _safe_float(obj["value"].get("raw"))
+        return _safe_float(obj.get("fmt")) or _safe_float(obj.get("value"))
     return _safe_float(obj)
 
 
@@ -107,66 +105,39 @@ def _base(symbol: str) -> Dict[str, Any]:
         "market_cap": None,
         "pe_ttm": None,
         "pb": None,
-        "dividend_yield": None,
+        "dividend_yield": None,  # NOTE: usually fraction (e.g., 0.0037 = 0.37%)
         "roe": None,
         "roa": None,
         "currency": None,
         "error": None,
-        "meta": {},
     }
 
 
 def _has_any(out: Dict[str, Any]) -> bool:
-    for k in ("market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa"):
-        if _safe_float(out.get(k)) is not None:
-            return True
-    return False
+    return any(
+        out.get(k) is not None
+        for k in ("market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa", "currency")
+    )
 
 
-async def _ensure_crumb(client: httpx.AsyncClient, symbol: str, timeout: float) -> Optional[str]:
+def _ts_latest_value(result0: Dict[str, Any], key: str) -> Optional[float]:
     """
-    Best-effort cookie+crumb retrieval.
-    Never raises (PROD SAFE).
+    Timeseries shape usually:
+      result0[key] = [ { "asOfDate": "...", "reportedValue": {"raw": ...} }, ... ]
+    We take the last element.
     """
-    now = time.time()
-    cached = _CRUMB_CACHE.get("crumb")
-    ts = float(_CRUMB_CACHE.get("ts") or 0.0)
-
-    if cached and (now - ts) < _CRUMB_TTL_SEC:
-        return str(cached)
-
-    async with _CRUMB_LOCK:
-        now2 = time.time()
-        cached2 = _CRUMB_CACHE.get("crumb")
-        ts2 = float(_CRUMB_CACHE.get("ts") or 0.0)
-        if cached2 and (now2 - ts2) < _CRUMB_TTL_SEC:
-            return str(cached2)
-
-        try:
-            # Step 1: load quote page to set cookies
-            client.timeout = httpx.Timeout(timeout)
-            await client.get(YAHOO_QUOTE_PAGE_URL.format(symbol=symbol))
-
-            # Step 2: fetch crumb
-            r = await client.get(YAHOO_GETCRUMB_URL)
-            if r.status_code >= 400:
-                _CRUMB_CACHE["crumb"] = None
-                _CRUMB_CACHE["ts"] = time.time()
-                return None
-
-            crumb = (r.text or "").strip()
-            if not crumb:
-                _CRUMB_CACHE["crumb"] = None
-                _CRUMB_CACHE["ts"] = time.time()
-                return None
-
-            _CRUMB_CACHE["crumb"] = crumb
-            _CRUMB_CACHE["ts"] = time.time()
-            return crumb
-        except Exception:
-            _CRUMB_CACHE["crumb"] = None
-            _CRUMB_CACHE["ts"] = time.time()
-            return None
+    arr = result0.get(key)
+    if not isinstance(arr, list) or not arr:
+        return None
+    last = arr[-1]
+    if not isinstance(last, dict):
+        return _safe_float(last)
+    if "reportedValue" in last:
+        return _get_raw(last.get("reportedValue"))
+    # some variants might use "value"
+    if "value" in last:
+        return _get_raw(last.get("value"))
+    return _get_raw(last)
 
 
 async def yahoo_fundamentals(
@@ -187,7 +158,7 @@ async def yahoo_fundamentals(
         client = httpx.AsyncClient(
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "application/json,text/plain,*/*;q=0.8",
+                "Accept": "application/json,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
                 "Referer": "https://finance.yahoo.com/",
                 "Connection": "keep-alive",
@@ -199,33 +170,15 @@ async def yahoo_fundamentals(
         close_client = True
 
     async def _try_quote_summary() -> None:
-        crumb = await _ensure_crumb(client, sym, timeout)
         url = YAHOO_QUOTE_SUMMARY_URL.format(symbol=sym)
         params = {"modules": "price,summaryDetail,defaultKeyStatistics,financialData"}
-        if crumb:
-            params["crumb"] = crumb
-
         r = await client.get(url, params=params)
-        out["meta"]["quoteSummary_status"] = r.status_code
-
         if r.status_code >= 400:
             raise RuntimeError(f"quoteSummary HTTP {r.status_code}")
-
-        # Yahoo can sometimes return HTML; protect JSON parse
-        try:
-            j = r.json() or {}
-        except Exception:
-            txt = (r.text or "")[:200].replace("\n", " ")
-            raise RuntimeError(f"quoteSummary non-JSON ({txt})")
-
-        qs = j.get("quoteSummary") or {}
-        if qs.get("error"):
-            raise RuntimeError(f"quoteSummary error: {qs.get('error')}")
-
-        res = (qs.get("result") or [])
+        j = r.json() or {}
+        res = (((j.get("quoteSummary") or {}).get("result")) or [])
         if not res:
             raise RuntimeError("quoteSummary empty result")
-
         data = res[0] or {}
 
         price = data.get("price") or {}
@@ -233,115 +186,123 @@ async def yahoo_fundamentals(
         stats = data.get("defaultKeyStatistics") or {}
         fin = data.get("financialData") or {}
 
-        out["currency"] = (price.get("currency") or out["currency"])
+        out["currency"] = price.get("currency") or out["currency"]
 
-        out["market_cap"] = _get_raw(price.get("marketCap")) or _get_raw(stats.get("marketCap"))
+        out["market_cap"] = (
+            _get_raw(price.get("marketCap"))
+            or _get_raw(stats.get("marketCap"))
+            or _get_raw(stats.get("enterpriseValue"))
+        )
         out["pe_ttm"] = _get_raw(summ.get("trailingPE")) or _get_raw(stats.get("trailingPE"))
-        out["pb"] = _get_raw(stats.get("priceToBook"))
-        out["dividend_yield"] = _get_raw(summ.get("dividendYield"))  # fraction
-        out["roe"] = _get_raw(fin.get("returnOnEquity"))
-        out["roa"] = _get_raw(fin.get("returnOnAssets"))
+        out["pb"] = _get_raw(stats.get("priceToBook")) or out["pb"]
+
+        # dividendYield is often a fraction
+        out["dividend_yield"] = _get_raw(summ.get("dividendYield")) or out["dividend_yield"]
+
+        out["roe"] = _get_raw(fin.get("returnOnEquity")) or out["roe"]
+        out["roa"] = _get_raw(fin.get("returnOnAssets")) or out["roa"]
 
     async def _try_quote_v7() -> None:
         r = await client.get(YAHOO_QUOTE_URL, params={"symbols": sym})
-        out["meta"]["quoteV7_status"] = r.status_code
-
         if r.status_code >= 400:
             raise RuntimeError(f"quote v7 HTTP {r.status_code}")
-
-        try:
-            j = r.json() or {}
-        except Exception:
-            txt = (r.text or "")[:200].replace("\n", " ")
-            raise RuntimeError(f"quote v7 non-JSON ({txt})")
-
+        j = r.json() or {}
         q = (((j.get("quoteResponse") or {}).get("result")) or [])
         if not q:
             raise RuntimeError("quote v7 empty result")
-
         q0 = q[0] or {}
+
         out["currency"] = q0.get("currency") or out["currency"]
         out["market_cap"] = _safe_float(q0.get("marketCap")) or out["market_cap"]
         out["pe_ttm"] = _safe_float(q0.get("trailingPE")) or out["pe_ttm"]
         out["pb"] = _safe_float(q0.get("priceToBook")) or out["pb"]
-        out["dividend_yield"] = _safe_float(q0.get("trailingAnnualDividendYield")) or out["dividend_yield"]
+
+        # Some symbols expose dividend yield here:
+        out["dividend_yield"] = (
+            _safe_float(q0.get("trailingAnnualDividendYield"))
+            or _safe_float(q0.get("dividendYield"))
+            or out["dividend_yield"]
+        )
 
     async def _try_timeseries() -> None:
-        """
-        Best-effort: pull latest values from fundamentals-timeseries endpoint.
-
-        NOTE: Yahoo naming is not always consistent across markets; we request a bundle of
-        common types and accept whichever are returned.
-        """
-        # common types seen in the wild
+        # We request multiple “type” candidates, then pick whichever exists.
+        # Yahoo varies naming across endpoints/regions, so we include several.
         types = [
             "trailingMarketCap",
+            "marketCap",
+            "trailingPE",
             "trailingPeRatio",
+            "trailingPB",
             "trailingPbRatio",
             "trailingAnnualDividendYield",
+            "dividendYield",
             "returnOnEquity",
             "returnOnAssets",
         ]
+        period2 = int(time.time())
+        period1 = 0  # oldest
 
-        # period window (Yahoo caps history anyway)
-        period1 = int(datetime(2016, 12, 31, tzinfo=timezone.utc).timestamp())
-        period2 = int(datetime.now(timezone.utc).timestamp())
+        last_err = None
+        for base_url in YAHOO_TIMESERIES_URLS:
+            try:
+                url = base_url.format(symbol=sym)
+                params = {
+                    "symbol": sym,
+                    "type": ",".join(types),
+                    "period1": str(period1),
+                    "period2": str(period2),
+                    "merge": "false",
+                }
+                r = await client.get(url, params=params)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"timeseries HTTP {r.status_code}")
+                j = r.json() or {}
+                ts = j.get("timeseries") or {}
+                if ts.get("error"):
+                    raise RuntimeError(f"timeseries error: {ts.get('error')}")
+                res = ts.get("result") or []
+                if not res:
+                    raise RuntimeError("timeseries empty result")
+                r0 = res[0] or {}
 
-        url = YAHOO_FUND_TIMESERIES_URL.format(symbol=sym)
-        params = {
-            "symbol": sym,
-            "type": ",".join(types),
-            "period1": str(period1),
-            "period2": str(period2),
-        }
+                # Market cap
+                out["market_cap"] = out["market_cap"] or (
+                    _ts_latest_value(r0, "trailingMarketCap") or _ts_latest_value(r0, "marketCap")
+                )
 
-        r = await client.get(url, params=params)
-        out["meta"]["timeseries_status"] = r.status_code
+                # PE
+                out["pe_ttm"] = out["pe_ttm"] or (
+                    _ts_latest_value(r0, "trailingPE") or _ts_latest_value(r0, "trailingPeRatio")
+                )
 
-        if r.status_code >= 400:
-            raise RuntimeError(f"timeseries HTTP {r.status_code}")
+                # PB
+                out["pb"] = out["pb"] or (
+                    _ts_latest_value(r0, "trailingPB") or _ts_latest_value(r0, "trailingPbRatio")
+                )
 
-        try:
-            j = r.json() or {}
-        except Exception:
-            txt = (r.text or "")[:200].replace("\n", " ")
-            raise RuntimeError(f"timeseries non-JSON ({txt})")
+                # Dividend yield (fraction)
+                out["dividend_yield"] = out["dividend_yield"] or (
+                    _ts_latest_value(r0, "trailingAnnualDividendYield") or _ts_latest_value(r0, "dividendYield")
+                )
 
-        res = ((j.get("timeseries") or {}).get("result") or [])
-        if not res:
-            raise RuntimeError("timeseries empty result")
+                # ROE/ROA (fractions)
+                out["roe"] = out["roe"] or _ts_latest_value(r0, "returnOnEquity")
+                out["roa"] = out["roa"] or _ts_latest_value(r0, "returnOnAssets")
 
-        # Usually first record carries metrics
-        rec = res[0] or {}
+                # Meta currency sometimes exists
+                meta = r0.get("meta") or {}
+                out["currency"] = out["currency"] or meta.get("currency")
 
-        # Currency might exist in per-metric meta or top meta; keep best-effort only
-        # Pull latest metric point:
-        def _latest(metric_key: str) -> Optional[float]:
-            arr = rec.get(metric_key)
-            if not isinstance(arr, list) or not arr:
-                return None
-            # choose last element with reportedValue.raw
-            for item in reversed(arr):
-                try:
-                    rv = ((item or {}).get("reportedValue") or {}).get("raw")
-                    v = _safe_float(rv)
-                    if v is not None:
-                        return v
-                except Exception:
-                    continue
-            return None
+                return  # success
+            except Exception as e:
+                last_err = str(e)
 
-        # Map if available
-        out["market_cap"] = _latest("trailingMarketCap") or out["market_cap"]
-        out["pe_ttm"] = _latest("trailingPeRatio") or out["pe_ttm"]
-        out["pb"] = _latest("trailingPbRatio") or out["pb"]
-        out["dividend_yield"] = _latest("trailingAnnualDividendYield") or out["dividend_yield"]
-        out["roe"] = _latest("returnOnEquity") or out["roe"]
-        out["roa"] = _latest("returnOnAssets") or out["roa"]
+        if last_err:
+            raise RuntimeError(last_err)
 
     last_err: Optional[str] = None
     try:
-        # 1) quoteSummary (with crumb best-effort)
+        # 1) quoteSummary
         for attempt in range(max(1, int(retry_attempts))):
             try:
                 await _try_quote_summary()
@@ -351,7 +312,7 @@ async def yahoo_fundamentals(
                 last_err = str(e)
                 await _sleep_backoff(attempt)
 
-        # 2) v7 quote fallback
+        # 2) quote v7 if still sparse
         if not _has_any(out):
             for attempt in range(max(1, int(retry_attempts))):
                 try:
@@ -362,8 +323,17 @@ async def yahoo_fundamentals(
                     last_err = str(e)
                     await _sleep_backoff(attempt)
 
-        # 3) timeseries fallback
-        if not _has_any(out):
+        # 3) timeseries fallback if still missing key fields
+        # Run it if any of the core metrics are missing
+        needs_ts = (
+            out["market_cap"] is None
+            or out["pe_ttm"] is None
+            or out["pb"] is None
+            or out["dividend_yield"] is None
+            or out["roe"] is None
+            or out["roa"] is None
+        )
+        if needs_ts:
             for attempt in range(max(1, int(retry_attempts))):
                 try:
                     await _try_timeseries()
@@ -373,12 +343,11 @@ async def yahoo_fundamentals(
                     last_err = str(e)
                     await _sleep_backoff(attempt)
 
-        # If still nothing usable -> clear error for engine warning
+        # Error policy:
         if not _has_any(out):
-            out["error"] = "yahoo fundamentals returned no usable fields"
-        elif last_err:
-            # Non-fatal: got something, but record last warning
-            out["error"] = last_err
+            out["error"] = last_err or "yahoo fundamentals returned no usable fields"
+        else:
+            out["error"] = None
 
         return out
 
@@ -389,12 +358,13 @@ async def yahoo_fundamentals(
 
 # --- Engine adapter (what DataEngineV2 calls) --------------------------------
 
-async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
+async def fetch_fundamentals_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     """
-    Returns a patch aligned to UnifiedQuote keys.
-    Only returns non-null fields.
+    Returns (patch, err) aligned to UnifiedQuote keys.
+    Engine will merge only non-None fields; err is used as warning when empty.
     """
     d = await yahoo_fundamentals(symbol)
+
     patch = {
         "currency": d.get("currency"),
         "market_cap": d.get("market_cap"),
@@ -404,4 +374,9 @@ async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
         "roe": d.get("roe"),
         "roa": d.get("roa"),
     }
-    return {k: v for k, v in patch.items() if v is not None}
+    patch = {k: v for k, v in patch.items() if v is not None}
+
+    err = (d.get("error") or None)
+    if not patch and not err:
+        err = "yahoo fundamentals returned no usable fields"
+    return patch, err
