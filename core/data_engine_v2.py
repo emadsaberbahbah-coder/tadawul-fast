@@ -5,15 +5,10 @@ core/data_engine_v2.py
 ===============================================================
 UNIFIED DATA ENGINE (v2.7.8) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-v2.7.8 improvements vs v2.7.7
-- ✅ Yahoo Fundamentals supplement now runs in TOP-UP mode:
-    If price exists and ANY of (market_cap, pe_ttm, pb, dividend_yield, roe, roa) are missing,
-    we call yahoo_fundamentals_provider to fill blanks (merge-only, never overwrite).
-- ✅ Keeps KSA pricing stable on yahoo_chart
-- ✅ PROD SAFE: never crashes app startup
-
-Return shape
-- Dict aligned to UnifiedQuote keys (safe for Sheets)
+v2.7.8 improvements (KSA fundamentals):
+- Yahoo Fundamentals supplement runs when KEY fundamentals are missing (not only "none").
+- Merges more fields from yahoo_fundamentals (shares_outstanding, eps_ttm, dividend_rate, beta).
+- Computes market_cap and pe_ttm when possible (shares*price, price/eps).
 """
 
 import asyncio
@@ -35,12 +30,7 @@ _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSEY = {"0", "false", "no", "n", "off", "f"}
 
-TARGET_YAHOO_FUND_FIELDS = ("market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa")
 
-
-# ---------------------------------------------------------------------------
-# Pydantic (best-effort)
-# ---------------------------------------------------------------------------
 try:
     from pydantic import BaseModel, ConfigDict, Field
 except Exception:  # pragma: no cover
@@ -58,9 +48,6 @@ except Exception:  # pragma: no cover
         return dict(kwargs)
 
 
-# ---------------------------------------------------------------------------
-# UnifiedQuote schema
-# ---------------------------------------------------------------------------
 class UnifiedQuote(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
@@ -147,9 +134,6 @@ class UnifiedQuote(BaseModel):
         return self
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -310,6 +294,21 @@ def _apply_derived(out: Dict[str, Any]) -> None:
         if cur is not None and hi is not None and lo is not None and hi != lo:
             out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
 
+    # Compute market cap if possible
+    if out.get("market_cap") is None:
+        sh = _safe_float(out.get("shares_outstanding"))
+        if cur is not None and sh is not None:
+            out["market_cap"] = cur * sh
+
+    # Compute PE if possible
+    if out.get("pe_ttm") is None:
+        eps = _safe_float(out.get("eps_ttm"))
+        if cur is not None and eps not in (None, 0.0):
+            try:
+                out["pe_ttm"] = cur / eps
+            except Exception:
+                pass
+
 
 def _score_quality(p: Dict[str, Any]) -> int:
     roe = _safe_float(p.get("roe"))
@@ -406,12 +405,15 @@ def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
     return False
 
 
-def _missing_target_fundamentals(out: Dict[str, Any]) -> bool:
-    # TOP-UP mode: fill any missing of these
-    for k in TARGET_YAHOO_FUND_FIELDS:
-        if _safe_float(out.get(k)) is None:
-            return True
-    return False
+def _missing_key_fundamentals(out: Dict[str, Any]) -> bool:
+    """
+    Key fundamentals that matter for your sheet:
+    market_cap, pe_ttm, dividend_yield, roe, roa
+    """
+    return any(
+        _safe_float(out.get(k)) is None
+        for k in ("market_cap", "pe_ttm", "dividend_yield", "roe", "roa")
+    )
 
 
 def _normalize_warning_prefix(msg: str) -> str:
@@ -424,9 +426,6 @@ def _normalize_warning_prefix(msg: str) -> str:
     return m
 
 
-# ---------------------------------------------------------------------------
-# DataEngine
-# ---------------------------------------------------------------------------
 class DataEngine:
     def __init__(self) -> None:
         self.providers_global = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
@@ -442,6 +441,7 @@ class DataEngine:
                 ttl = 3
         except Exception:
             ttl = 10
+
         self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
 
         logger.info(
@@ -559,17 +559,13 @@ class DataEngine:
                 )
 
             elif p == "eodhd":
-                fn_list = (
-                    [
-                        "fetch_enriched_quote_patch",
-                        "fetch_quote_and_fundamentals_patch",
-                        "fetch_enriched_patch",
-                        "fetch_quote_patch",
-                        "fetch_quote",
-                    ]
-                    if enrich
-                    else ["fetch_quote_patch", "fetch_quote"]
-                )
+                fn_list = [
+                    "fetch_enriched_quote_patch",
+                    "fetch_quote_and_fundamentals_patch",
+                    "fetch_enriched_patch",
+                    "fetch_quote_patch",
+                    "fetch_quote",
+                ] if enrich else ["fetch_quote_patch", "fetch_quote"]
                 patch, err = await _try_provider_call("core.providers.eodhd_provider", fn_list, sym)
 
             elif p == "fmp":
@@ -578,6 +574,7 @@ class DataEngine:
                     ["fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
                     sym,
                 )
+
             else:
                 warnings.append(f"{p}: unknown provider")
                 continue
@@ -588,10 +585,7 @@ class DataEngine:
 
             if err:
                 low = str(err).strip().lower()
-                if low.startswith(f"{p}:"):
-                    warnings.append(str(err).strip())
-                else:
-                    warnings.append(f"{p}: {str(err).strip()}")
+                warnings.append(str(err).strip() if low.startswith(f"{p}:") else f"{p}: {str(err).strip()}")
 
             _apply_derived(out)
 
@@ -602,10 +596,10 @@ class DataEngine:
                 if _has_any_fundamentals(out):
                     break
 
-        # ✅ Yahoo fundamentals supplement (TOP-UP mode)
+        # Yahoo Fundamentals supplement
         try:
             has_price = _safe_float(out.get("current_price")) is not None
-            needs_fund = enrich and has_price and _missing_target_fundamentals(out)
+            needs_fund = enrich and has_price and _missing_key_fundamentals(out)
 
             allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
 
@@ -617,7 +611,21 @@ class DataEngine:
                 )
 
                 if patch2:
-                    clean = {k: patch2.get(k) for k in ("currency",) + TARGET_YAHOO_FUND_FIELDS if patch2.get(k) is not None}
+                    clean = {k: patch2.get(k) for k in (
+                        "currency",
+                        "current_price",
+                        "market_cap",
+                        "shares_outstanding",
+                        "eps_ttm",
+                        "pe_ttm",
+                        "pb",
+                        "dividend_yield",
+                        "dividend_rate",
+                        "roe",
+                        "roa",
+                        "beta",
+                    ) if patch2.get(k) is not None}
+
                     if clean:
                         _merge_patch(out, clean)
                         source_used.append("yahoo_fundamentals")
@@ -644,7 +652,6 @@ class DataEngine:
         out["data_quality"] = _quality_label(out)
 
         has_price = _safe_float(out.get("current_price")) is not None
-
         base_err = str(out.get("error") or "").strip()
         parts: List[str] = []
         if base_err:
