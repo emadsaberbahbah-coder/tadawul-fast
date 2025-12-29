@@ -1,27 +1,20 @@
-# core/data_engine_v2.py  (FULL REPLACEMENT)
+from __future__ import annotations
+
 """
 core/data_engine_v2.py
 ===============================================================
 UNIFIED DATA ENGINE (v2.7.8) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 
-✅ v2.7.8 improvements vs v2.7.7 (fix KSA fundamentals visibility + reliability)
-- ✅ KSA price stays on yahoo_chart (stable).
-- ✅ Yahoo Fundamentals supplement is now DEBUGGABLE:
-    - prefers calling yahoo_fundamentals() (full dict includes "error")
-    - if returns empty fundamentals, emits warning (so we can see why)
-- ✅ Fundamentals cache (FUNDAMENTALS_TTL_SEC, default 21600s = 6h)
-- ✅ Better supplement trigger:
-    - runs when core fundamentals are missing (market_cap/pe/pb/div_yield/roe/roa/shares)
-- ✅ Derivations:
-    - compute shares_outstanding or market_cap if one exists + current_price
-    - compute free_float_market_cap when market_cap + free_float exist
-- ✅ PROD SAFE: never throws to callers; health stays up.
+v2.7.8 improvements vs v2.7.7
+- ✅ Yahoo Fundamentals supplement now runs in TOP-UP mode:
+    If price exists and ANY of (market_cap, pe_ttm, pb, dividend_yield, roe, roa) are missing,
+    we call yahoo_fundamentals_provider to fill blanks (merge-only, never overwrite).
+- ✅ Keeps KSA pricing stable on yahoo_chart
+- ✅ PROD SAFE: never crashes app startup
 
 Return shape
 - Dict aligned to UnifiedQuote keys (safe for Sheets)
 """
-
-from __future__ import annotations
 
 import asyncio
 import importlib
@@ -41,6 +34,8 @@ ENGINE_VERSION = "2.7.8"
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSEY = {"0", "false", "no", "n", "off", "f"}
+
+TARGET_YAHOO_FUND_FIELDS = ("market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa")
 
 
 # ---------------------------------------------------------------------------
@@ -64,19 +59,17 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# UnifiedQuote schema (for router schema-fill)
+# UnifiedQuote schema
 # ---------------------------------------------------------------------------
 class UnifiedQuote(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    # Identity
     symbol: str
     name: Optional[str] = None
     market: Optional[str] = None
     exchange: Optional[str] = None
     currency: Optional[str] = None
 
-    # Price / Trading
     current_price: Optional[float] = None
     previous_close: Optional[float] = None
     open: Optional[float] = None
@@ -94,35 +87,31 @@ class UnifiedQuote(BaseModel):
     price_change: Optional[float] = None
     percent_change: Optional[float] = None
 
-    # Fundamentals (optional)
     market_cap: Optional[float] = None
     shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None  # percent (0..100) per your AAPL output
+    free_float: Optional[float] = None
     free_float_market_cap: Optional[float] = None
 
     eps_ttm: Optional[float] = None
     pe_ttm: Optional[float] = None
     pb: Optional[float] = None
     ps: Optional[float] = None
-    dividend_yield: Optional[float] = None  # fraction (0.0037 = 0.37%)
+    dividend_yield: Optional[float] = None
     roe: Optional[float] = None
     roa: Optional[float] = None
     beta: Optional[float] = None
 
-    # Scores
     quality_score: Optional[int] = None
     value_score: Optional[int] = None
     momentum_score: Optional[int] = None
     risk_score: Optional[int] = None
     opportunity_score: Optional[int] = None
 
-    # Provenance
     data_source: Optional[str] = None
     data_quality: Optional[str] = None
     last_updated_utc: Optional[str] = None
     error: Optional[str] = None
 
-    # Router helpers (optional)
     symbol_input: Optional[str] = None
     symbol_normalized: Optional[str] = None
 
@@ -322,31 +311,6 @@ def _apply_derived(out: Dict[str, Any]) -> None:
             out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
 
 
-def _apply_fundamental_derivations(out: Dict[str, Any]) -> None:
-    """
-    Helpful derivations once we have price + either market_cap or shares_outstanding.
-    Keeps everything best-effort; never throws.
-    """
-    try:
-        cur = _safe_float(out.get("current_price"))
-        mc = _safe_float(out.get("market_cap"))
-        sh = _safe_float(out.get("shares_outstanding"))
-
-        if cur is not None and mc is not None and sh is None and cur != 0:
-            out["shares_outstanding"] = mc / cur
-
-        if cur is not None and sh is not None and mc is None:
-            out["market_cap"] = sh * cur
-
-        ff = _safe_float(out.get("free_float"))
-        mc2 = _safe_float(out.get("market_cap"))
-        if mc2 is not None and ff is not None and out.get("free_float_market_cap") is None:
-            # free_float is treated as percent (0..100) per your AAPL example.
-            out["free_float_market_cap"] = mc2 * (ff / 100.0)
-    except Exception:
-        return
-
-
 def _score_quality(p: Dict[str, Any]) -> int:
     roe = _safe_float(p.get("roe"))
     margin = _safe_float(p.get("net_margin"))
@@ -442,13 +406,10 @@ def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
     return False
 
 
-def _has_core_fundamentals(out: Dict[str, Any]) -> bool:
-    """
-    Core fundamentals that matter for your dashboard scoring.
-    If none exist, we should try Yahoo fundamentals supplement.
-    """
-    for k in ("market_cap", "shares_outstanding", "pe_ttm", "pb", "dividend_yield", "roe", "roa"):
-        if _safe_float(out.get(k)) is not None:
+def _missing_target_fundamentals(out: Dict[str, Any]) -> bool:
+    # TOP-UP mode: fill any missing of these
+    for k in TARGET_YAHOO_FUND_FIELDS:
+        if _safe_float(out.get(k)) is None:
             return True
     return False
 
@@ -467,19 +428,13 @@ def _normalize_warning_prefix(msg: str) -> str:
 # DataEngine
 # ---------------------------------------------------------------------------
 class DataEngine:
-    """
-    Engine used by app.state.engine (preferred by routers).
-    """
-
     def __init__(self) -> None:
         self.providers_global = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
         self.providers_ksa = _parse_list_env("KSA_PROVIDERS")
 
-        # ✅ Fundamentals supplement toggles (default ON for KSA)
         self.enable_yahoo_fundamentals_ksa = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True)
         self.enable_yahoo_fundamentals_global = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", False)
 
-        # Quote cache TTL
         ttl = 10
         try:
             ttl = int((os.getenv("ENGINE_CACHE_TTL_SEC") or "10").strip())
@@ -489,24 +444,12 @@ class DataEngine:
             ttl = 10
         self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
 
-        # Fundamentals cache TTL (long)
-        fttl = 21600
-        try:
-            fttl = int((os.getenv("FUNDAMENTALS_TTL_SEC") or "21600").strip())
-            if fttl < 300:
-                fttl = 300
-        except Exception:
-            fttl = 21600
-        self._fund_cache: TTLCache = TTLCache(maxsize=12000, ttl=fttl)
-
         logger.info(
-            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | quote_cache_ttl=%ss | fund_cache_ttl=%ss | "
-            "yahoo_fund_ksa=%s yahoo_fund_global=%s",
+            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss | yahoo_fund_ksa=%s yahoo_fund_global=%s",
             ENGINE_VERSION,
             ",".join(self.providers_global) if self.providers_global else "(none)",
             ",".join(self.providers_ksa) if self.providers_ksa else "(none)",
             ttl,
-            fttl,
             self.enable_yahoo_fundamentals_ksa,
             self.enable_yahoo_fundamentals_global,
         )
@@ -526,67 +469,12 @@ class DataEngine:
 
     def _providers_for(self, sym: str) -> List[str]:
         is_ksa = _is_ksa(sym)
-
         if is_ksa:
             if self.providers_ksa:
                 return list(self.providers_ksa)
             safe = [p for p in (self.providers_global or []) if p in {"tadawul", "argaam", "yahoo_chart"}]
             return safe
-
         return list(self.providers_global or [])
-
-    async def _yahoo_fundamentals_supplement(self, sym: str) -> Tuple[Dict[str, Any], Optional[str]]:
-        """
-        Returns (clean_patch, warning_or_error).
-        Uses fundamentals cache.
-        """
-        cache_key = f"fund::{sym}"
-        hit = self._fund_cache.get(cache_key)
-        if isinstance(hit, dict) and hit:
-            # cached patch, no warning
-            return dict(hit), None
-
-        # Prefer yahoo_fundamentals() first because it includes "error" in returned dict
-        patch2, err2 = await _try_provider_call(
-            "core.providers.yahoo_fundamentals_provider",
-            [
-                "yahoo_fundamentals",        # returns full dict including "error"
-                "fetch_fundamentals_patch",  # returns filtered patch only
-                "fetch_patch",
-                "fetch_fundamentals",
-            ],
-            sym,
-        )
-
-        # If yahoo_fundamentals() was used, patch2 includes many keys; we only keep what UnifiedQuote expects.
-        clean = {
-            k: patch2.get(k)
-            for k in (
-                "currency",
-                "market_cap",
-                "shares_outstanding",
-                "pe_ttm",
-                "pb",
-                "dividend_yield",
-                "roe",
-                "roa",
-            )
-            if patch2.get(k) is not None
-        }
-
-        # Pull error from either the engine err2 or the provider dict field (important!)
-        msg = (err2 or "") or str(patch2.get("error") or "").strip()
-        msg = msg.strip() if msg else ""
-
-        # If nothing returned and no error, still warn (this was your silent failure in v2.7.7)
-        if not clean and not msg:
-            msg = "yahoo fundamentals returned no usable fields"
-
-        # Cache only when we got something useful (avoid caching empties forever)
-        if clean:
-            self._fund_cache[cache_key] = dict(clean)
-
-        return clean, msg or None
 
     async def get_enriched_quote(self, symbol: str, *, enrich: bool = True) -> Dict[str, Any]:
         sym = normalize_symbol(symbol)
@@ -629,12 +517,10 @@ class DataEngine:
             if not p:
                 continue
 
-            # KSA safety: never call global-only providers for KSA unless explicitly in KSA providers list
             if is_ksa and p in {"eodhd", "fmp", "finnhub"} and (p not in (self.providers_ksa or [])):
                 warnings.append(f"{p}: skipped for KSA")
                 continue
 
-            # Auto-skip tadawul if not configured
             if p == "tadawul" and not _tadawul_configured():
                 warnings.append("tadawul: skipped (missing TADAWUL_QUOTE_URL/TADAWUL_FUNDAMENTALS_URL)")
                 continue
@@ -652,12 +538,7 @@ class DataEngine:
             elif p == "argaam":
                 patch, err = await _try_provider_call(
                     "core.providers.argaam_provider",
-                    [
-                        "fetch_quote_patch",
-                        "fetch_quote_and_fundamentals_patch",
-                        "fetch_enriched_patch",
-                        "fetch_enriched_quote_patch",
-                    ],
+                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_enriched_quote_patch"],
                     sym,
                 )
 
@@ -678,31 +559,25 @@ class DataEngine:
                 )
 
             elif p == "eodhd":
-                if enrich:
-                    fn_list = [
+                fn_list = (
+                    [
                         "fetch_enriched_quote_patch",
                         "fetch_quote_and_fundamentals_patch",
                         "fetch_enriched_patch",
                         "fetch_quote_patch",
                         "fetch_quote",
                     ]
-                else:
-                    fn_list = ["fetch_quote_patch", "fetch_quote"]
+                    if enrich
+                    else ["fetch_quote_patch", "fetch_quote"]
+                )
                 patch, err = await _try_provider_call("core.providers.eodhd_provider", fn_list, sym)
 
             elif p == "fmp":
                 patch, err = await _try_provider_call(
                     "core.providers.fmp_provider",
-                    [
-                        "fetch_quote_and_fundamentals_patch",
-                        "fetch_enriched_quote_patch",
-                        "fetch_enriched_patch",
-                        "fetch_quote_patch",
-                        "fetch_quote",
-                    ],
+                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
                     sym,
                 )
-
             else:
                 warnings.append(f"{p}: unknown provider")
                 continue
@@ -719,41 +594,41 @@ class DataEngine:
                     warnings.append(f"{p}: {str(err).strip()}")
 
             _apply_derived(out)
-            _apply_fundamental_derivations(out)
 
-            # Stop rule:
             has_price_now = _safe_float(out.get("current_price")) is not None
             if has_price_now:
                 if not enrich:
                     break
-                # If we already have ANY fundamentals from a provider, we can stop.
-                # (Supplement step later may still run if core fundamentals missing.)
                 if _has_any_fundamentals(out):
                     break
 
-        # ✅ Post-loop: Yahoo Fundamentals supplement (fix KSA fundamentals when core fundamentals missing)
+        # ✅ Yahoo fundamentals supplement (TOP-UP mode)
         try:
             has_price = _safe_float(out.get("current_price")) is not None
-            needs_core_fund = enrich and has_price and (not _has_core_fundamentals(out))
+            needs_fund = enrich and has_price and _missing_target_fundamentals(out)
+
             allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
 
-            if needs_core_fund and allow:
-                clean, msg = await self._yahoo_fundamentals_supplement(sym)
+            if needs_fund and allow:
+                patch2, err2 = await _try_provider_call(
+                    "core.providers.yahoo_fundamentals_provider",
+                    ["fetch_fundamentals_patch", "fetch_patch", "yahoo_fundamentals", "fetch_fundamentals"],
+                    sym,
+                )
 
-                if clean:
-                    _merge_patch(out, clean)
-                    source_used.append("yahoo_fundamentals")
+                if patch2:
+                    clean = {k: patch2.get(k) for k in ("currency",) + TARGET_YAHOO_FUND_FIELDS if patch2.get(k) is not None}
+                    if clean:
+                        _merge_patch(out, clean)
+                        source_used.append("yahoo_fundamentals")
 
-                if msg:
-                    warnings.append(f"yahoo_fundamentals: {msg}")
+                if err2:
+                    warnings.append(f"yahoo_fundamentals: {str(err2).strip()}")
 
                 _apply_derived(out)
-                _apply_fundamental_derivations(out)
-
         except Exception:
-            pass  # PROD SAFE
+            pass
 
-        # Scoring
         out["quality_score"] = _score_quality(out)
         out["value_score"] = _score_value(out)
         out["momentum_score"] = _score_momentum(out)
@@ -768,7 +643,6 @@ class DataEngine:
         out["data_source"] = ",".join(_dedup_preserve(source_used)) if source_used else (out.get("data_source") or None)
         out["data_quality"] = _quality_label(out)
 
-        # Final status + error normalization
         has_price = _safe_float(out.get("current_price")) is not None
 
         base_err = str(out.get("error") or "").strip()
@@ -805,7 +679,6 @@ class DataEngine:
                 out.append(r)
         return out
 
-    # Aliases expected by some legacy routers/services
     async def get_quote(self, symbol: str) -> Dict[str, Any]:
         return await self.get_enriched_quote(symbol, enrich=True)
 
@@ -813,7 +686,6 @@ class DataEngine:
         return await self.get_enriched_quotes(symbols, enrich=True)
 
 
-# Convenience module-level singleton (legacy-style)
 _ENGINE_SINGLETON: Optional[DataEngine] = None
 _LOCK = asyncio.Lock()
 
@@ -837,7 +709,6 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
     return await e.get_enriched_quotes(symbols, enrich=True)
 
 
-# legacy aliases
 async def get_quote(symbol: str) -> Dict[str, Any]:
     return await get_enriched_quote(symbol)
 
