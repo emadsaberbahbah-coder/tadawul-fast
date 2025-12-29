@@ -1,4 +1,5 @@
-# core/data_engine_v2.py
+```python
+# core/data_engine_v2.py  (FULL REPLACEMENT)
 """
 core/data_engine_v2.py
 ===============================================================
@@ -418,7 +419,7 @@ def _normalize_warning_prefix(msg: str) -> str:
         return ""
     low = m.lower()
     if low.startswith("warning:"):
-        return m[len("warning:"):].strip()
+        return m[len("warning:") :].strip()
     return m
 
 
@@ -545,7 +546,12 @@ class DataEngine:
             elif p == "argaam":
                 patch, err = await _try_provider_call(
                     "core.providers.argaam_provider",
-                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_enriched_quote_patch"],
+                    [
+                        "fetch_quote_patch",
+                        "fetch_quote_and_fundamentals_patch",
+                        "fetch_enriched_patch",
+                        "fetch_enriched_quote_patch",
+                    ],
                     sym,
                 )
 
@@ -585,7 +591,13 @@ class DataEngine:
             elif p == "fmp":
                 patch, err = await _try_provider_call(
                     "core.providers.fmp_provider",
-                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
+                    [
+                        "fetch_quote_and_fundamentals_patch",
+                        "fetch_enriched_quote_patch",
+                        "fetch_enriched_patch",
+                        "fetch_quote_patch",
+                        "fetch_quote",
+                    ],
                     sym,
                 )
 
@@ -593,7 +605,6 @@ class DataEngine:
                 warnings.append(f"{p}: unknown provider")
                 continue
 
-            # Merge patch
             if patch:
                 _merge_patch(out, patch)
                 source_used.append(p)
@@ -607,10 +618,6 @@ class DataEngine:
 
             _apply_derived(out)
 
-            # ✅ Stop rule:
-            # - If no price: keep trying
-            # - If enrich=False: stop once price exists
-            # - If enrich=True: stop only once price exists AND we have some fundamentals
             has_price_now = _safe_float(out.get("current_price")) is not None
             if has_price_now:
                 if not enrich:
@@ -623,14 +630,17 @@ class DataEngine:
             has_price = _safe_float(out.get("current_price")) is not None
             needs_fund = enrich and has_price and (not _has_any_fundamentals(out))
 
-            allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
+            allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or (
+                (not is_ksa) and self.enable_yahoo_fundamentals_global
+            )
+
             if needs_fund and allow:
                 patch2, err2 = await _try_provider_call(
                     "core.providers.yahoo_fundamentals_provider",
                     ["fetch_fundamentals_patch", "fetch_patch", "yahoo_fundamentals", "fetch_fundamentals"],
                     sym,
                 )
-                # only merge known fundamentals keys (avoid extra noise keys)
+
                 if patch2:
                     clean = {
                         k: patch2.get(k)
@@ -646,8 +656,7 @@ class DataEngine:
 
                 _apply_derived(out)
         except Exception:
-            # PROD SAFE: never break a quote because supplement failed
-            pass
+            pass  # PROD SAFE
 
         # Scoring
         out["quality_score"] = _score_quality(out)
@@ -659,7 +668,9 @@ class DataEngine:
         vs = float(out.get("value_score") or 50)
         ms = float(out.get("momentum_score") or 50)
         rs = float(out.get("risk_score") or 35)
-        out["opportunity_score"] = int(max(0, min(100, round((0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs)))))
+        out["opportunity_score"] = int(
+            max(0, min(100, round((0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs))))
+        )
 
         # data_source
         out["data_source"] = ",".join(_dedup_preserve(source_used)) if source_used else (out.get("data_source") or None)
@@ -667,7 +678,7 @@ class DataEngine:
         # data_quality
         out["data_quality"] = _quality_label(out)
 
-        # ✅ Final status + error normalization
+        # Final status + error normalization
         has_price = _safe_float(out.get("current_price")) is not None
 
         base_err = str(out.get("error") or "").strip()
@@ -684,7 +695,6 @@ class DataEngine:
             out["status"] = "success"
             out["error"] = "" if not parts else ("warning: " + " | ".join(parts))
 
-        # Cache
         self._cache[cache_key] = dict(out)
         return out
 
@@ -744,3 +754,4 @@ async def get_quote(symbol: str) -> Dict[str, Any]:
 
 async def get_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
     return await get_enriched_quotes(symbols)
+```
