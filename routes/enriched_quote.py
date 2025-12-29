@@ -12,7 +12,7 @@ Fixes / Improvements
         - if no price            => error
 - ✅ v2.4.1 HARDENING:
     - Accepts engine/provider accidental tuple returns like (payload_dict, err_str)
-      and converts them into a proper payload dict (prevents {"value":"(...)"})
+      and converts them into a proper payload dict (prevents {"value":"(...)"}).
 - ✅ Keeps schema-fill guarantees for Sheets (no missing columns)
 - ✅ Keeps PROD-safe import behavior (no core imports at module import-time)
 """
@@ -81,6 +81,7 @@ def _normalize_symbol_safe(raw: str) -> str:
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
 
+    # Yahoo special symbols / futures / FX
     if any(ch in s for ch in ("=", "^")):
         return s
 
@@ -122,14 +123,12 @@ def _as_payload(obj: Any) -> Dict[str, Any]:
         a, b = obj
         if isinstance(a, dict):
             payload = jsonable_encoder(a)
-            # if b looks like an error string, attach it if payload has no error
             if b is not None:
                 try:
                     b_str = str(b).strip()
                 except Exception:
                     b_str = ""
                 if b_str:
-                    # do not overwrite an existing non-empty error
                     cur_err = payload.get("error")
                     if cur_err is None or (isinstance(cur_err, str) and not cur_err.strip()):
                         payload["error"] = b_str
@@ -330,7 +329,6 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
     has_price = _has_price(payload)
 
     if has_price:
-        # succeed even with warnings
         payload["status"] = "success"
 
         # normalize warning prefix (do not double-prefix)
@@ -346,9 +344,7 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         if not payload.get("error"):
             payload["error"] = "No price returned"
 
-    # Schema fill last (adds any missing keys as None)
-    payload = _schema_fill_best_effort(payload)
-    return payload
+    return _schema_fill_best_effort(payload)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -400,8 +396,7 @@ async def enriched_quote(
             "data_source": "none",
             "error": "Empty symbol",
         }
-        out = _schema_fill_best_effort(out)
-        return JSONResponse(status_code=200, content=out)
+        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
 
     timeout_sec = _enriched_timeout_sec()
 
@@ -421,8 +416,7 @@ async def enriched_quote(
                 "data_source": "none",
                 "error": "Enriched quote engine not available (no working provider).",
             }
-            out = _schema_fill_best_effort(out)
-            return JSONResponse(status_code=200, content=out)
+            return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
 
         payload = _as_payload(result)
         payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
@@ -438,8 +432,7 @@ async def enriched_quote(
             "data_source": "none",
             "error": f"Timeout after {timeout_sec:.0f}s",
         }
-        out = _schema_fill_best_effort(out)
-        return JSONResponse(status_code=200, content=out)
+        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -457,8 +450,7 @@ async def enriched_quote(
         if dbg:
             out["traceback"] = tb[:8000]
 
-        out = _schema_fill_best_effort(out)
-        return JSONResponse(status_code=200, content=out)
+        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
 
 
 @router.get("/quotes")
@@ -537,10 +529,11 @@ async def enriched_quotes(
                 out["traceback"] = tb[:8000]
             return _schema_fill_best_effort(out)
 
+    trimmed = [r.strip() for r in raw_list if r and r.strip()]
+
     tasks: List[asyncio.Task] = []
     items: List[Dict[str, Any]] = []
 
-    trimmed = [r.strip() for r in raw_list if r and r.strip()]
     for idx, raw in enumerate(trimmed):
         if idx < max_allowed:
             tasks.append(asyncio.create_task(_one(raw)))
