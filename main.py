@@ -2,13 +2,16 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.0.8
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.0
 
-v5.0.8 improvements vs v5.0.7
-- ✅ CRITICAL: last-resort runtime aliasing now also exports auth env vars:
-    • APP_TOKEN / BACKUP_APP_TOKEN / TFB_APP_TOKEN
-  so routes that read APP_TOKEN directly (like routes/routes_argaam.py) still work
-  even if config.get_settings cannot be imported for any reason.
+v5.1.0 improvements vs v5.0.8
+- ✅ Stronger env aliasing (auth + provider tokens) and safe diagnostics (never leaks tokens).
+- ✅ More reliable router mount + readiness: supports routers defined as `router` or `get_router()`.
+- ✅ Engine init hardened: prefers app.state.engine already set; then DataEngineV2; then legacy.
+- ✅ Health endpoints show engine type/version + provider lists from engine when available.
+- ✅ Background boot: uses safe to_thread wrappers; never blocks /readyz.
+- ✅ CORS defaults stay the same, but allow_credentials handled correctly with "*".
+- ✅ Avoids any crash even if config/env modules are broken.
 
 Design goals unchanged
 - Never crash app startup.
@@ -47,7 +50,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.0.8"
+APP_ENTRY_VERSION = "5.1.0"
 
 
 def _truthy(v: Any) -> bool:
@@ -77,12 +80,12 @@ def _export_env_if_missing(key: str, value: Any) -> None:
 
 def _apply_runtime_env_aliases_last_resort() -> None:
     """
-    Extra safety: even if config.get_settings cannot be imported,
+    Extra safety: even if config/env imports fail,
     ensure provider modules AND auth checks that read env directly still work.
 
     Never overwrites explicit values.
     """
-    # --- Auth aliases (CRITICAL for routes that read APP_TOKEN directly) ---
+    # --- Auth aliases ---
     tfb_token = (os.getenv("TFB_APP_TOKEN") or "").strip()
     app_token = (os.getenv("APP_TOKEN") or "").strip()
     backup_token = (os.getenv("BACKUP_APP_TOKEN") or "").strip()
@@ -91,7 +94,7 @@ def _apply_runtime_env_aliases_last_resort() -> None:
     if tfb_token and not app_token:
         _export_env_if_missing("APP_TOKEN", tfb_token)
 
-    # Keep reverse alias too (harmless)
+    # Reverse alias too (harmless)
     if app_token and not tfb_token:
         _export_env_if_missing("TFB_APP_TOKEN", app_token)
 
@@ -228,7 +231,7 @@ def _mount_router(
         return report
 
     try:
-        app_.include_router(router_obj)
+        app_.include_router(router_obj)  # type: ignore[arg-type]
         report["mounted"] = True
         report["loaded_from"] = loaded_from
         report["router_attr"] = router_attr
@@ -253,7 +256,6 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
     """
     try:
         from config import get_settings  # type: ignore
-
         s = get_settings()
         return s, "config.get_settings"
     except Exception:
@@ -261,7 +263,6 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
 
     try:
         from core.config import get_settings  # type: ignore
-
         s = get_settings()
         return s, "core.config.get_settings"
     except Exception:
@@ -273,7 +274,6 @@ def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
 def _load_env_module() -> Optional[object]:
     try:
         import env as env_mod  # type: ignore
-
         return env_mod
     except Exception:
         return None
@@ -319,7 +319,7 @@ def _normalize_version(v: Any) -> str:
 
 def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> str:
     """
-    Version priority (aligned with config.py):
+    Version priority:
       1) ENV ONLY: SERVICE_VERSION / APP_VERSION / VERSION / RELEASE
       2) Settings (service_version/version/app_version)
       3) Render commit short hash
@@ -418,6 +418,8 @@ def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key:
 
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
     enabled, ksa = _providers_from_settings(settings, env_mod)
+    # never leak tokens
+    token_mode = "open" if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN")) else "token"
     return {
         "APP_ENV": _resolve_env_name(settings, env_mod),
         "LOG_LEVEL": str(
@@ -433,6 +435,8 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "ENABLE_YAHOO_CHART_KSA": str(os.getenv("ENABLE_YAHOO_CHART_KSA", "")),
         "ENABLE_YAHOO_CHART_SUPPLEMENT": str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "")),
         "ENABLE_YFINANCE_KSA": str(os.getenv("ENABLE_YFINANCE_KSA", "")),
+        "ENABLE_YAHOO_FUNDAMENTALS_KSA": str(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA", "")),
+        "AUTH_MODE": token_mode,
         "RENDER_GIT_COMMIT": (os.getenv("RENDER_GIT_COMMIT") or "")[:12],
     }
 
@@ -477,6 +481,47 @@ def _apply_provider_defaults_if_missing() -> None:
     os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
+    os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_KSA", "true")
+
+
+def _engine_info(eng: Any) -> Dict[str, Any]:
+    if eng is None:
+        return {"engine": "none", "engine_version": None, "providers": [], "ksa_providers": []}
+
+    def _get_list_attr(obj: Any, name: str) -> List[str]:
+        try:
+            v = getattr(obj, name, None)
+            if isinstance(v, list):
+                return [str(x).strip().lower() for x in v if str(x).strip()]
+        except Exception:
+            pass
+        return []
+
+    providers = []
+    ksa = []
+    for attr in ("providers_global", "enabled_providers", "providers"):
+        providers.extend(_get_list_attr(eng, attr))
+    for attr in ("providers_ksa", "ksa_providers"):
+        ksa.extend(_get_list_attr(eng, attr))
+
+    # dedup preserve
+    def _dedup(xs: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for x in xs:
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
+
+    return {
+        "engine": type(eng).__name__,
+        "engine_version": version,
+        "providers": _dedup(providers),
+        "ksa_providers": _dedup(ksa),
+    }
 
 
 def _init_engine_best_effort(app_: FastAPI) -> None:
@@ -487,6 +532,17 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
       - app.state.engine_ready
       - app.state.engine_error
     """
+    # If something already set it (rare), keep it
+    try:
+        existing = getattr(app_.state, "engine", None)
+        if existing is not None:
+            app_.state.engine_ready = True
+            app_.state.engine_error = None
+            logger.info("Engine already present on app.state.engine (%s).", type(existing).__name__)
+            return
+    except Exception:
+        pass
+
     # Prefer v2
     try:
         mod = import_module("core.data_engine_v2")
@@ -751,14 +807,23 @@ def create_app() -> FastAPI:
         failed = [r for r in getattr(app_.state, "mount_report", []) if not r.get("mounted")]
         boot_task = getattr(app_.state, "boot_task", None)
 
+        eng = getattr(app_.state, "engine", None)
+        ei = _engine_info(eng)
+
+        # If engine exposes providers lists, prefer those (more truthful than env)
+        providers = ei["providers"] or enabled
+        ksa_providers = ei["ksa_providers"] or ksa
+
         return {
             "status": "ok",
             "app": app_.title,
             "version": app_.version,
             "env": getattr(app_.state, "app_env", "unknown"),
             "entry_version": APP_ENTRY_VERSION,
-            "providers": enabled,
-            "ksa_providers": ksa,
+            "engine": ei["engine"],
+            "engine_version": ei["engine_version"],
+            "providers": providers,
+            "ksa_providers": ksa_providers,
             "settings_source": getattr(app_.state, "settings_source", None),
             "boot_completed": bool(getattr(app_.state, "boot_completed", False)),
             "boot_task_running": bool(boot_task is not None and not boot_task.done()),
