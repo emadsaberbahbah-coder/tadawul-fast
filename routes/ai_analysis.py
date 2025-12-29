@@ -1,6 +1,7 @@
+```python
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.1) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.2) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton.
@@ -13,6 +14,11 @@ Key goals
 
 Compatible with engines returning:
 - list[UnifiedQuote|dict] OR dict[symbol->UnifiedQuote|dict]
+
+v3.7.2 notes
+- ✅ health endpoint: correctly reads providers from engine (providers_global/providers_ksa/providers)
+- ✅ safer normalize_symbol usage: never crashes if v2 import failed
+- ✅ accepts engine tuple returns (payload, err) in batch path
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.7.1"
+AI_ANALYSIS_VERSION = "3.7.2"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -88,6 +94,15 @@ def _import_v2() -> Tuple[Any, Any, Any]:
 
 
 DataEngine, UnifiedQuote, normalize_symbol = _import_v2()
+
+
+def _normalize_any(raw: str) -> str:
+    try:
+        return (normalize_symbol(raw) or "").strip().upper()
+    except Exception:
+        # normalize_symbol could be fallback or could still fail on weird input
+        s = (raw or "").strip().upper()
+        return s
 
 
 # =============================================================================
@@ -416,14 +431,13 @@ def _clean_symbols(items: Sequence[Any]) -> List[str]:
     for x in (items or []):
         if x is None:
             continue
-        s = normalize_symbol(str(x).strip())
+        s = _normalize_any(str(x).strip())
         if not s:
             continue
-        su = s.upper()
-        if su in seen:
+        if s in seen:
             continue
-        seen.add(su)
-        out.append(su)
+        seen.add(s)
+        out.append(s)
     return out
 
 
@@ -496,7 +510,6 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
 
 # ---- Canonical 59 headers fallback (matches core.schemas.DEFAULT_HEADERS_59)
 _DEFAULT_HEADERS_59: List[str] = [
-    # Identity
     "Symbol",
     "Company Name",
     "Sector",
@@ -504,7 +517,6 @@ _DEFAULT_HEADERS_59: List[str] = [
     "Market",
     "Currency",
     "Listing Date",
-    # Prices
     "Last Price",
     "Previous Close",
     "Price Change",
@@ -514,18 +526,15 @@ _DEFAULT_HEADERS_59: List[str] = [
     "52W High",
     "52W Low",
     "52W Position %",
-    # Volume / Liquidity
     "Volume",
     "Avg Volume (30D)",
     "Value Traded",
     "Turnover %",
-    # Shares / Cap
     "Shares Outstanding",
     "Free Float %",
     "Market Cap",
     "Free Float Market Cap",
     "Liquidity Score",
-    # Fundamentals
     "EPS (TTM)",
     "Forward EPS",
     "P/E (TTM)",
@@ -543,14 +552,11 @@ _DEFAULT_HEADERS_59: List[str] = [
     "Revenue Growth %",
     "Net Income Growth %",
     "Beta",
-    # Technicals
     "Volatility (30D)",
     "RSI (14)",
-    # Valuation / Targets
     "Fair Value",
     "Upside %",
     "Valuation Label",
-    # Scores / Recommendation
     "Value Score",
     "Quality Score",
     "Momentum Score",
@@ -559,7 +565,6 @@ _DEFAULT_HEADERS_59: List[str] = [
     "Overall Score",
     "Error",
     "Recommendation",
-    # Meta
     "Data Source",
     "Data Quality",
     "Last Updated (UTC)",
@@ -617,7 +622,6 @@ def _snake_guess(header: str) -> str:
 
 # Header -> (candidate fields..., transform?)
 _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
-    # Identity
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
     "sector": (("sector",), None),
@@ -626,8 +630,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo"), None),
-
-    # Prices
     "last price": (("current_price", "last_price", "price"), None),
     "previous close": (("previous_close",), None),
     "price change": (("price_change", "change"), None),
@@ -637,21 +639,15 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "52w high": (("high_52w",), None),
     "52w low": (("low_52w",), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
-
-    # Liquidity
     "volume": (("volume",), None),
     "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
     "value traded": (("value_traded",), None),
     "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
-
-    # Shares/Cap
     "shares outstanding": (("shares_outstanding",), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
     "market cap": (("market_cap",), None),
     "free float market cap": (("free_float_market_cap",), None),
     "liquidity score": (("liquidity_score",), None),
-
-    # Fundamentals
     "eps (ttm)": (("eps_ttm", "eps"), None),
     "forward eps": (("forward_eps",), None),
     "p/e (ttm)": (("pe_ttm",), None),
@@ -669,17 +665,11 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
     "beta": (("beta",), None),
-
-    # Technicals
     "volatility (30d)": (("volatility_30d",), _ratio_to_percent),
     "rsi (14)": (("rsi_14",), None),
-
-    # Valuation
     "fair value": (("fair_value",), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
-
-    # Scores/Rec
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
@@ -687,8 +677,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
     "recommendation": (("recommendation",), None),
-
-    # Meta
     "data source": (("data_source", "source"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
@@ -700,7 +688,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
 def _value_for_header(header: str, uq: Any) -> Any:
     hk = _hkey(header)
 
-    # computed 52w position if needed
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
@@ -721,7 +708,6 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 return val
         return val
 
-    # auto-guess by snake_case
     guess = _snake_guess(header)
     val = _safe_get(uq, guess)
     if val is not None:
@@ -760,6 +746,13 @@ async def _maybe_await(x: Any) -> Any:
     return x
 
 
+def _unwrap_tuple_payload(x: Any) -> Any:
+    # Some engines/providers might return (payload, err)
+    if isinstance(x, tuple) and len(x) == 2 and isinstance(x[0], (dict, object)):
+        return x[0]
+    return x
+
+
 async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
     """
     Compatibility shim:
@@ -772,25 +765,25 @@ async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
     if callable(fn):
         res = await _maybe_await(fn(syms))
         if isinstance(res, dict):
-            return list(res.values())
-        return list(res or [])
+            return [ _unwrap_tuple_payload(v) for v in list(res.values()) ]
+        return [ _unwrap_tuple_payload(v) for v in list(res or []) ]
 
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
         res = await _maybe_await(fn2(syms))
         if isinstance(res, dict):
-            return list(res.values())
-        return list(res or [])
+            return [ _unwrap_tuple_payload(v) for v in list(res.values()) ]
+        return [ _unwrap_tuple_payload(v) for v in list(res or []) ]
 
     out: List[Any] = []
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
         if callable(fn3):
-            out.append(await _maybe_await(fn3(s)))
+            out.append(_unwrap_tuple_payload(await _maybe_await(fn3(s))))
             continue
         fn4 = getattr(engine, "get_quote", None)
         if callable(fn4):
-            out.append(await _maybe_await(fn4(s)))
+            out.append(_unwrap_tuple_payload(await _maybe_await(fn4(s))))
             continue
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
@@ -809,7 +802,7 @@ def _index_keys_for_quote(q: Any) -> List[str]:
     si = (_safe_get(q, "symbol_input") or "").strip()
     if si:
         try:
-            keys.append(normalize_symbol(si).upper())
+            keys.append(_normalize_any(si))
         except Exception:
             keys.append(si.strip().upper())
 
@@ -864,7 +857,7 @@ async def _get_quotes_chunked(
         chunk_map: Dict[str, Any] = {}
 
         for q in returned:
-            q2 = _finalize_quote(q)
+            q2 = _finalize_quote(_unwrap_tuple_payload(q))
             for k in _index_keys_for_quote(q2):
                 chunk_map.setdefault(k, q2)
 
@@ -886,7 +879,7 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     except Exception:
         pass
 
-    sym = (_safe_get(uq, "symbol") or normalize_symbol(requested_symbol) or requested_symbol or "").upper()
+    sym = (_safe_get(uq, "symbol") or _normalize_any(requested_symbol) or requested_symbol or "").upper()
 
     price = _safe_get(uq, "current_price", "last_price", "price")
     change_pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
@@ -935,7 +928,15 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
 
     providers: List[str] = []
     try:
-        providers = list(getattr(eng, "enabled_providers", []) or []) if eng else []
+        if eng is not None:
+            # support multiple engine styles
+            for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
+                v = getattr(eng, attr, None)
+                if isinstance(v, list) and v:
+                    providers.extend([str(x) for x in v if str(x).strip()])
+            # dedup
+            seen = set()
+            providers = [p for p in providers if not (p in seen or seen.add(p))]
     except Exception:
         providers = []
 
@@ -977,7 +978,7 @@ async def analyze_single_quote(
         max_concurrency=1,
     )
 
-    key = (normalize_symbol(t) or t).upper()
+    key = _normalize_any(t) or t.strip().upper()
     uq = m.get(key) or _make_placeholder(key, dq="MISSING", err="No data returned")
     return _quote_to_analysis(t, uq)
 
@@ -1070,3 +1071,4 @@ __all__ = [
     "BatchAnalysisResponse",
     "SheetAnalysisResponse",
 ]
+```
