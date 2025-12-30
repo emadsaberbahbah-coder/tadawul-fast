@@ -2,7 +2,7 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v3.8.0) — PROD SAFE (TRUE LAZY)
+LEGACY COMPATIBILITY ADAPTER (v3.8.2) — PROD SAFE (TRUE LAZY)
 
 What this module guarantees
 - ✅ Never crashes app startup (no hard dependency on data_engine_v2 at import-time).
@@ -19,10 +19,10 @@ What this module guarantees
 - ✅ If V2 missing/broken -> returns stub quotes with data_quality="MISSING" and error.
 - ✅ Never leaks secrets in meta/health.
 
-v3.8.0 improvements vs v3.7.0
-- ✅ Better V2 linking: accepts UnifiedQuote from v2 OR core.schemas OR core.models.schemas fallback.
-- ✅ Better tuple-unwrapping (payload, err) for both single and batch.
-- ✅ Better symbol cleaning/dedup using normalize_symbol where possible.
+v3.8.2 improvements
+- ✅ Fixes Pydantic v1 fallback: avoids model_config usage when ConfigDict is unavailable.
+- ✅ More robust V2 linking: accepts UnifiedQuote from v2 OR core.schemas OR core.models.schemas fallback.
+- ✅ Better tuple-unwrapping + list normalization for both single and batch.
 - ✅ Engine singleton init: safer signature probing (settings kwarg, settings positional, none).
 - ✅ get_engine_meta reads providers from env/settings safely and can show v2 module version if present.
 """
@@ -37,10 +37,23 @@ from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
-# Pydantic (best-effort)
+# -----------------------------------------------------------------------------
+# Pydantic (best-effort) with robust fallback
+# -----------------------------------------------------------------------------
 try:
-    from pydantic import BaseModel, ConfigDict, Field
+    from pydantic import BaseModel, Field  # type: ignore
+
+    try:
+        from pydantic import ConfigDict  # type: ignore
+
+        _PYDANTIC_HAS_CONFIGDICT = True
+    except Exception:  # pragma: no cover
+        ConfigDict = None  # type: ignore
+        _PYDANTIC_HAS_CONFIGDICT = False
+
 except Exception:  # pragma: no cover
+    _PYDANTIC_HAS_CONFIGDICT = False
+
     class BaseModel:  # type: ignore
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -54,20 +67,24 @@ except Exception:  # pragma: no cover
     def Field(default=None, **kwargs):  # type: ignore
         return default
 
-    def ConfigDict(**kwargs):  # type: ignore
-        return dict(kwargs)
+    ConfigDict = None  # type: ignore
 
 
-ADAPTER_VERSION = "3.8.0"
+ADAPTER_VERSION = "3.8.2"
 logger = logging.getLogger("core.data_engine")
-
 
 # =============================================================================
 # Legacy type kept so older type-checks don't fail
 # =============================================================================
 class QuoteSource(BaseModel):
     """Legacy provider metadata model kept so older type-checks don't fail."""
-    model_config = ConfigDict(extra="ignore")
+
+    if _PYDANTIC_HAS_CONFIGDICT and ConfigDict is not None:
+        model_config = ConfigDict(extra="ignore")  # type: ignore
+    else:  # pydantic v1 or fallback
+        class Config:  # pragma: no cover
+            extra = "ignore"
+
     provider: str
     latency_ms: Optional[float] = None
     timestamp_utc: Optional[datetime] = None
@@ -208,7 +225,12 @@ def _get_v2_engine_cls() -> Type[Any]:
 # Stub models (when V2 missing)
 # =============================================================================
 class _StubUnifiedQuote(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    if _PYDANTIC_HAS_CONFIGDICT and ConfigDict is not None:
+        model_config = ConfigDict(populate_by_name=True, extra="ignore")  # type: ignore
+    else:  # pragma: no cover
+        class Config:
+            extra = "ignore"
+            allow_population_by_field_name = True
 
     symbol: str
 
@@ -328,6 +350,7 @@ def _instantiate_engine(EngineCls: Type[Any]) -> Any:
     # 2) settings kwarg
     try:
         from core.config import get_settings as _gs  # type: ignore
+
         return EngineCls(settings=_gs())
     except Exception:
         pass
@@ -335,6 +358,7 @@ def _instantiate_engine(EngineCls: Type[Any]) -> Any:
     # 3) settings positional
     try:
         from core.config import get_settings as _gs  # type: ignore
+
         return EngineCls(_gs())
     except Exception:
         pass
@@ -464,8 +488,7 @@ def normalize_symbol(symbol: str) -> str:
 
 def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
     """
-    Cleans + dedups while trying to normalize to stable keys,
-    but preserves original-ish form for engine calls.
+    Cleans + dedups while trying to normalize to stable keys.
     """
     seen = set()
     out: List[str] = []
@@ -624,11 +647,13 @@ class DataEngine:
 def _safe_read_settings() -> Optional[object]:
     try:
         from config import get_settings as _gs  # type: ignore
+
         return _gs()
     except Exception:
         pass
     try:
         from core.config import get_settings as _gs  # type: ignore
+
         return _gs()
     except Exception:
         return None
@@ -638,8 +663,7 @@ def _safe_parse_env_list(key: str) -> List[str]:
     raw = (os.getenv(key) or "").strip()
     if not raw:
         return []
-    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    return parts
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
 
 
 def get_engine_meta() -> Dict[str, Any]:
