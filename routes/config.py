@@ -13,6 +13,7 @@ Version: v5.3.2
 Notes:
 - Render yaml alignment: *_TTL_SEC + HTTP_TIMEOUT_SEC supported.
 - Exposes legacy-friendly aliases via environment exports (only if missing).
+- Includes Advanced Analysis batching controls used by routes/advanced_analysis.py.
 """
 
 from __future__ import annotations
@@ -125,7 +126,10 @@ try:
         tz: str = Field(default="Asia/Riyadh", validation_alias=_alias("TZ", "TIMEZONE"))
         debug: bool = Field(default=False, validation_alias=_alias("DEBUG"))
         log_level: str = Field(default="info", validation_alias=_alias("LOG_LEVEL"))
-        log_format: str = Field(default="%(asctime)s | %(levelname)s | %(name)s | %(message)s", validation_alias=_alias("LOG_FORMAT"))
+        log_format: str = Field(
+            default="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            validation_alias=_alias("LOG_FORMAT"),
+        )
 
         # ---------------------------------------------------------------------
         # Auth
@@ -188,6 +192,14 @@ try:
         cache_save_interval: int = Field(default=300, validation_alias=_alias("CACHE_SAVE_INTERVAL"))
 
         # ---------------------------------------------------------------------
+        # Advanced Analysis batching (routes/advanced_analysis.py)
+        # ---------------------------------------------------------------------
+        adv_batch_size: int = Field(default=25, validation_alias=_alias("ADV_BATCH_SIZE"))
+        adv_batch_timeout_sec: float = Field(default=45.0, validation_alias=_alias("ADV_BATCH_TIMEOUT_SEC"))
+        adv_max_tickers: int = Field(default=500, validation_alias=_alias("ADV_MAX_TICKERS"))
+        adv_batch_concurrency: int = Field(default=6, validation_alias=_alias("ADV_BATCH_CONCURRENCY"))
+
+        # ---------------------------------------------------------------------
         # Google / Sheets
         # ---------------------------------------------------------------------
         default_spreadsheet_id: Optional[str] = Field(default=None, validation_alias=_alias("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID"))
@@ -204,7 +216,9 @@ try:
         enable_swagger: bool = Field(default=True, validation_alias=_alias("ENABLE_SWAGGER"))
         enable_redoc: bool = Field(default=True, validation_alias=_alias("ENABLE_REDOC"))
 
+        # ---------------------------------------------------------------------
         # Optional KSA routing URLs (if ever added later)
+        # ---------------------------------------------------------------------
         tadawul_quote_url: Optional[str] = Field(default=None, validation_alias=_alias("TADAWUL_QUOTE_URL"))
         tadawul_fundamentals_url: Optional[str] = Field(default=None, validation_alias=_alias("TADAWUL_FUNDAMENTALS_URL"))
         argaam_quote_url: Optional[str] = Field(default=None, validation_alias=_alias("ARGAAM_QUOTE_URL"))
@@ -265,6 +279,12 @@ try:
                 "fundamentals_ttl_sec": float(self.fundamentals_ttl_sec),
                 "argaam_snapshot_ttl_sec": float(self.argaam_snapshot_ttl_sec),
                 "cache_max_size": int(self.cache_max_size),
+                "advanced_batching": {
+                    "adv_batch_size": int(self.adv_batch_size),
+                    "adv_batch_timeout_sec": float(self.adv_batch_timeout_sec),
+                    "adv_max_tickers": int(self.adv_max_tickers),
+                    "adv_batch_concurrency": int(self.adv_batch_concurrency),
+                },
                 "rate_limiting": {
                     "enabled": bool(self.enable_rate_limiting),
                     "max_requests_per_minute": int(self.max_requests_per_minute),
@@ -292,6 +312,10 @@ try:
                     "EODHD_API_TOKEN": "eodhd_api_token",
                     "FINNHUB_API_TOKEN": "finnhub_api_token",
                     "HTTP_TIMEOUT_SEC": "http_timeout_sec",
+                    "ADV_BATCH_TIMEOUT_SEC": "adv_batch_timeout_sec",
+                    "ADV_BATCH_SIZE": "adv_batch_size",
+                    "ADV_MAX_TICKERS": "adv_max_tickers",
+                    "ADV_BATCH_CONCURRENCY": "adv_batch_concurrency",
                 }
                 if name in mapping and hasattr(self, mapping[name]):
                     return getattr(self, mapping[name])
@@ -319,6 +343,12 @@ try:
         _export_env_if_missing("QUOTE_TTL_SEC", str(float(s.quote_ttl_sec)))
         _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(s.fundamentals_ttl_sec)))
         _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(s.argaam_snapshot_ttl_sec)))
+
+        # Advanced Analysis env (so routes can read from os.getenv too)
+        _export_env_if_missing("ADV_BATCH_SIZE", str(int(s.adv_batch_size)))
+        _export_env_if_missing("ADV_BATCH_TIMEOUT_SEC", str(float(s.adv_batch_timeout_sec)))
+        _export_env_if_missing("ADV_MAX_TICKERS", str(int(s.adv_max_tickers)))
+        _export_env_if_missing("ADV_BATCH_CONCURRENCY", str(int(s.adv_batch_concurrency)))
 
         # Base URLs for provider modules that read env at call-time
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
@@ -364,6 +394,12 @@ try:
         s.cache_max_size = _to_int(s.cache_max_size, 5000)
         s.cache_save_interval = _to_int(s.cache_save_interval, 300)
 
+        # Advanced Analysis clamps (same intent as routes)
+        s.adv_batch_size = max(5, min(200, _to_int(s.adv_batch_size, 25)))
+        s.adv_batch_timeout_sec = max(5.0, min(180.0, _to_float(s.adv_batch_timeout_sec, 45.0)))
+        s.adv_max_tickers = max(10, min(2000, _to_int(s.adv_max_tickers, 500)))
+        s.adv_batch_concurrency = max(1, min(25, _to_int(s.adv_batch_concurrency, 6)))
+
         _apply_runtime_env_aliases(s)
         return s
 
@@ -374,6 +410,7 @@ except Exception:  # pragma: no cover
     try:
         from pydantic import BaseModel  # type: ignore
     except Exception:  # pragma: no cover
+
         class BaseModel:  # type: ignore
             def __init__(self, **kwargs: Any):
                 for k, v in kwargs.items():
@@ -423,6 +460,12 @@ except Exception:  # pragma: no cover
         cache_backup_enabled: bool = False
         cache_save_interval: int = 300
 
+        # Advanced analysis
+        adv_batch_size: int = 25
+        adv_batch_timeout_sec: float = 45.0
+        adv_max_tickers: int = 500
+        adv_batch_concurrency: int = 6
+
         default_spreadsheet_id: Optional[str] = None
         google_sheets_credentials: Optional[str] = None
         google_apps_script_url: Optional[str] = None
@@ -452,6 +495,38 @@ except Exception:  # pragma: no cover
         @property
         def http_timeout_sec(self) -> float:
             return float(getattr(self, "http_timeout", 30.0) or 30.0)
+
+        def as_safe_dict(self) -> Dict[str, Any]:
+            return {
+                "service_name": self.service_name,
+                "service_version": self.service_version,
+                "environment": self.environment,
+                "tz": self.tz,
+                "debug": bool(self.debug),
+                "log_level": (self.log_level or "info").strip().lower(),
+                "require_auth": bool(self.require_auth),
+                "enabled_providers": self.enabled_providers,
+                "primary_provider": (self.primary_provider or "").strip().lower(),
+                "ksa_providers": self.ksa_providers,
+                "http_timeout_sec": float(self.http_timeout_sec),
+                "max_retries": int(self.max_retries),
+                "retry_delay": float(self.retry_delay),
+                "cache_ttl_sec": float(self.cache_ttl_sec),
+                "quote_ttl_sec": float(self.quote_ttl_sec),
+                "fundamentals_ttl_sec": float(self.fundamentals_ttl_sec),
+                "argaam_snapshot_ttl_sec": float(self.argaam_snapshot_ttl_sec),
+                "advanced_batching": {
+                    "adv_batch_size": int(self.adv_batch_size),
+                    "adv_batch_timeout_sec": float(self.adv_batch_timeout_sec),
+                    "adv_max_tickers": int(self.adv_max_tickers),
+                    "adv_batch_concurrency": int(self.adv_batch_concurrency),
+                },
+                "app_token_set": bool((self.app_token or "").strip()),
+                "backup_app_token_set": bool((self.backup_app_token or "").strip()),
+                "app_token_mask": _mask_tail(self.app_token, keep=4),
+                "eodhd_key_set": bool((self.eodhd_api_key or "").strip()),
+                "finnhub_key_set": bool((self.finnhub_api_key or "").strip()),
+            }
 
     _CACHED: Optional[Settings] = None
 
@@ -483,6 +558,10 @@ except Exception:  # pragma: no cover
             quote_ttl_sec=_to_float(os.getenv("QUOTE_TTL_SEC"), 30.0),
             fundamentals_ttl_sec=_to_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0),
             argaam_snapshot_ttl_sec=_to_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0),
+            adv_batch_size=_to_int(os.getenv("ADV_BATCH_SIZE"), 25),
+            adv_batch_timeout_sec=_to_float(os.getenv("ADV_BATCH_TIMEOUT_SEC"), 45.0),
+            adv_max_tickers=_to_int(os.getenv("ADV_MAX_TICKERS"), 500),
+            adv_batch_concurrency=_to_int(os.getenv("ADV_BATCH_CONCURRENCY"), 6),
         )
 
         # Export runtime aliases (best-effort)
@@ -499,6 +578,11 @@ except Exception:  # pragma: no cover
         _export_env_if_missing("QUOTE_TTL_SEC", str(float(_CACHED.quote_ttl_sec)))
         _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(_CACHED.fundamentals_ttl_sec)))
         _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(_CACHED.argaam_snapshot_ttl_sec)))
+
+        _export_env_if_missing("ADV_BATCH_SIZE", str(int(_CACHED.adv_batch_size)))
+        _export_env_if_missing("ADV_BATCH_TIMEOUT_SEC", str(float(_CACHED.adv_batch_timeout_sec)))
+        _export_env_if_missing("ADV_MAX_TICKERS", str(int(_CACHED.adv_max_tickers)))
+        _export_env_if_missing("ADV_BATCH_CONCURRENCY", str(int(_CACHED.adv_batch_concurrency)))
 
         _export_env_if_missing("ENABLED_PROVIDERS", ",".join(_CACHED.enabled_providers))
         _export_env_if_missing("KSA_PROVIDERS", ",".join(_CACHED.ksa_providers))
