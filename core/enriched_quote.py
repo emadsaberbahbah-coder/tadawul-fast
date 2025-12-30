@@ -2,7 +2,7 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router: Enriched Quote (PROD SAFE) — v2.3.7
+Compatibility Router: Enriched Quote (PROD SAFE) — v2.3.8
 
 What this router is for
 - Legacy/compat endpoint under /v1/enriched/* (kept because some clients still call it)
@@ -10,12 +10,10 @@ What this router is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely
 
-v2.3.7 improvements vs v2.3.4
-- ✅ Never returns coroutine objects (await-safe everywhere)
-- ✅ Better batch alignment by symbol (handles dict/list/pydantic objects)
-- ✅ Always fills schema keys (best-effort) WITHOUT crashing if UnifiedQuote missing
-- ✅ Avoids accidental status="success" when error exists
-- ✅ Cleaner provider source labeling and debug hints
+v2.3.8 improvements vs v2.3.7
+- ✅ Fixes potential "last_err referenced before assignment" edge case
+- ✅ More defensive: never raises in finalize/schema fill
+- ✅ Keeps behavior identical for clients (HTTP 200, status field, schema fill)
 """
 
 from __future__ import annotations
@@ -28,6 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Query, Request
 from fastapi.encoders import jsonable_encoder
 from starlette.responses import JSONResponse
+
+ROUTER_VERSION = "2.3.8"
 
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
@@ -50,10 +50,8 @@ def _split_symbols(raw: str) -> List[str]:
     s = (raw or "").replace("\n", " ").replace("\t", " ").strip()
     if not s:
         return []
-    # support commas and spaces together
     s = s.replace(",", " ")
-    parts = [p.strip() for p in s.split(" ") if p.strip()]
-    return parts
+    return [p.strip() for p in s.split(" ") if p.strip()]
 
 
 def _normalize_symbol_safe(raw: str) -> str:
@@ -142,6 +140,7 @@ def _get_uq_keys() -> List[str]:
     global _UQ_KEYS
     if isinstance(_UQ_KEYS, list):
         return _UQ_KEYS
+
     try:
         from core.data_engine_v2 import UnifiedQuote as UQ  # type: ignore
 
@@ -152,7 +151,6 @@ def _get_uq_keys() -> List[str]:
     except Exception:
         pass
 
-    # fallback: no schema fill keys
     _UQ_KEYS = []
     return _UQ_KEYS
 
@@ -182,19 +180,16 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
         eng = None
 
     if eng is not None:
+        last_err: Optional[str] = None
         for fn_name in ("get_enriched_quote", "get_quote"):
             fn = getattr(eng, fn_name, None)
             if callable(fn):
                 try:
                     return await _maybe_await(fn(symbol)), f"app.state.engine.{fn_name}", None
                 except Exception as e:
-                    # keep trying other method
                     last_err = _safe_error_message(e)
                     continue
-        try:
-            return None, "app.state.engine", last_err  # type: ignore[name-defined]
-        except Exception:
-            return None, "app.state.engine", "engine call failed"
+        return None, "app.state.engine", last_err or "engine call failed"
 
     # 2) v2 module singleton function (if present)
     try:
@@ -256,6 +251,7 @@ async def _call_engine_batch_best_effort(
         eng = None
 
     if eng is not None:
+        last_err: Optional[str] = None
         for fn_name in ("get_enriched_quotes", "get_quotes"):
             fn = getattr(eng, fn_name, None)
             if callable(fn):
@@ -263,9 +259,10 @@ async def _call_engine_batch_best_effort(
                     res = await _maybe_await(fn(symbols_norm))
                     if isinstance(res, list):
                         return res, f"app.state.engine.{fn_name}", None
-                    return None, f"app.state.engine.{fn_name}", "batch returned non-list"
+                    last_err = "batch returned non-list"
                 except Exception as e:
-                    return None, f"app.state.engine.{fn_name}", _safe_error_message(e)
+                    last_err = _safe_error_message(e)
+        return None, "app.state.engine(batch)", last_err or "batch call failed"
 
     # 2) v2 singleton batch
     try:
@@ -286,45 +283,63 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
     Ensure standard metadata + status/error behavior is consistent.
     """
     sym = (norm or raw or "").strip()
+    if not sym:
+        sym = ""
 
-    payload.setdefault("symbol", sym)
-    payload["symbol_input"] = payload.get("symbol_input") or raw
-    payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
+    try:
+        payload.setdefault("symbol", sym)
+        payload["symbol_input"] = payload.get("symbol_input") or raw
+        payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
 
-    # normalize error field to string
-    if payload.get("error") is None:
-        payload["error"] = ""
-    if not isinstance(payload.get("error"), str):
-        payload["error"] = str(payload.get("error") or "")
+        # normalize error field to string
+        if payload.get("error") is None:
+            payload["error"] = ""
+        if not isinstance(payload.get("error"), str):
+            payload["error"] = str(payload.get("error") or "")
 
-    # set status consistently
-    if str(payload.get("error") or "").strip():
-        payload["status"] = "error"
-    else:
-        # if missing or empty -> success
-        if not str(payload.get("status") or "").strip():
-            payload["status"] = "success"
+        # set status consistently
+        if str(payload.get("error") or "").strip():
+            payload["status"] = "error"
+        else:
+            if not str(payload.get("status") or "").strip():
+                payload["status"] = "success"
 
-    # data_source/data_quality defaults
-    if not payload.get("data_source"):
-        payload["data_source"] = source or "unknown"
+        # data_source/data_quality defaults
+        if not payload.get("data_source"):
+            payload["data_source"] = source or "unknown"
 
-    if not payload.get("data_quality"):
-        payload["data_quality"] = "MISSING" if payload.get("current_price") is None else "PARTIAL"
+        if not payload.get("data_quality"):
+            payload["data_quality"] = "MISSING" if payload.get("current_price") is None else "PARTIAL"
 
-    return _schema_fill_best_effort(payload)
+        return _schema_fill_best_effort(payload)
+    except Exception:
+        # absolute last-resort safety
+        return _schema_fill_best_effort(
+            {
+                "status": "error",
+                "symbol": sym,
+                "symbol_input": raw,
+                "symbol_normalized": sym,
+                "data_quality": "MISSING",
+                "data_source": source or "unknown",
+                "error": "payload_finalize_failed",
+            }
+        )
 
 
 def _payload_symbol_key(p: Dict[str, Any]) -> str:
     """
     Extract a robust symbol key for alignment.
     """
-    for k in ("symbol_normalized", "symbol", "Symbol", "ticker", "code"):
-        v = p.get(k)
-        if v is not None:
-            s = str(v).strip().upper()
-            if s:
-                return s
+    try:
+        for k in ("symbol_normalized", "symbol", "Symbol", "ticker", "code"):
+            v = p.get(k)
+            if v is not None:
+                s = str(v).strip().upper()
+                if s:
+                    return s
+    except Exception:
+        pass
     return ""
 
 
@@ -411,7 +426,6 @@ async def enriched_quotes(
     # FAST PATH: batch list returned
     # ------------------------------------------------------------
     if isinstance(batch_res, list) and batch_res:
-        # Convert all batch items to payload dicts first
         payloads: List[Dict[str, Any]] = [_as_payload(x) for x in batch_res]
 
         # Case A: length matches input -> index align
@@ -474,6 +488,7 @@ async def enriched_quotes(
 
             payload = _as_payload(result)
             items.append(_finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown"))
+
         except Exception as e:
             out2: Dict[str, Any] = {
                 "status": "error",
@@ -495,7 +510,7 @@ async def enriched_quotes(
 
 @router.get("/health", include_in_schema=False)
 async def enriched_health():
-    return {"status": "ok", "module": "core.enriched_quote", "version": "2.3.7"}
+    return {"status": "ok", "module": "core.enriched_quote", "version": ROUTER_VERSION}
 
 
 def get_router() -> APIRouter:
