@@ -127,7 +127,6 @@ def _resolve_version_from_env_or_commit(service_version: str) -> str:
       2) Render commit short hash (RENDER_GIT_COMMIT / GIT_COMMIT)
       3) "dev"
     """
-    # env-first
     for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
         v = (os.getenv(k) or "").strip()
         if v and not _is_unset_string(v):
@@ -172,28 +171,13 @@ try:
         # ---------------------------------------------------------------------
         # App / Meta
         # ---------------------------------------------------------------------
-        service_name: str = Field(
-            default="Tadawul Stock Analysis API",
-            validation_alias=_alias("SERVICE_NAME", "APP_NAME"),
-        )
-
-        service_version: str = Field(
-            default="dev",
-            validation_alias=_alias("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"),
-        )
-
-        environment: str = Field(
-            default="production",
-            validation_alias=_alias("ENVIRONMENT", "APP_ENV", "ENV"),
-        )
-
+        service_name: str = Field(default="Tadawul Stock Analysis API", validation_alias=_alias("SERVICE_NAME", "APP_NAME"))
+        service_version: str = Field(default="dev", validation_alias=_alias("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"))
+        environment: str = Field(default="production", validation_alias=_alias("ENVIRONMENT", "APP_ENV", "ENV"))
         tz: str = Field(default="Asia/Riyadh", validation_alias=_alias("TZ", "TIMEZONE"))
         debug: bool = Field(default=False, validation_alias=_alias("DEBUG"))
         log_level: str = Field(default="info", validation_alias=_alias("LOG_LEVEL"))
-        log_format: str = Field(
-            default="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            validation_alias=_alias("LOG_FORMAT"),
-        )
+        log_format: str = Field(default="%(asctime)s | %(levelname)s | %(name)s | %(message)s", validation_alias=_alias("LOG_FORMAT"))
 
         # ---------------------------------------------------------------------
         # Boot / engine flags
@@ -211,24 +195,15 @@ try:
         # ---------------------------------------------------------------------
         # Providers (GLOBAL + KSA)
         # ---------------------------------------------------------------------
-        enabled_providers_raw: str = Field(
-            default="eodhd,finnhub",
-            validation_alias=_alias("ENABLED_PROVIDERS", "PROVIDERS"),
-        )
+        enabled_providers_raw: str = Field(default="eodhd,finnhub", validation_alias=_alias("ENABLED_PROVIDERS", "PROVIDERS"))
         primary_provider: str = Field(default="eodhd", validation_alias=_alias("PRIMARY_PROVIDER"))
         ksa_providers_raw: str = Field(default="yahoo_chart,tadawul,argaam", validation_alias=_alias("KSA_PROVIDERS"))
 
         # ---------------------------------------------------------------------
         # Provider keys/tokens
         # ---------------------------------------------------------------------
-        eodhd_api_key: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"),
-        )
-        finnhub_api_key: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"),
-        )
+        eodhd_api_key: Optional[str] = Field(default=None, validation_alias=_alias("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"))
+        finnhub_api_key: Optional[str] = Field(default=None, validation_alias=_alias("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"))
 
         fmp_api_key: Optional[str] = Field(default=None, validation_alias=_alias("FMP_API_KEY"))
         alpha_vantage_api_key: Optional[str] = Field(default=None, validation_alias=_alias("ALPHA_VANTAGE_API_KEY"))
@@ -239,10 +214,7 @@ try:
         # ---------------------------------------------------------------------
         # Base URLs / Networking
         # ---------------------------------------------------------------------
-        backend_base_url: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL"),
-        )
+        backend_base_url: Optional[str] = Field(default=None, validation_alias=_alias("BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL"))
 
         eodhd_base_url: str = Field(default="https://eodhistoricaldata.com/api", validation_alias=_alias("EODHD_BASE_URL"))
         finnhub_base_url: str = Field(default="https://finnhub.io/api/v1", validation_alias=_alias("FINNHUB_BASE_URL"))
@@ -268,14 +240,8 @@ try:
         fundamentals_ttl_sec: float = Field(default=21600.0, validation_alias=_alias("FUNDAMENTALS_TTL_SEC"))
         argaam_snapshot_ttl_sec: float = Field(default=30.0, validation_alias=_alias("ARGAAM_SNAPSHOT_TTL_SEC"))
 
-        engine_cache_ttl_sec: float = Field(
-            default=20.0,
-            validation_alias=_alias("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC", "CACHE_TTL_SEC"),
-        )
-        enriched_batch_concurrency: int = Field(
-            default=8,
-            validation_alias=_alias("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY"),
-        )
+        engine_cache_ttl_sec: float = Field(default=20.0, validation_alias=_alias("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC", "CACHE_TTL_SEC"))
+        enriched_batch_concurrency: int = Field(default=8, validation_alias=_alias("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY"))
 
         cache_max_size: int = Field(default=5000, validation_alias=_alias("CACHE_MAX_SIZE"))
         cache_backup_enabled: bool = Field(default=False, validation_alias=_alias("CACHE_BACKUP_ENABLED"))
@@ -284,14 +250,8 @@ try:
         # ---------------------------------------------------------------------
         # Google / Sheets
         # ---------------------------------------------------------------------
-        default_spreadsheet_id: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"),
-        )
-        google_sheets_credentials: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"),
-        )
+        default_spreadsheet_id: Optional[str] = Field(default=None, validation_alias=_alias("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"))
+        google_sheets_credentials: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"))
         google_apps_script_url: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_APPS_SCRIPT_URL"))
         google_apps_script_backup_url: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_APPS_SCRIPT_BACKUP_URL"))
 
@@ -304,7 +264,7 @@ try:
         enable_redoc: bool = Field(default=True, validation_alias=_alias("ENABLE_REDOC"))
 
         # ---------------------------------------------------------------------
-        # Feature flags (engine/provider routing)
+        # Feature flags (engine/provider routing) — v5.3.5
         # ---------------------------------------------------------------------
         enable_yahoo_chart_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_KSA"))
         enable_yahoo_chart_supplement: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_SUPPLEMENT"))
@@ -447,7 +407,7 @@ try:
         """
         Make providers + legacy modules work with your Render env names WITHOUT changing Render.
         """
-        # --- Version keys ---
+        # Version keys
         ver = _resolve_version_from_env_or_commit(s.service_version)
         s.service_version = ver
         _export_env_if_missing("SERVICE_VERSION", ver)
@@ -455,7 +415,7 @@ try:
         _export_env_if_missing("VERSION", ver)
         _export_env_if_missing("RELEASE", ver)
 
-        # --- App/name/env aliases ---
+        # App/name/env aliases
         _export_env_if_missing("APP_NAME", s.service_name)
         _export_env_if_missing("SERVICE_NAME", s.service_name)
 
@@ -468,7 +428,7 @@ try:
 
         _export_env_if_missing("LOG_LEVEL", (s.log_level or "info").strip().lower())
 
-        # ✅ CRITICAL AUTH ALIASES
+        # ✅ Auth aliases (critical)
         if (s.app_token or "").strip():
             _export_env_if_missing("APP_TOKEN", (s.app_token or "").strip())
         if (s.backup_app_token or "").strip():
@@ -496,7 +456,7 @@ try:
         _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(s.fundamentals_ttl_sec)))
         _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(s.argaam_snapshot_ttl_sec)))
 
-        # Engine/provider flags (export so modules that read env directly stay consistent)
+        # Engine/provider flags (v5.3.5)
         _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(bool(s.enable_yahoo_chart_ksa)).lower())
         _export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(bool(s.enable_yahoo_chart_supplement)).lower())
         _export_env_if_missing("ENABLE_YFINANCE_KSA", str(bool(s.enable_yfinance_ksa)).lower())
@@ -540,14 +500,14 @@ try:
     def get_settings() -> Settings:
         s = Settings()
 
-        # Normalize (strings)
+        # Normalize strings
         s.log_level = (s.log_level or "info").strip().lower()
         s.primary_provider = (s.primary_provider or "eodhd").strip().lower()
         s.environment = (s.environment or "production").strip()
         s.tz = (s.tz or "Asia/Riyadh").strip()
         s.backend_base_url = (s.backend_base_url or "").strip() or None
 
-        # Normalize (bools)
+        # Normalize bools
         s.debug = _to_bool(s.debug, False)
         s.require_auth = _to_bool(s.require_auth, False)
         s.enable_rate_limiting = _to_bool(s.enable_rate_limiting, True)
@@ -565,14 +525,14 @@ try:
         s.enable_yahoo_fundamentals_ksa = _to_bool(s.enable_yahoo_fundamentals_ksa, True)
         s.enable_yahoo_fundamentals_global = _to_bool(s.enable_yahoo_fundamentals_global, False)
 
-        # Normalize (ints)
+        # Normalize ints
         s.max_requests_per_minute = _positive_int(s.max_requests_per_minute, 240)
         s.max_retries = _positive_int(s.max_retries, 2)
         s.cache_max_size = _positive_int(s.cache_max_size, 5000)
         s.cache_save_interval = _positive_int(s.cache_save_interval, 300)
         s.enriched_batch_concurrency = _positive_int(s.enriched_batch_concurrency, 8)
 
-        # Normalize (floats)
+        # Normalize floats
         s.http_timeout = _positive_float(s.http_timeout, 30.0)
         s.retry_delay = _positive_float(s.retry_delay, 0.5)
 
@@ -590,7 +550,7 @@ try:
 
 except Exception:  # pragma: no cover
     # =============================================================================
-    # LAST-RESORT FALLBACK (NO pydantic-settings required)
+    # LAST-RESORT FALLBACK (NO pydantic-settings required) — FULL
     # =============================================================================
 
     class Settings:  # type: ignore
@@ -599,91 +559,8 @@ except Exception:  # pragma: no cover
         This must never throw during import.
         """
 
-        # App / Meta
-        service_name: str
-        service_version: str
-        environment: str
-        tz: str
-        debug: bool
-        log_level: str
-        log_format: str
-
-        # Boot flags
-        defer_router_mount: bool
-        init_engine_on_boot: bool
-
-        # Auth
-        require_auth: bool
-        app_token: Optional[str]
-        backup_app_token: Optional[str]
-
-        # Providers
-        enabled_providers_raw: str
-        primary_provider: str
-        ksa_providers_raw: str
-
-        # Provider keys
-        eodhd_api_key: Optional[str]
-        finnhub_api_key: Optional[str]
-        fmp_api_key: Optional[str]
-        alpha_vantage_api_key: Optional[str]
-        twelvedata_api_key: Optional[str]
-        marketstack_api_key: Optional[str]
-        argaam_api_key: Optional[str]
-
-        # Base URLs / Networking
-        backend_base_url: Optional[str]
-        eodhd_base_url: str
-        finnhub_base_url: str
-        fmp_base_url: Optional[str]
-        http_timeout: float
-        max_retries: int
-        retry_delay: float
-
-        # CORS / rate limiting
-        enable_cors_all_origins: bool
-        cors_origins: str
-        enable_rate_limiting: bool
-        max_requests_per_minute: int
-
-        # Cache tuning
-        cache_ttl_sec: float
-        quote_ttl_sec: float
-        fundamentals_ttl_sec: float
-        argaam_snapshot_ttl_sec: float
-        engine_cache_ttl_sec: float
-        enriched_batch_concurrency: int
-        cache_max_size: int
-        cache_backup_enabled: bool
-        cache_save_interval: int
-
-        # Google / Sheets
-        default_spreadsheet_id: Optional[str]
-        google_sheets_credentials: Optional[str]
-        google_apps_script_url: Optional[str]
-        google_apps_script_backup_url: Optional[str]
-
-        # Feature flags (general)
-        advanced_analysis_enabled: bool
-        tadawul_market_enabled: bool
-        enable_swagger: bool
-        enable_redoc: bool
-
-        # Feature flags (engine/provider routing)
-        enable_yahoo_chart_ksa: bool
-        enable_yahoo_chart_supplement: bool
-        enable_yfinance_ksa: bool
-        enable_yahoo_fundamentals_ksa: bool
-        enable_yahoo_fundamentals_global: bool
-
-        # KSA routing URLs
-        tadawul_quote_url: Optional[str]
-        tadawul_fundamentals_url: Optional[str]
-        argaam_quote_url: Optional[str]
-        argaam_profile_url: Optional[str]
-
         def __init__(self) -> None:
-            # App
+            # App / Meta
             self.service_name = (os.getenv("SERVICE_NAME") or os.getenv("APP_NAME") or "Tadawul Stock Analysis API").strip()
             self.service_version = (
                 os.getenv("SERVICE_VERSION")
@@ -698,7 +575,7 @@ except Exception:  # pragma: no cover
             self.log_level = (os.getenv("LOG_LEVEL") or "info").strip().lower()
             self.log_format = (os.getenv("LOG_FORMAT") or "%(asctime)s | %(levelname)s | %(name)s | %(message)s").strip()
 
-            # Boot
+            # Boot / engine flags
             self.defer_router_mount = _to_bool(os.getenv("DEFER_ROUTER_MOUNT"), True)
             self.init_engine_on_boot = _to_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
 
@@ -707,12 +584,12 @@ except Exception:  # pragma: no cover
             self.app_token = (os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or "").strip() or None
             self.backup_app_token = (os.getenv("BACKUP_APP_TOKEN") or "").strip() or None
 
-            # Providers
+            # Providers (GLOBAL + KSA)
             self.enabled_providers_raw = (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub").strip()
             self.primary_provider = (os.getenv("PRIMARY_PROVIDER") or "eodhd").strip().lower()
             self.ksa_providers_raw = (os.getenv("KSA_PROVIDERS") or "yahoo_chart,tadawul,argaam").strip()
 
-            # Keys
+            # Provider keys/tokens
             self.eodhd_api_key = (os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_TOKEN") or "").strip() or None
             self.finnhub_api_key = (os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_TOKEN") or os.getenv("FINNHUB_TOKEN") or "").strip() or None
             self.fmp_api_key = (os.getenv("FMP_API_KEY") or "").strip() or None
@@ -721,7 +598,7 @@ except Exception:  # pragma: no cover
             self.marketstack_api_key = (os.getenv("MARKETSTACK_API_KEY") or "").strip() or None
             self.argaam_api_key = (os.getenv("ARGAAM_API_KEY") or "").strip() or None
 
-            # URLs
+            # Base URLs / Networking
             self.backend_base_url = (os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or os.getenv("BASE_URL") or "").strip() or None
             self.eodhd_base_url = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").strip()
             self.finnhub_base_url = (os.getenv("FINNHUB_BASE_URL") or "https://finnhub.io/api/v1").strip()
@@ -731,58 +608,71 @@ except Exception:  # pragma: no cover
             self.max_retries = _positive_int(os.getenv("MAX_RETRIES"), 2)
             self.retry_delay = _positive_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5)
 
-            # CORS / rate limiting
+            # CORS / Rate limiting
             self.enable_cors_all_origins = _to_bool(os.getenv("ENABLE_CORS_ALL_ORIGINS") or os.getenv("CORS_ALL_ORIGINS"), True)
             self.cors_origins = (os.getenv("CORS_ORIGINS") or "*").strip()
             self.enable_rate_limiting = _to_bool(os.getenv("ENABLE_RATE_LIMITING"), True)
             self.max_requests_per_minute = _positive_int(os.getenv("MAX_REQUESTS_PER_MINUTE"), 240)
 
-            # Cache
+            # Cache tuning
             self.cache_ttl_sec = _positive_float(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20.0)
             self.quote_ttl_sec = _positive_float(os.getenv("QUOTE_TTL_SEC"), 30.0)
             self.fundamentals_ttl_sec = _positive_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0)
             self.argaam_snapshot_ttl_sec = _positive_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0)
-            self.engine_cache_ttl_sec = _positive_float(os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC"), float(self.cache_ttl_sec))
-            self.enriched_batch_concurrency = _positive_int(os.getenv("ENRICHED_BATCH_CONCURRENCY") or os.getenv("ENRICHED_CONCURRENCY"), 8)
+
+            self.engine_cache_ttl_sec = _positive_float(
+                os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC"),
+                float(self.cache_ttl_sec or 20.0),
+            )
+            self.enriched_batch_concurrency = _positive_int(
+                os.getenv("ENRICHED_BATCH_CONCURRENCY") or os.getenv("ENRICHED_CONCURRENCY"),
+                8,
+            )
 
             self.cache_max_size = _positive_int(os.getenv("CACHE_MAX_SIZE"), 5000)
             self.cache_backup_enabled = _to_bool(os.getenv("CACHE_BACKUP_ENABLED"), False)
             self.cache_save_interval = _positive_int(os.getenv("CACHE_SAVE_INTERVAL"), 300)
 
-            # Google
+            # Google / Sheets
             self.default_spreadsheet_id = (
-                os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID") or os.getenv("GOOGLE_SHEETS_ID") or ""
+                os.getenv("DEFAULT_SPREADSHEET_ID")
+                or os.getenv("SPREADSHEET_ID")
+                or os.getenv("GOOGLE_SHEETS_ID")
+                or ""
             ).strip() or None
             self.google_sheets_credentials = (
-                os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or os.getenv("GOOGLE_SA_JSON") or ""
+                os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+                or os.getenv("GOOGLE_CREDENTIALS")
+                or os.getenv("GOOGLE_SA_JSON")
+                or ""
             ).strip() or None
             self.google_apps_script_url = (os.getenv("GOOGLE_APPS_SCRIPT_URL") or "").strip() or None
             self.google_apps_script_backup_url = (os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "").strip() or None
 
-            # Features (general)
+            # Feature flags (general)
             self.advanced_analysis_enabled = _to_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
             self.tadawul_market_enabled = _to_bool(os.getenv("TADAWUL_MARKET_ENABLED"), True)
             self.enable_swagger = _to_bool(os.getenv("ENABLE_SWAGGER"), True)
             self.enable_redoc = _to_bool(os.getenv("ENABLE_REDOC"), True)
 
-            # Features (engine/provider routing)
+            # Feature flags (engine/provider routing) — v5.3.5
             self.enable_yahoo_chart_ksa = _to_bool(os.getenv("ENABLE_YAHOO_CHART_KSA"), True)
             self.enable_yahoo_chart_supplement = _to_bool(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
             self.enable_yfinance_ksa = _to_bool(os.getenv("ENABLE_YFINANCE_KSA"), False)
             self.enable_yahoo_fundamentals_ksa = _to_bool(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA"), True)
             self.enable_yahoo_fundamentals_global = _to_bool(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"), False)
 
-            # KSA endpoints
+            # Optional KSA routing URLs
             self.tadawul_quote_url = (os.getenv("TADAWUL_QUOTE_URL") or "").strip() or None
             self.tadawul_fundamentals_url = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip() or None
             self.argaam_quote_url = (os.getenv("ARGAAM_QUOTE_URL") or "").strip() or None
             self.argaam_profile_url = (os.getenv("ARGAAM_PROFILE_URL") or "").strip() or None
 
-            # Resolve version + export aliases
+            # Final normalize version + export runtime aliases
             self.service_version = _resolve_version_from_env_or_commit(self.service_version)
             _apply_runtime_env_aliases_fallback(self)
 
-        # --- Derived helpers ---
+        # ---- Derived helpers ----
         @property
         def enabled_providers(self) -> List[str]:
             xs = _csv(self.enabled_providers_raw, lower=True)
@@ -878,7 +768,7 @@ except Exception:  # pragma: no cover
         _export_env_if_missing("TIMEZONE", s.tz)
         _export_env_if_missing("LOG_LEVEL", (s.log_level or "info").strip().lower())
 
-        # ✅ Auth aliases
+        # Auth aliases
         if (s.app_token or "").strip():
             _export_env_if_missing("APP_TOKEN", (s.app_token or "").strip())
         if (s.backup_app_token or "").strip():
@@ -899,7 +789,11 @@ except Exception:  # pragma: no cover
         _export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
         _export_env_if_missing("ENRICHED_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
 
-        # Engine/provider flags
+        _export_env_if_missing("QUOTE_TTL_SEC", str(float(s.quote_ttl_sec)))
+        _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(s.fundamentals_ttl_sec)))
+        _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(s.argaam_snapshot_ttl_sec)))
+
+        # Engine/provider flags (v5.3.5)
         _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(bool(s.enable_yahoo_chart_ksa)).lower())
         _export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(bool(s.enable_yahoo_chart_supplement)).lower())
         _export_env_if_missing("ENABLE_YFINANCE_KSA", str(bool(s.enable_yfinance_ksa)).lower())
