@@ -2,7 +2,7 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.3.1 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.3.3 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
@@ -18,11 +18,14 @@ Design rules
 ✅ Defensive: always returns a valid header list (never raises).
 ✅ Stable: DEFAULT_HEADERS_59 order must not change lightly.
 ✅ No mutation leaks: always returns COPIES of header lists.
-✅ Better alignment: sheet aliases include your actual page names (Global_Markets, Insights_Analysis, etc).
+✅ Better alignment: sheet aliases include your actual page names.
 ✅ Convenience: provides HEADER<->FIELD mapping for UnifiedQuote-style payloads.
 
-v3.3.1 note
-- More robust symbol list coercion: supports mixed separators "AAPL,MSFT 1120.SR"
+v3.3.3 changes vs v3.3.1
+- ✅ Adds explicit alias keys for your exact sheet names (Market_Leaders, My_Portfolio, etc.)
+- ✅ Stronger sheet normalization (handles dots, slashes, parentheses)
+- ✅ Adds strict canonical header validation helper + debug-safe helpers
+- ✅ BatchProcessRequest: supports symbols/tickers as list OR mixed-separator string
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.3.1"
+SCHEMAS_VERSION = "3.3.3"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
@@ -142,6 +145,19 @@ _DEFAULT_59_TUPLE: Tuple[str, ...] = _ensure_len_59(DEFAULT_HEADERS_59)
 if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
     DEFAULT_HEADERS_59 = list(_DEFAULT_59_TUPLE)
 
+
+def is_canonical_headers(headers: Any) -> bool:
+    """Returns True if headers is a 59-length sequence matching canonical labels exactly."""
+    try:
+        if not isinstance(headers, (list, tuple)):
+            return False
+        if len(headers) != 59:
+            return False
+        return list(map(str, headers)) == list(_DEFAULT_59_TUPLE)
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Header <-> Field mapping (UnifiedQuote alignment helper)
 # =============================================================================
@@ -236,88 +252,94 @@ def field_to_header(field: str) -> str:
 
 def _norm_sheet_name(name: Optional[str]) -> str:
     """
-    Normalizes sheet names from Google Sheets (often with spaces/case).
+    Normalizes sheet names from Google Sheets (spaces/case/punctuations).
     Examples:
       "Global_Markets" -> "global_markets"
       "Insights Analysis" -> "insights_analysis"
-      "KSA-Tadawul" -> "ksa_tadawul"
+      "KSA-Tadawul (Market)" -> "ksa_tadawul_market"
+      "My/Portfolio" -> "my_portfolio"
     """
     s = (name or "").strip().lower()
     if not s:
         return ""
-    s = s.replace("-", "_").replace(" ", "_")
+    # unify separators
+    for ch in ["-", " ", ".", "/", "\\", "|", ":", ";", ","]:
+        s = s.replace(ch, "_")
+    # remove parentheses but keep content
+    s = s.replace("(", "_").replace(")", "_")
+    # collapse repeats
     while "__" in s:
         s = s.replace("__", "_")
-    return s
+    return s.strip("_")
 
 
 # Store as tuples internally to prevent mutation.
-_SHEET_HEADERS: Dict[str, Tuple[str, ...]] = {
-    # -------------------------
-    # KSA / Tadawul pages
-    # -------------------------
-    "ksa_tadawul": _DEFAULT_59_TUPLE,
-    "ksa_tadawul_market": _DEFAULT_59_TUPLE,
-    "ksa_market": _DEFAULT_59_TUPLE,
-    "tadawul": _DEFAULT_59_TUPLE,
-    "ksa": _DEFAULT_59_TUPLE,
-    "market_leaders": _DEFAULT_59_TUPLE,
-    "ksa_market_leaders": _DEFAULT_59_TUPLE,
+_SHEET_HEADERS: Dict[str, Tuple[str, ...]] = {}
 
-    # -------------------------
-    # Global Markets pages
-    # -------------------------
-    "global_markets": _DEFAULT_59_TUPLE,
-    "global_market": _DEFAULT_59_TUPLE,
-    "global": _DEFAULT_59_TUPLE,
 
-    # -------------------------
-    # Mutual Funds
-    # -------------------------
-    "mutual_funds": _DEFAULT_59_TUPLE,
-    "mutualfunds": _DEFAULT_59_TUPLE,
-    "funds": _DEFAULT_59_TUPLE,
+def _register(keys: List[str], headers: Tuple[str, ...]) -> None:
+    for k in keys:
+        kk = _norm_sheet_name(k)
+        if kk:
+            _SHEET_HEADERS[kk] = headers
 
-    # -------------------------
-    # Commodities & FX
-    # -------------------------
-    "commodities_fx": _DEFAULT_59_TUPLE,
-    "commodities_and_fx": _DEFAULT_59_TUPLE,
-    "commodities": _DEFAULT_59_TUPLE,
-    "fx": _DEFAULT_59_TUPLE,
 
-    # -------------------------
-    # Portfolio / Investment
-    # -------------------------
-    "my_portfolio": _DEFAULT_59_TUPLE,
-    "my_portfolio_investment": _DEFAULT_59_TUPLE,
-    "my_portfolio_investment_income_statement": _DEFAULT_59_TUPLE,
-    "investment_income_statement": _DEFAULT_59_TUPLE,
-    "portfolio": _DEFAULT_59_TUPLE,
-
-    # -------------------------
-    # Insights / Analysis / Advisor
-    # -------------------------
-    "insights_analysis": _DEFAULT_59_TUPLE,
-    "insights": _DEFAULT_59_TUPLE,
-    "analysis": _DEFAULT_59_TUPLE,
-    "investment_advisor": _DEFAULT_59_TUPLE,
-    "advisor": _DEFAULT_59_TUPLE,
-
-    # -------------------------
-    # Additional dashboard pages (aliases)
-    # -------------------------
-    "economic_calendar": _DEFAULT_59_TUPLE,
-    "calendar": _DEFAULT_59_TUPLE,
-    "status": _DEFAULT_59_TUPLE,
-}
+# Canonical schema used everywhere for now
+_register(
+    keys=[
+        # KSA / Tadawul
+        "KSA_Tadawul",
+        "KSA Tadawul",
+        "ksa_tadawul",
+        "ksa_tadawul_market",
+        "KSA_Tadawul_Market",
+        "KSA-Market",
+        "Tadawul",
+        "KSA",
+        "Market_Leaders",
+        "Market Leaders",
+        "KSA_Market_Leaders",
+        # Global
+        "Global_Markets",
+        "Global Markets",
+        "Global",
+        # Funds
+        "Mutual_Funds",
+        "Mutual Funds",
+        "Funds",
+        # Commodities & FX
+        "Commodities_FX",
+        "Commodities & FX",
+        "FX",
+        "Commodities",
+        # Portfolio / Investment
+        "My_Portfolio",
+        "My Portfolio",
+        "My_Portfolio_Investment",
+        "My Portfolio Investment",
+        "Investment_Income_Statement",
+        "Investment Income Statement",
+        "Portfolio",
+        # Insights / Analysis / Advisor
+        "Insights_Analysis",
+        "Insights Analysis",
+        "Insights",
+        "Analysis",
+        "Investment_Advisor",
+        "Investment Advisor",
+        "Advisor",
+        # Additional pages
+        "Economic_Calendar",
+        "Economic Calendar",
+        "Calendar",
+        "Status",
+    ],
+    headers=_DEFAULT_59_TUPLE,
+)
 
 
 def resolve_sheet_key(sheet_name: Optional[str]) -> str:
-    """
-    Returns the normalized key used for lookups.
-    Useful for debugging what your "Global_Markets" becomes internally.
-    """
+    """Returns the normalized key used for lookups."""
     return _norm_sheet_name(sheet_name)
 
 
@@ -336,12 +358,6 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
         v = _SHEET_HEADERS.get(key)
         if isinstance(v, tuple) and v:
             return list(v)
-
-        # defensive matching: try common patterns
-        key2 = key.strip("_")
-        v2 = _SHEET_HEADERS.get(key2)
-        if isinstance(v2, tuple) and v2:
-            return list(v2)
 
         # contains / prefix matching (best-effort)
         for k, vv in _SHEET_HEADERS.items():
@@ -412,7 +428,6 @@ class BatchProcessRequest(_ExtraIgnore):
     symbols: List[str] = Field(default_factory=list)
     tickers: List[str] = Field(default_factory=list)  # alias support
 
-    # --- v2 validators
     if _PYDANTIC_V2:  # type: ignore
         @field_validator("symbols", mode="before")  # type: ignore
         def _v2_symbols(cls, v: Any) -> List[str]:
@@ -424,7 +439,6 @@ class BatchProcessRequest(_ExtraIgnore):
 
         @model_validator(mode="after")  # type: ignore
         def _v2_post(self) -> "BatchProcessRequest":
-            # ensure list types (defensive)
             self.symbols = _coerce_str_list(self.symbols)
             self.tickers = _coerce_str_list(self.tickers)
             return self
@@ -456,6 +470,7 @@ class BatchProcessRequest(_ExtraIgnore):
 __all__ = [
     "SCHEMAS_VERSION",
     "DEFAULT_HEADERS_59",
+    "is_canonical_headers",
     "HEADER_TO_FIELD",
     "FIELD_TO_HEADER",
     "header_to_field",
