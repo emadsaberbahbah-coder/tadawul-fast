@@ -1,34 +1,33 @@
-# integrations/symbols_reader.py  (FULL REPLACEMENT)
+# integrations/symbols_reader.py
 """
 integrations/symbols_reader.py
 ===========================================================
-Compatibility Shim — v0.1.0 (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.1.0 (PROD SAFE)
 
-Why this exists
-- Some older code paths may try: `from integrations.symbols_reader import ...`
-- The canonical implementation in this repo is: `symbols_reader.py` (project root)
-- This shim prevents SyntaxError "time bombs" caused by accidental Markdown fences
-  and ensures imports never crash app startup.
+Why this file exists
+- Some older modules may import: `from integrations.symbols_reader import ...`
+- The canonical implementation lives in repo root: `symbols_reader.py`
+- This shim ensures:
+  1) This module is ALWAYS valid Python (no Markdown fences)
+  2) Imports remain backward-compatible
+  3) No duplicate business logic (single source of truth)
 
 Behavior
-- Re-exports the canonical symbols_reader symbols if available
-- If canonical import fails, returns safe error-shaped responses (never raises)
+- Preferred: re-export symbols from root `symbols_reader.py`
+- Fallback: return safe empty outputs with error metadata (never crash import)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-logger = logging.getLogger("integrations.symbols_reader")
+logger = logging.getLogger("symbols_reader_shim")
 
 SHIM_VERSION = "0.1.0"
-CANONICAL_MODULE = "symbols_reader"
-
-_IMPORT_ERROR: Optional[Exception] = None
 
 try:
-    # Canonical module (used by scripts/run_dashboard_sync.py etc.)
+    # ✅ Canonical module (repo root)
     from symbols_reader import (  # type: ignore
         PageConfig,
         PAGE_REGISTRY,
@@ -38,49 +37,49 @@ try:
         get_all_pages_symbols,
     )
 
+    # pass-through version (if defined upstream)
+    try:
+        from symbols_reader import SYMBOLS_READER_VERSION as SYMBOLS_READER_VERSION  # type: ignore
+    except Exception:
+        SYMBOLS_READER_VERSION = "unknown"
+
 except Exception as e:  # pragma: no cover
-    _IMPORT_ERROR = e
-    logger.exception("Failed to import canonical symbols_reader: %s", e)
-
-    # Safe fallbacks (never raise)
+    # -------------------------------------------------------------------------
+    # Safe fallback: never crash app startup because of optional module
+    # -------------------------------------------------------------------------
     PageConfig = object  # type: ignore
-    PAGE_REGISTRY: Dict[str, Any] = {}
+    PAGE_REGISTRY = {}  # type: ignore
+    SYMBOLS_READER_VERSION = "fallback"
 
-    def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:  # type: ignore
-        # best-effort: treat .SR numeric as KSA
-        ksa: List[str] = []
-        glob: List[str] = []
+    def split_tickers_by_market(tickers):  # type: ignore
+        ksa, glob = [], []
         for t in tickers or []:
-            u = (t or "").upper().strip()
-            if u.endswith(".SR") and u[:-3].isdigit():
-                ksa.append(t)
-            else:
-                glob.append(t)
+            u = str(t or "").upper()
+            (ksa if u.endswith(".SR") else glob).append(str(t))
         return {"ksa": ksa, "global": glob}
 
-    def _err_meta() -> Dict[str, Any]:
-        return {
-            "status": "error",
-            "shim_version": SHIM_VERSION,
-            "canonical": CANONICAL_MODULE,
-            "error": f"canonical symbols_reader import failed: {_IMPORT_ERROR}",
-        }
+    def _err(meta_error: str) -> Dict[str, Any]:
+        return {"status": "error", "error": meta_error, "shim_version": SHIM_VERSION}
 
-    def get_symbols_from_sheet(*args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore
-        return {"all": [], "ksa": [], "global": [], "meta": _err_meta()}
+    def get_symbols_from_sheet(  # type: ignore
+        spreadsheet_id: str,
+        sheet_name: str,
+        header_row: int = 5,
+        max_cols: int = 52,
+        scan_rows: int = 2000,
+    ) -> Dict[str, Any]:
+        return {"all": [], "ksa": [], "global": [], "meta": _err(f"symbols_reader import failed: {e}")}
 
-    def get_page_symbols(*args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore
-        return {"all": [], "ksa": [], "global": [], "meta": _err_meta()}
+    def get_page_symbols(page_key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:  # type: ignore
+        return {"all": [], "ksa": [], "global": [], "meta": _err(f"symbols_reader import failed: {e}")}
 
-    def get_all_pages_symbols(*args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore
-        return {"meta": _err_meta(), "pages": {}}
-
+    def get_all_pages_symbols(spreadsheet_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:  # type: ignore
+        return {}
 
 __all__ = [
-    "SHIM_VERSION",
-    "CANONICAL_MODULE",
     "PageConfig",
     "PAGE_REGISTRY",
+    "SYMBOLS_READER_VERSION",
     "split_tickers_by_market",
     "get_symbols_from_sheet",
     "get_page_symbols",
