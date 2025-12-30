@@ -1,14 +1,14 @@
-# main.py — FULL REPLACEMENT
+# main.py — FULL REPLACEMENT — v5.1.4
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.2
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.4
 
-v5.1.2 patch vs v5.1.1
-- ✅ Adds /favicon.ico handler (returns 204) to stop browser 404 noise.
-- ✅ Adds /robots.txt handler (200) to stop crawler 404 noise.
+v5.1.4 patch vs v5.1.2
+- ✅ Better Settings key resolution: reads BOTH env-style keys (UPPER_SNAKE) and Settings attrs (lower_snake).
+- ✅ Honors config.py flags even when env vars are not set (DEFER_ROUTER_MOUNT, INIT_ENGINE_ON_BOOT, etc.).
+- ✅ Last-resort env aliasing expanded to include engine/provider feature flags.
 - ✅ Keeps: never crashes startup; health endpoints always work; safe deferred boot.
-- ✅ Keeps: Engine init detects DataEngineV2 *or* DataEngine; env snapshot safe (no tokens).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.1.2"
+APP_ENTRY_VERSION = "5.1.4"
 
 
 def _truthy(v: Any) -> bool:
@@ -81,14 +81,10 @@ def _apply_runtime_env_aliases_last_resort() -> None:
     app_token = (os.getenv("APP_TOKEN") or "").strip()
     backup_token = (os.getenv("BACKUP_APP_TOKEN") or "").strip()
 
-    # If only TFB_APP_TOKEN is set, expose it as APP_TOKEN
     if tfb_token and not app_token:
         _export_env_if_missing("APP_TOKEN", tfb_token)
-
-    # Reverse alias too (harmless)
     if app_token and not tfb_token:
         _export_env_if_missing("TFB_APP_TOKEN", app_token)
-
     if backup_token:
         _export_env_if_missing("BACKUP_APP_TOKEN", backup_token)
 
@@ -109,6 +105,13 @@ def _apply_runtime_env_aliases_last_resort() -> None:
         _export_env_if_missing("HTTP_TIMEOUT_SEC", os.getenv("HTTP_TIMEOUT"))
     if os.getenv("RETRY_DELAY") and not os.getenv("RETRY_DELAY_SEC"):
         _export_env_if_missing("RETRY_DELAY_SEC", os.getenv("RETRY_DELAY"))
+
+    # --- Engine/provider flags defaults (so legacy env-readers remain consistent) ---
+    os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
+    os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
+    os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
+    os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_KSA", "true")
+    os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", "false")
 
 
 def _resolve_log_format() -> str:
@@ -273,21 +276,40 @@ def _load_env_module() -> Optional[object]:
         return None
 
 
+def _key_to_attr(name: str) -> str:
+    # ENV_STYLE -> env_style
+    return str(name or "").strip().lower()
+
+
 def _get(settings: Optional[object], env_mod: Optional[object], name: str, default: Any = None) -> Any:
-    # ENV wins
+    """
+    Resolution order:
+      1) ENV (name / name.upper)
+      2) env.py (exact attr, then lowercase)
+      3) settings (exact attr, then lowercase env-style mapping)
+      4) default
+    """
     v = os.getenv(name, None)
     if v is None:
         v = os.getenv(name.upper(), None)
     if v is not None:
         return v
 
-    # env.py next
-    if env_mod is not None and hasattr(env_mod, name):
-        return getattr(env_mod, name)
+    # env.py
+    if env_mod is not None:
+        if hasattr(env_mod, name):
+            return getattr(env_mod, name)
+        low = _key_to_attr(name)
+        if hasattr(env_mod, low):
+            return getattr(env_mod, low)
 
-    # settings last
-    if settings is not None and hasattr(settings, name):
-        return getattr(settings, name)
+    # settings
+    if settings is not None:
+        if hasattr(settings, name):
+            return getattr(settings, name)
+        low = _key_to_attr(name)
+        if hasattr(settings, low):
+            return getattr(settings, low)
 
     return default
 
@@ -369,16 +391,11 @@ def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> 
             vv = str(getattr(settings, k, "") or "").strip()
             if vv:
                 return vv
-    return (
-        str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip()
-        or "production"
-    )
+    return str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip() or "production"
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
-    cors_all = _truthy(
-        _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true"))
-    )
+    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
     if cors_all:
         return ["*"]
     raw = str(_get(settings, env_mod, "CORS_ORIGINS", "")).strip()
@@ -412,12 +429,7 @@ def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key:
 
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
     enabled, ksa = _providers_from_settings(settings, env_mod)
-    # never leak tokens
-    token_mode = (
-        "open"
-        if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN"))
-        else "token"
-    )
+    token_mode = "open" if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN")) else "token"
     return {
         "APP_ENV": _resolve_env_name(settings, env_mod),
         "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")),
@@ -426,13 +438,15 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "APP_VERSION_RESOLVED": _resolve_version(settings, env_mod),
         "ENABLED_PROVIDERS": enabled,
         "KSA_PROVIDERS": ksa,
-        "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true")),
-        "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")),
-        "ENABLE_YAHOO_CHART_KSA": str(os.getenv("ENABLE_YAHOO_CHART_KSA", "")),
-        "ENABLE_YAHOO_CHART_SUPPLEMENT": str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "")),
-        "ENABLE_YFINANCE_KSA": str(os.getenv("ENABLE_YFINANCE_KSA", "")),
-        "ENABLE_YAHOO_FUNDAMENTALS_KSA": str(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA", "")),
-        "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL": str(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", "")),
+        "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)),
+        "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)),
+        "ENGINE_CACHE_TTL_SEC": str(_get(settings, env_mod, "ENGINE_CACHE_TTL_SEC", "")),
+        "ENRICHED_BATCH_CONCURRENCY": str(_get(settings, env_mod, "ENRICHED_BATCH_CONCURRENCY", "")),
+        "ENABLE_YAHOO_CHART_KSA": str(_get(settings, env_mod, "ENABLE_YAHOO_CHART_KSA", os.getenv("ENABLE_YAHOO_CHART_KSA", ""))),
+        "ENABLE_YAHOO_CHART_SUPPLEMENT": str(_get(settings, env_mod, "ENABLE_YAHOO_CHART_SUPPLEMENT", os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", ""))),
+        "ENABLE_YFINANCE_KSA": str(_get(settings, env_mod, "ENABLE_YFINANCE_KSA", os.getenv("ENABLE_YFINANCE_KSA", ""))),
+        "ENABLE_YAHOO_FUNDAMENTALS_KSA": str(_get(settings, env_mod, "ENABLE_YAHOO_FUNDAMENTALS_KSA", os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA", ""))),
+        "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL": str(_get(settings, env_mod, "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", os.getenv("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", ""))),
         "AUTH_MODE": token_mode,
         "RENDER_GIT_COMMIT": (os.getenv("RENDER_GIT_COMMIT") or "")[:12],
     }
@@ -539,11 +553,9 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
     except Exception:
         pass
 
-    # Prefer v2
     v2_err = None
     try:
         mod = import_module("core.data_engine_v2")
-        # Support multiple class names
         Engine = getattr(mod, "DataEngineV2", None) or getattr(mod, "DataEngine", None)
         if Engine is not None:
             app_.state.engine = Engine()
@@ -556,14 +568,13 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
         app_.state.engine_ready = False
         app_.state.engine_error = v2_err
 
-    # Fallback legacy
     try:
         mod = import_module("core.data_engine")
         Engine = getattr(mod, "DataEngine", None)
         if Engine is not None:
             app_.state.engine = Engine()
             app_.state.engine_ready = True
-            app_.state.engine_error = None  # clear error on success
+            app_.state.engine_error = None
             logger.info("Engine initialized (legacy DataEngine).")
             return
     except Exception:
@@ -624,16 +635,12 @@ async def _maybe_close_engine(app_: FastAPI) -> None:
 
 
 def create_app() -> FastAPI:
-    # Apply provider defaults EARLY so engines/routers see intended routing.
     _apply_provider_defaults_if_missing()
-
-    # Extra safety: ensure token/auth aliases exist even if config import fails.
     _apply_runtime_env_aliases_last_resort()
 
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
 
-    # Prefer LOG_LEVEL from settings if possible
     log_level = str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")).upper()
     _safe_set_root_log_level(log_level)
 
@@ -648,7 +655,6 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
-        # State defaults (always present)
         app_.state.settings = settings
         app_.state.settings_source = settings_source
         app_.state.app_env = app_env
@@ -665,8 +671,12 @@ def create_app() -> FastAPI:
         app_.state.boot_error = None
         app_.state.boot_completed = False
 
-        app_.state.defer_router_mount = _truthy(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true"))
-        app_.state.init_engine_on_boot = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")
+        # ✅ honor settings attrs even if env vars are not set
+        defer_val = _get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)
+        init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)
+
+        app_.state.defer_router_mount = _truthy(defer_val) if isinstance(defer_val, str) else bool(defer_val)
+        app_.state.init_engine_on_boot = init_val
 
         rr = _parse_list_like(_get(settings, env_mod, "REQUIRED_ROUTERS", ""))
         app_.state.required_routers = rr or required_default
@@ -674,7 +684,6 @@ def create_app() -> FastAPI:
         logger.info("Settings loaded from %s", app_.state.settings_source or "(none)")
         logger.info("Fast boot: defer_router_mount=%s init_engine_on_boot=%s", app_.state.defer_router_mount, app_.state.init_engine_on_boot)
 
-        # Boot (deferred or immediate)
         if app_.state.defer_router_mount:
             app_.state.boot_task = asyncio.create_task(_background_boot(app_))
         else:
@@ -683,7 +692,6 @@ def create_app() -> FastAPI:
                 await asyncio.to_thread(_init_engine_best_effort, app_)
             app_.state.boot_completed = True
 
-        # Startup banner
         enabled, ksa = _providers_from_settings(settings, env_mod)
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
@@ -697,7 +705,6 @@ def create_app() -> FastAPI:
 
         yield
 
-        # Shutdown
         try:
             task = getattr(app_.state, "boot_task", None)
             if task and not task.done():
@@ -779,12 +786,10 @@ def create_app() -> FastAPI:
             "entry_version": APP_ENTRY_VERSION,
         }
 
-    # ✅ v5.1.2: stop browser favicon 404 noise
     @app_.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
     async def favicon():
         return Response(status_code=204)
 
-    # ✅ v5.1.2: stop crawler robots 404 noise
     @app_.api_route("/robots.txt", methods=["GET", "HEAD"], include_in_schema=False)
     async def robots():
         return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
@@ -820,7 +825,6 @@ def create_app() -> FastAPI:
         eng = getattr(app_.state, "engine", None)
         ei = _engine_info(eng)
 
-        # If engine exposes providers lists, prefer those (more truthful than env)
         providers = ei["providers"] or enabled
         ksa_providers = ei["ksa_providers"] or ksa
 
