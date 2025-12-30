@@ -1,8 +1,8 @@
-# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.8
+# env.py — FULL REPLACEMENT (QUIET + PROD SAFE) — v5.0.10
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.8)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.0.10)
 
 Key goals
 - ✅ Quiet boot by default (no banner logs unless ENV_LOG_ON_BOOT=true)
@@ -11,8 +11,13 @@ Key goals
 - ✅ Provides legacy exports used by older modules/routes
 - ✅ Ensures token alias exports (FINNHUB_API_TOKEN / EODHD_API_TOKEN) for legacy modules
 - ✅ Keeps ENGINE_CACHE_TTL_SEC + ENRICHED_BATCH_CONCURRENCY (aligns with ENRICHED_CONCURRENCY)
-- ✅ Robust GOOGLE_SHEETS_CREDENTIALS parsing: supports minified JSON OR base64(minified JSON)
+- ✅ Robust GOOGLE_SHEETS_CREDENTIALS parsing: supports:
+    - minified JSON
+    - pretty JSON
+    - base64(JSON)
+    - quoted JSON string (single/double)
 - ✅ Exposes feature toggles used by DataEngineV2 (Yahoo chart/fundamentals/yfinance KSA)
+- ✅ Exports APP_TOKEN / BACKUP_APP_TOKEN aliases when present (legacy routes read env directly)
 
 Notes
 - This file is intentionally defensive: it must never prevent app startup.
@@ -28,7 +33,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.0.8"
+ENV_VERSION = "5.0.10"
 logger = logging.getLogger("env")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -94,41 +99,20 @@ def _safe_join(items: List[str]) -> str:
     return ",".join([str(x) for x in items if str(x).strip()])
 
 
-def _as_list_lower(v: Any) -> List[str]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        raw = [str(x).strip().lower() for x in v if str(x).strip()]
-    else:
-        s = str(v).strip()
-        if not s:
-            return []
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                arr = json.loads(s)
-                if isinstance(arr, list):
-                    raw = [str(x).strip().lower() for x in arr if str(x).strip()]
-                else:
-                    raw = []
-            except Exception:
-                raw = []
-        else:
-            raw = [p.strip().lower() for p in s.split(",") if p.strip()]
-
-    out: List[str] = []
-    seen = set()
-    for x in raw:
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
 def _strip_wrapping_quotes(s: str) -> str:
     t = (s or "").strip()
     if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
         return t[1:-1].strip()
     return t
+
+
+def _looks_like_b64(s: str) -> bool:
+    raw = (s or "").strip()
+    if len(raw) < 80:
+        return False
+    # base64 is typically A-Z a-z 0-9 + / =
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    return all(c in allowed for c in raw)
 
 
 def _maybe_b64_decode(s: str) -> str:
@@ -141,11 +125,14 @@ def _maybe_b64_decode(s: str) -> str:
         return raw
     if raw.startswith("{"):
         return raw
-    if len(raw) < 120:
+
+    # avoid wasting time decoding short/non-b64 strings
+    if not _looks_like_b64(raw):
         return raw
+
     try:
         dec = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
-        if dec.startswith("{") and '"private_key"' in dec:
+        if dec.startswith("{") and ("private_key" in dec or '"type"' in dec):
             return dec
     except Exception:
         return raw
@@ -159,7 +146,7 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
     - JSON string
     - base64(JSON string)
     - quoted JSON string
-    Returns dict or None
+    Returns dict or None.
     """
     if raw is None:
         return None
@@ -204,6 +191,36 @@ def _get_first_env(*keys: str) -> Optional[str]:
         if v is not None and str(v).strip():
             return str(v).strip()
     return None
+
+
+def _as_list_lower(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        raw = [str(x).strip().lower() for x in v if str(x).strip()]
+    else:
+        s = str(v).strip()
+        if not s:
+            return []
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list):
+                    raw = [str(x).strip().lower() for x in arr if str(x).strip()]
+                else:
+                    raw = []
+            except Exception:
+                raw = []
+        else:
+            raw = [p.strip().lower() for p in s.split(",") if p.strip()]
+
+    out: List[str] = []
+    seen = set()
+    for x in raw:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -301,7 +318,7 @@ _base_settings = _try_load_settings_once()
 
 # Title/name (config.py uses service_name)
 APP_NAME = (
-    _get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE")
+    _get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE", "TITLE")
     or str(_get_attr(_base_settings, "service_name", "") or "").strip()
     or str(_get_attr(_base_settings, "app_name", "") or _get_attr(_base_settings, "APP_NAME", "") or "").strip()
     or "Tadawul Fast Bridge"
@@ -309,7 +326,7 @@ APP_NAME = (
 
 # Env (config.py uses environment)
 APP_ENV = (
-    _get_first_env("APP_ENV", "ENVIRONMENT")
+    _get_first_env("APP_ENV", "ENVIRONMENT", "ENV")
     or str(_get_attr(_base_settings, "environment", "") or "").strip()
     or str(_get_attr(_base_settings, "env", "") or "").strip()
     or "production"
@@ -323,6 +340,7 @@ BACKEND_BASE_URL = (
     or ""
 )
 
+# Auth tokens (ENV first, then settings)
 APP_TOKEN = (
     _get_first_env("APP_TOKEN", "TFB_APP_TOKEN")
     or str(_get_attr(_base_settings, "app_token", "") or "").strip()
@@ -335,6 +353,13 @@ BACKUP_APP_TOKEN = (
 )
 
 REQUIRE_AUTH = _env_first_bool(_base_settings, "REQUIRE_AUTH", "require_auth", False)
+
+# Ensure token aliases exist for legacy modules that read env directly (no overwrite)
+if APP_TOKEN:
+    _export_env_if_missing("APP_TOKEN", APP_TOKEN)
+    _export_env_if_missing("TFB_APP_TOKEN", APP_TOKEN)
+if BACKUP_APP_TOKEN:
+    _export_env_if_missing("BACKUP_APP_TOKEN", BACKUP_APP_TOKEN)
 
 # Providers (config.py exposes enabled_providers + ksa_providers)
 _enabled_from_env = _get_first_env("ENABLED_PROVIDERS", "PROVIDERS")
@@ -411,6 +436,7 @@ _export_env_if_missing("CACHE_TTL_SEC", str(float(CACHE_TTL_SEC)))
 _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(CACHE_TTL_SEC)))
 _export_env_if_missing("ENGINE_CACHE_TTL_SEC", str(int(ENGINE_CACHE_TTL_SEC)))
 _export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(ENRICHED_BATCH_CONCURRENCY)))
+_export_env_if_missing("ENRICHED_CONCURRENCY", str(int(ENRICHED_BATCH_CONCURRENCY)))
 
 # Provider keys
 EODHD_API_KEY = _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN") or _get_attr(_base_settings, "eodhd_api_key", None)
@@ -461,6 +487,12 @@ GOOGLE_APPS_SCRIPT_BACKUP_URL = (
     (_get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL") or str(_get_attr(_base_settings, "google_apps_script_backup_url", "") or "")).strip()
 )
 
+# Export creds/spreadsheet env aliases for older modules (no overwrite)
+if DEFAULT_SPREADSHEET_ID:
+    _export_env_if_missing("DEFAULT_SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
+    _export_env_if_missing("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID)
+    _export_env_if_missing("GOOGLE_SHEETS_ID", DEFAULT_SPREADSHEET_ID)
+
 # Sheet names (defaults aligned to your current API usage)
 SHEET_KSA_TADAWUL = (_get_first_env("SHEET_KSA_TADAWUL") or "KSA_Tadawul").strip()
 SHEET_GLOBAL_MARKETS = (_get_first_env("SHEET_GLOBAL_MARKETS") or "Global_Markets").strip()
@@ -483,12 +515,13 @@ IS_PRODUCTION = str(APP_ENV).strip().lower() in {"prod", "production"}
 # settings compatibility object (very lightweight)
 # ---------------------------------------------------------------------
 class _Settings:
-    # Keep common historical attribute names
+    # historical names
     app_name = APP_NAME
     env = APP_ENV
     environment = APP_ENV
     version = APP_VERSION
     service_version = APP_VERSION
+
     backend_base_url = BACKEND_BASE_URL
     base_url = BACKEND_BASE_URL
 
@@ -497,8 +530,8 @@ class _Settings:
     require_auth = REQUIRE_AUTH
 
     enabled_providers = ENABLED_PROVIDERS
-    ksa_providers = KSA_PROVIDERS  # canonical from config.py
-    enabled_ksa_providers = KSA_PROVIDERS  # legacy alias
+    ksa_providers = KSA_PROVIDERS
+    enabled_ksa_providers = KSA_PROVIDERS
     primary_provider = PRIMARY_PROVIDER
 
     http_timeout_sec = HTTP_TIMEOUT_SEC
