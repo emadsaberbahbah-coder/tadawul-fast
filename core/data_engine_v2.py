@@ -51,9 +51,24 @@ _TD_6M = 126
 _TD_12M = 252
 
 
+# -----------------------------------------------------------------------------
+# Pydantic (best-effort) with robust fallback for v1/v2
+# -----------------------------------------------------------------------------
 try:
-    from pydantic import BaseModel, ConfigDict, Field
+    from pydantic import BaseModel, Field  # type: ignore
+
+    try:
+        from pydantic import ConfigDict  # type: ignore
+
+        _PYDANTIC_HAS_CONFIGDICT = True
+    except Exception:  # pragma: no cover
+        ConfigDict = None  # type: ignore
+        _PYDANTIC_HAS_CONFIGDICT = False
+
 except Exception:  # pragma: no cover
+    _PYDANTIC_HAS_CONFIGDICT = False
+    ConfigDict = None  # type: ignore
+
     class BaseModel:  # type: ignore
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -61,15 +76,43 @@ except Exception:  # pragma: no cover
         def model_dump(self, *a, **k):
             return dict(self.__dict__)
 
+        def dict(self, *a, **k):
+            return dict(self.__dict__)
+
     def Field(default=None, **kwargs):  # type: ignore
         return default
 
-    def ConfigDict(**kwargs):  # type: ignore
-        return dict(kwargs)
+
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    try:
+        md = getattr(obj, "model_dump", None)
+        if callable(md):
+            d = md()
+            return d if isinstance(d, dict) else dict(d)
+    except Exception:
+        pass
+    try:
+        dct = getattr(obj, "dict", None)
+        if callable(dct):
+            d = dct()
+            return d if isinstance(d, dict) else dict(d)
+    except Exception:
+        pass
+    try:
+        return dict(getattr(obj, "__dict__", {}) or {})
+    except Exception:
+        return {}
 
 
 class UnifiedQuote(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    if _PYDANTIC_HAS_CONFIGDICT and ConfigDict is not None:
+        model_config = ConfigDict(populate_by_name=True, extra="ignore")  # type: ignore
+    else:  # pragma: no cover
+        class Config:
+            extra = "ignore"
+            allow_population_by_field_name = True
 
     symbol: str
     name: Optional[str] = None
@@ -417,10 +460,7 @@ def _missing_key_fundamentals(out: Dict[str, Any]) -> bool:
     Key fundamentals that matter for your sheet:
     market_cap, pe_ttm, dividend_yield, roe, roa
     """
-    return any(
-        _safe_float(out.get(k)) is None
-        for k in ("market_cap", "pe_ttm", "dividend_yield", "roe", "roa")
-    )
+    return any(_safe_float(out.get(k)) is None for k in ("market_cap", "pe_ttm", "dividend_yield", "roe", "roa"))
 
 
 def _normalize_warning_prefix(msg: str) -> str:
@@ -479,9 +519,8 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
         if payload is None:
             return out
 
-        # If provider returned a dict patch containing nested history
         if isinstance(payload, dict):
-            # Direct arrays (yahoo chart style)
+            # {"candles":{"t":[...], "c":[...]}}
             if isinstance(payload.get("candles"), dict):
                 c = payload["candles"]
                 t_list = c.get("t") or c.get("timestamp") or c.get("time")
@@ -495,7 +534,7 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                     out.sort(key=lambda x: x[0])
                     return out
 
-            # Another common format: {"t":[...], "c":[...]}
+            # {"t":[...], "c":[...]}
             t_list = payload.get("t") or payload.get("timestamp") or payload.get("time")
             c_list = payload.get("c") or payload.get("close") or payload.get("closes")
             if isinstance(t_list, list) and isinstance(c_list, list) and len(t_list) == len(c_list):
@@ -513,7 +552,6 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                     payload = v
                     break
 
-        # List cases
         if isinstance(payload, list):
             for row in payload:
                 if isinstance(row, tuple) and len(row) >= 2:
@@ -601,8 +639,8 @@ def _vol_ann_from_history(closes: List[float], lookback_td: int = 30) -> Optiona
         return None
     try:
         import numpy as np  # lazy import
+
         arr = np.array(closes[-(lookback_td + 1):], dtype=float)
-        # log returns
         r = np.diff(np.log(arr))
         if r.size < 5:
             return None
@@ -611,7 +649,6 @@ def _vol_ann_from_history(closes: List[float], lookback_td: int = 30) -> Optiona
             return None
         return vol
     except Exception:
-        # fallback (rough) without numpy
         try:
             subset = closes[-(lookback_td + 1):]
             rets: List[float] = []
@@ -641,6 +678,7 @@ def _drift_expected_return(closes: List[float], horizon_td: int) -> Optional[flo
         return None
     try:
         import numpy as np  # lazy
+
         arr = np.array(closes[-(min(len(closes), 260)):], dtype=float)
         r = np.diff(np.log(arr))
         if r.size < 10:
@@ -763,7 +801,6 @@ def _score_value(p: Dict[str, Any]) -> int:
 
 
 def _score_momentum(p: Dict[str, Any]) -> int:
-    # Prefer multi-horizon momentum when available
     r1m = _safe_float(p.get("returns_1m"))
     r3m = _safe_float(p.get("returns_3m"))
     chg = _safe_float(p.get("percent_change"))
@@ -788,7 +825,6 @@ def _score_momentum(p: Dict[str, Any]) -> int:
         score -= 5 if pos52 <= 20 else 0
 
     if rsi is not None:
-        # avoid overbought/oversold extremes
         score -= 5 if rsi >= 75 else 0
         score += 5 if 40 <= rsi <= 60 else 0
 
@@ -805,7 +841,6 @@ def _score_risk(p: Dict[str, Any]) -> int:
         score -= 10 if beta <= 0.8 else 0
 
     if vol is not None:
-        # Higher volatility => higher risk score
         score += 10 if vol >= 35 else 0
         score += 5 if vol >= 25 else 0
         score -= 5 if vol <= 15 else 0
@@ -873,7 +908,9 @@ class DataEngine:
             return safe
         return list(self.providers_global or [])
 
-    async def _fetch_history_best_effort(self, sym: str, providers: List[str]) -> Tuple[List[Tuple[int, float]], Optional[str]]:
+    async def _fetch_history_best_effort(
+        self, sym: str, providers: List[str]
+    ) -> Tuple[List[Tuple[int, float]], Optional[str]]:
         """
         Best-effort history fetch. Returns (series, source_name).
         Never raises.
@@ -892,15 +929,12 @@ class DataEngine:
         series: List[Tuple[int, float]] = []
         used_src: Optional[str] = None
 
-        # Try providers in order, but only those likely to have history
         pref = []
         for p in providers:
             pl = (p or "").strip().lower()
-            if not pl:
-                continue
-            pref.append(pl)
+            if pl:
+                pref.append(pl)
 
-        # History function candidates
         fn_hist = [
             "fetch_price_history",
             "fetch_history",
@@ -909,7 +943,6 @@ class DataEngine:
             "fetch_prices",
         ]
 
-        # Map provider -> module
         provider_modules = {
             "eodhd": "core.providers.eodhd_provider",
             "yahoo_chart": "core.providers.yahoo_chart_provider",
@@ -924,27 +957,20 @@ class DataEngine:
             if not mod_name:
                 continue
             try:
-                # Some providers need api key; support finnhub
                 if p == "finnhub":
                     api_key = os.getenv("FINNHUB_API_KEY")
-                    patch, err = await _try_provider_call(mod_name, fn_hist, sym, api_key)
+                    patch, _ = await _try_provider_call(mod_name, fn_hist, sym, api_key)
                 else:
-                    patch, err = await _try_provider_call(mod_name, fn_hist, sym)
+                    patch, _ = await _try_provider_call(mod_name, fn_hist, sym)
 
-                payload = patch
-                # If provider returns direct "history" etc, extract
-                s = _extract_close_series(payload)
+                s = _extract_close_series(patch)
                 if s:
                     series = s
                     used_src = p
                     break
-
-                # If error only, continue
-                _ = err  # keep silent for history
             except Exception:
                 continue
 
-        # Store
         try:
             self._cache[cache_key] = {"series": series, "source": used_src}
         except Exception:
@@ -952,7 +978,9 @@ class DataEngine:
 
         return series, used_src
 
-    def _apply_history_analytics(self, out: Dict[str, Any], series: List[Tuple[int, float]], history_source: Optional[str]) -> None:
+    def _apply_history_analytics(
+        self, out: Dict[str, Any], series: List[Tuple[int, float]], history_source: Optional[str]
+    ) -> None:
         if not series:
             return
 
@@ -960,7 +988,6 @@ class DataEngine:
         if len(closes) < 30:
             return
 
-        # Use last close as "current_price" fallback if missing (best-effort)
         if _safe_float(out.get("current_price")) is None:
             out["current_price"] = closes[-1]
 
@@ -968,25 +995,20 @@ class DataEngine:
         out["history_source"] = history_source
         out["history_last_utc"] = _utc_iso()
 
-        # Returns
         out["returns_1w"] = _returns_from_history(closes, _TD_1W)
         out["returns_1m"] = _returns_from_history(closes, _TD_1M)
         out["returns_3m"] = _returns_from_history(closes, _TD_3M)
         out["returns_6m"] = _returns_from_history(closes, _TD_6M)
         out["returns_12m"] = _returns_from_history(closes, _TD_12M)
 
-        # MAs
         out["ma20"] = _sma(closes, 20)
         out["ma50"] = _sma(closes, 50)
         out["ma200"] = _sma(closes, 200)
 
-        # RSI
         out["rsi14"] = _rsi14(closes, 14)
 
-        # Volatility
         out["vol_30d_ann"] = _vol_ann_from_history(closes, 30)
 
-        # Expectations (drift-based)
         cur = _safe_float(out.get("current_price"))
         if cur is not None and cur > 0:
             er_1m = _drift_expected_return(closes, _TD_1M)
@@ -1003,14 +1025,13 @@ class DataEngine:
 
             out["forecast_method"] = "historical_drift_vol"
 
-        # Confidence
         out["confidence_score"] = _confidence_from(out)
 
     async def get_enriched_quote(self, symbol: str, *, enrich: bool = True) -> Dict[str, Any]:
         sym = normalize_symbol(symbol)
         if not sym:
             q = UnifiedQuote(symbol=str(symbol or ""), error="empty symbol").finalize()
-            out0 = q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__)
+            out0 = _model_to_dict(q)
             out0["status"] = "error"
             out0["data_quality"] = "BAD"
             return out0
@@ -1023,14 +1044,15 @@ class DataEngine:
         is_ksa = _is_ksa(sym)
         providers = self._providers_for(sym)
 
-        out: Dict[str, Any] = UnifiedQuote(
+        q0 = UnifiedQuote(
             symbol=sym,
             market="KSA" if is_ksa else "GLOBAL",
             last_updated_utc=_utc_iso(),
             error="",
             symbol_input=str(symbol or ""),
             symbol_normalized=sym,
-        ).model_dump()
+        )
+        out: Dict[str, Any] = _model_to_dict(q0)
 
         if not providers:
             out["status"] = "error"
@@ -1089,13 +1111,17 @@ class DataEngine:
                 )
 
             elif p == "eodhd":
-                fn_list = [
-                    "fetch_enriched_quote_patch",
-                    "fetch_quote_and_fundamentals_patch",
-                    "fetch_enriched_patch",
-                    "fetch_quote_patch",
-                    "fetch_quote",
-                ] if enrich else ["fetch_quote_patch", "fetch_quote"]
+                fn_list = (
+                    [
+                        "fetch_enriched_quote_patch",
+                        "fetch_quote_and_fundamentals_patch",
+                        "fetch_enriched_patch",
+                        "fetch_quote_patch",
+                        "fetch_quote",
+                    ]
+                    if enrich
+                    else ["fetch_quote_patch", "fetch_quote"]
+                )
                 patch, err = await _try_provider_call("core.providers.eodhd_provider", fn_list, sym)
 
             elif p == "fmp":
@@ -1130,7 +1156,6 @@ class DataEngine:
         try:
             has_price = _safe_float(out.get("current_price")) is not None
             needs_fund = enrich and has_price and _missing_key_fundamentals(out)
-
             allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
 
             if needs_fund and allow:
@@ -1141,20 +1166,24 @@ class DataEngine:
                 )
 
                 if patch2:
-                    clean = {k: patch2.get(k) for k in (
-                        "currency",
-                        "current_price",
-                        "market_cap",
-                        "shares_outstanding",
-                        "eps_ttm",
-                        "pe_ttm",
-                        "pb",
-                        "dividend_yield",
-                        "dividend_rate",
-                        "roe",
-                        "roa",
-                        "beta",
-                    ) if patch2.get(k) is not None}
+                    clean = {
+                        k: patch2.get(k)
+                        for k in (
+                            "currency",
+                            "current_price",
+                            "market_cap",
+                            "shares_outstanding",
+                            "eps_ttm",
+                            "pe_ttm",
+                            "pb",
+                            "dividend_yield",
+                            "dividend_rate",
+                            "roe",
+                            "roa",
+                            "beta",
+                        )
+                        if patch2.get(k) is not None
+                    }
 
                     if clean:
                         _merge_patch(out, clean)
@@ -1187,7 +1216,6 @@ class DataEngine:
         ms = float(out.get("momentum_score") or 50)
         rs = float(out.get("risk_score") or 35)
 
-        # Opportunity = your current formula, but slightly reward confidence if present
         conf = float(out.get("confidence_score") or 50)
         opp = (0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs)
         opp += 0.05 * (conf - 50.0)
@@ -1223,7 +1251,7 @@ class DataEngine:
         for i, r in enumerate(res):
             if isinstance(r, Exception):
                 q = UnifiedQuote(symbol=normalize_symbol(symbols[i]) or str(symbols[i] or ""), error=str(r)).finalize()
-                d = q.model_dump() if hasattr(q, "model_dump") else dict(q.__dict__)
+                d = _model_to_dict(q)
                 d["status"] = "error"
                 d["data_quality"] = "BAD"
                 out.append(d)
@@ -1267,3 +1295,16 @@ async def get_quote(symbol: str) -> Dict[str, Any]:
 
 async def get_quotes(symbols: List[str]) -> List[Dict[str, Any]]:
     return await get_enriched_quotes(symbols)
+
+
+__all__ = [
+    "ENGINE_VERSION",
+    "UnifiedQuote",
+    "normalize_symbol",
+    "DataEngine",
+    "get_engine",
+    "get_quote",
+    "get_quotes",
+    "get_enriched_quote",
+    "get_enriched_quotes",
+]
