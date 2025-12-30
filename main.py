@@ -2,14 +2,13 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.1
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.2
 
-v5.1.1 patch vs v5.1.0
-- ✅ Engine init now detects DataEngineV2 *or* DataEngine (fixes class-name mismatch).
-- ✅ Provider defaults include ENABLE_YAHOO_FUNDAMENTALS_GLOBAL (default false).
-- ✅ /system/settings env snapshot includes ENABLE_YAHOO_FUNDAMENTALS_GLOBAL.
-- ✅ Engine init clears engine_error if legacy fallback succeeds.
-- ✅ Still: never crashes startup; health endpoints always work; safe deferred boot.
+v5.1.2 patch vs v5.1.1
+- ✅ Adds /favicon.ico handler (returns 204) to stop browser 404 noise.
+- ✅ Adds /robots.txt handler (200) to stop crawler 404 noise.
+- ✅ Keeps: never crashes startup; health endpoints always work; safe deferred boot.
+- ✅ Keeps: Engine init detects DataEngineV2 *or* DataEngine; env snapshot safe (no tokens).
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 # ---------------------------------------------------------------------
 # Path safety (Render/uvicorn import)
@@ -42,7 +41,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.1.1"
+APP_ENTRY_VERSION = "5.1.2"
 
 
 def _truthy(v: Any) -> bool:
@@ -414,12 +413,14 @@ def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key:
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
     enabled, ksa = _providers_from_settings(settings, env_mod)
     # never leak tokens
-    token_mode = "open" if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN")) else "token"
+    token_mode = (
+        "open"
+        if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN"))
+        else "token"
+    )
     return {
         "APP_ENV": _resolve_env_name(settings, env_mod),
-        "LOG_LEVEL": str(
-            _get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")
-        ),
+        "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")),
         "LOG_FORMAT": LOG_FORMAT,
         "ENTRY_VERSION": APP_ENTRY_VERSION,
         "APP_VERSION_RESOLVED": _resolve_version(settings, env_mod),
@@ -562,7 +563,7 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
         if Engine is not None:
             app_.state.engine = Engine()
             app_.state.engine_ready = True
-            app_.state.engine_error = None  # ✅ clear error on success
+            app_.state.engine_error = None  # clear error on success
             logger.info("Engine initialized (legacy DataEngine).")
             return
     except Exception:
@@ -633,9 +634,7 @@ def create_app() -> FastAPI:
     env_mod = _load_env_module()
 
     # Prefer LOG_LEVEL from settings if possible
-    log_level = str(
-        _get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")
-    ).upper()
+    log_level = str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")).upper()
     _safe_set_root_log_level(log_level)
 
     title = _resolve_title(settings, env_mod)
@@ -673,11 +672,7 @@ def create_app() -> FastAPI:
         app_.state.required_routers = rr or required_default
 
         logger.info("Settings loaded from %s", app_.state.settings_source or "(none)")
-        logger.info(
-            "Fast boot: defer_router_mount=%s init_engine_on_boot=%s",
-            app_.state.defer_router_mount,
-            app_.state.init_engine_on_boot,
-        )
+        logger.info("Fast boot: defer_router_mount=%s init_engine_on_boot=%s", app_.state.defer_router_mount, app_.state.init_engine_on_boot)
 
         # Boot (deferred or immediate)
         if app_.state.defer_router_mount:
@@ -783,6 +778,16 @@ def create_app() -> FastAPI:
             "env": getattr(app_.state, "app_env", "unknown"),
             "entry_version": APP_ENTRY_VERSION,
         }
+
+    # ✅ v5.1.2: stop browser favicon 404 noise
+    @app_.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
+    async def favicon():
+        return Response(status_code=204)
+
+    # ✅ v5.1.2: stop crawler robots 404 noise
+    @app_.api_route("/robots.txt", methods=["GET", "HEAD"], include_in_schema=False)
+    async def robots():
+        return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
 
     @app_.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
     async def healthz():
