@@ -1,36 +1,39 @@
-```python
 # core/yahoo_chart_provider.py  (FULL REPLACEMENT)
 from __future__ import annotations
 
 """
 core/yahoo_chart_provider.py
 ===========================================================
-Yahoo Chart Provider (NO yfinance) — v1.4.0 (PROD SAFE)
+Yahoo Chart Provider (NO yfinance) — v1.5.0 (PROD SAFE)
 
-Purpose
-- Robust fallback for Yahoo price data (especially .SR) without yfinance.
-- Best-effort parse for: price, prev_close, open, high, low, volume, currency, exchange
-- Defensive JSON parsing (handles Yahoo "chart.error" responses)
-- Retry on 429 / 5xx with jittered backoff
-- Import-safe: no engine imports, no side effects.
+Phase-0 hygiene + hardening
+- ✅ Valid Python file (NO markdown fences)
+- ✅ Import-safe (no side effects, no engine imports)
+- ✅ Defensive parsing for Yahoo chart errors / partial payloads
+- ✅ Retries on 429 / 5xx with jittered exponential backoff
+- ✅ Adds timestamp fields (best effort) from Yahoo meta/timestamps
+- ✅ Optional batch helper with concurrency cap (non-breaking)
 
 Returns a dict compatible with a UnifiedQuote-like shape (best effort):
   symbol, market, currency,
   current_price, previous_close, open, day_high, day_low, volume,
   price_change, percent_change,
   exchange,
-  data_source, data_quality, last_updated_utc, last_updated_riyadh, error
+  data_source, provider_version, data_quality,
+  last_trade_time_utc,
+  last_updated_utc, last_updated_riyadh,
+  http_status, error
 """
 
 import asyncio
 import json
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 
-PROVIDER_VERSION = "1.4.0"
+PROVIDER_VERSION = "1.5.0"
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
@@ -44,14 +47,34 @@ USER_AGENT = (
 RIYADH_TZ = timezone(timedelta(hours=3))
 
 
+# -----------------------------------------------------------------------------
+# Time helpers
+# -----------------------------------------------------------------------------
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _now_utc().isoformat()
 
 
 def _now_riyadh_iso() -> str:
     return datetime.now(RIYADH_TZ).isoformat()
 
 
+def _dt_from_epoch_utc(epoch_seconds: Any) -> Optional[datetime]:
+    try:
+        v = _safe_float(epoch_seconds)
+        if v is None:
+            return None
+        return datetime.fromtimestamp(float(v), tz=timezone.utc)
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------------
+# Safe parsers
+# -----------------------------------------------------------------------------
 def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -85,17 +108,33 @@ def _safe_int(x: Any) -> Optional[int]:
         return None
 
 
-def _last_non_none(series: Any) -> Optional[float]:
+def _get0(lst: Any) -> Dict[str, Any]:
+    if isinstance(lst, list) and lst:
+        x = lst[0]
+        return x if isinstance(x, dict) else {}
+    return {}
+
+
+def _last_valid_from_series(series: Any, timestamps: Any = None) -> Tuple[Optional[float], Optional[datetime]]:
+    """
+    Returns (last_value, last_timestamp_utc) scanning from end.
+    timestamps is optional list aligned with series.
+    """
     try:
         if not isinstance(series, list):
-            return None
+            return None, None
+        ts = timestamps if isinstance(timestamps, list) else None
         for i in range(len(series) - 1, -1, -1):
             v = _safe_float(series[i])
-            if v is not None:
-                return v
+            if v is None:
+                continue
+            dt = None
+            if ts is not None and i < len(ts):
+                dt = _dt_from_epoch_utc(ts[i])
+            return v, dt
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
 
 
 def _prev_from_series(series: Any) -> Optional[float]:
@@ -120,6 +159,9 @@ def _prev_from_series(series: Any) -> Optional[float]:
     return None
 
 
+# -----------------------------------------------------------------------------
+# Symbol normalization
+# -----------------------------------------------------------------------------
 def _yahoo_symbol(symbol: str) -> str:
     """
     Yahoo chart endpoint prefers:
@@ -146,10 +188,12 @@ def _default_currency_for(sym: str) -> Optional[str]:
     return "SAR" if (sym or "").upper().endswith(".SR") else None
 
 
+# -----------------------------------------------------------------------------
+# Output helpers
+# -----------------------------------------------------------------------------
 def _dq_from(price: Optional[float], prev: Optional[float], high: Optional[float], low: Optional[float]) -> str:
     if price is None:
         return "MISSING"
-    # FULL means we have core OHLC-ish + prev close
     if prev is not None and high is not None and low is not None:
         return "FULL"
     return "PARTIAL"
@@ -163,8 +207,10 @@ def _base_result(sym: str) -> Dict[str, Any]:
         "data_source": "yahoo_chart",
         "provider_version": PROVIDER_VERSION,
         "data_quality": "MISSING",
+        "last_trade_time_utc": None,
         "last_updated_utc": _now_utc_iso(),
         "last_updated_riyadh": _now_riyadh_iso(),
+        "http_status": None,
         "error": None,
     }
 
@@ -175,7 +221,6 @@ def _extract_chart_error(data: Dict[str, Any]) -> Optional[str]:
         err = chart.get("error")
         if not err:
             return None
-        # Yahoo returns {code, description}
         code = (err.get("code") or "").strip()
         desc = (err.get("description") or "").strip()
         if code and desc:
@@ -185,19 +230,15 @@ def _extract_chart_error(data: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def _get0(lst: Any) -> Dict[str, Any]:
-    if isinstance(lst, list) and lst:
-        x = lst[0]
-        return x if isinstance(x, dict) else {}
-    return {}
-
-
 async def _sleep_backoff(attempt: int) -> None:
     # jittered exponential backoff, capped
     base = 0.25 * (2**attempt)
     await asyncio.sleep(min(2.5, base + random.random() * 0.35))
 
 
+# -----------------------------------------------------------------------------
+# Public: single quote
+# -----------------------------------------------------------------------------
 async def yahoo_chart_quote(
     symbol: str,
     *,
@@ -215,7 +256,10 @@ async def yahoo_chart_quote(
       current_price, previous_close, open, day_high, day_low, volume,
       price_change, percent_change,
       exchange,
-      data_source, data_quality, last_updated_utc, last_updated_riyadh, error
+      data_source, provider_version, data_quality,
+      last_trade_time_utc,
+      last_updated_utc, last_updated_riyadh,
+      http_status, error
     """
     raw = (symbol or "").strip()
     if not raw:
@@ -223,7 +267,7 @@ async def yahoo_chart_quote(
         out.update({"data_quality": "MISSING", "error": "Empty symbol"})
         return out
 
-    sym = raw.strip().upper()
+    sym = raw.upper()
     ysym = _yahoo_symbol(sym)
 
     url = YAHOO_CHART_URL.format(symbol=ysym)
@@ -231,6 +275,7 @@ async def yahoo_chart_quote(
         "interval": interval,
         "range": range_,
         "includePrePost": "false",
+        "events": "div,splits",
     }
 
     close_client = False
@@ -256,9 +301,10 @@ async def yahoo_chart_quote(
         for attempt in range(attempts):
             try:
                 r = await client.get(url, params=params)
+                http_status = r.status_code
 
                 # Retry on 429/5xx
-                if r.status_code == 429 or (500 <= r.status_code < 600):
+                if http_status == 429 or (500 <= http_status < 600):
                     if attempt < attempts - 1:
                         ra = r.headers.get("Retry-After")
                         if ra and ra.strip().isdigit():
@@ -270,7 +316,7 @@ async def yahoo_chart_quote(
 
                 r.raise_for_status()
 
-                # Robust JSON parse (handle non-json bodies)
+                # Robust JSON parse
                 data: Union[Dict[str, Any], List[Any]]
                 try:
                     data = r.json() or {}
@@ -283,25 +329,24 @@ async def yahoo_chart_quote(
 
                 if not isinstance(data, dict) or not data:
                     out = _base_result(sym)
-                    out.update({"error": "yahoo_chart empty response", "data_quality": "MISSING"})
+                    out.update({"http_status": http_status, "error": "yahoo_chart empty response", "data_quality": "MISSING"})
                     return out
 
-                # Handle Yahoo explicit error
                 cerr = _extract_chart_error(data)
                 if cerr:
                     out = _base_result(sym)
-                    out.update({"error": f"yahoo_chart: {cerr}", "data_quality": "MISSING"})
+                    out.update({"http_status": http_status, "error": f"yahoo_chart: {cerr}", "data_quality": "MISSING"})
                     return out
 
                 chart = data.get("chart") or {}
                 result0 = _get0(chart.get("result"))
-
                 if not result0:
                     out = _base_result(sym)
-                    out.update({"error": "yahoo_chart missing result", "data_quality": "MISSING"})
+                    out.update({"http_status": http_status, "error": "yahoo_chart missing result", "data_quality": "MISSING"})
                     return out
 
                 meta = result0.get("meta") or {}
+                timestamps = result0.get("timestamp") or []
 
                 indicators = (result0.get("indicators") or {}).get("quote")
                 quote0 = _get0(indicators) if indicators is not None else {}
@@ -313,7 +358,11 @@ async def yahoo_chart_quote(
                 vol_series = quote0.get("volume") or []
 
                 # Prefer meta fields when available (more accurate intraday)
-                price = _safe_float(meta.get("regularMarketPrice")) or _last_non_none(close_series)
+                price = _safe_float(meta.get("regularMarketPrice"))
+                if price is None:
+                    price, dt_price = _last_valid_from_series(close_series, timestamps)
+                else:
+                    dt_price = _dt_from_epoch_utc(meta.get("regularMarketTime"))
 
                 prev_close = (
                     _safe_float(meta.get("previousClose"))
@@ -322,20 +371,39 @@ async def yahoo_chart_quote(
                     or _prev_from_series(close_series)
                 )
 
-                opn = _safe_float(meta.get("regularMarketOpen")) or _last_non_none(open_series)
-                hi = _safe_float(meta.get("regularMarketDayHigh")) or _last_non_none(high_series)
-                lo = _safe_float(meta.get("regularMarketDayLow")) or _last_non_none(low_series)
+                opn = _safe_float(meta.get("regularMarketOpen"))
+                if opn is None:
+                    opn, _ = _last_valid_from_series(open_series, timestamps)
 
-                vol = _safe_float(meta.get("regularMarketVolume")) or _last_non_none(vol_series)
+                hi = _safe_float(meta.get("regularMarketDayHigh"))
+                if hi is None:
+                    hi, _ = _last_valid_from_series(high_series, timestamps)
+
+                lo = _safe_float(meta.get("regularMarketDayLow"))
+                if lo is None:
+                    lo, _ = _last_valid_from_series(low_series, timestamps)
+
+                vol = _safe_float(meta.get("regularMarketVolume"))
+                if vol is None:
+                    vol_val, _ = _last_valid_from_series(vol_series, timestamps)
+                    vol = vol_val
 
                 currency = meta.get("currency") or _default_currency_for(sym)
                 exchange = meta.get("exchangeName") or meta.get("fullExchangeName") or meta.get("exchange")
 
-                chg = None
-                pct = None
-                if price is not None and prev_close not in (None, 0):
-                    chg = price - float(prev_close)
-                    pct = (chg / float(prev_close)) * 100.0
+                # Change & % change
+                chg = _safe_float(meta.get("regularMarketChange"))
+                pct = _safe_float(meta.get("regularMarketChangePercent"))
+
+                # If pct from meta looks like fraction (0.01), convert to percent; if already percent (>1.5), keep.
+                if pct is not None and abs(pct) <= 1.5:
+                    pct = pct * 100.0
+
+                # Compute if missing
+                if chg is None or pct is None:
+                    if price is not None and prev_close not in (None, 0):
+                        chg = price - float(prev_close)
+                        pct = (chg / float(prev_close)) * 100.0
 
                 dq = _dq_from(price, prev_close, hi, lo)
 
@@ -354,9 +422,10 @@ async def yahoo_chart_quote(
                         "percent_change": pct,
                         "exchange": exchange,
                         "data_quality": dq,
+                        "http_status": http_status,
                         "error": None if dq != "MISSING" else "Yahoo chart returned no price",
-                        # helpful debug fields (harmless if ignored)
                         "symbol_yahoo": ysym,
+                        "last_trade_time_utc": dt_price.isoformat() if isinstance(dt_price, datetime) else None,
                     }
                 )
                 return out
@@ -379,5 +448,57 @@ async def yahoo_chart_quote(
                 pass
 
 
-__all__ = ["yahoo_chart_quote", "YAHOO_CHART_URL", "PROVIDER_VERSION"]
-```
+# -----------------------------------------------------------------------------
+# Optional: batch helper (non-breaking)
+# -----------------------------------------------------------------------------
+async def yahoo_chart_quotes(
+    symbols: List[str],
+    *,
+    timeout: float = 12.0,
+    interval: str = "1d",
+    range_: str = "5d",
+    retry_attempts: int = 3,
+    concurrency: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch multiple symbols with a shared AsyncClient + concurrency cap.
+    Useful for batch endpoints or internal scans.
+    """
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async with httpx.AsyncClient(
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
+            "Referer": "https://finance.yahoo.com/",
+            "Connection": "keep-alive",
+        },
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout),
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    ) as client:
+
+        async def _one(sym: str) -> Dict[str, Any]:
+            async with sem:
+                return await yahoo_chart_quote(
+                    sym,
+                    timeout=timeout,
+                    client=client,
+                    interval=interval,
+                    range_=range_,
+                    retry_attempts=retry_attempts,
+                )
+
+        tasks = [asyncio.create_task(_one(s)) for s in (symbols or [])]
+        if not tasks:
+            return []
+        return await asyncio.gather(*tasks)
+
+
+__all__ = [
+    "yahoo_chart_quote",
+    "yahoo_chart_quotes",
+    "YAHOO_CHART_URL",
+    "PROVIDER_VERSION",
+]
