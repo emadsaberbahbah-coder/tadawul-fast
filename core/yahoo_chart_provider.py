@@ -2,18 +2,23 @@
 """
 core/yahoo_chart_provider.py
 ===========================================================
-Compatibility SHIM (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.2.0 (PROD SAFE)
 
-Why this exists
-- Some modules historically imported: `core.yahoo_chart_provider`
-- The real implementation should live in: `core.providers.yahoo_chart_provider`
-- This file must NEVER contain Markdown fences or heavy side effects.
+Problem this fixes
+- This file previously contained Markdown fences (```python) which makes it INVALID Python.
+- Even if the engine uses `core.providers.yahoo_chart_provider`, an invalid file here is a
+  "time bomb" if anything imports `core.yahoo_chart_provider` later.
 
-Behavior
-- Re-exports the real provider if available
-- If import fails, returns a safe MISSING payload (never crashes importers)
+Solution
+- Keep ONE canonical implementation:
+    core/providers/yahoo_chart_provider.py
+- This module becomes a small, import-safe re-export shim.
 
-(v1.0.0) — Repo Hygiene Fix
+Exports preserved (best-effort)
+- YahooChartProvider
+- fetch_quote / get_quote / get_quote_patch
+- yahoo_chart_quote (alias to get_quote for backward compatibility)
+- PROVIDER_VERSION
 """
 
 from __future__ import annotations
@@ -23,46 +28,53 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("yahoo_chart_provider_shim")
 
-SHIM_VERSION = "1.0.0"
+SHIM_VERSION = "0.2.0"
 
-# Default constant (used only if the real provider cannot be imported)
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-PROVIDER_VERSION = "missing"
-
-_IMPORT_ERROR: Optional[str] = None
+# Backward-compat constant (not necessarily used by canonical provider)
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
 try:
-    # ✅ Canonical provider location
+    # ✅ Canonical provider
     from core.providers.yahoo_chart_provider import (  # type: ignore
-        yahoo_chart_quote,
-        YAHOO_CHART_URL as _REAL_YAHOO_CHART_URL,
-        PROVIDER_VERSION as _REAL_PROVIDER_VERSION,
+        YahooChartProvider,
+        fetch_quote,
+        get_quote,
+        get_quote_patch,
+        PROVIDER_VERSION,
     )
 
-    # Re-export canonical constants
-    YAHOO_CHART_URL = _REAL_YAHOO_CHART_URL
-    PROVIDER_VERSION = _REAL_PROVIDER_VERSION
+    # Backward compatible alias (older code may call yahoo_chart_quote)
+    async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await get_quote(symbol, *args, **kwargs)
 
 except Exception as e:  # pragma: no cover
-    _IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    PROVIDER_VERSION = "fallback"
 
-    async def yahoo_chart_quote(  # type: ignore
-        symbol: str,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        sym = (symbol or "").strip().upper()
-        market = "KSA" if sym.endswith(".SR") else "GLOBAL"
-        currency = "SAR" if sym.endswith(".SR") else None
-        return {
-            "symbol": sym,
-            "market": market,
-            "currency": currency,
-            "data_source": "yahoo_chart",
-            "provider_version": PROVIDER_VERSION,
-            "data_quality": "MISSING",
-            "error": f"yahoo_chart provider import failed: {_IMPORT_ERROR}",
-        }
+    class YahooChartProvider:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._error = str(e)
 
+        async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return {"status": "error", "data_source": "yahoo_chart", "data_quality": "MISSING", "error": self._error}
 
-__all__ = ["yahoo_chart_quote", "YAHOO_CHART_URL", "PROVIDER_VERSION", "SHIM_VERSION"]
+    async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"status": "error", "data_source": "yahoo_chart", "data_quality": "MISSING", "error": str(e)}
+
+    async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await fetch_quote(symbol, *args, **kwargs)
+
+    async def get_quote_patch(symbol: str, base: Optional[Dict[str, Any]] = None, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"status": "error", "data_source": "yahoo_chart", "data_quality": "MISSING", "error": str(e)}
+
+    async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await get_quote(symbol, *args, **kwargs)
+
+__all__ = [
+    "YAHOO_CHART_URL",
+    "PROVIDER_VERSION",
+    "YahooChartProvider",
+    "fetch_quote",
+    "get_quote",
+    "get_quote_patch",
+    "yahoo_chart_quote",
+]
