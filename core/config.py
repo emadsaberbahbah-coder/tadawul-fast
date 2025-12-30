@@ -2,7 +2,7 @@
 """
 core/config.py
 ------------------------------------------------------------
-Compatibility shim (PROD SAFE) – v1.7.0 (RENDER-ENV LOCKED)
+Compatibility shim (PROD SAFE) – v1.7.1 (RENDER-ENV LOCKED)
 
 Many modules import settings via:
   from core.config import Settings, get_settings
@@ -38,7 +38,6 @@ import os
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-
 # =============================================================================
 # Try importing root config.py (preferred)
 # =============================================================================
@@ -53,7 +52,6 @@ try:
 except Exception:
     _root_Settings = None
     _root_get_settings = None
-
 
 # =============================================================================
 # Helpers (fallback-safe, no heavy imports)
@@ -242,7 +240,7 @@ def _apply_runtime_env_aliases_from_render(s: Any) -> None:
     _export_env_if_missing("EODHD_API_TOKEN", eodhd)
     _export_env_if_missing("EODHD_TOKEN", eodhd)
 
-    # Keep common alt names consistent for older scripts
+    # Common timeout aliases used by mixed legacy code
     http_timeout = getattr(s, "http_timeout", None) or _env_first(["HTTP_TIMEOUT"], None)
     retry_delay = getattr(s, "retry_delay", None) or _env_first(["RETRY_DELAY"], None)
     if http_timeout is not None:
@@ -258,8 +256,13 @@ Settings = None  # type: ignore
 get_settings = None  # type: ignore
 
 if _root_Settings is not None:
-    # Build a lightweight compat subclass to expose legacy attribute/property names
+
     class Settings(_root_Settings):  # type: ignore
+        """
+        Compat Settings wrapper around repo-root Settings.
+        Adds legacy properties used across older modules.
+        """
+
         # --- Common legacy names used across older modules ---
         @property
         def app_name(self) -> str:
@@ -288,12 +291,10 @@ if _root_Settings is not None:
         @property
         def enabled_providers(self) -> List[str]:
             # Prefer root's computed property if present
-            v = getattr(super(), "enabled_providers", None)  # type: ignore
             try:
-                if callable(v):
-                    out = v()
-                    if isinstance(out, list) and out:
-                        return [str(x).strip().lower() for x in out if str(x).strip()]
+                v = getattr(super(), "enabled_providers")  # type: ignore[misc]
+                if isinstance(v, list) and v:
+                    return [str(x).strip().lower() for x in v if str(x).strip()]
             except Exception:
                 pass
 
@@ -303,12 +304,10 @@ if _root_Settings is not None:
 
         @property
         def ksa_providers(self) -> List[str]:
-            v = getattr(super(), "ksa_providers", None)  # type: ignore
             try:
-                if callable(v):
-                    out = v()
-                    if isinstance(out, list) and out:
-                        return [str(x).strip().lower() for x in out if str(x).strip()]
+                v = getattr(super(), "ksa_providers")  # type: ignore[misc]
+                if isinstance(v, list) and v:
+                    return [str(x).strip().lower() for x in v if str(x).strip()]
             except Exception:
                 pass
 
@@ -319,13 +318,13 @@ if _root_Settings is not None:
         # --- token-style properties (some code expects *_api_token) ---
         @property
         def eodhd_api_token(self) -> Optional[str]:
-            v = getattr(self, "eodhd_api_key", None) or getattr(super(), "eodhd_api_token", None)  # type: ignore
+            v = getattr(self, "eodhd_api_key", None) or getattr(super(), "eodhd_api_token", None)  # type: ignore[attr-defined]
             v = v or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
             return (str(v).strip() if v else None)
 
         @property
         def finnhub_api_token(self) -> Optional[str]:
-            v = getattr(self, "finnhub_api_key", None) or getattr(super(), "finnhub_api_token", None)  # type: ignore
+            v = getattr(self, "finnhub_api_key", None) or getattr(super(), "finnhub_api_token", None)  # type: ignore[attr-defined]
             v = v or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
             return (str(v).strip() if v else None)
 
@@ -379,23 +378,22 @@ if _root_Settings is not None:
     def get_settings() -> Any:  # type: ignore
         # Use root get_settings if available; otherwise instantiate
         if callable(_root_get_settings):
-            s0 = _root_get_settings()  # type: ignore
+            s0 = _root_get_settings()  # type: ignore[misc]
         else:
-            s0 = Settings()  # type: ignore
+            s0 = Settings()  # type: ignore[call-arg]
 
-        # Convert to our compat class without mutating root instance (avoids Pydantic extra-attr issues)
+        # Convert to our compat class without mutating root instance
         if isinstance(s0, Settings):
             s = s0
         else:
             data = _to_mapping(s0)
             try:
-                s = Settings(**data)  # type: ignore
+                s = Settings(**data)  # type: ignore[arg-type]
             except Exception:
-                s = Settings()  # type: ignore
+                s = Settings()  # type: ignore[call-arg]
 
         # Runtime env alias export for providers
         _apply_runtime_env_aliases_from_render(s)
-
         return s
 
 
@@ -418,7 +416,10 @@ if Settings is None or get_settings is None:
 
             self.debug: bool = _to_bool(_env_str("DEBUG", "false"), False)
             self.log_level: str = (_env_first(["LOG_LEVEL"], "info") or "info").lower()
-            self.log_format: str = _env_first(["LOG_FORMAT"], "%(asctime)s | %(levelname)s | %(name)s | %(message)s") or "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+            self.log_format: str = _env_first(
+                ["LOG_FORMAT"],
+                "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            ) or "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
             # Auth
             self.require_auth: bool = _to_bool(_env_str("REQUIRE_AUTH", "false"), False)
@@ -466,6 +467,8 @@ if Settings is None or get_settings is None:
             # Feature flags
             self.advanced_analysis_enabled: bool = _to_bool(_env_first(["ADVANCED_ANALYSIS_ENABLED"], "true"), True)
             self.tadawul_market_enabled: bool = _to_bool(_env_first(["TADAWUL_MARKET_ENABLED"], "true"), True)
+            self.enable_swagger: bool = _to_bool(_env_first(["ENABLE_SWAGGER"], "true"), True)
+            self.enable_redoc: bool = _to_bool(_env_first(["ENABLE_REDOC"], "true"), True)
 
         # Legacy names
         @property
