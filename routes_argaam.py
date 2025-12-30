@@ -1,13 +1,16 @@
-# routes_argaam.py
+# routes_argaam.py  (FULL REPLACEMENT)
 """
 routes_argaam.py (repo root shim)
 ===============================================================
-Argaam Router Shim – v1.5.1 (PROD SAFE + QUIET BOOT + AUTH-COMPAT)
+Argaam Router Shim – v1.5.2 (PROD SAFE + QUIET BOOT + AUTH-COMPAT)
 
-This module MUST be valid Python. Do NOT include Markdown fences (```).
+IMPORTANT
+- This module MUST be valid Python.
+- Do NOT include Markdown code fences (three backticks) anywhere in this file,
+  even inside docstrings/comments, because repo_hygiene_check blocks deploys.
 
 Purpose
-- Backward compatibility for imports: `import routes_argaam; routes_argaam.router`
+- Backward compatibility for imports: import routes_argaam; routes_argaam.router
 - Prefer real router modules if present (in order):
     1) routes.routes_argaam
     2) core.routes_argaam
@@ -35,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("routes.argaam_shim")
 
-SHIM_VERSION = "1.5.1"
+SHIM_VERSION = "1.5.2"
 
 DEFAULT_DELEGATES = ("routes.routes_argaam", "core.routes_argaam")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -192,7 +195,7 @@ else:
             "data_source": "argaam_shim_fallback",
             "error": _clamp(
                 _delegate_error
-                or "Delegate router import failed. Ensure routes/routes_argaam.py exists and exports `router` (or `get_router()`)."
+                or "Delegate router import failed. Ensure routes/routes_argaam.py exists and exports router (or get_router())."
             ),
             "shim_version": SHIM_VERSION,
             "delegate_module": DELEGATE_MODULE,
@@ -229,7 +232,7 @@ else:
             out["debug"] = {
                 "token_provided": bool((token or "").strip()),
                 "delegate_modules_tried": list(_delegate_list()),
-                "hint": "Create routes/routes_argaam.py exporting `router` (or `get_router()`).",
+                "hint": "Create routes/routes_argaam.py exporting router (or get_router()).",
                 "env": {
                     "REQUIRE_AUTH": os.getenv("REQUIRE_AUTH", ""),
                     "APP_TOKEN_SET": bool((os.getenv("APP_TOKEN") or "").strip()),
