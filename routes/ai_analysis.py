@@ -1,24 +1,21 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.7.3) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.8.0) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
 - PROD SAFE: DO NOT import core.data_engine_v2 at module import-time.
 - Defensive batching: chunking + timeout + bounded concurrency.
 - Sheets-safe: /sheet-rows ALWAYS returns HTTP 200 with {headers, rows, status}.
-- Canonical headers: core.schemas.get_headers_for_sheet (59 columns) when available.
+- Canonical headers: core.schemas.get_headers_for_sheet (when available); fallback default.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 
-Compatible with engines returning:
-- list[dict|model] OR dict[symbol->dict|model] OR (payload, err)
-
-v3.7.3 notes
-- ✅ No module-import crash if core.data_engine_v2 has syntax/import errors
-- ✅ 52W mapping aligned to DataEngineV2 keys: week_52_high/week_52_low
-- ✅ Placeholder rows do not depend on UnifiedQuote existing
-- ✅ /health reports engine_version/providers when available
+v3.8.0 upgrades (future expectation + efficiency)
+- ✅ Maps new DataEngine fields when present (returns, RSI14, vol_30d_ann, expected_price/return, confidence_score).
+- ✅ Computes Fair Value / Upside / Valuation Label / Recommendation if missing.
+- ✅ Computes Overall Score if missing (uses opportunity/value/quality/momentum/risk + confidence).
+- ✅ Keeps strict stability: never requires those fields; everything is optional/best-effort.
 """
 
 from __future__ import annotations
@@ -36,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.7.3"
+AI_ANALYSIS_VERSION = "3.8.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -46,12 +43,13 @@ router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 try:
     from core.config import get_settings  # type: ignore
 except Exception:  # pragma: no cover
+
     def get_settings():  # type: ignore
         return None
 
 
 # =============================================================================
-# Canonical headers (59 cols) when available
+# Canonical headers (when available)
 # =============================================================================
 try:
     from core.schemas import get_headers_for_sheet  # type: ignore
@@ -78,6 +76,7 @@ def _fallback_normalize(raw: str) -> str:
         return s
     if "." in s:
         return s
+    # default: assume US
     return f"{s}.US"
 
 
@@ -90,6 +89,7 @@ def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
         from core.data_engine_v2 import DataEngine as _DE  # type: ignore
         from core.data_engine_v2 import UnifiedQuote as _UQ  # type: ignore
         from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
+
         return _DE, _UQ, _NS
     except Exception:
         return None, None, _fallback_normalize
@@ -142,6 +142,7 @@ def _allowed_tokens() -> List[str]:
     # 2) env.settings
     try:
         from env import settings as env_settings  # type: ignore
+
         for attr in ("app_token", "backup_app_token"):
             v = _read_token_attr(env_settings, attr)
             if v:
@@ -337,6 +338,27 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     roe: Optional[float] = None
     roa: Optional[float] = None
 
+    # History / expectations (optional, future-ready)
+    returns_1w: Optional[float] = None
+    returns_1m: Optional[float] = None
+    returns_3m: Optional[float] = None
+    returns_6m: Optional[float] = None
+    returns_12m: Optional[float] = None
+    rsi14: Optional[float] = None
+    vol_30d_ann: Optional[float] = None
+    ma20: Optional[float] = None
+    ma50: Optional[float] = None
+    ma200: Optional[float] = None
+
+    expected_return_1m: Optional[float] = None
+    expected_return_3m: Optional[float] = None
+    expected_return_12m: Optional[float] = None
+    expected_price_1m: Optional[float] = None
+    expected_price_3m: Optional[float] = None
+    expected_price_12m: Optional[float] = None
+    confidence_score: Optional[int] = None
+    forecast_method: Optional[str] = None
+
     data_quality: str = "MISSING"
 
     value_score: Optional[float] = None
@@ -486,6 +508,19 @@ def _ratio_to_percent(v: Any) -> Any:
         return v
 
 
+def _vol_to_percent(v: Any) -> Any:
+    """
+    Volatility might come as ratio (0.25) or percent (25).
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return f * 100.0 if 0.0 <= f <= 1.0 else f
+    except Exception:
+        return v
+
+
 def _hkey(h: str) -> str:
     s = str(h or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
@@ -509,6 +544,7 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
+
         tz = ZoneInfo("Asia/Riyadh")
         if isinstance(utc_any, datetime):
             dt = utc_any
@@ -521,7 +557,118 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
 
 
-# ---- Canonical 59 headers fallback (matches core.schemas.DEFAULT_HEADERS_59)
+def _safe_float_or_none(x: Any) -> Optional[float]:
+    try:
+        if x is None or x == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Fair value priority:
+      1) expected_price_3m
+      2) expected_price_12m
+      3) ma200
+      4) ma50
+    Upside% = (fair/price - 1)*100
+    Valuation label from upside thresholds.
+    """
+    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
+    if price is None or price <= 0:
+        return None, None, None
+
+    fair = _safe_float_or_none(_safe_get(uq, "fair_value"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "expected_price_3m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "expected_price_12m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "ma200"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "ma50"))
+
+    if fair is None or fair <= 0:
+        return None, None, None
+
+    upside = (fair / price - 1.0) * 100.0
+    label = "Fairly Valued"
+    if upside >= 15:
+        label = "Undervalued"
+    elif upside <= -15:
+        label = "Overvalued"
+
+    return fair, round(upside, 2), label
+
+
+def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    """
+    Overall score in 0..100 (best-effort):
+      - Start with opportunity_score if present
+      - Blend value/quality/momentum
+      - Penalize risk_score
+      - Add small confidence bump
+    Recommendation derived from overall + risk.
+    confidence returned as 0..1 if possible.
+    """
+    opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
+    val = _safe_float_or_none(_safe_get(uq, "value_score"))
+    qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
+    mom = _safe_float_or_none(_safe_get(uq, "momentum_score"))
+    risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
+    conf_score = _safe_float_or_none(_safe_get(uq, "confidence_score"))
+    if conf_score is None:
+        conf_score = _safe_float_or_none(_safe_get(uq, "confidence"))  # sometimes already 0..1/0..100
+
+    # normalize confidence (try)
+    conf01: Optional[float] = None
+    if conf_score is not None:
+        if 0.0 <= conf_score <= 1.0:
+            conf01 = conf_score
+            conf_score = conf_score * 100.0
+        elif 1.0 < conf_score <= 100.0:
+            conf01 = conf_score / 100.0
+
+    parts: List[float] = []
+    if opp is not None:
+        parts.append(0.45 * opp)
+    if val is not None:
+        parts.append(0.20 * val)
+    if qual is not None:
+        parts.append(0.20 * qual)
+    if mom is not None:
+        parts.append(0.15 * mom)
+
+    if not parts:
+        return None, None, conf01
+
+    score = sum(parts)
+    if risk is not None:
+        score -= 0.15 * risk
+    if conf_score is not None:
+        score += 0.05 * (conf_score - 50.0)
+
+    score = max(0.0, min(100.0, score))
+
+    reco = "Hold"
+    # Risk-aware thresholds
+    if score >= 80:
+        reco = "Strong Buy" if (risk is None or risk <= 55) else "Buy"
+    elif score >= 65:
+        reco = "Buy" if (risk is None or risk <= 70) else "Hold"
+    elif score >= 50:
+        reco = "Hold"
+    elif score >= 35:
+        reco = "Sell"
+    else:
+        reco = "Strong Sell"
+
+    return round(score, 2), reco, conf01
+
+
+# ---- Canonical headers fallback (59 columns)
 _DEFAULT_HEADERS_59: List[str] = [
     "Symbol",
     "Company Name",
@@ -589,7 +736,7 @@ def _select_headers(sheet_name: Optional[str]) -> List[str]:
     if get_headers_for_sheet:
         try:
             h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and len(h) == 59 and any(str(x).strip().lower() == "symbol" for x in h):
+            if isinstance(h, list) and len(h) >= 10:
                 return [str(x) for x in h]
         except Exception:
             pass
@@ -649,7 +796,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "percent change": (("percent_change", "change_percent", "change_pct"), None),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
-    # ✅ align to V2 keys
+    # ✅ align to DataEngineV2 keys
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
@@ -679,10 +826,12 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
     "beta": (("beta",), None),
-    "volatility (30d)": (("volatility_30d",), _ratio_to_percent),
-    "rsi (14)": (("rsi_14",), None),
-    "fair value": (("fair_value",), None),
-    "upside %": (("upside_percent",), _ratio_to_percent),
+    # ✅ new volatility / RSI names supported
+    "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
+    "rsi (14)": (("rsi14", "rsi_14"), None),
+    # computed if missing
+    "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
+    "upside %": (("upside_percent",), None),
     "valuation label": (("valuation_label",), None),
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
@@ -702,6 +851,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
 def _value_for_header(header: str, uq: Any) -> Any:
     hk = _hkey(header)
 
+    # 52W Position computed if missing
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
@@ -710,6 +860,31 @@ def _value_for_header(header: str, uq: Any) -> Any:
         lo = _safe_get(uq, "week_52_low", "low_52w")
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
+
+    # Fair value / upside / valuation label computed if missing
+    if hk in ("fair value", "upside %", "valuation label", "recommendation", "overall score"):
+        fair, upside, label = _compute_fair_value_and_upside(uq)
+        overall, reco, conf01 = _compute_overall_and_reco(uq)
+
+        if hk == "fair value":
+            v = _safe_get(uq, "fair_value")
+            return v if v is not None else fair
+
+        if hk == "upside %":
+            v = _safe_get(uq, "upside_percent")
+            return v if v is not None else upside
+
+        if hk == "valuation label":
+            v = _safe_get(uq, "valuation_label")
+            return v if v is not None else label
+
+        if hk == "overall score":
+            v = _safe_get(uq, "overall_score")
+            return v if v is not None else overall
+
+        if hk == "recommendation":
+            v = _safe_get(uq, "recommendation")
+            return v if v is not None else reco
 
     spec = _HEADER_MAP.get(hk)
     if spec:
@@ -722,6 +897,7 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 return val
         return val
 
+    # fallback: snake-case guess
     guess = _snake_guess(header)
     val = _safe_get(uq, guess)
     if val is not None:
@@ -884,9 +1060,10 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
-    # best-effort scoring enrichment (optional)
+    # optional external scoring enrichment (never required)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
+
         uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
@@ -898,6 +1075,18 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
 
     last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
     last_utc_iso = _iso_or_none(last_utc)
+
+    fair, upside, val_label = _compute_fair_value_and_upside(uq)
+    overall, reco, conf01 = _compute_overall_and_reco(uq)
+
+    # Prefer engine-provided if present
+    fair2 = _safe_get(uq, "fair_value")
+    upside2 = _safe_get(uq, "upside_percent")
+    val_label2 = _safe_get(uq, "valuation_label")
+    reco2 = _safe_get(uq, "recommendation")
+    overall2 = _safe_get(uq, "overall_score")
+    conf_score = _safe_get(uq, "confidence_score")
+    forecast_method = _safe_get(uq, "forecast_method")
 
     return SingleAnalysisResponse(
         symbol=sym,
@@ -911,18 +1100,37 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         dividend_yield=_ratio_to_percent(_safe_get(uq, "dividend_yield")),
         roe=_ratio_to_percent(_safe_get(uq, "roe")),
         roa=_ratio_to_percent(_safe_get(uq, "roa")),
+        # history / expectations
+        returns_1w=_safe_get(uq, "returns_1w"),
+        returns_1m=_safe_get(uq, "returns_1m"),
+        returns_3m=_safe_get(uq, "returns_3m"),
+        returns_6m=_safe_get(uq, "returns_6m"),
+        returns_12m=_safe_get(uq, "returns_12m"),
+        rsi14=_safe_get(uq, "rsi14", "rsi_14"),
+        vol_30d_ann=_vol_to_percent(_safe_get(uq, "vol_30d_ann", "volatility_30d", "volatility_30d_ann")),
+        ma20=_safe_get(uq, "ma20"),
+        ma50=_safe_get(uq, "ma50"),
+        ma200=_safe_get(uq, "ma200"),
+        expected_return_1m=_safe_get(uq, "expected_return_1m"),
+        expected_return_3m=_safe_get(uq, "expected_return_3m"),
+        expected_return_12m=_safe_get(uq, "expected_return_12m"),
+        expected_price_1m=_safe_get(uq, "expected_price_1m"),
+        expected_price_3m=_safe_get(uq, "expected_price_3m"),
+        expected_price_12m=_safe_get(uq, "expected_price_12m"),
+        confidence_score=conf_score,
+        forecast_method=forecast_method,
         data_quality=str(_safe_get(uq, "data_quality") or "MISSING"),
         value_score=_safe_get(uq, "value_score"),
         quality_score=_safe_get(uq, "quality_score"),
         momentum_score=_safe_get(uq, "momentum_score"),
         opportunity_score=_safe_get(uq, "opportunity_score"),
         risk_score=_safe_get(uq, "risk_score"),
-        overall_score=_safe_get(uq, "overall_score"),
-        recommendation=_safe_get(uq, "recommendation"),
-        confidence=_safe_get(uq, "confidence"),
-        fair_value=_safe_get(uq, "fair_value"),
-        upside_percent=_safe_get(uq, "upside_percent"),
-        valuation_label=_safe_get(uq, "valuation_label"),
+        overall_score=overall2 if overall2 is not None else overall,
+        recommendation=reco2 if reco2 is not None else reco,
+        confidence=_safe_get(uq, "confidence") if _safe_get(uq, "confidence") is not None else conf01,
+        fair_value=fair2 if fair2 is not None else fair,
+        upside_percent=upside2 if upside2 is not None else upside,
+        valuation_label=val_label2 if val_label2 is not None else val_label,
         last_updated_utc=last_utc_iso,
         sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
         error=_safe_get(uq, "error"),
@@ -946,7 +1154,6 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
         if eng is not None:
             engine_name = type(eng).__name__
             engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
-            # support multiple engine styles
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
