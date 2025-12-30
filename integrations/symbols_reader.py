@@ -1,16 +1,14 @@
-```python
 # symbols_reader.py  (FULL REPLACEMENT)
 """
 symbols_reader.py
 ===========================================================
 Central symbol reader for ALL dashboard Google Sheets pages.
-(v3.3.0) — Production-hardened, KSA-safe, Sheets-service aligned
+(v3.3.1) — Phase-0 hygiene fix (valid Python) + import-safe
 
-Key upgrades (v3.3.0)
-- FIX: Avoids calling split_tickers_by_market from google_sheets_service (may not exist)
-  -> provides safe local fallback splitter (still tries import if available)
-- PERFORMANCE: Heuristic column detection uses ONE block read (A..AZ sample rows),
-  instead of 50+ per-column API calls
+Key upgrades (v3.3.1)
+- ✅ Phase-0: Removed markdown code fences that caused SyntaxError on import
+- ✅ Import-safe: supports both package mode (integrations.google_sheets_service)
+  and flat-module mode (google_sheets_service)
 - Keeps your normalization + de-dup + consistent output: {all, ksa, global, meta}
 
 Dependencies
@@ -26,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("symbols_reader")
 
-SYMBOLS_READER_VERSION = "3.3.0"
+SYMBOLS_READER_VERSION = "3.3.1"
 
 # How much to scan (keep modest to avoid API cost)
 _MAX_COLS_SCAN = 52          # A..AZ
@@ -34,6 +32,9 @@ _MAX_DATA_ROWS_SCAN = 2000   # final extraction rows
 _SCORE_SAMPLE_ROWS = 300     # heuristic scoring rows (fast + enough)
 _HEADER_ROWS_TO_TRY = (5, 4, 3)
 
+# -----------------------------------------------------------------------------
+# Settings (env.py compatible)
+# -----------------------------------------------------------------------------
 try:
     from env import settings  # type: ignore
 except Exception:  # pragma: no cover
@@ -54,13 +55,37 @@ except Exception:  # pragma: no cover
 
     settings = MockSettings()  # type: ignore
 
-from google_sheets_service import read_range  # type: ignore
 
-# Try optional splitter from google_sheets_service if present; fallback locally.
+# -----------------------------------------------------------------------------
+# Google Sheets service imports (import-safe)
+# -----------------------------------------------------------------------------
+read_range = None  # type: ignore
+_split_tickers_by_market = None  # type: ignore
+
+# Prefer package mode
 try:
-    from google_sheets_service import split_tickers_by_market as _split_tickers_by_market  # type: ignore
+    from integrations.google_sheets_service import read_range as _read_range  # type: ignore
+    read_range = _read_range  # type: ignore
+    try:
+        from integrations.google_sheets_service import split_tickers_by_market as _stm  # type: ignore
+        _split_tickers_by_market = _stm  # type: ignore
+    except Exception:
+        _split_tickers_by_market = None
 except Exception:
-    _split_tickers_by_market = None
+    # Fallback to flat-module mode
+    try:
+        from google_sheets_service import read_range as _read_range  # type: ignore
+        read_range = _read_range  # type: ignore
+        try:
+            from google_sheets_service import split_tickers_by_market as _stm  # type: ignore
+            _split_tickers_by_market = _stm  # type: ignore
+        except Exception:
+            _split_tickers_by_market = None
+    except Exception as e:
+        # Hard fail only when actually used; keep module importable for Phase-0 safety
+        logger.error("[SymbolsReader] Cannot import read_range from google_sheets_service: %s", e)
+        read_range = None  # type: ignore
+        _split_tickers_by_market = None
 
 
 # -----------------------------------------------------------------------------
@@ -245,10 +270,16 @@ def split_tickers_by_market(tickers: List[str]) -> Dict[str, List[str]]:
 # -----------------------------------------------------------------------------
 # Column detection (fast)
 # -----------------------------------------------------------------------------
+def _require_read_range() -> None:
+    if read_range is None:
+        raise RuntimeError("read_range is not available (google_sheets_service import failed).")
+
+
 def _read_row(sid: str, sheet_name: str, row: int, max_cols: int) -> List[str]:
+    _require_read_range()
     last_col = _col_idx_to_a1(max_cols - 1)
     rng = f"{_safe_sheet_name(sheet_name)}!A{row}:{last_col}{row}"
-    rows = read_range(sid, rng) or []
+    rows = read_range(sid, rng) or []  # type: ignore
     if not rows or not rows[0]:
         return []
     return [_norm_header(h) for h in rows[0]]
@@ -258,13 +289,11 @@ def _find_symbol_column_by_header(headers: List[str]) -> Optional[int]:
     if not headers:
         return None
 
-    # direct alias match
     aliases = {_norm_header(a) for a in _HEADER_ALIASES}
     for i, h in enumerate(headers):
         if h in aliases:
             return i
 
-    # contains match
     for i, h in enumerate(headers):
         if "SYMBOL" in h or "TICKER" in h:
             return i
@@ -279,9 +308,10 @@ def _read_block(
     end_row: int,
     max_cols: int,
 ) -> List[List[str]]:
+    _require_read_range()
     last_col = _col_idx_to_a1(max_cols - 1)
     rng = f"{_safe_sheet_name(sheet_name)}!A{start_row}:{last_col}{end_row}"
-    raw = read_range(sid, rng) or []
+    raw = read_range(sid, rng) or []  # type: ignore
     out: List[List[str]] = []
     for r in raw:
         rr = [(_norm_cell(x)) for x in (r or [])]
@@ -290,7 +320,6 @@ def _read_block(
         else:
             rr = rr[:max_cols]
         out.append(rr)
-    # pad missing rows (rare)
     need = max(0, (end_row - start_row + 1) - len(out))
     for _ in range(need):
         out.append([""] * max_cols)
@@ -298,10 +327,6 @@ def _read_block(
 
 
 def _score_columns_from_block(block: List[List[str]]) -> Tuple[Optional[int], float, List[Tuple[int, float]]]:
-    """
-    block: rows x cols, already normalized to fixed col count.
-    Returns (best_idx, best_score, top5_scores)
-    """
     if not block:
         return None, 0.0, []
 
@@ -347,19 +372,15 @@ def _find_symbol_column(
 ) -> Tuple[Optional[int], Dict[str, Any]]:
     meta: Dict[str, Any] = {"method": None, "header_row_used": header_row}
 
-    # 1) Header-based (try multiple header rows)
     for hr in (header_row, *[r for r in _HEADER_ROWS_TO_TRY if r != header_row]):
         headers = _read_row(sid, sheet_name, hr, max_cols)
         if not headers:
             continue
         idx = _find_symbol_column_by_header(headers)
         if idx is not None:
-            meta.update(
-                {"method": "header", "header_row_used": hr, "header_sample": headers[:15], "col_idx": idx}
-            )
+            meta.update({"method": "header", "header_row_used": hr, "header_sample": headers[:15], "col_idx": idx})
             return idx, meta
 
-    # 2) Heuristic scoring (ONE block read)
     start = header_row + 1
     end = header_row + max(5, _SCORE_SAMPLE_ROWS)
 
@@ -372,7 +393,6 @@ def _find_symbol_column(
     best_idx, best_score, top5 = _score_columns_from_block(block)
     meta.update({"method": "heuristic", "best_score": best_score, "top_scores": top5, "col_idx": best_idx})
 
-    # accept only if convincing
     if best_idx is not None and best_score >= 0.55:
         return best_idx, meta
 
@@ -412,13 +432,13 @@ def get_symbols_from_sheet(
     target_col = col_idx if col_idx is not None else 0
     col_letter = _col_idx_to_a1(target_col)
 
-    # Finite range (avoid open-ended A:A)
     start = header_row + 1
     end = header_row + int(max(1, scan_rows))
     data_rng = f"{_safe_sheet_name(sh)}!{col_letter}{start}:{col_letter}{end}"
 
     try:
-        raw_rows = read_range(sid, data_rng) or []
+        _require_read_range()
+        raw_rows = read_range(sid, data_rng) or []  # type: ignore
     except Exception as e:
         logger.error("[SymbolsReader] Failed reading %s: %s", data_rng, e)
         return {"all": [], "ksa": [], "global": [], "meta": {"status": "error", "error": str(e), **detect_meta}}
@@ -484,4 +504,3 @@ __all__ = [
     "get_page_symbols",
     "get_all_pages_symbols",
 ]
-```
