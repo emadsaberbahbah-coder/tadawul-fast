@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.9.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.0.0) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,10 +12,11 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: supports Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v3.9.0 upgrades
-- ✅ Adds EXTENDED header mode (current + history + forecast) without breaking BASE.
-- ✅ Better ISO parsing (supports trailing 'Z').
-- ✅ Uses engine-provided overall_score/recommendation/valuation when available, else computes.
+v4.0.0 upgrades
+- ✅ Standardizes Recommendation enum everywhere: BUY / HOLD / REDUCE / SELL
+  (fixes inconsistency between /analysis and /sheet-rows).
+- ✅ Normalizes incoming provider/scoring values like "Sell", "Strong Buy", "STRONG_BUY", etc.
+- ✅ Keeps PROD-safe import patterns + sheets-safe behavior.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.9.0"
+AI_ANALYSIS_VERSION = "4.0.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -54,6 +55,67 @@ try:
     from core.schemas import get_headers_for_sheet  # type: ignore
 except Exception:  # pragma: no cover
     get_headers_for_sheet = None  # type: ignore
+
+
+# =============================================================================
+# Recommendation normalization (BUY/HOLD/REDUCE/SELL)
+# =============================================================================
+def _normalize_recommendation(x: Any) -> Optional[str]:
+    """
+    Canonical enum across all endpoints:
+      BUY / HOLD / REDUCE / SELL
+
+    Accepts variants:
+      "Buy", "Sell", "Hold", "Reduce"
+      "Strong Buy", "STRONG_BUY", "STRONG BUY"
+      "Strong Sell", "STRONG_SELL"
+      other synonyms -> HOLD (safe)
+    """
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+
+    u = s.upper().strip()
+    u2 = u.replace(" ", "_")
+
+    allowed = {"BUY", "HOLD", "REDUCE", "SELL"}
+    if u in allowed:
+        return u
+    if u2 in allowed:
+        return u2
+
+    strong_map = {
+        "STRONG_BUY": "BUY",
+        "STRONG BUY": "BUY",
+        "STRONGBUY": "BUY",
+        "STRONG_SELL": "SELL",
+        "STRONG SELL": "SELL",
+        "STRONGSELL": "SELL",
+    }
+    if u in strong_map:
+        return strong_map[u]
+    if u2 in strong_map:
+        return strong_map[u2]
+
+    synonyms = {
+        "NEUTRAL": "HOLD",
+        "KEEP": "HOLD",
+        "WAIT": "HOLD",
+        "TRIM": "REDUCE",
+        "TAKE_PROFIT": "REDUCE",
+        "TAKE PROFIT": "REDUCE",
+        "PARTIAL_SELL": "REDUCE",
+        "PARTIAL SELL": "REDUCE",
+    }
+    if u in synonyms:
+        return synonyms[u]
+    if u2 in synonyms:
+        return synonyms[u2]
+
+    # default safe fallback (prevents random strings leaking to Sheets)
+    return "HOLD"
 
 
 # =============================================================================
@@ -372,7 +434,7 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     opportunity_score: Optional[float] = None
     risk_score: Optional[float] = None
     overall_score: Optional[float] = None
-    recommendation: Optional[str] = None
+    recommendation: Optional[str] = None  # BUY/HOLD/REDUCE/SELL
     confidence: Optional[float] = None  # 0..1
 
     fair_value: Optional[float] = None
@@ -486,7 +548,7 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
         return []
     if size <= 0:
         return [items]
-    return [items[i : i + size] for i in range(0, len(items), size)]
+    return [items[i: i + size] for i in range(0, len(items), size)]
 
 
 def _extract_sources_from_any(x: Any) -> List[str]:
@@ -594,6 +656,10 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
 
 
 def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    """
+    Returns (overall_score_0_100, recommendation_enum, confidence_0_1).
+    Recommendation enum: BUY/HOLD/REDUCE/SELL
+    """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
     val = _safe_float_or_none(_safe_get(uq, "value_score"))
     qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
@@ -632,17 +698,24 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], 
 
     score = max(0.0, min(100.0, score))
 
-    reco = "Hold"
-    if score >= 80:
-        reco = "Strong Buy" if (risk is None or risk <= 55) else "Buy"
-    elif score >= 65:
-        reco = "Buy" if (risk is None or risk <= 70) else "Hold"
+    # Canonical 4-bucket recommendation
+    if score >= 65:
+        reco = "BUY"
     elif score >= 50:
-        reco = "Hold"
+        reco = "HOLD"
     elif score >= 35:
-        reco = "Sell"
+        reco = "REDUCE"
     else:
-        reco = "Strong Sell"
+        reco = "SELL"
+
+    # If risk is very high, degrade one step (never below SELL)
+    if risk is not None and risk >= 80:
+        if reco == "BUY":
+            reco = "HOLD"
+        elif reco == "HOLD":
+            reco = "REDUCE"
+        elif reco == "REDUCE":
+            reco = "SELL"
 
     return round(score, 2), reco, conf01
 
@@ -917,12 +990,18 @@ def _value_for_header(header: str, uq: Any) -> Any:
             return v if v is not None else overall
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
-            return v if v is not None else reco
+            raw = v if v is not None else reco
+            return _normalize_recommendation(raw)
 
     spec = _HEADER_MAP.get(hk)
     if spec:
         fields, transform = spec
         val = _safe_get(uq, *fields)
+
+        # ensure canonical Recommendation when pulled via direct mapping
+        if hk == "recommendation":
+            return _normalize_recommendation(val)
+
         if transform and val is not None:
             try:
                 return transform(val)
@@ -934,6 +1013,8 @@ def _value_for_header(header: str, uq: Any) -> Any:
     guess = _snake_guess(header)
     val = _safe_get(uq, guess)
     if val is not None:
+        if hk == "recommendation":
+            return _normalize_recommendation(val)
         return val
 
     return None
@@ -1109,7 +1190,7 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     last_utc_iso = _iso_or_none(last_utc)
 
     fair, upside, val_label = _compute_fair_value_and_upside(uq)
-    overall, reco, conf01 = _compute_overall_and_reco(uq)
+    overall, reco_calc, conf01 = _compute_overall_and_reco(uq)
 
     # Prefer engine-provided if present
     fair2 = _safe_get(uq, "fair_value")
@@ -1119,6 +1200,9 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     overall2 = _safe_get(uq, "overall_score")
     conf_score = _safe_get(uq, "confidence_score")
     forecast_method = _safe_get(uq, "forecast_method")
+
+    reco_raw = reco2 if reco2 is not None else reco_calc
+    reco_norm = _normalize_recommendation(reco_raw)
 
     return SingleAnalysisResponse(
         symbol=sym,
@@ -1157,7 +1241,7 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         opportunity_score=_safe_get(uq, "opportunity_score"),
         risk_score=_safe_get(uq, "risk_score"),
         overall_score=overall2 if overall2 is not None else overall,
-        recommendation=reco2 if reco2 is not None else reco,
+        recommendation=reco_norm,
         confidence=_safe_get(uq, "confidence") if _safe_get(uq, "confidence") is not None else conf01,
         fair_value=fair2 if fair2 is not None else fair,
         upside_percent=upside2 if upside2 is not None else upside,
@@ -1211,6 +1295,7 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
             "batch_concurrency": cfg["concurrency"],
             "max_tickers": cfg["max_tickers"],
         },
+        "recommendation_enum": ["BUY", "HOLD", "REDUCE", "SELL"],
         "auth": "open" if not _allowed_tokens() else "token",
         "timestamp_utc": _now_utc_iso(),
     }
