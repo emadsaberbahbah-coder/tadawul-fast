@@ -1,6 +1,6 @@
 # routes/advanced_analysis.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.9.0) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.9.1) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -11,9 +11,14 @@ Design goals
     • chunking + timeout + bounded concurrency + placeholders on failures.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
 
-✅ Alignment fix (v3.9.0):
-- Recommendation is now standardized across ALL outputs to:
+✅ Alignment fix
+- Recommendation standardized across ALL outputs to:
     BUY / HOLD / REDUCE / SELL  (always UPPERCASE)
+
+v3.9.1 upgrades
+- ✅ ISO parsing supports trailing 'Z' (matches ai_analysis.py).
+- ✅ Volatility treated as % when 0..1.
+- ✅ Quote_59 mapping forces recommendation enum.
 
 Modes for /sheet-rows:
 - "advanced": returns Advanced headers (opportunity scoreboard style)
@@ -41,7 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.9.0"
+ADVANCED_ANALYSIS_VERSION = "3.9.1"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -150,14 +155,11 @@ def _normalize_recommendation(x: Any) -> Optional[str]:
     if not s:
         return None
 
-    # direct match
     if s in _RECO_ENUM:
         return s
 
-    # normalize separators
     s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
 
-    # common mappings
     buy_like = {
         "STRONG BUY",
         "BUY",
@@ -202,7 +204,6 @@ def _normalize_recommendation(x: Any) -> Optional[str]:
     if s2 in sell_like:
         return "SELL"
 
-    # heuristic: if a provider sends "RECOMMENDATION: SELL" etc.
     if "SELL" in s2:
         return "SELL"
     if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
@@ -401,22 +402,32 @@ def _now_utc_iso() -> str:
     return _now_utc().isoformat()
 
 
-def _iso_or_none(x: Any) -> Optional[str]:
+def _parse_iso_dt(x: Any) -> Optional[datetime]:
     if x is None or x == "":
         return None
     try:
         if isinstance(x, datetime):
             dt = x
         else:
-            dt = datetime.fromisoformat(str(x))
+            s = str(x).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
+        return dt
     except Exception:
-        try:
-            return str(x)
-        except Exception:
-            return None
+        return None
+
+
+def _iso_or_none(x: Any) -> Optional[str]:
+    dt = _parse_iso_dt(x)
+    if dt is not None:
+        return dt.isoformat()
+    try:
+        return str(x) if x is not None else None
+    except Exception:
+        return None
 
 
 def _safe_get(obj: Any, *names: str) -> Any:
@@ -503,19 +514,11 @@ def _risk_bucket(opportunity: Optional[float], dq_score_value: float) -> str:
 
 
 def _data_age_minutes(as_of_utc: Any) -> Optional[float]:
-    if not as_of_utc:
+    dt = _parse_iso_dt(as_of_utc)
+    if dt is None:
         return None
-    try:
-        if isinstance(as_of_utc, datetime):
-            ts = as_of_utc
-        else:
-            ts = datetime.fromisoformat(str(as_of_utc))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        diff = _now_utc() - ts
-        return round(diff.total_seconds() / 60.0, 2)
-    except Exception:
-        return None
+    diff = _now_utc() - dt
+    return round(diff.total_seconds() / 60.0, 2)
 
 
 def _finalize_quote(uq: Any) -> Any:
@@ -569,6 +572,16 @@ def _ratio_to_percent(v: Any) -> Any:
         return v
 
 
+def _vol_to_percent(v: Any) -> Any:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return f * 100.0 if 0.0 <= f <= 1.0 else f
+    except Exception:
+        return v
+
+
 def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[float]:
     try:
         cp_f = float(cp)
@@ -582,18 +595,13 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
 
 
 def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
-    if not utc_any:
+    dt = _parse_iso_dt(utc_any)
+    if dt is None:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
 
         tz = ZoneInfo("Asia/Riyadh")
-        if isinstance(utc_any, datetime):
-            dt = utc_any
-        else:
-            dt = datetime.fromisoformat(str(utc_any))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(tz).isoformat()
     except Exception:
         return None
@@ -609,15 +617,6 @@ def _safe_float_or_none(x: Any) -> Optional[float]:
 
 
 def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """
-    Fair value priority:
-      1) fair_value
-      2) expected_price_3m
-      3) expected_price_12m
-      4) ma200 / ma50 (if present)
-    Upside% = (fair/price - 1)*100
-    Valuation label from upside thresholds.
-    """
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
     if price is None or price <= 0:
         return None, None, None
@@ -675,7 +674,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
     if risk is not None:
         score -= 0.15 * risk
 
-    # confidence bump if 0..1 or 0..100
     if conf is not None:
         if 0.0 <= conf <= 1.0:
             score += 0.05 * ((conf * 100.0) - 50.0)
@@ -684,7 +682,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
 
     score = max(0.0, min(100.0, score))
 
-    # ✅ standardized enum thresholds
     reco = "HOLD"
     if score >= 70:
         reco = "BUY"
@@ -734,19 +731,12 @@ async def _maybe_await(x: Any) -> Any:
 
 
 def _unwrap_tuple_payload(x: Any) -> Any:
-    # support (payload, err)
     if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
 
 
 async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
-    """
-    - Prefer engine.get_enriched_quotes
-    - Else engine.get_quotes
-    - Else per-symbol methods
-    Accept list OR dict OR (payload, err).
-    """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
         res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
@@ -899,7 +889,6 @@ class AdvancedSheetResponse(_ExtraIgnore):
 # Transform
 # =============================================================================
 def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
-    # scoring best-effort (engine may already do it)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
 
@@ -915,13 +904,11 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
     as_of_iso = _iso_or_none(as_of)
     age_min = _data_age_minutes(as_of)
 
-    # computed fair/upside/label if missing
     fair, upside, val_label = _compute_fair_value_and_upside(uq)
     fair2 = _safe_get(uq, "fair_value")
     upside2 = _safe_get(uq, "upside_percent")
     val_label2 = _safe_get(uq, "valuation_label")
 
-    # overall/reco if missing
     overall, reco = _compute_overall_and_reco(uq)
     overall2 = _safe_get(uq, "overall_score")
     reco2_raw = _safe_get(uq, "recommendation")
@@ -1192,7 +1179,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
     "beta": (("beta",), None),
-    "volatility (30d)": (("volatility_30d", "vol_30d_ann"), _ratio_to_percent),
+    "volatility (30d)": (("volatility_30d", "vol_30d_ann"), _vol_to_percent),
     "rsi (14)": (("rsi_14", "rsi14"), None),
     "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
@@ -1277,6 +1264,18 @@ def _value_for_header(header: str, uq: Any) -> Any:
 
 
 def _row_59_from_headers(headers: List[str], uq: Any) -> List[Any]:
+    # ensure reco enum in the row
+    try:
+        reco_raw = _safe_get(uq, "recommendation")
+        reco_norm = _normalize_recommendation(reco_raw)
+        if reco_norm:
+            if isinstance(uq, dict):
+                uq["recommendation"] = reco_norm
+            else:
+                setattr(uq, "recommendation", reco_norm)
+    except Exception:
+        pass
+
     row = [_value_for_header(h, uq) for h in headers]
     if len(row) < len(headers):
         row += [None] * (len(headers) - len(row))
