@@ -1,6 +1,6 @@
 # routes/advanced_analysis.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.8.0) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.9.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -10,6 +10,10 @@ Design goals
 - Defensive batching:
     • chunking + timeout + bounded concurrency + placeholders on failures.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
+
+✅ Alignment fix (v3.9.0):
+- Recommendation is now standardized across ALL outputs to:
+    BUY / HOLD / REDUCE / SELL  (always UPPERCASE)
 
 Modes for /sheet-rows:
 - "advanced": returns Advanced headers (opportunity scoreboard style)
@@ -37,7 +41,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.8.0"
+ADVANCED_ANALYSIS_VERSION = "3.9.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -83,10 +87,12 @@ def _fallback_normalize(raw: str) -> str:
     return f"{s}.US"
 
 
+@lru_cache(maxsize=1)
 def _try_import_v2_normalizer() -> Any:
     """
     Return normalize_symbol callable if available, else fallback.
     Never raises.
+    Cached to avoid repeated imports per cell/row.
     """
     try:
         from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
@@ -108,6 +114,7 @@ def _normalize_any(raw: str) -> str:
 # =============================================================================
 # Optional EnrichedQuote (lazy)
 # =============================================================================
+@lru_cache(maxsize=1)
 def _try_import_enriched_quote() -> Optional[Any]:
     try:
         from core.enriched_quote import EnrichedQuote  # type: ignore
@@ -115,6 +122,97 @@ def _try_import_enriched_quote() -> Optional[Any]:
         return EnrichedQuote
     except Exception:
         return None
+
+
+# =============================================================================
+# ✅ Recommendation normalization (ONE ENUM everywhere)
+# =============================================================================
+_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
+
+
+def _normalize_recommendation(x: Any) -> Optional[str]:
+    """
+    Standardize recommendation to BUY/HOLD/REDUCE/SELL (UPPERCASE).
+    Accepts many synonyms from providers / older versions:
+      - Strong Buy / Accumulate / Overweight -> BUY
+      - Neutral / Maintain -> HOLD
+      - Reduce / Trim / Underweight -> REDUCE
+      - Sell / Strong Sell -> SELL
+    """
+    if x is None:
+        return None
+
+    try:
+        s = str(x).strip().upper()
+    except Exception:
+        return None
+
+    if not s:
+        return None
+
+    # direct match
+    if s in _RECO_ENUM:
+        return s
+
+    # normalize separators
+    s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
+
+    # common mappings
+    buy_like = {
+        "STRONG BUY",
+        "BUY",
+        "ACCUMULATE",
+        "ADD",
+        "OUTPERFORM",
+        "OVERWEIGHT",
+        "LONG",
+    }
+    hold_like = {
+        "HOLD",
+        "NEUTRAL",
+        "MAINTAIN",
+        "MARKET PERFORM",
+        "EQUAL WEIGHT",
+        "WAIT",
+    }
+    reduce_like = {
+        "REDUCE",
+        "TRIM",
+        "LIGHTEN",
+        "UNDERWEIGHT",
+        "PARTIAL SELL",
+        "TAKE PROFIT",
+        "TAKE PROFITS",
+    }
+    sell_like = {
+        "SELL",
+        "STRONG SELL",
+        "EXIT",
+        "AVOID",
+        "UNDERPERFORM",
+        "SHORT",
+    }
+
+    if s2 in buy_like:
+        return "BUY"
+    if s2 in hold_like:
+        return "HOLD"
+    if s2 in reduce_like:
+        return "REDUCE"
+    if s2 in sell_like:
+        return "SELL"
+
+    # heuristic: if a provider sends "RECOMMENDATION: SELL" etc.
+    if "SELL" in s2:
+        return "SELL"
+    if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
+        return "REDUCE"
+    if "HOLD" in s2 or "NEUTRAL" in s2 or "MAINTAIN" in s2:
+        return "HOLD"
+    if "BUY" in s2 or "ACCUMULATE" in s2 or "OVERWEIGHT" in s2:
+        return "BUY"
+
+    return None
 
 
 # =============================================================================
@@ -549,8 +647,9 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
 
 def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
     """
-    Best-effort overall score + recommendation when missing.
+    Best-effort overall score + standardized recommendation when missing.
     Score in 0..100.
+    Recommendation is ALWAYS one of: BUY/HOLD/REDUCE/SELL
     """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
     val = _safe_float_or_none(_safe_get(uq, "value_score"))
@@ -585,17 +684,16 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
 
     score = max(0.0, min(100.0, score))
 
-    reco = "Hold"
-    if score >= 80:
-        reco = "Strong Buy" if (risk is None or risk <= 55) else "Buy"
-    elif score >= 65:
-        reco = "Buy" if (risk is None or risk <= 70) else "Hold"
+    # ✅ standardized enum thresholds
+    reco = "HOLD"
+    if score >= 70:
+        reco = "BUY"
     elif score >= 50:
-        reco = "Hold"
+        reco = "HOLD"
     elif score >= 35:
-        reco = "Sell"
+        reco = "REDUCE"
     else:
-        reco = "Strong Sell"
+        reco = "SELL"
 
     return round(score, 2), reco
 
@@ -757,7 +855,7 @@ class AdvancedItem(_ExtraIgnore):
     data_quality: Optional[str] = None
     data_quality_score: Optional[float] = None
 
-    recommendation: Optional[str] = None
+    recommendation: Optional[str] = None  # BUY/HOLD/REDUCE/SELL
     valuation_label: Optional[str] = None
     risk_bucket: Optional[str] = None
 
@@ -826,7 +924,8 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
     # overall/reco if missing
     overall, reco = _compute_overall_and_reco(uq)
     overall2 = _safe_get(uq, "overall_score")
-    reco2 = _safe_get(uq, "recommendation")
+    reco2_raw = _safe_get(uq, "recommendation")
+    reco2 = _normalize_recommendation(reco2_raw) or reco  # ✅ force enum
 
     opp = _safe_get(uq, "opportunity_score")
     bucket = _risk_bucket(opp, dq_s)
@@ -850,7 +949,7 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
         overall_score=overall2 if overall2 is not None else overall,
         data_quality=dq,
         data_quality_score=dq_s,
-        recommendation=reco2 if reco2 is not None else reco,
+        recommendation=reco2,
         valuation_label=val_label2 if val_label2 is not None else val_label,
         risk_bucket=bucket,
         provider=_safe_get(uq, "data_source", "provider", "source"),
@@ -905,7 +1004,6 @@ def _default_advanced_headers() -> List[str]:
     ]
 
 
-# 59-column fallback (matches your quote layout expectation)
 _DEFAULT_HEADERS_59: List[str] = [
     "Symbol",
     "Company Name",
@@ -972,22 +1070,18 @@ _DEFAULT_HEADERS_59: List[str] = [
 def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
     nm = (sheet_name or "").strip().lower()
 
-    # explicit advanced-ish keywords -> advanced scoreboard
     if any(k in nm for k in ("advanced", "opportunity", "advisor", "best", "scoreboard")):
         return _default_advanced_headers(), "advanced"
 
-    # schema-driven quote sheet headers if available
     if sheet_name and get_headers_for_sheet:
         try:
             h = get_headers_for_sheet(sheet_name)
             if isinstance(h, list) and h:
-                # If it looks like quote rows (has Symbol + Last Price etc.), treat as quote_59
                 if any(str(x).strip().lower() == "symbol" for x in h):
                     return [str(x) for x in h], "quote_59"
         except Exception:
             pass
 
-    # fallback to default 59 quote layout
     return list(_DEFAULT_HEADERS_59), "quote_59"
 
 
@@ -1008,7 +1102,7 @@ def _item_value_map(it: AdvancedItem) -> Dict[str, Any]:
         "Overall Score": it.overall_score,
         "Data Quality": it.data_quality or "",
         "Data Quality Score": it.data_quality_score,
-        "Recommendation": it.recommendation or "",
+        "Recommendation": _normalize_recommendation(it.recommendation) or "",
         "Valuation Label": it.valuation_label or "",
         "Risk Bucket": it.risk_bucket or "",
         "Provider": it.provider or "",
@@ -1054,7 +1148,6 @@ def _snake_guess(header: str) -> str:
     return s
 
 
-# Header -> (candidate fields..., transform?)
 _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
@@ -1070,7 +1163,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "percent change": (("percent_change", "change_percent", "change_pct"), None),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
-    # ✅ aligned to v2 keys
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
@@ -1111,7 +1203,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "opportunity score": (("opportunity_score",), None),
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
-    "recommendation": (("recommendation",), None),
+    "recommendation": (("recommendation",), _normalize_recommendation),  # ✅ force enum
     "data source": (("data_source", "source"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
@@ -1123,7 +1215,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
 def _value_for_header(header: str, uq: Any) -> Any:
     hk = _hkey(header)
 
-    # computed 52w position
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
@@ -1133,7 +1224,6 @@ def _value_for_header(header: str, uq: Any) -> Any:
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
-    # compute fair/upside/label if missing
     if hk in ("fair value", "upside %", "valuation label", "overall score", "recommendation"):
         fair, upside, label = _compute_fair_value_and_upside(uq)
         overall, reco = _compute_overall_and_reco(uq)
@@ -1152,9 +1242,8 @@ def _value_for_header(header: str, uq: Any) -> Any:
             return v if v is not None else overall
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
-            return v if v is not None else reco
+            return _normalize_recommendation(v) or reco
 
-    # Riyadh timestamp fill if requested but missing
     if hk == "last updated (riyadh)":
         v = _safe_get(uq, "last_updated_riyadh")
         if not v:
@@ -1180,7 +1269,6 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 return val
         return val
 
-    # fallback snake guess
     guess = _snake_guess(header)
     v = _safe_get(uq, guess)
     if hk == "last updated (utc)":
@@ -1211,7 +1299,11 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
+            engine_version = (
+                getattr(eng, "ENGINE_VERSION", None)
+                or getattr(eng, "engine_version", None)
+                or getattr(eng, "version", None)
+            )
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1326,7 +1418,6 @@ async def advanced_sheet_rows(
     top_n = _safe_int(body.top_n or 50, 50)
     top_n = max(1, min(500, top_n))
 
-    # Sheets-safe auth (never raise)
     if not _auth_ok(x_app_token):
         rows: List[List[Any]] = []
         for s in requested[:top_n]:
@@ -1338,11 +1429,14 @@ async def advanced_sheet_rows(
                     risk_bucket="LOW_CONFIDENCE",
                     provider="none",
                     as_of_utc=_now_utc_iso(),
+                    recommendation="HOLD",
                     error="Unauthorized (invalid or missing X-APP-TOKEN).",
                 )
                 rows.append(_row_for_headers(it, headers))
             else:
-                rows.append(_row_59_from_headers(headers, _make_placeholder(s, err="Unauthorized")))
+                pl = _make_placeholder(s, err="Unauthorized")
+                pl["recommendation"] = "HOLD"
+                rows.append(_row_59_from_headers(headers, pl))
         return AdvancedSheetResponse(
             status="error",
             error="Unauthorized (invalid or missing X-APP-TOKEN).",
@@ -1368,7 +1462,6 @@ async def advanced_sheet_rows(
             max_concurrency=cfg["concurrency"],
         )
 
-        # Build + sort by opportunity/confidence/upside
         items: List[AdvancedItem] = []
         for s in requested:
             uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
@@ -1386,6 +1479,18 @@ async def advanced_sheet_rows(
             for it in items_sorted:
                 uq = unified_map.get(it.symbol) or _make_placeholder(it.symbol, dq="MISSING", err="No data returned")
 
+                # ✅ ensure recommendation enum exists even if provider gave messy strings
+                try:
+                    reco_raw = _safe_get(uq, "recommendation")
+                    reco_norm = _normalize_recommendation(reco_raw)
+                    if reco_norm:
+                        if isinstance(uq, dict):
+                            uq["recommendation"] = reco_norm
+                        else:
+                            setattr(uq, "recommendation", reco_norm)
+                except Exception:
+                    pass
+
                 if EnrichedQuote is not None:
                     try:
                         eq = EnrichedQuote.from_unified(uq)  # type: ignore
@@ -1397,7 +1502,6 @@ async def advanced_sheet_rows(
                         rows.append(row[: len(headers)])
                         continue
                     except Exception as exc:
-                        # fallback mapping (annotate error best-effort)
                         try:
                             if isinstance(uq, dict):
                                 uq["error"] = f"Row mapping failed: {exc}"
@@ -1408,7 +1512,6 @@ async def advanced_sheet_rows(
                         rows.append(_row_59_from_headers(headers, uq))
                         continue
 
-                # If EnrichedQuote missing: header-driven fallback
                 rows.append(_row_59_from_headers(headers, uq))
 
         else:
@@ -1430,11 +1533,14 @@ async def advanced_sheet_rows(
                     risk_bucket="LOW_CONFIDENCE",
                     provider="none",
                     as_of_utc=_now_utc_iso(),
+                    recommendation="HOLD",
                     error=str(exc),
                 )
                 rows.append(_row_for_headers(it, headers))
             else:
-                rows.append(_row_59_from_headers(headers, _make_placeholder(s, err=str(exc))))
+                pl = _make_placeholder(s, err=str(exc))
+                pl["recommendation"] = "HOLD"
+                rows.append(_row_59_from_headers(headers, pl))
 
         return AdvancedSheetResponse(status="error", error=str(exc), headers=headers, rows=rows)
 
