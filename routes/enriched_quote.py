@@ -1,23 +1,21 @@
-# routes/enriched_quote.py — FULL REPLACEMENT — v5.1.5
+# routes/enriched_quote.py — FULL REPLACEMENT — v5.2.0
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + cache-friendly) — v5.1.5
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.2.0
 
-What’s included
-- ✅ Always awaits async engine methods (prevents returning "<coroutine object ...>")
+Aligned with your plan:
+- ✅ Always awaits async engine methods (prevents "<coroutine object ...>")
 - ✅ Works with BOTH async and sync engines
 - ✅ Never crashes: always returns HTTP 200 with status
+- ✅ Prefers app.state.engine, else uses core.data_engine_v2.get_engine() (singleton)
+    -> avoids creating a NEW engine per request (keeps cache warm + consistent)
+- ✅ Supports refresh=1 and fields=... (best-effort pass-through)
+- ✅ Batch endpoint uses engine.get_enriched_quotes if available (fast), else loops safely
 - ✅ Backward-compat: if engine returns dict -> return as-is; else wrap {"value": ...}
-- ✅ Batch endpoint: /v1/enriched/quotes?symbols=AAPL,1120.SR
-- ✅ Adds optional passthrough query params:
-    - refresh=1  (forces refresh when engine supports it)
-    - debug=1    (includes trace on failure)
-    - fields=... (optional hint to engine; ignored if not supported)
 
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
-- GET /v1/enriched/quote?symbol=AAPL
 - GET /v1/enriched/quotes?symbols=AAPL,MSFT,1120.SR
 """
 
@@ -57,7 +55,6 @@ def _normalize_symbols_csv(csv: str) -> List[str]:
     raw = (csv or "").strip()
     if not raw:
         return []
-    # preserve user case (KSA uses .SR); engine normalizes
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
@@ -100,11 +97,13 @@ def _to_jsonable(payload: Any) -> Any:
         return str(payload)
 
 
-def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str]:
+async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str]:
     """
     Prefer app.state.engine.
-    Fallback: best-effort instantiate engine (only if missing).
+    Fallback: core.data_engine_v2.get_engine() singleton (preferred).
+    Last fallback: instantiate DataEngineV2/DataEngine (rare).
     """
+    # 1) app.state.engine
     try:
         eng = getattr(request.app.state, "engine", None)
         if eng is not None:
@@ -112,7 +111,16 @@ def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str]:
     except Exception:
         pass
 
-    # fallback (should be rare)
+    # 2) singleton engine (preferred)
+    try:
+        from core.data_engine_v2 import get_engine  # type: ignore
+
+        eng = await get_engine()
+        return eng, "core.data_engine_v2.get_engine()"
+    except Exception:
+        pass
+
+    # 3) last resort instantiation
     try:
         from core.data_engine_v2 import DataEngineV2 as _V2  # type: ignore
 
@@ -124,13 +132,6 @@ def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str]:
         from core.data_engine_v2 import DataEngine as _V2Compat  # type: ignore
 
         return _V2Compat(), "core.data_engine_v2.DataEngine()"
-    except Exception:
-        pass
-
-    try:
-        from core.data_engine import DataEngine as _Legacy  # type: ignore
-
-        return _Legacy(), "core.data_engine.DataEngine()"
     except Exception:
         return None, "none"
 
@@ -144,7 +145,7 @@ def _call_engine_method_best_effort(
 ) -> Any:
     """
     Tries common method signatures in a safe order, WITHOUT assuming the engine API.
-    Returns the raw result (may be awaitable).
+    Returns raw result (may be awaitable).
     """
     fn = getattr(eng, method_name, None)
     if not callable(fn):
@@ -176,6 +177,44 @@ def _call_engine_method_best_effort(
     return fn(symbol)
 
 
+def _call_engine_batch_best_effort(
+    eng: Any,
+    symbols: List[str],
+    refresh: bool,
+    fields: Optional[str],
+) -> Any:
+    """
+    Prefer engine.get_enriched_quotes(symbols, ...) if available, else None.
+    Returns raw result (may be awaitable) or None if unsupported.
+    """
+    fn = getattr(eng, "get_enriched_quotes", None)
+    if not callable(fn):
+        return None
+
+    # kwargs-first
+    try:
+        return fn(symbols, refresh=refresh, fields=fields)
+    except TypeError:
+        pass
+
+    try:
+        return fn(symbols, refresh=refresh)
+    except TypeError:
+        pass
+
+    try:
+        return fn(symbols, fields=fields)
+    except TypeError:
+        pass
+
+    try:
+        return fn(symbols, refresh)
+    except TypeError:
+        pass
+
+    return fn(symbols)
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -188,7 +227,7 @@ async def enriched_quote(
     debug: int = Query(0, description="debug=1 includes a traceback on failure"),
 ) -> Dict[str, Any]:
     sym = _normalize_symbol(symbol)
-    eng, eng_src = _get_engine_from_request(request)
+    eng, eng_src = await _get_engine_from_request(request)
 
     if not sym:
         return {"status": "error", "error": "Missing symbol", "symbol": symbol, "engine_source": eng_src}
@@ -234,7 +273,7 @@ async def enriched_quotes(
     fields: Optional[str] = Query(None, description="Optional hint to engine (comma-separated fields)"),
     debug: int = Query(0, description="debug=1 includes a traceback on failure"),
 ) -> Dict[str, Any]:
-    eng, eng_src = _get_engine_from_request(request)
+    eng, eng_src = await _get_engine_from_request(request)
     syms = _normalize_symbols_csv(symbols)
 
     if not syms:
@@ -245,7 +284,20 @@ async def enriched_quotes(
 
     items: List[Any] = []
     try:
-        # quick check (raises if missing)
+        # Prefer batch call if engine supports it (faster + consistent)
+        raw_batch = _call_engine_batch_best_effort(eng, syms, refresh=bool(refresh), fields=fields)
+        if raw_batch is not None:
+            res = await _maybe_await(raw_batch)
+            if isinstance(res, list):
+                # Ensure each item is dict-ish
+                for i, it in enumerate(res):
+                    if isinstance(it, dict):
+                        items.append(it)
+                    else:
+                        items.append({"status": "ok", "symbol": syms[i] if i < len(syms) else "", "value": _to_jsonable(it)})
+                return {"status": "ok", "engine_source": eng_src, "count": len(items), "items": items}
+
+        # Fallback: per-symbol loop (still PROD SAFE)
         fn = getattr(eng, "get_enriched_quote", None)
         if not callable(fn):
             return {
