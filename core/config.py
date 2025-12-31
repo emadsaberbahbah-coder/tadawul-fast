@@ -1,8 +1,8 @@
-# core/config.py  (FULL REPLACEMENT)
+# core/config.py  — FULL REPLACEMENT — v1.8.0
 """
 core/config.py
 ------------------------------------------------------------
-Compatibility shim (PROD SAFE) – v1.7.1 (RENDER-ENV LOCKED)
+Compatibility shim (PROD SAFE) – v1.8.0 (RENDER-ENV LOCKED)
 
 Many modules import settings via:
   from core.config import Settings, get_settings
@@ -223,7 +223,6 @@ def _apply_runtime_env_aliases_from_render(s: Any) -> None:
     Your Render env uses *_API_KEY, but some provider modules read *_API_TOKEN.
     Export aliases safely (no overwrite if already set).
     """
-    # Read from settings (preferred), then env (fallback)
     finnhub = (
         getattr(s, "finnhub_api_token", None)
         or getattr(s, "finnhub_api_key", None)
@@ -374,6 +373,10 @@ if _root_Settings is not None:
                     return self.finnhub_api_token
             raise AttributeError(name)
 
+        # Optional helper used by main.py if available
+        def as_safe_dict(self) -> Dict[str, Any]:
+            return self.safe_summary()
+
     @lru_cache(maxsize=1)
     def get_settings() -> Any:  # type: ignore
         # Use root get_settings if available; otherwise instantiate
@@ -392,7 +395,6 @@ if _root_Settings is not None:
             except Exception:
                 s = Settings()  # type: ignore[call-arg]
 
-        # Runtime env alias export for providers
         _apply_runtime_env_aliases_from_render(s)
         return s
 
@@ -423,11 +425,11 @@ if Settings is None or get_settings is None:
 
             # Auth
             self.require_auth: bool = _to_bool(_env_str("REQUIRE_AUTH", "false"), False)
-            self.app_token: Optional[str] = _env_first(["APP_TOKEN"], None)
+            self.app_token: Optional[str] = _env_first(["APP_TOKEN", "TFB_APP_TOKEN"], None)
             self.backup_app_token: Optional[str] = _env_first(["BACKUP_APP_TOKEN"], None)
 
             # Providers
-            self.enabled_providers_raw: str = _env_first(["ENABLED_PROVIDERS"], "eodhd,finnhub") or "eodhd,finnhub"
+            self.enabled_providers_raw: str = _env_first(["ENABLED_PROVIDERS", "PROVIDERS"], "eodhd,finnhub,fmp") or "eodhd,finnhub,fmp"
             self.primary_provider: str = (_env_first(["PRIMARY_PROVIDER"], "eodhd") or "eodhd").strip().lower()
             self.ksa_providers_raw: str = _env_first(["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam") or "yahoo_chart,tadawul,argaam"
 
@@ -435,16 +437,10 @@ if Settings is None or get_settings is None:
             self.eodhd_api_key: Optional[str] = _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
             self.finnhub_api_key: Optional[str] = _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
 
-            # URLs
-            self.backend_base_url: Optional[str] = _env_first(["BACKEND_BASE_URL"], None)
-            self.eodhd_base_url: str = _env_first(["EODHD_BASE_URL"], "https://eodhistoricaldata.com/api") or "https://eodhistoricaldata.com/api"
-            self.finnhub_base_url: str = _env_first(["FINNHUB_BASE_URL"], "https://finnhub.io/api/v1") or "https://finnhub.io/api/v1"
-            self.fmp_base_url: Optional[str] = _env_first(["FMP_BASE_URL"], None)
-
             # HTTP/retry
-            self.http_timeout: float = _to_float(_env_first(["HTTP_TIMEOUT"], "30"), 30.0)
+            self.http_timeout: float = _to_float(_env_first(["HTTP_TIMEOUT", "HTTP_TIMEOUT_SEC"], "30"), 30.0)
             self.max_retries: int = _to_int(_env_first(["MAX_RETRIES"], "2"), 2)
-            self.retry_delay: float = _to_float(_env_first(["RETRY_DELAY"], "0.5"), 0.5)
+            self.retry_delay: float = _to_float(_env_first(["RETRY_DELAY", "RETRY_DELAY_SEC"], "0.5"), 0.5)
 
             # Cache
             self.cache_default_ttl: int = _to_int(_env_first(["CACHE_DEFAULT_TTL"], "10"), 10)
@@ -486,7 +482,7 @@ if Settings is None or get_settings is None:
         @property
         def enabled_providers(self) -> List[str]:
             xs = _parse_list(self.enabled_providers_raw)
-            return xs or ["eodhd", "finnhub"]
+            return xs or ["eodhd", "finnhub", "fmp"]
 
         @property
         def ksa_providers(self) -> List[str]:
@@ -522,6 +518,9 @@ if Settings is None or get_settings is None:
                 "GOOGLE_CREDS_SET": bool(creds),
                 "GOOGLE_CREDS_SOURCE": creds_src,
             }
+
+        def as_safe_dict(self) -> Dict[str, Any]:
+            return self.safe_summary()
 
         def __getattr__(self, name: str) -> Any:
             if name.isupper():
