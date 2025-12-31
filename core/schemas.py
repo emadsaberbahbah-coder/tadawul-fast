@@ -2,12 +2,12 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.4.0 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.4.1 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
 - Provide get_headers_for_sheet(sheet_name) used by:
-    - routes/enriched_quote.py
+    - core/enriched_quote.py
     - routes/ai_analysis.py
     - routes/advanced_analysis.py
     - Google Apps Script sheet builders
@@ -23,10 +23,17 @@ Design rules
     - HEADER_TO_FIELD remains for legacy callers
     - HEADER_FIELD_CANDIDATES adds multi-field fallbacks for engine/provider variations
     - FIELD_TO_HEADER recognizes common alias fields (week_52_high vs high_52w etc.)
+
+✅ v3.4.1 enhancements (this revision)
+- Header lookup is now tolerant to casing/punctuation variants:
+  "Sub Sector" == "Sub-Sector", "Avg Volume (30d)" == "Avg Volume (30D)", etc.
+- header_to_field() and header_field_candidates() normalize header labels before mapping.
+- Adds a few practical alias fields seen in providers (safe, non-breaking).
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Pydantic v2 preferred, v1 fallback
@@ -43,7 +50,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.4.0"
+SCHEMAS_VERSION = "3.4.1"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
@@ -186,12 +193,76 @@ def validate_headers_59(headers: Any) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Header normalization (tolerant mapping)
+# =============================================================================
+def _norm_header_label(h: Optional[str]) -> str:
+    """
+    Normalize header labels for tolerant lookups.
+    Example:
+      "Avg Volume (30d)" -> "avg_volume_30d"
+      "Sub Sector" -> "sub_sector"
+      "Last Updated Riyadh" -> "last_updated_riyadh"
+    """
+    s = str(h or "").strip().lower()
+    if not s:
+        return ""
+    # unify separators and remove noisy punctuation
+    s = s.replace("%", " percent ")
+    s = re.sub(r"[()\[\]{}]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+# Canonical header lookup by normalized key (auto-built)
+_HEADER_CANON_BY_NORM: Dict[str, str] = {}
+for _h in _DEFAULT_59_TUPLE:
+    _HEADER_CANON_BY_NORM[_norm_header_label(_h)] = _h
+
+# Common synonyms/variants that appear in code/sheets
+_HEADER_SYNONYMS: Dict[str, str] = {
+    "sub_sector": "Sub-Sector",
+    "subsector": "Sub-Sector",
+    "avg_volume_30d": "Avg Volume (30D)",
+    "avg_volume_30d_": "Avg Volume (30D)",
+    "volatility_30d": "Volatility (30D)",
+    "last_updated_utc": "Last Updated (UTC)",
+    "last_updated_riyadh": "Last Updated (Riyadh)",
+    "last_updated_ksa": "Last Updated (Riyadh)",
+    "free_float_percent": "Free Float %",
+    "turnover_percent": "Turnover %",
+    "dividend_yield_percent": "Dividend Yield %",
+    "payout_ratio_percent": "Payout Ratio %",
+    "roe_percent": "ROE %",
+    "roa_percent": "ROA %",
+}
+for k, canon_header in list(_HEADER_SYNONYMS.items()):
+    nk = _norm_header_label(k)
+    if nk and canon_header in _DEFAULT_59_TUPLE:
+        _HEADER_CANON_BY_NORM[nk] = canon_header
+
+
+def _canonical_header_label(header: str) -> str:
+    """
+    Best-effort variant header -> canonical header label.
+    Never raises.
+    """
+    h = str(header or "").strip()
+    if not h:
+        return ""
+    if h in HEADER_TO_FIELD:  # exact canonical match
+        return h
+    nh = _norm_header_label(h)
+    return _HEADER_CANON_BY_NORM.get(nh, h)
+
+
+# =============================================================================
 # Field aliases (engine/provider variations)
 # =============================================================================
 # Canonical field -> known aliases that might appear in payloads.
 FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     # Identity
-    "symbol": ("symbol_normalized", "symbol_input"),
+    "symbol": ("symbol_normalized", "symbol_input", "ticker", "code"),
     "name": ("company_name", "long_name"),
     "sub_sector": ("subsector",),
     "market": ("market_region", "exchange", "listing_exchange"),
@@ -200,38 +271,48 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "day_high": ("high",),
     "day_low": ("low",),
     "previous_close": ("prev_close",),
-    "percent_change": ("change_percent", "change_pct"),
+    "price_change": ("change",),
+    "percent_change": ("change_percent", "change_pct", "pct_change"),
     # 52W
     "week_52_high": ("high_52w", "52w_high"),
     "week_52_low": ("low_52w", "52w_low"),
     "position_52w_percent": ("position_52w",),
     # Liquidity / Shares
-    "avg_volume_30d": ("avg_volume",),
-    "turnover_percent": ("turnover",),
-    "free_float": ("free_float_percent",),
+    "avg_volume_30d": ("avg_volume", "avg_vol_30d"),
+    "value_traded": ("traded_value",),
+    "turnover_percent": ("turnover", "turnover_pct"),
+    "shares_outstanding": ("shares", "outstanding_shares"),
+    "free_float": ("free_float_percent", "free_float_pct"),
+    "market_cap": ("mkt_cap", "marketcapitalization"),
+    "free_float_market_cap": ("ff_market_cap",),
     # Fundamentals
     "eps_ttm": ("eps",),
+    "forward_eps": ("eps_forward",),
     "pe_ttm": ("pe",),
     "forward_pe": ("pe_forward",),
     "ev_ebitda": ("evebitda",),
-    "dividend_yield": ("div_yield",),
-    "payout_ratio": ("payout",),
+    "dividend_yield": ("div_yield", "dividend_yield_pct"),
+    "payout_ratio": ("payout", "payout_pct"),
     "roe": ("return_on_equity",),
     "roa": ("return_on_assets",),
     "net_margin": ("profit_margin",),
     "ebitda_margin": ("margin_ebitda",),
     "revenue_growth": ("rev_growth",),
     "net_income_growth": ("ni_growth",),
+    "beta": ("beta_5y",),
     # Technicals
     "volatility_30d": ("vol_30d_ann", "vol30d"),
     "rsi_14": ("rsi14",),
     # Valuation / Targets
     "fair_value": ("expected_price_3m", "expected_price_12m", "ma200", "ma50"),
     "upside_percent": ("upside_pct",),
+    # Scores/Rec
+    "overall_score": ("score", "total_score"),
     # Meta
     "data_source": ("source", "provider"),
+    "data_quality": ("dq",),
     "last_updated_utc": ("as_of_utc",),
-    "last_updated_riyadh": ("as_of_riyadh",),
+    "last_updated_riyadh": ("as_of_riyadh", "last_updated_ksa"),
 }
 
 # Build reverse lookup: alias_field -> canonical_field
@@ -273,7 +354,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Percent Change": "percent_change",
     "Day High": "day_high",
     "Day Low": "day_low",
-    # ✅ Align with current engine naming
+    # 52W
     "52W High": "week_52_high",
     "52W Low": "week_52_low",
     "52W Position %": "position_52w_percent",
@@ -337,7 +418,6 @@ for h, f in HEADER_TO_FIELD.items():
     aliases = FIELD_ALIASES.get(canon, ())
     HEADER_FIELD_CANDIDATES[h] = (canon,) + tuple(a for a in aliases if a)
 
-
 # Build FIELD_TO_HEADER that recognizes both canonical fields and known aliases.
 _FIELD_TO_HEADER: Dict[str, str] = {}
 for header, field in HEADER_TO_FIELD.items():
@@ -350,21 +430,26 @@ FIELD_TO_HEADER: Dict[str, str] = dict(_FIELD_TO_HEADER)
 
 
 def header_to_field(header: str) -> str:
-    """Best-effort header -> canonical field name."""
-    return canonical_field(HEADER_TO_FIELD.get(str(header or "").strip(), str(header or "").strip()))
+    """Best-effort header (any variant) -> canonical field name."""
+    h = _canonical_header_label(header)
+    return canonical_field(HEADER_TO_FIELD.get(h, str(header or "").strip()))
 
 
 def header_field_candidates(header: str) -> Tuple[str, ...]:
     """
     Robust mapping helper:
     returns preferred + aliases (e.g. ("week_52_high","high_52w","52w_high")).
+    Now tolerant to header variants.
     """
-    h = str(header or "").strip()
+    h0 = str(header or "").strip()
+    h = _canonical_header_label(h0)
+
     c = HEADER_FIELD_CANDIDATES.get(h)
     if c:
         return c
+
     # fallback: if caller passes unknown header, try using the header string itself
-    f = canonical_field(h)
+    f = canonical_field(h0)
     return (f,) if f else ()
 
 
@@ -391,12 +476,9 @@ def _norm_sheet_name(name: Optional[str]) -> str:
     s = (name or "").strip().lower()
     if not s:
         return ""
-    # unify separators
     for ch in ["-", " ", ".", "/", "\\", "|", ":", ";", ","]:
         s = s.replace(ch, "_")
-    # remove parentheses but keep content
     s = s.replace("(", "_").replace(")", "_")
-    # collapse repeats
     while "__" in s:
         s = s.replace("__", "_")
     return s.strip("_")
@@ -483,7 +565,6 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None) -> List[str]:
         if not key:
             return list(_DEFAULT_59_TUPLE)
 
-        # direct match
         v = _SHEET_HEADERS.get(key)
         if isinstance(v, tuple) and v:
             return list(v)
@@ -530,12 +611,10 @@ def _coerce_str_list(v: Any) -> List[str]:
                 out.append(s)
         return out
 
-    # single string: support mixed separators
     s = str(v).replace("\n", " ").replace("\t", " ").replace(",", " ").strip()
     if not s:
         return []
-    parts = [p.strip() for p in s.split(" ") if p.strip()]
-    return parts
+    return [p.strip() for p in s.split(" ") if p.strip()]
 
 
 class _ExtraIgnore(BaseModel):
@@ -548,7 +627,7 @@ class _ExtraIgnore(BaseModel):
 
 class BatchProcessRequest(_ExtraIgnore):
     """
-    Shared contract used by routes/enriched_quote.py (and reusable elsewhere).
+    Shared contract used by routers and sheet refresh endpoints.
     Supports both `symbols` and `tickers` (client robustness).
     """
     operation: str = Field(default="refresh")
