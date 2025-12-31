@@ -2,33 +2,32 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.4.0
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.5.1
 
 What this module is for
 - Legacy/compat endpoints under /v1/enriched/* (kept because some clients still call it)
 - Always returns HTTP 200 with a `status` field (client simplicity)
 - Works with BOTH async and sync engines
-- Attempts batch fast-path first; falls back per-symbol safely
+- Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.4.0 enhancements
-- Adds EnrichedQuote helper class with:
-    - from_unified(payload)  (dict or attribute object)
-    - to_row(headers)        (robust header-driven mapping aligned with core.schemas v3.4.0)
-- Standardizes recommendation everywhere to: BUY / HOLD / REDUCE / SELL
-- Better batch compatibility:
-    - engine may return list OR dict OR (payload, err)
-- More defensive schema filling:
-    - uses UnifiedQuote.model_fields if available, else fills using canonical header mappings
-- Riyadh timestamp fill (Last Updated Riyadh) from UTC if missing
-- 52W Position % computed if missing (from 52W high/low + current price)
+✅ v2.5.1 enhancements (this revision)
+- ISO parsing supports trailing 'Z' (aligned with routes/advanced_analysis.py)
+- Volatility treated as % when 0..1 (aligned)
+- Stronger, schema-independent header mapping fallback for EnrichedQuote.to_row(headers)
+- Recommendation standardized everywhere to: BUY / HOLD / REDUCE / SELL (UPPERCASE)
+- Riyadh timestamp fill from UTC if missing
+- 52W Position % computed + stored in payload if missing
+- Defensive per-symbol concurrency + timeout for /quotes slow path
 
 NOTE
-- This module is import-safe (no hard DataEngine dependency at import time).
+- Import-safe: no hard DataEngine dependency at import time.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
 import os
 import re
 import traceback
@@ -40,11 +39,15 @@ from fastapi import APIRouter, Query, Request
 from fastapi.encoders import jsonable_encoder
 from starlette.responses import JSONResponse
 
-ROUTER_VERSION = "2.4.0"
+logger = logging.getLogger("core.enriched_quote")
+
+ROUTER_VERSION = "2.5.1"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _UQ_KEYS: Optional[List[str]] = None
+
+_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
 
 # =============================================================================
@@ -145,9 +148,6 @@ def _unwrap_tuple_payload(x: Any) -> Any:
 # =============================================================================
 # Recommendation normalization (ONE ENUM everywhere)
 # =============================================================================
-_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
-
-
 def _normalize_recommendation(x: Any) -> str:
     """
     Always returns one of: BUY/HOLD/REDUCE/SELL
@@ -165,40 +165,10 @@ def _normalize_recommendation(x: Any) -> str:
 
     s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
 
-    buy_like = {
-        "STRONG BUY",
-        "BUY",
-        "ACCUMULATE",
-        "ADD",
-        "OUTPERFORM",
-        "OVERWEIGHT",
-        "LONG",
-    }
-    hold_like = {
-        "HOLD",
-        "NEUTRAL",
-        "MAINTAIN",
-        "MARKET PERFORM",
-        "EQUAL WEIGHT",
-        "WAIT",
-    }
-    reduce_like = {
-        "REDUCE",
-        "TRIM",
-        "LIGHTEN",
-        "UNDERWEIGHT",
-        "PARTIAL SELL",
-        "TAKE PROFIT",
-        "TAKE PROFITS",
-    }
-    sell_like = {
-        "SELL",
-        "STRONG SELL",
-        "EXIT",
-        "AVOID",
-        "UNDERPERFORM",
-        "SHORT",
-    }
+    buy_like = {"STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"}
+    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT"}
+    reduce_like = {"REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"}
+    sell_like = {"SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"}
 
     if s2 in buy_like:
         return "BUY"
@@ -225,34 +195,46 @@ def _normalize_recommendation(x: Any) -> str:
 # =============================================================================
 # Symbol normalization (PROD SAFE)
 # =============================================================================
-def _normalize_symbol_safe(raw: str) -> str:
-    s = (raw or "").strip()
+def _fallback_normalize(raw: str) -> str:
+    s = (raw or "").strip().upper()
     if not s:
         return ""
-    # Prefer engine's normalize if available (guarded)
-    try:
-        from core.data_engine_v2 import normalize_symbol as _norm  # type: ignore
-
-        ns = _norm(s)
-        return (ns or "").strip().upper()
-    except Exception:
-        pass
-
-    s = s.strip().upper()
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
-    # indices/commodities etc
     if any(ch in s for ch in ("=", "^")):
-        return s
-    if "." in s:
         return s
     if s.isdigit():
         return f"{s}.SR"
-    if s.isalpha():
-        return f"{s}.US"
-    return s
+    if s.endswith(".SR") or s.endswith(".US"):
+        return s
+    if "." in s:
+        return s
+    # default global
+    return f"{s}.US"
+
+
+@lru_cache(maxsize=1)
+def _try_import_v2_normalizer() -> Any:
+    try:
+        from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
+
+        return _NS
+    except Exception:
+        return _fallback_normalize
+
+
+def _normalize_symbol_safe(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    try:
+        ns = _try_import_v2_normalizer()
+        out = ns(s)
+        return (out or "").strip().upper()
+    except Exception:
+        return _fallback_normalize(s)
 
 
 # =============================================================================
@@ -297,18 +279,15 @@ def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
     Does not overwrite existing values.
     """
     try:
-        # Prefer UnifiedQuote fields if available
         keys = _get_uq_keys()
         if keys:
             for k in keys:
                 payload.setdefault(k, None)
             return payload
 
-        # Fallback: fill minimal known canonical fields using schemas mapping
         sch = _try_import_schemas()
         if sch is not None:
             try:
-                # HEADER_TO_FIELD contains canonical field names; fill them
                 for f in set(str(v) for v in getattr(sch, "HEADER_TO_FIELD", {}).values()):
                     if f:
                         payload.setdefault(f, None)
@@ -321,48 +300,56 @@ def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Time helpers
+# Time helpers (Z-safe)
 # =============================================================================
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso_or_none(x: Any) -> Optional[str]:
+def _parse_iso_dt(x: Any) -> Optional[datetime]:
     if x is None or x == "":
         return None
     try:
         if isinstance(x, datetime):
             dt = x
         else:
-            dt = datetime.fromisoformat(str(x))
+            s = str(x).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
+        return dt
     except Exception:
-        try:
-            return str(x)
-        except Exception:
-            return None
+        return None
+
+
+def _iso_or_none(x: Any) -> Optional[str]:
+    dt = _parse_iso_dt(x)
+    if dt is not None:
+        return dt.isoformat()
+    try:
+        return str(x) if x is not None else None
+    except Exception:
+        return None
 
 
 def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
-    if not utc_any:
+    dt = _parse_iso_dt(utc_any)
+    if dt is None:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
 
         tz = ZoneInfo("Asia/Riyadh")
-        if isinstance(utc_any, datetime):
-            dt = utc_any
-        else:
-            dt = datetime.fromisoformat(str(utc_any))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(tz).isoformat()
     except Exception:
         return None
 
 
+# =============================================================================
+# Computations / transforms
+# =============================================================================
 def _safe_float_or_none(x: Any) -> Optional[float]:
     try:
         if x is None or x == "":
@@ -394,6 +381,114 @@ def _ratio_to_percent(v: Any) -> Any:
         return v
 
 
+def _vol_to_percent(v: Any) -> Any:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return f * 100.0 if 0.0 <= f <= 1.0 else f
+    except Exception:
+        return v
+
+
+def _compute_fair_value_and_upside(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    price = _safe_float_or_none(_safe_get(payload, "current_price", "last_price", "price"))
+    if price is None or price <= 0:
+        return None, None, None
+
+    fair = _safe_float_or_none(_safe_get(payload, "fair_value"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "expected_price_3m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "expected_price_12m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "ma200"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "ma50"))
+
+    if fair is None or fair <= 0:
+        return None, None, None
+
+    upside = (fair / price - 1.0) * 100.0
+    label = "Fairly Valued"
+    if upside >= 15:
+        label = "Undervalued"
+    elif upside <= -15:
+        label = "Overvalued"
+
+    return fair, round(upside, 2), label
+
+
+def _hkey(h: str) -> str:
+    s = str(h or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
+    "symbol": (("symbol", "symbol_normalized", "ticker", "code"), None),
+    "company name": (("name", "company_name"), None),
+    "sector": (("sector",), None),
+    "sub-sector": (("sub_sector", "subsector"), None),
+    "sub sector": (("sub_sector", "subsector"), None),
+    "market": (("market", "market_region"), None),
+    "currency": (("currency",), None),
+    "listing date": (("listing_date", "ipo"), None),
+    "last price": (("current_price", "last_price", "price"), None),
+    "previous close": (("previous_close",), None),
+    "price change": (("price_change", "change"), None),
+    "percent change": (("percent_change", "change_percent", "change_pct"), None),
+    "day high": (("day_high",), None),
+    "day low": (("day_low",), None),
+    "52w high": (("week_52_high", "high_52w", "52w_high"), None),
+    "52w low": (("week_52_low", "low_52w", "52w_low"), None),
+    "52w position %": (("position_52w_percent", "position_52w"), None),
+    "volume": (("volume",), None),
+    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
+    "value traded": (("value_traded",), None),
+    "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
+    "shares outstanding": (("shares_outstanding",), None),
+    "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
+    "market cap": (("market_cap",), None),
+    "free float market cap": (("free_float_market_cap",), None),
+    "liquidity score": (("liquidity_score",), None),
+    "eps (ttm)": (("eps_ttm", "eps"), None),
+    "forward eps": (("forward_eps",), None),
+    "p/e (ttm)": (("pe_ttm",), None),
+    "forward p/e": (("forward_pe",), None),
+    "p/b": (("pb",), None),
+    "p/s": (("ps",), None),
+    "ev/ebitda": (("ev_ebitda",), None),
+    "dividend yield %": (("dividend_yield",), _ratio_to_percent),
+    "dividend rate": (("dividend_rate",), None),
+    "payout ratio %": (("payout_ratio",), _ratio_to_percent),
+    "roe %": (("roe",), _ratio_to_percent),
+    "roa %": (("roa",), _ratio_to_percent),
+    "net margin %": (("net_margin",), _ratio_to_percent),
+    "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
+    "revenue growth %": (("revenue_growth",), _ratio_to_percent),
+    "net income growth %": (("net_income_growth",), _ratio_to_percent),
+    "beta": (("beta",), None),
+    "volatility (30d)": (("volatility_30d", "vol_30d_ann"), _vol_to_percent),
+    "rsi (14)": (("rsi_14", "rsi14"), None),
+    "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
+    "upside %": (("upside_percent",), _ratio_to_percent),
+    "valuation label": (("valuation_label",), None),
+    "value score": (("value_score",), None),
+    "quality score": (("quality_score",), None),
+    "momentum score": (("momentum_score",), None),
+    "opportunity score": (("opportunity_score",), None),
+    "risk score": (("risk_score",), None),
+    "overall score": (("overall_score",), None),
+    "error": (("error",), None),
+    "recommendation": (("recommendation",), None),
+    "data source": (("data_source", "source"), None),
+    "data quality": (("data_quality",), None),
+    "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
+    "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
+}
+
+
 # =============================================================================
 # EnrichedQuote helper (used by routes/advanced_analysis.py)
 # =============================================================================
@@ -415,101 +510,139 @@ class EnrichedQuote:
         try:
             p["recommendation"] = _normalize_recommendation(p.get("recommendation"))
         except Exception:
-            pass
+            p["recommendation"] = "HOLD"
+
         # Ensure timestamps
         try:
             if not p.get("last_updated_utc") and p.get("as_of_utc"):
                 p["last_updated_utc"] = p.get("as_of_utc")
         except Exception:
             pass
+
+        # Fill Riyadh timestamp if possible
+        try:
+            if not p.get("last_updated_riyadh"):
+                p["last_updated_riyadh"] = _to_riyadh_iso(p.get("last_updated_utc")) or ""
+        except Exception:
+            pass
+
+        # Compute 52W position if missing
+        try:
+            if p.get("position_52w_percent") is None:
+                cp = _safe_get(p, "current_price", "last_price", "price")
+                lo = _safe_get(p, "week_52_low", "low_52w", "52w_low")
+                hi = _safe_get(p, "week_52_high", "high_52w", "52w_high")
+                pos = _compute_52w_position_pct(cp, lo, hi)
+                if pos is not None:
+                    p["position_52w_percent"] = pos
+        except Exception:
+            pass
+
         return cls(p)
 
     def _value_for_header(self, header: str) -> Any:
         sch = _try_import_schemas()
 
-        # Canonical+aliases candidates per header (best-effort)
+        hk = _hkey(header)
+
+        # Schema-driven candidates (preferred if available)
         candidates: Tuple[str, ...] = ()
         if sch is not None:
             try:
                 candidates = tuple(getattr(sch, "header_field_candidates")(header))  # type: ignore
             except Exception:
                 candidates = ()
-        if not candidates:
-            # fallback guess
-            candidates = (str(header or "").strip(),)
 
-        hk = str(header or "").strip().lower()
+        # Fallback to internal robust mapping
+        spec = _HEADER_MAP.get(hk)
+        if spec:
+            fields, transform = spec
 
-        # Computed 52W position %
-        if hk in ("52w position %", "52w position"):
-            v = self.payload.get("position_52w_percent")
-            if v is not None:
-                return v
-            cp = _safe_get(self.payload, "current_price", "last_price", "price")
-            lo = _safe_get(self.payload, "week_52_low", "low_52w", "52w_low")
-            hi = _safe_get(self.payload, "week_52_high", "high_52w", "52w_high")
-            return _compute_52w_position_pct(cp, lo, hi)
+            # computed: 52W position %
+            if hk in ("52w position %", "52w position"):
+                v = _safe_get(self.payload, *fields)
+                if v is not None:
+                    return v
+                cp = _safe_get(self.payload, "current_price", "last_price", "price")
+                lo = _safe_get(self.payload, "week_52_low", "low_52w", "52w_low")
+                hi = _safe_get(self.payload, "week_52_high", "high_52w", "52w_high")
+                v2 = _compute_52w_position_pct(cp, lo, hi)
+                if v2 is not None:
+                    try:
+                        self.payload["position_52w_percent"] = v2
+                    except Exception:
+                        pass
+                return v2
 
-        # Last Updated (Riyadh) fill from UTC
-        if hk == "last updated (riyadh)":
-            v = self.payload.get("last_updated_riyadh")
-            if not v:
-                u = self.payload.get("last_updated_utc") or self.payload.get("as_of_utc")
-                v = _to_riyadh_iso(u)
+            # computed: last updated (riyadh)
+            if hk == "last updated (riyadh)":
+                v = self.payload.get("last_updated_riyadh")
+                if not v:
+                    u = self.payload.get("last_updated_utc") or self.payload.get("as_of_utc")
+                    v = _to_riyadh_iso(u) or ""
+                    try:
+                        self.payload["last_updated_riyadh"] = v
+                    except Exception:
+                        pass
+                return _iso_or_none(v) or v
+
+            # computed fair/upside/label if missing
+            if hk in ("fair value", "upside %", "valuation label", "overall score"):
+                fair, upside, label = _compute_fair_value_and_upside(self.payload)
+                if hk == "fair value":
+                    v = _safe_get(self.payload, *fields)
+                    return v if v is not None else fair
+                if hk == "upside %":
+                    v = self.payload.get("upside_percent")
+                    return _ratio_to_percent(v) if v is not None else upside
+                if hk == "valuation label":
+                    v = self.payload.get("valuation_label")
+                    return v if v is not None else label
+
+            # recommendation forced enum
+            if hk == "recommendation":
+                return _normalize_recommendation(self.payload.get("recommendation"))
+
+            val = _safe_get(self.payload, *fields)
+            if transform and val is not None:
                 try:
-                    self.payload["last_updated_riyadh"] = v
+                    return transform(val)
                 except Exception:
-                    pass
-            return _iso_or_none(v) or v
+                    return val
+            return val
 
-        # Last Updated (UTC) normalization
-        if hk == "last updated (utc)":
-            v = self.payload.get("last_updated_utc") or self.payload.get("as_of_utc")
-            return _iso_or_none(v) or v
+        # If schema candidates exist, use them
+        if candidates:
+            for f in candidates:
+                if not f:
+                    continue
+                if f in self.payload and self.payload.get(f) is not None:
+                    val = self.payload.get(f)
+                    # common percent headers via schema candidates
+                    if hk in {
+                        "turnover %",
+                        "free float %",
+                        "dividend yield %",
+                        "payout ratio %",
+                        "roe %",
+                        "roa %",
+                        "net margin %",
+                        "ebitda margin %",
+                        "revenue growth %",
+                        "net income growth %",
+                        "upside %",
+                        "percent change",
+                    }:
+                        return _ratio_to_percent(val)
+                    if hk == "volatility (30d)":
+                        return _vol_to_percent(val)
+                    if hk == "last updated (utc)":
+                        return _iso_or_none(val) or val
+                    return val
 
-        # Recommendation forced enum
-        if hk == "recommendation":
-            return _normalize_recommendation(self.payload.get("recommendation"))
-
-        # Percent-style headers (best-effort)
-        pct_headers = {
-            "turnover %",
-            "free float %",
-            "dividend yield %",
-            "payout ratio %",
-            "roe %",
-            "roa %",
-            "net margin %",
-            "ebitda margin %",
-            "revenue growth %",
-            "net income growth %",
-            "volatility (30d)",
-            "upside %",
-            "percent change",
-        }
-
-        # Look up first available candidate
-        val = None
-        for f in candidates:
-            if not f:
-                continue
-            if f in self.payload and self.payload.get(f) is not None:
-                val = self.payload.get(f)
-                break
-
-        # Fallback alias resolution (common engine variants)
-        if val is None:
-            # Handle 52w high/low naming
-            if hk == "52w high":
-                val = _safe_get(self.payload, "week_52_high", "high_52w", "52w_high")
-            elif hk == "52w low":
-                val = _safe_get(self.payload, "week_52_low", "low_52w", "52w_low")
-
-        # Apply percent normalization for ratio fields
-        if hk in pct_headers:
-            return _ratio_to_percent(val)
-
-        return val
+        # Absolute last fallback: direct key lookup by a simple guess
+        guess = str(header or "").strip()
+        return self.payload.get(guess)
 
     def to_row(self, headers: Sequence[str]) -> List[Any]:
         hs = [str(h) for h in (headers or [])]
@@ -600,10 +733,7 @@ async def _call_engine_batch_best_effort(
 ) -> Tuple[Optional[Union[List[Any], Dict[str, Any]]], Optional[str], Optional[str]]:
     """
     Returns: (batch_result, source, error)
-    batch_result may be:
-      - list[payload]
-      - dict[symbol->payload]
-      - (payload, err) already unwrapped by _unwrap_tuple_payload at higher level
+    batch_result may be list[payload] OR dict[symbol->payload]
     """
     if not symbols_norm:
         return None, None, "empty"
@@ -651,9 +781,7 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
     """
     Ensure standard metadata + status/error behavior is consistent.
     """
-    sym = (norm or raw or "").strip().upper()
-    if not sym:
-        sym = ""
+    sym = (norm or raw or "").strip().upper() or ""
 
     try:
         payload.setdefault("symbol", sym)
@@ -686,12 +814,23 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         # timestamps
         if not payload.get("last_updated_utc"):
             payload["last_updated_utc"] = payload.get("as_of_utc") or _now_utc().isoformat()
+        else:
+            payload["last_updated_utc"] = _iso_or_none(payload.get("last_updated_utc")) or payload.get("last_updated_utc")
+
         if not payload.get("last_updated_riyadh"):
             payload["last_updated_riyadh"] = _to_riyadh_iso(payload.get("last_updated_utc")) or ""
 
+        # compute 52w position if missing
+        if payload.get("position_52w_percent") is None:
+            cp = _safe_get(payload, "current_price", "last_price", "price")
+            lo = _safe_get(payload, "week_52_low", "low_52w", "52w_low")
+            hi = _safe_get(payload, "week_52_high", "high_52w", "52w_high")
+            pos = _compute_52w_position_pct(cp, lo, hi)
+            if pos is not None:
+                payload["position_52w_percent"] = pos
+
         return _schema_fill_best_effort(payload)
     except Exception:
-        # absolute last-resort safety
         return _schema_fill_best_effort(
             {
                 "status": "error",
@@ -702,14 +841,13 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
                 "data_quality": "MISSING",
                 "data_source": source or "unknown",
                 "error": "payload_finalize_failed",
+                "last_updated_utc": _now_utc().isoformat(),
+                "last_updated_riyadh": "",
             }
         )
 
 
 def _payload_symbol_key(p: Dict[str, Any]) -> str:
-    """
-    Extract a robust symbol key for alignment.
-    """
     try:
         for k in ("symbol_normalized", "symbol", "Symbol", "ticker", "code"):
             v = p.get(k)
@@ -720,6 +858,36 @@ def _payload_symbol_key(p: Dict[str, Any]) -> str:
     except Exception:
         pass
     return ""
+
+
+# =============================================================================
+# Concurrency config for slow path
+# =============================================================================
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        v = int(str(x).strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _safe_float(x: Any, default: float) -> float:
+    try:
+        v = float(str(x).strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _cfg() -> Dict[str, Any]:
+    # env-only for this module (keep it simple)
+    concurrency = _safe_int(os.getenv("ENRICHED_CONCURRENCY", 8), 8)
+    timeout_sec = _safe_float(os.getenv("ENRICHED_TIMEOUT_SEC", 25), 25.0)
+
+    concurrency = max(1, min(25, concurrency))
+    timeout_sec = max(3.0, min(90.0, timeout_sec))
+
+    return {"concurrency": concurrency, "timeout_sec": timeout_sec}
 
 
 # =============================================================================
@@ -817,7 +985,6 @@ async def enriched_quotes(
     # FAST PATH: batch returned list or dict
     # ------------------------------------------------------------
     if isinstance(batch_res, (list, dict)) and batch_res:
-        # Case dict: map by key
         if isinstance(batch_res, dict):
             mp: Dict[str, Dict[str, Any]] = {}
             for k, v in batch_res.items():
@@ -853,7 +1020,6 @@ async def enriched_quotes(
         # Case list
         payloads: List[Dict[str, Any]] = [_as_payload(_unwrap_tuple_payload(x)) for x in list(batch_res)]
 
-        # Case A: length matches input -> index align
         if len(payloads) == len(raw_list):
             for i, raw in enumerate(raw_list):
                 norm = _normalize_symbol_safe(raw) or raw
@@ -861,7 +1027,6 @@ async def enriched_quotes(
                 items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
             return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
 
-        # Case B: mismatch -> map by symbol key
         mp2: Dict[str, Dict[str, Any]] = {}
         for p in payloads:
             k = _payload_symbol_key(p)
@@ -893,13 +1058,39 @@ async def enriched_quotes(
         return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
 
     # ------------------------------------------------------------
-    # SLOW PATH: per-symbol
+    # SLOW PATH: per-symbol (bounded concurrency + timeout)
     # ------------------------------------------------------------
-    for raw in raw_list:
+    cfg = _cfg()
+    sem = asyncio.Semaphore(cfg["concurrency"])
+
+    async def _one(raw: str) -> Dict[str, Any]:
         norm = _normalize_symbol_safe(raw)
-        try:
-            result, source, err = await _call_engine_best_effort(request, norm or raw)
-            if result is None:
+        async with sem:
+            try:
+                result, source, err = await asyncio.wait_for(
+                    _call_engine_best_effort(request, norm or raw), timeout=cfg["timeout_sec"]
+                )
+                if result is None:
+                    out = {
+                        "status": "error",
+                        "symbol": norm or raw,
+                        "symbol_input": raw,
+                        "symbol_normalized": norm or raw,
+                        "recommendation": "HOLD",
+                        "data_quality": "MISSING",
+                        "data_source": "none",
+                        "error": err or "Engine not available for this symbol.",
+                        "last_updated_utc": _now_utc().isoformat(),
+                        "last_updated_riyadh": "",
+                    }
+                    if dbg and batch_err:
+                        out["batch_error_hint"] = _clamp(batch_err, 1200)
+                    return _schema_fill_best_effort(out)
+
+                payload = _as_payload(result)
+                return _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
+
+            except asyncio.TimeoutError:
                 out = {
                     "status": "error",
                     "symbol": norm or raw,
@@ -908,37 +1099,32 @@ async def enriched_quotes(
                     "recommendation": "HOLD",
                     "data_quality": "MISSING",
                     "data_source": "none",
-                    "error": err or "Engine not available for this symbol.",
+                    "error": "timeout",
                     "last_updated_utc": _now_utc().isoformat(),
                     "last_updated_riyadh": "",
                 }
-                if dbg and batch_err:
-                    out["batch_error_hint"] = _clamp(batch_err, 1200)
-                items.append(_schema_fill_best_effort(out))
-                continue
+                return _schema_fill_best_effort(out)
 
-            payload = _as_payload(result)
-            items.append(_finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown"))
+            except Exception as e:
+                out2: Dict[str, Any] = {
+                    "status": "error",
+                    "symbol": norm or raw,
+                    "symbol_input": raw,
+                    "symbol_normalized": norm or raw,
+                    "recommendation": "HOLD",
+                    "data_quality": "MISSING",
+                    "data_source": "none",
+                    "error": _safe_error_message(e),
+                    "last_updated_utc": _now_utc().isoformat(),
+                    "last_updated_riyadh": "",
+                }
+                if dbg:
+                    out2["traceback"] = _clamp(traceback.format_exc(), 8000)
+                    if batch_err:
+                        out2["batch_error_hint"] = _clamp(batch_err, 1200)
+                return _schema_fill_best_effort(out2)
 
-        except Exception as e:
-            out2: Dict[str, Any] = {
-                "status": "error",
-                "symbol": norm or raw,
-                "symbol_input": raw,
-                "symbol_normalized": norm or raw,
-                "recommendation": "HOLD",
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": _safe_error_message(e),
-                "last_updated_utc": _now_utc().isoformat(),
-                "last_updated_riyadh": "",
-            }
-            if dbg:
-                out2["traceback"] = _clamp(traceback.format_exc(), 8000)
-                if batch_err:
-                    out2["batch_error_hint"] = _clamp(batch_err, 1200)
-            items.append(_schema_fill_best_effort(out2))
-
+    items = await asyncio.gather(*[_one(r) for r in raw_list])
     return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
 
 
