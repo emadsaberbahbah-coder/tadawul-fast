@@ -1,22 +1,21 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.8.1) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.9.0) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
 - PROD SAFE: DO NOT import core.data_engine_v2 at module import-time.
 - Defensive batching: chunking + timeout + bounded concurrency.
 - Sheets-safe: /sheet-rows ALWAYS returns HTTP 200 with {headers, rows, status}.
-- Canonical headers: core.schemas.get_headers_for_sheet (when available); fallback default.
+- Canonical headers: core.schemas.get_headers_for_sheet (when available); fallback defaults.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
+- Plan-aligned: supports Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v3.8.1 alignment upgrades
-- ✅ Percent normalization improved (ratio vs percent) for change/returns/upside/turnover/etc.
-- ✅ Volatility normalization (ratio 0.25 -> 25).
-- ✅ Computes Fair Value / Upside / Valuation Label / Recommendation / Overall Score if missing.
-- ✅ Supports extra future-ready headers when schema includes them (returns/MA/expected/confidence).
-- ✅ Keeps strict stability: never requires any optional field.
+v3.9.0 upgrades
+- ✅ Adds EXTENDED header mode (current + history + forecast) without breaking BASE.
+- ✅ Better ISO parsing (supports trailing 'Z').
+- ✅ Uses engine-provided overall_score/recommendation/valuation when available, else computes.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.8.1"
+AI_ANALYSIS_VERSION = "3.9.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -44,7 +43,6 @@ router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 try:
     from core.config import get_settings  # type: ignore
 except Exception:  # pragma: no cover
-
     def get_settings():  # type: ignore
         return None
 
@@ -89,7 +87,6 @@ def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
         from core.data_engine_v2 import DataEngine as _DE  # type: ignore
         from core.data_engine_v2 import UnifiedQuote as _UQ  # type: ignore
         from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
-
         return _DE, _UQ, _NS
     except Exception:
         return None, None, _fallback_normalize
@@ -141,7 +138,6 @@ def _allowed_tokens() -> List[str]:
     # 2) env.settings
     try:
         from env import settings as env_settings  # type: ignore
-
         for attr in ("app_token", "backup_app_token"):
             v = _read_token_attr(env_settings, attr)
             if v:
@@ -171,7 +167,7 @@ def _allowed_tokens() -> List[str]:
 def _auth_ok(x_app_token: Optional[str]) -> bool:
     allowed = _allowed_tokens()
     if not allowed:
-        return True
+        return True  # open mode
     return bool(x_app_token and x_app_token.strip() in allowed)
 
 
@@ -250,7 +246,7 @@ def _safe_int(x: Any, default: int) -> int:
         return default
 
 
-def _safe_float(x: Any, default: float) -> float:
+def _safe_float_pos(x: Any, default: float) -> float:
     try:
         v = float(str(x).strip())
         return v if v > 0 else default
@@ -265,22 +261,22 @@ def _cfg() -> Dict[str, Any]:
     except Exception:
         s = None
 
-    batch_size = _safe_int(getattr(s, "ai_batch_size", None), 20)
-    timeout_sec = _safe_float(getattr(s, "ai_batch_timeout_sec", None), 45.0)
-    concurrency = _safe_int(getattr(s, "ai_batch_concurrency", None), 5)
-    max_tickers = _safe_int(getattr(s, "ai_max_tickers", None), 500)
+    batch_size = _safe_int(getattr(s, "ai_batch_size", None), 25)
+    timeout_sec = _safe_float_pos(getattr(s, "ai_batch_timeout_sec", None), 45.0)
+    concurrency = _safe_int(getattr(s, "ai_batch_concurrency", None), 6)
+    max_tickers = _safe_int(getattr(s, "ai_max_tickers", None), 800)
 
     # env overrides
     batch_size = _safe_int(os.getenv("AI_BATCH_SIZE", batch_size), batch_size)
-    timeout_sec = _safe_float(os.getenv("AI_BATCH_TIMEOUT_SEC", timeout_sec), timeout_sec)
+    timeout_sec = _safe_float_pos(os.getenv("AI_BATCH_TIMEOUT_SEC", timeout_sec), timeout_sec)
     concurrency = _safe_int(os.getenv("AI_BATCH_CONCURRENCY", concurrency), concurrency)
     max_tickers = _safe_int(os.getenv("AI_MAX_TICKERS", max_tickers), max_tickers)
 
     # clamps
-    batch_size = max(5, min(200, batch_size))
+    batch_size = max(5, min(250, batch_size))
     timeout_sec = max(5.0, min(180.0, timeout_sec))
-    concurrency = max(1, min(25, concurrency))
-    max_tickers = max(10, min(2000, max_tickers))
+    concurrency = max(1, min(30, concurrency))
+    max_tickers = max(10, min(3000, max_tickers))
 
     return {
         "batch_size": batch_size,
@@ -298,22 +294,32 @@ def _now_utc_iso() -> str:
     return _now_utc().isoformat()
 
 
-def _iso_or_none(x: Any) -> Optional[str]:
+def _parse_iso_dt(x: Any) -> Optional[datetime]:
     if x is None or x == "":
         return None
     try:
         if isinstance(x, datetime):
             dt = x
         else:
-            dt = datetime.fromisoformat(str(x))
+            s = str(x).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
+        return dt
     except Exception:
-        try:
-            return str(x)
-        except Exception:
-            return None
+        return None
+
+
+def _iso_or_none(x: Any) -> Optional[str]:
+    dt = _parse_iso_dt(x)
+    if dt is not None:
+        return dt.isoformat()
+    try:
+        return str(x) if x is not None else None
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -337,7 +343,7 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     roe: Optional[float] = None
     roa: Optional[float] = None
 
-    # History / expectations (optional, future-ready)
+    # History / expectations
     returns_1w: Optional[float] = None
     returns_1m: Optional[float] = None
     returns_3m: Optional[float] = None
@@ -367,14 +373,13 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     risk_score: Optional[float] = None
     overall_score: Optional[float] = None
     recommendation: Optional[str] = None
-    confidence: Optional[float] = None
+    confidence: Optional[float] = None  # 0..1
 
     fair_value: Optional[float] = None
     upside_percent: Optional[float] = None
     valuation_label: Optional[str] = None
 
     last_updated_utc: Optional[str] = None
-    last_updated_riyadh: Optional[str] = None
     sources: List[str] = Field(default_factory=list)
     error: Optional[str] = None
 
@@ -509,9 +514,6 @@ def _ratio_to_percent(v: Any) -> Any:
 
 
 def _vol_to_percent(v: Any) -> Any:
-    """
-    Volatility might come as ratio (0.25) or percent (25).
-    """
     if v is None:
         return None
     try:
@@ -544,14 +546,11 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-
         tz = ZoneInfo("Asia/Riyadh")
-        if isinstance(utc_any, datetime):
-            dt = utc_any
-        else:
-            dt = datetime.fromisoformat(str(utc_any))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+
+        dt = _parse_iso_dt(utc_any)
+        if dt is None:
+            return None
         return dt.astimezone(tz).isoformat()
     except Exception:
         return None
@@ -567,15 +566,6 @@ def _safe_float_or_none(x: Any) -> Optional[float]:
 
 
 def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """
-    Fair value priority:
-      1) fair_value
-      2) expected_price_3m
-      3) expected_price_12m
-      4) ma200
-      5) ma50
-    Upside% = (fair/price - 1)*100
-    """
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
     if price is None or price <= 0:
         return None, None, None
@@ -604,13 +594,6 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
 
 
 def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], Optional[float]]:
-    """
-    Overall score in 0..100 (best-effort):
-      - Blend opportunity/value/quality/momentum
-      - Penalize risk_score
-      - Add small confidence bump
-    confidence returned as 0..1 if possible.
-    """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
     val = _safe_float_or_none(_safe_get(uq, "value_score"))
     qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
@@ -664,8 +647,10 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], 
     return round(score, 2), reco, conf01
 
 
-# ---- Canonical headers fallback (59 columns)
-_DEFAULT_HEADERS_59: List[str] = [
+# =============================================================================
+# Headers (BASE + EXTENDED)
+# =============================================================================
+_DEFAULT_HEADERS_BASE: List[str] = [
     "Symbol",
     "Company Name",
     "Sector",
@@ -727,16 +712,50 @@ _DEFAULT_HEADERS_59: List[str] = [
     "Last Updated (Riyadh)",
 ]
 
+_DEFAULT_HEADERS_EXTENDED: List[str] = _DEFAULT_HEADERS_BASE + [
+    "Returns 1W %",
+    "Returns 1M %",
+    "Returns 3M %",
+    "Returns 6M %",
+    "Returns 12M %",
+    "MA20",
+    "MA50",
+    "MA200",
+    "Expected Return 1M %",
+    "Expected Return 3M %",
+    "Expected Return 12M %",
+    "Expected Price 1M",
+    "Expected Price 3M",
+    "Expected Price 12M",
+    "Confidence Score",
+    "Forecast Method",
+    "History Points",
+    "History Source",
+    "History Last (UTC)",
+]
 
-def _select_headers(sheet_name: Optional[str]) -> List[str]:
+
+def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]:
+    # 1) Canonical schema if available
     if get_headers_for_sheet:
         try:
-            h = get_headers_for_sheet(sheet_name or "")
+            h = get_headers_for_sheet(sheet_name)
             if isinstance(h, list) and len(h) >= 10:
-                return [str(x) for x in h if str(x).strip()]
+                return [str(x) for x in h]
         except Exception:
             pass
-    return list(_DEFAULT_HEADERS_59)
+
+    # 2) Fallback mode
+    m = (mode or "").strip().lower()
+    if m in ("ext", "extended", "full"):
+        return list(_DEFAULT_HEADERS_EXTENDED)
+
+    # 3) Heuristic: global/insights/opportunity usually want extended
+    sn = (sheet_name or "").strip().lower()
+    if any(k in sn for k in ("global", "insight", "opportun", "advisor", "analysis")):
+        return list(_DEFAULT_HEADERS_EXTENDED)
+
+    return list(_DEFAULT_HEADERS_BASE)
 
 
 def _idx(headers: List[str], name: str) -> Optional[int]:
@@ -749,17 +768,17 @@ def _idx(headers: List[str], name: str) -> Optional[int]:
 
 def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
     row = [None] * len(headers)
-    i_sym = _idx(headers, "symbol")
+    i_sym = _idx(headers, "Symbol")
     if i_sym is not None:
         row[i_sym] = symbol
-    i_err = _idx(headers, "error")
+    i_err = _idx(headers, "Error")
     if i_err is not None:
         row[i_err] = err
     return row
 
 
 def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
-    i_err = _idx(headers, "error")
+    i_err = _idx(headers, "Error")
     if i_err is None:
         return "success"
     for r in rows:
@@ -776,6 +795,7 @@ def _snake_guess(header: str) -> str:
     return s
 
 
+# Header -> (candidate fields..., transform?)
 _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
@@ -788,7 +808,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "last price": (("current_price", "last_price", "price"), None),
     "previous close": (("previous_close",), None),
     "price change": (("price_change", "change"), None),
-    "percent change": (("percent_change", "change_percent", "change_pct"), _ratio_to_percent),
+    "percent change": (("percent_change", "change_percent", "change_pct"), None),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
@@ -822,9 +842,33 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "beta": (("beta",), None),
     "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "rsi (14)": (("rsi14", "rsi_14"), None),
+
+    # Extended fields
+    "returns 1w %": (("returns_1w",), None),
+    "returns 1m %": (("returns_1m",), None),
+    "returns 3m %": (("returns_3m",), None),
+    "returns 6m %": (("returns_6m",), None),
+    "returns 12m %": (("returns_12m",), None),
+    "ma20": (("ma20",), None),
+    "ma50": (("ma50",), None),
+    "ma200": (("ma200",), None),
+    "expected return 1m %": (("expected_return_1m",), None),
+    "expected return 3m %": (("expected_return_3m",), None),
+    "expected return 12m %": (("expected_return_12m",), None),
+    "expected price 1m": (("expected_price_1m",), None),
+    "expected price 3m": (("expected_price_3m",), None),
+    "expected price 12m": (("expected_price_12m",), None),
+    "confidence score": (("confidence_score",), None),
+    "forecast method": (("forecast_method",), None),
+    "history points": (("history_points",), None),
+    "history source": (("history_source",), None),
+    "history last (utc)": (("history_last_utc",), _iso_or_none),
+
+    # computed if missing
     "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
-    "upside %": (("upside_percent",), _ratio_to_percent),
+    "upside %": (("upside_percent",), None),
     "valuation label": (("valuation_label",), None),
+
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
@@ -832,35 +876,19 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
     "recommendation": (("recommendation",), None),
+
     "data source": (("data_source", "source"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
     "error": (("error",), None),
-
-    # optional future-ready headers if your schema includes them:
-    "returns 1w": (("returns_1w",), _ratio_to_percent),
-    "returns 1m": (("returns_1m",), _ratio_to_percent),
-    "returns 3m": (("returns_3m",), _ratio_to_percent),
-    "returns 6m": (("returns_6m",), _ratio_to_percent),
-    "returns 12m": (("returns_12m",), _ratio_to_percent),
-    "ma20": (("ma20",), None),
-    "ma50": (("ma50",), None),
-    "ma200": (("ma200",), None),
-    "expected price 1m": (("expected_price_1m",), None),
-    "expected price 3m": (("expected_price_3m",), None),
-    "expected price 12m": (("expected_price_12m",), None),
-    "expected return 1m": (("expected_return_1m",), _ratio_to_percent),
-    "expected return 3m": (("expected_return_3m",), _ratio_to_percent),
-    "expected return 12m": (("expected_return_12m",), _ratio_to_percent),
-    "confidence score": (("confidence_score",), None),
-    "forecast method": (("forecast_method",), None),
 }
 
 
 def _value_for_header(header: str, uq: Any) -> Any:
     hk = _hkey(header)
 
+    # 52W Position computed if missing
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
@@ -870,6 +898,7 @@ def _value_for_header(header: str, uq: Any) -> Any:
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
+    # Valuation / overall / reco computed if missing
     if hk in ("fair value", "upside %", "valuation label", "recommendation", "overall score"):
         fair, upside, label = _compute_fair_value_and_upside(uq)
         overall, reco, _ = _compute_overall_and_reco(uq)
@@ -879,7 +908,7 @@ def _value_for_header(header: str, uq: Any) -> Any:
             return v if v is not None else fair
         if hk == "upside %":
             v = _safe_get(uq, "upside_percent")
-            return _ratio_to_percent(v if v is not None else upside)
+            return v if v is not None else upside
         if hk == "valuation label":
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
@@ -901,16 +930,18 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 return val
         return val
 
+    # fallback: snake-case guess
     guess = _snake_guess(header)
     val = _safe_get(uq, guess)
     if val is not None:
         return val
+
     return None
 
 
 def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
-    # fill Riyadh if requested but missing
-    if _idx(headers, "last updated (riyadh)") is not None:
+    # Fill Riyadh if requested but missing
+    if _idx(headers, "Last Updated (Riyadh)") is not None:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
         last_riy = _safe_get(uq, "last_updated_riyadh")
         if not last_riy and last_utc:
@@ -945,6 +976,13 @@ def _unwrap_tuple_payload(x: Any) -> Any:
 
 
 async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
+    """
+    Compatibility shim:
+    - Prefer engine.get_enriched_quotes if present
+    - Else engine.get_quotes
+    - Else per-symbol engine.get_enriched_quote/get_quote
+    Accepts engines returning list OR dict OR (payload, err).
+    """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
         res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
@@ -1055,9 +1093,9 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
+    # optional external scoring enrichment (never required)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
-
         uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
@@ -1065,17 +1103,15 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     sym = (_safe_get(uq, "symbol") or _normalize_any(requested_symbol) or requested_symbol or "").upper()
 
     price = _safe_get(uq, "current_price", "last_price", "price")
-    change_pct = _ratio_to_percent(_safe_get(uq, "percent_change", "change_pct", "change_percent"))
+    change_pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
 
     last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
     last_utc_iso = _iso_or_none(last_utc)
-    last_riy = _safe_get(uq, "last_updated_riyadh")
-    if not last_riy and last_utc:
-        last_riy = _to_riyadh_iso(last_utc)
 
     fair, upside, val_label = _compute_fair_value_and_upside(uq)
     overall, reco, conf01 = _compute_overall_and_reco(uq)
 
+    # Prefer engine-provided if present
     fair2 = _safe_get(uq, "fair_value")
     upside2 = _safe_get(uq, "upside_percent")
     val_label2 = _safe_get(uq, "valuation_label")
@@ -1083,13 +1119,6 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     overall2 = _safe_get(uq, "overall_score")
     conf_score = _safe_get(uq, "confidence_score")
     forecast_method = _safe_get(uq, "forecast_method")
-
-    conf_int: Optional[int] = None
-    try:
-        if conf_score is not None:
-            conf_int = int(float(conf_score))
-    except Exception:
-        conf_int = None
 
     return SingleAnalysisResponse(
         symbol=sym,
@@ -1103,23 +1132,23 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         dividend_yield=_ratio_to_percent(_safe_get(uq, "dividend_yield")),
         roe=_ratio_to_percent(_safe_get(uq, "roe")),
         roa=_ratio_to_percent(_safe_get(uq, "roa")),
-        returns_1w=_ratio_to_percent(_safe_get(uq, "returns_1w")),
-        returns_1m=_ratio_to_percent(_safe_get(uq, "returns_1m")),
-        returns_3m=_ratio_to_percent(_safe_get(uq, "returns_3m")),
-        returns_6m=_ratio_to_percent(_safe_get(uq, "returns_6m")),
-        returns_12m=_ratio_to_percent(_safe_get(uq, "returns_12m")),
+        returns_1w=_safe_get(uq, "returns_1w"),
+        returns_1m=_safe_get(uq, "returns_1m"),
+        returns_3m=_safe_get(uq, "returns_3m"),
+        returns_6m=_safe_get(uq, "returns_6m"),
+        returns_12m=_safe_get(uq, "returns_12m"),
         rsi14=_safe_get(uq, "rsi14", "rsi_14"),
         vol_30d_ann=_vol_to_percent(_safe_get(uq, "vol_30d_ann", "volatility_30d", "volatility_30d_ann")),
         ma20=_safe_get(uq, "ma20"),
         ma50=_safe_get(uq, "ma50"),
         ma200=_safe_get(uq, "ma200"),
-        expected_return_1m=_ratio_to_percent(_safe_get(uq, "expected_return_1m")),
-        expected_return_3m=_ratio_to_percent(_safe_get(uq, "expected_return_3m")),
-        expected_return_12m=_ratio_to_percent(_safe_get(uq, "expected_return_12m")),
+        expected_return_1m=_safe_get(uq, "expected_return_1m"),
+        expected_return_3m=_safe_get(uq, "expected_return_3m"),
+        expected_return_12m=_safe_get(uq, "expected_return_12m"),
         expected_price_1m=_safe_get(uq, "expected_price_1m"),
         expected_price_3m=_safe_get(uq, "expected_price_3m"),
         expected_price_12m=_safe_get(uq, "expected_price_12m"),
-        confidence_score=conf_int,
+        confidence_score=conf_score,
         forecast_method=forecast_method,
         data_quality=str(_safe_get(uq, "data_quality") or "MISSING"),
         value_score=_safe_get(uq, "value_score"),
@@ -1131,10 +1160,9 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         recommendation=reco2 if reco2 is not None else reco,
         confidence=_safe_get(uq, "confidence") if _safe_get(uq, "confidence") is not None else conf01,
         fair_value=fair2 if fair2 is not None else fair,
-        upside_percent=_ratio_to_percent(upside2 if upside2 is not None else upside),
+        upside_percent=upside2 if upside2 is not None else upside,
         valuation_label=val_label2 if val_label2 is not None else val_label,
         last_updated_utc=last_utc_iso,
-        last_updated_riyadh=_iso_or_none(last_riy) or (str(last_riy) if last_riy else None),
         sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
         error=_safe_get(uq, "error"),
     )
@@ -1156,7 +1184,11 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
+            engine_version = (
+                getattr(eng, "ENGINE_VERSION", None)
+                or getattr(eng, "engine_version", None)
+                or getattr(eng, "version", None)
+            )
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1246,18 +1278,20 @@ async def analyze_batch_quotes(
 async def analyze_for_sheet(
     request: Request,
     body: BatchAnalysisRequest = Body(...),
+    mode: Optional[str] = Query(default=None, description="Headers mode: base|extended (fallback only)."),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> SheetAnalysisResponse:
     """
     Sheets-safe: ALWAYS returns HTTP 200 with {headers, rows, status}.
     If auth fails -> returns error rows (no exception).
     """
-    headers = _select_headers(body.sheet_name)
+    headers = _select_headers(body.sheet_name, mode)
     tickers = _clean_symbols((body.tickers or []) + (body.symbols or []))
 
     if not tickers:
         return SheetAnalysisResponse(headers=headers, rows=[], status="skipped", error="No tickers provided")
 
+    # Sheets-safe auth (never raise out)
     if not _auth_ok(x_app_token):
         err = "Unauthorized (invalid or missing X-APP-TOKEN)."
         rows = [_error_row(t, headers, err) for t in tickers]
