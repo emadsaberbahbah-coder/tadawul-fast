@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.8.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v3.8.1) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -11,11 +11,12 @@ Key goals
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 
-v3.8.0 upgrades (future expectation + efficiency)
-- ✅ Maps new DataEngine fields when present (returns, RSI14, vol_30d_ann, expected_price/return, confidence_score).
-- ✅ Computes Fair Value / Upside / Valuation Label / Recommendation if missing.
-- ✅ Computes Overall Score if missing (uses opportunity/value/quality/momentum/risk + confidence).
-- ✅ Keeps strict stability: never requires those fields; everything is optional/best-effort.
+v3.8.1 alignment upgrades
+- ✅ Percent normalization improved (ratio vs percent) for change/returns/upside/turnover/etc.
+- ✅ Volatility normalization (ratio 0.25 -> 25).
+- ✅ Computes Fair Value / Upside / Valuation Label / Recommendation / Overall Score if missing.
+- ✅ Supports extra future-ready headers when schema includes them (returns/MA/expected/confidence).
+- ✅ Keeps strict stability: never requires any optional field.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "3.8.0"
+AI_ANALYSIS_VERSION = "3.8.1"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -76,7 +77,6 @@ def _fallback_normalize(raw: str) -> str:
         return s
     if "." in s:
         return s
-    # default: assume US
     return f"{s}.US"
 
 
@@ -96,7 +96,6 @@ def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
 
 
 def _normalize_any(raw: str) -> str:
-    # Try v2 normalize_symbol at runtime; fallback if anything fails.
     try:
         _, _, ns = _try_import_v2_symbols()
         s = (ns(raw) or "").strip().upper()
@@ -172,7 +171,7 @@ def _allowed_tokens() -> List[str]:
 def _auth_ok(x_app_token: Optional[str]) -> bool:
     allowed = _allowed_tokens()
     if not allowed:
-        return True  # open mode
+        return True
     return bool(x_app_token and x_app_token.strip() in allowed)
 
 
@@ -375,6 +374,7 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     valuation_label: Optional[str] = None
 
     last_updated_utc: Optional[str] = None
+    last_updated_riyadh: Optional[str] = None
     sources: List[str] = Field(default_factory=list)
     error: Optional[str] = None
 
@@ -569,12 +569,12 @@ def _safe_float_or_none(x: Any) -> Optional[float]:
 def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """
     Fair value priority:
-      1) expected_price_3m
-      2) expected_price_12m
-      3) ma200
-      4) ma50
+      1) fair_value
+      2) expected_price_3m
+      3) expected_price_12m
+      4) ma200
+      5) ma50
     Upside% = (fair/price - 1)*100
-    Valuation label from upside thresholds.
     """
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
     if price is None or price <= 0:
@@ -606,11 +606,9 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
 def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], Optional[float]]:
     """
     Overall score in 0..100 (best-effort):
-      - Start with opportunity_score if present
-      - Blend value/quality/momentum
+      - Blend opportunity/value/quality/momentum
       - Penalize risk_score
       - Add small confidence bump
-    Recommendation derived from overall + risk.
     confidence returned as 0..1 if possible.
     """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
@@ -620,9 +618,8 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], 
     risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
     conf_score = _safe_float_or_none(_safe_get(uq, "confidence_score"))
     if conf_score is None:
-        conf_score = _safe_float_or_none(_safe_get(uq, "confidence"))  # sometimes already 0..1/0..100
+        conf_score = _safe_float_or_none(_safe_get(uq, "confidence"))
 
-    # normalize confidence (try)
     conf01: Optional[float] = None
     if conf_score is not None:
         if 0.0 <= conf_score <= 1.0:
@@ -653,7 +650,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], 
     score = max(0.0, min(100.0, score))
 
     reco = "Hold"
-    # Risk-aware thresholds
     if score >= 80:
         reco = "Strong Buy" if (risk is None or risk <= 55) else "Buy"
     elif score >= 65:
@@ -735,9 +731,9 @@ _DEFAULT_HEADERS_59: List[str] = [
 def _select_headers(sheet_name: Optional[str]) -> List[str]:
     if get_headers_for_sheet:
         try:
-            h = get_headers_for_sheet(sheet_name)
+            h = get_headers_for_sheet(sheet_name or "")
             if isinstance(h, list) and len(h) >= 10:
-                return [str(x) for x in h]
+                return [str(x) for x in h if str(x).strip()]
         except Exception:
             pass
     return list(_DEFAULT_HEADERS_59)
@@ -753,17 +749,17 @@ def _idx(headers: List[str], name: str) -> Optional[int]:
 
 def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
     row = [None] * len(headers)
-    i_sym = _idx(headers, "Symbol")
+    i_sym = _idx(headers, "symbol")
     if i_sym is not None:
         row[i_sym] = symbol
-    i_err = _idx(headers, "Error")
+    i_err = _idx(headers, "error")
     if i_err is not None:
         row[i_err] = err
     return row
 
 
 def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
-    i_err = _idx(headers, "Error")
+    i_err = _idx(headers, "error")
     if i_err is None:
         return "success"
     for r in rows:
@@ -780,7 +776,6 @@ def _snake_guess(header: str) -> str:
     return s
 
 
-# Header -> (candidate fields..., transform?)
 _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
@@ -793,10 +788,9 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "last price": (("current_price", "last_price", "price"), None),
     "previous close": (("previous_close",), None),
     "price change": (("price_change", "change"), None),
-    "percent change": (("percent_change", "change_percent", "change_pct"), None),
+    "percent change": (("percent_change", "change_percent", "change_pct"), _ratio_to_percent),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
-    # ✅ align to DataEngineV2 keys
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
@@ -826,12 +820,10 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
     "beta": (("beta",), None),
-    # ✅ new volatility / RSI names supported
     "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "rsi (14)": (("rsi14", "rsi_14"), None),
-    # computed if missing
     "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
-    "upside %": (("upside_percent",), None),
+    "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
@@ -845,13 +837,30 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
     "error": (("error",), None),
+
+    # optional future-ready headers if your schema includes them:
+    "returns 1w": (("returns_1w",), _ratio_to_percent),
+    "returns 1m": (("returns_1m",), _ratio_to_percent),
+    "returns 3m": (("returns_3m",), _ratio_to_percent),
+    "returns 6m": (("returns_6m",), _ratio_to_percent),
+    "returns 12m": (("returns_12m",), _ratio_to_percent),
+    "ma20": (("ma20",), None),
+    "ma50": (("ma50",), None),
+    "ma200": (("ma200",), None),
+    "expected price 1m": (("expected_price_1m",), None),
+    "expected price 3m": (("expected_price_3m",), None),
+    "expected price 12m": (("expected_price_12m",), None),
+    "expected return 1m": (("expected_return_1m",), _ratio_to_percent),
+    "expected return 3m": (("expected_return_3m",), _ratio_to_percent),
+    "expected return 12m": (("expected_return_12m",), _ratio_to_percent),
+    "confidence score": (("confidence_score",), None),
+    "forecast method": (("forecast_method",), None),
 }
 
 
 def _value_for_header(header: str, uq: Any) -> Any:
     hk = _hkey(header)
 
-    # 52W Position computed if missing
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
@@ -861,27 +870,22 @@ def _value_for_header(header: str, uq: Any) -> Any:
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
-    # Fair value / upside / valuation label computed if missing
     if hk in ("fair value", "upside %", "valuation label", "recommendation", "overall score"):
         fair, upside, label = _compute_fair_value_and_upside(uq)
-        overall, reco, conf01 = _compute_overall_and_reco(uq)
+        overall, reco, _ = _compute_overall_and_reco(uq)
 
         if hk == "fair value":
             v = _safe_get(uq, "fair_value")
             return v if v is not None else fair
-
         if hk == "upside %":
             v = _safe_get(uq, "upside_percent")
-            return v if v is not None else upside
-
+            return _ratio_to_percent(v if v is not None else upside)
         if hk == "valuation label":
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
-
         if hk == "overall score":
             v = _safe_get(uq, "overall_score")
             return v if v is not None else overall
-
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
             return v if v is not None else reco
@@ -897,18 +901,16 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 return val
         return val
 
-    # fallback: snake-case guess
     guess = _snake_guess(header)
     val = _safe_get(uq, guess)
     if val is not None:
         return val
-
     return None
 
 
 def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
     # fill Riyadh if requested but missing
-    if _idx(headers, "Last Updated (Riyadh)") is not None:
+    if _idx(headers, "last updated (riyadh)") is not None:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
         last_riy = _safe_get(uq, "last_updated_riyadh")
         if not last_riy and last_utc:
@@ -943,13 +945,6 @@ def _unwrap_tuple_payload(x: Any) -> Any:
 
 
 async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
-    """
-    Compatibility shim:
-    - Prefer engine.get_enriched_quotes if present
-    - Else engine.get_quotes
-    - Else per-symbol engine.get_enriched_quote/get_quote
-    Accepts engines returning list OR dict OR (payload, err).
-    """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
         res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
@@ -1060,7 +1055,6 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
-    # optional external scoring enrichment (never required)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
 
@@ -1071,15 +1065,17 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     sym = (_safe_get(uq, "symbol") or _normalize_any(requested_symbol) or requested_symbol or "").upper()
 
     price = _safe_get(uq, "current_price", "last_price", "price")
-    change_pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
+    change_pct = _ratio_to_percent(_safe_get(uq, "percent_change", "change_pct", "change_percent"))
 
     last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
     last_utc_iso = _iso_or_none(last_utc)
+    last_riy = _safe_get(uq, "last_updated_riyadh")
+    if not last_riy and last_utc:
+        last_riy = _to_riyadh_iso(last_utc)
 
     fair, upside, val_label = _compute_fair_value_and_upside(uq)
     overall, reco, conf01 = _compute_overall_and_reco(uq)
 
-    # Prefer engine-provided if present
     fair2 = _safe_get(uq, "fair_value")
     upside2 = _safe_get(uq, "upside_percent")
     val_label2 = _safe_get(uq, "valuation_label")
@@ -1087,6 +1083,13 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     overall2 = _safe_get(uq, "overall_score")
     conf_score = _safe_get(uq, "confidence_score")
     forecast_method = _safe_get(uq, "forecast_method")
+
+    conf_int: Optional[int] = None
+    try:
+        if conf_score is not None:
+            conf_int = int(float(conf_score))
+    except Exception:
+        conf_int = None
 
     return SingleAnalysisResponse(
         symbol=sym,
@@ -1100,24 +1103,23 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         dividend_yield=_ratio_to_percent(_safe_get(uq, "dividend_yield")),
         roe=_ratio_to_percent(_safe_get(uq, "roe")),
         roa=_ratio_to_percent(_safe_get(uq, "roa")),
-        # history / expectations
-        returns_1w=_safe_get(uq, "returns_1w"),
-        returns_1m=_safe_get(uq, "returns_1m"),
-        returns_3m=_safe_get(uq, "returns_3m"),
-        returns_6m=_safe_get(uq, "returns_6m"),
-        returns_12m=_safe_get(uq, "returns_12m"),
+        returns_1w=_ratio_to_percent(_safe_get(uq, "returns_1w")),
+        returns_1m=_ratio_to_percent(_safe_get(uq, "returns_1m")),
+        returns_3m=_ratio_to_percent(_safe_get(uq, "returns_3m")),
+        returns_6m=_ratio_to_percent(_safe_get(uq, "returns_6m")),
+        returns_12m=_ratio_to_percent(_safe_get(uq, "returns_12m")),
         rsi14=_safe_get(uq, "rsi14", "rsi_14"),
         vol_30d_ann=_vol_to_percent(_safe_get(uq, "vol_30d_ann", "volatility_30d", "volatility_30d_ann")),
         ma20=_safe_get(uq, "ma20"),
         ma50=_safe_get(uq, "ma50"),
         ma200=_safe_get(uq, "ma200"),
-        expected_return_1m=_safe_get(uq, "expected_return_1m"),
-        expected_return_3m=_safe_get(uq, "expected_return_3m"),
-        expected_return_12m=_safe_get(uq, "expected_return_12m"),
+        expected_return_1m=_ratio_to_percent(_safe_get(uq, "expected_return_1m")),
+        expected_return_3m=_ratio_to_percent(_safe_get(uq, "expected_return_3m")),
+        expected_return_12m=_ratio_to_percent(_safe_get(uq, "expected_return_12m")),
         expected_price_1m=_safe_get(uq, "expected_price_1m"),
         expected_price_3m=_safe_get(uq, "expected_price_3m"),
         expected_price_12m=_safe_get(uq, "expected_price_12m"),
-        confidence_score=conf_score,
+        confidence_score=conf_int,
         forecast_method=forecast_method,
         data_quality=str(_safe_get(uq, "data_quality") or "MISSING"),
         value_score=_safe_get(uq, "value_score"),
@@ -1129,9 +1131,10 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         recommendation=reco2 if reco2 is not None else reco,
         confidence=_safe_get(uq, "confidence") if _safe_get(uq, "confidence") is not None else conf01,
         fair_value=fair2 if fair2 is not None else fair,
-        upside_percent=upside2 if upside2 is not None else upside,
+        upside_percent=_ratio_to_percent(upside2 if upside2 is not None else upside),
         valuation_label=val_label2 if val_label2 is not None else val_label,
         last_updated_utc=last_utc_iso,
+        last_updated_riyadh=_iso_or_none(last_riy) or (str(last_riy) if last_riy else None),
         sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
         error=_safe_get(uq, "error"),
     )
@@ -1158,7 +1161,6 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
                     providers.extend([str(x) for x in v if str(x).strip()])
-            # de-dup
             seen = set()
             providers = [p for p in providers if not (p in seen or seen.add(p))]
     except Exception:
@@ -1256,7 +1258,6 @@ async def analyze_for_sheet(
     if not tickers:
         return SheetAnalysisResponse(headers=headers, rows=[], status="skipped", error="No tickers provided")
 
-    # Sheets-safe auth (never raise out)
     if not _auth_ok(x_app_token):
         err = "Unauthorized (invalid or missing X-APP-TOKEN)."
         rows = [_error_row(t, headers, err) for t in tickers]
