@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.0.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.1.0) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,11 +12,12 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: supports Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.0.0 upgrades
-- ✅ Standardizes Recommendation enum everywhere: BUY / HOLD / REDUCE / SELL
-  (fixes inconsistency between /analysis and /sheet-rows).
-- ✅ Normalizes incoming provider/scoring values like "Sell", "Strong Buy", "STRONG_BUY", etc.
-- ✅ Keeps PROD-safe import patterns + sheets-safe behavior.
+v4.1.0 upgrades
+- ✅ Keeps Recommendation enum everywhere: BUY / HOLD / REDUCE / SELL (normalized)
+- ✅ If core.schemas returns only 59 headers, mode=extended will APPEND extended columns (non-breaking)
+- ✅ Uses core.schemas.HEADER_TO_FIELD / header_to_field when available (better alignment)
+- ✅ Stronger batch alignment when engine returns dict OR list OR unordered list
+- ✅ More Sheets-safe status detection (Error + Data Quality)
 """
 
 from __future__ import annotations
@@ -30,13 +31,23 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+
+# Pydantic v2 preferred, v1 fallback
+try:
+    from pydantic import BaseModel, ConfigDict, Field  # type: ignore
+
+    _PYDANTIC_V2 = True
+except Exception:  # pragma: no cover
+    from pydantic import BaseModel, Field  # type: ignore
+
+    ConfigDict = None  # type: ignore
+    _PYDANTIC_V2 = False
+
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.0.0"
+AI_ANALYSIS_VERSION = "4.1.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
-
 
 # =============================================================================
 # Settings shim (safe)
@@ -49,72 +60,114 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
-# Canonical headers (when available)
+# Schemas (lazy-safe via local import helper)
 # =============================================================================
-try:
-    from core.schemas import get_headers_for_sheet  # type: ignore
-except Exception:  # pragma: no cover
-    get_headers_for_sheet = None  # type: ignore
+def _try_import_schemas():
+    try:
+        from core import schemas as sch  # type: ignore
+        return sch
+    except Exception:
+        return None
+
+
+def _schemas_get_headers(sheet_name: Optional[str]) -> Optional[List[str]]:
+    sch = _try_import_schemas()
+    if sch is None:
+        return None
+    fn = getattr(sch, "get_headers_for_sheet", None)
+    if callable(fn):
+        try:
+            h = fn(sheet_name)
+            if isinstance(h, list) and len(h) >= 10:
+                return [str(x) for x in h]
+        except Exception:
+            return None
+    return None
+
+
+def _schemas_header_to_field(header: str) -> Optional[str]:
+    sch = _try_import_schemas()
+    if sch is None:
+        return None
+    fn = getattr(sch, "header_to_field", None)
+    if callable(fn):
+        try:
+            out = fn(header)
+            out = str(out or "").strip()
+            return out or None
+        except Exception:
+            return None
+    # fallback: direct dict
+    m = getattr(sch, "HEADER_TO_FIELD", None)
+    if isinstance(m, dict):
+        try:
+            out = m.get(str(header).strip())
+            out = str(out or "").strip()
+            return out or None
+        except Exception:
+            return None
+    return None
 
 
 # =============================================================================
 # Recommendation normalization (BUY/HOLD/REDUCE/SELL)
 # =============================================================================
-def _normalize_recommendation(x: Any) -> Optional[str]:
+_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
+
+
+def _normalize_recommendation(x: Any) -> str:
     """
     Canonical enum across all endpoints:
       BUY / HOLD / REDUCE / SELL
-
-    Accepts variants:
-      "Buy", "Sell", "Hold", "Reduce"
-      "Strong Buy", "STRONG_BUY", "STRONG BUY"
-      "Strong Sell", "STRONG_SELL"
-      other synonyms -> HOLD (safe)
     """
     if x is None:
-        return None
-    s = str(x).strip()
+        return "HOLD"
+
+    try:
+        s = str(x).strip().upper()
+    except Exception:
+        return "HOLD"
+
     if not s:
-        return None
+        return "HOLD"
 
-    u = s.upper().strip()
-    u2 = u.replace(" ", "_")
+    if s in _RECO_ENUM:
+        return s
 
-    allowed = {"BUY", "HOLD", "REDUCE", "SELL"}
-    if u in allowed:
-        return u
-    if u2 in allowed:
-        return u2
+    s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
 
-    strong_map = {
-        "STRONG_BUY": "BUY",
-        "STRONG BUY": "BUY",
-        "STRONGBUY": "BUY",
-        "STRONG_SELL": "SELL",
-        "STRONG SELL": "SELL",
-        "STRONGSELL": "SELL",
+    buy_like = {
+        "STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"
     }
-    if u in strong_map:
-        return strong_map[u]
-    if u2 in strong_map:
-        return strong_map[u2]
-
-    synonyms = {
-        "NEUTRAL": "HOLD",
-        "KEEP": "HOLD",
-        "WAIT": "HOLD",
-        "TRIM": "REDUCE",
-        "TAKE_PROFIT": "REDUCE",
-        "TAKE PROFIT": "REDUCE",
-        "PARTIAL_SELL": "REDUCE",
-        "PARTIAL SELL": "REDUCE",
+    hold_like = {
+        "HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT", "KEEP"
     }
-    if u in synonyms:
-        return synonyms[u]
-    if u2 in synonyms:
-        return synonyms[u2]
+    reduce_like = {
+        "REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"
+    }
+    sell_like = {
+        "SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"
+    }
 
-    # default safe fallback (prevents random strings leaking to Sheets)
+    if s2 in buy_like:
+        return "BUY"
+    if s2 in hold_like:
+        return "HOLD"
+    if s2 in reduce_like:
+        return "REDUCE"
+    if s2 in sell_like:
+        return "SELL"
+
+    # heuristic contains
+    if "SELL" in s2:
+        return "SELL"
+    if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
+        return "REDUCE"
+    if "HOLD" in s2 or "NEUTRAL" in s2 or "MAINTAIN" in s2:
+        return "HOLD"
+    if "BUY" in s2 or "ACCUMULATE" in s2 or "OVERWEIGHT" in s2:
+        return "BUY"
+
     return "HOLD"
 
 
@@ -384,11 +437,29 @@ def _iso_or_none(x: Any) -> Optional[str]:
         return None
 
 
+def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
+    if not utc_any:
+        return None
+    try:
+        from zoneinfo import ZoneInfo  # py3.9+
+        tz = ZoneInfo("Asia/Riyadh")
+        dt = _parse_iso_dt(utc_any)
+        if dt is None:
+            return None
+        return dt.astimezone(tz).isoformat()
+    except Exception:
+        return None
+
+
 # =============================================================================
 # Models
 # =============================================================================
 class _ExtraIgnoreBase(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")  # type: ignore
+    else:  # pragma: no cover
+        class Config:
+            extra = "ignore"
 
 
 class SingleAnalysisResponse(_ExtraIgnoreBase):
@@ -501,10 +572,15 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
     return {
         "symbol": sym,
         "name": None,
+        "sector": None,
+        "sub_sector": None,
         "market": None,
         "currency": None,
+        "listing_date": None,
         "current_price": None,
         "previous_close": None,
+        "price_change": None,
+        "percent_change": None,
         "day_high": None,
         "day_low": None,
         "week_52_high": None,
@@ -513,17 +589,34 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "volume": None,
         "avg_volume_30d": None,
         "value_traded": None,
+        "turnover_percent": None,
+        "shares_outstanding": None,
+        "free_float": None,
         "market_cap": None,
+        "free_float_market_cap": None,
+        "liquidity_score": None,
         "pe_ttm": None,
         "pb": None,
         "dividend_yield": None,
         "roe": None,
         "roa": None,
+        "value_score": None,
+        "quality_score": None,
+        "momentum_score": None,
+        "opportunity_score": None,
+        "risk_score": None,
+        "overall_score": None,
+        "fair_value": None,
+        "upside_percent": None,
+        "valuation_label": None,
+        "recommendation": "HOLD",
+        "confidence": None,
         "data_source": "none",
         "data_quality": dq,
         "error": err,
         "status": "error",
         "last_updated_utc": _now_utc_iso(),
+        "last_updated_riyadh": "",
     }
 
 
@@ -603,21 +696,6 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
         return None
 
 
-def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
-    if not utc_any:
-        return None
-    try:
-        from zoneinfo import ZoneInfo  # py3.9+
-        tz = ZoneInfo("Asia/Riyadh")
-
-        dt = _parse_iso_dt(utc_any)
-        if dt is None:
-            return None
-        return dt.astimezone(tz).isoformat()
-    except Exception:
-        return None
-
-
 def _safe_float_or_none(x: Any) -> Optional[float]:
     try:
         if x is None or x == "":
@@ -655,27 +733,29 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
     return fair, round(upside, 2), label
 
 
-def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[float]]:
     """
     Returns (overall_score_0_100, recommendation_enum, confidence_0_1).
-    Recommendation enum: BUY/HOLD/REDUCE/SELL
     """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
     val = _safe_float_or_none(_safe_get(uq, "value_score"))
     qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
     mom = _safe_float_or_none(_safe_get(uq, "momentum_score"))
     risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
+
     conf_score = _safe_float_or_none(_safe_get(uq, "confidence_score"))
     if conf_score is None:
         conf_score = _safe_float_or_none(_safe_get(uq, "confidence"))
 
     conf01: Optional[float] = None
+    conf100: Optional[float] = None
     if conf_score is not None:
         if 0.0 <= conf_score <= 1.0:
             conf01 = conf_score
-            conf_score = conf_score * 100.0
+            conf100 = conf_score * 100.0
         elif 1.0 < conf_score <= 100.0:
             conf01 = conf_score / 100.0
+            conf100 = conf_score
 
     parts: List[float] = []
     if opp is not None:
@@ -688,17 +768,16 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], 
         parts.append(0.15 * mom)
 
     if not parts:
-        return None, None, conf01
+        return None, "HOLD", conf01
 
     score = sum(parts)
     if risk is not None:
         score -= 0.15 * risk
-    if conf_score is not None:
-        score += 0.05 * (conf_score - 50.0)
+    if conf100 is not None:
+        score += 0.05 * (conf100 - 50.0)
 
     score = max(0.0, min(100.0, score))
 
-    # Canonical 4-bucket recommendation
     if score >= 65:
         reco = "BUY"
     elif score >= 50:
@@ -708,8 +787,8 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str], 
     else:
         reco = "SELL"
 
-    # If risk is very high, degrade one step (never below SELL)
     if risk is not None and risk >= 80:
+        # degrade one step (never below SELL)
         if reco == "BUY":
             reco = "HOLD"
         elif reco == "HOLD":
@@ -809,21 +888,28 @@ _DEFAULT_HEADERS_EXTENDED: List[str] = _DEFAULT_HEADERS_BASE + [
 
 
 def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]:
-    # 1) Canonical schema if available
-    if get_headers_for_sheet:
-        try:
-            h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and len(h) >= 10:
-                return [str(x) for x in h]
-        except Exception:
-            pass
+    """
+    Preference order:
+    1) core.schemas.get_headers_for_sheet(sheet_name)
+    2) fallback defaults
 
-    # 2) Fallback mode
+    Enhancement:
+    - if mode=extended and schemas returned a short/canonical list (e.g. 59),
+      append extended columns that are missing (no breaking reorder).
+    """
     m = (mode or "").strip().lower()
+
+    h = _schemas_get_headers(sheet_name)
+    if isinstance(h, list) and len(h) >= 10:
+        if m in ("ext", "extended", "full"):
+            base_set = {str(x) for x in h}
+            extras = [x for x in _DEFAULT_HEADERS_EXTENDED if x not in base_set]
+            return list(h) + extras
+        return list(h)
+
     if m in ("ext", "extended", "full"):
         return list(_DEFAULT_HEADERS_EXTENDED)
 
-    # 3) Heuristic: global/insights/opportunity usually want extended
     sn = (sheet_name or "").strip().lower()
     if any(k in sn for k in ("global", "insight", "opportun", "advisor", "analysis")):
         return list(_DEFAULT_HEADERS_EXTENDED)
@@ -847,16 +933,33 @@ def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
     i_err = _idx(headers, "Error")
     if i_err is not None:
         row[i_err] = err
+    i_dq = _idx(headers, "Data Quality")
+    if i_dq is not None:
+        row[i_dq] = "MISSING"
+    i_rec = _idx(headers, "Recommendation")
+    if i_rec is not None:
+        row[i_rec] = "HOLD"
     return row
 
 
 def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
     i_err = _idx(headers, "Error")
-    if i_err is None:
-        return "success"
+    i_dq = _idx(headers, "Data Quality")
+    any_err = False
+    any_missing = False
+
     for r in rows:
-        if len(r) > i_err and (r[i_err] not in (None, "", "null", "None")):
-            return "partial"
+        if i_err is not None and len(r) > i_err and str(r[i_err] or "").strip():
+            any_err = True
+        if i_dq is not None and len(r) > i_dq and str(r[i_dq] or "").strip().upper() == "MISSING":
+            any_missing = True
+
+    if not rows:
+        return "skipped"
+    if any_err and all((i_err is not None and len(r) > i_err and str(r[i_err] or "").strip()) for r in rows):
+        return "error"
+    if any_err or any_missing:
+        return "partial"
     return "success"
 
 
@@ -868,43 +971,19 @@ def _snake_guess(header: str) -> str:
     return s
 
 
-# Header -> (candidate fields..., transform?)
-_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
-    "symbol": (("symbol",), None),
+# =============================================================================
+# Header mapping (schemas-aware + extended)
+# =============================================================================
+# local aliases for extended fields that are not in canonical schemas
+_LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "company name": (("name", "company_name"), None),
-    "sector": (("sector",), None),
     "sub-sector": (("sub_sector", "subsector"), None),
     "sub sector": (("sub_sector", "subsector"), None),
-    "market": (("market", "market_region"), None),
-    "currency": (("currency",), None),
-    "listing date": (("listing_date", "ipo"), None),
     "last price": (("current_price", "last_price", "price"), None),
-    "previous close": (("previous_close",), None),
-    "price change": (("price_change", "change"), None),
-    "percent change": (("percent_change", "change_percent", "change_pct"), None),
-    "day high": (("day_high",), None),
-    "day low": (("day_low",), None),
-    "52w high": (("week_52_high", "high_52w", "52w_high"), None),
-    "52w low": (("week_52_low", "low_52w", "52w_low"), None),
-    "52w position %": (("position_52w_percent", "position_52w"), None),
-    "volume": (("volume",), None),
-    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
-    "value traded": (("value_traded",), None),
+    "percent change": (("percent_change", "change_pct", "change_percent"), _ratio_to_percent),
     "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
-    "shares outstanding": (("shares_outstanding",), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
-    "market cap": (("market_cap",), None),
-    "free float market cap": (("free_float_market_cap",), None),
-    "liquidity score": (("liquidity_score",), None),
-    "eps (ttm)": (("eps_ttm", "eps"), None),
-    "forward eps": (("forward_eps",), None),
-    "p/e (ttm)": (("pe_ttm",), None),
-    "forward p/e": (("forward_pe",), None),
-    "p/b": (("pb",), None),
-    "p/s": (("ps",), None),
-    "ev/ebitda": (("ev_ebitda",), None),
     "dividend yield %": (("dividend_yield",), _ratio_to_percent),
-    "dividend rate": (("dividend_rate",), None),
     "payout ratio %": (("payout_ratio",), _ratio_to_percent),
     "roe %": (("roe",), _ratio_to_percent),
     "roa %": (("roa",), _ratio_to_percent),
@@ -912,22 +991,21 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
-    "beta": (("beta",), None),
     "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "rsi (14)": (("rsi14", "rsi_14"), None),
 
     # Extended fields
-    "returns 1w %": (("returns_1w",), None),
-    "returns 1m %": (("returns_1m",), None),
-    "returns 3m %": (("returns_3m",), None),
-    "returns 6m %": (("returns_6m",), None),
-    "returns 12m %": (("returns_12m",), None),
+    "returns 1w %": (("returns_1w",), _ratio_to_percent),
+    "returns 1m %": (("returns_1m",), _ratio_to_percent),
+    "returns 3m %": (("returns_3m",), _ratio_to_percent),
+    "returns 6m %": (("returns_6m",), _ratio_to_percent),
+    "returns 12m %": (("returns_12m",), _ratio_to_percent),
     "ma20": (("ma20",), None),
     "ma50": (("ma50",), None),
     "ma200": (("ma200",), None),
-    "expected return 1m %": (("expected_return_1m",), None),
-    "expected return 3m %": (("expected_return_3m",), None),
-    "expected return 12m %": (("expected_return_12m",), None),
+    "expected return 1m %": (("expected_return_1m",), _ratio_to_percent),
+    "expected return 3m %": (("expected_return_3m",), _ratio_to_percent),
+    "expected return 12m %": (("expected_return_12m",), _ratio_to_percent),
     "expected price 1m": (("expected_price_1m",), None),
     "expected price 3m": (("expected_price_3m",), None),
     "expected price 12m": (("expected_price_12m",), None),
@@ -937,24 +1015,16 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "history source": (("history_source",), None),
     "history last (utc)": (("history_last_utc",), _iso_or_none),
 
-    # computed if missing
-    "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
-    "upside %": (("upside_percent",), None),
-    "valuation label": (("valuation_label",), None),
-
-    "value score": (("value_score",), None),
-    "quality score": (("quality_score",), None),
-    "momentum score": (("momentum_score",), None),
-    "opportunity score": (("opportunity_score",), None),
-    "risk score": (("risk_score",), None),
-    "overall score": (("overall_score",), None),
-    "recommendation": (("recommendation",), None),
-
     "data source": (("data_source", "source"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
     "error": (("error",), None),
+    "recommendation": (("recommendation",), None),
+    "overall score": (("overall_score",), None),
+    "fair value": (("fair_value",), None),
+    "upside %": (("upside_percent",), None),
+    "valuation label": (("valuation_label",), None),
 }
 
 
@@ -971,37 +1041,64 @@ def _value_for_header(header: str, uq: Any) -> Any:
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
+    # Timestamps fill
+    if hk == "last updated (utc)":
+        v = _safe_get(uq, "last_updated_utc", "as_of_utc")
+        if not v:
+            v = _now_utc_iso()
+        return _iso_or_none(v)
+
+    if hk == "last updated (riyadh)":
+        v = _safe_get(uq, "last_updated_riyadh")
+        if not v:
+            u = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
+            v = _to_riyadh_iso(u) or ""
+        return _iso_or_none(v) or v
+
     # Valuation / overall / reco computed if missing
     if hk in ("fair value", "upside %", "valuation label", "recommendation", "overall score"):
         fair, upside, label = _compute_fair_value_and_upside(uq)
-        overall, reco, _ = _compute_overall_and_reco(uq)
+        overall_calc, reco_calc, _ = _compute_overall_and_reco(uq)
 
         if hk == "fair value":
             v = _safe_get(uq, "fair_value")
             return v if v is not None else fair
+
         if hk == "upside %":
             v = _safe_get(uq, "upside_percent")
             return v if v is not None else upside
+
         if hk == "valuation label":
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
+
         if hk == "overall score":
             v = _safe_get(uq, "overall_score")
-            return v if v is not None else overall
+            return v if v is not None else overall_calc
+
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
-            raw = v if v is not None else reco
+            raw = v if v is not None else reco_calc
             return _normalize_recommendation(raw)
 
-    spec = _HEADER_MAP.get(hk)
+    # 1) schemas mapping if available
+    f = _schemas_header_to_field(header)
+    if f:
+        v = _safe_get(uq, f)
+        # apply safe percent normalization for common percent fields
+        if hk in ("percent change", "dividend yield %", "roe %", "roa %", "payout ratio %", "turnover %", "free float %"):
+            return _ratio_to_percent(v)
+        if hk == "recommendation":
+            return _normalize_recommendation(v)
+        return v
+
+    # 2) local mapping
+    spec = _LOCAL_HEADER_MAP.get(hk)
     if spec:
         fields, transform = spec
         val = _safe_get(uq, *fields)
-
-        # ensure canonical Recommendation when pulled via direct mapping
         if hk == "recommendation":
             return _normalize_recommendation(val)
-
         if transform and val is not None:
             try:
                 return transform(val)
@@ -1009,25 +1106,22 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 return val
         return val
 
-    # fallback: snake-case guess
+    # 3) fallback snake-case guess
     guess = _snake_guess(header)
     val = _safe_get(uq, guess)
-    if val is not None:
-        if hk == "recommendation":
-            return _normalize_recommendation(val)
-        return val
-
-    return None
+    if hk == "recommendation":
+        return _normalize_recommendation(val)
+    return val
 
 
 def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
-    # Fill Riyadh if requested but missing
+    # Try to fill Riyadh if requested
     if _idx(headers, "Last Updated (Riyadh)") is not None:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
         last_riy = _safe_get(uq, "last_updated_riyadh")
         if not last_riy and last_utc:
             try:
-                riy = _to_riyadh_iso(last_utc)
+                riy = _to_riyadh_iso(last_utc) or ""
                 if isinstance(uq, dict):
                     uq["last_updated_riyadh"] = riy
                 else:
@@ -1056,42 +1150,6 @@ def _unwrap_tuple_payload(x: Any) -> Any:
     return x
 
 
-async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
-    """
-    Compatibility shim:
-    - Prefer engine.get_enriched_quotes if present
-    - Else engine.get_quotes
-    - Else per-symbol engine.get_enriched_quote/get_quote
-    Accepts engines returning list OR dict OR (payload, err).
-    """
-    fn = getattr(engine, "get_enriched_quotes", None)
-    if callable(fn):
-        res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
-        if isinstance(res, dict):
-            return [_unwrap_tuple_payload(v) for v in list(res.values())]
-        return [_unwrap_tuple_payload(v) for v in list(res or [])]
-
-    fn2 = getattr(engine, "get_quotes", None)
-    if callable(fn2):
-        res = _unwrap_tuple_payload(await _maybe_await(fn2(syms)))
-        if isinstance(res, dict):
-            return [_unwrap_tuple_payload(v) for v in list(res.values())]
-        return [_unwrap_tuple_payload(v) for v in list(res or [])]
-
-    out: List[Any] = []
-    for s in syms:
-        fn3 = getattr(engine, "get_enriched_quote", None)
-        if callable(fn3):
-            out.append(_unwrap_tuple_payload(await _maybe_await(fn3(s))))
-            continue
-        fn4 = getattr(engine, "get_quote", None)
-        if callable(fn4):
-            out.append(_unwrap_tuple_payload(await _maybe_await(fn4(s))))
-            continue
-        out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
-    return out
-
-
 def _index_keys_for_quote(q: Any) -> List[str]:
     keys: List[str] = []
     sym = (_safe_get(q, "symbol") or "").strip().upper()
@@ -1118,6 +1176,43 @@ def _index_keys_for_quote(q: Any) -> List[str]:
     return out
 
 
+async def _engine_get_quotes_any(engine: Any, syms: List[str]) -> Union[List[Any], Dict[str, Any]]:
+    """
+    Compatibility shim:
+    - Prefer engine.get_enriched_quotes if present
+    - Else engine.get_quotes
+    - Else per-symbol engine.get_enriched_quote/get_quote
+
+    Engine may return: list OR dict OR (payload, err)
+    """
+    fn = getattr(engine, "get_enriched_quotes", None)
+    if callable(fn):
+        res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
+        if isinstance(res, (list, dict)):
+            return res
+        return list(res or [])
+
+    fn2 = getattr(engine, "get_quotes", None)
+    if callable(fn2):
+        res = _unwrap_tuple_payload(await _maybe_await(fn2(syms)))
+        if isinstance(res, (list, dict)):
+            return res
+        return list(res or [])
+
+    out: List[Any] = []
+    for s in syms:
+        fn3 = getattr(engine, "get_enriched_quote", None)
+        if callable(fn3):
+            out.append(_unwrap_tuple_payload(await _maybe_await(fn3(s))))
+            continue
+        fn4 = getattr(engine, "get_quote", None)
+        if callable(fn4):
+            out.append(_unwrap_tuple_payload(await _maybe_await(fn4(s))))
+            continue
+        out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
+    return out
+
+
 async def _get_quotes_chunked(
     request: Optional[Request],
     symbols: List[str],
@@ -1137,10 +1232,10 @@ async def _get_quotes_chunked(
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[List[Any], Exception]]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[Union[List[Any], Dict[str, Any]], Exception]]:
         async with sem:
             try:
-                res = await asyncio.wait_for(_engine_get_quotes(engine, chunk_syms), timeout=timeout_sec)
+                res = await asyncio.wait_for(_engine_get_quotes_any(engine, chunk_syms), timeout=timeout_sec)
                 return chunk_syms, res
             except Exception as e:
                 return chunk_syms, e
@@ -1148,6 +1243,7 @@ async def _get_quotes_chunked(
     results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
 
     out: Dict[str, Any] = {}
+
     for chunk_syms, res in results:
         if isinstance(res, Exception):
             msg = "Engine batch timeout" if isinstance(res, asyncio.TimeoutError) else f"Engine batch error: {res}"
@@ -1156,12 +1252,34 @@ async def _get_quotes_chunked(
                 out[s.upper()] = _make_placeholder(s, dq="MISSING", err=msg)
             continue
 
-        returned = list(res or [])
+        # Build map for this chunk
         chunk_map: Dict[str, Any] = {}
-        for q in returned:
-            q2 = _finalize_quote(_unwrap_tuple_payload(q))
-            for k in _index_keys_for_quote(q2):
-                chunk_map.setdefault(k, q2)
+
+        # Case dict: use its entries as direct mapping
+        if isinstance(res, dict):
+            for k, v in res.items():
+                q = _finalize_quote(_unwrap_tuple_payload(v))
+                kk = str(k or "").strip().upper()
+                if kk:
+                    chunk_map.setdefault(kk, q)
+                for alt in _index_keys_for_quote(q):
+                    chunk_map.setdefault(alt, q)
+
+        # Case list
+        else:
+            returned = list(res or [])
+            # If length matches, assume aligned order but still index by symbol keys
+            if len(returned) == len(chunk_syms):
+                for i, s in enumerate(chunk_syms):
+                    q = _finalize_quote(_unwrap_tuple_payload(returned[i]))
+                    chunk_map.setdefault(s.upper(), q)
+                    for alt in _index_keys_for_quote(q):
+                        chunk_map.setdefault(alt, q)
+            else:
+                for q0 in returned:
+                    q = _finalize_quote(_unwrap_tuple_payload(q0))
+                    for alt in _index_keys_for_quote(q):
+                        chunk_map.setdefault(alt, q)
 
         for s in chunk_syms:
             s_up = s.upper()
@@ -1174,7 +1292,7 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
-    # optional external scoring enrichment (never required)
+    # optional scoring enrichment (never required)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
         uq = enrich_with_scores(uq)  # type: ignore
@@ -1184,25 +1302,33 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     sym = (_safe_get(uq, "symbol") or _normalize_any(requested_symbol) or requested_symbol or "").upper()
 
     price = _safe_get(uq, "current_price", "last_price", "price")
-    change_pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
+    change_pct = _ratio_to_percent(_safe_get(uq, "percent_change", "change_pct", "change_percent"))
 
-    last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
+    last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
     last_utc_iso = _iso_or_none(last_utc)
 
-    fair, upside, val_label = _compute_fair_value_and_upside(uq)
-    overall, reco_calc, conf01 = _compute_overall_and_reco(uq)
+    fair_calc, upside_calc, val_label_calc = _compute_fair_value_and_upside(uq)
+    overall_calc, reco_calc, conf01_calc = _compute_overall_and_reco(uq)
 
-    # Prefer engine-provided if present
     fair2 = _safe_get(uq, "fair_value")
     upside2 = _safe_get(uq, "upside_percent")
     val_label2 = _safe_get(uq, "valuation_label")
     reco2 = _safe_get(uq, "recommendation")
     overall2 = _safe_get(uq, "overall_score")
-    conf_score = _safe_get(uq, "confidence_score")
-    forecast_method = _safe_get(uq, "forecast_method")
 
-    reco_raw = reco2 if reco2 is not None else reco_calc
-    reco_norm = _normalize_recommendation(reco_raw)
+    reco_norm = _normalize_recommendation(reco2 if reco2 is not None else reco_calc)
+
+    conf = _safe_get(uq, "confidence")
+    if conf is None:
+        conf = conf01_calc
+    else:
+        # normalize confidence to 0..1 if looks like 0..100
+        try:
+            cf = float(conf)
+            if 1.0 < cf <= 100.0:
+                conf = cf / 100.0
+        except Exception:
+            pass
 
     return SingleAnalysisResponse(
         symbol=sym,
@@ -1216,36 +1342,36 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         dividend_yield=_ratio_to_percent(_safe_get(uq, "dividend_yield")),
         roe=_ratio_to_percent(_safe_get(uq, "roe")),
         roa=_ratio_to_percent(_safe_get(uq, "roa")),
-        returns_1w=_safe_get(uq, "returns_1w"),
-        returns_1m=_safe_get(uq, "returns_1m"),
-        returns_3m=_safe_get(uq, "returns_3m"),
-        returns_6m=_safe_get(uq, "returns_6m"),
-        returns_12m=_safe_get(uq, "returns_12m"),
+        returns_1w=_ratio_to_percent(_safe_get(uq, "returns_1w")),
+        returns_1m=_ratio_to_percent(_safe_get(uq, "returns_1m")),
+        returns_3m=_ratio_to_percent(_safe_get(uq, "returns_3m")),
+        returns_6m=_ratio_to_percent(_safe_get(uq, "returns_6m")),
+        returns_12m=_ratio_to_percent(_safe_get(uq, "returns_12m")),
         rsi14=_safe_get(uq, "rsi14", "rsi_14"),
         vol_30d_ann=_vol_to_percent(_safe_get(uq, "vol_30d_ann", "volatility_30d", "volatility_30d_ann")),
         ma20=_safe_get(uq, "ma20"),
         ma50=_safe_get(uq, "ma50"),
         ma200=_safe_get(uq, "ma200"),
-        expected_return_1m=_safe_get(uq, "expected_return_1m"),
-        expected_return_3m=_safe_get(uq, "expected_return_3m"),
-        expected_return_12m=_safe_get(uq, "expected_return_12m"),
+        expected_return_1m=_ratio_to_percent(_safe_get(uq, "expected_return_1m")),
+        expected_return_3m=_ratio_to_percent(_safe_get(uq, "expected_return_3m")),
+        expected_return_12m=_ratio_to_percent(_safe_get(uq, "expected_return_12m")),
         expected_price_1m=_safe_get(uq, "expected_price_1m"),
         expected_price_3m=_safe_get(uq, "expected_price_3m"),
         expected_price_12m=_safe_get(uq, "expected_price_12m"),
-        confidence_score=conf_score,
-        forecast_method=forecast_method,
+        confidence_score=_safe_get(uq, "confidence_score"),
+        forecast_method=_safe_get(uq, "forecast_method"),
         data_quality=str(_safe_get(uq, "data_quality") or "MISSING"),
         value_score=_safe_get(uq, "value_score"),
         quality_score=_safe_get(uq, "quality_score"),
         momentum_score=_safe_get(uq, "momentum_score"),
         opportunity_score=_safe_get(uq, "opportunity_score"),
         risk_score=_safe_get(uq, "risk_score"),
-        overall_score=overall2 if overall2 is not None else overall,
+        overall_score=overall2 if overall2 is not None else overall_calc,
         recommendation=reco_norm,
-        confidence=_safe_get(uq, "confidence") if _safe_get(uq, "confidence") is not None else conf01,
-        fair_value=fair2 if fair2 is not None else fair,
-        upside_percent=upside2 if upside2 is not None else upside,
-        valuation_label=val_label2 if val_label2 is not None else val_label,
+        confidence=conf,
+        fair_value=fair2 if fair2 is not None else fair_calc,
+        upside_percent=upside2 if upside2 is not None else upside_calc,
+        valuation_label=val_label2 if val_label2 is not None else val_label_calc,
         last_updated_utc=last_utc_iso,
         sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
         error=_safe_get(uq, "error"),
@@ -1363,7 +1489,7 @@ async def analyze_batch_quotes(
 async def analyze_for_sheet(
     request: Request,
     body: BatchAnalysisRequest = Body(...),
-    mode: Optional[str] = Query(default=None, description="Headers mode: base|extended (fallback only)."),
+    mode: Optional[str] = Query(default=None, description="Headers mode: base|extended (appends if schemas returns canonical)."),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> SheetAnalysisResponse:
     """
@@ -1376,7 +1502,6 @@ async def analyze_for_sheet(
     if not tickers:
         return SheetAnalysisResponse(headers=headers, rows=[], status="skipped", error="No tickers provided")
 
-    # Sheets-safe auth (never raise out)
     if not _auth_ok(x_app_token):
         err = "Unauthorized (invalid or missing X-APP-TOKEN)."
         rows = [_error_row(t, headers, err) for t in tickers]
@@ -1398,6 +1523,14 @@ async def analyze_for_sheet(
         rows: List[List[Any]] = []
         for t in tickers:
             uq = m.get(t) or _make_placeholder(t, dq="MISSING", err="No data returned")
+            # ensure recommendation enum
+            try:
+                if isinstance(uq, dict):
+                    uq["recommendation"] = _normalize_recommendation(uq.get("recommendation"))
+                else:
+                    setattr(uq, "recommendation", _normalize_recommendation(getattr(uq, "recommendation", None)))
+            except Exception:
+                pass
             rows.append(_row_from_headers(headers, uq))
 
         status = _status_from_rows(headers, rows)
