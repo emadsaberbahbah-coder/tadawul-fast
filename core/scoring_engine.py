@@ -8,17 +8,17 @@ Produces (0–100):
 - value_score
 - quality_score
 - momentum_score
-- risk_score
+- risk_score          (higher = MORE risk)
 - opportunity_score
 - overall_score
-- recommendation
-- confidence (internal, returned in AssetScores)
+- recommendation      (BUY / HOLD / REDUCE / SELL)
+- confidence          (0–100, reflects data completeness + data_quality)
 
 Design goals
 ✅ Deterministic + simple + explainable
 ✅ Works with partial data (confidence reflects missingness)
 ✅ Provider-agnostic: normalizes % values that may appear as decimals, percents, or strings ("12%")
-✅ Safe imports: does NOT require EnrichedQuote / DataEngine imports (avoids circular imports)
+✅ Import-safe: does NOT require EnrichedQuote / DataEngine imports (avoids circular imports)
 ✅ Works with either EnrichedQuote or UnifiedQuote-like objects (duck-typing)
 
 Usage:
@@ -29,7 +29,7 @@ Usage:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Pydantic best-effort (import-safe)
 try:
@@ -43,7 +43,10 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCORING_ENGINE_VERSION = "1.3.0"
+SCORING_ENGINE_VERSION = "1.4.0"
+
+# Recommendation enum (MUST match routers normalization)
+_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
 
 class AssetScores(BaseModel):
@@ -59,7 +62,7 @@ class AssetScores(BaseModel):
     value_score: float = Field(50.0, ge=0, le=100)
     quality_score: float = Field(50.0, ge=0, le=100)
     momentum_score: float = Field(50.0, ge=0, le=100)
-    risk_score: float = Field(50.0, ge=0, le=100)
+    risk_score: float = Field(50.0, ge=0, le=100)  # higher = more risk
 
     opportunity_score: float = Field(50.0, ge=0, le=100)
     overall_score: float = Field(50.0, ge=0, le=100)
@@ -93,6 +96,20 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
         return getattr(obj, name, default)
     except Exception:
         return default
+
+
+def _get_any(obj: Any, *names: str) -> Any:
+    """
+    Returns the first non-null, non-empty value across candidate names.
+    """
+    for n in names:
+        v = _get(obj, n, None)
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
 
 
 def _strip_percent_str(s: str) -> str:
@@ -141,9 +158,8 @@ def _to_percent(x: Any) -> Optional[float]:
     return v
 
 
-def _is_present(x: Any) -> bool:
-    v = _to_float(x)
-    return v is not None
+def _is_present_number(x: Any) -> bool:
+    return _to_float(x) is not None
 
 
 def _pos52w_frac(cp: Optional[float], low_52w: Optional[float], high_52w: Optional[float]) -> Optional[float]:
@@ -155,9 +171,10 @@ def _pos52w_frac(cp: Optional[float], low_52w: Optional[float], high_52w: Option
     return (cp - low_52w) / rng  # 0..1
 
 
-def _safe_score_from_ratio(x: Optional[float], good_low: float, good_high: float) -> float:
+def _score_band_linear(x: Optional[float], bands: List[Tuple[float, float]]) -> float:
     """
-    Score 0..100, peaky around a good interval. Used for dividend yield etc.
+    Piecewise linear score from ordered bands [(x,score),...].
+    If x is below first band -> first score; above last -> last score.
     """
     if x is None:
         return 50.0
@@ -165,13 +182,44 @@ def _safe_score_from_ratio(x: Optional[float], good_low: float, good_high: float
         xv = float(x)
     except Exception:
         return 50.0
-    if xv < good_low:
-        # ramp up to 50
-        return _clamp(50.0 * (xv / max(good_low, 1e-9)), 0, 50, 50)
-    if xv <= good_high:
-        return _clamp(70.0 + (xv - good_low) / max((good_high - good_low), 1e-9) * 30.0, 70, 100, 85)
-    # above good_high: gently decline (very high yield can be risky)
-    return _clamp(90.0 - min(40.0, (xv - good_high) * 5.0), 20, 90, 60)
+    if not bands:
+        return 50.0
+    bands = sorted(bands, key=lambda t: t[0])
+    if xv <= bands[0][0]:
+        return float(bands[0][1])
+    if xv >= bands[-1][0]:
+        return float(bands[-1][1])
+    for i in range(1, len(bands)):
+        x0, s0 = bands[i - 1]
+        x1, s1 = bands[i]
+        if x0 <= xv <= x1:
+            if x1 == x0:
+                return float(s1)
+            t = (xv - x0) / (x1 - x0)
+            return float(s0 + t * (s1 - s0))
+    return 50.0
+
+
+def _normalize_reco(x: Any) -> str:
+    """
+    Hard normalize to BUY/HOLD/REDUCE/SELL.
+    """
+    if x is None:
+        return "HOLD"
+    try:
+        s = str(x).strip().upper()
+    except Exception:
+        return "HOLD"
+    if s in _RECO_ENUM:
+        return s
+    # tolerate common variants
+    if "SELL" in s:
+        return "SELL"
+    if "REDUCE" in s or "TRIM" in s or "TAKE" in s:
+        return "REDUCE"
+    if "BUY" in s or "ACCUM" in s or "ADD" in s or "OVERWEIGHT" in s:
+        return "BUY"
+    return "HOLD"
 
 
 # ---------------------------------------------------------------------
@@ -182,109 +230,152 @@ def compute_scores(q: Any) -> AssetScores:
     Computes scores for an EnrichedQuote/UnifiedQuote-like object (duck typing).
     Never raises.
     """
-
     # -----------------------------
-    # Pull common inputs (best-effort)
+    # Pull common inputs (best-effort + alias tolerant)
     # -----------------------------
-    pe = _to_float(_get(q, "pe_ttm"))
-    fpe = _to_float(_get(q, "forward_pe"))
-    pb = _to_float(_get(q, "pb"))
-    ps = _to_float(_get(q, "ps"))
-    ev = _to_float(_get(q, "ev_ebitda"))
-    dy = _to_percent(_get(q, "dividend_yield"))
-    payout = _to_percent(_get(q, "payout_ratio"))
+    # Valuation
+    pe = _to_float(_get_any(q, "pe_ttm", "pe"))
+    fpe = _to_float(_get_any(q, "forward_pe", "pe_forward"))
+    pb = _to_float(_get_any(q, "pb"))
+    ps = _to_float(_get_any(q, "ps"))
+    ev = _to_float(_get_any(q, "ev_ebitda", "evebitda"))
 
-    upside = _to_percent(_get(q, "upside_percent"))
+    dy = _to_percent(_get_any(q, "dividend_yield", "div_yield", "dividend_yield_pct"))
+    payout = _to_percent(_get_any(q, "payout_ratio", "payout", "payout_pct"))
+    upside = _to_percent(_get_any(q, "upside_percent", "upside_pct"))
 
-    roe = _to_percent(_get(q, "roe"))
-    roa = _to_percent(_get(q, "roa"))
-    nm = _to_percent(_get(q, "net_margin"))
-    ebitda_m = _to_percent(_get(q, "ebitda_margin"))
-    rev_g = _to_percent(_get(q, "revenue_growth"))
-    ni_g = _to_percent(_get(q, "net_income_growth"))
+    # Quality
+    roe = _to_percent(_get_any(q, "roe", "return_on_equity"))
+    roa = _to_percent(_get_any(q, "roa", "return_on_assets"))
+    nm = _to_percent(_get_any(q, "net_margin", "profit_margin"))
+    ebitda_m = _to_percent(_get_any(q, "ebitda_margin", "margin_ebitda"))
+    rev_g = _to_percent(_get_any(q, "revenue_growth", "rev_growth"))
+    ni_g = _to_percent(_get_any(q, "net_income_growth", "ni_growth"))
 
-    dte = _to_float(_get(q, "debt_to_equity"))  # optional (not always present)
-    beta = _to_float(_get(q, "beta"))
-    vol = _to_percent(_get(q, "volatility_30d"))
-    rsi = _to_float(_get(q, "rsi_14"))
+    dte = _to_float(_get_any(q, "debt_to_equity"))  # optional
+    beta = _to_float(_get_any(q, "beta", "beta_5y"))
+    vol = _to_percent(_get_any(q, "volatility_30d", "vol_30d_ann", "vol30d"))
+    rsi = _to_float(_get_any(q, "rsi_14", "rsi14"))
 
-    pc = _to_percent(_get(q, "percent_change"))
+    # Momentum / price context
+    pc = _to_percent(_get_any(q, "percent_change", "change_percent", "change_pct", "pct_change"))
 
-    cp = _to_float(_get(q, "current_price"))
-    ma20 = _to_float(_get(q, "ma20"))  # optional
-    ma50 = _to_float(_get(q, "ma50"))  # optional
-    high_52w = _to_float(_get(q, "high_52w"))
-    low_52w = _to_float(_get(q, "low_52w"))
-    pos_52w_pct = _to_percent(_get(q, "position_52w_percent"))
+    cp = _to_float(_get_any(q, "current_price", "last_price", "price", "close", "last"))
+    ma20 = _to_float(_get_any(q, "ma20"))  # optional
+    ma50 = _to_float(_get_any(q, "ma50"))  # optional
 
-    liq = _to_float(_get(q, "liquidity_score"))
-    avg_vol = _to_float(_get(q, "avg_volume_30d"))
-    turnover = _to_percent(_get(q, "turnover_percent"))
-    free_float = _to_percent(_get(q, "free_float"))
+    high_52w = _to_float(_get_any(q, "week_52_high", "high_52w", "52w_high"))
+    low_52w = _to_float(_get_any(q, "week_52_low", "low_52w", "52w_low"))
+    pos_52w_pct = _to_percent(_get_any(q, "position_52w_percent", "position_52w"))
 
-    dq = str(_get(q, "data_quality", "") or "").strip().upper()
+    # Liquidity
+    liq = _to_float(_get_any(q, "liquidity_score"))
+    avg_vol = _to_float(_get_any(q, "avg_volume_30d", "avg_volume", "avg_vol_30d"))
+    turnover = _to_percent(_get_any(q, "turnover_percent", "turnover", "turnover_pct"))
+    free_float = _to_percent(_get_any(q, "free_float", "free_float_percent", "free_float_pct"))
+
+    dq = str(_get_any(q, "data_quality", "dq") or "").strip().upper()
 
     # -----------------------------
     # VALUE (0..100)
     # -----------------------------
+    # Start neutral, then adjust using simple, explainable rules.
     value_score = 50.0
 
-    # P/E: prefer pe then forward_pe
+    # P/E: lower is better (but ignore <=0)
     pe_like = None
     for cand in (pe, fpe):
         if cand is not None and cand > 0:
             pe_like = cand
             break
     if pe_like is not None:
-        if pe_like < 10:
-            value_score += 18
-        elif pe_like < 20:
-            value_score += 8
-        elif pe_like > 40:
-            value_score -= 14
-        elif pe_like > 25:
-            value_score -= 6
+        # band mapping: (PE -> score contribution around value dimension)
+        pe_val = _score_band_linear(
+            pe_like,
+            bands=[
+                (5.0, 85.0),
+                (10.0, 75.0),
+                (18.0, 60.0),
+                (25.0, 50.0),
+                (40.0, 35.0),
+                (60.0, 25.0),
+            ],
+        )
+        value_score = 0.70 * value_score + 0.30 * pe_val
 
     # P/B
     if pb is not None and pb > 0:
-        if pb < 1.0:
-            value_score += 10
-        elif pb < 2.0:
-            value_score += 5
-        elif pb > 6.0:
-            value_score -= 7
+        pb_val = _score_band_linear(
+            pb,
+            bands=[
+                (0.6, 80.0),
+                (1.0, 70.0),
+                (2.0, 60.0),
+                (4.0, 50.0),
+                (6.0, 40.0),
+                (10.0, 30.0),
+            ],
+        )
+        value_score = 0.80 * value_score + 0.20 * pb_val
 
     # P/S
     if ps is not None and ps > 0:
-        if ps < 1.0:
-            value_score += 6
-        elif ps > 10.0:
-            value_score -= 6
+        ps_val = _score_band_linear(
+            ps,
+            bands=[
+                (0.7, 75.0),
+                (1.5, 65.0),
+                (3.0, 55.0),
+                (6.0, 45.0),
+                (10.0, 35.0),
+                (20.0, 25.0),
+            ],
+        )
+        value_score = 0.85 * value_score + 0.15 * ps_val
 
     # EV/EBITDA
     if ev is not None and ev > 0:
-        if ev < 8:
-            value_score += 8
-        elif ev > 18:
-            value_score -= 6
+        ev_val = _score_band_linear(
+            ev,
+            bands=[
+                (5.0, 80.0),
+                (8.0, 70.0),
+                (12.0, 60.0),
+                (18.0, 45.0),
+                (25.0, 35.0),
+                (40.0, 25.0),
+            ],
+        )
+        value_score = 0.85 * value_score + 0.15 * ev_val
 
-    # Dividend yield (prefer "healthy" yields)
-    if dy is not None and dy > 0:
-        value_score += (_safe_score_from_ratio(dy, 2.0, 6.0) - 50.0) * 0.25  # add up to ~+12.5
+    # Dividend yield: 2%–6% usually "healthy"; too high can be risky
+    if dy is not None and dy >= 0:
+        dy_val = _score_band_linear(
+            dy,
+            bands=[
+                (0.0, 40.0),
+                (2.0, 65.0),
+                (4.0, 80.0),
+                (6.0, 75.0),
+                (10.0, 55.0),
+                (15.0, 40.0),
+            ],
+        )
+        value_score = 0.85 * value_score + 0.15 * dy_val
 
-    # Payout ratio (very high can be risky; moderate okay)
-    if payout is not None and payout > 0:
-        if payout > 100:
+    # Payout ratio: prefer 30–70, penalize >100
+    if payout is not None and payout >= 0:
+        if payout > 120:
             value_score -= 6
         elif 30 <= payout <= 70:
             value_score += 3
 
-    # Upside %
+    # Upside %: reward positive, penalize negative (but keep bounded)
     if upside is not None:
         if upside > 0:
-            value_score += min(18.0, upside / 2.0)
+            value_score += min(14.0, upside / 2.0)
         elif upside < 0:
-            value_score -= min(12.0, abs(upside) / 2.0)
+            value_score -= min(10.0, abs(upside) / 2.0)
 
     value_score = _clamp(value_score)
 
@@ -294,54 +385,40 @@ def compute_scores(q: Any) -> AssetScores:
     quality_score = 50.0
 
     if roe is not None:
-        if roe > 20:
-            quality_score += 18
-        elif roe > 15:
-            quality_score += 12
-        elif roe > 10:
-            quality_score += 6
-        elif roe < 0:
-            quality_score -= 14
+        quality_score = 0.70 * quality_score + 0.30 * _score_band_linear(
+            roe, bands=[(-10.0, 20.0), (0.0, 40.0), (10.0, 60.0), (15.0, 72.0), (20.0, 82.0), (30.0, 90.0)]
+        )
 
     if roa is not None:
-        if roa > 8:
-            quality_score += 6
-        elif roa < 0:
-            quality_score -= 6
+        quality_score = 0.80 * quality_score + 0.20 * _score_band_linear(
+            roa, bands=[(-5.0, 25.0), (0.0, 45.0), (4.0, 60.0), (8.0, 72.0), (12.0, 82.0)]
+        )
 
     if nm is not None:
-        if nm > 20:
-            quality_score += 8
-        elif nm > 10:
-            quality_score += 4
-        elif nm < 0:
-            quality_score -= 10
+        quality_score = 0.85 * quality_score + 0.15 * _score_band_linear(
+            nm, bands=[(-10.0, 25.0), (0.0, 45.0), (5.0, 58.0), (10.0, 68.0), (20.0, 80.0), (30.0, 88.0)]
+        )
 
     if ebitda_m is not None:
-        if ebitda_m > 20:
-            quality_score += 5
-        elif ebitda_m < 0:
-            quality_score -= 5
+        quality_score = 0.88 * quality_score + 0.12 * _score_band_linear(
+            ebitda_m, bands=[(-10.0, 30.0), (0.0, 45.0), (10.0, 60.0), (20.0, 72.0), (30.0, 82.0)]
+        )
 
+    # Growth (light touch)
+    if rev_g is not None:
+        quality_score += _clamp(_score_band_linear(rev_g, bands=[(-20.0, -6.0), (0.0, 0.0), (10.0, 3.0), (20.0, 5.0)]), -6, 5, 0)
+
+    if ni_g is not None:
+        quality_score += _clamp(_score_band_linear(ni_g, bands=[(-20.0, -6.0), (0.0, 0.0), (10.0, 3.0), (20.0, 5.0)]), -6, 5, 0)
+
+    # Leverage penalty/bonus (if available)
     if dte is not None:
         if dte > 2.5:
-            quality_score -= 14
+            quality_score -= 12
         elif dte > 1.5:
             quality_score -= 6
         elif 0 <= dte < 0.5:
-            quality_score += 8
-
-    if rev_g is not None:
-        if rev_g > 15:
-            quality_score += 4
-        elif rev_g < 0:
-            quality_score -= 4
-
-    if ni_g is not None:
-        if ni_g > 15:
-            quality_score += 4
-        elif ni_g < 0:
-            quality_score -= 4
+            quality_score += 6
 
     quality_score = _clamp(quality_score)
 
@@ -350,25 +427,20 @@ def compute_scores(q: Any) -> AssetScores:
     # -----------------------------
     momentum_score = 50.0
 
-    # Daily % change
+    # Daily % change (small weight)
     if pc is not None:
-        if pc > 3:
-            momentum_score += 6
-        elif pc > 0:
-            momentum_score += 2
-        elif pc < -3:
-            momentum_score -= 6
-        elif pc < 0:
-            momentum_score -= 2
+        momentum_score = 0.85 * momentum_score + 0.15 * _score_band_linear(
+            pc, bands=[(-8.0, 30.0), (-3.0, 42.0), (0.0, 50.0), (3.0, 58.0), (8.0, 70.0)]
+        )
 
-    # MAs (optional)
+    # MA trend (optional)
     if cp is not None:
         if ma20 is not None:
-            momentum_score += 5 if cp > ma20 else -5
+            momentum_score += 5.0 if cp > ma20 else -5.0
         if ma50 is not None:
-            momentum_score += 5 if cp > ma50 else -5
+            momentum_score += 5.0 if cp > ma50 else -5.0
 
-        # 52w position (prefer provided %, else compute)
+        # 52w position: use provided percent if exists, else compute
         pos_frac = None
         if pos_52w_pct is not None:
             pos_frac = pos_52w_pct / 100.0
@@ -376,12 +448,13 @@ def compute_scores(q: Any) -> AssetScores:
             pos_frac = _pos52w_frac(cp, low_52w, high_52w)
 
         if pos_frac is not None:
-            if pos_frac > 0.8:
+            # very low position may indicate "value zone" but weak momentum; high indicates strength
+            if pos_frac > 0.85:
                 momentum_score += 10
-            elif pos_frac < 0.2:
-                momentum_score -= 10
+            elif pos_frac < 0.15:
+                momentum_score -= 8
 
-    # RSI
+    # RSI (mean-reversion tilt)
     if rsi is not None:
         if rsi > 75:
             momentum_score -= 10
@@ -397,103 +470,96 @@ def compute_scores(q: Any) -> AssetScores:
     # -----------------------------
     risk_score = 50.0
 
-    # Volatility bands (%)
+    # Volatility (%)
     if vol is not None:
-        if vol <= 15:
-            risk_score -= 12
-        elif vol <= 30:
-            risk_score += 0
-        elif vol <= 50:
-            risk_score += 12
-        else:
-            risk_score += 22
+        risk_score = 0.70 * risk_score + 0.30 * _score_band_linear(
+            vol, bands=[(10.0, 30.0), (15.0, 38.0), (25.0, 50.0), (35.0, 62.0), (50.0, 75.0), (80.0, 90.0)]
+        )
 
+    # Beta
     if beta is not None:
-        if beta >= 1.7:
-            risk_score += 10
-        elif beta >= 1.3:
-            risk_score += 6
-        elif beta <= 0.8:
-            risk_score -= 5
+        risk_score = 0.80 * risk_score + 0.20 * _score_band_linear(
+            beta, bands=[(0.5, 40.0), (0.8, 45.0), (1.0, 50.0), (1.3, 58.0), (1.7, 68.0), (2.2, 78.0)]
+        )
 
+    # Leverage
     if dte is not None:
-        if dte > 2.5:
-            risk_score += 15
-        elif dte > 1.5:
-            risk_score += 7
-        elif 0 <= dte < 0.5:
-            risk_score -= 6
+        risk_score = 0.80 * risk_score + 0.20 * _score_band_linear(
+            dte, bands=[(0.0, 40.0), (0.5, 45.0), (1.0, 52.0), (1.5, 60.0), (2.5, 75.0), (4.0, 88.0)]
+        )
 
-    # Liquidity score (assume 0..100)
+    # Liquidity (assume 0..100, higher better -> lower risk)
     if liq is not None:
         if liq < 30:
             risk_score += 10
         elif liq > 70:
-            risk_score -= 4
+            risk_score -= 5
 
-    # Avg volume (if available)
+    # Avg volume
     if avg_vol is not None:
         if avg_vol < 100_000:
             risk_score += 6
         elif avg_vol > 5_000_000:
             risk_score -= 2
 
-    # Turnover% (very low turnover adds risk; very high tends to be liquid)
+    # Turnover %
     if turnover is not None:
         if turnover < 0.5:
             risk_score += 4
         elif turnover > 3.0:
             risk_score -= 2
 
-    # Free float% (very low float can be risky)
+    # Free float %
     if free_float is not None:
         if free_float < 20:
             risk_score += 3
         elif free_float > 60:
             risk_score -= 1
 
-    # Data quality penalty
+    # Data quality penalty to risk
     if dq in {"BAD", "MISSING"}:
-        risk_score += 10
+        risk_score += 12
     elif dq in {"PARTIAL"}:
-        risk_score += 4
+        risk_score += 5
 
     risk_score = _clamp(risk_score)
 
     # -----------------------------
     # OPPORTUNITY + OVERALL
     # -----------------------------
-    # Translate risk_score into a penalty/bonus applied to opportunity:
+    # Convert risk_score into a penalty applied to opportunity:
     # risk_score 50 => 0
     # risk_score 100 => +15 penalty
     # risk_score 0 => -15 bonus
     risk_penalty = ((risk_score - 50.0) / 50.0) * 15.0  # -15..+15
 
-    opportunity_score = _clamp(0.42 * value_score + 0.33 * momentum_score + 0.25 * quality_score - risk_penalty)
-    overall_score = _clamp(0.30 * value_score + 0.30 * quality_score + 0.25 * momentum_score + 0.15 * opportunity_score)
+    opportunity_score = _clamp(0.44 * value_score + 0.30 * momentum_score + 0.26 * quality_score - risk_penalty)
+    overall_score = _clamp(0.34 * value_score + 0.30 * quality_score + 0.22 * momentum_score + 0.14 * opportunity_score)
 
     # -----------------------------
     # Confidence (0..100)
     # -----------------------------
-    # coverage score: count how many important fields exist
-    key_fields = [
-        _get(q, "current_price"),
-        _get(q, "previous_close"),
-        _get(q, "market_cap"),
-        _get(q, "pe_ttm"),
-        _get(q, "roe"),
-        _get(q, "volatility_30d"),
-        _get(q, "avg_volume_30d"),
-        _get(q, "high_52w"),
-        _get(q, "low_52w"),
+    # Coverage by groups (weighted)
+    # - price/liquidity basics
+    # - valuation
+    # - quality
+    # - risk/technicals
+    groups: List[Tuple[float, List[Any]]] = [
+        (0.28, [cp, _get_any(q, "previous_close", "prev_close"), avg_vol, _get_any(q, "market_cap", "mkt_cap"), liq]),
+        (0.26, [pe, fpe, pb, ps, ev, dy]),
+        (0.26, [roe, roa, nm, ebitda_m, rev_g, ni_g]),
+        (0.20, [vol, beta, rsi, high_52w, low_52w]),
     ]
-    present = sum(1 for f in key_fields if _is_present(f))
-    total = len(key_fields)
-    coverage = (present / total) * 100.0 if total else 50.0
 
-    # start from coverage, then adjust by data_quality label
-    confidence = coverage
+    cov = 0.0
+    for w, vals in groups:
+        present = sum(1 for v in vals if _is_present_number(v))
+        total = len(vals) if vals else 1
+        cov += w * (present / total) * 100.0
 
+    confidence = cov
+
+    # Adjust by data_quality label
     if dq == "MISSING":
         confidence = 0.0
     elif dq == "BAD":
@@ -502,31 +568,32 @@ def compute_scores(q: Any) -> AssetScores:
         confidence = min(confidence, 70.0)
     elif dq == "OK":
         confidence = min(confidence, 85.0)
-    # FULL => keep as-is (can be up to 100)
+    # FULL or unknown => keep as computed
 
     confidence = _clamp(confidence)
 
     # -----------------------------
-    # Recommendation (confidence-aware)
+    # Recommendation (enum-only + confidence aware)
     # -----------------------------
-    recommendation = "HOLD"
-    if overall_score >= 80:
-        recommendation = "STRONG BUY"
-    elif overall_score >= 65:
-        recommendation = "BUY"
-    elif overall_score <= 35:
-        recommendation = "SELL"
-    elif overall_score <= 50:
-        recommendation = "REDUCE"
+    # Primary driver: overall_score; guardrails by confidence and risk.
+    reco = "HOLD"
+    if overall_score >= 72 and confidence >= 55 and risk_score <= 75:
+        reco = "BUY"
+    elif overall_score <= 32 and confidence >= 40:
+        reco = "SELL" if risk_score >= 60 else "REDUCE"
+    elif overall_score <= 45:
+        reco = "REDUCE"
     else:
-        recommendation = "HOLD"
+        reco = "HOLD"
 
-    # If confidence is low, downgrade aggressive recommendations
+    # If confidence is low, avoid extreme actions.
     if confidence < 40:
-        if recommendation in {"STRONG BUY", "BUY"}:
-            recommendation = "HOLD"
-        elif recommendation == "SELL":
-            recommendation = "REDUCE"
+        if reco == "BUY":
+            reco = "HOLD"
+        elif reco == "SELL":
+            reco = "REDUCE"
+
+    reco = _normalize_reco(reco)
 
     return AssetScores(
         value_score=_clamp(value_score),
@@ -535,7 +602,7 @@ def compute_scores(q: Any) -> AssetScores:
         risk_score=_clamp(risk_score),
         opportunity_score=_clamp(opportunity_score),
         overall_score=_clamp(overall_score),
-        recommendation=recommendation,
+        recommendation=reco,
         confidence=confidence,
     )
 
@@ -553,7 +620,7 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
       - otherwise: last resort mutates attributes
 
     prefer_existing_risk_score:
-      - If input already has a non-null risk_score, keep it.
+      - If input already has a non-null risk_score, keep it (useful if upstream risk model exists).
     """
     scores = compute_scores(q)
 
@@ -567,7 +634,7 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
         "risk_score": float(risk_out),
         "opportunity_score": float(scores.opportunity_score),
         "overall_score": float(scores.overall_score),
-        "recommendation": str(scores.recommendation),
+        "recommendation": str(_normalize_reco(scores.recommendation)),
         "confidence": float(scores.confidence),  # keep if your model supports it
         "scoring_version": SCORING_ENGINE_VERSION,
     }
