@@ -1,14 +1,16 @@
-# main.py — FULL REPLACEMENT — v5.1.4
+# main.py — FULL REPLACEMENT — v5.2.0
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.1.4
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.2.0
 
-v5.1.4 patch vs v5.1.2
-- ✅ Better Settings key resolution: reads BOTH env-style keys (UPPER_SNAKE) and Settings attrs (lower_snake).
-- ✅ Honors config.py flags even when env vars are not set (DEFER_ROUTER_MOUNT, INIT_ENGINE_ON_BOOT, etc.).
-- ✅ Last-resort env aliasing expanded to include engine/provider feature flags.
-- ✅ Keeps: never crashes startup; health endpoints always work; safe deferred boot.
+Aligned with your plan (engine + router consistency):
+- ✅ Prefers core.data_engine_v2.get_engine() singleton (keeps cache warm + consistent)
+- ✅ Still supports legacy/sync engines as fallback
+- ✅ Never crashes startup; /healthz /readyz always work
+- ✅ Deferred router mount supported (fast boot)
+- ✅ Settings resolution: ENV + env.py + config.py/core.config (best-effort)
+- ✅ Runtime env aliases + safe provider defaults applied early
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.1.4"
+APP_ENTRY_VERSION = "5.2.0"
 
 
 def _truthy(v: Any) -> bool:
@@ -71,9 +73,7 @@ def _export_env_if_missing(key: str, value: Any) -> None:
 
 def _apply_runtime_env_aliases_last_resort() -> None:
     """
-    Extra safety: even if config/env imports fail,
-    ensure provider modules AND auth checks that read env directly still work.
-
+    Extra safety: ensure provider modules AND auth checks that read env directly still work.
     Never overwrites explicit values.
     """
     # --- Auth aliases ---
@@ -106,19 +106,19 @@ def _apply_runtime_env_aliases_last_resort() -> None:
     if os.getenv("RETRY_DELAY") and not os.getenv("RETRY_DELAY_SEC"):
         _export_env_if_missing("RETRY_DELAY_SEC", os.getenv("RETRY_DELAY"))
 
-    # --- Engine/provider flags defaults (so legacy env-readers remain consistent) ---
+    # --- Engine/provider flags defaults (legacy env-readers consistency) ---
     os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
     os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", "false")
+    os.environ.setdefault("ENABLE_HISTORY_ANALYTICS", "true")
 
 
 def _resolve_log_format() -> str:
     raw = str(os.getenv("LOG_FORMAT", "") or "").strip()
     if not raw:
         return "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-
     low = raw.lower()
     if "%(" in raw:
         return raw
@@ -277,7 +277,6 @@ def _load_env_module() -> Optional[object]:
 
 
 def _key_to_attr(name: str) -> str:
-    # ENV_STYLE -> env_style
     return str(name or "").strip().lower()
 
 
@@ -286,7 +285,7 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
     Resolution order:
       1) ENV (name / name.upper)
       2) env.py (exact attr, then lowercase)
-      3) settings (exact attr, then lowercase env-style mapping)
+      3) settings (exact attr, then lowercase)
       4) default
     """
     v = os.getenv(name, None)
@@ -295,7 +294,6 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
     if v is not None:
         return v
 
-    # env.py
     if env_mod is not None:
         if hasattr(env_mod, name):
             return getattr(env_mod, name)
@@ -303,7 +301,6 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
         if hasattr(env_mod, low):
             return getattr(env_mod, low)
 
-    # settings
     if settings is not None:
         if hasattr(settings, name):
             return getattr(settings, name)
@@ -315,9 +312,7 @@ def _get(settings: Optional[object], env_mod: Optional[object], name: str, defau
 
 
 def _get_env_only(name: str) -> Optional[str]:
-    v = os.getenv(name)
-    if v is None:
-        v = os.getenv(name.upper())
+    v = os.getenv(name) or os.getenv(name.upper())
     if v is None:
         return None
     s = str(v).strip()
@@ -334,14 +329,6 @@ def _normalize_version(v: Any) -> str:
 
 
 def _resolve_version(settings: Optional[object], env_mod: Optional[object]) -> str:
-    """
-    Version priority:
-      1) ENV ONLY: SERVICE_VERSION / APP_VERSION / VERSION / RELEASE
-      2) Settings (service_version/version/app_version)
-      3) Render commit short hash
-      4) env.py legacy keys
-      5) "dev"
-    """
     for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
         vv = _normalize_version(_get_env_only(k))
         if vv:
@@ -441,7 +428,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)),
         "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)),
         "ENGINE_CACHE_TTL_SEC": str(_get(settings, env_mod, "ENGINE_CACHE_TTL_SEC", "")),
-        "ENRICHED_BATCH_CONCURRENCY": str(_get(settings, env_mod, "ENRICHED_BATCH_CONCURRENCY", "")),
+        "ENABLE_HISTORY_ANALYTICS": str(_get(settings, env_mod, "ENABLE_HISTORY_ANALYTICS", os.getenv("ENABLE_HISTORY_ANALYTICS", ""))),
         "ENABLE_YAHOO_CHART_KSA": str(_get(settings, env_mod, "ENABLE_YAHOO_CHART_KSA", os.getenv("ENABLE_YAHOO_CHART_KSA", ""))),
         "ENABLE_YAHOO_CHART_SUPPLEMENT": str(_get(settings, env_mod, "ENABLE_YAHOO_CHART_SUPPLEMENT", os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", ""))),
         "ENABLE_YFINANCE_KSA": str(_get(settings, env_mod, "ENABLE_YFINANCE_KSA", os.getenv("ENABLE_YFINANCE_KSA", ""))),
@@ -494,6 +481,7 @@ def _apply_provider_defaults_if_missing() -> None:
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
     os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", "false")
+    os.environ.setdefault("ENABLE_HISTORY_ANALYTICS", "true")
 
 
 def _engine_info(eng: Any) -> Dict[str, Any]:
@@ -511,6 +499,7 @@ def _engine_info(eng: Any) -> Dict[str, Any]:
 
     providers: List[str] = []
     ksa: List[str] = []
+
     for attr in ("providers_global", "enabled_providers", "providers"):
         providers.extend(_get_list_attr(eng, attr))
     for attr in ("providers_ksa", "ksa_providers"):
@@ -535,13 +524,18 @@ def _engine_info(eng: Any) -> Dict[str, Any]:
     }
 
 
-def _init_engine_best_effort(app_: FastAPI) -> None:
+async def _init_engine_best_effort_async(app_: FastAPI) -> None:
     """
     Best-effort engine init. Never throws.
     Sets:
       - app.state.engine
       - app.state.engine_ready
       - app.state.engine_error
+    Priority:
+      1) existing app.state.engine
+      2) core.data_engine_v2.get_engine() (singleton)
+      3) core.data_engine_v2.DataEngineV2/DataEngine (instantiate)
+      4) core.data_engine.DataEngine (legacy)
     """
     try:
         existing = getattr(app_.state, "engine", None)
@@ -553,7 +547,21 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
     except Exception:
         pass
 
-    v2_err = None
+    # 1) Preferred singleton
+    try:
+        from core.data_engine_v2 import get_engine  # type: ignore
+
+        eng = await get_engine()
+        app_.state.engine = eng
+        app_.state.engine_ready = True
+        app_.state.engine_error = None
+        logger.info("Engine initialized via core.data_engine_v2.get_engine() (singleton).")
+        return
+    except Exception:
+        app_.state.engine_ready = False
+        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
+
+    # 2) Fallback instantiate v2
     try:
         mod = import_module("core.data_engine_v2")
         Engine = getattr(mod, "DataEngineV2", None) or getattr(mod, "DataEngine", None)
@@ -561,13 +569,13 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             app_.state.engine = Engine()
             app_.state.engine_ready = True
             app_.state.engine_error = None
-            logger.info("Engine initialized (DataEngine v2).")
+            logger.info("Engine initialized (core.data_engine_v2.* instantiate).")
             return
     except Exception:
-        v2_err = _clamp_str(traceback.format_exc(), 8000)
         app_.state.engine_ready = False
-        app_.state.engine_error = v2_err
+        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
 
+    # 3) Legacy
     try:
         mod = import_module("core.data_engine")
         Engine = getattr(mod, "DataEngine", None)
@@ -575,11 +583,11 @@ def _init_engine_best_effort(app_: FastAPI) -> None:
             app_.state.engine = Engine()
             app_.state.engine_ready = True
             app_.state.engine_error = None
-            logger.info("Engine initialized (legacy DataEngine).")
+            logger.info("Engine initialized (legacy core.data_engine.DataEngine).")
             return
     except Exception:
         app_.state.engine_ready = False
-        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000) if not v2_err else v2_err
+        app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
 
 
 def _mount_all_routers(app_: FastAPI) -> None:
@@ -606,7 +614,7 @@ async def _background_boot(app_: FastAPI) -> None:
         await asyncio.to_thread(_mount_all_routers, app_)
         init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
         if init_engine:
-            await asyncio.to_thread(_init_engine_best_effort, app_)
+            await _init_engine_best_effort_async(app_)
         app_.state.boot_error = None
     except Exception:
         app_.state.boot_error = _clamp_str(traceback.format_exc(), 8000)
@@ -671,7 +679,7 @@ def create_app() -> FastAPI:
         app_.state.boot_error = None
         app_.state.boot_completed = False
 
-        # ✅ honor settings attrs even if env vars are not set
+        # Honor settings attrs even if env vars are not set
         defer_val = _get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)
         init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)
 
@@ -689,7 +697,7 @@ def create_app() -> FastAPI:
         else:
             await asyncio.to_thread(_mount_all_routers, app_)
             if _truthy(app_.state.init_engine_on_boot):
-                await asyncio.to_thread(_init_engine_best_effort, app_)
+                await _init_engine_best_effort_async(app_)
             app_.state.boot_completed = True
 
         enabled, ksa = _providers_from_settings(settings, env_mod)
