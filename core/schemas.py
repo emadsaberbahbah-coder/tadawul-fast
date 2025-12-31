@@ -2,7 +2,7 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.3.3 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.4.0 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
@@ -19,13 +19,10 @@ Design rules
 ✅ Stable: DEFAULT_HEADERS_59 order must not change lightly.
 ✅ No mutation leaks: always returns COPIES of header lists.
 ✅ Better alignment: sheet aliases include your actual page names.
-✅ Convenience: provides HEADER<->FIELD mapping for UnifiedQuote-style payloads.
-
-v3.3.3 changes vs v3.3.1
-- ✅ Adds explicit alias keys for your exact sheet names (Market_Leaders, My_Portfolio, etc.)
-- ✅ Stronger sheet normalization (handles dots, slashes, parentheses)
-- ✅ Adds strict canonical header validation helper + debug-safe helpers
-- ✅ BatchProcessRequest: supports symbols/tickers as list OR mixed-separator string
+✅ Compatibility helpers:
+    - HEADER_TO_FIELD remains for legacy callers
+    - HEADER_FIELD_CANDIDATES adds multi-field fallbacks for engine/provider variations
+    - FIELD_TO_HEADER recognizes common alias fields (week_52_high vs high_52w etc.)
 """
 
 from __future__ import annotations
@@ -46,7 +43,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.3.3"
+SCHEMAS_VERSION = "3.4.0"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
@@ -158,10 +155,108 @@ def is_canonical_headers(headers: Any) -> bool:
         return False
 
 
+def coerce_headers_59(headers: Any) -> List[str]:
+    """
+    Returns a safe 59 header list.
+    If given headers are invalid/wrong length => canonical headers.
+    Never raises.
+    """
+    try:
+        if isinstance(headers, (list, tuple)) and len(headers) == 59:
+            return [str(x) for x in headers]
+    except Exception:
+        pass
+    return list(_DEFAULT_59_TUPLE)
+
+
+def validate_headers_59(headers: Any) -> Dict[str, Any]:
+    """
+    Debug-safe validation helper.
+    Never raises.
+    """
+    try:
+        ok = is_canonical_headers(headers)
+        return {
+            "ok": bool(ok),
+            "expected_len": 59,
+            "got_len": (len(headers) if isinstance(headers, (list, tuple)) else None),
+        }
+    except Exception:
+        return {"ok": False, "expected_len": 59, "got_len": None}
+
+
+# =============================================================================
+# Field aliases (engine/provider variations)
+# =============================================================================
+# Canonical field -> known aliases that might appear in payloads.
+FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    # Identity
+    "symbol": ("symbol_normalized", "symbol_input"),
+    "name": ("company_name", "long_name"),
+    "sub_sector": ("subsector",),
+    "market": ("market_region", "exchange", "listing_exchange"),
+    # Prices
+    "current_price": ("last_price", "price", "close", "last"),
+    "day_high": ("high",),
+    "day_low": ("low",),
+    "previous_close": ("prev_close",),
+    "percent_change": ("change_percent", "change_pct"),
+    # 52W
+    "week_52_high": ("high_52w", "52w_high"),
+    "week_52_low": ("low_52w", "52w_low"),
+    "position_52w_percent": ("position_52w",),
+    # Liquidity / Shares
+    "avg_volume_30d": ("avg_volume",),
+    "turnover_percent": ("turnover",),
+    "free_float": ("free_float_percent",),
+    # Fundamentals
+    "eps_ttm": ("eps",),
+    "pe_ttm": ("pe",),
+    "forward_pe": ("pe_forward",),
+    "ev_ebitda": ("evebitda",),
+    "dividend_yield": ("div_yield",),
+    "payout_ratio": ("payout",),
+    "roe": ("return_on_equity",),
+    "roa": ("return_on_assets",),
+    "net_margin": ("profit_margin",),
+    "ebitda_margin": ("margin_ebitda",),
+    "revenue_growth": ("rev_growth",),
+    "net_income_growth": ("ni_growth",),
+    # Technicals
+    "volatility_30d": ("vol_30d_ann", "vol30d"),
+    "rsi_14": ("rsi14",),
+    # Valuation / Targets
+    "fair_value": ("expected_price_3m", "expected_price_12m", "ma200", "ma50"),
+    "upside_percent": ("upside_pct",),
+    # Meta
+    "data_source": ("source", "provider"),
+    "last_updated_utc": ("as_of_utc",),
+    "last_updated_riyadh": ("as_of_riyadh",),
+}
+
+# Build reverse lookup: alias_field -> canonical_field
+_ALIAS_TO_CANON: Dict[str, str] = {}
+for canon, aliases in FIELD_ALIASES.items():
+    for a in aliases:
+        _ALIAS_TO_CANON[a] = canon
+
+
+def canonical_field(field: str) -> str:
+    """
+    Best-effort alias -> canonical field.
+    Example: high_52w -> week_52_high
+    """
+    f = str(field or "").strip()
+    if not f:
+        return ""
+    return _ALIAS_TO_CANON.get(f, f)
+
+
 # =============================================================================
 # Header <-> Field mapping (UnifiedQuote alignment helper)
 # =============================================================================
 
+# Canonical (preferred) mapping
 HEADER_TO_FIELD: Dict[str, str] = {
     # Identity
     "Symbol": "symbol",
@@ -178,8 +273,9 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Percent Change": "percent_change",
     "Day High": "day_high",
     "Day Low": "day_low",
-    "52W High": "high_52w",
-    "52W Low": "low_52w",
+    # ✅ Align with current engine naming
+    "52W High": "week_52_high",
+    "52W Low": "week_52_low",
     "52W Position %": "position_52w_percent",
     # Volume/Liquidity
     "Volume": "volume",
@@ -233,23 +329,56 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Last Updated (Riyadh)": "last_updated_riyadh",
 }
 
-FIELD_TO_HEADER: Dict[str, str] = {v: k for k, v in HEADER_TO_FIELD.items()}
+# Multi-field fallback candidates per header (for robust mapping in routers)
+# Ordered: preferred first, then aliases.
+HEADER_FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {}
+for h, f in HEADER_TO_FIELD.items():
+    canon = canonical_field(f)
+    aliases = FIELD_ALIASES.get(canon, ())
+    HEADER_FIELD_CANDIDATES[h] = (canon,) + tuple(a for a in aliases if a)
+
+
+# Build FIELD_TO_HEADER that recognizes both canonical fields and known aliases.
+_FIELD_TO_HEADER: Dict[str, str] = {}
+for header, field in HEADER_TO_FIELD.items():
+    canon = canonical_field(field)
+    _FIELD_TO_HEADER[canon] = header
+    for a in FIELD_ALIASES.get(canon, ()):
+        _FIELD_TO_HEADER[a] = header
+
+FIELD_TO_HEADER: Dict[str, str] = dict(_FIELD_TO_HEADER)
 
 
 def header_to_field(header: str) -> str:
-    """Best-effort header -> UnifiedQuote field name."""
-    return HEADER_TO_FIELD.get(str(header or "").strip(), str(header or "").strip())
+    """Best-effort header -> canonical field name."""
+    return canonical_field(HEADER_TO_FIELD.get(str(header or "").strip(), str(header or "").strip()))
+
+
+def header_field_candidates(header: str) -> Tuple[str, ...]:
+    """
+    Robust mapping helper:
+    returns preferred + aliases (e.g. ("week_52_high","high_52w","52w_high")).
+    """
+    h = str(header or "").strip()
+    c = HEADER_FIELD_CANDIDATES.get(h)
+    if c:
+        return c
+    # fallback: if caller passes unknown header, try using the header string itself
+    f = canonical_field(h)
+    return (f,) if f else ()
 
 
 def field_to_header(field: str) -> str:
-    """Best-effort UnifiedQuote field -> header label."""
-    return FIELD_TO_HEADER.get(str(field or "").strip(), str(field or "").strip())
+    """Best-effort field (canonical or alias) -> header label."""
+    f = str(field or "").strip()
+    if not f:
+        return ""
+    return FIELD_TO_HEADER.get(f, FIELD_TO_HEADER.get(canonical_field(f), f))
 
 
 # =============================================================================
 # Sheet name normalization + mappings
 # =============================================================================
-
 def _norm_sheet_name(name: Optional[str]) -> str:
     """
     Normalizes sheet names from Google Sheets (spaces/case/punctuations).
@@ -380,7 +509,6 @@ def get_supported_sheets() -> List[str]:
 # =============================================================================
 # Shared request models
 # =============================================================================
-
 def _coerce_str_list(v: Any) -> List[str]:
     """
     Accept:
@@ -471,9 +599,15 @@ __all__ = [
     "SCHEMAS_VERSION",
     "DEFAULT_HEADERS_59",
     "is_canonical_headers",
+    "coerce_headers_59",
+    "validate_headers_59",
+    "FIELD_ALIASES",
+    "canonical_field",
     "HEADER_TO_FIELD",
+    "HEADER_FIELD_CANDIDATES",
     "FIELD_TO_HEADER",
     "header_to_field",
+    "header_field_candidates",
     "field_to_header",
     "resolve_sheet_key",
     "get_headers_for_sheet",
