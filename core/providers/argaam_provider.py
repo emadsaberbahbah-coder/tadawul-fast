@@ -1,27 +1,33 @@
-# core/providers/argaam_provider.py  (FULL REPLACEMENT)
+# core/providers/argaam_provider.py
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA optional enrichment) — v1.4.0
+Argaam Provider (KSA optional enrichment) — v1.4.1
 (PROD SAFE + ENGINE PATCH-STYLE + SILENT WHEN NOT CONFIGURED)
 
-Why v1.4.0
-- ✅ Silent when not configured: if ARGAAM_QUOTE_URL and ARGAAM_PROFILE_URL are both missing,
+Why v1.4.1
+- ✅ Keeps v1.4.0 guarantees
+- ✅ Fix: TTL cache is created with a static ttl at import-time; now also recreates cache if TTL env changes
+- ✅ Fix: accept both HTTP_TIMEOUT and HTTP_TIMEOUT_SEC consistently
+- ✅ Fix: safe handling for JSON responses wrapped under common top-level keys (e.g., {"data": {...}})
+- ✅ Better: more tolerant percent parsing and negative formats
+
+Key guarantees
+- Silent when not configured: if ARGAAM_QUOTE_URL and ARGAAM_PROFILE_URL are both missing,
   returns empty patch with no error (prevents noisy warnings in DataEngineV2).
-- ✅ Import-safe even if cachetools is missing (has a tiny TTL cache fallback).
-- ✅ Engine-friendly: exports PATCH functions that return (patch, err) tuples (DataEngineV2 supports both).
-- ✅ Patch is CLEAN: no "status"/"error" keys in the patch; no meta keys that can overwrite canonical output.
-- ✅ Strict KSA-only: non-KSA symbols are silently ignored (prevents misrouting / pollution).
-- ✅ Better numeric parsing (Arabic digits, commas, %, parentheses, K/M/B).
-- ✅ Defensive mapping: supports dict OR list payload shapes; bounded deep-find for nested JSON.
-- ✅ No network calls at import-time; AsyncClient is created lazily.
-- ✅ Enriched call merges profile identity into quote patch (fills blanks only).
+- Import-safe even if cachetools is missing (has a tiny TTL cache fallback).
+- Engine-friendly: exports PATCH functions that return (patch, err) tuples.
+- Patch is CLEAN: no "status"/"error" keys in the patch; no meta keys that can overwrite canonical output.
+- Strict KSA-only: non-KSA symbols are silently ignored (prevents misrouting / pollution).
+- Defensive mapping: supports dict OR list payload shapes; bounded deep-find for nested JSON.
+- No network calls at import-time; AsyncClient is created lazily.
+- Enriched call merges profile identity into quote patch (fills blanks only).
 
 Supported env vars (optional)
 - ARGAAM_QUOTE_URL              e.g. https://.../quote?symbol={symbol}  or .../{code}
 - ARGAAM_PROFILE_URL            e.g. https://.../profile?symbol={symbol}
 - ARGAAM_HEADERS_JSON           JSON dict for headers (optional)
-- ARGAAM_TIMEOUT_SEC            default: fallback to HTTP_TIMEOUT then 20
+- ARGAAM_TIMEOUT_SEC            default: fallback to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT then 20
 - ARGAAM_RETRY_ATTEMPTS         default: 2 (min 1)
 - ARGAAM_TTL_SEC                default: 15 (min 5)
 
@@ -42,14 +48,14 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
 
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "1.4.0"
+PROVIDER_VERSION = "1.4.1"
 
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_RETRY_ATTEMPTS = 2
@@ -68,6 +74,15 @@ _KSA_SYMBOL_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
+
+# -----------------------------------------------------------------------------
+
+
+def _safe_str(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s or None
 
 
 # -----------------------------------------------------------------------------
@@ -109,29 +124,29 @@ def _ttl_seconds() -> float:
 
 
 def _timeout_seconds() -> float:
-    t = _env_float("ARGAAM_TIMEOUT_SEC", 0.0)
-    if t > 0:
-        return t
-    t = _env_float("HTTP_TIMEOUT", 0.0)
-    if t > 0:
-        return t
-    t = _env_float("HTTP_TIMEOUT_SEC", 0.0)
-    if t > 0:
-        return t
+    # priority: ARGAAM_TIMEOUT_SEC, then HTTP_TIMEOUT_SEC, then HTTP_TIMEOUT
+    for key in ("ARGAAM_TIMEOUT_SEC", "HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
+        t = _env_float(key, 0.0)
+        if t and t > 0:
+            return float(t)
     return DEFAULT_TIMEOUT_SEC
+
+
+def _configured() -> bool:
+    return bool(_safe_str(os.getenv("ARGAAM_QUOTE_URL", "")) or _safe_str(os.getenv("ARGAAM_PROFILE_URL", "")))
 
 
 # -----------------------------------------------------------------------------
 # Tiny TTL cache fallback if cachetools missing (import-safe)
 # -----------------------------------------------------------------------------
 try:
-    from cachetools import TTLCache  # type: ignore
+    from cachetools import TTLCache as _TTLCache  # type: ignore
 
     _HAS_CACHETOOLS = True
 except Exception:  # pragma: no cover
     _HAS_CACHETOOLS = False
 
-    class TTLCache(dict):  # type: ignore
+    class _TTLCache(dict):  # type: ignore
         def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
             super().__init__()
             self._maxsize = max(1, int(maxsize))
@@ -151,6 +166,7 @@ except Exception:  # pragma: no cover
             return super().get(key, default)
 
         def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            # naive eviction
             if len(self) >= self._maxsize:
                 try:
                     oldest_key = next(iter(self.keys()))
@@ -161,20 +177,39 @@ except Exception:  # pragma: no cover
             super().__setitem__(key, value)
             self._exp[key] = time.time() + self._ttl
 
+        def _set_ttl(self, ttl: float) -> None:
+            # allow TTL update for env changes
+            try:
+                self._ttl = max(1.0, float(ttl))
+            except Exception:
+                pass
 
-_CACHE: TTLCache = TTLCache(maxsize=5000, ttl=_ttl_seconds())
+
+_CACHE_MAXSIZE = 5000
+_CACHE_TTL = _ttl_seconds()
+_CACHE: _TTLCache = _TTLCache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)  # type: ignore
+
+
+def _ensure_cache_ttl_current() -> None:
+    global _CACHE_TTL, _CACHE
+    ttl_now = _ttl_seconds()
+    if abs(ttl_now - _CACHE_TTL) < 0.0001:
+        return
+    _CACHE_TTL = ttl_now
+    # cachetools TTLCache ttl is not meant to be mutated reliably, so rebuild cleanly
+    try:
+        _CACHE = _TTLCache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)  # type: ignore
+    except Exception:
+        # fallback: best effort update for our tiny cache
+        try:
+            _CACHE._set_ttl(_CACHE_TTL)  # type: ignore
+        except Exception:
+            pass
 
 
 # -----------------------------------------------------------------------------
-# General helpers
+# Symbol helpers
 # -----------------------------------------------------------------------------
-def _safe_str(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s or None
-
-
 def _is_ksa_symbol(symbol: str) -> bool:
     s = (symbol or "").strip().upper()
     if not s:
@@ -194,9 +229,13 @@ def _normalize_ksa_symbol(symbol: str) -> str:
         return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
+    # accept raw "1234sr" styles? nope, keep strict
     return ""
 
 
+# -----------------------------------------------------------------------------
+# Parsing helpers
+# -----------------------------------------------------------------------------
 def _safe_float(val: Any) -> Optional[float]:
     if val is None:
         return None
@@ -213,11 +252,14 @@ def _safe_float(val: Any) -> Optional[float]:
 
         s = s.translate(_ARABIC_DIGITS)
         s = s.replace("٬", ",").replace("٫", ".")
+        # normalize percent and separators
         s = s.replace("%", "").replace(",", "").replace("+", "").strip()
 
+        # parentheses negative
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
 
+        # allow trailing percent sign already removed; allow whitespace
         m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
         mult = 1.0
         if m:
@@ -245,10 +287,6 @@ def _format_url(tpl: str, symbol: str) -> str:
     s = (symbol or "").strip().upper()
     code = s[:-3] if s.endswith(".SR") else s
     return (tpl or "").replace("{symbol}", s).replace("{code}", code)
-
-
-def _configured() -> bool:
-    return bool(_safe_str(os.getenv("ARGAAM_QUOTE_URL", "")) or _safe_str(os.getenv("ARGAAM_PROFILE_URL", "")))
 
 
 def _get_headers() -> Dict[str, str]:
@@ -366,6 +404,25 @@ def _pick_str(obj: Any, *keys: str) -> Optional[str]:
     return _safe_str(_find_first_value(obj, keys))
 
 
+def _unwrap_common_envelopes(js: Union[dict, list]) -> Union[dict, list]:
+    """
+    Some endpoints wrap payloads like {"data": {...}} or {"result": {...}}.
+    This unwraps a few common keys, bounded (no loops).
+    """
+    cur: Any = js
+    for _ in range(2):
+        if isinstance(cur, dict):
+            for k in ("data", "result", "payload", "quote", "profile"):
+                if k in cur and isinstance(cur[k], (dict, list)):
+                    cur = cur[k]
+                    break
+            else:
+                break
+        else:
+            break
+    return cur
+
+
 def _coerce_dict(data: Union[dict, list]) -> dict:
     if isinstance(data, dict):
         return data
@@ -405,6 +462,7 @@ async def _http_get_json(url: str) -> Tuple[Optional[Union[dict, list]], Optiona
             if not isinstance(js, (dict, list)):
                 return None, "unexpected JSON type"
 
+            js = _unwrap_common_envelopes(js)
             return js, None
 
         except Exception as e:
@@ -435,9 +493,28 @@ def _map_quote_payload(root: Any) -> Dict[str, Any]:
     patch["volume"] = _pick_num(root, "volume", "v", "Volume", "tradedVolume", "qty", "quantity")
 
     patch["price_change"] = _pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
-    patch["percent_change"] = _pick_pct(root, "change_pct", "change_percent", "dp", "percent_change", "ChangePercent", "pctChange")
+    patch["percent_change"] = _pick_pct(
+        root,
+        "change_pct",
+        "change_percent",
+        "dp",
+        "percent_change",
+        "ChangePercent",
+        "pctChange",
+        "changePercent",
+    )
 
-    name = _pick_str(root, "name", "company", "company_name", "CompanyName", "shortName", "longName", "securityName", "issuerName")
+    name = _pick_str(
+        root,
+        "name",
+        "company",
+        "company_name",
+        "CompanyName",
+        "shortName",
+        "longName",
+        "securityName",
+        "issuerName",
+    )
     if name:
         patch["name"] = name
 
@@ -453,7 +530,6 @@ def _map_quote_payload(root: Any) -> Dict[str, Any]:
     if sub_sector:
         patch["sub_sector"] = sub_sector
 
-    # Keep only meaningful
     return _clean_patch(patch)
 
 
@@ -474,6 +550,8 @@ async def _fetch_quote_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]
     tpl = _safe_str(os.getenv("ARGAAM_QUOTE_URL", ""))
     if not tpl:
         return {}, None
+
+    _ensure_cache_ttl_current()
 
     ck = f"quote::{sym}"
     hit = _CACHE.get(ck)
@@ -510,6 +588,8 @@ async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
     tpl = _safe_str(os.getenv("ARGAAM_PROFILE_URL", ""))
     if not tpl:
         return {}, None
+
+    _ensure_cache_ttl_current()
 
     ck = f"profile::{sym}"
     hit = _CACHE.get(ck)
@@ -560,7 +640,6 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
             for k, v in p_patch.items():
                 if k not in q_patch and v is not None:
                     q_patch[k] = v
-        # Prefer quote error if any; otherwise profile error if quote had none
         return _clean_patch(q_patch), (q_err or p_err)
 
     # No quote -> try profile
@@ -586,4 +665,5 @@ __all__ = [
     "fetch_quote_and_enrichment_patch",
     "aclose_argaam_client",
     "PROVIDER_VERSION",
+    "PROVIDER_NAME",
 ]
