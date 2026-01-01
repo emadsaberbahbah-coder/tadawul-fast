@@ -2,7 +2,7 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.4.2 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.5.0 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
@@ -18,16 +18,16 @@ Design rules
 ✅ Defensive: always returns a valid header list (never raises).
 ✅ Stable: DEFAULT_HEADERS_59 order must not change lightly.
 ✅ No mutation leaks: always returns COPIES of header lists.
-✅ Better alignment: sheet aliases include your actual page names.
 ✅ Compatibility helpers:
-    - HEADER_TO_FIELD remains for legacy callers
+    - HEADER_TO_FIELD remains for callers
     - HEADER_FIELD_CANDIDATES adds multi-field fallbacks for engine/provider variations
-    - FIELD_TO_HEADER recognizes common alias fields (week_52_high vs high_52w etc.)
+    - FIELD_TO_HEADER recognizes common alias fields
 
-v3.4.2 (this revision)
-- ✅ header_to_field() returns "" for unknown headers (prevents bad field lookups).
-- ✅ More header synonyms (52W variants, Avg Volume/Volatility variants).
-- ✅ Keeps tolerant normalization: "Sub Sector" == "Sub-Sector", "Avg Volume (30d)" == "Avg Volume (30D)".
+v3.5.0 (this revision)
+- ✅ Adds an Analysis/Extended header set (59 + forecast/returns/MAs/history columns).
+- ✅ get_headers_for_sheet() returns 59 for quote pages and Extended for analysis pages
+  (Global_Markets / Insights_Analysis / Investment_Advisor).
+- ✅ HEADER_TO_FIELD + FIELD_ALIASES expanded to cover extended headers.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.4.2"
+SCHEMAS_VERSION = "3.5.0"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
@@ -127,24 +127,56 @@ DEFAULT_HEADERS_59: List[str] = [
     "Last Updated (Riyadh)",
 ]
 
+# =============================================================================
+# Extended / Analysis schema (59 + additional columns)
+# =============================================================================
+_ANALYSIS_EXTRAS: List[str] = [
+    "Returns 1W %",
+    "Returns 1M %",
+    "Returns 3M %",
+    "Returns 6M %",
+    "Returns 12M %",
+    "MA20",
+    "MA50",
+    "MA200",
+    "Expected Return 1M %",
+    "Expected Return 3M %",
+    "Expected Return 12M %",
+    "Expected Price 1M",
+    "Expected Price 3M",
+    "Expected Price 12M",
+    "Confidence Score",
+    "Forecast Method",
+    "History Points",
+    "History Source",
+    "History Last (UTC)",
+]
 
-def _ensure_len_59(headers: Sequence[str]) -> Tuple[str, ...]:
+DEFAULT_HEADERS_ANALYSIS: List[str] = list(DEFAULT_HEADERS_59) + list(_ANALYSIS_EXTRAS)
+
+
+def _ensure_len(headers: Sequence[str], expected: int, fallback: Sequence[str]) -> Tuple[str, ...]:
     """
     PROD-SAFE: never raises.
-    If headers length != 59, returns the canonical DEFAULT_HEADERS_59 as tuple.
+    If headers length != expected, returns fallback as tuple.
     """
     try:
-        if isinstance(headers, (list, tuple)) and len(headers) == 59:
+        if isinstance(headers, (list, tuple)) and len(headers) == expected:
             return tuple(str(x) for x in headers)
     except Exception:
         pass
-    return tuple(DEFAULT_HEADERS_59)
+    return tuple(str(x) for x in fallback)
 
 
-# Freeze the canonical list as a tuple for internal use (prevents accidental mutation).
+def _ensure_len_59(headers: Sequence[str]) -> Tuple[str, ...]:
+    return _ensure_len(headers, 59, DEFAULT_HEADERS_59)
+
+
+# Freeze canonical lists as tuples for internal use (prevents accidental mutation).
 _DEFAULT_59_TUPLE: Tuple[str, ...] = _ensure_len_59(DEFAULT_HEADERS_59)
+_DEFAULT_ANALYSIS_TUPLE: Tuple[str, ...] = tuple(str(x) for x in DEFAULT_HEADERS_ANALYSIS)
 
-# Normalize exported list to canonical (if someone edited it accidentally)
+# Normalize exported lists to canonical (if someone edited accidentally)
 if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
     DEFAULT_HEADERS_59 = list(_DEFAULT_59_TUPLE)
 
@@ -214,7 +246,7 @@ def _norm_header_label(h: Optional[str]) -> str:
 
 # Canonical header lookup by normalized key (auto-built)
 _HEADER_CANON_BY_NORM: Dict[str, str] = {}
-for _h in _DEFAULT_59_TUPLE:
+for _h in list(_DEFAULT_59_TUPLE) + list(_DEFAULT_ANALYSIS_TUPLE):
     _HEADER_CANON_BY_NORM[_norm_header_label(_h)] = _h
 
 # Common synonyms/variants that appear in code/sheets
@@ -222,12 +254,14 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     # names
     "sub_sector": "Sub-Sector",
     "subsector": "Sub-Sector",
+    "sub sector": "Sub-Sector",
     # avg volume / vol
     "avg_volume_30d": "Avg Volume (30D)",
     "avg_vol_30d": "Avg Volume (30D)",
     "avg_volume_30day": "Avg Volume (30D)",
     "volatility_30d": "Volatility (30D)",
     "vol_30d": "Volatility (30D)",
+    "vol_30d_ann": "Volatility (30D)",
     # timestamps
     "last_updated_utc": "Last Updated (UTC)",
     "last_updated_riyadh": "Last Updated (Riyadh)",
@@ -246,10 +280,16 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "low_52w": "52W Low",
     "position_52w_percent": "52W Position %",
     "position_52w": "52W Position %",
+    # Returns / Forecast synonyms
+    "return_1w_percent": "Returns 1W %",
+    "return_1m_percent": "Returns 1M %",
+    "return_3m_percent": "Returns 3M %",
+    "return_6m_percent": "Returns 6M %",
+    "return_12m_percent": "Returns 12M %",
 }
 for k, canon_header in list(_HEADER_SYNONYMS.items()):
     nk = _norm_header_label(k)
-    if nk and canon_header in _DEFAULT_59_TUPLE:
+    if nk and canon_header:
         _HEADER_CANON_BY_NORM[nk] = canon_header
 
 
@@ -320,6 +360,26 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "upside_percent": ("upside_pct",),
     # Scores/Rec
     "overall_score": ("score", "total_score"),
+    # Extended / analysis
+    "returns_1w": ("return_1w", "ret_1w"),
+    "returns_1m": ("return_1m", "ret_1m"),
+    "returns_3m": ("return_3m", "ret_3m"),
+    "returns_6m": ("return_6m", "ret_6m"),
+    "returns_12m": ("return_12m", "ret_12m"),
+    "ma20": ("sma20",),
+    "ma50": ("sma50",),
+    "ma200": ("sma200",),
+    "expected_return_1m": ("exp_return_1m",),
+    "expected_return_3m": ("exp_return_3m",),
+    "expected_return_12m": ("exp_return_12m",),
+    "expected_price_1m": ("exp_price_1m",),
+    "expected_price_3m": ("exp_price_3m",),
+    "expected_price_12m": ("exp_price_12m",),
+    "confidence_score": ("conf_score",),
+    "forecast_method": ("forecast_model",),
+    "history_points": ("hist_points",),
+    "history_source": ("hist_source",),
+    "history_last_utc": ("hist_last_utc",),
     # Meta
     "data_source": ("source", "provider"),
     "data_quality": ("dq",),
@@ -420,6 +480,26 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Data Quality": "data_quality",
     "Last Updated (UTC)": "last_updated_utc",
     "Last Updated (Riyadh)": "last_updated_riyadh",
+    # Extended / analysis
+    "Returns 1W %": "returns_1w",
+    "Returns 1M %": "returns_1m",
+    "Returns 3M %": "returns_3m",
+    "Returns 6M %": "returns_6m",
+    "Returns 12M %": "returns_12m",
+    "MA20": "ma20",
+    "MA50": "ma50",
+    "MA200": "ma200",
+    "Expected Return 1M %": "expected_return_1m",
+    "Expected Return 3M %": "expected_return_3m",
+    "Expected Return 12M %": "expected_return_12m",
+    "Expected Price 1M": "expected_price_1m",
+    "Expected Price 3M": "expected_price_3m",
+    "Expected Price 12M": "expected_price_12m",
+    "Confidence Score": "confidence_score",
+    "Forecast Method": "forecast_method",
+    "History Points": "history_points",
+    "History Source": "history_source",
+    "History Last (UTC)": "history_last_utc",
 }
 
 # Multi-field fallback candidates per header (for robust mapping in routers)
@@ -444,7 +524,7 @@ FIELD_TO_HEADER: Dict[str, str] = dict(_FIELD_TO_HEADER)
 def header_to_field(header: str) -> str:
     """
     Best-effort header (any variant) -> canonical field name.
-    v3.4.2: returns "" when header is unknown (safer for callers).
+    Returns "" when header is unknown (safer for callers).
     """
     h = _canonical_header_label(header)
     if not h:
@@ -508,7 +588,7 @@ def _register(keys: List[str], headers: Tuple[str, ...]) -> None:
             _SHEET_HEADERS[kk] = headers
 
 
-# Canonical schema used everywhere for now
+# Quote / core pages -> 59
 _register(
     keys=[
         # KSA / Tadawul
@@ -523,10 +603,6 @@ _register(
         "Market_Leaders",
         "Market Leaders",
         "KSA_Market_Leaders",
-        # Global
-        "Global_Markets",
-        "Global Markets",
-        "Global",
         # Funds
         "Mutual_Funds",
         "Mutual Funds",
@@ -536,15 +612,27 @@ _register(
         "Commodities & FX",
         "FX",
         "Commodities",
-        # Portfolio / Investment
+        # Portfolio / Investment (quote-aligned view; income statement can be separate sheet logic)
         "My_Portfolio",
         "My Portfolio",
         "My_Portfolio_Investment",
         "My Portfolio Investment",
-        "Investment_Income_Statement",
-        "Investment Income Statement",
         "Portfolio",
-        # Insights / Analysis / Advisor
+        # Additional pages (default to 59 unless you later define custom schemas)
+        "Economic_Calendar",
+        "Economic Calendar",
+        "Calendar",
+        "Status",
+    ],
+    headers=_DEFAULT_59_TUPLE,
+)
+
+# Analysis pages -> Extended
+_register(
+    keys=[
+        "Global_Markets",
+        "Global Markets",
+        "Global",
         "Insights_Analysis",
         "Insights Analysis",
         "Insights",
@@ -552,13 +640,8 @@ _register(
         "Investment_Advisor",
         "Investment Advisor",
         "Advisor",
-        # Additional pages
-        "Economic_Calendar",
-        "Economic Calendar",
-        "Calendar",
-        "Status",
     ],
-    headers=_DEFAULT_59_TUPLE,
+    headers=_DEFAULT_ANALYSIS_TUPLE,
 )
 
 
@@ -690,6 +773,7 @@ class BatchProcessRequest(_ExtraIgnore):
 __all__ = [
     "SCHEMAS_VERSION",
     "DEFAULT_HEADERS_59",
+    "DEFAULT_HEADERS_ANALYSIS",
     "is_canonical_headers",
     "coerce_headers_59",
     "validate_headers_59",
