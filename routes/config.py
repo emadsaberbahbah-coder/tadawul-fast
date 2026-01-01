@@ -1,4 +1,4 @@
-# config.py  (REPO ROOT) — FULL REPLACEMENT — v5.3.2
+# config.py  (REPO ROOT) — FULL REPLACEMENT — v5.4.0
 """
 config.py
 ============================================================
@@ -9,16 +9,18 @@ Canonical Settings for Tadawul Fast Bridge (ROOT)
 ✅ No network at import-time. Minimal side effects at import-time.
 ✅ Defensive: never crashes import-time even if pydantic-settings missing.
 
-Version: v5.3.2
-Notes:
-- Render yaml alignment: *_TTL_SEC + HTTP_TIMEOUT_SEC supported.
-- Exposes legacy-friendly aliases via environment exports (only if missing).
-- Includes Advanced Analysis batching controls used by routes/advanced_analysis.py.
+Version: v5.4.0
+Upgrades vs v5.3.2
+- ✅ Adds KSA routing feature flags (ENABLE_YFINANCE_KSA / ENABLE_YAHOO_CHART_KSA).
+- ✅ Adds optional Yahoo Chart base URL.
+- ✅ Ensures auth is effectively “on” when APP_TOKEN is set (require_auth derived).
+- ✅ Adds safe module alias for core.config imports (best-effort).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -145,6 +147,10 @@ try:
         primary_provider: str = Field(default="eodhd", validation_alias=_alias("PRIMARY_PROVIDER"))
         ksa_providers_raw: str = Field(default="yahoo_chart,tadawul,argaam", validation_alias=_alias("KSA_PROVIDERS"))
 
+        # KSA routing feature flags (used by v2 engine)
+        enable_yfinance_ksa: bool = Field(default=False, validation_alias=_alias("ENABLE_YFINANCE_KSA"))
+        enable_yahoo_chart_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_KSA"))
+
         # ---------------------------------------------------------------------
         # Provider keys/tokens (Render names locked)
         # ---------------------------------------------------------------------
@@ -165,6 +171,9 @@ try:
         eodhd_base_url: str = Field(default="https://eodhistoricaldata.com/api", validation_alias=_alias("EODHD_BASE_URL"))
         finnhub_base_url: str = Field(default="https://finnhub.io/api/v1", validation_alias=_alias("FINNHUB_BASE_URL"))
         fmp_base_url: Optional[str] = Field(default=None, validation_alias=_alias("FMP_BASE_URL"))
+
+        # Optional Yahoo chart base url (if you ever override)
+        yahoo_chart_base_url: str = Field(default="https://query1.finance.yahoo.com", validation_alias=_alias("YAHOO_CHART_BASE_URL"))
 
         # Render yaml uses HTTP_TIMEOUT_SEC; keep HTTP_TIMEOUT too
         http_timeout: float = Field(default=30.0, validation_alias=_alias("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"))
@@ -271,6 +280,10 @@ try:
                 "enabled_providers": self.enabled_providers,
                 "primary_provider": (self.primary_provider or "").strip().lower(),
                 "ksa_providers": self.ksa_providers,
+                "ksa_flags": {
+                    "enable_yfinance_ksa": bool(self.enable_yfinance_ksa),
+                    "enable_yahoo_chart_ksa": bool(self.enable_yahoo_chart_ksa),
+                },
                 "http_timeout_sec": float(self.http_timeout_sec),
                 "max_retries": int(self.max_retries),
                 "retry_delay": float(self.retry_delay),
@@ -353,6 +366,7 @@ try:
         # Base URLs for provider modules that read env at call-time
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
         _export_env_if_missing("FINNHUB_BASE_URL", s.finnhub_base_url)
+        _export_env_if_missing("YAHOO_CHART_BASE_URL", s.yahoo_chart_base_url)
 
         # Providers lists (some older modules read these at runtime)
         _export_env_if_missing("ENABLED_PROVIDERS", ",".join(s.enabled_providers))
@@ -373,12 +387,15 @@ try:
         s.primary_provider = (s.primary_provider or "eodhd").strip().lower()
 
         s.debug = _to_bool(s.debug, False)
-        s.require_auth = _to_bool(s.require_auth, False)
+
         s.enable_rate_limiting = _to_bool(s.enable_rate_limiting, True)
         s.cache_backup_enabled = _to_bool(s.cache_backup_enabled, False)
         s.advanced_analysis_enabled = _to_bool(s.advanced_analysis_enabled, True)
         s.tadawul_market_enabled = _to_bool(s.tadawul_market_enabled, True)
         s.enable_cors_all_origins = _to_bool(s.enable_cors_all_origins, True)
+
+        s.enable_yfinance_ksa = _to_bool(s.enable_yfinance_ksa, False)
+        s.enable_yahoo_chart_ksa = _to_bool(s.enable_yahoo_chart_ksa, True)
 
         s.max_requests_per_minute = _to_int(s.max_requests_per_minute, 240)
         s.max_retries = _to_int(s.max_retries, 2)
@@ -399,6 +416,10 @@ try:
         s.adv_batch_timeout_sec = max(5.0, min(180.0, _to_float(s.adv_batch_timeout_sec, 45.0)))
         s.adv_max_tickers = max(10, min(2000, _to_int(s.adv_max_tickers, 500)))
         s.adv_batch_concurrency = max(1, min(25, _to_int(s.adv_batch_concurrency, 6)))
+
+        # Auth: if token is set, effectively require auth
+        tok_set = bool((s.app_token or "").strip() or (s.backup_app_token or "").strip())
+        s.require_auth = _to_bool(s.require_auth, False) or tok_set
 
         _apply_runtime_env_aliases(s)
         return s
@@ -433,6 +454,9 @@ except Exception:  # pragma: no cover
         primary_provider: str = "eodhd"
         ksa_providers_raw: str = "yahoo_chart,tadawul,argaam"
 
+        enable_yfinance_ksa: bool = False
+        enable_yahoo_chart_ksa: bool = True
+
         eodhd_api_key: Optional[str] = None
         finnhub_api_key: Optional[str] = None
         fmp_api_key: Optional[str] = None
@@ -441,6 +465,7 @@ except Exception:  # pragma: no cover
 
         eodhd_base_url: str = "https://eodhistoricaldata.com/api"
         finnhub_base_url: str = "https://finnhub.io/api/v1"
+        yahoo_chart_base_url: str = "https://query1.finance.yahoo.com"
         backend_base_url: Optional[str] = None
 
         http_timeout: float = 30.0
@@ -468,6 +493,7 @@ except Exception:  # pragma: no cover
 
         default_spreadsheet_id: Optional[str] = None
         google_sheets_credentials: Optional[str] = None
+        google_credentials: Optional[str] = None
         google_apps_script_url: Optional[str] = None
         google_apps_script_backup_url: Optional[str] = None
 
@@ -475,6 +501,11 @@ except Exception:  # pragma: no cover
         tadawul_market_enabled: bool = True
         enable_swagger: bool = True
         enable_redoc: bool = True
+
+        tadawul_quote_url: Optional[str] = None
+        tadawul_fundamentals_url: Optional[str] = None
+        argaam_quote_url: Optional[str] = None
+        argaam_profile_url: Optional[str] = None
 
         @property
         def enabled_providers(self) -> List[str]:
@@ -508,6 +539,10 @@ except Exception:  # pragma: no cover
                 "enabled_providers": self.enabled_providers,
                 "primary_provider": (self.primary_provider or "").strip().lower(),
                 "ksa_providers": self.ksa_providers,
+                "ksa_flags": {
+                    "enable_yfinance_ksa": bool(self.enable_yfinance_ksa),
+                    "enable_yahoo_chart_ksa": bool(self.enable_yahoo_chart_ksa),
+                },
                 "http_timeout_sec": float(self.http_timeout_sec),
                 "max_retries": int(self.max_retries),
                 "retry_delay": float(self.retry_delay),
@@ -535,6 +570,10 @@ except Exception:  # pragma: no cover
         if _CACHED is not None:
             return _CACHED
 
+        app_token = (os.getenv("APP_TOKEN") or "").strip() or None
+        backup = (os.getenv("BACKUP_APP_TOKEN") or "").strip() or None
+        require_auth = _to_bool(os.getenv("REQUIRE_AUTH"), False) or bool(app_token or backup)
+
         _CACHED = Settings(
             service_name=(os.getenv("SERVICE_NAME") or os.getenv("APP_NAME") or "Tadawul Stock Analysis API").strip(),
             service_version=(os.getenv("SERVICE_VERSION") or os.getenv("APP_VERSION") or os.getenv("VERSION") or "0.0.0").strip(),
@@ -542,15 +581,20 @@ except Exception:  # pragma: no cover
             tz=(os.getenv("TZ") or os.getenv("TIMEZONE") or "Asia/Riyadh").strip(),
             debug=_to_bool(os.getenv("DEBUG"), False),
             log_level=(os.getenv("LOG_LEVEL") or "info").strip().lower(),
-            require_auth=_to_bool(os.getenv("REQUIRE_AUTH"), False),
-            app_token=(os.getenv("APP_TOKEN") or "").strip() or None,
-            backup_app_token=(os.getenv("BACKUP_APP_TOKEN") or "").strip() or None,
+            require_auth=require_auth,
+            app_token=app_token,
+            backup_app_token=backup,
             enabled_providers_raw=(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub").strip(),
             primary_provider=(os.getenv("PRIMARY_PROVIDER") or "eodhd").strip().lower(),
             ksa_providers_raw=(os.getenv("KSA_PROVIDERS") or "yahoo_chart,tadawul,argaam").strip(),
+            enable_yfinance_ksa=_to_bool(os.getenv("ENABLE_YFINANCE_KSA"), False),
+            enable_yahoo_chart_ksa=_to_bool(os.getenv("ENABLE_YAHOO_CHART_KSA"), True),
             eodhd_api_key=(os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_TOKEN") or "").strip() or None,
             finnhub_api_key=(os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_TOKEN") or os.getenv("FINNHUB_TOKEN") or "").strip() or None,
             backend_base_url=(os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or os.getenv("BASE_URL") or "").strip() or None,
+            eodhd_base_url=(os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").strip(),
+            finnhub_base_url=(os.getenv("FINNHUB_BASE_URL") or "https://finnhub.io/api/v1").strip(),
+            yahoo_chart_base_url=(os.getenv("YAHOO_CHART_BASE_URL") or "https://query1.finance.yahoo.com").strip(),
             http_timeout=_to_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0),
             max_retries=_to_int(os.getenv("MAX_RETRIES"), 2),
             retry_delay=_to_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5),
@@ -588,11 +632,23 @@ except Exception:  # pragma: no cover
         _export_env_if_missing("KSA_PROVIDERS", ",".join(_CACHED.ksa_providers))
         _export_env_if_missing("PRIMARY_PROVIDER", (_CACHED.primary_provider or "eodhd").strip().lower())
 
+        _export_env_if_missing("YAHOO_CHART_BASE_URL", _CACHED.yahoo_chart_base_url)
+
         if _CACHED.backend_base_url:
             _export_env_if_missing("BACKEND_BASE_URL", (_CACHED.backend_base_url or "").rstrip("/"))
             _export_env_if_missing("BASE_URL", (_CACHED.backend_base_url or "").rstrip("/"))
 
         return _CACHED
+
+
+# -----------------------------------------------------------------------------
+# Best-effort module alias so `from core.config import get_settings` can work
+# when this file is used as the canonical implementation.
+# -----------------------------------------------------------------------------
+try:
+    sys.modules.setdefault("core.config", sys.modules[__name__])
+except Exception:
+    pass
 
 
 __all__ = ["Settings", "get_settings"]
