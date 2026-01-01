@@ -1,11 +1,1 @@
-# Procfile — Tadawul Fast Bridge (FastAPI)
-# Render compatible — PROD SAFE (v1.4.1)
-# ------------------------------------------------------------
-# v1.4.1 patch:
-# - Still validates WEB_CONCURRENCY numeric (prevents "integer expression expected")
-# - Adds WEB_THREADS optional (uvicorn has no threads flag; kept for future/gunicorn parity)
-# - Adds safe defaults + keeps all optional UVICORN_* tunings
-# - Uses argv building (safe quoting)
-# ------------------------------------------------------------
-
-web: sh -c 'LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")"; PORT_VAL="${PORT:-8000}"; KEEPALIVE_VAL="${UVICORN_KEEPALIVE:-75}"; case "${WEB_CONCURRENCY:-1}" in (""|*[!0-9]*) CONC=1 ;; (*) CONC="${WEB_CONCURRENCY:-1}" ;; esac; set -- uvicorn main:app --host 0.0.0.0 --port "$PORT_VAL" --proxy-headers --forwarded-allow-ips "*" --lifespan on --timeout-keep-alive "$KEEPALIVE_VAL" --log-level "$LOG_LEVEL_LC" --no-server-header; if [ "$CONC" -gt 1 ]; then set -- "$@" --workers "$CONC"; fi; case "${UVICORN_ACCESS_LOG:-1}" in (0|false|no|off) set -- "$@" --no-access-log ;; (*) set -- "$@" --access-log ;; esac; case "${UVICORN_LIMIT_CONCURRENCY:-}" in (""|*[!0-9]*) : ;; (*) set -- "$@" --limit-concurrency "${UVICORN_LIMIT_CONCURRENCY}" ;; esac; case "${UVICORN_LIMIT_MAX_REQUESTS:-}" in (""|*[!0-9]*) : ;; (*) set -- "$@" --limit-max-requests "${UVICORN_LIMIT_MAX_REQUESTS}" ;; esac; case "${UVICORN_BACKLOG:-}" in (""|*[!0-9]*) : ;; (*) set -- "$@" --backlog "${UVICORN_BACKLOG}" ;; esac; if [ -n "${UVICORN_ROOT_PATH:-}" ]; then set -- "$@" --root-path "${UVICORN_ROOT_PATH}"; fi; exec "$@"'
+web: python -m uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
