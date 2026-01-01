@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-# test_endpoints.py  (FULL REPLACEMENT)
+# tests/test_endpoints.py
 """
-SMOKE TESTER for Tadawul Fast Bridge API – v2.5.0 (Prod-aligned)
+SMOKE TESTER for Tadawul Fast Bridge API – v2.5.1 (Prod-aligned)
 
 What it tests (based on your deployed reality):
-- GET /healthz, /readyz, /health
+- GET /, /healthz, /readyz, /health
 - Router health: /v1/enriched/health, /v1/analysis/health, /v1/advanced/health, /v1/argaam/health, /system/settings
 - Single quotes: /v1/enriched/quote?symbol=...
 - Batch quotes (GET): /v1/enriched/quotes?symbols=SYM1,SYM2,...
 
 Notes:
-- /system/routes is NOT deployed (404) -> removed
-- /v1/enriched/sheet-rows is NOT deployed (404) -> removed
+- /system/routes is NOT deployed (404) -> not tested
+- /v1/enriched/sheet-rows may or may not be deployed depending on your version -> not tested here
 - Batch endpoint expects "symbols" query param (NOT "tickers")
 
 Usage:
-  python test_endpoints.py
-  TFB_BASE_URL=https://tadawul-fast-bridge.onrender.com python test_endpoints.py
-  python test_endpoints.py --ksa 1120.SR --global AAPL
+  python tests/test_endpoints.py
+  TFB_BASE_URL=https://tadawul-fast-bridge.onrender.com python tests/test_endpoints.py
+  python tests/test_endpoints.py --ksa 1120.SR --global AAPL
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
+
+SCRIPT_VERSION = "2.5.1"
 
 DEFAULT_BASE_URL = (
     os.getenv("TFB_BASE_URL")
@@ -53,7 +55,7 @@ TIMEOUT_SHORT = float(os.getenv("TFB_TIMEOUT_SHORT", "15") or "15")
 TIMEOUT_MED = float(os.getenv("TFB_TIMEOUT_MED", "25") or "25")
 TIMEOUT_LONG = float(os.getenv("TFB_TIMEOUT_LONG", "90") or "90")
 
-USER_AGENT = os.getenv("TFB_USER_AGENT", "TadawulFastBridge-EndpointTester/2.5.0") or "TadawulFastBridge-EndpointTester/2.5.0"
+USER_AGENT = os.getenv("TFB_USER_AGENT", f"TadawulFastBridge-EndpointTester/{SCRIPT_VERSION}") or f"TadawulFastBridge-EndpointTester/{SCRIPT_VERSION}"
 
 
 def _colors_enabled() -> bool:
@@ -237,7 +239,7 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
 
 def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str, str], symbols: List[str]) -> None:
     log("Testing Batch Quotes (GET /v1/enriched/quotes?symbols=...)", "header")
-    q = ",".join(symbols)
+    q = ",".join([s.strip() for s in symbols if str(s).strip()])
     r, dt, err = request_any(
         sess,
         "GET",
@@ -253,12 +255,17 @@ def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str,
         log(f"/v1/enriched/quotes -> HTTP {r.status_code} ({fmt_dt(dt)}) body={body_preview(r)!r}", "fail")
         return
 
-    data = safe_json(r) or {}
+    data = safe_json(r)
+    if not isinstance(data, dict):
+        log(f"/v1/enriched/quotes -> Non-JSON response ({fmt_dt(dt)})", "fail")
+        return
+
     items = data.get("items") or []
     log(f"batch status={data.get('status')} count={data.get('count')} items={len(items)} ({fmt_dt(dt)})", "success")
 
-    # quick per-item summary
     for it in items[:10]:
+        if not isinstance(it, dict):
+            continue
         sym = it.get("symbol")
         mkt = it.get("market")
         px = it.get("current_price")
@@ -273,12 +280,13 @@ def main() -> int:
     p.add_argument("--token", default=DEFAULT_TOKEN)
     p.add_argument("--ksa", default=KSA_TEST_SYMBOL)
     p.add_argument("--global", dest="global_sym", default=GLOBAL_TEST_SYMBOL)
+    p.add_argument("--verbose", action="store_true", help="Print response previews on warnings/failures")
     args = p.parse_args()
 
     base_url = str(args.base_url).rstrip("/")
     token = str(args.token).strip()
 
-    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.5.0{C.ENDC}")
+    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v{SCRIPT_VERSION}{C.ENDC}")
     print(f"BASE_URL={base_url} | TOKEN={'SET' if token else 'NOT SET'}")
     print(f"KSA_TEST_SYMBOL={args.ksa} | GLOBAL_TEST_SYMBOL={args.global_sym}")
 
@@ -290,9 +298,9 @@ def main() -> int:
         return 2
 
     check_router_health(sess, base_url, hdrs)
-    check_quote(sess, base_url, hdrs, args.ksa)
-    check_quote(sess, base_url, hdrs, args.global_sym)
-    check_batch_quotes(sess, base_url, hdrs, [args.ksa, args.global_sym])
+    check_quote(sess, base_url, hdrs, str(args.ksa).strip().upper())
+    check_quote(sess, base_url, hdrs, str(args.global_sym).strip().upper())
+    check_batch_quotes(sess, base_url, hdrs, [str(args.ksa).strip().upper(), str(args.global_sym).strip().upper()])
 
     print("\n✅ Smoke test finished.")
     return 0
