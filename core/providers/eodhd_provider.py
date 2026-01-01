@@ -1,15 +1,17 @@
-# core/providers/eodhd_provider.py  (FULL REPLACEMENT)
+# core/providers/eodhd_provider.py
 """
 core/providers/eodhd_provider.py
 ------------------------------------------------------------
-EODHD Provider — v1.8.0 (ENV-ALIAS + KSA-OPTIONAL + SHEET-KEY FIX)
+EODHD Provider — v1.9.0 (HARDENED + ENGINE-PATCH + KSA-OPTIONAL + CLIENT REUSE)
 
 Key points
 - ✅ Uses EODHD_API_KEY (preferred in Render)
 - ✅ Also accepts EODHD_API_TOKEN / EODHD_TOKEN (legacy)
 - ✅ Default base URL: https://eodhistoricaldata.com/api
 - ✅ No network calls at import-time
+- ✅ Lazy singleton AsyncClient (reuse connections)
 - ✅ Defensive JSON parsing + clear errors
+- ✅ Clean PATCH outputs (no null/empty noise unless useful)
 
 KSA handling (IMPORTANT)
 - Default: KSA is BLOCKED (safe) to avoid routing confusion.
@@ -20,6 +22,7 @@ Exports (engine discovery)
 - fetch_quote_patch
 - fetch_enriched_quote_patch
 - fetch_quote_and_enrichment_patch
+- aclose_eodhd_client
 
 Env vars (supported)
 - EODHD_API_KEY (preferred)
@@ -27,19 +30,20 @@ Env vars (supported)
 - EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
 - ALLOW_EODHD_KSA / EODHD_ALLOW_KSA (default: false)
-- EODHD_TIMEOUT_S (default: 8.5)  (fallbacks to HTTP_TIMEOUT / HTTP_TIMEOUT_SEC if present)
+- EODHD_TIMEOUT_S (default: 8.5)  (fallbacks to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT if present)
 - EODHD_UA (optional)
 """
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
-PROVIDER_VERSION = "1.8.0"
+PROVIDER_VERSION = "1.9.0"
 PROVIDER_NAME = "eodhd"
 
 BASE_URL = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").rstrip("/")
@@ -48,27 +52,15 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 
 def _timeout_default() -> float:
-    v = (os.getenv("EODHD_TIMEOUT_S") or "").strip()
-    if v:
-        try:
-            return float(v)
-        except Exception:
-            pass
-
-    v2 = (os.getenv("HTTP_TIMEOUT_SEC") or "").strip()
-    if v2:
-        try:
-            return float(v2)
-        except Exception:
-            pass
-
-    v3 = (os.getenv("HTTP_TIMEOUT") or "").strip()
-    if v3:
-        try:
-            return float(v3)
-        except Exception:
-            pass
-
+    for k in ("EODHD_TIMEOUT_S", "HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            try:
+                t = float(v)
+                if t > 0:
+                    return t
+            except Exception:
+                pass
     return 8.5
 
 
@@ -85,6 +77,31 @@ UA = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
+
+_CLIENT: Optional[httpx.AsyncClient] = None
+_LOCK = asyncio.Lock()
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _CLIENT
+    if _CLIENT is None:
+        async with _LOCK:
+            if _CLIENT is None:
+                headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
+                timeout = httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S))
+                _CLIENT = httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True)
+    return _CLIENT
+
+
+async def aclose_eodhd_client() -> None:
+    global _CLIENT
+    c = _CLIENT
+    _CLIENT = None
+    if c is not None:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +162,24 @@ def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> 
         return None
 
 
+def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (patch or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
+
+
 def _base_patch(symbol: str) -> Dict[str, Any]:
     # Keep patch aligned with UnifiedQuote keys + your extra fields used in outputs
     return {
         "symbol": symbol,
         "data_source": PROVIDER_NAME,
         "provider_version": PROVIDER_VERSION,
+        # IMPORTANT: keep "error" string but do NOT force it into output unless non-empty
         "error": "",
         # identity
         "name": "",
@@ -199,34 +228,33 @@ def _base_patch(symbol: str) -> Dict[str, Any]:
 
 
 async def _get_json(url: str, params: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str]]:
-    headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S, headers=headers) as client:
-            r = await client.get(url, params=params)
+        client = await _get_client()
+        r = await client.get(url, params=params)
 
-            if r.status_code != 200:
-                hint = ""
-                if r.status_code in (401, 403):
-                    hint = " (auth failed: check EODHD_API_KEY)"
-                msg = ""
-                try:
-                    js = r.json()
-                    if isinstance(js, dict):
-                        msg = str(js.get("message") or js.get("error") or "").strip()
-                except Exception:
-                    msg = ""
-                if msg:
-                    return None, f"HTTP {r.status_code}{hint}: {msg}"
-                return None, f"HTTP {r.status_code}{hint}"
-
+        if r.status_code != 200:
+            hint = ""
+            if r.status_code in (401, 403):
+                hint = " (auth failed: check EODHD_API_KEY)"
+            msg = ""
             try:
                 js = r.json()
+                if isinstance(js, dict):
+                    msg = str(js.get("message") or js.get("error") or "").strip()
             except Exception:
-                return None, "invalid JSON response"
+                msg = ""
+            if msg:
+                return None, f"HTTP {r.status_code}{hint}: {msg}"
+            return None, f"HTTP {r.status_code}{hint}"
 
-            if not isinstance(js, dict):
-                return None, "unexpected JSON type"
-            return js, None
+        try:
+            js = r.json()
+        except Exception:
+            return None, "invalid JSON response"
+
+        if not isinstance(js, dict):
+            return None, "unexpected JSON type"
+        return js, None
 
     except Exception as e:
         return None, f"{e.__class__.__name__}: {e}"
@@ -262,7 +290,7 @@ async def _fetch_realtime(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
         "price_change": _to_float(chg),
         "percent_change": _to_float(chg_p),
     }
-    return {k: v for k, v in patch.items() if v is not None}, None
+    return _clean_patch(patch), None
 
 
 async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -309,7 +337,6 @@ async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str
     patch["net_margin"] = _to_float(highlights.get("ProfitMargin"))
     patch["beta"] = _to_float(technicals.get("Beta"))
 
-    # ✅ Use the SAME keys your engine outputs
     patch["week_52_high"] = _to_float(technicals.get("52WeekHigh"))
     patch["week_52_low"] = _to_float(technicals.get("52WeekLow"))
 
@@ -331,15 +358,7 @@ async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str
     patch["current_ratio"] = _to_float(highlights.get("CurrentRatio"))
     patch["quick_ratio"] = _to_float(highlights.get("QuickRatio"))
 
-    clean: Dict[str, Any] = {}
-    for k, v in patch.items():
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        clean[k] = v
-
-    return clean, None
+    return _clean_patch(patch), None
 
 
 def _fill_derived(patch: Dict[str, Any]) -> None:
@@ -369,53 +388,61 @@ def _fill_derived(patch: Dict[str, Any]) -> None:
         patch["free_float_market_cap"] = mc * (ff / 100.0)
 
 
+def _merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Tuple[str, ...] = ()) -> None:
+    """
+    Merge src into dst:
+    - Fill blanks/missing in dst
+    - Force overwrite for keys in force_keys
+    """
+    for k, v in (src or {}).items():
+        if v is None:
+            continue
+        if k in force_keys:
+            dst[k] = v
+            continue
+        if dst.get(k) in (None, "", 0):
+            dst[k] = v
+
+
 async def _fetch(symbol: str, want_fundamentals: bool = True) -> Dict[str, Any]:
-    patch = _base_patch(symbol)
+    sym = (symbol or "").strip()
+    patch = _base_patch(sym)
 
     # Controlled KSA enablement
-    if _looks_like_ksa(symbol) and not ALLOW_EODHD_KSA:
+    if _looks_like_ksa(sym) and not ALLOW_EODHD_KSA:
         patch["error"] = "warning: KSA blocked for EODHD (set ALLOW_EODHD_KSA=true to enable)"
-        # return without price so engine can fall back to Yahoo chart safely
-        return {k: v for k, v in patch.items() if v not in (None, "", [])}
+        return _clean_patch(patch)
 
-    rt_patch, rt_err = await _fetch_realtime(symbol)
+    rt_patch, rt_err = await _fetch_realtime(sym)
     if rt_err:
-        # Hard failure (no price)
         patch["error"] = f"{PROVIDER_NAME}: {rt_err}"
-        return {k: v for k, v in patch.items() if v not in (None, "", [])}
+        return _clean_patch(patch)
 
-    # Merge realtime fields
-    for k, v in rt_patch.items():
-        patch[k] = v
+    _merge_into(patch, rt_patch)
 
     # Fundamentals (best-effort)
     if want_fundamentals and ENABLE_FUNDAMENTALS:
-        f_patch, f_err = await _fetch_fundamentals(symbol)
+        f_patch, f_err = await _fetch_fundamentals(sym)
         if not f_err:
-            for k, v in f_patch.items():
-                # allow fundamentals to overwrite blanks / missing
-                if v is None:
-                    continue
-                if patch.get(k) in (None, "", 0):
-                    patch[k] = v
-                # force important keys even if already present
-                if k in ("market_cap", "pe_ttm", "eps_ttm", "week_52_high", "week_52_low", "shares_outstanding", "free_float"):
-                    patch[k] = v
+            _merge_into(
+                patch,
+                f_patch,
+                force_keys=(
+                    "market_cap",
+                    "pe_ttm",
+                    "eps_ttm",
+                    "week_52_high",
+                    "week_52_low",
+                    "shares_outstanding",
+                    "free_float",
+                ),
+            )
         else:
             # Do not kill price if fundamentals fail
             patch["error"] = "warning: " + f"{PROVIDER_NAME}: {f_err}"
 
     _fill_derived(patch)
-
-    # Clean output (remove empty strings / None)
-    clean: Dict[str, Any] = {}
-    for k, v in patch.items():
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        clean[k] = v
-    return clean
+    return _clean_patch(patch)
 
 
 # ---------------------------------------------------------------------------
@@ -440,3 +467,15 @@ async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: 
 
 async def fetch_enriched_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=True)
+
+
+__all__ = [
+    "fetch_quote_patch",
+    "fetch_enriched_quote_patch",
+    "fetch_quote_and_enrichment_patch",
+    "fetch_quote_and_fundamentals_patch",
+    "fetch_enriched_patch",
+    "aclose_eodhd_client",
+    "PROVIDER_VERSION",
+    "PROVIDER_NAME",
+]
