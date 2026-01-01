@@ -1,8 +1,7 @@
-# routes_argaam.py  (FULL REPLACEMENT)
 """
 routes_argaam.py (repo root shim)
 ===============================================================
-Argaam Router Shim – v1.5.2 (PROD SAFE + QUIET BOOT + AUTH-COMPAT)
+Argaam Router Shim – v1.5.3 (PROD SAFE + QUIET BOOT + AUTH-COMPAT)
 
 IMPORTANT
 - This module MUST be valid Python.
@@ -38,7 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("routes.argaam_shim")
 
-SHIM_VERSION = "1.5.2"
+SHIM_VERSION = "1.5.3"
 
 DEFAULT_DELEGATES = ("routes.routes_argaam", "core.routes_argaam")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -119,6 +118,13 @@ def _import_delegate() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
 _delegate_router, _delegate_loaded_from, _delegate_error = _import_delegate()
 
 
+def get_router() -> Any:
+    """
+    Compatibility helper: returns the exported router.
+    """
+    return router
+
+
 # ---------------------------------------------------------------------
 # Export router (delegate if available, else fallback)
 # ---------------------------------------------------------------------
@@ -127,6 +133,7 @@ if _delegate_router is not None:
     DELEGATE_MODULE = _delegate_loaded_from or ""
 
 else:
+    # FastAPI is part of this repo’s runtime, but keep import local to avoid any import-time surprises.
     from fastapi import APIRouter, Header, Query
 
     DELEGATE_MODULE = _delegate_loaded_from or ",".join(_delegate_list())
@@ -134,10 +141,10 @@ else:
     router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam (shim fallback)"])
 
     def _token_required() -> bool:
-        # If REQUIRE_AUTH=true, require token even if APP_TOKEN empty (explicit)
+        # If REQUIRE_AUTH=true, require token even if APP_TOKEN empty (explicit).
         if _truthy(os.getenv("REQUIRE_AUTH", "0")):
             return True
-        # Otherwise require only if at least one token exists
+        # Otherwise require only if at least one token exists.
         return bool((os.getenv("APP_TOKEN") or "").strip() or (os.getenv("BACKUP_APP_TOKEN") or "").strip())
 
     def _extract_token(x_app_token: Optional[str], authorization: Optional[str]) -> Optional[str]:
@@ -201,6 +208,18 @@ else:
             "delegate_module": DELEGATE_MODULE,
         }
 
+    def _debug_block(token: Optional[str]) -> Dict[str, Any]:
+        return {
+            "token_provided": bool((token or "").strip()),
+            "delegate_modules_tried": list(_delegate_list()),
+            "hint": "Create routes/routes_argaam.py exporting router (or get_router()).",
+            "env": {
+                "REQUIRE_AUTH": os.getenv("REQUIRE_AUTH", ""),
+                "APP_TOKEN_SET": bool((os.getenv("APP_TOKEN") or "").strip()),
+                "BACKUP_APP_TOKEN_SET": bool((os.getenv("BACKUP_APP_TOKEN") or "").strip()),
+            },
+        }
+
     @router.get("/health", include_in_schema=False)
     async def health() -> Dict[str, Any]:
         out = _base("")
@@ -229,16 +248,27 @@ else:
             out["auth_ok"] = True
 
         if int(debug or 0) == 1 or _debug_enabled():
-            out["debug"] = {
-                "token_provided": bool((token or "").strip()),
-                "delegate_modules_tried": list(_delegate_list()),
-                "hint": "Create routes/routes_argaam.py exporting router (or get_router()).",
-                "env": {
-                    "REQUIRE_AUTH": os.getenv("REQUIRE_AUTH", ""),
-                    "APP_TOKEN_SET": bool((os.getenv("APP_TOKEN") or "").strip()),
-                    "BACKUP_APP_TOKEN_SET": bool((os.getenv("BACKUP_APP_TOKEN") or "").strip()),
-                },
-            }
+            out["debug"] = _debug_block(token)
+
+        return out
+
+    @router.get("/profile", include_in_schema=False)
+    async def profile(
+        symbol: str = Query(..., description="KSA symbol (e.g., 1120.SR or 1120)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        debug: int = Query(default=0),
+    ) -> Dict[str, Any]:
+        out = _base(symbol)
+        out["endpoint"] = "profile"
+        token = _extract_token(x_app_token, authorization)
+        if _token_required() and not _auth_ok(token):
+            out["error"] = "Unauthorized: invalid or missing token (X-APP-TOKEN or Authorization: Bearer)"
+            out["auth_ok"] = False
+        else:
+            out["auth_ok"] = True
+        if int(debug or 0) == 1 or _debug_enabled():
+            out["debug"] = _debug_block(token)
         return out
 
     @router.get("/quotes", include_in_schema=False)
@@ -261,7 +291,7 @@ else:
                 )
             )
 
-        return {"status": "ok", "count": len(items), "items": items, "shim_version": SHIM_VERSION}
+        return {"status": "ok", "count": len(items), "items": items, "shim_version": SHIM_VERSION, "delegate_module": DELEGATE_MODULE}
 
 
-__all__ = ["router", "SHIM_VERSION", "DELEGATE_MODULE"]
+__all__ = ["router", "get_router", "SHIM_VERSION", "DELEGATE_MODULE"]
