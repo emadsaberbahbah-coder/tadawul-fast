@@ -1,8 +1,8 @@
-# core/providers/finnhub_provider.py  (FULL REPLACEMENT)
+# core/providers/finnhub_provider.py
 """
 core/providers/finnhub_provider.py
 ------------------------------------------------------------
-Finnhub Provider (GLOBAL enrichment fallback) — v1.6.0 (PROD SAFE + ENGINE ALIGNED)
+Finnhub Provider (GLOBAL enrichment fallback) — v1.7.0 (PROD SAFE + ENGINE ALIGNED)
 
 Aligned with your Render env names
 - ✅ Uses FINNHUB_API_KEY (preferred)
@@ -13,14 +13,17 @@ Role
 - GLOBAL fallback/enrichment (quote + optional profile) when EODHD is primary.
 - KSA symbols are explicitly rejected to prevent wrong routing.
 
-Key improvements vs v1.5.0
+Key improvements vs v1.6.0
 - ✅ Engine-aligned: exported callables return Dict[str, Any] (no tuples)
 - ✅ AsyncClient reused (no new client per request) + aclose hook
 - ✅ Retry/backoff on 429 + transient 5xx
 - ✅ Detects Finnhub "zero payload" for invalid symbols (c=o=h=l=pc=0)
 - ✅ Symbol normalization: strips ".US" safely; rejects Yahoo special (^GSPC, GC=F, EURUSD=X)
-- ✅ Optional TTLCache to reduce rate-limit risk (FINNHUB_TTL_SEC, min 3s)
+- ✅ Optional TTL cache (FINNHUB_TTL_SEC, min 3s). Import-safe fallback if cachetools missing.
 - ✅ Never crashes if env vars missing; returns clean error object
+- ✅ CLEAN PATCH policy for engine merges:
+    - Default: return patch-style dict (no "status"/"data_quality") for success
+    - If not configured / invalid symbol: returns {"error": "..."} only (keeps engine fallback working)
 
 Env vars (supported)
 - FINNHUB_API_KEY (preferred)
@@ -43,15 +46,15 @@ import math
 import os
 import random
 import re
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
-from cachetools import TTLCache
 
 logger = logging.getLogger("core.providers.finnhub_provider")
 
-PROVIDER_VERSION = "1.6.0"
+PROVIDER_VERSION = "1.7.0"
 PROVIDER_NAME = "finnhub"
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
@@ -71,10 +74,50 @@ USER_AGENT_DEFAULT = (
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
 
+# ---------------------------------------------------------------------------
+# TTL cache (import-safe if cachetools missing)
+# ---------------------------------------------------------------------------
+try:
+    from cachetools import TTLCache  # type: ignore
 
-# -----------------------------------------------------------------------------
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1.0, float(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + self._ttl
+
+
+# ---------------------------------------------------------------------------
 # Safe env parsing (never crash on bad env values)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None:
@@ -186,29 +229,32 @@ async def _get_client() -> httpx.AsyncClient:
             if _CLIENT is None:
                 t = _timeout_sec()
                 timeout = httpx.Timeout(t, connect=min(10.0, t))
-                _CLIENT = httpx.AsyncClient(
-                    timeout=timeout,
-                    follow_redirects=True,
-                    headers=_get_headers(),
+                _CLIENT = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_get_headers())
+                logger.info(
+                    "Finnhub client init v%s | base=%s | timeout=%.1fs | cachetools=%s",
+                    PROVIDER_VERSION,
+                    _base_url(),
+                    t,
+                    _HAS_CACHETOOLS,
                 )
-                logger.info("Finnhub client init v%s | base=%s | timeout=%.1fs", PROVIDER_VERSION, _base_url(), t)
     return _CLIENT
 
 
 async def aclose_finnhub_client() -> None:
     global _CLIENT
-    if _CLIENT is None:
-        return
-    try:
-        await _CLIENT.aclose()
-    finally:
-        _CLIENT = None
+    c = _CLIENT
+    _CLIENT = None
+    if c is not None:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Symbol rules
-# -----------------------------------------------------------------------------
-_KSA_RE = re.compile(r"^\d{3,5}(\.SR)?$", re.IGNORECASE)
+# ---------------------------------------------------------------------------
+_KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 
 def _is_ksa_symbol(symbol: str) -> bool:
@@ -217,9 +263,7 @@ def _is_ksa_symbol(symbol: str) -> bool:
         return False
     if s.endswith(".SR"):
         return True
-    if _KSA_RE.match(s):
-        return True
-    return False
+    return bool(_KSA_RE.match(s))
 
 
 def _is_yahoo_special(symbol: str) -> bool:
@@ -227,7 +271,11 @@ def _is_yahoo_special(symbol: str) -> bool:
     if not s:
         return False
     # Yahoo-style symbols are not supported by Finnhub in your routing design
-    return any(ch in s for ch in ("^", "=", "/")) or s.endswith("=X")
+    if any(ch in s for ch in ("^", "=", "/")):
+        return True
+    if s.endswith("=X"):
+        return True
+    return False
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -237,9 +285,9 @@ def _normalize_symbol(symbol: str) -> str:
     return s
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Numeric helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _is_nan(x: Any) -> bool:
     try:
         return x is None or (isinstance(x, float) and math.isnan(x))
@@ -259,34 +307,15 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
-def _base(symbol: str) -> Dict[str, Any]:
-    # Keep shape consistent with your engine merge policy
-    return {
-        "status": "success",
-        "symbol": symbol,
-        "market": "GLOBAL",
-        "data_source": PROVIDER_NAME,
-        "data_quality": "OK",
-        "error": "",
-        "provider_version": PROVIDER_VERSION,
-        "last_updated_utc": _utc_iso(),
-        "currency": "",
-        "name": "",
-        "sector": "",
-        "industry": "",
-        "sub_sector": "",
-        "listing_date": "",
-        # quote-ish
-        "current_price": None,
-        "previous_close": None,
-        "open": None,
-        "day_high": None,
-        "day_low": None,
-        "volume": None,  # Finnhub /quote doesn't provide volume (kept for schema compatibility)
-        "price_change": None,
-        "percent_change": None,
-        "value_traded": None,
-    }
+def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (p or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
 
 
 def _fill_derived(out: Dict[str, Any]) -> None:
@@ -311,17 +340,20 @@ def _quote_looks_empty(js: Dict[str, Any]) -> bool:
     Treat that as empty.
     """
     keys = ("c", "h", "l", "o", "pc")
-    vals = []
     for k in keys:
         f = _to_float(js.get(k))
-        vals.append(0.0 if f is None else float(f))
-    return all(v == 0.0 for v in vals)
+        if f not in (None, 0.0):
+            return False
+    return True
 
 
-async def _get_json(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+async def _get_json(path: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     tok = _token()
     if not tok:
-        return None
+        return None, "not configured (FINNHUB_API_KEY)"
 
     base = _base_url()
     url = f"{base}{path}"
@@ -332,51 +364,65 @@ async def _get_json(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any
     retries = _retry_attempts()
     client = await _get_client()
 
+    last_err: Optional[str] = None
+
     for attempt in range(retries):
         try:
             r = await client.get(url, params=q)
 
             # Retry on rate-limit / transient server errors
             if r.status_code == 429 or 500 <= r.status_code < 600:
+                last_err = f"HTTP {r.status_code}"
                 if attempt < (retries - 1):
                     await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.25)
                     continue
-                return None
+                return None, last_err
 
             if r.status_code != 200:
-                return None
+                # best-effort message
+                msg = ""
+                try:
+                    js2 = r.json()
+                    if isinstance(js2, dict):
+                        msg = str(js2.get("error") or js2.get("message") or "").strip()
+                except Exception:
+                    msg = ""
+                return None, f"HTTP {r.status_code}" + (f": {msg}" if msg else "")
 
             try:
                 js = r.json()
-                if isinstance(js, dict):
-                    return js
-                return None
             except Exception:
-                return None
+                return None, "invalid JSON response"
 
-        except Exception:
+            if not isinstance(js, dict):
+                return None, "unexpected JSON type"
+
+            return js, None
+
+        except Exception as e:
+            last_err = f"{e.__class__.__name__}: {e}"
             if attempt < (retries - 1):
                 await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.25)
                 continue
-            return None
+            return None, last_err
 
-    return None
+    return None, last_err or "request failed"
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Finnhub calls
-# -----------------------------------------------------------------------------
-async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+async def _fetch_quote_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     """
     Finnhub quote endpoint:
       c=current, d=change, dp=percent change, h=high, l=low, o=open, pc=prev close
     """
-    js = await _get_json("/quote", {"symbol": symbol})
-    if not js or not isinstance(js, dict):
-        return {}
+    js, err = await _get_json("/quote", {"symbol": symbol})
+    if js is None:
+        return {}, err
 
     if _quote_looks_empty(js):
-        return {}
+        return {}, "empty quote"
 
     patch: Dict[str, Any] = {
         "current_price": _to_float(js.get("c")),
@@ -393,13 +439,13 @@ async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
     if dp is not None:
         patch["percent_change"] = dp
 
-    return {k: v for k, v in patch.items() if v is not None}
+    return _clean_patch(patch), None
 
 
-async def _fetch_profile_patch(symbol: str) -> Dict[str, Any]:
-    js = await _get_json("/stock/profile2", {"symbol": symbol})
-    if not js or not isinstance(js, dict):
-        return {}
+async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    js, err = await _get_json("/stock/profile2", {"symbol": symbol})
+    if js is None:
+        return {}, err
 
     patch: Dict[str, Any] = {
         "name": (js.get("name") or "") or "",
@@ -410,77 +456,63 @@ async def _fetch_profile_patch(symbol: str) -> Dict[str, Any]:
         "listing_date": (js.get("ipo") or "") or "",
     }
 
-    return {k: v for k, v in patch.items() if isinstance(v, str) and v.strip()}
+    return _clean_patch(patch), None
 
 
 async def _fetch(symbol_raw: str, want_profile: bool = True) -> Dict[str, Any]:
     sym_in = (symbol_raw or "").strip()
-    sym = _normalize_symbol(sym_in)
-
-    out = _base(sym_in)
+    if not sym_in:
+        return {"error": f"{PROVIDER_NAME}: empty symbol"}
 
     # Hard guard: avoid misrouting KSA to Finnhub
     if _is_ksa_symbol(sym_in):
-        out["status"] = "error"
-        out["data_quality"] = "BAD"
-        out["error"] = f"{PROVIDER_NAME}: KSA symbol not supported"
-        return out
+        return {"error": f"{PROVIDER_NAME}: KSA symbol not supported"}
 
     # Guard: avoid Yahoo-special symbols in this provider
     if _is_yahoo_special(sym_in):
-        out["status"] = "error"
-        out["data_quality"] = "BAD"
-        out["error"] = f"{PROVIDER_NAME}: symbol format not supported"
-        return out
+        return {"error": f"{PROVIDER_NAME}: symbol format not supported"}
 
     # Token required
     if not _token():
-        out["status"] = "error"
-        out["data_quality"] = "BAD"
-        out["error"] = f"{PROVIDER_NAME}: not configured (FINNHUB_API_KEY)"
-        return out
+        return {"error": f"{PROVIDER_NAME}: not configured (FINNHUB_API_KEY)"}
 
-    # Cache key (quote vs enriched)
+    sym = _normalize_symbol(sym_in)
+
     ck = f"finnhub::{('enriched' if want_profile else 'quote')}::{sym}"
     hit = _CACHE.get(ck)
     if isinstance(hit, dict) and hit:
         return dict(hit)
 
     # Quote required
-    q_patch = await _fetch_quote_patch(sym)
+    q_patch, q_err = await _fetch_quote_patch(sym)
     if not q_patch or _to_float(q_patch.get("current_price")) is None:
-        out["status"] = "error"
-        out["data_quality"] = "BAD"
-        out["error"] = f"{PROVIDER_NAME}: quote failed or empty"
-        out["last_updated_utc"] = _utc_iso()
+        out = {"error": f"{PROVIDER_NAME}: quote failed ({q_err or 'empty'})"}
         _CACHE[ck] = dict(out)
         return out
 
-    out.update(q_patch)
+    out: Dict[str, Any] = dict(q_patch)
     _fill_derived(out)
 
-    # Optional profile enrichment (never fails the quote)
+    # Optional profile enrichment (never fails quote)
     if want_profile and _enable_profile():
-        p_patch = await _fetch_profile_patch(sym)
+        p_patch, _ = await _fetch_profile_patch(sym)
+        # fill blanks only
         for k, v in p_patch.items():
-            # Only fill blanks (keep EODHD richer identity as primary)
-            if v and not out.get(k):
+            if not out.get(k) and v is not None:
                 out[k] = v
 
-    # Final quality
+    out["data_source"] = PROVIDER_NAME
+    out["provider_version"] = PROVIDER_VERSION
     out["last_updated_utc"] = _utc_iso()
-    out["data_quality"] = "OK" if _to_float(out.get("current_price")) is not None else "BAD"
-    if out["data_quality"] == "BAD":
-        out["status"] = "error"
-        out["error"] = out["error"] or f"{PROVIDER_NAME}: missing current_price"
 
+    out = _clean_patch(out)
     _CACHE[ck] = dict(out)
     return out
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Engine discovery callables (return Dict patch, no tuples)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_profile=False)
 
@@ -499,4 +531,5 @@ __all__ = [
     "fetch_quote_and_enrichment_patch",
     "aclose_finnhub_client",
     "PROVIDER_VERSION",
+    "PROVIDER_NAME",
 ]
