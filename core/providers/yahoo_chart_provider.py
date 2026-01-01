@@ -1,8 +1,9 @@
-# core/providers/yahoo_chart_provider.py  (FULL REPLACEMENT)
+# core/providers/yahoo_chart_provider.py
 """
 core/providers/yahoo_chart_provider.py
 ------------------------------------------------------------
-Yahoo Quote/Chart Provider (KSA-safe) — v1.6.1 (PATCH-ALIGNED + RETRY + CLIENT REUSE + 52W GUARDS)
+Yahoo Quote/Chart Provider (KSA-safe) — v1.7.0
+(PATCH-ALIGNED + RETRY + CLIENT REUSE + 52W GUARDS + DICT RETURNS)
 
 Goals
 - Reliable quote source for KSA (.SR) without yfinance.
@@ -13,14 +14,29 @@ Goals
 - Export PATCH-style functions expected by DataEngineV2.
 - Reuse a single AsyncClient (keep-alive) + lightweight retries for transient statuses.
 
+✅ IMPORTANT ENGINE ALIGNMENT (this revision)
+- fetch_quote_patch / fetch_enriched_quote_patch / fetch_quote_and_enrichment_patch
+  now return Dict[str, Any] ONLY (NO tuples).
+
 Exports (engine-compatible)
-- fetch_quote_patch(symbol, debug=False) -> (patch: dict, err: str|None)
-- fetch_quote_and_enrichment_patch(symbol, debug=False) -> (patch, err)
-- fetch_enriched_quote_patch(symbol, debug=False) -> (patch, err)
-- fetch_quote(symbol, debug=False)  (compat; returns rich dict with status/error)
+- fetch_quote_patch(symbol, debug=False) -> dict patch
+- fetch_quote_and_enrichment_patch(symbol, debug=False) -> dict patch
+- fetch_enriched_quote_patch(symbol, debug=False) -> dict patch
+- fetch_quote(symbol, debug=False) -> dict (compat; includes status/data_quality/error)
 - get_quote(symbol, debug=False)    (alias)
 - aclose_yahoo_client()            (best-effort close hook)
 - YahooChartProvider (class wrapper)
+
+Env vars (supported)
+- YAHOO_UA
+- YAHOO_ACCEPT_LANGUAGE
+- YAHOO_TIMEOUT_S (default 8.5)
+- YAHOO_RETRY_MAX (default 2)              # additional retries (0 => no retry)
+- YAHOO_RETRY_BACKOFF_MS (default 250)
+- YAHOO_ALT_HOSTS (comma-separated hosts or full base urls)
+- ENABLE_YAHOO_CHART_SUPPLEMENT (default true)
+- YAHOO_CHART_RANGE (default 5d)
+- YAHOO_CHART_INTERVAL (default 1d)
 """
 
 from __future__ import annotations
@@ -34,7 +50,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import httpx
 
-PROVIDER_VERSION = "1.6.1"
+PROVIDER_VERSION = "1.7.0"
+PROVIDER_NAME = "yahoo_chart"
 
 # ---------------------------
 # HTTP config
@@ -47,17 +64,34 @@ UA = os.getenv(
 
 _ACCEPT_LANGUAGE = os.getenv("YAHOO_ACCEPT_LANGUAGE", "en-US,en;q=0.9")
 
-_TIMEOUT_S = float(os.getenv("YAHOO_TIMEOUT_S", "8.5") or "8.5")
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        f = float(str(v).strip())
+        return f if f > 0 else default
+    except Exception:
+        return default
+
+
+_TIMEOUT_S = _env_float("YAHOO_TIMEOUT_S", 8.5)
 TIMEOUT = httpx.Timeout(timeout=_TIMEOUT_S, connect=min(5.0, _TIMEOUT_S))
 
 # Retries for transient Yahoo responses
 _RETRY_MAX = int(os.getenv("YAHOO_RETRY_MAX", "2") or "2")  # additional retries (0 => no retry)
-_RETRY_BACKOFF_MS = float(os.getenv("YAHOO_RETRY_BACKOFF_MS", "250") or "250")  # base backoff
+_RETRY_BACKOFF_MS = _env_float("YAHOO_RETRY_BACKOFF_MS", 250.0)  # base backoff
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # If quote is partial, supplement missing fields from chart (default ON)
 ENABLE_SUPPLEMENT = str(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")).strip().lower() in {
-    "1", "true", "yes", "y", "on", "t"
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+    "t",
 }
 
 # Allow alternative hosts (comma-separated): query2.finance.yahoo.com, etc.
@@ -171,13 +205,15 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _base_patch(symbol: str) -> Dict[str, Any]:
-    is_ksa = symbol.endswith(".SR")
+    sym = (symbol or "").strip().upper()
+    is_ksa = sym.endswith(".SR")
     return {
-        "symbol": symbol,
+        "symbol": sym,
         "market": "KSA" if is_ksa else "GLOBAL",
         "currency": "SAR" if is_ksa else None,
-        "data_source": "yahoo_chart",
+        "data_source": PROVIDER_NAME,
         "provider_version": PROVIDER_VERSION,
+        "error": "",
         # identity
         "name": None,
         "exchange": None,
@@ -197,6 +233,17 @@ def _base_patch(symbol: str) -> Dict[str, Any]:
         "price_change": None,
         "percent_change": None,
     }
+
+
+def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (p or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
 
 
 def _fill_derived(p: Dict[str, Any]) -> None:
@@ -236,15 +283,12 @@ def _guard_52w(p: Dict[str, Any]) -> None:
     If low==0 while price is normal, treat as missing (None).
     """
     cur = _to_float(p.get("current_price"))
-    hi = _to_float(p.get("week_52_high"))
     lo = _to_float(p.get("week_52_low"))
 
     if lo is not None and lo == 0.0 and cur is not None and cur > 1.0:
-        # almost certainly bogus for equities
         p["week_52_low"] = None
 
-    # if hi exists but lo missing, don't compute position
-    # (engine may compute too; keep ours safe)
+    # If low missing, avoid computing position_52w_percent
     if _to_float(p.get("week_52_low")) is None:
         p["position_52w_percent"] = None
 
@@ -272,7 +316,6 @@ async def _http_get_json(
                     last_err = "unexpected JSON type"
                 except Exception as je:
                     last_err = f"JSON decode failed: {je.__class__.__name__}"
-
             else:
                 if r.status_code in _RETRY_STATUSES and i < attempts - 1:
                     last_err = f"HTTP {r.status_code}"
@@ -283,7 +326,7 @@ async def _http_get_json(
             last_err = f"{e.__class__.__name__}: {e}"
 
         if i < attempts - 1:
-            delay = (_RETRY_BACKOFF_MS / 1000.0) * (2 ** i)
+            delay = (_RETRY_BACKOFF_MS / 1000.0) * (2**i)
             jitter = (time.time() % 0.2)
             await asyncio.sleep(min(2.0, delay + jitter))
 
@@ -305,7 +348,7 @@ async def _http_get_json_multi(
 
 
 # ---------------------------
-# Providers
+# Providers (internal: returns (patch, err))
 # ---------------------------
 async def _fetch_from_quote(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
     patch = _base_patch(symbol)
@@ -411,7 +454,6 @@ async def _fetch_from_chart(symbol: str, debug: bool = False) -> Tuple[Dict[str,
         return patch, "yahoo_chart parse error"
 
     patch["currency"] = (meta.get("currency") or patch.get("currency") or None)
-
     patch["exchange"] = (meta.get("exchangeName") or meta.get("fullExchangeName") or patch.get("exchange") or None)
     patch["name"] = (meta.get("longName") or meta.get("shortName") or patch.get("name") or None)
 
@@ -438,9 +480,9 @@ async def _fetch_from_chart(symbol: str, debug: bool = False) -> Tuple[Dict[str,
 
 
 # ---------------------------
-# Engine-facing PATCH API
+# Engine-facing PATCH API (DICT RETURNS)
 # ---------------------------
-async def fetch_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
+async def fetch_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     sym = _normalize_symbol(symbol)
 
     # 1) quote endpoint
@@ -450,8 +492,12 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str,
     if e1 or _to_float(p1.get("current_price")) is None:
         p2, e2 = await _fetch_from_chart(sym, debug=debug)
         if not e2 and _to_float(p2.get("current_price")) is not None:
-            return p2, None
-        return p1, (e1 or e2 or "yahoo_chart fallback failed")
+            p2["error"] = ""
+            return _clean_patch(p2)
+
+        # return best-effort patch with warning (allows engine fallback)
+        p1["error"] = f"warning: {e1 or e2 or 'yahoo quote+chart failed'}"
+        return _clean_patch(p1)
 
     # 3) optional supplement (quote partial -> fill missing from chart)
     if ENABLE_SUPPLEMENT and _is_patch_partial(p1):
@@ -465,25 +511,27 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str,
             _guard_52w(p1)
             _fill_derived(p1)
 
-    return p1, None
+    p1["error"] = ""
+    return _clean_patch(p1)
 
 
-async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
+async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     return await fetch_quote_patch(symbol, debug=debug)
 
 
-async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
+async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     return await fetch_quote_patch(symbol, debug=debug)
 
 
 # Back-compat helpers (return a full payload dict)
 async def fetch_quote(symbol: str, debug: bool = False) -> Dict[str, Any]:
-    patch, err = await fetch_quote_patch(symbol, debug=debug)
+    patch = await fetch_quote_patch(symbol, debug=debug)
     out = dict(patch or {})
     has_price = _to_float(out.get("current_price")) is not None
     out.setdefault("data_quality", "OK" if has_price else "BAD")
     out["status"] = "success" if has_price else "error"
-    out["error"] = "" if (not err) else str(err)
+    # Keep provider warning in error if present
+    out["error"] = str(out.get("error") or "")
     return out
 
 
@@ -493,7 +541,7 @@ async def get_quote(symbol: str, debug: bool = False) -> Dict[str, Any]:
 
 @dataclass
 class YahooChartProvider:
-    name: str = "yahoo_chart"
+    name: str = PROVIDER_NAME
 
     async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
         return await fetch_quote(symbol, debug=debug)
@@ -501,6 +549,7 @@ class YahooChartProvider:
 
 __all__ = [
     "PROVIDER_VERSION",
+    "PROVIDER_NAME",
     "fetch_quote_patch",
     "fetch_quote_and_enrichment_patch",
     "fetch_enriched_quote_patch",
