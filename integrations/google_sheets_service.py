@@ -1,8 +1,8 @@
-# google_sheets_service.py  (FULL REPLACEMENT)
+# integrations/google_sheets_service.py
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.11.0 (Enhanced + production-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.11.1 (Enhanced + production-hardened)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 
-SERVICE_VERSION = "3.11.0"
+SERVICE_VERSION = "3.11.1"
 
 # =============================================================================
 # OPTIONAL SAFE IMPORTS (NO HEAVY DEPENDENCIES)
@@ -50,7 +50,7 @@ except Exception:
 
 
 # =============================================================================
-# CONFIG IMPORT (env.py preferred -> core.config -> env vars)
+# CONFIG IMPORT (env.py preferred -> core.config -> root config -> env vars)
 # =============================================================================
 def _safe_import(path: str) -> Optional[Any]:
     try:
@@ -63,17 +63,22 @@ _env_mod = _safe_import("env")
 _settings_from_env = getattr(_env_mod, "settings", None) if _env_mod else None
 
 _core_cfg = _safe_import("core.config")
-_get_settings = getattr(_core_cfg, "get_settings", None) if _core_cfg else None
+_core_get_settings = getattr(_core_cfg, "get_settings", None) if _core_cfg else None
+
+_root_cfg = _safe_import("config")
+_root_get_settings = getattr(_root_cfg, "get_settings", None) if _root_cfg else None
 
 
 def _cfg_obj() -> Any:
     if _settings_from_env is not None:
         return _settings_from_env
-    if callable(_get_settings):
-        try:
-            return _get_settings()
-        except Exception:
-            return None
+
+    for getter in (_core_get_settings, _root_get_settings):
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                pass
     return None
 
 
@@ -148,9 +153,11 @@ def _get_bool(names: Sequence[str], env_keys: Sequence[str], default: bool) -> b
             return True
         if sv in {"0", "false", "no", "n", "off", "f"}:
             return False
+
     ev = _get_env_any(env_keys, None)
     if ev is None:
         return default
+
     sv = str(ev).strip().lower()
     if sv in {"1", "true", "yes", "y", "on", "t"}:
         return True
@@ -162,12 +169,12 @@ def _get_bool(names: Sequence[str], env_keys: Sequence[str], default: bool) -> b
 # Prefer env.py constants if present
 _BACKEND_URL = (
     (getattr(_env_mod, "BACKEND_BASE_URL", None) if _env_mod else None)
-    or _get_str(["backend_base_url"], ["BACKEND_BASE_URL"], "")
+    or _get_str(["backend_base_url"], ["BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL"], "")
 ).rstrip("/")
 
 _APP_TOKEN = (
     (getattr(_env_mod, "APP_TOKEN", None) if _env_mod else None)
-    or _get_str(["app_token"], ["APP_TOKEN"], "")
+    or _get_str(["app_token"], ["APP_TOKEN", "TFB_APP_TOKEN"], "")
 ).strip()
 
 _BACKUP_TOKEN = (
@@ -177,7 +184,11 @@ _BACKUP_TOKEN = (
 
 _DEFAULT_SHEET_ID = (
     (getattr(_env_mod, "DEFAULT_SPREADSHEET_ID", None) if _env_mod else None)
-    or _get_str(["default_spreadsheet_id"], ["DEFAULT_SPREADSHEET_ID", "GOOGLE_SHEET_ID"], "")
+    or _get_str(
+        ["default_spreadsheet_id"],
+        ["DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID", "GOOGLE_SHEET_ID"],
+        "",
+    )
 ).strip()
 
 _HTTP_TIMEOUT = max(5.0, _get_float(["http_timeout_sec"], ["HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"], 25.0))
@@ -198,7 +209,7 @@ try:
     s = _cfg_obj()
     raw = _get_attr_any(
         s,
-        ["google_sheets_credentials_raw", "google_sheets_credentials", "google_sheets_credentials_json"],
+        ["google_sheets_credentials_raw", "google_sheets_credentials", "google_sheets_credentials_json", "google_credentials"],
     )
     if isinstance(raw, str) and raw.strip():
         _CREDS_RAW = raw.strip()
@@ -206,7 +217,7 @@ except Exception:
     _CREDS_RAW = ""
 
 if not _CREDS_RAW:
-    _CREDS_RAW = (os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or "").strip()
+    _CREDS_RAW = (os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or os.getenv("GOOGLE_CREDENTIALS", "") or "").strip()
 
 
 # =============================================================================
@@ -255,8 +266,7 @@ _BACKEND_MAX_SYMBOLS_PER_CALL = max(
 )
 
 _USER_AGENT = (
-    (os.getenv("SHEETS_USER_AGENT", "") or "").strip()
-    or f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}"
+    (os.getenv("SHEETS_USER_AGENT", "") or "").strip() or f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}"
 )
 
 _A1_RE = re.compile(r"^\$?([A-Za-z]+)\$?(\d+)$")
@@ -294,14 +304,30 @@ def _coerce_private_key(creds_info: Dict[str, Any]) -> Dict[str, Any]:
     return creds_info
 
 
+def _looks_like_base64(s: str) -> bool:
+    raw = (s or "").strip()
+    if not raw or raw.startswith("{"):
+        return False
+    if len(raw) < 80:
+        # base64 creds can be short sometimes; allow but be cautious
+        pass
+    # crude heuristic: only base64 charset + padding
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    if any(ch not in allowed for ch in raw):
+        return False
+    # typical base64 length multiple of 4 (ignoring newlines)
+    compact = raw.replace("\n", "").replace("\r", "")
+    return len(compact) >= 40 and (len(compact) % 4 == 0)
+
+
 def _maybe_b64_decode(s: str) -> str:
     raw = (s or "").strip()
-    if not raw:
+    if not raw or raw.startswith("{"):
         return raw
-    if raw.startswith("{"):
+
+    if not _looks_like_base64(raw):
         return raw
-    if len(raw) < 200:
-        return raw
+
     try:
         decoded = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
         if decoded.startswith("{") and '"private_key"' in decoded:
@@ -322,7 +348,8 @@ def _parse_credentials(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
 
-    cleaned = _maybe_b64_decode(_strip_wrapping_quotes(str(raw).strip()))
+    cleaned = _strip_wrapping_quotes(str(raw).strip())
+    cleaned = _maybe_b64_decode(cleaned)
     cleaned = _strip_wrapping_quotes(cleaned)
 
     if not cleaned.startswith("{"):
@@ -335,7 +362,10 @@ def _parse_credentials(raw: str) -> Optional[Dict[str, Any]]:
 
 
 def _safe_sheet_name(sheet_name: str) -> str:
-    name = (sheet_name or "").strip().replace("'", "''")
+    name = (sheet_name or "").strip()
+    if not name:
+        name = "Sheet1"
+    name = name.replace("'", "''")
     return f"'{name}'"
 
 
@@ -444,7 +474,7 @@ def get_sheets_service():
             creds_info = _parse_credentials(_CREDS_RAW)
 
         if creds_info is None:
-            creds_info = _parse_credentials(os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or "")
+            creds_info = _parse_credentials(os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or os.getenv("GOOGLE_CREDENTIALS", "") or "")
 
         if not isinstance(creds_info, dict) or not creds_info:
             raise RuntimeError("Missing or invalid GOOGLE_SHEETS_CREDENTIALS (service account JSON).")
@@ -713,7 +743,6 @@ def _call_backend_api_once(endpoint: str, payload: Dict[str, Any]) -> Dict[str, 
         for tok_idx, tok in enumerate(tokens_to_try):
             try:
                 req = urllib.request.Request(url, data=body, headers=_backend_headers(tok), method="POST")
-
                 with urllib.request.urlopen(req, timeout=_BACKEND_TIMEOUT, context=_SSL_CONTEXT) as resp:  # type: ignore
                     raw = resp.read().decode("utf-8", errors="replace")
                     last_status = int(getattr(resp, "status", 0) or 0)
@@ -840,7 +869,6 @@ def _merge_backend_responses(
     status = "success"
     error_msg: Optional[str] = None
 
-    # pick best headers encountered (first non-empty)
     if not headers:
         for r in responses:
             hh = r.get("headers") or []
@@ -861,7 +889,6 @@ def _merge_backend_responses(
             error_msg = str(r.get("error") or "Backend error")
 
         hh, rr = _rows_to_grid(r.get("headers") or headers, r.get("rows") or [])
-        # If headers mismatch, we still try to map by symbol; otherwise append
         sym_idx = _find_symbol_col(hh)
 
         if sym_idx >= 0:
@@ -871,9 +898,7 @@ def _merge_backend_responses(
                 except Exception:
                     sym = ""
                 if sym:
-                    # align row to final headers if needed
                     if hh != headers:
-                        # best-effort: dict-like remap by header names
                         tmp = {str(hh[i]): (row[i] if i < len(row) else None) for i in range(len(hh))}
                         aligned = [tmp.get(h, None) for h in headers]
                         row_map.setdefault(sym, aligned)
@@ -882,10 +907,8 @@ def _merge_backend_responses(
                 else:
                     all_rows.append(row)
         else:
-            # cannot map; just append
             all_rows.extend(rr)
 
-    # If we have a symbol_col, produce rows in requested order (placeholders if missing)
     if symbol_col >= 0 and requested_symbols:
         merged: List[List[Any]] = []
         for s in requested_symbols:
@@ -894,7 +917,6 @@ def _merge_backend_responses(
             if row is None:
                 placeholder = [None] * len(headers)
                 placeholder[symbol_col] = key
-                # try to place a useful error if "Error" exists
                 try:
                     err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
                     placeholder[err_idx] = "Missing row from backend"
@@ -903,7 +925,6 @@ def _merge_backend_responses(
                 merged.append(placeholder)
                 status = "partial" if status == "success" else status
             else:
-                # pad/trim
                 if len(row) < len(headers):
                     row = row + [None] * (len(headers) - len(row))
                 elif len(row) > len(headers):
@@ -911,8 +932,6 @@ def _merge_backend_responses(
                 merged.append(row)
         return headers, merged, status, error_msg
 
-    # otherwise, fall back to appended rows
-    # (ensure padding/trim)
     fixed = []
     for row in all_rows:
         if len(row) < len(headers):
