@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# tests/test_endpoints.py
+# test_endpoints.py  (FULL REPLACEMENT)
 """
-SMOKE TESTER for Tadawul Fast Bridge API – v2.5.1 (Prod-aligned)
+SMOKE TESTER for Tadawul Fast Bridge API – v2.5.0 (Prod-aligned)
 
 What it tests (based on your deployed reality):
 - GET /, /healthz, /readyz, /health
@@ -10,14 +10,14 @@ What it tests (based on your deployed reality):
 - Batch quotes (GET): /v1/enriched/quotes?symbols=SYM1,SYM2,...
 
 Notes:
-- /system/routes is NOT deployed (404) -> not tested
-- /v1/enriched/sheet-rows may or may not be deployed depending on your version -> not tested here
+- /system/routes is NOT deployed (404) -> removed
+- /v1/enriched/sheet-rows is NOT deployed (404) -> removed
 - Batch endpoint expects "symbols" query param (NOT "tickers")
 
 Usage:
-  python tests/test_endpoints.py
-  TFB_BASE_URL=https://tadawul-fast-bridge.onrender.com python tests/test_endpoints.py
-  python tests/test_endpoints.py --ksa 1120.SR --global AAPL
+  python test_endpoints.py
+  TFB_BASE_URL=https://tadawul-fast-bridge.onrender.com python test_endpoints.py
+  python test_endpoints.py --ksa 1120.SR --global AAPL
 """
 
 from __future__ import annotations
@@ -32,8 +32,6 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
-
-SCRIPT_VERSION = "2.5.1"
 
 DEFAULT_BASE_URL = (
     os.getenv("TFB_BASE_URL")
@@ -55,7 +53,7 @@ TIMEOUT_SHORT = float(os.getenv("TFB_TIMEOUT_SHORT", "15") or "15")
 TIMEOUT_MED = float(os.getenv("TFB_TIMEOUT_MED", "25") or "25")
 TIMEOUT_LONG = float(os.getenv("TFB_TIMEOUT_LONG", "90") or "90")
 
-USER_AGENT = os.getenv("TFB_USER_AGENT", f"TadawulFastBridge-EndpointTester/{SCRIPT_VERSION}") or f"TadawulFastBridge-EndpointTester/{SCRIPT_VERSION}"
+USER_AGENT = os.getenv("TFB_USER_AGENT", "TadawulFastBridge-EndpointTester/2.5.0") or "TadawulFastBridge-EndpointTester/2.5.0"
 
 
 def _colors_enabled() -> bool:
@@ -174,7 +172,10 @@ def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str])
                 note = f"status={j.get('status')} engine_ready={j.get('engine_ready')}"
             log(f"GET {ep} -> 200 ({fmt_dt(dt)}) {note}".strip(), "success")
         else:
-            log(f"GET {ep} -> HTTP {r.status_code} ({fmt_dt(dt)}) body={body_preview(r)!r}", "fail" if critical else "warn")
+            log(
+                f"GET {ep} -> HTTP {r.status_code} ({fmt_dt(dt)}) body={body_preview(r)!r}",
+                "fail" if critical else "warn",
+            )
             if critical:
                 return False
 
@@ -206,7 +207,9 @@ def check_router_health(sess: requests.Session, base_url: str, headers: Dict[str
 
 
 def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], symbol: str) -> None:
+    symbol = (symbol or "").strip().upper()
     log(f"Testing Single Quote ({symbol})", "header")
+
     r, dt, err = request_any(
         sess,
         "GET",
@@ -232,6 +235,7 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
     src = data.get("data_source")
     dq = data.get("data_quality")
     err_msg = data.get("error") or ""
+
     log(f"status={status} price={price} dq={dq} src={src} ({fmt_dt(dt)})", "success" if price else "warn")
     if err_msg:
         log(f"warning/error: {err_msg}", "warn")
@@ -239,7 +243,9 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
 
 def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str, str], symbols: List[str]) -> None:
     log("Testing Batch Quotes (GET /v1/enriched/quotes?symbols=...)", "header")
-    q = ",".join([s.strip() for s in symbols if str(s).strip()])
+    syms = [str(s or "").strip().upper() for s in (symbols or []) if str(s or "").strip()]
+    q = ",".join(syms)
+
     r, dt, err = request_any(
         sess,
         "GET",
@@ -280,13 +286,12 @@ def main() -> int:
     p.add_argument("--token", default=DEFAULT_TOKEN)
     p.add_argument("--ksa", default=KSA_TEST_SYMBOL)
     p.add_argument("--global", dest="global_sym", default=GLOBAL_TEST_SYMBOL)
-    p.add_argument("--verbose", action="store_true", help="Print response previews on warnings/failures")
     args = p.parse_args()
 
     base_url = str(args.base_url).rstrip("/")
     token = str(args.token).strip()
 
-    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v{SCRIPT_VERSION}{C.ENDC}")
+    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.5.0{C.ENDC}")
     print(f"BASE_URL={base_url} | TOKEN={'SET' if token else 'NOT SET'}")
     print(f"KSA_TEST_SYMBOL={args.ksa} | GLOBAL_TEST_SYMBOL={args.global_sym}")
 
@@ -298,9 +303,9 @@ def main() -> int:
         return 2
 
     check_router_health(sess, base_url, hdrs)
-    check_quote(sess, base_url, hdrs, str(args.ksa).strip().upper())
-    check_quote(sess, base_url, hdrs, str(args.global_sym).strip().upper())
-    check_batch_quotes(sess, base_url, hdrs, [str(args.ksa).strip().upper(), str(args.global_sym).strip().upper()])
+    check_quote(sess, base_url, hdrs, str(args.ksa))
+    check_quote(sess, base_url, hdrs, str(args.global_sym))
+    check_batch_quotes(sess, base_url, hdrs, [str(args.ksa), str(args.global_sym)])
 
     print("\n✅ Smoke test finished.")
     return 0
