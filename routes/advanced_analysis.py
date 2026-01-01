@@ -1,6 +1,6 @@
 # routes/advanced_analysis.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.9.1) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.9.2) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -11,24 +11,14 @@ Design goals
     • chunking + timeout + bounded concurrency + placeholders on failures.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
 
-✅ Alignment fix
+✅ Alignment
 - Recommendation standardized across ALL outputs to:
-    BUY / HOLD / REDUCE / SELL  (always UPPERCASE)
+    BUY / HOLD / REDUCE / SELL  (always UPPERCASE, ALWAYS non-empty)
 
-v3.9.1 upgrades
-- ✅ ISO parsing supports trailing 'Z' (matches ai_analysis.py).
-- ✅ Volatility treated as % when 0..1.
-- ✅ Quote_59 mapping forces recommendation enum.
-
-Modes for /sheet-rows:
-- "advanced": returns Advanced headers (opportunity scoreboard style)
-- "quote_59": returns quote rows (sorted by opportunity score), using:
-    • EnrichedQuote.to_row(headers) if available and works
-    • else robust header-driven mapping fallback (computed 52W position, Riyadh timestamp fill)
-
-Compatibility:
-- Engines may return list[quote] OR dict[symbol->quote] OR (payload, err) for batch calls.
-- Quote objects may be dict-like or attribute objects.
+v3.9.2 upgrades
+- ✅ Recommendation is ALWAYS set (defaults to HOLD when missing).
+- ✅ /sheet-rows quote_59 mapping guarantees recommendation enum even when scores are missing.
+- ✅ Small hardening around enum propagation.
 """
 
 from __future__ import annotations
@@ -46,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.9.1"
+ADVANCED_ANALYSIS_VERSION = "3.9.2"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -138,11 +128,6 @@ _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 def _normalize_recommendation(x: Any) -> Optional[str]:
     """
     Standardize recommendation to BUY/HOLD/REDUCE/SELL (UPPERCASE).
-    Accepts many synonyms from providers / older versions:
-      - Strong Buy / Accumulate / Overweight -> BUY
-      - Neutral / Maintain -> HOLD
-      - Reduce / Trim / Underweight -> REDUCE
-      - Sell / Strong Sell -> SELL
     """
     if x is None:
         return None
@@ -216,6 +201,26 @@ def _normalize_recommendation(x: Any) -> Optional[str]:
     return None
 
 
+def _coerce_reco_enum(x: Any) -> str:
+    return _normalize_recommendation(x) or "HOLD"
+
+
+def _ensure_reco_on_obj(uq: Any) -> None:
+    """
+    Force recommendation enum on dict-like or attribute objects.
+    Never raises.
+    """
+    try:
+        reco_raw = _safe_get(uq, "recommendation")
+        reco = _coerce_reco_enum(reco_raw)
+        if isinstance(uq, dict):
+            uq["recommendation"] = reco
+        else:
+            setattr(uq, "recommendation", reco)
+    except Exception:
+        pass
+
+
 # =============================================================================
 # Auth (X-APP-TOKEN)
 # =============================================================================
@@ -260,7 +265,6 @@ def _allowed_tokens() -> List[str]:
         if v:
             tokens.append(v)
 
-    # de-dup preserve order
     out: List[str] = []
     seen = set()
     for t in tokens:
@@ -554,6 +558,7 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "dividend_yield": None,
         "roe": None,
         "roa": None,
+        "recommendation": "HOLD",
         "data_source": "none",
         "data_quality": dq,
         "error": err,
@@ -644,7 +649,7 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
     return fair, round(upside, 2), label
 
 
-def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
+def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str]:
     """
     Best-effort overall score + standardized recommendation when missing.
     Score in 0..100.
@@ -668,7 +673,7 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
         parts.append(0.15 * mom)
 
     if not parts:
-        return None, None
+        return None, "HOLD"
 
     score = sum(parts)
     if risk is not None:
@@ -682,7 +687,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], Optional[str]]:
 
     score = max(0.0, min(100.0, score))
 
-    reco = "HOLD"
     if score >= 70:
         reco = "BUY"
     elif score >= 50:
@@ -807,6 +811,7 @@ async def _get_quotes_chunked(
 
         for q in returned:
             q2 = _finalize_quote(_unwrap_tuple_payload(q))
+            _ensure_reco_on_obj(q2)
             for k in _index_keys_for_quote(q2):
                 chunk_map.setdefault(k, q2)
 
@@ -845,7 +850,7 @@ class AdvancedItem(_ExtraIgnore):
     data_quality: Optional[str] = None
     data_quality_score: Optional[float] = None
 
-    recommendation: Optional[str] = None  # BUY/HOLD/REDUCE/SELL
+    recommendation: str = "HOLD"  # ALWAYS BUY/HOLD/REDUCE/SELL
     valuation_label: Optional[str] = None
     risk_bucket: Optional[str] = None
 
@@ -896,6 +901,8 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
     except Exception:
         pass
 
+    _ensure_reco_on_obj(uq)
+
     symbol = (_safe_get(uq, "symbol") or _normalize_any(raw_symbol) or raw_symbol or "").strip().upper()
     dq = _safe_get(uq, "data_quality")
     dq_s = _dq_score(dq)
@@ -909,10 +916,10 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
     upside2 = _safe_get(uq, "upside_percent")
     val_label2 = _safe_get(uq, "valuation_label")
 
-    overall, reco = _compute_overall_and_reco(uq)
+    overall, reco_fallback = _compute_overall_and_reco(uq)
     overall2 = _safe_get(uq, "overall_score")
     reco2_raw = _safe_get(uq, "recommendation")
-    reco2 = _normalize_recommendation(reco2_raw) or reco  # ✅ force enum
+    reco2 = _coerce_reco_enum(reco2_raw) or reco_fallback or "HOLD"
 
     opp = _safe_get(uq, "opportunity_score")
     bucket = _risk_bucket(opp, dq_s)
@@ -936,7 +943,7 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
         overall_score=overall2 if overall2 is not None else overall,
         data_quality=dq,
         data_quality_score=dq_s,
-        recommendation=reco2,
+        recommendation=_coerce_reco_enum(reco2),
         valuation_label=val_label2 if val_label2 is not None else val_label,
         risk_bucket=bucket,
         provider=_safe_get(uq, "data_source", "provider", "source"),
@@ -1089,7 +1096,7 @@ def _item_value_map(it: AdvancedItem) -> Dict[str, Any]:
         "Overall Score": it.overall_score,
         "Data Quality": it.data_quality or "",
         "Data Quality Score": it.data_quality_score,
-        "Recommendation": _normalize_recommendation(it.recommendation) or "",
+        "Recommendation": _coerce_reco_enum(it.recommendation),
         "Valuation Label": it.valuation_label or "",
         "Risk Bucket": it.risk_bucket or "",
         "Provider": it.provider or "",
@@ -1190,7 +1197,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "opportunity score": (("opportunity_score",), None),
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
-    "recommendation": (("recommendation",), _normalize_recommendation),  # ✅ force enum
+    "recommendation": (("recommendation",), _coerce_reco_enum),
     "data source": (("data_source", "source"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
@@ -1229,7 +1236,7 @@ def _value_for_header(header: str, uq: Any) -> Any:
             return v if v is not None else overall
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
-            return _normalize_recommendation(v) or reco
+            return _coerce_reco_enum(v) or reco or "HOLD"
 
     if hk == "last updated (riyadh)":
         v = _safe_get(uq, "last_updated_riyadh")
@@ -1249,11 +1256,8 @@ def _value_for_header(header: str, uq: Any) -> Any:
     if spec:
         fields, transform = spec
         val = _safe_get(uq, *fields)
-        if transform and val is not None:
-            try:
-                return transform(val)
-            except Exception:
-                return val
+        if transform:
+            return transform(val)
         return val
 
     guess = _snake_guess(header)
@@ -1264,18 +1268,7 @@ def _value_for_header(header: str, uq: Any) -> Any:
 
 
 def _row_59_from_headers(headers: List[str], uq: Any) -> List[Any]:
-    # ensure reco enum in the row
-    try:
-        reco_raw = _safe_get(uq, "recommendation")
-        reco_norm = _normalize_recommendation(reco_raw)
-        if reco_norm:
-            if isinstance(uq, dict):
-                uq["recommendation"] = reco_norm
-            else:
-                setattr(uq, "recommendation", reco_norm)
-    except Exception:
-        pass
-
+    _ensure_reco_on_obj(uq)
     row = [_value_for_header(h, uq) for h in headers]
     if len(row) < len(headers):
         row += [None] * (len(headers) - len(row))
@@ -1434,7 +1427,6 @@ async def advanced_sheet_rows(
                 rows.append(_row_for_headers(it, headers))
             else:
                 pl = _make_placeholder(s, err="Unauthorized")
-                pl["recommendation"] = "HOLD"
                 rows.append(_row_59_from_headers(headers, pl))
         return AdvancedSheetResponse(
             status="error",
@@ -1477,18 +1469,7 @@ async def advanced_sheet_rows(
 
             for it in items_sorted:
                 uq = unified_map.get(it.symbol) or _make_placeholder(it.symbol, dq="MISSING", err="No data returned")
-
-                # ✅ ensure recommendation enum exists even if provider gave messy strings
-                try:
-                    reco_raw = _safe_get(uq, "recommendation")
-                    reco_norm = _normalize_recommendation(reco_raw)
-                    if reco_norm:
-                        if isinstance(uq, dict):
-                            uq["recommendation"] = reco_norm
-                        else:
-                            setattr(uq, "recommendation", reco_norm)
-                except Exception:
-                    pass
+                _ensure_reco_on_obj(uq)
 
                 if EnrichedQuote is not None:
                     try:
@@ -1538,7 +1519,6 @@ async def advanced_sheet_rows(
                 rows.append(_row_for_headers(it, headers))
             else:
                 pl = _make_placeholder(s, err=str(exc))
-                pl["recommendation"] = "HOLD"
                 rows.append(_row_59_from_headers(headers, pl))
 
         return AdvancedSheetResponse(status="error", error=str(exc), headers=headers, rows=rows)
