@@ -3,7 +3,7 @@
 """
 symbols_reader.py
 ===========================================================
-TADAWUL FAST BRIDGE – SYMBOLS READER (v2.3.0) – PROD SAFE
+TADAWUL FAST BRIDGE – SYMBOLS READER (v2.4.0) – PROD SAFE
 ===========================================================
 
 Purpose
@@ -12,19 +12,19 @@ Purpose
 
 Key guarantees
 - ✅ Never makes network calls at import-time
-- ✅ Never crashes startup (imports are best-effort)
+- ✅ Never crashes startup (imports + env parsing are best-effort)
 - ✅ Returns a predictable shape:
       {"all":[...], "ksa":[...], "global":[...], "meta": {...}}
 - ✅ Supports overrides via env (no Sheets needed)
 - ✅ Google Sheets read via service account JSON in env:
-      GOOGLE_SHEETS_CREDENTIALS  (minified JSON or base64 JSON)
+      GOOGLE_SHEETS_CREDENTIALS  (minified JSON / pretty JSON / quoted JSON / base64(JSON))
 
 Used by
 - scripts/run_market_scan.py (expects PAGE_REGISTRY + get_page_symbols)
 
 Env (optional)
-- DEFAULT_SPREADSHEET_ID / TFB_SPREADSHEET_ID
-- GOOGLE_SHEETS_CREDENTIALS (minified JSON OR base64(minified JSON))
+- DEFAULT_SPREADSHEET_ID / TFB_SPREADSHEET_ID / SPREADSHEET_ID / GOOGLE_SHEETS_ID
+- GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON (JSON or base64(JSON))
 - GOOGLE_APPLICATION_CREDENTIALS (path to service account json file)
 
 Overrides (optional)
@@ -34,6 +34,7 @@ Overrides (optional)
 - TFB_SYMBOL_HEADER_ROW (default 5)
 - TFB_SYMBOL_START_ROW  (default 6)
 - TFB_SYMBOL_MAX_ROWS   (default 5000)
+- TFB_SYMBOLS_CACHE_TTL_SEC (default 45)
 """
 
 from __future__ import annotations
@@ -49,12 +50,31 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version / constants
 # -----------------------------------------------------------------------------
-VERSION = "2.3.0"
-_DEFAULT_HEADER_ROW = int(os.getenv("TFB_SYMBOL_HEADER_ROW", "5") or "5")
-_DEFAULT_START_ROW = int(os.getenv("TFB_SYMBOL_START_ROW", "6") or "6")
-_DEFAULT_MAX_ROWS = int(os.getenv("TFB_SYMBOL_MAX_ROWS", "5000") or "5000")
-
+VERSION = "2.4.0"
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
+# -----------------------------------------------------------------------------
+# Safe env parsing (never crash import)
+# -----------------------------------------------------------------------------
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        x = int(str(v).strip())
+        return x if x > 0 else default
+    except Exception:
+        return default
+
+
+def _safe_float(v: Any, default: float) -> float:
+    try:
+        x = float(str(v).strip())
+        return x if x > 0 else default
+    except Exception:
+        return default
+
+
+_DEFAULT_HEADER_ROW = _safe_int(os.getenv("TFB_SYMBOL_HEADER_ROW", "5"), 5)
+_DEFAULT_START_ROW = _safe_int(os.getenv("TFB_SYMBOL_START_ROW", "6"), 6)
+_DEFAULT_MAX_ROWS = _safe_int(os.getenv("TFB_SYMBOL_MAX_ROWS", "5000"), 5000)
 
 # -----------------------------------------------------------------------------
 # Best-effort Google libs
@@ -73,7 +93,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Simple in-process cache (avoid hammering Sheets during scans)
 # -----------------------------------------------------------------------------
-_CACHE_TTL_SEC = float(os.getenv("TFB_SYMBOLS_CACHE_TTL_SEC", "45") or "45")
+_CACHE_TTL_SEC = _safe_float(os.getenv("TFB_SYMBOLS_CACHE_TTL_SEC", "45"), 45.0)
 _cache: Dict[str, Tuple[float, Any]] = {}
 
 
@@ -102,10 +122,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_spreadsheet_id() -> str:
-    return (
-        (os.getenv("TFB_SPREADSHEET_ID") or "").strip()
-        or (os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip()
-    )
+    # Support your env.py aliases + legacy names
+    for k in (
+        "TFB_SPREADSHEET_ID",
+        "DEFAULT_SPREADSHEET_ID",
+        "SPREADSHEET_ID",
+        "GOOGLE_SHEETS_ID",
+    ):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return ""
 
 
 def _strip_wrapping_quotes(s: str) -> str:
@@ -115,62 +142,94 @@ def _strip_wrapping_quotes(s: str) -> str:
     return t
 
 
+def _looks_like_b64(s: str) -> bool:
+    raw = (s or "").strip()
+    if len(raw) < 80:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    return all((c in allowed) for c in raw)
+
+
 def _maybe_b64_decode(s: str) -> str:
+    """
+    If s looks like base64 and decodes to JSON, return decoded.
+    Otherwise return original.
+    """
     raw = (s or "").strip()
     if not raw:
         return raw
     if raw.startswith("{"):
         return raw
-    if len(raw) < 120:
+    if not _looks_like_b64(raw):
         return raw
     try:
         dec = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
-        if dec.startswith("{") and '"private_key"' in dec:
+        if dec.startswith("{") and ("private_key" in dec or '"type"' in dec):
             return dec
     except Exception:
         return raw
     return raw
 
 
+def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    Accepts:
+    - dict
+    - JSON string
+    - base64(JSON string)
+    - quoted JSON string
+    Returns dict or None.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+
+    s = raw.strip()
+    if not s:
+        return None
+
+    s = _strip_wrapping_quotes(s)
+    s = _maybe_b64_decode(s)
+    s = _strip_wrapping_quotes(s).strip()
+
+    if not s or not s.startswith("{"):
+        return None
+
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
 def _load_service_account_info() -> Optional[Dict[str, Any]]:
     """
     Reads service account info from:
-    - GOOGLE_SHEETS_CREDENTIALS (minified json OR base64 json)
+    - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
+      (minified json OR pretty json OR quoted json OR base64 json)
     - else GOOGLE_APPLICATION_CREDENTIALS file path
     """
-    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or "").strip()
-    if raw:
-        raw = _strip_wrapping_quotes(raw)
-        raw = _maybe_b64_decode(raw)
-        raw = _strip_wrapping_quotes(raw)
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict) and obj.get("private_key") and obj.get("client_email"):
+    for k in ("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"):
+        raw = (os.getenv(k) or "").strip()
+        if raw:
+            obj = _try_parse_json_dict(raw)
+            if isinstance(obj, dict) and obj.get("client_email") and obj.get("private_key"):
                 return obj
-        except Exception:
-            return None
 
     path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if path and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 obj = json.load(f)
-            if isinstance(obj, dict) and obj.get("private_key") and obj.get("client_email"):
+            if isinstance(obj, dict) and obj.get("client_email") and obj.get("private_key"):
                 return obj
         except Exception:
             return None
 
     return None
-
-
-def _a1_col_to_index(col: str) -> int:
-    col = (col or "").strip().upper()
-    n = 0
-    for ch in col:
-        if not ("A" <= ch <= "Z"):
-            break
-        n = n * 26 + (ord(ch) - ord("A") + 1)
-    return n
 
 
 def _index_to_a1_col(idx: int) -> str:
@@ -202,6 +261,7 @@ def _normalize_symbol(s: str) -> str:
         x = x.split(":", 1)[1].strip().upper()
     if x.endswith(".TADAWUL"):
         x = x.replace(".TADAWUL", "")
+    # numeric Tadawul code -> .SR
     if x.isdigit() and 3 <= len(x) <= 6:
         return f"{x}.SR"
     return x
@@ -212,23 +272,21 @@ def _split_cell_into_symbols(cell: str) -> List[str]:
     Accepts:
     - single symbol: "1120.SR"
     - comma separated: "AAPL,MSFT,GOOGL"
-    - space separated (rare): "AAPL MSFT"
+    - space separated: "AAPL MSFT"
     - lines / bullets
     """
     raw = str(cell or "").strip()
     if not raw:
         return []
-    # remove bullet-like prefixes
     raw = raw.replace("•", " ").replace("·", " ").replace("\t", " ")
-    # split by comma / semicolon / whitespace / newlines
-    parts = re.split(r"[,\n;\r]+|\s{2,}", raw)
-    # also split if user used single spaces between tickers
+    # split by comma/semicolon/newlines
+    parts = re.split(r"[,\n;\r]+", raw)
     out: List[str] = []
     for p in parts:
         p = (p or "").strip()
         if not p:
             continue
-        # if still contains spaces, split once more
+        # split by whitespace inside each part
         for q in re.split(r"\s+", p):
             q = (q or "").strip()
             if q:
@@ -406,9 +464,9 @@ def _read_values(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
 
 def _resolve_symbol_column_letter(spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Optional[str]:
     """
-    Reads the header row A:AZ and finds the column where header matches candidates.
+    Reads the header row A:?? and finds the column where header matches candidates.
     """
-    try_cols = 52  # up to AZ
+    try_cols = 78  # up to BZ (more defensive than AZ)
     end_col = _index_to_a1_col(try_cols)
     rng = f"{_safe_sheet_name(sheet_name)}!A{spec.header_row}:{end_col}{spec.header_row}"
     rows = _read_values(spreadsheet_id, rng)
@@ -416,19 +474,15 @@ def _resolve_symbol_column_letter(spreadsheet_id: str, sheet_name: str, spec: Pa
         return None
 
     header = rows[0]
-    # normalize header cells
     cand = {c.strip().upper() for c in spec.header_candidates if c and c.strip()}
     for idx, cell in enumerate(header, start=1):
         h = str(cell or "").strip().upper()
-        # strip extra chars
         h = re.sub(r"[^A-Z0-9_% ]+", " ", h).strip()
         if not h:
             continue
-        # exact or startswith
         if h in cand or any(h.startswith(c) for c in cand):
             return _index_to_a1_col(idx)
 
-    # fallback: try common names even if not in spec
     common = {"SYMBOL", "TICKER", "CODE"}
     for idx, cell in enumerate(header, start=1):
         h = str(cell or "").strip().upper()
@@ -473,7 +527,6 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
             syms = _dedupe(syms)
             if syms:
                 return syms, meta
-            # if empty, try next sheet name
             continue
 
         # Determine symbol column
@@ -503,7 +556,6 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
         if syms2:
             return syms2, meta
 
-    # none worked
     meta["mode"] = "sheets_empty"
     return [], meta
 
@@ -566,7 +618,7 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
             "all": [],
             "ksa": [],
             "global": [],
-            "meta": {"error": "Spreadsheet ID missing (set DEFAULT_SPREADSHEET_ID/TFB_SPREADSHEET_ID)", "key": k, "version": VERSION},
+            "meta": {"error": "Spreadsheet ID missing (set DEFAULT_SPREADSHEET_ID/TFB_SPREADSHEET_ID/SPREADSHEET_ID)", "key": k, "version": VERSION},
         }
 
     # Cache per key+sheet id
