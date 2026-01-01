@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# scripts/run_market_scan.py  (FULL REPLACEMENT)
+# scripts/run_market_scan.py
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER (v1.2.0) – Sheets-ready
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.2.1) – Sheets-ready
 ===========================================================
 
 What this script does
-- Reads symbols from one or more dashboard pages via symbols_reader.PAGE_REGISTRY
+- Reads symbols from one or more dashboard pages via symbols_reader.PAGE_REGISTRY (or symbols_reader helpers)
 - Calls backend AI Analysis endpoint in chunks:
       POST /v1/analysis/quotes   { tickers:[...], symbols:[...] }
 - Produces a ranked "opportunities" table
@@ -18,14 +18,12 @@ Defaults (safe)
 - Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
 - Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
 
-Key upgrades (v1.2.0)
-- Always sends BOTH tickers and symbols to backend (compat across routers)
-- More robust backend response parsing (results/rows/data)
-- Adds Rank + Origin Pages columns for traceability
-- Safer, smart-clear range (clears only the table width by default)
-- Optional value_input for sheet write: RAW (default) or USER_ENTERED
-- Better keys parsing (comma/space), de-dup, and KSA/global filtering
-- Never crashes on one bad batch; error rows inserted per-symbol
+Key upgrades (v1.2.1)
+- ✅ Always sends BOTH tickers and symbols to backend (compat across routers)
+- ✅ More robust sheet writer selection: write_grid_chunked / write_grid / update_values fallback
+- ✅ Smart-clear is truly optional (respects --smart-clear flag)
+- ✅ Handles backend returning empty body / non-JSON gracefully
+- ✅ Never crashes on one bad batch; inserts per-symbol error rows for traceability
 
 Usage examples
   python scripts/run_market_scan.py
@@ -36,7 +34,7 @@ Usage examples
   python scripts/run_market_scan.py --top 25 --min-quality OK
   python scripts/run_market_scan.py --out-json market_scan.json
   python scripts/run_market_scan.py --no-sheet
-  python scripts/run_market_scan.py --clear --value-input USER_ENTERED
+  python scripts/run_market_scan.py --clear --smart-clear --value-input USER_ENTERED
 
 Notes
 - Uses env.py settings when available:
@@ -60,7 +58,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
@@ -80,8 +78,8 @@ def _ensure_project_root_on_path() -> None:
       - scripts folder: python run_market_scan.py
     """
     try:
-        here = os.path.dirname(os.path.abspath(__file__))      # .../scripts
-        parent = os.path.dirname(here)                          # project root
+        here = os.path.dirname(os.path.abspath(__file__))  # .../scripts
+        parent = os.path.dirname(here)  # project root
         for p in (here, parent):
             if p and p not in sys.path:
                 sys.path.insert(0, p)
@@ -174,6 +172,7 @@ def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
         s = str(x).strip()
         if not s:
             continue
+        # allow comma-separated in one arg
         out.extend([p.strip() for p in s.split(",") if p.strip()])
 
     seen = set()
@@ -195,21 +194,18 @@ def _norm_symbol(s: str) -> str:
     if not x:
         return ""
 
-    # Normalize "TADAWUL:xxxx"
     if x.startswith("TADAWUL:"):
         x = x.split(":", 1)[1].strip().upper()
 
-    # Normalize ".TADAWUL"
     if x.endswith(".TADAWUL"):
         x = x.replace(".TADAWUL", "")
 
     x = x.replace(" ", "")
 
-    # Normalize KSA numeric -> .SR
+    # KSA numeric -> .SR
     if x.isdigit() and 3 <= len(x) <= 5:
         return f"{x}.SR"
 
-    # If still numeric after removing suffixes
     if x.endswith(".SR") and x.replace(".SR", "").isdigit():
         return x
 
@@ -222,7 +218,6 @@ def _is_ksa(sym: str) -> bool:
         return False
     if s.endswith(".SR"):
         return True
-    # numeric-only (rare if already normalized)
     return s.isdigit() and 3 <= len(s) <= 5
 
 
@@ -262,7 +257,6 @@ def _safe_sheet_name(sheet_name: str) -> str:
 
 def _parse_a1_cell(cell: str) -> Tuple[str, int]:
     s = _validate_start_cell(cell)
-    # split col letters + row digits
     col = ""
     row = ""
     for ch in s:
@@ -312,7 +306,6 @@ def _headers(token: str) -> Dict[str, str]:
         "User-Agent": f"TadawulFastBridge-MarketScan/{SCRIPT_VERSION}",
     }
     if token:
-        # keep compatibility with your backend auth expectations
         h["X-APP-TOKEN"] = token
         h["Authorization"] = f"Bearer {token}"
     return h
@@ -347,10 +340,14 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                     last_body_preview = (raw or "")[:500]
 
                     if 200 <= status < 300:
-                        if not raw.strip():
+                        if not (raw or "").strip():
                             return {}
-                        parsed = json.loads(raw)
-                        return parsed if isinstance(parsed, dict) else {"results": parsed}
+                        try:
+                            parsed = json.loads(raw)
+                            return parsed if isinstance(parsed, dict) else {"results": parsed}
+                        except Exception:
+                            # Non-JSON body
+                            return {"results": [], "error": f"Non-JSON response: {(raw or '')[:200]}"}
 
                     last_err = f"HTTP {status}"
             except urllib.error.HTTPError as e:
@@ -386,6 +383,7 @@ def _extract_result_list(resp: Any) -> Tuple[List[Dict[str, Any]], Optional[str]
       - {"rows":[...]}
       - {"data":[...]}
       - {"status":..., "results":...}
+      - list of dicts
     """
     if isinstance(resp, dict):
         err = resp.get("error")
@@ -394,7 +392,6 @@ def _extract_result_list(resp: Any) -> Tuple[List[Dict[str, Any]], Optional[str]
             if isinstance(v, list):
                 out = [x for x in v if isinstance(x, dict)]
                 return out, (str(err) if err else None)
-        # sometimes nested
         v2 = resp.get("payload")
         if isinstance(v2, dict):
             for k in ("results", "rows", "data"):
@@ -446,7 +443,9 @@ def _read_symbols_for_key(key: str) -> SymbolBucket:
     if not isinstance(data, dict):
         return SymbolBucket(key=key, symbols=[], meta={"shape": str(type(data)), "count": 0})
 
-    all_syms = data.get("all") or data.get("tickers") or data.get("symbols") or []
+    all_syms = data.get("all")
+    if all_syms is None:
+        all_syms = data.get("tickers") or data.get("symbols") or []
     syms = _dedupe([str(x) for x in (all_syms or [])])
 
     meta = {
@@ -488,7 +487,6 @@ def _call_analysis_batch(
             out.extend(got)
             continue
 
-        # Insert per-symbol error rows if backend failed for this chunk
         err_msg = err or (str(resp.get("error")) if isinstance(resp, dict) else None) or "Backend returned invalid response"
         for s in c:
             out.append({"symbol": s, "data_quality": "MISSING", "error": err_msg})
@@ -545,7 +543,7 @@ DEFAULT_HEADERS: List[str] = [
     "Market Cap",
     "P/E (TTM)",
     "P/B",
-    "Dividend Yield %",
+    "Dividend Yield %",   # expects percent-like; backend may return fraction
     "ROE %",
     "ROA %",
 
@@ -581,7 +579,6 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
     else:
         sources_str = str(sources or "")
 
-    # normalize symbol
     sym = g("symbol", "ticker")
     sym = _norm_symbol(str(sym or ""))
 
@@ -637,7 +634,6 @@ def _grid_from_results(
         origins = ", ".join(origin_map.get(sym, [])) if sym else ""
         rows.append(_to_row(r, rank=i, origins=origins))
 
-    # Ensure width
     fixed: List[List[Any]] = []
     for rr in rows:
         if len(rr) < len(h):
@@ -647,6 +643,95 @@ def _grid_from_results(
         fixed.append(rr)
 
     return [h] + fixed
+
+
+# =============================================================================
+# Sheets write helpers (supports multiple service shapes)
+# =============================================================================
+def _write_grid(
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    grid: List[List[Any]],
+    *,
+    value_input: str = "RAW",
+) -> int:
+    """
+    Returns cells updated (best-effort int). Supports multiple google_sheets_service APIs.
+    """
+    if sheets_service is None:
+        raise RuntimeError("google_sheets_service not available")
+
+    vi = (value_input or "RAW").strip().upper()
+    if vi not in ("RAW", "USER_ENTERED"):
+        vi = "RAW"
+
+    # 1) Preferred: write_grid_chunked(sid, sheet_name, start_cell, grid, value_input=?)
+    fn = getattr(sheets_service, "write_grid_chunked", None)
+    if callable(fn):
+        try:
+            sig = None
+            try:
+                import inspect as _inspect  # local import to avoid unused if not needed
+
+                sig = _inspect.signature(fn)
+            except Exception:
+                sig = None
+
+            if sig and "value_input" in sig.parameters:
+                updated = fn(spreadsheet_id, sheet_name, start_cell, grid, value_input=vi)  # type: ignore
+            else:
+                updated = fn(spreadsheet_id, sheet_name, start_cell, grid)  # type: ignore
+            try:
+                return int(updated or 0)
+            except Exception:
+                return 0
+        except Exception:
+            # continue to fallbacks
+            pass
+
+    # 2) write_grid(...)
+    fn2 = getattr(sheets_service, "write_grid", None)
+    if callable(fn2):
+        try:
+            updated = fn2(spreadsheet_id, sheet_name, start_cell, grid)  # type: ignore
+            try:
+                return int(updated or 0)
+            except Exception:
+                return 0
+        except Exception:
+            pass
+
+    # 3) update_values / write_values pattern
+    fn3 = getattr(sheets_service, "update_values", None)
+    if callable(fn3):
+        # many libs expect a range like "Sheet!A5"
+        a1 = f"{sheet_name}!{start_cell}"
+        updated = fn3(spreadsheet_id, a1, grid, value_input=vi)  # type: ignore
+        try:
+            return int(updated or 0)
+        except Exception:
+            return 0
+
+    raise RuntimeError("No supported grid writer found in google_sheets_service (expected write_grid_chunked/write_grid/update_values).")
+
+
+def _clear_range(
+    spreadsheet_id: str,
+    a1_range: str,
+) -> None:
+    if sheets_service is None:
+        raise RuntimeError("google_sheets_service not available")
+    fn = getattr(sheets_service, "clear_range", None)
+    if callable(fn):
+        fn(spreadsheet_id, a1_range)  # type: ignore
+        return
+    # optional: try 'clear_values'
+    fn2 = getattr(sheets_service, "clear_values", None)
+    if callable(fn2):
+        fn2(spreadsheet_id, a1_range)  # type: ignore
+        return
+    raise RuntimeError("No supported clear function found in google_sheets_service (expected clear_range/clear_values).")
 
 
 # =============================================================================
@@ -677,7 +762,7 @@ def main() -> None:
     p.add_argument("--sheet-name", default="Market_Scan", help="Target sheet/tab name (default: Market_Scan)")
     p.add_argument("--start-cell", default="A5", help="Top-left cell for headers (default: A5)")
     p.add_argument("--clear", action="store_true", help="Clear old values before writing")
-    p.add_argument("--smart-clear", action="store_true", help="Clear only table width (default ON when --clear)")
+    p.add_argument("--smart-clear", action="store_true", help="Clear only table width (recommended with --clear)")
     p.add_argument("--clear-end-row", type=int, default=100000, help="Clear end row (default 100000)")
     p.add_argument("--value-input", default="RAW", choices=["RAW", "USER_ENTERED", "raw", "user_entered"], help="Sheets write mode")
 
@@ -750,7 +835,6 @@ def main() -> None:
         if min_q != "ANY":
             results = [r for r in results if _passes_quality(r, min_q)]
         else:
-            # with ANY: drop pure-error rows that have no scores at all
             tmp: List[Dict[str, Any]] = []
             for r in results:
                 if (r.get("error") or "") and (r.get("opportunity_score") is None) and (r.get("overall_score") is None):
@@ -826,24 +910,24 @@ def main() -> None:
 
     # Clear old values (optional)
     if args.clear:
-        smart_clear = bool(args.smart_clear) or True  # default ON when --clear
         try:
             start_col, start_row = _parse_a1_cell(start_cell)
+
+            # default clear: very wide (safe)
             end_col = "ZZ"
-            if smart_clear:
+
+            # optional: smart-clear only table width
+            if args.smart_clear:
                 end_col = _index_to_col(_col_to_index(start_col) + len(grid[0]) - 1)
 
             rng = f"{_safe_sheet_name(sheet_name)}!{_a1(start_col, start_row)}:{end_col}{clear_end_row}"
-            sheets_service.clear_range(sheet_id, rng)  # type: ignore
+            _clear_range(sheet_id, rng)
             logger.info("Cleared range: %s", rng)
         except Exception as e:
             logger.warning("Clear failed (continuing): %s", e)
 
     try:
-        # Prefer service's chunked writer
-        # (google_sheets_service writes in RAW; if your service supports value_input, it will accept it.
-        # If not, it will ignore because write_grid_chunked doesn't accept it.)
-        updated = sheets_service.write_grid_chunked(sheet_id, sheet_name, start_cell, grid)  # type: ignore
+        updated = _write_grid(sheet_id, sheet_name, start_cell, grid, value_input=value_input)
         logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
     except Exception as e:
         logger.error("❌ Sheet write failed: %s", e)
