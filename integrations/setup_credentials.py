@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# setup_credentials.py  (FULL REPLACEMENT)
+# integrations/setup_credentials.py
 """
 setup_credentials.py
 ===========================================================
-HELPER: Prepare Google Credentials for Deployment (v2.4.0)
+HELPER: Prepare Google Credentials for Deployment (v2.4.1)
 ===========================================================
 
 Why this exists
@@ -13,14 +13,15 @@ Why this exists
     1) Minified one-line JSON (safe for GOOGLE_SHEETS_CREDENTIALS)
     2) OPTIONAL Base64 version (often safer for deployment UIs)
 
-Extra safety (v2.4.0)
+Extra safety (v2.4.1)
 - Reads credentials from: file OR stdin (pipe) OR env var
 - Accepts JSON OR base64(JSON) OR "quoted JSON" in any source
 - Strict validation of required fields + private key marker
 - Optional sanitize of "\\n" -> "\n" inside private_key (common deployment issue)
 - Optional output to files to avoid copy/paste
 - Optional masked preview mode
-- Optional "print export command" helpers for Bash/PowerShell (masked by default)
+- Optional "print export command" helpers (masked by default)
+- Better base64 detection: supports newlines/whitespace and urlsafe base64
 
 Usage (examples)
 1) File (default):
@@ -50,12 +51,13 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_INPUT = "credentials.json"
 DEFAULT_ENV_NAME = "GOOGLE_SHEETS_CREDENTIALS"
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 
 # =============================================================================
@@ -83,29 +85,44 @@ def _strip_wrapping_quotes(s: str) -> str:
     return t
 
 
+def _compact_ws(s: str) -> str:
+    # remove whitespace/newlines that often get introduced in copied base64
+    return re.sub(r"\s+", "", s or "")
+
+
 def _is_probably_base64(raw: str) -> bool:
     """
-    Heuristic: base64 strings are usually long, no spaces, mostly base64 alphabet.
+    Heuristic: base64 strings are usually long, mostly base64 alphabet.
+    We allow newlines/whitespace (common in UIs) and urlsafe variants.
     """
-    s = (raw or "").strip()
+    s = _compact_ws((raw or "").strip())
     if not s:
         return False
     if s.startswith("{"):
         return False
-    if len(s) < 120:
+
+    # base64 alphabet + urlsafe
+    if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", s):
         return False
-    if any(ch.isspace() for ch in s):
+
+    # length heuristic: not too tiny
+    if len(s) < 80:
         return False
-    # allow '=' padding, '+' '/', '-' '_' (URL-safe), alnum
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
-    bad = sum(1 for ch in s if ch not in allowed)
-    return bad == 0
+
+    # often multiple of 4 (padding optional, but still a good signal)
+    if len(s) % 4 != 0:
+        # still allow (some systems strip padding), but lower confidence
+        return True
+
+    return True
 
 
 def _try_b64_decode_to_json(raw: str) -> Optional[str]:
-    s = (raw or "").strip()
-    if not s:
+    s0 = (raw or "").strip()
+    if not s0:
         return None
+
+    s = _compact_ws(s0)
     if not _is_probably_base64(s):
         return None
 
@@ -205,13 +222,13 @@ def _write_file(path: str, content: str) -> None:
 
 def _ps_setx(env_name: str, value: str, *, masked: bool) -> str:
     v = _mask(value) if masked else value
-    # setx has length limits; this is "helper text", not guaranteed for huge values
+    # NOTE: setx has length limits; this is helper text, not guaranteed for huge values.
     return f'setx {env_name} "{v}"'
 
 
 def _bash_export(env_name: str, value: str, *, masked: bool) -> str:
     v = _mask(value) if masked else value
-    # Quote with single quotes; if value contains single quote it's rare for JSON/base64
+    # Quote with single quotes; JSON/base64 typically doesn't contain single quotes.
     return f"export {env_name}='{v}'"
 
 
@@ -239,7 +256,11 @@ def main() -> int:
     out.add_argument("--env-name", default=DEFAULT_ENV_NAME, help="Env var name to display in instructions.")
     out.add_argument("--mask", action="store_true", help="Print masked previews instead of full secrets.")
     out.add_argument("--strict-type", action="store_true", help="Require type == service_account.")
-    out.add_argument("--fix-private-key", action="store_true", help="Convert literal '\\\\n' to real newlines in private_key before output.")
+    out.add_argument(
+        "--fix-private-key",
+        action="store_true",
+        help="Convert literal '\\\\n' to real newlines in private_key before output.",
+    )
     out.add_argument("--out-json", default="", help="Write minified JSON output to this file.")
     out.add_argument("--out-b64", default="", help="Write base64 output to this file.")
     out.add_argument("--print-export", action="store_true", help="Print helper export commands (masked by default).")
@@ -252,8 +273,9 @@ def main() -> int:
             raw_text = _read_stdin()
             src_label = "stdin"
         elif args.from_env:
-            raw_text = _read_env(str(args.from_env).strip())
-            src_label = f"env:{args.from_env}"
+            env_name = str(args.from_env).strip()
+            raw_text = _read_env(env_name)
+            src_label = f"env:{env_name}"
         else:
             raw_text = _read_file(args.input)
             src_label = args.input
@@ -300,7 +322,6 @@ def main() -> int:
             print("-" * 70)
 
         if args.print_export:
-            masked = True if args.mask or True else False  # always masked for safety
             print("\nHelper commands (MASKED preview):")
             if mode in ("json", "both"):
                 print("PowerShell:", _ps_setx(args.env_name, flat, masked=True))
