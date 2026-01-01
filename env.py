@@ -392,13 +392,28 @@ _export_env_if_missing("PROVIDERS", _safe_join(ENABLED_PROVIDERS))
 _export_env_if_missing("KSA_PROVIDERS", _safe_join(KSA_PROVIDERS))
 _export_env_if_missing("PRIMARY_PROVIDER", PRIMARY_PROVIDER)
 
-# Feature toggles (used by DataEngineV2 / providers; env-first)
-ENABLE_YAHOO_CHART_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_KSA"), True)
-ENABLE_YAHOO_CHART_SUPPLEMENT = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
-ENABLE_YFINANCE_KSA = _safe_bool(_get_first_env("ENABLE_YFINANCE_KSA"), False)
+# Feature toggles (used by DataEngineV2 / providers; env-first, fallback to settings)
+ENABLE_YAHOO_CHART_KSA = _safe_bool(
+    _get_first_env("ENABLE_YAHOO_CHART_KSA") or _get_attr(_base_settings, "enable_yahoo_chart_ksa", None),
+    True,
+)
+ENABLE_YAHOO_CHART_SUPPLEMENT = _safe_bool(
+    _get_first_env("ENABLE_YAHOO_CHART_SUPPLEMENT") or _get_attr(_base_settings, "enable_yahoo_chart_supplement", None),
+    True,
+)
+ENABLE_YFINANCE_KSA = _safe_bool(
+    _get_first_env("ENABLE_YFINANCE_KSA") or _get_attr(_base_settings, "enable_yfinance_ksa", None),
+    False,
+)
 
-ENABLE_YAHOO_FUNDAMENTALS_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_FUNDAMENTALS_KSA"), True)
-ENABLE_YAHOO_FUNDAMENTALS_GLOBAL = _safe_bool(_get_first_env("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"), False)
+ENABLE_YAHOO_FUNDAMENTALS_KSA = _safe_bool(
+    _get_first_env("ENABLE_YAHOO_FUNDAMENTALS_KSA") or _get_attr(_base_settings, "enable_yahoo_fundamentals_ksa", None),
+    True,
+)
+ENABLE_YAHOO_FUNDAMENTALS_GLOBAL = _safe_bool(
+    _get_first_env("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL") or _get_attr(_base_settings, "enable_yahoo_fundamentals_global", None),
+    False,
+)
 
 _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(ENABLE_YAHOO_CHART_KSA).lower())
 _export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(ENABLE_YAHOO_CHART_SUPPLEMENT).lower())
@@ -414,11 +429,14 @@ HTTP_TIMEOUT_SEC = _safe_float(
 HTTP_TIMEOUT_SEC = max(5.0, float(HTTP_TIMEOUT_SEC or 25.0))
 HTTP_TIMEOUT = _safe_int(_get_first_env("HTTP_TIMEOUT") or int(HTTP_TIMEOUT_SEC), int(HTTP_TIMEOUT_SEC))
 
-CACHE_TTL_SEC = _safe_float(_get_first_env("CACHE_TTL_SEC") or _get_attr(_base_settings, "cache_ttl_sec", None), 20.0)
+CACHE_TTL_SEC = _safe_float(
+    _get_first_env("CACHE_TTL_SEC", "CACHE_DEFAULT_TTL") or _get_attr(_base_settings, "cache_ttl_sec", None),
+    20.0,
+)
 
 ENGINE_CACHE_TTL_SEC = _safe_int(
     _get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC") or _get_attr(_base_settings, "engine_cache_ttl_sec", None),
-    int(CACHE_TTL_SEC) if CACHE_TTL_SEC > 0 else 20,
+    int(CACHE_TTL_SEC) if float(CACHE_TTL_SEC) > 0 else 20,
 )
 
 ENRICHED_BATCH_CONCURRENCY = _safe_int(
@@ -439,8 +457,14 @@ _export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(ENRICHED_BATCH_CONC
 _export_env_if_missing("ENRICHED_CONCURRENCY", str(int(ENRICHED_BATCH_CONCURRENCY)))
 
 # Provider keys
-EODHD_API_KEY = _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN") or _get_attr(_base_settings, "eodhd_api_key", None)
-FINNHUB_API_KEY = _get_first_env("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN") or _get_attr(_base_settings, "finnhub_api_key", None)
+EODHD_API_KEY = (
+    _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN")
+    or _get_attr(_base_settings, "eodhd_api_key", None)
+)
+FINNHUB_API_KEY = (
+    _get_first_env("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN")
+    or _get_attr(_base_settings, "finnhub_api_key", None)
+)
 FMP_API_KEY = _get_first_env("FMP_API_KEY") or _get_attr(_base_settings, "fmp_api_key", None)
 ALPHA_VANTAGE_API_KEY = _get_first_env("ALPHA_VANTAGE_API_KEY") or _get_attr(_base_settings, "alpha_vantage_api_key", None)
 ARGAAM_API_KEY = _get_first_env("ARGAAM_API_KEY") or _get_attr(_base_settings, "argaam_api_key", None)
@@ -457,7 +481,11 @@ if EODHD_API_KEY:
 # CORS
 ENABLE_CORS_ALL_ORIGINS = _env_first_bool(_base_settings, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", True)
 CORS_ALL_ORIGINS = ENABLE_CORS_ALL_ORIGINS
-CORS_ORIGINS = _get_first_env("CORS_ORIGINS") or str(_get_attr(_base_settings, "cors_origins", "") or "").strip() or "*"
+CORS_ORIGINS = (
+    _get_first_env("CORS_ORIGINS")
+    or str(_get_attr(_base_settings, "cors_origins", "") or "").strip()
+    or "*"
+)
 if ENABLE_CORS_ALL_ORIGINS:
     CORS_ORIGINS_LIST = ["*"]
 else:
