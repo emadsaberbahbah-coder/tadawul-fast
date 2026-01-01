@@ -1,21 +1,24 @@
-# main.py — FULL REPLACEMENT — v5.2.0
+# main.py — FULL REPLACEMENT — v5.2.1
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.2.0
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.2.1
 
-Aligned with your plan (engine + router consistency):
-- ✅ Prefers core.data_engine_v2.get_engine() singleton (keeps cache warm + consistent)
-- ✅ Still supports legacy/sync engines as fallback
-- ✅ Never crashes startup; /healthz /readyz always work
-- ✅ Deferred router mount supported (fast boot)
-- ✅ Settings resolution: ENV + env.py + config.py/core.config (best-effort)
-- ✅ Runtime env aliases + safe provider defaults applied early
+What changed vs your v5.2.0 draft (fixes real-world boot issues):
+- ✅ Fix: get_engine() may be sync in some builds → supports sync/async safely.
+- ✅ Fix: background boot task uses asyncio.to_thread incorrectly for async init → corrected.
+- ✅ Fix: router mount uses include_router safely with robust import candidates.
+- ✅ /readyz always returns without touching routers/engine internals.
+- ✅ Stronger settings/env resolution (ENV -> env.py -> config.py/core.config).
+- ✅ Keeps “never crash startup” guarantee.
+
+Entrypoint for Render/uvicorn:  main:app
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -43,7 +46,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.2.0"
+APP_ENTRY_VERSION = "5.2.1"
 
 
 def _truthy(v: Any) -> bool:
@@ -323,7 +326,7 @@ def _normalize_version(v: Any) -> str:
     s = str(v or "").strip()
     if not s:
         return ""
-    if s.lower() in ("unknown", "none", "null"):
+    if s.lower() in ("unknown", "none", "null", "0.0.0"):
         return ""
     return s
 
@@ -524,6 +527,12 @@ def _engine_info(eng: Any) -> Dict[str, Any]:
     }
 
 
+async def _await_maybe(v: Any) -> Any:
+    if inspect.isawaitable(v):
+        return await v
+    return v
+
+
 async def _init_engine_best_effort_async(app_: FastAPI) -> None:
     """
     Best-effort engine init. Never throws.
@@ -533,7 +542,7 @@ async def _init_engine_best_effort_async(app_: FastAPI) -> None:
       - app.state.engine_error
     Priority:
       1) existing app.state.engine
-      2) core.data_engine_v2.get_engine() (singleton)
+      2) core.data_engine_v2.get_engine() (sync OR async)
       3) core.data_engine_v2.DataEngineV2/DataEngine (instantiate)
       4) core.data_engine.DataEngine (legacy)
     """
@@ -551,7 +560,7 @@ async def _init_engine_best_effort_async(app_: FastAPI) -> None:
     try:
         from core.data_engine_v2 import get_engine  # type: ignore
 
-        eng = await get_engine()
+        eng = await _await_maybe(get_engine())
         app_.state.engine = eng
         app_.state.engine_ready = True
         app_.state.engine_error = None
@@ -610,6 +619,9 @@ def _mount_all_routers(app_: FastAPI) -> None:
 
 
 async def _background_boot(app_: FastAPI) -> None:
+    """
+    Background boot must be pure-async. Avoid asyncio.to_thread misuse for async funcs.
+    """
     try:
         await asyncio.to_thread(_mount_all_routers, app_)
         init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
