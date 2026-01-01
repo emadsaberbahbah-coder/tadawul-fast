@@ -1,22 +1,23 @@
-# core/providers/tadawul_provider.py  (FULL REPLACEMENT)
+# core/providers/tadawul_provider.py
 """
 core/providers/tadawul_provider.py
 ===============================================================
-Tadawul Provider / Client (KSA quote + fundamentals) — v1.10.0
-PROD SAFE + Async + ENGINE-ALIGNED (DICT RETURNS)
+Tadawul Provider / Client (KSA quote + fundamentals) — v1.11.0
+PROD SAFE + Async + ENGINE-ALIGNED (PATCH DICT RETURNS)
 
 What this revision guarantees
-- ✅ Engine-aligned exports:
+- ✅ Engine-aligned exports (ALL return Dict[str, Any] — NO tuples):
     fetch_quote_patch
     fetch_enriched_quote_patch
     fetch_quote_and_enrichment_patch
-  (all return Dict[str, Any] — NO tuples)
-- ✅ Never crashes import; never does network at import-time
-- ✅ Clean "not configured" if TADAWUL_* URLs are missing
-- ✅ Strict KSA-only guard (prevents misrouting GLOBAL tickers into Tadawul)
-- ✅ Defensive parsing + bounded deep-find (prevents recursion blowups)
+- ✅ Import-safe: no network at import-time, never crashes on missing env / cachetools
+- ✅ Strict KSA-only guard:
+    - Non-KSA symbols return {} (silent) to prevent misrouting/pollution
+- ✅ Clean "not configured" behavior:
+    - For KSA symbols: returns {"error": "warning: ..."} (no crash, allows engine fallback)
+- ✅ Defensive parsing + bounded deep-find
 - ✅ Retry/backoff on 429 + transient 5xx
-- ✅ Cache for quote + fundamentals (TTL from env)
+- ✅ TTL cache for quote + fundamentals (env-configurable)
 - ✅ Avoids misleading values: only sets fields we can parse
 
 Supported env vars (optional)
@@ -38,7 +39,7 @@ Also reads (if present)
 
 Notes
 - This provider expects you to supply your own Tadawul endpoints via env URLs.
-- The JSON schema of those endpoints can vary; parsing is best-effort via key search.
+- Endpoint JSON schema can vary; parsing is best-effort via key search.
 """
 
 from __future__ import annotations
@@ -52,14 +53,14 @@ import random
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
 
 logger = logging.getLogger("core.providers.tadawul_provider")
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "1.10.0"
+PROVIDER_VERSION = "1.11.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -80,7 +81,7 @@ _KSA_SYMBOL_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 
 # -----------------------------------------------------------------------------
-# Safe helpers
+# Env + safe helpers
 # -----------------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -91,19 +92,6 @@ def _safe_str(x: Any) -> Optional[str]:
         return None
     s = str(x).strip()
     return s if s else None
-
-
-def _to_bool(v: Any, default: bool = False) -> bool:
-    if v is None:
-        return default
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in _TRUTHY:
-        return True
-    if s in _FALSY:
-        return False
-    return default
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -132,6 +120,18 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).strip())
     except Exception:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
+    return default
 
 
 def _timeout_sec() -> float:
@@ -182,6 +182,52 @@ def _fund_ttl_sec() -> float:
     return 21600.0  # 6 hours
 
 
+def _enabled() -> bool:
+    # default enabled
+    return _env_bool("TADAWUL_MARKET_ENABLED", True)
+
+
+# -----------------------------------------------------------------------------
+# Symbol helpers (STRICT KSA)
+# -----------------------------------------------------------------------------
+def _is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    return bool(_KSA_SYMBOL_RE.match(s) or _KSA_CODE_RE.match(s))
+
+
+def _ksa_code(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    if s.endswith(".SR"):
+        s = s[:-3]
+    if "." in s:
+        s = s.split(".", 1)[0]
+    return s
+
+
+def _normalize_ksa_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    if s.endswith(".SR"):
+        code = s[:-3]
+        return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
+    if _KSA_CODE_RE.match(s):
+        return f"{s}.SR"
+    return ""  # STRICT (prevents GLOBAL tickers)
+
+
+def _format_url(template: str, symbol: str) -> str:
+    code = _ksa_code(symbol)
+    return (template or "").replace("{code}", code).replace("{symbol}", symbol)
+
+
+# -----------------------------------------------------------------------------
+# Robust numeric parsing
+# -----------------------------------------------------------------------------
 def _safe_float(val: Any) -> Optional[float]:
     """
     Robust numeric parser:
@@ -234,45 +280,61 @@ def _pct_if_fraction(x: Any) -> Optional[float]:
     v = _safe_float(x)
     if v is None:
         return None
-    # If provider returns 0.034 => treat as 3.4%
     return v * 100.0 if abs(v) <= 1.0 else v
 
 
-def _is_ksa_symbol(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return False
-    return bool(_KSA_SYMBOL_RE.match(s) or _KSA_CODE_RE.match(s))
+def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (p or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
 
 
-def _ksa_code(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return ""
-    if s.endswith(".SR"):
-        s = s[:-3]
-    if "." in s:
-        s = s.split(".", 1)[0]
-    return s
+def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
+    if cur is None or lo is None or hi is None:
+        return None
+    if hi == lo:
+        return None
+    try:
+        return (cur - lo) / (hi - lo) * 100.0
+    except Exception:
+        return None
 
 
-def _normalize_ksa_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return ""
-    if s.endswith(".SR"):
-        code = s[:-3]
-        return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
-    if _KSA_CODE_RE.match(s):
-        return f"{s}.SR"
-    return ""  # STRICT: prevent GLOBAL tickers
+def _fill_derived(p: Dict[str, Any]) -> None:
+    cur = _safe_float(p.get("current_price"))
+    prev = _safe_float(p.get("previous_close"))
+    vol = _safe_float(p.get("volume"))
+
+    if p.get("price_change") is None and cur is not None and prev is not None:
+        p["price_change"] = cur - prev
+
+    if p.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
+        p["percent_change"] = (cur - prev) / prev * 100.0
+
+    if p.get("value_traded") is None and cur is not None and vol is not None:
+        p["value_traded"] = cur * vol
+
+    if p.get("position_52w_percent") is None:
+        p["position_52w_percent"] = _pos_52w(
+            cur,
+            _safe_float(p.get("week_52_low")),
+            _safe_float(p.get("week_52_high")),
+        )
+
+    mc = _safe_float(p.get("market_cap"))
+    ff = _safe_float(p.get("free_float"))
+    if p.get("free_float_market_cap") is None and mc is not None and ff is not None:
+        p["free_float_market_cap"] = mc * (ff / 100.0)
 
 
-def _format_url(template: str, symbol: str) -> str:
-    code = _ksa_code(symbol)
-    return (template or "").replace("{code}", code).replace("{symbol}", symbol)
-
-
+# -----------------------------------------------------------------------------
+# Bounded deep-find (safe for unknown JSON shapes)
+# -----------------------------------------------------------------------------
 def _coerce_dict(data: Any) -> Dict[str, Any]:
     if isinstance(data, dict):
         return data
@@ -281,22 +343,7 @@ def _coerce_dict(data: Any) -> Dict[str, Any]:
     return {}
 
 
-# -----------------------------------------------------------------------------
-# Bounded deep-find helpers (safe for unknown JSON shapes)
-# -----------------------------------------------------------------------------
-def _iter_children(x: Any) -> Iterable[Any]:
-    if isinstance(x, dict):
-        return x.values()
-    if isinstance(x, list):
-        return x
-    return []
-
-
 def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 6, max_nodes: int = 2500) -> Any:
-    """
-    Breadth-first bounded search over dict/list nodes.
-    Never raises; returns first matching value for any key in `keys`.
-    """
     if obj is None:
         return None
     keyset = {str(k).strip().lower() for k in keys if k}
@@ -327,35 +374,32 @@ def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 6, max_
             for k, v in x.items():
                 if str(k).strip().lower() in keyset:
                     return v
-            for child in x.values():
-                q.append((child, d + 1))
+            for v in x.values():
+                q.append((v, d + 1))
             continue
 
         if isinstance(x, list):
-            for child in x:
-                q.append((child, d + 1))
+            for it in x:
+                q.append((it, d + 1))
             continue
 
     return None
 
 
 def _pick_num(obj: Any, *keys: str, max_depth: int = 6) -> Optional[float]:
-    v = _find_first_value(obj, keys, max_depth=max_depth)
-    return _safe_float(v)
+    return _safe_float(_find_first_value(obj, keys, max_depth=max_depth))
 
 
 def _pick_pct(obj: Any, *keys: str, max_depth: int = 6) -> Optional[float]:
-    v = _find_first_value(obj, keys, max_depth=max_depth)
-    return _pct_if_fraction(v)
+    return _pct_if_fraction(_find_first_value(obj, keys, max_depth=max_depth))
 
 
 def _pick_str(obj: Any, *keys: str, max_depth: int = 6) -> Optional[str]:
-    v = _find_first_value(obj, keys, max_depth=max_depth)
-    return _safe_str(v)
+    return _safe_str(_find_first_value(obj, keys, max_depth=max_depth))
 
 
 # -----------------------------------------------------------------------------
-# Minimal TTL cache (fallback if cachetools isn't installed)
+# TTL cache fallback (import-safe if cachetools missing)
 # -----------------------------------------------------------------------------
 try:
     from cachetools import TTLCache  # type: ignore
@@ -384,7 +428,6 @@ except Exception:  # pragma: no cover
             return super().get(key, default)
 
         def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
-            # naive eviction
             if len(self) >= self._maxsize:
                 try:
                     oldest_key = next(iter(self.keys()))
@@ -397,120 +440,23 @@ except Exception:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# Output schema (subset; engine merge remains safe)
-# -----------------------------------------------------------------------------
-def _base(symbol: str) -> Dict[str, Any]:
-    return {
-        "status": "success",
-        "symbol": symbol,
-        "market": "KSA",
-        "currency": "SAR",
-        "data_source": PROVIDER_NAME,
-        "data_quality": "OK",
-        "error": "",
-        "provider_version": PROVIDER_VERSION,
-        "last_updated_utc": _utc_iso(),
-        # identity / fundamentals
-        "name": "",
-        "sector": "",
-        "industry": "",
-        "sub_sector": "",
-        "listing_date": "",
-        "shares_outstanding": None,
-        "free_float": None,
-        "market_cap": None,
-        "free_float_market_cap": None,
-        # price / liquidity
-        "current_price": None,
-        "previous_close": None,
-        "open": None,
-        "day_high": None,
-        "day_low": None,
-        "high_52w": None,
-        "low_52w": None,
-        "position_52w_percent": None,
-        "volume": None,
-        "avg_volume_30d": None,
-        "value_traded": None,
-        "turnover_percent": None,
-        # valuation / ratios (best-effort)
-        "eps_ttm": None,
-        "forward_eps": None,
-        "pe_ttm": None,
-        "forward_pe": None,
-        "pb": None,
-        "ps": None,
-        "ev_ebitda": None,
-        "dividend_yield": None,
-        "dividend_rate": None,
-        "payout_ratio": None,
-        "roe": None,
-        "roa": None,
-        "net_margin": None,
-        "ebitda_margin": None,
-        "revenue_growth": None,
-        "net_income_growth": None,
-        "beta": None,
-        "debt_to_equity": None,
-        "current_ratio": None,
-        "quick_ratio": None,
-        # technicals (best-effort)
-        "ma20": None,
-        "ma50": None,
-        # derived
-        "price_change": None,
-        "percent_change": None,
-    }
-
-
-def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
-    if cur is None or lo is None or hi is None:
-        return None
-    if hi == lo:
-        return None
-    return (cur - lo) / (hi - lo) * 100.0
-
-
-def _fill_derived(out: Dict[str, Any]) -> None:
-    cur = _safe_float(out.get("current_price"))
-    prev = _safe_float(out.get("previous_close"))
-    vol = _safe_float(out.get("volume"))
-
-    if out.get("price_change") is None and cur is not None and prev is not None:
-        out["price_change"] = cur - prev
-
-    if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        out["percent_change"] = (cur - prev) / prev * 100.0
-
-    if out.get("value_traded") is None and cur is not None and vol is not None:
-        out["value_traded"] = cur * vol
-
-    if out.get("position_52w_percent") is None:
-        out["position_52w_percent"] = _pos_52w(cur, _safe_float(out.get("low_52w")), _safe_float(out.get("high_52w")))
-
-    mc = _safe_float(out.get("market_cap"))
-    ff = _safe_float(out.get("free_float"))
-    if out.get("free_float_market_cap") is None and mc is not None and ff is not None:
-        out["free_float_market_cap"] = mc * (ff / 100.0)
-
-
-def _quality(out: Dict[str, Any]) -> None:
-    has_price = _safe_float(out.get("current_price")) is not None
-    rich = bool((out.get("name") or "").strip()) or (_safe_float(out.get("market_cap")) is not None)
-
-    if not has_price:
-        out["data_quality"] = "BAD"
-    else:
-        out["data_quality"] = "FULL" if rich else "OK"
-
-    if (out.get("error") or "").strip():
-        out["status"] = "error"
-
-
-# -----------------------------------------------------------------------------
-# Client
+# Tadawul client
 # -----------------------------------------------------------------------------
 class TadawulClient:
+    """
+    Returns PATCH dictionaries for engine merges.
+
+    Success patches include (best-effort):
+      current_price, previous_close, open, day_high, day_low, volume, value_traded,
+      price_change, percent_change,
+      name/sector/industry/sub_sector/listing_date,
+      market_cap/shares_outstanding/free_float/...,
+      week_52_high/week_52_low, ma20/ma50, avg_volume_30d, etc.
+
+    Failure patches:
+      {"error": "..."}   (never raises)
+    """
+
     def __init__(
         self,
         quote_url: Optional[str] = None,
@@ -530,6 +476,7 @@ class TadawulClient:
         self.retry_attempts = int(retry_attempts) if (retry_attempts and retry_attempts > 0) else _retry_attempts()
 
         timeout = httpx.Timeout(self.timeout_sec, connect=min(10.0, self.timeout_sec))
+
         base_headers = {
             "User-Agent": USER_AGENT,
             "Accept": "application/json,text/plain,text/html;q=0.9,*/*;q=0.8",
@@ -537,26 +484,24 @@ class TadawulClient:
         }
 
         # Optional custom headers from env JSON
-        hdrs: Dict[str, str] = {}
         raw = _safe_str(_env_str("TADAWUL_HEADERS_JSON", ""))
         if raw:
             try:
                 obj = json.loads(raw)
                 if isinstance(obj, dict):
-                    hdrs.update({str(k): str(v) for k, v in obj.items()})
+                    for k, v in obj.items():
+                        base_headers[str(k)] = str(v)
             except Exception:
                 pass
 
         if headers:
-            hdrs.update({str(k): str(v) for k, v in headers.items()})
-
-        base_headers.update(hdrs)
-        self._headers = base_headers
+            for k, v in headers.items():
+                base_headers[str(k)] = str(v)
 
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers=self._headers,
+            headers=base_headers,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
         )
 
@@ -574,29 +519,37 @@ class TadawulClient:
         )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass
 
     async def _get_json(self, url: str) -> Tuple[Optional[Union[Dict[str, Any], List[Any]]], Optional[str]]:
         retries = max(1, int(self.retry_attempts))
         base_delay = _retry_delay_sec()
 
+        last_err: Optional[str] = None
+
         for attempt in range(retries):
             try:
                 r = await self._client.get(url)
+                sc = int(r.status_code)
 
                 # Retry on 429 + 5xx
-                if r.status_code == 429 or 500 <= r.status_code < 600:
+                if sc == 429 or 500 <= sc < 600:
+                    last_err = f"HTTP {sc}"
                     if attempt < (retries - 1):
                         await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.35)
                         continue
-                    return None, f"HTTP {r.status_code}"
+                    return None, last_err
 
-                if r.status_code >= 400:
-                    return None, f"HTTP {r.status_code}"
+                if sc >= 400:
+                    return None, f"HTTP {sc}"
 
                 # Prefer json() but tolerate JSON-in-text
                 try:
-                    return r.json(), None
+                    js = r.json()
+                    return js, None
                 except Exception:
                     txt = (r.text or "").strip()
                     if txt.startswith("{") or txt.startswith("["):
@@ -607,40 +560,28 @@ class TadawulClient:
                     return None, "non-JSON response"
 
             except Exception as e:
+                last_err = f"{e.__class__.__name__}: {e}"
                 if attempt < (retries - 1):
                     await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.35)
                     continue
-                return None, f"{e.__class__.__name__}: {e}"
+                return None, last_err
 
-        return None, "unknown error"
+        return None, last_err or "unknown error"
 
-    def _enabled(self) -> bool:
-        v = os.getenv("TADAWUL_MARKET_ENABLED")
-        if v is None or str(v).strip() == "":
-            return True
-        return _to_bool(v, True)
-
+    # -------------------------------------------------------------------------
+    # Quote
+    # -------------------------------------------------------------------------
     async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
-        out = _base(symbol)
-
-        if not self._enabled():
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: disabled (TADAWUL_MARKET_ENABLED=false)"
-            return out
-
+        # Strict KSA-only (silent for non-KSA)
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: not a KSA symbol (expected 3-6 digits or .SR)"
-            return out
+            return {}
+
+        if not _enabled():
+            return {"error": "warning: tadawul disabled (TADAWUL_MARKET_ENABLED=false)"}
 
         if not self.quote_url:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: not configured (TADAWUL_QUOTE_URL)"
-            return out
+            return {"error": "warning: tadawul not configured (TADAWUL_QUOTE_URL)"}
 
         ck = f"quote::{sym}"
         hit = self._quote_cache.get(ck)
@@ -653,18 +594,23 @@ class TadawulClient:
         dt_ms = int((time.perf_counter() - t0) * 1000)
 
         if not data:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = f"tadawul: quote empty ({err or 'no data'}) ({dt_ms}ms)"
-            return out
+            return {"error": f"warning: tadawul quote empty ({err or 'no data'}) ({dt_ms}ms)"}
 
         root = _coerce_dict(data)
 
         # Quote fields (best-effort)
         price = _pick_num(
             root,
-            "price", "last", "last_price", "lastPrice", "tradingPrice", "close", "currentPrice", "c",
-            "trading_price", "lastTradePrice",
+            "price",
+            "last",
+            "last_price",
+            "lastPrice",
+            "tradingPrice",
+            "close",
+            "currentPrice",
+            "c",
+            "trading_price",
+            "lastTradePrice",
         )
         prev = _pick_num(root, "previous_close", "previousClose", "prevClose", "prev_close", "pc", "previousPrice")
         opn = _pick_num(root, "open", "openPrice", "o")
@@ -680,57 +626,46 @@ class TadawulClient:
         currency = _pick_str(root, "currency") or "SAR"
 
         if price is None:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = f"tadawul: quote missing price ({dt_ms}ms)"
-            return out
+            return {"error": f"warning: tadawul quote missing price ({dt_ms}ms)"}
 
-        out.update(
-            {
-                "symbol": sym,
-                "market": "KSA",
-                "currency": currency,
-                "name": name or "",
-                "current_price": price,
-                "previous_close": prev,
-                "open": opn,
-                "day_high": hi,
-                "day_low": lo,
-                "volume": vol,
-                "value_traded": val_traded,
-                "price_change": chg,
-                "percent_change": chg_p,
-                "last_updated_utc": _utc_iso(),
-            }
-        )
+        patch: Dict[str, Any] = {
+            "symbol": sym,
+            "currency": currency,
+            "name": name or "",
+            "current_price": price,
+            "previous_close": prev,
+            "open": opn,
+            "day_high": hi,
+            "day_low": lo,
+            "volume": vol,
+            "value_traded": val_traded,
+            "price_change": chg,
+            "percent_change": chg_p,
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "last_updated_utc": _utc_iso(),
+        }
 
-        _fill_derived(out)
-        _quality(out)
+        _fill_derived(patch)
+        patch = _clean_patch(patch)
 
-        self._quote_cache[ck] = dict(out)
-        return out
+        self._quote_cache[ck] = dict(patch)
+        return patch
 
+    # -------------------------------------------------------------------------
+    # Fundamentals
+    # -------------------------------------------------------------------------
     async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
-        out = _base(symbol)
-
-        if not self._enabled():
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: disabled (TADAWUL_MARKET_ENABLED=false)"
-            return out
-
+        # Strict KSA-only (silent for non-KSA)
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: not a KSA symbol (expected 3-6 digits or .SR)"
-            return out
+            return {}
+
+        if not _enabled():
+            return {"error": "warning: tadawul disabled (TADAWUL_MARKET_ENABLED=false)"}
 
         if not self.fundamentals_url:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: not configured (TADAWUL_FUNDAMENTALS_URL)"
-            return out
+            return {"error": "warning: tadawul not configured (TADAWUL_FUNDAMENTALS_URL)"}
 
         ck = f"fund::{sym}"
         hit = self._fund_cache.get(ck)
@@ -740,15 +675,21 @@ class TadawulClient:
         url = _format_url(self.fundamentals_url, sym)
         data, err = await self._get_json(url)
         if not data:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = f"tadawul: fundamentals empty ({err or 'no data'})"
-            return out
+            return {"error": f"warning: tadawul fundamentals empty ({err or 'no data'})"}
 
         root = _coerce_dict(data)
 
         # Identity
-        name = _pick_str(root, "name", "companyName", "company_name", "securityName", "issuerName", "shortName", "longName")
+        name = _pick_str(
+            root,
+            "name",
+            "companyName",
+            "company_name",
+            "securityName",
+            "issuerName",
+            "shortName",
+            "longName",
+        )
         sector = _pick_str(root, "sector", "sectorName", "sector_name")
         industry = _pick_str(root, "industry", "industryName", "industry_name")
         sub_sector = _pick_str(root, "sub_sector", "subSector", "subSectorName", "sub_sector_name", "subIndustry")
@@ -756,10 +697,24 @@ class TadawulClient:
 
         # Core fundamentals
         market_cap = _pick_num(root, "market_cap", "marketCap", "MarketCap", "mcap", "marketCapitalization")
-        shares_out = _pick_num(root, "shares_outstanding", "sharesOutstanding", "SharesOutstanding", "outstandingShares", "issuedShares")
-        free_float_pct = _pick_pct(root, "free_float", "freeFloat", "freeFloatPercent", "freeFloatPct", "freeFloatPercentage")
+        shares_out = _pick_num(
+            root,
+            "shares_outstanding",
+            "sharesOutstanding",
+            "SharesOutstanding",
+            "outstandingShares",
+            "issuedShares",
+        )
+        free_float_pct = _pick_pct(
+            root,
+            "free_float",
+            "freeFloat",
+            "freeFloatPercent",
+            "freeFloatPct",
+            "freeFloatPercentage",
+        )
 
-        # Ratios
+        # Ratios / valuation
         eps_ttm = _pick_num(root, "eps", "eps_ttm", "epsTTM", "earningsPerShare", "EarningsPerShare")
         forward_eps = _pick_num(root, "forward_eps", "epsForward", "forwardEPS")
         pe_ttm = _pick_num(root, "pe", "pe_ttm", "peTTM", "priceEarnings", "PERatio")
@@ -784,110 +739,116 @@ class TadawulClient:
         current_ratio = _pick_num(root, "current_ratio", "currentRatio", "CurrentRatio")
         quick_ratio = _pick_num(root, "quick_ratio", "quickRatio", "QuickRatio")
 
-        high_52w = _pick_num(root, "high_52w", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh")
-        low_52w = _pick_num(root, "low_52w", "52WeekLow", "fiftyTwoWeekLow", "yearLow")
+        # Technicals (best-effort)
+        wk_hi = _pick_num(root, "week_52_high", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh", "high_52w")
+        wk_lo = _pick_num(root, "week_52_low", "52WeekLow", "fiftyTwoWeekLow", "yearLow", "low_52w")
         ma20 = _pick_num(root, "ma20", "MA20", "20DayMA", "movingAverage20")
         ma50 = _pick_num(root, "ma50", "MA50", "50DayMA", "movingAverage50")
+        avg_vol_30d = _pick_num(root, "avg_volume_30d", "avgVolume30d", "AverageVolume", "averageVolume", "avgVol30")
 
-        out.update(
-            {
-                "symbol": sym,
-                "market": "KSA",
-                "currency": "SAR",
-                "name": name or "",
-                "sector": sector or "",
-                "industry": industry or "",
-                "sub_sector": sub_sector or "",
-                "listing_date": listing_date or "",
-                "market_cap": market_cap,
-                "shares_outstanding": shares_out,
-                "free_float": free_float_pct,
-                "free_float_market_cap": (market_cap * (free_float_pct / 100.0)) if (market_cap is not None and free_float_pct is not None) else None,
-                "eps_ttm": eps_ttm,
-                "forward_eps": forward_eps,
-                "pe_ttm": pe_ttm,
-                "forward_pe": forward_pe,
-                "pb": pb,
-                "ps": ps,
-                "ev_ebitda": ev_ebitda,
-                "dividend_yield": dividend_yield,
-                "dividend_rate": dividend_rate,
-                "payout_ratio": payout_ratio,
-                "roe": roe,
-                "roa": roa,
-                "net_margin": net_margin,
-                "ebitda_margin": ebitda_margin,
-                "revenue_growth": revenue_growth,
-                "net_income_growth": net_income_growth,
-                "beta": beta,
-                "debt_to_equity": debt_to_equity,
-                "current_ratio": current_ratio,
-                "quick_ratio": quick_ratio,
-                "high_52w": high_52w,
-                "low_52w": low_52w,
-                "ma20": ma20,
-                "ma50": ma50,
-                "last_updated_utc": _utc_iso(),
-            }
+        patch: Dict[str, Any] = {
+            "symbol": sym,
+            "currency": "SAR",
+            "name": name or "",
+            "sector": sector or "",
+            "industry": industry or "",
+            "sub_sector": sub_sector or "",
+            "listing_date": listing_date or "",
+            "market_cap": market_cap,
+            "shares_outstanding": shares_out,
+            "free_float": free_float_pct,
+            "free_float_market_cap": (market_cap * (free_float_pct / 100.0))
+            if (market_cap is not None and free_float_pct is not None)
+            else None,
+            "eps_ttm": eps_ttm,
+            "forward_eps": forward_eps,
+            "pe_ttm": pe_ttm,
+            "forward_pe": forward_pe,
+            "pb": pb,
+            "ps": ps,
+            "ev_ebitda": ev_ebitda,
+            "dividend_yield": dividend_yield,
+            "dividend_rate": dividend_rate,
+            "payout_ratio": payout_ratio,
+            "roe": roe,
+            "roa": roa,
+            "net_margin": net_margin,
+            "ebitda_margin": ebitda_margin,
+            "revenue_growth": revenue_growth,
+            "net_income_growth": net_income_growth,
+            "beta": beta,
+            "debt_to_equity": debt_to_equity,
+            "current_ratio": current_ratio,
+            "quick_ratio": quick_ratio,
+            "week_52_high": wk_hi,
+            "week_52_low": wk_lo,
+            "ma20": ma20,
+            "ma50": ma50,
+            "avg_volume_30d": avg_vol_30d,
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "last_updated_utc": _utc_iso(),
+        }
+
+        # keep only meaningful fundamentals
+        useful = bool((patch.get("name") or "").strip()) or (_safe_float(patch.get("market_cap")) is not None) or (
+            _safe_float(patch.get("shares_outstanding")) is not None
         )
-
-        useful = bool((out.get("name") or "").strip()) or (_safe_float(out.get("market_cap")) is not None) or (_safe_float(out.get("shares_outstanding")) is not None)
         if not useful:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "tadawul: fundamentals parsed but no identity/mcap/shares found"
-            return out
+            return {"error": "warning: tadawul fundamentals parsed but no identity/mcap/shares found"}
 
-        _fill_derived(out)
-        _quality(out)
+        _fill_derived(patch)
+        patch = _clean_patch(patch)
 
-        self._fund_cache[ck] = dict(out)
-        return out
+        self._fund_cache[ck] = dict(patch)
+        return patch
 
+    # -------------------------------------------------------------------------
+    # Combined (fundamentals + quote)
+    # -------------------------------------------------------------------------
     async def fetch_quote_and_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
-        """
-        Merge fundamentals first, then quote overwrites quote fields.
-        If quote succeeds but fundamentals fails → overall success with _warn.
-        If both fail → error.
-        """
-        f_task = self.fetch_fundamentals_patch(symbol)
-        q_task = self.fetch_quote_patch(symbol)
+        # Strict KSA-only (silent for non-KSA)
+        sym = _normalize_ksa_symbol(symbol)
+        if not sym:
+            return {}
+
+        # Run in parallel
+        f_task = self.fetch_fundamentals_patch(sym)
+        q_task = self.fetch_quote_patch(sym)
         f, q = await asyncio.gather(f_task, q_task)
 
-        out = _base(symbol)
+        out: Dict[str, Any] = {}
+        warns: List[str] = []
 
-        # Merge only meaningful values
-        for src in (f, q):
-            if not isinstance(src, dict):
-                continue
-            for k, v in src.items():
-                if v is None:
-                    continue
-                if isinstance(v, str) and not v.strip():
-                    continue
-                out[k] = v
+        # Merge fundamentals first
+        if isinstance(f, dict) and f:
+            if "error" in f and isinstance(f.get("error"), str) and f.get("error"):
+                warns.append(str(f.get("error")))
+            else:
+                out.update({k: v for k, v in f.items() if k != "error"})
 
-        f_err = (f.get("error") or "").strip() if isinstance(f, dict) else ""
-        q_err = (q.get("error") or "").strip() if isinstance(q, dict) else ""
+        # Merge quote second (overwrites quote fields)
+        if isinstance(q, dict) and q:
+            if "error" in q and isinstance(q.get("error"), str) and q.get("error"):
+                warns.append(str(q.get("error")))
+            else:
+                out.update({k: v for k, v in q.items() if k != "error"})
 
-        q_ok = isinstance(q, dict) and q.get("status") != "error" and (_safe_float(q.get("current_price")) is not None)
-        f_ok = isinstance(f, dict) and f.get("status") != "error" and (bool((f.get("name") or "").strip()) or (_safe_float(f.get("market_cap")) is not None))
+        # If we got nothing useful, return a single error (never raise)
+        if not out:
+            joined = " | ".join([w for w in warns if w])
+            return {"error": joined or "warning: tadawul unavailable"}
 
-        if not q_ok and not f_ok:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            joined = " | ".join([e for e in (q_err, f_err) if e])
-            out["error"] = joined or "tadawul: unknown error"
-            return out
-
-        # Non-fatal warnings (do NOT populate `error`, because that flips status)
-        warns = " | ".join([e for e in (q_err, f_err) if e])
+        # Attach non-fatal warnings as _warn (keeps engine fallback safe)
         if warns:
-            out["_warn"] = warns
+            out["_warn"] = " | ".join([w for w in warns if w])
 
         _fill_derived(out)
-        _quality(out)
-        return out
+        out["data_source"] = PROVIDER_NAME
+        out["provider_version"] = PROVIDER_VERSION
+        out["last_updated_utc"] = _utc_iso()
+
+        return _clean_patch(out)
 
 
 # -----------------------------------------------------------------------------
@@ -908,12 +869,10 @@ async def get_tadawul_client() -> TadawulClient:
 
 async def aclose_tadawul_client() -> None:
     global _CLIENT_SINGLETON
-    if _CLIENT_SINGLETON is None:
-        return
-    try:
-        await _CLIENT_SINGLETON.aclose()
-    finally:
-        _CLIENT_SINGLETON = None
+    c = _CLIENT_SINGLETON
+    _CLIENT_SINGLETON = None
+    if c is not None:
+        await c.aclose()
 
 
 # -----------------------------------------------------------------------------
@@ -955,4 +914,5 @@ __all__ = [
     "fetch_quote_and_enrichment_patch",
     "fetch_quote_and_fundamentals_patch",
     "PROVIDER_VERSION",
+    "PROVIDER_NAME",
 ]
