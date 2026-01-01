@@ -1,33 +1,38 @@
-# routes/enriched_quote.py — FULL REPLACEMENT — v5.2.0
+# routes/enriched_quote.py
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.2.0
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.3.0
 
 Aligned with your plan:
-- ✅ Always awaits async engine methods (prevents "<coroutine object ...>")
-- ✅ Works with BOTH async and sync engines
-- ✅ Never crashes: always returns HTTP 200 with status
+- ✅ Await-safe everywhere (engine + get_engine may be sync OR async)
+- ✅ Never crashes: always returns HTTP 200 with a status field
 - ✅ Prefers app.state.engine, else uses core.data_engine_v2.get_engine() (singleton)
-    -> avoids creating a NEW engine per request (keeps cache warm + consistent)
 - ✅ Supports refresh=1 and fields=... (best-effort pass-through)
-- ✅ Batch endpoint uses engine.get_enriched_quotes if available (fast), else loops safely
-- ✅ Backward-compat: if engine returns dict -> return as-is; else wrap {"value": ...}
+- ✅ Batch endpoint:
+    - uses engine.get_enriched_quotes if available
+    - handles list OR dict OR {"items":[...]} shapes
+- ✅ If engine returns dict without status, we inject status="ok" (Sheets/client safety)
 
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
 - GET /v1/enriched/quotes?symbols=AAPL,MSFT,1120.SR
+- GET /v1/enriched/health
 """
 
 from __future__ import annotations
 
 import inspect
+import os
+import re
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Query, Request
 
 router = APIRouter(tags=["enriched"])
+
+ENRICHED_ROUTE_VERSION = "5.3.0"
 
 
 # -----------------------------
@@ -51,11 +56,19 @@ def _normalize_symbol(sym: str) -> str:
     return (sym or "").strip()
 
 
-def _normalize_symbols_csv(csv: str) -> List[str]:
-    raw = (csv or "").strip()
-    if not raw:
+def _parse_symbols_list(raw: str) -> List[str]:
+    """
+    Accepts:
+      "AAPL,MSFT,1120.SR"
+      "AAPL MSFT 1120.SR"
+      "AAPL, MSFT  ,1120.SR"
+    Returns a clean list (keeps order).
+    """
+    s = (raw or "").strip()
+    if not s:
         return []
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    parts = re.split(r"[\s,]+", s)
+    return [p.strip() for p in parts if p and p.strip()]
 
 
 def _to_jsonable(payload: Any) -> Any:
@@ -97,6 +110,28 @@ def _to_jsonable(payload: Any) -> Any:
         return str(payload)
 
 
+def _debug_enabled(debug_q: int) -> bool:
+    if debug_q:
+        return True
+    v = (os.getenv("DEBUG_ERRORS") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _ensure_status_dict(d: Dict[str, Any], *, symbol: str = "", engine_source: str = "") -> Dict[str, Any]:
+    """
+    Ensure returned dict always includes a `status`.
+    Does not overwrite existing keys (except filling missing).
+    """
+    out = dict(d)
+    if "status" not in out:
+        out["status"] = "ok"
+    if symbol and "symbol" not in out:
+        out["symbol"] = symbol
+    if engine_source and "engine_source" not in out:
+        out["engine_source"] = engine_source
+    return out
+
+
 async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str]:
     """
     Prefer app.state.engine.
@@ -115,7 +150,8 @@ async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str
     try:
         from core.data_engine_v2 import get_engine  # type: ignore
 
-        eng = await get_engine()
+        maybe = get_engine()
+        eng = await _maybe_await(maybe)
         return eng, "core.data_engine_v2.get_engine()"
     except Exception:
         pass
@@ -151,7 +187,7 @@ def _call_engine_method_best_effort(
     if not callable(fn):
         raise AttributeError(f"Engine missing method {method_name}")
 
-    # Most explicit first (kwargs)
+    # kwargs-first
     try:
         return fn(symbol, refresh=refresh, fields=fields)
     except TypeError:
@@ -167,13 +203,13 @@ def _call_engine_method_best_effort(
     except TypeError:
         pass
 
-    # Positional variants
+    # positional variants
     try:
         return fn(symbol, refresh)
     except TypeError:
         pass
 
-    # Minimal
+    # minimal
     return fn(symbol)
 
 
@@ -191,7 +227,6 @@ def _call_engine_batch_best_effort(
     if not callable(fn):
         return None
 
-    # kwargs-first
     try:
         return fn(symbols, refresh=refresh, fields=fields)
     except TypeError:
@@ -218,16 +253,24 @@ def _call_engine_batch_best_effort(
 # -----------------------------
 # Routes
 # -----------------------------
+@router.get("/v1/enriched/health")
+async def enriched_health(request: Request) -> Dict[str, Any]:
+    eng, eng_src = await _get_engine_from_request(request)
+    engine_name = type(eng).__name__ if eng is not None else "none"
+    return {"status": "ok", "module": "routes.enriched_quote", "version": ENRICHED_ROUTE_VERSION, "engine": engine_name, "engine_source": eng_src}
+
+
 @router.get("/v1/enriched/quote")
 async def enriched_quote(
     request: Request,
     symbol: str = Query(..., description="Ticker symbol, e.g. 1120.SR or AAPL"),
     refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
-    fields: Optional[str] = Query(None, description="Optional hint to engine (comma-separated fields)"),
-    debug: int = Query(0, description="debug=1 includes a traceback on failure"),
+    fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
+    debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
 ) -> Dict[str, Any]:
     sym = _normalize_symbol(symbol)
     eng, eng_src = await _get_engine_from_request(request)
+    dbg = _debug_enabled(debug)
 
     if not sym:
         return {"status": "error", "error": "Missing symbol", "symbol": symbol, "engine_source": eng_src}
@@ -243,14 +286,12 @@ async def enriched_quote(
             refresh=bool(refresh),
             fields=fields,
         )
-
         res = await _maybe_await(raw)
 
-        # If engine already returns a dict (recommended), return it as-is
         if isinstance(res, dict):
-            return res
+            return _ensure_status_dict(res, symbol=sym, engine_source=eng_src)
 
-        # Otherwise wrap for backward compatibility
+        # wrap for backward compatibility
         return {"status": "ok", "symbol": sym, "engine_source": eng_src, "value": _to_jsonable(res)}
 
     except Exception as e:
@@ -260,7 +301,7 @@ async def enriched_quote(
             "engine_source": eng_src,
             "error": _clamp(e),
         }
-        if debug:
+        if dbg:
             out["trace"] = _clamp(traceback.format_exc(), 8000)
         return out
 
@@ -268,13 +309,18 @@ async def enriched_quote(
 @router.get("/v1/enriched/quotes")
 async def enriched_quotes(
     request: Request,
-    symbols: str = Query(..., description="Comma-separated list, e.g. AAPL,MSFT,1120.SR"),
+    symbols: str = Query(..., description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
     refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
-    fields: Optional[str] = Query(None, description="Optional hint to engine (comma-separated fields)"),
-    debug: int = Query(0, description="debug=1 includes a traceback on failure"),
+    fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
+    debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
+    max_symbols: int = Query(800, description="Safety limit for very large requests"),
 ) -> Dict[str, Any]:
     eng, eng_src = await _get_engine_from_request(request)
-    syms = _normalize_symbols_csv(symbols)
+    dbg = _debug_enabled(debug)
+
+    syms = _parse_symbols_list(symbols)
+    if max_symbols and max_symbols > 0 and len(syms) > max_symbols:
+        syms = syms[:max_symbols]
 
     if not syms:
         return {"status": "error", "error": "No valid symbols", "engine_source": eng_src, "items": []}
@@ -288,24 +334,40 @@ async def enriched_quotes(
         raw_batch = _call_engine_batch_best_effort(eng, syms, refresh=bool(refresh), fields=fields)
         if raw_batch is not None:
             res = await _maybe_await(raw_batch)
+
+            # common: {"items":[...]} already shaped
+            if isinstance(res, dict) and isinstance(res.get("items"), list):
+                out = dict(res)
+                out.setdefault("status", "ok")
+                out.setdefault("engine_source", eng_src)
+                out.setdefault("count", len(out.get("items") or []))
+                return out
+
+            # list: align by index when possible
             if isinstance(res, list):
-                # Ensure each item is dict-ish
                 for i, it in enumerate(res):
                     if isinstance(it, dict):
-                        items.append(it)
+                        items.append(_ensure_status_dict(it, symbol=syms[i] if i < len(syms) else "", engine_source=eng_src))
                     else:
-                        items.append({"status": "ok", "symbol": syms[i] if i < len(syms) else "", "value": _to_jsonable(it)})
+                        items.append({"status": "ok", "symbol": syms[i] if i < len(syms) else "", "engine_source": eng_src, "value": _to_jsonable(it)})
+                return {"status": "ok", "engine_source": eng_src, "count": len(items), "items": items}
+
+            # dict mapping {symbol: quote}
+            if isinstance(res, dict):
+                for s in syms:
+                    v = res.get(s) or res.get(s.upper()) or res.get(s.lower())
+                    if isinstance(v, dict):
+                        items.append(_ensure_status_dict(v, symbol=s, engine_source=eng_src))
+                    elif v is None:
+                        items.append({"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response"})
+                    else:
+                        items.append({"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(v)})
                 return {"status": "ok", "engine_source": eng_src, "count": len(items), "items": items}
 
         # Fallback: per-symbol loop (still PROD SAFE)
         fn = getattr(eng, "get_enriched_quote", None)
         if not callable(fn):
-            return {
-                "status": "error",
-                "error": "Engine missing method get_enriched_quote",
-                "engine_source": eng_src,
-                "items": [],
-            }
+            return {"status": "error", "error": "Engine missing method get_enriched_quote", "engine_source": eng_src, "items": []}
 
         for s in syms:
             try:
@@ -317,10 +379,13 @@ async def enriched_quotes(
                     fields=fields,
                 )
                 res = await _maybe_await(raw)
-                items.append(res if isinstance(res, dict) else {"status": "ok", "symbol": s, "value": _to_jsonable(res)})
+                if isinstance(res, dict):
+                    items.append(_ensure_status_dict(res, symbol=s, engine_source=eng_src))
+                else:
+                    items.append({"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(res)})
             except Exception as ex:
-                err_item: Dict[str, Any] = {"status": "error", "symbol": s, "error": _clamp(ex)}
-                if debug:
+                err_item: Dict[str, Any] = {"status": "error", "symbol": s, "engine_source": eng_src, "error": _clamp(ex)}
+                if dbg:
                     err_item["trace"] = _clamp(traceback.format_exc(), 4000)
                 items.append(err_item)
 
@@ -328,6 +393,9 @@ async def enriched_quotes(
 
     except Exception as e:
         out: Dict[str, Any] = {"status": "error", "engine_source": eng_src, "error": _clamp(e), "items": items}
-        if debug:
+        if dbg:
             out["trace"] = _clamp(traceback.format_exc(), 8000)
         return out
+
+
+__all__ = ["router"]
