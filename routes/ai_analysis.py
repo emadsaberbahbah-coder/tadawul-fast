@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.1.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.0) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -10,14 +10,14 @@ Key goals
 - Canonical headers: core.schemas.get_headers_for_sheet (when available); fallback defaults.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
-- Plan-aligned: supports Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
+- Plan-aligned: Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.1.0 upgrades
-- ✅ Keeps Recommendation enum everywhere: BUY / HOLD / REDUCE / SELL (normalized)
-- ✅ If core.schemas returns only 59 headers, mode=extended will APPEND extended columns (non-breaking)
-- ✅ Uses core.schemas.HEADER_TO_FIELD / header_to_field when available (better alignment)
-- ✅ Stronger batch alignment when engine returns dict OR list OR unordered list
-- ✅ More Sheets-safe status detection (Error + Data Quality)
+v4.2.0 upgrades
+- ✅ Fast path: cached schema imports + cached header plans (big speedup for large sheets)
+- ✅ Robust mapping for tricky headers: P/E (TTM), P/B, P/S, Forward P/E
+- ✅ Upside % + other ratio fields normalized to percent when values are in 0..1
+- ✅ Volatility normalized to % when 0..1
+- ✅ Recommendation enum enforced everywhere: BUY / HOLD / REDUCE / SELL
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -43,11 +44,11 @@ except Exception:  # pragma: no cover
     ConfigDict = None  # type: ignore
     _PYDANTIC_V2 = False
 
-
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.1.0"
+AI_ANALYSIS_VERSION = "4.2.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
+
 
 # =============================================================================
 # Settings shim (safe)
@@ -55,22 +56,26 @@ router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 try:
     from core.config import get_settings  # type: ignore
 except Exception:  # pragma: no cover
+
     def get_settings():  # type: ignore
         return None
 
 
 # =============================================================================
-# Schemas (lazy-safe via local import helper)
+# Schemas (lazy-safe + cached)
 # =============================================================================
+@lru_cache(maxsize=1)
 def _try_import_schemas():
     try:
         from core import schemas as sch  # type: ignore
+
         return sch
     except Exception:
         return None
 
 
-def _schemas_get_headers(sheet_name: Optional[str]) -> Optional[List[str]]:
+@lru_cache(maxsize=64)
+def _schemas_get_headers(sheet_name: Optional[str]) -> Optional[Tuple[str, ...]]:
     sch = _try_import_schemas()
     if sch is None:
         return None
@@ -79,16 +84,18 @@ def _schemas_get_headers(sheet_name: Optional[str]) -> Optional[List[str]]:
         try:
             h = fn(sheet_name)
             if isinstance(h, list) and len(h) >= 10:
-                return [str(x) for x in h]
+                return tuple(str(x) for x in h)
         except Exception:
             return None
     return None
 
 
-def _schemas_header_to_field(header: str) -> Optional[str]:
+@lru_cache(maxsize=2048)
+def _schemas_header_to_field_cached(header: str) -> Optional[str]:
     sch = _try_import_schemas()
     if sch is None:
         return None
+
     fn = getattr(sch, "header_to_field", None)
     if callable(fn):
         try:
@@ -97,7 +104,7 @@ def _schemas_header_to_field(header: str) -> Optional[str]:
             return out or None
         except Exception:
             return None
-    # fallback: direct dict
+
     m = getattr(sch, "HEADER_TO_FIELD", None)
     if isinstance(m, dict):
         try:
@@ -106,6 +113,7 @@ def _schemas_header_to_field(header: str) -> Optional[str]:
             return out or None
         except Exception:
             return None
+
     return None
 
 
@@ -116,38 +124,23 @@ _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
 
 def _normalize_recommendation(x: Any) -> str:
-    """
-    Canonical enum across all endpoints:
-      BUY / HOLD / REDUCE / SELL
-    """
+    """Canonical enum across all endpoints: BUY / HOLD / REDUCE / SELL."""
     if x is None:
         return "HOLD"
-
     try:
         s = str(x).strip().upper()
     except Exception:
         return "HOLD"
-
     if not s:
         return "HOLD"
-
     if s in _RECO_ENUM:
         return s
 
     s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
-
-    buy_like = {
-        "STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"
-    }
-    hold_like = {
-        "HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT", "KEEP"
-    }
-    reduce_like = {
-        "REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"
-    }
-    sell_like = {
-        "SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"
-    }
+    buy_like = {"STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"}
+    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT", "KEEP"}
+    reduce_like = {"REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"}
+    sell_like = {"SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"}
 
     if s2 in buy_like:
         return "BUY"
@@ -158,7 +151,6 @@ def _normalize_recommendation(x: Any) -> str:
     if s2 in sell_like:
         return "SELL"
 
-    # heuristic contains
     if "SELL" in s2:
         return "SELL"
     if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
@@ -172,7 +164,7 @@ def _normalize_recommendation(x: Any) -> str:
 
 
 # =============================================================================
-# Lazy imports: V2 helpers (PROD SAFE)
+# Lazy imports: V2 helpers (PROD SAFE) + cached normalize
 # =============================================================================
 def _fallback_normalize(raw: str) -> str:
     s = (raw or "").strip().upper()
@@ -193,15 +185,17 @@ def _fallback_normalize(raw: str) -> str:
     return f"{s}.US"
 
 
+@lru_cache(maxsize=1)
 def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
     """
-    Returns (DataEngine, UnifiedQuote, normalize_symbol_callable).
-    Never raises.
+    Returns (DataEngine, UnifiedQuote, normalize_symbol_callable). Never raises.
+    Cached to avoid repeated imports per row/cell.
     """
     try:
         from core.data_engine_v2 import DataEngine as _DE  # type: ignore
         from core.data_engine_v2 import UnifiedQuote as _UQ  # type: ignore
         from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
+
         return _DE, _UQ, _NS
     except Exception:
         return None, None, _fallback_normalize
@@ -210,8 +204,7 @@ def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
 def _normalize_any(raw: str) -> str:
     try:
         _, _, ns = _try_import_v2_symbols()
-        s = (ns(raw) or "").strip().upper()
-        return s
+        return (ns(raw) or "").strip().upper()
     except Exception:
         return (raw or "").strip().upper()
 
@@ -240,7 +233,6 @@ def _allowed_tokens() -> List[str]:
     """
     tokens: List[str] = []
 
-    # 1) settings
     try:
         s = get_settings()
         for attr in ("app_token", "backup_app_token"):
@@ -250,9 +242,9 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
-    # 2) env.settings
     try:
         from env import settings as env_settings  # type: ignore
+
         for attr in ("app_token", "backup_app_token"):
             v = _read_token_attr(env_settings, attr)
             if v:
@@ -260,13 +252,11 @@ def _allowed_tokens() -> List[str]:
     except Exception:
         pass
 
-    # 3) environment
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
         v = (os.getenv(k) or "").strip()
         if v:
             tokens.append(v)
 
-    # de-dup preserve order
     out: List[str] = []
     seen = set()
     for t in tokens:
@@ -282,7 +272,7 @@ def _allowed_tokens() -> List[str]:
 def _auth_ok(x_app_token: Optional[str]) -> bool:
     allowed = _allowed_tokens()
     if not allowed:
-        return True  # open mode
+        return True
     return bool(x_app_token and x_app_token.strip() in allowed)
 
 
@@ -332,10 +322,8 @@ async def _get_singleton_engine() -> Optional[Any]:
         if _ENGINE is None:
             try:
                 DE, _, _ = _try_import_v2_symbols()
-                if DE is None:
-                    _ENGINE = None
-                else:
-                    _ENGINE = DE()
+                _ENGINE = None if DE is None else DE()
+                if _ENGINE is not None:
                     logger.info("[analysis] DataEngine initialized (fallback singleton).")
             except Exception as exc:
                 logger.exception("[analysis] Failed to init DataEngine: %s", exc)
@@ -381,24 +369,17 @@ def _cfg() -> Dict[str, Any]:
     concurrency = _safe_int(getattr(s, "ai_batch_concurrency", None), 6)
     max_tickers = _safe_int(getattr(s, "ai_max_tickers", None), 800)
 
-    # env overrides
     batch_size = _safe_int(os.getenv("AI_BATCH_SIZE", batch_size), batch_size)
     timeout_sec = _safe_float_pos(os.getenv("AI_BATCH_TIMEOUT_SEC", timeout_sec), timeout_sec)
     concurrency = _safe_int(os.getenv("AI_BATCH_CONCURRENCY", concurrency), concurrency)
     max_tickers = _safe_int(os.getenv("AI_MAX_TICKERS", max_tickers), max_tickers)
 
-    # clamps
     batch_size = max(5, min(250, batch_size))
     timeout_sec = max(5.0, min(180.0, timeout_sec))
     concurrency = max(1, min(30, concurrency))
     max_tickers = max(10, min(3000, max_tickers))
 
-    return {
-        "batch_size": batch_size,
-        "timeout_sec": timeout_sec,
-        "concurrency": concurrency,
-        "max_tickers": max_tickers,
-    }
+    return {"batch_size": batch_size, "timeout_sec": timeout_sec, "concurrency": concurrency, "max_tickers": max_tickers}
 
 
 def _now_utc() -> datetime:
@@ -442,6 +423,7 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         return None
     try:
         from zoneinfo import ZoneInfo  # py3.9+
+
         tz = ZoneInfo("Asia/Riyadh")
         dt = _parse_iso_dt(utc_any)
         if dt is None:
@@ -540,13 +522,11 @@ class SheetAnalysisResponse(_ExtraIgnoreBase):
 def _safe_get(obj: Any, *names: str) -> Any:
     if obj is None:
         return None
-
     if isinstance(obj, dict):
         for n in names:
             if n in obj and obj[n] is not None:
                 return obj[n]
         return None
-
     for n in names:
         try:
             v = getattr(obj, n, None)
@@ -596,7 +576,9 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "free_float_market_cap": None,
         "liquidity_score": None,
         "pe_ttm": None,
+        "forward_pe": None,
         "pb": None,
+        "ps": None,
         "dividend_yield": None,
         "roe": None,
         "roa": None,
@@ -641,7 +623,7 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
         return []
     if size <= 0:
         return [items]
-    return [items[i: i + size] for i in range(0, len(items), size)]
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def _extract_sources_from_any(x: Any) -> List[str]:
@@ -681,6 +663,14 @@ def _vol_to_percent(v: Any) -> Any:
 def _hkey(h: str) -> str:
     s = str(h or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _snake_guess(header: str) -> str:
+    s = str(header or "").strip().lower()
+    s = s.replace("%", " percent ")
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
@@ -788,7 +778,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[f
         reco = "SELL"
 
     if risk is not None and risk >= 80:
-        # degrade one step (never below SELL)
         if reco == "BUY":
             reco = "HOLD"
         elif reco == "HOLD":
@@ -894,13 +883,13 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
     2) fallback defaults
 
     Enhancement:
-    - if mode=extended and schemas returned a short/canonical list (e.g. 59),
+    - if mode=extended and schemas returned a short/canonical list,
       append extended columns that are missing (no breaking reorder).
     """
     m = (mode or "").strip().lower()
 
     h = _schemas_get_headers(sheet_name)
-    if isinstance(h, list) and len(h) >= 10:
+    if h and len(h) >= 10:
         if m in ("ext", "extended", "full"):
             base_set = {str(x) for x in h}
             extras = [x for x in _DEFAULT_HEADERS_EXTENDED if x not in base_set]
@@ -945,6 +934,7 @@ def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
 def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
     i_err = _idx(headers, "Error")
     i_dq = _idx(headers, "Data Quality")
+
     any_err = False
     any_missing = False
 
@@ -963,27 +953,72 @@ def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
     return "success"
 
 
-def _snake_guess(header: str) -> str:
-    s = str(header or "").strip().lower()
-    s = s.replace("%", " percent ")
-    s = re.sub(r"[^\w]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s
+# =============================================================================
+# Header mapping plan (cached)
+# =============================================================================
+# Percent-like headers where a ratio (0..1) should become percent (0..100)
+_RATIO_HEADERS = {
+    "percent change",
+    "turnover %",
+    "free float %",
+    "dividend yield %",
+    "payout ratio %",
+    "roe %",
+    "roa %",
+    "net margin %",
+    "ebitda margin %",
+    "revenue growth %",
+    "net income growth %",
+    "upside %",
+    "returns 1w %",
+    "returns 1m %",
+    "returns 3m %",
+    "returns 6m %",
+    "returns 12m %",
+    "expected return 1m %",
+    "expected return 3m %",
+    "expected return 12m %",
+}
+
+_VOL_HEADERS = {"volatility (30d)"}
 
 
-# =============================================================================
-# Header mapping (schemas-aware + extended)
-# =============================================================================
-# local aliases for extended fields that are not in canonical schemas
 _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
+    "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
+    "sector": (("sector",), None),
     "sub-sector": (("sub_sector", "subsector"), None),
     "sub sector": (("sub_sector", "subsector"), None),
+    "market": (("market", "market_region"), None),
+    "currency": (("currency",), None),
+    "listing date": (("listing_date", "ipo"), None),
     "last price": (("current_price", "last_price", "price"), None),
+    "previous close": (("previous_close",), None),
+    "price change": (("price_change", "change"), None),
     "percent change": (("percent_change", "change_pct", "change_percent"), _ratio_to_percent),
+    "day high": (("day_high",), None),
+    "day low": (("day_low",), None),
+    "52w high": (("week_52_high", "high_52w", "52w_high"), None),
+    "52w low": (("week_52_low", "low_52w", "52w_low"), None),
+    "52w position %": (("position_52w_percent", "position_52w"), None),
+    "volume": (("volume",), None),
+    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
+    "value traded": (("value_traded",), None),
     "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
+    "shares outstanding": (("shares_outstanding",), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
+    "market cap": (("market_cap",), None),
+    "free float market cap": (("free_float_market_cap",), None),
+    "liquidity score": (("liquidity_score",), None),
+    "eps (ttm)": (("eps_ttm", "eps"), None),
+    "forward eps": (("forward_eps",), None),
+    "p/e (ttm)": (("pe_ttm",), None),
+    "forward p/e": (("forward_pe",), None),
+    "p/b": (("pb",), None),
+    "p/s": (("ps",), None),
+    "ev/ebitda": (("ev_ebitda",), None),
     "dividend yield %": (("dividend_yield",), _ratio_to_percent),
+    "dividend rate": (("dividend_rate",), None),
     "payout ratio %": (("payout_ratio",), _ratio_to_percent),
     "roe %": (("roe",), _ratio_to_percent),
     "roa %": (("roa",), _ratio_to_percent),
@@ -991,9 +1026,24 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
+    "beta": (("beta",), None),
     "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "rsi (14)": (("rsi14", "rsi_14"), None),
-
+    "fair value": (("fair_value",), None),
+    "upside %": (("upside_percent",), _ratio_to_percent),
+    "valuation label": (("valuation_label",), None),
+    "value score": (("value_score",), None),
+    "quality score": (("quality_score",), None),
+    "momentum score": (("momentum_score",), None),
+    "opportunity score": (("opportunity_score",), None),
+    "risk score": (("risk_score",), None),
+    "overall score": (("overall_score",), None),
+    "recommendation": (("recommendation",), None),
+    "data source": (("data_source", "source", "provider"), None),
+    "data quality": (("data_quality",), None),
+    "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
+    "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
+    "error": (("error",), None),
     # Extended fields
     "returns 1w %": (("returns_1w",), _ratio_to_percent),
     "returns 1m %": (("returns_1m",), _ratio_to_percent),
@@ -1014,22 +1064,81 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "history points": (("history_points",), None),
     "history source": (("history_source",), None),
     "history last (utc)": (("history_last_utc",), _iso_or_none),
-
-    "data source": (("data_source", "source"), None),
-    "data quality": (("data_quality",), None),
-    "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
-    "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
-    "error": (("error",), None),
-    "recommendation": (("recommendation",), None),
-    "overall score": (("overall_score",), None),
-    "fair value": (("fair_value",), None),
-    "upside %": (("upside_percent",), None),
-    "valuation label": (("valuation_label",), None),
 }
 
 
-def _value_for_header(header: str, uq: Any) -> Any:
-    hk = _hkey(header)
+@dataclass(frozen=True)
+class _HeaderMeta:
+    header: str
+    hk: str
+    schema_field: Optional[str]
+    local_fields: Optional[Tuple[str, ...]]
+    local_transform: Optional[Any]
+    guess: str
+
+
+@dataclass(frozen=True)
+class _HeaderPlan:
+    metas: Tuple[_HeaderMeta, ...]
+    need_52w: bool
+    need_val: bool
+    need_overall: bool
+    need_last_utc: bool
+    need_last_riyadh: bool
+
+
+@lru_cache(maxsize=64)
+def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
+    metas: List[_HeaderMeta] = []
+    need_52w = False
+    need_val = False
+    need_overall = False
+    need_last_utc = False
+    need_last_riyadh = False
+
+    for h in headers:
+        hk = _hkey(h)
+        if hk in ("52w position %", "52w position"):
+            need_52w = True
+        if hk in ("fair value", "upside %", "valuation label"):
+            need_val = True
+        if hk in ("recommendation", "overall score"):
+            need_overall = True
+        if hk == "last updated (utc)":
+            need_last_utc = True
+        if hk == "last updated (riyadh)":
+            need_last_riyadh = True
+
+        schema_field = _schemas_header_to_field_cached(h)
+        local = _LOCAL_HEADER_MAP.get(hk)
+        if local:
+            lf, lt = local
+        else:
+            lf, lt = None, None
+
+        metas.append(
+            _HeaderMeta(
+                header=h,
+                hk=hk,
+                schema_field=schema_field,
+                local_fields=lf,
+                local_transform=lt,
+                guess=_snake_guess(h),
+            )
+        )
+
+    return _HeaderPlan(
+        metas=tuple(metas),
+        need_52w=need_52w,
+        need_val=need_val,
+        need_overall=need_overall,
+        need_last_utc=need_last_utc,
+        need_last_riyadh=need_last_riyadh,
+    )
+
+
+def _value_for_meta(meta: _HeaderMeta, uq: Any, *, fair_pack: Optional[Tuple[Any, Any, Any]], overall_pack: Optional[Tuple[Any, Any, Any]]) -> Any:
+    hk = meta.hk
 
     # 52W Position computed if missing
     if hk in ("52w position %", "52w position"):
@@ -1043,9 +1152,7 @@ def _value_for_header(header: str, uq: Any) -> Any:
 
     # Timestamps fill
     if hk == "last updated (utc)":
-        v = _safe_get(uq, "last_updated_utc", "as_of_utc")
-        if not v:
-            v = _now_utc_iso()
+        v = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         return _iso_or_none(v)
 
     if hk == "last updated (riyadh)":
@@ -1056,21 +1163,21 @@ def _value_for_header(header: str, uq: Any) -> Any:
         return _iso_or_none(v) or v
 
     # Valuation / overall / reco computed if missing
-    if hk in ("fair value", "upside %", "valuation label", "recommendation", "overall score"):
-        fair, upside, label = _compute_fair_value_and_upside(uq)
-        overall_calc, reco_calc, _ = _compute_overall_and_reco(uq)
-
+    if hk in ("fair value", "upside %", "valuation label"):
+        fair, upside, label = fair_pack or (None, None, None)
         if hk == "fair value":
             v = _safe_get(uq, "fair_value")
             return v if v is not None else fair
-
         if hk == "upside %":
             v = _safe_get(uq, "upside_percent")
-            return v if v is not None else upside
-
+            vv = v if v is not None else upside
+            return _ratio_to_percent(vv)
         if hk == "valuation label":
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
+
+    if hk in ("overall score", "recommendation"):
+        overall_calc, reco_calc, _conf01 = overall_pack or (None, "HOLD", None)
 
         if hk == "overall score":
             v = _safe_get(uq, "overall_score")
@@ -1082,44 +1189,57 @@ def _value_for_header(header: str, uq: Any) -> Any:
             return _normalize_recommendation(raw)
 
     # 1) schemas mapping if available
-    f = _schemas_header_to_field(header)
-    if f:
-        v = _safe_get(uq, f)
-        # apply safe percent normalization for common percent fields
-        if hk in ("percent change", "dividend yield %", "roe %", "roa %", "payout ratio %", "turnover %", "free float %"):
-            return _ratio_to_percent(v)
+    if meta.schema_field:
+        v = _safe_get(uq, meta.schema_field)
+        if hk in _RATIO_HEADERS:
+            v = _ratio_to_percent(v)
+        if hk in _VOL_HEADERS:
+            v = _vol_to_percent(v)
         if hk == "recommendation":
             return _normalize_recommendation(v)
         return v
 
     # 2) local mapping
-    spec = _LOCAL_HEADER_MAP.get(hk)
-    if spec:
-        fields, transform = spec
-        val = _safe_get(uq, *fields)
+    if meta.local_fields:
+        val = _safe_get(uq, *meta.local_fields)
         if hk == "recommendation":
             return _normalize_recommendation(val)
-        if transform and val is not None:
+        if hk in _RATIO_HEADERS:
+            val = _ratio_to_percent(val)
+        if hk in _VOL_HEADERS:
+            val = _vol_to_percent(val)
+        if meta.local_transform and val is not None:
             try:
-                return transform(val)
+                return meta.local_transform(val)
             except Exception:
                 return val
         return val
 
     # 3) fallback snake-case guess
-    guess = _snake_guess(header)
-    val = _safe_get(uq, guess)
+    val = _safe_get(uq, meta.guess)
     if hk == "recommendation":
         return _normalize_recommendation(val)
+    if hk in _RATIO_HEADERS:
+        return _ratio_to_percent(val)
+    if hk in _VOL_HEADERS:
+        return _vol_to_percent(val)
     return val
 
 
-def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
-    # Try to fill Riyadh if requested
-    if _idx(headers, "Last Updated (Riyadh)") is not None:
-        last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc")
+def _row_from_plan(plan: _HeaderPlan, uq: Any) -> List[Any]:
+    fair_pack: Optional[Tuple[Any, Any, Any]] = None
+    overall_pack: Optional[Tuple[Any, Any, Any]] = None
+
+    if plan.need_val:
+        fair_pack = _compute_fair_value_and_upside(uq)
+    if plan.need_overall:
+        overall_pack = _compute_overall_and_reco(uq)
+
+    # Fill Riyadh on the object if present in headers (helps other consumers too)
+    if plan.need_last_riyadh:
+        last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         last_riy = _safe_get(uq, "last_updated_riyadh")
-        if not last_riy and last_utc:
+        if not last_riy:
             try:
                 riy = _to_riyadh_iso(last_utc) or ""
                 if isinstance(uq, dict):
@@ -1129,10 +1249,10 @@ def _row_from_headers(headers: List[str], uq: Any) -> List[Any]:
             except Exception:
                 pass
 
-    row = [_value_for_header(h, uq) for h in headers]
-    if len(row) < len(headers):
-        row += [None] * (len(headers) - len(row))
-    return row[: len(headers)]
+    row = [_value_for_meta(m, uq, fair_pack=fair_pack, overall_pack=overall_pack) for m in plan.metas]
+    if len(row) < len(plan.metas):
+        row += [None] * (len(plan.metas) - len(row))
+    return row[: len(plan.metas)]
 
 
 # =============================================================================
@@ -1177,14 +1297,6 @@ def _index_keys_for_quote(q: Any) -> List[str]:
 
 
 async def _engine_get_quotes_any(engine: Any, syms: List[str]) -> Union[List[Any], Dict[str, Any]]:
-    """
-    Compatibility shim:
-    - Prefer engine.get_enriched_quotes if present
-    - Else engine.get_quotes
-    - Else per-symbol engine.get_enriched_quote/get_quote
-
-    Engine may return: list OR dict OR (payload, err)
-    """
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
         res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
@@ -1252,10 +1364,8 @@ async def _get_quotes_chunked(
                 out[s.upper()] = _make_placeholder(s, dq="MISSING", err=msg)
             continue
 
-        # Build map for this chunk
         chunk_map: Dict[str, Any] = {}
 
-        # Case dict: use its entries as direct mapping
         if isinstance(res, dict):
             for k, v in res.items():
                 q = _finalize_quote(_unwrap_tuple_payload(v))
@@ -1264,11 +1374,8 @@ async def _get_quotes_chunked(
                     chunk_map.setdefault(kk, q)
                 for alt in _index_keys_for_quote(q):
                     chunk_map.setdefault(alt, q)
-
-        # Case list
         else:
             returned = list(res or [])
-            # If length matches, assume aligned order but still index by symbol keys
             if len(returned) == len(chunk_syms):
                 for i, s in enumerate(chunk_syms):
                     q = _finalize_quote(_unwrap_tuple_payload(returned[i]))
@@ -1292,9 +1399,9 @@ async def _get_quotes_chunked(
 # Transform
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
-    # optional scoring enrichment (never required)
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
+
         uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
@@ -1322,7 +1429,6 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
     if conf is None:
         conf = conf01_calc
     else:
-        # normalize confidence to 0..1 if looks like 0..100
         try:
             cf = float(conf)
             if 1.0 < cf <= 100.0:
@@ -1370,7 +1476,7 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         recommendation=reco_norm,
         confidence=conf,
         fair_value=fair2 if fair2 is not None else fair_calc,
-        upside_percent=upside2 if upside2 is not None else upside_calc,
+        upside_percent=_ratio_to_percent(upside2 if upside2 is not None else upside_calc),
         valuation_label=val_label2 if val_label2 is not None else val_label_calc,
         last_updated_utc=last_utc_iso,
         sources=_extract_sources_from_any(_safe_get(uq, "data_source", "source")),
@@ -1394,11 +1500,7 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = (
-                getattr(eng, "ENGINE_VERSION", None)
-                or getattr(eng, "engine_version", None)
-                or getattr(eng, "version", None)
-            )
+            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1440,13 +1542,7 @@ async def analyze_single_quote(
         return SingleAnalysisResponse(symbol="", data_quality="MISSING", error="Symbol is required")
 
     cfg = _cfg()
-    m = await _get_quotes_chunked(
-        request,
-        [t],
-        batch_size=1,
-        timeout_sec=cfg["timeout_sec"],
-        max_concurrency=1,
-    )
+    m = await _get_quotes_chunked(request, [t], batch_size=1, timeout_sec=cfg["timeout_sec"], max_concurrency=1)
 
     key = _normalize_any(t) or t.strip().upper()
     uq = m.get(key) or _make_placeholder(key, dq="MISSING", err="No data returned")
@@ -1470,11 +1566,7 @@ async def analyze_batch_quotes(
         tickers = tickers[: cfg["max_tickers"]]
 
     m = await _get_quotes_chunked(
-        request,
-        tickers,
-        batch_size=cfg["batch_size"],
-        timeout_sec=cfg["timeout_sec"],
-        max_concurrency=cfg["concurrency"],
+        request, tickers, batch_size=cfg["batch_size"], timeout_sec=cfg["timeout_sec"], max_concurrency=cfg["concurrency"]
     )
 
     results: List[SingleAnalysisResponse] = []
@@ -1511,19 +1603,17 @@ async def analyze_for_sheet(
     if len(tickers) > cfg["max_tickers"]:
         tickers = tickers[: cfg["max_tickers"]]
 
+    plan = _build_header_plan(tuple(headers))
+
     try:
         m = await _get_quotes_chunked(
-            request,
-            tickers,
-            batch_size=cfg["batch_size"],
-            timeout_sec=cfg["timeout_sec"],
-            max_concurrency=cfg["concurrency"],
+            request, tickers, batch_size=cfg["batch_size"], timeout_sec=cfg["timeout_sec"], max_concurrency=cfg["concurrency"]
         )
 
         rows: List[List[Any]] = []
         for t in tickers:
             uq = m.get(t) or _make_placeholder(t, dq="MISSING", err="No data returned")
-            # ensure recommendation enum
+            # enforce recommendation enum on object (helps any downstream too)
             try:
                 if isinstance(uq, dict):
                     uq["recommendation"] = _normalize_recommendation(uq.get("recommendation"))
@@ -1531,7 +1621,7 @@ async def analyze_for_sheet(
                     setattr(uq, "recommendation", _normalize_recommendation(getattr(uq, "recommendation", None)))
             except Exception:
                 pass
-            rows.append(_row_from_headers(headers, uq))
+            rows.append(_row_from_plan(plan, uq))
 
         status = _status_from_rows(headers, rows)
         return SheetAnalysisResponse(headers=headers, rows=rows, status=status)
