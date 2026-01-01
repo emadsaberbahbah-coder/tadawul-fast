@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.1) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,12 +12,10 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.2.0 upgrades
-- ✅ Fast path: cached schema imports + cached header plans (big speedup for large sheets)
-- ✅ Robust mapping for tricky headers: P/E (TTM), P/B, P/S, Forward P/E
-- ✅ Upside % + other ratio fields normalized to percent when values are in 0..1
-- ✅ Volatility normalized to % when 0..1
-- ✅ Recommendation enum enforced everywhere: BUY / HOLD / REDUCE / SELL
+v4.2.1 upgrades
+- ✅ Enforce recommendation enum on every quote object early (dict/attr) to avoid propagation gaps.
+- ✅ Extended headers append is now case-insensitive (prevents duplicate columns from schema casing).
+- ✅ Minor hardening: always non-empty recommendation in all rows/outputs (BUY/HOLD/REDUCE/SELL).
 """
 
 from __future__ import annotations
@@ -46,7 +44,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.2.0"
+AI_ANALYSIS_VERSION = "4.2.1"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -163,6 +161,19 @@ def _normalize_recommendation(x: Any) -> str:
     return "HOLD"
 
 
+def _ensure_reco_on_obj(uq: Any) -> None:
+    """Force recommendation enum on dict-like or attribute objects. Never raises."""
+    try:
+        if uq is None:
+            return
+        if isinstance(uq, dict):
+            uq["recommendation"] = _normalize_recommendation(uq.get("recommendation"))
+        else:
+            setattr(uq, "recommendation", _normalize_recommendation(getattr(uq, "recommendation", None)))
+    except Exception:
+        pass
+
+
 # =============================================================================
 # Lazy imports: V2 helpers (PROD SAFE) + cached normalize
 # =============================================================================
@@ -206,7 +217,7 @@ def _normalize_any(raw: str) -> str:
         _, _, ns = _try_import_v2_symbols()
         return (ns(raw) or "").strip().upper()
     except Exception:
-        return (raw or "").strip().upper()
+        return _fallback_normalize(raw)
 
 
 # =============================================================================
@@ -541,9 +552,10 @@ def _finalize_quote(uq: Any) -> Any:
     try:
         fn = getattr(uq, "finalize", None)
         if callable(fn):
-            return fn()
+            uq = fn()
     except Exception:
         pass
+    _ensure_reco_on_obj(uq)
     return uq
 
 
@@ -885,14 +897,15 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
     Enhancement:
     - if mode=extended and schemas returned a short/canonical list,
       append extended columns that are missing (no breaking reorder).
+    - append check is case-insensitive to avoid duplicates.
     """
     m = (mode or "").strip().lower()
 
     h = _schemas_get_headers(sheet_name)
     if h and len(h) >= 10:
         if m in ("ext", "extended", "full"):
-            base_set = {str(x) for x in h}
-            extras = [x for x in _DEFAULT_HEADERS_EXTENDED if x not in base_set]
+            base_set_ci = {str(x).strip().lower() for x in h}
+            extras = [x for x in _DEFAULT_HEADERS_EXTENDED if x.strip().lower() not in base_set_ci]
             return list(h) + extras
         return list(h)
 
@@ -956,7 +969,6 @@ def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
 # =============================================================================
 # Header mapping plan (cached)
 # =============================================================================
-# Percent-like headers where a ratio (0..1) should become percent (0..100)
 _RATIO_HEADERS = {
     "percent change",
     "turnover %",
@@ -1137,10 +1149,15 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
     )
 
 
-def _value_for_meta(meta: _HeaderMeta, uq: Any, *, fair_pack: Optional[Tuple[Any, Any, Any]], overall_pack: Optional[Tuple[Any, Any, Any]]) -> Any:
+def _value_for_meta(
+    meta: _HeaderMeta,
+    uq: Any,
+    *,
+    fair_pack: Optional[Tuple[Any, Any, Any]],
+    overall_pack: Optional[Tuple[Any, Any, Any]],
+) -> Any:
     hk = meta.hk
 
-    # 52W Position computed if missing
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
@@ -1150,7 +1167,6 @@ def _value_for_meta(meta: _HeaderMeta, uq: Any, *, fair_pack: Optional[Tuple[Any
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
-    # Timestamps fill
     if hk == "last updated (utc)":
         v = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         return _iso_or_none(v)
@@ -1162,7 +1178,6 @@ def _value_for_meta(meta: _HeaderMeta, uq: Any, *, fair_pack: Optional[Tuple[Any
             v = _to_riyadh_iso(u) or ""
         return _iso_or_none(v) or v
 
-    # Valuation / overall / reco computed if missing
     if hk in ("fair value", "upside %", "valuation label"):
         fair, upside, label = fair_pack or (None, None, None)
         if hk == "fair value":
@@ -1178,11 +1193,9 @@ def _value_for_meta(meta: _HeaderMeta, uq: Any, *, fair_pack: Optional[Tuple[Any
 
     if hk in ("overall score", "recommendation"):
         overall_calc, reco_calc, _conf01 = overall_pack or (None, "HOLD", None)
-
         if hk == "overall score":
             v = _safe_get(uq, "overall_score")
             return v if v is not None else overall_calc
-
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
             raw = v if v is not None else reco_calc
@@ -1235,7 +1248,6 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any) -> List[Any]:
     if plan.need_overall:
         overall_pack = _compute_overall_and_reco(uq)
 
-    # Fill Riyadh on the object if present in headers (helps other consumers too)
     if plan.need_last_riyadh:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         last_riy = _safe_get(uq, "last_updated_riyadh")
@@ -1390,7 +1402,9 @@ async def _get_quotes_chunked(
 
         for s in chunk_syms:
             s_up = s.upper()
-            out[s_up] = chunk_map.get(s_up) or _make_placeholder(s_up, dq="MISSING", err="No data returned")
+            uq = chunk_map.get(s_up) or _make_placeholder(s_up, dq="MISSING", err="No data returned")
+            _ensure_reco_on_obj(uq)
+            out[s_up] = uq
 
     return out
 
@@ -1405,6 +1419,8 @@ def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse
         uq = enrich_with_scores(uq)  # type: ignore
     except Exception:
         pass
+
+    _ensure_reco_on_obj(uq)
 
     sym = (_safe_get(uq, "symbol") or _normalize_any(requested_symbol) or requested_symbol or "").upper()
 
@@ -1500,7 +1516,11 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
+            engine_version = (
+                getattr(eng, "ENGINE_VERSION", None)
+                or getattr(eng, "engine_version", None)
+                or getattr(eng, "version", None)
+            )
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1546,6 +1566,7 @@ async def analyze_single_quote(
 
     key = _normalize_any(t) or t.strip().upper()
     uq = m.get(key) or _make_placeholder(key, dq="MISSING", err="No data returned")
+    _ensure_reco_on_obj(uq)
     return _quote_to_analysis(t, uq)
 
 
@@ -1566,12 +1587,17 @@ async def analyze_batch_quotes(
         tickers = tickers[: cfg["max_tickers"]]
 
     m = await _get_quotes_chunked(
-        request, tickers, batch_size=cfg["batch_size"], timeout_sec=cfg["timeout_sec"], max_concurrency=cfg["concurrency"]
+        request,
+        tickers,
+        batch_size=cfg["batch_size"],
+        timeout_sec=cfg["timeout_sec"],
+        max_concurrency=cfg["concurrency"],
     )
 
     results: List[SingleAnalysisResponse] = []
     for t in tickers:
         uq = m.get(t) or _make_placeholder(t, dq="MISSING", err="No data returned")
+        _ensure_reco_on_obj(uq)
         results.append(_quote_to_analysis(t, uq))
 
     return BatchAnalysisResponse(results=results)
@@ -1607,20 +1633,17 @@ async def analyze_for_sheet(
 
     try:
         m = await _get_quotes_chunked(
-            request, tickers, batch_size=cfg["batch_size"], timeout_sec=cfg["timeout_sec"], max_concurrency=cfg["concurrency"]
+            request,
+            tickers,
+            batch_size=cfg["batch_size"],
+            timeout_sec=cfg["timeout_sec"],
+            max_concurrency=cfg["concurrency"],
         )
 
         rows: List[List[Any]] = []
         for t in tickers:
             uq = m.get(t) or _make_placeholder(t, dq="MISSING", err="No data returned")
-            # enforce recommendation enum on object (helps any downstream too)
-            try:
-                if isinstance(uq, dict):
-                    uq["recommendation"] = _normalize_recommendation(uq.get("recommendation"))
-                else:
-                    setattr(uq, "recommendation", _normalize_recommendation(getattr(uq, "recommendation", None)))
-            except Exception:
-                pass
+            _ensure_reco_on_obj(uq)
             rows.append(_row_from_plan(plan, uq))
 
         status = _status_from_rows(headers, rows)
