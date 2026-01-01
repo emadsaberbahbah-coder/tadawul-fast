@@ -1,13 +1,13 @@
-# core/schemas.py  (FULL REPLACEMENT)
+# core/schemas.py
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.4.1 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.4.2 (PROD SAFE)
 
 Purpose
 - Single source of truth for the canonical 59-column quote schema.
 - Provide get_headers_for_sheet(sheet_name) used by:
-    - core/enriched_quote.py
+    - routes/enriched_quote.py
     - routes/ai_analysis.py
     - routes/advanced_analysis.py
     - Google Apps Script sheet builders
@@ -24,11 +24,10 @@ Design rules
     - HEADER_FIELD_CANDIDATES adds multi-field fallbacks for engine/provider variations
     - FIELD_TO_HEADER recognizes common alias fields (week_52_high vs high_52w etc.)
 
-✅ v3.4.1 enhancements (this revision)
-- Header lookup is now tolerant to casing/punctuation variants:
-  "Sub Sector" == "Sub-Sector", "Avg Volume (30d)" == "Avg Volume (30D)", etc.
-- header_to_field() and header_field_candidates() normalize header labels before mapping.
-- Adds a few practical alias fields seen in providers (safe, non-breaking).
+v3.4.2 (this revision)
+- ✅ header_to_field() returns "" for unknown headers (prevents bad field lookups).
+- ✅ More header synonyms (52W variants, Avg Volume/Volatility variants).
+- ✅ Keeps tolerant normalization: "Sub Sector" == "Sub-Sector", "Avg Volume (30d)" == "Avg Volume (30D)".
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.4.1"
+SCHEMAS_VERSION = "3.4.2"
 
 # =============================================================================
 # Canonical 59-column schema (SOURCE OF TRUTH)
@@ -206,7 +205,6 @@ def _norm_header_label(h: Optional[str]) -> str:
     s = str(h or "").strip().lower()
     if not s:
         return ""
-    # unify separators and remove noisy punctuation
     s = s.replace("%", " percent ")
     s = re.sub(r"[()\[\]{}]", " ", s)
     s = re.sub(r"[^a-z0-9]+", "_", s)
@@ -221,20 +219,33 @@ for _h in _DEFAULT_59_TUPLE:
 
 # Common synonyms/variants that appear in code/sheets
 _HEADER_SYNONYMS: Dict[str, str] = {
+    # names
     "sub_sector": "Sub-Sector",
     "subsector": "Sub-Sector",
+    # avg volume / vol
     "avg_volume_30d": "Avg Volume (30D)",
-    "avg_volume_30d_": "Avg Volume (30D)",
+    "avg_vol_30d": "Avg Volume (30D)",
+    "avg_volume_30day": "Avg Volume (30D)",
     "volatility_30d": "Volatility (30D)",
+    "vol_30d": "Volatility (30D)",
+    # timestamps
     "last_updated_utc": "Last Updated (UTC)",
     "last_updated_riyadh": "Last Updated (Riyadh)",
     "last_updated_ksa": "Last Updated (Riyadh)",
+    # percent labels
     "free_float_percent": "Free Float %",
     "turnover_percent": "Turnover %",
     "dividend_yield_percent": "Dividend Yield %",
     "payout_ratio_percent": "Payout Ratio %",
     "roe_percent": "ROE %",
     "roa_percent": "ROA %",
+    # 52W variants
+    "52w_high": "52W High",
+    "high_52w": "52W High",
+    "52w_low": "52W Low",
+    "low_52w": "52W Low",
+    "position_52w_percent": "52W Position %",
+    "position_52w": "52W Position %",
 }
 for k, canon_header in list(_HEADER_SYNONYMS.items()):
     nk = _norm_header_label(k)
@@ -250,7 +261,8 @@ def _canonical_header_label(header: str) -> str:
     h = str(header or "").strip()
     if not h:
         return ""
-    if h in HEADER_TO_FIELD:  # exact canonical match
+    # Exact canonical match
+    if h in HEADER_TO_FIELD:
         return h
     nh = _norm_header_label(h)
     return _HEADER_CANON_BY_NORM.get(nh, h)
@@ -278,7 +290,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "week_52_low": ("low_52w", "52w_low"),
     "position_52w_percent": ("position_52w",),
     # Liquidity / Shares
-    "avg_volume_30d": ("avg_volume", "avg_vol_30d"),
+    "avg_volume_30d": ("avg_volume", "avg_vol_30d", "avg_volume_30day"),
     "value_traded": ("traded_value",),
     "turnover_percent": ("turnover", "turnover_pct"),
     "shares_outstanding": ("shares", "outstanding_shares"),
@@ -301,7 +313,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "net_income_growth": ("ni_growth",),
     "beta": ("beta_5y",),
     # Technicals
-    "volatility_30d": ("vol_30d_ann", "vol30d"),
+    "volatility_30d": ("vol_30d_ann", "vol30d", "vol_30d"),
     "rsi_14": ("rsi14",),
     # Valuation / Targets
     "fair_value": ("expected_price_3m", "expected_price_12m", "ma200", "ma50"),
@@ -430,27 +442,28 @@ FIELD_TO_HEADER: Dict[str, str] = dict(_FIELD_TO_HEADER)
 
 
 def header_to_field(header: str) -> str:
-    """Best-effort header (any variant) -> canonical field name."""
+    """
+    Best-effort header (any variant) -> canonical field name.
+    v3.4.2: returns "" when header is unknown (safer for callers).
+    """
     h = _canonical_header_label(header)
-    return canonical_field(HEADER_TO_FIELD.get(h, str(header or "").strip()))
+    if not h:
+        return ""
+    f = HEADER_TO_FIELD.get(h)
+    return canonical_field(f) if f else ""
 
 
 def header_field_candidates(header: str) -> Tuple[str, ...]:
     """
     Robust mapping helper:
     returns preferred + aliases (e.g. ("week_52_high","high_52w","52w_high")).
-    Now tolerant to header variants.
+    Tolerant to header variants.
     """
-    h0 = str(header or "").strip()
-    h = _canonical_header_label(h0)
-
+    h = _canonical_header_label(str(header or "").strip())
+    if not h:
+        return ()
     c = HEADER_FIELD_CANDIDATES.get(h)
-    if c:
-        return c
-
-    # fallback: if caller passes unknown header, try using the header string itself
-    f = canonical_field(h0)
-    return (f,) if f else ()
+    return c or ()
 
 
 def field_to_header(field: str) -> str:
