@@ -202,6 +202,7 @@ try:
             return AliasChoices(*names)
 
     except Exception:  # pragma: no cover
+
         def _alias(*names: str) -> Any:
             return names[0]
 
