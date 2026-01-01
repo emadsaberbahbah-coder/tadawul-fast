@@ -1,6 +1,6 @@
-# routes/advanced_analysis.py  (FULL REPLACEMENT)
+# routes/advanced_analysis.py
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.9.2) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.10.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -15,15 +15,18 @@ Design goals
 - Recommendation standardized across ALL outputs to:
     BUY / HOLD / REDUCE / SELL  (always UPPERCASE, ALWAYS non-empty)
 
-v3.9.2 upgrades
-- ✅ Recommendation is ALWAYS set (defaults to HOLD when missing).
-- ✅ /sheet-rows quote_59 mapping guarantees recommendation enum even when scores are missing.
-- ✅ Small hardening around enum propagation.
+v3.10.0 upgrades (this revision)
+- ✅ Engine singleton: prefers core.data_engine_v2.get_engine() (sync OR async) before instantiating.
+- ✅ Await-safe: uses inspect.isawaitable (covers Futures/Tasks/awaitables, not just coroutines).
+- ✅ Header mapping: uses core.schemas.header_field_candidates() when available (tolerant headers).
+- ✅ Quote_59 mapping guarantees Recommendation enum even if missing/unknown.
+- ✅ Percent conversions expanded safely (Percent Change + 52W Position% convert if 0..1).
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -32,11 +35,21 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Body, Header, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+
+# pydantic v2 preferred, v1 fallback
+try:
+    from pydantic import BaseModel, ConfigDict, Field  # type: ignore
+
+    _PYDANTIC_V2 = True
+except Exception:  # pragma: no cover
+    from pydantic import BaseModel, Field  # type: ignore
+
+    ConfigDict = None  # type: ignore
+    _PYDANTIC_V2 = False
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.9.2"
+ADVANCED_ANALYSIS_VERSION = "3.10.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -52,12 +65,19 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
-# Optional schema helper (headers)
+# Optional schema helpers (headers + tolerant mapping)
 # =============================================================================
 try:
-    from core.schemas import get_headers_for_sheet  # type: ignore
+    from core.schemas import DEFAULT_HEADERS_59 as _SCHEMAS_DEFAULT_59  # type: ignore
+    from core.schemas import get_headers_for_sheet as _get_headers_for_sheet  # type: ignore
+    from core.schemas import header_field_candidates as _header_field_candidates  # type: ignore
+
+    _SCHEMAS_OK = True
 except Exception:  # pragma: no cover
-    get_headers_for_sheet = None  # type: ignore
+    _SCHEMAS_DEFAULT_59 = None  # type: ignore
+    _get_headers_for_sheet = None  # type: ignore
+    _header_field_candidates = None  # type: ignore
+    _SCHEMAS_OK = False
 
 
 # =============================================================================
@@ -120,65 +140,39 @@ def _try_import_enriched_quote() -> Optional[Any]:
 
 
 # =============================================================================
+# Await helper (covers coroutine/future/task/awaitable)
+# =============================================================================
+async def _maybe_await(x: Any) -> Any:
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
+# =============================================================================
 # ✅ Recommendation normalization (ONE ENUM everywhere)
 # =============================================================================
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
 
 def _normalize_recommendation(x: Any) -> Optional[str]:
-    """
-    Standardize recommendation to BUY/HOLD/REDUCE/SELL (UPPERCASE).
-    """
+    """Standardize recommendation to BUY/HOLD/REDUCE/SELL (UPPERCASE)."""
     if x is None:
         return None
-
     try:
         s = str(x).strip().upper()
     except Exception:
         return None
-
     if not s:
         return None
-
     if s in _RECO_ENUM:
         return s
 
     s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
 
-    buy_like = {
-        "STRONG BUY",
-        "BUY",
-        "ACCUMULATE",
-        "ADD",
-        "OUTPERFORM",
-        "OVERWEIGHT",
-        "LONG",
-    }
-    hold_like = {
-        "HOLD",
-        "NEUTRAL",
-        "MAINTAIN",
-        "MARKET PERFORM",
-        "EQUAL WEIGHT",
-        "WAIT",
-    }
-    reduce_like = {
-        "REDUCE",
-        "TRIM",
-        "LIGHTEN",
-        "UNDERWEIGHT",
-        "PARTIAL SELL",
-        "TAKE PROFIT",
-        "TAKE PROFITS",
-    }
-    sell_like = {
-        "SELL",
-        "STRONG SELL",
-        "EXIT",
-        "AVOID",
-        "UNDERPERFORM",
-        "SHORT",
-    }
+    buy_like = {"STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"}
+    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT"}
+    reduce_like = {"REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"}
+    sell_like = {"SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"}
 
     if s2 in buy_like:
         return "BUY"
@@ -197,7 +191,6 @@ def _normalize_recommendation(x: Any) -> Optional[str]:
         return "HOLD"
     if "BUY" in s2 or "ACCUMULATE" in s2 or "OVERWEIGHT" in s2:
         return "BUY"
-
     return None
 
 
@@ -205,11 +198,26 @@ def _coerce_reco_enum(x: Any) -> str:
     return _normalize_recommendation(x) or "HOLD"
 
 
+def _safe_get(obj: Any, *names: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for n in names:
+            if n in obj and obj[n] is not None:
+                return obj[n]
+        return None
+    for n in names:
+        try:
+            v = getattr(obj, n, None)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    return None
+
+
 def _ensure_reco_on_obj(uq: Any) -> None:
-    """
-    Force recommendation enum on dict-like or attribute objects.
-    Never raises.
-    """
+    """Force recommendation enum on dict-like or attribute objects. Never raises."""
     try:
         reco_raw = _safe_get(uq, "recommendation")
         reco = _coerce_reco_enum(reco_raw)
@@ -316,25 +324,68 @@ def _get_app_engine(request: Optional[Request]) -> Optional[Any]:
         return None
 
 
+@lru_cache(maxsize=1)
+def _try_import_get_engine() -> Optional[Any]:
+    """
+    Prefer the singleton getter if present.
+    Never raises.
+    """
+    try:
+        from core.data_engine_v2 import get_engine  # type: ignore
+
+        return get_engine
+    except Exception:
+        return None
+
+
 async def _get_singleton_engine() -> Optional[Any]:
     """
-    Lazy init DataEngine only when needed.
+    Lazy init engine only when needed.
+    Order:
+      1) core.data_engine_v2.get_engine() (preferred; sync OR async)
+      2) core.data_engine_v2.DataEngine()
+      3) core.data_engine_v2.DataEngineV2()
     """
     global _ENGINE
     if _ENGINE is not None:
         return _ENGINE
 
     async with _ENGINE_LOCK:
-        if _ENGINE is None:
-            try:
-                from core.data_engine_v2 import DataEngine as _DE  # type: ignore
+        if _ENGINE is not None:
+            return _ENGINE
 
-                _ENGINE = _DE()
-                logger.info("[advanced] DataEngine initialized (fallback singleton).")
-            except Exception as exc:
-                logger.exception("[advanced] Failed to init DataEngine singleton: %s", exc)
-                _ENGINE = None
-    return _ENGINE
+        # 1) preferred singleton getter
+        try:
+            ge = _try_import_get_engine()
+            if callable(ge):
+                _ENGINE = await _maybe_await(ge())
+                if _ENGINE is not None:
+                    logger.info("[advanced] Engine resolved via core.data_engine_v2.get_engine()")
+                    return _ENGINE
+        except Exception as exc:
+            logger.warning("[advanced] get_engine() failed: %s", exc)
+
+        # 2) instantiate DataEngine
+        try:
+            from core.data_engine_v2 import DataEngine as _DE  # type: ignore
+
+            _ENGINE = _DE()
+            logger.info("[advanced] DataEngine initialized (fallback singleton).")
+            return _ENGINE
+        except Exception:
+            pass
+
+        # 3) last resort DataEngineV2
+        try:
+            from core.data_engine_v2 import DataEngineV2 as _DE2  # type: ignore
+
+            _ENGINE = _DE2()
+            logger.info("[advanced] DataEngineV2 initialized (last resort).")
+            return _ENGINE
+        except Exception as exc:
+            logger.exception("[advanced] Failed to init engine singleton: %s", exc)
+            _ENGINE = None
+            return None
 
 
 async def _resolve_engine(request: Optional[Request]) -> Optional[Any]:
@@ -387,12 +438,7 @@ def _cfg() -> Dict[str, Any]:
     max_tickers = max(10, min(2000, max_tickers))
     concurrency = max(1, min(25, concurrency))
 
-    return {
-        "batch_size": batch_size,
-        "timeout_sec": timeout_sec,
-        "max_tickers": max_tickers,
-        "concurrency": concurrency,
-    }
+    return {"batch_size": batch_size, "timeout_sec": timeout_sec, "max_tickers": max_tickers, "concurrency": concurrency}
 
 
 # =============================================================================
@@ -434,24 +480,6 @@ def _iso_or_none(x: Any) -> Optional[str]:
         return None
 
 
-def _safe_get(obj: Any, *names: str) -> Any:
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        for n in names:
-            if n in obj and obj[n] is not None:
-                return obj[n]
-        return None
-    for n in names:
-        try:
-            v = getattr(obj, n, None)
-            if v is not None:
-                return v
-        except Exception:
-            pass
-    return None
-
-
 def _clean_tickers(items: Sequence[Any]) -> List[str]:
     seen = set()
     out: List[str] = []
@@ -468,11 +496,11 @@ def _clean_tickers(items: Sequence[Any]) -> List[str]:
     return out
 
 
-def _parse_tickers_csv(s: str) -> List[str]:
+def _parse_tickers_any(s: str) -> List[str]:
     if not s:
         return []
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    return _clean_tickers(parts)
+    parts = re.split(r"[\s,]+", (s or "").strip())
+    return _clean_tickers([p for p in parts if p and p.strip()])
 
 
 def _chunk(items: List[str], size: int) -> List[List[str]]:
@@ -653,7 +681,7 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str]:
     """
     Best-effort overall score + standardized recommendation when missing.
     Score in 0..100.
-    Recommendation is ALWAYS one of: BUY/HOLD/REDUCE/SELL
+    Recommendation ALWAYS one of: BUY/HOLD/REDUCE/SELL
     """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
     val = _safe_float_or_none(_safe_get(uq, "value_score"))
@@ -701,6 +729,7 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str]:
 
 def _index_keys_for_quote(q: Any) -> List[str]:
     keys: List[str] = []
+
     sym = (_safe_get(q, "symbol") or "").strip().upper()
     if sym:
         keys.append(sym)
@@ -728,33 +757,45 @@ def _index_keys_for_quote(q: Any) -> List[str]:
 # =============================================================================
 # Engine calls (compat shim + chunking)
 # =============================================================================
-async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
-        return await x
-    return x
-
-
 def _unwrap_tuple_payload(x: Any) -> Any:
     if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
 
 
-async def _engine_get_quotes(engine: Any, syms: List[str]) -> List[Any]:
-    fn = getattr(engine, "get_enriched_quotes", None)
-    if callable(fn):
-        res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
-        if isinstance(res, dict):
-            return [_unwrap_tuple_payload(v) for v in list(res.values())]
-        return [_unwrap_tuple_payload(v) for v in list(res or [])]
+def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str]) -> Any:
+    fn = getattr(engine, fn_name, None)
+    if not callable(fn):
+        return None
+    # try refresh-aware signatures (some engines accept refresh)
+    try:
+        return fn(syms, refresh=False)
+    except TypeError:
+        pass
+    return fn(syms)
 
-    fn2 = getattr(engine, "get_quotes", None)
-    if callable(fn2):
-        res = _unwrap_tuple_payload(await _maybe_await(fn2(syms)))
-        if isinstance(res, dict):
-            return [_unwrap_tuple_payload(v) for v in list(res.values())]
-        return [_unwrap_tuple_payload(v) for v in list(res or [])]
 
+async def _engine_get_quotes(engine: Any, syms: List[str]) -> Union[List[Any], Dict[str, Any]]:
+    """
+    Returns list OR dict, depending on engine.
+    Never raises here (caller handles).
+    """
+    # preferred
+    res = None
+    if callable(getattr(engine, "get_enriched_quotes", None)):
+        res = await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms))
+        res = _unwrap_tuple_payload(res)
+    elif callable(getattr(engine, "get_quotes", None)):
+        res = await _maybe_await(_call_batch_best_effort(engine, "get_quotes", syms))
+        res = _unwrap_tuple_payload(res)
+
+    if res is not None:
+        # normalize {"items":[...]} into list
+        if isinstance(res, dict) and isinstance(res.get("items"), list):
+            return list(res["items"])
+        return res  # list OR dict
+
+    # per-symbol fallback
     out: List[Any] = []
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
@@ -787,7 +828,7 @@ async def _get_quotes_chunked(
     chunks = _chunk(clean, batch_size)
     sem = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[List[Any], Exception]]:
+    async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[Union[List[Any], Dict[str, Any]], Exception]]:
         async with sem:
             try:
                 res = await asyncio.wait_for(_engine_get_quotes(engine, chunk_syms), timeout=timeout_sec)
@@ -806,14 +847,28 @@ async def _get_quotes_chunked(
                 out[s.upper()] = _make_placeholder(s, dq="MISSING", err=msg)
             continue
 
-        returned = list(res or [])
         chunk_map: Dict[str, Any] = {}
 
-        for q in returned:
-            q2 = _finalize_quote(_unwrap_tuple_payload(q))
-            _ensure_reco_on_obj(q2)
-            for k in _index_keys_for_quote(q2):
-                chunk_map.setdefault(k, q2)
+        # dict form: try direct symbol hits first
+        if isinstance(res, dict):
+            for k, v in res.items():
+                q2 = _finalize_quote(_unwrap_tuple_payload(v))
+                _ensure_reco_on_obj(q2)
+
+                kk = (str(k or "").strip().upper()) if k is not None else ""
+                if kk:
+                    chunk_map.setdefault(kk, q2)
+
+                for idxk in _index_keys_for_quote(q2):
+                    chunk_map.setdefault(idxk, q2)
+
+        else:
+            returned = list(res or [])
+            for q in returned:
+                q2 = _finalize_quote(_unwrap_tuple_payload(q))
+                _ensure_reco_on_obj(q2)
+                for idxk in _index_keys_for_quote(q2):
+                    chunk_map.setdefault(idxk, q2)
 
         for s in chunk_syms:
             k = s.upper()
@@ -826,7 +881,11 @@ async def _get_quotes_chunked(
 # Response Models
 # =============================================================================
 class _ExtraIgnore(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    if _PYDANTIC_V2 and ConfigDict is not None:  # type: ignore
+        model_config = ConfigDict(extra="ignore")  # type: ignore
+    else:  # pragma: no cover
+        class Config:
+            extra = "ignore"
 
 
 class AdvancedItem(_ExtraIgnore):
@@ -922,7 +981,7 @@ def _to_advanced_item(raw_symbol: str, uq: Any) -> AdvancedItem:
     reco2 = _coerce_reco_enum(reco2_raw) or reco_fallback or "HOLD"
 
     opp = _safe_get(uq, "opportunity_score")
-    bucket = _risk_bucket(opp, dq_s)
+    bucket = _risk_bucket(_safe_float_or_none(opp), dq_s)
 
     last_price = _safe_get(uq, "current_price", "last_price", "price")
 
@@ -964,7 +1023,6 @@ def _sort_key(it: AdvancedItem) -> float:
     conf = f(it.data_quality_score)
     up = f(it.upside_percent)
     ov = f(it.overall_score)
-
     return (opp * 1_000_000.0) + (conf * 1_000.0) + (up * 10.0) + ov
 
 
@@ -998,67 +1056,69 @@ def _default_advanced_headers() -> List[str]:
     ]
 
 
-_DEFAULT_HEADERS_59: List[str] = [
-    "Symbol",
-    "Company Name",
-    "Sector",
-    "Sub-Sector",
-    "Market",
-    "Currency",
-    "Listing Date",
-    "Last Price",
-    "Previous Close",
-    "Price Change",
-    "Percent Change",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "52W Position %",
-    "Volume",
-    "Avg Volume (30D)",
-    "Value Traded",
-    "Turnover %",
-    "Shares Outstanding",
-    "Free Float %",
-    "Market Cap",
-    "Free Float Market Cap",
-    "Liquidity Score",
-    "EPS (TTM)",
-    "Forward EPS",
-    "P/E (TTM)",
-    "Forward P/E",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "Dividend Yield %",
-    "Dividend Rate",
-    "Payout Ratio %",
-    "ROE %",
-    "ROA %",
-    "Net Margin %",
-    "EBITDA Margin %",
-    "Revenue Growth %",
-    "Net Income Growth %",
-    "Beta",
-    "Volatility (30D)",
-    "RSI (14)",
-    "Fair Value",
-    "Upside %",
-    "Valuation Label",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Opportunity Score",
-    "Risk Score",
-    "Overall Score",
-    "Error",
-    "Recommendation",
-    "Data Source",
-    "Data Quality",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-]
+def _fallback_headers_59() -> List[str]:
+    # canonical fallback if schemas not importable
+    return [
+        "Symbol",
+        "Company Name",
+        "Sector",
+        "Sub-Sector",
+        "Market",
+        "Currency",
+        "Listing Date",
+        "Last Price",
+        "Previous Close",
+        "Price Change",
+        "Percent Change",
+        "Day High",
+        "Day Low",
+        "52W High",
+        "52W Low",
+        "52W Position %",
+        "Volume",
+        "Avg Volume (30D)",
+        "Value Traded",
+        "Turnover %",
+        "Shares Outstanding",
+        "Free Float %",
+        "Market Cap",
+        "Free Float Market Cap",
+        "Liquidity Score",
+        "EPS (TTM)",
+        "Forward EPS",
+        "P/E (TTM)",
+        "Forward P/E",
+        "P/B",
+        "P/S",
+        "EV/EBITDA",
+        "Dividend Yield %",
+        "Dividend Rate",
+        "Payout Ratio %",
+        "ROE %",
+        "ROA %",
+        "Net Margin %",
+        "EBITDA Margin %",
+        "Revenue Growth %",
+        "Net Income Growth %",
+        "Beta",
+        "Volatility (30D)",
+        "RSI (14)",
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
+        "Value Score",
+        "Quality Score",
+        "Momentum Score",
+        "Opportunity Score",
+        "Risk Score",
+        "Overall Score",
+        "Error",
+        "Recommendation",
+        "Data Source",
+        "Data Quality",
+        "Last Updated (UTC)",
+        "Last Updated (Riyadh)",
+    ]
 
 
 def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
@@ -1067,18 +1127,27 @@ def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
     if any(k in nm for k in ("advanced", "opportunity", "advisor", "best", "scoreboard")):
         return _default_advanced_headers(), "advanced"
 
-    if sheet_name and get_headers_for_sheet:
+    # Prefer canonical headers from schemas
+    if sheet_name and callable(_get_headers_for_sheet):
         try:
-            h = get_headers_for_sheet(sheet_name)
-            if isinstance(h, list) and h:
-                if any(str(x).strip().lower() == "symbol" for x in h):
-                    return [str(x) for x in h], "quote_59"
+            h = _get_headers_for_sheet(sheet_name)  # type: ignore
+            if isinstance(h, list) and h and any(str(x).strip().lower() == "symbol" for x in h):
+                return [str(x) for x in h], "quote_59"
         except Exception:
             pass
 
-    return list(_DEFAULT_HEADERS_59), "quote_59"
+    if _SCHEMAS_DEFAULT_59 is not None:
+        try:
+            return [str(x) for x in list(_SCHEMAS_DEFAULT_59)], "quote_59"  # type: ignore
+        except Exception:
+            pass
+
+    return _fallback_headers_59(), "quote_59"
 
 
+# =============================================================================
+# Row builders
+# =============================================================================
 def _item_value_map(it: AdvancedItem) -> Dict[str, Any]:
     return {
         "Symbol": it.symbol,
@@ -1126,7 +1195,7 @@ def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
 
 
 # =============================================================================
-# Quote-59 robust header mapping fallback
+# Quote-59 mapping (uses core.schemas.header_field_candidates when available)
 # =============================================================================
 def _hkey(h: str) -> str:
     s = str(h or "").strip().lower()
@@ -1134,85 +1203,35 @@ def _hkey(h: str) -> str:
     return s
 
 
-def _snake_guess(header: str) -> str:
-    s = str(header or "").strip().lower()
-    s = s.replace("%", " percent ")
-    s = re.sub(r"[^\w]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s
-
-
-_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
-    "symbol": (("symbol",), None),
-    "company name": (("name", "company_name"), None),
-    "sector": (("sector",), None),
-    "sub-sector": (("sub_sector", "subsector"), None),
-    "sub sector": (("sub_sector", "subsector"), None),
-    "market": (("market", "market_region"), None),
-    "currency": (("currency",), None),
-    "listing date": (("listing_date", "ipo"), None),
-    "last price": (("current_price", "last_price", "price"), None),
-    "previous close": (("previous_close",), None),
-    "price change": (("price_change", "change"), None),
-    "percent change": (("percent_change", "change_percent", "change_pct"), None),
-    "day high": (("day_high",), None),
-    "day low": (("day_low",), None),
-    "52w high": (("week_52_high", "high_52w", "52w_high"), None),
-    "52w low": (("week_52_low", "low_52w", "52w_low"), None),
-    "52w position %": (("position_52w_percent", "position_52w"), None),
-    "volume": (("volume",), None),
-    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
-    "value traded": (("value_traded",), None),
-    "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
-    "shares outstanding": (("shares_outstanding",), None),
-    "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
-    "market cap": (("market_cap",), None),
-    "free float market cap": (("free_float_market_cap",), None),
-    "liquidity score": (("liquidity_score",), None),
-    "eps (ttm)": (("eps_ttm", "eps"), None),
-    "forward eps": (("forward_eps",), None),
-    "p/e (ttm)": (("pe_ttm",), None),
-    "forward p/e": (("forward_pe",), None),
-    "p/b": (("pb",), None),
-    "p/s": (("ps",), None),
-    "ev/ebitda": (("ev_ebitda",), None),
-    "dividend yield %": (("dividend_yield",), _ratio_to_percent),
-    "dividend rate": (("dividend_rate",), None),
-    "payout ratio %": (("payout_ratio",), _ratio_to_percent),
-    "roe %": (("roe",), _ratio_to_percent),
-    "roa %": (("roa",), _ratio_to_percent),
-    "net margin %": (("net_margin",), _ratio_to_percent),
-    "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
-    "revenue growth %": (("revenue_growth",), _ratio_to_percent),
-    "net income growth %": (("net_income_growth",), _ratio_to_percent),
-    "beta": (("beta",), None),
-    "volatility (30d)": (("volatility_30d", "vol_30d_ann"), _vol_to_percent),
-    "rsi (14)": (("rsi_14", "rsi14"), None),
-    "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
-    "upside %": (("upside_percent",), _ratio_to_percent),
-    "valuation label": (("valuation_label",), None),
-    "value score": (("value_score",), None),
-    "quality score": (("quality_score",), None),
-    "momentum score": (("momentum_score",), None),
-    "opportunity score": (("opportunity_score",), None),
-    "risk score": (("risk_score",), None),
-    "overall score": (("overall_score",), None),
-    "recommendation": (("recommendation",), _coerce_reco_enum),
-    "data source": (("data_source", "source"), None),
-    "data quality": (("data_quality",), None),
-    "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
-    "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
-    "error": (("error",), None),
+# field -> transform (safe)
+_FIELD_TRANSFORMS: Dict[str, Any] = {
+    "percent_change": _ratio_to_percent,
+    "position_52w_percent": _ratio_to_percent,
+    "turnover_percent": _ratio_to_percent,
+    "free_float": _ratio_to_percent,
+    "dividend_yield": _ratio_to_percent,
+    "payout_ratio": _ratio_to_percent,
+    "roe": _ratio_to_percent,
+    "roa": _ratio_to_percent,
+    "net_margin": _ratio_to_percent,
+    "ebitda_margin": _ratio_to_percent,
+    "revenue_growth": _ratio_to_percent,
+    "net_income_growth": _ratio_to_percent,
+    "upside_percent": _ratio_to_percent,
+    "volatility_30d": _vol_to_percent,
+    "last_updated_utc": _iso_or_none,
+    "last_updated_riyadh": _iso_or_none,
 }
 
 
 def _value_for_header(header: str, uq: Any) -> Any:
     hk = _hkey(header)
 
+    # computed fields that must be robust
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
-            return v
+            return _ratio_to_percent(v)
         cp = _safe_get(uq, "current_price", "last_price", "price")
         lo = _safe_get(uq, "week_52_low", "low_52w")
         hi = _safe_get(uq, "week_52_high", "high_52w")
@@ -1225,15 +1244,19 @@ def _value_for_header(header: str, uq: Any) -> Any:
         if hk == "fair value":
             v = _safe_get(uq, "fair_value")
             return v if v is not None else fair
+
         if hk == "upside %":
             v = _safe_get(uq, "upside_percent")
             return v if v is not None else upside
+
         if hk == "valuation label":
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
+
         if hk == "overall score":
             v = _safe_get(uq, "overall_score")
             return v if v is not None else overall
+
         if hk == "recommendation":
             v = _safe_get(uq, "recommendation")
             return _coerce_reco_enum(v) or reco or "HOLD"
@@ -1252,24 +1275,42 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 pass
         return _iso_or_none(v) or v
 
-    spec = _HEADER_MAP.get(hk)
-    if spec:
-        fields, transform = spec
-        val = _safe_get(uq, *fields)
-        if transform:
-            return transform(val)
-        return val
+    # tolerant mapping via schemas if available
+    if callable(_header_field_candidates):
+        try:
+            candidates = _header_field_candidates(header)  # type: ignore
+            for f in candidates:
+                val = _safe_get(uq, f)
+                if val is None:
+                    continue
+                tf = _FIELD_TRANSFORMS.get(str(f))
+                return tf(val) if callable(tf) else val
+            # no value found
+            return None
+        except Exception:
+            pass
 
-    guess = _snake_guess(header)
+    # fallback: try snake guess
+    guess = re.sub(r"_+", "_", re.sub(r"[^\w]+", "_", (header or "").strip().lower())).strip("_")
     v = _safe_get(uq, guess)
-    if hk == "last updated (utc)":
-        return _iso_or_none(v) or v
+    if guess in _FIELD_TRANSFORMS and callable(_FIELD_TRANSFORMS[guess]):
+        return _FIELD_TRANSFORMS[guess](v)
     return v
 
 
 def _row_59_from_headers(headers: List[str], uq: Any) -> List[Any]:
     _ensure_reco_on_obj(uq)
     row = [_value_for_header(h, uq) for h in headers]
+
+    # guarantee recommendation enum if the sheet has such column
+    try:
+        for i, h in enumerate(headers):
+            if str(h).strip().lower() == "recommendation":
+                row[i] = _coerce_reco_enum(row[i])
+                break
+    except Exception:
+        pass
+
     if len(row) < len(headers):
         row += [None] * (len(headers) - len(row))
     return row[: len(headers)]
@@ -1291,11 +1332,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = (
-                getattr(eng, "ENGINE_VERSION", None)
-                or getattr(eng, "engine_version", None)
-                or getattr(eng, "version", None)
-            )
+            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1320,6 +1357,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
             "max_tickers": cfg["max_tickers"],
         },
         "auth": "open" if not _allowed_tokens() else "token",
+        "schemas": "available" if _SCHEMAS_OK else "fallback",
         "timestamp_utc": _now_utc_iso(),
     }
 
@@ -1327,7 +1365,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
 @router.get("/scoreboard", response_model=AdvancedScoreboardResponse)
 async def advanced_scoreboard(
     request: Request,
-    tickers: str = Query(..., description="Comma-separated tickers e.g. 'AAPL,MSFT,1120.SR'"),
+    tickers: str = Query(..., description="Comma/space-separated tickers e.g. 'AAPL,MSFT,1120.SR'"),
     top_n: int = Query(50, ge=1, le=500, description="Max rows returned after sorting"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> AdvancedScoreboardResponse:
@@ -1345,7 +1383,7 @@ async def advanced_scoreboard(
             items=[],
         )
 
-    requested = _parse_tickers_csv(tickers)
+    requested = _parse_tickers_any(tickers)
     if not requested:
         return AdvancedScoreboardResponse(
             generated_at_utc=_now_utc_iso(),
@@ -1428,12 +1466,7 @@ async def advanced_sheet_rows(
             else:
                 pl = _make_placeholder(s, err="Unauthorized")
                 rows.append(_row_59_from_headers(headers, pl))
-        return AdvancedSheetResponse(
-            status="error",
-            error="Unauthorized (invalid or missing X-APP-TOKEN).",
-            headers=headers,
-            rows=rows,
-        )
+        return AdvancedSheetResponse(status="error", error="Unauthorized (invalid or missing X-APP-TOKEN).", headers=headers, rows=rows)
 
     if not requested:
         return AdvancedSheetResponse(status="skipped", error="No tickers provided", headers=headers, rows=[])
@@ -1479,6 +1512,14 @@ async def advanced_sheet_rows(
                             raise ValueError("EnrichedQuote.to_row did not return a list")
                         if len(row) < len(headers):
                             row += [None] * (len(headers) - len(row))
+                        # enforce enum if sheet includes it
+                        try:
+                            for i, h in enumerate(headers):
+                                if str(h).strip().lower() == "recommendation":
+                                    row[i] = _coerce_reco_enum(row[i])
+                                    break
+                        except Exception:
+                            pass
                         rows.append(row[: len(headers)])
                         continue
                     except Exception as exc:
@@ -1524,10 +1565,4 @@ async def advanced_sheet_rows(
         return AdvancedSheetResponse(status="error", error=str(exc), headers=headers, rows=rows)
 
 
-__all__ = [
-    "router",
-    "AdvancedItem",
-    "AdvancedScoreboardResponse",
-    "AdvancedSheetRequest",
-    "AdvancedSheetResponse",
-]
+__all__ = ["router", "AdvancedItem", "AdvancedScoreboardResponse", "AdvancedSheetRequest", "AdvancedSheetResponse"]
