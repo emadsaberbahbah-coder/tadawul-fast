@@ -1,4 +1,8 @@
-# .gitignore — FULL REPLACEMENT (Tadawul Fast Bridge / FastAPI + Render + Google Sheets)
+# .gitignore — FULL REPLACEMENT (Tadawul Fast Bridge / FastAPI + Render + Google Sheets) — v1.1
+# Notes:
+# - Safe defaults for FastAPI/Python + tests + local tooling
+# - Strong secret protection (env files + service accounts + keys)
+# - Allows committing only .env.example
 
 # =======================================================
 # Python / FastAPI
@@ -9,7 +13,9 @@ __pycache__/
 *.pyd
 *.so
 
-# Caches / test / typecheck
+# =======================================================
+# Caches / test / typecheck / lint
+# =======================================================
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -22,12 +28,24 @@ htmlcov/
 *.cover
 *.py,cover
 
-# Build artifacts
+# pytest / hypothesis
+.hypothesis/
+
+# Pyre / Pytype / Pylint
+.pyre/
+.pytype/
+.pylint.d/
+
+# =======================================================
+# Build artifacts / packaging
+# =======================================================
 build/
 dist/
 *.egg-info/
 .eggs/
 pip-wheel-metadata/
+wheels/
+*.whl
 
 # =======================================================
 # Jupyter / IPython
@@ -127,3 +145,11 @@ local_settings.json
 # Render / Deployment artifacts (optional)
 # =======================================================
 .render/
+
+# =======================================================
+# Project-specific: runtime caches / snapshots (if any added later)
+# =======================================================
+cache/
+.snapshots/
+data/
+tmp/
