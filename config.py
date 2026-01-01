@@ -1,4 +1,4 @@
-# config.py (REPO ROOT) — FULL REPLACEMENT — v5.3.6
+# config.py  (REPO ROOT) — FULL REPLACEMENT — v5.3.7
 """
 config.py
 ============================================================
@@ -9,7 +9,7 @@ Canonical Settings for Tadawul Fast Bridge (ROOT)
 ✅ No network at import-time. Minimal side effects at import-time.
 ✅ FULL fallback included (boots even if pydantic-settings is unavailable).
 
-Version: v5.3.6 (ENHANCED + ALIGNED)
+Version: v5.3.7 (ENHANCED + ALIGNED)
 
 Key alignment guarantees (DO NOT rename Render env vars):
 - FINNHUB_API_KEY / EODHD_API_KEY
@@ -20,6 +20,8 @@ Key alignment guarantees (DO NOT rename Render env vars):
 - DEFAULT_SPREADSHEET_ID / GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_APPS_SCRIPT_URL / GOOGLE_APPS_SCRIPT_BACKUP_URL
 - SERVICE_NAME / SERVICE_VERSION / ENVIRONMENT / TZ / DEBUG / LOG_LEVEL / LOG_FORMAT
 - ADVANCED_ANALYSIS_ENABLED / AI_ANALYSIS_ENABLED / TADAWUL_MARKET_ENABLED / ENABLE_SWAGGER / ENABLE_REDOC
+- DEFER_ROUTER_MOUNT / INIT_ENGINE_ON_BOOT
+- YAHOO_CHART_BASE_URL (optional)
 
 Engine/provider flags (exported as env aliases for legacy env-readers):
 - ENABLE_YAHOO_CHART_KSA
@@ -27,12 +29,18 @@ Engine/provider flags (exported as env aliases for legacy env-readers):
 - ENABLE_YFINANCE_KSA
 - ENABLE_YAHOO_FUNDAMENTALS_KSA
 - ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
+
+v5.3.7 upgrades
+- ✅ Enforces require_auth=True automatically when APP_TOKEN/BACKUP_APP_TOKEN is set.
+- ✅ Adds optional YAHOO_CHART_BASE_URL setting + alias export.
+- ✅ Best-effort module alias: `core.config` -> this module (helps legacy imports).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -260,6 +268,9 @@ try:
         finnhub_base_url: str = Field(default="https://finnhub.io/api/v1", validation_alias=_alias("FINNHUB_BASE_URL"))
         fmp_base_url: Optional[str] = Field(default=None, validation_alias=_alias("FMP_BASE_URL"))
 
+        # Optional (only used if you override; safe default)
+        yahoo_chart_base_url: str = Field(default="https://query1.finance.yahoo.com", validation_alias=_alias("YAHOO_CHART_BASE_URL"))
+
         http_timeout: float = Field(default=30.0, validation_alias=_alias("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"))
         max_retries: int = Field(default=2, validation_alias=_alias("MAX_RETRIES"))
         retry_delay: float = Field(default=0.5, validation_alias=_alias("RETRY_DELAY", "RETRY_DELAY_SEC"))
@@ -430,6 +441,12 @@ try:
                     "ENABLE_YAHOO_FUNDAMENTALS_KSA": bool(self.enable_yahoo_fundamentals_ksa),
                     "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL": bool(self.enable_yahoo_fundamentals_global),
                 },
+                "base_urls": {
+                    "EODHD_BASE_URL": self.eodhd_base_url,
+                    "FINNHUB_BASE_URL": self.finnhub_base_url,
+                    "YAHOO_CHART_BASE_URL": self.yahoo_chart_base_url,
+                    "BACKEND_BASE_URL": (self.backend_base_url or "").rstrip("/"),
+                },
                 "keys_set": {
                     "eodhd": bool((self.eodhd_api_key or "").strip()),
                     "finnhub": bool((self.finnhub_api_key or "").strip()),
@@ -484,7 +501,7 @@ try:
         _export_env_if_missing("LOG_LEVEL", (s.log_level or "info").strip().lower())
         _export_env_if_missing("LOG_FORMAT", (s.log_format or "").strip())
 
-        # ✅ Auth aliases (critical)
+        # Auth aliases
         if (s.app_token or "").strip():
             _export_env_if_missing("APP_TOKEN", (s.app_token or "").strip())
             _export_env_if_missing("TFB_APP_TOKEN", (s.app_token or "").strip())
@@ -525,7 +542,7 @@ try:
         _export_env_if_missing("CACHE_BACKUP_ENABLED", str(bool(s.cache_backup_enabled)).lower())
         _export_env_if_missing("CACHE_SAVE_INTERVAL", str(int(s.cache_save_interval)))
 
-        # CORS / RL (some modules read env directly)
+        # CORS / RL
         _export_env_if_missing("ENABLE_CORS_ALL_ORIGINS", str(bool(s.enable_cors_all_origins)).lower())
         _export_env_if_missing("CORS_ALL_ORIGINS", str(bool(s.enable_cors_all_origins)).lower())
         _export_env_if_missing("CORS_ORIGINS", (s.cors_origins or "*").strip())
@@ -549,6 +566,8 @@ try:
         # Base URLs
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
         _export_env_if_missing("FINNHUB_BASE_URL", s.finnhub_base_url)
+        _export_env_if_missing("YAHOO_CHART_BASE_URL", s.yahoo_chart_base_url)
+
         if s.backend_base_url:
             base = (s.backend_base_url or "").rstrip("/")
             _export_env_if_missing("BACKEND_BASE_URL", base)
@@ -595,7 +614,6 @@ try:
 
         # Normalize bools
         s.debug = _to_bool(s.debug, False)
-        s.require_auth = _to_bool(s.require_auth, False)
         s.enable_rate_limiting = _to_bool(s.enable_rate_limiting, True)
         s.cache_backup_enabled = _to_bool(s.cache_backup_enabled, False)
         s.advanced_analysis_enabled = _to_bool(s.advanced_analysis_enabled, True)
@@ -630,6 +648,10 @@ try:
 
         # Normalize version (env/commit can win)
         s.service_version = _resolve_version_from_env_or_commit(s.service_version)
+
+        # ✅ Enforce require_auth when token exists
+        tok_set = bool((s.app_token or "").strip() or (s.backup_app_token or "").strip())
+        s.require_auth = _to_bool(s.require_auth, False) or tok_set
 
         _apply_runtime_env_aliases(s)
         return s
@@ -666,9 +688,9 @@ except Exception:  # pragma: no cover
             self.init_engine_on_boot = _to_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
 
             # Auth
-            self.require_auth = _to_bool(os.getenv("REQUIRE_AUTH"), False)
             self.app_token = (os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or "").strip() or None
             self.backup_app_token = (os.getenv("BACKUP_APP_TOKEN") or "").strip() or None
+            self.require_auth = _to_bool(os.getenv("REQUIRE_AUTH"), False) or bool(self.app_token or self.backup_app_token)
 
             # Providers (GLOBAL + KSA)
             self.enabled_providers_raw = (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub,fmp").strip()
@@ -690,6 +712,7 @@ except Exception:  # pragma: no cover
             self.eodhd_base_url = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").strip()
             self.finnhub_base_url = (os.getenv("FINNHUB_BASE_URL") or "https://finnhub.io/api/v1").strip()
             self.fmp_base_url = (os.getenv("FMP_BASE_URL") or "").strip() or None
+            self.yahoo_chart_base_url = (os.getenv("YAHOO_CHART_BASE_URL") or "https://query1.finance.yahoo.com").strip()
 
             self.http_timeout = _positive_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0)
             self.max_retries = _positive_int(os.getenv("MAX_RETRIES"), 2)
@@ -816,29 +839,6 @@ except Exception:  # pragma: no cover
         def google_credentials(self) -> Optional[str]:
             return self.google_sheets_credentials
 
-        def as_safe_dict(self) -> Dict[str, Any]:
-            return {
-                "service_name": self.service_name,
-                "service_version": self.service_version,
-                "environment": self.environment,
-                "tz": self.tz,
-                "debug": bool(self.debug),
-                "log_level": (self.log_level or "info").strip().lower(),
-                "require_auth": bool(self.require_auth),
-                "app_token_set": bool((self.app_token or "").strip()),
-                "backup_app_token_set": bool((self.backup_app_token or "").strip()),
-                "app_token_mask": _mask_tail(self.app_token, keep=4),
-                "enabled_providers": self.enabled_providers,
-                "primary_provider": (self.primary_provider or "eodhd").strip().lower(),
-                "ksa_providers": self.ksa_providers,
-                "http_timeout_sec": float(self.http_timeout_sec),
-                "max_retries": int(self.max_retries),
-                "retry_delay": float(self.retry_delay),
-                "cache_ttl_sec": float(self.cache_ttl_sec),
-                "engine_cache_ttl_sec": float(self.engine_cache_ttl_sec),
-                "enriched_batch_concurrency": int(self.enriched_batch_concurrency),
-            }
-
         def __getattr__(self, name: str) -> Any:
             if name.isupper():
                 mapping = {
@@ -911,6 +911,7 @@ except Exception:  # pragma: no cover
 
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
         _export_env_if_missing("FINNHUB_BASE_URL", s.finnhub_base_url)
+        _export_env_if_missing("YAHOO_CHART_BASE_URL", s.yahoo_chart_base_url)
 
         if s.backend_base_url:
             base = (s.backend_base_url or "").rstrip("/")
@@ -945,6 +946,15 @@ except Exception:  # pragma: no cover
     @lru_cache(maxsize=1)
     def get_settings() -> Settings:  # type: ignore
         return Settings()
+
+
+# -----------------------------------------------------------------------------
+# Best-effort module alias so `from core.config import get_settings` works.
+# -----------------------------------------------------------------------------
+try:
+    sys.modules.setdefault("core.config", sys.modules[__name__])
+except Exception:
+    pass
 
 
 __all__ = ["Settings", "get_settings"]
