@@ -1,8 +1,8 @@
-# integrations/google_sheets_service.py
+# integrations/google_sheets_service.py  (FULL REPLACEMENT)
 """
 google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.11.1 (Enhanced + production-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.12.0 (Aligned + production-hardened)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
@@ -15,9 +15,16 @@ Key guarantees
 - Robust adapter:
     • if backend returns rows as dicts -> converts to list rows using headers
     • if backend returns partial/mismatched -> fills placeholders
+    • header union (case-insensitive) across chunked calls to prevent losing columns
 - Handles very large ticker lists:
     • backend calls are chunked (SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL)
     • merged deterministically back to requested order when possible
+
+v3.12.0 upgrades
+- ✅ Adds header UNION (case-insensitive) across chunk responses (prevents dropped columns).
+- ✅ Supports endpoint query params (e.g., ?mode=extended) without caller needing to build URLs.
+- ✅ Supports GOOGLE_APPLICATION_CREDENTIALS / *_CREDENTIALS_FILE path as credentials source.
+- ✅ More defensive spreadsheet write: never raises to callers (refresh_* always returns status).
 """
 
 from __future__ import annotations
@@ -33,12 +40,13 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 
-SERVICE_VERSION = "3.11.1"
+SERVICE_VERSION = "3.12.0"
 
 # =============================================================================
 # OPTIONAL SAFE IMPORTS (NO HEAVY DEPENDENCIES)
@@ -47,6 +55,35 @@ try:
     from core.schemas import get_headers_for_sheet  # type: ignore
 except Exception:
     get_headers_for_sheet = None  # type: ignore
+
+# Optional symbol normalization (best-effort, never required)
+def _fallback_normalize_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", "")
+    if any(ch in s for ch in ("^", "=")):  # indices / formula-like
+        return s
+    if s.isdigit():
+        return f"{s}.SR"
+    if s.endswith(".SR") or s.endswith(".US"):
+        return s
+    if "." in s:
+        return s
+    return f"{s}.US"
+
+
+_NORMALIZE_SYMBOL = _fallback_normalize_symbol
+try:
+    from core.data_engine_v2 import normalize_symbol as _ns  # type: ignore
+
+    if callable(_ns):
+        _NORMALIZE_SYMBOL = lambda x: (_ns(x) or "").strip().upper()  # type: ignore
+except Exception:
+    pass
 
 
 # =============================================================================
@@ -72,7 +109,6 @@ _root_get_settings = getattr(_root_cfg, "get_settings", None) if _root_cfg else 
 def _cfg_obj() -> Any:
     if _settings_from_env is not None:
         return _settings_from_env
-
     for getter in (_core_get_settings, _root_get_settings):
         if callable(getter):
             try:
@@ -209,7 +245,12 @@ try:
     s = _cfg_obj()
     raw = _get_attr_any(
         s,
-        ["google_sheets_credentials_raw", "google_sheets_credentials", "google_sheets_credentials_json", "google_credentials"],
+        [
+            "google_sheets_credentials_raw",
+            "google_sheets_credentials",
+            "google_sheets_credentials_json",
+            "google_credentials",
+        ],
     )
     if isinstance(raw, str) and raw.strip():
         _CREDS_RAW = raw.strip()
@@ -218,6 +259,13 @@ except Exception:
 
 if not _CREDS_RAW:
     _CREDS_RAW = (os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or os.getenv("GOOGLE_CREDENTIALS", "") or "").strip()
+
+# Support credentials file paths
+_CREDS_FILE = (
+    os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "")
+    or os.getenv("GOOGLE_CREDENTIALS_FILE", "")
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+).strip()
 
 
 # =============================================================================
@@ -265,9 +313,7 @@ _BACKEND_MAX_SYMBOLS_PER_CALL = max(
     int(os.getenv("SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL", "") or _get_int([], ["SHEETS_BACKEND_BATCH_SIZE"], 200)),
 )
 
-_USER_AGENT = (
-    (os.getenv("SHEETS_USER_AGENT", "") or "").strip() or f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}"
-)
+_USER_AGENT = (os.getenv("SHEETS_USER_AGENT", "") or "").strip() or f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}"
 
 _A1_RE = re.compile(r"^\$?([A-Za-z]+)\$?(\d+)$")
 
@@ -308,14 +354,9 @@ def _looks_like_base64(s: str) -> bool:
     raw = (s or "").strip()
     if not raw or raw.startswith("{"):
         return False
-    if len(raw) < 80:
-        # base64 creds can be short sometimes; allow but be cautious
-        pass
-    # crude heuristic: only base64 charset + padding
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
     if any(ch not in allowed for ch in raw):
         return False
-    # typical base64 length multiple of 4 (ignoring newlines)
     compact = raw.replace("\n", "").replace("\r", "")
     return len(compact) >= 40 and (len(compact) % 4 == 0)
 
@@ -324,10 +365,8 @@ def _maybe_b64_decode(s: str) -> str:
     raw = (s or "").strip()
     if not raw or raw.startswith("{"):
         return raw
-
     if not _looks_like_base64(raw):
         return raw
-
     try:
         decoded = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
         if decoded.startswith("{") and '"private_key"' in decoded:
@@ -347,24 +386,31 @@ def _strip_wrapping_quotes(s: str) -> str:
 def _parse_credentials(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
-
     cleaned = _strip_wrapping_quotes(str(raw).strip())
     cleaned = _maybe_b64_decode(cleaned)
     cleaned = _strip_wrapping_quotes(cleaned)
-
     if not cleaned.startswith("{"):
         return None
-
     data = _safe_json_loads(cleaned)
     if isinstance(data, dict) and data:
         return _coerce_private_key(data)
     return None
 
 
+def _read_credentials_file(path: str) -> Optional[Dict[str, Any]]:
+    p = (path or "").strip()
+    if not p:
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        return _parse_credentials(raw) or (_safe_json_loads(raw) if raw.startswith("{") else None)
+    except Exception:
+        return None
+
+
 def _safe_sheet_name(sheet_name: str) -> str:
-    name = (sheet_name or "").strip()
-    if not name:
-        name = "Sheet1"
+    name = (sheet_name or "").strip() or "Sheet1"
     name = name.replace("'", "''")
     return f"'{name}'"
 
@@ -373,11 +419,9 @@ def _parse_a1_cell(cell: str) -> Tuple[str, int]:
     s = (cell or "").strip()
     if ":" in s:
         s = s.split(":", 1)[0].strip()
-
     m = _A1_RE.match(s)
     if not m:
         return ("A", 1)
-
     col = m.group(1).upper()
     row = int(m.group(2))
     if row <= 0:
@@ -447,10 +491,67 @@ def _chunk_list(items: List[str], size: int) -> List[List[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def _append_missing_headers_ci(base: List[str], extra: Sequence[Any]) -> List[str]:
+    """
+    Append any headers from extra that are not already in base (case-insensitive).
+    Keeps base order stable; new headers appended.
+    """
+    seen = {str(h).strip().lower() for h in (base or []) if str(h).strip()}
+    out = list(base or [])
+    for h in (extra or []):
+        hs = str(h).strip()
+        if not hs:
+            continue
+        hk = hs.lower()
+        if hk in seen:
+            continue
+        seen.add(hk)
+        out.append(hs)
+    return out
+
+
+def _safe_endpoint_join(base: str, endpoint: str) -> str:
+    b = (base or "").rstrip("/")
+    ep = (endpoint or "").strip()
+    if not ep.startswith("/"):
+        ep = "/" + ep
+    return b + ep
+
+
+def _add_query_params(endpoint: str, params: Optional[Dict[str, Any]]) -> str:
+    """
+    Allows callers to pass endpoint="/v1/analysis/sheet-rows" and params={"mode":"extended"}.
+    If endpoint already has a query string, merges/overrides keys.
+    """
+    if not params:
+        return endpoint
+    ep = (endpoint or "").strip()
+    if not ep:
+        return ep
+
+    parsed = urllib.parse.urlsplit(ep)
+    q = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    for k, v in params.items():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s == "":
+            continue
+        q[str(k)] = s
+    new_q = urllib.parse.urlencode(q, doseq=True)
+
+    rebuilt = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_q, parsed.fragment))
+    return rebuilt
+
+
 # =============================================================================
 # GOOGLE SHEETS SERVICE INITIALIZATION
 # =============================================================================
 def get_sheets_service():
+    """
+    Lazy-initializes and returns the Google Sheets API service (singleton).
+    Raises ONLY if called without valid credentials / libraries.
+    """
     global _SHEETS_SERVICE
     if _SHEETS_SERVICE is not None:
         return _SHEETS_SERVICE
@@ -467,17 +568,24 @@ def get_sheets_service():
 
         creds_info: Optional[Dict[str, Any]] = None
 
+        # 1) dict config
         if isinstance(_CREDS_DICT, dict) and _CREDS_DICT:
             creds_info = _coerce_private_key(dict(_CREDS_DICT))
 
+        # 2) raw JSON / base64 JSON
         if creds_info is None:
             creds_info = _parse_credentials(_CREDS_RAW)
 
+        # 3) credentials file path (including GOOGLE_APPLICATION_CREDENTIALS)
+        if creds_info is None and _CREDS_FILE:
+            creds_info = _read_credentials_file(_CREDS_FILE)
+
+        # 4) env raw fallback
         if creds_info is None:
             creds_info = _parse_credentials(os.getenv("GOOGLE_SHEETS_CREDENTIALS", "") or os.getenv("GOOGLE_CREDENTIALS", "") or "")
 
         if not isinstance(creds_info, dict) or not creds_info:
-            raise RuntimeError("Missing or invalid GOOGLE_SHEETS_CREDENTIALS (service account JSON).")
+            raise RuntimeError("Missing or invalid Google service account credentials (GOOGLE_SHEETS_CREDENTIALS / GOOGLE_APPLICATION_CREDENTIALS).")
 
         creds = Credentials.from_service_account_info(creds_info, scopes=_SCOPES)
         _SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
@@ -634,6 +742,7 @@ def write_grid_chunked(
 
     chunks = _chunk_rows(data_rows, _MAX_ROWS_PER_WRITE)
 
+    # Only header
     if not chunks:
         rng = f"{sheet_a1}!{_a1(start_col, start_row)}"
         return write_range(sid, rng, [header], value_input=value_input)
@@ -715,11 +824,11 @@ def _call_backend_api_once(endpoint: str, payload: Dict[str, Any]) -> Dict[str, 
     Single POST call with retries + token fallback.
     Returns a dict always (sheets-safe error payload on failure).
     """
-    url = f"{_backend_base_url()}{endpoint}"
+    base = _backend_base_url()
+    url = _safe_endpoint_join(base, endpoint)
 
     syms_any = payload.get("symbols") or payload.get("tickers") or []
     symbols = [str(t).strip() for t in (syms_any or []) if str(t).strip()]
-
     if not symbols:
         return {"headers": ["Symbol", "Error"], "rows": [], "status": "skipped", "error": "No symbols provided"}
 
@@ -863,24 +972,36 @@ def _merge_backend_responses(
 ) -> Tuple[List[str], List[List[Any]], str, Optional[str]]:
     """
     Merge chunked backend responses into one headers+rows in requested order when possible.
+    Enhancement: header UNION (case-insensitive) across responses.
     """
-    headers = first_headers[:] if first_headers else []
-    all_rows: List[List[Any]] = []
     status = "success"
     error_msg: Optional[str] = None
 
+    # Seed headers
+    headers = [str(h).strip() for h in (first_headers or []) if str(h).strip()]
+
+    # If not provided, pick first non-empty in responses
     if not headers:
         for r in responses:
             hh = r.get("headers") or []
             if isinstance(hh, list) and hh:
-                headers = [str(x) for x in hh]
+                headers = [str(x).strip() for x in hh if str(x).strip()]
                 break
+
+    # Header union (case-insensitive)
+    for r in responses:
+        hh = r.get("headers") or []
+        if isinstance(hh, list) and hh:
+            headers = _append_missing_headers_ci(headers, hh)
+
     if not headers:
         headers = ["Symbol", "Error"]
 
     symbol_col = _find_symbol_col(headers)
     row_map: Dict[str, List[Any]] = {}
+    all_rows: List[List[Any]] = []
 
+    # Build row map per response
     for r in responses:
         st = str(r.get("status") or "success")
         if st in ("error", "partial"):
@@ -888,7 +1009,8 @@ def _merge_backend_responses(
         if st == "error" and not error_msg:
             error_msg = str(r.get("error") or "Backend error")
 
-        hh, rr = _rows_to_grid(r.get("headers") or headers, r.get("rows") or [])
+        hh_raw = r.get("headers") or headers
+        hh, rr = _rows_to_grid(list(hh_raw) if isinstance(hh_raw, list) else headers, r.get("rows") or [])
         sym_idx = _find_symbol_col(hh)
 
         if sym_idx >= 0:
@@ -898,17 +1020,36 @@ def _merge_backend_responses(
                 except Exception:
                     sym = ""
                 if sym:
+                    # Align row to UNION headers
                     if hh != headers:
                         tmp = {str(hh[i]): (row[i] if i < len(row) else None) for i in range(len(hh))}
                         aligned = [tmp.get(h, None) for h in headers]
                         row_map.setdefault(sym, aligned)
                     else:
+                        if len(row) < len(headers):
+                            row = row + [None] * (len(headers) - len(row))
+                        elif len(row) > len(headers):
+                            row = row[: len(headers)]
                         row_map.setdefault(sym, row)
                 else:
-                    all_rows.append(row)
+                    # Keep un-keyed rows (rare)
+                    aligned = row
+                    if len(aligned) < len(headers):
+                        aligned = aligned + [None] * (len(headers) - len(aligned))
+                    elif len(aligned) > len(headers):
+                        aligned = aligned[: len(headers)]
+                    all_rows.append(aligned)
         else:
-            all_rows.extend(rr)
+            # No symbol col -> just append aligned rows
+            for row in rr:
+                aligned = row
+                if len(aligned) < len(headers):
+                    aligned = aligned + [None] * (len(headers) - len(aligned))
+                elif len(aligned) > len(headers):
+                    aligned = aligned[: len(headers)]
+                all_rows.append(aligned)
 
+    # Deterministic order merge (preferred)
     if symbol_col >= 0 and requested_symbols:
         merged: List[List[Any]] = []
         for s in requested_symbols:
@@ -932,20 +1073,13 @@ def _merge_backend_responses(
                 merged.append(row)
         return headers, merged, status, error_msg
 
-    fixed = []
-    for row in all_rows:
-        if len(row) < len(headers):
-            row = row + [None] * (len(headers) - len(row))
-        elif len(row) > len(headers):
-            row = row[: len(headers)]
-        fixed.append(row)
-
-    return headers, fixed, status, error_msg
+    return headers, all_rows, status, error_msg
 
 
-def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _call_backend_api(endpoint: str, payload: Dict[str, Any], *, query_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Sheets-safe backend client:
+    - optional query params support (e.g., mode=extended)
     - chunk symbols if very large (SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL)
     - merge deterministically when possible
     """
@@ -954,23 +1088,26 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not symbols:
         return {"headers": ["Symbol", "Error"], "rows": [], "status": "skipped", "error": "No symbols provided"}
 
-    chunks = _chunk_list(symbols, _BACKEND_MAX_SYMBOLS_PER_CALL)
+    endpoint2 = _add_query_params(endpoint, query_params)
 
+    chunks = _chunk_list(symbols, _BACKEND_MAX_SYMBOLS_PER_CALL)
     if len(chunks) <= 1:
-        return _call_backend_api_once(endpoint, payload)
+        return _call_backend_api_once(endpoint2, payload)
 
     responses: List[Dict[str, Any]] = []
     first_headers: List[str] = []
+
     for ch in chunks:
         p2 = dict(payload)
         p2["symbols"] = ch
         p2["tickers"] = ch
-        res = _call_backend_api_once(endpoint, p2)
+        res = _call_backend_api_once(endpoint2, p2)
         responses.append(res)
+
         if not first_headers:
             hh = res.get("headers") or []
             if isinstance(hh, list) and hh:
-                first_headers = [str(x) for x in hh]
+                first_headers = [str(x).strip() for x in hh if str(x).strip()]
 
     headers, rows, st, err = _merge_backend_responses(symbols, first_headers, responses)
     out: Dict[str, Any] = {"headers": headers, "rows": rows, "status": st}
@@ -983,32 +1120,46 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 # HIGH-LEVEL ORCHESTRATION
 # =============================================================================
 def _normalize_tickers(tickers: Sequence[str]) -> List[str]:
+    """
+    Normalize + de-dup tickers in a stable order.
+    Uses best-effort engine normalize when available; otherwise safe fallback.
+    """
     out: List[str] = []
     seen = set()
     for t in tickers or []:
-        s = str(t or "").strip()
-        if not s:
+        raw = str(t or "").strip()
+        if not raw:
             continue
-        su = s.upper()
-        if su in seen:
+        sym = _NORMALIZE_SYMBOL(raw) or raw.strip().upper()
+        if not sym:
             continue
-        seen.add(su)
-        out.append(s)
+        if sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
     return out
 
 
-def _payload_for_endpoint(endpoint: str, symbols_list: List[str], sheet_name: str) -> Dict[str, Any]:
+def _payload_for_endpoint(symbols_list: List[str], sheet_name: str, *, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     ✅ Universal payload:
       - Always send BOTH: symbols + tickers
       - Always send BOTH: sheet_name + sheetName
     """
-    return {
+    payload: Dict[str, Any] = {
         "symbols": symbols_list,
         "tickers": symbols_list,
         "sheet_name": sheet_name,
         "sheetName": sheet_name,
     }
+    if isinstance(extra, dict) and extra:
+        # Do NOT allow callers to remove required keys; only add/override safely
+        payload.update(extra)
+        payload["symbols"] = symbols_list
+        payload["tickers"] = symbols_list
+        payload["sheet_name"] = sheet_name
+        payload["sheetName"] = sheet_name
+    return payload
 
 
 def _refresh_logic(
@@ -1019,6 +1170,10 @@ def _refresh_logic(
     start_cell: str = "A5",
     clear: bool = False,
     value_input: str = "RAW",
+    *,
+    mode: Optional[str] = None,                 # e.g. "extended"
+    backend_query_params: Optional[Dict[str, Any]] = None,
+    backend_payload_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Core logic:
@@ -1042,9 +1197,18 @@ def _refresh_logic(
         if not sh:
             return _safe_status_error("sheet_name", "sheet_name is required", endpoint=endpoint)
 
+        # Build query params (mode is a common one for /sheet-rows endpoints)
+        qp = dict(backend_query_params or {})
+        if mode and str(mode).strip():
+            qp.setdefault("mode", str(mode).strip())
+
         # 1) backend call (sheets-safe)
         try:
-            response = _call_backend_api(endpoint, _payload_for_endpoint(endpoint, symbols_list, sh))
+            response = _call_backend_api(
+                endpoint,
+                _payload_for_endpoint(symbols_list, sh, extra=backend_payload_extra),
+                query_params=qp or None,
+            )
         except Exception as e:
             response = _sheets_safe_error_payload(symbols_list, f"Backend client error: {e}")
 
@@ -1062,6 +1226,11 @@ def _refresh_logic(
                 headers = []
 
         headers2, fixed_rows = _rows_to_grid(headers, rows)
+
+        # Final header cleanup (avoid empty header list)
+        if not headers2:
+            headers2 = ["Symbol", "Error"]
+
         grid = [headers2] + fixed_rows
 
         # 2) optional clear
@@ -1102,6 +1271,7 @@ def _refresh_logic(
             "status": status,
             "sheet": sh,
             "endpoint": endpoint,
+            "mode": (mode or ""),
             "rows_written": len(fixed_rows),
             "headers_count": len(headers2),
             "cells_updated": int(updated_cells or 0),
@@ -1136,6 +1306,9 @@ def refresh_sheet_with_ai_analysis(
     sid: str = "",
     **kwargs,
 ) -> Dict[str, Any]:
+    """
+    Tip: pass mode="extended" to request extended columns from /v1/analysis/sheet-rows.
+    """
     spreadsheet_id = (spreadsheet_id or sid or "").strip()
     return _refresh_logic("/v1/analysis/sheet-rows", spreadsheet_id, sheet_name, tickers, **kwargs)
 
