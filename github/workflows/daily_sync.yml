@@ -25,11 +25,11 @@ jobs:
 
       - name: Run Dashboard Sync
         env:
-          # Render API URL
+          # Render API URL (Variable)
           BACKEND_BASE_URL: ${{ vars.BACKEND_BASE_URL }}
-          # Spreadsheet ID
+          # Spreadsheet ID (Secret)
           DEFAULT_SPREADSHEET_ID: ${{ secrets.DEFAULT_SPREADSHEET_ID }}
-          # Google Service Account JSON (Paste the entire JSON content here)
+          # Google Service Account JSON (Secret)
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
           python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
