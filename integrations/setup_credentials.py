@@ -325,10 +325,10 @@ def main() -> int:
             print("\nHelper commands (MASKED preview):")
             if mode in ("json", "both"):
                 print("PowerShell:", _ps_setx(args.env_name, flat, masked=True))
-                print("Bash:     ", _bash_export(args.env_name, flat, masked=True))
+                print("Bash:      ", _bash_export(args.env_name, flat, masked=True))
             if mode in ("base64", "both"):
                 print("PowerShell:", _ps_setx(args.env_name, b64, masked=True))
-                print("Bash:     ", _bash_export(args.env_name, b64, masked=True))
+                print("Bash:      ", _bash_export(args.env_name, b64, masked=True))
 
         print("\nRecommended:")
         if args.out_json or args.out_b64:
