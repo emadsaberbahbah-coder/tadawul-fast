@@ -1,4 +1,4 @@
-# scripts/run_dashboard_sync.py
+#!/usr/bin/env python3
 """
 run_dashboard_sync.py
 ===========================================================
