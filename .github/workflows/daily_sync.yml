@@ -10,8 +10,13 @@ on:
       backend_url:
         description: 'Backend URL (e.g. https://...onrender.com)'
         required: false
+        default: 'https://tadawul-fast-bridge.onrender.com'
       sheet_id:
         description: 'Spreadsheet ID (Optional override)'
+        required: false
+        default: '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw'
+      google_creds_json:
+        description: 'Service Account JSON (Paste here if Secret fails)'
         required: false
 
 jobs:
@@ -32,8 +37,8 @@ jobs:
 
       - name: Wake up Render Backend
         env:
-          # Check Input -> Variable -> Secret
-          URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
+          # Check Input -> Variable -> Secret -> Hardcoded Fallback
+          URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
           if [ -z "$URL" ]; then
              echo "Backend URL missing in wake-up step, skipping ping..."
@@ -44,10 +49,11 @@ jobs:
 
       - name: Run Dashboard Sync
         env:
-          # Priority: Manual Input -> Repo Variable -> Repo Secret
-          BACKEND_BASE_URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
-          DEFAULT_SPREADSHEET_ID: ${{ inputs.sheet_id || secrets.DEFAULT_SPREADSHEET_ID }}
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
+          BACKEND_BASE_URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          DEFAULT_SPREADSHEET_ID: ${{ inputs.sheet_id || secrets.DEFAULT_SPREADSHEET_ID || '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw' }}
+          # Priority: Manual Input -> Repo Secret
+          GOOGLE_SHEETS_CREDENTIALS: ${{ inputs.google_creds_json || secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
           # --- DIAGNOSTIC CHECKS ---
           if [ -z "$BACKEND_BASE_URL" ]; then
@@ -61,10 +67,13 @@ jobs:
           fi
           
           if [ -z "$GOOGLE_SHEETS_CREDENTIALS" ]; then
-            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Go to Settings > Secrets and variables > Actions (Secrets) and add it."
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Please paste the JSON content into the 'Service Account JSON' box when running manually, OR check your Secrets."
             exit 1
           fi
           # -------------------------
 
-          echo "Configuration OK. Target: $BACKEND_BASE_URL"
+          echo "Configuration OK."
+          echo "Target Backend: $BACKEND_BASE_URL"
+          echo "Target Sheet: $DEFAULT_SPREADSHEET_ID"
+          
           python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
