@@ -39,7 +39,7 @@ try:
         YahooChartProvider,
         fetch_quote,
         get_quote,
-        get_quote_patch,
+        fetch_quote_patch as get_quote_patch,  # map new name to old name if needed
         PROVIDER_VERSION,
     )
 
