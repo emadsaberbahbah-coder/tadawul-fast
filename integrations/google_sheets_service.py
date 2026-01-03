@@ -1,4 +1,3 @@
-# integrations/google_sheets_service.py  (FULL REPLACEMENT)
 """
 google_sheets_service.py
 ------------------------------------------------------------
