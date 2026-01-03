@@ -1,6 +1,7 @@
-# routes/advanced_analysis.py
+from __future__ import annotations
+
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.11.0) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.12.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -15,14 +16,14 @@ Design goals
 - Recommendation standardized across ALL outputs to:
     BUY / HOLD / REDUCE / SELL  (always UPPERCASE, ALWAYS non-empty)
 
-v3.11.0 upgrades (this revision)
-- ✅ Works with core.schemas v3.5+ where get_headers_for_sheet may return EXTENDED headers (analysis pages).
-- ✅ Quote row mapping supports BOTH 59 and extended schemas (safe; EnrichedQuote used only for 59).
-- ✅ Added mapping/compute support for extended headers (Returns, MAs, Expected Price/Return, Confidence, History meta).
-- ✅ Robust enum enforcement for Recommendation across all modes.
+v3.12.0 upgrades (this revision)
+- ✅ Adds FIRST-CLASS support for common Google Sheets header variants used in your dashboard:
+    Price / Prev Close / Change / Change % / Avg Vol 30D / 52W High/Low / Turnover % / Free Float Mkt Cap ...
+  This prevents “missing columns” caused by strict header->field matching.
+- ✅ Optional computed columns when present in the sheet:
+    Rank, Origin  (filled safely without requiring provider support)
+- ✅ Keeps schema-driven mapping when core.schemas.header_field_candidates is available.
 """
-
-from __future__ import annotations
 
 import asyncio
 import inspect
@@ -48,7 +49,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.11.0"
+ADVANCED_ANALYSIS_VERSION = "3.12.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -1197,6 +1198,82 @@ def _hkey(h: str) -> str:
     return s
 
 
+# Local header aliases (fixes “missing columns” caused by strict header matching)
+# Key MUST be normalized with _hkey().
+# Value is ordered list of field candidates to try on the unified quote.
+_HEADER_ALIASES: Dict[str, List[str]] = {
+    # identity
+    "company name": ["name", "company_name", "short_name"],
+    "name": ["name", "company_name", "short_name"],
+    "sub sector": ["sub_sector", "subsector", "industry", "sub_industry"],
+    "sub-sector": ["sub_sector", "subsector", "industry", "sub_industry"],
+    "listing date": ["listing_date", "ipo_date", "first_trade_date"],
+    # prices / changes
+    "price": ["current_price", "last_price", "price", "close"],
+    "last price": ["current_price", "last_price", "price", "close"],
+    "prev close": ["previous_close", "prev_close", "prior_close"],
+    "previous close": ["previous_close", "prev_close", "prior_close"],
+    "change": ["price_change", "change", "chg"],
+    "price change": ["price_change", "change", "chg"],
+    "change %": ["percent_change", "change_percent", "pct_change", "percentchange"],
+    "percent change": ["percent_change", "change_percent", "pct_change", "percentchange"],
+    "day high": ["day_high", "high"],
+    "day low": ["day_low", "low"],
+    "open": ["open"],
+    # 52w
+    "52w high": ["week_52_high", "high_52w", "fifty_two_week_high", "week52_high", "52_week_high"],
+    "52w low": ["week_52_low", "low_52w", "fifty_two_week_low", "week52_low", "52_week_low"],
+    # volume / liquidity
+    "avg vol 30d": ["avg_volume_30d", "average_volume_30d", "avg_vol_30d"],
+    "avg volume 30d": ["avg_volume_30d", "average_volume_30d", "avg_vol_30d"],
+    "avg volume (30d)": ["avg_volume_30d", "average_volume_30d", "avg_vol_30d"],
+    "value traded": ["value_traded", "value", "turnover_value", "traded_value"],
+    "turnover %": ["turnover_percent", "turnover_pct", "turnover"],
+    "turnover percent": ["turnover_percent", "turnover_pct", "turnover"],
+    "liquidity score": ["liquidity_score"],
+    # shares / floats
+    "shares outstanding": ["shares_outstanding", "shares"],
+    "free float %": ["free_float", "free_float_percent", "freefloat"],
+    "free float mkt cap": ["free_float_market_cap", "free_float_mkt_cap"],
+    "free float market cap": ["free_float_market_cap", "free_float_mkt_cap"],
+    # valuation / fundamentals
+    "p/e (ttm)": ["pe_ttm", "pe", "trailing_pe", "trailing_pe_ratio"],
+    "forward p/e": ["forward_pe", "pe_forward", "forward_pe_ratio"],
+    "p/b": ["pb", "price_to_book"],
+    "p/s": ["ps", "price_to_sales"],
+    "ev/ebitda": ["ev_ebitda", "enterprise_to_ebitda"],
+    "eps (ttm)": ["eps_ttm", "eps", "eps_trailing_twelve_months"],
+    "forward eps": ["forward_eps", "eps_forward"],
+    "dividend yield": ["dividend_yield"],
+    "dividend yield %": ["dividend_yield"],
+    "dividend rate": ["dividend_rate", "dividend_per_share"],
+    "payout ratio": ["payout_ratio"],
+    "payout ratio %": ["payout_ratio"],
+    # profitability / growth
+    "roe": ["roe"],
+    "roe %": ["roe"],
+    "roa": ["roa"],
+    "roa %": ["roa"],
+    "net margin": ["net_margin"],
+    "net margin %": ["net_margin"],
+    "ebitda margin": ["ebitda_margin"],
+    "ebitda margin %": ["ebitda_margin"],
+    "revenue growth": ["revenue_growth"],
+    "revenue growth %": ["revenue_growth"],
+    "net income growth": ["net_income_growth"],
+    "net income growth %": ["net_income_growth"],
+    # technicals
+    "volatility 30d": ["volatility_30d", "volatility30d"],
+    "volatility (30d)": ["volatility_30d", "volatility30d"],
+    "rsi 14": ["rsi_14", "rsi14"],
+    "rsi (14)": ["rsi_14", "rsi14"],
+    # scoring labels
+    "data source": ["data_source", "provider", "source"],
+    "provider": ["data_source", "provider", "source"],
+    "data quality": ["data_quality"],
+}
+
+
 _FIELD_TRANSFORMS: Dict[str, Any] = {
     # percents / ratios
     "percent_change": _ratio_to_percent,
@@ -1246,20 +1323,21 @@ def _compute_expected_price_and_return(uq: Any, horizon: str) -> Tuple[Optional[
 
     # if missing, allow fair_value as proxy (esp for 3m / 12m)
     if exp_price is None and horizon in ("3m", "12m"):
-        exp_price = _safe_float_or_none(_safe_get(uq, "fair_value")) or _safe_float_or_none(_safe_get(uq, "expected_price_3m")) or _safe_float_or_none(
-            _safe_get(uq, "expected_price_12m")
+        exp_price = (
+            _safe_float_or_none(_safe_get(uq, "fair_value"))
+            or _safe_float_or_none(_safe_get(uq, "expected_price_3m"))
+            or _safe_float_or_none(_safe_get(uq, "expected_price_12m"))
         )
 
     # expected return lookup
     key_ret = f"expected_return_{horizon}"
     exp_ret = _safe_float_or_none(_safe_get(uq, key_ret))
     if exp_ret is not None:
-        exp_ret = _ratio_to_percent(exp_ret)  # handles 0..1
+        exp_ret2 = _ratio_to_percent(exp_ret)  # handles 0..1
         try:
-            exp_ret = float(exp_ret)  # type: ignore
+            return exp_price, float(exp_ret2)  # type: ignore[arg-type]
         except Exception:
-            pass
-        return exp_price, exp_ret if isinstance(exp_ret, (int, float)) else None
+            return exp_price, None
 
     if exp_price is None or exp_price <= 0:
         return None, None
@@ -1267,8 +1345,32 @@ def _compute_expected_price_and_return(uq: Any, horizon: str) -> Tuple[Optional[
     return exp_price, round(((exp_price / price) - 1.0) * 100.0, 2)
 
 
-def _value_for_header(header: str, uq: Any) -> Any:
+def _origin_from_sheet_name(sheet_name: Optional[str]) -> str:
+    s = (sheet_name or "").strip()
+    if not s:
+        return ""
+    s2 = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_").upper()
+    return s2
+
+
+def _value_for_alias_fields(uq: Any, fields: List[str]) -> Any:
+    for f in fields:
+        val = _safe_get(uq, f)
+        if val is None:
+            continue
+        tf = _FIELD_TRANSFORMS.get(str(f))
+        return tf(val) if callable(tf) else val
+    return None
+
+
+def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None) -> Any:
     hk = _hkey(header)
+
+    # computed: rank / origin (optional sheet columns)
+    if hk == "rank":
+        return (ctx or {}).get("rank")
+    if hk == "origin":
+        return (ctx or {}).get("origin")
 
     # computed: 52W position
     if hk in ("52w position %", "52w position"):
@@ -1306,7 +1408,14 @@ def _value_for_header(header: str, uq: Any) -> Any:
             return _coerce_reco_enum(v) or reco or "HOLD"
 
     # extended: expected price / expected return
-    if hk in ("expected price 1m", "expected return 1m %", "expected price 3m", "expected return 3m %", "expected price 12m", "expected return 12m %"):
+    if hk in (
+        "expected price 1m",
+        "expected return 1m %",
+        "expected price 3m",
+        "expected return 3m %",
+        "expected price 12m",
+        "expected return 12m %",
+    ):
         horizon = "1m" if "1m" in hk else ("3m" if "3m" in hk else "12m")
         exp_price, exp_ret = _compute_expected_price_and_return(uq, horizon)
         if "expected price" in hk:
@@ -1330,7 +1439,14 @@ def _value_for_header(header: str, uq: Any) -> Any:
                 pass
         return _iso_or_none(v) or v
 
-    # tolerant mapping via schemas if available (supports 59 + extended headers)
+    # ✅ Local alias support (covers your sheet variants)
+    alias_fields = _HEADER_ALIASES.get(hk)
+    if alias_fields:
+        v = _value_for_alias_fields(uq, alias_fields)
+        if v is not None:
+            return v
+
+    # schema-driven mapping (supports 59 + extended headers)
     if callable(_header_field_candidates):
         try:
             candidates = _header_field_candidates(header)  # type: ignore
@@ -1352,9 +1468,9 @@ def _value_for_header(header: str, uq: Any) -> Any:
     return v
 
 
-def _row_quote_from_headers(headers: List[str], uq: Any) -> List[Any]:
+def _row_quote_from_headers(headers: List[str], uq: Any, ctx: Optional[Dict[str, Any]] = None) -> List[Any]:
     _ensure_reco_on_obj(uq)
-    row = [_value_for_header(h, uq) for h in headers]
+    row = [_value_for_header(h, uq, ctx=ctx) for h in headers]
 
     # guarantee recommendation enum if the sheet has such column
     try:
@@ -1386,11 +1502,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = (
-                getattr(eng, "ENGINE_VERSION", None)
-                or getattr(eng, "engine_version", None)
-                or getattr(eng, "version", None)
-            )
+            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1506,9 +1618,12 @@ async def advanced_sheet_rows(
     top_n = _safe_int(body.top_n or 50, 50)
     top_n = max(1, min(500, top_n))
 
+    origin = _origin_from_sheet_name(body.sheet_name)
+
     if not _auth_ok(x_app_token):
         rows: List[List[Any]] = []
-        for s in requested[:top_n]:
+        for idx, s in enumerate(requested[:top_n], start=1):
+            ctx = {"rank": idx, "origin": origin}
             if mode == "advanced":
                 it = AdvancedItem(
                     symbol=s.upper(),
@@ -1523,7 +1638,7 @@ async def advanced_sheet_rows(
                 rows.append(_row_for_headers(it, headers))
             else:
                 pl = _make_placeholder(s, err="Unauthorized")
-                rows.append(_row_quote_from_headers(headers, pl))
+                rows.append(_row_quote_from_headers(headers, pl, ctx=ctx))
         return AdvancedSheetResponse(
             status="error",
             error="Unauthorized (invalid or missing X-APP-TOKEN).",
@@ -1565,9 +1680,10 @@ async def advanced_sheet_rows(
             EnrichedQuote = _try_import_enriched_quote()
             can_use_eq = EnrichedQuote is not None and isinstance(headers, list) and len(headers) == 59
 
-            for it in items_sorted:
+            for idx, it in enumerate(items_sorted, start=1):
                 uq = unified_map.get(it.symbol) or _make_placeholder(it.symbol, dq="MISSING", err="No data returned")
                 _ensure_reco_on_obj(uq)
+                ctx = {"rank": idx, "origin": origin}
 
                 if can_use_eq:
                     try:
@@ -1585,6 +1701,9 @@ async def advanced_sheet_rows(
                                     break
                         except Exception:
                             pass
+                        # if sheet has Rank/Origin, set them via fallback mapper (safe)
+                        if any(_hkey(h) in ("rank", "origin") for h in headers):
+                            row = _row_quote_from_headers(headers, uq, ctx=ctx)
                         rows.append(row[: len(headers)])
                         continue
                     except Exception as exc:
@@ -1595,11 +1714,11 @@ async def advanced_sheet_rows(
                                 setattr(uq, "error", f"Row mapping failed: {exc}")
                         except Exception:
                             pass
-                        rows.append(_row_quote_from_headers(headers, uq))
+                        rows.append(_row_quote_from_headers(headers, uq, ctx=ctx))
                         continue
 
                 # extended or fallback mapping
-                rows.append(_row_quote_from_headers(headers, uq))
+                rows.append(_row_quote_from_headers(headers, uq, ctx=ctx))
 
         else:
             rows = [_row_for_headers(it, headers) for it in items_sorted]
@@ -1611,7 +1730,8 @@ async def advanced_sheet_rows(
         logger.exception("[advanced] exception in /sheet-rows: %s", exc)
 
         rows = []
-        for s in requested[:top_n]:
+        for idx, s in enumerate(requested[:top_n], start=1):
+            ctx = {"rank": idx, "origin": origin}
             if mode == "advanced":
                 it = AdvancedItem(
                     symbol=s.upper(),
@@ -1626,7 +1746,7 @@ async def advanced_sheet_rows(
                 rows.append(_row_for_headers(it, headers))
             else:
                 pl = _make_placeholder(s, err=str(exc))
-                rows.append(_row_quote_from_headers(headers, pl))
+                rows.append(_row_quote_from_headers(headers, pl, ctx=ctx))
 
         return AdvancedSheetResponse(status="error", error=str(exc), headers=headers, rows=rows)
 
