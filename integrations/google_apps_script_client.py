@@ -8,7 +8,7 @@ GOALS
 - Robust bridge for backend/tools to call your deployed Google Apps Script WebApp.
 - Routes tickers intelligently:
       • KSA (.SR / TADAWUL: / numeric) -> Apps Script KSA logic
-      • Global                         -> Apps Script Global logic
+      • Global                          -> Apps Script Global logic
 - Reads configuration from (env.py -> core.config -> env vars) in that order.
 - NEVER calls market providers directly (only talks to GAS).
 
