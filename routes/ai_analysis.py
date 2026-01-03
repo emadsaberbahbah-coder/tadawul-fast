@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.1) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.2) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,15 +12,17 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.2.1 upgrades
-- ✅ Enforce recommendation enum on every quote object early (dict/attr) to avoid propagation gaps.
-- ✅ Extended headers append is now case-insensitive (prevents duplicate columns from schema casing).
-- ✅ Minor hardening: always non-empty recommendation in all rows/outputs (BUY/HOLD/REDUCE/SELL).
+v4.2.2 upgrades
+- ✅ Await helper now supports any awaitable (coroutines/futures/tasks) via inspect.isawaitable.
+- ✅ Engine batch calls support optional refresh kw (best-effort).
+- ✅ 52W position % respects ratio->percent when engine returns 0..1.
+- ✅ Always non-empty recommendation in all rows/outputs (BUY/HOLD/REDUCE/SELL).
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -44,7 +46,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.2.1"
+AI_ANALYSIS_VERSION = "4.2.2"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -448,7 +450,7 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
 # Models
 # =============================================================================
 class _ExtraIgnoreBase(BaseModel):
-    if _PYDANTIC_V2:
+    if _PYDANTIC_V2 and ConfigDict is not None:
         model_config = ConfigDict(extra="ignore")  # type: ignore
     else:  # pragma: no cover
         class Config:
@@ -587,13 +589,44 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "market_cap": None,
         "free_float_market_cap": None,
         "liquidity_score": None,
+        "eps_ttm": None,
+        "forward_eps": None,
         "pe_ttm": None,
         "forward_pe": None,
         "pb": None,
         "ps": None,
+        "ev_ebitda": None,
         "dividend_yield": None,
+        "dividend_rate": None,
+        "payout_ratio": None,
         "roe": None,
         "roa": None,
+        "net_margin": None,
+        "ebitda_margin": None,
+        "revenue_growth": None,
+        "net_income_growth": None,
+        "beta": None,
+        "volatility_30d": None,
+        "rsi14": None,
+        "ma20": None,
+        "ma50": None,
+        "ma200": None,
+        "returns_1w": None,
+        "returns_1m": None,
+        "returns_3m": None,
+        "returns_6m": None,
+        "returns_12m": None,
+        "expected_return_1m": None,
+        "expected_return_3m": None,
+        "expected_return_12m": None,
+        "expected_price_1m": None,
+        "expected_price_3m": None,
+        "expected_price_12m": None,
+        "confidence_score": None,
+        "forecast_method": None,
+        "history_points": None,
+        "history_source": None,
+        "history_last_utc": None,
         "value_score": None,
         "quality_score": None,
         "momentum_score": None,
@@ -990,10 +1023,10 @@ _RATIO_HEADERS = {
     "expected return 1m %",
     "expected return 3m %",
     "expected return 12m %",
+    "52w position %",
 }
 
 _VOL_HEADERS = {"volatility (30d)"}
-
 
 _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "symbol": (("symbol",), None),
@@ -1012,7 +1045,7 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "day low": (("day_low",), None),
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
-    "52w position %": (("position_52w_percent", "position_52w"), None),
+    "52w position %": (("position_52w_percent", "position_52w"), _ratio_to_percent),
     "volume": (("volume",), None),
     "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
     "value traded": (("value_traded",), None),
@@ -1161,7 +1194,7 @@ def _value_for_meta(
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
-            return v
+            return _ratio_to_percent(v)
         cp = _safe_get(uq, "current_price", "last_price", "price")
         lo = _safe_get(uq, "week_52_low", "low_52w")
         hi = _safe_get(uq, "week_52_high", "high_52w")
@@ -1271,7 +1304,7 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any) -> List[Any]:
 # Engine calls (defensive batching)
 # =============================================================================
 async def _maybe_await(x: Any) -> Any:
-    if asyncio.iscoroutine(x):
+    if inspect.isawaitable(x):
         return await x
     return x
 
@@ -1280,6 +1313,17 @@ def _unwrap_tuple_payload(x: Any) -> Any:
     if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
+
+
+def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str]) -> Any:
+    fn = getattr(engine, fn_name, None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(syms, refresh=False)
+    except TypeError:
+        pass
+    return fn(syms)
 
 
 def _index_keys_for_quote(q: Any) -> List[str]:
@@ -1311,14 +1355,14 @@ def _index_keys_for_quote(q: Any) -> List[str]:
 async def _engine_get_quotes_any(engine: Any, syms: List[str]) -> Union[List[Any], Dict[str, Any]]:
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
-        res = _unwrap_tuple_payload(await _maybe_await(fn(syms)))
+        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms)))
         if isinstance(res, (list, dict)):
             return res
         return list(res or [])
 
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
-        res = _unwrap_tuple_payload(await _maybe_await(fn2(syms)))
+        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_quotes", syms)))
         if isinstance(res, (list, dict)):
             return res
         return list(res or [])
