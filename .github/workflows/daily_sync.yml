@@ -45,6 +45,7 @@ jobs:
 
       - name: Debug: Quick Repo Check
         run: |
+          set -euo pipefail
           echo "PWD: $(pwd)"
           ls -la
           test -f scripts/run_dashboard_sync.py && echo "OK: scripts/run_dashboard_sync.py found" || (echo "::error::Missing scripts/run_dashboard_sync.py" && exit 1)
@@ -53,6 +54,7 @@ jobs:
         env:
           URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
+          set -euo pipefail
           if [ -z "${URL:-}" ]; then
             echo "Backend URL missing, skipping ping..."
             exit 0
