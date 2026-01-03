@@ -5,7 +5,14 @@ on:
     # Run every hour (at minute 0)
     - cron: '0 * * * *'
   workflow_dispatch:
-    # Allow manual triggering from GitHub UI
+    # Allow manual triggering with overrides
+    inputs:
+      backend_url:
+        description: 'Backend URL (e.g. https://...onrender.com)'
+        required: false
+      sheet_id:
+        description: 'Spreadsheet ID (Optional override)'
+        required: false
 
 jobs:
   run-sync:
@@ -25,8 +32,8 @@ jobs:
 
       - name: Wake up Render Backend
         env:
-          # Try Variable first, fall back to Secret if not found
-          URL: ${{ vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
+          # Check Input -> Variable -> Secret
+          URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
         run: |
           if [ -z "$URL" ]; then
              echo "Backend URL missing in wake-up step, skipping ping..."
@@ -37,29 +44,27 @@ jobs:
 
       - name: Run Dashboard Sync
         env:
-          # Render API URL (Check Variables first, then Secrets)
-          BACKEND_BASE_URL: ${{ vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
-          # Spreadsheet ID (Secret)
-          DEFAULT_SPREADSHEET_ID: ${{ secrets.DEFAULT_SPREADSHEET_ID }}
-          # Google Service Account JSON (Secret)
+          # Priority: Manual Input -> Repo Variable -> Repo Secret
+          BACKEND_BASE_URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
+          DEFAULT_SPREADSHEET_ID: ${{ inputs.sheet_id || secrets.DEFAULT_SPREADSHEET_ID }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
           # --- DIAGNOSTIC CHECKS ---
           if [ -z "$BACKEND_BASE_URL" ]; then
-            echo "::error::BACKEND_BASE_URL is missing! Go to Settings > Secrets and variables > Variables AND Secrets to check."
+            echo "::error::BACKEND_BASE_URL is missing! Please enter it in the 'Run workflow' popup or add to Repository Variables."
             exit 1
           fi
 
           if [ -z "$DEFAULT_SPREADSHEET_ID" ]; then
-            echo "::error::DEFAULT_SPREADSHEET_ID is missing! Go to Settings > Secrets and variables > Secrets and add it."
+            echo "::error::DEFAULT_SPREADSHEET_ID is missing! Please enter it in the 'Run workflow' popup or add to Repository Secrets."
             exit 1
           fi
           
           if [ -z "$GOOGLE_SHEETS_CREDENTIALS" ]; then
-            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Go to Settings > Secrets and variables > Secrets and add it."
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Go to Settings > Secrets and variables > Actions (Secrets) and add it."
             exit 1
           fi
           # -------------------------
 
-          echo "Configuration OK. Starting Sync..."
+          echo "Configuration OK. Target: $BACKEND_BASE_URL"
           python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
