@@ -79,7 +79,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # --- REQUIRED CHECKS ---
           if [ -z "${BACKEND_BASE_URL:-}" ]; then
             echo "::error::BACKEND_BASE_URL is missing!"
             exit 1
@@ -94,7 +93,6 @@ jobs:
             echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Add it in Settings > Secrets and variables > Actions."
             exit 1
           fi
-          # -----------------------
 
           echo "Configuration OK."
           echo "Target Backend: ${BACKEND_BASE_URL}"
