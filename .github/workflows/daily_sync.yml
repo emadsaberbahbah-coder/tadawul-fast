@@ -38,6 +38,12 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Debug: List Files
+        run: |
+          echo "Current Directory: $(pwd)"
+          echo "Listing files for diagnostic purposes:"
+          ls -R
+
       - name: Wake up Render Backend
         env:
           # Check Input -> Variable -> Secret -> Hardcoded Fallback
