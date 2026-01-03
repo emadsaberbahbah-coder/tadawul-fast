@@ -8,17 +8,17 @@ Design rules
 - ZERO heavy imports here (no FastAPI, no routers, no app state).
 - No side effects (no network, no env validation, no file IO).
 - Safe helpers for:
-    • version reporting
-    • expected module discovery
-    • optional availability checks (without importing routers directly)
-    • debug snapshot (Render logs friendly)
+  • version reporting
+  • expected module discovery
+  • optional availability checks (without importing routers directly)
+  • debug snapshot (Render logs friendly)
 
 Router mounting MUST remain in main.py (or your app factory).
 
 Update note (v1.4.0):
 - Track BOTH Argaam router locations:
-    • routes.routes_argaam  (main router inside package)
-    • routes_argaam         (repo-root shim for backward compatibility)
+  • routes.routes_argaam  (main router inside package)
+  • routes_argaam         (repo-root shim for backward compatibility)
 """
 
 from __future__ import annotations
