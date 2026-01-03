@@ -24,16 +24,16 @@ Design:
 
 Exports (engine-friendly)
 - fetch_fundamentals_patch(symbol, debug=False) -> Dict[str, Any]
-- fetch_quote_patch(symbol, debug=False) -> Dict[str, Any]                 (alias to fundamentals patch)
-- fetch_enriched_quote_patch(symbol, debug=False) -> Dict[str, Any]        (alias)
-- fetch_quote_and_enrichment_patch(symbol, debug=False) -> Dict[str, Any]  (alias)
+- fetch_quote_patch(symbol, debug=False) -> Dict[str, Any]                  (alias to fundamentals patch)
+- fetch_enriched_quote_patch(symbol, debug=False) -> Dict[str, Any]         (alias)
+- fetch_quote_and_enrichment_patch(symbol, debug=False) -> Dict[str, Any]   (alias)
 - aclose_yahoo_fundamentals_client() -> None
 
 Env vars (supported)
 - YAHOO_UA (optional)
 - YAHOO_ACCEPT_LANGUAGE (optional)
 - YAHOO_TIMEOUT_S (default 12.0)
-- YAHOO_FUND_RETRY_MAX (default 2)                 # additional retries
+- YAHOO_FUND_RETRY_MAX (default 2)                  # additional retries
 - YAHOO_FUND_RETRY_BACKOFF_MS (default 250)
 - YAHOO_FUND_TTL_SEC (default 3600, min 30)
 - YAHOO_ALT_HOSTS (optional, comma-separated; same as yahoo_chart_provider)
