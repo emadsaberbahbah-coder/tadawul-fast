@@ -30,10 +30,6 @@ jobs:
     environment: production
     timeout-minutes: 25
 
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -64,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${URL:-}" ]; then
-            echo "Backend URL missing in wake-up step, skipping ping..."
+            echo "Backend URL missing, skipping ping..."
             exit 0
           fi
 
@@ -81,17 +77,17 @@ jobs:
           set -euo pipefail
 
           if [ -z "${BACKEND_BASE_URL:-}" ]; then
-            echo "::error::BACKEND_BASE_URL is missing! Add Repository Variable/Secret BACKEND_BASE_URL or pass it in workflow_dispatch."
+            echo "::error::BACKEND_BASE_URL is missing!"
             exit 1
           fi
 
           if [ -z "${DEFAULT_SPREADSHEET_ID:-}" ]; then
-            echo "::error::DEFAULT_SPREADSHEET_ID is missing! Add Repository Secret DEFAULT_SPREADSHEET_ID or pass it in workflow_dispatch."
+            echo "::error::DEFAULT_SPREADSHEET_ID is missing!"
             exit 1
           fi
 
           if [ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]; then
-            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Add Repository Secret GOOGLE_SHEETS_CREDENTIALS or paste JSON in workflow_dispatch input."
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing!"
             exit 1
           fi
 
