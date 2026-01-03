@@ -48,12 +48,14 @@ jobs:
 
       - name: Install Dependencies
         run: |
+          set -euo pipefail
           python -V
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
       - name: Debug: Quick Repo Check
         run: |
+          set -euo pipefail
           echo "PWD: $(pwd)"
           ls -la
           test -f scripts/run_dashboard_sync.py && echo "OK: scripts/run_dashboard_sync.py found" || (echo "::error::Missing scripts/run_dashboard_sync.py" && exit 1)
@@ -63,7 +65,8 @@ jobs:
           # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
           URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
-          if [ -z "$URL" ]; then
+          set -euo pipefail
+          if [ -z "${URL:-}" ]; then
             echo "Backend URL missing in wake-up step, skipping ping..."
             exit 0
           fi
