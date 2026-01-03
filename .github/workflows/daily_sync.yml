@@ -23,6 +23,15 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Wake up Render Backend
+        env:
+          URL: ${{ vars.BACKEND_BASE_URL }}
+        run: |
+          echo "Pinging backend at $URL to ensure it is awake..."
+          # We don't fail here if it times out, the script below has retries.
+          # This just triggers the boot process.
+          curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "Ping failed, continuing..."
+
       - name: Run Dashboard Sync
         env:
           # Render API URL (Variable)
@@ -32,4 +41,22 @@ jobs:
           # Google Service Account JSON (Secret)
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
+          # --- DIAGNOSTIC CHECKS ---
+          if [ -z "$BACKEND_BASE_URL" ]; then
+            echo "::error::BACKEND_BASE_URL is missing! Go to Settings > Secrets and variables > Variables and add it."
+            exit 1
+          fi
+
+          if [ -z "$DEFAULT_SPREADSHEET_ID" ]; then
+            echo "::error::DEFAULT_SPREADSHEET_ID is missing! Go to Settings > Secrets and variables > Secrets and add it."
+            exit 1
+          fi
+          
+          if [ -z "$GOOGLE_SHEETS_CREDENTIALS" ]; then
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Go to Settings > Secrets and variables > Secrets and add it."
+            exit 1
+          fi
+          # -------------------------
+
+          echo "Configuration OK. Starting Sync..."
           python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
