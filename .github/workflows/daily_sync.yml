@@ -22,6 +22,9 @@ on:
 jobs:
   run-sync:
     runs-on: ubuntu-latest
+    # Connect to 'production' environment secrets if they exist there
+    environment: production
+    
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
