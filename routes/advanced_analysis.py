@@ -7,21 +7,21 @@ Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
 - PROD SAFE: no hard dependency on core.data_engine_v2 at import-time (lazy + guarded).
 - Google Sheets–friendly:
-    • /sheet-rows never raises for normal usage (always returns headers + rows + status).
+  • /sheet-rows never raises for normal usage (always returns headers + rows + status).
 - Defensive batching:
-    • chunking + timeout + bounded concurrency + placeholders on failures.
+  • chunking + timeout + bounded concurrency + placeholders on failures.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
 
 ✅ Alignment
 - Recommendation standardized across ALL outputs to:
-    BUY / HOLD / REDUCE / SELL  (always UPPERCASE, ALWAYS non-empty)
+  BUY / HOLD / REDUCE / SELL  (always UPPERCASE, ALWAYS non-empty)
 
 v3.12.0 upgrades (this revision)
 - ✅ Adds FIRST-CLASS support for common Google Sheets header variants used in your dashboard:
-    Price / Prev Close / Change / Change % / Avg Vol 30D / 52W High/Low / Turnover % / Free Float Mkt Cap ...
+  Price / Prev Close / Change / Change % / Avg Vol 30D / 52W High/Low / Turnover % / Free Float Mkt Cap ...
   This prevents “missing columns” caused by strict header->field matching.
 - ✅ Optional computed columns when present in the sheet:
-    Rank, Origin  (filled safely without requiring provider support)
+  Rank, Origin  (filled safely without requiring provider support)
 - ✅ Keeps schema-driven mapping when core.schemas.header_field_candidates is available.
 """
 
