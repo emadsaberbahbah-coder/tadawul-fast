@@ -25,17 +25,20 @@ jobs:
 
       - name: Wake up Render Backend
         env:
-          URL: ${{ vars.BACKEND_BASE_URL }}
+          # Try Variable first, fall back to Secret if not found
+          URL: ${{ vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
         run: |
-          echo "Pinging backend at $URL to ensure it is awake..."
-          # We don't fail here if it times out, the script below has retries.
-          # This just triggers the boot process.
-          curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "Ping failed, continuing..."
+          if [ -z "$URL" ]; then
+             echo "Backend URL missing in wake-up step, skipping ping..."
+          else
+             echo "Pinging backend at $URL to ensure it is awake..."
+             curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "Ping failed, continuing..."
+          fi
 
       - name: Run Dashboard Sync
         env:
-          # Render API URL (Variable)
-          BACKEND_BASE_URL: ${{ vars.BACKEND_BASE_URL }}
+          # Render API URL (Check Variables first, then Secrets)
+          BACKEND_BASE_URL: ${{ vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL }}
           # Spreadsheet ID (Secret)
           DEFAULT_SPREADSHEET_ID: ${{ secrets.DEFAULT_SPREADSHEET_ID }}
           # Google Service Account JSON (Secret)
@@ -43,7 +46,7 @@ jobs:
         run: |
           # --- DIAGNOSTIC CHECKS ---
           if [ -z "$BACKEND_BASE_URL" ]; then
-            echo "::error::BACKEND_BASE_URL is missing! Go to Settings > Secrets and variables > Variables and add it."
+            echo "::error::BACKEND_BASE_URL is missing! Go to Settings > Secrets and variables > Variables AND Secrets to check."
             exit 1
           fi
 
