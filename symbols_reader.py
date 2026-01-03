@@ -1,304 +1,231 @@
 #!/usr/bin/env python3
-# symbols_reader.py  (FULL REPLACEMENT)
+# scripts/run_market_scan.py
 """
-symbols_reader.py
+run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – SYMBOLS READER (v2.4.0) – PROD SAFE
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.2.1) – Sheets-ready
 ===========================================================
 
-Purpose
-- Provide a single, stable API for scripts (like scripts/run_market_scan.py)
-  to load symbols from your Google Sheets dashboard tabs.
+What this script does
+- Reads symbols from one or more dashboard pages via symbols_reader.PAGE_REGISTRY (or symbols_reader helpers)
+- Calls backend AI Analysis endpoint in chunks:
+      POST /v1/analysis/quotes   { tickers:[...], symbols:[...] }
+- Produces a ranked "opportunities" table
+- Optionally writes the ranked table to a Google Sheet tab (chunked write)
 
-Key guarantees
-- ✅ Never makes network calls at import-time
-- ✅ Never crashes startup (imports + env parsing are best-effort)
-- ✅ Returns a predictable shape:
-      {"all":[...], "ksa":[...], "global":[...], "meta": {...}}
-- ✅ Supports overrides via env (no Sheets needed)
-- ✅ Google Sheets read via service account JSON in env:
-      GOOGLE_SHEETS_CREDENTIALS  (minified JSON / pretty JSON / quoted JSON / base64(JSON))
+Defaults (safe)
+- Reads from: MARKET_LEADERS + GLOBAL_MARKETS + KSA_TADAWUL
+- Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
+- Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
 
-Used by
-- scripts/run_market_scan.py (expects PAGE_REGISTRY + get_page_symbols)
+Key upgrades (v1.2.1)
+- ✅ Always sends BOTH tickers and symbols to backend (compat across routers)
+- ✅ More robust sheet writer selection: write_grid_chunked / write_grid / update_values fallback
+- ✅ Smart-clear is truly optional (respects --smart-clear flag)
+- ✅ Handles backend returning empty body / non-JSON gracefully
+- ✅ Never crashes on one bad batch; inserts per-symbol error rows for traceability
 
-Env (optional)
-- DEFAULT_SPREADSHEET_ID / TFB_SPREADSHEET_ID / SPREADSHEET_ID / GOOGLE_SHEETS_ID
-- GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON (JSON or base64(JSON))
-- GOOGLE_APPLICATION_CREDENTIALS (path to service account json file)
+Usage examples
+  python scripts/run_market_scan.py
+  python scripts/run_market_scan.py --keys MARKET_LEADERS GLOBAL_MARKETS
+  python scripts/run_market_scan.py --keys "MARKET_LEADERS,GLOBAL_MARKETS"
+  python scripts/run_market_scan.py --ksa-only
+  python scripts/run_market_scan.py --global-only
+  python scripts/run_market_scan.py --top 25 --min-quality OK
+  python scripts/run_market_scan.py --out-json market_scan.json
+  python scripts/run_market_scan.py --no-sheet
+  python scripts/run_market_scan.py --clear --smart-clear --value-input USER_ENTERED
 
-Overrides (optional)
-- SYMBOLS_JSON  (JSON object mapping keys -> list or dict with "all"/"ksa"/"global")
-- SYMBOLS_<KEY> (comma-separated list for a specific key)
-  e.g. SYMBOLS_MARKET_LEADERS="1120.SR,2222.SR,GOOGL,AAPL"
-- TFB_SYMBOL_HEADER_ROW (default 5)
-- TFB_SYMBOL_START_ROW  (default 6)
-- TFB_SYMBOL_MAX_ROWS   (default 5000)
-- TFB_SYMBOLS_CACHE_TTL_SEC (default 45)
+Notes
+- Uses env.py settings when available:
+    backend_base_url, app_token, backup_app_token, default_spreadsheet_id
+- Uses google_sheets_service for sheet writing (service account required).
 """
 
 from __future__ import annotations
 
-import base64
+import argparse
+import csv
 import json
+import logging
 import os
 import re
+import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# -----------------------------------------------------------------------------
-# Version / constants
-# -----------------------------------------------------------------------------
-VERSION = "2.4.0"
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+SCRIPT_VERSION = "1.2.1"
 
-# -----------------------------------------------------------------------------
-# Safe env parsing (never crash import)
-# -----------------------------------------------------------------------------
-def _safe_int(v: Any, default: int) -> int:
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
+DATE_FORMAT = "%H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
+logger = logging.getLogger("MarketScan")
+
+_A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
+
+
+# =============================================================================
+# Path safety
+# =============================================================================
+def _ensure_project_root_on_path() -> None:
+    """
+    Allows running from:
+      - project root: python scripts/run_market_scan.py
+      - scripts folder: python run_market_scan.py
+    """
     try:
-        x = int(str(v).strip())
-        return x if x > 0 else default
+        here = os.path.dirname(os.path.abspath(__file__))  # .../scripts
+        parent = os.path.dirname(here)  # project root
+        for p in (here, parent):
+            if p and p not in sys.path:
+                sys.path.insert(0, p)
     except Exception:
-        return default
+        pass
 
 
-def _safe_float(v: Any, default: float) -> float:
-    try:
-        x = float(str(v).strip())
-        return x if x > 0 else default
-    except Exception:
-        return default
+_ensure_project_root_on_path()
 
 
-_DEFAULT_HEADER_ROW = _safe_int(os.getenv("TFB_SYMBOL_HEADER_ROW", "5"), 5)
-_DEFAULT_START_ROW = _safe_int(os.getenv("TFB_SYMBOL_START_ROW", "6"), 6)
-_DEFAULT_MAX_ROWS = _safe_int(os.getenv("TFB_SYMBOL_MAX_ROWS", "5000"), 5000)
-
-# -----------------------------------------------------------------------------
-# Best-effort Google libs
-# -----------------------------------------------------------------------------
-_GOOGLE_OK = False
-_Credentials = None
-_build = None
+# =============================================================================
+# Imports (project)
+# =============================================================================
 try:
-    from google.oauth2.service_account import Credentials as _Credentials  # type: ignore
-    from googleapiclient.discovery import build as _build  # type: ignore
-
-    _GOOGLE_OK = True
+    from env import settings  # type: ignore
 except Exception:
-    _GOOGLE_OK = False
+    settings = None  # type: ignore
 
-# -----------------------------------------------------------------------------
-# Simple in-process cache (avoid hammering Sheets during scans)
-# -----------------------------------------------------------------------------
-_CACHE_TTL_SEC = _safe_float(os.getenv("TFB_SYMBOLS_CACHE_TTL_SEC", "45"), 45.0)
-_cache: Dict[str, Tuple[float, Any]] = {}
+try:
+    import symbols_reader  # type: ignore
+except Exception as e:
+    logger.error("Import failed (symbols_reader): %s", e)
+    logger.error("Tip: run from project root where symbols_reader.py exists.")
+    sys.exit(1)
 
-
-def _cache_get(key: str) -> Optional[Any]:
-    it = _cache.get(key)
-    if not it:
-        return None
-    ts, val = it
-    if (time.time() - ts) <= _CACHE_TTL_SEC:
-        return val
-    return None
+# Sheets writing is optional
+try:
+    import google_sheets_service as sheets_service  # type: ignore
+except Exception:
+    sheets_service = None  # type: ignore
 
 
-def _cache_set(key: str, val: Any) -> None:
-    _cache[key] = (time.time(), val)
+# =============================================================================
+# Config helpers
+# =============================================================================
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in _TRUTHY
-
-
-def _get_spreadsheet_id() -> str:
-    # Support your env.py aliases + legacy names
-    for k in (
-        "TFB_SPREADSHEET_ID",
-        "DEFAULT_SPREADSHEET_ID",
-        "SPREADSHEET_ID",
-        "GOOGLE_SHEETS_ID",
-    ):
-        v = (os.getenv(k) or "").strip()
+def _get_backend_base_url() -> str:
+    if settings is not None:
+        v = (getattr(settings, "backend_base_url", "") or "").strip()
         if v:
-            return v
-    return ""
+            return v.rstrip("/")
+    return (os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000") or "http://127.0.0.1:8000").rstrip("/")
 
 
-def _strip_wrapping_quotes(s: str) -> str:
-    t = (s or "").strip()
-    if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
-        return t[1:-1].strip()
-    return t
+def _get_tokens() -> Tuple[str, str]:
+    primary = ""
+    backup = ""
+    if settings is not None:
+        primary = (getattr(settings, "app_token", None) or "").strip()
+        backup = (getattr(settings, "backup_app_token", None) or "").strip()
+    if not primary:
+        primary = (os.getenv("APP_TOKEN", "") or "").strip()
+    if not backup:
+        backup = (os.getenv("BACKUP_APP_TOKEN", "") or "").strip()
+    return primary, backup
 
 
-def _looks_like_b64(s: str) -> bool:
-    raw = (s or "").strip()
-    if len(raw) < 80:
-        return False
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
-    return all((c in allowed) for c in raw)
+def _get_default_spreadsheet_id() -> str:
+    if settings is not None:
+        sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip()
+        if sid:
+            return sid
+    return (os.getenv("DEFAULT_SPREADSHEET_ID", "") or "").strip()
 
 
-def _maybe_b64_decode(s: str) -> str:
-    """
-    If s looks like base64 and decodes to JSON, return decoded.
-    Otherwise return original.
-    """
-    raw = (s or "").strip()
-    if not raw:
-        return raw
-    if raw.startswith("{"):
-        return raw
-    if not _looks_like_b64(raw):
-        return raw
+def _safe_int(x: Any, default: int) -> int:
     try:
-        dec = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
-        if dec.startswith("{") and ("private_key" in dec or '"type"' in dec):
-            return dec
+        return int(x)
     except Exception:
-        return raw
-    return raw
+        return default
 
 
-def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
-    """
-    Accepts:
-    - dict
-    - JSON string
-    - base64(JSON string)
-    - quoted JSON string
-    Returns dict or None.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str):
-        return None
-
-    s = raw.strip()
-    if not s:
-        return None
-
-    s = _strip_wrapping_quotes(s)
-    s = _maybe_b64_decode(s)
-    s = _strip_wrapping_quotes(s).strip()
-
-    if not s or not s.startswith("{"):
-        return None
-
+def _safe_float(x: Any, default: float) -> float:
     try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else None
+        return float(x)
     except Exception:
-        return None
+        return default
 
 
-def _load_service_account_info() -> Optional[Dict[str, Any]]:
-    """
-    Reads service account info from:
-    - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
-      (minified json OR pretty json OR quoted json OR base64 json)
-    - else GOOGLE_APPLICATION_CREDENTIALS file path
-    """
-    for k in ("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"):
-        raw = (os.getenv(k) or "").strip()
-        if raw:
-            obj = _try_parse_json_dict(raw)
-            if isinstance(obj, dict) and obj.get("client_email") and obj.get("private_key"):
-                return obj
+def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
+    if not keys:
+        return []
+    out: List[str] = []
+    for x in keys:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if not s:
+            continue
+        # allow comma-separated in one arg
+        out.extend([p.strip() for p in s.split(",") if p.strip()])
 
-    path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
-    if path and os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            if isinstance(obj, dict) and obj.get("client_email") and obj.get("private_key"):
-                return obj
-        except Exception:
-            return None
-
-    return None
+    seen = set()
+    final: List[str] = []
+    for k in out:
+        ku = k.strip().upper()
+        if not ku or ku in seen:
+            continue
+        seen.add(ku)
+        final.append(ku)
+    return final
 
 
-def _index_to_a1_col(idx: int) -> str:
-    if idx <= 0:
-        return "A"
-    s = ""
-    n = idx
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(ord("A") + r) + s
-    return s
-
-
-def _safe_sheet_name(name: str) -> str:
-    # For A1 ranges: sheet names with spaces should be quoted
-    n = (name or "").strip()
-    if not n:
-        return "Sheet1"
-    if any(ch in n for ch in (" ", "-", "(", ")", ".", ",")):
-        return f"'{n}'"
-    return n
-
-
-def _normalize_symbol(s: str) -> str:
-    x = (s or "").strip().upper().replace(" ", "")
+# =============================================================================
+# Symbol normalization
+# =============================================================================
+def _norm_symbol(s: str) -> str:
+    x = (s or "").strip().upper()
     if not x:
         return ""
+
     if x.startswith("TADAWUL:"):
         x = x.split(":", 1)[1].strip().upper()
+
     if x.endswith(".TADAWUL"):
         x = x.replace(".TADAWUL", "")
-    # numeric Tadawul code -> .SR
-    if x.isdigit() and 3 <= len(x) <= 6:
+
+    x = x.replace(" ", "")
+
+    # KSA numeric -> .SR
+    if x.isdigit() and 3 <= len(x) <= 5:
         return f"{x}.SR"
+
+    if x.endswith(".SR") and x.replace(".SR", "").isdigit():
+        return x
+
     return x
 
 
-def _split_cell_into_symbols(cell: str) -> List[str]:
-    """
-    Accepts:
-    - single symbol: "1120.SR"
-    - comma separated: "AAPL,MSFT,GOOGL"
-    - space separated: "AAPL MSFT"
-    - lines / bullets
-    """
-    raw = str(cell or "").strip()
-    if not raw:
-        return []
-    raw = raw.replace("•", " ").replace("·", " ").replace("\t", " ")
-    # split by comma/semicolon/newlines
-    parts = re.split(r"[,\n;\r]+", raw)
-    out: List[str] = []
-    for p in parts:
-        p = (p or "").strip()
-        if not p:
-            continue
-        # split by whitespace inside each part
-        for q in re.split(r"\s+", p):
-            q = (q or "").strip()
-            if q:
-                out.append(q)
-    return out
+def _is_ksa(sym: str) -> bool:
+    s = (sym or "").strip().upper()
+    if not s:
+        return False
+    if s.endswith(".SR"):
+        return True
+    return s.isdigit() and 3 <= len(s) <= 5
 
 
-def _dedupe(seq: Sequence[str]) -> List[str]:
+def _dedupe(items: Sequence[str]) -> List[str]:
     out: List[str] = []
     seen = set()
-    for s in seq or []:
-        x = _normalize_symbol(s)
+    for s in items or []:
+        x = _norm_symbol(str(s))
         if not x:
             continue
         if x in seen:
@@ -308,387 +235,704 @@ def _dedupe(seq: Sequence[str]) -> List[str]:
     return out
 
 
-def _classify(symbols: Sequence[str]) -> Tuple[List[str], List[str]]:
-    ksa: List[str] = []
-    glob: List[str] = []
-    for s in symbols or []:
-        x = _normalize_symbol(s)
-        if not x:
-            continue
-        if x.endswith(".SR") or x.replace(".SR", "").isdigit():
-            ksa.append(x)
-        else:
-            glob.append(x)
-    return _dedupe(ksa), _dedupe(glob)
+# =============================================================================
+# A1 helpers (for safe clear)
+# =============================================================================
+def _validate_start_cell(cell: str) -> str:
+    c = (cell or "").strip()
+    if not c:
+        return "A5"
+    if ":" in c:
+        c = c.split(":", 1)[0].strip()
+    if not _A1_CELL_RE.match(c):
+        logger.warning("Invalid start-cell '%s' -> using A5", cell)
+        return "A5"
+    return c.replace("$", "").upper()
 
 
-# -----------------------------------------------------------------------------
-# Registry (keys -> sheet specs)
-# -----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class PageSpec:
-    key: str
-    sheet_names: Tuple[str, ...]
-    header_row: int = _DEFAULT_HEADER_ROW
-    start_row: int = _DEFAULT_START_ROW
-    max_rows: int = _DEFAULT_MAX_ROWS
-    # If fixed_col is provided, we won't search the header
-    fixed_col: Optional[str] = None
-    # If you prefer fixed A1 range (single column), set this (e.g. "B6:B1000")
-    fixed_range: Optional[str] = None
-    header_candidates: Tuple[str, ...] = ("SYMBOL", "TICKER", "CODE")
+def _safe_sheet_name(sheet_name: str) -> str:
+    name = (sheet_name or "").strip().replace("'", "''")
+    return f"'{name}'"
 
 
-# NOTE: Keep these keys in sync with scripts/run_market_scan.py defaults
-PAGE_REGISTRY: Dict[str, PageSpec] = {
-    "MARKET_LEADERS": PageSpec(
-        key="MARKET_LEADERS",
-        sheet_names=("Market_Leaders", "Market Leaders", "MARKET_LEADERS"),
-        header_candidates=("SYMBOL", "TICKER", "STOCK", "CODE"),
-    ),
-    "GLOBAL_MARKETS": PageSpec(
-        key="GLOBAL_MARKETS",
-        sheet_names=("Global_Markets", "Global Markets", "GLOBAL_MARKETS"),
-        header_candidates=("SYMBOL", "TICKER", "STOCK", "CODE"),
-    ),
-    "KSA_TADAWUL": PageSpec(
-        key="KSA_TADAWUL",
-        sheet_names=("KSA_Tadawul", "KSA_Tadawul_Market", "KSA Tadawul", "KSA_TADAWUL"),
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-    ),
-    # Optional pages (safe to keep; not used unless requested)
-    "MUTUAL_FUNDS": PageSpec(
-        key="MUTUAL_FUNDS",
-        sheet_names=("Mutual_Funds", "Mutual Funds", "MUTUAL_FUNDS"),
-        header_candidates=("SYMBOL", "TICKER", "FUND", "CODE"),
-    ),
-    "COMMODITIES_FX": PageSpec(
-        key="COMMODITIES_FX",
-        sheet_names=("Commodities_FX", "Commodities & FX", "COMMODITIES_FX"),
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-    ),
-    "MY_PORTFOLIO": PageSpec(
-        key="MY_PORTFOLIO",
-        sheet_names=("My_Portfolio", "My Portfolio", "MY_PORTFOLIO"),
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-    ),
-}
+def _parse_a1_cell(cell: str) -> Tuple[str, int]:
+    s = _validate_start_cell(cell)
+    col = ""
+    row = ""
+    for ch in s:
+        if ch.isalpha():
+            col += ch
+        elif ch.isdigit():
+            row += ch
+    if not col:
+        col = "A"
+    r = int(row or "1")
+    if r <= 0:
+        r = 1
+    return col.upper(), r
 
 
-# -----------------------------------------------------------------------------
-# Overrides via ENV
-# -----------------------------------------------------------------------------
-def _try_env_override_for_key(key: str) -> Optional[List[str]]:
-    env_name = f"SYMBOLS_{key.strip().upper()}"
-    raw = (os.getenv(env_name) or "").strip()
-    if not raw:
-        return None
-    parts = _split_cell_into_symbols(raw)
-    return _dedupe(parts)
+def _col_to_index(col: str) -> int:
+    col = (col or "").strip().upper()
+    n = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return max(1, n)
 
 
-def _try_symbols_json_override() -> Optional[Dict[str, Any]]:
-    raw = (os.getenv("SYMBOLS_JSON") or "").strip()
-    if not raw:
-        return None
-    raw = _strip_wrapping_quotes(raw)
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+def _index_to_col(idx: int) -> str:
+    idx = int(idx)
+    if idx <= 0:
+        idx = 1
+    s = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        s = chr(rem + ord("A")) + s
+    return s or "A"
 
 
-# -----------------------------------------------------------------------------
-# Google Sheets reading (lazy)
-# -----------------------------------------------------------------------------
-_svc = None
+def _a1(col: str, row: int) -> str:
+    return f"{col.upper()}{int(row)}"
 
 
-def _get_sheets_service():
-    """
-    Build Google Sheets API service lazily.
-    """
-    global _svc
-    if _svc is not None:
-        return _svc
-
-    if not _GOOGLE_OK:
-        return None
-
-    info = _load_service_account_info()
-    if not info:
-        return None
-
-    try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-        creds = _Credentials.from_service_account_info(info, scopes=scopes)  # type: ignore
-        _svc = _build("sheets", "v4", credentials=creds, cache_discovery=False)  # type: ignore
-        return _svc
-    except Exception:
-        return None
-
-
-def _read_values(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
-    """
-    Returns values as list of rows.
-    Never raises; returns [] on any error.
-    """
-    if not spreadsheet_id or not range_a1:
-        return []
-
-    cache_key = f"values::{spreadsheet_id}::{range_a1}"
-    hit = _cache_get(cache_key)
-    if hit is not None:
-        return hit
-
-    svc = _get_sheets_service()
-    if svc is None:
-        return []
-
-    try:
-        res = (
-            svc.spreadsheets()
-            .values()
-            .get(spreadsheetId=spreadsheet_id, range=range_a1, valueRenderOption="UNFORMATTED_VALUE")
-            .execute()
-        )
-        values = res.get("values") or []
-        if not isinstance(values, list):
-            values = []
-        _cache_set(cache_key, values)
-        return values
-    except Exception:
-        return []
-
-
-def _resolve_symbol_column_letter(spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Optional[str]:
-    """
-    Reads the header row A:?? and finds the column where header matches candidates.
-    """
-    try_cols = 78  # up to BZ (more defensive than AZ)
-    end_col = _index_to_a1_col(try_cols)
-    rng = f"{_safe_sheet_name(sheet_name)}!A{spec.header_row}:{end_col}{spec.header_row}"
-    rows = _read_values(spreadsheet_id, rng)
-    if not rows or not isinstance(rows, list) or not rows[0]:
-        return None
-
-    header = rows[0]
-    cand = {c.strip().upper() for c in spec.header_candidates if c and c.strip()}
-    for idx, cell in enumerate(header, start=1):
-        h = str(cell or "").strip().upper()
-        h = re.sub(r"[^A-Z0-9_% ]+", " ", h).strip()
-        if not h:
-            continue
-        if h in cand or any(h.startswith(c) for c in cand):
-            return _index_to_a1_col(idx)
-
-    common = {"SYMBOL", "TICKER", "CODE"}
-    for idx, cell in enumerate(header, start=1):
-        h = str(cell or "").strip().upper()
-        h = re.sub(r"[^A-Z0-9_% ]+", " ", h).strip()
-        if h in common:
-            return _index_to_a1_col(idx)
-
-    return None
-
-
-def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Tries the first sheet name that returns data. Returns (symbols, meta).
-    """
-    meta: Dict[str, Any] = {
-        "key": spec.key,
-        "version": VERSION,
-        "mode": "sheets",
-        "sheet_used": "",
-        "range_used": "",
-        "header_row": spec.header_row,
-        "start_row": spec.start_row,
-        "max_rows": spec.max_rows,
+# =============================================================================
+# Backend client (urllib)
+# =============================================================================
+def _headers(token: str) -> Dict[str, str]:
+    h = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+        "User-Agent": f"TadawulFastBridge-MarketScan/{SCRIPT_VERSION}",
     }
+    if token:
+        h["X-APP-TOKEN"] = token
+        h["Authorization"] = f"Bearer {token}"
+    return h
 
-    for sheet in spec.sheet_names:
-        sheet = (sheet or "").strip()
-        if not sheet:
-            continue
 
-        # If fixed_range is provided, use it directly
-        if spec.fixed_range:
-            rng = f"{_safe_sheet_name(sheet)}!{spec.fixed_range}"
-            values = _read_values(spreadsheet_id, rng)
-            meta["sheet_used"] = sheet
-            meta["range_used"] = rng
-            syms: List[str] = []
-            for row in values or []:
-                if not row:
+def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: int) -> Dict[str, Any]:
+    primary, backup = _get_tokens()
+    tokens_to_try: List[str] = []
+    if primary:
+        tokens_to_try.append(primary)
+    if backup and backup != primary:
+        tokens_to_try.append(backup)
+    if not tokens_to_try:
+        tokens_to_try.append("")  # open mode
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    last_err: Optional[str] = None
+    last_body_preview: Optional[str] = None
+    last_status: Optional[int] = None
+
+    attempts = max(1, int(retries) + 1)
+
+    for attempt in range(attempts):
+        for tok_idx, tok in enumerate(tokens_to_try):
+            try:
+                req = urllib.request.Request(url, data=data, headers=_headers(tok), method="POST")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    last_status = status
+                    last_body_preview = (raw or "")[:500]
+
+                    if 200 <= status < 300:
+                        if not (raw or "").strip():
+                            return {}
+                        try:
+                            parsed = json.loads(raw)
+                            return parsed if isinstance(parsed, dict) else {"results": parsed}
+                        except Exception:
+                            # Non-JSON body
+                            return {"results": [], "error": f"Non-JSON response: {(raw or '')[:200]}"}
+
+                    last_err = f"HTTP {status}"
+            except urllib.error.HTTPError as e:
+                last_status = int(getattr(e, "code", 0) or 0)
+                try:
+                    raw = e.read().decode("utf-8", errors="replace")  # type: ignore
+                except Exception:
+                    raw = str(e)
+                last_body_preview = (raw or "")[:500]
+                last_err = f"HTTP {last_status}"
+
+                # If unauthorized and another token exists -> try next token
+                if last_status in (401, 403) and tok_idx < (len(tokens_to_try) - 1):
                     continue
-                syms.extend(_split_cell_into_symbols(str(row[0] if row else "")))
-            syms = _dedupe(syms)
-            if syms:
-                return syms, meta
+            except Exception as e:
+                last_err = str(e)
+
+        if attempt < attempts - 1:
+            time.sleep(min(8.0, 1.5 * (attempt + 1) * (attempt + 1)))
+
+    msg = last_err or "Unknown error"
+    if last_status:
+        msg = f"HTTP {last_status}: {msg}"
+    if last_body_preview:
+        msg = f"{msg} | body: {last_body_preview}"
+    return {"results": [], "error": msg}
+
+
+def _extract_result_list(resp: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Accept multiple backend shapes:
+      - {"results":[...]}
+      - {"rows":[...]}
+      - {"data":[...]}
+      - {"status":..., "results":...}
+      - list of dicts
+    """
+    if isinstance(resp, dict):
+        err = resp.get("error")
+        for k in ("results", "rows", "data"):
+            v = resp.get(k)
+            if isinstance(v, list):
+                out = [x for x in v if isinstance(x, dict)]
+                return out, (str(err) if err else None)
+        v2 = resp.get("payload")
+        if isinstance(v2, dict):
+            for k in ("results", "rows", "data"):
+                vv = v2.get(k)
+                if isinstance(vv, list):
+                    out = [x for x in vv if isinstance(x, dict)]
+                    return out, (str(err) if err else None)
+        return [], (str(err) if err else None)
+
+    if isinstance(resp, list):
+        return [x for x in resp if isinstance(x, dict)], None
+
+    return [], "Invalid backend response shape"
+
+
+# =============================================================================
+# Symbols selection
+# =============================================================================
+@dataclass(frozen=True)
+class SymbolBucket:
+    key: str
+    symbols: List[str]
+    meta: Dict[str, Any]
+
+
+def _symbols_reader_call(key: str) -> Any:
+    fn = getattr(symbols_reader, "get_page_symbols", None)
+    if callable(fn):
+        return fn(key)
+
+    for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
+        fn2 = getattr(symbols_reader, name, None)
+        if callable(fn2):
+            return fn2(key)
+
+    raise RuntimeError("symbols_reader has no supported symbol function (expected get_page_symbols).")
+
+
+def _read_symbols_for_key(key: str) -> SymbolBucket:
+    try:
+        data = _symbols_reader_call(key)
+    except Exception as e:
+        return SymbolBucket(key=key, symbols=[], meta={"shape": "error", "error": str(e), "count": 0})
+
+    if isinstance(data, list):
+        syms = _dedupe([str(x) for x in data])
+        return SymbolBucket(key=key, symbols=syms, meta={"shape": "list", "count": len(syms)})
+
+    if not isinstance(data, dict):
+        return SymbolBucket(key=key, symbols=[], meta={"shape": str(type(data)), "count": 0})
+
+    all_syms = data.get("all")
+    if all_syms is None:
+        all_syms = data.get("tickers") or data.get("symbols") or []
+    syms = _dedupe([str(x) for x in (all_syms or [])])
+
+    meta = {
+        "shape": "dict",
+        "count": len(syms),
+        "ksa_count": len(data.get("ksa") or []) if isinstance(data.get("ksa"), list) else None,
+        "global_count": len(data.get("global") or []) if isinstance(data.get("global"), list) else None,
+    }
+    return SymbolBucket(key=key, symbols=syms, meta=meta)
+
+
+def _default_keys() -> List[str]:
+    return ["MARKET_LEADERS", "GLOBAL_MARKETS", "KSA_TADAWUL"]
+
+
+# =============================================================================
+# Scan / rank
+# =============================================================================
+def _call_analysis_batch(
+    symbols: List[str],
+    *,
+    timeout: float,
+    retries: int,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    base = _get_backend_base_url()
+    url = f"{base}/v1/analysis/quotes"
+
+    out: List[Dict[str, Any]] = []
+    chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
+
+    for idx, c in enumerate(chunks, start=1):
+        payload = {"tickers": c, "symbols": c}  # ✅ always send both
+        logger.info("Backend batch %s/%s | symbols=%s", idx, len(chunks), len(c))
+        resp = _post_json(url, payload, timeout=timeout, retries=retries)
+        got, err = _extract_result_list(resp)
+
+        if got:
+            out.extend(got)
             continue
 
-        # Determine symbol column
-        col = (spec.fixed_col or "").strip().upper() or None
-        if not col:
-            col = _resolve_symbol_column_letter(spreadsheet_id, sheet, spec)
+        err_msg = err or (str(resp.get("error")) if isinstance(resp, dict) else None) or "Backend returned invalid response"
+        for s in c:
+            out.append({"symbol": s, "data_quality": "MISSING", "error": err_msg})
 
-        # Fallback column if header search failed
-        if not col:
-            col = "A"
-
-        end_row = spec.start_row + max(1, spec.max_rows) - 1
-        rng = f"{_safe_sheet_name(sheet)}!{col}{spec.start_row}:{col}{end_row}"
-        values = _read_values(spreadsheet_id, rng)
-
-        meta["sheet_used"] = sheet
-        meta["range_used"] = rng
-        meta["col_used"] = col
-
-        syms2: List[str] = []
-        for row in values or []:
-            if not row:
-                continue
-            syms2.extend(_split_cell_into_symbols(str(row[0] if row else "")))
-
-        syms2 = _dedupe(syms2)
-        if syms2:
-            return syms2, meta
-
-    meta["mode"] = "sheets_empty"
-    return [], meta
-
-
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
-# Compatibility aliases for integrations/symbols_reader.py
-PageConfig = PageSpec
-split_tickers_by_market = _classify
-
-
-def list_keys() -> List[str]:
-    return sorted(PAGE_REGISTRY.keys())
-
-
-def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "all": [...],
-        "ksa": [...],
-        "global": [...],
-        "meta": {...}
-      }
-
-    Never raises.
-    """
-    k = (key or "").strip().upper()
-    if not k:
-        return {"all": [], "ksa": [], "global": [], "meta": {"error": "empty key", "version": VERSION}}
-
-    # 1) Per-key env override: SYMBOLS_<KEY>
-    ov = _try_env_override_for_key(k)
-    if ov is not None:
-        ksa, glob = _classify(ov)
-        return {
-            "all": _dedupe(ov),
-            "ksa": ksa,
-            "global": glob,
-            "meta": {"mode": "env_override", "key": k, "version": VERSION, "env": f"SYMBOLS_{k}"},
-        }
-
-    # 2) Bulk JSON override: SYMBOLS_JSON
-    j = _try_symbols_json_override()
-    if isinstance(j, dict) and k in j:
-        val = j.get(k)
-        if isinstance(val, list):
-            all_syms = _dedupe([str(x) for x in val])
-            ksa, glob = _classify(all_syms)
-            return {"all": all_syms, "ksa": ksa, "global": glob, "meta": {"mode": "symbols_json", "key": k, "version": VERSION}}
-        if isinstance(val, dict):
-            all_syms = _dedupe([str(x) for x in (val.get("all") or val.get("symbols") or val.get("tickers") or [])])
-            ksa, glob = _classify(all_syms)
-            return {"all": all_syms, "ksa": ksa, "global": glob, "meta": {"mode": "symbols_json", "key": k, "version": VERSION}}
-
-    # 3) Sheets registry lookup
-    spec = PAGE_REGISTRY.get(k)
-    if spec is None:
-        return {"all": [], "ksa": [], "global": [], "meta": {"error": f"unknown key: {k}", "version": VERSION}}
-
-    sid = (spreadsheet_id or "").strip() or _get_spreadsheet_id()
-    if not sid:
-        return {
-            "all": [],
-            "ksa": [],
-            "global": [],
-            "meta": {"error": "Spreadsheet ID missing (set DEFAULT_SPREADSHEET_ID/TFB_SPREADSHEET_ID/SPREADSHEET_ID)", "key": k, "version": VERSION},
-        }
-
-    # Cache per key+sheet id
-    cache_key = f"page::{sid}::{k}"
-    hit = _cache_get(cache_key)
-    if isinstance(hit, dict) and "all" in hit:
-        return hit
-
-    syms, meta = _read_symbols_from_sheet(sid, spec)
-    ksa, glob = _classify(syms)
-
-    out = {"all": syms, "ksa": ksa, "global": glob, "meta": meta}
-    _cache_set(cache_key, out)
     return out
 
 
-def get_all_pages_symbols(spreadsheet_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """
-    Convenience: returns a dict of {key: get_page_symbols(key)} for all registered keys.
-    """
-    return {k: get_page_symbols(k, spreadsheet_id) for k in list_keys()}
+def _score_num(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
-def get_symbols_from_sheet(
+def _rank_key(r: Dict[str, Any]) -> Tuple[float, float, float, str]:
+    opp = _score_num(r.get("opportunity_score"))
+    overall = _score_num(r.get("overall_score"))
+    qual = _score_num(r.get("quality_score"))
+    sym = str(r.get("symbol") or r.get("ticker") or "")
+    return (
+        opp if opp is not None else -1e9,
+        overall if overall is not None else -1e9,
+        qual if qual is not None else -1e9,
+        sym,
+    )
+
+
+def _passes_quality(r: Dict[str, Any], min_quality: str) -> bool:
+    q = (r.get("data_quality") or "").strip().upper()
+    if not min_quality:
+        return True
+    min_quality = min_quality.strip().upper()
+    if min_quality == "ANY":
+        return True
+    order = {"OK": 3, "PARTIAL": 2, "MISSING": 1, "ERROR": 0}
+    return order.get(q, 0) >= order.get(min_quality, 0)
+
+
+# =============================================================================
+# Output shaping
+# =============================================================================
+DEFAULT_HEADERS: List[str] = [
+    "Rank",
+    "Symbol",
+    "Origin Pages",
+    "Name",
+    "Market",
+    "Currency",
+    "Price",
+    "Change %",
+
+    "Market Cap",
+    "P/E (TTM)",
+    "P/B",
+    "Dividend Yield %",   # expects percent-like; backend may return fraction
+    "ROE %",
+    "ROA %",
+
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Risk Score",
+    "Opportunity Score",
+    "Overall Score",
+    "Recommendation",
+
+    "Fair Value",
+    "Upside %",
+    "Valuation Label",
+
+    "Data Quality",
+    "Sources",
+    "Last Updated (UTC)",
+    "Error",
+]
+
+
+def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
+    def g(*keys: str) -> Any:
+        for k in keys:
+            if k in r:
+                return r.get(k)
+        return None
+
+    sources = r.get("sources")
+    if isinstance(sources, list):
+        sources_str = ", ".join([str(x) for x in sources if str(x).strip()])
+    else:
+        sources_str = str(sources or "")
+
+    sym = g("symbol", "ticker")
+    sym = _norm_symbol(str(sym or ""))
+
+    return [
+        rank,
+        sym,
+        origins,
+        g("name"),
+        g("market_region", "market"),
+        g("currency"),
+
+        g("price", "current_price"),
+        g("change_pct", "percent_change"),
+
+        g("market_cap"),
+        g("pe_ttm"),
+        g("pb"),
+        g("dividend_yield"),
+        g("roe"),
+        g("roa"),
+
+        g("value_score"),
+        g("quality_score"),
+        g("momentum_score"),
+        g("risk_score"),
+        g("opportunity_score"),
+        g("overall_score"),
+        g("recommendation"),
+
+        g("fair_value"),
+        g("upside_percent"),
+        g("valuation_label"),
+
+        g("data_quality"),
+        sources_str,
+        g("last_updated_utc"),
+        g("error"),
+    ]
+
+
+def _grid_from_results(
+    results_sorted: List[Dict[str, Any]],
+    *,
+    headers: Optional[List[str]] = None,
+    origin_map: Optional[Dict[str, List[str]]] = None,
+) -> List[List[Any]]:
+    h = headers or list(DEFAULT_HEADERS)
+    origin_map = origin_map or {}
+
+    rows: List[List[Any]] = []
+    for i, r in enumerate(results_sorted, start=1):
+        sym = _norm_symbol(str(r.get("symbol") or r.get("ticker") or ""))
+        origins = ", ".join(origin_map.get(sym, [])) if sym else ""
+        rows.append(_to_row(r, rank=i, origins=origins))
+
+    fixed: List[List[Any]] = []
+    for rr in rows:
+        if len(rr) < len(h):
+            rr = rr + [None] * (len(h) - len(rr))
+        elif len(rr) > len(h):
+            rr = rr[: len(h)]
+        fixed.append(rr)
+
+    return [h] + fixed
+
+
+# =============================================================================
+# Sheets write helpers (supports multiple service shapes)
+# =============================================================================
+def _write_grid(
     spreadsheet_id: str,
     sheet_name: str,
-    header_row: int = 5,
-    max_cols: int = 52,
-    scan_rows: int = 2000,
-) -> Dict[str, Any]:
+    start_cell: str,
+    grid: List[List[Any]],
+    *,
+    value_input: str = "RAW",
+) -> int:
     """
-    Legacy/shim support for fetching from a specific sheet by name.
-    Creates a temporary PageSpec.
+    Returns cells updated (best-effort int). Supports multiple google_sheets_service APIs.
     """
-    spec = PageSpec(
-        key="TEMP_CUSTOM",
-        sheet_names=(sheet_name,),
-        header_row=header_row,
-        start_row=header_row + 1,
-        max_rows=scan_rows,
+    if sheets_service is None:
+        raise RuntimeError("google_sheets_service not available")
+
+    vi = (value_input or "RAW").strip().upper()
+    if vi not in ("RAW", "USER_ENTERED"):
+        vi = "RAW"
+
+    # 1) Preferred: write_grid_chunked(sid, sheet_name, start_cell, grid, value_input=?)
+    fn = getattr(sheets_service, "write_grid_chunked", None)
+    if callable(fn):
+        try:
+            sig = None
+            try:
+                import inspect as _inspect  # local import to avoid unused if not needed
+
+                sig = _inspect.signature(fn)
+            except Exception:
+                sig = None
+
+            if sig and "value_input" in sig.parameters:
+                updated = fn(spreadsheet_id, sheet_name, start_cell, grid, value_input=vi)  # type: ignore
+            else:
+                updated = fn(spreadsheet_id, sheet_name, start_cell, grid)  # type: ignore
+            try:
+                return int(updated or 0)
+            except Exception:
+                return 0
+        except Exception:
+            # continue to fallbacks
+            pass
+
+    # 2) write_grid(...)
+    fn2 = getattr(sheets_service, "write_grid", None)
+    if callable(fn2):
+        try:
+            updated = fn2(spreadsheet_id, sheet_name, start_cell, grid)  # type: ignore
+            try:
+                return int(updated or 0)
+            except Exception:
+                return 0
+        except Exception:
+            pass
+
+    # 3) update_values / write_values pattern
+    fn3 = getattr(sheets_service, "update_values", None)
+    if callable(fn3):
+        # many libs expect a range like "Sheet!A5"
+        a1 = f"{sheet_name}!{start_cell}"
+        updated = fn3(spreadsheet_id, a1, grid, value_input=vi)  # type: ignore
+        try:
+            return int(updated or 0)
+        except Exception:
+            return 0
+
+    raise RuntimeError("No supported grid writer found in google_sheets_service (expected write_grid_chunked/write_grid/update_values).")
+
+
+def _clear_range(
+    spreadsheet_id: str,
+    a1_range: str,
+) -> None:
+    if sheets_service is None:
+        raise RuntimeError("google_sheets_service not available")
+    fn = getattr(sheets_service, "clear_range", None)
+    if callable(fn):
+        fn(spreadsheet_id, a1_range)  # type: ignore
+        return
+    # optional: try 'clear_values'
+    fn2 = getattr(sheets_service, "clear_values", None)
+    if callable(fn2):
+        fn2(spreadsheet_id, a1_range)  # type: ignore
+        return
+    raise RuntimeError("No supported clear function found in google_sheets_service (expected clear_range/clear_values).")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main() -> None:
+    p = argparse.ArgumentParser(description="Run a market scan (AI Analysis) and optionally write to Google Sheets.")
+    p.add_argument("--keys", nargs="*", default=None, help="PAGE_REGISTRY keys to scan (default: MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL)")
+    p.add_argument("--ksa-only", action="store_true", help="Keep only KSA (.SR or numeric) symbols")
+    p.add_argument("--global-only", action="store_true", help="Keep only Global (non-.SR) symbols")
+    p.add_argument("--max-symbols", type=int, default=0, help="Cap total symbols (0 = no cap)")
+
+    p.add_argument("--batch-size", type=int, default=200, help="Backend batch size for /v1/analysis/quotes")
+    p.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout per batch")
+    p.add_argument("--retries", type=int, default=2, help="HTTP retries per batch")
+
+    p.add_argument("--top", type=int, default=50, help="Keep top N results after ranking")
+    p.add_argument("--min-quality", default="ANY", help="ANY | OK | PARTIAL | MISSING | ERROR")
+    p.add_argument("--include-errors", action="store_true", help="Keep rows with error (default: filtered if quality too low)")
+
+    p.add_argument("--out-json", default="", help="Write results JSON to file path")
+    p.add_argument("--out-csv", default="", help="Write results CSV to file path (basic)")
+    p.add_argument("--dry-run", action="store_true", help="Run scan and ranking but do not write to sheet")
+
+    # Sheets output
+    p.add_argument("--no-sheet", action="store_true", help="Do not write to Google Sheets; print summary only")
+    p.add_argument("--sheet-id", default="", help="Spreadsheet ID (default from env DEFAULT_SPREADSHEET_ID)")
+    p.add_argument("--sheet-name", default="Market_Scan", help="Target sheet/tab name (default: Market_Scan)")
+    p.add_argument("--start-cell", default="A5", help="Top-left cell for headers (default: A5)")
+    p.add_argument("--clear", action="store_true", help="Clear old values before writing")
+    p.add_argument("--smart-clear", action="store_true", help="Clear only table width (recommended with --clear)")
+    p.add_argument("--clear-end-row", type=int, default=100000, help="Clear end row (default 100000)")
+    p.add_argument("--value-input", default="RAW", choices=["RAW", "USER_ENTERED", "raw", "user_entered"], help="Sheets write mode")
+
+    # Logging
+    p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
+
+    args = p.parse_args()
+    try:
+        logging.getLogger().setLevel(getattr(logging, str(args.log_level).upper(), logging.INFO))
+    except Exception:
+        pass
+
+    base_url = _get_backend_base_url()
+    logger.info("MarketScan v%s | backend=%s | ts=%s", SCRIPT_VERSION, base_url, _utc_now_iso())
+
+    # Keys
+    keys = _parse_keys_list(args.keys)
+    if not keys:
+        keys = _default_keys()
+
+    # Read symbols
+    all_symbols: List[str] = []
+    per_key_meta: Dict[str, Any] = {}
+    origin_map: Dict[str, List[str]] = {}
+
+    for k in keys:
+        b = _read_symbols_for_key(k)
+        per_key_meta[k] = b.meta
+        all_symbols.extend(b.symbols)
+        for s in b.symbols:
+            origin_map.setdefault(s, [])
+            if k not in origin_map[s]:
+                origin_map[s].append(k)
+
+    all_symbols = _dedupe(all_symbols)
+
+    if args.ksa_only and args.global_only:
+        logger.error("You cannot use --ksa-only and --global-only together.")
+        sys.exit(2)
+
+    if args.ksa_only:
+        all_symbols = [s for s in all_symbols if _is_ksa(s)]
+    if args.global_only:
+        all_symbols = [s for s in all_symbols if not _is_ksa(s)]
+
+    if args.max_symbols and args.max_symbols > 0 and len(all_symbols) > int(args.max_symbols):
+        all_symbols = all_symbols[: int(args.max_symbols)]
+
+    if not all_symbols:
+        logger.warning("No symbols found after filtering. keys=%s meta=%s", keys, per_key_meta)
+        sys.exit(0)
+
+    logger.info("Symbols loaded: %s | keys=%s | meta=%s", len(all_symbols), keys, per_key_meta)
+
+    # Call backend
+    t0 = time.time()
+    results = _call_analysis_batch(
+        all_symbols,
+        timeout=_safe_float(args.timeout, 60.0),
+        retries=_safe_int(args.retries, 2),
+        batch_size=max(1, _safe_int(args.batch_size, 200)),
     )
-    syms, meta = _read_symbols_from_sheet(spreadsheet_id, spec)
-    ksa, glob = _classify(syms)
-    return {"all": syms, "ksa": ksa, "global": glob, "meta": meta}
+    dt = time.time() - t0
+    logger.info("Backend returned raw rows=%s in %.2fs", len(results), dt)
 
+    # Quality filter
+    min_q = str(args.min_quality or "ANY").strip().upper()
 
-# -----------------------------------------------------------------------------
-# Optional CLI (safe)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    sid = _get_spreadsheet_id()
-    print(f"symbols_reader v{VERSION}")
-    print(f"Spreadsheet ID: {'SET' if sid else 'NOT SET'}")
-    print("Keys:", ", ".join(list_keys()))
-    print()
-
-    for k in list_keys():
-        data = get_page_symbols(k, spreadsheet_id=sid)
-        all_syms = data.get("all") or []
-        meta = data.get("meta") or {}
-        print(f"[{k}] count={len(all_syms)} mode={meta.get('mode','')} sheet={meta.get('sheet_used','')}")
-        if all_syms:
-            print("  first:", all_syms[:10])
+    if not args.include_errors:
+        if min_q != "ANY":
+            results = [r for r in results if _passes_quality(r, min_q)]
         else:
-            err = meta.get("error")
-            if err:
-                print("  error:", err)
-        print()
+            tmp: List[Dict[str, Any]] = []
+            for r in results:
+                if (r.get("error") or "") and (r.get("opportunity_score") is None) and (r.get("overall_score") is None):
+                    continue
+                tmp.append(r)
+            results = tmp
+
+    # Rank + Top N
+    results_sorted = sorted(results, key=_rank_key, reverse=True)
+    top_n = max(1, _safe_int(args.top, 50))
+    results_sorted = results_sorted[:top_n]
+
+    logger.info("Final ranked rows: %s (top=%s, min_quality=%s)", len(results_sorted), top_n, min_q)
+
+    # Outputs: JSON/CSV
+    if args.out_json:
+        try:
+            with open(args.out_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "generated_utc": _utc_now_iso(),
+                        "version": SCRIPT_VERSION,
+                        "backend": base_url,
+                        "keys": keys,
+                        "symbols_count": len(all_symbols),
+                        "ranked_count": len(results_sorted),
+                        "results": results_sorted,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            logger.info("Wrote JSON: %s", args.out_json)
+        except Exception as e:
+            logger.error("Failed writing JSON (%s): %s", args.out_json, e)
+
+    if args.out_csv:
+        try:
+            grid = _grid_from_results(results_sorted, origin_map=origin_map)
+            with open(args.out_csv, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                for row in grid:
+                    w.writerow(row)
+            logger.info("Wrote CSV: %s", args.out_csv)
+        except Exception as e:
+            logger.error("Failed writing CSV (%s): %s", args.out_csv, e)
+
+    # No sheet / dry run
+    if args.no_sheet or args.dry_run:
+        top_syms = [_norm_symbol(str(r.get("symbol") or r.get("ticker") or "")) for r in results_sorted[:10]]
+        logger.info("Done (%s). Top symbols: %s", "no-sheet" if args.no_sheet else "dry-run", top_syms)
+        return
+
+    # Sheets write
+    if sheets_service is None:
+        logger.error("google_sheets_service not importable; cannot write to sheet. Use --no-sheet.")
+        sys.exit(2)
+
+    sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
+    if not sheet_id:
+        logger.error("Spreadsheet ID missing. Set DEFAULT_SPREADSHEET_ID or pass --sheet-id, or use --no-sheet.")
+        sys.exit(2)
+
+    sheet_name = (args.sheet_name or "Market_Scan").strip()
+    start_cell = _validate_start_cell(str(args.start_cell or "A5"))
+    clear_end_row = max(1000, _safe_int(args.clear_end_row, 100000))
+
+    value_input = str(args.value_input or "RAW").strip().upper()
+    if value_input not in ("RAW", "USER_ENTERED"):
+        value_input = "RAW"
+
+    grid = _grid_from_results(results_sorted, origin_map=origin_map)
+
+    # Clear old values (optional)
+    if args.clear:
+        try:
+            start_col, start_row = _parse_a1_cell(start_cell)
+
+            # default clear: very wide (safe)
+            end_col = "ZZ"
+
+            # optional: smart-clear only table width
+            if args.smart_clear:
+                end_col = _index_to_col(_col_to_index(start_col) + len(grid[0]) - 1)
+
+            rng = f"{_safe_sheet_name(sheet_name)}!{_a1(start_col, start_row)}:{end_col}{clear_end_row}"
+            _clear_range(sheet_id, rng)
+            logger.info("Cleared range: %s", rng)
+        except Exception as e:
+            logger.warning("Clear failed (continuing): %s", e)
+
+    try:
+        updated = _write_grid(sheet_id, sheet_name, start_cell, grid, value_input=value_input)
+        logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
+    except Exception as e:
+        logger.error("❌ Sheet write failed: %s", e)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
