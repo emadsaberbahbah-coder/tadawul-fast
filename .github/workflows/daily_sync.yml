@@ -18,7 +18,7 @@ on:
         description: 'Service Account JSON (Paste here if Secret fails)'
         required: false
 
-# Prevent overlapping scheduled runs (hourly can overlap if one run is slow)
+# Prevent overlapping hourly runs
 concurrency:
   group: tadawul-dashboard-sync
   cancel-in-progress: true
@@ -31,6 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 25
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout Repository
@@ -45,14 +49,14 @@ jobs:
       - name: Install Dependencies
         run: |
           python -V
-          pip -V
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Debug: List Files
+      - name: Debug: Quick Repo Check
         run: |
-          echo "Current Directory: $(pwd)"
-          echo "Listing files for diagnostic purposes:"
-          ls -R
+          echo "PWD: $(pwd)"
+          ls -la
+          test -f scripts/run_dashboard_sync.py && echo "OK: scripts/run_dashboard_sync.py found" || (echo "::error::Missing scripts/run_dashboard_sync.py" && exit 1)
 
       - name: Wake up Render Backend
         env:
@@ -61,11 +65,13 @@ jobs:
         run: |
           if [ -z "$URL" ]; then
             echo "Backend URL missing in wake-up step, skipping ping..."
-          else
-            echo "Pinging backend at $URL/healthz to ensure it is awake..."
-            # Don't fail the workflow if backend is cold/asleep
-            curl -fsS --max-time 20 "$URL/healthz" >/dev/null || echo "Ping failed (backend may be cold), continuing..."
+            exit 0
           fi
+
+          echo "Pinging backend (best-effort): $URL/healthz"
+          # Do not fail if backend is cold/asleep
+          curl -fsS --max-time 25 --retry 3 --retry-delay 3 "$URL/healthz" >/dev/null \
+            || echo "Ping failed (backend may be cold), continuing..."
 
       - name: Run Dashboard Sync
         env:
@@ -75,27 +81,27 @@ jobs:
           # Priority: Manual Input -> Repo Secret
           GOOGLE_SHEETS_CREDENTIALS: ${{ inputs.google_creds_json || secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
-          set -e
+          set -euo pipefail
 
-          # --- DIAGNOSTIC CHECKS ---
-          if [ -z "$BACKEND_BASE_URL" ]; then
-            echo "::error::BACKEND_BASE_URL is missing! Please enter it in the 'Run workflow' popup or add to Repository Variables/Secrets."
+          # --- REQUIRED CONFIG CHECKS ---
+          if [ -z "${BACKEND_BASE_URL:-}" ]; then
+            echo "::error::BACKEND_BASE_URL is missing! Add Repository Variable/Secret BACKEND_BASE_URL or pass it in workflow_dispatch."
             exit 1
           fi
 
-          if [ -z "$DEFAULT_SPREADSHEET_ID" ]; then
-            echo "::error::DEFAULT_SPREADSHEET_ID is missing! Please enter it in the 'Run workflow' popup or add to Repository Secrets."
+          if [ -z "${DEFAULT_SPREADSHEET_ID:-}" ]; then
+            echo "::error::DEFAULT_SPREADSHEET_ID is missing! Add Repository Secret DEFAULT_SPREADSHEET_ID or pass it in workflow_dispatch."
             exit 1
           fi
 
-          if [ -z "$GOOGLE_SHEETS_CREDENTIALS" ]; then
-            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Please paste the JSON into the manual input OR set Repository Secret GOOGLE_SHEETS_CREDENTIALS."
+          if [ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]; then
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Add Repository Secret GOOGLE_SHEETS_CREDENTIALS or paste JSON in workflow_dispatch input."
             exit 1
           fi
-          # -------------------------
+          # --------------------------------
 
           echo "Configuration OK."
-          echo "Target Backend: $BACKEND_BASE_URL"
-          echo "Target Sheet: $DEFAULT_SPREADSHEET_ID"
+          echo "Target Backend: ${BACKEND_BASE_URL}"
+          echo "Target Sheet  : ${DEFAULT_SPREADSHEET_ID}"
 
           python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
