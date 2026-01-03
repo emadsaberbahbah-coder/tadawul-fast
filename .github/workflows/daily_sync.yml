@@ -5,7 +5,6 @@ on:
     # Run every hour (at minute 0)
     - cron: '0 * * * *'
   workflow_dispatch:
-    # Allow manual triggering with overrides
     inputs:
       backend_url:
         description: 'Backend URL (e.g. https://...onrender.com)'
@@ -19,23 +18,34 @@ on:
         description: 'Service Account JSON (Paste here if Secret fails)'
         required: false
 
+# Prevent overlapping scheduled runs (hourly can overlap if one run is slow)
+concurrency:
+  group: tadawul-dashboard-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   run-sync:
     runs-on: ubuntu-latest
-    # Connect to 'production' environment secrets if they exist there
     environment: production
-    
+    timeout-minutes: 25
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
+          python -V
+          pip -V
           pip install -r requirements.txt
 
       - name: Debug: List Files
@@ -46,14 +56,15 @@ jobs:
 
       - name: Wake up Render Backend
         env:
-          # Check Input -> Variable -> Secret -> Hardcoded Fallback
+          # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
           URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
           if [ -z "$URL" ]; then
-             echo "Backend URL missing in wake-up step, skipping ping..."
+            echo "Backend URL missing in wake-up step, skipping ping..."
           else
-             echo "Pinging backend at $URL to ensure it is awake..."
-             curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "Ping failed, continuing..."
+            echo "Pinging backend at $URL/healthz to ensure it is awake..."
+            # Don't fail the workflow if backend is cold/asleep
+            curl -fsS --max-time 20 "$URL/healthz" >/dev/null || echo "Ping failed (backend may be cold), continuing..."
           fi
 
       - name: Run Dashboard Sync
@@ -64,9 +75,11 @@ jobs:
           # Priority: Manual Input -> Repo Secret
           GOOGLE_SHEETS_CREDENTIALS: ${{ inputs.google_creds_json || secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
+          set -e
+
           # --- DIAGNOSTIC CHECKS ---
           if [ -z "$BACKEND_BASE_URL" ]; then
-            echo "::error::BACKEND_BASE_URL is missing! Please enter it in the 'Run workflow' popup or add to Repository Variables."
+            echo "::error::BACKEND_BASE_URL is missing! Please enter it in the 'Run workflow' popup or add to Repository Variables/Secrets."
             exit 1
           fi
 
@@ -74,9 +87,9 @@ jobs:
             echo "::error::DEFAULT_SPREADSHEET_ID is missing! Please enter it in the 'Run workflow' popup or add to Repository Secrets."
             exit 1
           fi
-          
+
           if [ -z "$GOOGLE_SHEETS_CREDENTIALS" ]; then
-            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Please paste the JSON content into the 'Service Account JSON' box when running manually, OR check your Secrets."
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Please paste the JSON into the manual input OR set Repository Secret GOOGLE_SHEETS_CREDENTIALS."
             exit 1
           fi
           # -------------------------
@@ -84,5 +97,5 @@ jobs:
           echo "Configuration OK."
           echo "Target Backend: $BACKEND_BASE_URL"
           echo "Target Sheet: $DEFAULT_SPREADSHEET_ID"
-          
+
           python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
