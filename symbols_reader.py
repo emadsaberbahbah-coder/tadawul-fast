@@ -563,6 +563,11 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
+# Compatibility aliases for integrations/symbols_reader.py
+PageConfig = PageSpec
+split_tickers_by_market = _classify
+
+
 def list_keys() -> List[str]:
     return sorted(PAGE_REGISTRY.keys())
 
@@ -633,6 +638,36 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
     out = {"all": syms, "ksa": ksa, "global": glob, "meta": meta}
     _cache_set(cache_key, out)
     return out
+
+
+def get_all_pages_symbols(spreadsheet_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Convenience: returns a dict of {key: get_page_symbols(key)} for all registered keys.
+    """
+    return {k: get_page_symbols(k, spreadsheet_id) for k in list_keys()}
+
+
+def get_symbols_from_sheet(
+    spreadsheet_id: str,
+    sheet_name: str,
+    header_row: int = 5,
+    max_cols: int = 52,
+    scan_rows: int = 2000,
+) -> Dict[str, Any]:
+    """
+    Legacy/shim support for fetching from a specific sheet by name.
+    Creates a temporary PageSpec.
+    """
+    spec = PageSpec(
+        key="TEMP_CUSTOM",
+        sheet_names=(sheet_name,),
+        header_row=header_row,
+        start_row=header_row + 1,
+        max_rows=scan_rows,
+    )
+    syms, meta = _read_symbols_from_sheet(spreadsheet_id, spec)
+    ksa, glob = _classify(syms)
+    return {"all": syms, "ksa": ksa, "global": glob, "meta": meta}
 
 
 # -----------------------------------------------------------------------------
