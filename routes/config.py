@@ -550,95 +550,138 @@ except Exception:  # pragma: no cover
                 "quote_ttl_sec": float(self.quote_ttl_sec),
                 "fundamentals_ttl_sec": float(self.fundamentals_ttl_sec),
                 "argaam_snapshot_ttl_sec": float(self.argaam_snapshot_ttl_sec),
+                "cache_max_size": int(self.cache_max_size),
                 "advanced_batching": {
                     "adv_batch_size": int(self.adv_batch_size),
                     "adv_batch_timeout_sec": float(self.adv_batch_timeout_sec),
                     "adv_max_tickers": int(self.adv_max_tickers),
                     "adv_batch_concurrency": int(self.adv_batch_concurrency),
                 },
+                "rate_limiting": {
+                    "enabled": bool(self.enable_rate_limiting),
+                    "max_requests_per_minute": int(self.max_requests_per_minute),
+                },
+                "cors": {
+                    "all_origins": bool(self.enable_cors_all_origins),
+                    "origins_list": self.cors_origins_list,
+                },
                 "app_token_set": bool((self.app_token or "").strip()),
                 "backup_app_token_set": bool((self.backup_app_token or "").strip()),
                 "app_token_mask": _mask_tail(self.app_token, keep=4),
                 "eodhd_key_set": bool((self.eodhd_api_key or "").strip()),
                 "finnhub_key_set": bool((self.finnhub_api_key or "").strip()),
+                "default_spreadsheet_id_set": bool((self.default_spreadsheet_id or "").strip()),
+                "google_creds_set": bool((self.google_sheets_credentials or "").strip() or (self.google_credentials or "").strip()),
             }
 
-    _CACHED: Optional[Settings] = None
+        def __getattr__(self, name: str) -> Any:
+            # Optional: uppercase attribute compatibility (best-effort)
+            if name.isupper():
+                low = name.lower()
+                if hasattr(self, low):
+                    return getattr(self, low)
+                mapping = {
+                    "EODHD_API_TOKEN": "eodhd_api_token",
+                    "FINNHUB_API_TOKEN": "finnhub_api_token",
+                    "HTTP_TIMEOUT_SEC": "http_timeout_sec",
+                    "ADV_BATCH_TIMEOUT_SEC": "adv_batch_timeout_sec",
+                    "ADV_BATCH_SIZE": "adv_batch_size",
+                    "ADV_MAX_TICKERS": "adv_max_tickers",
+                    "ADV_BATCH_CONCURRENCY": "adv_batch_concurrency",
+                }
+                if name in mapping and hasattr(self, mapping[name]):
+                    return getattr(self, mapping[name])
+            raise AttributeError(name)
 
-    def get_settings() -> Settings:  # type: ignore
-        global _CACHED
-        if _CACHED is not None:
-            return _CACHED
+    def _apply_runtime_env_aliases(s: Settings) -> None:
+        """
+        Make providers + legacy modules work with your Render env names WITHOUT changing Render.
+        """
+        # Provider token aliases
+        _export_env_if_missing("FINNHUB_API_TOKEN", s.finnhub_api_token)
+        _export_env_if_missing("FINNHUB_TOKEN", s.finnhub_api_token)
 
-        app_token = (os.getenv("APP_TOKEN") or "").strip() or None
-        backup = (os.getenv("BACKUP_APP_TOKEN") or "").strip() or None
-        require_auth = _to_bool(os.getenv("REQUIRE_AUTH"), False) or bool(app_token or backup)
+        _export_env_if_missing("EODHD_API_TOKEN", s.eodhd_api_token)
+        _export_env_if_missing("EODHD_TOKEN", s.eodhd_api_token)
 
-        _CACHED = Settings(
-            service_name=(os.getenv("SERVICE_NAME") or os.getenv("APP_NAME") or "Tadawul Stock Analysis API").strip(),
-            service_version=(os.getenv("SERVICE_VERSION") or os.getenv("APP_VERSION") or os.getenv("VERSION") or "0.0.0").strip(),
-            environment=(os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("ENV") or "production").strip(),
-            tz=(os.getenv("TZ") or os.getenv("TIMEZONE") or "Asia/Riyadh").strip(),
-            debug=_to_bool(os.getenv("DEBUG"), False),
-            log_level=(os.getenv("LOG_LEVEL") or "info").strip().lower(),
-            require_auth=require_auth,
-            app_token=app_token,
-            backup_app_token=backup,
-            enabled_providers_raw=(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub").strip(),
-            primary_provider=(os.getenv("PRIMARY_PROVIDER") or "eodhd").strip().lower(),
-            ksa_providers_raw=(os.getenv("KSA_PROVIDERS") or "yahoo_chart,tadawul,argaam").strip(),
-            enable_yfinance_ksa=_to_bool(os.getenv("ENABLE_YFINANCE_KSA"), False),
-            enable_yahoo_chart_ksa=_to_bool(os.getenv("ENABLE_YAHOO_CHART_KSA"), True),
-            eodhd_api_key=(os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_TOKEN") or "").strip() or None,
-            finnhub_api_key=(os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_TOKEN") or os.getenv("FINNHUB_TOKEN") or "").strip() or None,
-            backend_base_url=(os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or os.getenv("BASE_URL") or "").strip() or None,
-            eodhd_base_url=(os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").strip(),
-            finnhub_base_url=(os.getenv("FINNHUB_BASE_URL") or "https://finnhub.io/api/v1").strip(),
-            yahoo_chart_base_url=(os.getenv("YAHOO_CHART_BASE_URL") or "https://query1.finance.yahoo.com").strip(),
-            http_timeout=_to_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0),
-            max_retries=_to_int(os.getenv("MAX_RETRIES"), 2),
-            retry_delay=_to_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5),
-            cache_ttl_sec=_to_float(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20.0),
-            quote_ttl_sec=_to_float(os.getenv("QUOTE_TTL_SEC"), 30.0),
-            fundamentals_ttl_sec=_to_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0),
-            argaam_snapshot_ttl_sec=_to_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0),
-            adv_batch_size=_to_int(os.getenv("ADV_BATCH_SIZE"), 25),
-            adv_batch_timeout_sec=_to_float(os.getenv("ADV_BATCH_TIMEOUT_SEC"), 45.0),
-            adv_max_tickers=_to_int(os.getenv("ADV_MAX_TICKERS"), 500),
-            adv_batch_concurrency=_to_int(os.getenv("ADV_BATCH_CONCURRENCY"), 6),
-        )
+        # Timeout aliases
+        _export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(s.http_timeout_sec)))
+        _export_env_if_missing("HTTP_TIMEOUT", str(float(s.http_timeout_sec)))
 
-        # Export runtime aliases (best-effort)
-        _export_env_if_missing("FINNHUB_API_TOKEN", _CACHED.finnhub_api_token)
-        _export_env_if_missing("FINNHUB_TOKEN", _CACHED.finnhub_api_token)
-        _export_env_if_missing("EODHD_API_TOKEN", _CACHED.eodhd_api_token)
-        _export_env_if_missing("EODHD_TOKEN", _CACHED.eodhd_api_token)
+        # TTL aliases
+        _export_env_if_missing("CACHE_TTL_SEC", str(float(s.cache_ttl_sec)))
+        _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(s.cache_ttl_sec)))
 
-        _export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(_CACHED.http_timeout_sec)))
-        _export_env_if_missing("HTTP_TIMEOUT", str(float(_CACHED.http_timeout_sec)))
+        _export_env_if_missing("QUOTE_TTL_SEC", str(float(s.quote_ttl_sec)))
+        _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(s.fundamentals_ttl_sec)))
+        _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(s.argaam_snapshot_ttl_sec)))
 
-        _export_env_if_missing("CACHE_TTL_SEC", str(float(_CACHED.cache_ttl_sec)))
-        _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(_CACHED.cache_ttl_sec)))
-        _export_env_if_missing("QUOTE_TTL_SEC", str(float(_CACHED.quote_ttl_sec)))
-        _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(_CACHED.fundamentals_ttl_sec)))
-        _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(_CACHED.argaam_snapshot_ttl_sec)))
+        # Advanced Analysis env (so routes can read from os.getenv too)
+        _export_env_if_missing("ADV_BATCH_SIZE", str(int(s.adv_batch_size)))
+        _export_env_if_missing("ADV_BATCH_TIMEOUT_SEC", str(float(s.adv_batch_timeout_sec)))
+        _export_env_if_missing("ADV_MAX_TICKERS", str(int(s.adv_max_tickers)))
+        _export_env_if_missing("ADV_BATCH_CONCURRENCY", str(int(s.adv_batch_concurrency)))
 
-        _export_env_if_missing("ADV_BATCH_SIZE", str(int(_CACHED.adv_batch_size)))
-        _export_env_if_missing("ADV_BATCH_TIMEOUT_SEC", str(float(_CACHED.adv_batch_timeout_sec)))
-        _export_env_if_missing("ADV_MAX_TICKERS", str(int(_CACHED.adv_max_tickers)))
-        _export_env_if_missing("ADV_BATCH_CONCURRENCY", str(int(_CACHED.adv_batch_concurrency)))
+        # Base URLs for provider modules that read env at call-time
+        _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
+        _export_env_if_missing("FINNHUB_BASE_URL", s.finnhub_base_url)
+        _export_env_if_missing("YAHOO_CHART_BASE_URL", s.yahoo_chart_base_url)
 
-        _export_env_if_missing("ENABLED_PROVIDERS", ",".join(_CACHED.enabled_providers))
-        _export_env_if_missing("KSA_PROVIDERS", ",".join(_CACHED.ksa_providers))
-        _export_env_if_missing("PRIMARY_PROVIDER", (_CACHED.primary_provider or "eodhd").strip().lower())
+        # Providers lists (some older modules read these at runtime)
+        _export_env_if_missing("ENABLED_PROVIDERS", ",".join(s.enabled_providers))
+        _export_env_if_missing("KSA_PROVIDERS", ",".join(s.ksa_providers))
+        _export_env_if_missing("PRIMARY_PROVIDER", (s.primary_provider or "eodhd").strip().lower())
 
-        _export_env_if_missing("YAHOO_CHART_BASE_URL", _CACHED.yahoo_chart_base_url)
+        # Optional base URL alias
+        if s.backend_base_url:
+            _export_env_if_missing("BACKEND_BASE_URL", (s.backend_base_url or "").rstrip("/"))
+            _export_env_if_missing("BASE_URL", (s.backend_base_url or "").rstrip("/"))
 
-        if _CACHED.backend_base_url:
-            _export_env_if_missing("BACKEND_BASE_URL", (_CACHED.backend_base_url or "").rstrip("/"))
-            _export_env_if_missing("BASE_URL", (_CACHED.backend_base_url or "").rstrip("/"))
+    @lru_cache(maxsize=1)
+    def get_settings() -> Settings:
+        s = Settings()
 
-        return _CACHED
+        # Normalize / coerce
+        s.log_level = (s.log_level or "info").strip().lower()
+        s.primary_provider = (s.primary_provider or "eodhd").strip().lower()
+
+        s.debug = _to_bool(s.debug, False)
+
+        s.enable_rate_limiting = _to_bool(s.enable_rate_limiting, True)
+        s.cache_backup_enabled = _to_bool(s.cache_backup_enabled, False)
+        s.advanced_analysis_enabled = _to_bool(s.advanced_analysis_enabled, True)
+        s.tadawul_market_enabled = _to_bool(s.tadawul_market_enabled, True)
+        s.enable_cors_all_origins = _to_bool(s.enable_cors_all_origins, True)
+
+        s.enable_yfinance_ksa = _to_bool(s.enable_yfinance_ksa, False)
+        s.enable_yahoo_chart_ksa = _to_bool(s.enable_yahoo_chart_ksa, True)
+
+        s.max_requests_per_minute = _to_int(s.max_requests_per_minute, 240)
+        s.max_retries = _to_int(s.max_retries, 2)
+
+        s.http_timeout = _to_float(s.http_timeout, 30.0)
+        s.retry_delay = _to_float(s.retry_delay, 0.5)
+
+        s.cache_ttl_sec = _to_float(s.cache_ttl_sec, 20.0)
+        s.quote_ttl_sec = _to_float(s.quote_ttl_sec, 30.0)
+        s.fundamentals_ttl_sec = _to_float(s.fundamentals_ttl_sec, 21600.0)
+        s.argaam_snapshot_ttl_sec = _to_float(s.argaam_snapshot_ttl_sec, 30.0)
+
+        s.cache_max_size = _to_int(s.cache_max_size, 5000)
+        s.cache_save_interval = _to_int(s.cache_save_interval, 300)
+
+        # Advanced Analysis clamps (same intent as routes)
+        s.adv_batch_size = max(5, min(200, _to_int(s.adv_batch_size, 25)))
+        s.adv_batch_timeout_sec = max(5.0, min(180.0, _to_float(s.adv_batch_timeout_sec, 45.0)))
+        s.adv_max_tickers = max(10, min(2000, _to_int(s.adv_max_tickers, 500)))
+        s.adv_batch_concurrency = max(1, min(25, _to_int(s.adv_batch_concurrency, 6)))
+
+        # Auth: if token is set, effectively require auth
+        tok_set = bool((s.app_token or "").strip() or (s.backup_app_token or "").strip())
+        s.require_auth = _to_bool(s.require_auth, False) or tok_set
+
+        _apply_runtime_env_aliases(s)
+        return s
 
 
 # -----------------------------------------------------------------------------
