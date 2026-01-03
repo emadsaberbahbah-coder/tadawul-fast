@@ -2,7 +2,6 @@ name: Tadawul Dashboard Sync
 
 on:
   schedule:
-    # Run every hour (at minute 0)
     - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
@@ -18,7 +17,6 @@ on:
         description: 'Service Account JSON (Paste here if Secret fails)'
         required: false
 
-# Prevent overlapping hourly runs
 concurrency:
   group: tadawul-dashboard-sync
   cancel-in-progress: true
@@ -62,7 +60,6 @@ jobs:
 
       - name: Wake up Render Backend
         env:
-          # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
           URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
           set -euo pipefail
@@ -72,21 +69,17 @@ jobs:
           fi
 
           echo "Pinging backend (best-effort): $URL/healthz"
-          # Do not fail if backend is cold/asleep
           curl -fsS --max-time 25 --retry 3 --retry-delay 3 "$URL/healthz" >/dev/null \
             || echo "Ping failed (backend may be cold), continuing..."
 
       - name: Run Dashboard Sync
         env:
-          # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
           BACKEND_BASE_URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
           DEFAULT_SPREADSHEET_ID: ${{ inputs.sheet_id || secrets.DEFAULT_SPREADSHEET_ID || '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw' }}
-          # Priority: Manual Input -> Repo Secret
           GOOGLE_SHEETS_CREDENTIALS: ${{ inputs.google_creds_json || secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
           set -euo pipefail
 
-          # --- REQUIRED CONFIG CHECKS ---
           if [ -z "${BACKEND_BASE_URL:-}" ]; then
             echo "::error::BACKEND_BASE_URL is missing! Add Repository Variable/Secret BACKEND_BASE_URL or pass it in workflow_dispatch."
             exit 1
@@ -101,7 +94,6 @@ jobs:
             echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Add Repository Secret GOOGLE_SHEETS_CREDENTIALS or paste JSON in workflow_dispatch input."
             exit 1
           fi
-          # --------------------------------
 
           echo "Configuration OK."
           echo "Target Backend: ${BACKEND_BASE_URL}"
