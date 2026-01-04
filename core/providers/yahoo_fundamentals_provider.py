@@ -1,42 +1,60 @@
-# core/providers/yahoo_fundamentals_provider.py
+# core/providers/yahoo_fundamentals_provider.py  (FULL REPLACEMENT)
 """
 core/providers/yahoo_fundamentals_provider.py
 ------------------------------------------------------------
-Yahoo Fundamentals Provider (NO yfinance) — v1.3.0
-PROD SAFE + ENGINE-ALIGNED (DICT RETURNS) + CLIENT REUSE + RETRY + TTL CACHE
+Yahoo Fundamentals Provider (NO yfinance) — v1.4.0
+PROD SAFE + ENGINE-ALIGNED (PATCH DICT) + CLIENT REUSE + RETRY + TTL CACHE + COOKIE WARMUP
+
+Why this upgrade (v1.4.0)
+- ✅ Adds more fields needed by your 59/78-column sheets:
+    • forward_eps, forward_pe
+    • ps (P/S)
+    • ev_ebitda
+    • payout_ratio
+- ✅ Normalizes % fields to match your sheet columns:
+    • dividend_yield => percent (not fraction)
+    • roe / roa      => percent (not fraction)
+    • payout_ratio   => percent (not fraction)
+  (Heuristic: if value <= 1.5 => treated as fraction and multiplied by 100)
+- ✅ Adds default host rotation (query1 + query2) + env overrides
+- ✅ Adds best-effort cookie warmup on 401/403 to reduce Yahoo blocks
+- ✅ Keeps import-safe behavior (never crashes app startup)
 
 Best-effort fundamentals for symbols (KSA .SR + GLOBAL):
 - market_cap, shares_outstanding
 - eps_ttm, pe_ttm (computed if missing)
 - pb (or computed using bookValue if available)
-- dividend_yield, dividend_rate
-- roe, roa, beta
+- dividend_yield (%), dividend_rate
+- payout_ratio (%)
+- roe (%), roa (%), beta
+- forward_eps, forward_pe
+- ps, ev_ebitda
 - currency
-
-Design:
-- Safe import (never crashes app on import)
-- Uses Yahoo JSON endpoints only
-- Adds lang/region params (helps non-US symbols sometimes)
-- Retry/backoff on 429 + transient 5xx
-- Reuses one AsyncClient (keep-alive)
-- TTL cache to reduce Yahoo rate limits (configurable)
-- Engine adapter returns PATCH dict (UnifiedQuote-aligned keys)
 
 Exports (engine-friendly)
 - fetch_fundamentals_patch(symbol, debug=False) -> Dict[str, Any]
-- fetch_quote_patch(symbol, debug=False) -> Dict[str, Any]                  (alias to fundamentals patch)
+- fetch_quote_patch(symbol, debug=False) -> Dict[str, Any]                  (alias)
 - fetch_enriched_quote_patch(symbol, debug=False) -> Dict[str, Any]         (alias)
 - fetch_quote_and_enrichment_patch(symbol, debug=False) -> Dict[str, Any]   (alias)
 - aclose_yahoo_fundamentals_client() -> None
 
 Env vars (supported)
+- ENABLE_YAHOO_FUNDAMENTALS=true/false (default true)
+- ENABLE_YAHOO_FUNDAMENTALS_KSA=true/false (default true)
+
 - YAHOO_UA (optional)
 - YAHOO_ACCEPT_LANGUAGE (optional)
 - YAHOO_TIMEOUT_S (default 12.0)
 - YAHOO_FUND_RETRY_MAX (default 2)                  # additional retries
 - YAHOO_FUND_RETRY_BACKOFF_MS (default 250)
 - YAHOO_FUND_TTL_SEC (default 3600, min 30)
-- YAHOO_ALT_HOSTS (optional, comma-separated; same as yahoo_chart_provider)
+
+- YAHOO_ALT_HOSTS (optional, comma-separated; appended after defaults)
+  e.g. "https://query1.finance.yahoo.com,https://query2.finance.yahoo.com"
+
+- YAHOO_REGION_KSA (default "SA")
+- YAHOO_REGION_GLOBAL (default "US")
+- YAHOO_LANG (default "en-US")
 """
 
 from __future__ import annotations
@@ -47,27 +65,50 @@ import os
 import random
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Set
 
 import httpx
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "1.3.0"
+PROVIDER_VERSION = "1.4.0"
+
+# ---------------------------
+# Feature flags
+# ---------------------------
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
+ENABLE_YAHOO_FUNDAMENTALS = _env_bool("ENABLE_YAHOO_FUNDAMENTALS", True)
+ENABLE_YAHOO_FUNDAMENTALS_KSA = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True)
 
 # ---------------------------
 # URLs (host overridable)
 # ---------------------------
-_DEFAULT_HOST = "https://query1.finance.yahoo.com"
+_DEFAULT_HOSTS = [
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com",
+]
 _QUOTE_SUMMARY_PATH = "/v10/finance/quoteSummary/{symbol}"
 _QUOTE_V7_PATH = "/v7/finance/quote"
+_WARMUP_URL = "https://finance.yahoo.com/quote/{symbol}"
 
 _ALT_HOSTS = [h.strip() for h in (os.getenv("YAHOO_ALT_HOSTS", "") or "").split(",") if h.strip()]
-_HOSTS: List[str] = [_DEFAULT_HOST]
+_HOSTS: List[str] = []
+for h in _DEFAULT_HOSTS:
+    if h and h not in _HOSTS:
+        _HOSTS.append(h.rstrip("/"))
 for host in _ALT_HOSTS:
     if "://" in host:
-        _HOSTS.append(host.rstrip("/"))
+        h2 = host.rstrip("/")
     else:
-        _HOSTS.append(f"https://{host}".rstrip("/"))
+        h2 = f"https://{host}".rstrip("/")
+    if h2 and h2 not in _HOSTS:
+        _HOSTS.append(h2)
 
 USER_AGENT = os.getenv(
     "YAHOO_UA",
@@ -95,18 +136,28 @@ _TIMEOUT = httpx.Timeout(timeout=_TIMEOUT_S, connect=min(6.0, _TIMEOUT_S))
 # Retries for transient Yahoo responses
 _RETRY_MAX = int(os.getenv("YAHOO_FUND_RETRY_MAX", "2") or "2")  # additional retries (0 => no retry)
 _RETRY_BACKOFF_MS = _env_float("YAHOO_FUND_RETRY_BACKOFF_MS", 250.0)
-_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+# Treat 403 as sometimes transient (cookie/edge blocks), plus standard 5xx/429
+_RETRY_STATUSES = {403, 429, 500, 502, 503, 504}
 
 # TTL Cache
 _TTL_SEC = _env_float("YAHOO_FUND_TTL_SEC", 3600.0)
 _TTL_SEC = max(30.0, _TTL_SEC)
 
+# Region / language
+_REGION_KSA = (os.getenv("YAHOO_REGION_KSA", "SA") or "SA").strip()
+_REGION_GLOBAL = (os.getenv("YAHOO_REGION_GLOBAL", "US") or "US").strip()
+_LANG = (os.getenv("YAHOO_LANG", "en-US") or "en-US").strip()
 
 # ---------------------------
 # Client reuse (keep-alive)
 # ---------------------------
 _CLIENT: Optional[httpx.AsyncClient] = None
 _CLIENT_LOCK = asyncio.Lock()
+
+# Best-effort warmup set (avoid repeated warmups)
+_WARMED: Set[str] = set()
+_WARM_LOCK = asyncio.Lock()
 
 # Minimal TTL cache (fallback if cachetools isn't installed)
 try:
@@ -160,6 +211,10 @@ def _headers_for(symbol: str) -> Dict[str, str]:
         "Referer": ref,
         "Origin": "https://finance.yahoo.com",
         "Connection": "keep-alive",
+        # helps some Yahoo edges
+        "DNT": "1",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
     }
 
 
@@ -247,6 +302,22 @@ def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
         return {}
 
 
+def _to_percent(v: Optional[float]) -> Optional[float]:
+    """
+    Normalize percent-like fields to percent.
+    If Yahoo returns fraction (0.12), convert to 12.0
+    If already percent-like (12.0), keep as-is.
+    """
+    if v is None:
+        return None
+    try:
+        if abs(v) <= 1.5:
+            return v * 100.0
+        return v
+    except Exception:
+        return v
+
+
 def _compute_if_possible(out: Dict[str, Any]) -> None:
     """
     Compute PE and Market Cap if Yahoo didn't provide them.
@@ -266,7 +337,23 @@ def _compute_if_possible(out: Dict[str, Any]) -> None:
 
 
 def _has_any_useful(out: Dict[str, Any]) -> bool:
-    keys = ("market_cap", "pe_ttm", "pb", "dividend_yield", "roe", "roa", "shares_outstanding", "eps_ttm", "beta")
+    keys = (
+        "market_cap",
+        "shares_outstanding",
+        "eps_ttm",
+        "pe_ttm",
+        "pb",
+        "dividend_yield",
+        "dividend_rate",
+        "payout_ratio",
+        "roe",
+        "roa",
+        "beta",
+        "forward_eps",
+        "forward_pe",
+        "ps",
+        "ev_ebitda",
+    )
     return any(_safe_float(out.get(k)) is not None for k in keys)
 
 
@@ -282,11 +369,16 @@ def _base(symbol: str) -> Dict[str, Any]:
         "shares_outstanding": None,
         "eps_ttm": None,
         "pe_ttm": None,
+        "forward_eps": None,
+        "forward_pe": None,
         "pb": None,
-        "dividend_yield": None,  # fraction (e.g. 0.035)
+        "ps": None,
+        "ev_ebitda": None,
+        "dividend_yield": None,  # percent (sheet-ready)
         "dividend_rate": None,
-        "roe": None,
-        "roa": None,
+        "payout_ratio": None,  # percent (sheet-ready)
+        "roe": None,  # percent (sheet-ready)
+        "roa": None,  # percent (sheet-ready)
         "beta": None,
         "error": None,
     }
@@ -295,6 +387,33 @@ def _base(symbol: str) -> Dict[str, Any]:
 async def _sleep_backoff(attempt: int) -> None:
     base = (_RETRY_BACKOFF_MS / 1000.0) * (2**attempt)
     await asyncio.sleep(min(2.5, base + random.random() * 0.35))
+
+
+def _region_for(sym: str) -> str:
+    return _REGION_KSA if sym.endswith(".SR") else _REGION_GLOBAL
+
+
+async def _warmup_cookie(symbol: str) -> None:
+    """
+    Best-effort: hit finance.yahoo.com to set cookies (A3, etc.)
+    which may reduce 401/403 on query*.finance.yahoo.com.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return
+
+    key = f"warm::{sym}"
+    async with _WARM_LOCK:
+        if key in _WARMED:
+            return
+        _WARMED.add(key)
+
+    try:
+        client = await _get_client(sym)
+        url = _WARMUP_URL.format(symbol=sym)
+        await client.get(url, headers=_headers_for(sym))
+    except Exception:
+        pass
 
 
 async def _http_get_json(
@@ -308,16 +427,24 @@ async def _http_get_json(
     attempts = 1 + max(0, _RETRY_MAX)
     last_err: Optional[str] = None
 
+    warmed = False
+
     for i in range(attempts):
         try:
             r = await client.get(url, params=params, headers=headers)
+
             if r.status_code == 200:
                 j = _safe_json(r)
                 if j:
                     return j, None
                 last_err = "invalid JSON"
             else:
-                if r.status_code in _RETRY_STATUSES and i < attempts - 1:
+                # Try cookie warmup once if we get blocked (401/403)
+                if r.status_code in (401, 403) and not warmed:
+                    warmed = True
+                    await _warmup_cookie(symbol)
+                    last_err = f"HTTP {r.status_code} (warmup)"
+                elif r.status_code in _RETRY_STATUSES and i < attempts - 1:
                     last_err = f"HTTP {r.status_code}"
                 else:
                     return None, f"HTTP {r.status_code}"
@@ -335,20 +462,35 @@ async def _http_get_json(
 # ---------------------------
 async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, Any]:
     sym = _yahoo_symbol(symbol)
+
+    # Feature flags
+    if not ENABLE_YAHOO_FUNDAMENTALS:
+        return {
+            **_base(sym),
+            "error": "Yahoo fundamentals disabled (ENABLE_YAHOO_FUNDAMENTALS=false)",
+            "last_updated_utc": _now_utc_iso(),
+        }
+
+    if sym.endswith(".SR") and not ENABLE_YAHOO_FUNDAMENTALS_KSA:
+        return {
+            **_base(sym),
+            "error": "Yahoo fundamentals disabled for KSA (ENABLE_YAHOO_FUNDAMENTALS_KSA=false)",
+            "last_updated_utc": _now_utc_iso(),
+        }
+
     out = _base(sym)
     if not sym:
         out["error"] = "Empty symbol"
         return out
 
     # Cache
-    ck = f"yahoo_fund::{sym}"
+    ck = f"yahoo_fund::{PROVIDER_VERSION}::{sym}"
     hit = _CACHE.get(ck)
     if isinstance(hit, dict) and hit:
         return dict(hit)
 
-    # Region heuristic: KSA => SA, else US
-    region = "SA" if sym.endswith(".SR") else "US"
-    lang = "en-US"
+    region = _region_for(sym)
+    lang = _LANG
 
     last_err: Optional[str] = None
 
@@ -380,12 +522,20 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
             out["currency"] = price.get("currency") or out["currency"]
             out["current_price"] = _get_raw(price.get("regularMarketPrice")) or out["current_price"]
 
-            out["market_cap"] = _get_raw(price.get("marketCap")) or _get_raw(stats.get("marketCap")) or out["market_cap"]
+            out["market_cap"] = (
+                _get_raw(price.get("marketCap"))
+                or _get_raw(stats.get("marketCap"))
+                or out["market_cap"]
+            )
             out["shares_outstanding"] = _get_raw(stats.get("sharesOutstanding")) or out["shares_outstanding"]
 
-            # EPS + PE
+            # EPS + PE (TTM)
             out["eps_ttm"] = _get_raw(stats.get("trailingEps")) or out["eps_ttm"]
             out["pe_ttm"] = _get_raw(summ.get("trailingPE")) or _get_raw(stats.get("trailingPE")) or out["pe_ttm"]
+
+            # Forward EPS + Forward PE
+            out["forward_eps"] = _get_raw(stats.get("forwardEps")) or out["forward_eps"]
+            out["forward_pe"] = _get_raw(summ.get("forwardPE")) or _get_raw(stats.get("forwardPE")) or out["forward_pe"]
 
             # PB (or compute using bookValue if provided)
             out["pb"] = _get_raw(stats.get("priceToBook")) or out["pb"]
@@ -398,13 +548,30 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
                     except Exception:
                         pass
 
-            # Dividends
-            out["dividend_yield"] = _get_raw(summ.get("dividendYield")) or out["dividend_yield"]  # fraction
+            # P/S
+            out["ps"] = _get_raw(summ.get("priceToSalesTrailing12Months")) or out["ps"]
+
+            # EV/EBITDA
+            out["ev_ebitda"] = (
+                _get_raw(stats.get("enterpriseToEbitda"))
+                or _get_raw(fin.get("enterpriseToEbitda"))
+                or out["ev_ebitda"]
+            )
+
+            # Dividends (Yahoo dividendYield usually fraction)
+            dy = _get_raw(summ.get("dividendYield")) or out["dividend_yield"]
+            out["dividend_yield"] = _to_percent(dy) if dy is not None else out["dividend_yield"]
             out["dividend_rate"] = _get_raw(summ.get("dividendRate")) or out["dividend_rate"]
 
-            # Returns
-            out["roe"] = _get_raw(fin.get("returnOnEquity")) or out["roe"]
-            out["roa"] = _get_raw(fin.get("returnOnAssets")) or out["roa"]
+            # Payout ratio (Yahoo payoutRatio usually fraction)
+            pr = _get_raw(summ.get("payoutRatio")) or out["payout_ratio"]
+            out["payout_ratio"] = _to_percent(pr) if pr is not None else out["payout_ratio"]
+
+            # Returns / profitability (Yahoo ROE/ROA often fraction)
+            roe = _get_raw(fin.get("returnOnEquity")) or out["roe"]
+            roa = _get_raw(fin.get("returnOnAssets")) or out["roa"]
+            out["roe"] = _to_percent(roe) if roe is not None else out["roe"]
+            out["roa"] = _to_percent(roa) if roa is not None else out["roa"]
 
             # Risk
             out["beta"] = _get_raw(stats.get("beta")) or out["beta"]
@@ -413,6 +580,7 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
                 out["_debug"] = {
                     "host": host,
                     "region": region,
+                    "lang": lang,
                     "source": "quoteSummary",
                 }
 
@@ -451,15 +619,34 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
 
             out["eps_ttm"] = _safe_float(q0.get("epsTrailingTwelveMonths")) or out["eps_ttm"]
             out["pe_ttm"] = _safe_float(q0.get("trailingPE")) or out["pe_ttm"]
-            out["pb"] = _safe_float(q0.get("priceToBook")) or out["pb"]
 
-            out["dividend_yield"] = _safe_float(q0.get("trailingAnnualDividendYield")) or out["dividend_yield"]
+            out["forward_eps"] = _safe_float(q0.get("epsForward")) or out["forward_eps"]
+            out["forward_pe"] = _safe_float(q0.get("forwardPE")) or out["forward_pe"]
+
+            out["pb"] = _safe_float(q0.get("priceToBook")) or out["pb"]
+            out["ps"] = _safe_float(q0.get("priceToSalesTrailing12Months")) or out["ps"]
+            out["ev_ebitda"] = _safe_float(q0.get("enterpriseToEbitda")) or out["ev_ebitda"]
+
+            dy = _safe_float(q0.get("trailingAnnualDividendYield")) or out["dividend_yield"]
+            out["dividend_yield"] = _to_percent(dy) if dy is not None else out["dividend_yield"]
             out["dividend_rate"] = _safe_float(q0.get("trailingAnnualDividendRate")) or out["dividend_rate"]
+
+            pr = _safe_float(q0.get("payoutRatio")) or out["payout_ratio"]
+            out["payout_ratio"] = _to_percent(pr) if pr is not None else out["payout_ratio"]
+
+            # Some v7 responses contain ROE/ROA already in percent-ish; still normalize
+            roe = _safe_float(q0.get("returnOnEquity")) or out["roe"]
+            roa = _safe_float(q0.get("returnOnAssets")) or out["roa"]
+            out["roe"] = _to_percent(roe) if roe is not None else out["roe"]
+            out["roa"] = _to_percent(roa) if roa is not None else out["roa"]
+
+            out["beta"] = _safe_float(q0.get("beta")) or out["beta"]
 
             if debug:
                 out["_debug"] = {
                     "host": host,
                     "region": region,
+                    "lang": lang,
                     "source": "quote_v7",
                 }
 
@@ -496,23 +683,42 @@ def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
 async def fetch_fundamentals_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     """
     Returns a patch aligned to UnifiedQuote keys.
+
+    NOTE: This provider outputs sheet-ready percent fields:
+      - dividend_yield (%)
+      - roe (%)
+      - roa (%)
+      - payout_ratio (%)
     """
     d = await yahoo_fundamentals(symbol, debug=debug)
+
     patch = {
         "currency": d.get("currency"),
         "current_price": d.get("current_price"),
+
         "market_cap": d.get("market_cap"),
         "shares_outstanding": d.get("shares_outstanding"),
+
         "eps_ttm": d.get("eps_ttm"),
         "pe_ttm": d.get("pe_ttm"),
+
+        "forward_eps": d.get("forward_eps"),
+        "forward_pe": d.get("forward_pe"),
+
         "pb": d.get("pb"),
+        "ps": d.get("ps"),
+        "ev_ebitda": d.get("ev_ebitda"),
+
         "dividend_yield": d.get("dividend_yield"),
         "dividend_rate": d.get("dividend_rate"),
+        "payout_ratio": d.get("payout_ratio"),
+
         "roe": d.get("roe"),
         "roa": d.get("roa"),
         "beta": d.get("beta"),
     }
-    # surface warning only if fully failed (engine can still merge others)
+
+    # Surface warning only if provider failed (engine can still merge other providers)
     if d.get("error"):
         patch["error"] = f"warning: yahoo_fundamentals: {d.get('error')}"
     return _clean_patch(patch)
