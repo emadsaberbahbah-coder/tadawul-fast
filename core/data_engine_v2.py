@@ -1,27 +1,19 @@
-# core/data_engine_v2.py
+# core/data_engine_v2.py  (FULL REPLACEMENT)
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.8.0) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.8.1) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
 + Forecast-ready + History analytics (returns/vol/MA/RSI) + Better scoring
++ Yahoo Fundamentals (NO yfinance) supplement aligned with v1.4.0 provider
 
-What’s new in v2.8.0 (your “future expectation + analysis” upgrade):
-- Adds lightweight historical analytics (no new deps required; uses numpy if available).
-- Computes returns (1W/1M/3M/6M/12M), MA20/50/200, RSI14, Volatility (30D, annualized).
-- Adds forward expectations (ExpectedReturn/ExpectedPrice for 1M/3M/12M) using drift+vol model.
-- Adds confidence_score + forecast_method + history metadata.
-- Adds refresh=1 support (router can bypass cache safely).
-- Keeps PROD-SAFE behavior:
-  - Never hard-requires provider history functions (best-effort only).
-  - Never breaks startup if numpy not available (safe fallbacks).
-  - Always returns a dict with status/data_quality/error.
-
-Provider integration:
-- Tries optional provider history functions if they exist:
-  - eodhd_provider: fetch_price_history / fetch_history / fetch_ohlc_history / fetch_history_patch
-  - yahoo_chart_provider: fetch_price_history / fetch_history / fetch_ohlc_history / fetch_history_patch
-  - finnhub/fmp/tadawul/argaam: best-effort if they expose similar history functions
-If none exist, analytics fields remain None and API stays stable.
+v2.8.1 Improvements (over your 2.8.0)
+- ✅ Adds explicit fundamentals fields to UnifiedQuote (non-breaking): dividend_rate, payout_ratio, forward_eps, forward_pe, ev_ebitda
+- ✅ Normalizes % fields consistently across providers:
+    dividend_yield, roe, roa, payout_ratio => percent (if <= 1.5 treated as fraction)
+- ✅ Better early-stop logic: for enrich=True, stop only when KEY fundamentals are filled (not just “any”)
+- ✅ Wider Yahoo fundamentals merge (adds ps, ev_ebitda, payout_ratio, forward_eps, forward_pe)
+- ✅ Closes yahoo_fundamentals + yahoo_chart clients on shutdown (best-effort)
+- ✅ Keeps PROD SAFE behavior and stable API shape
 """
 
 import asyncio
@@ -30,14 +22,13 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from cachetools import TTLCache
-
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.8.0"
+ENGINE_VERSION = "2.8.1"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -51,9 +42,50 @@ _TD_6M = 126
 _TD_12M = 252
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TTLCache (best-effort) with fallback
+# ---------------------------------------------------------------------------
+try:
+    from cachetools import TTLCache  # type: ignore
+
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: int = 60) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1, int(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + float(self._ttl)
+
+
+# ---------------------------------------------------------------------------
 # Pydantic (best-effort) with robust fallback for v1/v2
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     from pydantic import BaseModel, Field  # type: ignore
 
@@ -144,11 +176,19 @@ class UnifiedQuote(BaseModel):
 
     eps_ttm: Optional[float] = None
     pe_ttm: Optional[float] = None
+    forward_eps: Optional[float] = None
+    forward_pe: Optional[float] = None
+
     pb: Optional[float] = None
     ps: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    roe: Optional[float] = None
-    roa: Optional[float] = None
+    ev_ebitda: Optional[float] = None
+
+    dividend_yield: Optional[float] = None  # percent (sheet-ready)
+    dividend_rate: Optional[float] = None
+    payout_ratio: Optional[float] = None  # percent (sheet-ready)
+
+    roe: Optional[float] = None  # percent (sheet-ready)
+    roa: Optional[float] = None  # percent (sheet-ready)
     beta: Optional[float] = None
 
     # ===============================
@@ -284,6 +324,23 @@ def _safe_float(val: Any) -> Optional[float]:
         return None
 
 
+def _maybe_percent(v: Any) -> Optional[float]:
+    """
+    Normalize percent-like fields to percent.
+    If provider returns fraction (0.12), convert to 12.0
+    If provider already returns percent-like (12.0), keep as-is.
+    """
+    x = _safe_float(v)
+    if x is None:
+        return None
+    try:
+        if abs(x) <= 1.5:
+            return x * 100.0
+        return x
+    except Exception:
+        return x
+
+
 def _parse_list_env(name: str, fallback: str = "") -> List[str]:
     raw = (os.getenv(name) or "").strip()
     if not raw and fallback:
@@ -392,6 +449,16 @@ def _apply_derived(out: Dict[str, Any]) -> None:
         if cur is not None and hi is not None and lo is not None and hi != lo:
             out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
 
+    # Normalize percent-like fundamentals to percent (sheet-ready)
+    if out.get("dividend_yield") is not None:
+        out["dividend_yield"] = _maybe_percent(out.get("dividend_yield"))
+    if out.get("roe") is not None:
+        out["roe"] = _maybe_percent(out.get("roe"))
+    if out.get("roa") is not None:
+        out["roa"] = _maybe_percent(out.get("roa"))
+    if out.get("payout_ratio") is not None:
+        out["payout_ratio"] = _maybe_percent(out.get("payout_ratio"))
+
     # Compute market cap if possible
     if out.get("market_cap") is None:
         sh = _safe_float(out.get("shares_outstanding"))
@@ -442,13 +509,18 @@ def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
         "pe_ttm",
         "eps_ttm",
         "dividend_yield",
+        "dividend_rate",
+        "payout_ratio",
         "pb",
         "ps",
+        "ev_ebitda",
         "shares_outstanding",
         "free_float",
         "roe",
         "roa",
         "beta",
+        "forward_eps",
+        "forward_pe",
     ):
         if _safe_float(out.get(k)) is not None:
             return True
@@ -691,7 +763,6 @@ def _drift_expected_return(closes: List[float], horizon_td: int) -> Optional[flo
     except Exception:
         try:
             subset = closes[-(min(len(closes), 260)):]
-
             rets: List[float] = []
             for i in range(1, len(subset)):
                 a = subset[i - 1]
@@ -701,7 +772,6 @@ def _drift_expected_return(closes: List[float], horizon_td: int) -> Optional[flo
                 rets.append(math.log(b / a))
             if len(rets) < 10:
                 return None
-
             mu_d = sum(rets) / len(rets)
             exp_ret = (math.exp(mu_d * horizon_td) - 1.0) * 100.0
             if math.isnan(exp_ret) or math.isinf(exp_ret):
@@ -877,7 +947,7 @@ class DataEngine:
         self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
 
         logger.info(
-            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss | yahoo_fund_ksa=%s yahoo_fund_global=%s | history=%s lookback=%sd",
+            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss | yahoo_fund_ksa=%s yahoo_fund_global=%s | history=%s lookback=%sd | cachetools=%s",
             ENGINE_VERSION,
             ",".join(self.providers_global) if self.providers_global else "(none)",
             ",".join(self.providers_ksa) if self.providers_ksa else "(none)",
@@ -886,13 +956,18 @@ class DataEngine:
             self.enable_yahoo_fundamentals_global,
             self.enable_history_analytics,
             self.history_lookback_days,
+            _HAS_CACHETOOLS,
         )
 
     async def aclose(self) -> None:
-        for mod_name, closer in [
+        # Best-effort close of provider clients (never raises)
+        closers = [
             ("core.providers.finnhub_provider", "aclose_finnhub_client"),
             ("core.providers.tadawul_provider", "aclose_tadawul_client"),
-        ]:
+            ("core.providers.yahoo_chart_provider", "aclose_yahoo_chart_client"),
+            ("core.providers.yahoo_fundamentals_provider", "aclose_yahoo_fundamentals_client"),
+        ]
+        for mod_name, closer in closers:
             try:
                 mod = importlib.import_module(mod_name)
                 fn = getattr(mod, closer, None)
@@ -1170,10 +1245,11 @@ class DataEngine:
             if has_price_now:
                 if not enrich:
                     break
-                if _has_any_fundamentals(out):
+                # improved: stop only when key fundamentals are filled
+                if not _missing_key_fundamentals(out):
                     break
 
-        # Yahoo Fundamentals supplement
+        # Yahoo Fundamentals supplement (NO yfinance)
         try:
             has_price = _safe_float(out.get("current_price")) is not None
             needs_fund = enrich and has_price and _missing_key_fundamentals(out)
@@ -1182,11 +1258,12 @@ class DataEngine:
             if needs_fund and allow:
                 patch2, err2 = await _try_provider_call(
                     "core.providers.yahoo_fundamentals_provider",
-                    ["fetch_fundamentals_patch", "fetch_patch", "yahoo_fundamentals", "fetch_fundamentals"],
+                    ["fetch_fundamentals_patch", "fetch_quote_patch", "fetch_enriched_quote_patch", "yahoo_fundamentals"],
                     sym,
                 )
 
                 if patch2:
+                    # Merge a wider set (aligned with yahoo_fundamentals_provider v1.4.0)
                     clean = {
                         k: patch2.get(k)
                         for k in (
@@ -1196,9 +1273,14 @@ class DataEngine:
                             "shares_outstanding",
                             "eps_ttm",
                             "pe_ttm",
+                            "forward_eps",
+                            "forward_pe",
                             "pb",
+                            "ps",
+                            "ev_ebitda",
                             "dividend_yield",
                             "dividend_rate",
+                            "payout_ratio",
                             "roe",
                             "roa",
                             "beta",
