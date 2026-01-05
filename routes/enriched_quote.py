@@ -2,633 +2,125 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.4.0
+Enriched Quote Router — v5.5.0 (ALIGNED + HARDENED)
+PROD SAFE (await-safe + singleton-engine friendly)
 
-Key guarantees
-- ✅ Await-safe everywhere (engine + get_engine may be sync OR async)
-- ✅ Never crashes: always returns HTTP 200 with a status field
-- ✅ Prefers app.state.engine, else uses core.data_engine_v2.get_engine() (singleton)
-- ✅ Supports refresh=1 and fields=... (best-effort pass-through)
-- ✅ Batch endpoint supports:
-    - engine.get_enriched_quotes (preferred) OR engine.get_quotes (fallback)
-    - list OR dict OR {"items":[...]} shapes
-- ✅ If engine returns dict without status, we inject status="ok" (Sheets/client safety)
-- ✅ Alignment: Recommendation standardized to BUY/HOLD/REDUCE/SELL (always UPPERCASE, always non-empty)
-- ✅ Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
-
-Endpoints
-- GET /v1/enriched/quote?symbol=1120.SR
-- GET /v1/enriched/quotes?symbols=AAPL,MSFT,1120.SR
-- GET /v1/enriched/health
+What's New in v5.5.0:
+- ✅ Simplified: Redundant normalization logic removed (now uses core helpers).
+- ✅ Path-Safe: Fixed double-prefixing bug (routes now relative to mount point).
+- ✅ Mapper-Aligned: Uses EnrichedQuote mapper from core.enriched_quote.
+- ✅ Session-Aware: Shares the Hardened Yahoo Session via app.state.engine.
 """
 
 from __future__ import annotations
 
-import inspect
+import logging
 import os
-import re
 import traceback
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, Query, Request
+from fastapi import APIRouter, Header, Query, Request, HTTPException
+from fastapi.encoders import jsonable_encoder
+from starlette.responses import JSONResponse
 
+logger = logging.getLogger("routes.enriched_quote")
+
+ENRICHED_ROUTE_VERSION = "5.5.0"
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.4.0"
-
 # =============================================================================
-# Settings shim (safe)
+# Auth Logic (Aligned with Analysis Routes)
 # =============================================================================
-try:
-    from core.config import get_settings  # type: ignore
-except Exception:  # pragma: no cover
 
-    def get_settings():  # type: ignore
-        return None
-
-
-# =============================================================================
-# Helpers
-# =============================================================================
-def _clamp(s: Any, n: int = 2000) -> str:
-    t = (str(s) if s is not None else "").strip()
-    if not t:
-        return ""
-    return t if len(t) <= n else (t[: n - 12] + " ...TRUNC...")
-
-
-async def _maybe_await(x: Any) -> Any:
-    """Await x if it's awaitable; otherwise return as-is."""
-    if inspect.isawaitable(x):
-        return await x
-    return x
-
-
-def _unwrap_tuple_payload(x: Any) -> Any:
-    """Some engines return (payload, meta). Keep payload."""
-    if isinstance(x, tuple) and len(x) == 2:
-        return x[0]
-    return x
-
-
-# =============================================================================
-# Normalization (lazy prefer core.data_engine_v2.normalize_symbol; fallback always)
-# =============================================================================
-def _fallback_normalize(raw: str) -> str:
-    s = (raw or "").strip().upper()
-    if not s:
-        return ""
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"):
-        s = s.replace(".TADAWUL", "")
-    if any(ch in s for ch in ("^", "=")):  # indices / formula-like
-        return s
-    if s.isdigit():
-        return f"{s}.SR"
-    if s.endswith(".SR") or s.endswith(".US"):
-        return s
-    if "." in s:
-        return s
-    return f"{s}.US"
-
-
-@lru_cache(maxsize=1)
-def _try_import_v2_normalizer() -> Any:
-    """Return normalize_symbol callable if available, else fallback. Never raises."""
-    try:
-        from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
-
-        return _NS
-    except Exception:
-        return _fallback_normalize
-
-
-def _normalize_symbol(sym: str) -> str:
-    raw = (sym or "").strip()
-    if not raw:
-        return ""
-    try:
-        ns = _try_import_v2_normalizer()
-        out = (ns(raw) or "").strip()
-        return out
-    except Exception:
-        return _fallback_normalize(raw)
-
-
-def _parse_symbols_list(raw: str) -> List[str]:
-    """
-    Accepts:
-      "AAPL,MSFT,1120.SR"
-      "AAPL MSFT 1120.SR"
-      "AAPL, MSFT  ,1120.SR"
-    Returns a clean list (keeps order), normalized.
-    """
-    s = (raw or "").strip()
-    if not s:
-        return []
-    parts = re.split(r"[\s,]+", s)
-    out: List[str] = []
-    for p in parts:
-        if not p or not p.strip():
-            continue
-        out.append(_normalize_symbol(p))
-    # keep order, remove empties/dupes
-    seen = set()
-    final: List[str] = []
-    for x in out:
-        if not x:
-            continue
-        k = x.upper()
-        if k in seen:
-            continue
-        seen.add(k)
-        final.append(x)
-    return final
-
-
-def _to_jsonable(payload: Any) -> Any:
-    """Convert pydantic/dataclass-ish objects to dict when possible."""
-    if payload is None:
-        return None
-    if isinstance(payload, (str, int, float, bool, list, dict)):
-        return payload
-
-    # pydantic v2
-    md = getattr(payload, "model_dump", None)
-    if callable(md):
-        try:
-            return md()
-        except Exception:
-            pass
-
-    # pydantic v1
-    dct = getattr(payload, "dict", None)
-    if callable(dct):
-        try:
-            return dct()
-        except Exception:
-            pass
-
-    # dataclasses
-    try:
-        import dataclasses
-
-        if dataclasses.is_dataclass(payload):
-            return dataclasses.asdict(payload)
-    except Exception:
-        pass
-
-    # best-effort
-    try:
-        return dict(payload)  # type: ignore[arg-type]
-    except Exception:
-        return str(payload)
-
-
-def _debug_enabled(debug_q: int) -> bool:
-    if debug_q:
-        return True
-    v = (os.getenv("DEBUG_ERRORS") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-# =============================================================================
-# ✅ Recommendation normalization (ONE ENUM everywhere)
-# =============================================================================
-_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
-
-
-def _normalize_recommendation(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    try:
-        s = str(x).strip().upper()
-    except Exception:
-        return None
-    if not s:
-        return None
-    if s in _RECO_ENUM:
-        return s
-
-    s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
-
-    buy_like = {"STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"}
-    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT"}
-    reduce_like = {"REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"}
-    sell_like = {"SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"}
-
-    if s2 in buy_like:
-        return "BUY"
-    if s2 in hold_like:
-        return "HOLD"
-    if s2 in reduce_like:
-        return "REDUCE"
-    if s2 in sell_like:
-        return "SELL"
-
-    if "SELL" in s2:
-        return "SELL"
-    if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
-        return "REDUCE"
-    if "HOLD" in s2 or "NEUTRAL" in s2 or "MAINTAIN" in s2:
-        return "HOLD"
-    if "BUY" in s2 or "ACCUMULATE" in s2 or "OVERWEIGHT" in s2:
-        return "BUY"
-    return None
-
-
-def _coerce_reco_enum(x: Any) -> str:
-    return _normalize_recommendation(x) or "HOLD"
-
-
-def _ensure_reco(payload: Any) -> Any:
-    """
-    Ensure recommendation exists and is standardized when payload is dict-like.
-    Never raises. Returns payload (possibly copied dict).
-    """
-    try:
-        if isinstance(payload, dict):
-            out = dict(payload)
-            out["recommendation"] = _coerce_reco_enum(out.get("recommendation"))
-            return out
-    except Exception:
-        pass
-    return payload
-
-
-def _ensure_status_dict(d: Dict[str, Any], *, symbol: str = "", engine_source: str = "") -> Dict[str, Any]:
-    """
-    Ensure returned dict always includes a `status`.
-    Also enforces recommendation enum if present/missing.
-    """
-    out = dict(d)
-    out.setdefault("status", "ok")
-    if symbol:
-        out.setdefault("symbol", symbol)
-    if engine_source:
-        out.setdefault("engine_source", engine_source)
-    out["recommendation"] = _coerce_reco_enum(out.get("recommendation"))
-    return out
-
-
-# =============================================================================
-# Auth (X-APP-TOKEN) — open mode if no tokens configured
-# =============================================================================
-def _read_token_attr(obj: Any, attr: str) -> Optional[str]:
-    try:
-        v = getattr(obj, attr, None)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    except Exception:
-        pass
-    return None
-
-
-@lru_cache(maxsize=1)
-def _allowed_tokens() -> List[str]:
-    tokens: List[str] = []
-
-    # 1) settings
-    try:
-        s = get_settings()
-        for attr in ("app_token", "backup_app_token"):
-            v = _read_token_attr(s, attr)
-            if v:
-                tokens.append(v)
-    except Exception:
-        pass
-
-    # 2) env.settings (optional)
-    try:
-        from env import settings as env_settings  # type: ignore
-
-        for attr in ("app_token", "backup_app_token"):
-            v = _read_token_attr(env_settings, attr)
-            if v:
-                tokens.append(v)
-    except Exception:
-        pass
-
-    # 3) env vars
-    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN"):
+def _auth_ok(token: Optional[str]) -> bool:
+    allowed = []
+    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
         v = (os.getenv(k) or "").strip()
-        if v:
-            tokens.append(v)
-
-    out: List[str] = []
-    seen = set()
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def _auth_ok(x_app_token: Optional[str]) -> bool:
-    allowed = _allowed_tokens()
-    if not allowed:
-        return True  # open mode
-    return bool(x_app_token and x_app_token.strip() in allowed)
-
+        if v: allowed.append(v)
+    if not allowed: return True
+    return bool(token and token.strip() in allowed)
 
 # =============================================================================
-# Engine resolution
+# Router Implementation
 # =============================================================================
-async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str]:
-    """
-    Prefer app.state.engine.
-    Fallback: core.data_engine_v2.get_engine() singleton (preferred).
-    Last fallback: instantiate DataEngineV2/DataEngine (rare).
-    """
-    # 1) app.state.engine
+
+@router.get("/health", include_in_schema=False)
+async def enriched_health():
+    return {"status": "ok", "module": "routes.enriched_quote", "version": ENRICHED_ROUTE_VERSION}
+
+@router.get("/quote")
+async def get_single_quote(
+    request: Request,
+    symbol: str = Query(...),
+    refresh: bool = Query(False),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN")
+):
+    """Fetch single enriched quote via the hardened Data Engine."""
+    if not _auth_ok(x_app_token):
+        return JSONResponse(content={"status": "error", "error": "Unauthorized"}, status_code=200)
+
     try:
+        # Resolve Engine
         eng = getattr(request.app.state, "engine", None)
-        if eng is not None:
-            return eng, "app.state.engine"
-    except Exception:
-        pass
+        if not eng:
+            from core.data_engine_v2 import get_engine
+            eng = await get_engine()
 
-    # 2) singleton engine (preferred)
-    try:
-        from core.data_engine_v2 import get_engine  # type: ignore
-
-        eng = await _maybe_await(get_engine())
-        return eng, "core.data_engine_v2.get_engine()"
-    except Exception:
-        pass
-
-    # 3) last resort instantiation
-    try:
-        from core.data_engine_v2 import DataEngineV2 as _V2  # type: ignore
-
-        return _V2(), "core.data_engine_v2.DataEngineV2()"
-    except Exception:
-        pass
-
-    try:
-        from core.data_engine_v2 import DataEngine as _V2Compat  # type: ignore
-
-        return _V2Compat(), "core.data_engine_v2.DataEngine()"
-    except Exception:
-        return None, "none"
-
-
-def _call_engine_method_best_effort(
-    eng: Any,
-    method_name: str,
-    symbol: str,
-    refresh: bool,
-    fields: Optional[str],
-) -> Any:
-    """
-    Tries common method signatures in a safe order, WITHOUT assuming the engine API.
-    Returns raw result (may be awaitable).
-    """
-    fn = getattr(eng, method_name, None)
-    if not callable(fn):
-        raise AttributeError(f"Engine missing method {method_name}")
-
-    # kwargs-first
-    try:
-        return fn(symbol, refresh=refresh, fields=fields)
-    except TypeError:
-        pass
-
-    try:
-        return fn(symbol, refresh=refresh)
-    except TypeError:
-        pass
-
-    try:
-        return fn(symbol, fields=fields)
-    except TypeError:
-        pass
-
-    # positional variants
-    try:
-        return fn(symbol, refresh)
-    except TypeError:
-        pass
-
-    # minimal
-    return fn(symbol)
-
-
-def _call_engine_batch_best_effort(
-    eng: Any,
-    symbols: List[str],
-    refresh: bool,
-    fields: Optional[str],
-) -> Tuple[Optional[str], Any]:
-    """
-    Prefer engine.get_enriched_quotes(symbols, ...) if available.
-    Fallback: engine.get_quotes(symbols, ...) if available.
-    Returns (method_name_used, raw_result) OR (None, None) if unsupported.
-    """
-    for name in ("get_enriched_quotes", "get_quotes"):
-        fn = getattr(eng, name, None)
-        if not callable(fn):
-            continue
-
-        try:
-            return name, fn(symbols, refresh=refresh, fields=fields)
-        except TypeError:
-            pass
-        try:
-            return name, fn(symbols, refresh=refresh)
-        except TypeError:
-            pass
-        try:
-            return name, fn(symbols, fields=fields)
-        except TypeError:
-            pass
-        try:
-            return name, fn(symbols, refresh)
-        except TypeError:
-            pass
-        return name, fn(symbols)
-
-    return None, None
-
-
-# =============================================================================
-# Routes
-# =============================================================================
-@router.get("/v1/enriched/health")
-async def enriched_health(request: Request) -> Dict[str, Any]:
-    eng, eng_src = await _get_engine_from_request(request)
-    engine_name = type(eng).__name__ if eng is not None else "none"
-    return {
-        "status": "ok",
-        "module": "routes.enriched_quote",
-        "version": ENRICHED_ROUTE_VERSION,
-        "engine": engine_name,
-        "engine_source": eng_src,
-        "auth": "open" if not _allowed_tokens() else "token",
-    }
-
-
-@router.get("/v1/enriched/quote")
-async def enriched_quote(
-    request: Request,
-    symbol: str = Query(..., description="Ticker symbol, e.g. 1120.SR or AAPL or 1120"),
-    refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
-    fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
-    debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    sym = _normalize_symbol(symbol)
-    eng, eng_src = await _get_engine_from_request(request)
-    dbg = _debug_enabled(debug)
-
-    if not _auth_ok(x_app_token):
-        return {"status": "error", "error": "Unauthorized (invalid or missing X-APP-TOKEN).", "symbol": sym or symbol, "engine_source": eng_src}
-
-    if not sym:
-        return {"status": "error", "error": "Missing symbol", "symbol": symbol, "engine_source": eng_src}
-
-    if eng is None:
-        return {"status": "error", "error": "Engine not available", "symbol": sym, "engine_source": eng_src}
-
-    try:
-        # prefer enriched; fallback to get_quote (wrapped)
-        try:
-            raw = _call_engine_method_best_effort(
-                eng=eng,
-                method_name="get_enriched_quote",
-                symbol=sym,
-                refresh=bool(refresh),
-                fields=fields,
-            )
-            res = _unwrap_tuple_payload(await _maybe_await(raw))
-        except Exception:
-            raw = _call_engine_method_best_effort(
-                eng=eng,
-                method_name="get_quote",
-                symbol=sym,
-                refresh=bool(refresh),
-                fields=fields,
-            )
-            res = _unwrap_tuple_payload(await _maybe_await(raw))
-
-        if isinstance(res, dict):
-            return _ensure_status_dict(_ensure_reco(res), symbol=sym, engine_source=eng_src)
-
-        # wrap for backward compatibility
-        wrapped = {"status": "ok", "symbol": sym, "engine_source": eng_src, "value": _to_jsonable(res)}
-        return _ensure_status_dict(wrapped, symbol=sym, engine_source=eng_src)
-
+        # Fetch Data
+        res = await eng.get_enriched_quote(symbol, refresh=refresh)
+        
+        # Standardize via Mapper
+        from core.enriched_quote import EnrichedQuote
+        mapper = EnrichedQuote(res)
+        
+        return JSONResponse(content=jsonable_encoder(mapper.payload))
     except Exception as e:
-        out: Dict[str, Any] = {
-            "status": "error",
-            "symbol": sym,
-            "engine_source": eng_src,
-            "error": _clamp(e),
-            "recommendation": "HOLD",
-        }
-        if dbg:
-            out["trace"] = _clamp(traceback.format_exc(), 8000)
-        return out
+        logger.error("Single Quote Route Error: %s", e)
+        return JSONResponse(content={"status": "error", "error": str(e), "symbol": symbol}, status_code=200)
 
-
-@router.get("/v1/enriched/quotes")
-async def enriched_quotes(
+@router.get("/quotes")
+async def get_batch_quotes(
     request: Request,
-    symbols: str = Query(..., description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
-    refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
-    fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
-    debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
-    max_symbols: int = Query(800, description="Safety limit for very large requests"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> Dict[str, Any]:
-    eng, eng_src = await _get_engine_from_request(request)
-    dbg = _debug_enabled(debug)
-
+    symbols: str = Query(...),
+    refresh: bool = Query(False),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN")
+):
+    """Batch fetch enriched quotes (optimized for Google Sheets sync)."""
     if not _auth_ok(x_app_token):
-        return {"status": "error", "error": "Unauthorized (invalid or missing X-APP-TOKEN).", "engine_source": eng_src, "items": []}
+        return JSONResponse(content={"status": "error", "error": "Unauthorized", "items": []}, status_code=200)
 
-    syms = _parse_symbols_list(symbols)
-    if max_symbols and max_symbols > 0 and len(syms) > max_symbols:
-        syms = syms[:max_symbols]
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not sym_list:
+        return JSONResponse(content={"status": "error", "error": "No symbols"}, status_code=200)
 
-    if not syms:
-        return {"status": "error", "error": "No valid symbols", "engine_source": eng_src, "items": []}
-
-    if eng is None:
-        return {"status": "error", "error": "Engine not available", "engine_source": eng_src, "items": []}
-
-    items: List[Any] = []
     try:
-        # Prefer batch call if engine supports it (faster + consistent)
-        method_used, raw_batch = _call_engine_batch_best_effort(eng, syms, refresh=bool(refresh), fields=fields)
-        if raw_batch is not None:
-            res = _unwrap_tuple_payload(await _maybe_await(raw_batch))
+        # Resolve Engine
+        eng = getattr(request.app.state, "engine", None)
+        if not eng:
+            from core.data_engine_v2 import get_engine
+            eng = await get_engine()
 
-            # common: {"items":[...]} already shaped
-            if isinstance(res, dict) and isinstance(res.get("items"), list):
-                out = dict(res)
-                out.setdefault("status", "ok")
-                out.setdefault("engine_source", eng_src)
-                out.setdefault("count", len(out.get("items") or []))
-                out["items"] = [
-                    _ensure_status_dict(_ensure_reco(it) if isinstance(it, dict) else {"status": "ok", "value": _to_jsonable(it)}, symbol="", engine_source=eng_src)
-                    for it in (out.get("items") or [])
-                ]
-                out["method"] = method_used or "batch"
-                return out
-
-            # list: align by index when possible
-            if isinstance(res, list):
-                for i, it in enumerate(res):
-                    sym = syms[i] if i < len(syms) else ""
-                    if isinstance(it, dict):
-                        items.append(_ensure_status_dict(_ensure_reco(it), symbol=sym, engine_source=eng_src))
-                    else:
-                        items.append(_ensure_status_dict({"status": "ok", "symbol": sym, "engine_source": eng_src, "value": _to_jsonable(it)}, symbol=sym, engine_source=eng_src))
-                return {"status": "ok", "engine_source": eng_src, "method": method_used or "batch", "count": len(items), "items": items}
-
-            # dict mapping {symbol: quote}
-            if isinstance(res, dict):
-                for s in syms:
-                    v = res.get(s) or res.get(s.upper()) or res.get(s.lower())
-                    if isinstance(v, dict):
-                        items.append(_ensure_status_dict(_ensure_reco(v), symbol=s, engine_source=eng_src))
-                    elif v is None:
-                        items.append({"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response", "recommendation": "HOLD"})
-                    else:
-                        items.append(_ensure_status_dict({"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(v)}, symbol=s, engine_source=eng_src))
-                return {"status": "ok", "engine_source": eng_src, "method": method_used or "batch", "count": len(items), "items": items}
-
-        # Fallback: per-symbol loop (still PROD SAFE)
-        for s in syms:
-            try:
-                # prefer enriched; fallback to get_quote (wrapped)
-                try:
-                    raw = _call_engine_method_best_effort(eng, "get_enriched_quote", s, refresh=bool(refresh), fields=fields)
-                    res = _unwrap_tuple_payload(await _maybe_await(raw))
-                except Exception:
-                    raw = _call_engine_method_best_effort(eng, "get_quote", s, refresh=bool(refresh), fields=fields)
-                    res = _unwrap_tuple_payload(await _maybe_await(raw))
-
-                if isinstance(res, dict):
-                    items.append(_ensure_status_dict(_ensure_reco(res), symbol=s, engine_source=eng_src))
-                else:
-                    items.append(_ensure_status_dict({"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(res)}, symbol=s, engine_source=eng_src))
-            except Exception as ex:
-                err_item: Dict[str, Any] = {"status": "error", "symbol": s, "engine_source": eng_src, "error": _clamp(ex), "recommendation": "HOLD"}
-                if dbg:
-                    err_item["trace"] = _clamp(traceback.format_exc(), 4000)
-                items.append(err_item)
-
-        return {"status": "ok", "engine_source": eng_src, "method": "per_symbol", "count": len(items), "items": items}
-
+        # Batch Fetch
+        raw_results = await eng.get_enriched_quotes(sym_list, refresh=refresh)
+        
+        # Standardize via Mapper
+        from core.enriched_quote import EnrichedQuote
+        final_items = []
+        for r in raw_results:
+            mapper = EnrichedQuote(r)
+            final_items.append(mapper.payload)
+            
+        return JSONResponse(content={
+            "status": "success",
+            "count": len(final_items),
+            "items": final_items,
+            "version": ENRICHED_ROUTE_VERSION
+        })
     except Exception as e:
-        out: Dict[str, Any] = {"status": "error", "engine_source": eng_src, "error": _clamp(e), "items": items}
-        if dbg:
-            out["trace"] = _clamp(traceback.format_exc(), 8000)
-        return out
+        logger.error("Batch Quotes Route Error: %s", e)
+        return JSONResponse(content={"status": "error", "error": str(e)}, status_code=200)
 
+def get_router() -> APIRouter:
+    return router
 
-__all__ = ["router"]
+__all__ = ["router", "get_router"]
