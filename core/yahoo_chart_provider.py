@@ -1,207 +1,279 @@
-# core/enriched_quote.py
+# core/yahoo_chart_provider.py  (FULL REPLACEMENT)
 """
-core/enriched_quote.py
-------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.5.6
+core/yahoo_chart_provider.py
+===========================================================
+Compatibility + Repo-Hygiene Shim — v0.3.0 (PROD SAFE)
 
-What this module is for:
-- Legacy/compat endpoints under /v1/enriched/* for dashboard sync.
-- Bridges engine results to Google Sheets row formats.
-- Ensures strict standardization of Recommendations and Timestamps.
+Why this exists
+- The canonical Yahoo Chart provider lives here:
+    core/providers/yahoo_chart_provider.py
+- This top-level module must remain VALID Python forever (no markdown fences),
+  because older imports may still do:
+    import core.yahoo_chart_provider
 
-✅ v2.5.6 Alignment:
-- Engine-First: Directly utilizes app.state.engine singleton (v2.8.5 compatible).
-- Schema-Aware: Uses core.schemas for intelligent header mapping if available.
-- Reco-Standard: Forces strict BUY / HOLD / REDUCE / SELL enums.
-- Riyadh Time: Precise localized timestamps for Tadawul market sync.
+What this shim guarantees
+- ✅ Import-safe (never crashes app startup)
+- ✅ Re-exports canonical provider symbols when available
+- ✅ Provides backward-compatible function names:
+    - fetch_quote, get_quote
+    - get_quote_patch / fetch_quote_patch
+    - yahoo_chart_quote (older code)
+    - history function names (best-effort pass-through)
+    - aclose_yahoo_chart_client (best-effort)
+
+If canonical import fails
+- Returns safe error-shaped dicts (never raises)
 """
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import logging
-import os
-import re
-import traceback
-from datetime import datetime, timezone, timedelta
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-from fastapi import APIRouter, Query, Request
-from fastapi.encoders import jsonable_encoder
-from starlette.responses import JSONResponse
+logger = logging.getLogger("core.yahoo_chart_provider_shim")
 
-logger = logging.getLogger("core.enriched_quote")
+SHIM_VERSION = "0.3.0"
 
-ROUTER_VERSION = "2.5.6"
-router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
+# Backward-compat constant (not necessarily used by canonical provider)
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
-# =============================================================================
-# Normalization & Utility Shims
-# =============================================================================
 
-@lru_cache(maxsize=1)
-def _get_reco_normalizer():
-    """Try to import the dedicated normalization utility."""
+def _is_awaitable(x: Any) -> bool:
     try:
-        from core.reco_normalize import normalize_recommendation
-        return normalize_recommendation
-    except ImportError:
-        def fallback(x, default="HOLD"):
-            if not x: return default
-            s = str(x).strip().upper()
-            if "BUY" in s: return "BUY"
-            if "SELL" in s: return "SELL"
-            if "REDUCE" in s or "TRIM" in s: return "REDUCE"
-            return "HOLD"
-        return fallback
+        return hasattr(x, "__await__")
+    except Exception:
+        return False
 
-def _to_riyadh_iso(utc_any: Any) -> str:
-    """Convert UTC ISO string to Riyadh Local ISO (+3)."""
-    if not utc_any: return ""
-    try:
-        s = str(utc_any).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-        # Riyadh is UTC+3
-        riyadh_dt = dt.astimezone(timezone(timedelta(hours=3)))
-        return riyadh_dt.isoformat()
-    except: return ""
 
-def _maybe_percent(v: Any) -> Optional[float]:
-    """Convert ratio (0.05) to percentage (5.0) for Sheets."""
-    try:
-        f = float(v)
-        # Only multiply if it looks like a fraction
-        return f * 100.0 if abs(f) <= 1.5 else f
-    except: return None
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    out = fn(*args, **kwargs)
+    if _is_awaitable(out):
+        return await out
+    return out
 
-# =============================================================================
-# Enriched Quote Mapping Logic
-# =============================================================================
 
-class EnrichedQuote:
-    """Mapper for converting UnifiedQuote payloads to Sheet-ready rows."""
-    def __init__(self, payload: Dict[str, Any]):
-        self.payload = payload or {}
-        self._standardize()
+def _norm_symbol(symbol: str) -> str:
+    return (symbol or "").strip().upper()
 
-    def _standardize(self):
-        """Standardize internal keys before mapping to rows."""
-        normalize = _get_reco_normalizer()
-        self.payload["recommendation"] = normalize(self.payload.get("recommendation", "HOLD"))
-        
-        # Ensure timestamp exists
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self.payload.setdefault("last_updated_utc", now_iso)
-        
-        # localized timestamp for Saudi Dashboard
-        if not self.payload.get("last_updated_riyadh"):
-            self.payload["last_updated_riyadh"] = _to_riyadh_iso(self.payload["last_updated_utc"])
-            
-    def to_row(self, headers: Sequence[str]) -> List[Any]:
-        """Maps payload keys to requested header order with alias support."""
-        row = []
-        for h in headers:
-            # Clean header to key
-            hk = h.lower().replace(" ", "_").replace("%", "percent").replace("/", "_").replace("-", "_")
-            
-            # Robust Alias Map for Google Sheets columns
-            alias_map = {
-                "last_price": "current_price",
-                "price": "current_price",
-                "price_change": "price_change",
-                "change": "price_change",
-                "change_percent": "percent_change",
-                "52w_high": "week_52_high",
-                "52w_low": "week_52_low",
-                "pe_ttm": "pe_ratio",
-                "p_e_ttm": "pe_ratio",
-                "dividend_yield_percent": "dividend_yield"
-            }
-            
-            key = alias_map.get(hk, hk)
-            val = self.payload.get(key)
-            
-            # Auto-format percentages for specific columns
-            pct_cols = {"yield", "return", "roe", "roa", "payout", "change_percent", "percent_change"}
-            if any(p in hk for p in pct_cols):
-                val = _maybe_percent(val)
-                
-            row.append(val)
-        return row
 
-# =============================================================================
-# Routes
-# =============================================================================
+def _err_payload(symbol: str, err: str, *, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(base or {})
+    out.update(
+        {
+            "status": "error",
+            "symbol": _norm_symbol(symbol),
+            "data_source": "yahoo_chart",
+            "data_quality": "MISSING",
+            "error": err,
+            "shim_version": SHIM_VERSION,
+        }
+    )
+    return out
 
-@router.get("/quote")
-async def get_single_quote(request: Request, symbol: str = Query(...)):
-    """Fetch single enriched quote via the active Data Engine."""
-    try:
-        # Access engine initialized in main.py lifespan
-        eng = getattr(request.app.state, "engine", None)
-        if not eng:
-            from core.data_engine_v2 import get_engine
-            eng = await get_engine()
-            
-        result = await eng.get_enriched_quote(symbol)
-        mapper = EnrichedQuote(result)
-        
-        # Return standardized payload
-        return JSONResponse(content=jsonable_encoder(mapper.payload))
-    except Exception as e:
-        logger.error("Enriched Route Error for %s: %s", symbol, e)
-        return JSONResponse(content={
-            "status": "error", 
-            "error": str(e), 
-            "symbol": symbol,
-            "data_quality": "MISSING"
-        }, status_code=200)
 
-@router.get("/quotes")
-async def get_batch_quotes(request: Request, symbols: str = Query(...)):
-    """Batch fetch enriched quotes with bounded concurrency."""
-    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    if not sym_list:
-        return JSONResponse(content={"status": "error", "error": "No symbols provided"}, status_code=200)
+try:
+    # Canonical provider module
+    import core.providers.yahoo_chart_provider as _canon  # type: ignore
 
-    try:
-        eng = getattr(request.app.state, "engine", None)
-        if not eng:
-            from core.data_engine_v2 import get_engine
-            eng = await get_engine()
+    # Prefer canonical constants if present
+    PROVIDER_VERSION = getattr(_canon, "PROVIDER_VERSION", "unknown")
 
-        # Batch fetch via DataEngineV2 (optimized with asyncio.gather)
-        results = await eng.get_enriched_quotes(sym_list)
-        
-        final_items = []
-        for r in results:
-            mapper = EnrichedQuote(r)
-            final_items.append(mapper.payload)
-            
-        return JSONResponse(content={
-            "status": "success",
-            "count": len(final_items),
-            "items": final_items,
-            "engine_version": getattr(eng, "ENGINE_VERSION", "unknown"),
-            "router_version": ROUTER_VERSION
-        })
-    except Exception as e:
-        logger.error("Batch Enriched Route Error: %s", e)
-        return JSONResponse(content={"status": "error", "error": str(e)}, status_code=200)
+    # Provider class (if present)
+    YahooChartProvider = getattr(_canon, "YahooChartProvider")  # type: ignore
 
-@router.get("/health", include_in_schema=False)
-async def health():
-    return {
-        "status": "ok", 
-        "module": "core.enriched_quote", 
-        "version": ROUTER_VERSION,
-        "timezone_offset": "+03:00 (Riyadh)"
-    }
+    # -------- Quote helpers (best-effort mapping) --------
+    _get_quote = getattr(_canon, "get_quote", None)
+    _fetch_quote = getattr(_canon, "fetch_quote", None)
 
-def get_router() -> APIRouter:
-    return router
+    _fetch_quote_patch = getattr(_canon, "fetch_quote_patch", None)
+    _get_quote_patch = getattr(_canon, "get_quote_patch", None)  # some canon versions used this name
 
-__all__ = ["router", "get_router", "EnrichedQuote"]
+    _fetch_enriched_quote_patch = getattr(_canon, "fetch_enriched_quote_patch", None)
+    _fetch_quote_and_enrichment_patch = getattr(_canon, "fetch_quote_and_enrichment_patch", None)
+
+    # -------- History helpers (optional pass-through) --------
+    _fetch_price_history = getattr(_canon, "fetch_price_history", None)
+    _fetch_history = getattr(_canon, "fetch_history", None)
+    _fetch_ohlc_history = getattr(_canon, "fetch_ohlc_history", None)
+    _fetch_history_patch = getattr(_canon, "fetch_history_patch", None)
+    _fetch_prices = getattr(_canon, "fetch_prices", None)
+
+    # -------- Client closer (optional) --------
+    _aclose = getattr(_canon, "aclose_yahoo_chart_client", None)
+
+    async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_fetch_quote):
+            r = await _call_maybe_async(_fetch_quote, symbol, *args, **kwargs)
+            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
+        if callable(_get_quote):
+            r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
+            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
+        return {"status": "error", "symbol": _norm_symbol(symbol), "error": "canonical provider missing get_quote/fetch_quote"}
+
+    async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_get_quote):
+            r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
+            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
+        return await fetch_quote(symbol, *args, **kwargs)
+
+    async def get_quote_patch(
+        symbol: str,
+        base: Optional[Dict[str, Any]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        # Prefer canonical patch functions if present
+        if callable(_get_quote_patch):
+            r = await _call_maybe_async(_get_quote_patch, symbol, base, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type", base=base)
+        if callable(_fetch_quote_patch):
+            r = await _call_maybe_async(_fetch_quote_patch, symbol, *args, **kwargs)
+            if isinstance(r, dict):
+                out = dict(base or {})
+                out.update(r)
+                return out
+            return _err_payload(symbol, "unexpected return type", base=base)
+        # Fallback: merge get_quote (full quote) into base
+        q = await get_quote(symbol, *args, **kwargs)
+        out = dict(base or {})
+        if isinstance(q, dict):
+            out.update(q)
+            return out
+        return _err_payload(symbol, "unexpected return type", base=base)
+
+    # Engine-friendly alias (many engines call this exact name)
+    async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        # debug is ignored here; canonical provider may accept it
+        if callable(_fetch_quote_patch):
+            r = await _call_maybe_async(_fetch_quote_patch, symbol, debug=debug, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
+        # fall back to old name mapping
+        return await get_quote_patch(symbol, None, *args, **kwargs)
+
+    async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_fetch_enriched_quote_patch):
+            r = await _call_maybe_async(_fetch_enriched_quote_patch, symbol, debug=debug, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
+        return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+    async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_fetch_quote_and_enrichment_patch):
+            r = await _call_maybe_async(_fetch_quote_and_enrichment_patch, symbol, debug=debug, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
+        return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+    # Backward compatible alias (older code may call yahoo_chart_quote)
+    async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await get_quote(symbol, *args, **kwargs)
+
+    # -------- History pass-throughs (optional) --------
+    async def fetch_price_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        if callable(_fetch_price_history):
+            return await _call_maybe_async(_fetch_price_history, symbol, *args, **kwargs)
+        if callable(_fetch_history):
+            return await _call_maybe_async(_fetch_history, symbol, *args, **kwargs)
+        if callable(_fetch_ohlc_history):
+            return await _call_maybe_async(_fetch_ohlc_history, symbol, *args, **kwargs)
+        if callable(_fetch_history_patch):
+            return await _call_maybe_async(_fetch_history_patch, symbol, *args, **kwargs)
+        if callable(_fetch_prices):
+            return await _call_maybe_async(_fetch_prices, symbol, *args, **kwargs)
+        return {}
+
+    async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
+
+    async def fetch_ohlc_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
+
+    async def fetch_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
+
+    async def fetch_prices(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
+
+    async def aclose_yahoo_chart_client() -> None:
+        if callable(_aclose):
+            try:
+                await _call_maybe_async(_aclose)
+            except Exception:
+                pass
+
+except Exception as e:  # pragma: no cover
+    # Quiet boot: do not log at import-time
+    PROVIDER_VERSION = "fallback"
+
+    class YahooChartProvider:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._error = f"{e.__class__.__name__}: {e}"
+
+        async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return _err_payload(symbol, self._error, base=base)
+
+    async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await fetch_quote(symbol, *args, **kwargs)
+
+    async def get_quote_patch(
+        symbol: str,
+        base: Optional[Dict[str, Any]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}", base=base)
+
+    async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await get_quote(symbol, *args, **kwargs)
+
+    # History fallbacks
+    async def fetch_price_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_ohlc_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_prices(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def aclose_yahoo_chart_client() -> None:
+        return None
+
+
+__all__ = [
+    "YAHOO_CHART_URL",
+    "PROVIDER_VERSION",
+    "YahooChartProvider",
+    # Quote API
+    "fetch_quote",
+    "get_quote",
+    "get_quote_patch",
+    "fetch_quote_patch",
+    "fetch_enriched_quote_patch",
+    "fetch_quote_and_enrichment_patch",
+    "yahoo_chart_quote",
+    # History API (best-effort)
+    "fetch_price_history",
+    "fetch_history",
+    "fetch_ohlc_history",
+    "fetch_history_patch",
+    "fetch_prices",
+    # Client close
+    "aclose_yahoo_chart_client",
+]
