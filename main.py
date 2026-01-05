@@ -1,12 +1,12 @@
-# main.py — FULL REPLACEMENT — v5.3.6
+# main.py — FULL REPLACEMENT — v5.3.7
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.6
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.7
 
-Fixes:
-- ✅ Resolves ValueError: Invalid format 'detailed' for '%' style.
-- ✅ Keywords like 'detailed', 'simple', 'json' are now correctly mapped to format strings.
+Fixes & Improvements:
+- ✅ Resolves 405 Method Not Allowed for HEAD requests on root/health endpoints.
+- ✅ Maintains fix for ValueError: Invalid format 'detailed' for '%' style.
 - ✅ Aligned with DataEngineV2 (v2.8.5) and Hardened Providers.
 - ✅ Fast Boot: Binds port immediately while engine/routers load in background.
 
@@ -42,7 +42,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-APP_ENTRY_VERSION = "5.3.6"
+APP_ENTRY_VERSION = "5.3.7"
 
 # ---------------------------------------------------------------------
 # Logging & Environment Helpers
@@ -181,11 +181,12 @@ def create_app() -> FastAPI:
 
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-    @app.get("/", include_in_schema=False)
+    # api_route allows us to support both GET and HEAD for health checks/pingers
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
         return {"status": "ok", "app": "Tadawul Fast Bridge", "boot_completed": getattr(app.state, "boot_completed", False)}
 
-    @app.get("/readyz", tags=["system"])
+    @app.api_route("/readyz", methods=["GET", "HEAD"], tags=["system"])
     async def readyz():
         return {
             "status": "ok" if getattr(app.state, "boot_completed", False) else "booting",
