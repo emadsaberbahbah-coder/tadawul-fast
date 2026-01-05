@@ -1,4 +1,4 @@
-# config.py  (REPO ROOT) — FULL REPLACEMENT — v5.3.7
+# config.py  (REPO ROOT) — FULL REPLACEMENT — v5.4.0
 """
 config.py
 ============================================================
@@ -7,38 +7,18 @@ Canonical Settings for Tadawul Fast Bridge (ROOT)
 ✅ Single source of truth for env vars (Render names).
 ✅ Runtime alias export (so legacy/provider modules keep working).
 ✅ No network at import-time. Minimal side effects at import-time.
-✅ FULL fallback included (boots even if pydantic-settings is unavailable).
+✅ Defensive: never crashes import-time even if pydantic-settings missing.
 
-Version: v5.3.7 (ENHANCED + ALIGNED)
-
-Key alignment guarantees (DO NOT rename Render env vars):
-- FINNHUB_API_KEY / EODHD_API_KEY
-- ENABLED_PROVIDERS / PRIMARY_PROVIDER / KSA_PROVIDERS
-- HTTP_TIMEOUT / HTTP_TIMEOUT_SEC / MAX_RETRIES / RETRY_DELAY / RETRY_DELAY_SEC
-- CACHE_DEFAULT_TTL / CACHE_TTL_SEC / ENGINE_CACHE_TTL_SEC / CACHE_MAX_SIZE / CACHE_BACKUP_ENABLED / CACHE_SAVE_INTERVAL
-- CORS_ORIGINS / ENABLE_CORS_ALL_ORIGINS (CORS_ALL_ORIGINS) / ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE
-- DEFAULT_SPREADSHEET_ID / GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_APPS_SCRIPT_URL / GOOGLE_APPS_SCRIPT_BACKUP_URL
-- SERVICE_NAME / SERVICE_VERSION / ENVIRONMENT / TZ / DEBUG / LOG_LEVEL / LOG_FORMAT
-- ADVANCED_ANALYSIS_ENABLED / AI_ANALYSIS_ENABLED / TADAWUL_MARKET_ENABLED / ENABLE_SWAGGER / ENABLE_REDOC
-- DEFER_ROUTER_MOUNT / INIT_ENGINE_ON_BOOT
-- YAHOO_CHART_BASE_URL (optional)
-
-Engine/provider flags (exported as env aliases for legacy env-readers):
-- ENABLE_YAHOO_CHART_KSA
-- ENABLE_YAHOO_CHART_SUPPLEMENT
-- ENABLE_YFINANCE_KSA
-- ENABLE_YAHOO_FUNDAMENTALS_KSA
-- ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
-
-v5.3.7 upgrades
-- ✅ Enforces require_auth=True automatically when APP_TOKEN/BACKUP_APP_TOKEN is set.
-- ✅ Adds optional YAHOO_CHART_BASE_URL setting + alias export.
-- ✅ Best-effort module alias: `core.config` -> this module (helps legacy imports).
+Version: v5.4.0
+Upgrades vs v5.3.2
+- ✅ Adds KSA routing feature flags (ENABLE_YFINANCE_KSA / ENABLE_YAHOO_CHART_KSA).
+- ✅ Adds optional Yahoo Chart base URL.
+- ✅ Ensures auth is effectively “on” when APP_TOKEN is set (require_auth derived).
+- ✅ Adds safe module alias for core.config imports (best-effort).
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from functools import lru_cache
@@ -47,12 +27,7 @@ from typing import Any, Dict, List, Optional
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-_UNSET_STRINGS = {"", "0.0.0", "unknown", "none", "null", "unset", "n/a", "na"}
 
-
-# =============================================================================
-# Helpers (no heavy deps, no network)
-# =============================================================================
 def _to_bool(v: Any, default: bool = False) -> bool:
     if v is None:
         return default
@@ -84,42 +59,14 @@ def _to_float(v: Any, default: float) -> float:
         return default
 
 
-def _positive_int(v: Any, default: int) -> int:
-    x = _to_int(v, default)
-    return x if x > 0 else default
-
-
-def _positive_float(v: Any, default: float) -> float:
-    x = _to_float(v, default)
-    return x if x > 0 else default
-
-
-def _is_unset_string(s: str) -> bool:
-    return str(s or "").strip().lower() in _UNSET_STRINGS
-
-
-def _resolve_version_from_env_or_commit(service_version: str) -> str:
-    """
-    Version priority:
-      1) SERVICE_VERSION / APP_VERSION / VERSION / RELEASE
-      2) Provided service_version (if meaningful)
-      3) Render commit short hash
-      4) "dev"
-    """
-    for k in ("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"):
-        v = (os.getenv(k) or "").strip()
-        if v and not _is_unset_string(v):
-            return v
-
-    sv = (service_version or "").strip()
-    if sv and not _is_unset_string(sv):
-        return sv
-
-    commit = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()
-    if commit:
-        return commit[:7]
-
-    return "dev"
+def _csv(v: Any, *, lower: bool = True) -> List[str]:
+    if v is None:
+        return []
+    s = str(v).strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return [p.lower() for p in parts] if lower else parts
 
 
 def _mask_tail(s: Optional[str], keep: int = 4) -> str:
@@ -134,8 +81,8 @@ def _mask_tail(s: Optional[str], keep: int = 4) -> str:
 def _export_env_if_missing(key: str, value: Optional[str]) -> None:
     """
     Export env alias only if:
-      - value is non-empty
-      - target env var is missing/blank
+    - value is non-empty
+    - target env var is missing/blank
     """
     if value is None:
         return
@@ -145,47 +92,6 @@ def _export_env_if_missing(key: str, value: Optional[str]) -> None:
     cur = os.getenv(key)
     if cur is None or str(cur).strip() == "":
         os.environ[key] = v
-
-
-def _parse_listlike(v: Any, *, lower: bool = True) -> List[str]:
-    """
-    Accept:
-      - list
-      - CSV string
-      - JSON list string: '["eodhd","finnhub"]'
-    Return: deduped list (order preserved)
-    """
-    if v is None:
-        return []
-    items: List[str] = []
-
-    if isinstance(v, list):
-        items = [str(x).strip() for x in v if str(x).strip()]
-    else:
-        s = str(v).strip()
-        if not s:
-            return []
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                arr = json.loads(s)
-                if isinstance(arr, list):
-                    items = [str(x).strip() for x in arr if str(x).strip()]
-                else:
-                    items = [p.strip() for p in s.split(",") if p.strip()]
-            except Exception:
-                items = [p.strip() for p in s.split(",") if p.strip()]
-        else:
-            items = [p.strip() for p in s.split(",") if p.strip()]
-
-    out: List[str] = []
-    seen = set()
-    for x in items:
-        y = x.lower() if lower else x
-        if not y or y in seen:
-            continue
-        seen.add(y)
-        out.append(y)
-    return out
 
 
 # =============================================================================
@@ -202,14 +108,13 @@ try:
             return AliasChoices(*names)
 
     except Exception:  # pragma: no cover
-
         def _alias(*names: str) -> Any:
             return names[0]
 
     class Settings(BaseSettings):  # type: ignore
         """
         Canonical env-backed settings model.
-        Field aliases are aligned to YOUR Render env variable names.
+        Field aliases are aligned to your Render env variable names.
         """
 
         model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
@@ -218,7 +123,7 @@ try:
         # App / Meta
         # ---------------------------------------------------------------------
         service_name: str = Field(default="Tadawul Stock Analysis API", validation_alias=_alias("SERVICE_NAME", "APP_NAME"))
-        service_version: str = Field(default="dev", validation_alias=_alias("SERVICE_VERSION", "APP_VERSION", "VERSION", "RELEASE"))
+        service_version: str = Field(default="0.0.0", validation_alias=_alias("SERVICE_VERSION", "APP_VERSION", "VERSION"))
         environment: str = Field(default="production", validation_alias=_alias("ENVIRONMENT", "APP_ENV", "ENV"))
         tz: str = Field(default="Asia/Riyadh", validation_alias=_alias("TZ", "TIMEZONE"))
         debug: bool = Field(default=False, validation_alias=_alias("DEBUG"))
@@ -229,27 +134,25 @@ try:
         )
 
         # ---------------------------------------------------------------------
-        # Boot / engine flags
-        # ---------------------------------------------------------------------
-        defer_router_mount: bool = Field(default=True, validation_alias=_alias("DEFER_ROUTER_MOUNT"))
-        init_engine_on_boot: bool = Field(default=True, validation_alias=_alias("INIT_ENGINE_ON_BOOT"))
-
-        # ---------------------------------------------------------------------
         # Auth
         # ---------------------------------------------------------------------
         require_auth: bool = Field(default=False, validation_alias=_alias("REQUIRE_AUTH"))
-        app_token: Optional[str] = Field(default=None, validation_alias=_alias("APP_TOKEN", "TFB_APP_TOKEN"))
+        app_token: Optional[str] = Field(default=None, validation_alias=_alias("APP_TOKEN"))
         backup_app_token: Optional[str] = Field(default=None, validation_alias=_alias("BACKUP_APP_TOKEN"))
 
         # ---------------------------------------------------------------------
         # Providers (GLOBAL + KSA)
         # ---------------------------------------------------------------------
-        enabled_providers_raw: str = Field(default="eodhd,finnhub,fmp", validation_alias=_alias("ENABLED_PROVIDERS", "PROVIDERS"))
+        enabled_providers_raw: str = Field(default="eodhd,finnhub", validation_alias=_alias("ENABLED_PROVIDERS", "PROVIDERS"))
         primary_provider: str = Field(default="eodhd", validation_alias=_alias("PRIMARY_PROVIDER"))
         ksa_providers_raw: str = Field(default="yahoo_chart,tadawul,argaam", validation_alias=_alias("KSA_PROVIDERS"))
 
+        # KSA routing feature flags (used by v2 engine)
+        enable_yfinance_ksa: bool = Field(default=False, validation_alias=_alias("ENABLE_YFINANCE_KSA"))
+        enable_yahoo_chart_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_KSA"))
+
         # ---------------------------------------------------------------------
-        # Provider keys/tokens
+        # Provider keys/tokens (Render names locked)
         # ---------------------------------------------------------------------
         eodhd_api_key: Optional[str] = Field(default=None, validation_alias=_alias("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"))
         finnhub_api_key: Optional[str] = Field(default=None, validation_alias=_alias("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"))
@@ -269,9 +172,10 @@ try:
         finnhub_base_url: str = Field(default="https://finnhub.io/api/v1", validation_alias=_alias("FINNHUB_BASE_URL"))
         fmp_base_url: Optional[str] = Field(default=None, validation_alias=_alias("FMP_BASE_URL"))
 
-        # Optional (only used if you override; safe default)
+        # Optional Yahoo chart base url (if you ever override)
         yahoo_chart_base_url: str = Field(default="https://query1.finance.yahoo.com", validation_alias=_alias("YAHOO_CHART_BASE_URL"))
 
+        # Render yaml uses HTTP_TIMEOUT_SEC; keep HTTP_TIMEOUT too
         http_timeout: float = Field(default=30.0, validation_alias=_alias("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"))
         max_retries: int = Field(default=2, validation_alias=_alias("MAX_RETRIES"))
         retry_delay: float = Field(default=0.5, validation_alias=_alias("RETRY_DELAY", "RETRY_DELAY_SEC"))
@@ -285,53 +189,45 @@ try:
         max_requests_per_minute: int = Field(default=240, validation_alias=_alias("MAX_REQUESTS_PER_MINUTE"))
 
         # ---------------------------------------------------------------------
-        # Cache tuning
+        # Cache tuning (Render yaml uses *_TTL_SEC)
         # ---------------------------------------------------------------------
         cache_ttl_sec: float = Field(default=20.0, validation_alias=_alias("CACHE_TTL_SEC", "CACHE_DEFAULT_TTL"))
         quote_ttl_sec: float = Field(default=30.0, validation_alias=_alias("QUOTE_TTL_SEC"))
         fundamentals_ttl_sec: float = Field(default=21600.0, validation_alias=_alias("FUNDAMENTALS_TTL_SEC"))
         argaam_snapshot_ttl_sec: float = Field(default=30.0, validation_alias=_alias("ARGAAM_SNAPSHOT_TTL_SEC"))
 
-        engine_cache_ttl_sec: float = Field(default=20.0, validation_alias=_alias("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC", "CACHE_TTL_SEC"))
-        enriched_batch_concurrency: int = Field(default=8, validation_alias=_alias("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY"))
-
         cache_max_size: int = Field(default=5000, validation_alias=_alias("CACHE_MAX_SIZE"))
         cache_backup_enabled: bool = Field(default=False, validation_alias=_alias("CACHE_BACKUP_ENABLED"))
         cache_save_interval: int = Field(default=300, validation_alias=_alias("CACHE_SAVE_INTERVAL"))
 
         # ---------------------------------------------------------------------
+        # Advanced Analysis batching (routes/advanced_analysis.py)
+        # ---------------------------------------------------------------------
+        adv_batch_size: int = Field(default=25, validation_alias=_alias("ADV_BATCH_SIZE"))
+        adv_batch_timeout_sec: float = Field(default=45.0, validation_alias=_alias("ADV_BATCH_TIMEOUT_SEC"))
+        adv_max_tickers: int = Field(default=500, validation_alias=_alias("ADV_MAX_TICKERS"))
+        adv_batch_concurrency: int = Field(default=6, validation_alias=_alias("ADV_BATCH_CONCURRENCY"))
+
+        # ---------------------------------------------------------------------
         # Google / Sheets
         # ---------------------------------------------------------------------
-        default_spreadsheet_id: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"),
-        )
-        google_sheets_credentials: Optional[str] = Field(
-            default=None,
-            validation_alias=_alias("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"),
-        )
+        default_spreadsheet_id: Optional[str] = Field(default=None, validation_alias=_alias("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID"))
+        google_sheets_credentials: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"))
+        google_credentials: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_CREDENTIALS"))
         google_apps_script_url: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_APPS_SCRIPT_URL"))
         google_apps_script_backup_url: Optional[str] = Field(default=None, validation_alias=_alias("GOOGLE_APPS_SCRIPT_BACKUP_URL"))
 
         # ---------------------------------------------------------------------
-        # Feature flags (general)
+        # Feature flags
         # ---------------------------------------------------------------------
-        ai_analysis_enabled: bool = Field(default=True, validation_alias=_alias("AI_ANALYSIS_ENABLED"))
         advanced_analysis_enabled: bool = Field(default=True, validation_alias=_alias("ADVANCED_ANALYSIS_ENABLED"))
         tadawul_market_enabled: bool = Field(default=True, validation_alias=_alias("TADAWUL_MARKET_ENABLED"))
         enable_swagger: bool = Field(default=True, validation_alias=_alias("ENABLE_SWAGGER"))
         enable_redoc: bool = Field(default=True, validation_alias=_alias("ENABLE_REDOC"))
 
         # ---------------------------------------------------------------------
-        # Feature flags (engine/provider routing)
+        # Optional KSA routing URLs (if ever added later)
         # ---------------------------------------------------------------------
-        enable_yahoo_chart_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_KSA"))
-        enable_yahoo_chart_supplement: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_CHART_SUPPLEMENT"))
-        enable_yfinance_ksa: bool = Field(default=False, validation_alias=_alias("ENABLE_YFINANCE_KSA"))
-        enable_yahoo_fundamentals_ksa: bool = Field(default=True, validation_alias=_alias("ENABLE_YAHOO_FUNDAMENTALS_KSA"))
-        enable_yahoo_fundamentals_global: bool = Field(default=False, validation_alias=_alias("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"))
-
-        # Optional KSA routing URLs
         tadawul_quote_url: Optional[str] = Field(default=None, validation_alias=_alias("TADAWUL_QUOTE_URL"))
         tadawul_fundamentals_url: Optional[str] = Field(default=None, validation_alias=_alias("TADAWUL_FUNDAMENTALS_URL"))
         argaam_quote_url: Optional[str] = Field(default=None, validation_alias=_alias("ARGAAM_QUOTE_URL"))
@@ -342,12 +238,12 @@ try:
         # ---------------------------------------------------------------------
         @property
         def enabled_providers(self) -> List[str]:
-            xs = _parse_listlike(self.enabled_providers_raw, lower=True)
-            return xs or ["eodhd", "finnhub", "fmp"]
+            xs = _csv(self.enabled_providers_raw, lower=True)
+            return xs or ["eodhd", "finnhub"]
 
         @property
         def ksa_providers(self) -> List[str]:
-            xs = _parse_listlike(self.ksa_providers_raw, lower=True)
+            xs = _csv(self.ksa_providers_raw, lower=True)
             return xs or ["yahoo_chart", "tadawul", "argaam"]
 
         @property
@@ -372,30 +268,6 @@ try:
         def http_timeout_sec(self) -> float:
             return float(self.http_timeout or 30.0)
 
-        @property
-        def version(self) -> str:
-            return self.service_version
-
-        @property
-        def app_version(self) -> str:
-            return self.service_version
-
-        @property
-        def app_name(self) -> str:
-            return self.service_name
-
-        @property
-        def env(self) -> str:
-            return self.environment
-
-        @property
-        def base_url(self) -> str:
-            return (self.backend_base_url or "").rstrip("/")
-
-        @property
-        def google_credentials(self) -> Optional[str]:
-            return self.google_sheets_credentials
-
         def as_safe_dict(self) -> Dict[str, Any]:
             return {
                 "service_name": self.service_name,
@@ -405,22 +277,27 @@ try:
                 "debug": bool(self.debug),
                 "log_level": (self.log_level or "info").strip().lower(),
                 "require_auth": bool(self.require_auth),
-                "app_token_set": bool((self.app_token or "").strip()),
-                "backup_app_token_set": bool((self.backup_app_token or "").strip()),
-                "app_token_mask": _mask_tail(self.app_token, keep=4),
                 "enabled_providers": self.enabled_providers,
-                "primary_provider": (self.primary_provider or "eodhd").strip().lower(),
+                "primary_provider": (self.primary_provider or "").strip().lower(),
                 "ksa_providers": self.ksa_providers,
+                "ksa_flags": {
+                    "enable_yfinance_ksa": bool(self.enable_yfinance_ksa),
+                    "enable_yahoo_chart_ksa": bool(self.enable_yahoo_chart_ksa),
+                },
                 "http_timeout_sec": float(self.http_timeout_sec),
                 "max_retries": int(self.max_retries),
                 "retry_delay": float(self.retry_delay),
                 "cache_ttl_sec": float(self.cache_ttl_sec),
-                "engine_cache_ttl_sec": float(self.engine_cache_ttl_sec),
-                "enriched_batch_concurrency": int(self.enriched_batch_concurrency),
                 "quote_ttl_sec": float(self.quote_ttl_sec),
                 "fundamentals_ttl_sec": float(self.fundamentals_ttl_sec),
                 "argaam_snapshot_ttl_sec": float(self.argaam_snapshot_ttl_sec),
                 "cache_max_size": int(self.cache_max_size),
+                "advanced_batching": {
+                    "adv_batch_size": int(self.adv_batch_size),
+                    "adv_batch_timeout_sec": float(self.adv_batch_timeout_sec),
+                    "adv_max_tickers": int(self.adv_max_tickers),
+                    "adv_batch_concurrency": int(self.adv_batch_concurrency),
+                },
                 "rate_limiting": {
                     "enabled": bool(self.enable_rate_limiting),
                     "max_requests_per_minute": int(self.max_requests_per_minute),
@@ -429,38 +306,17 @@ try:
                     "all_origins": bool(self.enable_cors_all_origins),
                     "origins_list": self.cors_origins_list,
                 },
-                "feature_flags": {
-                    "AI_ANALYSIS_ENABLED": bool(self.ai_analysis_enabled),
-                    "ADVANCED_ANALYSIS_ENABLED": bool(self.advanced_analysis_enabled),
-                    "TADAWUL_MARKET_ENABLED": bool(self.tadawul_market_enabled),
-                    "ENABLE_SWAGGER": bool(self.enable_swagger),
-                    "ENABLE_REDOC": bool(self.enable_redoc),
-                },
-                "engine_flags": {
-                    "ENABLE_YAHOO_CHART_KSA": bool(self.enable_yahoo_chart_ksa),
-                    "ENABLE_YAHOO_CHART_SUPPLEMENT": bool(self.enable_yahoo_chart_supplement),
-                    "ENABLE_YFINANCE_KSA": bool(self.enable_yfinance_ksa),
-                    "ENABLE_YAHOO_FUNDAMENTALS_KSA": bool(self.enable_yahoo_fundamentals_ksa),
-                    "ENABLE_YAHOO_FUNDAMENTALS_GLOBAL": bool(self.enable_yahoo_fundamentals_global),
-                },
-                "base_urls": {
-                    "EODHD_BASE_URL": self.eodhd_base_url,
-                    "FINNHUB_BASE_URL": self.finnhub_base_url,
-                    "YAHOO_CHART_BASE_URL": self.yahoo_chart_base_url,
-                    "BACKEND_BASE_URL": (self.backend_base_url or "").rstrip("/"),
-                },
-                "keys_set": {
-                    "eodhd": bool((self.eodhd_api_key or "").strip()),
-                    "finnhub": bool((self.finnhub_api_key or "").strip()),
-                },
-                "google": {
-                    "default_spreadsheet_id_set": bool((self.default_spreadsheet_id or "").strip()),
-                    "google_creds_set": bool((self.google_sheets_credentials or "").strip()),
-                    "apps_script_url_set": bool((self.google_apps_script_url or "").strip()),
-                },
+                "app_token_set": bool((self.app_token or "").strip()),
+                "backup_app_token_set": bool((self.backup_app_token or "").strip()),
+                "app_token_mask": _mask_tail(self.app_token, keep=4),
+                "eodhd_key_set": bool((self.eodhd_api_key or "").strip()),
+                "finnhub_key_set": bool((self.finnhub_api_key or "").strip()),
+                "default_spreadsheet_id_set": bool((self.default_spreadsheet_id or "").strip()),
+                "google_creds_set": bool((self.google_sheets_credentials or "").strip() or (self.google_credentials or "").strip()),
             }
 
         def __getattr__(self, name: str) -> Any:
+            # Optional: uppercase attribute compatibility (best-effort)
             if name.isupper():
                 low = name.lower()
                 if hasattr(self, low):
@@ -469,9 +325,10 @@ try:
                     "EODHD_API_TOKEN": "eodhd_api_token",
                     "FINNHUB_API_TOKEN": "finnhub_api_token",
                     "HTTP_TIMEOUT_SEC": "http_timeout_sec",
-                    "APP_NAME": "app_name",
-                    "APP_ENV": "env",
-                    "APP_VERSION": "app_version",
+                    "ADV_BATCH_TIMEOUT_SEC": "adv_batch_timeout_sec",
+                    "ADV_BATCH_SIZE": "adv_batch_size",
+                    "ADV_MAX_TICKERS": "adv_max_tickers",
+                    "ADV_BATCH_CONCURRENCY": "adv_batch_concurrency",
                 }
                 if name in mapping and hasattr(self, mapping[name]):
                     return getattr(self, mapping[name])
@@ -480,178 +337,87 @@ try:
     def _apply_runtime_env_aliases(s: Settings) -> None:
         """
         Make providers + legacy modules work with your Render env names WITHOUT changing Render.
-        Executed ONLY inside get_settings().
         """
-        # Version keys
-        ver = _resolve_version_from_env_or_commit(s.service_version)
-        s.service_version = ver
-        _export_env_if_missing("SERVICE_VERSION", ver)
-        _export_env_if_missing("APP_VERSION", ver)
-        _export_env_if_missing("VERSION", ver)
-        _export_env_if_missing("RELEASE", ver)
-
-        # App/name/env aliases
-        _export_env_if_missing("APP_NAME", s.service_name)
-        _export_env_if_missing("SERVICE_NAME", s.service_name)
-        _export_env_if_missing("APP_ENV", s.environment)
-        _export_env_if_missing("ENVIRONMENT", s.environment)
-        _export_env_if_missing("ENV", s.environment)
-        _export_env_if_missing("TZ", s.tz)
-        _export_env_if_missing("TIMEZONE", s.tz)
-
-        # Logging
-        _export_env_if_missing("LOG_LEVEL", (s.log_level or "info").strip().lower())
-        _export_env_if_missing("LOG_FORMAT", (s.log_format or "").strip())
-
-        # Auth aliases
-        if (s.app_token or "").strip():
-            _export_env_if_missing("APP_TOKEN", (s.app_token or "").strip())
-            _export_env_if_missing("TFB_APP_TOKEN", (s.app_token or "").strip())
-        if (s.backup_app_token or "").strip():
-            _export_env_if_missing("BACKUP_APP_TOKEN", (s.backup_app_token or "").strip())
-
         # Provider token aliases
         _export_env_if_missing("FINNHUB_API_TOKEN", s.finnhub_api_token)
         _export_env_if_missing("FINNHUB_TOKEN", s.finnhub_api_token)
+
         _export_env_if_missing("EODHD_API_TOKEN", s.eodhd_api_token)
         _export_env_if_missing("EODHD_TOKEN", s.eodhd_api_token)
-
-        # Providers lists for legacy env-readers
-        _export_env_if_missing("ENABLED_PROVIDERS", (s.enabled_providers_raw or "").strip())
-        _export_env_if_missing("PROVIDERS", (s.enabled_providers_raw or "").strip())
-        _export_env_if_missing("KSA_PROVIDERS", (s.ksa_providers_raw or "").strip())
-        _export_env_if_missing("PRIMARY_PROVIDER", (s.primary_provider or "eodhd").strip().lower())
 
         # Timeout aliases
         _export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(s.http_timeout_sec)))
         _export_env_if_missing("HTTP_TIMEOUT", str(float(s.http_timeout_sec)))
-        _export_env_if_missing("MAX_RETRIES", str(int(s.max_retries)))
-        _export_env_if_missing("RETRY_DELAY", str(float(s.retry_delay)))
-        _export_env_if_missing("RETRY_DELAY_SEC", str(float(s.retry_delay)))
 
         # TTL aliases
         _export_env_if_missing("CACHE_TTL_SEC", str(float(s.cache_ttl_sec)))
         _export_env_if_missing("CACHE_DEFAULT_TTL", str(float(s.cache_ttl_sec)))
-        _export_env_if_missing("ENGINE_CACHE_TTL_SEC", str(float(s.engine_cache_ttl_sec)))
-        _export_env_if_missing("ENRICHED_BATCH_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
-        _export_env_if_missing("ENRICHED_CONCURRENCY", str(int(s.enriched_batch_concurrency)))
+
         _export_env_if_missing("QUOTE_TTL_SEC", str(float(s.quote_ttl_sec)))
         _export_env_if_missing("FUNDAMENTALS_TTL_SEC", str(float(s.fundamentals_ttl_sec)))
         _export_env_if_missing("ARGAAM_SNAPSHOT_TTL_SEC", str(float(s.argaam_snapshot_ttl_sec)))
 
-        # Cache sizing / backup
-        _export_env_if_missing("CACHE_MAX_SIZE", str(int(s.cache_max_size)))
-        _export_env_if_missing("CACHE_BACKUP_ENABLED", str(bool(s.cache_backup_enabled)).lower())
-        _export_env_if_missing("CACHE_SAVE_INTERVAL", str(int(s.cache_save_interval)))
+        # Advanced Analysis env (so routes can read from os.getenv too)
+        _export_env_if_missing("ADV_BATCH_SIZE", str(int(s.adv_batch_size)))
+        _export_env_if_missing("ADV_BATCH_TIMEOUT_SEC", str(float(s.adv_batch_timeout_sec)))
+        _export_env_if_missing("ADV_MAX_TICKERS", str(int(s.adv_max_tickers)))
+        _export_env_if_missing("ADV_BATCH_CONCURRENCY", str(int(s.adv_batch_concurrency)))
 
-        # CORS / RL
-        _export_env_if_missing("ENABLE_CORS_ALL_ORIGINS", str(bool(s.enable_cors_all_origins)).lower())
-        _export_env_if_missing("CORS_ALL_ORIGINS", str(bool(s.enable_cors_all_origins)).lower())
-        _export_env_if_missing("CORS_ORIGINS", (s.cors_origins or "*").strip())
-        _export_env_if_missing("ENABLE_RATE_LIMITING", str(bool(s.enable_rate_limiting)).lower())
-        _export_env_if_missing("MAX_REQUESTS_PER_MINUTE", str(int(s.max_requests_per_minute)))
-
-        # Feature flags
-        _export_env_if_missing("AI_ANALYSIS_ENABLED", str(bool(s.ai_analysis_enabled)).lower())
-        _export_env_if_missing("ADVANCED_ANALYSIS_ENABLED", str(bool(s.advanced_analysis_enabled)).lower())
-        _export_env_if_missing("TADAWUL_MARKET_ENABLED", str(bool(s.tadawul_market_enabled)).lower())
-        _export_env_if_missing("ENABLE_SWAGGER", str(bool(s.enable_swagger)).lower())
-        _export_env_if_missing("ENABLE_REDOC", str(bool(s.enable_redoc)).lower())
-
-        # Engine/provider flags
-        _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(bool(s.enable_yahoo_chart_ksa)).lower())
-        _export_env_if_missing("ENABLE_YAHOO_CHART_SUPPLEMENT", str(bool(s.enable_yahoo_chart_supplement)).lower())
-        _export_env_if_missing("ENABLE_YFINANCE_KSA", str(bool(s.enable_yfinance_ksa)).lower())
-        _export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_KSA", str(bool(s.enable_yahoo_fundamentals_ksa)).lower())
-        _export_env_if_missing("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", str(bool(s.enable_yahoo_fundamentals_global)).lower())
-
-        # Base URLs
+        # Base URLs for provider modules that read env at call-time
         _export_env_if_missing("EODHD_BASE_URL", s.eodhd_base_url)
         _export_env_if_missing("FINNHUB_BASE_URL", s.finnhub_base_url)
         _export_env_if_missing("YAHOO_CHART_BASE_URL", s.yahoo_chart_base_url)
 
+        # Providers lists (some older modules read these at runtime)
+        _export_env_if_missing("ENABLED_PROVIDERS", ",".join(s.enabled_providers))
+        _export_env_if_missing("KSA_PROVIDERS", ",".join(s.ksa_providers))
+        _export_env_if_missing("PRIMARY_PROVIDER", (s.primary_provider or "eodhd").strip().lower())
+
+        # Optional base URL alias
         if s.backend_base_url:
-            base = (s.backend_base_url or "").rstrip("/")
-            _export_env_if_missing("BACKEND_BASE_URL", base)
-            _export_env_if_missing("TFB_BASE_URL", base)
-            _export_env_if_missing("BASE_URL", base)
-
-        # Spreadsheet ID alias
-        if s.default_spreadsheet_id:
-            _export_env_if_missing("DEFAULT_SPREADSHEET_ID", s.default_spreadsheet_id)
-            _export_env_if_missing("SPREADSHEET_ID", s.default_spreadsheet_id)
-            _export_env_if_missing("GOOGLE_SHEETS_ID", s.default_spreadsheet_id)
-
-        # Google creds alias
-        if s.google_sheets_credentials:
-            _export_env_if_missing("GOOGLE_SHEETS_CREDENTIALS", s.google_sheets_credentials)
-            _export_env_if_missing("GOOGLE_CREDENTIALS", s.google_sheets_credentials)
-            _export_env_if_missing("GOOGLE_SA_JSON", s.google_sheets_credentials)
-
-        if s.google_apps_script_url:
-            _export_env_if_missing("GOOGLE_APPS_SCRIPT_URL", s.google_apps_script_url)
-        if s.google_apps_script_backup_url:
-            _export_env_if_missing("GOOGLE_APPS_SCRIPT_BACKUP_URL", s.google_apps_script_backup_url)
-
-        # Optional KSA endpoint aliases
-        if s.tadawul_quote_url:
-            _export_env_if_missing("TADAWUL_QUOTE_URL", s.tadawul_quote_url)
-        if s.tadawul_fundamentals_url:
-            _export_env_if_missing("TADAWUL_FUNDAMENTALS_URL", s.tadawul_fundamentals_url)
-        if s.argaam_quote_url:
-            _export_env_if_missing("ARGAAM_QUOTE_URL", s.argaam_quote_url)
-        if s.argaam_profile_url:
-            _export_env_if_missing("ARGAAM_PROFILE_URL", s.argaam_profile_url)
+            _export_env_if_missing("BACKEND_BASE_URL", (s.backend_base_url or "").rstrip("/"))
+            _export_env_if_missing("BASE_URL", (s.backend_base_url or "").rstrip("/"))
 
     @lru_cache(maxsize=1)
     def get_settings() -> Settings:
         s = Settings()
 
-        # Normalize strings
+        # Normalize / coerce
         s.log_level = (s.log_level or "info").strip().lower()
         s.primary_provider = (s.primary_provider or "eodhd").strip().lower()
-        s.environment = (s.environment or "production").strip()
-        s.tz = (s.tz or "Asia/Riyadh").strip()
-        s.backend_base_url = (s.backend_base_url or "").strip() or None
 
-        # Normalize bools
         s.debug = _to_bool(s.debug, False)
+
         s.enable_rate_limiting = _to_bool(s.enable_rate_limiting, True)
         s.cache_backup_enabled = _to_bool(s.cache_backup_enabled, False)
         s.advanced_analysis_enabled = _to_bool(s.advanced_analysis_enabled, True)
-        s.ai_analysis_enabled = _to_bool(s.ai_analysis_enabled, True)
         s.tadawul_market_enabled = _to_bool(s.tadawul_market_enabled, True)
         s.enable_cors_all_origins = _to_bool(s.enable_cors_all_origins, True)
-        s.defer_router_mount = _to_bool(s.defer_router_mount, True)
-        s.init_engine_on_boot = _to_bool(s.init_engine_on_boot, True)
 
-        # Engine/provider routing flags
-        s.enable_yahoo_chart_ksa = _to_bool(s.enable_yahoo_chart_ksa, True)
-        s.enable_yahoo_chart_supplement = _to_bool(s.enable_yahoo_chart_supplement, True)
         s.enable_yfinance_ksa = _to_bool(s.enable_yfinance_ksa, False)
-        s.enable_yahoo_fundamentals_ksa = _to_bool(s.enable_yahoo_fundamentals_ksa, True)
-        s.enable_yahoo_fundamentals_global = _to_bool(s.enable_yahoo_fundamentals_global, False)
+        s.enable_yahoo_chart_ksa = _to_bool(s.enable_yahoo_chart_ksa, True)
 
-        # Normalize ints
-        s.max_requests_per_minute = _positive_int(s.max_requests_per_minute, 240)
-        s.max_retries = _positive_int(s.max_retries, 2)
-        s.cache_max_size = _positive_int(s.cache_max_size, 5000)
-        s.cache_save_interval = _positive_int(s.cache_save_interval, 300)
-        s.enriched_batch_concurrency = _positive_int(s.enriched_batch_concurrency, 8)
+        s.max_requests_per_minute = _to_int(s.max_requests_per_minute, 240)
+        s.max_retries = _to_int(s.max_retries, 2)
 
-        # Normalize floats
-        s.http_timeout = _positive_float(s.http_timeout, 30.0)
-        s.retry_delay = _positive_float(s.retry_delay, 0.5)
-        s.cache_ttl_sec = _positive_float(s.cache_ttl_sec, 20.0)
-        s.quote_ttl_sec = _positive_float(s.quote_ttl_sec, 30.0)
-        s.fundamentals_ttl_sec = _positive_float(s.fundamentals_ttl_sec, 21600.0)
-        s.argaam_snapshot_ttl_sec = _positive_float(s.argaam_snapshot_ttl_sec, 30.0)
-        s.engine_cache_ttl_sec = _positive_float(s.engine_cache_ttl_sec, float(s.cache_ttl_sec or 20.0))
+        s.http_timeout = _to_float(s.http_timeout, 30.0)
+        s.retry_delay = _to_float(s.retry_delay, 0.5)
 
-        # Normalize version (env/commit can win)
-        s.service_version = _resolve_version_from_env_or_commit(s.service_version)
+        s.cache_ttl_sec = _to_float(s.cache_ttl_sec, 20.0)
+        s.quote_ttl_sec = _to_float(s.quote_ttl_sec, 30.0)
+        s.fundamentals_ttl_sec = _to_float(s.fundamentals_ttl_sec, 21600.0)
+        s.argaam_snapshot_ttl_sec = _to_float(s.argaam_snapshot_ttl_sec, 30.0)
 
-        # ✅ Enforce require_auth when token exists
+        s.cache_max_size = _to_int(s.cache_max_size, 5000)
+        s.cache_save_interval = _to_int(s.cache_save_interval, 300)
+
+        # Advanced Analysis clamps (same intent as routes)
+        s.adv_batch_size = max(5, min(200, _to_int(s.adv_batch_size, 25)))
+        s.adv_batch_timeout_sec = max(5.0, min(180.0, _to_float(s.adv_batch_timeout_sec, 45.0)))
+        s.adv_max_tickers = max(10, min(2000, _to_int(s.adv_max_tickers, 500)))
+        s.adv_batch_concurrency = max(1, min(25, _to_int(s.adv_batch_concurrency, 6)))
+
+        # Auth: if token is set, effectively require auth
         tok_set = bool((s.app_token or "").strip() or (s.backup_app_token or "").strip())
         s.require_auth = _to_bool(s.require_auth, False) or tok_set
 
@@ -660,127 +426,86 @@ try:
 
 except Exception:  # pragma: no cover
     # =============================================================================
-    # LAST-RESORT FALLBACK (NO pydantic-settings required) — FULL
+    # LAST-RESORT FALLBACK (no pydantic-settings available)
     # =============================================================================
+    try:
+        from pydantic import BaseModel  # type: ignore
+    except Exception:  # pragma: no cover
 
-    class Settings:  # type: ignore
-        """
-        Minimal env-backed settings with the SAME attribute names expected across the codebase.
-        This must never throw during import.
-        """
+        class BaseModel:  # type: ignore
+            def __init__(self, **kwargs: Any):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
 
-        def __init__(self) -> None:
-            # App / Meta
-            self.service_name = (os.getenv("SERVICE_NAME") or os.getenv("APP_NAME") or "Tadawul Stock Analysis API").strip()
-            self.service_version = (
-                os.getenv("SERVICE_VERSION")
-                or os.getenv("APP_VERSION")
-                or os.getenv("VERSION")
-                or os.getenv("RELEASE")
-                or "dev"
-            ).strip()
-            self.environment = (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("ENV") or "production").strip()
-            self.tz = (os.getenv("TZ") or os.getenv("TIMEZONE") or "Asia/Riyadh").strip()
-            self.debug = _to_bool(os.getenv("DEBUG"), False)
-            self.log_level = (os.getenv("LOG_LEVEL") or "info").strip().lower()
-            self.log_format = (os.getenv("LOG_FORMAT") or "%(asctime)s | %(levelname)s | %(name)s | %(message)s").strip()
+    class Settings(BaseModel):  # type: ignore
+        service_name: str = "Tadawul Stock Analysis API"
+        service_version: str = "0.0.0"
+        environment: str = "production"
+        tz: str = "Asia/Riyadh"
+        debug: bool = False
+        log_level: str = "info"
+        log_format: str = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
-            # Boot / engine flags
-            self.defer_router_mount = _to_bool(os.getenv("DEFER_ROUTER_MOUNT"), True)
-            self.init_engine_on_boot = _to_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
+        require_auth: bool = False
+        app_token: Optional[str] = None
+        backup_app_token: Optional[str] = None
 
-            # Auth
-            self.app_token = (os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or "").strip() or None
-            self.backup_app_token = (os.getenv("BACKUP_APP_TOKEN") or "").strip() or None
-            self.require_auth = _to_bool(os.getenv("REQUIRE_AUTH"), False) or bool(self.app_token or self.backup_app_token)
+        enabled_providers_raw: str = "eodhd,finnhub"
+        primary_provider: str = "eodhd"
+        ksa_providers_raw: str = "yahoo_chart,tadawul,argaam"
 
-            # Providers (GLOBAL + KSA)
-            self.enabled_providers_raw = (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "eodhd,finnhub,fmp").strip()
-            self.primary_provider = (os.getenv("PRIMARY_PROVIDER") or "eodhd").strip().lower()
-            self.ksa_providers_raw = (os.getenv("KSA_PROVIDERS") or "yahoo_chart,tadawul,argaam").strip()
+        enable_yfinance_ksa: bool = False
+        enable_yahoo_chart_ksa: bool = True
 
-            # Provider keys/tokens
-            self.eodhd_api_key = (os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_TOKEN") or "").strip() or None
-            self.finnhub_api_key = (os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_TOKEN") or os.getenv("FINNHUB_TOKEN") or "").strip() or None
+        eodhd_api_key: Optional[str] = None
+        finnhub_api_key: Optional[str] = None
+        fmp_api_key: Optional[str] = None
+        alpha_vantage_api_key: Optional[str] = None
+        argaam_api_key: Optional[str] = None
 
-            self.fmp_api_key = (os.getenv("FMP_API_KEY") or "").strip() or None
-            self.alpha_vantage_api_key = (os.getenv("ALPHA_VANTAGE_API_KEY") or "").strip() or None
-            self.twelvedata_api_key = (os.getenv("TWELVEDATA_API_KEY") or "").strip() or None
-            self.marketstack_api_key = (os.getenv("MARKETSTACK_API_KEY") or "").strip() or None
-            self.argaam_api_key = (os.getenv("ARGAAM_API_KEY") or "").strip() or None
+        eodhd_base_url: str = "https://eodhistoricaldata.com/api"
+        finnhub_base_url: str = "https://finnhub.io/api/v1"
+        yahoo_chart_base_url: str = "https://query1.finance.yahoo.com"
+        backend_base_url: Optional[str] = None
 
-            # Base URLs / Networking
-            self.backend_base_url = (os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or os.getenv("BASE_URL") or "").strip() or None
-            self.eodhd_base_url = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").strip()
-            self.finnhub_base_url = (os.getenv("FINNHUB_BASE_URL") or "https://finnhub.io/api/v1").strip()
-            self.fmp_base_url = (os.getenv("FMP_BASE_URL") or "").strip() or None
-            self.yahoo_chart_base_url = (os.getenv("YAHOO_CHART_BASE_URL") or "https://query1.finance.yahoo.com").strip()
+        http_timeout: float = 30.0
+        max_retries: int = 2
+        retry_delay: float = 0.5
 
-            self.http_timeout = _positive_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 30.0)
-            self.max_retries = _positive_int(os.getenv("MAX_RETRIES"), 2)
-            self.retry_delay = _positive_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 0.5)
+        enable_cors_all_origins: bool = True
+        cors_origins: str = "*"
+        enable_rate_limiting: bool = True
+        max_requests_per_minute: int = 240
 
-            # CORS / Rate limiting
-            self.enable_cors_all_origins = _to_bool(os.getenv("ENABLE_CORS_ALL_ORIGINS") or os.getenv("CORS_ALL_ORIGINS"), True)
-            self.cors_origins = (os.getenv("CORS_ORIGINS") or "*").strip()
-            self.enable_rate_limiting = _to_bool(os.getenv("ENABLE_RATE_LIMITING"), True)
-            self.max_requests_per_minute = _positive_int(os.getenv("MAX_REQUESTS_PER_MINUTE"), 240)
+        cache_ttl_sec: float = 20.0
+        quote_ttl_sec: float = 30.0
+        fundamentals_ttl_sec: float = 21600.0
+        argaam_snapshot_ttl_sec: float = 30.0
+        cache_max_size: int = 5000
+        cache_backup_enabled: bool = False
+        cache_save_interval: int = 300
 
-            # Cache tuning
-            self.cache_ttl_sec = _positive_float(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20.0)
-            self.quote_ttl_sec = _positive_float(os.getenv("QUOTE_TTL_SEC"), 30.0)
-            self.fundamentals_ttl_sec = _positive_float(os.getenv("FUNDAMENTALS_TTL_SEC"), 21600.0)
-            self.argaam_snapshot_ttl_sec = _positive_float(os.getenv("ARGAAM_SNAPSHOT_TTL_SEC"), 30.0)
-            self.cache_max_size = _positive_int(os.getenv("CACHE_MAX_SIZE"), 5000)
-            self.cache_backup_enabled = _to_bool(os.getenv("CACHE_BACKUP_ENABLED"), False)
-            self.cache_save_interval = _positive_int(os.getenv("CACHE_SAVE_INTERVAL"), 300)
+        # Advanced analysis
+        adv_batch_size: int = 25
+        adv_batch_timeout_sec: float = 45.0
+        adv_max_tickers: int = 500
+        adv_batch_concurrency: int = 6
 
-            # Advanced analysis
-            self.adv_batch_size = 25
-            self.adv_batch_timeout_sec = 45.0
-            self.adv_max_tickers = 500
-            self.adv_batch_concurrency = 6
+        default_spreadsheet_id: Optional[str] = None
+        google_sheets_credentials: Optional[str] = None
+        google_credentials: Optional[str] = None
+        google_apps_script_url: Optional[str] = None
+        google_apps_script_backup_url: Optional[str] = None
 
-            self.default_spreadsheet_id = (
-                os.getenv("DEFAULT_SPREADSHEET_ID")
-                or os.getenv("SPREADSHEET_ID")
-                or os.getenv("GOOGLE_SHEETS_ID")
-                or ""
-            ).strip() or None
-            self.google_sheets_credentials = (
-                os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-                or os.getenv("GOOGLE_CREDENTIALS")
-                or os.getenv("GOOGLE_SA_JSON")
-                or ""
-            ).strip() or None
-            self.google_apps_script_url = (os.getenv("GOOGLE_APPS_SCRIPT_URL") or "").strip() or None
-            self.google_apps_script_backup_url = (os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "").strip() or None
+        advanced_analysis_enabled: bool = True
+        tadawul_market_enabled: bool = True
+        enable_swagger: bool = True
+        enable_redoc: bool = True
 
-            self.advanced_analysis_enabled = True
-            self.tadawul_market_enabled = True
-            self.enable_swagger = True
-            self.enable_redoc = True
-
-            self.tadawul_quote_url = (os.getenv("TADAWUL_QUOTE_URL") or "").strip() or None
-            self.tadawul_fundamentals_url = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip() or None
-            self.argaam_quote_url = (os.getenv("ARGAAM_QUOTE_URL") or "").strip() or None
-            self.argaam_profile_url = (os.getenv("ARGAAM_PROFILE_URL") or "").strip() or None
-
-            # Fallback engine flags
-            self.enable_yahoo_chart_ksa = _to_bool(os.getenv("ENABLE_YAHOO_CHART_KSA"), True)
-            self.enable_yahoo_chart_supplement = _to_bool(os.getenv("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
-            self.enable_yfinance_ksa = _to_bool(os.getenv("ENABLE_YFINANCE_KSA"), False)
-            self.enable_yahoo_fundamentals_ksa = _to_bool(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_KSA"), True)
-            self.enable_yahoo_fundamentals_global = _to_bool(os.getenv("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"), False)
-
-            self.engine_cache_ttl_sec = _positive_float(
-                os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC"),
-                float(self.cache_ttl_sec or 20.0),
-            )
-            self.enriched_batch_concurrency = _positive_int(
-                os.getenv("ENRICHED_BATCH_CONCURRENCY") or os.getenv("ENRICHED_CONCURRENCY"),
-                8,
-            )
+        tadawul_quote_url: Optional[str] = None
+        tadawul_fundamentals_url: Optional[str] = None
+        argaam_quote_url: Optional[str] = None
+        argaam_profile_url: Optional[str] = None
 
         @property
         def enabled_providers(self) -> List[str]:
