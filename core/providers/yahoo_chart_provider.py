@@ -1,207 +1,279 @@
-# core/providers/yahoo_chart_provider.py
+# core/yahoo_chart_provider.py  (FULL REPLACEMENT)
 """
-Hardened Yahoo Quote/Chart Provider (v1.8.5)
-------------------------------------------------------------
-PROD SAFE + SESSION-HARDENED + KSA-SAFE + ENGINE-ALIGNED
+core/yahoo_chart_provider.py
+===========================================================
+Compatibility + Repo-Hygiene Shim — v0.3.0 (PROD SAFE)
 
-What's New in v1.8.5:
-- ✅ Utilizes central YahooSessionManager from core.providers.yahoo_provider.
-- ✅ Resolves 401 Unauthorized errors via Crumb/Cookie persistence.
-- ✅ Robust Fallback: Attempts v7/quote first (rich data); falls back to v8/chart.
-- ✅ History Support: fetch_price_history for Technical Analysis (MAs, RSI).
-- ✅ 52W Guards: Specifically handles Yahoo's "0.0" low-price bug for KSA stocks.
-- ✅ Derived Fields: Automatically computes price_change, percent_change, and value_traded.
+Why this exists
+- The canonical Yahoo Chart provider lives here:
+    core/providers/yahoo_chart_provider.py
+- This top-level module must remain VALID Python forever (no markdown fences),
+  because older imports may still do:
+    import core.yahoo_chart_provider
 
-Exports:
-- fetch_quote_patch (Primary engine entry point)
-- fetch_price_history (For technical analytics)
-- fetch_enriched_quote_patch / fetch_quote_and_enrichment_patch (Aliases)
+What this shim guarantees
+- ✅ Import-safe (never crashes app startup)
+- ✅ Re-exports canonical provider symbols when available
+- ✅ Provides backward-compatible function names:
+    - fetch_quote, get_quote
+    - get_quote_patch / fetch_quote_patch
+    - yahoo_chart_quote (older code)
+    - history function names (best-effort pass-through)
+    - aclose_yahoo_chart_client (best-effort)
+
+If canonical import fails
+- Returns safe error-shaped dicts (never raises)
 """
 
-import asyncio
+from __future__ import annotations
+
 import logging
-import httpx
-import math
-from typing import Any, Dict, Optional, List, Tuple
-from core.providers.yahoo_provider import session_manager, fetch_yahoo_quote_hardened
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-logger = logging.getLogger("core.providers.yahoo_chart")
+logger = logging.getLogger("core.yahoo_chart_provider_shim")
 
-PROVIDER_NAME = "yahoo_chart_hardened"
-PROVIDER_VERSION = "1.8.5"
+SHIM_VERSION = "0.3.0"
 
-# --- Internal Helpers ---
+# Backward-compat constant (not necessarily used by canonical provider)
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
-def _to_float(x: Any) -> Optional[float]:
+
+def _is_awaitable(x: Any) -> bool:
     try:
-        if x is None or isinstance(x, bool): return None
-        v = float(x)
-        return v if not (math.isnan(v) or math.isinf(v)) else None
-    except: return None
+        return hasattr(x, "__await__")
+    except Exception:
+        return False
 
-def _last_non_null(vals: List[Any]) -> Optional[float]:
-    if not vals: return None
-    for v in reversed(vals):
-        f = _to_float(v)
-        if f is not None: return f
-    return None
 
-def _normalize_symbol(symbol: str) -> str:
-    s = symbol.strip().upper()
-    if s.isdigit() and len(s) == 4:
-        return f"{s}.SR"
-    return s
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    out = fn(*args, **kwargs)
+    if _is_awaitable(out):
+        return await out
+    return out
 
-def _fill_derived(p: Dict[str, Any]) -> None:
-    cur = p.get("current_price")
-    prev = p.get("previous_close")
-    vol = p.get("volume")
 
-    if p.get("price_change") is None and cur is not None and prev is not None:
-        p["price_change"] = cur - prev
+def _norm_symbol(symbol: str) -> str:
+    return (symbol or "").strip().upper()
 
-    if p.get("percent_change") is None and cur is not None and prev:
-        p["percent_change"] = (cur - prev) / prev * 100.0
 
-    if p.get("value_traded") is None and cur is not None and vol is not None:
-        p["value_traded"] = cur * vol
-
-def _guard_52w(p: Dict[str, Any]) -> None:
-    """Yahoo often returns 0.0 for 52W low on KSA stocks during market gaps."""
-    cur = p.get("current_price")
-    lo = p.get("week_52_low")
-    if lo is not None and lo == 0.0 and cur is not None and cur > 1.0:
-        p["week_52_low"] = None
-
-# --- Core Logic ---
-
-async def fetch_quote_patch(symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
-    """
-    Unified fetcher: v7/quote (hardened) -> Fallback to v8/chart.
-    Returns a 'patch' dictionary for DataEngineV2.
-    """
-    norm_symbol = _normalize_symbol(symbol)
-    local_client = client or httpx.AsyncClient(headers={"User-Agent": session_manager.user_agent}, timeout=12)
-    
-    # 1. Attempt Hardened v7/quote (Best data)
-    patch, err = await fetch_yahoo_quote_hardened(norm_symbol, local_client)
-    
-    # 2. If v7 fails (401 or empty), attempt v8/chart (More resilient)
-    if not patch or err:
-        logger.info("v7/quote failed for %s (%s), trying v8/chart fallback", norm_symbol, err)
-        chart_patch = await _fetch_v8_chart_data(norm_symbol, local_client)
-        if chart_patch:
-            if not patch: patch = {}
-            patch.update(chart_patch)
-            patch["data_source"] = f"{PROVIDER_NAME}_fallback"
-
-    if not patch:
-        return {"error": err or "No data available", "status": "error", "symbol": norm_symbol}
-
-    # Finalize enrichment
-    patch["symbol"] = norm_symbol
-    patch.setdefault("data_source", PROVIDER_NAME)
-    _guard_52w(patch)
-    _fill_derived(patch)
-    
-    if not client:
-        await local_client.aclose()
-        
-    return {k: v for k, v in patch.items() if v is not None}
-
-async def _fetch_v8_chart_data(symbol: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-    """Internal fallback for v8 chart endpoint."""
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "1d", "interval": "1m"}
-    
-    try:
-        await session_manager.ensure_session(client)
-        if session_manager.crumb:
-            params["crumb"] = session_manager.crumb
-            
-        resp = await client.get(url, params=params)
-        if resp.status_code != 200: return {}
-        
-        res = resp.json().get("chart", {}).get("result", [None])[0]
-        if not res: return {}
-        
-        meta = res.get("meta", {})
-        return {
-            "current_price": _to_float(meta.get("regularMarketPrice")),
-            "previous_close": _to_float(meta.get("previousClose")) or _to_float(meta.get("chartPreviousClose")),
-            "currency": meta.get("currency"),
-            "week_52_high": _to_float(meta.get("fiftyTwoWeekHigh")),
-            "week_52_low": _to_float(meta.get("fiftyTwoWeekLow")),
+def _err_payload(symbol: str, err: str, *, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(base or {})
+    out.update(
+        {
+            "status": "error",
+            "symbol": _norm_symbol(symbol),
+            "data_source": "yahoo_chart",
+            "data_quality": "MISSING",
+            "error": err,
+            "shim_version": SHIM_VERSION,
         }
-    except:
+    )
+    return out
+
+
+try:
+    # Canonical provider module
+    import core.providers.yahoo_chart_provider as _canon  # type: ignore
+
+    # Prefer canonical constants if present
+    PROVIDER_VERSION = getattr(_canon, "PROVIDER_VERSION", "unknown")
+
+    # Provider class (if present)
+    YahooChartProvider = getattr(_canon, "YahooChartProvider")  # type: ignore
+
+    # -------- Quote helpers (best-effort mapping) --------
+    _get_quote = getattr(_canon, "get_quote", None)
+    _fetch_quote = getattr(_canon, "fetch_quote", None)
+
+    _fetch_quote_patch = getattr(_canon, "fetch_quote_patch", None)
+    _get_quote_patch = getattr(_canon, "get_quote_patch", None)  # some canon versions used this name
+
+    _fetch_enriched_quote_patch = getattr(_canon, "fetch_enriched_quote_patch", None)
+    _fetch_quote_and_enrichment_patch = getattr(_canon, "fetch_quote_and_enrichment_patch", None)
+
+    # -------- History helpers (optional pass-through) --------
+    _fetch_price_history = getattr(_canon, "fetch_price_history", None)
+    _fetch_history = getattr(_canon, "fetch_history", None)
+    _fetch_ohlc_history = getattr(_canon, "fetch_ohlc_history", None)
+    _fetch_history_patch = getattr(_canon, "fetch_history_patch", None)
+    _fetch_prices = getattr(_canon, "fetch_prices", None)
+
+    # -------- Client closer (optional) --------
+    _aclose = getattr(_canon, "aclose_yahoo_chart_client", None)
+
+    async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_fetch_quote):
+            r = await _call_maybe_async(_fetch_quote, symbol, *args, **kwargs)
+            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
+        if callable(_get_quote):
+            r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
+            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
+        return {"status": "error", "symbol": _norm_symbol(symbol), "error": "canonical provider missing get_quote/fetch_quote"}
+
+    async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_get_quote):
+            r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
+            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
+        return await fetch_quote(symbol, *args, **kwargs)
+
+    async def get_quote_patch(
+        symbol: str,
+        base: Optional[Dict[str, Any]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        # Prefer canonical patch functions if present
+        if callable(_get_quote_patch):
+            r = await _call_maybe_async(_get_quote_patch, symbol, base, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type", base=base)
+        if callable(_fetch_quote_patch):
+            r = await _call_maybe_async(_fetch_quote_patch, symbol, *args, **kwargs)
+            if isinstance(r, dict):
+                out = dict(base or {})
+                out.update(r)
+                return out
+            return _err_payload(symbol, "unexpected return type", base=base)
+        # Fallback: merge get_quote (full quote) into base
+        q = await get_quote(symbol, *args, **kwargs)
+        out = dict(base or {})
+        if isinstance(q, dict):
+            out.update(q)
+            return out
+        return _err_payload(symbol, "unexpected return type", base=base)
+
+    # Engine-friendly alias (many engines call this exact name)
+    async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        # debug is ignored here; canonical provider may accept it
+        if callable(_fetch_quote_patch):
+            r = await _call_maybe_async(_fetch_quote_patch, symbol, debug=debug, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
+        # fall back to old name mapping
+        return await get_quote_patch(symbol, None, *args, **kwargs)
+
+    async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_fetch_enriched_quote_patch):
+            r = await _call_maybe_async(_fetch_enriched_quote_patch, symbol, debug=debug, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
+        return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+    async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        if callable(_fetch_quote_and_enrichment_patch):
+            r = await _call_maybe_async(_fetch_quote_and_enrichment_patch, symbol, debug=debug, *args, **kwargs)
+            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
+        return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+    # Backward compatible alias (older code may call yahoo_chart_quote)
+    async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await get_quote(symbol, *args, **kwargs)
+
+    # -------- History pass-throughs (optional) --------
+    async def fetch_price_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        if callable(_fetch_price_history):
+            return await _call_maybe_async(_fetch_price_history, symbol, *args, **kwargs)
+        if callable(_fetch_history):
+            return await _call_maybe_async(_fetch_history, symbol, *args, **kwargs)
+        if callable(_fetch_ohlc_history):
+            return await _call_maybe_async(_fetch_ohlc_history, symbol, *args, **kwargs)
+        if callable(_fetch_history_patch):
+            return await _call_maybe_async(_fetch_history_patch, symbol, *args, **kwargs)
+        if callable(_fetch_prices):
+            return await _call_maybe_async(_fetch_prices, symbol, *args, **kwargs)
         return {}
 
-async def fetch_price_history(
-    symbol: str, 
-    period: str = "1mo", 
-    interval: str = "1d", 
-    client: Optional[httpx.AsyncClient] = None
-) -> List[Dict[str, Any]]:
-    """
-    Historical OHLCV fetcher for technical indicators (MAs, RSI).
-    """
-    norm_symbol = _normalize_symbol(symbol)
-    local_client = client or httpx.AsyncClient(headers={"User-Agent": session_manager.user_agent}, timeout=15)
+    async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
 
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{norm_symbol}"
-    params = {"range": period, "interval": interval}
+    async def fetch_ohlc_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
 
-    try:
-        await session_manager.ensure_session(local_client)
-        if session_manager.crumb:
-            params["crumb"] = session_manager.crumb
+    async def fetch_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
 
-        resp = await local_client.get(url, params=params)
-        if resp.status_code != 200: return []
+    async def fetch_prices(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return await fetch_price_history(symbol, *args, **kwargs)
 
-        data = resp.json().get("chart", {}).get("result", [None])[0]
-        if not data: return []
+    async def aclose_yahoo_chart_client() -> None:
+        if callable(_aclose):
+            try:
+                await _call_maybe_async(_aclose)
+            except Exception:
+                pass
 
-        timestamps = data.get("timestamp", [])
-        indicators = data.get("indicators", {}).get("quote", [{}])[0]
-        adj_close = data.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
-        
-        history = []
-        for i in range(len(timestamps)):
-            close_val = _to_float(indicators.get("close", [])[i])
-            if close_val is None: continue # Skip missing data points
-            
-            history.append({
-                "timestamp": timestamps[i],
-                "close": close_val,
-                "adj_close": _to_float(adj_close[i]) if i < len(adj_close) else close_val,
-                "open": _to_float(indicators.get("open", [])[i]),
-                "high": _to_float(indicators.get("high", [])[i]),
-                "low": _to_float(indicators.get("low", [])[i]),
-                "volume": _to_float(indicators.get("volume", [])[i]),
-            })
-        return history
-    except Exception as e:
-        logger.error("History fetch error for %s: %s", symbol, e)
-        return []
-    finally:
-        if not client:
-            await local_client.aclose()
+except Exception as e:  # pragma: no cover
+    # Quiet boot: do not log at import-time
+    PROVIDER_VERSION = "fallback"
 
-# --- Compatibility Aliases ---
-async def fetch_enriched_quote_patch(symbol: str, **kwargs):
-    return await fetch_quote_patch(symbol, **kwargs)
+    class YahooChartProvider:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._error = f"{e.__class__.__name__}: {e}"
 
-async def fetch_quote_and_enrichment_patch(symbol: str, **kwargs):
-    return await fetch_quote_patch(symbol, **kwargs)
+        async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return _err_payload(symbol, self._error, base=base)
 
-async def aclose_yahoo_client():
-    pass
+    async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await fetch_quote(symbol, *args, **kwargs)
+
+    async def get_quote_patch(
+        symbol: str,
+        base: Optional[Dict[str, Any]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}", base=base)
+
+    async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+
+    async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await get_quote(symbol, *args, **kwargs)
+
+    # History fallbacks
+    async def fetch_price_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_ohlc_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def fetch_prices(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        return {}
+
+    async def aclose_yahoo_chart_client() -> None:
+        return None
+
 
 __all__ = [
+    "YAHOO_CHART_URL",
+    "PROVIDER_VERSION",
+    "YahooChartProvider",
+    # Quote API
+    "fetch_quote",
+    "get_quote",
+    "get_quote_patch",
     "fetch_quote_patch",
-    "fetch_price_history",
     "fetch_enriched_quote_patch",
     "fetch_quote_and_enrichment_patch",
-    "aclose_yahoo_client"
+    "yahoo_chart_quote",
+    # History API (best-effort)
+    "fetch_price_history",
+    "fetch_history",
+    "fetch_ohlc_history",
+    "fetch_history_patch",
+    "fetch_prices",
+    # Client close
+    "aclose_yahoo_chart_client",
 ]
