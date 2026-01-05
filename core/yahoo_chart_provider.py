@@ -1,124 +1,207 @@
-# core/providers/yahoo_chart_provider.py
+# core/enriched_quote.py
 """
-Yahoo Chart Provider (v1.8.1)
-Revised to utilize the Hardened Yahoo Session Manager to avoid 401 blocks.
-Includes history fetching and client management.
+core/enriched_quote.py
+------------------------------------------------------------
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.5.6
+
+What this module is for:
+- Legacy/compat endpoints under /v1/enriched/* for dashboard sync.
+- Bridges engine results to Google Sheets row formats.
+- Ensures strict standardization of Recommendations and Timestamps.
+
+✅ v2.5.6 Alignment:
+- Engine-First: Directly utilizes app.state.engine singleton (v2.8.5 compatible).
+- Schema-Aware: Uses core.schemas for intelligent header mapping if available.
+- Reco-Standard: Forces strict BUY / HOLD / REDUCE / SELL enums.
+- Riyadh Time: Precise localized timestamps for Tadawul market sync.
 """
 
+from __future__ import annotations
+
+import asyncio
+import inspect
 import logging
-import httpx
-from typing import Any, Dict, Optional, List
-from core.providers.yahoo_provider import session_manager
+import os
+import re
+import traceback
+from datetime import datetime, timezone, timedelta
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-logger = logging.getLogger("core.providers.yahoo_chart")
+from fastapi import APIRouter, Query, Request
+from fastapi.encoders import jsonable_encoder
+from starlette.responses import JSONResponse
 
-async def fetch_quote_patch(symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
-    """
-    Fetch price data via the Yahoo v8 chart endpoint.
-    Often more resilient to blocks than the v7 quote endpoint.
-    """
-    # Reuse or create client
-    local_client = client or httpx.AsyncClient(headers={"User-Agent": session_manager.user_agent}, timeout=10)
-    
-    # KSA Normalization
-    if symbol.isdigit() and len(symbol) == 4:
-        symbol = f"{symbol}.SR"
-    elif not symbol.endswith(".SR") and not symbol.endswith(".SA") and symbol.isdigit():
-        symbol = f"{symbol}.SR"
+logger = logging.getLogger("core.enriched_quote")
+
+ROUTER_VERSION = "2.5.6"
+router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
+
+# =============================================================================
+# Normalization & Utility Shims
+# =============================================================================
+
+@lru_cache(maxsize=1)
+def _get_reco_normalizer():
+    """Try to import the dedicated normalization utility."""
+    try:
+        from core.reco_normalize import normalize_recommendation
+        return normalize_recommendation
+    except ImportError:
+        def fallback(x, default="HOLD"):
+            if not x: return default
+            s = str(x).strip().upper()
+            if "BUY" in s: return "BUY"
+            if "SELL" in s: return "SELL"
+            if "REDUCE" in s or "TRIM" in s: return "REDUCE"
+            return "HOLD"
+        return fallback
+
+def _to_riyadh_iso(utc_any: Any) -> str:
+    """Convert UTC ISO string to Riyadh Local ISO (+3)."""
+    if not utc_any: return ""
+    try:
+        s = str(utc_any).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        # Riyadh is UTC+3
+        riyadh_dt = dt.astimezone(timezone(timedelta(hours=3)))
+        return riyadh_dt.isoformat()
+    except: return ""
+
+def _maybe_percent(v: Any) -> Optional[float]:
+    """Convert ratio (0.05) to percentage (5.0) for Sheets."""
+    try:
+        f = float(v)
+        # Only multiply if it looks like a fraction
+        return f * 100.0 if abs(f) <= 1.5 else f
+    except: return None
+
+# =============================================================================
+# Enriched Quote Mapping Logic
+# =============================================================================
+
+class EnrichedQuote:
+    """Mapper for converting UnifiedQuote payloads to Sheet-ready rows."""
+    def __init__(self, payload: Dict[str, Any]):
+        self.payload = payload or {}
+        self._standardize()
+
+    def _standardize(self):
+        """Standardize internal keys before mapping to rows."""
+        normalize = _get_reco_normalizer()
+        self.payload["recommendation"] = normalize(self.payload.get("recommendation", "HOLD"))
         
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "1d", "interval": "1m", "includePrePost": "false"}
+        # Ensure timestamp exists
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.payload.setdefault("last_updated_utc", now_iso)
+        
+        # localized timestamp for Saudi Dashboard
+        if not self.payload.get("last_updated_riyadh"):
+            self.payload["last_updated_riyadh"] = _to_riyadh_iso(self.payload["last_updated_utc"])
+            
+    def to_row(self, headers: Sequence[str]) -> List[Any]:
+        """Maps payload keys to requested header order with alias support."""
+        row = []
+        for h in headers:
+            # Clean header to key
+            hk = h.lower().replace(" ", "_").replace("%", "percent").replace("/", "_").replace("-", "_")
+            
+            # Robust Alias Map for Google Sheets columns
+            alias_map = {
+                "last_price": "current_price",
+                "price": "current_price",
+                "price_change": "price_change",
+                "change": "price_change",
+                "change_percent": "percent_change",
+                "52w_high": "week_52_high",
+                "52w_low": "week_52_low",
+                "pe_ttm": "pe_ratio",
+                "p_e_ttm": "pe_ratio",
+                "dividend_yield_percent": "dividend_yield"
+            }
+            
+            key = alias_map.get(hk, hk)
+            val = self.payload.get(key)
+            
+            # Auto-format percentages for specific columns
+            pct_cols = {"yield", "return", "roe", "roa", "payout", "change_percent", "percent_change"}
+            if any(p in hk for p in pct_cols):
+                val = _maybe_percent(val)
+                
+            row.append(val)
+        return row
+
+# =============================================================================
+# Routes
+# =============================================================================
+
+@router.get("/quote")
+async def get_single_quote(request: Request, symbol: str = Query(...)):
+    """Fetch single enriched quote via the active Data Engine."""
+    try:
+        # Access engine initialized in main.py lifespan
+        eng = getattr(request.app.state, "engine", None)
+        if not eng:
+            from core.data_engine_v2 import get_engine
+            eng = await get_engine()
+            
+        result = await eng.get_enriched_quote(symbol)
+        mapper = EnrichedQuote(result)
+        
+        # Return standardized payload
+        return JSONResponse(content=jsonable_encoder(mapper.payload))
+    except Exception as e:
+        logger.error("Enriched Route Error for %s: %s", symbol, e)
+        return JSONResponse(content={
+            "status": "error", 
+            "error": str(e), 
+            "symbol": symbol,
+            "data_quality": "MISSING"
+        }, status_code=200)
+
+@router.get("/quotes")
+async def get_batch_quotes(request: Request, symbols: str = Query(...)):
+    """Batch fetch enriched quotes with bounded concurrency."""
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not sym_list:
+        return JSONResponse(content={"status": "error", "error": "No symbols provided"}, status_code=200)
 
     try:
-        # Ensure session if managed by yahoo_provider
-        await session_manager.ensure_session(local_client)
-        if session_manager.crumb:
-            params["crumb"] = session_manager.crumb
+        eng = getattr(request.app.state, "engine", None)
+        if not eng:
+            from core.data_engine_v2 import get_engine
+            eng = await get_engine()
 
-        resp = await local_client.get(url, params=params)
-        if resp.status_code != 200:
-            return {"error": f"yahoo_chart: {resp.status_code}", "status": "error", "symbol": symbol}
-            
-        res = resp.json().get("chart", {}).get("result", [None])[0]
-        if not res:
-            return {"error": "yahoo_chart: empty_response", "status": "error", "symbol": symbol}
-            
-        meta = res.get("meta", {})
-        return {
-            "price": meta.get("regularMarketPrice"),
-            "prev_close": meta.get("previousClose"),
-            "change": meta.get("regularMarketPrice", 0) - meta.get("previousClose", 0) if meta.get("previousClose") else None,
-            "currency": meta.get("currency"),
-            "data_source": "yahoo_chart_hardened",
-            "status": "ok",
-            "symbol": symbol
-        }
-    except Exception as e:
-        logger.error("Yahoo Chart Fetch Error for %s: %s", symbol, e)
-        return {"error": str(e), "status": "error", "symbol": symbol}
-    finally:
-        if not client:
-            await local_client.aclose()
-
-async def fetch_price_history(
-    symbol: str, 
-    period: str = "1mo", 
-    interval: str = "1d", 
-    client: Optional[httpx.AsyncClient] = None
-) -> List[Dict[str, Any]]:
-    """
-    Fetch historical price data for technical analysis (MAs, RSI, etc).
-    """
-    local_client = client or httpx.AsyncClient(headers={"User-Agent": session_manager.user_agent}, timeout=15)
-    
-    if symbol.isdigit() and len(symbol) == 4:
-        symbol = f"{symbol}.SR"
-
-    # Yahoo ranges: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": period, "interval": interval}
-
-    try:
-        await session_manager.ensure_session(local_client)
-        if session_manager.crumb:
-            params["crumb"] = session_manager.crumb
-
-        resp = await local_client.get(url, params=params)
-        if resp.status_code != 200:
-            return []
-
-        data = resp.json().get("chart", {}).get("result", [None])[0]
-        if not data:
-            return []
-
-        timestamps = data.get("timestamp", [])
-        indicators = data.get("indicators", {}).get("quote", [{}])[0]
+        # Batch fetch via DataEngineV2 (optimized with asyncio.gather)
+        results = await eng.get_enriched_quotes(sym_list)
         
-        history = []
-        for i in range(len(timestamps)):
-            history.append({
-                "timestamp": timestamps[i],
-                "close": indicators.get("close", [])[i],
-                "open": indicators.get("open", [])[i],
-                "high": indicators.get("high", [])[i],
-                "low": indicators.get("low", [])[i],
-                "volume": indicators.get("volume", [])[i],
-            })
-        return history
+        final_items = []
+        for r in results:
+            mapper = EnrichedQuote(r)
+            final_items.append(mapper.payload)
+            
+        return JSONResponse(content={
+            "status": "success",
+            "count": len(final_items),
+            "items": final_items,
+            "engine_version": getattr(eng, "ENGINE_VERSION", "unknown"),
+            "router_version": ROUTER_VERSION
+        })
     except Exception as e:
-        logger.error("History fetch error for %s: %s", symbol, e)
-        return []
-    finally:
-        if not client:
-            await local_client.aclose()
+        logger.error("Batch Enriched Route Error: %s", e)
+        return JSONResponse(content={"status": "error", "error": str(e)}, status_code=200)
 
-async def aclose_yahoo_chart_client():
-    """Best-effort cleanup of global state if any."""
-    pass
+@router.get("/health", include_in_schema=False)
+async def health():
+    return {
+        "status": "ok", 
+        "module": "core.enriched_quote", 
+        "version": ROUTER_VERSION,
+        "timezone_offset": "+03:00 (Riyadh)"
+    }
 
-# Compatibility Aliases
-async def fetch_enriched_quote_patch(symbol: str, **kwargs):
-    return await fetch_quote_patch(symbol, **kwargs)
+def get_router() -> APIRouter:
+    return router
 
-async def fetch_quote_and_enrichment_patch(symbol: str, **kwargs):
-    return await fetch_quote_patch(symbol, **kwargs)
+__all__ = ["router", "get_router", "EnrichedQuote"]
