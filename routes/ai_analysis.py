@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.2) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.3) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,11 +12,12 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.2.2 upgrades
-- ✅ Await helper now supports any awaitable (coroutines/futures/tasks) via inspect.isawaitable.
-- ✅ Engine batch calls support optional refresh kw (best-effort).
-- ✅ 52W position % respects ratio->percent when engine returns 0..1.
-- ✅ Always non-empty recommendation in all rows/outputs (BUY/HOLD/REDUCE/SELL).
+v4.2.3 upgrades
+- ✅ FIX: schema-field mapping now falls back to local fields / snake-guess when schema field is missing.
+    This prevents blank columns when schemas field names differ from engine payload keys
+    (e.g., high_52w vs week_52_high, volatility_30d vs vol_30d_ann, rsi_14 vs rsi14).
+- ✅ Fallback normalize now aligns with DataEngineV2 (no forced ".US" suffix).
+- ✅ Keeps v4.2.2 improvements (await-any, refresh best-effort, 52W ratio->percent guard, always non-empty reco).
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.2.2"
+AI_ANALYSIS_VERSION = "4.2.3"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -180,6 +181,11 @@ def _ensure_reco_on_obj(uq: Any) -> None:
 # Lazy imports: V2 helpers (PROD SAFE) + cached normalize
 # =============================================================================
 def _fallback_normalize(raw: str) -> str:
+    """
+    Fallback normalization aligned with DataEngineV2.normalize_symbol():
+    - digits -> .SR
+    - otherwise keep symbol as-is (no forced .US)
+    """
     s = (raw or "").strip().upper()
     if not s:
         return ""
@@ -191,11 +197,7 @@ def _fallback_normalize(raw: str) -> str:
         return s
     if s.isdigit():
         return f"{s}.SR"
-    if s.endswith(".SR") or s.endswith(".US"):
-        return s
-    if "." in s:
-        return s
-    return f"{s}.US"
+    return s
 
 
 @lru_cache(maxsize=1)
@@ -1182,6 +1184,24 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
     )
 
 
+def _is_blank(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
+def _apply_common_transforms(hk: str, v: Any) -> Any:
+    if hk == "recommendation":
+        return _normalize_recommendation(v)
+    if hk in _RATIO_HEADERS:
+        return _ratio_to_percent(v)
+    if hk in _VOL_HEADERS:
+        return _vol_to_percent(v)
+    return v
+
+
 def _value_for_meta(
     meta: _HeaderMeta,
     uq: Any,
@@ -1234,41 +1254,28 @@ def _value_for_meta(
             raw = v if v is not None else reco_calc
             return _normalize_recommendation(raw)
 
-    # 1) schemas mapping if available
+    # 1) schemas mapping if available (but FALL BACK if missing)
     if meta.schema_field:
         v = _safe_get(uq, meta.schema_field)
-        if hk in _RATIO_HEADERS:
-            v = _ratio_to_percent(v)
-        if hk in _VOL_HEADERS:
-            v = _vol_to_percent(v)
-        if hk == "recommendation":
-            return _normalize_recommendation(v)
-        return v
+        v = _apply_common_transforms(hk, v)
+        if not _is_blank(v):
+            return v
 
     # 2) local mapping
     if meta.local_fields:
         val = _safe_get(uq, *meta.local_fields)
-        if hk == "recommendation":
-            return _normalize_recommendation(val)
-        if hk in _RATIO_HEADERS:
-            val = _ratio_to_percent(val)
-        if hk in _VOL_HEADERS:
-            val = _vol_to_percent(val)
         if meta.local_transform and val is not None:
             try:
-                return meta.local_transform(val)
+                val = meta.local_transform(val)
             except Exception:
-                return val
-        return val
+                pass
+        val = _apply_common_transforms(hk, val)
+        if not _is_blank(val):
+            return val
 
     # 3) fallback snake-case guess
     val = _safe_get(uq, meta.guess)
-    if hk == "recommendation":
-        return _normalize_recommendation(val)
-    if hk in _RATIO_HEADERS:
-        return _ratio_to_percent(val)
-    if hk in _VOL_HEADERS:
-        return _vol_to_percent(val)
+    val = _apply_common_transforms(hk, val)
     return val
 
 
