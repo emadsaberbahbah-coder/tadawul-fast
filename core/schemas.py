@@ -1,13 +1,17 @@
-# core/schemas.py  — FULL REPLACEMENT — v3.6.1
+# core/schemas.py  — FULL REPLACEMENT — v3.6.2
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.6.1 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.6.2 (PROD SAFE)
 
-What changed in v3.6.1
-- ✅ Adds vNext registry mapping for Insights_Analysis (previously relied on fallback).
-- ✅ Adds a few tolerant synonyms for portfolio headers.
-- ✅ Adds asset_type to FIELD_ALIASES (header exists; keep mapping complete).
+What changed in v3.6.2 (alignment release)
+- ✅ vNext headers aligned to routes/ai_analysis.py expectations:
+    • Percent columns explicitly include "%" (Dividend Yield %, ROE %, etc.)
+    • Technicals use legacy-style labels for safer transforms: Volatility (30D), RSI (14)
+    • Forecast block uses "Expected Return" + "Expected Price" (keeps ROI/Target as synonyms)
+- ✅ Keeps backwards compatibility:
+    • All prior v3.6.1 headers remain recognized via tolerant header normalization + synonyms
+    • Legacy 59 + legacy Analysis headers preserved as-is
 - ✅ Still import-safe: no DataEngine imports, no network, no heavy deps.
 - ✅ Defensive: get_headers_for_sheet() never raises and always returns COPIES.
 """
@@ -31,7 +35,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.6.1"
+SCHEMAS_VERSION = "3.6.2"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -194,7 +198,7 @@ def validate_headers_59(headers: Any) -> Dict[str, Any]:
 # vNext: Page-customized schemas (what your Sheets should use)
 # =============================================================================
 
-# --- Common blocks (vNext labels aligned to your current Sheets outputs) ---
+# --- Common blocks (vNext labels aligned to routes/ai_analysis.py transforms) ---
 _VN_IDENTITY: List[str] = [
     "Rank",
     "Symbol",
@@ -234,6 +238,7 @@ _VN_CAP: List[str] = [
     "Liquidity Score",
 ]
 
+# IMPORTANT: percent fields include "%" to allow robust ratio->percent transforms in routes.
 _VN_FUNDAMENTALS: List[str] = [
     "EPS (TTM)",
     "Forward EPS",
@@ -242,21 +247,22 @@ _VN_FUNDAMENTALS: List[str] = [
     "P/B",
     "P/S",
     "EV/EBITDA",
-    "Dividend Yield",
+    "Dividend Yield %",   # was "Dividend Yield"
     "Dividend Rate",
-    "Payout Ratio",
-    "ROE",
-    "ROA",
-    "Net Margin",
-    "EBITDA Margin",
-    "Revenue Growth",
-    "Net Income Growth",
+    "Payout Ratio %",     # was "Payout Ratio"
+    "ROE %",              # was "ROE"
+    "ROA %",              # was "ROA"
+    "Net Margin %",       # was "Net Margin"
+    "EBITDA Margin %",    # was "EBITDA Margin"
+    "Revenue Growth %",   # was "Revenue Growth"
+    "Net Income Growth %",# was "Net Income Growth"
     "Beta",
 ]
 
+# Align technical labels with legacy-safe keys used across routes.
 _VN_TECHNICALS: List[str] = [
-    "Volatility 30D",
-    "RSI 14",
+    "Volatility (30D)",   # was "Volatility 30D"
+    "RSI (14)",           # was "RSI 14"
 ]
 
 _VN_VALUATION: List[str] = [
@@ -281,7 +287,7 @@ _VN_BADGES: List[str] = [
     "Risk Badge",
 ]
 
-# Forecasting / history / targets (future-focused columns)
+# Forecasting / history / targets (use Expected Return / Expected Price to match analysis routes)
 _VN_FORECAST: List[str] = [
     "Returns 1W %",
     "Returns 1M %",
@@ -291,12 +297,12 @@ _VN_FORECAST: List[str] = [
     "MA20",
     "MA50",
     "MA200",
-    "Expected ROI 1M %",
-    "Expected ROI 3M %",
-    "Expected ROI 12M %",
-    "Target Price 1M",
-    "Target Price 3M",
-    "Target Price 12M",
+    "Expected Return 1M %",
+    "Expected Return 3M %",
+    "Expected Return 12M %",
+    "Expected Price 1M",
+    "Expected Price 3M",
+    "Expected Price 12M",
     "Confidence Score",
     "Forecast Method",
     "History Points",
@@ -373,10 +379,10 @@ _VN_HEADERS_FUNDS: List[str] = (
         "Value Traded",
         "Expense Ratio",
         "AUM",
-        "Distribution Yield",
+        "Distribution Yield",  # keep as-is (providers vary)
         "Beta",
-        "Volatility 30D",
-        "RSI 14",
+        "Volatility (30D)",
+        "RSI (14)",
         "Fair Value",
         "Upside %",
         "Valuation Label",
@@ -413,8 +419,8 @@ _VN_HEADERS_COMMODITIES_FX: List[str] = (
         "52W Position %",
         "Volume",
         "Value Traded",
-        "Volatility 30D",
-        "RSI 14",
+        "Volatility (30D)",
+        "RSI (14)",
         "Fair Value",
         "Upside %",
         "Valuation Label",
@@ -476,12 +482,12 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Fair Value",
         "Upside %",
         "Valuation Label",
-        "Expected ROI 1M %",
-        "Expected ROI 3M %",
-        "Expected ROI 12M %",
-        "Target Price 1M",
-        "Target Price 3M",
-        "Target Price 12M",
+        "Expected Return 1M %",
+        "Expected Return 3M %",
+        "Expected Return 12M %",
+        "Expected Price 1M",
+        "Expected Price 3M",
+        "Expected Price 12M",
         "Confidence Score",
         "Recommendation",
         "Rec Badge",
@@ -490,8 +496,8 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         # Quality/safety indicators
         "Risk Score",
         "Overall Score",
-        "Volatility 30D",
-        "RSI 14",
+        "Volatility (30D)",
+        "RSI (14)",
     ]
     + [
         # Provenance / meta
@@ -584,11 +590,23 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "free_float_market_cap": "Free Float Mkt Cap",
     "ff_market_cap": "Free Float Mkt Cap",
 
-    "dividend_yield_percent": "Dividend Yield",
-    "dividend_yield_pct": "Dividend Yield",
+    # technical variants
+    "volatility_30d": "Volatility (30D)",
+    "volatility30d": "Volatility (30D)",
+    "rsi_14": "RSI (14)",
 
-    "volatility_30d": "Volatility 30D",
-    "rsi_14": "RSI 14",
+    # percent label variants (accept non-% versions)
+    "dividend_yield": "Dividend Yield %",
+    "dividend_yield_percent": "Dividend Yield %",
+    "dividend_yield_pct": "Dividend Yield %",
+
+    "payout_ratio": "Payout Ratio %",
+    "roe": "ROE %",
+    "roa": "ROA %",
+    "net_margin": "Net Margin %",
+    "ebitda_margin": "EBITDA Margin %",
+    "revenue_growth": "Revenue Growth %",
+    "net_income_growth": "Net Income Growth %",
 
     # timestamps
     "last_updated_utc": "Last Updated (UTC)",
@@ -600,13 +618,16 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "portfolio_group": "Portfolio Group",
     "asset_type": "Asset Type",
 
-    # forecast aliases
-    "expected_return_1m_percent": "Expected ROI 1M %",
-    "expected_return_3m_percent": "Expected ROI 3M %",
-    "expected_return_12m_percent": "Expected ROI 12M %",
-    "expected_price_1m": "Target Price 1M",
-    "expected_price_3m": "Target Price 3M",
-    "expected_price_12m": "Target Price 12M",
+    # forecast aliases (support ROI/Target labels too)
+    "expected_roi_1m_percent": "Expected Return 1M %",
+    "expected_roi_3m_percent": "Expected Return 3M %",
+    "expected_roi_12m_percent": "Expected Return 12M %",
+    "expected_return_1m_percent": "Expected Return 1M %",
+    "expected_return_3m_percent": "Expected Return 3M %",
+    "expected_return_12m_percent": "Expected Return 12M %",
+    "target_price_1m": "Expected Price 1M",
+    "target_price_3m": "Expected Price 3M",
+    "target_price_12m": "Expected Price 12M",
 }
 for k, canon_header in list(_HEADER_SYNONYMS.items()):
     nk = _norm_header_label(k)
@@ -811,7 +832,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Free Float Mkt Cap": "free_float_market_cap",
     "Liquidity Score": "liquidity_score",
 
-    # --- vNext Fundamentals ---
+    # --- vNext Fundamentals (percent labels explicit) ---
     "EPS (TTM)": "eps_ttm",
     "Forward EPS": "forward_eps",
     "P/E (TTM)": "pe_ttm",
@@ -819,20 +840,20 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "P/B": "pb",
     "P/S": "ps",
     "EV/EBITDA": "ev_ebitda",
-    "Dividend Yield": "dividend_yield",
+    "Dividend Yield %": "dividend_yield",
     "Dividend Rate": "dividend_rate",
-    "Payout Ratio": "payout_ratio",
-    "ROE": "roe",
-    "ROA": "roa",
-    "Net Margin": "net_margin",
-    "EBITDA Margin": "ebitda_margin",
-    "Revenue Growth": "revenue_growth",
-    "Net Income Growth": "net_income_growth",
+    "Payout Ratio %": "payout_ratio",
+    "ROE %": "roe",
+    "ROA %": "roa",
+    "Net Margin %": "net_margin",
+    "EBITDA Margin %": "ebitda_margin",
+    "Revenue Growth %": "revenue_growth",
+    "Net Income Growth %": "net_income_growth",
     "Beta": "beta",
 
     # --- vNext Technicals ---
-    "Volatility 30D": "volatility_30d",
-    "RSI 14": "rsi_14",
+    "Volatility (30D)": "volatility_30d",
+    "RSI (14)": "rsi_14",
 
     # --- vNext Valuation ---
     "Fair Value": "fair_value",
@@ -851,7 +872,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Opportunity Badge": "opportunity_badge",
     "Risk Badge": "risk_badge",
 
-    # --- Forecast / history ---
+    # --- Forecast / history (Expected Return / Expected Price) ---
     "Returns 1W %": "returns_1w",
     "Returns 1M %": "returns_1m",
     "Returns 3M %": "returns_3m",
@@ -860,12 +881,12 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "MA20": "ma20",
     "MA50": "ma50",
     "MA200": "ma200",
-    "Expected ROI 1M %": "expected_return_1m",
-    "Expected ROI 3M %": "expected_return_3m",
-    "Expected ROI 12M %": "expected_return_12m",
-    "Target Price 1M": "expected_price_1m",
-    "Target Price 3M": "expected_price_3m",
-    "Target Price 12M": "expected_price_12m",
+    "Expected Return 1M %": "expected_return_1m",
+    "Expected Return 3M %": "expected_return_3m",
+    "Expected Return 12M %": "expected_return_12m",
+    "Expected Price 1M": "expected_price_1m",
+    "Expected Price 3M": "expected_price_3m",
+    "Expected Price 12M": "expected_price_12m",
     "Confidence Score": "confidence_score",
     "Forecast Method": "forecast_method",
     "History Points": "history_points",
@@ -916,16 +937,24 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Percent Change": "percent_change",
     "Avg Volume (30D)": "avg_volume_30d",
     "Free Float Market Cap": "free_float_market_cap",
-    "Dividend Yield %": "dividend_yield",
-    "Payout Ratio %": "payout_ratio",
-    "ROE %": "roe",
-    "ROA %": "roa",
-    "Net Margin %": "net_margin",
-    "EBITDA Margin %": "ebitda_margin",
-    "Revenue Growth %": "revenue_growth",
-    "Net Income Growth %": "net_income_growth",
-    "Volatility (30D)": "volatility_30d",
-    "RSI (14)": "rsi_14",
+    "Dividend Yield": "dividend_yield",          # legacy/no-% variant (tolerant)
+    "Payout Ratio": "payout_ratio",
+    "ROE": "roe",
+    "ROA": "roa",
+    "Net Margin": "net_margin",
+    "EBITDA Margin": "ebitda_margin",
+    "Revenue Growth": "revenue_growth",
+    "Net Income Growth": "net_income_growth",
+    "Volatility 30D": "volatility_30d",          # legacy v3.6.1 variant
+    "RSI 14": "rsi_14",                          # legacy v3.6.1 variant
+
+    # ROI/Target legacy variants (tolerant)
+    "Expected ROI 1M %": "expected_return_1m",
+    "Expected ROI 3M %": "expected_return_3m",
+    "Expected ROI 12M %": "expected_return_12m",
+    "Target Price 1M": "expected_price_1m",
+    "Target Price 3M": "expected_price_3m",
+    "Target Price 12M": "expected_price_12m",
 }
 
 # Multi-field fallback candidates per header (preferred first, then aliases)
@@ -1077,7 +1106,7 @@ _register(
     ],
     headers=_VN_PORTFOLIO_T,
 )
-# ✅ v3.6.1: explicit mapping for Insights_Analysis under vNext (previously fallback)
+# Explicit mapping for Insights_Analysis under vNext
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
