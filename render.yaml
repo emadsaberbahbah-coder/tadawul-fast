@@ -1,18 +1,18 @@
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.1.4)
+# PROD-SAFE + Backward-Compatible env var names (v1.1.6)
 # ============================================================
 #
-# v1.1.4 changes vs v1.1.3
-# - ✅ Fix: startCommand quoting/argv building hardened (less shell edge-cases)
-# - ✅ Fix: WEB_CONCURRENCY parsing fully numeric-safe + clamps to >=1
-# - ✅ Add: UVICORN_GRACEFUL_TIMEOUT + UVICORN_TIMEOUT (optional)
+# v1.1.6 changes vs v1.1.4
+# - ✅ Fix: remove invalid uvicorn flag (--timeout-graceful-shutdown)
+#          use correct flag: --graceful-timeout
+# - ✅ Harden: numeric parsing for ALL tunables (port/workers/keepalive/graceful/backlog/limits)
 # - ✅ Keep: Option A KSA_PROVIDERS=yahoo_chart (quiet + stable KSA)
 # - ✅ Keep: full env compat (both *_SEC and legacy aliases)
 #
-# NOTE:
-# - If you rename the service, update BACKEND_BASE_URL/TFB_BASE_URL (or set in Render dashboard).
+# Notes
 # - Secrets must be set in Render Environment UI or via `sync: false` placeholders below.
+# - If you rename the service, update BACKEND_BASE_URL/TFB_BASE_URL (or set in Render dashboard).
 
 services:
   - type: web
@@ -28,21 +28,54 @@ services:
       sh -c '
       set -eu;
 
+      # ----------------------------
+      # Helpers
+      # ----------------------------
+      as_int() {
+        # usage: as_int "$RAW" "$DEFAULT"
+        raw="${1:-}";
+        def="${2:-0}";
+        case "$raw" in
+          (""|*[!0-9]*) printf "%s" "$def" ;;
+          (*)          printf "%s" "$raw" ;;
+        esac
+      }
+
+      clamp_min_1() {
+        v="$(as_int "${1:-}" "1")";
+        if [ "$v" -lt 1 ]; then v="1"; fi;
+        printf "%s" "$v";
+      }
+
+      # ----------------------------
+      # Resolve runtime values
+      # ----------------------------
       LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
-      PORT_VAL="${PORT:-8000}";
-      KEEPALIVE_VAL="${UVICORN_KEEPALIVE:-75}";
-      GRACE_VAL="${UVICORN_GRACEFUL_TIMEOUT:-30}";
-      TIMEOUT_VAL="${UVICORN_TIMEOUT:-0}";
+
+      PORT_VAL="$(clamp_min_1 "$(as_int "${PORT:-8000}" "8000")")";
+
+      KEEPALIVE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")";
+
+      # graceful-timeout is uvicorn flag; default 30 seconds
+      GRACE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")")";
 
       # WEB_CONCURRENCY numeric-safe (default 1). Clamp to >=1.
-      CONC_RAW="${WEB_CONCURRENCY:-1}";
-      case "$CONC_RAW" in
-        (""|*[!0-9]*) CONC="1" ;;
-        (*)           CONC="$CONC_RAW" ;;
-      esac;
-      if [ "$CONC" -lt 1 ]; then CONC="1"; fi;
+      CONC="$(clamp_min_1 "$(as_int "${WEB_CONCURRENCY:-1}" "1")")";
 
+      # Access log toggle
+      ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")";
+
+      # Optional tunables (numeric or empty)
+      LIMIT_CONC="$(as_int "${UVICORN_LIMIT_CONCURRENCY:-}" "")";
+      LIMIT_REQS="$(as_int "${UVICORN_LIMIT_MAX_REQUESTS:-}" "")";
+      BACKLOG="$(as_int "${UVICORN_BACKLOG:-}" "")";
+
+      # Root path (string)
+      ROOT_PATH="${UVICORN_ROOT_PATH:-}";
+
+      # ----------------------------
       # Build argv deterministically
+      # ----------------------------
       set -- uvicorn main:app \
         --host 0.0.0.0 \
         --port "$PORT_VAL" \
@@ -50,14 +83,9 @@ services:
         --forwarded-allow-ips "*" \
         --lifespan on \
         --timeout-keep-alive "$KEEPALIVE_VAL" \
+        --graceful-timeout "$GRACE_VAL" \
         --log-level "$LOG_LEVEL_LC" \
         --no-server-header;
-
-      # Optional: request timeout (0 means disabled for uvicorn)
-      case "$TIMEOUT_VAL" in
-        (""|*[!0-9]*) : ;;
-        (*) if [ "$TIMEOUT_VAL" -gt 0 ]; then set -- "$@" --timeout-graceful-shutdown "$GRACE_VAL"; fi ;;
-      esac;
 
       # Workers only when >1
       if [ "$CONC" -gt 1 ]; then
@@ -65,29 +93,26 @@ services:
       fi;
 
       # Access log toggle
-      case "${UVICORN_ACCESS_LOG:-1}" in
+      case "$ACCESS_RAW" in
         (0|false|no|off) set -- "$@" --no-access-log ;;
         (*)              set -- "$@" --access-log ;;
       esac;
 
       # Optional tuning flags (only if numeric)
-      case "${UVICORN_LIMIT_CONCURRENCY:-}" in
-        (""|*[!0-9]*) : ;;
-        (*) set -- "$@" --limit-concurrency "${UVICORN_LIMIT_CONCURRENCY}" ;;
-      esac;
+      if [ -n "$LIMIT_CONC" ]; then
+        set -- "$@" --limit-concurrency "$LIMIT_CONC";
+      fi;
 
-      case "${UVICORN_LIMIT_MAX_REQUESTS:-}" in
-        (""|*[!0-9]*) : ;;
-        (*) set -- "$@" --limit-max-requests "${UVICORN_LIMIT_MAX_REQUESTS}" ;;
-      esac;
+      if [ -n "$LIMIT_REQS" ]; then
+        set -- "$@" --limit-max-requests "$LIMIT_REQS";
+      fi;
 
-      case "${UVICORN_BACKLOG:-}" in
-        (""|*[!0-9]*) : ;;
-        (*) set -- "$@" --backlog "${UVICORN_BACKLOG}" ;;
-      esac;
+      if [ -n "$BACKLOG" ]; then
+        set -- "$@" --backlog "$BACKLOG";
+      fi;
 
-      if [ -n "${UVICORN_ROOT_PATH:-}" ]; then
-        set -- "$@" --root-path "${UVICORN_ROOT_PATH}";
+      if [ -n "$ROOT_PATH" ]; then
+        set -- "$@" --root-path "$ROOT_PATH";
       fi;
 
       exec "$@"'
@@ -102,14 +127,17 @@ services:
         value: "1"
       - key: TZ
         value: "Asia/Riyadh"
+
+      # Concurrency / Uvicorn
       - key: WEB_CONCURRENCY
         value: "1"
       - key: UVICORN_KEEPALIVE
         value: "75"
       - key: UVICORN_GRACEFUL_TIMEOUT
         value: "30"
-      - key: UVICORN_TIMEOUT
-        value: "0"
+      - key: UVICORN_ACCESS_LOG
+        value: "1"
+
       - key: LOG_LEVEL
         value: "info"
       - key: LOG_JSON
@@ -166,14 +194,14 @@ services:
       # -------------------------
       # Feature flags
       # -------------------------
-      - key: ENABLE_SWAGGER
-        value: "true"
-      - key: ENABLE_REDOC
-        value: "true"
       - key: AI_ANALYSIS_ENABLED
         value: "true"
       - key: ADVANCED_ANALYSIS_ENABLED
         value: "true"
+      - key: ENABLE_RATE_LIMITING
+        value: "true"
+      - key: MAX_REQUESTS_PER_MINUTE
+        value: "240"
 
       # -------------------------
       # Providers policy (GLOBAL)
@@ -224,10 +252,6 @@ services:
         sync: false
       - key: ALPHA_VANTAGE_API_KEY
         sync: false
-
-      # Optional Argaam (not used in Option A)
-      - key: ARGAAM_GATEWAY_URL
-        value: ""
       - key: ARGAAM_API_KEY
         sync: false
 
@@ -236,9 +260,7 @@ services:
         value: ""
       - key: TADAWUL_FUNDAMENTALS_URL
         value: ""
-      - key: ARGAAM_QUOTE_URL
-        value: ""
-      - key: ARGAAM_PROFILE_URL
+      - key: ARGAAM_GATEWAY_URL
         value: ""
 
       # -------------------------
@@ -263,14 +285,6 @@ services:
         value: "21600"
       - key: ARGAAM_SNAPSHOT_TTL_SEC
         value: "30"
-
-      # -------------------------
-      # Rate limiting (SlowAPI)
-      # -------------------------
-      - key: ENABLE_RATE_LIMITING
-        value: "true"
-      - key: MAX_REQUESTS_PER_MINUTE
-        value: "240"
 
       # -------------------------
       # Batch controls
