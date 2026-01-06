@@ -2,11 +2,12 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.4.0
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.4.1
 
 Key guarantees
 - ✅ Await-safe everywhere (engine + get_engine may be sync OR async)
 - ✅ Never crashes: always returns HTTP 200 with a status field
+- ✅ Avoids FastAPI 422 for missing symbol/symbols by making them optional
 - ✅ Prefers app.state.engine, else uses core.data_engine_v2.get_engine() (singleton)
 - ✅ Supports refresh=1 and fields=... (best-effort pass-through)
 - ✅ Batch endpoint supports:
@@ -14,7 +15,11 @@ Key guarantees
     - list OR dict OR {"items":[...]} shapes
 - ✅ If engine returns dict without status, we inject status="ok" (Sheets/client safety)
 - ✅ Alignment: Recommendation standardized to BUY/HOLD/REDUCE/SELL (always UPPERCASE, always non-empty)
-- ✅ Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
+- ✅ Token guard via:
+    • X-APP-TOKEN
+    • Authorization: Bearer <token>
+    • (optional) ?token=... (disabled unless ALLOW_QUERY_TOKEN=1)
+  If no token is set => open mode.
 
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
@@ -28,6 +33,7 @@ import inspect
 import os
 import re
 import traceback
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,7 +41,18 @@ from fastapi import APIRouter, Header, Query, Request
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.4.0"
+ENRICHED_ROUTE_VERSION = "5.4.1"
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
+
+def _truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in _TRUTHY
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 # =============================================================================
 # Settings shim (safe)
@@ -188,7 +205,7 @@ def _to_jsonable(payload: Any) -> Any:
 
 
 def _debug_enabled(debug_q: int) -> bool:
-    if debug_q:
+    if int(debug_q or 0):
         return True
     v = (os.getenv("DEBUG_ERRORS") or "").strip().lower()
     return v in ("1", "true", "yes", "on")
@@ -261,7 +278,7 @@ def _ensure_reco(payload: Any) -> Any:
 def _ensure_status_dict(d: Dict[str, Any], *, symbol: str = "", engine_source: str = "") -> Dict[str, Any]:
     """
     Ensure returned dict always includes a `status`.
-    Also enforces recommendation enum if present/missing.
+    Also enforces recommendation enum always.
     """
     out = dict(d)
     out.setdefault("status", "ok")
@@ -269,12 +286,14 @@ def _ensure_status_dict(d: Dict[str, Any], *, symbol: str = "", engine_source: s
         out.setdefault("symbol", symbol)
     if engine_source:
         out.setdefault("engine_source", engine_source)
+    out.setdefault("route_version", ENRICHED_ROUTE_VERSION)
+    out.setdefault("time_utc", _utc_iso())
     out["recommendation"] = _coerce_reco_enum(out.get("recommendation"))
     return out
 
 
 # =============================================================================
-# Auth (X-APP-TOKEN) — open mode if no tokens configured
+# Auth (X-APP-TOKEN / Authorization Bearer / optional ?token)
 # =============================================================================
 def _read_token_attr(obj: Any, attr: str) -> Optional[str]:
     try:
@@ -326,11 +345,36 @@ def _allowed_tokens() -> List[str]:
     return out
 
 
-def _auth_ok(x_app_token: Optional[str]) -> bool:
+def _extract_token(
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    token_qs: Optional[str],
+) -> Optional[str]:
+    t = (x_app_token or "").strip()
+    if t:
+        return t
+
+    auth = (authorization or "").strip()
+    if auth:
+        low = auth.lower()
+        if low.startswith("bearer "):
+            return auth.split(" ", 1)[1].strip() or None
+        return auth.strip() or None
+
+    if _truthy(os.getenv("ALLOW_QUERY_TOKEN", "0")):
+        tq = (token_qs or "").strip()
+        if tq:
+            return tq
+
+    return None
+
+
+def _auth_ok(provided: Optional[str]) -> bool:
     allowed = _allowed_tokens()
     if not allowed:
         return True  # open mode
-    return bool(x_app_token and x_app_token.strip() in allowed)
+    pt = (provided or "").strip()
+    return bool(pt and pt in allowed)
 
 
 # =============================================================================
@@ -463,34 +507,43 @@ async def enriched_health(request: Request) -> Dict[str, Any]:
     return {
         "status": "ok",
         "module": "routes.enriched_quote",
-        "version": ENRICHED_ROUTE_VERSION,
+        "route_version": ENRICHED_ROUTE_VERSION,
         "engine": engine_name,
         "engine_source": eng_src,
         "auth": "open" if not _allowed_tokens() else "token",
+        "time_utc": _utc_iso(),
     }
 
 
 @router.get("/v1/enriched/quote")
 async def enriched_quote(
     request: Request,
-    symbol: str = Query(..., description="Ticker symbol, e.g. 1120.SR or AAPL or 1120"),
+    symbol: str = Query("", description="Ticker symbol, e.g. 1120.SR or AAPL or 1120"),
     refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
     fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
     debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    token: Optional[str] = Query(default=None, description="(optional) query token if ALLOW_QUERY_TOKEN=1"),
 ) -> Dict[str, Any]:
-    sym = _normalize_symbol(symbol)
     eng, eng_src = await _get_engine_from_request(request)
     dbg = _debug_enabled(debug)
 
-    if not _auth_ok(x_app_token):
-        return {"status": "error", "error": "Unauthorized (invalid or missing X-APP-TOKEN).", "symbol": sym or symbol, "engine_source": eng_src}
+    sym = _normalize_symbol(symbol)
+
+    provided = _extract_token(x_app_token, authorization, token)
+    if not _auth_ok(provided):
+        return _ensure_status_dict(
+            {"status": "error", "error": "Unauthorized: invalid or missing token (X-APP-TOKEN or Authorization: Bearer)."},
+            symbol=sym or (symbol or ""),
+            engine_source=eng_src,
+        )
 
     if not sym:
-        return {"status": "error", "error": "Missing symbol", "symbol": symbol, "engine_source": eng_src}
+        return _ensure_status_dict({"status": "error", "error": "Missing symbol"}, symbol=(symbol or ""), engine_source=eng_src)
 
     if eng is None:
-        return {"status": "error", "error": "Engine not available", "symbol": sym, "engine_source": eng_src}
+        return _ensure_status_dict({"status": "error", "error": "Engine not available"}, symbol=sym, engine_source=eng_src)
 
     try:
         # prefer enriched; fallback to get_quote (wrapped)
@@ -499,7 +552,7 @@ async def enriched_quote(
                 eng=eng,
                 method_name="get_enriched_quote",
                 symbol=sym,
-                refresh=bool(refresh),
+                refresh=bool(int(refresh or 0)),
                 fields=fields,
             )
             res = _unwrap_tuple_payload(await _maybe_await(raw))
@@ -508,7 +561,7 @@ async def enriched_quote(
                 eng=eng,
                 method_name="get_quote",
                 symbol=sym,
-                refresh=bool(refresh),
+                refresh=bool(int(refresh or 0)),
                 fields=fields,
             )
             res = _unwrap_tuple_payload(await _maybe_await(raw))
@@ -516,7 +569,6 @@ async def enriched_quote(
         if isinstance(res, dict):
             return _ensure_status_dict(_ensure_reco(res), symbol=sym, engine_source=eng_src)
 
-        # wrap for backward compatibility
         wrapped = {"status": "ok", "symbol": sym, "engine_source": eng_src, "value": _to_jsonable(res)}
         return _ensure_status_dict(wrapped, symbol=sym, engine_source=eng_src)
 
@@ -530,39 +582,65 @@ async def enriched_quote(
         }
         if dbg:
             out["trace"] = _clamp(traceback.format_exc(), 8000)
-        return out
+        return _ensure_status_dict(out, symbol=sym, engine_source=eng_src)
 
 
 @router.get("/v1/enriched/quotes")
 async def enriched_quotes(
     request: Request,
-    symbols: str = Query(..., description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
+    symbols: str = Query("", description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
     refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
     fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
     debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
     max_symbols: int = Query(800, description="Safety limit for very large requests"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    token: Optional[str] = Query(default=None, description="(optional) query token if ALLOW_QUERY_TOKEN=1"),
 ) -> Dict[str, Any]:
     eng, eng_src = await _get_engine_from_request(request)
     dbg = _debug_enabled(debug)
 
-    if not _auth_ok(x_app_token):
-        return {"status": "error", "error": "Unauthorized (invalid or missing X-APP-TOKEN).", "engine_source": eng_src, "items": []}
+    provided = _extract_token(x_app_token, authorization, token)
+    if not _auth_ok(provided):
+        return {
+            "status": "error",
+            "error": "Unauthorized: invalid or missing token (X-APP-TOKEN or Authorization: Bearer).",
+            "engine_source": eng_src,
+            "route_version": ENRICHED_ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+            "count": 0,
+            "items": [],
+        }
 
     syms = _parse_symbols_list(symbols)
     if max_symbols and max_symbols > 0 and len(syms) > max_symbols:
         syms = syms[:max_symbols]
 
     if not syms:
-        return {"status": "error", "error": "No valid symbols", "engine_source": eng_src, "items": []}
+        return {
+            "status": "error",
+            "error": "No valid symbols",
+            "engine_source": eng_src,
+            "route_version": ENRICHED_ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+            "count": 0,
+            "items": [],
+        }
 
     if eng is None:
-        return {"status": "error", "error": "Engine not available", "engine_source": eng_src, "items": []}
+        return {
+            "status": "error",
+            "error": "Engine not available",
+            "engine_source": eng_src,
+            "route_version": ENRICHED_ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+            "count": 0,
+            "items": [],
+        }
 
     items: List[Any] = []
     try:
-        # Prefer batch call if engine supports it (faster + consistent)
-        method_used, raw_batch = _call_engine_batch_best_effort(eng, syms, refresh=bool(refresh), fields=fields)
+        method_used, raw_batch = _call_engine_batch_best_effort(eng, syms, refresh=bool(int(refresh or 0)), fields=fields)
         if raw_batch is not None:
             res = _unwrap_tuple_payload(await _maybe_await(raw_batch))
 
@@ -571,11 +649,13 @@ async def enriched_quotes(
                 out = dict(res)
                 out.setdefault("status", "ok")
                 out.setdefault("engine_source", eng_src)
-                out.setdefault("count", len(out.get("items") or []))
+                out.setdefault("route_version", ENRICHED_ROUTE_VERSION)
+                out.setdefault("time_utc", _utc_iso())
                 out["items"] = [
                     _ensure_status_dict(_ensure_reco(it) if isinstance(it, dict) else {"status": "ok", "value": _to_jsonable(it)}, symbol="", engine_source=eng_src)
                     for it in (out.get("items") or [])
                 ]
+                out["count"] = int(out.get("count") or len(out["items"]))
                 out["method"] = method_used or "batch"
                 return out
 
@@ -587,7 +667,15 @@ async def enriched_quotes(
                         items.append(_ensure_status_dict(_ensure_reco(it), symbol=sym, engine_source=eng_src))
                     else:
                         items.append(_ensure_status_dict({"status": "ok", "symbol": sym, "engine_source": eng_src, "value": _to_jsonable(it)}, symbol=sym, engine_source=eng_src))
-                return {"status": "ok", "engine_source": eng_src, "method": method_used or "batch", "count": len(items), "items": items}
+                return {
+                    "status": "ok",
+                    "engine_source": eng_src,
+                    "route_version": ENRICHED_ROUTE_VERSION,
+                    "time_utc": _utc_iso(),
+                    "method": method_used or "batch",
+                    "count": len(items),
+                    "items": items,
+                }
 
             # dict mapping {symbol: quote}
             if isinstance(res, dict):
@@ -596,20 +684,27 @@ async def enriched_quotes(
                     if isinstance(v, dict):
                         items.append(_ensure_status_dict(_ensure_reco(v), symbol=s, engine_source=eng_src))
                     elif v is None:
-                        items.append({"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response", "recommendation": "HOLD"})
+                        items.append(_ensure_status_dict({"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response"}, symbol=s, engine_source=eng_src))
                     else:
                         items.append(_ensure_status_dict({"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(v)}, symbol=s, engine_source=eng_src))
-                return {"status": "ok", "engine_source": eng_src, "method": method_used or "batch", "count": len(items), "items": items}
+                return {
+                    "status": "ok",
+                    "engine_source": eng_src,
+                    "route_version": ENRICHED_ROUTE_VERSION,
+                    "time_utc": _utc_iso(),
+                    "method": method_used or "batch",
+                    "count": len(items),
+                    "items": items,
+                }
 
-        # Fallback: per-symbol loop (still PROD SAFE)
+        # Fallback: per-symbol loop
         for s in syms:
             try:
-                # prefer enriched; fallback to get_quote (wrapped)
                 try:
-                    raw = _call_engine_method_best_effort(eng, "get_enriched_quote", s, refresh=bool(refresh), fields=fields)
+                    raw = _call_engine_method_best_effort(eng, "get_enriched_quote", s, refresh=bool(int(refresh or 0)), fields=fields)
                     res = _unwrap_tuple_payload(await _maybe_await(raw))
                 except Exception:
-                    raw = _call_engine_method_best_effort(eng, "get_quote", s, refresh=bool(refresh), fields=fields)
+                    raw = _call_engine_method_best_effort(eng, "get_quote", s, refresh=bool(int(refresh or 0)), fields=fields)
                     res = _unwrap_tuple_payload(await _maybe_await(raw))
 
                 if isinstance(res, dict):
@@ -617,15 +712,31 @@ async def enriched_quotes(
                 else:
                     items.append(_ensure_status_dict({"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(res)}, symbol=s, engine_source=eng_src))
             except Exception as ex:
-                err_item: Dict[str, Any] = {"status": "error", "symbol": s, "engine_source": eng_src, "error": _clamp(ex), "recommendation": "HOLD"}
+                err_item: Dict[str, Any] = {"status": "error", "symbol": s, "engine_source": eng_src, "error": _clamp(ex)}
                 if dbg:
                     err_item["trace"] = _clamp(traceback.format_exc(), 4000)
-                items.append(err_item)
+                items.append(_ensure_status_dict(err_item, symbol=s, engine_source=eng_src))
 
-        return {"status": "ok", "engine_source": eng_src, "method": "per_symbol", "count": len(items), "items": items}
+        return {
+            "status": "ok",
+            "engine_source": eng_src,
+            "route_version": ENRICHED_ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+            "method": "per_symbol",
+            "count": len(items),
+            "items": items,
+        }
 
     except Exception as e:
-        out: Dict[str, Any] = {"status": "error", "engine_source": eng_src, "error": _clamp(e), "items": items}
+        out: Dict[str, Any] = {
+            "status": "error",
+            "engine_source": eng_src,
+            "route_version": ENRICHED_ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+            "error": _clamp(e),
+            "items": items,
+            "count": len(items),
+        }
         if dbg:
             out["trace"] = _clamp(traceback.format_exc(), 8000)
         return out
