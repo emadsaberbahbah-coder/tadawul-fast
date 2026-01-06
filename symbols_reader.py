@@ -3,8 +3,14 @@
 """
 symbols_reader.py
 ===========================================================
-TADAWUL FAST BRIDGE – SYMBOLS READER (v2.4.0) – PROD SAFE
+TADAWUL FAST BRIDGE – SYMBOLS READER (v2.4.1) – PROD SAFE
 ===========================================================
+
+What’s improved vs your v2.4.0:
+- ✅ Fix: sheet names with apostrophes now work (proper A1 escaping: 'Bob''s Sheet')
+- ✅ Add: optional env sheet-name overrides (uses env keys like SHEET_MARKET_LEADERS, etc.)
+- ✅ Add: base64url credentials support (- and _), safer padding handling
+- ✅ Add: INSIGHTS_ANALYSIS + INVESTMENT_ADVISOR keys (safe; won’t break anything)
 
 Purpose
 - Provide a single, stable API for scripts (like scripts/run_market_scan.py)
@@ -35,6 +41,9 @@ Overrides (optional)
 - TFB_SYMBOL_START_ROW  (default 6)
 - TFB_SYMBOL_MAX_ROWS   (default 5000)
 - TFB_SYMBOLS_CACHE_TTL_SEC (default 45)
+
+Sheet name overrides (optional)
+- SHEET_MARKET_LEADERS, SHEET_GLOBAL_MARKETS, SHEET_KSA_TADAWUL, etc.
 """
 
 from __future__ import annotations
@@ -50,7 +59,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version / constants
 # -----------------------------------------------------------------------------
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 # -----------------------------------------------------------------------------
@@ -146,13 +155,38 @@ def _looks_like_b64(s: str) -> bool:
     raw = (s or "").strip()
     if len(raw) < 80:
         return False
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    # allow base64 + base64url + whitespace/newlines
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-\n\r")
     return all((c in allowed) for c in raw)
+
+
+def _b64_decode_any(raw: str) -> Optional[str]:
+    """
+    Best-effort decode base64/base64url with padding fixes.
+    Returns decoded string or None.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+
+    # base64url -> base64
+    s2 = s.replace("-", "+").replace("_", "/").strip()
+
+    # add padding if needed
+    pad = len(s2) % 4
+    if pad:
+        s2 = s2 + ("=" * (4 - pad))
+
+    try:
+        dec = base64.b64decode(s2.encode("utf-8")).decode("utf-8", errors="strict").strip()
+        return dec
+    except Exception:
+        return None
 
 
 def _maybe_b64_decode(s: str) -> str:
     """
-    If s looks like base64 and decodes to JSON, return decoded.
+    If s looks like base64/base64url and decodes to JSON-like service account, return decoded.
     Otherwise return original.
     """
     raw = (s or "").strip()
@@ -162,12 +196,12 @@ def _maybe_b64_decode(s: str) -> str:
         return raw
     if not _looks_like_b64(raw):
         return raw
-    try:
-        dec = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
-        if dec.startswith("{") and ("private_key" in dec or '"type"' in dec):
-            return dec
-    except Exception:
+
+    dec = _b64_decode_any(raw)
+    if not dec:
         return raw
+    if dec.startswith("{") and ("private_key" in dec or '"type"' in dec):
+        return dec
     return raw
 
 
@@ -176,9 +210,9 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
     Accepts:
     - dict
     - JSON string
-    - base64(JSON string)
+    - base64(JSON string) / base64url(JSON string)
     - quoted JSON string
-    - Returns dict or None.
+    Returns dict or None.
     """
     if raw is None:
         return None
@@ -209,7 +243,7 @@ def _load_service_account_info() -> Optional[Dict[str, Any]]:
     """
     Reads service account info from:
     - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
-      (minified json OR pretty json OR quoted json OR base64 json)
+      (minified json OR pretty json OR quoted json OR base64 json OR base64url json)
     - else GOOGLE_APPLICATION_CREDENTIALS file path
     """
     for k in ("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"):
@@ -243,13 +277,31 @@ def _index_to_a1_col(idx: int) -> str:
     return s
 
 
-def _safe_sheet_name(name: str) -> str:
-    # For A1 ranges: sheet names with spaces should be quoted
+def _escape_sheet_name_for_a1(name: str) -> str:
+    """
+    Google Sheets A1 quoting:
+    - sheet names with special chars should be in single quotes
+    - any single quote inside name must be doubled: Bob's -> 'Bob''s'
+    """
     n = (name or "").strip()
     if not n:
         return "Sheet1"
-    if any(ch in n for ch in (" ", "-", "(", ")", ".", ",")):
-        return f"'{n}'"
+    return n.replace("'", "''")
+
+
+def _safe_sheet_name(name: str) -> str:
+    """
+    For A1 ranges: quote when needed.
+    Always escape embedded apostrophes correctly.
+    """
+    n = (name or "").strip()
+    if not n:
+        return "Sheet1"
+
+    # quote if contains spaces or typical special chars (safe + consistent)
+    needs_quote = any(ch in n for ch in (" ", "-", "(", ")", ".", ",", "!", "[", "]", "{", "}", "&", "/"))
+    if needs_quote or ("'" in n):
+        return f"'{_escape_sheet_name_for_a1(n)}'"
     return n
 
 
@@ -279,14 +331,12 @@ def _split_cell_into_symbols(cell: str) -> List[str]:
     if not raw:
         return []
     raw = raw.replace("•", " ").replace("·", " ").replace("\t", " ")
-    # split by comma/semicolon/newlines
     parts = re.split(r"[,\n;\r]+", raw)
     out: List[str] = []
     for p in parts:
         p = (p or "").strip()
         if not p:
             continue
-        # split by whitespace inside each part
         for q in re.split(r"\s+", p):
             q = (q or "").strip()
             if q:
@@ -332,9 +382,7 @@ class PageSpec:
     header_row: int = _DEFAULT_HEADER_ROW
     start_row: int = _DEFAULT_START_ROW
     max_rows: int = _DEFAULT_MAX_ROWS
-    # If fixed_col is provided, we won't search the header
     fixed_col: Optional[str] = None
-    # If you prefer fixed A1 range (single column), set this (e.g. "B6:B1000")
     fixed_range: Optional[str] = None
     header_candidates: Tuple[str, ...] = ("SYMBOL", "TICKER", "CODE")
 
@@ -356,7 +404,6 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("KSA_Tadawul", "KSA_Tadawul_Market", "KSA Tadawul", "KSA_TADAWUL"),
         header_candidates=("SYMBOL", "TICKER", "CODE"),
     ),
-    # Optional pages (safe to keep; not used unless requested)
     "MUTUAL_FUNDS": PageSpec(
         key="MUTUAL_FUNDS",
         sheet_names=("Mutual_Funds", "Mutual Funds", "MUTUAL_FUNDS"),
@@ -372,7 +419,54 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("My_Portfolio", "My Portfolio", "MY_PORTFOLIO"),
         header_candidates=("SYMBOL", "TICKER", "CODE"),
     ),
+    # Safe extras (won’t be used unless requested)
+    "INSIGHTS_ANALYSIS": PageSpec(
+        key="INSIGHTS_ANALYSIS",
+        sheet_names=("Insights_Analysis", "Insights Analysis", "INSIGHTS_ANALYSIS"),
+        header_candidates=("SYMBOL", "TICKER", "CODE"),
+    ),
+    "INVESTMENT_ADVISOR": PageSpec(
+        key="INVESTMENT_ADVISOR",
+        sheet_names=("Investment_Advisor", "Investment Advisor", "INVESTMENT_ADVISOR"),
+        header_candidates=("SYMBOL", "TICKER", "CODE"),
+    ),
 }
+
+_SHEET_ENV_BY_KEY: Dict[str, Tuple[str, ...]] = {
+    "MARKET_LEADERS": ("SHEET_MARKET_LEADERS",),
+    "GLOBAL_MARKETS": ("SHEET_GLOBAL_MARKETS",),
+    "KSA_TADAWUL": ("SHEET_KSA_TADAWUL",),
+    "MUTUAL_FUNDS": ("SHEET_MUTUAL_FUNDS",),
+    "COMMODITIES_FX": ("SHEET_COMMODITIES_FX",),
+    "MY_PORTFOLIO": ("SHEET_MY_PORTFOLIO",),
+    "INSIGHTS_ANALYSIS": ("SHEET_INSIGHTS_ANALYSIS",),
+    "INVESTMENT_ADVISOR": ("SHEET_INVESTMENT_ADVISOR",),
+}
+
+
+def _candidate_sheet_names(spec: PageSpec) -> Tuple[str, ...]:
+    """
+    Prepend env-provided sheet name (if any) in front of registry names, deduped.
+    """
+    env_keys = _SHEET_ENV_BY_KEY.get(spec.key, ())
+    env_names: List[str] = []
+    for ek in env_keys:
+        v = (os.getenv(ek) or "").strip()
+        if v:
+            env_names.append(v)
+
+    all_names = list(env_names) + list(spec.sheet_names)
+    out: List[str] = []
+    seen = set()
+    for n in all_names:
+        nn = (n or "").strip()
+        if not nn:
+            continue
+        if nn.lower() in seen:
+            continue
+        seen.add(nn.lower())
+        out.append(nn)
+    return tuple(out)
 
 
 # -----------------------------------------------------------------------------
@@ -466,7 +560,7 @@ def _resolve_symbol_column_letter(spreadsheet_id: str, sheet_name: str, spec: Pa
     """
     Reads the header row A:?? and finds the column where header matches candidates.
     """
-    try_cols = 78  # up to BZ (more defensive than AZ)
+    try_cols = 78  # up to BZ
     end_col = _index_to_a1_col(try_cols)
     rng = f"{_safe_sheet_name(sheet_name)}!A{spec.header_row}:{end_col}{spec.header_row}"
     rows = _read_values(spreadsheet_id, rng)
@@ -508,7 +602,7 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
         "max_rows": spec.max_rows,
     }
 
-    for sheet in spec.sheet_names:
+    for sheet in _candidate_sheet_names(spec):
         sheet = (sheet or "").strip()
         if not sheet:
             continue
