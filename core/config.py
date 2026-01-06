@@ -1,8 +1,8 @@
-# core/config.py  — FULL REPLACEMENT — v1.9.0
+# core/config.py  — FULL REPLACEMENT — v1.9.1
 """
 core/config.py
 ------------------------------------------------------------
-Compatibility shim (PROD SAFE) – v1.9.0 (RENDER-ENV LOCKED)
+Compatibility shim (PROD SAFE) – v1.9.1 (RENDER-ENV LOCKED)
 
 Many modules import settings via:
   from core.config import Settings, get_settings
@@ -177,7 +177,6 @@ def _parse_int_list(value: Any, default: List[int]) -> List[int]:
     """
     xs_raw = _parse_list(value)
     if not xs_raw and isinstance(value, list):
-        # list that didn't parse to strings properly — best effort
         try:
             xs_raw = [str(x).strip() for x in value if str(x).strip()]
         except Exception:
@@ -265,15 +264,28 @@ def _apply_runtime_env_aliases_from_render(s: Any) -> None:
     Export aliases safely (no overwrite if already set).
     """
     finnhub = (
-        getattr(s, "finnhub_api_token", None)
-        or getattr(s, "finnhub_api_key", None)
+        getattr(s, "finnhub_api_key", None)
         or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
     )
     eodhd = (
-        getattr(s, "eodhd_api_token", None)
-        or getattr(s, "eodhd_api_key", None)
+        getattr(s, "eodhd_api_key", None)
         or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
     )
+
+    # If the wrapper exposes token-style properties, prefer them (but do not force)
+    try:
+        finnhub_tok = getattr(s, "finnhub_api_token", None)
+        if finnhub_tok:
+            finnhub = finnhub_tok
+    except Exception:
+        pass
+
+    try:
+        eodhd_tok = getattr(s, "eodhd_api_token", None)
+        if eodhd_tok:
+            eodhd = eodhd_tok
+    except Exception:
+        pass
 
     _export_env_if_missing("FINNHUB_API_TOKEN", finnhub)
     _export_env_if_missing("FINNHUB_TOKEN", finnhub)
@@ -362,14 +374,22 @@ if _root_Settings is not None:
         @property
         def eodhd_api_token(self) -> Optional[str]:
             v = getattr(self, "eodhd_api_key", None)
-            v = v or getattr(super(), "eodhd_api_token", None)  # type: ignore[attr-defined]
+            if not v:
+                try:
+                    v = super().eodhd_api_token  # type: ignore[attr-defined]
+                except Exception:
+                    v = None
             v = v or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
             return (str(v).strip() if v else None)
 
         @property
         def finnhub_api_token(self) -> Optional[str]:
             v = getattr(self, "finnhub_api_key", None)
-            v = v or getattr(super(), "finnhub_api_token", None)  # type: ignore[attr-defined]
+            if not v:
+                try:
+                    v = super().finnhub_api_token  # type: ignore[attr-defined]
+                except Exception:
+                    v = None
             v = v or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
             return (str(v).strip() if v else None)
 
@@ -378,14 +398,24 @@ if _root_Settings is not None:
         # ---------------------------------------------------------------------
         @property
         def sheet_schemas_enabled(self) -> bool:
-            v = getattr(self, "sheet_schemas_enabled", None)
+            v = None
+            try:
+                v = super().sheet_schemas_enabled  # type: ignore[attr-defined]
+            except Exception:
+                v = None
             if v is None:
                 v = _env_first(["SHEET_SCHEMAS_ENABLED"], "true")
             return _to_bool(v, True)
 
         @property
         def sheet_schema_version(self) -> str:
-            v = getattr(self, "sheet_schema_version", None) or _env_first(["SHEET_SCHEMA_VERSION"], "vNext")
+            v = None
+            try:
+                v = super().sheet_schema_version  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if not v:
+                v = _env_first(["SHEET_SCHEMA_VERSION"], "vNext")
             return (v or "vNext").strip()
 
         # ---------------------------------------------------------------------
@@ -393,48 +423,104 @@ if _root_Settings is not None:
         # ---------------------------------------------------------------------
         @property
         def forecast_enabled(self) -> bool:
-            v = getattr(self, "forecast_enabled", None)
+            v = None
+            try:
+                v = super().forecast_enabled  # type: ignore[attr-defined]
+            except Exception:
+                v = None
             if v is None:
                 v = _env_first(["FORECAST_ENABLED"], "true")
             return _to_bool(v, True)
 
         @property
         def forecast_horizons_days(self) -> List[int]:
-            raw = getattr(self, "forecast_horizons_days_raw", None) or _env_first(["FORECAST_HORIZONS_DAYS"], "30,90,365")
-            return _parse_int_list(raw, default=[30, 90, 365])
+            raw = None
+            try:
+                raw = super().forecast_horizons_days  # type: ignore[attr-defined]
+            except Exception:
+                raw = None
+
+            if isinstance(raw, list) and raw:
+                # already list[int]
+                out: List[int] = []
+                seen = set()
+                for x in raw:
+                    n = _to_int(x, -1)
+                    if n > 0 and n not in seen:
+                        seen.add(n)
+                        out.append(n)
+                if out:
+                    return out
+
+            raw2 = getattr(self, "forecast_horizons_days_raw", None) or _env_first(["FORECAST_HORIZONS_DAYS"], "30,90,365")
+            return _parse_int_list(raw2, default=[30, 90, 365])
 
         @property
         def forecast_lookback_days(self) -> int:
-            raw = getattr(self, "forecast_lookback_days", None) or _env_first(["FORECAST_LOOKBACK_DAYS"], "365")
-            return _to_int(raw, 365)
+            v = None
+            try:
+                v = super().forecast_lookback_days  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if v is None:
+                v = _env_first(["FORECAST_LOOKBACK_DAYS"], "365")
+            return _to_int(v, 365)
 
         @property
         def forecast_min_points(self) -> int:
-            raw = getattr(self, "forecast_min_points", None) or _env_first(["FORECAST_MIN_POINTS"], "90")
-            return _to_int(raw, 90)
+            v = None
+            try:
+                v = super().forecast_min_points  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if v is None:
+                v = _env_first(["FORECAST_MIN_POINTS"], "90")
+            return _to_int(v, 90)
 
         @property
         def forecast_method(self) -> str:
-            raw = getattr(self, "forecast_method", None) or _env_first(["FORECAST_METHOD"], "ewma")
-            return (raw or "ewma").strip().lower()
+            v = None
+            try:
+                v = super().forecast_method  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if not v:
+                v = _env_first(["FORECAST_METHOD"], "ewma")
+            return (v or "ewma").strip().lower()
 
         @property
         def forecast_cache_ttl(self) -> int:
-            raw = getattr(self, "forecast_cache_ttl", None) or _env_first(["FORECAST_CACHE_TTL"], "180")
-            return _to_int(raw, 180)
+            v = None
+            try:
+                v = super().forecast_cache_ttl  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if v is None:
+                v = _env_first(["FORECAST_CACHE_TTL"], "180")
+            return _to_int(v, 180)
 
         @property
         def recommendation_mode(self) -> str:
-            raw = getattr(self, "recommendation_mode", None) or _env_first(["RECOMMENDATION_MODE"], "hybrid")
-            x = (raw or "hybrid").strip().lower()
+            v = None
+            try:
+                v = super().recommendation_mode  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if not v:
+                v = _env_first(["RECOMMENDATION_MODE"], "hybrid")
+            x = (v or "hybrid").strip().lower()
             return x if x in {"fair_value", "forecast", "hybrid"} else "hybrid"
 
         @property
         def recommendation_primary_horizon_days(self) -> int:
-            raw = getattr(self, "recommendation_primary_horizon_days", None) or _env_first(
-                ["RECOMMENDATION_PRIMARY_HORIZON_DAYS"], "90"
-            )
-            return _to_int(raw, 90)
+            v = None
+            try:
+                v = super().recommendation_primary_horizon_days  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if v is None:
+                v = _env_first(["RECOMMENDATION_PRIMARY_HORIZON_DAYS"], "90")
+            return _to_int(v, 90)
 
         @property
         def percent_change_format(self) -> str:
@@ -442,8 +528,14 @@ if _root_Settings is not None:
             ratio  -> store as 0.0123 and format as % in Sheets (recommended)
             percent -> store as 1.23 (already percent units)
             """
-            raw = getattr(self, "percent_change_format", None) or _env_first(["PERCENT_CHANGE_FORMAT"], "ratio")
-            x = (raw or "ratio").strip().lower()
+            v = None
+            try:
+                v = super().percent_change_format  # type: ignore[attr-defined]
+            except Exception:
+                v = None
+            if not v:
+                v = _env_first(["PERCENT_CHANGE_FORMAT"], "ratio")
+            x = (v or "ratio").strip().lower()
             return x if x in {"ratio", "percent"} else "ratio"
 
         # --- safe summary (no secrets) ---
@@ -555,7 +647,7 @@ if Settings is None or get_settings is None:
             ) or "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
             # Auth
-            self.require_auth: bool = _to_bool(_env_str("REQUIRE_AUTH", "false"), False)
+            self.require_auth: bool = _to_bool(_env_first(["REQUIRE_AUTH"], "false"), False)
             self.app_token: Optional[str] = _env_first(["APP_TOKEN", "TFB_APP_TOKEN"], None)
             self.backup_app_token: Optional[str] = _env_first(["BACKUP_APP_TOKEN"], None)
 
