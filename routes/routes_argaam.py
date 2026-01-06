@@ -1,16 +1,20 @@
-# routes/routes_argaam.py  (FULL REPLACEMENT)
+# routes/routes_argaam.py  (FULL REPLACEMENT) — v3.6.0
 """
 routes/routes_argaam.py
 ===============================================================
-Argaam Router (delegate) — v3.5.0
-(PROD SAFE + Auth-Compat + Sheet-Rows + Cleaner Errors)
+Argaam Router (delegate) — v3.6.0
+(PROD SAFE + Auth-Compat + Sheet-Rows + Schema-Aligned)
 
-✅ v3.5.0 improvements
-- ✅ Accepts token via:
-    • X-APP-TOKEN
-    • Authorization: Bearer <token>
-    • (optional) ?token=...   (disabled by default unless ALLOW_QUERY_TOKEN=1)
-- ✅ Adds POST /v1/argaam/sheet-rows (required by your dashboard sync + test_endpoints.py)
+✅ v3.6.0 improvements
+- ✅ Adds Last Updated (Riyadh) computed from UTC (+03:00)
+- ✅ POST /v1/argaam/sheet-rows supports 2 modes:
+    • compact (legacy small headers)
+    • schema  (uses core.schemas.get_headers_for_sheet(sheet_name))
+  Default:
+    - if payload.sheet_name provided -> schema
+    - else -> compact
+  You can force: ?mode=schema or ?mode=compact
+- ✅ Still: token via X-APP-TOKEN / Authorization: Bearer / optional ?token (if ALLOW_QUERY_TOKEN=1)
 - ✅ Cleaner "not configured" messaging when ARGAAM_QUOTE_URL is missing
 - ✅ Best-effort: engine -> provider module -> configured endpoint
 - ✅ Chunk-safe & concurrency-limited batch fetching for sheet-rows
@@ -19,10 +23,7 @@ Argaam Router (delegate) — v3.5.0
 Expected env vars
 - APP_TOKEN / BACKUP_APP_TOKEN (optional; if none set, auth is disabled)
 - ARGAAM_QUOTE_URL (optional; if missing, endpoint mode will report "not configured")
-    Example templates supported:
-      https://.../quote?code={code}
-      https://.../{symbol}
-- ARGAAM_PROFILE_URL (optional; used to fetch/resolve company name if quote doesn’t contain it)
+- ARGAAM_PROFILE_URL (optional)
 - ARGAAM_HEADERS_JSON (optional; JSON dict for headers/cookies)
 - HTTP_TIMEOUT_SEC (default 25)
 - HTTP_RETRY_ATTEMPTS (default 3)
@@ -30,6 +31,7 @@ Expected env vars
 - ARGAAM_META_TTL_SEC (default 21600)
 - DEBUG_ERRORS=1 (optional; include debug details on failures)
 - ALLOW_QUERY_TOKEN=1 (optional; allow ?token=... for quick manual testing)
+- ARGAAM_SHEET_MODE=schema|compact (optional default override)
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
@@ -52,7 +54,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("routes.routes_argaam")
 
-ROUTE_VERSION = "3.5.0"
+ROUTE_VERSION = "3.6.0"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 USER_AGENT = (
@@ -66,6 +68,7 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_SHEET_MAX = 500
 DEFAULT_CONCURRENCY = 12
 
+_KSA_TZ = timezone(timedelta(hours=3))
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -74,8 +77,38 @@ def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _utc_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or datetime.now(timezone.utc)
+    return d.astimezone(timezone.utc).isoformat()
+
+
+def _riyadh_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or datetime.now(timezone.utc)
+    return d.astimezone(_KSA_TZ).isoformat()
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        ss = str(s).strip()
+        if ss.endswith("Z"):
+            ss = ss[:-1] + "+00:00"
+        return datetime.fromisoformat(ss)
+    except Exception:
+        return None
+
+
+def _utc_to_riyadh_iso(utc_iso: Optional[str]) -> Optional[str]:
+    d = _parse_iso(utc_iso)
+    if not d:
+        return None
+    try:
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(_KSA_TZ).isoformat()
+    except Exception:
+        return None
 
 
 def _safe_str(x: Any) -> Optional[str]:
@@ -515,6 +548,7 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
 
         ch, pct = _compute_change(price, prev)
 
+        now_utc = _utc_iso()
         patch = {
             "market": "KSA",
             "currency": "SAR",
@@ -526,7 +560,8 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
             "volume": vol,
             "market_cap": mcap,
             "data_source": "argaam",
-            "last_updated_utc": _utc_iso(),
+            "last_updated_utc": now_utc,
+            "last_updated_riyadh": _utc_to_riyadh_iso(now_utc),
         }
 
         if patch.get("current_price") is not None:
@@ -549,6 +584,7 @@ def _base_ok(symbol: str) -> Dict[str, Any]:
         "error": "",
         "route_version": ROUTE_VERSION,
         "time_utc": _utc_iso(),
+        "time_riyadh": _riyadh_iso(),
     }
 
 
@@ -563,6 +599,7 @@ def _base_err(symbol: str, err: str, quality: str = "MISSING") -> Dict[str, Any]
         "error": err or "unknown error",
         "route_version": ROUTE_VERSION,
         "time_utc": _utc_iso(),
+        "time_riyadh": _riyadh_iso(),
     }
 
 
@@ -596,6 +633,7 @@ async def health(request: Request) -> Dict[str, Any]:
         "ARGAAM_QUOTE_URL_set": bool(ARGAAM_QUOTE_URL),
         "ARGAAM_PROFILE_URL_set": bool(ARGAAM_PROFILE_URL),
         "time_utc": _utc_iso(),
+        "time_riyadh": _riyadh_iso(),
     }
 
 
@@ -622,6 +660,9 @@ async def _get_quote_payload(
             ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
             out.setdefault("price_change", ch)
             out.setdefault("percent_change", pct)
+        # ensure last_updated_riyadh
+        if out.get("last_updated_utc") and not out.get("last_updated_riyadh"):
+            out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
         return out
     debug_info["engine"] = err
 
@@ -633,6 +674,8 @@ async def _get_quote_payload(
             ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
             out.setdefault("price_change", ch)
             out.setdefault("percent_change", pct)
+        if out.get("last_updated_utc") and not out.get("last_updated_riyadh"):
+            out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
         return out
     debug_info["provider"] = err
 
@@ -644,6 +687,8 @@ async def _get_quote_payload(
             ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
             out.setdefault("price_change", ch)
             out.setdefault("percent_change", pct)
+        if out.get("last_updated_utc") and not out.get("last_updated_riyadh"):
+            out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
         return out
     debug_info["endpoint"] = err
 
@@ -693,20 +738,23 @@ async def quotes(
 
     arr = [s.strip() for s in (symbols or "").split(",") if s.strip()]
     arr = [_normalize_ksa_symbol(x) for x in arr if _normalize_ksa_symbol(x)]
-    # safety cap
     arr = arr[:50]
 
-    items: List[Dict[str, Any]] = []
-    for s in arr:
-        items.append(await _get_quote_payload(request, s, debug=debug))
+    concurrency = int(_safe_float(os.getenv("ARGAAM_SHEET_CONCURRENCY")) or DEFAULT_CONCURRENCY)
+    sem = asyncio.Semaphore(max(1, concurrency))
 
+    async def one(sym: str) -> Dict[str, Any]:
+        async with sem:
+            return await _get_quote_payload(request, sym, debug=debug)
+
+    items = await asyncio.gather(*[asyncio.create_task(one(s)) for s in arr])
     return {"status": "ok", "count": len(items), "items": items, "route_version": ROUTE_VERSION, "time_utc": _utc_iso()}
 
 
-# -----------------------------------------------------------------------------
-# Sheet Rows (required by your dashboard + smoke tests)
-# -----------------------------------------------------------------------------
-SHEET_HEADERS: List[str] = [
+# --------------------------------------------------------------------------
+# Sheet Rows
+# --------------------------------------------------------------------------
+SHEET_HEADERS_COMPACT: List[str] = [
     "Symbol",
     "Name",
     "Market",
@@ -720,11 +768,12 @@ SHEET_HEADERS: List[str] = [
     "Data Source",
     "Data Quality",
     "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
     "Error",
 ]
 
 
-def _to_sheet_row(q: Dict[str, Any]) -> List[Any]:
+def _to_sheet_row_compact(q: Dict[str, Any]) -> List[Any]:
     def g(*keys: str) -> Any:
         for k in keys:
             if k in q:
@@ -745,8 +794,67 @@ def _to_sheet_row(q: Dict[str, Any]) -> List[Any]:
         g("data_source"),
         g("data_quality"),
         g("last_updated_utc", "time_utc"),
+        g("last_updated_riyadh", "time_riyadh"),
         g("error"),
     ]
+
+
+def _sheet_mode(payload: SheetRowsIn, mode: Optional[str]) -> str:
+    # explicit mode first
+    m = (mode or "").strip().lower()
+    if m in {"schema", "compact"}:
+        return m
+
+    # env default override
+    em = (os.getenv("ARGAAM_SHEET_MODE") or "").strip().lower()
+    if em in {"schema", "compact"}:
+        return em
+
+    # default decision
+    return "schema" if (payload.sheet_name or "").strip() else "compact"
+
+
+def _build_schema_rows(
+    items: List[Dict[str, Any]],
+    *,
+    sheet_name: str,
+) -> Tuple[List[str], List[List[Any]]]:
+    """
+    Returns (headers, rows) aligned to core.schemas.get_headers_for_sheet(sheet_name).
+    Missing fields are returned as None (safe for Sheets).
+    """
+    try:
+        from core.schemas import get_headers_for_sheet, header_field_candidates  # import-safe module
+
+        headers = get_headers_for_sheet(sheet_name)
+        rows: List[List[Any]] = []
+
+        origin_label = (sheet_name or "").strip() or "KSA_Tadawul"
+
+        for idx, it in enumerate(items, start=1):
+            q = dict(it or {})
+            q.setdefault("rank", idx)
+            q.setdefault("origin", origin_label)
+
+            # ensure timestamps in both zones when possible
+            if q.get("last_updated_utc") and not q.get("last_updated_riyadh"):
+                q["last_updated_riyadh"] = _utc_to_riyadh_iso(str(q.get("last_updated_utc")))
+
+            row: List[Any] = []
+            for h in headers:
+                val = None
+                for f in header_field_candidates(h):
+                    if f in q and q.get(f) is not None:
+                        val = q.get(f)
+                        break
+                row.append(val)
+            rows.append(row)
+
+        return headers, rows
+    except Exception as exc:
+        # fallback to compact if schema tools not available
+        logger.warning("schema row builder failed; fallback to compact: %s", exc)
+        return SHEET_HEADERS_COMPACT, [_to_sheet_row_compact(it) for it in items]
 
 
 @router.post("/sheet-rows")
@@ -757,12 +865,14 @@ async def sheet_rows(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     token: Optional[str] = Query(default=None),
     debug: int = Query(default=0),
+    mode: Optional[str] = Query(default=None, description="schema|compact (optional)"),
 ) -> Dict[str, Any]:
     provided = _extract_token(x_app_token, authorization, token)
     if not _auth_ok(provided):
         return {
             "status": "error",
-            "headers": SHEET_HEADERS,
+            "mode": _sheet_mode(payload, mode),
+            "headers": SHEET_HEADERS_COMPACT,
             "rows": [],
             "count": 0,
             "error": "Unauthorized: invalid or missing token",
@@ -785,14 +895,19 @@ async def sheet_rows(
     max_n = int(_safe_float(os.getenv("ARGAAM_SHEET_MAX")) or DEFAULT_SHEET_MAX)
     normed = normed[: max(1, max_n)]
 
+    eff_mode = _sheet_mode(payload, mode)
+
     if not normed:
+        headers = SHEET_HEADERS_COMPACT
         return {
             "status": "ok",
-            "headers": SHEET_HEADERS,
+            "mode": eff_mode,
+            "headers": headers,
             "rows": [],
             "count": 0,
             "route_version": ROUTE_VERSION,
             "time_utc": _utc_iso(),
+            "error": "",
         }
 
     # concurrency-limited fetch
@@ -803,19 +918,24 @@ async def sheet_rows(
         async with sem:
             return await _get_quote_payload(request, sym, debug=debug)
 
-    tasks = [asyncio.create_task(one(s)) for s in normed]
-    items: List[Dict[str, Any]] = await asyncio.gather(*tasks)
-
-    rows = [_to_sheet_row(it) for it in items]
+    items: List[Dict[str, Any]] = await asyncio.gather(*[asyncio.create_task(one(s)) for s in normed])
 
     # If argaam isn't configured, provide a clearer top-level message
     top_err = ""
     if not ARGAAM_QUOTE_URL:
         top_err = "Argaam not configured (ARGAAM_QUOTE_URL not set)."
 
+    if eff_mode == "schema":
+        sheet_name = (payload.sheet_name or "KSA_Tadawul").strip()
+        headers, rows = _build_schema_rows(items, sheet_name=sheet_name)
+    else:
+        headers = SHEET_HEADERS_COMPACT
+        rows = [_to_sheet_row_compact(it) for it in items]
+
     return {
         "status": "ok",
-        "headers": SHEET_HEADERS,
+        "mode": eff_mode,
+        "headers": headers,
         "rows": rows,
         "count": len(rows),
         "route_version": ROUTE_VERSION,
