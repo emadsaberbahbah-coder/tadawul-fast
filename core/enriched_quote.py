@@ -1,8 +1,9 @@
-# core/enriched_quote.py  (FULL REPLACEMENT)
+# core/enriched_quote.py
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.5.1
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.6.0
+(Emad Bahbah – Financial Leader)
 
 What this module is for
 - Legacy/compat endpoints under /v1/enriched/* (kept because some clients still call it)
@@ -10,10 +11,15 @@ What this module is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.5.1 enhancements (this revision)
-- ISO parsing supports trailing 'Z' (aligned with routes/advanced_analysis.py)
-- Volatility treated as % when 0..1 (aligned)
-- Stronger, schema-independent header mapping fallback for EnrichedQuote.to_row(headers)
+✅ v2.6.0 enhancements (this revision)
+- Adds "customized header" support for your sheet headers (Price/Prev Close/Change/Change %/Avg Vol 30D, etc.)
+- Forecast outputs supported in row mapping (1M/3M/12M expected returns/prices/ROI + forecast_confidence/method)
+- Best-effort scoring+forecast fill:
+    • If engine didn’t provide score/forecast fields, we apply core.scoring_engine.enrich_with_scores() safely (no crash)
+- Percent scaling is safer:
+    • Avoids multiplying already-percent values like 0.8% into 80% (heuristics per field)
+- ISO parsing supports trailing 'Z'
+- Volatility treated as % when 0..1
 - Recommendation standardized everywhere to: BUY / HOLD / REDUCE / SELL (UPPERCASE)
 - Riyadh timestamp fill from UTC if missing
 - 52W Position % computed + stored in payload if missing
@@ -41,7 +47,7 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("core.enriched_quote")
 
-ROUTER_VERSION = "2.5.1"
+ROUTER_VERSION = "2.6.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -149,9 +155,7 @@ def _unwrap_tuple_payload(x: Any) -> Any:
 # Recommendation normalization (ONE ENUM everywhere)
 # =============================================================================
 def _normalize_recommendation(x: Any) -> str:
-    """
-    Always returns one of: BUY/HOLD/REDUCE/SELL
-    """
+    """Always returns one of: BUY/HOLD/REDUCE/SELL"""
     if x is None:
         return "HOLD"
     try:
@@ -179,7 +183,6 @@ def _normalize_recommendation(x: Any) -> str:
     if s2 in sell_like:
         return "SELL"
 
-    # heuristic contains
     if "SELL" in s2:
         return "SELL"
     if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
@@ -211,7 +214,6 @@ def _fallback_normalize(raw: str) -> str:
         return s
     if "." in s:
         return s
-    # default global
     return f"{s}.US"
 
 
@@ -251,10 +253,7 @@ def _try_import_schemas():
 
 
 def _get_uq_keys() -> List[str]:
-    """
-    Cached list of UnifiedQuote fields, if available.
-    Never raises.
-    """
+    """Cached list of UnifiedQuote fields, if available. Never raises."""
     global _UQ_KEYS
     if isinstance(_UQ_KEYS, list):
         return _UQ_KEYS
@@ -274,10 +273,7 @@ def _get_uq_keys() -> List[str]:
 
 
 def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure keys exist for downstream sheet writers.
-    Does not overwrite existing values.
-    """
+    """Ensure keys exist for downstream sheet writers. Does not overwrite existing values."""
     try:
         keys = _get_uq_keys()
         if keys:
@@ -371,14 +367,28 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
         return None
 
 
-def _ratio_to_percent(v: Any) -> Any:
+def _pct_from_maybe_fraction(v: Any, *, frac_threshold: float = 1.0) -> Any:
+    """
+    Convert ratios to percent using a safer heuristic.
+    - If abs(v) <= frac_threshold => treat as fraction (0.12 -> 12)
+    - Else treat as already-percent (12 -> 12)
+    """
     if v is None:
         return None
     try:
         f = float(v)
-        return (f * 100.0) if -1.0 <= f <= 1.0 else f
+        return (f * 100.0) if (-frac_threshold <= f <= frac_threshold) else f
     except Exception:
         return v
+
+
+def _pct_maybe_small(v: Any, *, frac_threshold: float = 0.25) -> Any:
+    """
+    For fields where legitimate percent values can be < 1% (e.g., 0.8%):
+    - Treat <= 0.25 as fraction (0.12 -> 12)
+    - Treat 0.8 as percent (keep 0.8)
+    """
+    return _pct_from_maybe_fraction(v, frac_threshold=frac_threshold)
 
 
 def _vol_to_percent(v: Any) -> Any:
@@ -396,11 +406,14 @@ def _compute_fair_value_and_upside(payload: Dict[str, Any]) -> Tuple[Optional[fl
     if price is None or price <= 0:
         return None, None, None
 
+    # Prefer explicit fair_value, else use expected 12m/3m prices, else MA proxies
     fair = _safe_float_or_none(_safe_get(payload, "fair_value"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "expected_price_12m"))
     if fair is None:
         fair = _safe_float_or_none(_safe_get(payload, "expected_price_3m"))
     if fair is None:
-        fair = _safe_float_or_none(_safe_get(payload, "expected_price_12m"))
+        fair = _safe_float_or_none(_safe_get(payload, "target_mean_price", "intrinsic_value"))
     if fair is None:
         fair = _safe_float_or_none(_safe_get(payload, "ma200"))
     if fair is None:
@@ -419,39 +432,97 @@ def _compute_fair_value_and_upside(payload: Dict[str, Any]) -> Tuple[Optional[fl
     return fair, round(upside, 2), label
 
 
+def _try_apply_scoring(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort scoring+forecast fill for legacy endpoints.
+    - Never raises.
+    - Only enriches if key outputs look missing.
+    """
+    try:
+        if not isinstance(payload, dict) or not payload:
+            return payload
+
+        # If engine already computed, do not re-run.
+        has_scores = payload.get("overall_score") is not None or payload.get("scoring_version")
+        has_forecast = payload.get("expected_return_3m") is not None or payload.get("expected_roi_3m") is not None
+
+        if has_scores and has_forecast:
+            return payload
+
+        from core.scoring_engine import enrich_with_scores  # import-safe in scoring_engine
+
+        enriched = enrich_with_scores(payload)
+        if isinstance(enriched, dict):
+            return enriched
+        # if it returns non-dict for any reason, keep original
+        return payload
+    except Exception:
+        return payload
+
+
 def _hkey(h: str) -> str:
     s = str(h or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
 
 
+# =============================================================================
+# Header mapping (customized for your sheet headers + robust fallbacks)
+# =============================================================================
 _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
+    # Common sheet headers
+    "rank": (("rank",), None),
     "symbol": (("symbol", "symbol_normalized", "ticker", "code"), None),
+    "origin": (("origin", "page_key", "source_page", "market_origin"), None),
+
+    "name": (("name", "company_name"), None),
     "company name": (("name", "company_name"), None),
+
     "sector": (("sector",), None),
-    "sub-sector": (("sub_sector", "subsector"), None),
     "sub sector": (("sub_sector", "subsector"), None),
+    "sub-sector": (("sub_sector", "subsector"), None),
+
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo"), None),
+
+    # Price block (your headers: Price / Prev Close / Change / Change %)
+    "price": (("current_price", "last_price", "price"), None),
     "last price": (("current_price", "last_price", "price"), None),
-    "previous close": (("previous_close",), None),
+    "prev close": (("previous_close", "prev_close"), None),
+    "previous close": (("previous_close", "prev_close"), None),
+    "change": (("price_change", "change"), None),
     "price change": (("price_change", "change"), None),
+    "change %": (("percent_change", "change_percent", "change_pct"), None),
+    "change % ": (("percent_change", "change_percent", "change_pct"), None),
     "percent change": (("percent_change", "change_percent", "change_pct"), None),
+
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
+
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), None),
+
     "volume": (("volume",), None),
-    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
+    "avg vol 30d": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
+    "avg volume 30d": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
+    "avg volume (30d)": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
+
     "value traded": (("value_traded",), None),
-    "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
+
+    # Turnover and float: may be fraction or percent
+    "turnover %": (("turnover_percent", "turnover", "turnover_pct"), lambda v: _pct_maybe_small(v, frac_threshold=0.25)),
     "shares outstanding": (("shares_outstanding",), None),
-    "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
+    "free float %": (("free_float", "free_float_percent", "free_float_pct"), lambda v: _pct_from_maybe_fraction(v, frac_threshold=1.5)),
+
     "market cap": (("market_cap",), None),
-    "free float market cap": (("free_float_market_cap",), None),
+    "free float mkt cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
+    "free float market cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
+
     "liquidity score": (("liquidity_score",), None),
+
+    # Fundamentals/valuation (often already normalized upstream, but tolerate fractions)
     "eps (ttm)": (("eps_ttm", "eps"), None),
     "forward eps": (("forward_eps",), None),
     "p/e (ttm)": (("pe_ttm",), None),
@@ -459,27 +530,65 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "p/b": (("pb",), None),
     "p/s": (("ps",), None),
     "ev/ebitda": (("ev_ebitda",), None),
-    "dividend yield %": (("dividend_yield",), _ratio_to_percent),
+
+    # Dividend/returns: may arrive as fraction OR percent (handle safely)
+    "dividend yield": (("dividend_yield", "dividend_yield_pct"), lambda v: _pct_maybe_small(v, frac_threshold=0.25)),
+    "dividend yield %": (("dividend_yield", "dividend_yield_pct"), lambda v: _pct_maybe_small(v, frac_threshold=0.25)),
     "dividend rate": (("dividend_rate",), None),
-    "payout ratio %": (("payout_ratio",), _ratio_to_percent),
-    "roe %": (("roe",), _ratio_to_percent),
-    "roa %": (("roa",), _ratio_to_percent),
-    "net margin %": (("net_margin",), _ratio_to_percent),
-    "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
-    "revenue growth %": (("revenue_growth",), _ratio_to_percent),
-    "net income growth %": (("net_income_growth",), _ratio_to_percent),
+    "payout ratio": (("payout_ratio",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=1.5)),
+    "payout ratio %": (("payout_ratio",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=1.5)),
+    "roe": (("roe",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "roe %": (("roe",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "roa": (("roa",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "roa %": (("roa",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+
+    "net margin": (("net_margin",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "net margin %": (("net_margin",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "ebitda margin": (("ebitda_margin",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "ebitda margin %": (("ebitda_margin",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "revenue growth": (("revenue_growth",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "revenue growth %": (("revenue_growth",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "net income growth": (("net_income_growth",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+    "net income growth %": (("net_income_growth",), lambda v: _pct_from_maybe_fraction(v, frac_threshold=0.5)),
+
     "beta": (("beta",), None),
+    "volatility 30d": (("volatility_30d", "vol_30d_ann"), _vol_to_percent),
     "volatility (30d)": (("volatility_30d", "vol_30d_ann"), _vol_to_percent),
+    "rsi 14": (("rsi_14", "rsi14"), None),
     "rsi (14)": (("rsi_14", "rsi14"), None),
-    "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
-    "upside %": (("upside_percent",), _ratio_to_percent),
+
+    # Fair value / upside
+    "fair value": (("fair_value", "expected_price_12m", "expected_price_3m", "target_mean_price", "ma200", "ma50"), None),
+    "upside %": (("upside_percent",), None),
     "valuation label": (("valuation_label",), None),
+
+    # Scores
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
     "opportunity score": (("opportunity_score",), None),
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
+    "confidence": (("confidence",), None),
+    "scoring version": (("scoring_version",), None),
+
+    # Forecast columns (78-col sheets)
+    "expected return 1m": (("expected_return_1m",), None),
+    "expected return 3m": (("expected_return_3m",), None),
+    "expected return 12m": (("expected_return_12m",), None),
+
+    "expected price 1m": (("expected_price_1m",), None),
+    "expected price 3m": (("expected_price_3m",), None),
+    "expected price 12m": (("expected_price_12m",), None),
+
+    "expected roi 1m": (("expected_roi_1m",), None),
+    "expected roi 3m": (("expected_roi_3m",), None),
+    "expected roi 12m": (("expected_roi_12m",), None),
+
+    "forecast confidence": (("forecast_confidence", "confidence_score"), None),
+    "forecast method": (("forecast_method",), None),
+
+    # Meta
     "error": (("error",), None),
     "recommendation": (("recommendation",), None),
     "data source": (("data_source", "source"), None),
@@ -506,6 +615,10 @@ class EnrichedQuote:
     @classmethod
     def from_unified(cls, uq: Any) -> "EnrichedQuote":
         p = _as_payload(_unwrap_tuple_payload(uq))
+
+        # Best-effort scoring+forecast fill (safe)
+        p = _try_apply_scoring(p)
+
         # Ensure recommendation enum
         try:
             p["recommendation"] = _normalize_recommendation(p.get("recommendation"))
@@ -538,11 +651,23 @@ class EnrichedQuote:
         except Exception:
             pass
 
-        return cls(p)
+        # Compute fair/upside/label if missing
+        try:
+            if p.get("fair_value") is None or p.get("upside_percent") is None or not p.get("valuation_label"):
+                fair, upside, label = _compute_fair_value_and_upside(p)
+                if p.get("fair_value") is None and fair is not None:
+                    p["fair_value"] = fair
+                if p.get("upside_percent") is None and upside is not None:
+                    p["upside_percent"] = upside
+                if not p.get("valuation_label") and label:
+                    p["valuation_label"] = label
+        except Exception:
+            pass
+
+        return cls(_schema_fill_best_effort(p))
 
     def _value_for_header(self, header: str) -> Any:
         sch = _try_import_schemas()
-
         hk = _hkey(header)
 
         # Schema-driven candidates (preferred if available)
@@ -587,14 +712,14 @@ class EnrichedQuote:
                 return _iso_or_none(v) or v
 
             # computed fair/upside/label if missing
-            if hk in ("fair value", "upside %", "valuation label", "overall score"):
+            if hk in ("fair value", "upside %", "valuation label"):
                 fair, upside, label = _compute_fair_value_and_upside(self.payload)
                 if hk == "fair value":
                     v = _safe_get(self.payload, *fields)
                     return v if v is not None else fair
                 if hk == "upside %":
                     v = self.payload.get("upside_percent")
-                    return _ratio_to_percent(v) if v is not None else upside
+                    return v if v is not None else upside
                 if hk == "valuation label":
                     v = self.payload.get("valuation_label")
                     return v if v is not None else label
@@ -618,29 +743,15 @@ class EnrichedQuote:
                     continue
                 if f in self.payload and self.payload.get(f) is not None:
                     val = self.payload.get(f)
-                    # common percent headers via schema candidates
-                    if hk in {
-                        "turnover %",
-                        "free float %",
-                        "dividend yield %",
-                        "payout ratio %",
-                        "roe %",
-                        "roa %",
-                        "net margin %",
-                        "ebitda margin %",
-                        "revenue growth %",
-                        "net income growth %",
-                        "upside %",
-                        "percent change",
-                    }:
-                        return _ratio_to_percent(val)
-                    if hk == "volatility (30d)":
+                    if hk == "recommendation":
+                        return _normalize_recommendation(val)
+                    if hk == "volatility 30d" or hk == "volatility (30d)":
                         return _vol_to_percent(val)
-                    if hk == "last updated (utc)":
+                    if hk in ("last updated (utc)", "last updated (riyadh)"):
                         return _iso_or_none(val) or val
                     return val
 
-        # Absolute last fallback: direct key lookup by a simple guess
+        # Absolute last fallback: direct key lookup by exact header text
         guess = str(header or "").strip()
         return self.payload.get(guess)
 
@@ -659,9 +770,7 @@ class EnrichedQuote:
 # Engine calls (best-effort)
 # =============================================================================
 async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
-    """
-    Returns: (result, source, error)
-    """
+    """Returns: (result, source, error)"""
     # 1) app.state.engine
     try:
         eng = getattr(request.app.state, "engine", None)
@@ -778,15 +887,19 @@ async def _call_engine_batch_best_effort(
 # Finalization rules for API payloads
 # =============================================================================
 def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: str) -> Dict[str, Any]:
-    """
-    Ensure standard metadata + status/error behavior is consistent.
-    """
+    """Ensure standard metadata + status/error behavior is consistent."""
     sym = (norm or raw or "").strip().upper() or ""
 
     try:
+        if not isinstance(payload, dict):
+            payload = {}
+
         payload.setdefault("symbol", sym)
         payload["symbol_input"] = payload.get("symbol_input") or raw
         payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
+
+        # Best-effort scoring + forecast fill
+        payload = _try_apply_scoring(payload)
 
         # recommendation enum
         payload["recommendation"] = _normalize_recommendation(payload.get("recommendation"))
@@ -829,7 +942,18 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
             if pos is not None:
                 payload["position_52w_percent"] = pos
 
+        # compute fair/upside/label if missing
+        if payload.get("fair_value") is None or payload.get("upside_percent") is None or not payload.get("valuation_label"):
+            fair, upside, label = _compute_fair_value_and_upside(payload)
+            if payload.get("fair_value") is None and fair is not None:
+                payload["fair_value"] = fair
+            if payload.get("upside_percent") is None and upside is not None:
+                payload["upside_percent"] = upside
+            if not payload.get("valuation_label") and label:
+                payload["valuation_label"] = label
+
         return _schema_fill_best_effort(payload)
+
     except Exception:
         return _schema_fill_best_effort(
             {
@@ -880,7 +1004,6 @@ def _safe_float(x: Any, default: float) -> float:
 
 
 def _cfg() -> Dict[str, Any]:
-    # env-only for this module (keep it simple)
     concurrency = _safe_int(os.getenv("ENRICHED_CONCURRENCY", 8), 8)
     timeout_sec = _safe_float(os.getenv("ENRICHED_TIMEOUT_SEC", 25), 25.0)
 
@@ -945,7 +1068,7 @@ async def enriched_quote(
         return JSONResponse(status_code=200, content=payload)
 
     except Exception as e:
-        out: Dict[str, Any] = {
+        out2: Dict[str, Any] = {
             "status": "error",
             "symbol": norm or raw,
             "symbol_input": raw,
@@ -958,8 +1081,8 @@ async def enriched_quote(
             "last_updated_riyadh": "",
         }
         if dbg:
-            out["traceback"] = _clamp(traceback.format_exc(), 8000)
-        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
+            out2["traceback"] = _clamp(traceback.format_exc(), 8000)
+        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out2))
 
 
 @router.get("/quotes")
@@ -978,7 +1101,6 @@ async def enriched_quotes(
     norms = [n for n in norms if n]
 
     batch_res, batch_source, batch_err = await _call_engine_batch_best_effort(request, norms)
-
     items: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------
