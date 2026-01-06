@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.3) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.4) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,12 +12,10 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.2.3 upgrades
-- ✅ FIX: schema-field mapping now falls back to local fields / snake-guess when schema field is missing.
-    This prevents blank columns when schemas field names differ from engine payload keys
-    (e.g., high_52w vs week_52_high, volatility_30d vs vol_30d_ann, rsi_14 vs rsi14).
-- ✅ Fallback normalize now aligns with DataEngineV2 (no forced ".US" suffix).
-- ✅ Keeps v4.2.2 improvements (await-any, refresh best-effort, 52W ratio->percent guard, always non-empty reco).
+v4.2.4 upgrades
+- ✅ Robust config import: tries core.config then root config (back-compat).
+- ✅ Placeholder rows now include Last Updated (Riyadh) consistently (when possible).
+- ✅ Keeps v4.2.3 schema-field fallback mapping + V2-normalize alignment.
 """
 
 from __future__ import annotations
@@ -47,7 +45,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.2.3"
+AI_ANALYSIS_VERSION = "4.2.4"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -57,9 +55,12 @@ router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 try:
     from core.config import get_settings  # type: ignore
 except Exception:  # pragma: no cover
+    try:
+        from config import get_settings  # type: ignore
+    except Exception:  # pragma: no cover
 
-    def get_settings():  # type: ignore
-        return None
+        def get_settings():  # type: ignore
+            return None
 
 
 # =============================================================================
@@ -84,7 +85,7 @@ def _schemas_get_headers(sheet_name: Optional[str]) -> Optional[Tuple[str, ...]]
     if callable(fn):
         try:
             h = fn(sheet_name)
-            if isinstance(h, list) and len(h) >= 10:
+            if isinstance(h, (list, tuple)) and len(h) >= 10:
                 return tuple(str(x) for x in h)
         except Exception:
             return None
@@ -565,6 +566,8 @@ def _finalize_quote(uq: Any) -> Any:
 
 def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data") -> Dict[str, Any]:
     sym = (symbol or "").strip().upper() or "UNKNOWN"
+    last_utc = _now_utc_iso()
+    last_riy = _to_riyadh_iso(last_utc) or ""
     return {
         "symbol": sym,
         "name": None,
@@ -644,8 +647,8 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "data_quality": dq,
         "error": err,
         "status": "error",
-        "last_updated_utc": _now_utc_iso(),
-        "last_updated_riyadh": "",
+        "last_updated_utc": last_utc,
+        "last_updated_riyadh": last_riy,
     }
 
 
@@ -1127,7 +1130,6 @@ class _HeaderMeta:
 @dataclass(frozen=True)
 class _HeaderPlan:
     metas: Tuple[_HeaderMeta, ...]
-    need_52w: bool
     need_val: bool
     need_overall: bool
     need_last_utc: bool
@@ -1137,7 +1139,6 @@ class _HeaderPlan:
 @lru_cache(maxsize=64)
 def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
     metas: List[_HeaderMeta] = []
-    need_52w = False
     need_val = False
     need_overall = False
     need_last_utc = False
@@ -1145,8 +1146,6 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
 
     for h in headers:
         hk = _hkey(h)
-        if hk in ("52w position %", "52w position"):
-            need_52w = True
         if hk in ("fair value", "upside %", "valuation label"):
             need_val = True
         if hk in ("recommendation", "overall score"):
@@ -1176,7 +1175,6 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
 
     return _HeaderPlan(
         metas=tuple(metas),
-        need_52w=need_52w,
         need_val=need_val,
         need_overall=need_overall,
         need_last_utc=need_last_utc,
