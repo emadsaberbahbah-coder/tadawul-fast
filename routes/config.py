@@ -1,64 +1,53 @@
 # routes/config.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – CONFIG ROUTES (v1.1.0) – PROD SAFE
+ROUTES CONFIG SHIM – PROD SAFE
 
-- Exposes safe config snapshot (masked) for diagnostics.
-- Never returns secrets (tokens / service account JSON).
+Purpose:
+- Backward compatibility for imports like:
+    from routes.config import get_settings, auth_ok, Settings
+- Single source of truth lives in repo-root config.py
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict
-
-from fastapi import APIRouter
-
-router = APIRouter(prefix="/v1/config", tags=["Config"])
+from typing import Any, Dict, List, Optional
 
 try:
-    from core.config import CONFIG_VERSION, get_settings, is_open_mode, mask_settings_dict  # type: ignore
-except Exception:  # pragma: no cover
-    CONFIG_VERSION = "unknown"
+    from config import (  # type: ignore
+        CONFIG_VERSION,
+        Settings,
+        allowed_tokens,
+        auth_ok,
+        get_settings,
+        is_open_mode,
+        mask_settings_dict,
+    )
+except Exception:
+    CONFIG_VERSION = "shim-fallback"
+    Settings = object  # type: ignore
 
-    def get_settings():  # type: ignore
-        return None
+    def get_settings() -> object:  # type: ignore
+        return object()
 
-    def is_open_mode() -> bool:  # type: ignore
+    def allowed_tokens() -> List[str]:
+        return []
+
+    def is_open_mode() -> bool:
         return True
 
-    def mask_settings_dict() -> Dict[str, Any]:  # type: ignore
-        return {"status": "unknown"}
+    def auth_ok(x_app_token: Optional[str]) -> bool:
+        return True
+
+    def mask_settings_dict() -> Dict[str, Any]:
+        return {"status": "fallback", "open_mode": True}
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-@router.get("/health")
-def config_health() -> Dict[str, Any]:
-    s = get_settings()
-    return {
-        "status": "ok",
-        "module": "routes.config",
-        "config_version": CONFIG_VERSION,
-        "environment": getattr(s, "environment", None),
-        "service_name": getattr(s, "service_name", None),
-        "auth": "open" if is_open_mode() else "token",
-        "ai_limits": {
-            "ai_batch_size": getattr(s, "ai_batch_size", None),
-            "ai_batch_timeout_sec": getattr(s, "ai_batch_timeout_sec", None),
-            "ai_batch_concurrency": getattr(s, "ai_batch_concurrency", None),
-            "ai_max_tickers": getattr(s, "ai_max_tickers", None),
-        },
-        "timestamp_utc": _now_utc_iso(),
-    }
-
-
-@router.get("/public")
-def config_public() -> Dict[str, Any]:
-    d = mask_settings_dict()
-    d["timestamp_utc"] = _now_utc_iso()
-    return d
-
-
-__all__ = ["router"]
+__all__ = [
+    "CONFIG_VERSION",
+    "Settings",
+    "get_settings",
+    "allowed_tokens",
+    "is_open_mode",
+    "auth_ok",
+    "mask_settings_dict",
+]
