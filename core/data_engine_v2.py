@@ -1,1632 +1,1287 @@
-# core/data_engine_v2.py  (FULL REPLACEMENT)
+# core/schemas.py  — FULL REPLACEMENT — v3.6.0
 """
-core/data_engine_v2.py
-===============================================================
-UNIFIED DATA ENGINE (v2.9.0) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
-Emad Bahbah — Financial Leader Edition
+core/schemas.py
+===========================================================
+CANONICAL SHEET SCHEMAS + HEADERS — v3.6.0 (PROD SAFE)
 
-Adds (non-breaking)
-- ✅ “Emad 59-column” sheet readiness:
-    • Adds optional fields: turnover_percent, free_float_market_cap, liquidity_score,
-      fair_value, upside_percent, valuation_label, overall_score, recommendation
-- ✅ Forecasting upgrade:
-    • GBM-based forecast (drift + volatility) using daily log returns
-    • expected_return_{1m,3m,12m}, expected_price_{1m,3m,12m}
-    • Adds confidence bands (P5/P95) for prices & returns (extra fields; safe)
-- ✅ Fair Value computation:
-    • Uses best available blend: expected_price_12m, forward valuation, MA200/MA50
-    • Upside % + valuation label computed consistently
-- ✅ Recommendation standardized enum: BUY / HOLD / REDUCE / SELL
-- ✅ Batch concurrency limit for get_enriched_quotes (ENGINE_BATCH_CONCURRENCY)
+What changed in v3.6.0
+- ✅ Adds true per-page (per-sheet) customized headers (vNext schemas):
+    Global_Markets, KSA_Tadawul, Market_Leaders, Mutual_Funds, Commodities_FX, My_Portfolio
+- ✅ Keeps LEGACY 59-column schema for backward compatibility (DEFAULT_HEADERS_59)
+- ✅ Adds forecasting/returns/targets columns to pages that need it (Global_Markets + optional others)
+- ✅ Adds portfolio-specific columns for My_Portfolio (inputs + KPIs)
+- ✅ Adds fund-specific columns for Mutual_Funds
+- ✅ Adds commodity/fx-specific columns for Commodities_FX
+- ✅ Import-safe: no DataEngine imports, no network, no heavy deps.
+- ✅ Defensive: get_headers_for_sheet() never raises and always returns COPIES.
 
-Still
-- Import safe (no network at import-time)
-- KSA safe provider routing
-- TTL cache
+Important note
+- This file defines headers + mapping only.
+- Actual forecasting calculations are implemented in:
+    core/data_engine_v2.py / providers / scoring_engine.py
+  This schema enables those fields to appear in sheets in a consistent way.
 """
 
-import asyncio
-import importlib
-import logging
-import math
-import os
+from __future__ import annotations
+
 import re
-import time
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-logger = logging.getLogger("core.data_engine_v2")
-
-ENGINE_VERSION = "2.9.0"
-
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSEY = {"0", "false", "no", "n", "off", "f"}
-
-_TD_1W = 5
-_TD_1M = 21
-_TD_3M = 63
-_TD_6M = 126
-_TD_12M = 252
-
-_RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
-
-
-# ---------------------------------------------------------------------------
-# TTLCache (best-effort) with fallback
-# ---------------------------------------------------------------------------
+# Pydantic v2 preferred, v1 fallback
 try:
-    from cachetools import TTLCache  # type: ignore
+    from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator  # type: ignore
 
-    _HAS_CACHETOOLS = True
+    _PYDANTIC_V2 = True
 except Exception:  # pragma: no cover
-    _HAS_CACHETOOLS = False
+    from pydantic import BaseModel, Field, validator  # type: ignore
 
-    class TTLCache(dict):  # type: ignore
-        def __init__(self, maxsize: int = 1024, ttl: int = 60) -> None:
-            super().__init__()
-            self._maxsize = max(1, int(maxsize))
-            self._ttl = max(1, int(ttl))
-            self._exp: Dict[str, float] = {}
-
-        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
-            now = time.time()
-            exp = self._exp.get(key)
-            if exp is not None and exp < now:
-                try:
-                    super().pop(key, None)
-                except Exception:
-                    pass
-                self._exp.pop(key, None)
-                return default
-            return super().get(key, default)
-
-        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
-            if len(self) >= self._maxsize:
-                try:
-                    oldest_key = next(iter(self.keys()))
-                    super().pop(oldest_key, None)
-                    self._exp.pop(oldest_key, None)
-                except Exception:
-                    pass
-            super().__setitem__(key, value)
-            self._exp[key] = time.time() + float(self._ttl)
-
-
-# ---------------------------------------------------------------------------
-# Pydantic (best-effort) with robust fallback for v1/v2
-# ---------------------------------------------------------------------------
-try:
-    from pydantic import BaseModel, Field  # type: ignore
-
-    try:
-        from pydantic import ConfigDict  # type: ignore
-
-        _PYDANTIC_HAS_CONFIGDICT = True
-    except Exception:  # pragma: no cover
-        ConfigDict = None  # type: ignore
-        _PYDANTIC_HAS_CONFIGDICT = False
-
-except Exception:  # pragma: no cover
-    _PYDANTIC_HAS_CONFIGDICT = False
     ConfigDict = None  # type: ignore
-
-    class BaseModel:  # type: ignore
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-        def model_dump(self, *a, **k):
-            return dict(self.__dict__)
-
-        def dict(self, *a, **k):
-            return dict(self.__dict__)
-
-    def Field(default=None, **kwargs):  # type: ignore
-        return default
+    field_validator = None  # type: ignore
+    model_validator = None  # type: ignore
+    _PYDANTIC_V2 = False
 
 
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
+SCHEMAS_VERSION = "3.6.0"
+
+# =============================================================================
+# LEGACY: Canonical 59-column schema (kept for backward compatibility)
+# =============================================================================
+# NOTE: Do not change order lightly. Many older routes/scripts assume this.
+DEFAULT_HEADERS_59: List[str] = [
+    # Identity
+    "Symbol",
+    "Company Name",
+    "Sector",
+    "Sub-Sector",
+    "Market",
+    "Currency",
+    "Listing Date",
+    # Prices
+    "Last Price",
+    "Previous Close",
+    "Price Change",
+    "Percent Change",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "52W Position %",
+    # Volume / Liquidity
+    "Volume",
+    "Avg Volume (30D)",
+    "Value Traded",
+    "Turnover %",
+    # Shares / Cap
+    "Shares Outstanding",
+    "Free Float %",
+    "Market Cap",
+    "Free Float Market Cap",
+    "Liquidity Score",
+    # Fundamentals
+    "EPS (TTM)",
+    "Forward EPS",
+    "P/E (TTM)",
+    "Forward P/E",
+    "P/B",
+    "P/S",
+    "EV/EBITDA",
+    "Dividend Yield %",
+    "Dividend Rate",
+    "Payout Ratio %",
+    "ROE %",
+    "ROA %",
+    "Net Margin %",
+    "EBITDA Margin %",
+    "Revenue Growth %",
+    "Net Income Growth %",
+    "Beta",
+    # Technicals
+    "Volatility (30D)",
+    "RSI (14)",
+    # Valuation / Targets
+    "Fair Value",
+    "Upside %",
+    "Valuation Label",
+    # Scores / Recommendation
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Opportunity Score",
+    "Risk Score",
+    "Overall Score",
+    "Error",
+    "Recommendation",
+    # Meta
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+]
+
+# Legacy "analysis extras" (old names kept)
+_LEGACY_ANALYSIS_EXTRAS: List[str] = [
+    "Returns 1W %",
+    "Returns 1M %",
+    "Returns 3M %",
+    "Returns 6M %",
+    "Returns 12M %",
+    "MA20",
+    "MA50",
+    "MA200",
+    "Expected Return 1M %",
+    "Expected Return 3M %",
+    "Expected Return 12M %",
+    "Expected Price 1M",
+    "Expected Price 3M",
+    "Expected Price 12M",
+    "Confidence Score",
+    "Forecast Method",
+    "History Points",
+    "History Source",
+    "History Last (UTC)",
+]
+DEFAULT_HEADERS_ANALYSIS: List[str] = list(DEFAULT_HEADERS_59) + list(_LEGACY_ANALYSIS_EXTRAS)
+
+
+def _ensure_len(headers: Sequence[str], expected: int, fallback: Sequence[str]) -> Tuple[str, ...]:
+    """PROD-SAFE: never raises. If headers length != expected, returns fallback as tuple."""
     try:
-        md = getattr(obj, "model_dump", None)
-        if callable(md):
-            d = md()
-            return d if isinstance(d, dict) else dict(d)
+        if isinstance(headers, (list, tuple)) and len(headers) == expected:
+            return tuple(str(x) for x in headers)
     except Exception:
         pass
+    return tuple(str(x) for x in fallback)
+
+
+def _ensure_len_59(headers: Sequence[str]) -> Tuple[str, ...]:
+    return _ensure_len(headers, 59, DEFAULT_HEADERS_59)
+
+
+_DEFAULT_59_TUPLE: Tuple[str, ...] = _ensure_len_59(DEFAULT_HEADERS_59)
+_DEFAULT_ANALYSIS_TUPLE: Tuple[str, ...] = tuple(str(x) for x in DEFAULT_HEADERS_ANALYSIS)
+
+# Normalize exported lists to canonical (if someone edited accidentally)
+if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
+    DEFAULT_HEADERS_59 = list(_DEFAULT_59_TUPLE)
+
+
+def is_canonical_headers(headers: Any) -> bool:
+    """True if headers is a 59-length sequence matching legacy canonical labels exactly."""
     try:
-        dct = getattr(obj, "dict", None)
-        if callable(dct):
-            d = dct()
-            return d if isinstance(d, dict) else dict(d)
+        if not isinstance(headers, (list, tuple)):
+            return False
+        if len(headers) != 59:
+            return False
+        return list(map(str, headers)) == list(_DEFAULT_59_TUPLE)
     except Exception:
-        pass
-    try:
-        return dict(getattr(obj, "__dict__", {}) or {})
-    except Exception:
-        return {}
-
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
-    if utc_any is None or utc_any == "":
-        return None
-    try:
-        s = str(utc_any).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        from zoneinfo import ZoneInfo  # py3.9+
-
-        return dt.astimezone(ZoneInfo("Asia/Riyadh")).isoformat()
-    except Exception:
-        return None
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _FALSEY:
         return False
-    if raw in _TRUTHY:
-        return True
-    return default
 
 
-def _safe_float(val: Any) -> Optional[float]:
-    if val is None:
-        return None
+def coerce_headers_59(headers: Any) -> List[str]:
+    """Returns a safe 59 header list. Invalid/wrong length => legacy canonical headers. Never raises."""
     try:
-        if isinstance(val, (int, float)):
-            f = float(val)
-            if math.isnan(f) or math.isinf(f):
-                return None
-            return f
-
-        s = str(val).strip()
-        if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
-            return None
-
-        s = s.translate(_ARABIC_DIGITS)
-        s = s.replace("٬", ",").replace("٫", ".")
-        s = s.replace("%", "").replace(",", "").replace("+", "").strip()
-
-        if s.startswith("(") and s.endswith(")"):
-            s = "-" + s[1:-1].strip()
-
-        m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
-        mult = 1.0
-        if m:
-            num = m.group(1)
-            suf = m.group(3).upper()
-            mult = 1_000.0 if suf == "K" else 1_000_000.0 if suf == "M" else 1_000_000_000.0
-            s = num
-
-        f = float(s) * mult
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
+        if isinstance(headers, (list, tuple)) and len(headers) == 59:
+            return [str(x) for x in headers]
     except Exception:
-        return None
+        pass
+    return list(_DEFAULT_59_TUPLE)
 
 
-def _maybe_percent(v: Any) -> Optional[float]:
-    x = _safe_float(v)
-    if x is None:
-        return None
+def validate_headers_59(headers: Any) -> Dict[str, Any]:
+    """Debug-safe validation helper. Never raises."""
     try:
-        if abs(x) <= 1.5:
-            return x * 100.0
-        return x
+        ok = is_canonical_headers(headers)
+        return {
+            "ok": bool(ok),
+            "expected_len": 59,
+            "got_len": (len(headers) if isinstance(headers, (list, tuple)) else None),
+        }
     except Exception:
-        return x
+        return {"ok": False, "expected_len": 59, "got_len": None}
 
 
-def _ff_to_fraction(x: Any) -> Optional[float]:
-    f = _safe_float(x)
-    if f is None:
-        return None
-    if f > 1.5:
-        return max(0.0, min(1.0, f / 100.0))
-    return max(0.0, min(1.0, f))
+# =============================================================================
+# vNext: Page-customized schemas (what your Sheets should use)
+# =============================================================================
+
+# --- Common blocks (vNext labels aligned to your current Sheets outputs) ---
+_VN_IDENTITY: List[str] = [
+    "Rank",
+    "Symbol",
+    "Origin",
+    "Name",
+    "Sector",
+    "Sub Sector",
+    "Market",
+    "Currency",
+    "Listing Date",
+]
+
+_VN_PRICE: List[str] = [
+    "Price",
+    "Prev Close",
+    "Change",
+    "Change %",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "52W Position %",
+]
+
+_VN_LIQUIDITY: List[str] = [
+    "Volume",
+    "Avg Vol 30D",
+    "Value Traded",
+    "Turnover %",
+]
+
+_VN_CAP: List[str] = [
+    "Shares Outstanding",
+    "Free Float %",
+    "Market Cap",
+    "Free Float Mkt Cap",
+    "Liquidity Score",
+]
+
+_VN_FUNDAMENTALS: List[str] = [
+    "EPS (TTM)",
+    "Forward EPS",
+    "P/E (TTM)",
+    "Forward P/E",
+    "P/B",
+    "P/S",
+    "EV/EBITDA",
+    "Dividend Yield",
+    "Dividend Rate",
+    "Payout Ratio",
+    "ROE",
+    "ROA",
+    "Net Margin",
+    "EBITDA Margin",
+    "Revenue Growth",
+    "Net Income Growth",
+    "Beta",
+]
+
+_VN_TECHNICALS: List[str] = [
+    "Volatility 30D",
+    "RSI 14",
+]
+
+_VN_VALUATION: List[str] = [
+    "Fair Value",
+    "Upside %",
+    "Valuation Label",
+]
+
+_VN_SCORES: List[str] = [
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Opportunity Score",
+    "Risk Score",
+    "Overall Score",
+]
+
+_VN_BADGES: List[str] = [
+    "Rec Badge",
+    "Momentum Badge",
+    "Opportunity Badge",
+    "Risk Badge",
+]
+
+# Forecasting / history / targets (future-focused columns)
+_VN_FORECAST: List[str] = [
+    "Returns 1W %",
+    "Returns 1M %",
+    "Returns 3M %",
+    "Returns 6M %",
+    "Returns 12M %",
+    "MA20",
+    "MA50",
+    "MA200",
+    "Expected ROI 1M %",
+    "Expected ROI 3M %",
+    "Expected ROI 12M %",
+    "Target Price 1M",
+    "Target Price 3M",
+    "Target Price 12M",
+    "Confidence Score",
+    "Forecast Method",
+    "History Points",
+    "History Source",
+    "History Last (UTC)",
+]
+
+_VN_META: List[str] = [
+    "Error",
+    "Recommendation",
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+]
+
+# --- Page Schemas (vNext) ---
+# Market Leaders + KSA Tadawul: full equity superset (scores + badges)
+_VN_HEADERS_EQUITY_FULL: List[str] = (
+    _VN_IDENTITY
+    + _VN_PRICE
+    + _VN_LIQUIDITY
+    + _VN_CAP
+    + _VN_FUNDAMENTALS
+    + _VN_TECHNICALS
+    + _VN_VALUATION
+    + _VN_SCORES
+    + _VN_BADGES
+    + _VN_META
+)
+
+# Global markets: equity superset + forecast/history/targets
+_VN_HEADERS_GLOBAL: List[str] = (
+    _VN_IDENTITY
+    + _VN_PRICE
+    + _VN_LIQUIDITY
+    + _VN_CAP
+    + _VN_FUNDAMENTALS
+    + _VN_TECHNICALS
+    + _VN_VALUATION
+    + _VN_SCORES
+    + _VN_BADGES
+    + _VN_FORECAST
+    + _VN_META
+)
+
+# Mutual funds: simplified + fund attributes + forecast
+_VN_HEADERS_FUNDS: List[str] = (
+    [
+        "Rank",
+        "Symbol",
+        "Origin",
+        "Name",
+        "Fund Type",
+        "Fund Category",
+        "Market",
+        "Currency",
+        "Inception Date",
+    ]
+    + [
+        "Price",
+        "Prev Close",
+        "Change",
+        "Change %",
+        "Day High",
+        "Day Low",
+        "52W High",
+        "52W Low",
+        "52W Position %",
+    ]
+    + [
+        "Volume",
+        "Avg Vol 30D",
+        "Value Traded",
+        "Expense Ratio",
+        "AUM",
+        "Distribution Yield",
+        "Beta",
+        "Volatility 30D",
+        "RSI 14",
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
+        "Momentum Score",
+        "Risk Score",
+        "Overall Score",
+        "Rec Badge",
+    ]
+    + _VN_FORECAST
+    + _VN_META
+)
+
+# Commodities & FX: stripped fundamentals + forecast
+_VN_HEADERS_COMMODITIES_FX: List[str] = (
+    [
+        "Rank",
+        "Symbol",
+        "Origin",
+        "Name",
+        "Asset Class",
+        "Sub Class",
+        "Market",
+        "Currency",
+    ]
+    + [
+        "Price",
+        "Prev Close",
+        "Change",
+        "Change %",
+        "Day High",
+        "Day Low",
+        "52W High",
+        "52W Low",
+        "52W Position %",
+        "Volume",
+        "Value Traded",
+        "Volatility 30D",
+        "RSI 14",
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
+        "Momentum Score",
+        "Risk Score",
+        "Overall Score",
+        "Rec Badge",
+    ]
+    + _VN_FORECAST
+    + _VN_META
+)
+
+# My Portfolio: inputs + market data + portfolio KPIs + forecast
+_VN_HEADERS_PORTFOLIO: List[str] = (
+    [
+        # Identity / grouping
+        "Rank",
+        "Symbol",
+        "Origin",
+        "Name",
+        "Market",
+        "Currency",
+        "Asset Type",          # Stock / ETF / Fund / Commodity / FX
+        "Portfolio Group",     # user-defined (e.g., Core / Growth / Income)
+        "Broker/Account",      # user-defined
+    ]
+    + [
+        # User inputs (Sheet-entered)
+        "Quantity",
+        "Avg Cost",
+        "Cost Value",
+        "Target Weight %",
+        "Notes",
+    ]
+    + [
+        # Market snapshot (API)
+        "Price",
+        "Prev Close",
+        "Change",
+        "Change %",
+        "Day High",
+        "Day Low",
+        "52W High",
+        "52W Low",
+        "52W Position %",
+        "Volume",
+        "Value Traded",
+    ]
+    + [
+        # Position metrics (can be sheet formulas OR API if you later implement)
+        "Market Value",
+        "Unrealized P/L",
+        "Unrealized P/L %",
+        "Weight %",
+        "Rebalance Δ",
+    ]
+    + [
+        # Analytics / forward-looking
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
+        "Expected ROI 1M %",
+        "Expected ROI 3M %",
+        "Expected ROI 12M %",
+        "Target Price 1M",
+        "Target Price 3M",
+        "Target Price 12M",
+        "Confidence Score",
+        "Recommendation",
+        "Rec Badge",
+    ]
+    + [
+        # Quality/safety indicators
+        "Risk Score",
+        "Overall Score",
+        "Volatility 30D",
+        "RSI 14",
+    ]
+    + [
+        # Provenance / meta
+        "Error",
+        "Data Source",
+        "Data Quality",
+        "Last Updated (UTC)",
+        "Last Updated (Riyadh)",
+    ]
+)
+
+# Freeze vNext schemas as tuples (prevent accidental mutation)
+_VN_EQUITY_FULL_T: Tuple[str, ...] = tuple(_VN_HEADERS_EQUITY_FULL)
+_VN_GLOBAL_T: Tuple[str, ...] = tuple(_VN_HEADERS_GLOBAL)
+_VN_FUNDS_T: Tuple[str, ...] = tuple(_VN_HEADERS_FUNDS)
+_VN_COMFX_T: Tuple[str, ...] = tuple(_VN_HEADERS_COMMODITIES_FX)
+_VN_PORTFOLIO_T: Tuple[str, ...] = tuple(_VN_HEADERS_PORTFOLIO)
 
 
-def _normalize_recommendation(x: Any) -> str:
-    if x is None:
-        return "HOLD"
-    try:
-        s = str(x).strip().upper()
-    except Exception:
-        return "HOLD"
-    if not s:
-        return "HOLD"
-    if s in _RECO_ENUM:
-        return s
-    s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
-
-    buy_like = {"STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"}
-    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT"}
-    reduce_like = {"REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"}
-    sell_like = {"SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"}
-
-    if s2 in buy_like:
-        return "BUY"
-    if s2 in hold_like:
-        return "HOLD"
-    if s2 in reduce_like:
-        return "REDUCE"
-    if s2 in sell_like:
-        return "SELL"
-
-    if "SELL" in s2:
-        return "SELL"
-    if "REDUCE" in s2 or "TRIM" in s2 or "UNDERWEIGHT" in s2:
-        return "REDUCE"
-    if "HOLD" in s2 or "NEUTRAL" in s2 or "MAINTAIN" in s2:
-        return "HOLD"
-    if "BUY" in s2 or "ACCUMULATE" in s2 or "OVERWEIGHT" in s2:
-        return "BUY"
-    return "HOLD"
+# =============================================================================
+# Header grouping (category-wise cross-check helper)
+# =============================================================================
+# This is optional for UI/builders: GAS can use this to build grouped headers.
+_HEADER_GROUPS_VNEXT: Dict[str, Tuple[str, ...]] = {
+    "Identity": tuple(_VN_IDENTITY),
+    "Price": tuple(_VN_PRICE),
+    "Liquidity": tuple(_VN_LIQUIDITY),
+    "Capitalization": tuple(_VN_CAP),
+    "Fundamentals": tuple(_VN_FUNDAMENTALS),
+    "Technicals": tuple(_VN_TECHNICALS),
+    "Valuation": tuple(_VN_VALUATION),
+    "Scores": tuple(_VN_SCORES),
+    "Badges": tuple(_VN_BADGES),
+    "Forecast": tuple(_VN_FORECAST),
+    "Meta": tuple(_VN_META),
+}
 
 
-class UnifiedQuote(BaseModel):
-    if _PYDANTIC_HAS_CONFIGDICT and ConfigDict is not None:
-        model_config = ConfigDict(populate_by_name=True, extra="ignore")  # type: ignore
-    else:  # pragma: no cover
-        class Config:
-            extra = "ignore"
-            allow_population_by_field_name = True
-
-    symbol: str
-    name: Optional[str] = None
-    market: Optional[str] = None
-    exchange: Optional[str] = None
-    currency: Optional[str] = None
-
-    current_price: Optional[float] = None
-    previous_close: Optional[float] = None
-    open: Optional[float] = None
-    day_high: Optional[float] = None
-    day_low: Optional[float] = None
-
-    week_52_high: Optional[float] = None
-    week_52_low: Optional[float] = None
-    position_52w_percent: Optional[float] = None
-
-    volume: Optional[float] = None
-    avg_volume_30d: Optional[float] = None
-    value_traded: Optional[float] = None
-
-    price_change: Optional[float] = None
-    percent_change: Optional[float] = None
-
-    market_cap: Optional[float] = None
-    shares_outstanding: Optional[float] = None
-    free_float: Optional[float] = None
-    free_float_market_cap: Optional[float] = None
-
-    turnover_percent: Optional[float] = None
-    liquidity_score: Optional[float] = None
-
-    eps_ttm: Optional[float] = None
-    pe_ttm: Optional[float] = None
-    forward_eps: Optional[float] = None
-    forward_pe: Optional[float] = None
-
-    pb: Optional[float] = None
-    ps: Optional[float] = None
-    ev_ebitda: Optional[float] = None
-
-    dividend_yield: Optional[float] = None  # percent (sheet-ready)
-    dividend_rate: Optional[float] = None
-    payout_ratio: Optional[float] = None  # percent (sheet-ready)
-
-    roe: Optional[float] = None  # percent (sheet-ready)
-    roa: Optional[float] = None  # percent (sheet-ready)
-    beta: Optional[float] = None
-
-    # Optional profitability/growth fields (if providers supply)
-    net_margin: Optional[float] = None
-    ebitda_margin: Optional[float] = None
-    revenue_growth: Optional[float] = None
-    net_income_growth: Optional[float] = None
-
-    # ===============================
-    # History analytics
-    # ===============================
-    returns_1w: Optional[float] = None
-    returns_1m: Optional[float] = None
-    returns_3m: Optional[float] = None
-    returns_6m: Optional[float] = None
-    returns_12m: Optional[float] = None
-
-    ma20: Optional[float] = None
-    ma50: Optional[float] = None
-    ma200: Optional[float] = None
-
-    rsi14: Optional[float] = None
-    vol_30d_ann: Optional[float] = None  # annualized vol (%)
-
-    # ===============================
-    # Forecast (GBM drift+vol)
-    # ===============================
-    expected_return_1m: Optional[float] = None
-    expected_return_3m: Optional[float] = None
-    expected_return_12m: Optional[float] = None
-
-    expected_price_1m: Optional[float] = None
-    expected_price_3m: Optional[float] = None
-    expected_price_12m: Optional[float] = None
-
-    # Confidence bands (extra; safe)
-    expected_return_1m_p5: Optional[float] = None
-    expected_return_1m_p95: Optional[float] = None
-    expected_return_3m_p5: Optional[float] = None
-    expected_return_3m_p95: Optional[float] = None
-    expected_return_12m_p5: Optional[float] = None
-    expected_return_12m_p95: Optional[float] = None
-
-    expected_price_1m_p5: Optional[float] = None
-    expected_price_1m_p95: Optional[float] = None
-    expected_price_3m_p5: Optional[float] = None
-    expected_price_3m_p95: Optional[float] = None
-    expected_price_12m_p5: Optional[float] = None
-    expected_price_12m_p95: Optional[float] = None
-
-    confidence_score: Optional[int] = None
-    forecast_method: Optional[str] = None
-
-    # Valuation helpers
-    fair_value: Optional[float] = None
-    upside_percent: Optional[float] = None
-    valuation_label: Optional[str] = None
-
-    history_points: Optional[int] = None
-    history_source: Optional[str] = None
-    history_last_utc: Optional[str] = None
-
-    # Scores
-    quality_score: Optional[int] = None
-    value_score: Optional[int] = None
-    momentum_score: Optional[int] = None
-    risk_score: Optional[int] = None
-    opportunity_score: Optional[int] = None
-    overall_score: Optional[int] = None
-    recommendation: Optional[str] = None
-
-    data_source: Optional[str] = None
-    data_quality: Optional[str] = None
-    last_updated_utc: Optional[str] = None
-    last_updated_riyadh: Optional[str] = None
-    error: Optional[str] = None
-
-    symbol_input: Optional[str] = None
-    symbol_normalized: Optional[str] = None
-
-    def finalize(self) -> "UnifiedQuote":
-        cur = _safe_float(self.current_price)
-        prev = _safe_float(self.previous_close)
-        vol = _safe_float(self.volume)
-
-        if self.price_change is None and cur is not None and prev is not None:
-            self.price_change = cur - prev
-
-        if self.percent_change is None and cur is not None and prev not in (None, 0.0):
-            try:
-                self.percent_change = (cur - prev) / prev * 100.0
-            except Exception:
-                pass
-
-        if self.value_traded is None and cur is not None and vol is not None:
-            self.value_traded = cur * vol
-
-        if self.position_52w_percent is None:
-            hi = _safe_float(self.week_52_high)
-            lo = _safe_float(self.week_52_low)
-            if cur is not None and hi is not None and lo is not None and hi != lo:
-                self.position_52w_percent = (cur - lo) / (hi - lo) * 100.0
-
-        if not self.last_updated_utc:
-            self.last_updated_utc = _utc_iso()
-        if not self.last_updated_riyadh:
-            self.last_updated_riyadh = _to_riyadh_iso(self.last_updated_utc) or ""
-
-        if self.error is None:
-            self.error = ""
-
-        if self.recommendation:
-            self.recommendation = _normalize_recommendation(self.recommendation)
-
-        return self
-
-
-def _parse_list_env(name: str, fallback: str = "") -> List[str]:
-    raw = (os.getenv(name) or "").strip()
-    if not raw and fallback:
-        raw = fallback
-    if not raw:
-        return []
-    return [p.strip().lower() for p in raw.split(",") if p.strip()]
-
-
-def _is_ksa(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    return s.endswith(".SR") or s.isdigit() or bool(re.fullmatch(r"\d{3,6}(\.SR)?", s))
-
-
-def normalize_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
+# =============================================================================
+# Header normalization (tolerant mapping)
+# =============================================================================
+def _norm_header_label(h: Optional[str]) -> str:
+    """
+    Normalize header labels for tolerant lookups.
+    Example:
+      "Avg Vol 30D" -> "avg_vol_30d"
+      "Sub Sector" -> "sub_sector"
+      "Last Updated (Riyadh)" -> "last_updated_riyadh"
+    """
+    s = str(h or "").strip().lower()
     if not s:
         return ""
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"):
-        s = s.replace(".TADAWUL", "")
-    if s.isdigit() or re.fullmatch(r"\d{3,6}", s):
-        return f"{s}.SR"
+    s = s.replace("%", " percent ")
+    s = re.sub(r"[()\[\]{}]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
-def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    for k, v in (src or {}).items():
-        if v is None:
-            continue
-        if k not in dst or dst.get(k) is None or dst.get(k) == "":
-            dst[k] = v
+# Build canonical header lookup by normalized key
+_HEADER_CANON_BY_NORM: Dict[str, str] = {}
+
+# Include legacy + vNext headers in canon map
+for _h in list(_DEFAULT_59_TUPLE) + list(_DEFAULT_ANALYSIS_TUPLE) + list(_VN_GLOBAL_T) + list(_VN_EQUITY_FULL_T) + list(_VN_FUNDS_T) + list(_VN_COMFX_T) + list(_VN_PORTFOLIO_T):
+    _HEADER_CANON_BY_NORM[_norm_header_label(_h)] = str(_h)
+
+# Common synonyms/variants
+_HEADER_SYNONYMS: Dict[str, str] = {
+    # legacy vs vNext name alignment
+    "company_name": "Name",
+    "company": "Name",
+    "sub_sector": "Sub Sector",
+    "subsector": "Sub Sector",
+
+    "last_price": "Price",
+    "previous_close": "Prev Close",
+    "price_change": "Change",
+    "percent_change": "Change %",
+
+    "avg_volume_30d": "Avg Vol 30D",
+    "avg_vol_30d": "Avg Vol 30D",
+
+    "free_float_market_cap": "Free Float Mkt Cap",
+    "ff_market_cap": "Free Float Mkt Cap",
+
+    "dividend_yield_percent": "Dividend Yield",
+    "dividend_yield_pct": "Dividend Yield",
+
+    "volatility_30d": "Volatility 30D",
+    "rsi_14": "RSI 14",
+
+    # timestamps
+    "last_updated_utc": "Last Updated (UTC)",
+    "last_updated_riyadh": "Last Updated (Riyadh)",
+    "last_updated_ksa": "Last Updated (Riyadh)",
+
+    # forecast aliases
+    "expected_return_1m_percent": "Expected ROI 1M %",
+    "expected_return_3m_percent": "Expected ROI 3M %",
+    "expected_return_12m_percent": "Expected ROI 12M %",
+    "expected_price_1m": "Target Price 1M",
+    "expected_price_3m": "Target Price 3M",
+    "expected_price_12m": "Target Price 12M",
+}
+for k, canon_header in list(_HEADER_SYNONYMS.items()):
+    nk = _norm_header_label(k)
+    if nk and canon_header:
+        _HEADER_CANON_BY_NORM[nk] = canon_header
 
 
-async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    out = fn(*args, **kwargs)
-    if asyncio.iscoroutine(out):
-        return await out
-    return out
-
-
-def _is_tuple2(x: Any) -> bool:
-    try:
-        return isinstance(x, tuple) and len(x) == 2
-    except Exception:
-        return False
-
-
-async def _try_provider_call(
-    module_name: str,
-    fn_names: List[str],
-    *args: Any,
-    **kwargs: Any,
-) -> Tuple[Dict[str, Any], Optional[str]]:
-    try:
-        mod = importlib.import_module(module_name)
-    except Exception as e:
-        return {}, f"{module_name}: import failed ({e})"
-
-    fn = None
-    used = None
-    for n in fn_names:
-        if hasattr(mod, n):
-            cand = getattr(mod, n)
-            if callable(cand):
-                fn = cand
-                used = n
-                break
-
-    if fn is None:
-        return {}, f"{module_name}: no callable in {fn_names}"
-
-    try:
-        res = await _call_maybe_async(fn, *args, **kwargs)
-        if _is_tuple2(res):
-            patch, err = res
-            return (patch or {}) if isinstance(patch, dict) else {}, err
-        if isinstance(res, dict):
-            return res, None
-        return {}, f"{module_name}.{used}: unexpected return type"
-    except Exception as e:
-        return {}, f"{module_name}.{used}: call failed ({e})"
-
-
-def _compute_turnover_percent(volume: Any, shares_outstanding: Any) -> Optional[float]:
-    v = _safe_float(volume)
-    sh = _safe_float(shares_outstanding)
-    if v is None or sh in (None, 0.0):
-        return None
-    try:
-        return round((v / sh) * 100.0, 4)
-    except Exception:
-        return None
-
-
-def _compute_free_float_mkt_cap(market_cap: Any, free_float: Any) -> Optional[float]:
-    mc = _safe_float(market_cap)
-    ff = _ff_to_fraction(free_float)
-    if mc is None or ff is None:
-        return None
-    try:
-        return mc * ff
-    except Exception:
-        return None
-
-
-def _compute_liquidity_score(value_traded: Any) -> Optional[float]:
-    vt = _safe_float(value_traded)
-    if vt is None or vt <= 0:
-        return None
-    try:
-        x = math.log10(vt)
-        score = (x - 6.0) / (9.0 - 6.0) * 100.0
-        return float(max(0.0, min(100.0, round(score, 2))))
-    except Exception:
-        return None
-
-
-def _apply_derived(out: Dict[str, Any]) -> None:
-    cur = _safe_float(out.get("current_price"))
-    prev = _safe_float(out.get("previous_close"))
-    vol = _safe_float(out.get("volume"))
-
-    if out.get("price_change") is None and cur is not None and prev is not None:
-        out["price_change"] = cur - prev
-
-    if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        try:
-            out["percent_change"] = (cur - prev) / prev * 100.0
-        except Exception:
-            pass
-
-    if out.get("value_traded") is None and cur is not None and vol is not None:
-        out["value_traded"] = cur * vol
-
-    if out.get("position_52w_percent") is None:
-        hi = _safe_float(out.get("week_52_high"))
-        lo = _safe_float(out.get("week_52_low"))
-        if cur is not None and hi is not None and lo is not None and hi != lo:
-            out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
-
-    # Normalize percent-like fundamentals to percent (sheet-ready)
-    for k in ("dividend_yield", "roe", "roa", "payout_ratio", "net_margin", "ebitda_margin", "revenue_growth", "net_income_growth"):
-        if out.get(k) is not None:
-            out[k] = _maybe_percent(out.get(k))
-
-    # Compute market cap if possible
-    if out.get("market_cap") is None:
-        sh = _safe_float(out.get("shares_outstanding"))
-        if cur is not None and sh is not None:
-            out["market_cap"] = cur * sh
-
-    # Compute PE if possible
-    if out.get("pe_ttm") is None:
-        eps = _safe_float(out.get("eps_ttm"))
-        if cur is not None and eps not in (None, 0.0):
-            try:
-                out["pe_ttm"] = cur / eps
-            except Exception:
-                pass
-
-    # Turnover %
-    if out.get("turnover_percent") is None:
-        out["turnover_percent"] = _compute_turnover_percent(out.get("volume"), out.get("shares_outstanding"))
-
-    # Free float market cap
-    if out.get("free_float_market_cap") is None:
-        out["free_float_market_cap"] = _compute_free_float_mkt_cap(out.get("market_cap"), out.get("free_float"))
-
-    # Liquidity score
-    if out.get("liquidity_score") is None:
-        out["liquidity_score"] = _compute_liquidity_score(out.get("value_traded"))
-
-    # Last updated riyadh
-    if not out.get("last_updated_utc"):
-        out["last_updated_utc"] = _utc_iso()
-    if not out.get("last_updated_riyadh"):
-        out["last_updated_riyadh"] = _to_riyadh_iso(out.get("last_updated_utc")) or ""
-
-
-def _quality_label(out: Dict[str, Any]) -> str:
-    must = ["current_price", "previous_close", "day_high", "day_low", "volume"]
-    ok = all(_safe_float(out.get(k)) is not None for k in must)
-    if _safe_float(out.get("current_price")) is None:
-        return "BAD"
-    return "FULL" if ok else "PARTIAL"
-
-
-def _dedup_preserve(items: List[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in items:
-        s = (x or "").strip()
-        if not s:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _tadawul_configured() -> bool:
-    tq = (os.getenv("TADAWUL_QUOTE_URL") or "").strip()
-    tf = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip()
-    return bool(tq or tf)
-
-
-def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
-    for k in (
-        "market_cap",
-        "pe_ttm",
-        "eps_ttm",
-        "dividend_yield",
-        "dividend_rate",
-        "payout_ratio",
-        "pb",
-        "ps",
-        "ev_ebitda",
-        "shares_outstanding",
-        "free_float",
-        "roe",
-        "roa",
-        "beta",
-        "forward_eps",
-        "forward_pe",
-    ):
-        if _safe_float(out.get(k)) is not None:
-            return True
-    return False
-
-
-def _missing_key_fundamentals(out: Dict[str, Any]) -> bool:
-    return any(_safe_float(out.get(k)) is None for k in ("market_cap", "pe_ttm", "dividend_yield", "roe", "roa"))
-
-
-def _normalize_warning_prefix(msg: str) -> str:
-    m = (msg or "").strip()
-    if not m:
+def _canonical_header_label(header: str) -> str:
+    """Best-effort variant header -> canonical header label. Never raises."""
+    h = str(header or "").strip()
+    if not h:
         return ""
-    low = m.lower()
-    if low.startswith("warning:"):
-        return m[len("warning:") :].strip()
-    return m
+    nh = _norm_header_label(h)
+    return _HEADER_CANON_BY_NORM.get(nh, h)
 
 
-# ============================================================
-# History parsing + analytics (best-effort, provider-agnostic)
-# ============================================================
-def _to_epoch_seconds(x: Any) -> Optional[int]:
+# =============================================================================
+# Field aliases (engine/provider variations)
+# =============================================================================
+FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    # Identity
+    "rank": ("row_rank", "position", "rank_num"),
+    "symbol": ("symbol_normalized", "symbol_input", "ticker", "code"),
+    "origin": ("page_key", "sheet_key", "source_page"),
+    "name": ("company_name", "long_name"),
+    "sector": ("industry",),
+    "sub_sector": ("subsector",),
+    "market": ("market_region", "exchange", "listing_exchange"),
+    "currency": ("ccy",),
+    "listing_date": ("ipo_date", "listed_at"),
+
+    # Prices
+    "current_price": ("last_price", "price", "close", "last"),
+    "previous_close": ("prev_close",),
+    "price_change": ("change",),
+    "percent_change": ("change_percent", "change_pct", "pct_change"),
+    "day_high": ("high",),
+    "day_low": ("low",),
+
+    # 52W
+    "week_52_high": ("high_52w", "52w_high"),
+    "week_52_low": ("low_52w", "52w_low"),
+    "position_52w_percent": ("position_52w", "pos_52w_pct"),
+
+    # Liquidity / Shares
+    "volume": ("vol",),
+    "avg_volume_30d": ("avg_volume", "avg_vol_30d", "avg_volume_30day"),
+    "value_traded": ("traded_value",),
+    "turnover_percent": ("turnover", "turnover_pct"),
+    "shares_outstanding": ("shares", "outstanding_shares"),
+    "free_float": ("free_float_percent", "free_float_pct"),
+    "market_cap": ("mkt_cap", "marketcapitalization"),
+    "free_float_market_cap": ("ff_market_cap",),
+    "liquidity_score": ("liq_score",),
+
+    # Fundamentals
+    "eps_ttm": ("eps",),
+    "forward_eps": ("eps_forward",),
+    "pe_ttm": ("pe",),
+    "forward_pe": ("pe_forward",),
+    "pb": ("p_b",),
+    "ps": ("p_s",),
+    "ev_ebitda": ("evebitda",),
+    "dividend_yield": ("div_yield", "dividend_yield_pct", "dividend_yield_percent"),
+    "dividend_rate": ("div_rate",),
+    "payout_ratio": ("payout", "payout_pct"),
+    "roe": ("return_on_equity",),
+    "roa": ("return_on_assets",),
+    "net_margin": ("profit_margin",),
+    "ebitda_margin": ("margin_ebitda",),
+    "revenue_growth": ("rev_growth",),
+    "net_income_growth": ("ni_growth",),
+    "beta": ("beta_5y",),
+
+    # Technicals
+    "volatility_30d": ("vol_30d_ann", "vol30d", "vol_30d"),
+    "rsi_14": ("rsi14",),
+
+    # Valuation / targets
+    "fair_value": ("intrinsic_value",),
+    "upside_percent": ("upside_pct",),
+    "valuation_label": ("valuation",),
+
+    # Scores / recommendation
+    "value_score": ("score_value",),
+    "quality_score": ("score_quality",),
+    "momentum_score": ("score_momentum",),
+    "opportunity_score": ("score_opportunity",),
+    "risk_score": ("score_risk",),
+    "overall_score": ("score", "total_score"),
+    "rec_badge": ("recommendation_badge",),
+    "momentum_badge": ("mom_badge",),
+    "opportunity_badge": ("opp_badge",),
+    "risk_badge": ("rk_badge",),
+
+    "error": ("err",),
+    "recommendation": ("recommend", "action"),
+
+    # Forecast / history
+    "returns_1w": ("return_1w", "ret_1w"),
+    "returns_1m": ("return_1m", "ret_1m"),
+    "returns_3m": ("return_3m", "ret_3m"),
+    "returns_6m": ("return_6m", "ret_6m"),
+    "returns_12m": ("return_12m", "ret_12m"),
+    "ma20": ("sma20",),
+    "ma50": ("sma50",),
+    "ma200": ("sma200",),
+    "expected_return_1m": ("exp_return_1m", "expected_roi_1m"),
+    "expected_return_3m": ("exp_return_3m", "expected_roi_3m"),
+    "expected_return_12m": ("exp_return_12m", "expected_roi_12m"),
+    "expected_price_1m": ("exp_price_1m", "target_price_1m"),
+    "expected_price_3m": ("exp_price_3m", "target_price_3m"),
+    "expected_price_12m": ("exp_price_12m", "target_price_12m"),
+    "confidence_score": ("conf_score",),
+    "forecast_method": ("forecast_model",),
+    "history_points": ("hist_points",),
+    "history_source": ("hist_source",),
+    "history_last_utc": ("hist_last_utc",),
+
+    # Funds
+    "fund_type": ("etf_type",),
+    "fund_category": ("category",),
+    "inception_date": ("fund_inception_date",),
+    "expense_ratio": ("expense_ratio_percent",),
+    "aum": ("assets_under_management",),
+    "distribution_yield": ("yield", "yield_percent"),
+
+    # Commodities/FX
+    "asset_class": ("class",),
+    "sub_class": ("subclass",),
+
+    # Meta
+    "data_source": ("source", "provider"),
+    "data_quality": ("dq",),
+    "last_updated_utc": ("as_of_utc",),
+    "last_updated_riyadh": ("as_of_riyadh", "last_updated_ksa"),
+
+    # Portfolio (sheet inputs / computed)
+    "portfolio_group": ("group",),
+    "broker_account": ("account",),
+    "quantity": ("qty",),
+    "avg_cost": ("avg_price", "cost_avg"),
+    "cost_value": ("cost_basis",),
+    "target_weight": ("target_weight_percent",),
+    "notes": ("comment",),
+    "market_value": ("position_value",),
+    "unrealized_pl": ("unrealized_pnl",),
+    "unrealized_pl_percent": ("unrealized_pnl_percent",),
+    "weight_percent": ("weight",),
+    "rebalance_delta": ("rebalance",),
+}
+
+_ALIAS_TO_CANON: Dict[str, str] = {}
+for canon, aliases in FIELD_ALIASES.items():
+    for a in aliases:
+        _ALIAS_TO_CANON[a] = canon
+
+
+def canonical_field(field: str) -> str:
+    """Best-effort alias -> canonical field. Example: high_52w -> week_52_high"""
+    f = str(field or "").strip()
+    if not f:
+        return ""
+    return _ALIAS_TO_CANON.get(f, f)
+
+
+# =============================================================================
+# Header <-> Field mapping (UnifiedQuote alignment helper)
+# =============================================================================
+
+HEADER_TO_FIELD: Dict[str, str] = {
+    # --- vNext Identity ---
+    "Rank": "rank",
+    "Symbol": "symbol",
+    "Origin": "origin",
+    "Name": "name",
+    "Sector": "sector",
+    "Sub Sector": "sub_sector",
+    "Market": "market",
+    "Currency": "currency",
+    "Listing Date": "listing_date",
+
+    # --- vNext Prices ---
+    "Price": "current_price",
+    "Prev Close": "previous_close",
+    "Change": "price_change",
+    "Change %": "percent_change",
+    "Day High": "day_high",
+    "Day Low": "day_low",
+    "52W High": "week_52_high",
+    "52W Low": "week_52_low",
+    "52W Position %": "position_52w_percent",
+
+    # --- vNext Liquidity / Cap ---
+    "Volume": "volume",
+    "Avg Vol 30D": "avg_volume_30d",
+    "Value Traded": "value_traded",
+    "Turnover %": "turnover_percent",
+    "Shares Outstanding": "shares_outstanding",
+    "Free Float %": "free_float",
+    "Market Cap": "market_cap",
+    "Free Float Mkt Cap": "free_float_market_cap",
+    "Liquidity Score": "liquidity_score",
+
+    # --- vNext Fundamentals ---
+    "EPS (TTM)": "eps_ttm",
+    "Forward EPS": "forward_eps",
+    "P/E (TTM)": "pe_ttm",
+    "Forward P/E": "forward_pe",
+    "P/B": "pb",
+    "P/S": "ps",
+    "EV/EBITDA": "ev_ebitda",
+    "Dividend Yield": "dividend_yield",
+    "Dividend Rate": "dividend_rate",
+    "Payout Ratio": "payout_ratio",
+    "ROE": "roe",
+    "ROA": "roa",
+    "Net Margin": "net_margin",
+    "EBITDA Margin": "ebitda_margin",
+    "Revenue Growth": "revenue_growth",
+    "Net Income Growth": "net_income_growth",
+    "Beta": "beta",
+
+    # --- vNext Technicals ---
+    "Volatility 30D": "volatility_30d",
+    "RSI 14": "rsi_14",
+
+    # --- vNext Valuation ---
+    "Fair Value": "fair_value",
+    "Upside %": "upside_percent",
+    "Valuation Label": "valuation_label",
+
+    # --- vNext Scores / badges ---
+    "Value Score": "value_score",
+    "Quality Score": "quality_score",
+    "Momentum Score": "momentum_score",
+    "Opportunity Score": "opportunity_score",
+    "Risk Score": "risk_score",
+    "Overall Score": "overall_score",
+    "Rec Badge": "rec_badge",
+    "Momentum Badge": "momentum_badge",
+    "Opportunity Badge": "opportunity_badge",
+    "Risk Badge": "risk_badge",
+
+    # --- Forecast / history ---
+    "Returns 1W %": "returns_1w",
+    "Returns 1M %": "returns_1m",
+    "Returns 3M %": "returns_3m",
+    "Returns 6M %": "returns_6m",
+    "Returns 12M %": "returns_12m",
+    "MA20": "ma20",
+    "MA50": "ma50",
+    "MA200": "ma200",
+    "Expected ROI 1M %": "expected_return_1m",
+    "Expected ROI 3M %": "expected_return_3m",
+    "Expected ROI 12M %": "expected_return_12m",
+    "Target Price 1M": "expected_price_1m",
+    "Target Price 3M": "expected_price_3m",
+    "Target Price 12M": "expected_price_12m",
+    "Confidence Score": "confidence_score",
+    "Forecast Method": "forecast_method",
+    "History Points": "history_points",
+    "History Source": "history_source",
+    "History Last (UTC)": "history_last_utc",
+
+    # --- Fund specific ---
+    "Fund Type": "fund_type",
+    "Fund Category": "fund_category",
+    "Inception Date": "inception_date",
+    "Expense Ratio": "expense_ratio",
+    "AUM": "aum",
+    "Distribution Yield": "distribution_yield",
+
+    # --- Commodities/FX ---
+    "Asset Class": "asset_class",
+    "Sub Class": "sub_class",
+
+    # --- Portfolio inputs / KPIs ---
+    "Asset Type": "asset_type",
+    "Portfolio Group": "portfolio_group",
+    "Broker/Account": "broker_account",
+    "Quantity": "quantity",
+    "Avg Cost": "avg_cost",
+    "Cost Value": "cost_value",
+    "Target Weight %": "target_weight",
+    "Notes": "notes",
+    "Market Value": "market_value",
+    "Unrealized P/L": "unrealized_pl",
+    "Unrealized P/L %": "unrealized_pl_percent",
+    "Weight %": "weight_percent",
+    "Rebalance Δ": "rebalance_delta",
+
+    # --- Meta ---
+    "Error": "error",
+    "Recommendation": "recommendation",
+    "Data Source": "data_source",
+    "Data Quality": "data_quality",
+    "Last Updated (UTC)": "last_updated_utc",
+    "Last Updated (Riyadh)": "last_updated_riyadh",
+
+    # --- Legacy labels still supported (do not remove) ---
+    "Company Name": "name",
+    "Sub-Sector": "sub_sector",
+    "Last Price": "current_price",
+    "Previous Close": "previous_close",
+    "Price Change": "price_change",
+    "Percent Change": "percent_change",
+    "Avg Volume (30D)": "avg_volume_30d",
+    "Free Float Market Cap": "free_float_market_cap",
+    "Dividend Yield %": "dividend_yield",
+    "Payout Ratio %": "payout_ratio",
+    "ROE %": "roe",
+    "ROA %": "roa",
+    "Net Margin %": "net_margin",
+    "EBITDA Margin %": "ebitda_margin",
+    "Revenue Growth %": "revenue_growth",
+    "Net Income Growth %": "net_income_growth",
+    "Volatility (30D)": "volatility_30d",
+    "RSI (14)": "rsi_14",
+}
+
+# Multi-field fallback candidates per header (preferred first, then aliases)
+HEADER_FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {}
+for h, f in HEADER_TO_FIELD.items():
+    canon = canonical_field(f)
+    aliases = FIELD_ALIASES.get(canon, ())
+    HEADER_FIELD_CANDIDATES[h] = (canon,) + tuple(a for a in aliases if a)
+
+# Build FIELD_TO_HEADER that recognizes both canonical fields and known aliases.
+_FIELD_TO_HEADER: Dict[str, str] = {}
+for header, field in HEADER_TO_FIELD.items():
+    canon = canonical_field(field)
+    _FIELD_TO_HEADER[canon] = header
+    for a in FIELD_ALIASES.get(canon, ()):
+        _FIELD_TO_HEADER[a] = header
+
+FIELD_TO_HEADER: Dict[str, str] = dict(_FIELD_TO_HEADER)
+
+
+def header_to_field(header: str) -> str:
+    """
+    Best-effort header (any variant) -> canonical field name.
+    Returns "" when header is unknown (safer for callers).
+    """
+    h = _canonical_header_label(header)
+    if not h:
+        return ""
+    f = HEADER_TO_FIELD.get(h)
+    return canonical_field(f) if f else ""
+
+
+def header_field_candidates(header: str) -> Tuple[str, ...]:
+    """
+    Robust mapping helper:
+    returns preferred + aliases (e.g. ("week_52_high","high_52w","52w_high")).
+    Tolerant to header variants.
+    """
+    h = _canonical_header_label(str(header or "").strip())
+    if not h:
+        return ()
+    c = HEADER_FIELD_CANDIDATES.get(h)
+    return c or ()
+
+
+def field_to_header(field: str) -> str:
+    """Best-effort field (canonical or alias) -> header label."""
+    f = str(field or "").strip()
+    if not f:
+        return ""
+    return FIELD_TO_HEADER.get(f, FIELD_TO_HEADER.get(canonical_field(f), f))
+
+
+# =============================================================================
+# Sheet name normalization + registry (legacy + vNext)
+# =============================================================================
+def _norm_sheet_name(name: Optional[str]) -> str:
+    """
+    Normalizes sheet names from Google Sheets (spaces/case/punctuations).
+    Examples:
+      "Global_Markets" -> "global_markets"
+      "Insights Analysis" -> "insights_analysis"
+      "KSA-Tadawul (Market)" -> "ksa_tadawul_market"
+      "My/Portfolio" -> "my_portfolio"
+    """
+    s = (name or "").strip().lower()
+    if not s:
+        return ""
+    for ch in ["-", " ", ".", "/", "\\", "|", ":", ";", ","]:
+        s = s.replace(ch, "_")
+    s = s.replace("(", "_").replace(")", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
+
+
+# Internal registries stored as tuples to prevent mutation leaks
+_SHEET_HEADERS_LEGACY: Dict[str, Tuple[str, ...]] = {}
+_SHEET_HEADERS_VNEXT: Dict[str, Tuple[str, ...]] = {}
+
+
+def _register(reg: Dict[str, Tuple[str, ...]], keys: List[str], headers: Tuple[str, ...]) -> None:
+    for k in keys:
+        kk = _norm_sheet_name(k)
+        if kk:
+            reg[kk] = headers
+
+
+# ----- Legacy mapping (kept) -----
+_register(
+    _SHEET_HEADERS_LEGACY,
+    keys=[
+        "KSA_Tadawul", "ksa_tadawul", "tadawul", "ksa",
+        "Market_Leaders", "market_leaders",
+        "Mutual_Funds", "mutual_funds",
+        "Commodities_FX", "commodities_fx",
+        "My_Portfolio", "my_portfolio",
+        "Global_Markets", "global_markets",
+        "Insights_Analysis", "investment_advisor",
+    ],
+    headers=_DEFAULT_59_TUPLE,
+)
+_register(
+    _SHEET_HEADERS_LEGACY,
+    keys=["Global_Markets", "Insights_Analysis", "Investment_Advisor"],
+    headers=_DEFAULT_ANALYSIS_TUPLE,
+)
+
+# ----- vNext mapping (custom per page) -----
+_register(
+    _SHEET_HEADERS_VNEXT,
+    keys=[
+        "KSA_Tadawul", "KSA Tadawul", "ksa_tadawul", "ksa_tadawul_market", "tadawul", "ksa",
+    ],
+    headers=_VN_EQUITY_FULL_T,
+)
+_register(
+    _SHEET_HEADERS_VNEXT,
+    keys=[
+        "Market_Leaders", "Market Leaders", "market_leaders", "ksa_market_leaders",
+    ],
+    headers=_VN_EQUITY_FULL_T,
+)
+_register(
+    _SHEET_HEADERS_VNEXT,
+    keys=[
+        "Global_Markets", "Global Markets", "global_markets", "global",
+    ],
+    headers=_VN_GLOBAL_T,
+)
+_register(
+    _SHEET_HEADERS_VNEXT,
+    keys=[
+        "Mutual_Funds", "Mutual Funds", "mutual_funds", "funds",
+    ],
+    headers=_VN_FUNDS_T,
+)
+_register(
+    _SHEET_HEADERS_VNEXT,
+    keys=[
+        "Commodities_FX", "Commodities & FX", "commodities_fx", "commodities", "fx",
+    ],
+    headers=_VN_COMFX_T,
+)
+_register(
+    _SHEET_HEADERS_VNEXT,
+    keys=[
+        "My_Portfolio", "My Portfolio", "my_portfolio", "portfolio", "my_portfolio_investment",
+    ],
+    headers=_VN_PORTFOLIO_T,
+)
+
+
+def resolve_sheet_key(sheet_name: Optional[str]) -> str:
+    """Returns the normalized key used for lookups."""
+    return _norm_sheet_name(sheet_name)
+
+
+def _get_schema_mode_from_settings() -> Tuple[bool, str]:
+    """
+    Read schema settings (import-safe).
+    Returns: (schemas_enabled, schema_version)
+    """
+    # Defaults are vNext enabled
+    enabled = True
+    version = "vNext"
+
     try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            v = int(x)
-            if v > 10_000_000_000:  # ms
-                v = int(v / 1000)
-            return v if v > 0 else None
-        s = str(x).strip()
-        if not s:
-            return None
-        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
-            try:
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                dt = datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-        return None
+        # Import inside function (avoid import-time coupling)
+        from core.config import get_settings  # type: ignore
+
+        s = get_settings()
+        enabled = bool(getattr(s, "sheet_schemas_enabled", True))
+        version = str(getattr(s, "sheet_schema_version", "vNext") or "vNext")
     except Exception:
-        return None
+        pass
+
+    version = (version or "vNext").strip()
+    return enabled, version
 
 
-def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
-    out: List[Tuple[int, float]] = []
+def _pick_registry(schema_version: Optional[str]) -> Dict[str, Tuple[str, ...]]:
+    enabled, ver = _get_schema_mode_from_settings()
+    v = (schema_version or ver or "vNext").strip().lower()
+
+    # If disabled: keep legacy behavior
+    if not enabled:
+        return _SHEET_HEADERS_LEGACY
+
+    # Explicit legacy switch
+    if v in {"legacy", "v3", "3.5.0", "3.5", "3.0"}:
+        return _SHEET_HEADERS_LEGACY
+
+    # Default: vNext customized schemas
+    return _SHEET_HEADERS_VNEXT
+
+
+def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Optional[str] = None) -> List[str]:
+    """
+    Returns a safe headers list for the given sheet.
+    - Always returns a list (never raises).
+    - Returns a COPY to prevent accidental mutation by callers.
+    - Uses vNext customized schemas by default (unless settings force legacy).
+    """
     try:
-        if payload is None:
-            return out
+        key = _norm_sheet_name(sheet_name)
+        reg = _pick_registry(schema_version)
 
-        if isinstance(payload, dict):
-            if isinstance(payload.get("candles"), dict):
-                c = payload["candles"]
-                t_list = c.get("t") or c.get("timestamp") or c.get("time")
-                c_list = c.get("c") or c.get("close") or c.get("closes")
-                if isinstance(t_list, list) and isinstance(c_list, list) and len(t_list) == len(c_list):
-                    for t, cl in zip(t_list, c_list):
-                        ts = _to_epoch_seconds(t)
-                        fv = _safe_float(cl)
-                        if ts is not None and fv is not None:
-                            out.append((ts, fv))
-                    out.sort(key=lambda x: x[0])
-                    return out
+        if not key:
+            # Default fallback: vNext equity full (most common), else legacy 59
+            if reg is _SHEET_HEADERS_VNEXT:
+                return list(_VN_EQUITY_FULL_T)
+            return list(_DEFAULT_59_TUPLE)
 
-            t_list = payload.get("t") or payload.get("timestamp") or payload.get("time")
-            c_list = payload.get("c") or payload.get("close") or payload.get("closes")
-            if isinstance(t_list, list) and isinstance(c_list, list) and len(t_list) == len(c_list):
-                for t, cl in zip(t_list, c_list):
-                    ts = _to_epoch_seconds(t)
-                    fv = _safe_float(cl)
-                    if ts is not None and fv is not None:
-                        out.append((ts, fv))
-                out.sort(key=lambda x: x[0])
-                return out
+        v = reg.get(key)
+        if isinstance(v, tuple) and v:
+            return list(v)
 
-            for key in ("history", "prices", "ohlc", "daily", "series", "data"):
-                v = payload.get(key)
-                if isinstance(v, list):
-                    payload = v
-                    break
+        # contains / prefix matching (best-effort)
+        for k, vv in reg.items():
+            if key == k or key.startswith(k) or k in key:
+                return list(vv)
 
-        if isinstance(payload, list):
-            for row in payload:
-                if isinstance(row, tuple) and len(row) >= 2:
-                    ts = _to_epoch_seconds(row[0])
-                    cl = _safe_float(row[1])
-                    if ts is not None and cl is not None:
-                        out.append((ts, cl))
-                    continue
+        # Final fallback
+        if reg is _SHEET_HEADERS_VNEXT:
+            return list(_VN_EQUITY_FULL_T)
+        return list(_DEFAULT_59_TUPLE)
 
-                if isinstance(row, dict):
-                    ts = _to_epoch_seconds(
-                        row.get("t")
-                        or row.get("timestamp")
-                        or row.get("time")
-                        or row.get("date")
-                        or row.get("datetime")
-                    )
-                    cl = _safe_float(
-                        row.get("c")
-                        or row.get("close")
-                        or row.get("adj_close")
-                        or row.get("adjClose")
-                        or row.get("close_price")
-                    )
-                    if ts is not None and cl is not None:
-                        out.append((ts, cl))
-                    continue
+    except Exception:
+        return list(_DEFAULT_59_TUPLE)
 
-        out.sort(key=lambda x: x[0])
-        return out
+
+def get_supported_sheets(schema_version: Optional[str] = None) -> List[str]:
+    """Useful for debugging / UI lists."""
+    try:
+        reg = _pick_registry(schema_version)
+        return sorted(list(reg.keys()))
     except Exception:
         return []
 
 
-def _sma(values: List[float], n: int) -> Optional[float]:
-    if not values or n <= 0 or len(values) < n:
-        return None
-    try:
-        return sum(values[-n:]) / float(n)
-    except Exception:
-        return None
-
-
-def _rsi14(closes: List[float], n: int = 14) -> Optional[float]:
-    if not closes or len(closes) < n + 1:
-        return None
-    try:
-        gains = 0.0
-        losses = 0.0
-        for i in range(-n, 0):
-            ch = closes[i] - closes[i - 1]
-            if ch >= 0:
-                gains += ch
-            else:
-                losses += (-ch)
-        if losses == 0:
-            return 100.0
-        rs = (gains / n) / (losses / n)
-        return 100.0 - (100.0 / (1.0 + rs))
-    except Exception:
-        return None
-
-
-def _returns_from_history(closes: List[float], td: int) -> Optional[float]:
-    if not closes or td <= 0 or len(closes) <= td:
-        return None
-    try:
-        now = closes[-1]
-        past = closes[-1 - td]
-        if past in (0.0, None) or now is None:
-            return None
-        return (now / past - 1.0) * 100.0
-    except Exception:
-        return None
-
-
-def _vol_ann_from_history(closes: List[float], lookback_td: int = 30) -> Optional[float]:
-    if not closes or len(closes) < lookback_td + 2:
-        return None
-    try:
-        import numpy as np  # lazy
-
-        arr = np.array(closes[-(lookback_td + 1):], dtype=float)
-        r = np.diff(np.log(arr))
-        if r.size < 5:
-            return None
-        vol = float(np.std(r, ddof=1)) * math.sqrt(_TD_12M) * 100.0
-        if math.isnan(vol) or math.isinf(vol):
-            return None
-        return vol
-    except Exception:
-        try:
-            subset = closes[-(lookback_td + 1):]
-            rets: List[float] = []
-            for i in range(1, len(subset)):
-                a = subset[i - 1]
-                b = subset[i]
-                if a <= 0 or b <= 0:
-                    continue
-                rets.append(math.log(b / a))
-            if len(rets) < 5:
-                return None
-            mean = sum(rets) / len(rets)
-            var = sum((x - mean) ** 2 for x in rets) / max(1, (len(rets) - 1))
-            vol = math.sqrt(var) * math.sqrt(_TD_12M) * 100.0
-            if math.isnan(vol) or math.isinf(vol):
-                return None
-            return vol
-        except Exception:
-            return None
-
-
-def _gbm_forecast(closes: List[float], horizon_td: int) -> Optional[Dict[str, float]]:
+def get_header_groups() -> Dict[str, List[str]]:
     """
-    GBM forecast using daily log returns.
-    Returns percent returns + price percentiles relative to current price.
+    Category-wise cross-check (vNext).
+    Always returns a safe dict of lists.
     """
-    if not closes or len(closes) < 60 or horizon_td <= 0:
-        return None
     try:
-        # use up to ~1y history for stability
-        subset = closes[-min(len(closes), 260):]
-        logrets: List[float] = []
-        for i in range(1, len(subset)):
-            a = subset[i - 1]
-            b = subset[i]
-            if a <= 0 or b <= 0:
-                continue
-            logrets.append(math.log(b / a))
-        if len(logrets) < 20:
-            return None
-
-        mu = sum(logrets) / len(logrets)
-        var = sum((x - mu) ** 2 for x in logrets) / max(1, (len(logrets) - 1))
-        sigma = math.sqrt(var)
-
-        S0 = subset[-1]
-
-        # mean of GBM: E[S_T] = S0 * exp(mu*h)
-        mean_price = S0 * math.exp(mu * horizon_td)
-
-        # quantiles of lognormal: ln(S_T/S0) ~ N(mu*h, sigma*sqrt(h))
-        z5 = -1.6448536269514722
-        z95 = 1.6448536269514722
-        s = sigma * math.sqrt(horizon_td)
-        p5 = S0 * math.exp(mu * horizon_td + z5 * s)
-        p95 = S0 * math.exp(mu * horizon_td + z95 * s)
-
-        def pct(S: float) -> float:
-            return (S / S0 - 1.0) * 100.0
-
-        return {
-            "ret_mean": pct(mean_price),
-            "ret_p5": pct(p5),
-            "ret_p95": pct(p95),
-            "px_mean": mean_price,
-            "px_p5": p5,
-            "px_p95": p95,
-        }
+        return {k: list(v) for k, v in _HEADER_GROUPS_VNEXT.items()}
     except Exception:
-        return None
+        return {}
 
 
-def _confidence_from(out: Dict[str, Any]) -> int:
-    score = 40
-    dq = str(out.get("data_quality") or "").upper()
-    if dq == "FULL":
-        score += 20
-    elif dq == "PARTIAL":
-        score += 10
-    else:
-        score -= 10
-
-    hp = out.get("history_points")
-    try:
-        hp_i = int(hp) if hp is not None else 0
-    except Exception:
-        hp_i = 0
-
-    if hp_i >= 200:
-        score += 20
-    elif hp_i >= 120:
-        score += 15
-    elif hp_i >= 60:
-        score += 10
-    elif hp_i >= 30:
-        score += 5
-    else:
-        score -= 10
-
-    if _safe_float(out.get("vol_30d_ann")) is not None:
-        score += 5
-
-    if _has_any_fundamentals(out):
-        score += 5
-    else:
-        score -= 5
-
-    return int(max(0, min(100, score)))
-
-
-# ============================================================
-# Scoring (kept compatible)
-# ============================================================
-def _score_quality(p: Dict[str, Any]) -> int:
-    roe = _safe_float(p.get("roe"))
-    margin = _safe_float(p.get("net_margin"))
-    debt = _safe_float(p.get("debt_to_equity"))
-    score = 50
-    if roe is not None:
-        score += 10 if roe >= 10 else 0
-        score += 10 if roe >= 15 else 0
-    if margin is not None:
-        score += 5 if margin >= 10 else 0
-        score += 5 if margin >= 20 else 0
-    if debt is not None:
-        score += 5 if debt <= 1.0 else 0
-        score -= 5 if debt >= 2.0 else 0
-    if _safe_float(p.get("market_cap")) is not None:
-        score += 3
-    if _safe_float(p.get("eps_ttm")) is not None:
-        score += 3
-    return int(max(0, min(100, score)))
-
-
-def _score_value(p: Dict[str, Any]) -> int:
-    pe = _safe_float(p.get("pe_ttm"))
-    pb = _safe_float(p.get("pb"))
-    score = 50
-    if pe is not None:
-        score += 10 if pe <= 15 else 0
-        score -= 10 if pe >= 30 else 0
-    if pb is not None:
-        score += 5 if pb <= 2 else 0
-        score -= 5 if pb >= 6 else 0
-    er3 = _safe_float(p.get("expected_return_3m"))
-    if er3 is not None:
-        score += 5 if er3 >= 2 else 0
-        score -= 5 if er3 <= -2 else 0
-    return int(max(0, min(100, score)))
-
-
-def _score_momentum(p: Dict[str, Any]) -> int:
-    r1m = _safe_float(p.get("returns_1m"))
-    r3m = _safe_float(p.get("returns_3m"))
-    chg = _safe_float(p.get("percent_change"))
-    pos52 = _safe_float(p.get("position_52w_percent"))
-    rsi = _safe_float(p.get("rsi14"))
-
-    score = 50
-    base = r1m if r1m is not None else chg
-    if base is not None:
-        score += 15 if base >= 2 else 0
-        score += 10 if base >= 5 else 0
-        score -= 15 if base <= -2 else 0
-        score -= 10 if base <= -5 else 0
-
-    if r3m is not None:
-        score += 10 if r3m >= 5 else 0
-        score -= 10 if r3m <= -5 else 0
-
-    if pos52 is not None:
-        score += 5 if pos52 >= 60 else 0
-        score -= 5 if pos52 <= 20 else 0
-
-    if rsi is not None:
-        score -= 5 if rsi >= 75 else 0
-        score += 5 if 40 <= rsi <= 60 else 0
-
-    return int(max(0, min(100, score)))
-
-
-def _score_risk(p: Dict[str, Any]) -> int:
-    beta = _safe_float(p.get("beta"))
-    vol = _safe_float(p.get("vol_30d_ann"))
-    score = 35
-    if beta is not None:
-        score += 10 if beta >= 1.2 else 0
-        score -= 10 if beta <= 0.8 else 0
-    if vol is not None:
-        score += 10 if vol >= 35 else 0
-        score += 5 if vol >= 25 else 0
-        score -= 5 if vol <= 15 else 0
-    return int(max(0, min(100, score)))
-
-
-def _compute_fair_value(out: Dict[str, Any]) -> Optional[float]:
+# =============================================================================
+# Shared request models
+# =============================================================================
+def _coerce_str_list(v: Any) -> List[str]:
     """
-    Fair value blend (best-effort, stable):
-    1) expected_price_12m
-    2) forward_eps * forward_pe
-    3) forward_eps * pe_ttm
-    4) ma200 / ma50
+    Accept:
+      - ["AAPL","MSFT"]
+      - "AAPL,MSFT 1120.SR"
+      - "AAPL MSFT,1120.SR"
+      - None
+    and return a clean list of strings.
     """
-    candidates: List[float] = []
-
-    for k in ("expected_price_12m", "expected_price_3m"):
-        v = _safe_float(out.get(k))
-        if v is not None and v > 0:
-            candidates.append(v)
-
-    fe = _safe_float(out.get("forward_eps"))
-    fpe = _safe_float(out.get("forward_pe"))
-    if fe is not None and fpe is not None and fe > 0 and fpe > 0:
-        candidates.append(fe * fpe)
-
-    pe = _safe_float(out.get("pe_ttm"))
-    if fe is not None and pe is not None and fe > 0 and pe > 0:
-        candidates.append(fe * pe)
-
-    for k in ("ma200", "ma50"):
-        v = _safe_float(out.get(k))
-        if v is not None and v > 0:
-            candidates.append(v)
-
-    if not candidates:
-        return None
-
-    # robust center (median-ish)
-    candidates.sort()
-    mid = candidates[len(candidates) // 2]
-    return float(mid)
-
-
-def _compute_upside_and_label(price: Any, fair: Any) -> Tuple[Optional[float], Optional[str]]:
-    p = _safe_float(price)
-    f = _safe_float(fair)
-    if p is None or f is None or p <= 0:
-        return None, None
-    up = (f / p - 1.0) * 100.0
-    label = "Fairly Valued"
-    if up >= 15:
-        label = "Undervalued"
-    elif up <= -15:
-        label = "Overvalued"
-    return round(up, 2), label
-
-
-def _recommend_from_scores(out: Dict[str, Any]) -> str:
-    """
-    Stable rule-based recommendation (sheet-friendly, not “advice”):
-    - Uses opportunity_score + upside_percent + risk_score
-    """
-    opp = float(out.get("opportunity_score") or 50)
-    up = _safe_float(out.get("upside_percent"))
-    risk = float(out.get("risk_score") or 35)
-
-    if up is None:
-        up = 0.0
-
-    if opp >= 70 and up >= 10 and risk <= 60:
-        return "BUY"
-    if opp >= 55:
-        return "HOLD"
-    if opp >= 40:
-        return "REDUCE"
-    return "SELL"
-
-
-class DataEngine:
-    def __init__(self) -> None:
-        self.providers_global = _parse_list_env("ENABLED_PROVIDERS") or _parse_list_env("PROVIDERS")
-        self.providers_ksa = _parse_list_env("KSA_PROVIDERS")
-
-        self.enable_yahoo_fundamentals_ksa = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True)
-        self.enable_yahoo_fundamentals_global = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL", False)
-
-        self.enable_history_analytics = _env_bool("ENABLE_HISTORY_ANALYTICS", True)
-        self.history_lookback_days = int((os.getenv("HISTORY_LOOKBACK_DAYS") or "400").strip() or "400")
-        self.history_lookback_days = min(1200, max(60, self.history_lookback_days))
-
-        ttl = 10
-        try:
-            ttl = int((os.getenv("ENGINE_CACHE_TTL_SEC") or "10").strip())
-            ttl = max(3, ttl)
-        except Exception:
-            ttl = 10
-
-        self._cache: TTLCache = TTLCache(maxsize=8000, ttl=ttl)
-
-        self.batch_concurrency = 15
-        try:
-            self.batch_concurrency = int((os.getenv("ENGINE_BATCH_CONCURRENCY") or "15").strip())
-            self.batch_concurrency = max(1, min(50, self.batch_concurrency))
-        except Exception:
-            self.batch_concurrency = 15
-
-        logger.info(
-            "DataEngineV2 init v%s | GLOBAL=%s | KSA=%s | cache_ttl=%ss | yahoo_fund_ksa=%s yahoo_fund_global=%s | history=%s lookback=%sd | batch_conc=%s | cachetools=%s",
-            ENGINE_VERSION,
-            ",".join(self.providers_global) if self.providers_global else "(none)",
-            ",".join(self.providers_ksa) if self.providers_ksa else "(none)",
-            ttl,
-            self.enable_yahoo_fundamentals_ksa,
-            self.enable_yahoo_fundamentals_global,
-            self.enable_history_analytics,
-            self.history_lookback_days,
-            self.batch_concurrency,
-            _HAS_CACHETOOLS,
-        )
-
-    async def aclose(self) -> None:
-        closers = [
-            ("core.providers.finnhub_provider", "aclose_finnhub_client"),
-            ("core.providers.tadawul_provider", "aclose_tadawul_client"),
-            ("core.providers.yahoo_chart_provider", "aclose_yahoo_chart_client"),
-            ("core.providers.yahoo_fundamentals_provider", "aclose_yahoo_fundamentals_client"),
-        ]
-        for mod_name, closer in closers:
-            try:
-                mod = importlib.import_module(mod_name)
-                fn = getattr(mod, closer, None)
-                if callable(fn):
-                    await _call_maybe_async(fn)
-            except Exception:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: List[str] = []
+        for x in v:
+            if x is None:
                 continue
-
-    def _providers_for(self, sym: str) -> List[str]:
-        is_ksa = _is_ksa(sym)
-        if is_ksa:
-            if self.providers_ksa:
-                return list(self.providers_ksa)
-            safe = [p for p in (self.providers_global or []) if p in {"tadawul", "argaam", "yahoo_chart"}]
-            return safe
-        return list(self.providers_global or [])
-
-    async def _fetch_history_best_effort(
-        self, sym: str, providers: List[str], *, refresh: bool = False
-    ) -> Tuple[List[Tuple[int, float]], Optional[str]]:
-        if not providers:
-            return [], None
-
-        cache_key = f"h::{sym}::{self.history_lookback_days}"
-        if refresh:
-            try:
-                self._cache.pop(cache_key, None)
-            except Exception:
-                pass
-
-        hit = self._cache.get(cache_key)
-        if isinstance(hit, dict) and hit.get("series"):
-            series = hit.get("series")
-            src = hit.get("source")
-            if isinstance(series, list):
-                return series, src if isinstance(src, str) else None
-
-        series: List[Tuple[int, float]] = []
-        used_src: Optional[str] = None
-
-        pref = [(p or "").strip().lower() for p in providers if (p or "").strip()]
-        fn_hist = ["fetch_price_history", "fetch_history", "fetch_ohlc_history", "fetch_history_patch", "fetch_prices"]
-
-        provider_modules = {
-            "eodhd": "core.providers.eodhd_provider",
-            "yahoo_chart": "core.providers.yahoo_chart_provider",
-            "finnhub": "core.providers.finnhub_provider",
-            "fmp": "core.providers.fmp_provider",
-            "tadawul": "core.providers.tadawul_provider",
-            "argaam": "core.providers.argaam_provider",
-        }
-
-        for p in pref:
-            mod_name = provider_modules.get(p)
-            if not mod_name:
-                continue
-            try:
-                if p == "finnhub":
-                    api_key = os.getenv("FINNHUB_API_KEY")
-                    patch, _ = await _try_provider_call(mod_name, fn_hist, sym, api_key)
-                else:
-                    patch, _ = await _try_provider_call(mod_name, fn_hist, sym)
-
-                s = _extract_close_series(patch)
-                if s:
-                    series = s
-                    used_src = p
-                    break
-            except Exception:
-                continue
-
-        try:
-            self._cache[cache_key] = {"series": series, "source": used_src}
-        except Exception:
-            pass
-
-        return series, used_src
-
-    def _apply_history_analytics(self, out: Dict[str, Any], series: List[Tuple[int, float]], history_source: Optional[str]) -> None:
-        if not series:
-            return
-
-        closes = [c for _, c in series if isinstance(c, (int, float)) and float(c) > 0 and not math.isnan(float(c))]
-        if len(closes) < 60:
-            return
-
-        if _safe_float(out.get("current_price")) is None:
-            out["current_price"] = closes[-1]
-
-        out["history_points"] = len(closes)
-        out["history_source"] = history_source
-        out["history_last_utc"] = _utc_iso()
-
-        out["returns_1w"] = _returns_from_history(closes, _TD_1W)
-        out["returns_1m"] = _returns_from_history(closes, _TD_1M)
-        out["returns_3m"] = _returns_from_history(closes, _TD_3M)
-        out["returns_6m"] = _returns_from_history(closes, _TD_6M)
-        out["returns_12m"] = _returns_from_history(closes, _TD_12M)
-
-        out["ma20"] = _sma(closes, 20)
-        out["ma50"] = _sma(closes, 50)
-        out["ma200"] = _sma(closes, 200)
-
-        out["rsi14"] = _rsi14(closes, 14)
-        out["vol_30d_ann"] = _vol_ann_from_history(closes, 30)
-
-        cur = _safe_float(out.get("current_price"))
-        if cur is not None and cur > 0:
-            f1 = _gbm_forecast(closes, _TD_1M)
-            f3 = _gbm_forecast(closes, _TD_3M)
-            f12 = _gbm_forecast(closes, _TD_12M)
-
-            if f1:
-                out["expected_return_1m"] = f1["ret_mean"]
-                out["expected_return_1m_p5"] = f1["ret_p5"]
-                out["expected_return_1m_p95"] = f1["ret_p95"]
-                out["expected_price_1m"] = f1["px_mean"]
-                out["expected_price_1m_p5"] = f1["px_p5"]
-                out["expected_price_1m_p95"] = f1["px_p95"]
-
-            if f3:
-                out["expected_return_3m"] = f3["ret_mean"]
-                out["expected_return_3m_p5"] = f3["ret_p5"]
-                out["expected_return_3m_p95"] = f3["ret_p95"]
-                out["expected_price_3m"] = f3["px_mean"]
-                out["expected_price_3m_p5"] = f3["px_p5"]
-                out["expected_price_3m_p95"] = f3["px_p95"]
-
-            if f12:
-                out["expected_return_12m"] = f12["ret_mean"]
-                out["expected_return_12m_p5"] = f12["ret_p5"]
-                out["expected_return_12m_p95"] = f12["ret_p95"]
-                out["expected_price_12m"] = f12["px_mean"]
-                out["expected_price_12m_p5"] = f12["px_p5"]
-                out["expected_price_12m_p95"] = f12["px_p95"]
-
-            if f1 or f3 or f12:
-                out["forecast_method"] = "gbm_drift_vol"
-
-        out["confidence_score"] = _confidence_from(out)
-
-    async def get_enriched_quote(
-        self,
-        symbol: str,
-        *,
-        enrich: bool = True,
-        refresh: bool = False,
-        fields: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        sym = normalize_symbol(symbol)
-        if not sym:
-            q = UnifiedQuote(symbol=str(symbol or ""), error="empty symbol").finalize()
-            out0 = _model_to_dict(q)
-            out0["status"] = "error"
-            out0["data_quality"] = "BAD"
-            return out0
-
-        cache_key = f"q::{sym}::{int(bool(enrich))}"
-        if refresh:
-            try:
-                self._cache.pop(cache_key, None)
-            except Exception:
-                pass
-
-        hit = self._cache.get(cache_key)
-        if (not refresh) and isinstance(hit, dict) and hit:
-            return dict(hit)
-
-        is_ksa = _is_ksa(sym)
-        providers = self._providers_for(sym)
-
-        q0 = UnifiedQuote(
-            symbol=sym,
-            market="KSA" if is_ksa else "GLOBAL",
-            last_updated_utc=_utc_iso(),
-            last_updated_riyadh=_to_riyadh_iso(_utc_iso()) or "",
-            error="",
-            symbol_input=str(symbol or ""),
-            symbol_normalized=sym,
-        )
-        out: Dict[str, Any] = _model_to_dict(q0)
-
-        if not providers:
-            out["status"] = "error"
-            out["data_quality"] = "BAD"
-            out["error"] = "No providers configured"
-            self._cache[cache_key] = dict(out)
-            return out
-
-        warnings: List[str] = []
-        source_used: List[str] = []
-
-        for p in providers:
-            p = (p or "").strip().lower()
-            if not p:
-                continue
-
-            if is_ksa and p in {"eodhd", "fmp", "finnhub"} and (p not in (self.providers_ksa or [])):
-                warnings.append(f"{p}: skipped for KSA")
-                continue
-
-            if p == "tadawul" and not _tadawul_configured():
-                warnings.append("tadawul: skipped (missing TADAWUL_QUOTE_URL/TADAWUL_FUNDAMENTALS_URL)")
-                continue
-
-            patch: Dict[str, Any] = {}
-            err: Optional[str] = None
-
-            if p == "tadawul":
-                patch, err = await _try_provider_call(
-                    "core.providers.tadawul_provider",
-                    ["fetch_quote_and_fundamentals_patch", "fetch_fundamentals_patch", "fetch_quote_patch"],
-                    sym,
-                )
-            elif p == "argaam":
-                patch, err = await _try_provider_call(
-                    "core.providers.argaam_provider",
-                    ["fetch_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_enriched_quote_patch"],
-                    sym,
-                )
-            elif p == "yahoo_chart":
-                patch, err = await _try_provider_call(
-                    "core.providers.yahoo_chart_provider",
-                    ["fetch_quote_patch", "fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote"],
-                    sym,
-                )
-            elif p == "finnhub":
-                api_key = os.getenv("FINNHUB_API_KEY")
-                patch, err = await _try_provider_call(
-                    "core.providers.finnhub_provider",
-                    ["fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"],
-                    sym,
-                    api_key,
-                )
-            elif p == "eodhd":
-                fn_list = (
-                    ["fetch_enriched_quote_patch", "fetch_quote_and_fundamentals_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"]
-                    if enrich
-                    else ["fetch_quote_patch", "fetch_quote"]
-                )
-                patch, err = await _try_provider_call("core.providers.eodhd_provider", fn_list, sym)
-            elif p == "fmp":
-                patch, err = await _try_provider_call(
-                    "core.providers.fmp_provider",
-                    ["fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_enriched_patch", "fetch_quote_patch", "fetch_quote"],
-                    sym,
-                )
-            else:
-                warnings.append(f"{p}: unknown provider")
-                continue
-
-            if patch:
-                _merge_patch(out, patch)
-                source_used.append(p)
-
-            if err:
-                low = str(err).strip().lower()
-                warnings.append(str(err).strip() if low.startswith(f"{p}:") else f"{p}: {str(err).strip()}")
-
-            _apply_derived(out)
-
-            has_price_now = _safe_float(out.get("current_price")) is not None
-            if has_price_now:
-                if not enrich:
-                    break
-                if not _missing_key_fundamentals(out):
-                    break
-
-        # Yahoo Fundamentals supplement (NO yfinance)
-        try:
-            has_price = _safe_float(out.get("current_price")) is not None
-            needs_fund = enrich and has_price and _missing_key_fundamentals(out)
-            allow = (is_ksa and self.enable_yahoo_fundamentals_ksa) or ((not is_ksa) and self.enable_yahoo_fundamentals_global)
-
-            if needs_fund and allow:
-                patch2, err2 = await _try_provider_call(
-                    "core.providers.yahoo_fundamentals_provider",
-                    ["fetch_fundamentals_patch", "fetch_quote_patch", "fetch_enriched_quote_patch", "yahoo_fundamentals"],
-                    sym,
-                )
-
-                if patch2:
-                    clean = {
-                        k: patch2.get(k)
-                        for k in (
-                            "currency",
-                            "current_price",
-                            "market_cap",
-                            "shares_outstanding",
-                            "eps_ttm",
-                            "pe_ttm",
-                            "forward_eps",
-                            "forward_pe",
-                            "pb",
-                            "ps",
-                            "ev_ebitda",
-                            "dividend_yield",
-                            "dividend_rate",
-                            "payout_ratio",
-                            "roe",
-                            "roa",
-                            "beta",
-                        )
-                        if patch2.get(k) is not None
-                    }
-                    if clean:
-                        _merge_patch(out, clean)
-                        source_used.append("yahoo_fundamentals")
-
-                if err2:
-                    warnings.append(f"yahoo_fundamentals: {str(err2).strip()}")
-
-                _apply_derived(out)
-        except Exception:
-            pass
-
-        # History analytics + forecasting (GBM)
-        if enrich and self.enable_history_analytics and _safe_float(out.get("current_price")) is not None:
-            try:
-                series, hist_src = await self._fetch_history_best_effort(sym, providers, refresh=refresh)
-                if series:
-                    self._apply_history_analytics(out, series, hist_src)
-            except Exception:
-                pass
-
-        # Scores
-        out["quality_score"] = _score_quality(out)
-        out["value_score"] = _score_value(out)
-        out["momentum_score"] = _score_momentum(out)
-        out["risk_score"] = _score_risk(out)
-
-        qs = float(out.get("quality_score") or 50)
-        vs = float(out.get("value_score") or 50)
-        ms = float(out.get("momentum_score") or 50)
-        rs = float(out.get("risk_score") or 35)
-        conf = float(out.get("confidence_score") or 50)
-
-        opp = (0.35 * qs) + (0.35 * vs) + (0.30 * ms) - (0.15 * rs)
-        opp += 0.05 * (conf - 50.0)
-        out["opportunity_score"] = int(max(0, min(100, round(opp))))
-
-        # Overall score (sheet helper): lean on opportunity
-        out["overall_score"] = int(max(0, min(100, round(float(out.get("opportunity_score") or 50)))))
-
-        # Fair value + upside + label
-        try:
-            if _safe_float(out.get("fair_value")) is None:
-                out["fair_value"] = _compute_fair_value(out)
-            up, label = _compute_upside_and_label(out.get("current_price"), out.get("fair_value"))
-            if out.get("upside_percent") is None:
-                out["upside_percent"] = up
-            if not out.get("valuation_label"):
-                out["valuation_label"] = label
-        except Exception:
-            pass
-
-        # Recommendation (enum)
-        if not out.get("recommendation"):
-            out["recommendation"] = _recommend_from_scores(out)
-        else:
-            out["recommendation"] = _normalize_recommendation(out.get("recommendation"))
-
-        out["data_source"] = ",".join(_dedup_preserve(source_used)) if source_used else (out.get("data_source") or None)
-        out["data_quality"] = _quality_label(out)
-
-        has_price = _safe_float(out.get("current_price")) is not None
-        base_err = str(out.get("error") or "").strip()
-        parts: List[str] = []
-        if base_err:
-            parts.append(_normalize_warning_prefix(base_err))
-        parts += [_normalize_warning_prefix(w) for w in warnings]
-        parts = _dedup_preserve([p for p in parts if p])
-
-        if not has_price:
-            out["status"] = "error"
-            out["error"] = " | ".join(parts) if parts else "No price returned"
-        else:
-            out["status"] = "success"
-            out["error"] = "" if not parts else ("warning: " + " | ".join(parts))
-
-        self._cache[cache_key] = dict(out)
+            s = str(x).strip()
+            if s:
+                out.append(s)
         return out
 
-    async def get_enriched_quotes(
-        self,
-        symbols: List[str],
-        *,
-        enrich: bool = True,
-        refresh: bool = False,
-        fields: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        if not symbols:
-            return []
-
-        sem = asyncio.Semaphore(self.batch_concurrency)
-
-        async def _one(s: str) -> Dict[str, Any]:
-            async with sem:
-                try:
-                    return await self.get_enriched_quote(s, enrich=enrich, refresh=refresh, fields=fields)
-                except Exception as e:
-                    q = UnifiedQuote(symbol=normalize_symbol(s) or str(s or ""), error=str(e)).finalize()
-                    d = _model_to_dict(q)
-                    d["status"] = "error"
-                    d["data_quality"] = "BAD"
-                    return d
-
-        res = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=False)
-        return list(res)
-
-    async def get_quote(self, symbol: str, *, refresh: bool = False, fields: Optional[str] = None) -> Dict[str, Any]:
-        return await self.get_enriched_quote(symbol, enrich=True, refresh=refresh, fields=fields)
-
-    async def get_quotes(self, symbols: List[str], *, refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        return await self.get_enriched_quotes(symbols, enrich=True, refresh=refresh, fields=fields)
+    s = str(v).replace("\n", " ").replace("\t", " ").replace(",", " ").strip()
+    if not s:
+        return []
+    return [p.strip() for p in s.split(" ") if p.strip()]
 
 
-DataEngineV2 = DataEngine
-
-_ENGINE_SINGLETON: Optional[DataEngine] = None
-_LOCK = asyncio.Lock()
-
-
-async def get_engine() -> DataEngine:
-    global _ENGINE_SINGLETON
-    if _ENGINE_SINGLETON is None:
-        async with _LOCK:
-            if _ENGINE_SINGLETON is None:
-                _ENGINE_SINGLETON = DataEngine()
-    return _ENGINE_SINGLETON
+class _ExtraIgnore(BaseModel):
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")  # type: ignore
+    else:  # pragma: no cover
+        class Config:
+            extra = "ignore"
 
 
-async def get_enriched_quote(symbol: str, *, refresh: bool = False, fields: Optional[str] = None) -> Dict[str, Any]:
-    e = await get_engine()
-    return await e.get_enriched_quote(symbol, enrich=True, refresh=refresh, fields=fields)
+class BatchProcessRequest(_ExtraIgnore):
+    """
+    Shared contract used by routers and sheet refresh endpoints.
+    Supports both `symbols` and `tickers` (client robustness).
+    """
+    operation: str = Field(default="refresh")
+    sheet_name: Optional[str] = Field(default=None)
+    symbols: List[str] = Field(default_factory=list)
+    tickers: List[str] = Field(default_factory=list)  # alias support
 
+    if _PYDANTIC_V2:  # type: ignore
+        @field_validator("symbols", mode="before")  # type: ignore
+        def _v2_symbols(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
 
-async def get_enriched_quotes(symbols: List[str], *, refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-    e = await get_engine()
-    return await e.get_enriched_quotes(symbols, enrich=True, refresh=refresh, fields=fields)
+        @field_validator("tickers", mode="before")  # type: ignore
+        def _v2_tickers(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
 
+        @model_validator(mode="after")  # type: ignore
+        def _v2_post(self) -> "BatchProcessRequest":
+            self.symbols = _coerce_str_list(self.symbols)
+            self.tickers = _coerce_str_list(self.tickers)
+            return self
 
-async def get_quote(symbol: str, *, refresh: bool = False, fields: Optional[str] = None) -> Dict[str, Any]:
-    return await get_enriched_quote(symbol, refresh=refresh, fields=fields)
+    else:  # pragma: no cover
+        @validator("symbols", pre=True)  # type: ignore
+        def _v1_symbols(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
 
+        @validator("tickers", pre=True)  # type: ignore
+        def _v1_tickers(cls, v: Any) -> List[str]:
+            return _coerce_str_list(v)
 
-async def get_quotes(symbols: List[str], *, refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-    return await get_enriched_quotes(symbols, refresh=refresh, fields=fields)
+    def all_symbols(self) -> List[str]:
+        """Returns combined symbols (symbols + tickers), trimmed, in original order."""
+        out: List[str] = []
+        for x in (self.symbols or []) + (self.tickers or []):
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
 
 
 __all__ = [
-    "ENGINE_VERSION",
-    "UnifiedQuote",
-    "normalize_symbol",
-    "DataEngine",
-    "DataEngineV2",
-    "get_engine",
-    "get_quote",
-    "get_quotes",
-    "get_enriched_quote",
-    "get_enriched_quotes",
+    "SCHEMAS_VERSION",
+    # Legacy exports (kept)
+    "DEFAULT_HEADERS_59",
+    "DEFAULT_HEADERS_ANALYSIS",
+    "is_canonical_headers",
+    "coerce_headers_59",
+    "validate_headers_59",
+    # Mapping exports
+    "FIELD_ALIASES",
+    "canonical_field",
+    "HEADER_TO_FIELD",
+    "HEADER_FIELD_CANDIDATES",
+    "FIELD_TO_HEADER",
+    "header_to_field",
+    "header_field_candidates",
+    "field_to_header",
+    # Schemas helpers
+    "resolve_sheet_key",
+    "get_headers_for_sheet",
+    "get_supported_sheets",
+    "get_header_groups",
+    # Request models
+    "BatchProcessRequest",
 ]
