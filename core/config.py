@@ -1,3 +1,4 @@
+```python
 # core/config.py  (FULL REPLACEMENT)
 """
 TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v2.8.0-shim) – PROD SAFE
@@ -9,17 +10,19 @@ Purpose
 - Never crashes startup (defensive import)
 
 If repo-root config.py is missing for any reason, this file provides a tiny fallback
-that preserves OPEN mode behavior.
+that preserves OPEN mode behavior (no auth required).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, asdict
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 CONFIG_VERSION = "2.8.0-shim"
 
 try:
-    # Canonical source
+    # Canonical source (repo root): config.py
     from config import (  # type: ignore
         CONFIG_VERSION as _MAIN_CONFIG_VERSION,
         Settings,
@@ -30,14 +33,27 @@ try:
         mask_settings_dict,
     )
 
-    CONFIG_VERSION = _MAIN_CONFIG_VERSION  # mirror canonical version
+    # Mirror canonical version so /version endpoints stay consistent
+    CONFIG_VERSION = _MAIN_CONFIG_VERSION
 
 except Exception:
+    # -------------------------------------------------------------------------
     # Ultra-light fallback (should almost never happen)
-    Settings = object  # type: ignore
+    # - Open mode only (no auth)
+    # - Minimal Settings object for code expecting attributes
+    # -------------------------------------------------------------------------
 
-    def get_settings() -> object:  # type: ignore
-        return object()
+    @dataclass(frozen=True)
+    class Settings:  # type: ignore
+        service_name: str = "tadawul-fast-bridge"
+        environment: str = "prod"
+        log_level: str = "INFO"
+        app_token: Optional[str] = None
+        backup_app_token: Optional[str] = None
+
+    @lru_cache(maxsize=1)
+    def get_settings() -> Settings:  # type: ignore
+        return Settings()
 
     def allowed_tokens() -> List[str]:
         return []
@@ -49,7 +65,13 @@ except Exception:
         return True
 
     def mask_settings_dict() -> Dict[str, Any]:
-        return {"status": "fallback", "open_mode": True}
+        s = get_settings()
+        d = asdict(s)
+        d.update({"status": "fallback", "open_mode": True})
+        # never expose secrets even in fallback
+        d["app_token"] = None
+        d["backup_app_token"] = None
+        return d
 
 
 __all__ = [
@@ -61,3 +83,4 @@ __all__ = [
     "auth_ok",
     "mask_settings_dict",
 ]
+```
