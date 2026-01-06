@@ -1,16 +1,16 @@
-# main.py — FULL REPLACEMENT — v5.2.1
+# main.py  (FULL REPLACEMENT)
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.2.1
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.2.2
 
-What changed vs your v5.2.0 draft (fixes real-world boot issues):
-- ✅ Fix: get_engine() may be sync in some builds → supports sync/async safely.
-- ✅ Fix: background boot task uses asyncio.to_thread incorrectly for async init → corrected.
-- ✅ Fix: router mount uses include_router safely with robust import candidates.
-- ✅ /readyz always returns without touching routers/engine internals.
-- ✅ Stronger settings/env resolution (ENV -> env.py -> config.py/core.config).
-- ✅ Keeps “never crash startup” guarantee.
+What changed vs v5.2.1:
+- ✅ Safer deferred router boot: heavy imports happen in a background thread,
+  but app.include_router() runs on the main event loop thread.
+  (prevents thread-unsafe router table mutations)
+- ✅ Settings resolution kept defensive: ENV -> env.py -> config.py/core.config
+- ✅ /readyz always returns without touching routers/engine internals
+- ✅ Never-crash startup guarantee preserved
 
 Entrypoint for Render/uvicorn:  main:app
 """
@@ -46,7 +46,7 @@ if str(BASE_DIR) not in sys.path:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
-APP_ENTRY_VERSION = "5.2.1"
+APP_ENTRY_VERSION = "5.2.2"
 
 
 def _truthy(v: Any) -> bool:
@@ -109,7 +109,7 @@ def _apply_runtime_env_aliases_last_resort() -> None:
     if os.getenv("RETRY_DELAY") and not os.getenv("RETRY_DELAY_SEC"):
         _export_env_if_missing("RETRY_DELAY_SEC", os.getenv("RETRY_DELAY"))
 
-    # --- Engine/provider flags defaults (legacy env-readers consistency) ---
+    # --- Feature defaults (legacy env-readers consistency) ---
     os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
@@ -180,66 +180,6 @@ def _import_first(candidates: List[str]) -> Tuple[Optional[object], Optional[str
     return None, None, last_tb
 
 
-def _mount_router(
-    app_: FastAPI,
-    name: str,
-    candidates: List[str],
-    attr_candidates: Tuple[str, ...] = ("router",),
-) -> Dict[str, Any]:
-    report: Dict[str, Any] = {
-        "name": name,
-        "candidates": candidates,
-        "mounted": False,
-        "loaded_from": None,
-        "router_attr": None,
-        "error": None,
-    }
-
-    mod, loaded_from, err_tb = _import_first(candidates)
-    if mod is None:
-        report["error"] = _clamp_str(f"All imports failed. Last traceback:\n{err_tb or '(none)'}", 8000)
-        logger.warning("Router not mounted (%s): import failed for %s", name, candidates)
-        return report
-
-    router_obj = None
-    router_attr = None
-
-    for attr in attr_candidates:
-        if hasattr(mod, attr):
-            router_obj = getattr(mod, attr)
-            router_attr = attr
-            break
-
-    if router_obj is None and hasattr(mod, "get_router"):
-        try:
-            router_obj = getattr(mod, "get_router")()
-            router_attr = "get_router()"
-        except Exception:
-            report["error"] = _clamp_str(f"get_router() failed:\n{traceback.format_exc()}", 8000)
-            logger.warning("Router not mounted (%s): get_router() failed", name)
-            return report
-
-    if router_obj is None:
-        report["error"] = _clamp_str(
-            f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}",
-            3000,
-        )
-        logger.warning("Router not mounted (%s): no router found in %s", name, loaded_from)
-        return report
-
-    try:
-        app_.include_router(router_obj)  # type: ignore[arg-type]
-        report["mounted"] = True
-        report["loaded_from"] = loaded_from
-        report["router_attr"] = router_attr
-        logger.info("Mounted router: %s (%s.%s)", name, loaded_from, router_attr)
-        return report
-    except Exception:
-        report["error"] = _clamp_str(f"include_router failed:\n{traceback.format_exc()}", 8000)
-        logger.warning("Router not mounted (%s): include_router failed", name)
-        return report
-
-
 def _safe_set_root_log_level(level: str) -> None:
     try:
         logging.getLogger().setLevel(str(level).upper())
@@ -250,6 +190,7 @@ def _safe_set_root_log_level(level: str) -> None:
 def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
     """
     Prefer repo-root config.py. Fall back to core.config.
+    (Keeps boot safe if core.config is absent or heavy.)
     """
     try:
         from config import get_settings  # type: ignore
@@ -381,11 +322,16 @@ def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> 
             vv = str(getattr(settings, k, "") or "").strip()
             if vv:
                 return vv
-    return str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip() or "production"
+    return (
+        str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip()
+        or "production"
+    )
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
-    cors_all = _truthy(_get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true")))
+    cors_all = _truthy(
+        _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", _get(settings, env_mod, "CORS_ALL_ORIGINS", "true"))
+    )
     if cors_all:
         return ["*"]
     raw = str(_get(settings, env_mod, "CORS_ORIGINS", "")).strip()
@@ -419,17 +365,27 @@ def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key:
 
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
     enabled, ksa = _providers_from_settings(settings, env_mod)
-    token_mode = "open" if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN")) else "token"
+    token_mode = (
+        "open"
+        if not (os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN"))
+        else "token"
+    )
     return {
         "APP_ENV": _resolve_env_name(settings, env_mod),
-        "LOG_LEVEL": str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")),
+        "LOG_LEVEL": str(
+            _get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")
+        ),
         "LOG_FORMAT": LOG_FORMAT,
         "ENTRY_VERSION": APP_ENTRY_VERSION,
         "APP_VERSION_RESOLVED": _resolve_version(settings, env_mod),
         "ENABLED_PROVIDERS": enabled,
         "KSA_PROVIDERS": ksa,
-        "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)),
-        "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)),
+        "DEFER_ROUTER_MOUNT": str(
+            _get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)
+        ),
+        "INIT_ENGINE_ON_BOOT": str(
+            _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)
+        ),
         "ENGINE_CACHE_TTL_SEC": str(_get(settings, env_mod, "ENGINE_CACHE_TTL_SEC", "")),
         "ENABLE_HISTORY_ANALYTICS": str(_get(settings, env_mod, "ENABLE_HISTORY_ANALYTICS", os.getenv("ENABLE_HISTORY_ANALYTICS", ""))),
         "ENABLE_YAHOO_CHART_KSA": str(_get(settings, env_mod, "ENABLE_YAHOO_CHART_KSA", os.getenv("ENABLE_YAHOO_CHART_KSA", ""))),
@@ -540,11 +496,6 @@ async def _init_engine_best_effort_async(app_: FastAPI) -> None:
       - app.state.engine
       - app.state.engine_ready
       - app.state.engine_error
-    Priority:
-      1) existing app.state.engine
-      2) core.data_engine_v2.get_engine() (sync OR async)
-      3) core.data_engine_v2.DataEngineV2/DataEngine (instantiate)
-      4) core.data_engine.DataEngine (legacy)
     """
     try:
         existing = getattr(app_.state, "engine", None)
@@ -599,11 +550,92 @@ async def _init_engine_best_effort_async(app_: FastAPI) -> None:
         app_.state.engine_error = _clamp_str(traceback.format_exc(), 8000)
 
 
-def _mount_all_routers(app_: FastAPI) -> None:
+def _load_router_object_sync(
+    candidates: List[str],
+    attr_candidates: Tuple[str, ...] = ("router",),
+) -> Tuple[Optional[object], Optional[str], Optional[str], Optional[str]]:
+    """
+    Runs in a worker thread:
+    - imports router module
+    - extracts router object
+    Returns: (router_obj, loaded_from, router_attr, error_str)
+    """
+    mod, loaded_from, err_tb = _import_first(candidates)
+    if mod is None:
+        return None, None, None, _clamp_str(f"All imports failed. Last traceback:\n{err_tb or '(none)'}", 8000)
+
+    router_obj = None
+    router_attr = None
+
+    for attr in attr_candidates:
+        if hasattr(mod, attr):
+            router_obj = getattr(mod, attr)
+            router_attr = attr
+            break
+
+    if router_obj is None and hasattr(mod, "get_router"):
+        try:
+            router_obj = getattr(mod, "get_router")()
+            router_attr = "get_router()"
+        except Exception:
+            return None, loaded_from, "get_router()", _clamp_str(f"get_router() failed:\n{traceback.format_exc()}", 8000)
+
+    if router_obj is None:
+        return None, loaded_from, None, _clamp_str(
+            f"Module '{loaded_from}' imported but no router attr found. attrs tried={list(attr_candidates)}",
+            3000,
+        )
+
+    return router_obj, loaded_from, router_attr, None
+
+
+async def _mount_router_async(
+    app_: FastAPI,
+    name: str,
+    candidates: List[str],
+    attr_candidates: Tuple[str, ...] = ("router",),
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
+        "name": name,
+        "candidates": candidates,
+        "mounted": False,
+        "loaded_from": None,
+        "router_attr": None,
+        "error": None,
+    }
+
+    try:
+        router_obj, loaded_from, router_attr, err = await asyncio.to_thread(
+            _load_router_object_sync,
+            candidates,
+            attr_candidates,
+        )
+    except Exception:
+        router_obj, loaded_from, router_attr, err = None, None, None, _clamp_str(traceback.format_exc(), 8000)
+
+    if router_obj is None:
+        report["error"] = err or "router_obj is None"
+        logger.warning("Router not mounted (%s): %s", name, report["error"])
+        return report
+
+    try:
+        app_.include_router(router_obj)  # type: ignore[arg-type]
+        report["mounted"] = True
+        report["loaded_from"] = loaded_from
+        report["router_attr"] = router_attr
+        logger.info("Mounted router: %s (%s.%s)", name, loaded_from, router_attr)
+        return report
+    except Exception:
+        report["error"] = _clamp_str(f"include_router failed:\n{traceback.format_exc()}", 8000)
+        logger.warning("Router not mounted (%s): include_router failed", name)
+        return report
+
+
+async def _mount_all_routers_async(app_: FastAPI) -> None:
     routers = getattr(app_.state, "routers_to_mount", [])
     results: List[Dict[str, Any]] = []
     for name, candidates in routers:
-        results.append(_mount_router(app_, name=name, candidates=candidates))
+        results.append(await _mount_router_async(app_, name=name, candidates=candidates))
 
     app_.state.mount_report = results
     mounted_names = {r["name"] for r in results if r.get("mounted")}
@@ -620,10 +652,12 @@ def _mount_all_routers(app_: FastAPI) -> None:
 
 async def _background_boot(app_: FastAPI) -> None:
     """
-    Background boot must be pure-async. Avoid asyncio.to_thread misuse for async funcs.
+    Background boot: keep event loop responsive.
+    - heavy router imports happen in threads per router
+    - include_router runs on event loop thread
     """
     try:
-        await asyncio.to_thread(_mount_all_routers, app_)
+        await _mount_all_routers_async(app_)
         init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
         if init_engine:
             await _init_engine_best_effort_async(app_)
@@ -661,7 +695,9 @@ def create_app() -> FastAPI:
     settings, settings_source = _try_load_settings()
     env_mod = _load_env_module()
 
-    log_level = str(_get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")).upper()
+    log_level = str(
+        _get(settings, env_mod, "LOG_LEVEL", getattr(settings, "log_level", "INFO") if settings else "INFO")
+    ).upper()
     _safe_set_root_log_level(log_level)
 
     title = _resolve_title(settings, env_mod)
@@ -691,9 +727,18 @@ def create_app() -> FastAPI:
         app_.state.boot_error = None
         app_.state.boot_completed = False
 
-        # Honor settings attrs even if env vars are not set
-        defer_val = _get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)
-        init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)
+        defer_val = _get(
+            settings,
+            env_mod,
+            "DEFER_ROUTER_MOUNT",
+            getattr(settings, "defer_router_mount", True) if settings else True,
+        )
+        init_val = _get(
+            settings,
+            env_mod,
+            "INIT_ENGINE_ON_BOOT",
+            getattr(settings, "init_engine_on_boot", True) if settings else True,
+        )
 
         app_.state.defer_router_mount = _truthy(defer_val) if isinstance(defer_val, str) else bool(defer_val)
         app_.state.init_engine_on_boot = init_val
@@ -707,7 +752,7 @@ def create_app() -> FastAPI:
         if app_.state.defer_router_mount:
             app_.state.boot_task = asyncio.create_task(_background_boot(app_))
         else:
-            await asyncio.to_thread(_mount_all_routers, app_)
+            await _mount_all_routers_async(app_)
             if _truthy(app_.state.init_engine_on_boot):
                 await _init_engine_best_effort_async(app_)
             app_.state.boot_completed = True
