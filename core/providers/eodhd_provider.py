@@ -1,8 +1,8 @@
 # core/providers/eodhd_provider.py
 """
 core/providers/eodhd_provider.py
-------------------------------------------------------------
-EODHD Provider — v1.9.0 (HARDENED + ENGINE-PATCH + KSA-OPTIONAL + CLIENT REUSE)
+============================================================
+EODHD Provider — v2.0.0 (HARDENED + ENGINE-PATCH + CUSTOM HEADERS + HISTORY/FORECAST)
 
 Key points
 - ✅ Uses EODHD_API_KEY (preferred in Render)
@@ -10,45 +10,136 @@ Key points
 - ✅ Default base URL: https://eodhistoricaldata.com/api
 - ✅ No network calls at import-time
 - ✅ Lazy singleton AsyncClient (reuse connections)
-- ✅ Defensive JSON parsing + clear errors
-- ✅ Clean PATCH outputs (no null/empty noise unless useful)
+- ✅ Retry/backoff on 429 + transient 5xx
+- ✅ Clean PATCH outputs (no empty-string / None noise)
+- ✅ Optional History + Forecast (momentum/vol/RSI/MA) from EOD endpoint
 
 KSA handling (IMPORTANT)
 - Default: KSA is BLOCKED (safe) to avoid routing confusion.
-- Enable KSA via: ALLOW_EODHD_KSA=true
-  (also accepts EODHD_ALLOW_KSA=true)
+- Enable KSA via: ALLOW_EODHD_KSA=true  (also accepts EODHD_ALLOW_KSA=true)
+
+Customized Headers (NEW)
+- EODHD_HEADERS_JSON                     (base headers)
+- EODHD_HEADERS_REALTIME_JSON            (realtime endpoint override)
+- EODHD_HEADERS_FUNDAMENTALS_JSON        (fundamentals endpoint override)
+- EODHD_HEADERS_HISTORY_JSON             (history endpoint override)
+All are JSON dict strings.
+
+History/Forecast (NEW)
+- Uses /eod/{symbol} daily candles
+- Adds (best-effort):
+  returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d (% annualized), rsi_14
+  expected_return_1m/3m/12m (%), expected_price_1m/3m/12m
+  confidence_score, forecast_method, history_points, history_last_date
 
 Exports (engine discovery)
 - fetch_quote_patch
 - fetch_enriched_quote_patch
 - fetch_quote_and_enrichment_patch
+- fetch_quote_and_fundamentals_patch      (alias)
+- fetch_enriched_patch                    (alias)
 - aclose_eodhd_client
 
 Env vars (supported)
+Auth/Base
 - EODHD_API_KEY (preferred)
 - EODHD_API_TOKEN / EODHD_TOKEN (legacy)
 - EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
+
+Behavior
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
+- EODHD_ENABLE_HISTORY (default: true)
+- EODHD_ENABLE_FORECAST (default: true)
+- EODHD_VERBOSE_WARNINGS (default: false)  # if true attaches _warn
+
+KSA guard
 - ALLOW_EODHD_KSA / EODHD_ALLOW_KSA (default: false)
-- EODHD_TIMEOUT_S (default: 8.5)  (fallbacks to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT if present)
-- EODHD_UA (optional)
+
+Timeout/Retry
+- EODHD_TIMEOUT_S (default: 8.5)  (fallback to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT)
+- EODHD_RETRY_ATTEMPTS (default: 2) (min 1)
+- EODHD_RETRY_DELAY_SEC (default: 0.25)
+
+Caching
+- EODHD_QUOTE_TTL_SEC (default: 12, min 5)
+- EODHD_FUND_TTL_SEC (default: 21600, min 120)   # 6 hours
+- EODHD_HISTORY_TTL_SEC (default: 1200, min 60)  # 20 min
+
+History window
+- EODHD_HISTORY_DAYS (default: 400, min 60)
+- EODHD_HISTORY_POINTS_MAX (default: 400, min 100)
+
+Notes
+- Forecast here is a simple momentum-style estimate (non-investment advice).
+- This provider is meant for GLOBAL symbols primarily; KSA is off by default.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
-from typing import Any, Dict, Optional, Tuple
+import random
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
 
-PROVIDER_VERSION = "1.9.0"
+PROVIDER_VERSION = "2.0.0"
 PROVIDER_NAME = "eodhd"
 
 BASE_URL = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").rstrip("/")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_FALSY = {"0", "false", "no", "n", "off", "f"}
+
+
+# -----------------------------------------------------------------------------
+# Env helpers
+# -----------------------------------------------------------------------------
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _FALSY:
+        return False
+    if raw in _TRUTHY:
+        return True
+    return default
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _timeout_default() -> float:
@@ -66,11 +157,12 @@ def _timeout_default() -> float:
 
 TIMEOUT_S = _timeout_default()
 
-ENABLE_FUNDAMENTALS = (os.getenv("EODHD_ENABLE_FUNDAMENTALS") or "true").strip().lower() in _TRUTHY
+ENABLE_FUNDAMENTALS = _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
+ENABLE_HISTORY = _env_bool("EODHD_ENABLE_HISTORY", True)
+ENABLE_FORECAST = _env_bool("EODHD_ENABLE_FORECAST", True)
+VERBOSE_WARNINGS = _env_bool("EODHD_VERBOSE_WARNINGS", False)
 
-ALLOW_EODHD_KSA = (
-    (os.getenv("ALLOW_EODHD_KSA") or os.getenv("EODHD_ALLOW_KSA") or "false").strip().lower() in _TRUTHY
-)
+ALLOW_EODHD_KSA = _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
 
 UA = os.getenv(
     "EODHD_UA",
@@ -78,35 +170,45 @@ UA = os.getenv(
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
 
-_CLIENT: Optional[httpx.AsyncClient] = None
-_LOCK = asyncio.Lock()
+
+def _retry_attempts() -> int:
+    r = _env_int("EODHD_RETRY_ATTEMPTS", 2)
+    return max(1, int(r))
 
 
-async def _get_client() -> httpx.AsyncClient:
-    global _CLIENT
-    if _CLIENT is None:
-        async with _LOCK:
-            if _CLIENT is None:
-                headers = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
-                timeout = httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S))
-                _CLIENT = httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True)
-    return _CLIENT
+def _retry_delay_sec() -> float:
+    d = _env_float("EODHD_RETRY_DELAY_SEC", 0.25)
+    return d if d > 0 else 0.25
 
 
-async def aclose_eodhd_client() -> None:
-    global _CLIENT
-    c = _CLIENT
-    _CLIENT = None
-    if c is not None:
-        try:
-            await c.aclose()
-        except Exception:
-            pass
+def _quote_ttl_sec() -> float:
+    ttl = _env_float("EODHD_QUOTE_TTL_SEC", 12.0)
+    return max(5.0, float(ttl))
 
 
-# ---------------------------------------------------------------------------
-# Env + parsing helpers
-# ---------------------------------------------------------------------------
+def _fund_ttl_sec() -> float:
+    ttl = _env_float("EODHD_FUND_TTL_SEC", 21600.0)  # 6h
+    return max(120.0, float(ttl))
+
+
+def _history_ttl_sec() -> float:
+    ttl = _env_float("EODHD_HISTORY_TTL_SEC", 1200.0)
+    return max(60.0, float(ttl))
+
+
+def _history_days() -> int:
+    d = _env_int("EODHD_HISTORY_DAYS", 400)
+    return max(60, int(d))
+
+
+def _history_points_max() -> int:
+    n = _env_int("EODHD_HISTORY_POINTS_MAX", 400)
+    return max(100, int(n))
+
+
+# -----------------------------------------------------------------------------
+# Token + symbol guards
+# -----------------------------------------------------------------------------
 def _token() -> Optional[str]:
     for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
         v = (os.getenv(k) or "").strip()
@@ -126,6 +228,9 @@ def _looks_like_ksa(symbol: str) -> bool:
     return False
 
 
+# -----------------------------------------------------------------------------
+# Numeric helpers
+# -----------------------------------------------------------------------------
 def _is_nan(x: Any) -> bool:
     try:
         return x is None or (isinstance(x, float) and math.isnan(x))
@@ -173,100 +278,425 @@ def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _base_patch(symbol: str) -> Dict[str, Any]:
-    # Keep patch aligned with UnifiedQuote keys + your extra fields used in outputs
-    return {
-        "symbol": symbol,
-        "data_source": PROVIDER_NAME,
-        "provider_version": PROVIDER_VERSION,
-        # IMPORTANT: keep "error" string but do NOT force it into output unless non-empty
-        "error": "",
-        # identity
-        "name": "",
-        "exchange": "",
-        "currency": "",
-        "sector": "",
-        "industry": "",
-        "sub_sector": "",
-        "listing_date": "",
-        # quote
-        "current_price": None,
-        "previous_close": None,
-        "open": None,
-        "day_high": None,
-        "day_low": None,
-        "week_52_high": None,
-        "week_52_low": None,
-        "position_52w_percent": None,
-        "volume": None,
-        "avg_volume_30d": None,
-        "value_traded": None,
-        "price_change": None,
-        "percent_change": None,
-        # fundamentals
-        "market_cap": None,
-        "shares_outstanding": None,
-        "free_float": None,  # %
-        "free_float_market_cap": None,
-        "eps_ttm": None,
-        "pe_ttm": None,
-        "pb": None,
-        "ps": None,
-        "dividend_yield": None,
-        "roe": None,
-        "roa": None,
-        "beta": None,
-        # extra ratios (optional; engine can ignore)
-        "net_margin": None,
-        "debt_to_equity": None,
-        "current_ratio": None,
-        "quick_ratio": None,
-        "ev_ebitda": None,
-        "ma20": None,
-        "ma50": None,
-    }
+def _merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
+    """
+    Merge src into dst:
+    - Fill blanks/missing in dst
+    - Force overwrite for keys in force_keys
+    """
+    fset = set(force_keys or ())
+    for k, v in (src or {}).items():
+        if v is None:
+            continue
+        if k in fset:
+            dst[k] = v
+            continue
+        if k not in dst:
+            dst[k] = v
+            continue
+        cur = dst.get(k)
+        if cur is None:
+            dst[k] = v
+        elif isinstance(cur, str) and not cur.strip():
+            dst[k] = v
 
 
-async def _get_json(url: str, params: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str]]:
+def _fill_derived(patch: Dict[str, Any]) -> None:
+    cur = _to_float(patch.get("current_price"))
+    prev = _to_float(patch.get("previous_close"))
+    vol = _to_float(patch.get("volume"))
+
+    if patch.get("price_change") is None and cur is not None and prev is not None:
+        patch["price_change"] = cur - prev
+
+    if patch.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
+        patch["percent_change"] = (cur - prev) / prev * 100.0
+
+    if patch.get("value_traded") is None and cur is not None and vol is not None:
+        patch["value_traded"] = cur * vol
+
+    if patch.get("position_52w_percent") is None:
+        patch["position_52w_percent"] = _pos_52w(
+            cur,
+            _to_float(patch.get("week_52_low")),
+            _to_float(patch.get("week_52_high")),
+        )
+
+    mc = _to_float(patch.get("market_cap"))
+    ff = _to_float(patch.get("free_float"))
+    if patch.get("free_float_market_cap") is None and mc is not None and ff is not None:
+        patch["free_float_market_cap"] = mc * (ff / 100.0)
+
+
+# -----------------------------------------------------------------------------
+# Customized headers
+# -----------------------------------------------------------------------------
+def _json_headers(env_key: str) -> Dict[str, str]:
+    raw = _env_str(env_key, "")
+    if not raw:
+        return {}
     try:
-        client = await _get_client()
-        r = await client.get(url, params=params)
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return {str(k): str(v) for k, v in obj.items()}
+    except Exception:
+        return {}
+    return {}
 
-        if r.status_code != 200:
-            hint = ""
-            if r.status_code in (401, 403):
-                hint = " (auth failed: check EODHD_API_KEY)"
-            msg = ""
+
+def _base_headers() -> Dict[str, str]:
+    h = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
+    h.update(_json_headers("EODHD_HEADERS_JSON"))
+    return h
+
+
+def _endpoint_headers(kind: str) -> Dict[str, str]:
+    key = {
+        "realtime": "EODHD_HEADERS_REALTIME_JSON",
+        "fundamentals": "EODHD_HEADERS_FUNDAMENTALS_JSON",
+        "history": "EODHD_HEADERS_HISTORY_JSON",
+    }.get(kind, "")
+    return _json_headers(key) if key else {}
+
+
+# -----------------------------------------------------------------------------
+# TTL cache fallback (import-safe)
+# -----------------------------------------------------------------------------
+try:
+    from cachetools import TTLCache  # type: ignore
+
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1.0, float(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + self._ttl
+
+
+# -----------------------------------------------------------------------------
+# History analytics (forecast)
+# -----------------------------------------------------------------------------
+def _stddev(xs: List[float]) -> Optional[float]:
+    try:
+        n = len(xs)
+        if n < 2:
+            return None
+        mu = sum(xs) / n
+        var = sum((x - mu) ** 2 for x in xs) / (n - 1)
+        return math.sqrt(var)
+    except Exception:
+        return None
+
+
+def _compute_rsi_14(closes: List[float]) -> Optional[float]:
+    try:
+        if len(closes) < 15:
+            return None
+        gains: List[float] = []
+        losses: List[float] = []
+        for i in range(-14, 0):
+            d = closes[i] - closes[i - 1]
+            if d >= 0:
+                gains.append(d)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(-d)
+        avg_gain = sum(gains) / 14.0
+        avg_loss = sum(losses) / 14.0
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        if math.isnan(rsi) or math.isinf(rsi):
+            return None
+        return float(max(0.0, min(100.0, rsi)))
+    except Exception:
+        return None
+
+
+def _return_pct(last: float, prior: float) -> Optional[float]:
+    try:
+        if prior == 0:
+            return None
+        return (last / prior - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not closes:
+        return out
+
+    last = closes[-1]
+
+    idx = {
+        "returns_1w": 5,
+        "returns_1m": 21,
+        "returns_3m": 63,
+        "returns_6m": 126,
+        "returns_12m": 252,
+    }
+    for k, n in idx.items():
+        if len(closes) > n:
+            out[k] = _return_pct(last, closes[-(n + 1)])
+
+    def ma(n: int) -> Optional[float]:
+        if len(closes) < n:
+            return None
+        xs = closes[-n:]
+        return sum(xs) / float(n)
+
+    out["ma20"] = ma(20)
+    out["ma50"] = ma(50)
+    out["ma200"] = ma(200)
+
+    # volatility_30d from last 31 closes
+    if len(closes) >= 31:
+        rets: List[float] = []
+        window = closes[-31:]
+        for i in range(1, len(window)):
+            p0 = window[i - 1]
+            p1 = window[i]
+            if p0 != 0:
+                rets.append((p1 / p0) - 1.0)
+        sd = _stddev(rets)
+        if sd is not None:
+            out["volatility_30d"] = float(sd * math.sqrt(252.0) * 100.0)
+
+    out["rsi_14"] = _compute_rsi_14(closes)
+
+    # Forecast (momentum-style)
+    def mean_daily_return(n_days: int) -> Optional[float]:
+        if len(closes) < (n_days + 2):
+            return None
+        start = closes[-(n_days + 1)]
+        if start == 0:
+            return None
+        total = (last / start) - 1.0
+        return total / float(n_days)
+
+    r1m_d = mean_daily_return(21)
+    r3m_d = mean_daily_return(63)
+    r12m_d = mean_daily_return(252)
+
+    if ENABLE_FORECAST:
+        if r1m_d is not None:
+            out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
+            out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
+        if r3m_d is not None:
+            out["expected_return_3m"] = float(r3m_d * 63.0 * 100.0)
+            out["expected_price_3m"] = float(last * (1.0 + (out["expected_return_3m"] / 100.0)))
+        if r12m_d is not None:
+            out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
+            out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
+        out["forecast_method"] = "eodhd_history_momentum_v1"
+    else:
+        out["forecast_method"] = "history_only"
+
+    # Confidence score: more points + lower vol => higher
+    pts = len(closes)
+    base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
+    vol = _to_float(out.get("volatility_30d"))
+    if vol is None:
+        conf = base * 0.75
+    else:
+        penalty = min(60.0, max(0.0, (vol / 100.0) * 35.0))
+        conf = max(0.0, min(100.0, base - penalty))
+    out["confidence_score"] = float(conf)
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Client singleton
+# -----------------------------------------------------------------------------
+_CLIENT: Optional[httpx.AsyncClient] = None
+_LOCK = asyncio.Lock()
+
+# provider-level caches (safe, no network at import time)
+_QUOTE_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_quote_ttl_sec())
+_FUND_CACHE: TTLCache = TTLCache(maxsize=4000, ttl=_fund_ttl_sec())
+_HIST_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _CLIENT
+    if _CLIENT is None:
+        async with _LOCK:
+            if _CLIENT is None:
+                timeout = httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S))
+                _CLIENT = httpx.AsyncClient(timeout=timeout, headers=_base_headers(), follow_redirects=True)
+    return _CLIENT
+
+
+async def aclose_eodhd_client() -> None:
+    global _CLIENT
+    c = _CLIENT
+    _CLIENT = None
+    if c is not None:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
+# HTTP helpers
+# -----------------------------------------------------------------------------
+async def _get_json_dict(url: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[dict], Optional[str]]:
+    tok = _token()
+    if not tok:
+        return None, "not configured (EODHD_API_KEY)"
+
+    params = dict(params or {})
+    params.setdefault("api_token", tok)
+    params.setdefault("fmt", "json")
+
+    client = await _get_client()
+    retries = _retry_attempts()
+    base_delay = _retry_delay_sec()
+    req_headers = _endpoint_headers(kind)
+
+    last_err: Optional[str] = None
+
+    for attempt in range(retries):
+        try:
+            r = await client.get(url, params=params, headers=req_headers if req_headers else None)
+            sc = int(r.status_code)
+
+            if sc == 429 or 500 <= sc < 600:
+                last_err = f"HTTP {sc}"
+                if attempt < retries - 1:
+                    await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
+                    continue
+                return None, last_err
+
+            if sc != 200:
+                hint = ""
+                if sc in (401, 403):
+                    hint = " (auth failed: check EODHD_API_KEY)"
+                msg = ""
+                try:
+                    js = r.json()
+                    if isinstance(js, dict):
+                        msg = str(js.get("message") or js.get("error") or "").strip()
+                except Exception:
+                    msg = ""
+                if msg:
+                    return None, f"HTTP {sc}{hint}: {msg}"
+                return None, f"HTTP {sc}{hint}"
+
             try:
                 js = r.json()
-                if isinstance(js, dict):
-                    msg = str(js.get("message") or js.get("error") or "").strip()
             except Exception:
-                msg = ""
-            if msg:
-                return None, f"HTTP {r.status_code}{hint}: {msg}"
-            return None, f"HTTP {r.status_code}{hint}"
+                return None, "invalid JSON response"
 
+            if not isinstance(js, dict):
+                return None, "unexpected JSON type"
+            return js, None
+
+        except Exception as e:
+            last_err = f"{e.__class__.__name__}: {e}"
+            if attempt < retries - 1:
+                await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
+                continue
+            return None, last_err
+
+    return None, last_err or "request failed"
+
+
+async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[list], Optional[str]]:
+    tok = _token()
+    if not tok:
+        return None, "not configured (EODHD_API_KEY)"
+
+    params = dict(params or {})
+    params.setdefault("api_token", tok)
+    params.setdefault("fmt", "json")
+
+    client = await _get_client()
+    retries = _retry_attempts()
+    base_delay = _retry_delay_sec()
+    req_headers = _endpoint_headers(kind)
+
+    last_err: Optional[str] = None
+
+    for attempt in range(retries):
         try:
-            js = r.json()
-        except Exception:
-            return None, "invalid JSON response"
+            r = await client.get(url, params=params, headers=req_headers if req_headers else None)
+            sc = int(r.status_code)
 
-        if not isinstance(js, dict):
-            return None, "unexpected JSON type"
-        return js, None
+            if sc == 429 or 500 <= sc < 600:
+                last_err = f"HTTP {sc}"
+                if attempt < retries - 1:
+                    await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
+                    continue
+                return None, last_err
 
-    except Exception as e:
-        return None, f"{e.__class__.__name__}: {e}"
+            if sc != 200:
+                hint = ""
+                if sc in (401, 403):
+                    hint = " (auth failed: check EODHD_API_KEY)"
+                return None, f"HTTP {sc}{hint}"
+
+            try:
+                js = r.json()
+            except Exception:
+                return None, "invalid JSON response"
+
+            if not isinstance(js, list):
+                return None, "unexpected JSON type"
+            return js, None
+
+        except Exception as e:
+            last_err = f"{e.__class__.__name__}: {e}"
+            if attempt < retries - 1:
+                await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
+                continue
+            return None, last_err
+
+    return None, last_err or "request failed"
 
 
-async def _fetch_realtime(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+# -----------------------------------------------------------------------------
+# Endpoint fetchers
+# -----------------------------------------------------------------------------
+async def _fetch_realtime_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     tok = _token()
     if not tok:
         return {}, "not configured (EODHD_API_KEY)"
 
     url = f"{BASE_URL}/real-time/{symbol}"
-    js, err = await _get_json(url, {"api_token": tok, "fmt": "json"})
+    js, err = await _get_json_dict(url, {}, kind="realtime")
     if js is None:
         return {}, f"realtime failed: {err}"
 
@@ -293,13 +723,13 @@ async def _fetch_realtime(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     return _clean_patch(patch), None
 
 
-async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+async def _fetch_fundamentals_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
     tok = _token()
     if not tok:
         return {}, "not configured (EODHD_API_KEY)"
 
     url = f"{BASE_URL}/fundamentals/{symbol}"
-    js, err = await _get_json(url, {"api_token": tok, "fmt": "json"})
+    js, err = await _get_json_dict(url, {}, kind="fundamentals")
     if js is None:
         return {}, f"fundamentals failed: {err}"
 
@@ -361,71 +791,140 @@ async def _fetch_fundamentals(symbol: str) -> Tuple[Dict[str, Any], Optional[str
     return _clean_patch(patch), None
 
 
-def _fill_derived(patch: Dict[str, Any]) -> None:
-    cur = _to_float(patch.get("current_price"))
-    prev = _to_float(patch.get("previous_close"))
-    vol = _to_float(patch.get("volume"))
+async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    if not ENABLE_HISTORY:
+        return {}, None
 
-    if patch.get("price_change") is None and cur is not None and prev is not None:
-        patch["price_change"] = cur - prev
+    tok = _token()
+    if not tok:
+        return {}, "not configured (EODHD_API_KEY)"
 
-    if patch.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        patch["percent_change"] = (cur - prev) / prev * 100.0
+    # EODHD /eod endpoint returns list of daily candles
+    # We'll request a window using from/to.
+    days = _history_days()
+    to_d = date.today()
+    from_d = to_d - timedelta(days=days)
 
-    if patch.get("value_traded") is None and cur is not None and vol is not None:
-        patch["value_traded"] = cur * vol
+    url = f"{BASE_URL}/eod/{symbol}"
+    js_list, err = await _get_json_list(
+        url,
+        {"from": from_d.isoformat(), "to": to_d.isoformat(), "period": "d"},
+        kind="history",
+    )
+    if js_list is None:
+        return {}, f"history failed: {err}"
 
-    if patch.get("position_52w_percent") is None:
-        patch["position_52w_percent"] = _pos_52w(
-            cur,
-            _to_float(patch.get("week_52_low")),
-            _to_float(patch.get("week_52_high")),
-        )
+    closes: List[float] = []
+    last_date: Optional[str] = None
 
-    mc = _to_float(patch.get("market_cap"))
-    ff = _to_float(patch.get("free_float"))
-    if patch.get("free_float_market_cap") is None and mc is not None and ff is not None:
-        patch["free_float_market_cap"] = mc * (ff / 100.0)
-
-
-def _merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Tuple[str, ...] = ()) -> None:
-    """
-    Merge src into dst:
-    - Fill blanks/missing in dst
-    - Force overwrite for keys in force_keys
-    """
-    for k, v in (src or {}).items():
-        if v is None:
+    # EOD list items look like: {"date":"2025-01-01","open":...,"high":...,"low":...,"close":...,"volume":...}
+    for it in js_list:
+        if not isinstance(it, dict):
             continue
-        if k in force_keys:
-            dst[k] = v
+        c = _to_float(it.get("close"))
+        if c is None:
             continue
-        if dst.get(k) in (None, "", 0):
-            dst[k] = v
+        closes.append(float(c))
+        d = it.get("date")
+        if isinstance(d, str) and d.strip():
+            last_date = d.strip()
+
+    # Keep only recent points (cap)
+    closes = closes[-_history_points_max():]
+
+    if len(closes) < 25:  # not enough for meaningful signals
+        return {}, "history returned too few points"
+
+    analytics = _compute_history_analytics(closes)
+    patch: Dict[str, Any] = {
+        "history_points": len(closes),
+        "history_last_date": last_date or "",
+        "forecast_source": "eodhd_eod",
+    }
+    patch.update(analytics)
+    return _clean_patch(patch), None
 
 
-async def _fetch(symbol: str, want_fundamentals: bool = True) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Main fetch
+# -----------------------------------------------------------------------------
+async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) -> Dict[str, Any]:
     sym = (symbol or "").strip()
-    patch = _base_patch(sym)
+    if not sym:
+        return {}
 
     # Controlled KSA enablement
     if _looks_like_ksa(sym) and not ALLOW_EODHD_KSA:
-        patch["error"] = "warning: KSA blocked for EODHD (set ALLOW_EODHD_KSA=true to enable)"
-        return _clean_patch(patch)
+        p = {
+            "symbol": sym,
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "error": "warning: KSA blocked for EODHD (set ALLOW_EODHD_KSA=true to enable)",
+            "last_updated_utc": _utc_iso(),
+        }
+        return _clean_patch(p)
 
-    rt_patch, rt_err = await _fetch_realtime(sym)
+    tok = _token()
+    if not tok:
+        p = {
+            "symbol": sym,
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "error": "warning: not configured (EODHD_API_KEY)",
+            "last_updated_utc": _utc_iso(),
+        }
+        return _clean_patch(p)
+
+    warns: List[str] = []
+
+    # --- realtime (cached) ---
+    ck_q = f"q::{sym}"
+    hit = _QUOTE_CACHE.get(ck_q)
+    if isinstance(hit, dict) and hit:
+        rt_patch = dict(hit)
+        rt_err = None
+    else:
+        rt_patch, rt_err = await _fetch_realtime_patch(sym)
+        if rt_patch:
+            _QUOTE_CACHE[ck_q] = dict(rt_patch)
+
     if rt_err:
-        patch["error"] = f"{PROVIDER_NAME}: {rt_err}"
-        return _clean_patch(patch)
+        # If realtime fails, we return a warning patch (engine can fallback)
+        p = {
+            "symbol": sym,
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "error": f"warning: {PROVIDER_NAME}: {rt_err}",
+            "last_updated_utc": _utc_iso(),
+        }
+        return _clean_patch(p)
 
-    _merge_into(patch, rt_patch)
+    out: Dict[str, Any] = {
+        "symbol": sym,
+        "data_source": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "last_updated_utc": _utc_iso(),
+    }
+    _merge_into(out, rt_patch)
 
-    # Fundamentals (best-effort)
+    # --- fundamentals (cached, best-effort) ---
     if want_fundamentals and ENABLE_FUNDAMENTALS:
-        f_patch, f_err = await _fetch_fundamentals(sym)
-        if not f_err:
+        ck_f = f"f::{sym}"
+        hitf = _FUND_CACHE.get(ck_f)
+        if isinstance(hitf, dict) and hitf:
+            f_patch = dict(hitf)
+            f_err = None
+        else:
+            f_patch, f_err = await _fetch_fundamentals_patch(sym)
+            if f_patch:
+                _FUND_CACHE[ck_f] = dict(f_patch)
+
+        if f_err:
+            warns.append(f"{PROVIDER_NAME}: {f_err}")
+        else:
+            # fundamentals should overwrite these if present
             _merge_into(
-                patch,
+                out,
                 f_patch,
                 force_keys=(
                     "market_cap",
@@ -435,38 +934,64 @@ async def _fetch(symbol: str, want_fundamentals: bool = True) -> Dict[str, Any]:
                     "week_52_low",
                     "shares_outstanding",
                     "free_float",
+                    "ma20",
+                    "ma50",
+                    "avg_volume_30d",
                 ),
             )
+
+    # --- history/forecast (cached, best-effort) ---
+    if want_history and ENABLE_HISTORY:
+        ck_h = f"h::{sym}::{_history_days()}"
+        hith = _HIST_CACHE.get(ck_h)
+        if isinstance(hith, dict) and hith:
+            h_patch = dict(hith)
+            h_err = None
         else:
-            # Do not kill price if fundamentals fail
-            patch["error"] = "warning: " + f"{PROVIDER_NAME}: {f_err}"
+            h_patch, h_err = await _fetch_history_patch(sym)
+            if h_patch:
+                _HIST_CACHE[ck_h] = dict(h_patch)
 
-    _fill_derived(patch)
-    return _clean_patch(patch)
+        if h_err:
+            warns.append(f"{PROVIDER_NAME}: {h_err}")
+        else:
+            # analytics should not overwrite quote/fundamentals fields
+            for k, v in (h_patch or {}).items():
+                if k not in out and v is not None:
+                    out[k] = v
+
+    if warns and VERBOSE_WARNINGS:
+        out["_warn"] = " | ".join([w for w in warns if w])
+
+    _fill_derived(out)
+    return _clean_patch(out)
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Engine-compatible exported callables (name-based discovery)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_fundamentals=False)
+    # fast path: realtime only
+    return await _fetch(symbol, want_fundamentals=False, want_history=False)
 
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_fundamentals=True)
+    # enriched: realtime + fundamentals + history/forecast (best-effort)
+    # NOTE: history requires /eod access and counts against quota.
+    return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
 
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_fundamentals=True)
+    return await fetch_enriched_quote_patch(symbol)
 
 
 # Compatibility aliases (some engines try these names)
 async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_fundamentals=True)
+    return await _fetch(symbol, want_fundamentals=True, want_history=False)
 
 
 async def fetch_enriched_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_fundamentals=True)
+    return await fetch_enriched_quote_patch(symbol)
 
 
 __all__ = [
