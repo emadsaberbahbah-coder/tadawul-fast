@@ -1,40 +1,71 @@
 # core/providers/finnhub_provider.py
 """
 core/providers/finnhub_provider.py
-------------------------------------------------------------
-Finnhub Provider (GLOBAL enrichment fallback) — v1.7.0 (PROD SAFE + ENGINE ALIGNED)
-
-Aligned with your Render env names
-- ✅ Uses FINNHUB_API_KEY (preferred)
-- ✅ Supports legacy aliases: FINNHUB_API_TOKEN / FINNHUB_TOKEN
-- ✅ Uses standard query param token=<...>
+============================================================
+Finnhub Provider (GLOBAL enrichment fallback) — v2.0.0
+(PROD SAFE + ENGINE PATCH + CUSTOM HEADERS + HISTORY/FORECAST)
 
 Role
-- GLOBAL fallback/enrichment (quote + optional profile) when EODHD is primary.
+- GLOBAL fallback/enrichment (quote + optional profile + optional history analytics)
 - KSA symbols are explicitly rejected to prevent wrong routing.
+- Yahoo-special symbols (^GSPC, GC=F, EURUSD=X, etc.) are rejected per your routing design.
 
-Key improvements vs v1.6.0
-- ✅ Engine-aligned: exported callables return Dict[str, Any] (no tuples)
-- ✅ AsyncClient reused (no new client per request) + aclose hook
+What’s improved vs v1.7.0
+- ✅ Customized headers (base + per-endpoint overrides):
+    FINNHUB_HEADERS_JSON
+    FINNHUB_HEADERS_QUOTE_JSON
+    FINNHUB_HEADERS_PROFILE_JSON
+    FINNHUB_HEADERS_HISTORY_JSON
+- ✅ Provider-level TTL caches separated by type (quote/profile/history) with different TTLs
 - ✅ Retry/backoff on 429 + transient 5xx
-- ✅ Detects Finnhub "zero payload" for invalid symbols (c=o=h=l=pc=0)
-- ✅ Symbol normalization: strips ".US" safely; rejects Yahoo special (^GSPC, GC=F, EURUSD=X)
-- ✅ Optional TTL cache (FINNHUB_TTL_SEC, min 3s). Import-safe fallback if cachetools missing.
-- ✅ Never crashes if env vars missing; returns clean error object
-- ✅ CLEAN PATCH policy for engine merges:
-    - Default: return patch-style dict (no "status"/"data_quality") for success
-    - If not configured / invalid symbol: returns {"error": "..."} only (keeps engine fallback working)
+- ✅ Optional history analytics + forecast (momentum-style) from /stock/candle
+    Adds: returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d (annualized %), rsi_14,
+          expected_return_1m/3m/12m, expected_price_1m/3m/12m, confidence_score,
+          forecast_method, history_points, history_last_ts
+- ✅ Strict “clean patch” policy (no noisy empties)
+- ✅ Never crashes if env is missing or invalid; returns {"error": "..."} for fallback logic
 
 Env vars (supported)
+Auth/Base
 - FINNHUB_API_KEY (preferred)
 - FINNHUB_API_TOKEN / FINNHUB_TOKEN (legacy)
 - FINNHUB_BASE_URL (default: https://finnhub.io/api/v1)
+
+Timeout/Retry
 - FINNHUB_TIMEOUT_SEC (default: falls back to HTTP_TIMEOUT_SEC then 8.0)
 - FINNHUB_RETRY_ATTEMPTS (default: 2, min 1)
+- FINNHUB_RETRY_DELAY_SEC (default: 0.25)
+
+Features
 - FINNHUB_ENABLE_PROFILE (default: true)
-- FINNHUB_HEADERS_JSON (optional JSON dict)
+- FINNHUB_ENABLE_HISTORY (default: true)
+- FINNHUB_ENABLE_FORECAST (default: true)
+- FINNHUB_VERBOSE_WARNINGS (default: false)  # adds _warn to patch
+
+Caching
+- FINNHUB_QUOTE_TTL_SEC   (default: 10, min 3)
+- FINNHUB_PROFILE_TTL_SEC (default: 6 hours, min 120)
+- FINNHUB_HISTORY_TTL_SEC (default: 20 min, min 60)
+
+History window
+- FINNHUB_HISTORY_DAYS (default: 400, min 60)
+- FINNHUB_HISTORY_POINTS_MAX (default: 400, min 100)
+
+Headers
 - FINNHUB_UA (optional override)
-- FINNHUB_TTL_SEC (default: 10, min 3)
+- FINNHUB_HEADERS_JSON (base headers JSON dict)
+- FINNHUB_HEADERS_QUOTE_JSON (quote override JSON dict)
+- FINNHUB_HEADERS_PROFILE_JSON (profile override JSON dict)
+- FINNHUB_HEADERS_HISTORY_JSON (history override JSON dict)
+
+Exports
+- fetch_quote_patch(symbol) -> Dict[str, Any]
+- fetch_enriched_quote_patch(symbol) -> Dict[str, Any]
+- fetch_quote_and_enrichment_patch(symbol) -> Dict[str, Any]
+- aclose_finnhub_client()
+
+Notes
+- Forecast is a simple momentum-style estimate (non-investment advice).
 """
 
 from __future__ import annotations
@@ -47,14 +78,14 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
 logger = logging.getLogger("core.providers.finnhub_provider")
 
-PROVIDER_VERSION = "1.7.0"
+PROVIDER_VERSION = "2.0.0"
 PROVIDER_NAME = "finnhub"
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
@@ -73,6 +104,7 @@ USER_AGENT_DEFAULT = (
 # Reuse one client
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # TTL cache (import-safe if cachetools missing)
@@ -147,14 +179,13 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
         return default
-    s = str(v).strip().lower()
-    if s in _TRUTHY:
-        return True
-    if s in _FALSY:
+    if raw in _FALSY:
         return False
+    if raw in _TRUTHY:
+        return True
     return default
 
 
@@ -163,7 +194,6 @@ def _utc_iso() -> str:
 
 
 def _token() -> Optional[str]:
-    # ✅ Render uses FINNHUB_API_KEY
     for k in ("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"):
         v = (os.getenv(k) or "").strip()
         if v:
@@ -176,50 +206,104 @@ def _base_url() -> str:
 
 
 def _timeout_sec() -> float:
-    # prefer FINNHUB_TIMEOUT_SEC; fallback to HTTP_TIMEOUT_SEC; then default
     t = _env_float("FINNHUB_TIMEOUT_SEC", _env_float("HTTP_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC))
     return t if t > 0 else DEFAULT_TIMEOUT_SEC
 
 
 def _retry_attempts() -> int:
     r = _env_int("FINNHUB_RETRY_ATTEMPTS", _env_int("MAX_RETRIES", DEFAULT_RETRY_ATTEMPTS))
-    return max(1, r)
+    return max(1, int(r))
+
+
+def _retry_delay_sec() -> float:
+    d = _env_float("FINNHUB_RETRY_DELAY_SEC", 0.25)
+    return d if d > 0 else 0.25
 
 
 def _enable_profile() -> bool:
     return _env_bool("FINNHUB_ENABLE_PROFILE", True)
 
 
+def _enable_history() -> bool:
+    return _env_bool("FINNHUB_ENABLE_HISTORY", True)
+
+
+def _enable_forecast() -> bool:
+    return _env_bool("FINNHUB_ENABLE_FORECAST", True)
+
+
+def _verbose_warn() -> bool:
+    return _env_bool("FINNHUB_VERBOSE_WARNINGS", False)
+
+
 def _ua() -> str:
     return _env_str("FINNHUB_UA", USER_AGENT_DEFAULT)
 
 
-def _ttl_seconds() -> float:
-    ttl = _env_float("FINNHUB_TTL_SEC", 10.0)
-    if ttl <= 0:
-        ttl = 10.0
-    return max(3.0, ttl)
+def _quote_ttl_sec() -> float:
+    ttl = _env_float("FINNHUB_QUOTE_TTL_SEC", 10.0)
+    return max(3.0, ttl if ttl > 0 else 10.0)
 
 
-_CACHE: TTLCache = TTLCache(maxsize=5000, ttl=_ttl_seconds())
+def _profile_ttl_sec() -> float:
+    ttl = _env_float("FINNHUB_PROFILE_TTL_SEC", 21600.0)  # 6 hours
+    return max(120.0, ttl if ttl > 0 else 21600.0)
 
 
-def _get_headers() -> Dict[str, str]:
+def _history_ttl_sec() -> float:
+    ttl = _env_float("FINNHUB_HISTORY_TTL_SEC", 1200.0)  # 20 min
+    return max(60.0, ttl if ttl > 0 else 1200.0)
+
+
+def _history_days() -> int:
+    d = _env_int("FINNHUB_HISTORY_DAYS", 400)
+    return max(60, int(d))
+
+
+def _history_points_max() -> int:
+    n = _env_int("FINNHUB_HISTORY_POINTS_MAX", 400)
+    return max(100, int(n))
+
+
+# Separate caches (different TTLs)
+_Q_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_quote_ttl_sec())
+_P_CACHE: TTLCache = TTLCache(maxsize=4000, ttl=_profile_ttl_sec())
+_H_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
+
+
+# ---------------------------------------------------------------------------
+# Customized headers
+# ---------------------------------------------------------------------------
+def _json_headers(env_key: str) -> Dict[str, str]:
+    raw = _env_str(env_key, "")
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return {str(k): str(v) for k, v in obj.items()}
+    except Exception:
+        return {}
+    return {}
+
+
+def _base_headers() -> Dict[str, str]:
     h = {
         "User-Agent": _ua(),
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "en-US,en;q=0.8",
     }
-    raw = _env_str("FINNHUB_HEADERS_JSON", "")
-    if raw:
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    h[str(k)] = str(v)
-        except Exception:
-            pass
+    h.update(_json_headers("FINNHUB_HEADERS_JSON"))
     return h
+
+
+def _endpoint_headers(kind: str) -> Dict[str, str]:
+    key = {
+        "quote": "FINNHUB_HEADERS_QUOTE_JSON",
+        "profile": "FINNHUB_HEADERS_PROFILE_JSON",
+        "history": "FINNHUB_HEADERS_HISTORY_JSON",
+    }.get(kind, "")
+    return _json_headers(key) if key else {}
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -229,7 +313,7 @@ async def _get_client() -> httpx.AsyncClient:
             if _CLIENT is None:
                 t = _timeout_sec()
                 timeout = httpx.Timeout(t, connect=min(10.0, t))
-                _CLIENT = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_get_headers())
+                _CLIENT = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_base_headers())
                 logger.info(
                     "Finnhub client init v%s | base=%s | timeout=%.1fs | cachetools=%s",
                     PROVIDER_VERSION,
@@ -270,7 +354,6 @@ def _is_yahoo_special(symbol: str) -> bool:
     s = (symbol or "").strip().upper()
     if not s:
         return False
-    # Yahoo-style symbols are not supported by Finnhub in your routing design
     if any(ch in s for ch in ("^", "=", "/")):
         return True
     if s.endswith("=X"):
@@ -334,11 +417,6 @@ def _fill_derived(out: Dict[str, Any]) -> None:
 
 
 def _quote_looks_empty(js: Dict[str, Any]) -> bool:
-    """
-    Finnhub often returns 0 for invalid/unknown symbols:
-      {c:0, d:0, dp:0, h:0, l:0, o:0, pc:0, t:0}
-    Treat that as empty.
-    """
     keys = ("c", "h", "l", "o", "pc")
     for k in keys:
         f = _to_float(js.get(k))
@@ -348,9 +426,141 @@ def _quote_looks_empty(js: Dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# History analytics (forecast)
+# ---------------------------------------------------------------------------
+def _stddev(xs: List[float]) -> Optional[float]:
+    try:
+        n = len(xs)
+        if n < 2:
+            return None
+        mu = sum(xs) / n
+        var = sum((x - mu) ** 2 for x in xs) / (n - 1)
+        return math.sqrt(var)
+    except Exception:
+        return None
+
+
+def _compute_rsi_14(closes: List[float]) -> Optional[float]:
+    try:
+        if len(closes) < 15:
+            return None
+        gains: List[float] = []
+        losses: List[float] = []
+        for i in range(-14, 0):
+            d = closes[i] - closes[i - 1]
+            if d >= 0:
+                gains.append(d)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(-d)
+        avg_gain = sum(gains) / 14.0
+        avg_loss = sum(losses) / 14.0
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        if math.isnan(rsi) or math.isinf(rsi):
+            return None
+        return float(max(0.0, min(100.0, rsi)))
+    except Exception:
+        return None
+
+
+def _return_pct(last: float, prior: float) -> Optional[float]:
+    try:
+        if prior == 0:
+            return None
+        return (last / prior - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not closes:
+        return out
+
+    last = closes[-1]
+    idx = {
+        "returns_1w": 5,
+        "returns_1m": 21,
+        "returns_3m": 63,
+        "returns_6m": 126,
+        "returns_12m": 252,
+    }
+    for k, n in idx.items():
+        if len(closes) > n:
+            out[k] = _return_pct(last, closes[-(n + 1)])
+
+    def ma(n: int) -> Optional[float]:
+        if len(closes) < n:
+            return None
+        xs = closes[-n:]
+        return sum(xs) / float(n)
+
+    out["ma20"] = ma(20)
+    out["ma50"] = ma(50)
+    out["ma200"] = ma(200)
+
+    if len(closes) >= 31:
+        rets: List[float] = []
+        window = closes[-31:]
+        for i in range(1, len(window)):
+            p0 = window[i - 1]
+            p1 = window[i]
+            if p0 != 0:
+                rets.append((p1 / p0) - 1.0)
+        sd = _stddev(rets)
+        if sd is not None:
+            out["volatility_30d"] = float(sd * math.sqrt(252.0) * 100.0)
+
+    out["rsi_14"] = _compute_rsi_14(closes)
+
+    def mean_daily_return(n_days: int) -> Optional[float]:
+        if len(closes) < (n_days + 2):
+            return None
+        start = closes[-(n_days + 1)]
+        if start == 0:
+            return None
+        total = (last / start) - 1.0
+        return total / float(n_days)
+
+    r1m_d = mean_daily_return(21)
+    r3m_d = mean_daily_return(63)
+    r12m_d = mean_daily_return(252)
+
+    if _enable_forecast():
+        if r1m_d is not None:
+            out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
+            out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
+        if r3m_d is not None:
+            out["expected_return_3m"] = float(r3m_d * 63.0 * 100.0)
+            out["expected_price_3m"] = float(last * (1.0 + (out["expected_return_3m"] / 100.0)))
+        if r12m_d is not None:
+            out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
+            out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
+        out["forecast_method"] = "finnhub_history_momentum_v1"
+    else:
+        out["forecast_method"] = "history_only"
+
+    pts = len(closes)
+    base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
+    vol = _to_float(out.get("volatility_30d"))
+    if vol is None:
+        conf = base * 0.75
+    else:
+        penalty = min(60.0, max(0.0, (vol / 100.0) * 35.0))
+        conf = max(0.0, min(100.0, base - penalty))
+    out["confidence_score"] = float(conf)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
-async def _get_json(path: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def _get_json(path: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     tok = _token()
     if not tok:
         return None, "not configured (FINNHUB_API_KEY)"
@@ -358,28 +568,27 @@ async def _get_json(path: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[st
     base = _base_url()
     url = f"{base}{path}"
 
-    q = dict(params)
+    q = dict(params or {})
     q["token"] = tok
 
     retries = _retry_attempts()
     client = await _get_client()
-
     last_err: Optional[str] = None
+    base_delay = _retry_delay_sec()
+    hdrs = _endpoint_headers(kind)
 
     for attempt in range(retries):
         try:
-            r = await client.get(url, params=q)
+            r = await client.get(url, params=q, headers=hdrs if hdrs else None)
 
-            # Retry on rate-limit / transient server errors
             if r.status_code == 429 or 500 <= r.status_code < 600:
                 last_err = f"HTTP {r.status_code}"
                 if attempt < (retries - 1):
-                    await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.25)
+                    await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
                     continue
                 return None, last_err
 
             if r.status_code != 200:
-                # best-effort message
                 msg = ""
                 try:
                     js2 = r.json()
@@ -402,7 +611,7 @@ async def _get_json(path: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[st
         except Exception as e:
             last_err = f"{e.__class__.__name__}: {e}"
             if attempt < (retries - 1):
-                await asyncio.sleep(0.25 * (2**attempt) + random.random() * 0.25)
+                await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
                 continue
             return None, last_err
 
@@ -413,11 +622,7 @@ async def _get_json(path: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[st
 # Finnhub calls
 # ---------------------------------------------------------------------------
 async def _fetch_quote_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Finnhub quote endpoint:
-      c=current, d=change, dp=percent change, h=high, l=low, o=open, pc=prev close
-    """
-    js, err = await _get_json("/quote", {"symbol": symbol})
+    js, err = await _get_json("/quote", {"symbol": symbol}, kind="quote")
     if js is None:
         return {}, err
 
@@ -443,7 +648,7 @@ async def _fetch_quote_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]
 
 
 async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    js, err = await _get_json("/stock/profile2", {"symbol": symbol})
+    js, err = await _get_json("/stock/profile2", {"symbol": symbol}, kind="profile")
     if js is None:
         return {}, err
 
@@ -455,11 +660,70 @@ async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
         "sub_sector": (js.get("gsubind") or "") or "",
         "listing_date": (js.get("ipo") or "") or "",
     }
+    return _clean_patch(patch), None
+
+
+async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    if not _enable_history():
+        return {}, None
+
+    # Finnhub candle needs: resolution + from + to (unix seconds)
+    days = _history_days()
+    now = datetime.now(timezone.utc)
+    frm = now - timedelta(days=days)
+    to_ts = int(now.timestamp())
+    from_ts = int(frm.timestamp())
+
+    js, err = await _get_json(
+        "/stock/candle",
+        {"symbol": symbol, "resolution": "D", "from": from_ts, "to": to_ts},
+        kind="history",
+    )
+    if js is None:
+        return {}, err
+
+    # Expected shape: {c:[...], h:[...], l:[...], o:[...], s:"ok", t:[...], v:[...]}
+    if str(js.get("s") or "").lower() != "ok":
+        return {}, f"history status not ok ({js.get('s')})"
+
+    closes_raw = js.get("c")
+    times_raw = js.get("t")
+
+    if not isinstance(closes_raw, list) or not closes_raw:
+        return {}, "history empty"
+    closes: List[float] = []
+    for x in closes_raw:
+        f = _to_float(x)
+        if f is not None:
+            closes.append(float(f))
+
+    closes = closes[-_history_points_max():]
+    if len(closes) < 25:
+        return {}, "history too short"
+
+    analytics = _compute_history_analytics(closes)
+
+    last_ts: Optional[int] = None
+    if isinstance(times_raw, list) and times_raw:
+        try:
+            last_ts = int(times_raw[-1])
+        except Exception:
+            last_ts = None
+
+    patch: Dict[str, Any] = {
+        "history_points": len(closes),
+        "history_last_ts": last_ts or 0,
+        "forecast_source": "finnhub_candle",
+    }
+    patch.update(analytics)
 
     return _clean_patch(patch), None
 
 
-async def _fetch(symbol_raw: str, want_profile: bool = True) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Main fetch
+# ---------------------------------------------------------------------------
+async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> Dict[str, Any]:
     sym_in = (symbol_raw or "").strip()
     if not sym_in:
         return {"error": f"{PROVIDER_NAME}: empty symbol"}
@@ -472,57 +736,93 @@ async def _fetch(symbol_raw: str, want_profile: bool = True) -> Dict[str, Any]:
     if _is_yahoo_special(sym_in):
         return {"error": f"{PROVIDER_NAME}: symbol format not supported"}
 
-    # Token required
     if not _token():
         return {"error": f"{PROVIDER_NAME}: not configured (FINNHUB_API_KEY)"}
 
     sym = _normalize_symbol(sym_in)
 
-    ck = f"finnhub::{('enriched' if want_profile else 'quote')}::{sym}"
-    hit = _CACHE.get(ck)
-    if isinstance(hit, dict) and hit:
-        return dict(hit)
+    warns: List[str] = []
 
     # Quote required
-    q_patch, q_err = await _fetch_quote_patch(sym)
+    ckq = f"q::{sym}"
+    hitq = _Q_CACHE.get(ckq)
+    if isinstance(hitq, dict) and hitq:
+        q_patch = dict(hitq)
+        q_err = None
+    else:
+        q_patch, q_err = await _fetch_quote_patch(sym)
+        if q_patch:
+            _Q_CACHE[ckq] = dict(q_patch)
+
     if not q_patch or _to_float(q_patch.get("current_price")) is None:
-        out = {"error": f"{PROVIDER_NAME}: quote failed ({q_err or 'empty'})"}
-        _CACHE[ck] = dict(out)
-        return out
+        return {"error": f"{PROVIDER_NAME}: quote failed ({q_err or 'empty'})"}
 
     out: Dict[str, Any] = dict(q_patch)
     _fill_derived(out)
 
-    # Optional profile enrichment (never fails quote)
+    # Optional profile
     if want_profile and _enable_profile():
-        p_patch, _ = await _fetch_profile_patch(sym)
-        # fill blanks only
-        for k, v in p_patch.items():
-            if not out.get(k) and v is not None:
-                out[k] = v
+        ckp = f"p::{sym}"
+        hitp = _P_CACHE.get(ckp)
+        if isinstance(hitp, dict) and hitp:
+            p_patch = dict(hitp)
+            p_err = None
+        else:
+            p_patch, p_err = await _fetch_profile_patch(sym)
+            if p_patch:
+                _P_CACHE[ckp] = dict(p_patch)
+
+        if p_err:
+            warns.append(f"profile: {p_err}")
+        else:
+            for k, v in p_patch.items():
+                if not out.get(k) and v is not None:
+                    out[k] = v
+
+    # Optional history/forecast
+    if want_history and _enable_history():
+        ckh = f"h::{sym}::{_history_days()}"
+        hith = _H_CACHE.get(ckh)
+        if isinstance(hith, dict) and hith:
+            h_patch = dict(hith)
+            h_err = None
+        else:
+            h_patch, h_err = await _fetch_history_patch(sym)
+            if h_patch:
+                _H_CACHE[ckh] = dict(h_patch)
+
+        if h_err:
+            warns.append(f"history: {h_err}")
+        else:
+            for k, v in h_patch.items():
+                if k not in out and v is not None:
+                    out[k] = v
 
     out["data_source"] = PROVIDER_NAME
     out["provider_version"] = PROVIDER_VERSION
     out["last_updated_utc"] = _utc_iso()
 
-    out = _clean_patch(out)
-    _CACHE[ck] = dict(out)
-    return out
+    if warns and _verbose_warn():
+        out["_warn"] = " | ".join([w for w in warns if w])
+
+    return _clean_patch(out)
 
 
 # ---------------------------------------------------------------------------
 # Engine discovery callables (return Dict patch, no tuples)
 # ---------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_profile=False)
+    # fast: quote only
+    return await _fetch(symbol, want_profile=False, want_history=False)
 
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_profile=True)
+    # enriched: quote + profile + history/forecast (best-effort)
+    return await _fetch(symbol, want_profile=True, want_history=True)
 
 
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _fetch(symbol, want_profile=True)
+    return await fetch_enriched_quote_patch(symbol)
 
 
 __all__ = [
