@@ -2,10 +2,10 @@
 """
 core/providers/tadawul_provider.py
 ===============================================================
-Tadawul Provider / Client (KSA quote + fundamentals) — v1.11.0
+Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v1.12.0
 PROD SAFE + Async + ENGINE-ALIGNED (PATCH DICT RETURNS)
 
-What this revision guarantees
+What this revision guarantees (v1.12.0)
 - ✅ Engine-aligned exports (ALL return Dict[str, Any] — NO tuples):
     fetch_quote_patch
     fetch_enriched_quote_patch
@@ -17,25 +17,43 @@ What this revision guarantees
     - For KSA symbols: returns {"error": "warning: ..."} (no crash, allows engine fallback)
 - ✅ Defensive parsing + bounded deep-find
 - ✅ Retry/backoff on 429 + transient 5xx
-- ✅ TTL cache for quote + fundamentals (env-configurable)
-- ✅ Avoids misleading values: only sets fields we can parse
+- ✅ TTL cache for quote + fundamentals + history (env-configurable)
+- ✅ Adds OPTIONAL history + derived analytics:
+    - returns_1w/1m/3m/6m/12m
+    - ma20/ma50/ma200
+    - volatility_30d (annualized %, computed from last ~30 trading days)
+    - rsi_14 (computed)
+    - expected_return_1m/3m/12m + expected_price_1m/3m/12m (simple momentum estimate)
+    - confidence_score + forecast_method + history_points/source/last_utc
 
 Supported env vars (optional)
 - TADAWUL_MARKET_ENABLED          true/false (default true)
+
+Quote/Fundamentals endpoints (required if you want Tadawul data):
 - TADAWUL_QUOTE_URL               template with {symbol} and/or {code}
 - TADAWUL_FUNDAMENTALS_URL        template with {symbol} and/or {code}
   (also accepts TADAWUL_PROFILE_URL as fallback for fundamentals URL)
+
+Optional history endpoint (for returns/MAs/forecast):
+- TADAWUL_HISTORY_URL             template with {symbol}/{code} and optional {days}
+  (also accepts TADAWUL_CANDLES_URL)
+
+Optional headers and HTTP tuning:
 - TADAWUL_HEADERS_JSON            JSON dict of headers (optional)
 - TADAWUL_TIMEOUT_SEC             default falls back to HTTP_TIMEOUT then 25
 - TADAWUL_RETRY_ATTEMPTS          default 3 (min 1)
+- TADAWUL_RETRY_DELAY_SEC         default 0.35
+
+Cache tuning:
 - TADAWUL_REFRESH_INTERVAL        used as quote cache TTL if > 0 (seconds)
 - TADAWUL_QUOTE_TTL_SEC           explicit quote TTL override
 - TADAWUL_FUND_TTL_SEC            fundamentals TTL (default 6 hours)
+- TADAWUL_HISTORY_TTL_SEC         history TTL (default 20 minutes)
+- TADAWUL_HISTORY_POINTS_MAX      default 400 (cap stored points for safety)
 
-Also reads (if present)
-- HTTP_TIMEOUT                    (Render env list)
-- HTTP_TIMEOUT_SEC                (legacy)
-- MAX_RETRIES / RETRY_DELAY       (tolerated)
+History/forecast feature toggles:
+- TADAWUL_ENABLE_HISTORY          true/false (default true)
+- TADAWUL_ENABLE_FORECAST         true/false (default true)
 
 Notes
 - This provider expects you to supply your own Tadawul endpoints via env URLs.
@@ -60,7 +78,7 @@ import httpx
 logger = logging.getLogger("core.providers.tadawul_provider")
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "1.11.0"
+PROVIDER_VERSION = "1.12.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -182,9 +200,32 @@ def _fund_ttl_sec() -> float:
     return 21600.0  # 6 hours
 
 
+def _history_ttl_sec() -> float:
+    ttl = _env_float("TADAWUL_HISTORY_TTL_SEC", 0.0)
+    if ttl > 0:
+        return max(60.0, ttl)
+    return 1200.0  # 20 minutes
+
+
+def _history_points_max() -> int:
+    n = _env_int("TADAWUL_HISTORY_POINTS_MAX", 0)
+    return max(100, n) if n > 0 else 400
+
+
 def _enabled() -> bool:
-    # default enabled
     return _env_bool("TADAWUL_MARKET_ENABLED", True)
+
+
+def _history_enabled() -> bool:
+    return _env_bool("TADAWUL_ENABLE_HISTORY", True)
+
+
+def _forecast_enabled() -> bool:
+    return _env_bool("TADAWUL_ENABLE_FORECAST", True)
+
+
+def _origin_key() -> str:
+    return _env_str("TADAWUL_ORIGIN_KEY", "KSA_TADAWUL").strip() or "KSA_TADAWUL"
 
 
 # -----------------------------------------------------------------------------
@@ -220,9 +261,12 @@ def _normalize_ksa_symbol(symbol: str) -> str:
     return ""  # STRICT (prevents GLOBAL tickers)
 
 
-def _format_url(template: str, symbol: str) -> str:
+def _format_url(template: str, symbol: str, *, days: Optional[int] = None) -> str:
     code = _ksa_code(symbol)
-    return (template or "").replace("{code}", code).replace("{symbol}", symbol)
+    u = (template or "").replace("{code}", code).replace("{symbol}", symbol)
+    if days is not None:
+        u = u.replace("{days}", str(int(days)))
+    return u
 
 
 # -----------------------------------------------------------------------------
@@ -280,7 +324,10 @@ def _pct_if_fraction(x: Any) -> Optional[float]:
     v = _safe_float(x)
     if v is None:
         return None
-    return v * 100.0 if abs(v) <= 1.0 else v
+    # If input is a fraction (0.0123) convert to %
+    if abs(v) <= 1.0:
+        return v * 100.0
+    return v
 
 
 def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -440,6 +487,292 @@ except Exception:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
+# History extraction + analytics (defensive)
+# -----------------------------------------------------------------------------
+def _safe_dt(x: Any) -> Optional[datetime]:
+    """
+    Best-effort timestamp parser:
+    - epoch seconds/ms
+    - ISO strings
+    """
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            v = float(x)
+            if v > 10_000_000_000:  # ms
+                v = v / 1000.0
+            if v > 0:
+                return datetime.fromtimestamp(v, tz=timezone.utc)
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        # tolerate trailing Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # some APIs: "2026-01-06"
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _find_first_list_of_dicts(obj: Any, *, required_keys: Sequence[str], max_depth: int = 7, max_nodes: int = 5000) -> Optional[List[Dict[str, Any]]]:
+    if obj is None:
+        return None
+
+    req = {str(k).strip().lower() for k in required_keys if k}
+    if not req:
+        return None
+
+    q: List[Tuple[Any, int]] = [(obj, 0)]
+    seen: set[int] = set()
+    nodes = 0
+
+    while q:
+        x, d = q.pop(0)
+        if x is None:
+            continue
+
+        xid = id(x)
+        if xid in seen:
+            continue
+        seen.add(xid)
+
+        nodes += 1
+        if nodes > max_nodes:
+            return None
+        if d > max_depth:
+            continue
+
+        if isinstance(x, list) and x:
+            if isinstance(x[0], dict):
+                # check if any required key exists
+                keys0 = {str(k).strip().lower() for k in x[0].keys()}
+                if keys0.intersection(req):
+                    # ensure all are dict
+                    out = [it for it in x if isinstance(it, dict)]
+                    return out if out else None
+            for it in x:
+                q.append((it, d + 1))
+            continue
+
+        if isinstance(x, dict):
+            for v in x.values():
+                q.append((v, d + 1))
+            continue
+
+    return None
+
+
+def _extract_close_series(history_json: Any, *, max_points: int) -> Tuple[List[float], Optional[str]]:
+    """
+    Returns (closes_sorted, last_dt_iso_or_none)
+    """
+    try:
+        # Find first list-of-dicts that looks like candles/prices
+        items = _find_first_list_of_dicts(
+            history_json,
+            required_keys=("close", "c", "price", "last", "tradingPrice", "value"),
+        )
+        if not items:
+            return [], None
+
+        rows: List[Tuple[Optional[datetime], float]] = []
+        last_dt: Optional[datetime] = None
+
+        for it in items:
+            close = (
+                _safe_float(it.get("close"))
+                or _safe_float(it.get("c"))
+                or _safe_float(it.get("price"))
+                or _safe_float(it.get("last"))
+                or _safe_float(it.get("tradingPrice"))
+                or _safe_float(it.get("value"))
+            )
+            if close is None:
+                continue
+
+            dt = (
+                _safe_dt(it.get("date"))
+                or _safe_dt(it.get("datetime"))
+                or _safe_dt(it.get("time"))
+                or _safe_dt(it.get("timestamp"))
+                or _safe_dt(it.get("t"))
+            )
+
+            if dt and (last_dt is None or dt > last_dt):
+                last_dt = dt
+
+            rows.append((dt, float(close)))
+
+        if not rows:
+            return [], None
+
+        # Sort if we have timestamps; otherwise keep order
+        have_dt = any(dt is not None for dt, _ in rows)
+        if have_dt:
+            rows = sorted(rows, key=lambda x: (x[0] or datetime(1970, 1, 1, tzinfo=timezone.utc)))
+
+        closes = [c for _, c in rows][-max_points:]
+        last_iso = (last_dt.isoformat() if last_dt else None)
+        return closes, last_iso
+    except Exception:
+        return [], None
+
+
+def _return_pct(last: float, prior: float) -> Optional[float]:
+    try:
+        if prior == 0:
+            return None
+        return (last / prior - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _stddev(xs: List[float]) -> Optional[float]:
+    try:
+        n = len(xs)
+        if n < 2:
+            return None
+        mu = sum(xs) / n
+        var = sum((x - mu) ** 2 for x in xs) / (n - 1)
+        return math.sqrt(var)
+    except Exception:
+        return None
+
+
+def _compute_rsi_14(closes: List[float]) -> Optional[float]:
+    try:
+        if len(closes) < 15:
+            return None
+        gains: List[float] = []
+        losses: List[float] = []
+        for i in range(-14, 0):
+            d = closes[i] - closes[i - 1]
+            if d >= 0:
+                gains.append(d)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(-d)
+        avg_gain = sum(gains) / 14.0
+        avg_loss = sum(losses) / 14.0
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        if math.isnan(rsi) or math.isinf(rsi):
+            return None
+        return float(max(0.0, min(100.0, rsi)))
+    except Exception:
+        return None
+
+
+def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
+    """
+    Produces:
+    - returns_1w/1m/3m/6m/12m
+    - ma20/ma50/ma200
+    - volatility_30d (annualized %, from last ~30 trading days)
+    - rsi_14
+    - expected_return_1m/3m/12m + expected_price_1m/3m/12m (simple momentum)
+    - confidence_score + forecast_method
+    """
+    out: Dict[str, Any] = {}
+    if not closes:
+        return out
+
+    last = closes[-1]
+
+    # trading-day approximations
+    idx = {
+        "returns_1w": 5,
+        "returns_1m": 21,
+        "returns_3m": 63,
+        "returns_6m": 126,
+        "returns_12m": 252,
+    }
+
+    for k, n in idx.items():
+        if len(closes) > n:
+            prior = closes[-(n + 1)]
+            out[k] = _return_pct(last, prior)
+
+    # moving averages
+    def ma(n: int) -> Optional[float]:
+        if len(closes) < n:
+            return None
+        xs = closes[-n:]
+        return sum(xs) / float(n)
+
+    out["ma20"] = ma(20)
+    out["ma50"] = ma(50)
+    out["ma200"] = ma(200)
+
+    # volatility (use last ~30 trading days returns, annualized)
+    if len(closes) >= 31:
+        rets: List[float] = []
+        window = closes[-31:]
+        for i in range(1, len(window)):
+            p0 = window[i - 1]
+            p1 = window[i]
+            if p0 != 0:
+                rets.append((p1 / p0) - 1.0)
+        sd = _stddev(rets)
+        if sd is not None:
+            out["volatility_30d"] = float(sd * math.sqrt(252.0) * 100.0)
+
+    # RSI 14
+    out["rsi_14"] = _compute_rsi_14(closes)
+
+    # Simple forecast (momentum-style) — optional at caller
+    # Use mean daily return over horizons and scale:
+    def mean_daily_return(n_days: int) -> Optional[float]:
+        if len(closes) < (n_days + 2):
+            return None
+        # use last n_days returns
+        start = closes[-(n_days + 1)]
+        if start == 0:
+            return None
+        total = (last / start) - 1.0
+        return total / float(n_days)
+
+    r1m_d = mean_daily_return(21)
+    r3m_d = mean_daily_return(63)
+    r12m_d = mean_daily_return(252)
+
+    # expected returns (%)
+    if r1m_d is not None:
+        out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
+        out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
+    if r3m_d is not None:
+        out["expected_return_3m"] = float(r3m_d * 63.0 * 100.0)
+        out["expected_price_3m"] = float(last * (1.0 + (out["expected_return_3m"] / 100.0)))
+    if r12m_d is not None:
+        out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
+        out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
+
+    # Confidence score (0..100): more points + lower volatility => higher confidence
+    pts = len(closes)
+    base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
+    vol = _safe_float(out.get("volatility_30d"))
+    if vol is None:
+        conf = base * 0.75
+    else:
+        # penalize very high vol
+        penalty = min(60.0, max(0.0, (vol / 100.0) * 35.0))
+        conf = max(0.0, min(100.0, base - penalty))
+
+    out["confidence_score"] = float(conf)
+    out["forecast_method"] = "tadawul_history_momentum_v1"
+
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Tadawul client
 # -----------------------------------------------------------------------------
 class TadawulClient:
@@ -451,16 +784,15 @@ class TadawulClient:
       price_change, percent_change,
       name/sector/industry/sub_sector/listing_date,
       market_cap/shares_outstanding/free_float/...,
-      week_52_high/week_52_low, ma20/ma50, avg_volume_30d, etc.
-
-    Failure patches:
-      {"error": "..."}   (never raises)
+      week_52_high/week_52_low, ma20/ma50/ma200, avg_volume_30d,
+      plus optional history-derived analytics (returns/MAs/volatility/RSI/forecast).
     """
 
     def __init__(
         self,
         quote_url: Optional[str] = None,
         fundamentals_url: Optional[str] = None,
+        history_url: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout_sec: Optional[float] = None,
         retry_attempts: Optional[int] = None,
@@ -470,6 +802,11 @@ class TadawulClient:
             fundamentals_url
             or _env_str("TADAWUL_FUNDAMENTALS_URL", "")
             or _env_str("TADAWUL_PROFILE_URL", "")
+        )
+        self.history_url = _safe_str(
+            history_url
+            or _env_str("TADAWUL_HISTORY_URL", "")
+            or _env_str("TADAWUL_CANDLES_URL", "")
         )
 
         self.timeout_sec = float(timeout_sec) if (timeout_sec and timeout_sec > 0) else _timeout_sec()
@@ -507,12 +844,14 @@ class TadawulClient:
 
         self._quote_cache: TTLCache = TTLCache(maxsize=5000, ttl=_quote_ttl_sec())
         self._fund_cache: TTLCache = TTLCache(maxsize=3000, ttl=_fund_ttl_sec())
+        self._hist_cache: TTLCache = TTLCache(maxsize=2000, ttl=_history_ttl_sec())
 
         logger.info(
-            "Tadawul client init v%s | quote_url_set=%s | fund_url_set=%s | timeout=%.1fs | retries=%s | cachetools=%s",
+            "Tadawul client init v%s | quote_url_set=%s | fund_url_set=%s | hist_url_set=%s | timeout=%.1fs | retries=%s | cachetools=%s",
             PROVIDER_VERSION,
             bool(self.quote_url),
             bool(self.fundamentals_url),
+            bool(self.history_url),
             self.timeout_sec,
             self.retry_attempts,
             _HAS_CACHETOOLS,
@@ -546,7 +885,6 @@ class TadawulClient:
                 if sc >= 400:
                     return None, f"HTTP {sc}"
 
-                # Prefer json() but tolerate JSON-in-text
                 try:
                     js = r.json()
                     return js, None
@@ -572,7 +910,6 @@ class TadawulClient:
     # Quote
     # -------------------------------------------------------------------------
     async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
-        # Strict KSA-only (silent for non-KSA)
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
             return {}
@@ -598,7 +935,6 @@ class TadawulClient:
 
         root = _coerce_dict(data)
 
-        # Quote fields (best-effort)
         price = _pick_num(
             root,
             "price",
@@ -629,8 +965,13 @@ class TadawulClient:
             return {"error": f"warning: tadawul quote missing price ({dt_ms}ms)"}
 
         patch: Dict[str, Any] = {
+            # identity hints (help schemas/mappers)
             "symbol": sym,
+            "market": "KSA",
+            "origin": _origin_key(),
             "currency": currency,
+
+            # quote
             "name": name or "",
             "current_price": price,
             "previous_close": prev,
@@ -641,6 +982,8 @@ class TadawulClient:
             "value_traded": val_traded,
             "price_change": chg,
             "percent_change": chg_p,
+
+            # meta
             "data_source": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "last_updated_utc": _utc_iso(),
@@ -656,7 +999,6 @@ class TadawulClient:
     # Fundamentals
     # -------------------------------------------------------------------------
     async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
-        # Strict KSA-only (silent for non-KSA)
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
             return {}
@@ -735,9 +1077,6 @@ class TadawulClient:
         net_income_growth = _pick_pct(root, "net_income_growth", "netIncomeGrowth", "NetIncomeGrowth")
 
         beta = _pick_num(root, "beta", "Beta")
-        debt_to_equity = _pick_num(root, "debt_to_equity", "debtToEquity", "DebtToEquity")
-        current_ratio = _pick_num(root, "current_ratio", "currentRatio", "CurrentRatio")
-        quick_ratio = _pick_num(root, "quick_ratio", "quickRatio", "QuickRatio")
 
         # Technicals (best-effort)
         wk_hi = _pick_num(root, "week_52_high", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh", "high_52w")
@@ -748,18 +1087,23 @@ class TadawulClient:
 
         patch: Dict[str, Any] = {
             "symbol": sym,
+            "market": "KSA",
+            "origin": _origin_key(),
             "currency": "SAR",
+
             "name": name or "",
             "sector": sector or "",
             "industry": industry or "",
             "sub_sector": sub_sector or "",
             "listing_date": listing_date or "",
+
             "market_cap": market_cap,
             "shares_outstanding": shares_out,
             "free_float": free_float_pct,
             "free_float_market_cap": (market_cap * (free_float_pct / 100.0))
             if (market_cap is not None and free_float_pct is not None)
             else None,
+
             "eps_ttm": eps_ttm,
             "forward_eps": forward_eps,
             "pe_ttm": pe_ttm,
@@ -767,9 +1111,11 @@ class TadawulClient:
             "pb": pb,
             "ps": ps,
             "ev_ebitda": ev_ebitda,
+
             "dividend_yield": dividend_yield,
             "dividend_rate": dividend_rate,
             "payout_ratio": payout_ratio,
+
             "roe": roe,
             "roa": roa,
             "net_margin": net_margin,
@@ -777,20 +1123,18 @@ class TadawulClient:
             "revenue_growth": revenue_growth,
             "net_income_growth": net_income_growth,
             "beta": beta,
-            "debt_to_equity": debt_to_equity,
-            "current_ratio": current_ratio,
-            "quick_ratio": quick_ratio,
+
             "week_52_high": wk_hi,
             "week_52_low": wk_lo,
             "ma20": ma20,
             "ma50": ma50,
             "avg_volume_30d": avg_vol_30d,
+
             "data_source": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "last_updated_utc": _utc_iso(),
         }
 
-        # keep only meaningful fundamentals
         useful = bool((patch.get("name") or "").strip()) or (_safe_float(patch.get("market_cap")) is not None) or (
             _safe_float(patch.get("shares_outstanding")) is not None
         )
@@ -804,15 +1148,75 @@ class TadawulClient:
         return patch
 
     # -------------------------------------------------------------------------
-    # Combined (fundamentals + quote)
+    # History (optional): returns/MAs/vol/RSI/forecast inputs
     # -------------------------------------------------------------------------
-    async def fetch_quote_and_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
-        # Strict KSA-only (silent for non-KSA)
+    async def fetch_history_patch(self, symbol: str, *, days: int = 400) -> Dict[str, Any]:
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
             return {}
 
-        # Run in parallel
+        if not _enabled():
+            return {"error": "warning: tadawul disabled (TADAWUL_MARKET_ENABLED=false)"}
+
+        if not _history_enabled():
+            return {"error": "warning: tadawul history disabled (TADAWUL_ENABLE_HISTORY=false)"}
+
+        if not self.history_url:
+            return {"error": "warning: tadawul history not configured (TADAWUL_HISTORY_URL)"}
+
+        # cache key includes days bucket
+        days_i = max(30, int(days))
+        ck = f"hist::{sym}::{days_i}"
+        hit = self._hist_cache.get(ck)
+        if isinstance(hit, dict) and hit:
+            return dict(hit)
+
+        url = _format_url(self.history_url, sym, days=days_i)
+        data, err = await self._get_json(url)
+        if not data:
+            return {"error": f"warning: tadawul history empty ({err or 'no data'})"}
+
+        closes, last_iso = _extract_close_series(data, max_points=_history_points_max())
+        if not closes:
+            return {"error": "warning: tadawul history parsed but no close series found"}
+
+        analytics = _compute_history_analytics(closes)
+        patch: Dict[str, Any] = {
+            "symbol": sym,
+            "market": "KSA",
+            "origin": _origin_key(),
+
+            # history meta (kept lightweight)
+            "history_points": len(closes),
+            "history_source": "tadawul_history",
+            "history_last_utc": last_iso or _utc_iso(),
+        }
+        patch.update(analytics)
+
+        # Respect forecast toggle (history always ok, but forecast fields optional)
+        if not _forecast_enabled():
+            patch.pop("expected_return_1m", None)
+            patch.pop("expected_return_3m", None)
+            patch.pop("expected_return_12m", None)
+            patch.pop("expected_price_1m", None)
+            patch.pop("expected_price_3m", None)
+            patch.pop("expected_price_12m", None)
+            # confidence still useful for history quality
+            patch["forecast_method"] = "history_only"
+
+        patch = _clean_patch(patch)
+        self._hist_cache[ck] = dict(patch)
+        return patch
+
+    # -------------------------------------------------------------------------
+    # Combined (fundamentals + quote + optional history)
+    # -------------------------------------------------------------------------
+    async def fetch_quote_and_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
+        sym = _normalize_ksa_symbol(symbol)
+        if not sym:
+            return {}
+
+        # Run quote + fundamentals in parallel
         f_task = self.fetch_fundamentals_patch(sym)
         q_task = self.fetch_quote_patch(sym)
         f, q = await asyncio.gather(f_task, q_task)
@@ -820,26 +1224,22 @@ class TadawulClient:
         out: Dict[str, Any] = {}
         warns: List[str] = []
 
-        # Merge fundamentals first
         if isinstance(f, dict) and f:
             if "error" in f and isinstance(f.get("error"), str) and f.get("error"):
                 warns.append(str(f.get("error")))
             else:
                 out.update({k: v for k, v in f.items() if k != "error"})
 
-        # Merge quote second (overwrites quote fields)
         if isinstance(q, dict) and q:
             if "error" in q and isinstance(q.get("error"), str) and q.get("error"):
                 warns.append(str(q.get("error")))
             else:
                 out.update({k: v for k, v in q.items() if k != "error"})
 
-        # If we got nothing useful, return a single error (never raise)
         if not out:
             joined = " | ".join([w for w in warns if w])
             return {"error": joined or "warning: tadawul unavailable"}
 
-        # Attach non-fatal warnings as _warn (keeps engine fallback safe)
         if warns:
             out["_warn"] = " | ".join([w for w in warns if w])
 
@@ -849,6 +1249,34 @@ class TadawulClient:
         out["last_updated_utc"] = _utc_iso()
 
         return _clean_patch(out)
+
+    async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        sym = _normalize_ksa_symbol(symbol)
+        if not sym:
+            return {}
+
+        base = await self.fetch_quote_and_fundamentals_patch(sym)
+
+        # If base is just an error, return it (engine fallback safe)
+        if base and "error" in base and len(base.keys()) == 1:
+            return base
+
+        # Optional history patch (safe, non-fatal)
+        if _history_enabled() and self.history_url:
+            h = await self.fetch_history_patch(sym, days=400)
+            if isinstance(h, dict) and h:
+                if "error" in h and isinstance(h.get("error"), str) and h.get("error"):
+                    base["_warn"] = (base.get("_warn", "") + " | " + str(h.get("error"))).strip(" |")
+                else:
+                    base.update({k: v for k, v in h.items() if k != "error"})
+
+        # Ensure derived fields and meta
+        _fill_derived(base)
+        base["data_source"] = PROVIDER_NAME
+        base["provider_version"] = PROVIDER_VERSION
+        base["last_updated_utc"] = _utc_iso()
+
+        return _clean_patch(base)
 
 
 # -----------------------------------------------------------------------------
@@ -883,20 +1311,19 @@ async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str,
     return await c.fetch_quote_patch(symbol)
 
 
+async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    c = await get_tadawul_client()
+    return await c.fetch_fundamentals_patch(symbol)
+
+
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     c = await get_tadawul_client()
-    return await c.fetch_quote_and_fundamentals_patch(symbol)
+    return await c.fetch_enriched_quote_patch(symbol)
 
 
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     c = await get_tadawul_client()
-    return await c.fetch_quote_and_fundamentals_patch(symbol)
-
-
-# Backwards-compatible aliases (older code may call these)
-async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    c = await get_tadawul_client()
-    return await c.fetch_fundamentals_patch(symbol)
+    return await c.fetch_enriched_quote_patch(symbol)
 
 
 async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
