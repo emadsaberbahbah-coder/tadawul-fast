@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# scripts/run_market_scan.py
+# scripts/run_market_scan.py  (FULL REPLACEMENT)
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER (v1.2.1) – Sheets-ready
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.3.0) – Sheets-ready
 ===========================================================
 
 What this script does
-- Reads symbols from one or more dashboard pages via symbols_reader.PAGE_REGISTRY (or symbols_reader helpers)
+- Reads symbols from one or more dashboard pages via symbols_reader.get_page_symbols()
 - Calls backend AI Analysis endpoint in chunks:
       POST /v1/analysis/quotes   { tickers:[...], symbols:[...] }
 - Produces a ranked "opportunities" table
@@ -18,12 +18,15 @@ Defaults (safe)
 - Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
 - Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
 
-Key upgrades (v1.2.1)
-- ✅ Always sends BOTH tickers and symbols to backend (compat across routers)
-- ✅ More robust sheet writer selection: write_grid_chunked / write_grid / update_values fallback
-- ✅ Smart-clear is truly optional (respects --smart-clear flag)
-- ✅ Handles backend returning empty body / non-JSON gracefully
+Key upgrades (v1.3.0)
+- ✅ Symbols-sheet ID selection:
+    * new --symbols-sheet-id (read symbols from a specific spreadsheet)
+    * default: uses --sheet-id if provided, else DEFAULT_SPREADSHEET_ID (env/settings)
+- ✅ Calls symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not)
+- ✅ Origin map uses normalized symbols (more stable)
+- ✅ Percent normalization: change %, dividend yield %, ROE/ROA %, upside % (handles 0..1 fractions)
 - ✅ Never crashes on one bad batch; inserts per-symbol error rows for traceability
+- ✅ More defensive backend shape parsing + last-updated field fallbacks
 
 Usage examples
   python scripts/run_market_scan.py
@@ -58,7 +61,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.0"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
@@ -141,11 +144,17 @@ def _get_tokens() -> Tuple[str, str]:
 
 
 def _get_default_spreadsheet_id() -> str:
+    # env.py preferred
     if settings is not None:
         sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip()
         if sid:
             return sid
-    return (os.getenv("DEFAULT_SPREADSHEET_ID", "") or "").strip()
+    # env fallbacks
+    for k in ("DEFAULT_SPREADSHEET_ID", "TFB_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"):
+        v = (os.getenv(k, "") or "").strip()
+        if v:
+            return v
+    return ""
 
 
 def _safe_int(x: Any, default: int) -> int:
@@ -172,7 +181,6 @@ def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
         s = str(x).strip()
         if not s:
             continue
-        # allow comma-separated in one arg
         out.extend([p.strip() for p in s.split(",") if p.strip()])
 
     seen = set()
@@ -203,7 +211,7 @@ def _norm_symbol(s: str) -> str:
     x = x.replace(" ", "")
 
     # KSA numeric -> .SR
-    if x.isdigit() and 3 <= len(x) <= 5:
+    if x.isdigit() and 3 <= len(x) <= 6:
         return f"{x}.SR"
 
     if x.endswith(".SR") and x.replace(".SR", "").isdigit():
@@ -218,7 +226,7 @@ def _is_ksa(sym: str) -> bool:
         return False
     if s.endswith(".SR"):
         return True
-    return s.isdigit() and 3 <= len(s) <= 5
+    return s.isdigit() and 3 <= len(s) <= 6
 
 
 def _dedupe(items: Sequence[str]) -> List[str]:
@@ -346,7 +354,6 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                             parsed = json.loads(raw)
                             return parsed if isinstance(parsed, dict) else {"results": parsed}
                         except Exception:
-                            # Non-JSON body
                             return {"results": [], "error": f"Non-JSON response: {(raw or '')[:200]}"}
 
                     last_err = f"HTTP {status}"
@@ -359,7 +366,6 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                 last_body_preview = (raw or "")[:500]
                 last_err = f"HTTP {last_status}"
 
-                # If unauthorized and another token exists -> try next token
                 if last_status in (401, 403) and tok_idx < (len(tokens_to_try) - 1):
                     continue
             except Exception as e:
@@ -417,11 +423,22 @@ class SymbolBucket:
     meta: Dict[str, Any]
 
 
-def _symbols_reader_call(key: str) -> Any:
+def _symbols_reader_call(key: str, spreadsheet_id: Optional[str]) -> Any:
+    """
+    Prefer symbols_reader.get_page_symbols(key, spreadsheet_id=...).
+    Fall back safely if older signature.
+    """
     fn = getattr(symbols_reader, "get_page_symbols", None)
     if callable(fn):
-        return fn(key)
+        # Try passing spreadsheet_id if supported
+        if spreadsheet_id:
+            try:
+                return fn(key, spreadsheet_id=spreadsheet_id)  # type: ignore
+            except TypeError:
+                return fn(key)  # type: ignore
+        return fn(key)  # type: ignore
 
+    # legacy names
     for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
         fn2 = getattr(symbols_reader, name, None)
         if callable(fn2):
@@ -430,9 +447,9 @@ def _symbols_reader_call(key: str) -> Any:
     raise RuntimeError("symbols_reader has no supported symbol function (expected get_page_symbols).")
 
 
-def _read_symbols_for_key(key: str) -> SymbolBucket:
+def _read_symbols_for_key(key: str, spreadsheet_id: Optional[str]) -> SymbolBucket:
     try:
-        data = _symbols_reader_call(key)
+        data = _symbols_reader_call(key, spreadsheet_id)
     except Exception as e:
         return SymbolBucket(key=key, symbols=[], meta={"shape": "error", "error": str(e), "count": 0})
 
@@ -448,11 +465,13 @@ def _read_symbols_for_key(key: str) -> SymbolBucket:
         all_syms = data.get("tickers") or data.get("symbols") or []
     syms = _dedupe([str(x) for x in (all_syms or [])])
 
+    meta_raw = data.get("meta") if isinstance(data.get("meta"), dict) else {}
     meta = {
         "shape": "dict",
         "count": len(syms),
         "ksa_count": len(data.get("ksa") or []) if isinstance(data.get("ksa"), list) else None,
         "global_count": len(data.get("global") or []) if isinstance(data.get("global"), list) else None,
+        "meta": meta_raw,
     }
     return SymbolBucket(key=key, symbols=syms, meta=meta)
 
@@ -470,9 +489,10 @@ def _call_analysis_batch(
     timeout: float,
     retries: int,
     batch_size: int,
+    endpoint: str,
 ) -> List[Dict[str, Any]]:
     base = _get_backend_base_url()
-    url = f"{base}/v1/analysis/quotes"
+    url = f"{base}{endpoint}"
 
     out: List[Dict[str, Any]] = []
     chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
@@ -543,7 +563,7 @@ DEFAULT_HEADERS: List[str] = [
     "Market Cap",
     "P/E (TTM)",
     "P/B",
-    "Dividend Yield %",   # expects percent-like; backend may return fraction
+    "Dividend Yield %",
     "ROE %",
     "ROA %",
 
@@ -566,56 +586,91 @@ DEFAULT_HEADERS: List[str] = [
 ]
 
 
-def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
-    def g(*keys: str) -> Any:
-        for k in keys:
-            if k in r:
-                return r.get(k)
-        return None
+def _as_percent(x: Any) -> Any:
+    """
+    Normalize percent-like fields.
+    - If value looks like a fraction (abs<=1) => multiply by 100
+    - If value already looks like percent (abs>1) => keep
+    """
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if v == 0.0:
+            return 0.0
+        if abs(v) <= 1.0:
+            return v * 100.0
+        return v
+    except Exception:
+        return x
 
+
+def _first_present(d: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    return None
+
+
+def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
     sources = r.get("sources")
     if isinstance(sources, list):
         sources_str = ", ".join([str(x) for x in sources if str(x).strip()])
     else:
         sources_str = str(sources or "")
 
-    sym = g("symbol", "ticker")
-    sym = _norm_symbol(str(sym or ""))
+    sym = _norm_symbol(str(_first_present(r, "symbol", "ticker") or ""))
+
+    price = _first_present(r, "price", "current_price")
+    change_pct = _first_present(r, "change_pct", "percent_change", "pct_change")
+    dividend_yield = _first_present(r, "dividend_yield", "div_yield", "dividendYield")
+    roe = _first_present(r, "roe", "return_on_equity")
+    roa = _first_present(r, "roa", "return_on_assets")
+    upside = _first_present(r, "upside_percent", "upside_pct", "upside")
+
+    last_updated = _first_present(
+        r,
+        "last_updated_utc",
+        "last_updated",
+        "updated_at",
+        "updatedAt",
+        "timestamp_utc",
+    )
 
     return [
         rank,
         sym,
         origins,
-        g("name"),
-        g("market_region", "market"),
-        g("currency"),
+        _first_present(r, "name"),
+        _first_present(r, "market_region", "market"),
+        _first_present(r, "currency"),
 
-        g("price", "current_price"),
-        g("change_pct", "percent_change"),
+        price,
+        _as_percent(change_pct),
 
-        g("market_cap"),
-        g("pe_ttm"),
-        g("pb"),
-        g("dividend_yield"),
-        g("roe"),
-        g("roa"),
+        _first_present(r, "market_cap", "marketCap"),
+        _first_present(r, "pe_ttm", "pe", "pe_ratio"),
+        _first_present(r, "pb", "pb_ratio"),
+        _as_percent(dividend_yield),
+        _as_percent(roe),
+        _as_percent(roa),
 
-        g("value_score"),
-        g("quality_score"),
-        g("momentum_score"),
-        g("risk_score"),
-        g("opportunity_score"),
-        g("overall_score"),
-        g("recommendation"),
+        _first_present(r, "value_score"),
+        _first_present(r, "quality_score"),
+        _first_present(r, "momentum_score"),
+        _first_present(r, "risk_score"),
+        _first_present(r, "opportunity_score"),
+        _first_present(r, "overall_score"),
+        _first_present(r, "recommendation"),
 
-        g("fair_value"),
-        g("upside_percent"),
-        g("valuation_label"),
+        _first_present(r, "fair_value", "fairValue"),
+        _as_percent(upside),
+        _first_present(r, "valuation_label", "valuation"),
 
-        g("data_quality"),
+        _first_present(r, "data_quality"),
         sources_str,
-        g("last_updated_utc"),
-        g("error"),
+        last_updated,
+        _first_present(r, "error"),
     ]
 
 
@@ -672,7 +727,7 @@ def _write_grid(
         try:
             sig = None
             try:
-                import inspect as _inspect  # local import to avoid unused if not needed
+                import inspect as _inspect  # local import
 
                 sig = _inspect.signature(fn)
             except Exception:
@@ -687,7 +742,6 @@ def _write_grid(
             except Exception:
                 return 0
         except Exception:
-            # continue to fallbacks
             pass
 
     # 2) write_grid(...)
@@ -702,10 +756,9 @@ def _write_grid(
         except Exception:
             pass
 
-    # 3) update_values / write_values pattern
+    # 3) update_values pattern
     fn3 = getattr(sheets_service, "update_values", None)
     if callable(fn3):
-        # many libs expect a range like "Sheet!A5"
         a1 = f"{sheet_name}!{start_cell}"
         updated = fn3(spreadsheet_id, a1, grid, value_input=vi)  # type: ignore
         try:
@@ -716,21 +769,20 @@ def _write_grid(
     raise RuntimeError("No supported grid writer found in google_sheets_service (expected write_grid_chunked/write_grid/update_values).")
 
 
-def _clear_range(
-    spreadsheet_id: str,
-    a1_range: str,
-) -> None:
+def _clear_range(spreadsheet_id: str, a1_range: str) -> None:
     if sheets_service is None:
         raise RuntimeError("google_sheets_service not available")
+
     fn = getattr(sheets_service, "clear_range", None)
     if callable(fn):
         fn(spreadsheet_id, a1_range)  # type: ignore
         return
-    # optional: try 'clear_values'
+
     fn2 = getattr(sheets_service, "clear_values", None)
     if callable(fn2):
         fn2(spreadsheet_id, a1_range)  # type: ignore
         return
+
     raise RuntimeError("No supported clear function found in google_sheets_service (expected clear_range/clear_values).")
 
 
@@ -744,21 +796,26 @@ def main() -> None:
     p.add_argument("--global-only", action="store_true", help="Keep only Global (non-.SR) symbols")
     p.add_argument("--max-symbols", type=int, default=0, help="Cap total symbols (0 = no cap)")
 
-    p.add_argument("--batch-size", type=int, default=200, help="Backend batch size for /v1/analysis/quotes")
+    # Backend
+    p.add_argument("--endpoint", default="/v1/analysis/quotes", help="Backend endpoint path (default: /v1/analysis/quotes)")
+    p.add_argument("--batch-size", type=int, default=80, help="Backend batch size for /v1/analysis/quotes (default: 80)")
     p.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout per batch")
     p.add_argument("--retries", type=int, default=2, help="HTTP retries per batch")
 
+    # Ranking/filter
     p.add_argument("--top", type=int, default=50, help="Keep top N results after ranking")
     p.add_argument("--min-quality", default="ANY", help="ANY | OK | PARTIAL | MISSING | ERROR")
     p.add_argument("--include-errors", action="store_true", help="Keep rows with error (default: filtered if quality too low)")
 
+    # Output files
     p.add_argument("--out-json", default="", help="Write results JSON to file path")
     p.add_argument("--out-csv", default="", help="Write results CSV to file path (basic)")
     p.add_argument("--dry-run", action="store_true", help="Run scan and ranking but do not write to sheet")
 
     # Sheets output
     p.add_argument("--no-sheet", action="store_true", help="Do not write to Google Sheets; print summary only")
-    p.add_argument("--sheet-id", default="", help="Spreadsheet ID (default from env DEFAULT_SPREADSHEET_ID)")
+    p.add_argument("--sheet-id", default="", help="Spreadsheet ID to WRITE to (default from env DEFAULT_SPREADSHEET_ID)")
+    p.add_argument("--symbols-sheet-id", default="", help="Spreadsheet ID to READ symbols from (default: uses --sheet-id if set, else DEFAULT_SPREADSHEET_ID)")
     p.add_argument("--sheet-name", default="Market_Scan", help="Target sheet/tab name (default: Market_Scan)")
     p.add_argument("--start-cell", default="A5", help="Top-left cell for headers (default: A5)")
     p.add_argument("--clear", action="store_true", help="Clear old values before writing")
@@ -776,12 +833,25 @@ def main() -> None:
         pass
 
     base_url = _get_backend_base_url()
-    logger.info("MarketScan v%s | backend=%s | ts=%s", SCRIPT_VERSION, base_url, _utc_now_iso())
+    endpoint = str(args.endpoint or "/v1/analysis/quotes").strip()
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+
+    logger.info("MarketScan v%s | backend=%s | endpoint=%s | ts=%s", SCRIPT_VERSION, base_url, endpoint, _utc_now_iso())
 
     # Keys
     keys = _parse_keys_list(args.keys)
     if not keys:
         keys = _default_keys()
+
+    # Determine spreadsheet IDs
+    write_sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
+
+    # Read-symbols sheet default:
+    # - if user passed --symbols-sheet-id => use it
+    # - else if user passed --sheet-id => read from same sheet
+    # - else use DEFAULT_SPREADSHEET_ID (env/settings)
+    symbols_sheet_id = (args.symbols_sheet_id or write_sheet_id or _get_default_spreadsheet_id() or "").strip() or None
 
     # Read symbols
     all_symbols: List[str] = []
@@ -789,10 +859,14 @@ def main() -> None:
     origin_map: Dict[str, List[str]] = {}
 
     for k in keys:
-        b = _read_symbols_for_key(k)
+        b = _read_symbols_for_key(k, symbols_sheet_id)
         per_key_meta[k] = b.meta
-        all_symbols.extend(b.symbols)
-        for s in b.symbols:
+
+        # normalize symbols for stable origin_map keys
+        syms_norm = _dedupe(b.symbols)
+        all_symbols.extend(syms_norm)
+
+        for s in syms_norm:
             origin_map.setdefault(s, [])
             if k not in origin_map[s]:
                 origin_map[s].append(k)
@@ -815,7 +889,7 @@ def main() -> None:
         logger.warning("No symbols found after filtering. keys=%s meta=%s", keys, per_key_meta)
         sys.exit(0)
 
-    logger.info("Symbols loaded: %s | keys=%s | meta=%s", len(all_symbols), keys, per_key_meta)
+    logger.info("Symbols loaded: %s | keys=%s | symbols_sheet_id=%s", len(all_symbols), keys, "SET" if symbols_sheet_id else "NOT SET")
 
     # Call backend
     t0 = time.time()
@@ -823,7 +897,8 @@ def main() -> None:
         all_symbols,
         timeout=_safe_float(args.timeout, 60.0),
         retries=_safe_int(args.retries, 2),
-        batch_size=max(1, _safe_int(args.batch_size, 200)),
+        batch_size=max(1, _safe_int(args.batch_size, 80)),
+        endpoint=endpoint,
     )
     dt = time.time() - t0
     logger.info("Backend returned raw rows=%s in %.2fs", len(results), dt)
@@ -858,10 +933,13 @@ def main() -> None:
                         "generated_utc": _utc_now_iso(),
                         "version": SCRIPT_VERSION,
                         "backend": base_url,
+                        "endpoint": endpoint,
                         "keys": keys,
+                        "symbols_sheet_id": symbols_sheet_id,
                         "symbols_count": len(all_symbols),
                         "ranked_count": len(results_sorted),
                         "results": results_sorted,
+                        "per_key_meta": per_key_meta,
                     },
                     f,
                     ensure_ascii=False,
@@ -884,8 +962,13 @@ def main() -> None:
 
     # No sheet / dry run
     if args.no_sheet or args.dry_run:
-        top_syms = [_norm_symbol(str(r.get("symbol") or r.get("ticker") or "")) for r in results_sorted[:10]]
-        logger.info("Done (%s). Top symbols: %s", "no-sheet" if args.no_sheet else "dry-run", top_syms)
+        top_preview = []
+        for r in results_sorted[:10]:
+            sym = _norm_symbol(str(r.get("symbol") or r.get("ticker") or ""))
+            opp = r.get("opportunity_score")
+            overall = r.get("overall_score")
+            top_preview.append(f"{sym}(opp={opp}, overall={overall})")
+        logger.info("Done (%s). Top preview: %s", "no-sheet" if args.no_sheet else "dry-run", ", ".join(top_preview))
         return
 
     # Sheets write
@@ -893,9 +976,8 @@ def main() -> None:
         logger.error("google_sheets_service not importable; cannot write to sheet. Use --no-sheet.")
         sys.exit(2)
 
-    sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
-    if not sheet_id:
-        logger.error("Spreadsheet ID missing. Set DEFAULT_SPREADSHEET_ID or pass --sheet-id, or use --no-sheet.")
+    if not write_sheet_id:
+        logger.error("Spreadsheet ID missing for WRITE. Set DEFAULT_SPREADSHEET_ID or pass --sheet-id, or use --no-sheet.")
         sys.exit(2)
 
     sheet_name = (args.sheet_name or "Market_Scan").strip()
@@ -913,21 +995,18 @@ def main() -> None:
         try:
             start_col, start_row = _parse_a1_cell(start_cell)
 
-            # default clear: very wide (safe)
             end_col = "ZZ"
-
-            # optional: smart-clear only table width
             if args.smart_clear:
                 end_col = _index_to_col(_col_to_index(start_col) + len(grid[0]) - 1)
 
             rng = f"{_safe_sheet_name(sheet_name)}!{_a1(start_col, start_row)}:{end_col}{clear_end_row}"
-            _clear_range(sheet_id, rng)
+            _clear_range(write_sheet_id, rng)
             logger.info("Cleared range: %s", rng)
         except Exception as e:
             logger.warning("Clear failed (continuing): %s", e)
 
     try:
-        updated = _write_grid(sheet_id, sheet_name, start_cell, grid, value_input=value_input)
+        updated = _write_grid(write_sheet_id, sheet_name, start_cell, grid, value_input=value_input)
         logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
     except Exception as e:
         logger.error("❌ Sheet write failed: %s", e)
