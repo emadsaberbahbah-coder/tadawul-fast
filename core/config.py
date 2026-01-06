@@ -1,8 +1,8 @@
-# core/config.py  — FULL REPLACEMENT — v1.8.0
+# core/config.py  — FULL REPLACEMENT — v1.9.0
 """
 core/config.py
 ------------------------------------------------------------
-Compatibility shim (PROD SAFE) – v1.8.0 (RENDER-ENV LOCKED)
+Compatibility shim (PROD SAFE) – v1.9.0 (RENDER-ENV LOCKED)
 
 Many modules import settings via:
   from core.config import Settings, get_settings
@@ -23,6 +23,19 @@ This module re-exports Settings/get_settings so older imports keep working.
 - DEFAULT_SPREADSHEET_ID / GOOGLE_* / GOOGLE_APPS_SCRIPT_*
 - SERVICE_NAME / SERVICE_VERSION / ENVIRONMENT / TZ / DEBUG / LOG_LEVEL / LOG_FORMAT
 - ADVANCED_ANALYSIS_ENABLED / TADAWUL_MARKET_ENABLED / ENABLE_SWAGGER / ENABLE_REDOC
+
+✅ New (non-breaking) env keys to enable the “per-page headers + forecasting plan”:
+- SHEET_SCHEMAS_ENABLED                 (default: true)
+- SHEET_SCHEMA_VERSION                  (default: "vNext")
+- FORECAST_ENABLED                      (default: true)
+- FORECAST_HORIZONS_DAYS                (default: "30,90,365")
+- FORECAST_LOOKBACK_DAYS                (default: 365)
+- FORECAST_MIN_POINTS                   (default: 90)
+- FORECAST_METHOD                       (default: "ewma")  # engine decides
+- FORECAST_CACHE_TTL                    (default: 180)
+- RECOMMENDATION_MODE                   (default: "hybrid")  # fair_value | forecast | hybrid
+- RECOMMENDATION_PRIMARY_HORIZON_DAYS   (default: 90)
+- PERCENT_CHANGE_FORMAT                 (default: "ratio")   # ratio | percent (ratio recommended for Sheets)
 
 Key guarantee:
 - If providers/modules expect FINNHUB_API_TOKEN / EODHD_API_TOKEN (token-style),
@@ -96,7 +109,7 @@ def _to_int(v: Any, default: int) -> int:
         s = str(v).strip()
         if s == "":
             return default
-        return int(s)
+        return int(float(s))
     except Exception:
         return default
 
@@ -152,6 +165,34 @@ def _parse_list(value: Any) -> List[str]:
         seen.add(y)
         out.append(y)
     return out
+
+
+def _parse_int_list(value: Any, default: List[int]) -> List[int]:
+    """
+    Accept:
+      - python list
+      - CSV string "30,90,365"
+      - JSON list string "[30,90,365]"
+    Return: cleaned int list (deduped, order preserved). Falls back to default if empty.
+    """
+    xs_raw = _parse_list(value)
+    if not xs_raw and isinstance(value, list):
+        # list that didn't parse to strings properly — best effort
+        try:
+            xs_raw = [str(x).strip() for x in value if str(x).strip()]
+        except Exception:
+            xs_raw = []
+
+    out: List[int] = []
+    seen = set()
+    for x in xs_raw:
+        n = _to_int(x, -1)
+        if n <= 0 or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+
+    return out or list(default)
 
 
 def _mask_tail(s: Optional[str], keep: int = 4) -> str:
@@ -259,7 +300,7 @@ if _root_Settings is not None:
     class Settings(_root_Settings):  # type: ignore
         """
         Compat Settings wrapper around repo-root Settings.
-        Adds legacy properties used across older modules.
+        Adds legacy + new “schema + forecasting” properties used across modules.
         """
 
         # --- Common legacy names used across older modules ---
@@ -287,11 +328,12 @@ if _root_Settings is not None:
                 or "0.0.0"
             )
 
+        # --- provider lists ---
         @property
         def enabled_providers(self) -> List[str]:
             # Prefer root's computed property if present
             try:
-                v = getattr(super(), "enabled_providers")  # type: ignore[misc]
+                v = super().enabled_providers  # type: ignore[misc]
                 if isinstance(v, list) and v:
                     return [str(x).strip().lower() for x in v if str(x).strip()]
             except Exception:
@@ -304,28 +346,105 @@ if _root_Settings is not None:
         @property
         def ksa_providers(self) -> List[str]:
             try:
-                v = getattr(super(), "ksa_providers")  # type: ignore[misc]
+                v = super().ksa_providers  # type: ignore[misc]
                 if isinstance(v, list) and v:
                     return [str(x).strip().lower() for x in v if str(x).strip()]
             except Exception:
                 pass
 
-            raw = getattr(self, "ksa_providers_raw", None) or _env_first(["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam")
+            raw = getattr(self, "ksa_providers_raw", None) or _env_first(
+                ["KSA_PROVIDERS"], "yahoo_chart,tadawul,argaam"
+            )
             xs = _parse_list(raw)
             return xs or ["yahoo_chart", "tadawul", "argaam"]
 
         # --- token-style properties (some code expects *_api_token) ---
         @property
         def eodhd_api_token(self) -> Optional[str]:
-            v = getattr(self, "eodhd_api_key", None) or getattr(super(), "eodhd_api_token", None)  # type: ignore[attr-defined]
+            v = getattr(self, "eodhd_api_key", None)
+            v = v or getattr(super(), "eodhd_api_token", None)  # type: ignore[attr-defined]
             v = v or _env_first(["EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"], None)
             return (str(v).strip() if v else None)
 
         @property
         def finnhub_api_token(self) -> Optional[str]:
-            v = getattr(self, "finnhub_api_key", None) or getattr(super(), "finnhub_api_token", None)  # type: ignore[attr-defined]
+            v = getattr(self, "finnhub_api_key", None)
+            v = v or getattr(super(), "finnhub_api_token", None)  # type: ignore[attr-defined]
             v = v or _env_first(["FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"], None)
             return (str(v).strip() if v else None)
+
+        # ---------------------------------------------------------------------
+        # ✅ New: Sheet schemas (per-page headers) controls
+        # ---------------------------------------------------------------------
+        @property
+        def sheet_schemas_enabled(self) -> bool:
+            v = getattr(self, "sheet_schemas_enabled", None)
+            if v is None:
+                v = _env_first(["SHEET_SCHEMAS_ENABLED"], "true")
+            return _to_bool(v, True)
+
+        @property
+        def sheet_schema_version(self) -> str:
+            v = getattr(self, "sheet_schema_version", None) or _env_first(["SHEET_SCHEMA_VERSION"], "vNext")
+            return (v or "vNext").strip()
+
+        # ---------------------------------------------------------------------
+        # ✅ New: Forecasting & recommendation controls
+        # ---------------------------------------------------------------------
+        @property
+        def forecast_enabled(self) -> bool:
+            v = getattr(self, "forecast_enabled", None)
+            if v is None:
+                v = _env_first(["FORECAST_ENABLED"], "true")
+            return _to_bool(v, True)
+
+        @property
+        def forecast_horizons_days(self) -> List[int]:
+            raw = getattr(self, "forecast_horizons_days_raw", None) or _env_first(["FORECAST_HORIZONS_DAYS"], "30,90,365")
+            return _parse_int_list(raw, default=[30, 90, 365])
+
+        @property
+        def forecast_lookback_days(self) -> int:
+            raw = getattr(self, "forecast_lookback_days", None) or _env_first(["FORECAST_LOOKBACK_DAYS"], "365")
+            return _to_int(raw, 365)
+
+        @property
+        def forecast_min_points(self) -> int:
+            raw = getattr(self, "forecast_min_points", None) or _env_first(["FORECAST_MIN_POINTS"], "90")
+            return _to_int(raw, 90)
+
+        @property
+        def forecast_method(self) -> str:
+            raw = getattr(self, "forecast_method", None) or _env_first(["FORECAST_METHOD"], "ewma")
+            return (raw or "ewma").strip().lower()
+
+        @property
+        def forecast_cache_ttl(self) -> int:
+            raw = getattr(self, "forecast_cache_ttl", None) or _env_first(["FORECAST_CACHE_TTL"], "180")
+            return _to_int(raw, 180)
+
+        @property
+        def recommendation_mode(self) -> str:
+            raw = getattr(self, "recommendation_mode", None) or _env_first(["RECOMMENDATION_MODE"], "hybrid")
+            x = (raw or "hybrid").strip().lower()
+            return x if x in {"fair_value", "forecast", "hybrid"} else "hybrid"
+
+        @property
+        def recommendation_primary_horizon_days(self) -> int:
+            raw = getattr(self, "recommendation_primary_horizon_days", None) or _env_first(
+                ["RECOMMENDATION_PRIMARY_HORIZON_DAYS"], "90"
+            )
+            return _to_int(raw, 90)
+
+        @property
+        def percent_change_format(self) -> str:
+            """
+            ratio  -> store as 0.0123 and format as % in Sheets (recommended)
+            percent -> store as 1.23 (already percent units)
+            """
+            raw = getattr(self, "percent_change_format", None) or _env_first(["PERCENT_CHANGE_FORMAT"], "ratio")
+            x = (raw or "ratio").strip().lower()
+            return x if x in {"ratio", "percent"} else "ratio"
 
         # --- safe summary (no secrets) ---
         def safe_summary(self) -> Dict[str, Any]:
@@ -353,6 +472,17 @@ if _root_Settings is not None:
                 "SPREADSHEET_ID_SOURCE": sid_src,
                 "GOOGLE_CREDS_SET": bool(creds),
                 "GOOGLE_CREDS_SOURCE": creds_src,
+                "SHEET_SCHEMAS_ENABLED": bool(self.sheet_schemas_enabled),
+                "SHEET_SCHEMA_VERSION": self.sheet_schema_version,
+                "FORECAST_ENABLED": bool(self.forecast_enabled),
+                "FORECAST_HORIZONS_DAYS": list(self.forecast_horizons_days),
+                "FORECAST_LOOKBACK_DAYS": int(self.forecast_lookback_days),
+                "FORECAST_MIN_POINTS": int(self.forecast_min_points),
+                "FORECAST_METHOD": self.forecast_method,
+                "FORECAST_CACHE_TTL": int(self.forecast_cache_ttl),
+                "RECOMMENDATION_MODE": self.recommendation_mode,
+                "RECOMMENDATION_PRIMARY_HORIZON_DAYS": int(self.recommendation_primary_horizon_days),
+                "PERCENT_CHANGE_FORMAT": self.percent_change_format,
             }
 
         # --- uppercase aliases (legacy) ---
@@ -407,6 +537,7 @@ if Settings is None or get_settings is None:
     class Settings:  # type: ignore
         """
         Minimal Settings fallback aligned to your Render env variable names.
+        Includes vNext schema + forecast controls (non-breaking).
         """
 
         def __init__(self) -> None:
@@ -466,6 +597,21 @@ if Settings is None or get_settings is None:
             self.enable_swagger: bool = _to_bool(_env_first(["ENABLE_SWAGGER"], "true"), True)
             self.enable_redoc: bool = _to_bool(_env_first(["ENABLE_REDOC"], "true"), True)
 
+            # ✅ vNext schema + forecasting controls
+            self._sheet_schemas_enabled_raw: str = _env_first(["SHEET_SCHEMAS_ENABLED"], "true") or "true"
+            self._sheet_schema_version_raw: str = _env_first(["SHEET_SCHEMA_VERSION"], "vNext") or "vNext"
+
+            self._forecast_enabled_raw: str = _env_first(["FORECAST_ENABLED"], "true") or "true"
+            self._forecast_horizons_days_raw: str = _env_first(["FORECAST_HORIZONS_DAYS"], "30,90,365") or "30,90,365"
+            self._forecast_lookback_days_raw: str = _env_first(["FORECAST_LOOKBACK_DAYS"], "365") or "365"
+            self._forecast_min_points_raw: str = _env_first(["FORECAST_MIN_POINTS"], "90") or "90"
+            self._forecast_method_raw: str = _env_first(["FORECAST_METHOD"], "ewma") or "ewma"
+            self._forecast_cache_ttl_raw: str = _env_first(["FORECAST_CACHE_TTL"], "180") or "180"
+
+            self._recommendation_mode_raw: str = _env_first(["RECOMMENDATION_MODE"], "hybrid") or "hybrid"
+            self._recommendation_primary_horizon_days_raw: str = _env_first(["RECOMMENDATION_PRIMARY_HORIZON_DAYS"], "90") or "90"
+            self._percent_change_format_raw: str = _env_first(["PERCENT_CHANGE_FORMAT"], "ratio") or "ratio"
+
         # Legacy names
         @property
         def app_name(self) -> str:
@@ -497,6 +643,53 @@ if Settings is None or get_settings is None:
         def finnhub_api_token(self) -> Optional[str]:
             return (self.finnhub_api_key or "").strip() or None
 
+        # ✅ vNext schema + forecasting properties
+        @property
+        def sheet_schemas_enabled(self) -> bool:
+            return _to_bool(self._sheet_schemas_enabled_raw, True)
+
+        @property
+        def sheet_schema_version(self) -> str:
+            return (self._sheet_schema_version_raw or "vNext").strip()
+
+        @property
+        def forecast_enabled(self) -> bool:
+            return _to_bool(self._forecast_enabled_raw, True)
+
+        @property
+        def forecast_horizons_days(self) -> List[int]:
+            return _parse_int_list(self._forecast_horizons_days_raw, default=[30, 90, 365])
+
+        @property
+        def forecast_lookback_days(self) -> int:
+            return _to_int(self._forecast_lookback_days_raw, 365)
+
+        @property
+        def forecast_min_points(self) -> int:
+            return _to_int(self._forecast_min_points_raw, 90)
+
+        @property
+        def forecast_method(self) -> str:
+            return (self._forecast_method_raw or "ewma").strip().lower()
+
+        @property
+        def forecast_cache_ttl(self) -> int:
+            return _to_int(self._forecast_cache_ttl_raw, 180)
+
+        @property
+        def recommendation_mode(self) -> str:
+            x = (self._recommendation_mode_raw or "hybrid").strip().lower()
+            return x if x in {"fair_value", "forecast", "hybrid"} else "hybrid"
+
+        @property
+        def recommendation_primary_horizon_days(self) -> int:
+            return _to_int(self._recommendation_primary_horizon_days_raw, 90)
+
+        @property
+        def percent_change_format(self) -> str:
+            x = (self._percent_change_format_raw or "ratio").strip().lower()
+            return x if x in {"ratio", "percent"} else "ratio"
+
         def safe_summary(self) -> Dict[str, Any]:
             creds, creds_src = _resolve_google_credentials(self.google_sheets_credentials, self.google_credentials)
             sid, sid_src = _resolve_spreadsheet_id(self.default_spreadsheet_id)
@@ -517,6 +710,17 @@ if Settings is None or get_settings is None:
                 "SPREADSHEET_ID_SOURCE": sid_src,
                 "GOOGLE_CREDS_SET": bool(creds),
                 "GOOGLE_CREDS_SOURCE": creds_src,
+                "SHEET_SCHEMAS_ENABLED": bool(self.sheet_schemas_enabled),
+                "SHEET_SCHEMA_VERSION": self.sheet_schema_version,
+                "FORECAST_ENABLED": bool(self.forecast_enabled),
+                "FORECAST_HORIZONS_DAYS": list(self.forecast_horizons_days),
+                "FORECAST_LOOKBACK_DAYS": int(self.forecast_lookback_days),
+                "FORECAST_MIN_POINTS": int(self.forecast_min_points),
+                "FORECAST_METHOD": self.forecast_method,
+                "FORECAST_CACHE_TTL": int(self.forecast_cache_ttl),
+                "RECOMMENDATION_MODE": self.recommendation_mode,
+                "RECOMMENDATION_PRIMARY_HORIZON_DAYS": int(self.recommendation_primary_horizon_days),
+                "PERCENT_CHANGE_FORMAT": self.percent_change_format,
             }
 
         def as_safe_dict(self) -> Dict[str, Any]:
