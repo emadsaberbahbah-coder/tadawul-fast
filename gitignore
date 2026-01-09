@@ -1,26 +1,18 @@
-```gitignore
 # .gitignore  (FULL REPLACEMENT)
 # Tadawul Fast Bridge / FastAPI + Render + Google Sheets — v1.2.0 (PROD SAFE)
-#
-# Fixes vs your draft:
-# - ✅ Valid .gitignore syntax (no decorative separators that accidentally become patterns)
-# - ✅ Correct Python cache folder name: __pycache__/
-# - ✅ Uses leading slashes where helpful (repo-root only) but keeps common ignores global
-# - ✅ Strong secret protection without over-blocking normal JSON app data
-# - ✅ Keeps .env.example tracked
 
-# -------------------------------------------------------
+# ------------------------------
 # Python / FastAPI
-# -------------------------------------------------------
+# ------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyd
 *.so
 
-# -------------------------------------------------------
+# ------------------------------
 # Caches / test / typecheck / lint
-# -------------------------------------------------------
+# ------------------------------
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -32,18 +24,14 @@ htmlcov/
 .nox/
 *.cover
 *.py,cover
-
-# pytest / hypothesis
 .hypothesis/
-
-# Pyre / Pytype / Pylint
 .pyre/
 .pytype/
 .pylint.d/
 
-# -------------------------------------------------------
+# ------------------------------
 # Build artifacts / packaging
-# -------------------------------------------------------
+# ------------------------------
 build/
 dist/
 *.egg-info/
@@ -52,25 +40,25 @@ pip-wheel-metadata/
 wheels/
 *.whl
 
-# -------------------------------------------------------
+# ------------------------------
 # Jupyter / IPython
-# -------------------------------------------------------
+# ------------------------------
 .ipynb_checkpoints/
 .profile_default/
 ipython_config.py
 
-# -------------------------------------------------------
+# ------------------------------
 # Virtual environments
-# -------------------------------------------------------
+# ------------------------------
 venv/
 .venv/
 env/
 ENV/
 .ENV/
 
-# -------------------------------------------------------
+# ------------------------------
 # Environment & Secrets (NEVER COMMIT THESE)
-# -------------------------------------------------------
+# ------------------------------
 .env
 .env.*
 !.env.example
@@ -97,19 +85,16 @@ service_account*.json
 google_service_account*.json
 client_secret*.json
 oauth*.json
+google_sa.json
 
 # If you sometimes download keys into folders:
 secrets/
 keys/
 private/
 
-# Optional: if you store SA JSON under a known filename
-# (keep this if you sometimes dump it from Render locally)
-google_sa.json
-
-# -------------------------------------------------------
+# ------------------------------
 # Logs & Local Databases
-# -------------------------------------------------------
+# ------------------------------
 *.log
 *.sqlite
 *.sqlite3
@@ -117,43 +102,41 @@ google_sa.json
 logs/
 *.out
 
-# -------------------------------------------------------
+# ------------------------------
 # Editor / OS
-# -------------------------------------------------------
+# ------------------------------
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# -------------------------------------------------------
+# ------------------------------
 # Local tooling / temp
-# -------------------------------------------------------
+# ------------------------------
 *.tmp
 *.temp
 *.swp
 *.swo
 *.bak
 
-# -------------------------------------------------------
+# ------------------------------
 # Node (if any tools later)
-# -------------------------------------------------------
+# ------------------------------
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# -------------------------------------------------------
+# ------------------------------
 # Render / Deployment artifacts (optional)
-# -------------------------------------------------------
+# ------------------------------
 .render/
 
-# -------------------------------------------------------
-# Project-specific: runtime caches / snapshots
-# (Only ignore at repo root to avoid blocking legit packages named "cache")
-# -------------------------------------------------------
+# ------------------------------
+# Project-specific: repo-root runtime caches / snapshots
+# ------------------------------
 /cache/
 /.snapshots/
 /data/
 /tmp/
-```
