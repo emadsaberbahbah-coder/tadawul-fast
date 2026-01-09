@@ -558,7 +558,12 @@ def _engine_info(eng: Any) -> Dict[str, Any]:
         return out
 
     version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
-    return {"engine": type(eng).__name__, "engine_version": version, "providers": _dedup(providers), "ksa_providers": _dedup(ksa)}
+    return {
+        "engine": type(eng).__name__,
+        "engine_version": version,
+        "providers": _dedup(providers),
+        "ksa_providers": _dedup(ksa),
+    }
 
 
 def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) -> Dict[str, Any]:
@@ -769,7 +774,6 @@ def create_app() -> FastAPI:
     async def system_settings():
         safe_settings = None
         try:
-            # prefer config.py helper if available
             from config import mask_settings_dict as _mask  # type: ignore
 
             safe_settings = _mask()
