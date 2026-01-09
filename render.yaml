@@ -1,18 +1,18 @@
+# render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.1.6)
+# PROD-SAFE + Backward-Compatible env var names (v1.2.0)
 # ============================================================
 #
-# v1.1.6 changes vs v1.1.4
-# - ✅ Fix: remove invalid uvicorn flag (--timeout-graceful-shutdown)
-#          use correct flag: --graceful-timeout
-# - ✅ Harden: numeric parsing for ALL tunables (port/workers/keepalive/graceful/backlog/limits)
-# - ✅ Keep: Option A KSA_PROVIDERS=yahoo_chart (quiet + stable KSA)
-# - ✅ Keep: full env compat (both *_SEC and legacy aliases)
+# Key goals
+# - Deterministic boot (numeric-safe parsing for uvicorn tunables)
+# - No invalid uvicorn flags
+# - Backward-compatible env var names (legacy + *_SEC style)
+# - KSA providers pinned to yahoo_chart (quiet + stable)
 #
 # Notes
-# - Secrets must be set in Render Environment UI or via `sync: false` placeholders below.
-# - If you rename the service, update BACKEND_BASE_URL/TFB_BASE_URL (or set in Render dashboard).
+# - Secrets must be set in Render Environment UI (sync: false).
+# - If you rename the service, update BACKEND_BASE_URL/TFB_BASE_URL.
 
 services:
   - type: web
@@ -24,17 +24,17 @@ services:
     buildCommand: pip install -r requirements.txt
 
     # Deterministic + safe startup (no "integer expression" crash)
-    startCommand: >
+    startCommand: |
       sh -c '
-      set -eu;
+      set -eu
 
       # ----------------------------
-      # Helpers
+      # Helpers (numeric-safe)
       # ----------------------------
       as_int() {
         # usage: as_int "$RAW" "$DEFAULT"
-        raw="${1:-}";
-        def="${2:-0}";
+        raw="${1:-}"
+        def="${2:-0}"
         case "$raw" in
           (""|*[!0-9]*) printf "%s" "$def" ;;
           (*)          printf "%s" "$raw" ;;
@@ -42,36 +42,28 @@ services:
       }
 
       clamp_min_1() {
-        v="$(as_int "${1:-}" "1")";
-        if [ "$v" -lt 1 ]; then v="1"; fi;
-        printf "%s" "$v";
+        v="$(as_int "${1:-}" "1")"
+        if [ "$v" -lt 1 ]; then v="1"; fi
+        printf "%s" "$v"
       }
 
       # ----------------------------
       # Resolve runtime values
       # ----------------------------
-      LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")";
+      LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")"
 
-      PORT_VAL="$(clamp_min_1 "$(as_int "${PORT:-8000}" "8000")")";
+      PORT_VAL="$(clamp_min_1 "$(as_int "${PORT:-8000}" "8000")")"
+      KEEPALIVE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")"
+      GRACE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")")"
+      CONC="$(clamp_min_1 "$(as_int "${WEB_CONCURRENCY:-1}" "1")")"
 
-      KEEPALIVE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")";
+      ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")"
 
-      # graceful-timeout is uvicorn flag; default 30 seconds
-      GRACE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")")";
+      LIMIT_CONC="$(as_int "${UVICORN_LIMIT_CONCURRENCY:-}" "")"
+      LIMIT_REQS="$(as_int "${UVICORN_LIMIT_MAX_REQUESTS:-}" "")"
+      BACKLOG="$(as_int "${UVICORN_BACKLOG:-}" "")"
 
-      # WEB_CONCURRENCY numeric-safe (default 1). Clamp to >=1.
-      CONC="$(clamp_min_1 "$(as_int "${WEB_CONCURRENCY:-1}" "1")")";
-
-      # Access log toggle
-      ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")";
-
-      # Optional tunables (numeric or empty)
-      LIMIT_CONC="$(as_int "${UVICORN_LIMIT_CONCURRENCY:-}" "")";
-      LIMIT_REQS="$(as_int "${UVICORN_LIMIT_MAX_REQUESTS:-}" "")";
-      BACKLOG="$(as_int "${UVICORN_BACKLOG:-}" "")";
-
-      # Root path (string)
-      ROOT_PATH="${UVICORN_ROOT_PATH:-}";
+      ROOT_PATH="${UVICORN_ROOT_PATH:-}"
 
       # ----------------------------
       # Build argv deterministically
@@ -85,37 +77,38 @@ services:
         --timeout-keep-alive "$KEEPALIVE_VAL" \
         --graceful-timeout "$GRACE_VAL" \
         --log-level "$LOG_LEVEL_LC" \
-        --no-server-header;
+        --no-server-header
 
       # Workers only when >1
       if [ "$CONC" -gt 1 ]; then
-        set -- "$@" --workers "$CONC";
-      fi;
+        set -- "$@" --workers "$CONC"
+      fi
 
       # Access log toggle
       case "$ACCESS_RAW" in
         (0|false|no|off) set -- "$@" --no-access-log ;;
         (*)              set -- "$@" --access-log ;;
-      esac;
+      esac
 
       # Optional tuning flags (only if numeric)
       if [ -n "$LIMIT_CONC" ]; then
-        set -- "$@" --limit-concurrency "$LIMIT_CONC";
-      fi;
+        set -- "$@" --limit-concurrency "$LIMIT_CONC"
+      fi
 
       if [ -n "$LIMIT_REQS" ]; then
-        set -- "$@" --limit-max-requests "$LIMIT_REQS";
-      fi;
+        set -- "$@" --limit-max-requests "$LIMIT_REQS"
+      fi
 
       if [ -n "$BACKLOG" ]; then
-        set -- "$@" --backlog "$BACKLOG";
-      fi;
+        set -- "$@" --backlog "$BACKLOG"
+      fi
 
       if [ -n "$ROOT_PATH" ]; then
-        set -- "$@" --root-path "$ROOT_PATH";
-      fi;
+        set -- "$@" --root-path "$ROOT_PATH"
+      fi
 
-      exec "$@"'
+      exec "$@"
+      '
 
     healthCheckPath: /healthz
 
@@ -128,7 +121,7 @@ services:
       - key: TZ
         value: "Asia/Riyadh"
 
-      # Concurrency / Uvicorn
+      # Uvicorn/Concurrency (all numeric-safe in startCommand)
       - key: WEB_CONCURRENCY
         value: "1"
       - key: UVICORN_KEEPALIVE
@@ -214,28 +207,26 @@ services:
         value: "eodhd"
 
       # -------------------------
-      # KSA routing order (Option A: quiet + stable)
+      # KSA routing order (quiet + stable)
       # -------------------------
       - key: KSA_PROVIDERS
         value: "yahoo_chart"
-
-      # Hard safety: never use EODHD for KSA
       - key: KSA_DISALLOW_EODHD
         value: "true"
 
-      # Yahoo Chart fallbacks
+      # Yahoo chart toggles
       - key: ENABLE_YAHOO_CHART_KSA
         value: "true"
       - key: ENABLE_YAHOO_CHART_SUPPLEMENT
         value: "true"
 
-      # yfinance policy (if engine references it)
+      # yfinance policy (if referenced)
       - key: ENABLE_YFINANCE
         value: "true"
       - key: ENABLE_YFINANCE_KSA
         value: "false"
 
-      # Yahoo fundamentals toggles (if your engine supports them)
+      # Yahoo fundamentals toggles (if supported)
       - key: ENABLE_YAHOO_FUNDAMENTALS_KSA
         value: "true"
       - key: ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
@@ -275,7 +266,6 @@ services:
         value: "20"
       - key: CACHE_DEFAULT_TTL
         value: "20"
-
       - key: ENGINE_CACHE_TTL_SEC
         value: "20"
 
