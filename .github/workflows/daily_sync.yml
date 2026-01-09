@@ -1,3 +1,4 @@
+# .github/workflows/daily_sync.yml
 name: Tadawul Dashboard Sync
 
 on:
@@ -43,6 +44,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -V
@@ -50,6 +52,7 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Debug: Quick Repo Check
+        shell: bash
         run: |
           set -euo pipefail
           echo "PWD: $(pwd)"
@@ -57,25 +60,26 @@ jobs:
           test -f scripts/run_dashboard_sync.py && echo "OK: scripts/run_dashboard_sync.py found" || (echo "::error::Missing scripts/run_dashboard_sync.py" && exit 1)
 
       - name: Wake up Render Backend
+        shell: bash
         env:
-          URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          URL: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.backend_url) || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
           set -euo pipefail
           if [ -z "${URL:-}" ]; then
             echo "Backend URL missing, skipping ping..."
             exit 0
           fi
-
-          echo "Pinging backend (best-effort): $URL/healthz"
-          curl -fsS --max-time 25 --retry 3 --retry-delay 3 "$URL/healthz" >/dev/null || echo "Ping failed (backend may be cold), continuing..."
+          echo "Pinging backend (best-effort): $URL/readyz"
+          curl -fsS --max-time 25 --retry 3 --retry-delay 3 "$URL/readyz" >/dev/null || echo "Ping failed (backend may be cold), continuing..."
 
       - name: Run Dashboard Sync
+        shell: bash
         env:
           # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
-          BACKEND_BASE_URL: ${{ inputs.backend_url || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
-          DEFAULT_SPREADSHEET_ID: ${{ inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID || secrets.DEFAULT_SPREADSHEET_ID || '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw' }}
+          BACKEND_BASE_URL: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.backend_url) || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          DEFAULT_SPREADSHEET_ID: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.sheet_id) || vars.DEFAULT_SPREADSHEET_ID || secrets.DEFAULT_SPREADSHEET_ID || '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw' }}
           # Priority: Manual Input -> Repo Secret
-          GOOGLE_SHEETS_CREDENTIALS: ${{ inputs.google_creds_json || secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.google_creds_json) || secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
           set -euo pipefail
 
@@ -98,4 +102,6 @@ jobs:
           echo "Target Backend: ${BACKEND_BASE_URL}"
           echo "Target Sheet  : ${DEFAULT_SPREADSHEET_ID}"
 
-          python scripts/run_dashboard_sync.py --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL
+          python scripts/run_dashboard_sync.py \
+            --health \
+            --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS
