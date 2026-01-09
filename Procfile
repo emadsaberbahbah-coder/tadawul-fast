@@ -1,1 +1,1 @@
-web: python -m uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+web: sh -c 'exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips "*" --lifespan on --timeout-keep-alive ${UVICORN_KEEPALIVE:-75} --graceful-timeout ${UVICORN_GRACEFUL_TIMEOUT:-30} --log-level ${LOG_LEVEL:-info} ${UVICORN_ACCESS_LOG:-1}'
