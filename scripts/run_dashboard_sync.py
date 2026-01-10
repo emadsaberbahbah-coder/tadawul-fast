@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
+# scripts/run_dashboard_sync.py  (FULL REPLACEMENT)
 """
 run_dashboard_sync.py
 ===========================================================
-TADAWUL FAST BRIDGE – DASHBOARD SYNCHRONIZER (v2.8.1)
+TADAWUL FAST BRIDGE – DASHBOARD SYNCHRONIZER (v2.9.0)
 ===========================================================
 
 What this script does
 1) Connects to your Google Spreadsheet (DEFAULT_SPREADSHEET_ID or --sheet-id).
-2) Reads symbols from configured tabs via `symbols_reader`.
+2) Reads symbols from configured tabs via `symbols_reader` (optionally from a different spreadsheet).
 3) Calls backend endpoints (enriched / analysis / advanced / argaam) through `google_sheets_service`.
 4) Writes updated {headers, rows} back into the target sheets (chunked, Sheets-safe).
 
-v2.8.1 changes (safe hardening)
-- ✅ Handles symbols_reader outputs that are {tickers:[...]} or {symbols:[...]} cleanly.
-- ✅ More robust key resolution (accepts page registry key variants).
-- ✅ Value-input validation hardened.
+v2.9.0 changes (safe hardening + flexibility)
+- ✅ Adds --symbols-sheet-id (read symbols from a separate spreadsheet than the write target).
+- ✅ symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not).
+- ✅ Better key normalization + friendly aliases (KSA, GLOBAL, PORTFOLIO, INSIGHTS, etc).
+- ✅ Value-input validation hardened (case-insensitive).
 - ✅ Health-check won’t crash on non-JSON bodies.
+- ✅ Never aborts entire run on one page failure; exits 2 if any failures exist.
 
 Exit code
 - 2 if failures exist, else 0
@@ -41,7 +44,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 # Version / Logging
 # =============================================================================
 
-SCRIPT_VERSION = "2.8.1"
+SCRIPT_VERSION = "2.9.0"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
@@ -118,6 +121,17 @@ def _get_spreadsheet_id(cli_sheet_id: Optional[str] = None) -> str:
     return sid
 
 
+def _get_symbols_spreadsheet_id(cli_symbols_sheet_id: Optional[str], write_sheet_id: str) -> str:
+    """
+    Read-symbols sheet default:
+    - if user passed --symbols-sheet-id => use it
+    - else use the write target sheet-id (most common)
+    """
+    if cli_symbols_sheet_id and str(cli_symbols_sheet_id).strip():
+        return str(cli_symbols_sheet_id).strip()
+    return (write_sheet_id or "").strip()
+
+
 def _validate_start_cell(cell: str) -> str:
     c = (cell or "").strip()
     if not c:
@@ -140,8 +154,8 @@ def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
         s = str(x).strip()
         if not s:
             continue
-        parts = [p.strip() for p in s.split(",") if p.strip()]
-        out.extend(parts)
+        out.extend([p.strip() for p in s.split(",") if p.strip()])
+
     seen = set()
     final: List[str] = []
     for k in out:
@@ -155,13 +169,47 @@ def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
     return final
 
 
+def _canon_key(user_key: str) -> str:
+    """
+    Normalize key / accept aliases.
+    """
+    k = (user_key or "").strip().upper()
+    k = k.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "KSA": "KSA_TADAWUL",
+        "TADAWUL": "KSA_TADAWUL",
+        "KSA_TASI": "KSA_TADAWUL",
+        "GLOBAL": "GLOBAL_MARKETS",
+        "GLOBAL_SHARES": "GLOBAL_MARKETS",
+        "GLOBAL_MARKET": "GLOBAL_MARKETS",
+        "FUNDS": "MUTUAL_FUNDS",
+        "MUTUALFUND": "MUTUAL_FUNDS",
+        "MUTUAL_FUND": "MUTUAL_FUNDS",
+        "FX": "COMMODITIES_FX",
+        "COMMODITIES": "COMMODITIES_FX",
+        "COMMODITIES_FX": "COMMODITIES_FX",
+        "PORTFOLIO": "MY_PORTFOLIO",
+        "MYPORTFOLIO": "MY_PORTFOLIO",
+        "LEADERS": "MARKET_LEADERS",
+        "MARKETLEADERS": "MARKET_LEADERS",
+        "INSIGHTS": "INSIGHTS_ANALYSIS",
+        "INSIGHTS_AI": "INSIGHTS_ANALYSIS",
+        "AI": "INSIGHTS_ANALYSIS",
+        "ADVISOR": "INVESTMENT_ADVISOR",
+        "ADV": "ADVANCED_ANALYSIS",
+        "ADVANCED": "ADVANCED_ANALYSIS",
+    }
+    return aliases.get(k, k)
+
+
 def _resolve_sheet_name(task_key: str) -> Optional[str]:
     """
     Prefer symbols_reader.PAGE_REGISTRY[key].sheet_name if available.
     Fall back to env settings.* fields.
     If still missing: fallback to key itself (safe last resort).
     """
-    key = (task_key or "").strip().upper()
+    key = _canon_key(task_key)
     if not key:
         return None
 
@@ -169,7 +217,6 @@ def _resolve_sheet_name(task_key: str) -> Optional[str]:
     try:
         reg = getattr(symbols_reader, "PAGE_REGISTRY", None)
         if isinstance(reg, dict):
-            # accept common key variants
             cfg = (
                 reg.get(key)
                 or reg.get(key.lower())
@@ -210,23 +257,31 @@ def _resolve_sheet_name(task_key: str) -> Optional[str]:
     return key
 
 
-def _symbols_reader_call(key: str) -> Any:
+def _symbols_reader_call(key: str, *, symbols_spreadsheet_id: Optional[str]) -> Any:
     """
     Support multiple symbols_reader APIs without breaking.
+    Prefer get_page_symbols(key, spreadsheet_id=...) when supported.
     """
+    k = _canon_key(key)
+
     fn = getattr(symbols_reader, "get_page_symbols", None)
     if callable(fn):
-        return fn(key)
+        if symbols_spreadsheet_id:
+            try:
+                return fn(k, spreadsheet_id=symbols_spreadsheet_id)  # type: ignore
+            except TypeError:
+                return fn(k)  # type: ignore
+        return fn(k)  # type: ignore
 
     for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
         fn2 = getattr(symbols_reader, name, None)
         if callable(fn2):
-            return fn2(key)
+            return fn2(k)
 
     raise RuntimeError("symbols_reader has no supported symbol function (expected get_page_symbols).")
 
 
-def _read_symbols_for_key(task_key: str) -> Tuple[List[str], Dict[str, Any]]:
+def _read_symbols_for_key(task_key: str, *, symbols_spreadsheet_id: Optional[str]) -> Tuple[List[str], Dict[str, Any]]:
     """
     Returns (symbols, meta).
 
@@ -235,8 +290,8 @@ def _read_symbols_for_key(task_key: str) -> Tuple[List[str], Dict[str, Any]]:
     - dict: {"tickers":[...]} or {"symbols":[...]}
     - list: [...]
     """
-    key = (task_key or "").strip().upper()
-    data = _symbols_reader_call(key)
+    key = _canon_key(task_key)
+    data = _symbols_reader_call(key, symbols_spreadsheet_id=symbols_spreadsheet_id)
 
     if isinstance(data, list):
         syms = [str(x).strip() for x in data if str(x).strip()]
@@ -268,6 +323,7 @@ def _read_symbols_for_key(task_key: str) -> Tuple[List[str], Dict[str, Any]]:
         "global_count": len(glob_syms) if isinstance(glob_syms, list) else None,
         "source_shape": "dict",
         "chosen_list": ("ksa" if chosen is ksa_syms else ("global" if chosen is glob_syms else "all/tickers")),
+        "symbols_spreadsheet_id": ("SET" if symbols_spreadsheet_id else "NOT_SET"),
     }
     if isinstance(meta_in, dict):
         meta["symbols_reader"] = {
@@ -280,10 +336,10 @@ def _read_symbols_for_key(task_key: str) -> Tuple[List[str], Dict[str, Any]]:
 
 
 def _select_tasks(args: argparse.Namespace, all_tasks: List[SyncTask]) -> List[SyncTask]:
-    wanted = _parse_keys_list(args.keys)
+    wanted = [_canon_key(x) for x in _parse_keys_list(args.keys)]
     if wanted:
         wset = set(wanted)
-        return [t for t in all_tasks if t.key.upper() in wset]
+        return [t for t in all_tasks if _canon_key(t.key) in wset]
 
     if args.ksa:
         return [t for t in all_tasks if t.key == "KSA_TADAWUL"]
@@ -315,6 +371,7 @@ def _call_refresh(
     if not callable(fn):
         return {"status": "error", "error": "refresh function not callable"}
 
+    # Attempt kwargs-based call if signature supports it
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
@@ -354,6 +411,7 @@ def _call_refresh(
     except Exception:
         pass
 
+    # Fallback positional patterns
     try:
         out = fn(
             spreadsheet_id,
@@ -525,6 +583,7 @@ def sync_page(
     task: SyncTask,
     *,
     spreadsheet_id: str,
+    symbols_spreadsheet_id: Optional[str],
     start_cell: str = "A5",
     clear: bool = False,
     dry_run: bool = False,
@@ -534,7 +593,7 @@ def sync_page(
     progress_idx: int = 1,
     progress_total: int = 1,
 ) -> Dict[str, Any]:
-    key = task.key
+    key = _canon_key(task.key)
     desc = task.desc
 
     pct = (progress_idx / max(1, progress_total)) * 100.0
@@ -547,7 +606,7 @@ def sync_page(
         return {"status": "error", "key": key, "desc": desc, "error": msg}
 
     try:
-        symbols, meta = _read_symbols_for_key(key)
+        symbols, meta = _read_symbols_for_key(key, symbols_spreadsheet_id=symbols_spreadsheet_id)
     except Exception as e:
         logger.exception("Failed reading symbols for %s", key)
         return {"status": "error", "key": key, "desc": desc, "sheet": sheet_name, "error": str(e)}
@@ -656,6 +715,7 @@ def sync_page(
             "symbols_meta": meta,
             "ksa_gateway": ksa_gateway if task.kind == "ksa" else None,
             "progress": {"idx": progress_idx, "total": progress_total, "pct": round(pct, 2)},
+            "symbols_spreadsheet_id": ("SET" if symbols_spreadsheet_id else "NOT_SET"),
         }
     )
     return out
@@ -666,7 +726,8 @@ def sync_page(
 # =============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synchronize Dashboard Sheets")
-    parser.add_argument("--sheet-id", default=None, help="Override Spreadsheet ID (otherwise uses DEFAULT_SPREADSHEET_ID)")
+    parser.add_argument("--sheet-id", default=None, help="Spreadsheet ID to WRITE to (otherwise uses DEFAULT_SPREADSHEET_ID)")
+    parser.add_argument("--symbols-sheet-id", default=None, help="Spreadsheet ID to READ symbols from (default: same as --sheet-id)")
     parser.add_argument("--dry-run", action="store_true", help="Read symbols but do not write data")
     parser.add_argument("--clear", action="store_true", help="Clear old values first (safe range) before writing")
     parser.add_argument("--start-cell", default="A5", help="Top-left cell where headers should be written (default A5)")
@@ -706,19 +767,33 @@ def main() -> None:
     except Exception:
         pass
 
+    # WRITE target
     sid = _get_spreadsheet_id(args.sheet_id)
     if not sid:
         logger.error("DEFAULT_SPREADSHEET_ID is not set in env.py or environment variables (or pass --sheet-id).")
         sys.exit(1)
 
+    # READ symbols source (defaults to same as WRITE)
+    symbols_sid = _get_symbols_spreadsheet_id(args.symbols_sheet_id, sid)
+    symbols_sid = symbols_sid.strip() if symbols_sid else ""
+    symbols_sid_opt: Optional[str] = symbols_sid or None
+
     value_input = str(args.value_input or "RAW").strip().upper()
+    if value_input not in ("RAW", "USER_ENTERED"):
+        value_input = "RAW"
 
     if args.health:
         hc = _health_check()
         logger.info("=== Backend Health Check ===")
         logger.info("Base: %s", hc.get("base"))
         for c in hc.get("checks", []):
-            logger.info(" - %s | http=%s | ok=%s | status=%s", c.get("endpoint"), c.get("http"), c.get("ok"), c.get("status"))
+            logger.info(
+                " - %s | http=%s | ok=%s | status=%s",
+                c.get("endpoint"),
+                c.get("http"),
+                c.get("ok"),
+                c.get("status"),
+            )
 
     sync_map = _build_sync_map()
     tasks = _select_tasks(args, sync_map)
@@ -739,7 +814,8 @@ def main() -> None:
         args.ksa_gateway,
         value_input,
     )
-    logger.info("Target Spreadsheet ID: %s", sid)
+    logger.info("WRITE Spreadsheet ID: %s", sid)
+    logger.info("READ  Symbols Sheet ID: %s", symbols_sid if symbols_sid else "(not set)")
 
     t0 = time.time()
 
@@ -755,6 +831,7 @@ def main() -> None:
         r = sync_page(
             task,
             spreadsheet_id=sid,
+            symbols_spreadsheet_id=symbols_sid_opt,
             start_cell=start_cell,
             clear=bool(args.clear),
             dry_run=bool(args.dry_run),
@@ -800,6 +877,7 @@ def main() -> None:
                 "version": SCRIPT_VERSION,
                 "timestamp_utc": _utc_now_iso(),
                 "spreadsheet_id": sid,
+                "symbols_spreadsheet_id": symbols_sid_opt,
                 "tasks_total": total,
                 "summary": {
                     "success": successes,
