@@ -1,13 +1,23 @@
-# config.py  (FULL REPLACEMENT)
+# config.py  (FULL REPLACEMENT) — v3.0.0
 """
-TADAWUL FAST BRIDGE – MAIN CONFIG (v2.9.1) – PROD SAFE / NO HEAVY IMPORTS
+TADAWUL FAST BRIDGE – MAIN CONFIG (v3.0.0) – PROD SAFE / NO HEAVY IMPORTS
 
-Key fixes vs prior draft
-- ✅ Default ENV name = production (not "prod")
-- ✅ Default KSA providers = yahoo_chart ONLY (aligns with render.yaml Option A)
-- ✅ Google Sheets credentials: supports JSON or base64(JSON) + common alias keys
-- ✅ Adds optional rate-limit tunables (ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE)
-- ✅ Never raises at import-time; safe at startup
+✅ Goals
+- Never raises at import-time; safe at startup
+- Default ENV name = "production"
+- Default KSA providers = ["yahoo_chart"] (Option A)
+- Google Sheets credentials: supports JSON or base64(JSON) + common alias keys
+- Optional rate-limit tunables (ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE)
+- Back-compat helpers: allowed_tokens(), is_open_mode(), auth_ok(), mask_settings_dict()
+
+✅ v3.0.0 improvements (vs v2.9.1)
+- Better bool parsing (more truthy/falsy tokens)
+- Safer base64(JSON) detection (won’t mis-decode random strings)
+- Stronger CSV/list parsing (supports JSON arrays, CSV, Python-ish lists)
+- Adds derived flags:
+    • auth_effective_required (true when tokens exist OR REQUIRE_AUTH=true)
+    • auth_enabled (true when tokens exist)
+  (Policy still: no tokens => open mode)
 """
 
 from __future__ import annotations
@@ -19,10 +29,29 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-CONFIG_VERSION = "2.9.1"
+CONFIG_VERSION = "3.0.0"
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
+_TRUTHY = {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+    "t",
+    "enable",
+    "enabled",
+    "ok",
+}
+_FALSY = {
+    "0",
+    "false",
+    "no",
+    "n",
+    "off",
+    "f",
+    "disable",
+    "disabled",
+}
 
 
 def _strip(v: Any) -> str:
@@ -69,27 +98,43 @@ def _as_list_lower(v: Any) -> List[str]:
     """
     Accepts:
       - list
-      - "a,b,c"
-      - '["a","b"]'
+      - CSV: "a,b,c"
+      - JSON list: '["a","b"]'
+      - Python-ish list: "['a','b']" (best-effort)
     Returns: deduped lowercase list
     """
     if v is None:
         return []
+
+    raw: List[str] = []
     if isinstance(v, list):
-        raw = [str(x).strip().lower() for x in v if str(x).strip()]
+        raw = [str(x).strip().lower() for x in v if _strip(x)]
     else:
         s = _strip(v)
         if not s:
             return []
-        if s.startswith("[") and s.endswith("]"):
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+            # Try JSON first
             try:
                 arr = json.loads(s)
                 if isinstance(arr, list):
-                    raw = [str(x).strip().lower() for x in arr if str(x).strip()]
+                    raw = [str(x).strip().lower() for x in arr if _strip(x)]
                 else:
                     raw = []
             except Exception:
-                raw = []
+                # Try to normalize python-ish list to JSON list
+                try:
+                    ss = s.strip()
+                    if ss.startswith("(") and ss.endswith(")"):
+                        ss = "[" + ss[1:-1] + "]"
+                    ss = ss.replace("'", '"')
+                    arr = json.loads(ss)
+                    if isinstance(arr, list):
+                        raw = [str(x).strip().lower() for x in arr if _strip(x)]
+                    else:
+                        raw = []
+                except Exception:
+                    raw = []
         else:
             raw = [p.strip().lower() for p in s.split(",") if p.strip()]
 
@@ -111,6 +156,11 @@ def _mask_secret(s: Optional[str]) -> Optional[str]:
     return t[:3] + "***" + t[-3:]
 
 
+def _looks_like_json_object(s: str) -> bool:
+    ss = (s or "").strip()
+    return ss.startswith("{") and ss.endswith("}") and len(ss) >= 2
+
+
 def _maybe_decode_b64_json(s: str) -> Optional[str]:
     """
     - If value is JSON -> return it
@@ -123,17 +173,22 @@ def _maybe_decode_b64_json(s: str) -> Optional[str]:
         return None
 
     # Plain JSON?
-    if raw.startswith("{") and raw.endswith("}"):
+    if _looks_like_json_object(raw):
         try:
             json.loads(raw)
             return raw
         except Exception:
             return raw
 
-    # Try base64 decode -> JSON (lenient)
+    # Heuristic: base64 is usually long-ish and mostly base64 chars
+    # (This avoids decoding random short tokens.)
+    b64ish = all(c.isalnum() or c in "+/=\n\r" for c in raw)
+    if not b64ish or len(raw) < 40:
+        return raw
+
     try:
         decoded = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="replace").strip()
-        if decoded.startswith("{") and decoded.endswith("}"):
+        if _looks_like_json_object(decoded):
             json.loads(decoded)
             return decoded
     except Exception:
@@ -180,6 +235,10 @@ class Settings:
     app_token: Optional[str] = None
     backup_app_token: Optional[str] = None
     require_auth: bool = False  # NOTE: policy still OPEN if no tokens exist
+
+    # Derived flags (computed in from_env)
+    auth_enabled: bool = False  # true when tokens exist
+    auth_effective_required: bool = False  # true when tokens exist OR require_auth=true (still open if no tokens)
 
     # ------------------------------------------------------------------
     # Providers policy
@@ -343,6 +402,10 @@ class Settings:
 
         timezone_default = _strip(os.getenv("TIMEZONE_DEFAULT") or os.getenv("TZ") or "Asia/Riyadh")
 
+        # Derived flags
+        auth_enabled = bool((app_token or "").strip() or (backup_app_token or "").strip())
+        auth_effective_required = bool(auth_enabled or require_auth)
+
         return Settings(
             service_name=service_name,
             environment=environment,
@@ -357,6 +420,8 @@ class Settings:
             app_token=app_token,
             backup_app_token=backup_app_token,
             require_auth=require_auth,
+            auth_enabled=auth_enabled,
+            auth_effective_required=auth_effective_required,
             enabled_providers=enabled_providers,
             ksa_providers=ksa_providers,
             primary_provider=primary_provider,
