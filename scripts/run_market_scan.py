@@ -3,7 +3,7 @@
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER (v1.3.0) – Sheets-ready
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.4.0) – Sheets-ready
 ===========================================================
 
 What this script does
@@ -18,13 +18,16 @@ Defaults (safe)
 - Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
 - Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
 
-Key upgrades (v1.3.0)
+Key upgrades (v1.4.0)
 - ✅ Symbols-sheet ID selection:
-    * new --symbols-sheet-id (read symbols from a specific spreadsheet)
+    * --symbols-sheet-id (read symbols from a specific spreadsheet)
     * default: uses --sheet-id if provided, else DEFAULT_SPREADSHEET_ID (env/settings)
 - ✅ Calls symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not)
 - ✅ Origin map uses normalized symbols (more stable)
-- ✅ Percent normalization: change %, dividend yield %, ROE/ROA %, upside % (handles 0..1 fractions)
+- ✅ Percent normalization: change %, dividend yield %, ROE/ROA %, upside %, expected ROI % (handles 0..1 fractions)
+- ✅ Adds Forecast/History columns (best-effort) if backend returns them:
+    returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d, rsi_14,
+    expected_price_1m/3m/12m, expected_return_1m/3m/12m, confidence_score, forecast_method, forecast_source
 - ✅ Never crashes on one bad batch; inserts per-symbol error rows for traceability
 - ✅ More defensive backend shape parsing + last-updated field fallbacks
 
@@ -61,7 +64,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
@@ -315,6 +318,7 @@ def _headers(token: str) -> Dict[str, str]:
     }
     if token:
         h["X-APP-TOKEN"] = token
+        # keep Authorization for backends that expect it
         h["Authorization"] = f"Bearer {token}"
     return h
 
@@ -357,6 +361,7 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                             return {"results": [], "error": f"Non-JSON response: {(raw or '')[:200]}"}
 
                     last_err = f"HTTP {status}"
+
             except urllib.error.HTTPError as e:
                 last_status = int(getattr(e, "code", 0) or 0)
                 try:
@@ -366,11 +371,14 @@ def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: in
                 last_body_preview = (raw or "")[:500]
                 last_err = f"HTTP {last_status}"
 
+                # If auth failed and we have another token, try it
                 if last_status in (401, 403) and tok_idx < (len(tokens_to_try) - 1):
                     continue
+
             except Exception as e:
                 last_err = str(e)
 
+        # backoff between retry rounds
         if attempt < attempts - 1:
             time.sleep(min(8.0, 1.5 * (attempt + 1) * (attempt + 1)))
 
@@ -430,7 +438,6 @@ def _symbols_reader_call(key: str, spreadsheet_id: Optional[str]) -> Any:
     """
     fn = getattr(symbols_reader, "get_page_symbols", None)
     if callable(fn):
-        # Try passing spreadsheet_id if supported
         if spreadsheet_id:
             try:
                 return fn(key, spreadsheet_id=spreadsheet_id)  # type: ignore
@@ -498,7 +505,7 @@ def _call_analysis_batch(
     chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
 
     for idx, c in enumerate(chunks, start=1):
-        payload = {"tickers": c, "symbols": c}  # ✅ always send both
+        payload = {"tickers": c, "symbols": c}  # ✅ always send both (compat)
         logger.info("Backend batch %s/%s | symbols=%s", idx, len(chunks), len(c))
         resp = _post_json(url, payload, timeout=timeout, retries=retries)
         got, err = _extract_result_list(resp)
@@ -579,6 +586,27 @@ DEFAULT_HEADERS: List[str] = [
     "Upside %",
     "Valuation Label",
 
+    # History / Forecast (best-effort)
+    "Returns 1W %",
+    "Returns 1M %",
+    "Returns 3M %",
+    "Returns 6M %",
+    "Returns 12M %",
+    "MA20",
+    "MA50",
+    "MA200",
+    "Volatility 30D %",
+    "RSI 14",
+    "Forecast Price (1M)",
+    "Expected ROI % (1M)",
+    "Forecast Price (3M)",
+    "Expected ROI % (3M)",
+    "Forecast Price (12M)",
+    "Expected ROI % (12M)",
+    "Forecast Confidence",
+    "Forecast Method",
+    "Forecast Source",
+
     "Data Quality",
     "Sources",
     "Last Updated (UTC)",
@@ -637,6 +665,32 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
         "timestamp_utc",
     )
 
+    # History/Forecast best-effort fields (provider patches / engine analytics)
+    returns_1w = _first_present(r, "returns_1w")
+    returns_1m = _first_present(r, "returns_1m")
+    returns_3m = _first_present(r, "returns_3m")
+    returns_6m = _first_present(r, "returns_6m")
+    returns_12m = _first_present(r, "returns_12m")
+
+    ma20 = _first_present(r, "ma20")
+    ma50 = _first_present(r, "ma50")
+    ma200 = _first_present(r, "ma200")
+    vol30 = _first_present(r, "volatility_30d")
+    rsi14 = _first_present(r, "rsi_14")
+
+    fp_1m = _first_present(r, "expected_price_1m", "forecast_price_1m", "forecast_1m_price")
+    er_1m = _first_present(r, "expected_return_1m", "expected_roi_1m", "forecast_roi_1m")
+
+    fp_3m = _first_present(r, "expected_price_3m", "forecast_price_3m", "forecast_3m_price")
+    er_3m = _first_present(r, "expected_return_3m", "expected_roi_3m", "forecast_roi_3m")
+
+    fp_12m = _first_present(r, "expected_price_12m", "forecast_price_12m", "forecast_12m_price")
+    er_12m = _first_present(r, "expected_return_12m", "expected_roi_12m", "forecast_roi_12m")
+
+    conf = _first_present(r, "confidence_score", "forecast_confidence", "confidence")
+    f_method = _first_present(r, "forecast_method")
+    f_source = _first_present(r, "forecast_source", "forecast_provider", "forecast_data_source")
+
     return [
         rank,
         sym,
@@ -666,6 +720,26 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
         _first_present(r, "fair_value", "fairValue"),
         _as_percent(upside),
         _first_present(r, "valuation_label", "valuation"),
+
+        _as_percent(returns_1w),
+        _as_percent(returns_1m),
+        _as_percent(returns_3m),
+        _as_percent(returns_6m),
+        _as_percent(returns_12m),
+        ma20,
+        ma50,
+        ma200,
+        _as_percent(vol30),  # already % in our providers, but normalize defensively
+        rsi14,
+        fp_1m,
+        _as_percent(er_1m),
+        fp_3m,
+        _as_percent(er_3m),
+        fp_12m,
+        _as_percent(er_12m),
+        conf,
+        f_method,
+        f_source,
 
         _first_present(r, "data_quality"),
         sources_str,
@@ -756,7 +830,7 @@ def _write_grid(
         except Exception:
             pass
 
-    # 3) update_values pattern
+    # 3) update_values(spreadsheet_id, a1_range, values, value_input=?)
     fn3 = getattr(sheets_service, "update_values", None)
     if callable(fn3):
         a1 = f"{sheet_name}!{start_cell}"
@@ -766,7 +840,10 @@ def _write_grid(
         except Exception:
             return 0
 
-    raise RuntimeError("No supported grid writer found in google_sheets_service (expected write_grid_chunked/write_grid/update_values).")
+    raise RuntimeError(
+        "No supported grid writer found in google_sheets_service "
+        "(expected write_grid_chunked/write_grid/update_values)."
+    )
 
 
 def _clear_range(spreadsheet_id: str, a1_range: str) -> None:
@@ -862,7 +939,6 @@ def main() -> None:
         b = _read_symbols_for_key(k, symbols_sheet_id)
         per_key_meta[k] = b.meta
 
-        # normalize symbols for stable origin_map keys
         syms_norm = _dedupe(b.symbols)
         all_symbols.extend(syms_norm)
 
@@ -994,7 +1070,6 @@ def main() -> None:
     if args.clear:
         try:
             start_col, start_row = _parse_a1_cell(start_cell)
-
             end_col = "ZZ"
             if args.smart_clear:
                 end_col = _index_to_col(_col_to_index(start_col) + len(grid[0]) - 1)
