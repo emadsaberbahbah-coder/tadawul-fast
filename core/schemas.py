@@ -1,18 +1,22 @@
-# core/schemas.py  — FULL REPLACEMENT — v3.6.2
+# core/schemas.py  — FULL REPLACEMENT — v3.7.0
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.6.2 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.7.0 (PROD SAFE)
 
-What changed in v3.6.2 (alignment release)
-- ✅ vNext headers aligned to routes/ai_analysis.py expectations:
-    • Percent columns explicitly include "%" (Dividend Yield %, ROE %, etc.)
-    • Technicals use legacy-style labels for safer transforms: Volatility (30D), RSI (14)
-    • Forecast block uses "Expected Return" + "Expected Price" (keeps ROI/Target as synonyms)
-- ✅ Keeps backwards compatibility:
-    • All prior v3.6.1 headers remain recognized via tolerant header normalization + synonyms
-    • Legacy 59 + legacy Analysis headers preserved as-is
-- ✅ Still import-safe: no DataEngine imports, no network, no heavy deps.
+What changed in v3.7.0 (page-custom + forecast clarity)
+- ✅ Each page has its own customized vNext header set (no “one size fits all”).
+- ✅ Forecast columns updated to match the agreed Google Sheets naming:
+    • Forecast Price (1M/3M/12M)
+    • Expected ROI % (1M/3M/12M)
+    • Forecast Confidence
+    • Forecast Updated (UTC)
+  (while still recognizing legacy “Expected Return/Expected Price” variants)
+- ✅ Equity pages (KSA Tadawul + Market Leaders) now include Forecast CORE columns.
+- ✅ Still backward compatible:
+    • Legacy 59 + legacy Analysis headers preserved
+    • Tolerant header normalization + synonyms maintained
+- ✅ Import-safe: no DataEngine imports, no network, no heavy deps.
 - ✅ Defensive: get_headers_for_sheet() never raises and always returns COPIES.
 """
 
@@ -35,7 +39,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.6.2"
+SCHEMAS_VERSION = "3.7.0"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -198,7 +202,7 @@ def validate_headers_59(headers: Any) -> Dict[str, Any]:
 # vNext: Page-customized schemas (what your Sheets should use)
 # =============================================================================
 
-# --- Common blocks (vNext labels aligned to routes/ai_analysis.py transforms) ---
+# --- Common blocks (vNext labels aligned to routes transforms) ---
 _VN_IDENTITY: List[str] = [
     "Rank",
     "Symbol",
@@ -238,7 +242,7 @@ _VN_CAP: List[str] = [
     "Liquidity Score",
 ]
 
-# IMPORTANT: percent fields include "%" to allow robust ratio->percent transforms in routes.
+# IMPORTANT: percent fields include "%" to allow robust ratio->percent transforms.
 _VN_FUNDAMENTALS: List[str] = [
     "EPS (TTM)",
     "Forward EPS",
@@ -247,22 +251,22 @@ _VN_FUNDAMENTALS: List[str] = [
     "P/B",
     "P/S",
     "EV/EBITDA",
-    "Dividend Yield %",   # was "Dividend Yield"
+    "Dividend Yield %",
     "Dividend Rate",
-    "Payout Ratio %",     # was "Payout Ratio"
-    "ROE %",              # was "ROE"
-    "ROA %",              # was "ROA"
-    "Net Margin %",       # was "Net Margin"
-    "EBITDA Margin %",    # was "EBITDA Margin"
-    "Revenue Growth %",   # was "Revenue Growth"
-    "Net Income Growth %",# was "Net Income Growth"
+    "Payout Ratio %",
+    "ROE %",
+    "ROA %",
+    "Net Margin %",
+    "EBITDA Margin %",
+    "Revenue Growth %",
+    "Net Income Growth %",
     "Beta",
 ]
 
 # Align technical labels with legacy-safe keys used across routes.
 _VN_TECHNICALS: List[str] = [
-    "Volatility (30D)",   # was "Volatility 30D"
-    "RSI (14)",           # was "RSI 14"
+    "Volatility (30D)",
+    "RSI (14)",
 ]
 
 _VN_VALUATION: List[str] = [
@@ -287,8 +291,20 @@ _VN_BADGES: List[str] = [
     "Risk Badge",
 ]
 
-# Forecasting / history / targets (use Expected Return / Expected Price to match analysis routes)
-_VN_FORECAST: List[str] = [
+# Forecast CORE (the agreed 8 columns)
+_VN_FORECAST_CORE: List[str] = [
+    "Forecast Price (1M)",
+    "Expected ROI % (1M)",
+    "Forecast Price (3M)",
+    "Expected ROI % (3M)",
+    "Forecast Price (12M)",
+    "Expected ROI % (12M)",
+    "Forecast Confidence",
+    "Forecast Updated (UTC)",
+]
+
+# Forecast EXTENDED (optional analytics + provenance)
+_VN_FORECAST_EXTENDED: List[str] = [
     "Returns 1W %",
     "Returns 1M %",
     "Returns 3M %",
@@ -297,18 +313,17 @@ _VN_FORECAST: List[str] = [
     "MA20",
     "MA50",
     "MA200",
-    "Expected Return 1M %",
-    "Expected Return 3M %",
-    "Expected Return 12M %",
-    "Expected Price 1M",
-    "Expected Price 3M",
-    "Expected Price 12M",
-    "Confidence Score",
     "Forecast Method",
     "History Points",
     "History Source",
     "History Last (UTC)",
 ]
+
+# Full forecast block (global/funds/comfx can use this)
+_VN_FORECAST_FULL: List[str] = (
+    list(_VN_FORECAST_EXTENDED)
+    + list(_VN_FORECAST_CORE)
+)
 
 _VN_META: List[str] = [
     "Error",
@@ -320,8 +335,8 @@ _VN_META: List[str] = [
 ]
 
 # --- Page Schemas (vNext) ---
-# Market Leaders + KSA Tadawul: full equity superset (scores + badges)
-_VN_HEADERS_EQUITY_FULL: List[str] = (
+# 1) KSA Tadawul: equity core + forecast CORE + scores + badges
+_VN_HEADERS_KSA_TADAWUL: List[str] = (
     _VN_IDENTITY
     + _VN_PRICE
     + _VN_LIQUIDITY
@@ -331,10 +346,26 @@ _VN_HEADERS_EQUITY_FULL: List[str] = (
     + _VN_VALUATION
     + _VN_SCORES
     + _VN_BADGES
+    + _VN_FORECAST_CORE
     + _VN_META
 )
 
-# Global markets: equity superset + forecast/history/targets
+# 2) Market Leaders: equity core + forecast CORE + scores + badges
+_VN_HEADERS_MARKET_LEADERS: List[str] = (
+    _VN_IDENTITY
+    + _VN_PRICE
+    + _VN_LIQUIDITY
+    + _VN_CAP
+    + _VN_FUNDAMENTALS
+    + _VN_TECHNICALS
+    + _VN_VALUATION
+    + _VN_SCORES
+    + _VN_BADGES
+    + _VN_FORECAST_CORE
+    + _VN_META
+)
+
+# 3) Global Markets: equity superset + FULL forecast/history
 _VN_HEADERS_GLOBAL: List[str] = (
     _VN_IDENTITY
     + _VN_PRICE
@@ -345,11 +376,11 @@ _VN_HEADERS_GLOBAL: List[str] = (
     + _VN_VALUATION
     + _VN_SCORES
     + _VN_BADGES
-    + _VN_FORECAST
+    + _VN_FORECAST_FULL
     + _VN_META
 )
 
-# Mutual funds: simplified + fund attributes + forecast
+# 4) Mutual funds: simplified + fund attributes + FULL forecast/history
 _VN_HEADERS_FUNDS: List[str] = (
     [
         "Rank",
@@ -379,7 +410,7 @@ _VN_HEADERS_FUNDS: List[str] = (
         "Value Traded",
         "Expense Ratio",
         "AUM",
-        "Distribution Yield",  # keep as-is (providers vary)
+        "Distribution Yield",
         "Beta",
         "Volatility (30D)",
         "RSI (14)",
@@ -391,11 +422,11 @@ _VN_HEADERS_FUNDS: List[str] = (
         "Overall Score",
         "Rec Badge",
     ]
-    + _VN_FORECAST
+    + _VN_FORECAST_FULL
     + _VN_META
 )
 
-# Commodities & FX: stripped fundamentals + forecast
+# 5) Commodities & FX: stripped fundamentals + FULL forecast/history
 _VN_HEADERS_COMMODITIES_FX: List[str] = (
     [
         "Rank",
@@ -429,11 +460,11 @@ _VN_HEADERS_COMMODITIES_FX: List[str] = (
         "Overall Score",
         "Rec Badge",
     ]
-    + _VN_FORECAST
+    + _VN_FORECAST_FULL
     + _VN_META
 )
 
-# My Portfolio: inputs + market data + portfolio KPIs + forecast
+# 6) My Portfolio: inputs + KPIs + forecast CORE (lean)
 _VN_HEADERS_PORTFOLIO: List[str] = (
     [
         # Identity / grouping
@@ -443,12 +474,12 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Name",
         "Market",
         "Currency",
-        "Asset Type",          # Stock / ETF / Fund / Commodity / FX
-        "Portfolio Group",     # user-defined (e.g., Core / Growth / Income)
-        "Broker/Account",      # user-defined
+        "Asset Type",
+        "Portfolio Group",
+        "Broker/Account",
     ]
     + [
-        # User inputs (Sheet-entered)
+        # User inputs
         "Quantity",
         "Avg Cost",
         "Cost Value",
@@ -456,7 +487,7 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Notes",
     ]
     + [
-        # Market snapshot (API)
+        # Market snapshot
         "Price",
         "Prev Close",
         "Change",
@@ -470,7 +501,7 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Value Traded",
     ]
     + [
-        # Position metrics (can be sheet formulas OR API if you later implement)
+        # Position metrics
         "Market Value",
         "Unrealized P/L",
         "Unrealized P/L %",
@@ -478,29 +509,29 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Rebalance Δ",
     ]
     + [
-        # Analytics / forward-looking
+        # Forward-looking
         "Fair Value",
         "Upside %",
         "Valuation Label",
-        "Expected Return 1M %",
-        "Expected Return 3M %",
-        "Expected Return 12M %",
-        "Expected Price 1M",
-        "Expected Price 3M",
-        "Expected Price 12M",
-        "Confidence Score",
+        "Forecast Price (1M)",
+        "Expected ROI % (1M)",
+        "Forecast Price (3M)",
+        "Expected ROI % (3M)",
+        "Forecast Price (12M)",
+        "Expected ROI % (12M)",
+        "Forecast Confidence",
         "Recommendation",
         "Rec Badge",
     ]
     + [
-        # Quality/safety indicators
+        # Risk/technicals
         "Risk Score",
         "Overall Score",
         "Volatility (30D)",
         "RSI (14)",
     ]
     + [
-        # Provenance / meta
+        # Meta
         "Error",
         "Data Source",
         "Data Quality",
@@ -509,12 +540,17 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
     ]
 )
 
+# 7) Insights_Analysis: by default uses Global schema (safe for leaderboards/tables)
+_VN_HEADERS_INSIGHTS_ANALYSIS: List[str] = list(_VN_HEADERS_GLOBAL)
+
 # Freeze vNext schemas as tuples (prevent accidental mutation)
-_VN_EQUITY_FULL_T: Tuple[str, ...] = tuple(_VN_HEADERS_EQUITY_FULL)
+_VN_KSA_T: Tuple[str, ...] = tuple(_VN_HEADERS_KSA_TADAWUL)
+_VN_ML_T: Tuple[str, ...] = tuple(_VN_HEADERS_MARKET_LEADERS)
 _VN_GLOBAL_T: Tuple[str, ...] = tuple(_VN_HEADERS_GLOBAL)
 _VN_FUNDS_T: Tuple[str, ...] = tuple(_VN_HEADERS_FUNDS)
 _VN_COMFX_T: Tuple[str, ...] = tuple(_VN_HEADERS_COMMODITIES_FX)
 _VN_PORTFOLIO_T: Tuple[str, ...] = tuple(_VN_HEADERS_PORTFOLIO)
+_VN_INSIGHTS_T: Tuple[str, ...] = tuple(_VN_HEADERS_INSIGHTS_ANALYSIS)
 
 
 # =============================================================================
@@ -530,7 +566,8 @@ _HEADER_GROUPS_VNEXT: Dict[str, Tuple[str, ...]] = {
     "Valuation": tuple(_VN_VALUATION),
     "Scores": tuple(_VN_SCORES),
     "Badges": tuple(_VN_BADGES),
-    "Forecast": tuple(_VN_FORECAST),
+    "Forecast Core": tuple(_VN_FORECAST_CORE),
+    "Forecast Extended": tuple(_VN_FORECAST_EXTENDED),
     "Meta": tuple(_VN_META),
 }
 
@@ -563,11 +600,13 @@ _HEADER_CANON_BY_NORM: Dict[str, str] = {}
 for _h in (
     list(_DEFAULT_59_TUPLE)
     + list(_DEFAULT_ANALYSIS_TUPLE)
+    + list(_VN_KSA_T)
+    + list(_VN_ML_T)
     + list(_VN_GLOBAL_T)
-    + list(_VN_EQUITY_FULL_T)
     + list(_VN_FUNDS_T)
     + list(_VN_COMFX_T)
     + list(_VN_PORTFOLIO_T)
+    + list(_VN_INSIGHTS_T)
 ):
     _HEADER_CANON_BY_NORM[_norm_header_label(_h)] = str(_h)
 
@@ -618,16 +657,29 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "portfolio_group": "Portfolio Group",
     "asset_type": "Asset Type",
 
-    # forecast aliases (support ROI/Target labels too)
-    "expected_roi_1m_percent": "Expected Return 1M %",
-    "expected_roi_3m_percent": "Expected Return 3M %",
-    "expected_roi_12m_percent": "Expected Return 12M %",
-    "expected_return_1m_percent": "Expected Return 1M %",
-    "expected_return_3m_percent": "Expected Return 3M %",
-    "expected_return_12m_percent": "Expected Return 12M %",
-    "target_price_1m": "Expected Price 1M",
-    "target_price_3m": "Expected Price 3M",
-    "target_price_12m": "Expected Price 12M",
+    # forecast aliases (support ROI/Target/Expected variants too)
+    "expected_return_1m_percent": "Expected ROI % (1M)",
+    "expected_return_3m_percent": "Expected ROI % (3M)",
+    "expected_return_12m_percent": "Expected ROI % (12M)",
+    "expected_roi_1m_percent": "Expected ROI % (1M)",
+    "expected_roi_3m_percent": "Expected ROI % (3M)",
+    "expected_roi_12m_percent": "Expected ROI % (12M)",
+    "expected_roi_percent_1m": "Expected ROI % (1M)",
+    "expected_roi_percent_3m": "Expected ROI % (3M)",
+    "expected_roi_percent_12m": "Expected ROI % (12M)",
+
+    "expected_price_1m": "Forecast Price (1M)",
+    "expected_price_3m": "Forecast Price (3M)",
+    "expected_price_12m": "Forecast Price (12M)",
+    "target_price_1m": "Forecast Price (1M)",
+    "target_price_3m": "Forecast Price (3M)",
+    "target_price_12m": "Forecast Price (12M)",
+
+    "confidence_score": "Forecast Confidence",
+    "forecast_confidence": "Forecast Confidence",
+
+    "forecast_updated_utc": "Forecast Updated (UTC)",
+    "history_last_utc": "History Last (UTC)",
 }
 for k, canon_header in list(_HEADER_SYNONYMS.items()):
     nk = _norm_header_label(k)
@@ -735,17 +787,23 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ma20": ("sma20",),
     "ma50": ("sma50",),
     "ma200": ("sma200",),
+
     "expected_return_1m": ("exp_return_1m", "expected_roi_1m"),
     "expected_return_3m": ("exp_return_3m", "expected_roi_3m"),
     "expected_return_12m": ("exp_return_12m", "expected_roi_12m"),
     "expected_price_1m": ("exp_price_1m", "target_price_1m"),
     "expected_price_3m": ("exp_price_3m", "target_price_3m"),
     "expected_price_12m": ("exp_price_12m", "target_price_12m"),
-    "confidence_score": ("conf_score",),
+
+    "confidence_score": ("conf_score", "forecast_confidence"),
     "forecast_method": ("forecast_model",),
+
     "history_points": ("hist_points",),
     "history_source": ("hist_source",),
     "history_last_utc": ("hist_last_utc",),
+
+    # NEW: forecast updated timestamp (separate from history_last_utc if you supply it)
+    "forecast_updated_utc": ("forecast_last_utc", "forecast_asof_utc", "forecast_time_utc", "forecast_updated"),
 
     # Funds
     "fund_type": ("etf_type",),
@@ -832,7 +890,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Free Float Mkt Cap": "free_float_market_cap",
     "Liquidity Score": "liquidity_score",
 
-    # --- vNext Fundamentals (percent labels explicit) ---
+    # --- vNext Fundamentals ---
     "EPS (TTM)": "eps_ttm",
     "Forward EPS": "forward_eps",
     "P/E (TTM)": "pe_ttm",
@@ -872,7 +930,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Opportunity Badge": "opportunity_badge",
     "Risk Badge": "risk_badge",
 
-    # --- Forecast / history (Expected Return / Expected Price) ---
+    # --- Forecast / history (FULL) ---
     "Returns 1W %": "returns_1w",
     "Returns 1M %": "returns_1m",
     "Returns 3M %": "returns_3m",
@@ -881,17 +939,20 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "MA20": "ma20",
     "MA50": "ma50",
     "MA200": "ma200",
-    "Expected Return 1M %": "expected_return_1m",
-    "Expected Return 3M %": "expected_return_3m",
-    "Expected Return 12M %": "expected_return_12m",
-    "Expected Price 1M": "expected_price_1m",
-    "Expected Price 3M": "expected_price_3m",
-    "Expected Price 12M": "expected_price_12m",
-    "Confidence Score": "confidence_score",
     "Forecast Method": "forecast_method",
     "History Points": "history_points",
     "History Source": "history_source",
     "History Last (UTC)": "history_last_utc",
+
+    # --- Forecast CORE (agreed labels) ---
+    "Forecast Price (1M)": "expected_price_1m",
+    "Expected ROI % (1M)": "expected_return_1m",
+    "Forecast Price (3M)": "expected_price_3m",
+    "Expected ROI % (3M)": "expected_return_3m",
+    "Forecast Price (12M)": "expected_price_12m",
+    "Expected ROI % (12M)": "expected_return_12m",
+    "Forecast Confidence": "confidence_score",
+    "Forecast Updated (UTC)": "forecast_updated_utc",
 
     # --- Fund specific ---
     "Fund Type": "fund_type",
@@ -937,7 +998,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Percent Change": "percent_change",
     "Avg Volume (30D)": "avg_volume_30d",
     "Free Float Market Cap": "free_float_market_cap",
-    "Dividend Yield": "dividend_yield",          # legacy/no-% variant (tolerant)
+    "Dividend Yield": "dividend_yield",  # legacy/no-% variant
     "Payout Ratio": "payout_ratio",
     "ROE": "roe",
     "ROA": "roa",
@@ -945,16 +1006,17 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "EBITDA Margin": "ebitda_margin",
     "Revenue Growth": "revenue_growth",
     "Net Income Growth": "net_income_growth",
-    "Volatility 30D": "volatility_30d",          # legacy v3.6.1 variant
-    "RSI 14": "rsi_14",                          # legacy v3.6.1 variant
+    "Volatility 30D": "volatility_30d",
+    "RSI 14": "rsi_14",
 
     # ROI/Target legacy variants (tolerant)
-    "Expected ROI 1M %": "expected_return_1m",
-    "Expected ROI 3M %": "expected_return_3m",
-    "Expected ROI 12M %": "expected_return_12m",
-    "Target Price 1M": "expected_price_1m",
-    "Target Price 3M": "expected_price_3m",
-    "Target Price 12M": "expected_price_12m",
+    "Expected Return 1M %": "expected_return_1m",
+    "Expected Return 3M %": "expected_return_3m",
+    "Expected Return 12M %": "expected_return_12m",
+    "Expected Price 1M": "expected_price_1m",
+    "Expected Price 3M": "expected_price_3m",
+    "Expected Price 12M": "expected_price_12m",
+    "Confidence Score": "confidence_score",
 }
 
 # Multi-field fallback candidates per header (preferred first, then aliases)
@@ -965,12 +1027,26 @@ for h, f in HEADER_TO_FIELD.items():
     HEADER_FIELD_CANDIDATES[h] = (canon,) + tuple(a for a in aliases if a)
 
 # Build FIELD_TO_HEADER that recognizes both canonical fields and known aliases.
+# Preference: keep vNext ROI/Forecast headers as “preferred” even if legacy variants exist.
+_PREFERRED_HEADERS: Tuple[str, ...] = (
+    "Forecast Price (1M)",
+    "Expected ROI % (1M)",
+    "Forecast Price (3M)",
+    "Expected ROI % (3M)",
+    "Forecast Price (12M)",
+    "Expected ROI % (12M)",
+    "Forecast Confidence",
+    "Forecast Updated (UTC)",
+)
+
 _FIELD_TO_HEADER: Dict[str, str] = {}
 for header, field in HEADER_TO_FIELD.items():
     canon = canonical_field(field)
-    _FIELD_TO_HEADER[canon] = header
+    if (canon not in _FIELD_TO_HEADER) or (header in _PREFERRED_HEADERS):
+        _FIELD_TO_HEADER[canon] = header
     for a in FIELD_ALIASES.get(canon, ()):
-        _FIELD_TO_HEADER[a] = header
+        if (a not in _FIELD_TO_HEADER) or (header in _PREFERRED_HEADERS):
+            _FIELD_TO_HEADER[a] = header
 
 FIELD_TO_HEADER: Dict[str, str] = dict(_FIELD_TO_HEADER)
 
@@ -1069,14 +1145,14 @@ _register(
     keys=[
         "KSA_Tadawul", "KSA Tadawul", "ksa_tadawul", "ksa_tadawul_market", "tadawul", "ksa",
     ],
-    headers=_VN_EQUITY_FULL_T,
+    headers=_VN_KSA_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
         "Market_Leaders", "Market Leaders", "market_leaders", "ksa_market_leaders",
     ],
-    headers=_VN_EQUITY_FULL_T,
+    headers=_VN_ML_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
@@ -1106,13 +1182,12 @@ _register(
     ],
     headers=_VN_PORTFOLIO_T,
 )
-# Explicit mapping for Insights_Analysis under vNext
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
         "Insights_Analysis", "Insights Analysis", "insights_analysis", "insights",
     ],
-    headers=_VN_GLOBAL_T,
+    headers=_VN_INSIGHTS_T,
 )
 
 
@@ -1152,7 +1227,7 @@ def _pick_registry(schema_version: Optional[str]) -> Dict[str, Tuple[str, ...]]:
         return _SHEET_HEADERS_LEGACY
 
     # Explicit legacy switch
-    if v in {"legacy", "v3", "3.5.0", "3.5", "3.0"}:
+    if v in {"legacy", "v3", "3.6.2", "3.6", "3.5.0", "3.5", "3.0"}:
         return _SHEET_HEADERS_LEGACY
 
     # Default: vNext customized schemas
@@ -1171,9 +1246,9 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Opti
         reg = _pick_registry(schema_version)
 
         if not key:
-            # Default fallback: vNext equity full (most common), else legacy 59
+            # Default fallback: vNext KSA (common), else legacy 59
             if reg is _SHEET_HEADERS_VNEXT:
-                return list(_VN_EQUITY_FULL_T)
+                return list(_VN_KSA_T)
             return list(_DEFAULT_59_TUPLE)
 
         v = reg.get(key)
@@ -1187,7 +1262,7 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Opti
 
         # Final fallback
         if reg is _SHEET_HEADERS_VNEXT:
-            return list(_VN_EQUITY_FULL_T)
+            return list(_VN_KSA_T)
         return list(_DEFAULT_59_TUPLE)
 
     except Exception:
