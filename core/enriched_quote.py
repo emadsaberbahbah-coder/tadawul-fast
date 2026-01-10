@@ -2,7 +2,7 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.6.0
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.7.0
 Emad Bahbah — Financial Leader Edition
 
 What this module is for
@@ -11,23 +11,22 @@ What this module is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.6.0 enhancements
-- Custom “Emad 59-column” headers support:
-    • Stronger header synonym mapping (Price/Prev Close/Change/Change %, etc.)
-    • Adds default ENRICHED_HEADERS_59 list (sheet-ready)
-- Forecast fields compatibility:
-    • Uses fair_value / expected_price_* / upside_percent when present
-    • Auto-computes Fair Value / Upside % / Valuation Label if missing
-- Computes missing sheet KPIs:
-    • turnover_percent, free_float_market_cap, liquidity_score, overall_score
+✅ v2.7.0 enhancements (this revision)
+- Stronger “Emad 59-column” mapping (Price/Prev Close/Change/Change %, Value Traded, etc.)
+- Computes missing KPIs when provider fields are missing:
+    • Change, Change %, Value Traded
+    • 52W Position %
+    • turnover_percent, free_float_market_cap, liquidity_score
+- Fair Value / Upside % / Valuation Label: computed if missing (uses fair_value/expected_price_*/MA proxies)
 - Recommendation standardized everywhere to: BUY / HOLD / REDUCE / SELL (UPPERCASE)
 - ISO parsing supports trailing 'Z'
 - Riyadh timestamp fill from UTC if missing
-- 52W Position % computed + stored in payload if missing
 - Defensive per-symbol concurrency + timeout for /quotes slow path
+- Import-safe: no hard DataEngine dependency at import time.
 
 NOTE
-- Import-safe: no hard DataEngine dependency at import time.
+- This module is intentionally “compat + sheet-mapper”. Your newer sheet endpoints should use:
+    routes/advanced_analysis.py  (engine-driven + schema-driven)
 """
 
 from __future__ import annotations
@@ -48,13 +47,14 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("core.enriched_quote")
 
-ROUTER_VERSION = "2.6.0"
+ROUTER_VERSION = "2.7.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _UQ_KEYS: Optional[List[str]] = None
 
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
+
 
 # -----------------------------------------------------------------------------
 # Default “Emad 59-column” headers (sheet-ready)
@@ -158,6 +158,9 @@ async def _maybe_await(v: Any) -> Any:
 
 
 def _safe_get(obj: Any, *names: str) -> Any:
+    """
+    Safe getter for dict-like or object-like payloads.
+    """
     if obj is None:
         return None
     if isinstance(obj, dict):
@@ -343,6 +346,10 @@ def _get_uq_keys() -> List[str]:
 
 
 def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tries to ensure a stable key-set for older clients.
+    Never raises.
+    """
     try:
         keys = _get_uq_keys()
         if keys:
@@ -353,9 +360,11 @@ def _schema_fill_best_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
         sch = _try_import_schemas()
         if sch is not None:
             try:
-                for f in set(str(v) for v in getattr(sch, "HEADER_TO_FIELD", {}).values()):
-                    if f:
-                        payload.setdefault(f, None)
+                hdr_to_field = getattr(sch, "HEADER_TO_FIELD", {})
+                if isinstance(hdr_to_field, dict):
+                    for f in set(str(v) for v in hdr_to_field.values()):
+                        if f:
+                            payload.setdefault(f, None)
             except Exception:
                 pass
 
@@ -437,6 +446,10 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
 
 
 def _ratio_to_percent(v: Any) -> Any:
+    """
+    If value looks like a ratio (between -1 and 1), convert to percent.
+    Otherwise keep as-is.
+    """
     if v is None:
         return None
     try:
@@ -492,6 +505,27 @@ def _compute_free_float_mkt_cap(market_cap: Any, free_float: Any) -> Optional[fl
         return None
 
 
+def _compute_value_traded(price: Any, volume: Any) -> Optional[float]:
+    p = _safe_float_or_none(price)
+    v = _safe_float_or_none(volume)
+    if p is None or v is None:
+        return None
+    try:
+        return round(p * v, 4)
+    except Exception:
+        return None
+
+
+def _compute_change_and_pct(price: Any, prev_close: Any) -> Tuple[Optional[float], Optional[float]]:
+    p = _safe_float_or_none(price)
+    pc = _safe_float_or_none(prev_close)
+    if p is None or pc is None or pc == 0:
+        return None, None
+    ch = p - pc
+    pct = (p / pc - 1.0) * 100.0
+    return round(ch, 6), round(pct, 6)
+
+
 def _compute_liquidity_score(value_traded: Any) -> Optional[float]:
     """
     Simple, stable liquidity score 0..100 using log10(value_traded).
@@ -545,6 +579,19 @@ def _hkey(h: str) -> str:
     return s
 
 
+def _payload_symbol_key(p: Dict[str, Any]) -> str:
+    try:
+        for k in ("symbol_normalized", "symbol", "Symbol", "ticker", "code"):
+            v = p.get(k)
+            if v is not None:
+                s = str(v).strip().upper()
+                if s:
+                    return s
+    except Exception:
+        pass
+    return ""
+
+
 # =============================================================================
 # Header mapping (robust synonyms for your 59 columns)
 # =============================================================================
@@ -560,30 +607,30 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "sub-sector": (("sub_sector", "subsector"), None),
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
-    "listing date": (("listing_date", "ipo"), None),
+    "listing date": (("listing_date", "ipo_date", "ipo"), None),
 
     # Prices
     "price": (("current_price", "last_price", "price"), None),
     "last price": (("current_price", "last_price", "price"), None),
-    "prev close": (("previous_close",), None),
-    "previous close": (("previous_close",), None),
+    "prev close": (("previous_close", "prev_close", "prior_close"), None),
+    "previous close": (("previous_close", "prev_close", "prior_close"), None),
     "change": (("price_change", "change"), None),
     "price change": (("price_change", "change"), None),
-    "change %": (("percent_change", "change_percent", "change_pct"), None),
-    "percent change": (("percent_change", "change_percent", "change_pct"), None),
+    "change %": (("percent_change", "change_percent", "change_pct", "pct_change"), _ratio_to_percent),
+    "percent change": (("percent_change", "change_percent", "change_pct", "pct_change"), _ratio_to_percent),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
 
     # 52W
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
-    "52w position %": (("position_52w_percent", "position_52w"), None),
+    "52w position %": (("position_52w_percent", "position_52w"), _ratio_to_percent),
 
     # Volume/Liquidity
-    "volume": (("volume",), None),
+    "volume": (("volume", "vol"), None),
     "avg vol 30d": (("avg_volume_30d", "avg_volume"), None),
     "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
-    "value traded": (("value_traded",), None),
+    "value traded": (("value_traded", "traded_value", "turnover_value"), None),
     "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
     "shares outstanding": (("shares_outstanding",), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
@@ -642,7 +689,7 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     # Metadata
     "error": (("error",), None),
     "recommendation": (("recommendation",), None),
-    "data source": (("data_source", "source"), None),
+    "data source": (("data_source", "source", "provider"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
@@ -667,16 +714,25 @@ class EnrichedQuote:
     def from_unified(cls, uq: Any) -> "EnrichedQuote":
         p = _as_payload(_unwrap_tuple_payload(uq))
 
-        # Recommendation enum
+        # --- Normalize core identity
+        try:
+            if not p.get("symbol") and p.get("symbol_normalized"):
+                p["symbol"] = p.get("symbol_normalized")
+        except Exception:
+            pass
+
+        # --- Recommendation enum
         try:
             p["recommendation"] = _normalize_recommendation(p.get("recommendation"))
         except Exception:
             p["recommendation"] = "HOLD"
 
-        # Ensure timestamps
+        # --- Ensure timestamps
         try:
             if not p.get("last_updated_utc") and p.get("as_of_utc"):
                 p["last_updated_utc"] = p.get("as_of_utc")
+            if p.get("last_updated_utc"):
+                p["last_updated_utc"] = _iso_or_none(p.get("last_updated_utc")) or p.get("last_updated_utc")
         except Exception:
             pass
 
@@ -687,7 +743,34 @@ class EnrichedQuote:
         except Exception:
             pass
 
-        # Compute 52W position if missing
+        # --- Compute Change / Change % if missing (prefer provider values if present)
+        try:
+            price = _safe_get(p, "current_price", "last_price", "price")
+            prev = _safe_get(p, "previous_close", "prev_close", "prior_close")
+            ch = _safe_get(p, "price_change", "change")
+            pct = _safe_get(p, "percent_change", "change_percent", "change_pct", "pct_change")
+
+            if ch is None or pct is None:
+                ch2, pct2 = _compute_change_and_pct(price, prev)
+                if ch is None and ch2 is not None:
+                    p["price_change"] = ch2
+                if pct is None and pct2 is not None:
+                    p["percent_change"] = pct2  # store as percent (0..100)
+        except Exception:
+            pass
+
+        # --- Compute Value Traded if missing (price * volume)
+        try:
+            if p.get("value_traded") is None:
+                price = _safe_get(p, "current_price", "last_price", "price")
+                vol = _safe_get(p, "volume", "vol")
+                vt = _compute_value_traded(price, vol)
+                if vt is not None:
+                    p["value_traded"] = vt
+        except Exception:
+            pass
+
+        # --- Compute 52W position if missing
         try:
             if p.get("position_52w_percent") is None:
                 cp = _safe_get(p, "current_price", "last_price", "price")
@@ -699,7 +782,7 @@ class EnrichedQuote:
         except Exception:
             pass
 
-        # Compute turnover/free-float mkt cap/liquidity score if missing
+        # --- Compute turnover/free-float mkt cap/liquidity score if missing
         try:
             if p.get("turnover_percent") is None:
                 p["turnover_percent"] = _compute_turnover_percent(p.get("volume"), p.get("shares_outstanding"))
@@ -718,7 +801,20 @@ class EnrichedQuote:
         except Exception:
             pass
 
-        # overall_score default
+        # --- Fair value / upside / label if missing
+        try:
+            if p.get("fair_value") is None or p.get("upside_percent") is None or p.get("valuation_label") is None:
+                fair, upside, label = _compute_fair_value_and_upside(p)
+                if p.get("fair_value") is None and fair is not None:
+                    p["fair_value"] = fair
+                if p.get("upside_percent") is None and upside is not None:
+                    p["upside_percent"] = upside  # store as percent
+                if p.get("valuation_label") is None and label is not None:
+                    p["valuation_label"] = label
+        except Exception:
+            pass
+
+        # --- overall_score default
         try:
             if p.get("overall_score") is None:
                 p["overall_score"] = p.get("opportunity_score")
@@ -726,6 +822,15 @@ class EnrichedQuote:
             pass
 
         return cls(p)
+
+    def _origin_default(self) -> str:
+        sym = str(self.payload.get("symbol_normalized") or self.payload.get("symbol") or "").upper()
+        mkt = str(self.payload.get("market") or "").upper()
+        if sym.endswith(".SR") or mkt == "KSA":
+            return "KSA_TADAWUL"
+        if sym.startswith("^") or "=" in sym:
+            return "GLOBAL_MARKETS"
+        return "GLOBAL_MARKETS"
 
     def _value_for_header(self, header: str) -> Any:
         sch = _try_import_schemas()
@@ -735,7 +840,9 @@ class EnrichedQuote:
         candidates: Tuple[str, ...] = ()
         if sch is not None:
             try:
-                candidates = tuple(getattr(sch, "header_field_candidates")(header))  # type: ignore
+                fn = getattr(sch, "header_field_candidates", None)
+                if callable(fn):
+                    candidates = tuple(fn(header))  # type: ignore[misc]
             except Exception:
                 candidates = ()
 
@@ -747,21 +854,60 @@ class EnrichedQuote:
             # computed: origin
             if hk == "origin":
                 v = _safe_get(self.payload, *fields)
+                return v if v is not None else self._origin_default()
+
+            # computed: change / change % (always safe)
+            if hk in ("change", "price change"):
+                v = _safe_get(self.payload, *fields)
                 if v is not None:
                     return v
-                sym = str(self.payload.get("symbol_normalized") or self.payload.get("symbol") or "").upper()
-                mkt = str(self.payload.get("market") or "").upper()
-                if sym.endswith(".SR") or mkt == "KSA":
-                    return "KSA_TADAWUL"
-                if sym.startswith("^") or "=" in sym:
-                    return "GLOBAL_MARKETS"
-                return "GLOBAL_MARKETS"
+                ch2, _pct2 = _compute_change_and_pct(
+                    _safe_get(self.payload, "current_price", "last_price", "price"),
+                    _safe_get(self.payload, "previous_close", "prev_close", "prior_close"),
+                )
+                if ch2 is not None:
+                    try:
+                        self.payload["price_change"] = ch2
+                    except Exception:
+                        pass
+                return ch2
+
+            if hk in ("change %", "percent change"):
+                v = _safe_get(self.payload, *fields)
+                if v is not None:
+                    return transform(v) if transform else v
+                _ch2, pct2 = _compute_change_and_pct(
+                    _safe_get(self.payload, "current_price", "last_price", "price"),
+                    _safe_get(self.payload, "previous_close", "prev_close", "prior_close"),
+                )
+                if pct2 is not None:
+                    try:
+                        self.payload["percent_change"] = pct2
+                    except Exception:
+                        pass
+                return pct2
+
+            # computed: value traded
+            if hk == "value traded":
+                v = _safe_get(self.payload, *fields)
+                if v is not None:
+                    return v
+                vt = _compute_value_traded(
+                    _safe_get(self.payload, "current_price", "last_price", "price"),
+                    _safe_get(self.payload, "volume", "vol"),
+                )
+                if vt is not None:
+                    try:
+                        self.payload["value_traded"] = vt
+                    except Exception:
+                        pass
+                return vt
 
             # computed: 52W position %
             if hk in ("52w position %", "52w position"):
                 v = _safe_get(self.payload, *fields)
                 if v is not None:
-                    return v
+                    return transform(v) if transform else v
                 cp = _safe_get(self.payload, "current_price", "last_price", "price")
                 lo = _safe_get(self.payload, "week_52_low", "low_52w", "52w_low")
                 hi = _safe_get(self.payload, "week_52_high", "high_52w", "52w_high")
@@ -824,6 +970,17 @@ class EnrichedQuote:
                         pass
                 return _iso_or_none(v) or v
 
+            # computed: last updated (utc) iso
+            if hk == "last updated (utc)":
+                v = self.payload.get("last_updated_utc") or self.payload.get("as_of_utc")
+                if not v:
+                    v = _now_utc().isoformat()
+                    try:
+                        self.payload["last_updated_utc"] = v
+                    except Exception:
+                        pass
+                return _iso_or_none(v) or v
+
             # computed fair/upside/label if missing
             if hk in ("fair value", "upside %", "valuation label"):
                 fair, upside, label = _compute_fair_value_and_upside(self.payload)
@@ -856,7 +1013,7 @@ class EnrichedQuote:
                     return val
             return val
 
-        # If schema candidates exist, use them
+        # If schema candidates exist, use them (best-effort transforms for known pct/vol/time headers)
         if candidates:
             for f in candidates:
                 if not f:
@@ -886,6 +1043,7 @@ class EnrichedQuote:
                         "upside %",
                         "change %",
                         "percent change",
+                        "52w position %",
                     }:
                         return _ratio_to_percent(val)
 
@@ -897,13 +1055,23 @@ class EnrichedQuote:
 
                     return val
 
-        # Absolute last fallback
+        # Absolute last fallback: snake-ish guess
         guess = str(header or "").strip()
         return self.payload.get(guess)
 
     def to_row(self, headers: Sequence[str]) -> List[Any]:
         hs = [str(h) for h in (headers or [])]
         row = [self._value_for_header(h) for h in hs]
+
+        # Ensure recommendation column is enum if present
+        try:
+            for i, h in enumerate(hs):
+                if str(h).strip().lower() == "recommendation":
+                    row[i] = _normalize_recommendation(row[i])
+                    break
+        except Exception:
+            pass
+
         if len(row) < len(hs):
             row += [None] * (len(hs) - len(row))
         return row[: len(hs)]
@@ -1073,6 +1241,29 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         if not payload.get("last_updated_riyadh"):
             payload["last_updated_riyadh"] = _to_riyadh_iso(payload.get("last_updated_utc")) or ""
 
+        # compute change/change% if missing
+        try:
+            price = _safe_get(payload, "current_price", "last_price", "price")
+            prev = _safe_get(payload, "previous_close", "prev_close", "prior_close")
+            if payload.get("price_change") is None or payload.get("percent_change") is None:
+                ch, pct = _compute_change_and_pct(price, prev)
+                if payload.get("price_change") is None and ch is not None:
+                    payload["price_change"] = ch
+                if payload.get("percent_change") is None and pct is not None:
+                    payload["percent_change"] = pct
+        except Exception:
+            pass
+
+        # compute value_traded if missing
+        try:
+            if payload.get("value_traded") is None:
+                payload["value_traded"] = _compute_value_traded(
+                    _safe_get(payload, "current_price", "last_price", "price"),
+                    _safe_get(payload, "volume", "vol"),
+                )
+        except Exception:
+            pass
+
         # compute 52w position if missing
         if payload.get("position_52w_percent") is None:
             cp = _safe_get(payload, "current_price", "last_price", "price")
@@ -1091,6 +1282,19 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
 
         if payload.get("liquidity_score") is None:
             payload["liquidity_score"] = _compute_liquidity_score(payload.get("value_traded"))
+
+        # fair/upside/label if missing
+        try:
+            if payload.get("fair_value") is None or payload.get("upside_percent") is None or payload.get("valuation_label") is None:
+                fair, upside, label = _compute_fair_value_and_upside(payload)
+                if payload.get("fair_value") is None and fair is not None:
+                    payload["fair_value"] = fair
+                if payload.get("upside_percent") is None and upside is not None:
+                    payload["upside_percent"] = upside
+                if payload.get("valuation_label") is None and label is not None:
+                    payload["valuation_label"] = label
+        except Exception:
+            pass
 
         # overall_score fallback
         if payload.get("overall_score") is None:
@@ -1112,19 +1316,6 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
                 "last_updated_riyadh": "",
             }
         )
-
-
-def _payload_symbol_key(p: Dict[str, Any]) -> str:
-    try:
-        for k in ("symbol_normalized", "symbol", "Symbol", "ticker", "code"):
-            v = p.get(k)
-            if v is not None:
-                s = str(v).strip().upper()
-                if s:
-                    return s
-    except Exception:
-        pass
-    return ""
 
 
 # =============================================================================
@@ -1249,13 +1440,17 @@ async def enriched_quotes(
 
     # FAST PATH: batch returned list or dict
     if isinstance(batch_res, (list, dict)) and batch_res:
+        # dict case
         if isinstance(batch_res, dict):
             mp: Dict[str, Dict[str, Any]] = {}
             for k, v in batch_res.items():
-                kk = str(k or "").strip().upper()
                 pv = _as_payload(_unwrap_tuple_payload(v))
-                if kk and kk not in mp:
-                    mp[kk] = pv
+                kk = str(k or "").strip().upper()
+                if kk:
+                    mp.setdefault(kk, pv)
+                symk = _payload_symbol_key(pv)
+                if symk:
+                    mp.setdefault(symk, pv)
 
             for raw in raw_list:
                 norm = (_normalize_symbol_safe(raw) or raw).strip().upper()
@@ -1284,6 +1479,7 @@ async def enriched_quotes(
         # list case
         payloads: List[Dict[str, Any]] = [_as_payload(_unwrap_tuple_payload(x)) for x in list(batch_res)]
 
+        # If list length matches request, map by order
         if len(payloads) == len(raw_list):
             for i, raw in enumerate(raw_list):
                 norm = _normalize_symbol_safe(raw) or raw
@@ -1291,6 +1487,7 @@ async def enriched_quotes(
                 items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
             return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
 
+        # else build dict by symbol key
         mp2: Dict[str, Dict[str, Any]] = {}
         for p in payloads:
             k = _payload_symbol_key(p)
