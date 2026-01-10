@@ -3,7 +3,7 @@
 core/providers/finnhub_provider.py
 ============================================================
 Finnhub Provider (GLOBAL enrichment fallback) — v2.0.0
-(PROD SAFE + ENGINE PATCH + CUSTOM HEADERS + HISTORY/FORECAST)
+(PROD SAFE + ENGINE PATCH + CUSTOM HEADERS + HISTORY/FORECAST + CLIENT REUSE)
 
 Role
 - GLOBAL fallback/enrichment (quote + optional profile + optional history analytics)
@@ -78,8 +78,9 @@ import os
 import random
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -308,19 +309,20 @@ def _endpoint_headers(kind: str) -> Dict[str, str]:
 
 async def _get_client() -> httpx.AsyncClient:
     global _CLIENT
-    if _CLIENT is None:
-        async with _LOCK:
-            if _CLIENT is None:
-                t = _timeout_sec()
-                timeout = httpx.Timeout(t, connect=min(10.0, t))
-                _CLIENT = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_base_headers())
-                logger.info(
-                    "Finnhub client init v%s | base=%s | timeout=%.1fs | cachetools=%s",
-                    PROVIDER_VERSION,
-                    _base_url(),
-                    t,
-                    _HAS_CACHETOOLS,
-                )
+    if _CLIENT is not None:
+        return _CLIENT
+    async with _LOCK:
+        if _CLIENT is None:
+            t = _timeout_sec()
+            timeout = httpx.Timeout(t, connect=min(10.0, t))
+            _CLIENT = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_base_headers())
+            logger.info(
+                "Finnhub client init v%s | base=%s | timeout=%.1fs | cachetools=%s",
+                PROVIDER_VERSION,
+                _base_url(),
+                t,
+                _HAS_CACHETOOLS,
+            )
     return _CLIENT
 
 
@@ -354,6 +356,7 @@ def _is_yahoo_special(symbol: str) -> bool:
     s = (symbol or "").strip().upper()
     if not s:
         return False
+    # Yahoo "special" set often includes characters that Finnhub won't accept as symbol
     if any(ch in s for ch in ("^", "=", "/")):
         return True
     if s.endswith("=X"):
@@ -410,15 +413,18 @@ def _fill_derived(out: Dict[str, Any]) -> None:
         out["price_change"] = cur - prev
 
     if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        out["percent_change"] = (cur - prev) / prev * 100.0
+        try:
+            out["percent_change"] = (cur - prev) / prev * 100.0
+        except Exception:
+            pass
 
     if out.get("value_traded") is None and cur is not None and vol is not None:
         out["value_traded"] = cur * vol
 
 
 def _quote_looks_empty(js: Dict[str, Any]) -> bool:
-    keys = ("c", "h", "l", "o", "pc")
-    for k in keys:
+    # Finnhub quote keys: c,h,l,o,pc (and sometimes d,dp)
+    for k in ("c", "h", "l", "o", "pc"):
         f = _to_float(js.get(k))
         if f not in (None, 0.0):
             return False
@@ -503,9 +509,10 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out["ma50"] = ma(50)
     out["ma200"] = ma(200)
 
+    # volatility 30d annualized %
     if len(closes) >= 31:
-        rets: List[float] = []
         window = closes[-31:]
+        rets: List[float] = []
         for i in range(1, len(window)):
             p0 = window[i - 1]
             p1 = window[i]
@@ -544,6 +551,7 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     else:
         out["forecast_method"] = "history_only"
 
+    # confidence_score (0..100)
     pts = len(closes)
     base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
     vol = _to_float(out.get("volatility_30d"))
@@ -659,6 +667,12 @@ async def _fetch_profile_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
         "sector": (js.get("gsector") or "") or "",
         "sub_sector": (js.get("gsubind") or "") or "",
         "listing_date": (js.get("ipo") or "") or "",
+        "exchange": (js.get("exchange") or "") or "",
+        "market_cap": _to_float(js.get("marketCapitalization")),
+        "shares_outstanding": _to_float(js.get("shareOutstanding")),
+        "country": (js.get("country") or "") or "",
+        "weburl": (js.get("weburl") or "") or "",
+        "logo": (js.get("logo") or "") or "",
     }
     return _clean_patch(patch), None
 
@@ -667,7 +681,6 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
     if not _enable_history():
         return {}, None
 
-    # Finnhub candle needs: resolution + from + to (unix seconds)
     days = _history_days()
     now = datetime.now(timezone.utc)
     frm = now - timedelta(days=days)
@@ -682,7 +695,6 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
     if js is None:
         return {}, err
 
-    # Expected shape: {c:[...], h:[...], l:[...], o:[...], s:"ok", t:[...], v:[...]}
     if str(js.get("s") or "").lower() != "ok":
         return {}, f"history status not ok ({js.get('s')})"
 
@@ -691,6 +703,7 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
 
     if not isinstance(closes_raw, list) or not closes_raw:
         return {}, "history empty"
+
     closes: List[float] = []
     for x in closes_raw:
         f = _to_float(x)
@@ -712,8 +725,7 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
 
     patch: Dict[str, Any] = {
         "history_points": len(closes),
-        "history_last_ts": last_ts or 0,
-        "forecast_source": "finnhub_candle",
+        "history_last_ts": int(last_ts) if last_ts else None,
     }
     patch.update(analytics)
 
@@ -723,6 +735,58 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
 # ---------------------------------------------------------------------------
 # Main fetch
 # ---------------------------------------------------------------------------
+def _base_patch(symbol: str) -> Dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "market": "GLOBAL",
+        "currency": None,
+        "data_source": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "error": "",
+        # identity/profile
+        "name": None,
+        "exchange": None,
+        "sector": None,
+        "sub_sector": None,
+        "industry": None,
+        "listing_date": None,
+        # price
+        "current_price": None,
+        "previous_close": None,
+        "open": None,
+        "day_high": None,
+        "day_low": None,
+        "price_change": None,
+        "percent_change": None,
+        "volume": None,
+        "avg_volume_30d": None,
+        "value_traded": None,
+        "market_cap": None,
+        "shares_outstanding": None,
+        # history/forecast
+        "returns_1w": None,
+        "returns_1m": None,
+        "returns_3m": None,
+        "returns_6m": None,
+        "returns_12m": None,
+        "ma20": None,
+        "ma50": None,
+        "ma200": None,
+        "volatility_30d": None,
+        "rsi_14": None,
+        "expected_return_1m": None,
+        "expected_return_3m": None,
+        "expected_return_12m": None,
+        "expected_price_1m": None,
+        "expected_price_3m": None,
+        "expected_price_12m": None,
+        "confidence_score": None,
+        "forecast_method": None,
+        "history_points": None,
+        "history_last_ts": None,
+    }
+
+
 async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> Dict[str, Any]:
     sym_in = (symbol_raw or "").strip()
     if not sym_in:
@@ -743,6 +807,8 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
 
     warns: List[str] = []
 
+    out: Dict[str, Any] = _base_patch(sym)
+
     # Quote required
     ckq = f"q::{sym}"
     hitq = _Q_CACHE.get(ckq)
@@ -757,7 +823,9 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
     if not q_patch or _to_float(q_patch.get("current_price")) is None:
         return {"error": f"{PROVIDER_NAME}: quote failed ({q_err or 'empty'})"}
 
-    out: Dict[str, Any] = dict(q_patch)
+    for k, v in q_patch.items():
+        if v is not None:
+            out[k] = v
     _fill_derived(out)
 
     # Optional profile
@@ -776,12 +844,12 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
             warns.append(f"profile: {p_err}")
         else:
             for k, v in p_patch.items():
-                if not out.get(k) and v is not None:
+                if out.get(k) in (None, "", 0) and v not in (None, ""):
                     out[k] = v
 
     # Optional history/forecast
     if want_history and _enable_history():
-        ckh = f"h::{sym}::{_history_days()}"
+        ckh = f"h::{sym}::{_history_days()}::{_history_points_max()}"
         hith = _H_CACHE.get(ckh)
         if isinstance(hith, dict) and hith:
             h_patch = dict(hith)
@@ -795,11 +863,9 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
             warns.append(f"history: {h_err}")
         else:
             for k, v in h_patch.items():
-                if k not in out and v is not None:
+                if out.get(k) in (None, "", 0) and v is not None:
                     out[k] = v
 
-    out["data_source"] = PROVIDER_NAME
-    out["provider_version"] = PROVIDER_VERSION
     out["last_updated_utc"] = _utc_iso()
 
     if warns and _verbose_warn():
@@ -822,7 +888,16 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
 
 
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await fetch_enriched_quote_patch(symbol)
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
+
+
+@dataclass
+class FinnhubProvider:
+    name: str = PROVIDER_NAME
+
+    async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
+        # keep signature compatible with other providers
+        return await fetch_enriched_quote_patch(symbol)
 
 
 __all__ = [
@@ -832,4 +907,5 @@ __all__ = [
     "aclose_finnhub_client",
     "PROVIDER_VERSION",
     "PROVIDER_NAME",
+    "FinnhubProvider",
 ]
