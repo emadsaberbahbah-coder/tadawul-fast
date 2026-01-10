@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.2.4) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.3.0) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,10 +12,15 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forward expectations + Valuation + Overall + Recommendation.
 
-v4.2.4 upgrades
-- ✅ Robust config import: tries core.config then root config (back-compat).
-- ✅ Placeholder rows now include Last Updated (Riyadh) consistently (when possible).
-- ✅ Keeps v4.2.3 schema-field fallback mapping + V2-normalize alignment.
+v4.3.0 upgrades (Completeness-focused)
+- ✅ Fills sheet-level fields: Rank + Origin (from request context).
+- ✅ Stronger header alias mapping (Rank/Origin/AvgVol variants, etc.)
+- ✅ Derived metrics from history_points (when present):
+     Avg Volume (30D), Prev Close, Returns(1W/1M/3M/6M/12M), MA20/50/200, RSI14, Vol(30D),
+     52W high/low (fallback), History Source/Last (UTC) fallback.
+- ✅ Computes Forward P/E when Forward EPS exists (and vice versa when possible),
+     Dividend Rate and Payout Ratio when feasible.
+- ✅ Never invents “Liquidity Score” (keeps None unless provided by engine).
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -45,7 +51,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.2.4"
+AI_ANALYSIS_VERSION = "4.3.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -92,7 +98,7 @@ def _schemas_get_headers(sheet_name: Optional[str]) -> Optional[Tuple[str, ...]]
     return None
 
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=4096)
 def _schemas_header_to_field_cached(header: str) -> Optional[str]:
     sch = _try_import_schemas()
     if sch is None:
@@ -126,7 +132,7 @@ _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
 
 def _normalize_recommendation(x: Any) -> str:
-    """Canonical enum across all endpoints: BUY / HOLD / REDUCE / SELL."""
+    """Canonical enum: BUY / HOLD / REDUCE / SELL."""
     if x is None:
         return "HOLD"
     try:
@@ -185,7 +191,7 @@ def _fallback_normalize(raw: str) -> str:
     """
     Fallback normalization aligned with DataEngineV2.normalize_symbol():
     - digits -> .SR
-    - otherwise keep symbol as-is (no forced .US)
+    - otherwise keep symbol as-is
     """
     s = (raw or "").strip().upper()
     if not s:
@@ -519,6 +525,7 @@ class BatchAnalysisRequest(_ExtraIgnoreBase):
     tickers: List[str] = Field(default_factory=list)
     symbols: List[str] = Field(default_factory=list)
     sheet_name: Optional[str] = None
+    sheetName: Optional[str] = None  # back-compat
 
 
 class BatchAnalysisResponse(_ExtraIgnoreBase):
@@ -724,6 +731,15 @@ def _snake_guess(header: str) -> str:
     return s
 
 
+def _safe_float_or_none(x: Any) -> Optional[float]:
+    try:
+        if x is None or x == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
 def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[float]:
     try:
         cp_f = float(cp)
@@ -736,13 +752,227 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
         return None
 
 
-def _safe_float_or_none(x: Any) -> Optional[float]:
+# =============================================================================
+# Derived metrics from history_points (when available)
+# =============================================================================
+def _history_parse_points(hp: Any) -> Tuple[List[float], List[float], Optional[str]]:
+    """
+    Returns (closes, volumes, last_dt_iso_utc) from history_points-like structures.
+    Accepts:
+      - list[dict] with keys close/c/cAdj, volume/v, t/time/date
+      - list[list/tuple] (t, o, h, l, c, v) or similar
+    """
+    closes: List[Tuple[float, float]] = []  # (t_epoch, close)
+    vols: List[Tuple[float, float]] = []  # (t_epoch, vol)
+    last_dt: Optional[datetime] = None
+
+    if not hp:
+        return [], [], None
+
     try:
-        if x is None or x == "":
-            return None
-        return float(x)
+        if isinstance(hp, dict):
+            # sometimes embedded under "points" or "data"
+            for k in ("points", "data", "bars", "history"):
+                if k in hp:
+                    hp = hp[k]
+                    break
+    except Exception:
+        pass
+
+    if not isinstance(hp, list):
+        return [], [], None
+
+    for p in hp:
+        try:
+            t_epoch: Optional[float] = None
+            c_val: Optional[float] = None
+            v_val: Optional[float] = None
+
+            if isinstance(p, dict):
+                t_raw = p.get("t") or p.get("time") or p.get("timestamp") or p.get("date")
+                if t_raw is not None:
+                    if isinstance(t_raw, (int, float)):
+                        t_epoch = float(t_raw)
+                    else:
+                        dt = _parse_iso_dt(t_raw)
+                        if dt:
+                            t_epoch = dt.timestamp()
+                            if last_dt is None or dt > last_dt:
+                                last_dt = dt
+
+                for ck in ("close", "c", "adjClose", "adj_close", "close_adj", "cAdj"):
+                    if ck in p and p[ck] is not None:
+                        c_val = _safe_float_or_none(p[ck])
+                        break
+
+                for vk in ("volume", "v", "vol"):
+                    if vk in p and p[vk] is not None:
+                        v_val = _safe_float_or_none(p[vk])
+                        break
+
+            elif isinstance(p, (list, tuple)) and len(p) >= 5:
+                # common OHLCV arrays: [t, o, h, l, c, v]
+                t_raw = p[0]
+                if isinstance(t_raw, (int, float)):
+                    t_epoch = float(t_raw)
+                else:
+                    dt = _parse_iso_dt(t_raw)
+                    if dt:
+                        t_epoch = dt.timestamp()
+                        if last_dt is None or dt > last_dt:
+                            last_dt = dt
+
+                c_val = _safe_float_or_none(p[4])
+                if len(p) >= 6:
+                    v_val = _safe_float_or_none(p[5])
+
+            if t_epoch is None:
+                continue
+            if c_val is not None:
+                closes.append((t_epoch, c_val))
+            if v_val is not None:
+                vols.append((t_epoch, v_val))
+        except Exception:
+            continue
+
+    closes.sort(key=lambda x: x[0])
+    vols.sort(key=lambda x: x[0])
+
+    closes_f = [c for _, c in closes]
+    vols_f = [v for _, v in vols]
+
+    if last_dt is None and closes:
+        try:
+            last_dt = datetime.fromtimestamp(closes[-1][0], tz=timezone.utc)
+        except Exception:
+            last_dt = None
+
+    last_iso = last_dt.astimezone(timezone.utc).isoformat() if last_dt else None
+    return closes_f, vols_f, last_iso
+
+
+def _mean(xs: List[float]) -> Optional[float]:
+    xs = [x for x in xs if x is not None and math.isfinite(x)]
+    if not xs:
+        return None
+    return sum(xs) / float(len(xs))
+
+
+def _sma(xs: List[float], n: int) -> Optional[float]:
+    if n <= 0 or not xs or len(xs) < n:
+        return None
+    window = xs[-n:]
+    return _mean(window)
+
+
+def _returns_from_close(xs: List[float], days: int) -> Optional[float]:
+    if not xs or len(xs) <= days:
+        return None
+    a = xs[-1]
+    b = xs[-(days + 1)]
+    if b is None or b == 0:
+        return None
+    try:
+        return ((a / b) - 1.0) * 100.0
     except Exception:
         return None
+
+
+def _vol_30d_ann(xs: List[float]) -> Optional[float]:
+    # stdev of daily returns (simple), last 30 intervals, annualize sqrt(252)
+    if not xs or len(xs) < 31:
+        return None
+    closes = xs[-31:]
+    rets: List[float] = []
+    for i in range(1, len(closes)):
+        a = closes[i - 1]
+        b = closes[i]
+        if a is None or a == 0:
+            continue
+        try:
+            r = (b / a) - 1.0
+            if math.isfinite(r):
+                rets.append(r)
+        except Exception:
+            continue
+    if len(rets) < 10:
+        return None
+    m = sum(rets) / float(len(rets))
+    var = sum((r - m) ** 2 for r in rets) / float(max(1, len(rets) - 1))
+    sd = math.sqrt(var)
+    ann = sd * math.sqrt(252.0)
+    return round(ann * 100.0, 4)
+
+
+def _rsi_14(xs: List[float]) -> Optional[float]:
+    if not xs or len(xs) < 15:
+        return None
+    closes = xs[-(14 + 1) :]
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains += diff
+        else:
+            losses -= diff
+    if gains + losses == 0:
+        return None
+    avg_gain = gains / 14.0
+    avg_loss = losses / 14.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(rsi, 2)
+
+
+def _compute_turnover_pct(volume: Any, shares_out: Any, value_traded: Any, market_cap: Any) -> Optional[float]:
+    v = _safe_float_or_none(volume)
+    so = _safe_float_or_none(shares_out)
+    if v is not None and so is not None and so > 0:
+        return round((v / so) * 100.0, 4)
+
+    # fallback heuristic: value_traded / market_cap (not the classic definition, but better than empty)
+    vt = _safe_float_or_none(value_traded)
+    mc = _safe_float_or_none(market_cap)
+    if vt is not None and mc is not None and mc > 0:
+        return round((vt / mc) * 100.0, 4)
+
+    return None
+
+
+def _compute_dividend_rate(div_yield_pct: Any, price: Any) -> Optional[float]:
+    dy = _safe_float_or_none(div_yield_pct)
+    p = _safe_float_or_none(price)
+    if dy is None or p is None or p <= 0:
+        return None
+    # dy is % (e.g. 3.5), rate = dy% * price
+    return round((dy / 100.0) * p, 6)
+
+
+def _compute_payout_ratio_pct(div_rate: Any, eps_ttm: Any) -> Optional[float]:
+    dr = _safe_float_or_none(div_rate)
+    eps = _safe_float_or_none(eps_ttm)
+    if dr is None or eps is None or eps == 0:
+        return None
+    return round((dr / eps) * 100.0, 4)
+
+
+def _compute_forward_pe(price: Any, forward_eps: Any) -> Optional[float]:
+    p = _safe_float_or_none(price)
+    fe = _safe_float_or_none(forward_eps)
+    if p is None or fe is None or fe == 0:
+        return None
+    return round(p / fe, 6)
+
+
+def _compute_forward_eps(price: Any, forward_pe: Any) -> Optional[float]:
+    p = _safe_float_or_none(price)
+    fp = _safe_float_or_none(forward_pe)
+    if p is None or fp is None or fp == 0:
+        return None
+    return round(p / fp, 6)
 
 
 def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -839,7 +1069,7 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[f
 
 
 # =============================================================================
-# Headers (BASE + EXTENDED)
+# Headers (BASE + EXTENDED) fallback (used only if schemas missing)
 # =============================================================================
 _DEFAULT_HEADERS_BASE: List[str] = [
     "Symbol",
@@ -934,8 +1164,7 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
 
     Enhancement:
     - if mode=extended and schemas returned a short/canonical list,
-      append extended columns that are missing (no breaking reorder).
-    - append check is case-insensitive to avoid duplicates.
+      append extended columns that are missing (case-insensitive; no duplicates).
     """
     m = (mode or "").strip().lower()
 
@@ -965,20 +1194,41 @@ def _idx(headers: List[str], name: str) -> Optional[int]:
     return None
 
 
-def _error_row(symbol: str, headers: List[str], err: str) -> List[Any]:
+def _error_row(symbol: str, headers: List[str], err: str, *, rank: Optional[int] = None, origin: Optional[str] = None) -> List[Any]:
     row = [None] * len(headers)
+
+    i_rank = _idx(headers, "Rank")
+    if i_rank is not None and rank is not None:
+        row[i_rank] = rank
+
+    i_origin = _idx(headers, "Origin")
+    if i_origin is not None and origin:
+        row[i_origin] = origin
+
     i_sym = _idx(headers, "Symbol")
     if i_sym is not None:
         row[i_sym] = symbol
+
     i_err = _idx(headers, "Error")
     if i_err is not None:
         row[i_err] = err
+
     i_dq = _idx(headers, "Data Quality")
     if i_dq is not None:
         row[i_dq] = "MISSING"
+
     i_rec = _idx(headers, "Recommendation")
     if i_rec is not None:
         row[i_rec] = "HOLD"
+
+    i_last_utc = _idx(headers, "Last Updated (UTC)")
+    if i_last_utc is not None:
+        row[i_last_utc] = _now_utc_iso()
+
+    i_last_riy = _idx(headers, "Last Updated (Riyadh)")
+    if i_last_riy is not None:
+        row[i_last_riy] = _to_riyadh_iso(_now_utc_iso())
+
     return row
 
 
@@ -1033,55 +1283,79 @@ _RATIO_HEADERS = {
 
 _VOL_HEADERS = {"volatility (30d)"}
 
+# Local header map: (candidate_fields, transform)
+# NOTE: Many fields are already aligned with engine; this map just adds robust aliases.
 _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
+    "rank": (("rank",), None),  # will be filled from row index if missing
+    "origin": (("origin",), None),  # will be filled from sheet context if missing
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
-    "sector": (("sector",), None),
-    "sub-sector": (("sub_sector", "subsector"), None),
-    "sub sector": (("sub_sector", "subsector"), None),
+    "name": (("name", "company_name"), None),
+
+    "sector": (("sector", "sector_name"), None),
+    "sub-sector": (("sub_sector", "subsector", "sub_sector_name"), None),
+    "sub sector": (("sub_sector", "subsector", "sub_sector_name"), None),
+
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
-    "listing date": (("listing_date", "ipo"), None),
-    "last price": (("current_price", "last_price", "price"), None),
-    "previous close": (("previous_close",), None),
+    "listing date": (("listing_date", "ipo", "ipo_date"), None),
+
+    "last price": (("current_price", "last_price", "price", "last"), None),
+    "previous close": (("previous_close", "prev_close"), None),
     "price change": (("price_change", "change"), None),
     "percent change": (("percent_change", "change_pct", "change_percent"), _ratio_to_percent),
-    "day high": (("day_high",), None),
-    "day low": (("day_low",), None),
+
+    "day high": (("day_high", "high"), None),
+    "day low": (("day_low", "low"), None),
+
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), _ratio_to_percent),
-    "volume": (("volume",), None),
-    "avg volume (30d)": (("avg_volume_30d", "avg_volume"), None),
-    "value traded": (("value_traded",), None),
+
+    "volume": (("volume", "vol"), None),
+    "avg volume (30d)": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
+    "avg vol 30d": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
+    "avg volume 30d": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
+
+    "value traded": (("value_traded", "value", "turnover_value"), None),
     "turnover %": (("turnover_percent", "turnover"), _ratio_to_percent),
-    "shares outstanding": (("shares_outstanding",), None),
+
+    "shares outstanding": (("shares_outstanding", "shares", "shares_out"), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
     "market cap": (("market_cap",), None),
-    "free float market cap": (("free_float_market_cap",), None),
+    "free float market cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
+
     "liquidity score": (("liquidity_score",), None),
+
     "eps (ttm)": (("eps_ttm", "eps"), None),
-    "forward eps": (("forward_eps",), None),
-    "p/e (ttm)": (("pe_ttm",), None),
-    "forward p/e": (("forward_pe",), None),
+    "forward eps": (("forward_eps", "eps_forward"), None),
+
+    "p/e (ttm)": (("pe_ttm", "pe"), None),
+    "forward p/e": (("forward_pe", "pe_forward"), None),
+
     "p/b": (("pb",), None),
     "p/s": (("ps",), None),
-    "ev/ebitda": (("ev_ebitda",), None),
-    "dividend yield %": (("dividend_yield",), _ratio_to_percent),
-    "dividend rate": (("dividend_rate",), None),
+    "ev/ebitda": (("ev_ebitda", "ev_to_ebitda"), None),
+
+    "dividend yield %": (("dividend_yield", "div_yield"), _ratio_to_percent),
+    "dividend rate": (("dividend_rate", "dividend_per_share"), None),
     "payout ratio %": (("payout_ratio",), _ratio_to_percent),
+
     "roe %": (("roe",), _ratio_to_percent),
     "roa %": (("roa",), _ratio_to_percent),
-    "net margin %": (("net_margin",), _ratio_to_percent),
+    "net margin %": (("net_margin", "profit_margin"), _ratio_to_percent),
     "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
-    "revenue growth %": (("revenue_growth",), _ratio_to_percent),
-    "net income growth %": (("net_income_growth",), _ratio_to_percent),
+    "revenue growth %": (("revenue_growth", "revenue_growth_pct"), _ratio_to_percent),
+    "net income growth %": (("net_income_growth", "net_income_growth_pct"), _ratio_to_percent),
+
     "beta": (("beta",), None),
     "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "rsi (14)": (("rsi14", "rsi_14"), None),
+
     "fair value": (("fair_value",), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
+
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
@@ -1089,28 +1363,37 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
     "recommendation": (("recommendation",), None),
+
     "data source": (("data_source", "source", "provider"), None),
     "data quality": (("data_quality",), None),
+
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
+
     "error": (("error",), None),
+
     # Extended fields
     "returns 1w %": (("returns_1w",), _ratio_to_percent),
     "returns 1m %": (("returns_1m",), _ratio_to_percent),
     "returns 3m %": (("returns_3m",), _ratio_to_percent),
     "returns 6m %": (("returns_6m",), _ratio_to_percent),
     "returns 12m %": (("returns_12m",), _ratio_to_percent),
+
     "ma20": (("ma20",), None),
     "ma50": (("ma50",), None),
     "ma200": (("ma200",), None),
+
     "expected return 1m %": (("expected_return_1m",), _ratio_to_percent),
     "expected return 3m %": (("expected_return_3m",), _ratio_to_percent),
     "expected return 12m %": (("expected_return_12m",), _ratio_to_percent),
+
     "expected price 1m": (("expected_price_1m",), None),
     "expected price 3m": (("expected_price_3m",), None),
     "expected price 12m": (("expected_price_12m",), None),
+
     "confidence score": (("confidence_score",), None),
     "forecast method": (("forecast_method",), None),
+
     "history points": (("history_points",), None),
     "history source": (("history_source",), None),
     "history last (utc)": (("history_last_utc",), _iso_or_none),
@@ -1134,6 +1417,7 @@ class _HeaderPlan:
     need_overall: bool
     need_last_utc: bool
     need_last_riyadh: bool
+    needs_history_deriv: bool
 
 
 @lru_cache(maxsize=64)
@@ -1143,9 +1427,11 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
     need_overall = False
     need_last_utc = False
     need_last_riyadh = False
+    needs_history_deriv = False
 
     for h in headers:
         hk = _hkey(h)
+
         if hk in ("fair value", "upside %", "valuation label"):
             need_val = True
         if hk in ("recommendation", "overall score"):
@@ -1154,6 +1440,29 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
             need_last_utc = True
         if hk == "last updated (riyadh)":
             need_last_riyadh = True
+
+        # if any of these exists, we may compute from history_points when missing
+        if hk in (
+            "avg volume (30d)",
+            "avg vol 30d",
+            "previous close",
+            "returns 1w %",
+            "returns 1m %",
+            "returns 3m %",
+            "returns 6m %",
+            "returns 12m %",
+            "ma20",
+            "ma50",
+            "ma200",
+            "rsi (14)",
+            "volatility (30d)",
+            "52w high",
+            "52w low",
+            "history points",
+            "history source",
+            "history last (utc)",
+        ):
+            needs_history_deriv = True
 
         schema_field = _schemas_header_to_field_cached(h)
         local = _LOCAL_HEADER_MAP.get(hk)
@@ -1179,6 +1488,7 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
         need_overall=need_overall,
         need_last_utc=need_last_utc,
         need_last_riyadh=need_last_riyadh,
+        needs_history_deriv=needs_history_deriv,
     )
 
 
@@ -1200,22 +1510,105 @@ def _apply_common_transforms(hk: str, v: Any) -> Any:
     return v
 
 
+def _derive_from_history(uq: Any) -> Dict[str, Any]:
+    """
+    Build derived metrics from history_points when present.
+    Returned dict uses the SAME header-keys convention (lowered), e.g.:
+      'avg vol 30d', 'returns 1m %', 'ma20', 'rsi (14)', 'history last (utc)', ...
+    """
+    out: Dict[str, Any] = {}
+
+    hp = _safe_get(uq, "history_points", "history", "chart_points", "price_history", "bars")
+    closes, vols, last_iso = _history_parse_points(hp)
+
+    if closes:
+        # Previous close (last-1)
+        if len(closes) >= 2:
+            out["previous close"] = closes[-2]
+
+        # MA / returns / RSI / vol
+        out["ma20"] = _sma(closes, 20)
+        out["ma50"] = _sma(closes, 50)
+        out["ma200"] = _sma(closes, 200)
+
+        out["returns 1w %"] = _returns_from_close(closes, 5)
+        out["returns 1m %"] = _returns_from_close(closes, 21)
+        out["returns 3m %"] = _returns_from_close(closes, 63)
+        out["returns 6m %"] = _returns_from_close(closes, 126)
+        out["returns 12m %"] = _returns_from_close(closes, 252)
+
+        out["rsi (14)"] = _rsi_14(closes)
+        out["volatility (30d)"] = _vol_30d_ann(closes)
+
+        # 52W bounds (fallback)
+        if len(closes) >= 30:
+            look = closes[-252:] if len(closes) >= 252 else closes
+            try:
+                out["52w high"] = max(look) if look else None
+                out["52w low"] = min(look) if look else None
+            except Exception:
+                pass
+
+    if vols:
+        # Avg volume 30D from last 30 points
+        take = vols[-30:] if len(vols) >= 30 else vols
+        avg = _mean(take)
+        if avg is not None:
+            out["avg volume (30d)"] = avg
+            out["avg vol 30d"] = avg
+
+        # If volume missing in quote, use last volume
+        out["volume"] = vols[-1]
+
+    # history meta
+    if isinstance(hp, list):
+        out["history points"] = len(hp)
+    elif isinstance(hp, dict):
+        # if dict contains a list
+        for k in ("points", "data", "bars", "history"):
+            if isinstance(hp.get(k), list):
+                out["history points"] = len(hp[k])
+                break
+
+    if last_iso:
+        out["history last (utc)"] = last_iso
+
+    # source fallback: if engine didn’t provide history_source but we do have points
+    if hp:
+        out["history source"] = _safe_get(uq, "history_source") or "yahoo_chart"
+
+    return out
+
+
 def _value_for_meta(
     meta: _HeaderMeta,
     uq: Any,
     *,
+    row_index_1based: int,
+    origin: str,
+    derived: Dict[str, Any],
     fair_pack: Optional[Tuple[Any, Any, Any]],
     overall_pack: Optional[Tuple[Any, Any, Any]],
 ) -> Any:
     hk = meta.hk
 
+    # Sheet-level fields
+    if hk == "rank":
+        v = _safe_get(uq, "rank")
+        return v if not _is_blank(v) else row_index_1based
+
+    if hk == "origin":
+        v = _safe_get(uq, "origin")
+        return v if not _is_blank(v) else origin
+
+    # Special computed
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
             return _ratio_to_percent(v)
         cp = _safe_get(uq, "current_price", "last_price", "price")
-        lo = _safe_get(uq, "week_52_low", "low_52w")
-        hi = _safe_get(uq, "week_52_high", "high_52w")
+        lo = _safe_get(uq, "week_52_low", "low_52w") or derived.get("52w low")
+        hi = _safe_get(uq, "week_52_high", "high_52w") or derived.get("52w high")
         return _compute_52w_position_pct(cp, lo, hi)
 
     if hk == "last updated (utc)":
@@ -1229,6 +1622,7 @@ def _value_for_meta(
             v = _to_riyadh_iso(u) or ""
         return _iso_or_none(v) or v
 
+    # Fair / upside pack
     if hk in ("fair value", "upside %", "valuation label"):
         fair, upside, label = fair_pack or (None, None, None)
         if hk == "fair value":
@@ -1242,6 +1636,7 @@ def _value_for_meta(
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
 
+    # Overall/reco pack
     if hk in ("overall score", "recommendation"):
         overall_calc, reco_calc, _conf01 = overall_pack or (None, "HOLD", None)
         if hk == "overall score":
@@ -1252,7 +1647,7 @@ def _value_for_meta(
             raw = v if v is not None else reco_calc
             return _normalize_recommendation(raw)
 
-    # 1) schemas mapping if available (but FALL BACK if missing)
+    # 1) schemas mapping if available
     if meta.schema_field:
         v = _safe_get(uq, meta.schema_field)
         v = _apply_common_transforms(hk, v)
@@ -1271,13 +1666,69 @@ def _value_for_meta(
         if not _is_blank(val):
             return val
 
-    # 3) fallback snake-case guess
+    # 3) derived from history (if missing)
+    if hk in derived and not _is_blank(derived.get(hk)):
+        return _apply_common_transforms(hk, derived.get(hk))
+
+    # 4) fallback snake-case guess
     val = _safe_get(uq, meta.guess)
     val = _apply_common_transforms(hk, val)
-    return val
+    if not _is_blank(val):
+        return val
+
+    # 5) computed cross-field fallbacks for certain blanks (forward pe/eps, dividend)
+    if hk == "forward p/e":
+        # compute from forward EPS if missing
+        v = _safe_get(uq, "forward_pe")
+        if not _is_blank(v):
+            return v
+        price = _safe_get(uq, "current_price", "last_price", "price") or derived.get("last price")
+        feps = _safe_get(uq, "forward_eps")
+        return _compute_forward_pe(price, feps)
+
+    if hk == "forward eps":
+        v = _safe_get(uq, "forward_eps")
+        if not _is_blank(v):
+            return v
+        price = _safe_get(uq, "current_price", "last_price", "price") or derived.get("last price")
+        fpe = _safe_get(uq, "forward_pe")
+        return _compute_forward_eps(price, fpe)
+
+    if hk == "dividend rate":
+        v = _safe_get(uq, "dividend_rate")
+        if not _is_blank(v):
+            return v
+        dy = _ratio_to_percent(_safe_get(uq, "dividend_yield"))
+        price = _safe_get(uq, "current_price", "last_price", "price")
+        return _compute_dividend_rate(dy, price)
+
+    if hk == "payout ratio %":
+        v = _safe_get(uq, "payout_ratio")
+        if not _is_blank(v):
+            return _ratio_to_percent(v)
+        dr = _safe_get(uq, "dividend_rate")
+        if _is_blank(dr):
+            dy = _ratio_to_percent(_safe_get(uq, "dividend_yield"))
+            price = _safe_get(uq, "current_price", "last_price", "price")
+            dr = _compute_dividend_rate(dy, price)
+        eps = _safe_get(uq, "eps_ttm", "eps")
+        return _compute_payout_ratio_pct(dr, eps)
+
+    if hk == "turnover %":
+        v = _safe_get(uq, "turnover_percent", "turnover")
+        if not _is_blank(v):
+            return _ratio_to_percent(v)
+        return _compute_turnover_pct(
+            _safe_get(uq, "volume") or derived.get("volume"),
+            _safe_get(uq, "shares_outstanding"),
+            _safe_get(uq, "value_traded"),
+            _safe_get(uq, "market_cap"),
+        )
+
+    return None
 
 
-def _row_from_plan(plan: _HeaderPlan, uq: Any) -> List[Any]:
+def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin: str) -> List[Any]:
     fair_pack: Optional[Tuple[Any, Any, Any]] = None
     overall_pack: Optional[Tuple[Any, Any, Any]] = None
 
@@ -1286,6 +1737,7 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any) -> List[Any]:
     if plan.need_overall:
         overall_pack = _compute_overall_and_reco(uq)
 
+    # Ensure Riyadh timestamp exists if requested
     if plan.need_last_riyadh:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         last_riy = _safe_get(uq, "last_updated_riyadh")
@@ -1299,7 +1751,25 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any) -> List[Any]:
             except Exception:
                 pass
 
-    row = [_value_for_meta(m, uq, fair_pack=fair_pack, overall_pack=overall_pack) for m in plan.metas]
+    derived: Dict[str, Any] = {}
+    if plan.needs_history_deriv:
+        try:
+            derived = _derive_from_history(uq)
+        except Exception:
+            derived = {}
+
+    row = [
+        _value_for_meta(
+            m,
+            uq,
+            row_index_1based=row_index_1based,
+            origin=origin,
+            derived=derived,
+            fair_pack=fair_pack,
+            overall_pack=overall_pack,
+        )
+        for m in plan.metas
+    ]
     if len(row) < len(plan.metas):
         row += [None] * (len(plan.metas) - len(row))
     return row[: len(plan.metas)]
@@ -1459,7 +1929,7 @@ async def _get_quotes_chunked(
 
 
 # =============================================================================
-# Transform
+# Transform to single response (kept mostly as-is)
 # =============================================================================
 def _quote_to_analysis(requested_symbol: str, uq: Any) -> SingleAnalysisResponse:
     try:
@@ -1656,22 +2126,28 @@ async def analyze_batch_quotes(
 async def analyze_for_sheet(
     request: Request,
     body: BatchAnalysisRequest = Body(...),
-    mode: Optional[str] = Query(default=None, description="Headers mode: base|extended (appends if schemas returns canonical)."),
+    mode: Optional[str] = Query(
+        default=None,
+        description="Headers mode: base|extended (appends if schemas returns canonical).",
+    ),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> SheetAnalysisResponse:
     """
     Sheets-safe: ALWAYS returns HTTP 200 with {headers, rows, status}.
     If auth fails -> returns error rows (no exception).
     """
-    headers = _select_headers(body.sheet_name, mode)
+    sheet_name = (body.sheet_name or body.sheetName or "").strip() or None
+    headers = _select_headers(sheet_name, mode)
     tickers = _clean_symbols((body.tickers or []) + (body.symbols or []))
 
     if not tickers:
         return SheetAnalysisResponse(headers=headers, rows=[], status="skipped", error="No tickers provided")
 
+    origin = (sheet_name or "UNKNOWN").strip()
+
     if not _auth_ok(x_app_token):
         err = "Unauthorized (invalid or missing X-APP-TOKEN)."
-        rows = [_error_row(t, headers, err) for t in tickers]
+        rows = [_error_row(t, headers, err, rank=i + 1, origin=origin) for i, t in enumerate(tickers)]
         return SheetAnalysisResponse(headers=headers, rows=rows, status="error", error=err)
 
     cfg = _cfg()
@@ -1690,17 +2166,17 @@ async def analyze_for_sheet(
         )
 
         rows: List[List[Any]] = []
-        for t in tickers:
+        for i, t in enumerate(tickers, start=1):
             uq = m.get(t) or _make_placeholder(t, dq="MISSING", err="No data returned")
             _ensure_reco_on_obj(uq)
-            rows.append(_row_from_plan(plan, uq))
+            rows.append(_row_from_plan(plan, uq, row_index_1based=i, origin=origin))
 
         status = _status_from_rows(headers, rows)
         return SheetAnalysisResponse(headers=headers, rows=rows, status=status)
 
     except Exception as exc:
         logger.exception("[analysis] exception in /sheet-rows: %s", exc)
-        rows = [_error_row(t, headers, str(exc)) for t in tickers]
+        rows = [_error_row(t, headers, str(exc), rank=i + 1, origin=origin) for i, t in enumerate(tickers)]
         return SheetAnalysisResponse(headers=headers, rows=rows, status="error", error=str(exc))
 
 
