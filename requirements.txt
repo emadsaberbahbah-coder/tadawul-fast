@@ -4,47 +4,47 @@
 # FastAPI + Uvicorn + async providers + caching + Google Sheets
 # ============================================================
 
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
+fastapi>=0.128.0
+uvicorn[standard]>=0.40.0
 
-python-dotenv>=1.0.1
+python-dotenv>=1.2.1
 
 # Rate limiting
 slowapi>=0.1.9
-limits>=3.13.0
+limits>=5.6.0
 
 # Pydantic / settings
-pydantic>=2.8.0
-pydantic-settings>=2.4.0
+pydantic>=2.12.0
+pydantic-settings>=2.12.0
 
 # JSON + caching
-orjson>=3.10.0
+orjson>=3.11.0
 cachetools>=5.5.0,<6.0.0
-typing-extensions>=4.12.0,<5.0.0
+typing-extensions>=4.15.0,<5.0.0
 
 # HTTP clients
-httpx>=0.27.2
-requests>=2.32.0
-aiohttp>=3.10.0
+httpx>=0.28.1
+requests>=2.32.5
+aiohttp>=3.13.0
 
 # HTML parsing (Argaam / scraping)
-beautifulsoup4>=4.12.3
-lxml>=5.2.2
+beautifulsoup4>=4.14.0
+lxml>=6.0.0
 html5lib>=1.1
 
-# Market data
-yfinance>=0.2.43
+# Market data (pin below 1.0 to avoid breaking changes)
+yfinance>=0.2.43,<1.0.0
 
 # Data processing
-pandas>=2.2.2
-numpy>=2.0.0
+pandas>=2.3.0
+numpy>=2.4.0
 
 # Google APIs (Sheets via service account)
-google-api-python-client>=2.140.0,<3.0.0
-google-auth>=2.34.0,<3.0.0
-google-auth-httplib2>=0.2.0,<1.0.0
-google-api-core>=2.19.0,<3.0.0
-googleapis-common-protos>=1.63.0,<2.0.0
-proto-plus>=1.24.0,<2.0.0
-protobuf>=4.25.4,<6.0.0
-httplib2>=0.22.0,<1.0.0
+google-api-python-client>=2.187.0,<3.0.0
+google-auth>=2.47.0,<3.0.0
+google-auth-httplib2>=0.3.0,<1.0.0
+google-api-core>=2.29.0,<3.0.0
+googleapis-common-protos>=1.72.0,<2.0.0
+proto-plus>=1.27.0,<2.0.0
+protobuf>=5.29.0,<6.0.0
+httplib2>=0.31.0,<1.0.0
