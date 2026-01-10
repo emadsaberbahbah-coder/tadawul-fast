@@ -2,7 +2,7 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.2
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.3
 
 Key guarantees
 - ✅ Never-crash startup: all heavy imports are deferred + best-effort
@@ -44,14 +44,18 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.3.2"
+APP_ENTRY_VERSION = "5.3.3"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
 
 def _truthy(v: Any) -> bool:
-    s = str(v or "").strip().lower()
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
     if not s:
         return False
     if s in _TRUTHY:
@@ -98,7 +102,11 @@ def _safe_list_like(v: Any) -> List[str]:
 
 def _safe_set_root_log_level(level: str) -> None:
     try:
-        logging.getLogger().setLevel(str(level).upper())
+        lvl = str(level).upper()
+        logging.getLogger().setLevel(lvl)
+        logging.getLogger("uvicorn").setLevel(lvl)
+        logging.getLogger("uvicorn.error").setLevel(lvl)
+        logging.getLogger("uvicorn.access").setLevel(lvl)
     except Exception:
         pass
 
@@ -299,7 +307,7 @@ def _resolve_title(settings: Optional[object], env_mod: Optional[object]) -> str
 
 def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> str:
     v = str(_get(settings, env_mod, "ENVIRONMENT", _get(settings, env_mod, "APP_ENV", "production"))).strip()
-    return v or "production"
+    return (v or "production").lower()
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
@@ -515,7 +523,7 @@ async def _mount_all_routers_async(app_: FastAPI) -> None:
 async def _background_boot(app_: FastAPI) -> None:
     try:
         await _mount_all_routers_async(app_)
-        init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", "true"))
+        init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", True))
         if init_engine:
             await _init_engine_best_effort_async(app_)
         app_.state.boot_error = None
@@ -629,7 +637,7 @@ def create_app() -> FastAPI:
         init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)
 
         app_.state.defer_router_mount = _truthy(defer_val) if isinstance(defer_val, str) else bool(defer_val)
-        app_.state.init_engine_on_boot = init_val
+        app_.state.init_engine_on_boot = _truthy(init_val) if isinstance(init_val, str) else bool(init_val)
 
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
@@ -646,7 +654,7 @@ def create_app() -> FastAPI:
             app_.state.boot_task = asyncio.create_task(_background_boot(app_))
         else:
             await _mount_all_routers_async(app_)
-            if _truthy(app_.state.init_engine_on_boot):
+            if app_.state.init_engine_on_boot:
                 await _init_engine_best_effort_async(app_)
             app_.state.boot_completed = True
 
