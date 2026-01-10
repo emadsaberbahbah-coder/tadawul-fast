@@ -1,8 +1,8 @@
-# env.py  (FULL REPLACEMENT)
+# env.py  (FULL REPLACEMENT) — v5.2.0
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.1.0)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.2.0)
 
 Key goals
 - ✅ Quiet boot by default (no banner logs unless ENV_LOG_ON_BOOT=true)
@@ -34,10 +34,10 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.1.0"
+ENV_VERSION = "5.2.0"
 logger = logging.getLogger("env")
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
 
@@ -81,7 +81,6 @@ def _normalize_version(v: Any) -> str:
     low = s.lower()
     if low in {"unknown", "none", "null"}:
         return ""
-    # treat common placeholder as "not set"
     if low == "0.0.0":
         return ""
     return s
@@ -107,15 +106,20 @@ def _strip_wrapping_quotes(s: str) -> str:
     return t
 
 
+def _looks_like_json_object(s: str) -> bool:
+    ss = (s or "").strip()
+    return ss.startswith("{") and ss.endswith("}") and len(ss) >= 2
+
+
 def _looks_like_b64(s: str) -> bool:
     raw = (s or "").strip()
-    if len(raw) < 60:
+    if len(raw) < 40:
         return False
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
     return all((c in allowed) for c in raw)
 
 
-def _maybe_b64_decode(s: str) -> str:
+def _maybe_b64_decode_json(s: str) -> str:
     """
     If s looks like base64 and decodes to JSON, return decoded.
     Otherwise return original.
@@ -123,14 +127,16 @@ def _maybe_b64_decode(s: str) -> str:
     raw = (s or "").strip()
     if not raw:
         return raw
-    if raw.startswith("{"):
+    if _looks_like_json_object(raw):
         return raw
     if not _looks_like_b64(raw):
         return raw
 
     try:
-        dec = base64.b64decode(raw).decode("utf-8", errors="strict").strip()
-        if dec.startswith("{") and ("private_key" in dec or '"type"' in dec or "'type'" in dec):
+        dec = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="strict").strip()
+        if _looks_like_json_object(dec):
+            # must be valid JSON
+            json.loads(dec)
             return dec
     except Exception:
         return raw
@@ -158,10 +164,10 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
     s = _strip_wrapping_quotes(s)
-    s = _maybe_b64_decode(s)
+    s = _maybe_b64_decode_json(s)
     s = _strip_wrapping_quotes(s).strip()
 
-    if not s or not s.startswith("{"):
+    if not _looks_like_json_object(s):
         return None
 
     try:
@@ -191,15 +197,25 @@ def _get_first_env(*keys: str) -> Optional[str]:
 
 
 def _as_list_lower(v: Any) -> List[str]:
+    """
+    Accepts:
+      - list
+      - "a,b,c"
+      - '["a","b"]'
+      - "['a','b']" (best-effort)
+    Returns: deduped lowercase list
+    """
     if v is None:
         return []
+
+    raw: List[str] = []
     if isinstance(v, list):
         raw = [str(x).strip().lower() for x in v if str(x).strip()]
     else:
         s = str(v).strip()
         if not s:
             return []
-        if s.startswith("[") and s.endswith("]"):
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
             try:
                 arr = json.loads(s)
                 if isinstance(arr, list):
@@ -207,7 +223,18 @@ def _as_list_lower(v: Any) -> List[str]:
                 else:
                     raw = []
             except Exception:
-                raw = []
+                try:
+                    ss = s.strip()
+                    if ss.startswith("(") and ss.endswith(")"):
+                        ss = "[" + ss[1:-1] + "]"
+                    ss = ss.replace("'", '"')
+                    arr = json.loads(ss)
+                    if isinstance(arr, list):
+                        raw = [str(x).strip().lower() for x in arr if str(x).strip()]
+                    else:
+                        raw = []
+                except Exception:
+                    raw = []
         else:
             raw = [p.strip().lower() for p in s.split(",") if p.strip()]
 
@@ -293,7 +320,7 @@ def _resolve_version(settings_obj: Optional[object]) -> str:
         if vv:
             return vv
 
-    # 2) Settings
+    # 2) Settings (try common attribute names)
     for k in ("service_version", "version", "app_version", "APP_VERSION"):
         vv = _normalize_version(_get_attr(settings_obj, k, ""))
         if vv:
@@ -324,7 +351,7 @@ APP_ENV = (
     or str(_get_attr(_base_settings, "environment", "") or "").strip()
     or str(_get_attr(_base_settings, "env", "") or "").strip()
     or "production"
-)
+).lower()
 
 APP_VERSION = _resolve_version(_base_settings)
 
@@ -358,7 +385,7 @@ BACKUP_APP_TOKEN = (
     or None
 )
 
-# Legacy flag (routes actually use "open if tokens missing"; keep for older code)
+# Legacy flag (routes use "open if tokens missing"; keep for older code)
 REQUIRE_AUTH = _env_first_bool(_base_settings, "REQUIRE_AUTH", "require_auth", False)
 
 # Export token aliases for legacy modules (no overwrite)
@@ -368,17 +395,17 @@ if APP_TOKEN:
 if BACKUP_APP_TOKEN:
     _export_env_if_missing("BACKUP_APP_TOKEN", BACKUP_APP_TOKEN)
 
-# AI batching (from settings if present; env can override)
-AI_BATCH_SIZE = _safe_int(_get_first_env("AI_BATCH_SIZE") or _get_attr(_base_settings, "ai_batch_size", None), 25)
+# AI batching (env overrides settings)
+AI_BATCH_SIZE = _safe_int(_get_first_env("AI_BATCH_SIZE") or _get_attr(_base_settings, "ai_batch_size", None), 20)
 AI_BATCH_TIMEOUT_SEC = _safe_float(
     _get_first_env("AI_BATCH_TIMEOUT_SEC") or _get_attr(_base_settings, "ai_batch_timeout_sec", None),
     45.0,
 )
 AI_BATCH_CONCURRENCY = _safe_int(
     _get_first_env("AI_BATCH_CONCURRENCY") or _get_attr(_base_settings, "ai_batch_concurrency", None),
-    6,
+    5,
 )
-AI_MAX_TICKERS = _safe_int(_get_first_env("AI_MAX_TICKERS") or _get_attr(_base_settings, "ai_max_tickers", None), 800)
+AI_MAX_TICKERS = _safe_int(_get_first_env("AI_MAX_TICKERS") or _get_attr(_base_settings, "ai_max_tickers", None), 500)
 
 AI_BATCH_SIZE = max(5, min(250, AI_BATCH_SIZE))
 AI_BATCH_TIMEOUT_SEC = max(5.0, min(180.0, float(AI_BATCH_TIMEOUT_SEC)))
@@ -407,31 +434,27 @@ _export_env_if_missing("TADAWUL_QUOTE_URL", TADAWUL_QUOTE_URL)
 _export_env_if_missing("TADAWUL_FUNDAMENTALS_URL", TADAWUL_FUNDAMENTALS_URL)
 _export_env_if_missing("ARGAAM_BASE_URL", ARGAAM_BASE_URL)
 
-# Simple toggle from canonical config (enable_yahoo) + optional env override
+# Optional toggle (legacy). If config doesn't have it, default True.
 ENABLE_YAHOO = _safe_bool(_get_first_env("ENABLE_YAHOO") or _get_attr(_base_settings, "enable_yahoo", None), True)
 _export_env_if_missing("ENABLE_YAHOO", str(bool(ENABLE_YAHOO)).lower())
 
-# Providers (legacy lists; env-first, fallback defaults)
+# Providers lists (env-first; fallbacks aligned with config default)
 _enabled_from_env = _get_first_env("ENABLED_PROVIDERS", "PROVIDERS")
 if _enabled_from_env is not None:
     ENABLED_PROVIDERS: List[str] = _as_list_lower(_enabled_from_env)
 else:
-    ENABLED_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "enabled_providers", None)) or _as_list_lower(
-        _get_attr(_base_settings, "enabled_providers_raw", None) or "eodhd,finnhub"
-    )
+    ENABLED_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "enabled_providers", None)) or ["eodhd", "finnhub"]
 
 _ksa_from_env = _get_first_env("KSA_PROVIDERS")
 if _ksa_from_env is not None:
     KSA_PROVIDERS: List[str] = _as_list_lower(_ksa_from_env)
 else:
-    KSA_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "ksa_providers", None)) or _as_list_lower(
-        _get_attr(_base_settings, "ksa_providers_raw", None) or "yahoo_chart,tadawul,argaam"
-    )
+    KSA_PROVIDERS = _as_list_lower(_get_attr(_base_settings, "ksa_providers", None)) or ["yahoo_chart"]
 
 PRIMARY_PROVIDER = (
     (_get_first_env("PRIMARY_PROVIDER") or "").strip().lower()
     or str(_get_attr(_base_settings, "primary_provider", "") or "").strip().lower()
-    or (ENABLED_PROVIDERS[0] if ENABLED_PROVIDERS else "finnhub")
+    or (ENABLED_PROVIDERS[0] if ENABLED_PROVIDERS else "eodhd")
 )
 
 PROVIDERS = _safe_join(ENABLED_PROVIDERS)
@@ -441,7 +464,7 @@ _export_env_if_missing("PROVIDERS", _safe_join(ENABLED_PROVIDERS))
 _export_env_if_missing("KSA_PROVIDERS", _safe_join(KSA_PROVIDERS))
 _export_env_if_missing("PRIMARY_PROVIDER", PRIMARY_PROVIDER)
 
-# Feature toggles (used by legacy provider modules; env-first, safe defaults)
+# Feature toggles (legacy provider modules; env-first, safe defaults)
 ENABLE_YAHOO_CHART_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_KSA"), True)
 ENABLE_YAHOO_CHART_SUPPLEMENT = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
 ENABLE_YFINANCE_KSA = _safe_bool(_get_first_env("ENABLE_YFINANCE_KSA"), False)
@@ -463,7 +486,7 @@ HTTP_TIMEOUT = _safe_int(_get_first_env("HTTP_TIMEOUT") or int(HTTP_TIMEOUT_SEC)
 CACHE_TTL_SEC = _safe_float(_get_first_env("CACHE_TTL_SEC", "CACHE_DEFAULT_TTL"), 20.0)
 ENGINE_CACHE_TTL_SEC = _safe_int(_get_first_env("ENGINE_CACHE_TTL_SEC", "ENGINE_TTL_SEC"), int(CACHE_TTL_SEC) or 20)
 
-ENRICHED_BATCH_CONCURRENCY = _safe_int(_get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY"), 8)
+ENRICHED_BATCH_CONCURRENCY = _safe_int(_get_first_env("ENRICHED_BATCH_CONCURRENCY", "ENRICHED_CONCURRENCY"), 5)
 
 _export_env_if_missing("HTTP_TIMEOUT_SEC", str(float(HTTP_TIMEOUT_SEC)))
 _export_env_if_missing("HTTP_TIMEOUT", str(float(HTTP_TIMEOUT_SEC)))
@@ -488,7 +511,7 @@ if EODHD_API_KEY:
     _export_env_if_missing("EODHD_API_TOKEN", EODHD_API_KEY)
     _export_env_if_missing("EODHD_TOKEN", EODHD_API_KEY)
 
-# CORS (env-first, fallback to core.config cors_origins if present)
+# CORS (env-first, fallback to config cors_origins if present)
 ENABLE_CORS_ALL_ORIGINS = _env_first_bool(_base_settings, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", True)
 CORS_ALL_ORIGINS = ENABLE_CORS_ALL_ORIGINS
 
@@ -511,7 +534,7 @@ _export_env_if_missing("CORS_ORIGINS", CORS_ORIGINS)
 
 # Google Sheets (ENV first, then settings)
 _google_creds_raw = (
-    _get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON")
+    _get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_SA_JSON")
     or str(_get_attr(_base_settings, "google_sheets_credentials", "") or "").strip()
     or ""
 ).strip()
@@ -542,7 +565,7 @@ if DEFAULT_SPREADSHEET_ID:
 if TFB_SPREADSHEET_ID:
     _export_env_if_missing("TFB_SPREADSHEET_ID", TFB_SPREADSHEET_ID)
 
-# Sheet names (defaults aligned with your dashboard)
+# Sheet names (defaults aligned with dashboard tabs)
 SHEET_KSA_TADAWUL = (_get_first_env("SHEET_KSA_TADAWUL") or "KSA_Tadawul").strip()
 SHEET_GLOBAL_MARKETS = (_get_first_env("SHEET_GLOBAL_MARKETS") or "Global_Markets").strip()
 SHEET_MUTUAL_FUNDS = (_get_first_env("SHEET_MUTUAL_FUNDS") or "Mutual_Funds").strip()
@@ -560,7 +583,7 @@ IS_PRODUCTION = str(APP_ENV).strip().lower() in {"prod", "production"}
 # settings compatibility object (very lightweight)
 # ---------------------------------------------------------------------
 class _Settings:
-    # common identity
+    # identity
     app_name = APP_NAME
     service_name = APP_NAME
     env = APP_ENV
@@ -575,8 +598,8 @@ class _Settings:
     base_url = BACKEND_BASE_URL
 
     # auth
-    app_token = APP_TOKEN or ""
-    backup_app_token = BACKUP_APP_TOKEN or ""
+    app_token = (APP_TOKEN or "")
+    backup_app_token = (BACKUP_APP_TOKEN or "")
     require_auth = REQUIRE_AUTH
 
     # AI batch controls
@@ -585,13 +608,13 @@ class _Settings:
     ai_batch_concurrency = AI_BATCH_CONCURRENCY
     ai_max_tickers = AI_MAX_TICKERS
 
-    # legacy providers
+    # providers
     enabled_providers = ENABLED_PROVIDERS
     ksa_providers = KSA_PROVIDERS
     enabled_ksa_providers = KSA_PROVIDERS
     primary_provider = PRIMARY_PROVIDER
 
-    # legacy timeouts/ttl
+    # timeouts/ttl
     http_timeout_sec = HTTP_TIMEOUT_SEC
     cache_ttl_sec = CACHE_TTL_SEC
     engine_cache_ttl_sec = ENGINE_CACHE_TTL_SEC
@@ -603,7 +626,7 @@ class _Settings:
     argaam_base_url = ARGAAM_BASE_URL
     enable_yahoo = ENABLE_YAHOO
 
-    # legacy feature toggles
+    # legacy toggles
     enable_yahoo_chart_ksa = ENABLE_YAHOO_CHART_KSA
     enable_yahoo_chart_supplement = ENABLE_YAHOO_CHART_SUPPLEMENT
     enable_yfinance_ksa = ENABLE_YFINANCE_KSA
