@@ -1,18 +1,19 @@
 # render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.2.0)
+# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.0)
 # ============================================================
 #
-# Key goals
-# - Deterministic boot (numeric-safe parsing for uvicorn tunables)
+# Goals
+# - Deterministic boot (no "integer expression expected" crashes)
 # - No invalid uvicorn flags
 # - Backward-compatible env var names (legacy + *_SEC style)
-# - KSA providers pinned to yahoo_chart (quiet + stable)
+# - Supports WEB_CONCURRENCY workers safely
+# - Keeps your current provider policy (GLOBAL=eodhd,finnhub | KSA=yahoo_chart)
 #
 # Notes
 # - Secrets must be set in Render Environment UI (sync: false).
-# - If you rename the service, update BACKEND_BASE_URL/TFB_BASE_URL.
+# - If you rename the service, update BACKEND_BASE_URL / TFB_BASE_URL.
 
 services:
   - type: web
@@ -23,7 +24,7 @@ services:
 
     buildCommand: pip install -r requirements.txt
 
-    # Deterministic + safe startup (no "integer expression" crash)
+    # Deterministic + safe startup
     startCommand: |
       sh -c '
       set -eu
@@ -165,6 +166,8 @@ services:
         value: "5.3.1"
       - key: VERSION
         value: "5.3.1"
+      - key: RELEASE
+        value: "5.3.1"
 
       # Base URLs
       - key: BACKEND_BASE_URL
@@ -232,6 +235,16 @@ services:
       - key: ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
         value: "false"
 
+      # History analytics / forecast
+      - key: ENABLE_HISTORY_ANALYTICS
+        value: "true"
+      - key: HISTORY_LOOKBACK_DAYS
+        value: "400"
+      - key: FORECAST_CI_LEVEL
+        value: "0.80"
+      - key: ENGINE_MAX_CONCURRENCY
+        value: "20"
+
       # -------------------------
       # Provider keys (SECRETS)
       # -------------------------
@@ -250,6 +263,8 @@ services:
       - key: TADAWUL_QUOTE_URL
         value: ""
       - key: TADAWUL_FUNDAMENTALS_URL
+        value: ""
+      - key: ARGAAM_BASE_URL
         value: ""
       - key: ARGAAM_GATEWAY_URL
         value: ""
@@ -294,8 +309,12 @@ services:
         value: "20"
       - key: AI_MAX_TICKERS
         value: "500"
+      - key: AI_BATCH_CONCURRENCY
+        value: "5"
       - key: AI_CONCURRENCY
         value: "5"
+      - key: AI_BATCH_TIMEOUT_SEC
+        value: "45"
       - key: AI_TIMEOUT_SEC
         value: "45"
 
@@ -303,8 +322,12 @@ services:
         value: "25"
       - key: ADV_MAX_TICKERS
         value: "500"
+      - key: ADV_BATCH_CONCURRENCY
+        value: "6"
       - key: ADV_CONCURRENCY
         value: "6"
+      - key: ADV_BATCH_TIMEOUT_SEC
+        value: "45"
       - key: ADV_TIMEOUT_SEC
         value: "45"
 
