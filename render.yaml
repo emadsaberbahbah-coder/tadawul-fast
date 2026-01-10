@@ -1,7 +1,7 @@
 # render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.0)
+# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.1)
 # ============================================================
 #
 # Goals
@@ -9,7 +9,7 @@
 # - No invalid uvicorn flags
 # - Backward-compatible env var names (legacy + *_SEC style)
 # - Supports WEB_CONCURRENCY workers safely
-# - Keeps your current provider policy (GLOBAL=eodhd,finnhub | KSA=yahoo_chart)
+# - Keeps provider policy (GLOBAL=eodhd,finnhub | KSA=yahoo_chart)
 #
 # Notes
 # - Secrets must be set in Render Environment UI (sync: false).
@@ -48,10 +48,19 @@ services:
         printf "%s" "$v"
       }
 
+      valid_log_level() {
+        # normalize + allow only known uvicorn levels
+        v="$(printf "%s" "${1:-info}" | tr "[:upper:]" "[:lower:]")"
+        case "$v" in
+          (critical|error|warning|info|debug|trace) printf "%s" "$v" ;;
+          (*) printf "%s" "info" ;;
+        esac
+      }
+
       # ----------------------------
       # Resolve runtime values
       # ----------------------------
-      LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")"
+      LOG_LEVEL_LC="$(valid_log_level "${LOG_LEVEL:-info}")"
 
       PORT_VAL="$(clamp_min_1 "$(as_int "${PORT:-8000}" "8000")")"
       KEEPALIVE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")"
@@ -131,6 +140,16 @@ services:
         value: "30"
       - key: UVICORN_ACCESS_LOG
         value: "1"
+
+      # Optional uvicorn tunables (leave empty unless you want them)
+      - key: UVICORN_LIMIT_CONCURRENCY
+        value: ""
+      - key: UVICORN_LIMIT_MAX_REQUESTS
+        value: ""
+      - key: UVICORN_BACKLOG
+        value: ""
+      - key: UVICORN_ROOT_PATH
+        value: ""
 
       - key: LOG_LEVEL
         value: "info"
@@ -235,7 +254,36 @@ services:
       - key: ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
         value: "false"
 
-      # History analytics / forecast
+      # -------------------------
+      # Provider feature toggles (explicit; aligns with v2.0.0 providers)
+      # -------------------------
+      # EODHD
+      - key: EODHD_ENABLE_FUNDAMENTALS
+        value: "true"
+      - key: EODHD_ENABLE_HISTORY
+        value: "true"
+      - key: EODHD_ENABLE_FORECAST
+        value: "true"
+      - key: EODHD_VERBOSE_WARNINGS
+        value: "false"
+      - key: ALLOW_EODHD_KSA
+        value: "false"
+      - key: EODHD_ALLOW_KSA
+        value: "false"
+
+      # FINNHUB
+      - key: FINNHUB_ENABLE_PROFILE
+        value: "true"
+      - key: FINNHUB_ENABLE_HISTORY
+        value: "true"
+      - key: FINNHUB_ENABLE_FORECAST
+        value: "true"
+      - key: FINNHUB_VERBOSE_WARNINGS
+        value: "false"
+
+      # -------------------------
+      # History analytics / forecast (engine-level)
+      # -------------------------
       - key: ENABLE_HISTORY_ANALYTICS
         value: "true"
       - key: HISTORY_LOOKBACK_DAYS
@@ -244,6 +292,37 @@ services:
         value: "0.80"
       - key: ENGINE_MAX_CONCURRENCY
         value: "20"
+
+      # -------------------------
+      # Provider endpoints / base URLs (optional)
+      # -------------------------
+      - key: EODHD_BASE_URL
+        value: "https://eodhistoricaldata.com/api"
+      - key: FINNHUB_BASE_URL
+        value: "https://finnhub.io/api/v1"
+
+      # -------------------------
+      # Custom headers (optional JSON dict strings; empty = off)
+      # -------------------------
+      # EODHD headers
+      - key: EODHD_HEADERS_JSON
+        value: ""
+      - key: EODHD_HEADERS_REALTIME_JSON
+        value: ""
+      - key: EODHD_HEADERS_FUNDAMENTALS_JSON
+        value: ""
+      - key: EODHD_HEADERS_HISTORY_JSON
+        value: ""
+
+      # FINNHUB headers
+      - key: FINNHUB_HEADERS_JSON
+        value: ""
+      - key: FINNHUB_HEADERS_QUOTE_JSON
+        value: ""
+      - key: FINNHUB_HEADERS_PROFILE_JSON
+        value: ""
+      - key: FINNHUB_HEADERS_HISTORY_JSON
+        value: ""
 
       # -------------------------
       # Provider keys (SECRETS)
