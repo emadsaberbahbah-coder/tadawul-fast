@@ -1,21 +1,13 @@
 # config.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – MAIN CONFIG (v2.8.0) – PROD SAFE / NO HEAVY IMPORTS
+TADAWUL FAST BRIDGE – MAIN CONFIG (v2.9.1) – PROD SAFE / NO HEAVY IMPORTS
 
-Goals
-- ✅ Single canonical source of truth for settings used across routes + engine.
-- ✅ Works without pydantic-settings (plain dataclass + env parsing).
-- ✅ Token mode:
-    - If APP_TOKEN (or BACKUP_APP_TOKEN) is set -> token-protected endpoints
-    - If none are set -> OPEN mode (no auth)
-- ✅ Aligns with latest env naming used by:
-    - main.py  (DEFER_ROUTER_MOUNT / INIT_ENGINE_ON_BOOT / providers lists)
-    - env.py   (enabled_providers / ksa_providers compatibility)
-    - render.yaml (AI_TIMEOUT_SEC / AI_CONCURRENCY aliases, etc.)
-- ✅ Never raises at import-time; safe to import at startup.
-
-Notes
-- This module intentionally avoids any heavy imports (engine/providers/etc.).
+Key fixes vs prior draft
+- ✅ Default ENV name = production (not "prod")
+- ✅ Default KSA providers = yahoo_chart ONLY (aligns with render.yaml Option A)
+- ✅ Google Sheets credentials: supports JSON or base64(JSON) + common alias keys
+- ✅ Adds optional rate-limit tunables (ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE)
+- ✅ Never raises at import-time; safe at startup
 """
 
 from __future__ import annotations
@@ -27,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-CONFIG_VERSION = "2.8.0"
+CONFIG_VERSION = "2.9.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -123,7 +115,7 @@ def _maybe_decode_b64_json(s: str) -> Optional[str]:
     """
     - If value is JSON -> return it
     - If value is base64(JSON) -> decode+return JSON
-    - Else return original string (still useful for some setups)
+    - Else return original string
     Never raises.
     """
     raw = (s or "").strip()
@@ -138,9 +130,9 @@ def _maybe_decode_b64_json(s: str) -> Optional[str]:
         except Exception:
             return raw
 
-    # Try base64 decode -> JSON
+    # Try base64 decode -> JSON (lenient)
     try:
-        decoded = base64.b64decode(raw.encode("utf-8"), validate=True).decode("utf-8", errors="replace").strip()
+        decoded = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="replace").strip()
         if decoded.startswith("{") and decoded.endswith("}"):
             json.loads(decoded)
             return decoded
@@ -163,58 +155,59 @@ class Settings:
     # ------------------------------------------------------------------
     # Identity
     # ------------------------------------------------------------------
-    service_name: str = "tadawul-fast-bridge"
-    environment: str = "prod"
+    service_name: str = "Tadawul Fast Bridge"
+    environment: str = "production"
     log_level: str = "INFO"
-    app_version: str = ""  # optional (ENV: APP_VERSION / SERVICE_VERSION / VERSION / RELEASE)
+    app_version: str = ""
 
     # ------------------------------------------------------------------
-    # Fast boot controls (main.py reads these from settings if present)
+    # Fast boot controls (main.py reads these if present)
     # ------------------------------------------------------------------
-    defer_router_mount: bool = True          # ENV: DEFER_ROUTER_MOUNT
-    init_engine_on_boot: bool = True         # ENV: INIT_ENGINE_ON_BOOT
+    defer_router_mount: bool = True
+    init_engine_on_boot: bool = True
 
-    # Feature flags (optional)
-    ai_analysis_enabled: bool = True         # ENV: AI_ANALYSIS_ENABLED
-    advanced_analysis_enabled: bool = True   # ENV: ADVANCED_ANALYSIS_ENABLED
+    # Feature flags
+    ai_analysis_enabled: bool = True
+    advanced_analysis_enabled: bool = True
+
+    # Rate limiting (optional)
+    enable_rate_limiting: bool = True
+    max_requests_per_minute: int = 240
 
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
     app_token: Optional[str] = None
     backup_app_token: Optional[str] = None
-    require_auth: bool = False              # ENV: REQUIRE_AUTH (still OPEN if no tokens)
+    require_auth: bool = False  # NOTE: policy still OPEN if no tokens exist
 
     # ------------------------------------------------------------------
-    # Providers policy (settings-based compatibility for env.py/main.py)
+    # Providers policy
     # ------------------------------------------------------------------
     enabled_providers: List[str] = field(default_factory=lambda: ["eodhd", "finnhub"])
-    ksa_providers: List[str] = field(default_factory=lambda: ["yahoo_chart", "tadawul", "argaam"])
+    ksa_providers: List[str] = field(default_factory=lambda: ["yahoo_chart"])  # Option A default
     primary_provider: str = "eodhd"
-    ksa_disallow_eodhd: bool = True         # ENV: KSA_DISALLOW_EODHD
+    ksa_disallow_eodhd: bool = True
 
     # ------------------------------------------------------------------
     # HTTP + caching
     # ------------------------------------------------------------------
-    http_timeout_sec: float = 25.0          # ENV: HTTP_TIMEOUT_SEC / HTTP_TIMEOUT
-    cache_ttl_sec: float = 20.0             # ENV: CACHE_TTL_SEC / CACHE_DEFAULT_TTL
-    engine_cache_ttl_sec: int = 20          # ENV: ENGINE_CACHE_TTL_SEC / ENGINE_TTL_SEC
+    http_timeout_sec: float = 25.0
+    cache_ttl_sec: float = 20.0
+    engine_cache_ttl_sec: int = 20
 
     # ------------------------------------------------------------------
-    # Batching controls (routes + engine)
-    # - AI: used by routes/ai_analysis.py
-    # - ADV: used by routes/advanced_analysis.py (if separate)
-    # - ENRICHED: used by enriched endpoints
+    # Batch controls (routes + engine)
     # ------------------------------------------------------------------
-    ai_batch_size: int = 25
+    ai_batch_size: int = 20
     ai_batch_timeout_sec: float = 45.0
-    ai_batch_concurrency: int = 6
-    ai_max_tickers: int = 800
+    ai_batch_concurrency: int = 5
+    ai_max_tickers: int = 500
 
     adv_batch_size: int = 25
     adv_batch_timeout_sec: float = 45.0
     adv_batch_concurrency: int = 6
-    adv_max_tickers: int = 800
+    adv_max_tickers: int = 500
 
     enriched_batch_size: int = 40
     enriched_timeout_sec: float = 45.0
@@ -233,14 +226,14 @@ class Settings:
     default_spreadsheet_id: Optional[str] = None
     tfb_spreadsheet_id: Optional[str] = None
     google_sheets_credentials: Optional[str] = None  # JSON or base64(JSON) decoded
-    google_application_credentials: Optional[str] = None  # file path (if used)
+    google_application_credentials: Optional[str] = None  # file path
 
     # Apps Script (optional)
     google_apps_script_url: Optional[str] = None
     google_apps_script_backup_url: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Optional direct provider URLs (optional)
+    # Optional direct provider URLs
     # ------------------------------------------------------------------
     tadawul_quote_url: Optional[str] = None
     tadawul_fundamentals_url: Optional[str] = None
@@ -253,20 +246,21 @@ class Settings:
 
     @staticmethod
     def from_env() -> "Settings":
-        service_name = _strip(os.getenv("SERVICE_NAME") or os.getenv("APP_NAME") or "tadawul-fast-bridge")
-        environment = _strip(os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("ENV") or "prod").lower()
+        service_name = _strip(os.getenv("SERVICE_NAME") or os.getenv("APP_NAME") or os.getenv("APP_TITLE") or "Tadawul Fast Bridge")
+        environment = _strip(os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("ENV") or "production").lower()
         log_level = _strip(os.getenv("LOG_LEVEL") or "INFO").upper()
 
-        # Version: ENV first (align with env.py)
-        app_version = (
-            _env_first("APP_VERSION", "SERVICE_VERSION", "VERSION", "RELEASE") or ""
-        ).strip()
+        app_version = (_env_first("APP_VERSION", "SERVICE_VERSION", "VERSION", "RELEASE") or "").strip()
 
         defer_router_mount = _coerce_bool(os.getenv("DEFER_ROUTER_MOUNT"), True)
         init_engine_on_boot = _coerce_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
 
         ai_analysis_enabled = _coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True)
         advanced_analysis_enabled = _coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
+
+        enable_rate_limiting = _coerce_bool(os.getenv("ENABLE_RATE_LIMITING"), True)
+        max_requests_per_minute = _coerce_int(os.getenv("MAX_REQUESTS_PER_MINUTE"), 240)
+        max_requests_per_minute = max(10, min(5000, max_requests_per_minute))
 
         app_token = _strip(os.getenv("APP_TOKEN")) or _strip(os.getenv("TFB_APP_TOKEN")) or None
         backup_app_token = _strip(os.getenv("BACKUP_APP_TOKEN")) or None
@@ -276,14 +270,14 @@ class Settings:
         if not enabled_providers:
             enabled_providers = ["eodhd", "finnhub"]
 
+        # IMPORTANT: Default KSA = yahoo_chart ONLY (unless env explicitly sets otherwise)
         ksa_providers = _as_list_lower(os.getenv("KSA_PROVIDERS") or "")
         if not ksa_providers:
-            ksa_providers = ["yahoo_chart", "tadawul", "argaam"]
+            ksa_providers = ["yahoo_chart"]
 
-        primary_provider = (_strip(os.getenv("PRIMARY_PROVIDER")) or (enabled_providers[0] if enabled_providers else "finnhub")).lower()
+        primary_provider = (_strip(os.getenv("PRIMARY_PROVIDER")) or (enabled_providers[0] if enabled_providers else "eodhd")).lower()
         ksa_disallow_eodhd = _coerce_bool(os.getenv("KSA_DISALLOW_EODHD"), True)
 
-        # HTTP/caching (support legacy aliases)
         http_timeout_sec = _coerce_float(os.getenv("HTTP_TIMEOUT_SEC") or os.getenv("HTTP_TIMEOUT"), 25.0)
         http_timeout_sec = max(5.0, min(180.0, float(http_timeout_sec or 25.0)))
 
@@ -293,17 +287,17 @@ class Settings:
         engine_cache_ttl_sec = _coerce_int(os.getenv("ENGINE_CACHE_TTL_SEC") or os.getenv("ENGINE_TTL_SEC"), int(cache_ttl_sec))
         engine_cache_ttl_sec = max(1, min(3600, engine_cache_ttl_sec))
 
-        # AI batching (support AI_* aliases in render.yaml)
-        ai_batch_size = _coerce_int(os.getenv("AI_BATCH_SIZE"), _coerce_int(os.getenv("AI_BATCH"), 25))
-        ai_batch_timeout_sec = _coerce_float(os.getenv("AI_BATCH_TIMEOUT_SEC"), _coerce_float(os.getenv("AI_TIMEOUT_SEC"), 45.0))
-        ai_batch_concurrency = _coerce_int(os.getenv("AI_BATCH_CONCURRENCY"), _coerce_int(os.getenv("AI_CONCURRENCY"), 6))
-        ai_max_tickers = _coerce_int(os.getenv("AI_MAX_TICKERS"), 800)
+        # AI batching
+        ai_batch_size = _coerce_int(os.getenv("AI_BATCH_SIZE"), 20)
+        ai_batch_timeout_sec = _coerce_float(os.getenv("AI_BATCH_TIMEOUT_SEC") or os.getenv("AI_TIMEOUT_SEC"), 45.0)
+        ai_batch_concurrency = _coerce_int(os.getenv("AI_BATCH_CONCURRENCY") or os.getenv("AI_CONCURRENCY"), 5)
+        ai_max_tickers = _coerce_int(os.getenv("AI_MAX_TICKERS"), 500)
 
-        # ADV batching (support ADV_* aliases in render.yaml)
+        # ADV batching
         adv_batch_size = _coerce_int(os.getenv("ADV_BATCH_SIZE"), 25)
-        adv_batch_timeout_sec = _coerce_float(os.getenv("ADV_BATCH_TIMEOUT_SEC"), _coerce_float(os.getenv("ADV_TIMEOUT_SEC"), 45.0))
-        adv_batch_concurrency = _coerce_int(os.getenv("ADV_BATCH_CONCURRENCY"), _coerce_int(os.getenv("ADV_CONCURRENCY"), 6))
-        adv_max_tickers = _coerce_int(os.getenv("ADV_MAX_TICKERS"), 800)
+        adv_batch_timeout_sec = _coerce_float(os.getenv("ADV_BATCH_TIMEOUT_SEC") or os.getenv("ADV_TIMEOUT_SEC"), 45.0)
+        adv_batch_concurrency = _coerce_int(os.getenv("ADV_BATCH_CONCURRENCY") or os.getenv("ADV_CONCURRENCY"), 6)
+        adv_max_tickers = _coerce_int(os.getenv("ADV_MAX_TICKERS"), 500)
 
         # ENRICHED batching
         enriched_batch_size = _coerce_int(os.getenv("ENRICHED_BATCH_SIZE"), 40)
@@ -311,7 +305,7 @@ class Settings:
         enriched_batch_concurrency = _coerce_int(os.getenv("ENRICHED_BATCH_CONCURRENCY") or os.getenv("ENRICHED_CONCURRENCY"), 5)
         enriched_max_tickers = _coerce_int(os.getenv("ENRICHED_MAX_TICKERS"), 250)
 
-        # guardrails
+        # Guardrails
         ai_batch_size = max(5, min(250, ai_batch_size))
         ai_batch_timeout_sec = max(5.0, min(180.0, ai_batch_timeout_sec))
         ai_batch_concurrency = max(1, min(30, ai_batch_concurrency))
@@ -335,7 +329,8 @@ class Settings:
         default_spreadsheet_id = _strip(os.getenv("DEFAULT_SPREADSHEET_ID")) or None
         tfb_spreadsheet_id = _strip(os.getenv("TFB_SPREADSHEET_ID")) or None
 
-        gsc_raw = _strip(os.getenv("GOOGLE_SHEETS_CREDENTIALS"))
+        # Credentials: support common aliases
+        gsc_raw = _strip(_env_first("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SERVICE_ACCOUNT_JSON") or "")
         google_sheets_credentials = _maybe_decode_b64_json(gsc_raw) if gsc_raw else None
         google_application_credentials = _strip(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")) or None
 
@@ -357,6 +352,8 @@ class Settings:
             init_engine_on_boot=init_engine_on_boot,
             ai_analysis_enabled=ai_analysis_enabled,
             advanced_analysis_enabled=advanced_analysis_enabled,
+            enable_rate_limiting=enable_rate_limiting,
+            max_requests_per_minute=max_requests_per_minute,
             app_token=app_token,
             backup_app_token=backup_app_token,
             require_auth=require_auth,
@@ -394,7 +391,12 @@ class Settings:
         )
 
     def as_safe_dict(self) -> Dict[str, Any]:
-        return mask_settings_dict()
+        d = asdict(self)
+        d["app_token"] = _mask_secret(self.app_token)
+        d["backup_app_token"] = _mask_secret(self.backup_app_token)
+        d["google_sheets_credentials"] = "***present***" if self.google_sheets_credentials else None
+        d["google_application_credentials"] = "***present***" if self.google_application_credentials else None
+        return d
 
 
 @lru_cache(maxsize=1)
@@ -420,7 +422,7 @@ def allowed_tokens() -> List[str]:
 
 
 def is_open_mode() -> bool:
-    # Policy: no tokens => open, regardless of REQUIRE_AUTH flag
+    # Policy: no tokens => open (even if REQUIRE_AUTH=true)
     return len(allowed_tokens()) == 0
 
 
@@ -432,21 +434,7 @@ def auth_ok(x_app_token: Optional[str]) -> bool:
 
 
 def mask_settings_dict() -> Dict[str, Any]:
-    """
-    Safe dictionary for returning via API.
-    Secrets are masked and heavy JSON blobs are not returned.
-    """
-    s = get_settings()
-    d = asdict(s)
-
-    d["app_token"] = _mask_secret(s.app_token)
-    d["backup_app_token"] = _mask_secret(s.backup_app_token)
-
-    # never return service-account JSON
-    d["google_sheets_credentials"] = "***present***" if s.google_sheets_credentials else None
-    d["google_application_credentials"] = "***present***" if s.google_application_credentials else None
-
-    return d
+    return get_settings().as_safe_dict()
 
 
 __all__ = [
