@@ -78,27 +78,37 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import random
+import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
+
+logger = logging.getLogger("core.providers.eodhd_provider")
 
 PROVIDER_VERSION = "2.0.0"
 PROVIDER_NAME = "eodhd"
 
-BASE_URL = (os.getenv("EODHD_BASE_URL") or "https://eodhistoricaldata.com/api").rstrip("/")
+DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
+USER_AGENT_DEFAULT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
-# -----------------------------------------------------------------------------
-# Env helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Env helpers (safe)
+# ---------------------------------------------------------------------------
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None:
@@ -142,6 +152,22 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _token() -> Optional[str]:
+    for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def _base_url() -> str:
+    return _env_str("EODHD_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def _ua() -> str:
+    return _env_str("EODHD_UA", USER_AGENT_DEFAULT)
+
+
 def _timeout_default() -> float:
     for k in ("EODHD_TIMEOUT_S", "HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
         v = (os.getenv(k) or "").strip()
@@ -155,24 +181,8 @@ def _timeout_default() -> float:
     return 8.5
 
 
-TIMEOUT_S = _timeout_default()
-
-ENABLE_FUNDAMENTALS = _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
-ENABLE_HISTORY = _env_bool("EODHD_ENABLE_HISTORY", True)
-ENABLE_FORECAST = _env_bool("EODHD_ENABLE_FORECAST", True)
-VERBOSE_WARNINGS = _env_bool("EODHD_VERBOSE_WARNINGS", False)
-
-ALLOW_EODHD_KSA = _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
-
-UA = os.getenv(
-    "EODHD_UA",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-)
-
-
 def _retry_attempts() -> int:
-    r = _env_int("EODHD_RETRY_ATTEMPTS", 2)
+    r = _env_int("EODHD_RETRY_ATTEMPTS", _env_int("MAX_RETRIES", 2))
     return max(1, int(r))
 
 
@@ -181,19 +191,39 @@ def _retry_delay_sec() -> float:
     return d if d > 0 else 0.25
 
 
+def _enable_fundamentals() -> bool:
+    return _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
+
+
+def _enable_history() -> bool:
+    return _env_bool("EODHD_ENABLE_HISTORY", True)
+
+
+def _enable_forecast() -> bool:
+    return _env_bool("EODHD_ENABLE_FORECAST", True)
+
+
+def _verbose_warn() -> bool:
+    return _env_bool("EODHD_VERBOSE_WARNINGS", False)
+
+
+def _allow_ksa() -> bool:
+    return _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
+
+
 def _quote_ttl_sec() -> float:
     ttl = _env_float("EODHD_QUOTE_TTL_SEC", 12.0)
-    return max(5.0, float(ttl))
+    return max(5.0, float(ttl if ttl > 0 else 12.0))
 
 
 def _fund_ttl_sec() -> float:
-    ttl = _env_float("EODHD_FUND_TTL_SEC", 21600.0)  # 6h
-    return max(120.0, float(ttl))
+    ttl = _env_float("EODHD_FUND_TTL_SEC", 21600.0)
+    return max(120.0, float(ttl if ttl > 0 else 21600.0))
 
 
 def _history_ttl_sec() -> float:
     ttl = _env_float("EODHD_HISTORY_TTL_SEC", 1200.0)
-    return max(60.0, float(ttl))
+    return max(60.0, float(ttl if ttl > 0 else 1200.0))
 
 
 def _history_days() -> int:
@@ -206,15 +236,92 @@ def _history_points_max() -> int:
     return max(100, int(n))
 
 
-# -----------------------------------------------------------------------------
-# Token + symbol guards
-# -----------------------------------------------------------------------------
-def _token() -> Optional[str]:
-    for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
-        v = (os.getenv(k) or "").strip()
-        if v:
-            return v
-    return None
+# ---------------------------------------------------------------------------
+# TTL cache (import-safe if cachetools missing)
+# ---------------------------------------------------------------------------
+try:
+    from cachetools import TTLCache  # type: ignore
+
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1.0, float(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + self._ttl
+
+
+# Provider-level caches (no network at import time)
+_QUOTE_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_quote_ttl_sec())
+_FUND_CACHE: TTLCache = TTLCache(maxsize=4000, ttl=_fund_ttl_sec())
+_HIST_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
+
+
+# ---------------------------------------------------------------------------
+# Customized headers
+# ---------------------------------------------------------------------------
+def _json_headers(env_key: str) -> Dict[str, str]:
+    raw = _env_str(env_key, "")
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return {str(k): str(v) for k, v in obj.items()}
+    except Exception:
+        return {}
+    return {}
+
+
+def _base_headers() -> Dict[str, str]:
+    h = {
+        "User-Agent": _ua(),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.8",
+    }
+    h.update(_json_headers("EODHD_HEADERS_JSON"))
+    return h
+
+
+def _endpoint_headers(kind: str) -> Dict[str, str]:
+    key = {
+        "realtime": "EODHD_HEADERS_REALTIME_JSON",
+        "fundamentals": "EODHD_HEADERS_FUNDAMENTALS_JSON",
+        "history": "EODHD_HEADERS_HISTORY_JSON",
+    }.get(kind, "")
+    return _json_headers(key) if key else {}
+
+
+# ---------------------------------------------------------------------------
+# Symbol guards
+# ---------------------------------------------------------------------------
+_KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 
 def _looks_like_ksa(symbol: str) -> bool:
@@ -223,14 +330,14 @@ def _looks_like_ksa(symbol: str) -> bool:
         return False
     if s.endswith(".SR"):
         return True
-    if s.isdigit():  # raw Tadawul numeric code
+    if s.isdigit():
         return True
-    return False
+    return bool(_KSA_RE.match(s))
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Numeric helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _is_nan(x: Any) -> bool:
     try:
         return x is None or (isinstance(x, float) and math.isnan(x))
@@ -242,7 +349,10 @@ def _to_float(x: Any) -> Optional[float]:
     try:
         if _is_nan(x) or x is None:
             return None
-        return float(x)
+        s = str(x).strip()
+        if s == "":
+            return None
+        return float(s)
     except Exception:
         return None
 
@@ -310,7 +420,10 @@ def _fill_derived(patch: Dict[str, Any]) -> None:
         patch["price_change"] = cur - prev
 
     if patch.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        patch["percent_change"] = (cur - prev) / prev * 100.0
+        try:
+            patch["percent_change"] = (cur - prev) / prev * 100.0
+        except Exception:
+            pass
 
     if patch.get("value_traded") is None and cur is not None and vol is not None:
         patch["value_traded"] = cur * vol
@@ -328,81 +441,9 @@ def _fill_derived(patch: Dict[str, Any]) -> None:
         patch["free_float_market_cap"] = mc * (ff / 100.0)
 
 
-# -----------------------------------------------------------------------------
-# Customized headers
-# -----------------------------------------------------------------------------
-def _json_headers(env_key: str) -> Dict[str, str]:
-    raw = _env_str(env_key, "")
-    if not raw:
-        return {}
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return {str(k): str(v) for k, v in obj.items()}
-    except Exception:
-        return {}
-    return {}
-
-
-def _base_headers() -> Dict[str, str]:
-    h = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
-    h.update(_json_headers("EODHD_HEADERS_JSON"))
-    return h
-
-
-def _endpoint_headers(kind: str) -> Dict[str, str]:
-    key = {
-        "realtime": "EODHD_HEADERS_REALTIME_JSON",
-        "fundamentals": "EODHD_HEADERS_FUNDAMENTALS_JSON",
-        "history": "EODHD_HEADERS_HISTORY_JSON",
-    }.get(kind, "")
-    return _json_headers(key) if key else {}
-
-
-# -----------------------------------------------------------------------------
-# TTL cache fallback (import-safe)
-# -----------------------------------------------------------------------------
-try:
-    from cachetools import TTLCache  # type: ignore
-
-    _HAS_CACHETOOLS = True
-except Exception:  # pragma: no cover
-    _HAS_CACHETOOLS = False
-
-    class TTLCache(dict):  # type: ignore
-        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
-            super().__init__()
-            self._maxsize = max(1, int(maxsize))
-            self._ttl = max(1.0, float(ttl))
-            self._exp: Dict[str, float] = {}
-
-        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
-            now = time.time()
-            exp = self._exp.get(key)
-            if exp is not None and exp < now:
-                try:
-                    super().pop(key, None)
-                except Exception:
-                    pass
-                self._exp.pop(key, None)
-                return default
-            return super().get(key, default)
-
-        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
-            if len(self) >= self._maxsize:
-                try:
-                    oldest_key = next(iter(self.keys()))
-                    super().pop(oldest_key, None)
-                    self._exp.pop(oldest_key, None)
-                except Exception:
-                    pass
-            super().__setitem__(key, value)
-            self._exp[key] = time.time() + self._ttl
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # History analytics (forecast)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _stddev(xs: List[float]) -> Optional[float]:
     try:
         n = len(xs)
@@ -481,8 +522,8 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     # volatility_30d from last 31 closes
     if len(closes) >= 31:
-        rets: List[float] = []
         window = closes[-31:]
+        rets: List[float] = []
         for i in range(1, len(window)):
             p0 = window[i - 1]
             p1 = window[i]
@@ -494,7 +535,7 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     out["rsi_14"] = _compute_rsi_14(closes)
 
-    # Forecast (momentum-style)
+    # momentum forecast
     def mean_daily_return(n_days: int) -> Optional[float]:
         if len(closes) < (n_days + 2):
             return None
@@ -508,7 +549,7 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     r3m_d = mean_daily_return(63)
     r12m_d = mean_daily_return(252)
 
-    if ENABLE_FORECAST:
+    if _enable_forecast():
         if r1m_d is not None:
             out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
             out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
@@ -522,7 +563,7 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     else:
         out["forecast_method"] = "history_only"
 
-    # Confidence score: more points + lower vol => higher
+    # confidence score (0..100): more points + lower vol => higher
     pts = len(closes)
     base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
     vol = _to_float(out.get("volatility_30d"))
@@ -536,25 +577,29 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     return out
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Client singleton
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
-
-# provider-level caches (safe, no network at import time)
-_QUOTE_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_quote_ttl_sec())
-_FUND_CACHE: TTLCache = TTLCache(maxsize=4000, ttl=_fund_ttl_sec())
-_HIST_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
 
 
 async def _get_client() -> httpx.AsyncClient:
     global _CLIENT
-    if _CLIENT is None:
-        async with _LOCK:
-            if _CLIENT is None:
-                timeout = httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S))
-                _CLIENT = httpx.AsyncClient(timeout=timeout, headers=_base_headers(), follow_redirects=True)
+    if _CLIENT is not None:
+        return _CLIENT
+    async with _LOCK:
+        if _CLIENT is None:
+            t = _timeout_default()
+            timeout = httpx.Timeout(t, connect=min(10.0, t))
+            _CLIENT = httpx.AsyncClient(timeout=timeout, headers=_base_headers(), follow_redirects=True)
+            logger.info(
+                "EODHD client init v%s | base=%s | timeout=%.1fs | cachetools=%s",
+                PROVIDER_VERSION,
+                _base_url(),
+                t,
+                _HAS_CACHETOOLS,
+            )
     return _CLIENT
 
 
@@ -569,17 +614,17 @@ async def aclose_eodhd_client() -> None:
             pass
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # HTTP helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def _get_json_dict(url: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[dict], Optional[str]]:
     tok = _token()
     if not tok:
         return None, "not configured (EODHD_API_KEY)"
 
-    params = dict(params or {})
-    params.setdefault("api_token", tok)
-    params.setdefault("fmt", "json")
+    p = dict(params or {})
+    p.setdefault("api_token", tok)
+    p.setdefault("fmt", "json")
 
     client = await _get_client()
     retries = _retry_attempts()
@@ -590,7 +635,7 @@ async def _get_json_dict(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 
     for attempt in range(retries):
         try:
-            r = await client.get(url, params=params, headers=req_headers if req_headers else None)
+            r = await client.get(url, params=p, headers=req_headers if req_headers else None)
             sc = int(r.status_code)
 
             if sc == 429 or 500 <= sc < 600:
@@ -639,9 +684,9 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
     if not tok:
         return None, "not configured (EODHD_API_KEY)"
 
-    params = dict(params or {})
-    params.setdefault("api_token", tok)
-    params.setdefault("fmt", "json")
+    p = dict(params or {})
+    p.setdefault("api_token", tok)
+    p.setdefault("fmt", "json")
 
     client = await _get_client()
     retries = _retry_attempts()
@@ -652,7 +697,7 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 
     for attempt in range(retries):
         try:
-            r = await client.get(url, params=params, headers=req_headers if req_headers else None)
+            r = await client.get(url, params=p, headers=req_headers if req_headers else None)
             sc = int(r.status_code)
 
             if sc == 429 or 500 <= sc < 600:
@@ -666,6 +711,15 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
                 hint = ""
                 if sc in (401, 403):
                     hint = " (auth failed: check EODHD_API_KEY)"
+                msg = ""
+                try:
+                    js = r.json()
+                    if isinstance(js, dict):
+                        msg = str(js.get("message") or js.get("error") or "").strip()
+                except Exception:
+                    msg = ""
+                if msg:
+                    return None, f"HTTP {sc}{hint}: {msg}"
                 return None, f"HTTP {sc}{hint}"
 
             try:
@@ -687,15 +741,14 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
     return None, last_err or "request failed"
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Endpoint fetchers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def _fetch_realtime_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    tok = _token()
-    if not tok:
+    if not _token():
         return {}, "not configured (EODHD_API_KEY)"
 
-    url = f"{BASE_URL}/real-time/{symbol}"
+    url = f"{_base_url()}/real-time/{symbol}"
     js, err = await _get_json_dict(url, {}, kind="realtime")
     if js is None:
         return {}, f"realtime failed: {err}"
@@ -724,11 +777,12 @@ async def _fetch_realtime_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[s
 
 
 async def _fetch_fundamentals_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    tok = _token()
-    if not tok:
+    if not _enable_fundamentals():
+        return {}, None
+    if not _token():
         return {}, "not configured (EODHD_API_KEY)"
 
-    url = f"{BASE_URL}/fundamentals/{symbol}"
+    url = f"{_base_url()}/fundamentals/{symbol}"
     js, err = await _get_json_dict(url, {}, kind="fundamentals")
     if js is None:
         return {}, f"fundamentals failed: {err}"
@@ -792,20 +846,16 @@ async def _fetch_fundamentals_patch(symbol: str) -> Tuple[Dict[str, Any], Option
 
 
 async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    if not ENABLE_HISTORY:
+    if not _enable_history():
         return {}, None
-
-    tok = _token()
-    if not tok:
+    if not _token():
         return {}, "not configured (EODHD_API_KEY)"
 
-    # EODHD /eod endpoint returns list of daily candles
-    # We'll request a window using from/to.
     days = _history_days()
     to_d = date.today()
     from_d = to_d - timedelta(days=days)
 
-    url = f"{BASE_URL}/eod/{symbol}"
+    url = f"{_base_url()}/eod/{symbol}"
     js_list, err = await _get_json_list(
         url,
         {"from": from_d.isoformat(), "to": to_d.isoformat(), "period": "d"},
@@ -817,7 +867,6 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
     closes: List[float] = []
     last_date: Optional[str] = None
 
-    # EOD list items look like: {"date":"2025-01-01","open":...,"high":...,"low":...,"close":...,"volume":...}
     for it in js_list:
         if not isinstance(it, dict):
             continue
@@ -829,10 +878,9 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
         if isinstance(d, str) and d.strip():
             last_date = d.strip()
 
-    # Keep only recent points (cap)
     closes = closes[-_history_points_max():]
 
-    if len(closes) < 25:  # not enough for meaningful signals
+    if len(closes) < 25:
         return {}, "history returned too few points"
 
     analytics = _compute_history_analytics(closes)
@@ -845,16 +893,16 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
     return _clean_patch(patch), None
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main fetch
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) -> Dict[str, Any]:
     sym = (symbol or "").strip()
     if not sym:
-        return {}
+        return {"error": f"{PROVIDER_NAME}: empty symbol"}
 
     # Controlled KSA enablement
-    if _looks_like_ksa(sym) and not ALLOW_EODHD_KSA:
+    if _looks_like_ksa(sym) and not _allow_ksa():
         p = {
             "symbol": sym,
             "data_source": PROVIDER_NAME,
@@ -864,8 +912,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
         }
         return _clean_patch(p)
 
-    tok = _token()
-    if not tok:
+    if not _token():
         p = {
             "symbol": sym,
             "data_source": PROVIDER_NAME,
@@ -889,7 +936,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
             _QUOTE_CACHE[ck_q] = dict(rt_patch)
 
     if rt_err:
-        # If realtime fails, we return a warning patch (engine can fallback)
+        # If realtime fails, return warning patch (engine can fallback)
         p = {
             "symbol": sym,
             "data_source": PROVIDER_NAME,
@@ -908,7 +955,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
     _merge_into(out, rt_patch)
 
     # --- fundamentals (cached, best-effort) ---
-    if want_fundamentals and ENABLE_FUNDAMENTALS:
+    if want_fundamentals and _enable_fundamentals():
         ck_f = f"f::{sym}"
         hitf = _FUND_CACHE.get(ck_f)
         if isinstance(hitf, dict) and hitf:
@@ -920,9 +967,8 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
                 _FUND_CACHE[ck_f] = dict(f_patch)
 
         if f_err:
-            warns.append(f"{PROVIDER_NAME}: {f_err}")
+            warns.append(f"fundamentals: {f_err}")
         else:
-            # fundamentals should overwrite these if present
             _merge_into(
                 out,
                 f_patch,
@@ -941,8 +987,8 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
             )
 
     # --- history/forecast (cached, best-effort) ---
-    if want_history and ENABLE_HISTORY:
-        ck_h = f"h::{sym}::{_history_days()}"
+    if want_history and _enable_history():
+        ck_h = f"h::{sym}::{_history_days()}::{_history_points_max()}"
         hith = _HIST_CACHE.get(ck_h)
         if isinstance(hith, dict) and hith:
             h_patch = dict(hith)
@@ -953,23 +999,23 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
                 _HIST_CACHE[ck_h] = dict(h_patch)
 
         if h_err:
-            warns.append(f"{PROVIDER_NAME}: {h_err}")
+            warns.append(f"history: {h_err}")
         else:
-            # analytics should not overwrite quote/fundamentals fields
+            # analytics shouldn't overwrite quote/fundamentals
             for k, v in (h_patch or {}).items():
                 if k not in out and v is not None:
                     out[k] = v
 
-    if warns and VERBOSE_WARNINGS:
+    if warns and _verbose_warn():
         out["_warn"] = " | ".join([w for w in warns if w])
 
     _fill_derived(out)
     return _clean_patch(out)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Engine-compatible exported callables (name-based discovery)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     # fast path: realtime only
     return await _fetch(symbol, want_fundamentals=False, want_history=False)
@@ -977,12 +1023,11 @@ async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str,
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     # enriched: realtime + fundamentals + history/forecast (best-effort)
-    # NOTE: history requires /eod access and counts against quota.
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
 
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await fetch_enriched_quote_patch(symbol)
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
 # Compatibility aliases (some engines try these names)
@@ -991,7 +1036,16 @@ async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: 
 
 
 async def fetch_enriched_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await fetch_enriched_quote_patch(symbol)
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
+
+
+@dataclass
+class EodhdProvider:
+    name: str = PROVIDER_NAME
+
+    async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
+        # keep signature compatible with other providers
+        return await fetch_enriched_quote_patch(symbol)
 
 
 __all__ = [
@@ -1003,4 +1057,5 @@ __all__ = [
     "aclose_eodhd_client",
     "PROVIDER_VERSION",
     "PROVIDER_NAME",
+    "EodhdProvider",
 ]
