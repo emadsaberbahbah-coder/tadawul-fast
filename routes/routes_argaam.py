@@ -1,23 +1,18 @@
-# routes/routes_argaam.py  (FULL REPLACEMENT) — v3.6.0
+# routes/routes_argaam.py  (FULL REPLACEMENT) — v3.7.0
 """
 routes/routes_argaam.py
 ===============================================================
-Argaam Router (delegate) — v3.6.0
+Argaam Router (delegate) — v3.7.0
 (PROD SAFE + Auth-Compat + Sheet-Rows + Schema-Aligned)
 
-✅ v3.6.0 improvements
-- ✅ Adds Last Updated (Riyadh) computed from UTC (+03:00)
-- ✅ POST /v1/argaam/sheet-rows supports 2 modes:
-    • compact (legacy small headers)
-    • schema  (uses core.schemas.get_headers_for_sheet(sheet_name))
-  Default:
-    - if payload.sheet_name provided -> schema
-    - else -> compact
-  You can force: ?mode=schema or ?mode=compact
+✅ v3.7.0 improvements (over v3.6.0)
+- ✅ Stronger finalize step:
+    • Normalizes percent_change (ratio→% when needed)
+    • Computes value_traded = price * volume
+    • Ensures last_updated_utc + last_updated_riyadh always present (when possible)
+    • Sets data_quality based on presence of current_price (OK / MISSING)
+- ✅ Schema sheet-rows fills rank + origin consistently
 - ✅ Still: token via X-APP-TOKEN / Authorization: Bearer / optional ?token (if ALLOW_QUERY_TOKEN=1)
-- ✅ Cleaner "not configured" messaging when ARGAAM_QUOTE_URL is missing
-- ✅ Best-effort: engine -> provider module -> configured endpoint
-- ✅ Chunk-safe & concurrency-limited batch fetching for sheet-rows
 - ✅ Always returns HTTP 200 with {status, data_quality, error?} for client simplicity
 
 Expected env vars
@@ -54,7 +49,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("routes.routes_argaam")
 
-ROUTE_VERSION = "3.6.0"
+ROUTE_VERSION = "3.7.0"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 USER_AGENT = (
@@ -281,6 +276,7 @@ async def _get_client() -> httpx.AsyncClient:
 
 # Optional: close client on shutdown (best-effort)
 try:
+
     @router.on_event("shutdown")  # type: ignore[attr-defined]
     async def _shutdown() -> None:
         global _client
@@ -291,6 +287,7 @@ try:
                 await c.aclose()
         except Exception:
             pass
+
 except Exception:
     pass
 
@@ -427,6 +424,35 @@ def _compute_change(price: Optional[float], prev: Optional[float]) -> Tuple[Opti
         return None, None
 
 
+def _normalize_pct(pct: Any) -> Optional[float]:
+    """
+    Accepts either:
+    - percent value (e.g. 1.25 means 1.25%)
+    - ratio value (e.g. 0.0125 means 1.25%)
+    Returns percent.
+    """
+    f = _safe_float(pct)
+    if f is None:
+        return None
+    try:
+        if -1.2 <= f <= 1.2:
+            return f * 100.0
+        return f
+    except Exception:
+        return f
+
+
+def _compute_value_traded(price: Any, volume: Any) -> Optional[float]:
+    p = _safe_float(price)
+    v = _safe_float(volume)
+    if p is None or v is None:
+        return None
+    try:
+        return round(p * v, 6)
+    except Exception:
+        return None
+
+
 # =============================================================================
 # Engine/provider integration (best-effort)
 # =============================================================================
@@ -506,7 +532,6 @@ async def _try_profile_name(symbol: str) -> Optional[str]:
         root = _coerce_dict(data)
         name = _pick_str(root, "name", "company", "company_name", "companyName", "shortName", "longName")
     elif raw:
-        # ultra-light HTML sniff (best-effort)
         m = re.search(r"<title>\s*(.*?)\s*</title>", raw, re.IGNORECASE)
         if m:
             name = _safe_str(m.group(1))
@@ -550,6 +575,7 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
 
         now_utc = _utc_iso()
         patch = {
+            "origin": "KSA_TADAWUL",
             "market": "KSA",
             "currency": "SAR",
             "name": name,
@@ -559,6 +585,7 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
             "percent_change": pct,
             "volume": vol,
             "market_cap": mcap,
+            "value_traded": _compute_value_traded(price, vol),
             "data_source": "argaam",
             "last_updated_utc": now_utc,
             "last_updated_riyadh": _utc_to_riyadh_iso(now_utc),
@@ -574,37 +601,99 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
 
 
 def _base_ok(symbol: str) -> Dict[str, Any]:
+    now = _utc_iso()
     return {
         "status": "ok",
         "symbol": _normalize_ksa_symbol(symbol),
+        "origin": "KSA_TADAWUL",
         "market": "KSA",
         "currency": "SAR",
         "data_source": "argaam",
         "data_quality": "OK",
         "error": "",
         "route_version": ROUTE_VERSION,
-        "time_utc": _utc_iso(),
-        "time_riyadh": _riyadh_iso(),
+        "time_utc": now,
+        "time_riyadh": _utc_to_riyadh_iso(now) or _riyadh_iso(),
+        "last_updated_utc": now,
+        "last_updated_riyadh": _utc_to_riyadh_iso(now) or _riyadh_iso(),
     }
 
 
 def _base_err(symbol: str, err: str, quality: str = "MISSING") -> Dict[str, Any]:
+    now = _utc_iso()
     return {
         "status": "error",
         "symbol": _normalize_ksa_symbol(symbol),
+        "origin": "KSA_TADAWUL",
         "market": "KSA",
         "currency": "SAR",
         "data_source": "argaam",
         "data_quality": quality,
         "error": err or "unknown error",
         "route_version": ROUTE_VERSION,
-        "time_utc": _utc_iso(),
-        "time_riyadh": _riyadh_iso(),
+        "time_utc": now,
+        "time_riyadh": _utc_to_riyadh_iso(now) or _riyadh_iso(),
+        "last_updated_utc": now,
+        "last_updated_riyadh": _utc_to_riyadh_iso(now) or _riyadh_iso(),
     }
 
 
 def _debug_enabled(debug: int) -> bool:
     return _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(int(debug or 0))
+
+
+def _finalize_quote(sym: str, out: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensures:
+    - percent_change in % (not ratio)
+    - value_traded computed
+    - last_updated_utc/riyadh present
+    - data_quality consistent with current_price
+    """
+    try:
+        out["symbol"] = _normalize_ksa_symbol(sym) or out.get("symbol") or sym
+        out.setdefault("origin", "KSA_TADAWUL")
+        out.setdefault("market", "KSA")
+        out.setdefault("currency", "SAR")
+        out.setdefault("data_source", "argaam")
+
+        # timestamps
+        if not out.get("last_updated_utc"):
+            out["last_updated_utc"] = out.get("time_utc") or _utc_iso()
+        if not out.get("last_updated_riyadh"):
+            out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc"))) or out.get("time_riyadh") or _riyadh_iso()
+
+        # normalize percent_change
+        if out.get("percent_change") is not None:
+            out["percent_change"] = _normalize_pct(out.get("percent_change"))
+
+        # compute change if missing
+        if out.get("price_change") is None or out.get("percent_change") is None:
+            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
+            if out.get("price_change") is None:
+                out["price_change"] = ch
+            if out.get("percent_change") is None:
+                out["percent_change"] = pct
+
+        # compute value_traded
+        if out.get("value_traded") is None:
+            out["value_traded"] = _compute_value_traded(out.get("current_price"), out.get("volume"))
+
+        # quality
+        if _safe_float(out.get("current_price")) is None:
+            out["status"] = "error"
+            out["data_quality"] = "MISSING"
+            if not str(out.get("error") or "").strip():
+                out["error"] = "missing price"
+        else:
+            out.setdefault("status", "ok")
+            out["data_quality"] = out.get("data_quality") or "OK"
+            out["error"] = str(out.get("error") or "")
+
+        return out
+    except Exception:
+        # never raise
+        return out
 
 
 # =============================================================================
@@ -655,41 +744,27 @@ async def _get_quote_payload(
     if patch:
         out = _base_ok(sym)
         out.update({k: v for k, v in patch.items() if v is not None})
-        # ensure computed change if not provided
-        if out.get("percent_change") is None or out.get("price_change") is None:
-            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
-            out.setdefault("price_change", ch)
-            out.setdefault("percent_change", pct)
-        # ensure last_updated_riyadh
         if out.get("last_updated_utc") and not out.get("last_updated_riyadh"):
             out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
-        return out
+        return _finalize_quote(sym, out)
     debug_info["engine"] = err
 
     patch, err = await _try_provider_module(sym)
     if patch:
         out = _base_ok(sym)
         out.update({k: v for k, v in patch.items() if v is not None})
-        if out.get("percent_change") is None or out.get("price_change") is None:
-            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
-            out.setdefault("price_change", ch)
-            out.setdefault("percent_change", pct)
         if out.get("last_updated_utc") and not out.get("last_updated_riyadh"):
             out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
-        return out
+        return _finalize_quote(sym, out)
     debug_info["provider"] = err
 
     patch, err = await _try_configured_endpoints(sym)
     if patch:
         out = _base_ok(sym)
         out.update({k: v for k, v in patch.items() if v is not None})
-        if out.get("percent_change") is None or out.get("price_change") is None:
-            ch, pct = _compute_change(_safe_float(out.get("current_price")), _safe_float(out.get("previous_close")))
-            out.setdefault("price_change", ch)
-            out.setdefault("percent_change", pct)
         if out.get("last_updated_utc") and not out.get("last_updated_riyadh"):
             out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
-        return out
+        return _finalize_quote(sym, out)
     debug_info["endpoint"] = err
 
     msg = "Argaam quote unavailable."
@@ -700,7 +775,7 @@ async def _get_quote_payload(
     if dbg:
         out["debug"] = debug_info
         out["hint"] = "Set ARGAAM_QUOTE_URL (and optional ARGAAM_HEADERS_JSON) OR add core.providers.argaam_provider."
-    return out
+    return _finalize_quote(sym, out)
 
 
 @router.get("/quote")
@@ -765,6 +840,7 @@ SHEET_HEADERS_COMPACT: List[str] = [
     "Change %",
     "Volume",
     "Market Cap",
+    "Value Traded",
     "Data Source",
     "Data Quality",
     "Last Updated (UTC)",
@@ -791,6 +867,7 @@ def _to_sheet_row_compact(q: Dict[str, Any]) -> List[Any]:
         g("percent_change"),
         g("volume"),
         g("market_cap"),
+        g("value_traded"),
         g("data_source"),
         g("data_quality"),
         g("last_updated_utc", "time_utc"),
@@ -829,7 +906,7 @@ def _build_schema_rows(
         headers = get_headers_for_sheet(sheet_name)
         rows: List[List[Any]] = []
 
-        origin_label = (sheet_name or "").strip() or "KSA_Tadawul"
+        origin_label = "KSA_TADAWUL"
 
         for idx, it in enumerate(items, start=1):
             q = dict(it or {})
@@ -839,6 +916,14 @@ def _build_schema_rows(
             # ensure timestamps in both zones when possible
             if q.get("last_updated_utc") and not q.get("last_updated_riyadh"):
                 q["last_updated_riyadh"] = _utc_to_riyadh_iso(str(q.get("last_updated_utc")))
+
+            # ensure percent_change normalization
+            if q.get("percent_change") is not None:
+                q["percent_change"] = _normalize_pct(q.get("percent_change"))
+
+            # ensure value_traded
+            if q.get("value_traded") is None:
+                q["value_traded"] = _compute_value_traded(q.get("current_price"), q.get("volume"))
 
             row: List[Any] = []
             for h in headers:
@@ -852,7 +937,6 @@ def _build_schema_rows(
 
         return headers, rows
     except Exception as exc:
-        # fallback to compact if schema tools not available
         logger.warning("schema row builder failed; fallback to compact: %s", exc)
         return SHEET_HEADERS_COMPACT, [_to_sheet_row_compact(it) for it in items]
 
@@ -869,9 +953,10 @@ async def sheet_rows(
 ) -> Dict[str, Any]:
     provided = _extract_token(x_app_token, authorization, token)
     if not _auth_ok(provided):
+        eff_mode = _sheet_mode(payload, mode)
         return {
             "status": "error",
-            "mode": _sheet_mode(payload, mode),
+            "mode": eff_mode,
             "headers": SHEET_HEADERS_COMPACT,
             "rows": [],
             "count": 0,
@@ -898,11 +983,10 @@ async def sheet_rows(
     eff_mode = _sheet_mode(payload, mode)
 
     if not normed:
-        headers = SHEET_HEADERS_COMPACT
         return {
             "status": "ok",
             "mode": eff_mode,
-            "headers": headers,
+            "headers": SHEET_HEADERS_COMPACT,
             "rows": [],
             "count": 0,
             "route_version": ROUTE_VERSION,
