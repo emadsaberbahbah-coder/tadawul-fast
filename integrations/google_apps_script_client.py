@@ -1,18 +1,21 @@
 """
-google_apps_script_client.py
+integrations/google_apps_script_client.py
 ------------------------------------------------------------
-Google Apps Script client for Tadawul Fast Bridge – v2.6.0 (HARDENED)
+Google Apps Script client for Tadawul Fast Bridge – v2.7.0 (HARDENED + PAGE-AWARE)
 
 GOALS
 - Robust bridge for backend/tools to call your deployed Google Apps Script WebApp.
 - Routes tickers intelligently:
       • KSA (.SR / TADAWUL: / numeric) -> Apps Script KSA logic
       • Global                          -> Apps Script Global logic
+- Adds PAGE-aware helpers (Market_Leaders / Global_Markets / etc.) so callers can use:
+      sync_page_quotes(page_key=..., tickers=...)
+  and the client will route (ksa/global/mixed) correctly.
 - Reads configuration from (env.py -> core.config -> env vars) in that order.
-- NEVER calls market providers directly (only talks to GAS).
+- DOES NOT import heavy provider modules; stays lightweight + import-safe.
 
 SECURITY NOTE (IMPORTANT)
-- Google Apps Script WebApp doPost(e) typically cannot access custom HTTP headers reliably.
+- Google Apps Script WebApp doPost(e) often cannot rely on custom headers consistently.
   So token-in-header alone may not work.
 - This client supports sending token via:
     - query string (recommended for GAS)
@@ -24,6 +27,17 @@ NOTES
 - Uses urllib only (max portability).
 - Defensive networking: retries for transient failures, JSON-safe parsing.
 - Prefers GOOGLE_APPS_SCRIPT_URL, falls back to GOOGLE_APPS_SCRIPT_BACKUP_URL.
+
+ENV (selected)
+- GOOGLE_APPS_SCRIPT_URL / GOOGLE_APPS_SCRIPT_BACKUP_URL
+- APP_TOKEN / BACKUP_APP_TOKEN
+- BACKEND_BASE_URL (optional informational only)
+- APPS_SCRIPT_TIMEOUT_SEC
+- APPS_SCRIPT_VERIFY_SSL=1|0
+- APPS_SCRIPT_MAX_RAW_TEXT_CHARS
+- APPS_SCRIPT_TOKEN_TRANSPORT="query,body" (default)
+- APPS_SCRIPT_TOKEN_PARAM_NAME="token" (default)
+- APPS_SCRIPT_MODE_<PAGEKEY> optional override per page (see PAGE_SPECS)
 """
 
 from __future__ import annotations
@@ -44,7 +58,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_apps_script_client")
 
-CLIENT_VERSION = "2.6.0"
+CLIENT_VERSION = "2.7.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -154,6 +168,7 @@ _APP_TOKEN = _get_str(attr="app_token", env_key="APP_TOKEN", default="")
 _BACKUP_TOKEN = _get_str(attr="backup_app_token", env_key="BACKUP_APP_TOKEN", default="")
 _DEFAULT_TOKEN = _first_nonempty(_APP_TOKEN, _BACKUP_TOKEN)
 
+# Optional informational base URL
 _BACKEND_URL = _get_str(attr="backend_base_url", env_key="BACKEND_BASE_URL", default="")
 
 _DEFAULT_TIMEOUT = _get_float(attr="apps_script_timeout_sec", env_key="APPS_SCRIPT_TIMEOUT_SEC", default=45.0)
@@ -168,6 +183,33 @@ _VERIFY_SSL_DEFAULT = _env_bool("APPS_SCRIPT_VERIFY_SSL", True)
 
 # Safety: avoid leaking huge HTML error pages into memory/logs
 _MAX_RAW_TEXT_CHARS = int(os.getenv("APPS_SCRIPT_MAX_RAW_TEXT_CHARS", "12000") or "12000")
+
+
+# =============================================================================
+# Optional symbol normalization hook (best-effort)
+# =============================================================================
+def _fallback_normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    s = s.replace(" ", "")
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip().upper()
+    if s.endswith(".TADAWUL"):
+        s = s[: -len(".TADAWUL")].strip()
+    if s.isdigit() and 3 <= len(s) <= 6:
+        return f"{s}.SR"
+    return s
+
+
+_NORMALIZE_SYMBOL = _fallback_normalize_symbol
+try:
+    _norm_mod = _safe_import("core.symbols.normalize")
+    _norm_fn = getattr(_norm_mod, "normalize_symbol", None) if _norm_mod else None
+    if callable(_norm_fn):
+        _NORMALIZE_SYMBOL = lambda x: str(_norm_fn(x) or "").strip().upper()  # type: ignore
+except Exception:
+    pass
 
 
 # =============================================================================
@@ -208,6 +250,45 @@ class AppsScriptResult:
             "url": self.url,
             "elapsed_ms": self.elapsed_ms,
         }
+
+
+# =============================================================================
+# Page specs (optional but very useful)
+# =============================================================================
+# market:
+#   - "ksa": only ksa_tickers
+#   - "global": only global_tickers
+#   - "mixed": both (default)
+#
+# mode:
+#   - default GAS "mode" query string param
+#   - override per page via env: APPS_SCRIPT_MODE_<PAGEKEY>
+#
+PAGE_SPECS: Dict[str, Dict[str, str]] = {
+    "MARKET_LEADERS": {"market": "mixed", "mode": "refresh_quotes"},
+    "MY_PORTFOLIO": {"market": "mixed", "mode": "refresh_quotes"},
+    "INSIGHTS_ANALYSIS": {"market": "mixed", "mode": "refresh_quotes"},
+    "GLOBAL_MARKETS": {"market": "global", "mode": "refresh_quotes_global"},
+    "MUTUAL_FUNDS": {"market": "global", "mode": "refresh_quotes_global"},
+    "COMMODITIES_FX": {"market": "global", "mode": "refresh_quotes_global"},
+    "KSA_TADAWUL": {"market": "ksa", "mode": "refresh_quotes_ksa"},
+}
+
+
+def _env_page_mode(page_key: str, default_mode: str) -> str:
+    k = (page_key or "").strip().upper()
+    if not k:
+        return default_mode
+    v = (os.getenv(f"APPS_SCRIPT_MODE_{k}") or "").strip()
+    return v or default_mode
+
+
+def resolve_page_spec(page_key: str) -> Dict[str, str]:
+    k = (page_key or "").strip().upper()
+    spec = dict(PAGE_SPECS.get(k, {"market": "mixed", "mode": "refresh_quotes"}))
+    spec["mode"] = _env_page_mode(k, spec.get("mode", "refresh_quotes"))
+    spec["page_key"] = k or "UNKNOWN"
+    return spec
 
 
 # =============================================================================
@@ -263,15 +344,18 @@ def split_tickers_by_market(tickers: Sequence[str]) -> Tuple[List[str], List[str
         if not raw:
             continue
 
-        ksa_norm = _normalize_ksa_symbol(raw)
+        # Use project normalizer first (if any), then strict KSA check
+        norm = _NORMALIZE_SYMBOL(raw) or raw.strip().upper()
+        ksa_norm = _normalize_ksa_symbol(norm) or _normalize_ksa_symbol(raw)
+
         if ksa_norm:
             if ksa_norm not in seen_ksa:
                 seen_ksa.add(ksa_norm)
                 ksa.append(ksa_norm)
             continue
 
-        up = raw.strip().upper()
-        if up not in seen_glb:
+        up = (norm or raw).strip().upper()
+        if up and up not in seen_glb:
             seen_glb.add(up)
             glb.append(up)
 
@@ -385,7 +469,10 @@ class GoogleAppsScriptClient:
                 pass
 
         # GAS sometimes returns HTML (error page / permission issues)
-        return {"raw": text}
+        # Keep raw but structured
+        if t.startswith("<"):
+            return {"raw_html": t}
+        return {"raw": t}
 
     # ------------------------------------------------------------------
     # Retry policy
@@ -413,7 +500,12 @@ class GoogleAppsScriptClient:
         headers: Optional[Dict[str, str]] = None,
     ) -> AppsScriptResult:
         if not self.base_url:
-            return AppsScriptResult(False, 0, None, "Apps Script URL not configured (GOOGLE_APPS_SCRIPT_URL or GOOGLE_APPS_SCRIPT_BACKUP_URL)")
+            return AppsScriptResult(
+                False,
+                0,
+                None,
+                "Apps Script URL not configured (GOOGLE_APPS_SCRIPT_URL or GOOGLE_APPS_SCRIPT_BACKUP_URL)",
+            )
 
         method = (method or "POST").strip().upper()
         url = self._build_url(mode=mode, extra_query=extra_query)
@@ -428,6 +520,7 @@ class GoogleAppsScriptClient:
         # Token in header (optional)
         if self.app_token and "header" in _TOKEN_TRANSPORT:
             req_headers["X-APP-TOKEN"] = self.app_token
+            req_headers["Authorization"] = f"Bearer {self.app_token}"
 
         if headers:
             for k, v in headers.items():
@@ -465,10 +558,9 @@ class GoogleAppsScriptClient:
             except Exception as exc:
                 return AppsScriptResult(False, 0, None, f"JSON Encode Error: {exc}", url=url_redacted)
 
-        last_err: Optional[str] = None
         started = time.time()
-
         total_tries = max(0, int(retries)) + 1
+
         for attempt in range(total_tries):
             try:
                 req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method=method)
@@ -483,8 +575,12 @@ class GoogleAppsScriptClient:
                     elapsed_ms = int((time.time() - started) * 1000)
 
                     if (not ok) and self._is_retryable_status(status_code) and attempt < (total_tries - 1):
-                        last_err = f"HTTP {status_code}"
-                        logger.warning("[AppsScriptClient] %s (attempt=%d/%d) -> retry", last_err, attempt + 1, total_tries)
+                        logger.warning(
+                            "[AppsScriptClient] HTTP %s (attempt=%d/%d) -> retry",
+                            status_code,
+                            attempt + 1,
+                            total_tries,
+                        )
                         self._sleep_backoff(attempt)
                         continue
 
@@ -510,8 +606,12 @@ class GoogleAppsScriptClient:
                 elapsed_ms = int((time.time() - started) * 1000)
 
                 if self._is_retryable_status(code) and attempt < (total_tries - 1):
-                    last_err = f"HTTP {code}"
-                    logger.warning("[AppsScriptClient] %s (attempt=%d/%d) -> retry", last_err, attempt + 1, total_tries)
+                    logger.warning(
+                        "[AppsScriptClient] HTTP %s (attempt=%d/%d) -> retry",
+                        code,
+                        attempt + 1,
+                        total_tries,
+                    )
                     self._sleep_backoff(attempt)
                     continue
 
@@ -529,10 +629,13 @@ class GoogleAppsScriptClient:
 
             except Exception as exc:
                 elapsed_ms = int((time.time() - started) * 1000)
-                last_err = str(exc)
-
                 if attempt < (total_tries - 1):
-                    logger.warning("[AppsScriptClient] Network error '%s' (attempt=%d/%d) -> retry", last_err, attempt + 1, total_tries)
+                    logger.warning(
+                        "[AppsScriptClient] Network error '%s' (attempt=%d/%d) -> retry",
+                        str(exc),
+                        attempt + 1,
+                        total_tries,
+                    )
                     self._sleep_backoff(attempt)
                     continue
 
@@ -540,13 +643,13 @@ class GoogleAppsScriptClient:
                     ok=False,
                     status_code=0,
                     data=None,
-                    error=f"Max retries exceeded. Last error: {last_err}",
+                    error=f"Max retries exceeded. Last error: {exc}",
                     raw_text=None,
                     url=url_redacted,
                     elapsed_ms=elapsed_ms,
                 )
 
-        return AppsScriptResult(False, 0, None, f"Max retries exceeded. Last error: {last_err}", url=url_redacted)
+        return AppsScriptResult(False, 0, None, "Max retries exceeded.", url=url_redacted)
 
     # ------------------------------------------------------------------
     # Async wrapper
@@ -581,15 +684,27 @@ class GoogleAppsScriptClient:
         sheet_id: str,
         sheet_name: str,
         tickers: Sequence[str],
+        *,
+        page_key: Optional[str] = None,
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        ksa_tickers, global_tickers = split_tickers_by_market(list(tickers or []))
+        # Normalize + split
+        normed = []
+        for t in list(tickers or []):
+            s = _NORMALIZE_SYMBOL(t)
+            if s:
+                normed.append(s)
+
+        ksa_tickers, global_tickers = split_tickers_by_market(normed)
 
         meta: Dict[str, Any] = {
             "client": "tadawul_fast_bridge",
             "client_version": CLIENT_VERSION,
             "generated_at_utc": _now_utc_iso(),
+            "backend_base_url": (_BACKEND_URL or "").strip(),
         }
+        if page_key:
+            meta["page_key"] = (page_key or "").strip().upper()
         if extra_meta:
             try:
                 meta.update(extra_meta)
@@ -613,8 +728,75 @@ class GoogleAppsScriptClient:
         *,
         mode: str = "refresh_quotes",
         retries: int = 2,
+        page_key: Optional[str] = None,
+        extra_meta: Optional[Dict[str, Any]] = None,
+        log: bool = True,
     ) -> AppsScriptResult:
-        payload = self.build_quotes_payload(sheet_id, sheet_name, tickers)
+        payload = self.build_quotes_payload(sheet_id, sheet_name, tickers, page_key=page_key, extra_meta=extra_meta)
+        if log:
+            ksa_n = len(payload.get("ksa_tickers") or [])
+            glb_n = len(payload.get("global_tickers") or [])
+            logger.info(
+                "[AppsScriptClient] sync_quotes_to_sheet mode=%s page=%s sheet=%s ksa=%d global=%d total=%d",
+                mode,
+                (page_key or "").strip().upper() or "-",
+                (sheet_name or "").strip() or "-",
+                ksa_n,
+                glb_n,
+                ksa_n + glb_n,
+            )
+        return self.call_script(mode=mode, payload=payload, method="POST", retries=retries)
+
+    def sync_page_quotes(
+        self,
+        *,
+        sheet_id: str,
+        sheet_name: str,
+        page_key: str,
+        tickers: Sequence[str],
+        retries: int = 2,
+        extra_meta: Optional[Dict[str, Any]] = None,
+        log: bool = True,
+    ) -> AppsScriptResult:
+        """
+        Page-aware sync. Uses PAGE_SPECS to decide:
+          - GAS mode
+          - whether to send ksa-only / global-only / mixed
+        """
+        spec = resolve_page_spec(page_key)
+        market = (spec.get("market") or "mixed").lower()
+        mode = spec.get("mode") or "refresh_quotes"
+
+        payload = self.build_quotes_payload(
+            sheet_id=sheet_id,
+            sheet_name=sheet_name,
+            tickers=tickers,
+            page_key=spec.get("page_key"),
+            extra_meta=extra_meta,
+        )
+
+        if market == "ksa":
+            payload["all_tickers"] = list(payload.get("ksa_tickers") or [])
+            payload["global_tickers"] = []
+        elif market == "global":
+            payload["all_tickers"] = list(payload.get("global_tickers") or [])
+            payload["ksa_tickers"] = []
+
+        if log:
+            ksa_n = len(payload.get("ksa_tickers") or [])
+            glb_n = len(payload.get("global_tickers") or [])
+            all_n = len(payload.get("all_tickers") or [])
+            logger.info(
+                "[AppsScriptClient] sync_page_quotes page=%s market=%s mode=%s sheet=%s ksa=%d global=%d all=%d",
+                spec.get("page_key"),
+                market,
+                mode,
+                (sheet_name or "").strip() or "-",
+                ksa_n,
+                glb_n,
+                all_n,
+            )
+
         return self.call_script(mode=mode, payload=payload, method="POST", retries=retries)
 
     def ping(self, *, mode: str = "ping") -> AppsScriptResult:
@@ -637,4 +819,6 @@ __all__ = [
     "apps_script_client",
     "get_apps_script_client",
     "split_tickers_by_market",
+    "resolve_page_spec",
+    "PAGE_SPECS",
 ]
