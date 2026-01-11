@@ -2,29 +2,38 @@
 """
 core/providers/tadawul_provider.py
 ===============================================================
-Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v1.12.0
+Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v1.13.0
 PROD SAFE + Async + ENGINE-ALIGNED (PATCH DICT RETURNS)
 
-What this revision guarantees (v1.12.0)
+What this revision guarantees (v1.13.0)
 - ✅ Engine-aligned exports (ALL return Dict[str, Any] — NO tuples):
     fetch_quote_patch
+    fetch_fundamentals_patch
     fetch_enriched_quote_patch
     fetch_quote_and_enrichment_patch
+    fetch_quote_and_fundamentals_patch
 - ✅ Import-safe: no network at import-time, never crashes on missing env / cachetools
 - ✅ Strict KSA-only guard:
     - Non-KSA symbols return {} (silent) to prevent misrouting/pollution
 - ✅ Clean "not configured" behavior:
     - For KSA symbols: returns {"error": "warning: ..."} (no crash, allows engine fallback)
-- ✅ Defensive parsing + bounded deep-find
+- ✅ Defensive parsing + bounded deep-find (safe for unknown JSON shapes)
 - ✅ Retry/backoff on 429 + transient 5xx
 - ✅ TTL cache for quote + fundamentals + history (env-configurable)
-- ✅ Adds OPTIONAL history + derived analytics:
+- ✅ OPTIONAL history + derived analytics:
     - returns_1w/1m/3m/6m/12m
     - ma20/ma50/ma200
-    - volatility_30d (annualized %, computed from last ~30 trading days)
-    - rsi_14 (computed)
+    - volatility_30d (annualized %, last ~30 trading days)
+    - rsi_14
     - expected_return_1m/3m/12m + expected_price_1m/3m/12m (simple momentum estimate)
     - confidence_score + forecast_method + history_points/source/last_utc
+- ✅ Adds Sheets-friendly forecast alias fields (keeps originals too):
+    • forecast_price_1m/3m/12m  (alias of expected_price_*)
+    • expected_roi_pct_1m/3m/12m (alias of expected_return_*)
+    • forecast_confidence       (alias of confidence_score)
+    • forecast_updated_utc      (alias of history_last_utc)
+- ✅ Fixes merge behavior: does NOT treat numeric 0 as “empty” when merging
+- ✅ Adds stable provenance fields: provider="tadawul", data_source="tadawul", provider_version
 
 Supported env vars (optional)
 - TADAWUL_MARKET_ENABLED          true/false (default true)
@@ -40,9 +49,9 @@ Optional history endpoint (for returns/MAs/forecast):
 
 Optional headers and HTTP tuning:
 - TADAWUL_HEADERS_JSON            JSON dict of headers (optional)
-- TADAWUL_TIMEOUT_SEC             default falls back to HTTP_TIMEOUT then 25
+- TADAWUL_TIMEOUT_SEC             default falls back to HTTP_TIMEOUT/HTTP_TIMEOUT_SEC then 25
 - TADAWUL_RETRY_ATTEMPTS          default 3 (min 1)
-- TADAWUL_RETRY_DELAY_SEC         default 0.35
+- TADAWUL_RETRY_DELAY_SEC         default 0.35 (supports RETRY_DELAY/RETRY_DELAY_SEC)
 
 Cache tuning:
 - TADAWUL_REFRESH_INTERVAL        used as quote cache TTL if > 0 (seconds)
@@ -70,7 +79,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
@@ -78,7 +87,7 @@ import httpx
 logger = logging.getLogger("core.providers.tadawul_provider")
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "1.12.0"
+PROVIDER_VERSION = "1.13.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -97,10 +106,31 @@ _FALSY = {"0", "false", "no", "n", "off", "f"}
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 _KSA_SYMBOL_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# Optional shared normalizer (PROD SAFE)
+# ---------------------------------------------------------------------------
 
-# -----------------------------------------------------------------------------
+
+def _try_import_shared_ksa_helpers() -> Tuple[Optional[Any], Optional[Any]]:
+    """
+    Returns (normalize_ksa, looks_like_ksa) if available; else (None, None).
+    Never raises.
+    """
+    try:
+        from core.symbols.normalize import normalize_ksa_symbol as _nksa  # type: ignore
+        from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
+
+        return _nksa, _lk
+    except Exception:
+        return None, None
+
+
+_SHARED_NORM_KSA, _SHARED_LOOKS_KSA = _try_import_shared_ksa_helpers()
+
+
+# ---------------------------------------------------------------------------
 # Env + safe helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -228,14 +258,20 @@ def _origin_key() -> str:
     return _env_str("TADAWUL_ORIGIN_KEY", "KSA_TADAWUL").strip() or "KSA_TADAWUL"
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Symbol helpers (STRICT KSA)
-# -----------------------------------------------------------------------------
-def _is_ksa_symbol(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
+# ---------------------------------------------------------------------------
+def _looks_like_ksa(symbol: str) -> bool:
+    s = (symbol or "").strip()
     if not s:
         return False
-    return bool(_KSA_SYMBOL_RE.match(s) or _KSA_CODE_RE.match(s))
+    if callable(_SHARED_LOOKS_KSA):
+        try:
+            return bool(_SHARED_LOOKS_KSA(s))
+        except Exception:
+            pass
+    u = s.strip().upper()
+    return bool(_KSA_SYMBOL_RE.match(u) or _KSA_CODE_RE.match(u))
 
 
 def _ksa_code(symbol: str) -> str:
@@ -250,15 +286,32 @@ def _ksa_code(symbol: str) -> str:
 
 
 def _normalize_ksa_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
+    """
+    STRICT:
+    - "1234"   -> "1234.SR"
+    - "1234.SR"-> "1234.SR"
+    - everything else -> ""
+    """
+    s = (symbol or "").strip()
     if not s:
         return ""
-    if s.endswith(".SR"):
-        code = s[:-3]
+
+    if callable(_SHARED_NORM_KSA):
+        try:
+            out = str(_SHARED_NORM_KSA(s) or "").strip().upper()
+            if out and out.endswith(".SR") and _KSA_CODE_RE.match(out[:-3]):
+                return out
+            # fall through if shared normalizer returns something unexpected
+        except Exception:
+            pass
+
+    u = s.strip().upper()
+    if u.endswith(".SR"):
+        code = u[:-3]
         return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
-    if _KSA_CODE_RE.match(s):
-        return f"{s}.SR"
-    return ""  # STRICT (prevents GLOBAL tickers)
+    if _KSA_CODE_RE.match(u):
+        return f"{u}.SR"
+    return ""
 
 
 def _format_url(template: str, symbol: str, *, days: Optional[int] = None) -> str:
@@ -269,9 +322,9 @@ def _format_url(template: str, symbol: str, *, days: Optional[int] = None) -> st
     return u
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Robust numeric parsing
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _safe_float(val: Any) -> Optional[float]:
     """
     Robust numeric parser:
@@ -379,9 +432,47 @@ def _fill_derived(p: Dict[str, Any]) -> None:
         p["free_float_market_cap"] = mc * (ff / 100.0)
 
 
-# -----------------------------------------------------------------------------
+def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p or {})
+
+    # price aliases
+    if "expected_price_1m" in out and "forecast_price_1m" not in out:
+        out["forecast_price_1m"] = out.get("expected_price_1m")
+    if "expected_price_3m" in out and "forecast_price_3m" not in out:
+        out["forecast_price_3m"] = out.get("expected_price_3m")
+    if "expected_price_12m" in out and "forecast_price_12m" not in out:
+        out["forecast_price_12m"] = out.get("expected_price_12m")
+
+    # ROI aliases
+    if "expected_return_1m" in out and "expected_roi_pct_1m" not in out:
+        out["expected_roi_pct_1m"] = out.get("expected_return_1m")
+    if "expected_return_3m" in out and "expected_roi_pct_3m" not in out:
+        out["expected_roi_pct_3m"] = out.get("expected_return_3m")
+    if "expected_return_12m" in out and "expected_roi_pct_12m" not in out:
+        out["expected_roi_pct_12m"] = out.get("expected_return_12m")
+
+    # confidence alias
+    if "confidence_score" in out and "forecast_confidence" not in out:
+        out["forecast_confidence"] = out.get("confidence_score")
+
+    # updated alias
+    if "history_last_utc" in out and "forecast_updated_utc" not in out:
+        out["forecast_updated_utc"] = out.get("history_last_utc")
+
+    return out
+
+
+def _with_provenance(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p or {})
+    out.setdefault("provider", PROVIDER_NAME)
+    out.setdefault("data_source", PROVIDER_NAME)
+    out.setdefault("provider_version", PROVIDER_VERSION)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Bounded deep-find (safe for unknown JSON shapes)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _coerce_dict(data: Any) -> Dict[str, Any]:
     if isinstance(data, dict):
         return data
@@ -445,9 +536,9 @@ def _pick_str(obj: Any, *keys: str, max_depth: int = 6) -> Optional[str]:
     return _safe_str(_find_first_value(obj, keys, max_depth=max_depth))
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # TTL cache fallback (import-safe if cachetools missing)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     from cachetools import TTLCache  # type: ignore
 
@@ -486,9 +577,9 @@ except Exception:  # pragma: no cover
             self._exp[key] = time.time() + self._ttl
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # History extraction + analytics (defensive)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _safe_dt(x: Any) -> Optional[datetime]:
     """
     Best-effort timestamp parser:
@@ -508,18 +599,25 @@ def _safe_dt(x: Any) -> Optional[datetime]:
         s = str(x).strip()
         if not s:
             return None
-        # tolerate trailing Z
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        # some APIs: "2026-01-06"
         if len(s) == 10 and s[4] == "-" and s[7] == "-":
             return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
 
-def _find_first_list_of_dicts(obj: Any, *, required_keys: Sequence[str], max_depth: int = 7, max_nodes: int = 5000) -> Optional[List[Dict[str, Any]]]:
+def _find_first_list_of_dicts(
+    obj: Any,
+    *,
+    required_keys: Sequence[str],
+    max_depth: int = 7,
+    max_nodes: int = 5000,
+) -> Optional[List[Dict[str, Any]]]:
     if obj is None:
         return None
 
@@ -549,10 +647,8 @@ def _find_first_list_of_dicts(obj: Any, *, required_keys: Sequence[str], max_dep
 
         if isinstance(x, list) and x:
             if isinstance(x[0], dict):
-                # check if any required key exists
                 keys0 = {str(k).strip().lower() for k in x[0].keys()}
                 if keys0.intersection(req):
-                    # ensure all are dict
                     out = [it for it in x if isinstance(it, dict)]
                     return out if out else None
             for it in x:
@@ -572,7 +668,6 @@ def _extract_close_series(history_json: Any, *, max_points: int) -> Tuple[List[f
     Returns (closes_sorted, last_dt_iso_or_none)
     """
     try:
-        # Find first list-of-dicts that looks like candles/prices
         items = _find_first_list_of_dicts(
             history_json,
             required_keys=("close", "c", "price", "last", "tradingPrice", "value"),
@@ -611,7 +706,6 @@ def _extract_close_series(history_json: Any, *, max_points: int) -> Tuple[List[f
         if not rows:
             return [], None
 
-        # Sort if we have timestamps; otherwise keep order
         have_dt = any(dt is not None for dt, _ in rows)
         if have_dt:
             rows = sorted(rows, key=lambda x: (x[0] or datetime(1970, 1, 1, tzinfo=timezone.utc)))
@@ -672,22 +766,12 @@ def _compute_rsi_14(closes: List[float]) -> Optional[float]:
 
 
 def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
-    """
-    Produces:
-    - returns_1w/1m/3m/6m/12m
-    - ma20/ma50/ma200
-    - volatility_30d (annualized %, from last ~30 trading days)
-    - rsi_14
-    - expected_return_1m/3m/12m + expected_price_1m/3m/12m (simple momentum)
-    - confidence_score + forecast_method
-    """
     out: Dict[str, Any] = {}
     if not closes:
         return out
 
     last = closes[-1]
 
-    # trading-day approximations
     idx = {
         "returns_1w": 5,
         "returns_1m": 21,
@@ -698,10 +782,8 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     for k, n in idx.items():
         if len(closes) > n:
-            prior = closes[-(n + 1)]
-            out[k] = _return_pct(last, prior)
+            out[k] = _return_pct(last, closes[-(n + 1)])
 
-    # moving averages
     def ma(n: int) -> Optional[float]:
         if len(closes) < n:
             return None
@@ -712,7 +794,6 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out["ma50"] = ma(50)
     out["ma200"] = ma(200)
 
-    # volatility (use last ~30 trading days returns, annualized)
     if len(closes) >= 31:
         rets: List[float] = []
         window = closes[-31:]
@@ -725,15 +806,11 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
         if sd is not None:
             out["volatility_30d"] = float(sd * math.sqrt(252.0) * 100.0)
 
-    # RSI 14
     out["rsi_14"] = _compute_rsi_14(closes)
 
-    # Simple forecast (momentum-style) — optional at caller
-    # Use mean daily return over horizons and scale:
     def mean_daily_return(n_days: int) -> Optional[float]:
         if len(closes) < (n_days + 2):
             return None
-        # use last n_days returns
         start = closes[-(n_days + 1)]
         if start == 0:
             return None
@@ -744,7 +821,6 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     r3m_d = mean_daily_return(63)
     r12m_d = mean_daily_return(252)
 
-    # expected returns (%)
     if r1m_d is not None:
         out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
         out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
@@ -755,26 +831,23 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
         out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
         out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
 
-    # Confidence score (0..100): more points + lower volatility => higher confidence
     pts = len(closes)
     base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
     vol = _safe_float(out.get("volatility_30d"))
     if vol is None:
         conf = base * 0.75
     else:
-        # penalize very high vol
         penalty = min(60.0, max(0.0, (vol / 100.0) * 35.0))
         conf = max(0.0, min(100.0, base - penalty))
 
     out["confidence_score"] = float(conf)
     out["forecast_method"] = "tadawul_history_momentum_v1"
-
     return out
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Tadawul client
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 class TadawulClient:
     """
     Returns PATCH dictionaries for engine merges.
@@ -820,7 +893,6 @@ class TadawulClient:
             "Accept-Language": "en-US,en;q=0.8,ar;q=0.6",
         }
 
-        # Optional custom headers from env JSON
         raw = _safe_str(_env_str("TADAWUL_HEADERS_JSON", ""))
         if raw:
             try:
@@ -874,7 +946,6 @@ class TadawulClient:
                 r = await self._client.get(url)
                 sc = int(r.status_code)
 
-                # Retry on 429 + 5xx
                 if sc == 429 or 500 <= sc < 600:
                     last_err = f"HTTP {sc}"
                     if attempt < (retries - 1):
@@ -906,9 +977,9 @@ class TadawulClient:
 
         return None, last_err or "unknown error"
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Quote
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
@@ -965,13 +1036,11 @@ class TadawulClient:
             return {"error": f"warning: tadawul quote missing price ({dt_ms}ms)"}
 
         patch: Dict[str, Any] = {
-            # identity hints (help schemas/mappers)
             "symbol": sym,
             "market": "KSA",
             "origin": _origin_key(),
             "currency": currency,
 
-            # quote
             "name": name or "",
             "current_price": price,
             "previous_close": prev,
@@ -983,21 +1052,21 @@ class TadawulClient:
             "price_change": chg,
             "percent_change": chg_p,
 
-            # meta
+            "provider": PROVIDER_NAME,
             "data_source": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "last_updated_utc": _utc_iso(),
         }
 
         _fill_derived(patch)
-        patch = _clean_patch(patch)
+        patch = _clean_patch(_add_forecast_aliases(_with_provenance(patch)))
 
         self._quote_cache[ck] = dict(patch)
         return patch
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Fundamentals
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
@@ -1078,7 +1147,6 @@ class TadawulClient:
 
         beta = _pick_num(root, "beta", "Beta")
 
-        # Technicals (best-effort)
         wk_hi = _pick_num(root, "week_52_high", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh", "high_52w")
         wk_lo = _pick_num(root, "week_52_low", "52WeekLow", "fiftyTwoWeekLow", "yearLow", "low_52w")
         ma20 = _pick_num(root, "ma20", "MA20", "20DayMA", "movingAverage20")
@@ -1130,6 +1198,7 @@ class TadawulClient:
             "ma50": ma50,
             "avg_volume_30d": avg_vol_30d,
 
+            "provider": PROVIDER_NAME,
             "data_source": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "last_updated_utc": _utc_iso(),
@@ -1142,14 +1211,14 @@ class TadawulClient:
             return {"error": "warning: tadawul fundamentals parsed but no identity/mcap/shares found"}
 
         _fill_derived(patch)
-        patch = _clean_patch(patch)
+        patch = _clean_patch(_add_forecast_aliases(_with_provenance(patch)))
 
         self._fund_cache[ck] = dict(patch)
         return patch
 
-    # -------------------------------------------------------------------------
-    # History (optional): returns/MAs/vol/RSI/forecast inputs
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # History (optional)
+    # -----------------------------------------------------------------------
     async def fetch_history_patch(self, symbol: str, *, days: int = 400) -> Dict[str, Any]:
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
@@ -1164,7 +1233,6 @@ class TadawulClient:
         if not self.history_url:
             return {"error": "warning: tadawul history not configured (TADAWUL_HISTORY_URL)"}
 
-        # cache key includes days bucket
         days_i = max(30, int(days))
         ck = f"hist::{sym}::{days_i}"
         hit = self._hist_cache.get(ck)
@@ -1181,19 +1249,18 @@ class TadawulClient:
             return {"error": "warning: tadawul history parsed but no close series found"}
 
         analytics = _compute_history_analytics(closes)
+
         patch: Dict[str, Any] = {
             "symbol": sym,
             "market": "KSA",
             "origin": _origin_key(),
 
-            # history meta (kept lightweight)
             "history_points": len(closes),
             "history_source": "tadawul_history",
             "history_last_utc": last_iso or _utc_iso(),
         }
         patch.update(analytics)
 
-        # Respect forecast toggle (history always ok, but forecast fields optional)
         if not _forecast_enabled():
             patch.pop("expected_return_1m", None)
             patch.pop("expected_return_3m", None)
@@ -1201,22 +1268,20 @@ class TadawulClient:
             patch.pop("expected_price_1m", None)
             patch.pop("expected_price_3m", None)
             patch.pop("expected_price_12m", None)
-            # confidence still useful for history quality
             patch["forecast_method"] = "history_only"
 
-        patch = _clean_patch(patch)
+        patch = _clean_patch(_add_forecast_aliases(_with_provenance(patch)))
         self._hist_cache[ck] = dict(patch)
         return patch
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Combined (fundamentals + quote + optional history)
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     async def fetch_quote_and_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
         sym = _normalize_ksa_symbol(symbol)
         if not sym:
             return {}
 
-        # Run quote + fundamentals in parallel
         f_task = self.fetch_fundamentals_patch(sym)
         q_task = self.fetch_quote_patch(sym)
         f, q = await asyncio.gather(f_task, q_task)
@@ -1244,8 +1309,7 @@ class TadawulClient:
             out["_warn"] = " | ".join([w for w in warns if w])
 
         _fill_derived(out)
-        out["data_source"] = PROVIDER_NAME
-        out["provider_version"] = PROVIDER_VERSION
+        out = _add_forecast_aliases(_with_provenance(out))
         out["last_updated_utc"] = _utc_iso()
 
         return _clean_patch(out)
@@ -1257,31 +1321,33 @@ class TadawulClient:
 
         base = await self.fetch_quote_and_fundamentals_patch(sym)
 
-        # If base is just an error, return it (engine fallback safe)
+        # If base is only error, return it
         if base and "error" in base and len(base.keys()) == 1:
             return base
 
-        # Optional history patch (safe, non-fatal)
         if _history_enabled() and self.history_url:
             h = await self.fetch_history_patch(sym, days=400)
             if isinstance(h, dict) and h:
                 if "error" in h and isinstance(h.get("error"), str) and h.get("error"):
                     base["_warn"] = (base.get("_warn", "") + " | " + str(h.get("error"))).strip(" |")
                 else:
-                    base.update({k: v for k, v in h.items() if k != "error"})
+                    # merge only missing keys (do not treat 0 as empty)
+                    for k, v in h.items():
+                        if k == "error":
+                            continue
+                        if base.get(k) is None and v is not None:
+                            base[k] = v
 
-        # Ensure derived fields and meta
         _fill_derived(base)
-        base["data_source"] = PROVIDER_NAME
-        base["provider_version"] = PROVIDER_VERSION
+        base = _add_forecast_aliases(_with_provenance(base))
         base["last_updated_utc"] = _utc_iso()
 
         return _clean_patch(base)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Lazy singleton
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _CLIENT_SINGLETON: Optional[TadawulClient] = None
 _CLIENT_LOCK = asyncio.Lock()
 
@@ -1303,9 +1369,9 @@ async def aclose_tadawul_client() -> None:
         await c.aclose()
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Engine-compatible exported callables (DICT RETURNS)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     c = await get_tadawul_client()
     return await c.fetch_quote_patch(symbol)
