@@ -1,4 +1,4 @@
-# core/scoring_engine.py
+# core/scoring_engine.py  — FULL REPLACEMENT — v1.6.0
 """
 core/scoring_engine.py
 ===========================================================
@@ -15,14 +15,16 @@ Produces (0–100):
 - recommendation          (BUY / HOLD / REDUCE / SELL)
 - confidence              (0–100, reflects data completeness + data_quality)
 
-Adds Forecast Outputs (best-effort, deterministic):
-- fair_value                  (if present upstream, preserved)
+Forecast outputs (best-effort, deterministic):
+- fair_value                  (pass-through if upstream provides it; may be used to derive upside)
 - upside_percent              (best-effort)
-- expected_return_1m / 3m / 12m        (%)
-- expected_price_1m / 3m / 12m         (price)
-- expected_roi_1m / 3m / 12m           (% risk+confidence adjusted)
-- forecast_confidence                  (0–100)
-- forecast_method                      (string, e.g. yahoo_analyst_targets_v1)
+- expected_price_1m/3m/12m     (FORECAST PRICE, derived from gross expected return)
+- expected_return_1m/3m/12m    (EXPECTED ROI %, risk+confidence adjusted)  ✅ aligns with Sheets "Expected ROI %"
+- expected_roi_1m/3m/12m       (same as expected_return_*; kept for back-compat/debug)
+- forecast_confidence          (0–100)
+- confidence_score             (alias to forecast_confidence for header mapping compatibility)
+- forecast_method              (string, e.g. simple_horizon_scaling_v2)
+- forecast_updated_utc         (pass-through if upstream provides it; else None)
 
 Design goals
 ✅ Deterministic + simple + explainable
@@ -53,7 +55,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCORING_ENGINE_VERSION = "1.5.0"
+SCORING_ENGINE_VERSION = "1.6.0"
 
 # Recommendation enum (MUST match routers normalization)
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
@@ -81,6 +83,8 @@ class AssetScores(BaseModel):
     confidence: float = Field(50.0, ge=0, le=100)
 
     # Forecast outputs (optional, best-effort)
+    # NOTE: expected_return_* is "Expected ROI % (Horizon)" (risk-adjusted),
+    # aligned with the sheet column naming.
     expected_return_1m: Optional[float] = None
     expected_return_3m: Optional[float] = None
     expected_return_12m: Optional[float] = None
@@ -89,12 +93,20 @@ class AssetScores(BaseModel):
     expected_price_3m: Optional[float] = None
     expected_price_12m: Optional[float] = None
 
+    # kept for compatibility / debugging (same as expected_return_*)
     expected_roi_1m: Optional[float] = None
     expected_roi_3m: Optional[float] = None
     expected_roi_12m: Optional[float] = None
 
+    # gross (unadjusted) returns for audit/debug (NOT mapped to sheets by default)
+    expected_return_gross_1m: Optional[float] = None
+    expected_return_gross_3m: Optional[float] = None
+    expected_return_gross_12m: Optional[float] = None
+
     forecast_confidence: Optional[float] = None
+    confidence_score: Optional[float] = None  # alias (some routes/providers expect this)
     forecast_method: Optional[str] = None
+    forecast_updated_utc: Optional[str] = None
 
 
 # ---------------------------------------------------------------------
@@ -254,74 +266,86 @@ def _compute_forecast(
     current_price: Optional[float],
     fair_value: Optional[float],
     upside_percent: Optional[float],
-    expected_return_12m_in: Optional[float],
-    forecast_method: Optional[str],
+    expected_return_12m_gross_in: Optional[float],
+    forecast_method_in: Optional[str],
     forecast_conf_in: Optional[float],
     confidence_fallback: float,
     risk_score: float,
+    forecast_updated_utc: Optional[str],
 ) -> Dict[str, Any]:
     """
     Best-effort forecast outputs:
-    - expected_return_* (%)
-    - expected_price_* (price)
-    - expected_roi_* (%), adjusted by confidence + risk
+    - expected_return_gross_* (%): unadjusted horizon returns
+    - expected_price_* (price): derived from gross returns
+    - expected_return_* (%): "Expected ROI %" risk+confidence adjusted (SHEETS)
+    - expected_roi_* (%): alias of expected_return_*
+    - forecast_confidence (0..100), confidence_score alias, forecast_method
     """
     out: Dict[str, Any] = {}
 
     cp = current_price if (current_price is not None and current_price > 0) else None
     fv = fair_value if (fair_value is not None and fair_value > 0) else None
 
-    # 1) Base expected 12m return (prefer explicit expected_return_12m)
-    er12 = expected_return_12m_in
-    if er12 is None:
+    # 1) Base 12m gross expected return (prefer explicit input)
+    er12_gross = expected_return_12m_gross_in
+    if er12_gross is None:
         if upside_percent is not None:
-            er12 = upside_percent
+            er12_gross = upside_percent
         elif cp is not None and fv is not None:
-            er12 = (fv / cp - 1.0) * 100.0
+            er12_gross = (fv / cp - 1.0) * 100.0
 
-    if er12 is None or cp is None:
-        # no usable forecast
+    if er12_gross is None or cp is None:
         return out
 
-    # 2) Horizon returns
-    er1 = er12 * _forecast_scale(30)
-    er3 = er12 * _forecast_scale(90)
+    # 2) Horizon gross returns
+    er1_gross = er12_gross * _forecast_scale(30)
+    er3_gross = er12_gross * _forecast_scale(90)
 
-    # 3) Prices from returns
-    ep1 = cp * (1.0 + er1 / 100.0)
-    ep3 = cp * (1.0 + er3 / 100.0)
-    ep12 = cp * (1.0 + er12 / 100.0)
+    # 3) Forecast prices from GROSS returns (not risk-adjusted)
+    ep1 = cp * (1.0 + er1_gross / 100.0)
+    ep3 = cp * (1.0 + er3_gross / 100.0)
+    ep12 = cp * (1.0 + er12_gross / 100.0)
 
     # 4) Forecast confidence:
-    # Prefer upstream confidence_score if present; else fallback to our completeness confidence.
-    fc = forecast_conf_in
-    if fc is None:
-        fc = confidence_fallback
+    # Prefer upstream confidence_score if present; else fallback to completeness confidence.
+    fc = forecast_conf_in if forecast_conf_in is not None else confidence_fallback
     fc = _clamp(fc, 0.0, 100.0, 50.0)
 
     # 5) Risk adjustment (higher risk => lower expected ROI)
-    # risk_score: 0..100 => multiplier ~ 1.00..0.29
+    # risk_score: 0..100 => multiplier ~ 1.00..0.25 (floored)
     risk_mult = max(0.25, 1.0 - (risk_score / 140.0))
 
-    # 6) Expected ROI (risk + confidence adjusted)
-    # ROI here is “risk-adjusted expected return”
-    roi1 = er1 * (fc / 100.0) * risk_mult
-    roi3 = er3 * (fc / 100.0) * risk_mult
-    roi12 = er12 * (fc / 100.0) * risk_mult
+    # 6) Expected ROI% (risk + confidence adjusted)
+    roi1 = er1_gross * (fc / 100.0) * risk_mult
+    roi3 = er3_gross * (fc / 100.0) * risk_mult
+    roi12 = er12_gross * (fc / 100.0) * risk_mult
 
     out.update(
         {
-            "expected_return_1m": float(er1),
-            "expected_return_3m": float(er3),
-            "expected_return_12m": float(er12),
+            # gross (audit)
+            "expected_return_gross_1m": float(er1_gross),
+            "expected_return_gross_3m": float(er3_gross),
+            "expected_return_gross_12m": float(er12_gross),
+
+            # Forecast prices (Sheets: Forecast Price)
             "expected_price_1m": float(ep1),
             "expected_price_3m": float(ep3),
             "expected_price_12m": float(ep12),
+
+            # Sheets: Expected ROI %  (mapped via schemas to expected_return_*)
+            "expected_return_1m": float(roi1),
+            "expected_return_3m": float(roi3),
+            "expected_return_12m": float(roi12),
+
+            # Alias / compatibility
             "expected_roi_1m": float(roi1),
             "expected_roi_3m": float(roi3),
             "expected_roi_12m": float(roi12),
+
             "forecast_confidence": float(fc),
-            "forecast_method": str(forecast_method or "simple_horizon_scaling_v1"),
+            "confidence_score": float(fc),
+            "forecast_method": str(forecast_method_in or "simple_horizon_scaling_v2"),
+            "forecast_updated_utc": str(forecast_updated_utc) if forecast_updated_utc else None,
         }
     )
     return out
@@ -345,15 +369,19 @@ def compute_scores(q: Any) -> AssetScores:
     ps = _to_float(_get_any(q, "ps"))
     ev = _to_float(_get_any(q, "ev_ebitda", "evebitda"))
 
-    dy = _to_percent(_get_any(q, "dividend_yield", "div_yield", "dividend_yield_pct"))
+    dy = _to_percent(_get_any(q, "dividend_yield", "div_yield", "dividend_yield_pct", "dividend_yield_percent"))
     payout = _to_percent(_get_any(q, "payout_ratio", "payout", "payout_pct"))
 
     # Forecast inputs (provider-enriched best-effort)
     fair_value = _to_float(_get_any(q, "fair_value", "target_mean_price", "intrinsic_value"))
     upside = _to_percent(_get_any(q, "upside_percent", "upside_pct"))
-    expected_return_12m_in = _to_percent(_get_any(q, "expected_return_12m", "expected_roi_12m", "expected_return"))
-    forecast_method_in = _get_any(q, "forecast_method")
-    forecast_conf_in = _to_float(_get_any(q, "confidence_score", "forecast_confidence"))  # provider confidence
+    # gross return hint (if provider supplies): can be decimals or percents
+    expected_return_12m_gross_in = _to_percent(
+        _get_any(q, "expected_return_12m_gross", "expected_return_12m", "expected_return", "expected_roi_12m_gross")
+    )
+    forecast_method_in = _get_any(q, "forecast_method", "forecast_model")
+    forecast_conf_in = _to_float(_get_any(q, "confidence_score", "forecast_confidence", "confidence"))
+    forecast_updated_utc = _get_any(q, "forecast_updated_utc", "forecast_last_utc", "as_of_utc", "last_updated_utc")
 
     # Quality
     roe = _to_percent(_get_any(q, "roe", "return_on_equity"))
@@ -365,22 +393,22 @@ def compute_scores(q: Any) -> AssetScores:
 
     dte = _to_float(_get_any(q, "debt_to_equity"))  # optional
     beta = _to_float(_get_any(q, "beta", "beta_5y"))
-    vol = _to_percent(_get_any(q, "volatility_30d", "vol_30d_ann", "vol30d"))
+    vol = _to_percent(_get_any(q, "volatility_30d", "vol_30d_ann", "vol30d", "vol_30d"))
     rsi = _to_float(_get_any(q, "rsi_14", "rsi14"))
 
     # Momentum / price context
     pc = _to_percent(_get_any(q, "percent_change", "change_percent", "change_pct", "pct_change"))
 
     cp = _to_float(_get_any(q, "current_price", "last_price", "price", "close", "last"))
-    ma20 = _to_float(_get_any(q, "ma20"))  # optional
-    ma50 = _to_float(_get_any(q, "ma50"))  # optional
+    ma20 = _to_float(_get_any(q, "ma20", "sma20"))
+    ma50 = _to_float(_get_any(q, "ma50", "sma50"))
 
     high_52w = _to_float(_get_any(q, "week_52_high", "high_52w", "52w_high"))
     low_52w = _to_float(_get_any(q, "week_52_low", "low_52w", "52w_low"))
-    pos_52w_pct = _to_percent(_get_any(q, "position_52w_percent", "position_52w"))
+    pos_52w_pct = _to_percent(_get_any(q, "position_52w_percent", "position_52w", "pos_52w_pct"))
 
-    # Liquidity
-    liq = _to_float(_get_any(q, "liquidity_score"))
+    # Liquidity / market structure
+    liq = _to_float(_get_any(q, "liquidity_score", "liq_score"))
     avg_vol = _to_float(_get_any(q, "avg_volume_30d", "avg_volume", "avg_vol_30d"))
     turnover = _to_percent(_get_any(q, "turnover_percent", "turnover", "turnover_pct"))
     free_float = _to_percent(_get_any(q, "free_float", "free_float_percent", "free_float_pct"))
@@ -400,43 +428,24 @@ def compute_scores(q: Any) -> AssetScores:
     if pe_like is not None:
         pe_val = _score_band_linear(
             pe_like,
-            bands=[
-                (5.0, 85.0),
-                (10.0, 75.0),
-                (18.0, 60.0),
-                (25.0, 50.0),
-                (40.0, 35.0),
-                (60.0, 25.0),
-            ],
+            bands=[(5.0, 85.0), (10.0, 75.0), (18.0, 60.0), (25.0, 50.0), (40.0, 35.0), (60.0, 25.0)],
         )
         value_score = 0.70 * value_score + 0.30 * pe_val
 
     if pb is not None and pb > 0:
-        pb_val = _score_band_linear(
-            pb,
-            bands=[(0.6, 80.0), (1.0, 70.0), (2.0, 60.0), (4.0, 50.0), (6.0, 40.0), (10.0, 30.0)],
-        )
+        pb_val = _score_band_linear(pb, bands=[(0.6, 80.0), (1.0, 70.0), (2.0, 60.0), (4.0, 50.0), (6.0, 40.0), (10.0, 30.0)])
         value_score = 0.80 * value_score + 0.20 * pb_val
 
     if ps is not None and ps > 0:
-        ps_val = _score_band_linear(
-            ps,
-            bands=[(0.7, 75.0), (1.5, 65.0), (3.0, 55.0), (6.0, 45.0), (10.0, 35.0), (20.0, 25.0)],
-        )
+        ps_val = _score_band_linear(ps, bands=[(0.7, 75.0), (1.5, 65.0), (3.0, 55.0), (6.0, 45.0), (10.0, 35.0), (20.0, 25.0)])
         value_score = 0.85 * value_score + 0.15 * ps_val
 
     if ev is not None and ev > 0:
-        ev_val = _score_band_linear(
-            ev,
-            bands=[(5.0, 80.0), (8.0, 70.0), (12.0, 60.0), (18.0, 45.0), (25.0, 35.0), (40.0, 25.0)],
-        )
+        ev_val = _score_band_linear(ev, bands=[(5.0, 80.0), (8.0, 70.0), (12.0, 60.0), (18.0, 45.0), (25.0, 35.0), (40.0, 25.0)])
         value_score = 0.85 * value_score + 0.15 * ev_val
 
     if dy is not None and dy >= 0:
-        dy_val = _score_band_linear(
-            dy,
-            bands=[(0.0, 40.0), (2.0, 65.0), (4.0, 80.0), (6.0, 75.0), (10.0, 55.0), (15.0, 40.0)],
-        )
+        dy_val = _score_band_linear(dy, bands=[(0.0, 40.0), (2.0, 65.0), (4.0, 80.0), (6.0, 75.0), (10.0, 55.0), (15.0, 40.0)])
         value_score = 0.85 * value_score + 0.15 * dy_val
 
     if payout is not None and payout >= 0:
@@ -464,40 +473,26 @@ def compute_scores(q: Any) -> AssetScores:
 
     if roe is not None:
         quality_score = 0.70 * quality_score + 0.30 * _score_band_linear(
-            roe,
-            bands=[(-10.0, 20.0), (0.0, 40.0), (10.0, 60.0), (15.0, 72.0), (20.0, 82.0), (30.0, 90.0)],
+            roe, bands=[(-10.0, 20.0), (0.0, 40.0), (10.0, 60.0), (15.0, 72.0), (20.0, 82.0), (30.0, 90.0)]
         )
-
     if roa is not None:
         quality_score = 0.80 * quality_score + 0.20 * _score_band_linear(
             roa, bands=[(-5.0, 25.0), (0.0, 45.0), (4.0, 60.0), (8.0, 72.0), (12.0, 82.0)]
         )
-
     if nm is not None:
         quality_score = 0.85 * quality_score + 0.15 * _score_band_linear(
             nm, bands=[(-10.0, 25.0), (0.0, 45.0), (5.0, 58.0), (10.0, 68.0), (20.0, 80.0), (30.0, 88.0)]
         )
-
     if ebitda_m is not None:
         quality_score = 0.88 * quality_score + 0.12 * _score_band_linear(
             ebitda_m, bands=[(-10.0, 30.0), (0.0, 45.0), (10.0, 60.0), (20.0, 72.0), (30.0, 82.0)]
         )
 
+    # Growth adds small bonus/penalty (bounded)
     if rev_g is not None:
-        quality_score += _clamp(
-            _score_band_linear(rev_g, bands=[(-20.0, -6.0), (0.0, 0.0), (10.0, 3.0), (20.0, 5.0)]),
-            -6,
-            5,
-            0,
-        )
-
+        quality_score += _clamp(_score_band_linear(rev_g, bands=[(-30.0, -6.0), (-10.0, -3.0), (0.0, 0.0), (10.0, 2.0), (20.0, 4.0), (40.0, 6.0)]), -6.0, 6.0, 0.0)
     if ni_g is not None:
-        quality_score += _clamp(
-            _score_band_linear(ni_g, bands=[(-20.0, -6.0), (0.0, 0.0), (10.0, 3.0), (20.0, 5.0)]),
-            -6,
-            5,
-            0,
-        )
+        quality_score += _clamp(_score_band_linear(ni_g, bands=[(-30.0, -6.0), (-10.0, -3.0), (0.0, 0.0), (10.0, 2.0), (20.0, 4.0), (40.0, 6.0)]), -6.0, 6.0, 0.0)
 
     if dte is not None:
         if dte > 2.5:
@@ -601,9 +596,10 @@ def compute_scores(q: Any) -> AssetScores:
     # -----------------------------
     # OPPORTUNITY + OVERALL
     # -----------------------------
-    risk_penalty = ((risk_score - 50.0) / 50.0) * 15.0  # -15..+15
-    opportunity_score = _clamp(0.44 * value_score + 0.30 * momentum_score + 0.26 * quality_score - risk_penalty)
-    overall_score = _clamp(0.34 * value_score + 0.30 * quality_score + 0.22 * momentum_score + 0.14 * opportunity_score)
+    # penalty is negative when risk < 50 (helps), positive when risk > 50 (hurts)
+    risk_penalty = ((risk_score - 50.0) / 50.0) * 14.0  # -14..+14
+    opportunity_score = _clamp(0.46 * value_score + 0.30 * momentum_score + 0.24 * quality_score - risk_penalty)
+    overall_score = _clamp(0.36 * value_score + 0.32 * quality_score + 0.22 * momentum_score + 0.10 * opportunity_score)
 
     # -----------------------------
     # Confidence (0..100)
@@ -636,8 +632,8 @@ def compute_scores(q: Any) -> AssetScores:
 
     # Blend in provider forecast confidence if present (best-effort)
     if forecast_conf_in is not None:
-        fc = _clamp(forecast_conf_in, 0.0, 100.0, 50.0)
-        confidence = _clamp(0.65 * confidence + 0.35 * fc)
+        fc0 = _clamp(forecast_conf_in, 0.0, 100.0, 50.0)
+        confidence = _clamp(0.65 * confidence + 0.35 * fc0)
 
     # -----------------------------
     # Forecast outputs (1M/3M/12M)
@@ -646,11 +642,12 @@ def compute_scores(q: Any) -> AssetScores:
         current_price=cp,
         fair_value=fair_value,
         upside_percent=upside,
-        expected_return_12m_in=expected_return_12m_in,
-        forecast_method=str(forecast_method_in) if forecast_method_in is not None else None,
+        expected_return_12m_gross_in=expected_return_12m_gross_in,
+        forecast_method_in=str(forecast_method_in) if forecast_method_in is not None else None,
         forecast_conf_in=forecast_conf_in,
         confidence_fallback=confidence,
         risk_score=risk_score,
+        forecast_updated_utc=str(forecast_updated_utc) if forecast_updated_utc else None,
     )
 
     # -----------------------------
@@ -658,14 +655,14 @@ def compute_scores(q: Any) -> AssetScores:
     # -----------------------------
     reco = "HOLD"
 
-    # Optional forecast tilt (uses risk-adjusted 3M expected ROI)
-    roi3 = _to_percent(forecast_out.get("expected_roi_3m"))
-    roi1 = _to_percent(forecast_out.get("expected_roi_1m"))
+    # Use risk-adjusted ROI (our expected_return_* outputs)
+    roi3 = _to_percent(forecast_out.get("expected_return_3m"))
+    roi1 = _to_percent(forecast_out.get("expected_return_1m"))
 
-    if overall_score >= 72 and confidence >= 55 and risk_score <= 75:
+    if overall_score >= 74 and confidence >= 55 and risk_score <= 78:
         reco = "BUY"
-    elif overall_score <= 32 and confidence >= 40:
-        reco = "SELL" if risk_score >= 60 else "REDUCE"
+    elif overall_score <= 30 and confidence >= 40:
+        reco = "SELL" if risk_score >= 62 else "REDUCE"
     elif overall_score <= 45:
         reco = "REDUCE"
     else:
@@ -673,7 +670,7 @@ def compute_scores(q: Any) -> AssetScores:
 
     # Forecast tilt (conservative)
     if confidence >= 55 and roi3 is not None:
-        if roi3 >= 6.0 and reco == "HOLD" and overall_score >= 60 and risk_score <= 75:
+        if roi3 >= 6.0 and reco == "HOLD" and overall_score >= 60 and risk_score <= 78:
             reco = "BUY"
         if roi3 <= -4.0 and reco in ("HOLD", "BUY"):
             reco = "REDUCE"
@@ -708,8 +705,14 @@ def compute_scores(q: Any) -> AssetScores:
         expected_roi_3m=forecast_out.get("expected_roi_3m"),
         expected_roi_12m=forecast_out.get("expected_roi_12m"),
 
+        expected_return_gross_1m=forecast_out.get("expected_return_gross_1m"),
+        expected_return_gross_3m=forecast_out.get("expected_return_gross_3m"),
+        expected_return_gross_12m=forecast_out.get("expected_return_gross_12m"),
+
         forecast_confidence=forecast_out.get("forecast_confidence"),
+        confidence_score=forecast_out.get("confidence_score"),
         forecast_method=forecast_out.get("forecast_method"),
+        forecast_updated_utc=forecast_out.get("forecast_updated_utc"),
     )
 
 
@@ -734,6 +737,7 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
     risk_out = existing_risk if (prefer_existing_risk_score and existing_risk is not None) else scores.risk_score
 
     update_data: Dict[str, Any] = {
+        # scores
         "value_score": float(scores.value_score),
         "quality_score": float(scores.quality_score),
         "momentum_score": float(scores.momentum_score),
@@ -744,18 +748,29 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
         "confidence": float(scores.confidence),
         "scoring_version": SCORING_ENGINE_VERSION,
 
-        # Forecast outputs (sheet-friendly)
-        "expected_return_1m": scores.expected_return_1m,
-        "expected_return_3m": scores.expected_return_3m,
-        "expected_return_12m": scores.expected_return_12m,
+        # forecast (Sheets mapping)
         "expected_price_1m": scores.expected_price_1m,
         "expected_price_3m": scores.expected_price_3m,
         "expected_price_12m": scores.expected_price_12m,
+
+        # IMPORTANT: expected_return_* is "Expected ROI % (Horizon)" (risk-adjusted)
+        "expected_return_1m": scores.expected_return_1m,
+        "expected_return_3m": scores.expected_return_3m,
+        "expected_return_12m": scores.expected_return_12m,
+
+        # aliases / compat
         "expected_roi_1m": scores.expected_roi_1m,
         "expected_roi_3m": scores.expected_roi_3m,
         "expected_roi_12m": scores.expected_roi_12m,
+
+        "expected_return_gross_1m": scores.expected_return_gross_1m,
+        "expected_return_gross_3m": scores.expected_return_gross_3m,
+        "expected_return_gross_12m": scores.expected_return_gross_12m,
+
         "forecast_confidence": scores.forecast_confidence,
+        "confidence_score": scores.confidence_score,
         "forecast_method": scores.forecast_method,
+        "forecast_updated_utc": scores.forecast_updated_utc,
     }
 
     # Pydantic v2
