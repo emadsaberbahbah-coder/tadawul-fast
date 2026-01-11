@@ -2,27 +2,19 @@
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA optional enrichment + optional history/forecast) — v1.7.0
+Argaam Provider (KSA optional enrichment + optional history/forecast) — v1.8.0
 PROD SAFE + ASYNC + ENGINE PATCH-STYLE + SILENT WHEN NOT CONFIGURED
 
-What’s improved in v1.7.0
-- ✅ Customized headers (global + per-endpoint overrides):
-    • ARGAAM_HEADERS_JSON
-    • ARGAAM_HEADERS_QUOTE_JSON / ARGAAM_HEADERS_PROFILE_JSON / ARGAAM_HEADERS_HISTORY_JSON
-- ✅ Optional History + Forecast analytics (if ARGAAM_HISTORY_URL is provided):
-    • returns_1w/1m/3m/6m/12m
-    • ma20/ma50/ma200
-    • volatility_30d (annualized %, last ~30 trading days)
-    • rsi_14
-    • expected_return_1m/3m/12m + expected_price_1m/3m/12m (simple momentum estimate)
-    • confidence_score + forecast_method
-- ✅ Better symbol normalization:
-    Accepts "1234", "1234.SR", "TADAWUL:1234", "TADAWUL:1234.SR", "1234.TADAWUL"
-- ✅ Profile fallback for quote:
-    If ARGAAM_QUOTE_URL is missing but ARGAAM_PROFILE_URL exists, it tries profile for quote-like fields.
-- ✅ Still SILENT when not configured:
-    If ARGAAM_ENABLED=false OR (ARGAAM_QUOTE_URL/ARGAAM_PROFILE_URL/ARGAAM_HISTORY_URL all missing),
-    returns {} with no warnings (prevents noise in DataEngineV2).
+What’s improved in v1.8.0
+- ✅ Uses shared canonical symbol normalizer when available (core.symbols.normalize) with strict KSA gating
+- ✅ Adds stable provenance fields in patches: data_source="argaam", provider="argaam"
+- ✅ Adds forecast alias fields for Sheets friendliness (keeps old keys too):
+    • forecast_price_1m/3m/12m  (alias of expected_price_*)
+    • expected_roi_pct_1m/3m/12m (alias of expected_return_*)
+    • forecast_confidence       (alias of confidence_score)
+    • forecast_updated_utc      (alias of history_last_utc)
+- ✅ Symbol normalization now translates Arabic digits and is wrapper-safe
+- ✅ Keeps v1.7.0 guarantees: silent when not configured, strict KSA-only, no network at import-time
 
 Key guarantees
 - Import-safe even if cachetools is missing (tiny TTL cache fallback).
@@ -30,45 +22,6 @@ Key guarantees
 - No network calls at import-time; AsyncClient is created lazily.
 - Patch is CLEAN (only useful fields + optional _warn if enabled).
 - Enriched call merges profile identity into quote patch (fills blanks only).
-
-Supported env vars (optional)
-Core enablement
-- ARGAAM_ENABLED                  default true (set false to disable silently)
-- ARGAAM_VERBOSE_WARNINGS         default false (if true, returns _warn strings)
-
-Endpoints
-- ARGAAM_QUOTE_URL                e.g. https://.../quote?symbol={symbol} or .../{code}
-- ARGAAM_PROFILE_URL              e.g. https://.../profile?symbol={symbol}
-- ARGAAM_HISTORY_URL              e.g. https://.../history?symbol={symbol}&days={days}
-  (also accepts ARGAAM_CANDLES_URL as fallback for history)
-
-Headers
-- ARGAAM_HEADERS_JSON             JSON dict for base headers (optional)
-- ARGAAM_HEADERS_QUOTE_JSON       JSON dict merged only for quote requests (optional)
-- ARGAAM_HEADERS_PROFILE_JSON     JSON dict merged only for profile requests (optional)
-- ARGAAM_HEADERS_HISTORY_JSON     JSON dict merged only for history requests (optional)
-
-Timeout/Retry/TTL
-- ARGAAM_TIMEOUT_SEC              fallback to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT then 20
-- ARGAAM_RETRY_ATTEMPTS           default 2 (min 1)
-- ARGAAM_RETRY_DELAY_SEC          default 0.25
-- ARGAAM_TTL_SEC                  quote TTL default 15 (min 5)
-- ARGAAM_PROFILE_TTL_SEC          default 3600 (min 60)
-- ARGAAM_HISTORY_TTL_SEC          default 1200 (min 60)
-
-History/Forecast toggles
-- ARGAAM_ENABLE_HISTORY           default true
-- ARGAAM_ENABLE_FORECAST          default true
-- ARGAAM_HISTORY_DAYS             default 400
-- ARGAAM_HISTORY_POINTS_MAX       default 400 (cap stored points)
-
-Exports (DICT RETURNS)
-- fetch_quote_patch(symbol) -> Dict[str, Any]
-- fetch_enriched_quote_patch(symbol) -> Dict[str, Any]
-- fetch_quote_and_enrichment_patch(symbol) -> Dict[str, Any]      # alias
-- fetch_enriched_patch(symbol) -> Dict[str, Any]                  # alias
-- fetch_quote_and_fundamentals_patch(symbol) -> Dict[str, Any]    # alias (Argaam has no true fundamentals)
-- aclose_argaam_client()
 """
 
 from __future__ import annotations
@@ -89,7 +42,7 @@ import httpx
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "1.7.0"
+PROVIDER_VERSION = "1.8.0"
 
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_RETRY_ATTEMPTS = 2
@@ -108,9 +61,29 @@ _FALSY = {"0", "false", "no", "n", "off", "f"}
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Optional shared normalizer (PROD SAFE)
+# ---------------------------------------------------------------------------
+def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
+    """
+    Returns (normalize_symbol, looks_like_ksa) if available; else (None, None).
+    Never raises.
+    """
+    try:
+        from core.symbols.normalize import normalize_symbol as _ns  # type: ignore
+        from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
+
+        return _ns, _lk
+    except Exception:
+        return None, None
+
+
+_SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
+
+
+# ---------------------------------------------------------------------------
 # Env + safe helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -242,31 +215,50 @@ def _forecast_enabled() -> bool:
     return _env_bool("ARGAAM_ENABLE_FORECAST", True)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Symbol helpers (KSA strict)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _normalize_ksa_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if not s:
+    """
+    Strict KSA normalization:
+    - Accepts "1234", "1234.SR", "TADAWUL:1234", "TADAWUL:1234.SR", "1234.TADAWUL"
+    - Translates Arabic digits to ASCII
+    - Returns canonical "####.SR" OR "" when non-KSA/invalid
+    """
+    raw = (symbol or "").strip()
+    if not raw:
         return ""
 
-    # common wrappers
+    raw = raw.translate(_ARABIC_DIGITS).strip()
+
+    # Prefer shared normalizer if available
+    if callable(_SHARED_NORMALIZE) and callable(_SHARED_LOOKS_KSA):
+        try:
+            if not _SHARED_LOOKS_KSA(raw):
+                return ""
+            s2 = (_SHARED_NORMALIZE(raw) or "").strip().upper()
+            if s2.endswith(".SR"):
+                code = s2[:-3].strip()
+                return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
+            return ""
+        except Exception:
+            pass
+
+    # Local fallback (keep provider self-contained)
+    s = raw.strip().upper()
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
-
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "").strip()
 
-    # normalize ".SR"
     if s.endswith(".SR"):
         code = s[:-3].strip()
         return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
 
-    # raw digits
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
 
-    return ""  # strict
+    return ""
 
 
 def _format_url(tpl: str, symbol: str, *, days: Optional[int] = None) -> str:
@@ -282,9 +274,9 @@ def _format_url(tpl: str, symbol: str, *, days: Optional[int] = None) -> str:
     return u
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Tiny TTL cache fallback if cachetools missing (import-safe)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     from cachetools import TTLCache  # type: ignore
 
@@ -323,9 +315,9 @@ except Exception:  # pragma: no cover
             self._exp[key] = time.time() + self._ttl
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Parsing helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _safe_float(val: Any) -> Optional[float]:
     if val is None:
         return None
@@ -468,9 +460,9 @@ def _pick_str(obj: Any, *keys: str) -> Optional[str]:
     return _safe_str(_find_first_value(obj, keys))
 
 
-# -----------------------------------------------------------------------------
-# History analytics (same style as Tadawul provider)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# History analytics
+# ---------------------------------------------------------------------------
 def _safe_dt(x: Any) -> Optional[datetime]:
     try:
         if x is None:
@@ -722,9 +714,41 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     return out
 
 
-# -----------------------------------------------------------------------------
+def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adds alias fields for Sheets readability while keeping the original keys.
+    Does not overwrite existing values.
+    """
+    out = dict(p or {})
+
+    # price aliases
+    if "expected_price_1m" in out and "forecast_price_1m" not in out:
+        out["forecast_price_1m"] = out.get("expected_price_1m")
+    if "expected_price_3m" in out and "forecast_price_3m" not in out:
+        out["forecast_price_3m"] = out.get("expected_price_3m")
+    if "expected_price_12m" in out and "forecast_price_12m" not in out:
+        out["forecast_price_12m"] = out.get("expected_price_12m")
+
+    # ROI aliases
+    if "expected_return_1m" in out and "expected_roi_pct_1m" not in out:
+        out["expected_roi_pct_1m"] = out.get("expected_return_1m")
+    if "expected_return_3m" in out and "expected_roi_pct_3m" not in out:
+        out["expected_roi_pct_3m"] = out.get("expected_return_3m")
+    if "expected_return_12m" in out and "expected_roi_pct_12m" not in out:
+        out["expected_roi_pct_12m"] = out.get("expected_return_12m")
+
+    # confidence/update aliases
+    if "confidence_score" in out and "forecast_confidence" not in out:
+        out["forecast_confidence"] = out.get("confidence_score")
+    if "history_last_utc" in out and "forecast_updated_utc" not in out:
+        out["forecast_updated_utc"] = out.get("history_last_utc")
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Header builder
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _base_headers() -> Dict[str, str]:
     h = {
         "User-Agent": USER_AGENT,
@@ -770,9 +794,9 @@ def _endpoint_headers(kind: str) -> Dict[str, str]:
     return {}
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # HTTP client (lazy singleton)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 class ArgaamClient:
     def __init__(self) -> None:
         self.timeout_sec = _timeout_seconds()
@@ -816,7 +840,6 @@ class ArgaamClient:
         base_delay = _retry_delay_sec()
         last_err: Optional[str] = None
 
-        # Per-request header overrides (merged by httpx on request)
         req_headers = _endpoint_headers(kind)
 
         for attempt in range(retries):
@@ -862,9 +885,9 @@ class ArgaamClient:
         return None, last_err or "request failed"
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Mapping (best-effort)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _map_payload(root: Any) -> Dict[str, Any]:
     """
     Best-effort mapping for common JSON payload shapes.
@@ -934,7 +957,7 @@ def _map_payload(root: Any) -> Dict[str, Any]:
     if sub_sector:
         patch["sub_sector"] = sub_sector
 
-    # Currency hint
+    # Currency hint (KSA)
     if patch.get("currency") is None:
         patch["currency"] = "SAR"
 
@@ -950,9 +973,16 @@ def _identity_only(mapped: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-# -----------------------------------------------------------------------------
+def _with_provenance(patch: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(patch or {})
+    out.setdefault("provider", PROVIDER_NAME)
+    out.setdefault("data_source", PROVIDER_NAME)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Lazy singleton
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _CLIENT_SINGLETON: Optional[ArgaamClient] = None
 _CLIENT_LOCK = asyncio.Lock()
 
@@ -974,9 +1004,9 @@ async def aclose_argaam_client() -> None:
         await c.aclose()
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Fetchers (DICT PATCH RETURNS)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
     if not _configured():
         return {}
@@ -1005,13 +1035,17 @@ async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
             if _emit_warnings():
                 return {"_warn": f"argaam quote failed: {err}"}
             return {}
+
         root = _coerce_dict(js)
         mapped = _map_payload(root)
+
         if _safe_float(mapped.get("current_price")) is None:
             if _emit_warnings():
                 return {"_warn": "argaam quote returned no price"}
             return {}
-        patch = dict(mapped)
+
+        patch = _with_provenance(dict(mapped))
+        patch = _clean_patch(patch)
         c._quote_cache[ck] = dict(patch)
         return patch
 
@@ -1023,18 +1057,23 @@ async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
             if _emit_warnings():
                 return {"_warn": f"argaam profile-as-quote failed: {err}"}
             return {}
+
         root = _coerce_dict(js)
         mapped = _map_payload(root)
+
         if _safe_float(mapped.get("current_price")) is None:
             if _emit_warnings():
                 return {"_warn": "argaam profile-as-quote returned no price"}
             return {}
-        patch = dict(mapped)
+
+        patch = _with_provenance(dict(mapped))
         if _emit_warnings():
             warns.append("argaam: used profile endpoint as quote fallback")
             patch["_warn"] = " | ".join(warns)
-        c._quote_cache[ck] = dict(_clean_patch(patch))
-        return _clean_patch(patch)
+
+        patch = _clean_patch(patch)
+        c._quote_cache[ck] = dict(patch)
+        return patch
 
     return {}
 
@@ -1072,6 +1111,9 @@ async def _fetch_profile_identity_patch(symbol: str) -> Dict[str, Any]:
         if _emit_warnings():
             return {"_warn": "argaam profile had no identity fields"}
         return {}
+
+    identity = _with_provenance(identity)
+    identity = _clean_patch(identity)
 
     c._profile_cache[ck] = dict(identity)
     return identity
@@ -1122,6 +1164,8 @@ async def _fetch_history_patch(symbol: str) -> Dict[str, Any]:
             "expected_price_1m",
             "expected_price_3m",
             "expected_price_12m",
+            "confidence_score",
+            "forecast_method",
         ):
             analytics.pop(k, None)
         analytics["forecast_method"] = "history_only"
@@ -1133,14 +1177,17 @@ async def _fetch_history_patch(symbol: str) -> Dict[str, Any]:
     }
     patch.update(analytics)
 
+    patch = _with_provenance(patch)
+    patch = _add_forecast_aliases(patch)
     patch = _clean_patch(patch)
+
     c._hist_cache[ck] = dict(patch)
     return patch
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Engine-compatible exported callables (DICT RETURNS)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch_quote_patch(symbol)
 
@@ -1158,15 +1205,13 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
     p_patch = await _fetch_profile_identity_patch(symbol)
     h_patch = await _fetch_history_patch(symbol)
 
-    # If quote exists, enrich it with identity (fill blanks only)
     out: Dict[str, Any] = {}
     warns: List[str] = []
 
     if q_patch:
-        # keep quote fields
         out.update({k: v for k, v in q_patch.items() if k != "_warn"})
 
-        # fill identity gaps
+        # fill identity gaps only
         if p_patch:
             for k, v in p_patch.items():
                 if k == "_warn":
@@ -1174,14 +1219,13 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
                 if (k not in out or out.get(k) in (None, "")) and v is not None:
                     out[k] = v
 
-        # merge history analytics (only if not already present)
+        # merge history analytics only if missing
         if h_patch:
             for k, v in h_patch.items():
                 if k == "_warn":
                     continue
                 if k not in out and v is not None:
                     out[k] = v
-
     else:
         # no quote -> still provide identity/history if available
         for src in (p_patch, h_patch):
@@ -1189,6 +1233,10 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
                 for k, v in src.items():
                     if k != "_warn" and v is not None:
                         out[k] = v
+
+    # Ensure provenance + forecast aliases on final output
+    out = _with_provenance(out)
+    out = _add_forecast_aliases(out)
 
     # Collect warnings if enabled
     if _emit_warnings():
