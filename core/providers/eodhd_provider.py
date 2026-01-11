@@ -2,19 +2,23 @@
 """
 core/providers/eodhd_provider.py
 ============================================================
-EODHD Provider — v2.1.0 (GLOBAL PRIMARY + SYMBOL VARIANTS + DATA_QUALITY + HISTORY/FORECAST)
+EODHD Provider — v2.2.0 (GLOBAL PRIMARY + SYMBOL VARIANTS + HISTORY/FCAST + ENGINE-DISCOVERY SAFE)
 
-What’s improved vs v2.0.0
-- ✅ Global symbol fix: auto-derives EODHD exchange format (AAPL -> AAPL.US) using EODHD_DEFAULT_EXCHANGE (default US)
-- ✅ Symbol variants for tricky tickers: tries BRK.B.US and BRK-B.US (dot/dash swap) before failing
-- ✅ No “error”-only early return: realtime failure will still attempt fundamentals/history (best-effort)
-- ✅ Adds `data_quality` heuristic (GOOD/OK/BAD) to help upstream routes avoid BAD/none surprises
-- ✅ Adds `provider_symbol` showing the exact symbol used at EODHD (debuggable coverage)
-- ✅ Still: no network at import-time, lazy AsyncClient, retry/backoff, patch-style output, optional KSA block
+Key goals
+- ✅ Engine-discovery compatible: exposes get_quote / get_enriched_quote / fetch_quote / quote / fetch
+  (because your engine registry probes these names in order).
+- ✅ Global symbol fix: AAPL -> AAPL.US (via EODHD_DEFAULT_EXCHANGE, default US)
+- ✅ Variants for tricky tickers: BRK.B.US + BRK-B.US
+- ✅ Best-effort: even if realtime fails, still attempts fundamentals/history (unless disabled)
+- ✅ Aligns forecast fields with your canonical schema:
+    expected_roi_1m/3m/12m, forecast_price_1m/3m/12m, forecast_confidence (0..1),
+    forecast_method, forecast_updated_utc, forecast_updated_riyadh
+  (and still provides returns_*, ma*, volatility_30d, rsi_14)
+- ✅ Import-safe: no network at import time, lazy AsyncClient + TTL caches
 
 KSA handling
 - Default: KSA is BLOCKED (safe) to avoid routing confusion.
-- Enable KSA via: ALLOW_EODHD_KSA=true  (also accepts EODHD_ALLOW_KSA=true)
+- Enable KSA via: ALLOW_EODHD_KSA=true  (or EODHD_ALLOW_KSA=true)
 
 Env vars (supported)
 Auth/Base
@@ -66,7 +70,7 @@ import httpx
 
 logger = logging.getLogger("core.providers.eodhd_provider")
 
-PROVIDER_VERSION = "2.1.0"
+PROVIDER_VERSION = "2.2.0"
 PROVIDER_NAME = "eodhd"
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -83,6 +87,8 @@ USER_AGENT_DEFAULT = (
 # ---------------------------------------------------------------------------
 # Env helpers (safe)
 # ---------------------------------------------------------------------------
+
+
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None:
@@ -124,6 +130,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
 
 def _token() -> Optional[str]:
@@ -265,6 +276,8 @@ _HIST_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
 # ---------------------------------------------------------------------------
 # Customized headers
 # ---------------------------------------------------------------------------
+
+
 def _json_headers(env_key: str) -> Dict[str, str]:
     raw = _env_str(env_key, "")
     if not raw:
@@ -339,7 +352,6 @@ def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
     exch = (m.group(2) or "").strip()
     if not base or not exch:
         return s, None
-    # avoid misclassifying class shares like BRK.B (exch would be "B" which is too short anyway)
     return base, exch
 
 
@@ -372,7 +384,7 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
     if exch is None:
         exch = _default_exchange()
         primary = f"{base}.{exch}"
-        also = base  # sometimes upstream passes plain
+        also = base
     else:
         primary = f"{base}.{exch}"
         also = base
@@ -388,7 +400,7 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
     if base_dash_to_dot != base and base_dash_to_dot != base_dot_to_dash:
         out.append(f"{base_dash_to_dot}.{exch}")
 
-    # as a last resort, try without exchange (some APIs accept it)
+    # last resort: try without exchange
     if also and also not in out:
         out.append(also)
 
@@ -408,6 +420,8 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # Numeric helpers
 # ---------------------------------------------------------------------------
+
+
 def _is_nan(x: Any) -> bool:
     try:
         return x is None or (isinstance(x, float) and math.isnan(x))
@@ -524,15 +538,16 @@ def _data_quality(patch: Dict[str, Any], warns: List[str]) -> str:
         if patch.get(k) is not None and str(patch.get(k)).strip() != "":
             return "OK"
 
-    # if we had only warnings / config issues
     if warns:
         return "BAD"
     return "BAD"
 
 
 # ---------------------------------------------------------------------------
-# History analytics (forecast)
+# History analytics + canonical forecast fields
 # ---------------------------------------------------------------------------
+
+
 def _stddev(xs: List[float]) -> Optional[float]:
     try:
         n = len(xs)
@@ -624,7 +639,7 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     out["rsi_14"] = _compute_rsi_14(closes)
 
-    # momentum forecast
+    # momentum forecast (canonical fields)
     def mean_daily_return(n_days: int) -> Optional[float]:
         if len(closes) < (n_days + 2):
             return None
@@ -640,28 +655,33 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     if _enable_forecast():
         if r1m_d is not None:
-            out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
-            out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
+            out["expected_roi_1m"] = float(r1m_d * 21.0 * 100.0)
+            out["forecast_price_1m"] = float(last * (1.0 + (out["expected_roi_1m"] / 100.0)))
         if r3m_d is not None:
-            out["expected_return_3m"] = float(r3m_d * 63.0 * 100.0)
-            out["expected_price_3m"] = float(last * (1.0 + (out["expected_return_3m"] / 100.0)))
+            out["expected_roi_3m"] = float(r3m_d * 63.0 * 100.0)
+            out["forecast_price_3m"] = float(last * (1.0 + (out["expected_roi_3m"] / 100.0)))
         if r12m_d is not None:
-            out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
-            out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
+            out["expected_roi_12m"] = float(r12m_d * 252.0 * 100.0)
+            out["forecast_price_12m"] = float(last * (1.0 + (out["expected_roi_12m"] / 100.0)))
         out["forecast_method"] = "eodhd_history_momentum_v1"
+        out["forecast_updated_utc"] = _utc_iso()
+        out["forecast_updated_riyadh"] = _riyadh_iso()
     else:
         out["forecast_method"] = "history_only"
 
-    # confidence score (0..100): more points + lower vol => higher
+    # confidence score:
+    # - compute 0..100 then map to 0..1 for forecast_confidence (canonical)
     pts = len(closes)
     base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
     vol = _to_float(out.get("volatility_30d"))
     if vol is None:
-        conf = base * 0.75
+        conf_100 = base * 0.75
     else:
         penalty = min(60.0, max(0.0, (vol / 100.0) * 35.0))
-        conf = max(0.0, min(100.0, base - penalty))
-    out["confidence_score"] = float(conf)
+        conf_100 = max(0.0, min(100.0, base - penalty))
+
+    out["confidence_score"] = float(conf_100)
+    out["forecast_confidence"] = float(max(0.05, min(0.95, conf_100 / 100.0)))
 
     return out
 
@@ -707,6 +727,8 @@ async def aclose_eodhd_client() -> None:
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
+
 async def _get_json_dict(url: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[dict], Optional[str]]:
     tok = _token()
     if not tok:
@@ -834,6 +856,8 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 # ---------------------------------------------------------------------------
 # Endpoint fetchers (try variants)
 # ---------------------------------------------------------------------------
+
+
 async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     """
     Returns (patch, err, used_symbol)
@@ -847,10 +871,8 @@ async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, A
         js, err = await _get_json_dict(url, {}, kind="realtime")
         if js is None:
             last_err = err
-            # common: try next on 404
             if err and err.startswith("HTTP 404"):
                 continue
-            # for other errors, still try next variant (cheap), then fail
             continue
 
         close = _pick(js, "close", "Close", "last", "Last", "price")
@@ -935,10 +957,7 @@ async def _fetch_fundamentals_patch(symbol_variants: List[str]) -> Tuple[Dict[st
         patch["ma20"] = _to_float(technicals.get("20DayMA") or technicals.get("10DayMA"))
         patch["avg_volume_30d"] = _to_float(technicals.get("AverageVolume"))
 
-        so = _to_float(
-            _pick(shares, "SharesOutstanding", "SharesOutstandingFloat", "SharesOutstandingEOD")
-            or general.get("SharesOutstanding")
-        )
+        so = _to_float(_pick(shares, "SharesOutstanding", "SharesOutstandingFloat", "SharesOutstandingEOD") or general.get("SharesOutstanding"))
         patch["shares_outstanding"] = so
 
         float_shares = _to_float(_pick(shares, "SharesFloat", "FloatShares", "SharesOutstandingFloat"))
@@ -1011,12 +1030,21 @@ async def _fetch_history_patch(symbol_variants: List[str]) -> Tuple[Dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# Main fetch
+# Main fetch (best-effort)
 # ---------------------------------------------------------------------------
+
+
 async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) -> Dict[str, Any]:
     sym_in = (symbol or "").strip()
     if not sym_in:
-        return {"data_source": PROVIDER_NAME, "provider_version": PROVIDER_VERSION, "data_quality": "BAD", "error": "empty symbol"}
+        return {
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "data_quality": "BAD",
+            "error": "empty symbol",
+            "last_updated_utc": _utc_iso(),
+            "last_updated_riyadh": _riyadh_iso(),
+        }
 
     # Controlled KSA enablement
     if _looks_like_ksa(sym_in) and not _allow_ksa():
@@ -1029,6 +1057,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
                 "provider_blocked": True,
                 "provider_warning": "KSA blocked for EODHD (set ALLOW_EODHD_KSA=true to enable)",
                 "last_updated_utc": _utc_iso(),
+                "last_updated_riyadh": _riyadh_iso(),
             }
         )
 
@@ -1042,10 +1071,10 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
                 "provider_unavailable": True,
                 "provider_warning": "not configured (EODHD_API_KEY)",
                 "last_updated_utc": _utc_iso(),
+                "last_updated_riyadh": _riyadh_iso(),
             }
         )
 
-    # Build EODHD-compatible variants
     variants = _provider_symbol_variants(sym_in)
     if not variants:
         variants = [sym_in.strip().upper()]
@@ -1057,10 +1086,11 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
         "data_source": PROVIDER_NAME,
         "provider_version": PROVIDER_VERSION,
         "last_updated_utc": _utc_iso(),
+        "last_updated_riyadh": _riyadh_iso(),
         "provider_symbol": variants[0],
     }
 
-    # --- realtime (cached by FIRST variant key; we also store used_symbol in out) ---
+    # --- realtime (cached) ---
     ck_q = f"q::{variants[0]}"
     hit = _QUOTE_CACHE.get(ck_q)
     if isinstance(hit, dict) and hit:
@@ -1078,7 +1108,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
         out["provider_symbol"] = rt_used
     _merge_into(out, rt_patch)
 
-    # --- fundamentals (cached, best-effort) ---
+    # --- fundamentals (cached) ---
     if want_fundamentals and _enable_fundamentals():
         ck_f = f"f::{variants[0]}"
         hitf = _FUND_CACHE.get(ck_f)
@@ -1113,7 +1143,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
                 ),
             )
 
-    # --- history/forecast (cached, best-effort) ---
+    # --- history/forecast (cached) ---
     if want_history and _enable_history():
         ck_h = f"h::{variants[0]}::{_history_days()}::{_history_points_max()}"
         hith = _HIST_CACHE.get(ck_h)
@@ -1141,7 +1171,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
     _fill_derived(out)
     out["data_quality"] = _data_quality(out, warns)
 
-    # Only attach a light warning marker (non-fatal) so upstream doesn’t treat it as hard error
+    # Non-fatal warning marker (avoid forcing engine 'error')
     if warns:
         out.setdefault("provider_warning", warns[0])
 
@@ -1150,14 +1180,38 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
 
 # ---------------------------------------------------------------------------
 # Engine-compatible exported callables (name-based discovery)
+# IMPORTANT: your engine tries get_quote FIRST; therefore get_quote must be enriched.
 # ---------------------------------------------------------------------------
+
+
+async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    # Enriched by default (so engine gets history/forecast columns)
+    return await _fetch(symbol, want_fundamentals=True, want_history=True)
+
+
+async def get_enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await _fetch(symbol, want_fundamentals=True, want_history=True)
+
+
+async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    # Alias many engines probe
+    return await get_quote(symbol, *args, **kwargs)
+
+
+async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await get_quote(symbol, *args, **kwargs)
+
+
+async def fetch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await get_quote(symbol, *args, **kwargs)
+
+
+# Legacy aliases (kept for older code paths that used *_patch names)
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # realtime only (fast)
     return await _fetch(symbol, want_fundamentals=False, want_history=False)
 
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # realtime + fundamentals + history/forecast (best-effort)
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
 
@@ -1165,7 +1219,6 @@ async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: An
     return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
-# Compatibility aliases (some engines try these names)
 async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=True, want_history=False)
 
@@ -1179,16 +1232,23 @@ class EodhdProvider:
     name: str = PROVIDER_NAME
 
     async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
-        # keep signature compatible with other providers
-        return await fetch_enriched_quote_patch(symbol)
+        return await get_quote(symbol)
 
 
 __all__ = [
+    # engine discovery
+    "get_quote",
+    "get_enriched_quote",
+    "fetch_quote",
+    "quote",
+    "fetch",
+    # legacy names
     "fetch_quote_patch",
     "fetch_enriched_quote_patch",
     "fetch_quote_and_enrichment_patch",
     "fetch_quote_and_fundamentals_patch",
     "fetch_enriched_patch",
+    # client cleanup + metadata
     "aclose_eodhd_client",
     "PROVIDER_VERSION",
     "PROVIDER_NAME",
