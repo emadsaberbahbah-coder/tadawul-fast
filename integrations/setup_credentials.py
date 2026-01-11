@@ -3,7 +3,7 @@
 """
 setup_credentials.py
 ===========================================================
-HELPER: Prepare Google Credentials for Deployment (v2.4.1)
+HELPER: Prepare Google Credentials for Deployment (v2.5.0)
 ===========================================================
 
 Why this exists
@@ -13,7 +13,7 @@ Why this exists
     1) Minified one-line JSON (safe for GOOGLE_SHEETS_CREDENTIALS)
     2) OPTIONAL Base64 version (often safer for deployment UIs)
 
-Extra safety (v2.4.1)
+Extra safety (v2.5.0)
 - Reads credentials from: file OR stdin (pipe) OR env var
 - Accepts JSON OR base64(JSON) OR "quoted JSON" in any source
 - Strict validation of required fields + private key marker
@@ -21,7 +21,10 @@ Extra safety (v2.4.1)
 - Optional output to files to avoid copy/paste
 - Optional masked preview mode
 - Optional "print export command" helpers (masked by default)
-- Better base64 detection: supports newlines/whitespace and urlsafe base64
+- Better base64 detection:
+    • supports newlines/whitespace
+    • supports urlsafe base64
+    • supports missing padding (auto-fix)
 
 Usage (examples)
 1) File (default):
@@ -57,8 +60,7 @@ from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_INPUT = "credentials.json"
 DEFAULT_ENV_NAME = "GOOGLE_SHEETS_CREDENTIALS"
-VERSION = "2.4.1"
-
+VERSION = "2.5.0"
 
 # =============================================================================
 # IO helpers
@@ -90,10 +92,24 @@ def _compact_ws(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 
+def _pad_base64(s: str) -> str:
+    """
+    Some UIs strip '=' padding. Base64 decoder often needs correct padding length.
+    """
+    raw = _compact_ws(s)
+    if not raw:
+        return raw
+    # only pad if mod 4 != 0
+    m = len(raw) % 4
+    if m == 0:
+        return raw
+    return raw + ("=" * (4 - m))
+
+
 def _is_probably_base64(raw: str) -> bool:
     """
     Heuristic: base64 strings are usually long, mostly base64 alphabet.
-    We allow newlines/whitespace (common in UIs) and urlsafe variants.
+    We allow newlines/whitespace and urlsafe variants.
     """
     s = _compact_ws((raw or "").strip())
     if not s:
@@ -109,11 +125,7 @@ def _is_probably_base64(raw: str) -> bool:
     if len(s) < 80:
         return False
 
-    # often multiple of 4 (padding optional, but still a good signal)
-    if len(s) % 4 != 0:
-        # still allow (some systems strip padding), but lower confidence
-        return True
-
+    # padding heuristic: not mandatory, but common
     return True
 
 
@@ -126,10 +138,12 @@ def _try_b64_decode_to_json(raw: str) -> Optional[str]:
     if not _is_probably_base64(s):
         return None
 
+    s_padded = _pad_base64(s)
+
     # Try standard base64 and urlsafe base64
     for fn in (base64.b64decode, base64.urlsafe_b64decode):
         try:
-            decoded = fn(s).decode("utf-8", errors="strict").strip()
+            decoded = fn(s_padded).decode("utf-8", errors="strict").strip()
             if decoded.startswith("{") and '"private_key"' in decoded:
                 return decoded
         except Exception:
@@ -156,7 +170,14 @@ def _coerce_private_key_newlines(data: Dict[str, Any], *, fix: bool) -> None:
 
 
 def _load_json_text(text: str) -> Dict[str, Any]:
-    t = _strip_wrapping_quotes(text)
+    """
+    Accepts:
+    - raw JSON
+    - quoted JSON
+    - base64(JSON) (standard or urlsafe; padding optional)
+    """
+    t0 = (text or "")
+    t = _strip_wrapping_quotes(t0)
     decoded = _try_b64_decode_to_json(t)
     if decoded:
         t = decoded
@@ -164,7 +185,8 @@ def _load_json_text(text: str) -> Dict[str, Any]:
 
     if not t:
         raise ValueError("Empty input (no JSON found).")
-    if not t.startswith("{"):
+    # allow whitespace prefix
+    if not t.lstrip().startswith("{"):
         raise ValueError("Input is not JSON (expected '{' at start), and it did not decode as base64 JSON.")
 
     data = json.loads(t)
@@ -232,6 +254,12 @@ def _bash_export(env_name: str, value: str, *, masked: bool) -> str:
     return f"export {env_name}='{v}'"
 
 
+def _dotenv_line(env_name: str, value: str, *, masked: bool) -> str:
+    v = _mask(value) if masked else value
+    # .env parsers vary; quoting reduces breakage
+    return f"{env_name}='{v}'"
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -264,6 +292,7 @@ def main() -> int:
     out.add_argument("--out-json", default="", help="Write minified JSON output to this file.")
     out.add_argument("--out-b64", default="", help="Write base64 output to this file.")
     out.add_argument("--print-export", action="store_true", help="Print helper export commands (masked by default).")
+    out.add_argument("--print-dotenv", action="store_true", help="Print helper .env line (masked by default).")
 
     args = p.parse_args()
 
@@ -329,6 +358,13 @@ def main() -> int:
             if mode in ("base64", "both"):
                 print("PowerShell:", _ps_setx(args.env_name, b64, masked=True))
                 print("Bash:      ", _bash_export(args.env_name, b64, masked=True))
+
+        if args.print_dotenv:
+            print("\nHelper .env line (MASKED preview):")
+            if mode in ("json", "both"):
+                print(_dotenv_line(args.env_name, flat, masked=True))
+            if mode in ("base64", "both"):
+                print(_dotenv_line(args.env_name, b64, masked=True))
 
         print("\nRecommended:")
         if args.out_json or args.out_b64:
