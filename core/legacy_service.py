@@ -4,14 +4,14 @@ from __future__ import annotations
 """
 core/legacy_service.py
 ------------------------------------------------------------
-Compatibility shim (quiet + useful) — v1.6.0
+Compatibility shim (quiet + useful) — v1.7.0
 
 Goals
 - Provide a stable legacy router that NEVER breaks app startup.
 - Never raise outward from endpoints (always HTTP 200 with a JSON body).
 - Best-effort engine discovery:
     1) request.app.state.engine
-    2) core.data_engine_v2.get_engine() (singleton) if available
+    2) core.data_engine_v2.get_engine() (singleton) if available  ✅ (sync OR async supported)
     3) core.data_engine_v2.DataEngine() temp
     4) core.data_engine.DataEngine() temp
 - Support BOTH async and sync engine method implementations.
@@ -26,6 +26,7 @@ Env
 
 import asyncio
 import importlib
+import inspect
 import os
 import traceback
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -35,7 +36,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -110,6 +111,7 @@ class SymbolsIn(BaseModel):
       {"symbols":[...]}
       {"tickers":[...]}
     """
+
     symbols: List[str] = []
     tickers: List[str] = []
 
@@ -133,6 +135,7 @@ class SheetRowsIn(BaseModel):
     """
     Lightweight compatibility payload for sheet-rows-like output.
     """
+
     symbols: List[str] = []
     tickers: List[str] = []
     sheet_name: str = ""
@@ -142,22 +145,50 @@ class SheetRowsIn(BaseModel):
 # -----------------------------------------------------------------------------
 # Engine discovery / calling helpers
 # -----------------------------------------------------------------------------
+def _safe_err(e: BaseException) -> str:
+    msg = str(e).strip()
+    return msg or e.__class__.__name__
+
+
+async def _maybe_await(x: Any) -> Any:
+    """
+    Supports:
+    - async functions returning coroutine/future/task
+    - sync functions returning value
+    """
+    try:
+        if inspect.isawaitable(x):
+            return await x
+    except Exception:
+        pass
+    return x
+
+
 async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str]:
     """
     Returns (engine, source_label).
     """
     # 1) already attached
-    eng = getattr(request.app.state, "engine", None)
+    try:
+        eng = getattr(request.app.state, "engine", None)
+    except Exception:
+        eng = None
+
     if eng is not None:
         return eng, "app.state.engine"
 
-    # 2) v2 singleton getter
+    # 2) v2 singleton getter (sync OR async supported)
     try:
         from core.data_engine_v2 import get_engine as v2_get_engine  # type: ignore
 
-        eng2 = await v2_get_engine()
-        request.app.state.engine = eng2
-        return eng2, "core.data_engine_v2.get_engine(singleton)"
+        maybe_eng2 = v2_get_engine()
+        eng2 = await _maybe_await(maybe_eng2)
+        if eng2 is not None:
+            try:
+                request.app.state.engine = eng2
+            except Exception:
+                pass
+            return eng2, "core.data_engine_v2.get_engine(singleton)"
     except Exception:
         pass
 
@@ -166,7 +197,10 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str]
         from core.data_engine_v2 import DataEngine as V2Engine  # type: ignore
 
         eng3 = V2Engine()
-        request.app.state.engine = eng3
+        try:
+            request.app.state.engine = eng3
+        except Exception:
+            pass
         return eng3, "core.data_engine_v2.DataEngine(temp)"
     except Exception:
         pass
@@ -176,29 +210,13 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str]
         from core.data_engine import DataEngine as V1Engine  # type: ignore
 
         eng4 = V1Engine()
-        request.app.state.engine = eng4
+        try:
+            request.app.state.engine = eng4
+        except Exception:
+            pass
         return eng4, "core.data_engine.DataEngine(temp)"
     except Exception:
         return None, "none"
-
-
-def _safe_err(e: BaseException) -> str:
-    msg = str(e).strip()
-    return msg or e.__class__.__name__
-
-
-async def _maybe_await(x: Any) -> Any:
-    """
-    Supports:
-    - async functions returning coroutine
-    - sync functions returning value
-    """
-    try:
-        if asyncio.iscoroutine(x):
-            return await x
-    except Exception:
-        pass
-    return x
 
 
 async def _call_engine_method(engine: Any, method_names: Sequence[str], *args, **kwargs) -> Tuple[Optional[Any], str]:
@@ -219,8 +237,7 @@ async def _call_engine_method(engine: Any, method_names: Sequence[str], *args, *
 
 
 def _sheet_name_from(payload: SheetRowsIn) -> str:
-    nm = (payload.sheet_name or payload.sheetName or "").strip()
-    return nm
+    return (payload.sheet_name or payload.sheetName or "").strip()
 
 
 def _headers_fallback(sheet_name: str) -> List[str]:
@@ -265,7 +282,6 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         d = q
     else:
         try:
-            # pydantic model or object
             if hasattr(q, "model_dump"):
                 d = q.model_dump()  # type: ignore
             elif hasattr(q, "dict"):
@@ -281,20 +297,19 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
                 return d.get(k)
         return None
 
-    # Map common legacy fields
     mapped: Dict[str, Any] = {
-        "Symbol": g("symbol", "ticker"),
+        "Symbol": g("symbol", "symbol_normalized", "ticker"),
         "Name": g("name", "company_name"),
         "Market": g("market", "market_region"),
         "Currency": g("currency"),
         "Price": g("current_price", "last_price", "price"),
         "Change": g("price_change", "change"),
-        "Change %": g("percent_change", "change_pct"),
+        "Change %": g("percent_change", "change_pct", "change_percent"),
         "Volume": g("volume"),
         "Market Cap": g("market_cap"),
         "P/E (TTM)": g("pe_ttm", "pe"),
         "Data Quality": g("data_quality"),
-        "Data Source": g("data_source", "source"),
+        "Data Source": g("data_source", "source", "provider"),
         "Error": g("error"),
     }
 
@@ -380,7 +395,6 @@ async def legacy_quote(
             }
             return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
-        # Return quote as-is (legacy behavior)
         return JSONResponse(status_code=200, content=jsonable_encoder(q))
 
     except Exception as e:
@@ -402,17 +416,18 @@ async def legacy_quotes(
     payload: SymbolsIn,
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
+    """
+    IMPORTANT: keep legacy shape as LIST (not dict) for maximum compatibility.
+    """
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
 
-    try:
-        symbols = payload.normalized()
-        if not symbols:
-            out = []
-            return JSONResponse(status_code=200, content=jsonable_encoder(out))
+    symbols = payload.normalized()
+    if not symbols:
+        return JSONResponse(status_code=200, content=jsonable_encoder([]))
 
+    try:
         eng, src = await _get_engine_best_effort(request)
         if eng is None:
-            # Legacy endpoint: historically returns a list; keep that shape.
             out = [
                 {
                     "status": "error",
@@ -444,9 +459,18 @@ async def legacy_quotes(
         return JSONResponse(status_code=200, content=jsonable_encoder(items))
 
     except Exception as e:
-        out: Dict[str, Any] = {"status": "error", "count": 0, "items": [], "error": _safe_err(e)}
+        out = [
+            {
+                "status": "error",
+                "symbol": s,
+                "data_quality": "MISSING",
+                "data_source": "none",
+                "error": _safe_err(e),
+            }
+            for s in symbols
+        ]
         if dbg:
-            out["traceback"] = traceback.format_exc()[:8000]
+            out.append({"debug": True, "traceback": traceback.format_exc()[:8000]})
         return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
 
@@ -465,7 +489,6 @@ async def legacy_sheet_rows(
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
 
     try:
-        # Normalize symbols
         symbols_in = SymbolsIn(symbols=payload.symbols or [], tickers=payload.tickers or [])
         symbols = symbols_in.normalized()
         if not symbols:
@@ -479,19 +502,42 @@ async def legacy_sheet_rows(
 
         eng, src = await _get_engine_best_effort(request)
         if eng is None:
-            rows = [[s, None, None, None, None, None, None, None, None, None, "MISSING", "none", "Legacy engine not available"] for s in symbols]
+            rows = [
+                [s, None, None, None, None, None, None, None, None, None, "MISSING", "none", "Legacy engine not available"]
+                for s in symbols
+            ]
             return JSONResponse(
                 status_code=200,
-                content=jsonable_encoder({"status": "error", "headers": headers, "rows": rows, "error": "Legacy engine not available", "engine_source": src}),
+                content=jsonable_encoder(
+                    {
+                        "status": "error",
+                        "headers": headers,
+                        "rows": rows,
+                        "error": "Legacy engine not available",
+                        "engine_source": src,
+                    }
+                ),
             )
 
         items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
+
         if not isinstance(items, list):
-            # If engine returns a dict or something else, wrap into error rows
-            rows = [[s, None, None, None, None, None, None, None, None, None, "MISSING", "none", f"Engine returned non-list (method={used})"] for s in symbols]
+            rows = [
+                [s, None, None, None, None, None, None, None, None, None, "MISSING", "none", f"Engine returned non-list (method={used})"]
+                for s in symbols
+            ]
             return JSONResponse(
                 status_code=200,
-                content=jsonable_encoder({"status": "error", "headers": headers, "rows": rows, "error": "Engine returned non-list", "engine_source": src, "method": used}),
+                content=jsonable_encoder(
+                    {
+                        "status": "error",
+                        "headers": headers,
+                        "rows": rows,
+                        "error": "Engine returned non-list",
+                        "engine_source": src,
+                        "method": used,
+                    }
+                ),
             )
 
         rows = [_quote_to_row(q, headers) for q in items]
