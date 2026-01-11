@@ -2,16 +2,13 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.5.0
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.5.1
 
-What’s fixed / improved in v5.5.0
-- ✅ Global symbol routing fix: tries RAW symbol first (e.g., AAPL), then exchange-mapped variants (e.g., AAPL.US)
-  so engines/providers that expect either format can succeed.
-- ✅ KSA symbol routing fix: supports both "1120" and "1120.SR" by trying both variants (without breaking indices/FX).
-- ✅ Batch endpoint “rescue”: for items that come back missing/empty provenance (data_source=none) or status=error,
-  it retries per-symbol with variants (bounded, safe).
-- ✅ Provenance normalization: if provider returns provider/source under different keys, we normalize to data_source.
-- ✅ Still: always HTTP 200 with a status field; token guard unchanged; recommendation enum enforced.
+What’s fixed / improved in v5.5.1
+- ✅ Hardens _get_one_quote_with_variants() against UnboundLocalError (always initializes `last`)
+- ✅ Hardens batch dispatcher: final fallback call is now TypeError-safe (no surprise crash)
+- ✅ More defensive alignment for batch list outputs (pads missing items with error rows)
+- ✅ Keeps v5.5.0 behavior: always HTTP 200 with status field; token guard unchanged; reco enum enforced
 
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
@@ -33,7 +30,7 @@ from fastapi import APIRouter, Header, Query, Request
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.5.0"
+ENRICHED_ROUTE_VERSION = "5.5.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -175,6 +172,7 @@ def _parse_symbols_list(raw: str) -> List[str]:
         if not p or not p.strip():
             continue
         out.append(_normalize_symbol(p))
+
     # keep order, remove empties/dupes
     seen = set()
     final: List[str] = []
@@ -323,8 +321,6 @@ def _ensure_provenance(d: Dict[str, Any], *, engine_source: str) -> Dict[str, An
     if ds_s:
         out["data_source"] = ds_s
     else:
-        # keep blank; DO NOT force to EODHD/Yahoo here.
-        # But never keep the literal string "none".
         if "data_source" in out and _norm_str(out.get("data_source")).lower() in ("none", "null"):
             out["data_source"] = ""
 
@@ -500,7 +496,6 @@ def _call_engine_method_best_effort(
 
     hint_kwargs: List[Dict[str, Any]] = []
     if hint:
-        # try a few common kw names; all are best-effort (TypeError-safe)
         hint_kwargs = [
             {"market": hint},
             {"market_hint": hint},
@@ -510,7 +505,6 @@ def _call_engine_method_best_effort(
     else:
         hint_kwargs = [{}]
 
-    # try with hints, then without
     for hk in (hint_kwargs + [{}]):
         # kwargs-first
         try:
@@ -538,7 +532,6 @@ def _call_engine_method_best_effort(
         except TypeError:
             pass
 
-    # if we got here, re-raise a consistent error
     return fn(symbol)
 
 
@@ -592,7 +585,11 @@ def _call_engine_batch_best_effort(
             except TypeError:
                 pass
 
-        return name, fn(symbols)
+        # final fallback call (still TypeError-safe)
+        try:
+            return name, fn(symbols)
+        except TypeError:
+            return None, None
 
     return None, None
 
@@ -629,7 +626,7 @@ def _symbol_variants(sym_norm: str) -> List[str]:
             out.append(u.replace(".SR", ""))
         else:
             out.append(u)
-        # de-dupe preserve order
+
         seen = set()
         final: List[str] = []
         for x in out:
@@ -639,7 +636,6 @@ def _symbol_variants(sym_norm: str) -> List[str]:
         return final
 
     # Global (default)
-    # keep as-is, then add .US form (common for EODHD)
     out.append(u)
     if u.endswith(".US"):
         base = u[:-3]
@@ -675,7 +671,7 @@ def _looks_ok(d: Dict[str, Any]) -> bool:
     st = _norm_str(d.get("status")).lower()
     if st and st != "ok":
         return False
-    # common price keys
+
     for k in ("price", "last", "close", "current_price", "last_price"):
         v = d.get(k)
         try:
@@ -683,10 +679,11 @@ def _looks_ok(d: Dict[str, Any]) -> bool:
                 return True
         except Exception:
             continue
-    # sometimes provider returns just name/market cap etc; treat as ok if any meaningful field exists
+
     for k in ("name", "market_cap", "currency", "exchange", "timestamp", "time_utc", "updated_at"):
         if _norm_str(d.get(k)):
             return True
+
     return False
 
 
@@ -700,7 +697,6 @@ def _needs_rescue(d: Dict[str, Any]) -> bool:
     ds = _norm_str(d.get("data_source")).lower()
     if ds in ("none", "null"):
         return True
-    # if empty and looks not ok, rescue
     if (not ds) and (not _looks_ok(d)):
         return True
     return False
@@ -738,8 +734,14 @@ async def _get_one_quote_with_variants(
     """
     hint = _market_hint_for(sym_norm)
     attempts: List[Dict[str, Any]] = []
+    last: Dict[str, Any] = _ensure_status_dict(
+        {"status": "error", "error": "No attempts executed", "recommendation": "HOLD"},
+        symbol=sym_norm,
+        engine_source=eng_src,
+    )
 
-    for s_try in _symbol_variants(sym_norm):
+    variants = _symbol_variants(sym_norm) or [sym_norm]
+    for s_try in variants:
         try:
             # prefer enriched; fallback to get_quote
             try:
@@ -765,6 +767,7 @@ async def _get_one_quote_with_variants(
 
             if isinstance(res, dict):
                 out = _ensure_status_dict(_ensure_reco(res), symbol=s_try, engine_source=eng_src)
+
                 if debug:
                     attempts.append(
                         {
@@ -774,30 +777,36 @@ async def _get_one_quote_with_variants(
                             "data_quality": out.get("data_quality") or "",
                         }
                     )
+
                 if _looks_ok(out):
-                    # Keep original normalized as "requested_symbol"
                     out.setdefault("requested_symbol", sym_norm)
                     if debug:
                         out["attempts"] = attempts
                     return out
 
-                # keep last non-ok-ish dict in case nothing better appears
                 last = out
-            else:
-                wrapped = {"status": "ok", "symbol": s_try, "engine_source": eng_src, "value": _to_jsonable(res)}
-                out = _ensure_status_dict(wrapped, symbol=s_try, engine_source=eng_src)
-                out.setdefault("requested_symbol", sym_norm)
-                if debug:
-                    attempts.append(
-                        {
-                            "symbol_try": s_try,
-                            "status": out.get("status"),
-                            "data_source": out.get("data_source") or "",
-                            "data_quality": out.get("data_quality") or "",
-                        }
-                    )
-                    out["attempts"] = attempts
-                return out
+                continue
+
+            # non-dict payload: wrap
+            wrapped = {
+                "status": "ok",
+                "symbol": s_try,
+                "engine_source": eng_src,
+                "value": _to_jsonable(res),
+            }
+            out2 = _ensure_status_dict(wrapped, symbol=s_try, engine_source=eng_src)
+            out2.setdefault("requested_symbol", sym_norm)
+            if debug:
+                attempts.append(
+                    {
+                        "symbol_try": s_try,
+                        "status": out2.get("status"),
+                        "data_source": out2.get("data_source") or "",
+                        "data_quality": out2.get("data_quality") or "",
+                    }
+                )
+                out2["attempts"] = attempts
+            return out2
 
         except Exception as e:
             if debug:
@@ -808,18 +817,10 @@ async def _get_one_quote_with_variants(
                 engine_source=eng_src,
             )
 
-    # if all attempts failed, return the last captured
-    if isinstance(last, dict):
-        last.setdefault("requested_symbol", sym_norm)
-        if debug:
-            last["attempts"] = attempts
-        return last
-
-    return _ensure_status_dict(
-        {"status": "error", "error": "Failed to resolve symbol via variants", "recommendation": "HOLD"},
-        symbol=sym_norm,
-        engine_source=eng_src,
-    )
+    last.setdefault("requested_symbol", sym_norm)
+    if debug:
+        last["attempts"] = attempts
+    return last
 
 
 @router.get("/v1/enriched/quote")
@@ -952,10 +953,19 @@ async def enriched_quotes(
 
                 shaped: List[Dict[str, Any]] = []
                 raw_items = out.get("items") or []
-                for i, it in enumerate(raw_items):
-                    sym_i = syms[i] if i < len(syms) else ""
+                for i in range(len(syms)):
+                    sym_i = syms[i]
+                    it = raw_items[i] if i < len(raw_items) else None
                     if isinstance(it, dict):
                         shaped.append(_ensure_status_dict(_ensure_reco(it), symbol=sym_i or it.get("symbol", ""), engine_source=eng_src))
+                    elif it is None:
+                        shaped.append(
+                            _ensure_status_dict(
+                                {"status": "error", "symbol": sym_i, "engine_source": eng_src, "error": "Missing item in batch response"},
+                                symbol=sym_i,
+                                engine_source=eng_src,
+                            )
+                        )
                     else:
                         shaped.append(
                             _ensure_status_dict(
@@ -968,7 +978,7 @@ async def enriched_quotes(
                 # rescue weak items (status error or data_source none/empty and looks bad)
                 rescued: List[Dict[str, Any]] = []
                 for i, q in enumerate(shaped):
-                    sym_i = syms[i] if i < len(syms) else q.get("symbol", "")
+                    sym_i = syms[i]
                     if sym_i and _needs_rescue(q):
                         fixed = await _get_one_quote_with_variants(
                             eng=eng,
@@ -987,13 +997,22 @@ async def enriched_quotes(
                 out["method"] = method_used or "batch"
                 return out
 
-            # list: align by index when possible
+            # list: align by index when possible (pad missing)
             if isinstance(res, list):
                 shaped2: List[Dict[str, Any]] = []
-                for i, it in enumerate(res):
-                    sym_i = syms[i] if i < len(syms) else ""
+                for i in range(len(syms)):
+                    sym_i = syms[i]
+                    it = res[i] if i < len(res) else None
                     if isinstance(it, dict):
                         shaped2.append(_ensure_status_dict(_ensure_reco(it), symbol=sym_i or it.get("symbol", ""), engine_source=eng_src))
+                    elif it is None:
+                        shaped2.append(
+                            _ensure_status_dict(
+                                {"status": "error", "symbol": sym_i, "engine_source": eng_src, "error": "Missing item in batch list"},
+                                symbol=sym_i,
+                                engine_source=eng_src,
+                            )
+                        )
                     else:
                         shaped2.append(
                             _ensure_status_dict(
@@ -1006,7 +1025,7 @@ async def enriched_quotes(
                 # rescue
                 final_items: List[Dict[str, Any]] = []
                 for i, q in enumerate(shaped2):
-                    sym_i = syms[i] if i < len(syms) else q.get("symbol", "")
+                    sym_i = syms[i]
                     if sym_i and _needs_rescue(q):
                         final_items.append(
                             await _get_one_quote_with_variants(
@@ -1056,7 +1075,7 @@ async def enriched_quotes(
                         )
 
                 # rescue
-                final_items = []
+                final_items: List[Dict[str, Any]] = []
                 for q in shaped3:
                     s = _norm_str(q.get("symbol"))
                     if s and _needs_rescue(q):
@@ -1096,7 +1115,13 @@ async def enriched_quotes(
                 )
                 items.append(out)
             except Exception as ex:
-                err_item: Dict[str, Any] = {"status": "error", "symbol": s, "engine_source": eng_src, "error": _clamp(ex), "recommendation": "HOLD"}
+                err_item: Dict[str, Any] = {
+                    "status": "error",
+                    "symbol": s,
+                    "engine_source": eng_src,
+                    "error": _clamp(ex),
+                    "recommendation": "HOLD",
+                }
                 if dbg:
                     err_item["trace"] = _clamp(traceback.format_exc(), 4000)
                 items.append(_ensure_status_dict(err_item, symbol=s, engine_source=eng_src))
