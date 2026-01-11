@@ -2,58 +2,32 @@
 """
 core/providers/eodhd_provider.py
 ============================================================
-EODHD Provider — v2.0.0 (HARDENED + ENGINE-PATCH + CUSTOM HEADERS + HISTORY/FORECAST)
+EODHD Provider — v2.1.0 (GLOBAL PRIMARY + SYMBOL VARIANTS + DATA_QUALITY + HISTORY/FORECAST)
 
-Key points
-- ✅ Uses EODHD_API_KEY (preferred in Render)
-- ✅ Also accepts EODHD_API_TOKEN / EODHD_TOKEN (legacy)
-- ✅ Default base URL: https://eodhistoricaldata.com/api
-- ✅ No network calls at import-time
-- ✅ Lazy singleton AsyncClient (reuse connections)
-- ✅ Retry/backoff on 429 + transient 5xx
-- ✅ Clean PATCH outputs (no empty-string / None noise)
-- ✅ Optional History + Forecast (momentum/vol/RSI/MA) from EOD endpoint
+What’s improved vs v2.0.0
+- ✅ Global symbol fix: auto-derives EODHD exchange format (AAPL -> AAPL.US) using EODHD_DEFAULT_EXCHANGE (default US)
+- ✅ Symbol variants for tricky tickers: tries BRK.B.US and BRK-B.US (dot/dash swap) before failing
+- ✅ No “error”-only early return: realtime failure will still attempt fundamentals/history (best-effort)
+- ✅ Adds `data_quality` heuristic (GOOD/OK/BAD) to help upstream routes avoid BAD/none surprises
+- ✅ Adds `provider_symbol` showing the exact symbol used at EODHD (debuggable coverage)
+- ✅ Still: no network at import-time, lazy AsyncClient, retry/backoff, patch-style output, optional KSA block
 
-KSA handling (IMPORTANT)
+KSA handling
 - Default: KSA is BLOCKED (safe) to avoid routing confusion.
 - Enable KSA via: ALLOW_EODHD_KSA=true  (also accepts EODHD_ALLOW_KSA=true)
-
-Customized Headers (NEW)
-- EODHD_HEADERS_JSON                     (base headers)
-- EODHD_HEADERS_REALTIME_JSON            (realtime endpoint override)
-- EODHD_HEADERS_FUNDAMENTALS_JSON        (fundamentals endpoint override)
-- EODHD_HEADERS_HISTORY_JSON             (history endpoint override)
-All are JSON dict strings.
-
-History/Forecast (NEW)
-- Uses /eod/{symbol} daily candles
-- Adds (best-effort):
-  returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d (% annualized), rsi_14
-  expected_return_1m/3m/12m (%), expected_price_1m/3m/12m
-  confidence_score, forecast_method, history_points, history_last_date
-
-Exports (engine discovery)
-- fetch_quote_patch
-- fetch_enriched_quote_patch
-- fetch_quote_and_enrichment_patch
-- fetch_quote_and_fundamentals_patch      (alias)
-- fetch_enriched_patch                    (alias)
-- aclose_eodhd_client
 
 Env vars (supported)
 Auth/Base
 - EODHD_API_KEY (preferred)
 - EODHD_API_TOKEN / EODHD_TOKEN (legacy)
 - EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
+- EODHD_DEFAULT_EXCHANGE (default: US)
 
 Behavior
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
 - EODHD_ENABLE_HISTORY (default: true)
 - EODHD_ENABLE_FORECAST (default: true)
 - EODHD_VERBOSE_WARNINGS (default: false)  # if true attaches _warn
-
-KSA guard
-- ALLOW_EODHD_KSA / EODHD_ALLOW_KSA (default: false)
 
 Timeout/Retry
 - EODHD_TIMEOUT_S (default: 8.5)  (fallback to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT)
@@ -92,7 +66,7 @@ import httpx
 
 logger = logging.getLogger("core.providers.eodhd_provider")
 
-PROVIDER_VERSION = "2.0.0"
+PROVIDER_VERSION = "2.1.0"
 PROVIDER_NAME = "eodhd"
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -166,6 +140,11 @@ def _base_url() -> str:
 
 def _ua() -> str:
     return _env_str("EODHD_UA", USER_AGENT_DEFAULT)
+
+
+def _default_exchange() -> str:
+    ex = _env_str("EODHD_DEFAULT_EXCHANGE", "US").strip().upper()
+    return ex or "US"
 
 
 def _timeout_default() -> float:
@@ -319,7 +298,7 @@ def _endpoint_headers(kind: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Symbol guards
+# Symbol guards + variants
 # ---------------------------------------------------------------------------
 _KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
@@ -333,6 +312,97 @@ def _looks_like_ksa(symbol: str) -> bool:
     if s.isdigit():
         return True
     return bool(_KSA_RE.match(s))
+
+
+def _is_index_or_fx(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    # indices / yahoo-style FX/commodities
+    return ("^" in s) or ("=" in s) or s.endswith("=X") or s.endswith("=F")
+
+
+_EXCH_SUFFIX_RE = re.compile(r"^(.+)\.([A-Z0-9]{2,6})$")
+
+
+def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
+    """
+    If sym ends in .US/.L/.TO/... treat last segment as exchange suffix.
+    """
+    s = (sym or "").strip().upper()
+    if not s:
+        return "", None
+    m = _EXCH_SUFFIX_RE.match(s)
+    if not m:
+        return s, None
+    base = (m.group(1) or "").strip()
+    exch = (m.group(2) or "").strip()
+    if not base or not exch:
+        return s, None
+    # avoid misclassifying class shares like BRK.B (exch would be "B" which is too short anyway)
+    return base, exch
+
+
+def _provider_symbol_variants(raw_symbol: str) -> List[str]:
+    """
+    Best-effort variants to increase hit rate:
+    - AAPL -> AAPL.US (using EODHD_DEFAULT_EXCHANGE)
+    - AAPL.US -> AAPL.US
+    - BRK.B -> BRK.B.US then BRK-B.US
+    - BRK-B -> BRK-B.US then BRK.B.US
+    Indices/FX => keep as-is
+    KSA => keep as-is (but usually blocked unless allowed)
+    """
+    s = (raw_symbol or "").strip().upper()
+    if not s:
+        return []
+
+    if _is_index_or_fx(s):
+        return [s]
+
+    # KSA: keep as-is; engine/router should route elsewhere unless explicitly enabled
+    if _looks_like_ksa(s):
+        if s.isdigit():
+            return [f"{s}.SR", s]
+        if s.endswith(".SR"):
+            return [s, s.replace(".SR", "")]
+        return [s]
+
+    base, exch = _split_exchange_suffix(s)
+    if exch is None:
+        exch = _default_exchange()
+        primary = f"{base}.{exch}"
+        also = base  # sometimes upstream passes plain
+    else:
+        primary = f"{base}.{exch}"
+        also = base
+
+    out: List[str] = [primary]
+
+    # dot/dash swap inside BASE (not the exchange separator)
+    base_dot_to_dash = base.replace(".", "-")
+    base_dash_to_dot = base.replace("-", ".")
+
+    if base_dot_to_dash != base:
+        out.append(f"{base_dot_to_dash}.{exch}")
+    if base_dash_to_dot != base and base_dash_to_dot != base_dot_to_dash:
+        out.append(f"{base_dash_to_dot}.{exch}")
+
+    # as a last resort, try without exchange (some APIs accept it)
+    if also and also not in out:
+        out.append(also)
+
+    # de-dupe preserve order
+    seen = set()
+    final: List[str] = []
+    for x in out:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        final.append(x)
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +509,25 @@ def _fill_derived(patch: Dict[str, Any]) -> None:
     ff = _to_float(patch.get("free_float"))
     if patch.get("free_float_market_cap") is None and mc is not None and ff is not None:
         patch["free_float_market_cap"] = mc * (ff / 100.0)
+
+
+def _data_quality(patch: Dict[str, Any], warns: List[str]) -> str:
+    """
+    Heuristic quality for upstream (GOOD/OK/BAD).
+    """
+    cur = _to_float(patch.get("current_price"))
+    if cur is not None:
+        return "GOOD"
+
+    # if we have meaningful partials (fundamentals/history), not totally dead
+    for k in ("market_cap", "pe_ttm", "name", "week_52_high", "week_52_low", "returns_1m", "ma50"):
+        if patch.get(k) is not None and str(patch.get(k)).strip() != "":
+            return "OK"
+
+    # if we had only warnings / config issues
+    if warns:
+        return "BAD"
+    return "BAD"
 
 
 # ---------------------------------------------------------------------------
@@ -594,11 +683,12 @@ async def _get_client() -> httpx.AsyncClient:
             timeout = httpx.Timeout(t, connect=min(10.0, t))
             _CLIENT = httpx.AsyncClient(timeout=timeout, headers=_base_headers(), follow_redirects=True)
             logger.info(
-                "EODHD client init v%s | base=%s | timeout=%.1fs | cachetools=%s",
+                "EODHD client init v%s | base=%s | timeout=%.1fs | cachetools=%s | default_exch=%s",
                 PROVIDER_VERSION,
                 _base_url(),
                 t,
                 _HAS_CACHETOOLS,
+                _default_exchange(),
             )
     return _CLIENT
 
@@ -742,233 +832,270 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 
 
 # ---------------------------------------------------------------------------
-# Endpoint fetchers
+# Endpoint fetchers (try variants)
 # ---------------------------------------------------------------------------
-async def _fetch_realtime_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+    """
+    Returns (patch, err, used_symbol)
+    """
     if not _token():
-        return {}, "not configured (EODHD_API_KEY)"
+        return {}, "not configured (EODHD_API_KEY)", None
 
-    url = f"{_base_url()}/real-time/{symbol}"
-    js, err = await _get_json_dict(url, {}, kind="realtime")
-    if js is None:
-        return {}, f"realtime failed: {err}"
+    last_err: Optional[str] = None
+    for sym in (symbol_variants or []):
+        url = f"{_base_url()}/real-time/{sym}"
+        js, err = await _get_json_dict(url, {}, kind="realtime")
+        if js is None:
+            last_err = err
+            # common: try next on 404
+            if err and err.startswith("HTTP 404"):
+                continue
+            # for other errors, still try next variant (cheap), then fail
+            continue
 
-    close = _pick(js, "close", "Close")
-    prev = _pick(js, "previous_close", "previousClose", "PreviousClose", "previousClosePrice")
-    opn = _pick(js, "open", "Open")
-    high = _pick(js, "high", "High")
-    low = _pick(js, "low", "Low")
-    vol = _pick(js, "volume", "Volume")
+        close = _pick(js, "close", "Close", "last", "Last", "price")
+        prev = _pick(js, "previous_close", "previousClose", "PreviousClose", "previousClosePrice", "prev_close", "prevClose")
+        opn = _pick(js, "open", "Open")
+        high = _pick(js, "high", "High")
+        low = _pick(js, "low", "Low")
+        vol = _pick(js, "volume", "Volume")
 
-    chg = _pick(js, "change", "Change")
-    chg_p = _pick(js, "change_p", "ChangePercent", "changePercent", "changePercentages")
+        chg = _pick(js, "change", "Change")
+        chg_p = _pick(js, "change_p", "ChangePercent", "changePercent", "changePercentages", "change_percent")
 
-    patch: Dict[str, Any] = {
-        "current_price": _to_float(close),
-        "previous_close": _to_float(prev),
-        "open": _to_float(opn),
-        "day_high": _to_float(high),
-        "day_low": _to_float(low),
-        "volume": _to_float(vol),
-        "price_change": _to_float(chg),
-        "percent_change": _to_float(chg_p),
-    }
-    return _clean_patch(patch), None
+        patch: Dict[str, Any] = {
+            "current_price": _to_float(close),
+            "previous_close": _to_float(prev),
+            "open": _to_float(opn),
+            "day_high": _to_float(high),
+            "day_low": _to_float(low),
+            "volume": _to_float(vol),
+            "price_change": _to_float(chg),
+            "percent_change": _to_float(chg_p),
+        }
+        return _clean_patch(patch), None, sym
+
+    return {}, f"realtime failed: {last_err or 'unknown'}", None
 
 
-async def _fetch_fundamentals_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+async def _fetch_fundamentals_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     if not _enable_fundamentals():
-        return {}, None
+        return {}, None, None
     if not _token():
-        return {}, "not configured (EODHD_API_KEY)"
+        return {}, "not configured (EODHD_API_KEY)", None
 
-    url = f"{_base_url()}/fundamentals/{symbol}"
-    js, err = await _get_json_dict(url, {}, kind="fundamentals")
-    if js is None:
-        return {}, f"fundamentals failed: {err}"
+    last_err: Optional[str] = None
+    for sym in (symbol_variants or []):
+        url = f"{_base_url()}/fundamentals/{sym}"
+        js, err = await _get_json_dict(url, {}, kind="fundamentals")
+        if js is None:
+            last_err = err
+            if err and err.startswith("HTTP 404"):
+                continue
+            continue
 
-    general = js.get("General") or {}
-    highlights = js.get("Highlights") or {}
-    valuation = js.get("Valuation") or {}
-    technicals = js.get("Technicals") or {}
-    shares = js.get("SharesStats") or {}
+        general = js.get("General") or {}
+        highlights = js.get("Highlights") or {}
+        valuation = js.get("Valuation") or {}
+        technicals = js.get("Technicals") or {}
+        shares = js.get("SharesStats") or {}
 
-    patch: Dict[str, Any] = {}
+        patch: Dict[str, Any] = {}
 
-    patch["name"] = (general.get("Name") or general.get("LongName") or "") or ""
-    patch["sector"] = (general.get("Sector") or "") or ""
-    patch["industry"] = (general.get("Industry") or "") or ""
-    patch["sub_sector"] = (general.get("GicSector") or general.get("GicIndustry") or "") or ""
-    patch["currency"] = (general.get("CurrencyCode") or "") or ""
-    patch["listing_date"] = (general.get("IPODate") or "") or ""
-    patch["exchange"] = (general.get("Exchange") or general.get("ExchangeName") or "") or ""
+        patch["name"] = (general.get("Name") or general.get("LongName") or "") or ""
+        patch["sector"] = (general.get("Sector") or "") or ""
+        patch["industry"] = (general.get("Industry") or "") or ""
+        patch["sub_sector"] = (general.get("GicSector") or general.get("GicIndustry") or "") or ""
+        patch["currency"] = (general.get("CurrencyCode") or "") or ""
+        patch["listing_date"] = (general.get("IPODate") or "") or ""
+        patch["exchange"] = (general.get("Exchange") or general.get("ExchangeName") or "") or ""
 
-    mc = _to_float(highlights.get("MarketCapitalization"))
-    mc_mln = _to_float(highlights.get("MarketCapitalizationMln"))
-    if mc is None and mc_mln is not None:
-        mc = mc_mln * 1_000_000.0
-    patch["market_cap"] = mc
+        mc = _to_float(highlights.get("MarketCapitalization"))
+        mc_mln = _to_float(highlights.get("MarketCapitalizationMln"))
+        if mc is None and mc_mln is not None:
+            mc = mc_mln * 1_000_000.0
+        patch["market_cap"] = mc
 
-    patch["eps_ttm"] = _to_float(highlights.get("EarningsShare"))
-    patch["pe_ttm"] = _to_float(highlights.get("PERatio"))
-    patch["pb"] = _to_float(valuation.get("PriceBookMRQ") or highlights.get("PriceBook"))
-    patch["ps"] = _to_float(valuation.get("PriceSalesTTM") or highlights.get("PriceSalesTTM"))
-    patch["ev_ebitda"] = _to_float(valuation.get("EnterpriseValueEbitda") or highlights.get("EVToEBITDA"))
+        patch["eps_ttm"] = _to_float(highlights.get("EarningsShare"))
+        patch["pe_ttm"] = _to_float(highlights.get("PERatio"))
+        patch["pb"] = _to_float(valuation.get("PriceBookMRQ") or highlights.get("PriceBook"))
+        patch["ps"] = _to_float(valuation.get("PriceSalesTTM") or highlights.get("PriceSalesTTM"))
+        patch["ev_ebitda"] = _to_float(valuation.get("EnterpriseValueEbitda") or highlights.get("EVToEBITDA"))
 
-    patch["dividend_yield"] = _to_float(highlights.get("DividendYield"))
-    patch["roe"] = _to_float(highlights.get("ReturnOnEquityTTM"))
-    patch["roa"] = _to_float(highlights.get("ReturnOnAssetsTTM"))
-    patch["net_margin"] = _to_float(highlights.get("ProfitMargin"))
-    patch["beta"] = _to_float(technicals.get("Beta"))
+        patch["dividend_yield"] = _to_float(highlights.get("DividendYield"))
+        patch["roe"] = _to_float(highlights.get("ReturnOnEquityTTM"))
+        patch["roa"] = _to_float(highlights.get("ReturnOnAssetsTTM"))
+        patch["net_margin"] = _to_float(highlights.get("ProfitMargin"))
+        patch["beta"] = _to_float(technicals.get("Beta"))
 
-    patch["week_52_high"] = _to_float(technicals.get("52WeekHigh"))
-    patch["week_52_low"] = _to_float(technicals.get("52WeekLow"))
+        patch["week_52_high"] = _to_float(technicals.get("52WeekHigh"))
+        patch["week_52_low"] = _to_float(technicals.get("52WeekLow"))
 
-    patch["ma50"] = _to_float(technicals.get("50DayMA"))
-    patch["ma20"] = _to_float(technicals.get("20DayMA") or technicals.get("10DayMA"))
-    patch["avg_volume_30d"] = _to_float(technicals.get("AverageVolume"))
+        patch["ma50"] = _to_float(technicals.get("50DayMA"))
+        patch["ma20"] = _to_float(technicals.get("20DayMA") or technicals.get("10DayMA"))
+        patch["avg_volume_30d"] = _to_float(technicals.get("AverageVolume"))
 
-    so = _to_float(
-        _pick(shares, "SharesOutstanding", "SharesOutstandingFloat", "SharesOutstandingEOD")
-        or general.get("SharesOutstanding")
-    )
-    patch["shares_outstanding"] = so
+        so = _to_float(
+            _pick(shares, "SharesOutstanding", "SharesOutstandingFloat", "SharesOutstandingEOD")
+            or general.get("SharesOutstanding")
+        )
+        patch["shares_outstanding"] = so
 
-    float_shares = _to_float(_pick(shares, "SharesFloat", "FloatShares", "SharesOutstandingFloat"))
-    if so and float_shares and so > 0:
-        patch["free_float"] = (float_shares / so) * 100.0
+        float_shares = _to_float(_pick(shares, "SharesFloat", "FloatShares", "SharesOutstandingFloat"))
+        if so and float_shares and so > 0:
+            patch["free_float"] = (float_shares / so) * 100.0
 
-    patch["debt_to_equity"] = _to_float(highlights.get("DebtToEquity"))
-    patch["current_ratio"] = _to_float(highlights.get("CurrentRatio"))
-    patch["quick_ratio"] = _to_float(highlights.get("QuickRatio"))
+        patch["debt_to_equity"] = _to_float(highlights.get("DebtToEquity"))
+        patch["current_ratio"] = _to_float(highlights.get("CurrentRatio"))
+        patch["quick_ratio"] = _to_float(highlights.get("QuickRatio"))
 
-    return _clean_patch(patch), None
+        return _clean_patch(patch), None, sym
+
+    return {}, f"fundamentals failed: {last_err or 'unknown'}", None
 
 
-async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+async def _fetch_history_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     if not _enable_history():
-        return {}, None
+        return {}, None, None
     if not _token():
-        return {}, "not configured (EODHD_API_KEY)"
+        return {}, "not configured (EODHD_API_KEY)", None
 
     days = _history_days()
     to_d = date.today()
     from_d = to_d - timedelta(days=days)
 
-    url = f"{_base_url()}/eod/{symbol}"
-    js_list, err = await _get_json_list(
-        url,
-        {"from": from_d.isoformat(), "to": to_d.isoformat(), "period": "d"},
-        kind="history",
-    )
-    if js_list is None:
-        return {}, f"history failed: {err}"
-
-    closes: List[float] = []
-    last_date: Optional[str] = None
-
-    for it in js_list:
-        if not isinstance(it, dict):
+    last_err: Optional[str] = None
+    for sym in (symbol_variants or []):
+        url = f"{_base_url()}/eod/{sym}"
+        js_list, err = await _get_json_list(
+            url,
+            {"from": from_d.isoformat(), "to": to_d.isoformat(), "period": "d"},
+            kind="history",
+        )
+        if js_list is None:
+            last_err = err
+            if err and err.startswith("HTTP 404"):
+                continue
             continue
-        c = _to_float(it.get("close"))
-        if c is None:
+
+        closes: List[float] = []
+        last_date: Optional[str] = None
+
+        for it in js_list:
+            if not isinstance(it, dict):
+                continue
+            c = _to_float(it.get("close"))
+            if c is None:
+                continue
+            closes.append(float(c))
+            d = it.get("date")
+            if isinstance(d, str) and d.strip():
+                last_date = d.strip()
+
+        closes = closes[-_history_points_max():]
+
+        if len(closes) < 25:
+            last_err = "history returned too few points"
             continue
-        closes.append(float(c))
-        d = it.get("date")
-        if isinstance(d, str) and d.strip():
-            last_date = d.strip()
 
-    closes = closes[-_history_points_max():]
+        analytics = _compute_history_analytics(closes)
+        patch: Dict[str, Any] = {
+            "history_points": len(closes),
+            "history_last_date": last_date or "",
+            "forecast_source": "eodhd_eod",
+        }
+        patch.update(analytics)
+        return _clean_patch(patch), None, sym
 
-    if len(closes) < 25:
-        return {}, "history returned too few points"
-
-    analytics = _compute_history_analytics(closes)
-    patch: Dict[str, Any] = {
-        "history_points": len(closes),
-        "history_last_date": last_date or "",
-        "forecast_source": "eodhd_eod",
-    }
-    patch.update(analytics)
-    return _clean_patch(patch), None
+    return {}, f"history failed: {last_err or 'unknown'}", None
 
 
 # ---------------------------------------------------------------------------
 # Main fetch
 # ---------------------------------------------------------------------------
 async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) -> Dict[str, Any]:
-    sym = (symbol or "").strip()
-    if not sym:
-        return {"error": f"{PROVIDER_NAME}: empty symbol"}
+    sym_in = (symbol or "").strip()
+    if not sym_in:
+        return {"data_source": PROVIDER_NAME, "provider_version": PROVIDER_VERSION, "data_quality": "BAD", "error": "empty symbol"}
 
     # Controlled KSA enablement
-    if _looks_like_ksa(sym) and not _allow_ksa():
-        p = {
-            "symbol": sym,
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-            "error": "warning: KSA blocked for EODHD (set ALLOW_EODHD_KSA=true to enable)",
-            "last_updated_utc": _utc_iso(),
-        }
-        return _clean_patch(p)
+    if _looks_like_ksa(sym_in) and not _allow_ksa():
+        return _clean_patch(
+            {
+                "symbol": sym_in,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "data_quality": "BAD",
+                "provider_blocked": True,
+                "provider_warning": "KSA blocked for EODHD (set ALLOW_EODHD_KSA=true to enable)",
+                "last_updated_utc": _utc_iso(),
+            }
+        )
 
     if not _token():
-        p = {
-            "symbol": sym,
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-            "error": "warning: not configured (EODHD_API_KEY)",
-            "last_updated_utc": _utc_iso(),
-        }
-        return _clean_patch(p)
+        return _clean_patch(
+            {
+                "symbol": sym_in,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "data_quality": "BAD",
+                "provider_unavailable": True,
+                "provider_warning": "not configured (EODHD_API_KEY)",
+                "last_updated_utc": _utc_iso(),
+            }
+        )
+
+    # Build EODHD-compatible variants
+    variants = _provider_symbol_variants(sym_in)
+    if not variants:
+        variants = [sym_in.strip().upper()]
 
     warns: List[str] = []
 
-    # --- realtime (cached) ---
-    ck_q = f"q::{sym}"
+    out: Dict[str, Any] = {
+        "symbol": sym_in,
+        "data_source": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "last_updated_utc": _utc_iso(),
+        "provider_symbol": variants[0],
+    }
+
+    # --- realtime (cached by FIRST variant key; we also store used_symbol in out) ---
+    ck_q = f"q::{variants[0]}"
     hit = _QUOTE_CACHE.get(ck_q)
     if isinstance(hit, dict) and hit:
         rt_patch = dict(hit)
         rt_err = None
+        rt_used = variants[0]
     else:
-        rt_patch, rt_err = await _fetch_realtime_patch(sym)
+        rt_patch, rt_err, rt_used = await _fetch_realtime_patch(variants)
         if rt_patch:
             _QUOTE_CACHE[ck_q] = dict(rt_patch)
 
     if rt_err:
-        # If realtime fails, return warning patch (engine can fallback)
-        p = {
-            "symbol": sym,
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-            "error": f"warning: {PROVIDER_NAME}: {rt_err}",
-            "last_updated_utc": _utc_iso(),
-        }
-        return _clean_patch(p)
-
-    out: Dict[str, Any] = {
-        "symbol": sym,
-        "data_source": PROVIDER_NAME,
-        "provider_version": PROVIDER_VERSION,
-        "last_updated_utc": _utc_iso(),
-    }
+        warns.append(rt_err)
+    if rt_used:
+        out["provider_symbol"] = rt_used
     _merge_into(out, rt_patch)
 
     # --- fundamentals (cached, best-effort) ---
     if want_fundamentals and _enable_fundamentals():
-        ck_f = f"f::{sym}"
+        ck_f = f"f::{variants[0]}"
         hitf = _FUND_CACHE.get(ck_f)
         if isinstance(hitf, dict) and hitf:
             f_patch = dict(hitf)
             f_err = None
+            f_used = variants[0]
         else:
-            f_patch, f_err = await _fetch_fundamentals_patch(sym)
+            f_patch, f_err, f_used = await _fetch_fundamentals_patch(variants)
             if f_patch:
                 _FUND_CACHE[ck_f] = dict(f_patch)
 
         if f_err:
-            warns.append(f"fundamentals: {f_err}")
+            warns.append(f_err)
         else:
+            if f_used:
+                out.setdefault("provider_symbol_fundamentals", f_used)
             _merge_into(
                 out,
                 f_patch,
@@ -988,20 +1115,22 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
 
     # --- history/forecast (cached, best-effort) ---
     if want_history and _enable_history():
-        ck_h = f"h::{sym}::{_history_days()}::{_history_points_max()}"
+        ck_h = f"h::{variants[0]}::{_history_days()}::{_history_points_max()}"
         hith = _HIST_CACHE.get(ck_h)
         if isinstance(hith, dict) and hith:
             h_patch = dict(hith)
             h_err = None
+            h_used = variants[0]
         else:
-            h_patch, h_err = await _fetch_history_patch(sym)
+            h_patch, h_err, h_used = await _fetch_history_patch(variants)
             if h_patch:
                 _HIST_CACHE[ck_h] = dict(h_patch)
 
         if h_err:
-            warns.append(f"history: {h_err}")
+            warns.append(h_err)
         else:
-            # analytics shouldn't overwrite quote/fundamentals
+            if h_used:
+                out.setdefault("provider_symbol_history", h_used)
             for k, v in (h_patch or {}).items():
                 if k not in out and v is not None:
                     out[k] = v
@@ -1010,6 +1139,12 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
         out["_warn"] = " | ".join([w for w in warns if w])
 
     _fill_derived(out)
+    out["data_quality"] = _data_quality(out, warns)
+
+    # Only attach a light warning marker (non-fatal) so upstream doesn’t treat it as hard error
+    if warns:
+        out.setdefault("provider_warning", warns[0])
+
     return _clean_patch(out)
 
 
@@ -1017,12 +1152,12 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
 # Engine-compatible exported callables (name-based discovery)
 # ---------------------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # fast path: realtime only
+    # realtime only (fast)
     return await _fetch(symbol, want_fundamentals=False, want_history=False)
 
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # enriched: realtime + fundamentals + history/forecast (best-effort)
+    # realtime + fundamentals + history/forecast (best-effort)
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
 
