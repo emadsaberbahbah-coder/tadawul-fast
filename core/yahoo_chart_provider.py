@@ -1,8 +1,8 @@
-# core/yahoo_chart_provider.py  (FULL REPLACEMENT)
+# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.1
 """
 core/yahoo_chart_provider.py
 ===========================================================
-Compatibility + Repo-Hygiene Shim — v0.3.0 (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.3.1 (PROD SAFE)
 
 Why this exists
 - The canonical Yahoo Chart provider lives here:
@@ -27,12 +27,13 @@ If canonical import fails
 
 from __future__ import annotations
 
+import inspect
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("core.yahoo_chart_provider_shim")
 
-SHIM_VERSION = "0.3.0"
+SHIM_VERSION = "0.3.1"
 
 # Backward-compat constant (not necessarily used by canonical provider)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
@@ -40,9 +41,12 @@ YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
 def _is_awaitable(x: Any) -> bool:
     try:
-        return hasattr(x, "__await__")
+        return inspect.isawaitable(x)
     except Exception:
-        return False
+        try:
+            return hasattr(x, "__await__")
+        except Exception:
+            return False
 
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -50,6 +54,28 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
     if _is_awaitable(out):
         return await out
     return out
+
+
+async def _call_with_optional_kw(
+    fn: Callable[..., Any],
+    *,
+    kw_name: str,
+    kw_value: Any,
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """
+    Call fn(*args, **kwargs) but with optional kw_name:
+      - try with kw
+      - if TypeError (unexpected kw), retry without it
+    Never raises TypeError outward.
+    """
+    try:
+        k2 = dict(kwargs)
+        k2[kw_name] = kw_value
+        return await _call_maybe_async(fn, *args, **k2)
+    except TypeError:
+        return await _call_maybe_async(fn, *args, **kwargs)
 
 
 def _norm_symbol(symbol: str) -> str:
@@ -71,22 +97,28 @@ def _err_payload(symbol: str, err: str, *, base: Optional[Dict[str, Any]] = None
     return out
 
 
+def _ensure_dict(symbol: str, r: Any, *, err: str = "unexpected return type") -> Dict[str, Any]:
+    if isinstance(r, dict):
+        return r
+    return _err_payload(symbol, err)
+
+
 try:
     # Canonical provider module
     import core.providers.yahoo_chart_provider as _canon  # type: ignore
 
     # Prefer canonical constants if present
-    PROVIDER_VERSION = getattr(_canon, "PROVIDER_VERSION", "unknown")
+    PROVIDER_VERSION = str(getattr(_canon, "PROVIDER_VERSION", "unknown") or "unknown")
 
-    # Provider class (if present)
-    YahooChartProvider = getattr(_canon, "YahooChartProvider")  # type: ignore
+    # Provider class (optional; do not force failure if missing)
+    YahooChartProvider = getattr(_canon, "YahooChartProvider", None)  # type: ignore
 
     # -------- Quote helpers (best-effort mapping) --------
     _get_quote = getattr(_canon, "get_quote", None)
     _fetch_quote = getattr(_canon, "fetch_quote", None)
 
     _fetch_quote_patch = getattr(_canon, "fetch_quote_patch", None)
-    _get_quote_patch = getattr(_canon, "get_quote_patch", None)  # some canon versions used this name
+    _get_quote_patch = getattr(_canon, "get_quote_patch", None)
 
     _fetch_enriched_quote_patch = getattr(_canon, "fetch_enriched_quote_patch", None)
     _fetch_quote_and_enrichment_patch = getattr(_canon, "fetch_quote_and_enrichment_patch", None)
@@ -101,20 +133,37 @@ try:
     # -------- Client closer (optional) --------
     _aclose = getattr(_canon, "aclose_yahoo_chart_client", None)
 
+    # If canonical provider class is missing, provide a thin adapter that uses patch funcs.
+    if YahooChartProvider is None:
+
+        class YahooChartProvider:  # type: ignore
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                return await get_quote_patch(symbol, base)
+
     async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        if callable(_fetch_quote):
-            r = await _call_maybe_async(_fetch_quote, symbol, *args, **kwargs)
-            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
-        if callable(_get_quote):
-            r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
-            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
-        return {"status": "error", "symbol": _norm_symbol(symbol), "error": "canonical provider missing get_quote/fetch_quote"}
+        try:
+            if callable(_fetch_quote):
+                r = await _call_maybe_async(_fetch_quote, symbol, *args, **kwargs)
+                return _ensure_dict(symbol, r)
+            if callable(_get_quote):
+                r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
+                return _ensure_dict(symbol, r)
+            return _err_payload(symbol, "canonical provider missing get_quote/fetch_quote")
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
 
     async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        if callable(_get_quote):
-            r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
-            return r if isinstance(r, dict) else {"status": "error", "symbol": _norm_symbol(symbol), "error": "unexpected return type"}
-        return await fetch_quote(symbol, *args, **kwargs)
+        # Prefer canonical get_quote, else fallback to fetch_quote
+        try:
+            if callable(_get_quote):
+                r = await _call_maybe_async(_get_quote, symbol, *args, **kwargs)
+                return _ensure_dict(symbol, r)
+            return await fetch_quote(symbol, *args, **kwargs)
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
 
     async def get_quote_patch(
         symbol: str,
@@ -122,45 +171,78 @@ try:
         *args: Any,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        # Prefer canonical patch functions if present
-        if callable(_get_quote_patch):
-            r = await _call_maybe_async(_get_quote_patch, symbol, base, *args, **kwargs)
-            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type", base=base)
-        if callable(_fetch_quote_patch):
-            r = await _call_maybe_async(_fetch_quote_patch, symbol, *args, **kwargs)
-            if isinstance(r, dict):
-                out = dict(base or {})
-                out.update(r)
-                return out
-            return _err_payload(symbol, "unexpected return type", base=base)
-        # Fallback: merge get_quote (full quote) into base
-        q = await get_quote(symbol, *args, **kwargs)
-        out = dict(base or {})
-        if isinstance(q, dict):
-            out.update(q)
+        """
+        Returns a PATCH dict suitable for merging into an existing quote dict.
+        When canonical patch exists, prefer it. Else merge full quote.
+        """
+        try:
+            if callable(_get_quote_patch):
+                r = await _call_maybe_async(_get_quote_patch, symbol, base, *args, **kwargs)
+                return _ensure_dict(symbol, r, err="unexpected return type from get_quote_patch")
+            if callable(_fetch_quote_patch):
+                r = await _call_maybe_async(_fetch_quote_patch, symbol, *args, **kwargs)
+                if isinstance(r, dict):
+                    out = dict(base or {})
+                    out.update(r)
+                    return out
+                return _err_payload(symbol, "unexpected return type from fetch_quote_patch", base=base)
+
+            # Fallback: merge get_quote (full quote) into base
+            q = await get_quote(symbol, *args, **kwargs)
+            out = dict(base or {})
+            out.update(q if isinstance(q, dict) else {})
             return out
-        return _err_payload(symbol, "unexpected return type", base=base)
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}", base=base)
 
     # Engine-friendly alias (many engines call this exact name)
     async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        # debug is ignored here; canonical provider may accept it
-        if callable(_fetch_quote_patch):
-            r = await _call_maybe_async(_fetch_quote_patch, symbol, debug=debug, *args, **kwargs)
-            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
-        # fall back to old name mapping
-        return await get_quote_patch(symbol, None, *args, **kwargs)
+        """
+        Returns a patch dict. Tries passing debug=... if canonical accepts it; otherwise retries without.
+        """
+        try:
+            if callable(_fetch_quote_patch):
+                r = await _call_with_optional_kw(
+                    _fetch_quote_patch,
+                    kw_name="debug",
+                    kw_value=debug,
+                    args=(symbol,) + tuple(args),
+                    kwargs=dict(kwargs),
+                )
+                return _ensure_dict(symbol, r, err="unexpected return type from fetch_quote_patch")
+            return await get_quote_patch(symbol, None, *args, **kwargs)
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
 
     async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        if callable(_fetch_enriched_quote_patch):
-            r = await _call_maybe_async(_fetch_enriched_quote_patch, symbol, debug=debug, *args, **kwargs)
-            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
-        return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+        try:
+            if callable(_fetch_enriched_quote_patch):
+                r = await _call_with_optional_kw(
+                    _fetch_enriched_quote_patch,
+                    kw_name="debug",
+                    kw_value=debug,
+                    args=(symbol,) + tuple(args),
+                    kwargs=dict(kwargs),
+                )
+                return _ensure_dict(symbol, r, err="unexpected return type from fetch_enriched_quote_patch")
+            return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
 
     async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        if callable(_fetch_quote_and_enrichment_patch):
-            r = await _call_maybe_async(_fetch_quote_and_enrichment_patch, symbol, debug=debug, *args, **kwargs)
-            return r if isinstance(r, dict) else _err_payload(symbol, "unexpected return type")
-        return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+        try:
+            if callable(_fetch_quote_and_enrichment_patch):
+                r = await _call_with_optional_kw(
+                    _fetch_quote_and_enrichment_patch,
+                    kw_name="debug",
+                    kw_value=debug,
+                    args=(symbol,) + tuple(args),
+                    kwargs=dict(kwargs),
+                )
+                return _ensure_dict(symbol, r, err="unexpected return type from fetch_quote_and_enrichment_patch")
+            return await fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
 
     # Backward compatible alias (older code may call yahoo_chart_quote)
     async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -168,17 +250,20 @@ try:
 
     # -------- History pass-throughs (optional) --------
     async def fetch_price_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
-        if callable(_fetch_price_history):
-            return await _call_maybe_async(_fetch_price_history, symbol, *args, **kwargs)
-        if callable(_fetch_history):
-            return await _call_maybe_async(_fetch_history, symbol, *args, **kwargs)
-        if callable(_fetch_ohlc_history):
-            return await _call_maybe_async(_fetch_ohlc_history, symbol, *args, **kwargs)
-        if callable(_fetch_history_patch):
-            return await _call_maybe_async(_fetch_history_patch, symbol, *args, **kwargs)
-        if callable(_fetch_prices):
-            return await _call_maybe_async(_fetch_prices, symbol, *args, **kwargs)
-        return {}
+        try:
+            if callable(_fetch_price_history):
+                return await _call_maybe_async(_fetch_price_history, symbol, *args, **kwargs)
+            if callable(_fetch_history):
+                return await _call_maybe_async(_fetch_history, symbol, *args, **kwargs)
+            if callable(_fetch_ohlc_history):
+                return await _call_maybe_async(_fetch_ohlc_history, symbol, *args, **kwargs)
+            if callable(_fetch_history_patch):
+                return await _call_maybe_async(_fetch_history_patch, symbol, *args, **kwargs)
+            if callable(_fetch_prices):
+                return await _call_maybe_async(_fetch_prices, symbol, *args, **kwargs)
+            return {}
+        except Exception:
+            return {}
 
     async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Any:
         return await fetch_price_history(symbol, *args, **kwargs)
