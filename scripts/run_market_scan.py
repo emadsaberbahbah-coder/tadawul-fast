@@ -3,7 +3,7 @@
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER (v1.4.0) – Sheets-ready
+TADAWUL FAST BRIDGE – MARKET SCANNER (v1.4.1) – Sheets-ready
 ===========================================================
 
 What this script does
@@ -18,18 +18,23 @@ Defaults (safe)
 - Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
 - Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
 
-Key upgrades (v1.4.0)
-- ✅ Symbols-sheet ID selection:
+Key upgrades (v1.4.0 baseline)
+- Symbols-sheet ID selection:
     * --symbols-sheet-id (read symbols from a specific spreadsheet)
     * default: uses --sheet-id if provided, else DEFAULT_SPREADSHEET_ID (env/settings)
-- ✅ Calls symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not)
-- ✅ Origin map uses normalized symbols (more stable)
-- ✅ Percent normalization: change %, dividend yield %, ROE/ROA %, upside %, expected ROI % (handles 0..1 fractions)
-- ✅ Adds Forecast/History columns (best-effort) if backend returns them:
+- Calls symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not)
+- Origin map uses normalized symbols (more stable)
+- Percent normalization: change %, dividend yield %, ROE/ROA %, upside %, expected ROI % (handles 0..1 fractions)
+- Adds Forecast/History columns (best-effort) if backend returns them:
     returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d, rsi_14,
     expected_price_1m/3m/12m, expected_return_1m/3m/12m, confidence_score, forecast_method, forecast_source
-- ✅ Never crashes on one bad batch; inserts per-symbol error rows for traceability
-- ✅ More defensive backend shape parsing + last-updated field fallbacks
+- Never crashes on one bad batch; inserts per-symbol error rows for traceability
+- More defensive backend shape parsing + last-updated field fallbacks
+
+v1.4.1 patch
+- Adds key alias normalization (KSA/GLOBAL/LEADERS/etc) like dashboard sync.
+- Quotes sheet names for update_values A1 ranges.
+- Adds Forecast Updated (UTC) column (best-effort) if backend returns it.
 
 Usage examples
   python scripts/run_market_scan.py
@@ -64,7 +69,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.4.1"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
@@ -109,7 +114,7 @@ try:
 except Exception as e:
     logger.error("Import failed (symbols_reader): %s", e)
     logger.error("Tip: run from project root where symbols_reader.py exists.")
-    sys.exit(1)
+    raise SystemExit(1)
 
 # Sheets writing is optional
 try:
@@ -195,6 +200,36 @@ def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
         seen.add(ku)
         final.append(ku)
     return final
+
+
+def _canon_key(user_key: str) -> str:
+    """
+    Normalize key / accept common aliases (match dashboard sync behavior).
+    """
+    k = (user_key or "").strip().upper()
+    k = k.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "KSA": "KSA_TADAWUL",
+        "TADAWUL": "KSA_TADAWUL",
+        "KSA_TASI": "KSA_TADAWUL",
+        "GLOBAL": "GLOBAL_MARKETS",
+        "GLOBAL_SHARES": "GLOBAL_MARKETS",
+        "GLOBAL_MARKET": "GLOBAL_MARKETS",
+        "FUNDS": "MUTUAL_FUNDS",
+        "MUTUALFUND": "MUTUAL_FUNDS",
+        "MUTUAL_FUND": "MUTUAL_FUNDS",
+        "FX": "COMMODITIES_FX",
+        "COMMODITIES": "COMMODITIES_FX",
+        "PORTFOLIO": "MY_PORTFOLIO",
+        "MYPORTFOLIO": "MY_PORTFOLIO",
+        "LEADERS": "MARKET_LEADERS",
+        "MARKETLEADERS": "MARKET_LEADERS",
+        "INSIGHTS": "INSIGHTS_ANALYSIS",
+        "INSIGHTS_AI": "INSIGHTS_ANALYSIS",
+        "AI": "INSIGHTS_ANALYSIS",
+    }
+    return aliases.get(k, k)
 
 
 # =============================================================================
@@ -455,17 +490,18 @@ def _symbols_reader_call(key: str, spreadsheet_id: Optional[str]) -> Any:
 
 
 def _read_symbols_for_key(key: str, spreadsheet_id: Optional[str]) -> SymbolBucket:
+    canon = _canon_key(key)
     try:
-        data = _symbols_reader_call(key, spreadsheet_id)
+        data = _symbols_reader_call(canon, spreadsheet_id)
     except Exception as e:
-        return SymbolBucket(key=key, symbols=[], meta={"shape": "error", "error": str(e), "count": 0})
+        return SymbolBucket(key=canon, symbols=[], meta={"shape": "error", "error": str(e), "count": 0, "key_in": key})
 
     if isinstance(data, list):
         syms = _dedupe([str(x) for x in data])
-        return SymbolBucket(key=key, symbols=syms, meta={"shape": "list", "count": len(syms)})
+        return SymbolBucket(key=canon, symbols=syms, meta={"shape": "list", "count": len(syms), "key_in": key})
 
     if not isinstance(data, dict):
-        return SymbolBucket(key=key, symbols=[], meta={"shape": str(type(data)), "count": 0})
+        return SymbolBucket(key=canon, symbols=[], meta={"shape": str(type(data)), "count": 0, "key_in": key})
 
     all_syms = data.get("all")
     if all_syms is None:
@@ -479,8 +515,9 @@ def _read_symbols_for_key(key: str, spreadsheet_id: Optional[str]) -> SymbolBuck
         "ksa_count": len(data.get("ksa") or []) if isinstance(data.get("ksa"), list) else None,
         "global_count": len(data.get("global") or []) if isinstance(data.get("global"), list) else None,
         "meta": meta_raw,
+        "key_in": key,
     }
-    return SymbolBucket(key=key, symbols=syms, meta=meta)
+    return SymbolBucket(key=canon, symbols=syms, meta=meta)
 
 
 def _default_keys() -> List[str]:
@@ -505,7 +542,7 @@ def _call_analysis_batch(
     chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
 
     for idx, c in enumerate(chunks, start=1):
-        payload = {"tickers": c, "symbols": c}  # ✅ always send both (compat)
+        payload = {"tickers": c, "symbols": c}  # always send both (compat)
         logger.info("Backend batch %s/%s | symbols=%s", idx, len(chunks), len(c))
         resp = _post_json(url, payload, timeout=timeout, retries=retries)
         got, err = _extract_result_list(resp)
@@ -606,6 +643,7 @@ DEFAULT_HEADERS: List[str] = [
     "Forecast Confidence",
     "Forecast Method",
     "Forecast Source",
+    "Forecast Updated (UTC)",
 
     "Data Quality",
     "Sources",
@@ -664,8 +702,10 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
         "updatedAt",
         "timestamp_utc",
     )
+    if not last_updated:
+        last_updated = _utc_now_iso()
 
-    # History/Forecast best-effort fields (provider patches / engine analytics)
+    # History/Forecast best-effort fields
     returns_1w = _first_present(r, "returns_1w")
     returns_1m = _first_present(r, "returns_1m")
     returns_3m = _first_present(r, "returns_3m")
@@ -690,6 +730,7 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
     conf = _first_present(r, "confidence_score", "forecast_confidence", "confidence")
     f_method = _first_present(r, "forecast_method")
     f_source = _first_present(r, "forecast_source", "forecast_provider", "forecast_data_source")
+    f_updated = _first_present(r, "forecast_updated_utc", "forecast_updated", "forecast_timestamp_utc")
 
     return [
         rank,
@@ -729,7 +770,7 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
         ma20,
         ma50,
         ma200,
-        _as_percent(vol30),  # already % in our providers, but normalize defensively
+        _as_percent(vol30),
         rsi14,
         fp_1m,
         _as_percent(er_1m),
@@ -740,6 +781,7 @@ def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
         conf,
         f_method,
         f_source,
+        f_updated,
 
         _first_present(r, "data_quality"),
         sources_str,
@@ -833,7 +875,7 @@ def _write_grid(
     # 3) update_values(spreadsheet_id, a1_range, values, value_input=?)
     fn3 = getattr(sheets_service, "update_values", None)
     if callable(fn3):
-        a1 = f"{sheet_name}!{start_cell}"
+        a1 = f"{_safe_sheet_name(sheet_name)}!{start_cell}"
         updated = fn3(spreadsheet_id, a1, grid, value_input=vi)  # type: ignore
         try:
             return int(updated or 0)
@@ -916,10 +958,9 @@ def main() -> None:
 
     logger.info("MarketScan v%s | backend=%s | endpoint=%s | ts=%s", SCRIPT_VERSION, base_url, endpoint, _utc_now_iso())
 
-    # Keys
-    keys = _parse_keys_list(args.keys)
-    if not keys:
-        keys = _default_keys()
+    # Keys (with alias normalization)
+    keys_raw = _parse_keys_list(args.keys)
+    keys = [_canon_key(k) for k in (keys_raw or _default_keys())]
 
     # Determine spreadsheet IDs
     write_sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
@@ -937,21 +978,21 @@ def main() -> None:
 
     for k in keys:
         b = _read_symbols_for_key(k, symbols_sheet_id)
-        per_key_meta[k] = b.meta
+        per_key_meta[b.key] = b.meta
 
         syms_norm = _dedupe(b.symbols)
         all_symbols.extend(syms_norm)
 
         for s in syms_norm:
             origin_map.setdefault(s, [])
-            if k not in origin_map[s]:
-                origin_map[s].append(k)
+            if b.key not in origin_map[s]:
+                origin_map[s].append(b.key)
 
     all_symbols = _dedupe(all_symbols)
 
     if args.ksa_only and args.global_only:
         logger.error("You cannot use --ksa-only and --global-only together.")
-        sys.exit(2)
+        raise SystemExit(2)
 
     if args.ksa_only:
         all_symbols = [s for s in all_symbols if _is_ksa(s)]
@@ -963,7 +1004,7 @@ def main() -> None:
 
     if not all_symbols:
         logger.warning("No symbols found after filtering. keys=%s meta=%s", keys, per_key_meta)
-        sys.exit(0)
+        raise SystemExit(0)
 
     logger.info("Symbols loaded: %s | keys=%s | symbols_sheet_id=%s", len(all_symbols), keys, "SET" if symbols_sheet_id else "NOT SET")
 
@@ -1050,11 +1091,11 @@ def main() -> None:
     # Sheets write
     if sheets_service is None:
         logger.error("google_sheets_service not importable; cannot write to sheet. Use --no-sheet.")
-        sys.exit(2)
+        raise SystemExit(2)
 
     if not write_sheet_id:
         logger.error("Spreadsheet ID missing for WRITE. Set DEFAULT_SPREADSHEET_ID or pass --sheet-id, or use --no-sheet.")
-        sys.exit(2)
+        raise SystemExit(2)
 
     sheet_name = (args.sheet_name or "Market_Scan").strip()
     start_cell = _validate_start_cell(str(args.start_cell or "A5"))
@@ -1085,7 +1126,7 @@ def main() -> None:
         logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
     except Exception as e:
         logger.error("❌ Sheet write failed: %s", e)
-        sys.exit(2)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
