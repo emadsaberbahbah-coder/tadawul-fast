@@ -1,18 +1,18 @@
-# routes/enriched_quote.py
+# routes/enriched_quote.py  (FULL REPLACEMENT)
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.0
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.1
 
-What’s fixed / improved in v5.6.0
-- ✅ Prefers core.symbols.normalize.normalize_symbol (new shared normalizer) instead of importing engine for normalization
-- ✅ status auto-infers to "error" when payload contains error / BAD quality (prevents hiding failures as ok)
-- ✅ Keeps v5.5.1 guarantees:
-    • always HTTP 200 with {status,...}
-    • token guard unchanged
-    • reco enum enforced
-    • variant rescue for Global/KSA symbols
-    • batch alignment hardened
+What’s fixed / improved in v5.6.1
+- ✅ Prefers core.symbols.normalize.normalize_symbol (shared normalizer) with safe fallback
+- ✅ Always HTTP 200 with {status,...} (no FastAPI exceptions for auth/symbol errors)
+- ✅ Token guard unchanged (X-APP-TOKEN / Authorization: Bearer / optional ?token when ALLOW_QUERY_TOKEN=1)
+- ✅ status auto-infers "error" when payload contains error / BAD quality
+- ✅ Recommendation enum enforced (BUY/HOLD/REDUCE/SELL)
+- ✅ Variant rescue for Global/KSA symbols (AAPL <-> AAPL.US, 1120 <-> 1120.SR)
+- ✅ Batch alignment hardened (list/dict responses)
+- ✅ Provenance normalization: fills data_source/data_quality from common provider keys
 
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
@@ -23,6 +23,7 @@ Endpoints
 from __future__ import annotations
 
 import inspect
+import importlib
 import os
 import re
 import traceback
@@ -34,7 +35,7 @@ from fastapi import APIRouter, Header, Query, Request
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.6.0"
+ENRICHED_ROUTE_VERSION = "5.6.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -105,6 +106,13 @@ def _is_ksa(sym: str) -> bool:
         return True
     # allow naked digits as KSA
     return s.isdigit()
+
+
+def _norm_str(x: Any) -> str:
+    try:
+        return (str(x) if x is not None else "").strip()
+    except Exception:
+        return ""
 
 
 # =============================================================================
@@ -252,7 +260,7 @@ def _normalize_recommendation(x: Any) -> Optional[str]:
     s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
 
     buy_like = {"STRONG BUY", "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "OVERWEIGHT", "LONG"}
-    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT"}
+    hold_like = {"HOLD", "NEUTRAL", "MAINTAIN", "MARKET PERFORM", "EQUAL WEIGHT", "WAIT", "KEEP"}
     reduce_like = {"REDUCE", "TRIM", "LIGHTEN", "UNDERWEIGHT", "PARTIAL SELL", "TAKE PROFIT", "TAKE PROFITS"}
     sell_like = {"SELL", "STRONG SELL", "EXIT", "AVOID", "UNDERPERFORM", "SHORT"}
 
@@ -293,15 +301,8 @@ def _ensure_reco(payload: Any) -> Any:
 
 
 # =============================================================================
-# Provenance normalization (fix data_source: none when provider returns alt keys)
+# Provenance normalization
 # =============================================================================
-def _norm_str(x: Any) -> str:
-    try:
-        return (str(x) if x is not None else "").strip()
-    except Exception:
-        return ""
-
-
 def _ensure_provenance(d: Dict[str, Any], *, engine_source: str) -> Dict[str, Any]:
     """
     Normalize common provider keys to:
@@ -320,7 +321,9 @@ def _ensure_provenance(d: Dict[str, Any], *, engine_source: str) -> Dict[str, An
         or out.get("quote_source")
     )
     ds_s = _norm_str(ds)
-    if ds_s.lower() in ("none", "null", "na", "n/a"):
+    if ds_s.lower() in ("null", "na", "n/a"):
+        ds_s = ""
+    if ds_s.lower() == "none":
         ds_s = "none"
     if ds_s:
         out["data_source"] = ds_s
@@ -461,11 +464,12 @@ async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str
     """
     Prefer app.state.engine.
     Fallback: core.data_engine_v2.get_engine() singleton (preferred).
-    Last fallback: instantiate DataEngineV2/DataEngine (rare).
+    Last fallback: instantiate DataEngineV2/DataEngine.
     """
     # 1) app.state.engine
     try:
-        eng = getattr(request.app.state, "engine", None)
+        st = getattr(request.app, "state", None)
+        eng = getattr(st, "engine", None) if st else None
         if eng is not None:
             return eng, "app.state.engine"
     except Exception:
@@ -473,27 +477,25 @@ async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str
 
     # 2) singleton engine (preferred)
     try:
-        from core.data_engine_v2 import get_engine  # type: ignore
-
-        eng = await _maybe_await(get_engine())
-        return eng, "core.data_engine_v2.get_engine()"
+        m = importlib.import_module("core.data_engine_v2")
+        get_engine = getattr(m, "get_engine", None)
+        if callable(get_engine):
+            eng = await _maybe_await(get_engine())
+            return eng, "core.data_engine_v2.get_engine()"
     except Exception:
         pass
 
     # 3) last resort instantiation
     try:
-        from core.data_engine_v2 import DataEngineV2 as _V2  # type: ignore
-
-        return _V2(), "core.data_engine_v2.DataEngineV2()"
+        m = importlib.import_module("core.data_engine_v2")
+        for cls_name in ("DataEngineV2", "DataEngine"):
+            cls = getattr(m, cls_name, None)
+            if cls is not None:
+                return cls(), f"core.data_engine_v2.{cls_name}()"
     except Exception:
         pass
 
-    try:
-        from core.data_engine_v2 import DataEngine as _V2Compat  # type: ignore
-
-        return _V2Compat(), "core.data_engine_v2.DataEngine()"
-    except Exception:
-        return None, "none"
+    return None, "none"
 
 
 def _call_engine_method_best_effort(
@@ -506,7 +508,7 @@ def _call_engine_method_best_effort(
 ) -> Any:
     """
     Tries common method signatures in a safe order, WITHOUT assuming the engine API.
-    Adds an optional hint kw (e.g. "market_hint") best-effort.
+    Adds an optional hint kw (e.g. market_hint) best-effort.
     Returns raw result (may be awaitable).
     """
     fn = getattr(eng, method_name, None)
@@ -604,7 +606,6 @@ def _call_engine_batch_best_effort(
             except TypeError:
                 pass
 
-        # final fallback call (still TypeError-safe)
         try:
             return name, fn(symbols)
         except TypeError:
@@ -661,7 +662,6 @@ def _symbol_variants(sym_norm: str) -> List[str]:
         if base:
             out.append(base)
     else:
-        # only add .US for plain tickers (no dot)
         if "." not in u:
             out.append(f"{u}.US")
 
@@ -682,9 +682,7 @@ def _market_hint_for(sym_norm: str) -> str:
 
 
 def _looks_ok(d: Dict[str, Any]) -> bool:
-    """
-    Best-effort 'did we get real data?'
-    """
+    """Best-effort: did we get real data?"""
     st = _norm_str(d.get("status")).lower()
     if st and st != "ok":
         return False
@@ -697,7 +695,7 @@ def _looks_ok(d: Dict[str, Any]) -> bool:
         except Exception:
             continue
 
-    for k in ("name", "market_cap", "currency", "exchange", "timestamp", "time_utc", "updated_at", "last_updated_utc"):
+    for k in ("name", "market_cap", "currency", "exchange", "time_utc", "updated_at", "last_updated_utc"):
         if _norm_str(d.get(k)):
             return True
 
@@ -706,15 +704,21 @@ def _looks_ok(d: Dict[str, Any]) -> bool:
 
 def _needs_rescue(d: Dict[str, Any]) -> bool:
     """
-    When batch returns data_source='none' (or missing) and/or status error, try variants per-symbol.
+    When response looks weak or indicates errors, try variants per-symbol.
     """
     st = _norm_str(d.get("status")).lower()
     if st and st != "ok":
         return True
 
+    if _norm_str(d.get("error")):
+        return True
+
+    dq = _norm_str(d.get("data_quality")).upper()
+    if dq == "BAD":
+        return True
+
     ds = _norm_str(d.get("data_source")).lower()
     if ds in ("none", "null"):
-        # rescue only if also looks weak (avoid pointless extra calls if data is actually OK)
         return not _looks_ok(d)
 
     if (not ds) and (not _looks_ok(d)):
@@ -750,9 +754,7 @@ async def _get_one_quote_with_variants(
     fields: Optional[str],
     debug: bool,
 ) -> Dict[str, Any]:
-    """
-    Try symbol variants until we get a good result.
-    """
+    """Try symbol variants until we get a good result."""
     hint = _market_hint_for(sym_norm)
     attempts: List[Dict[str, Any]] = []
 
@@ -809,7 +811,6 @@ async def _get_one_quote_with_variants(
                 last = out
                 continue
 
-            # non-dict payload: wrap
             wrapped = {
                 "status": "ok",
                 "symbol": s_try,
@@ -878,7 +879,7 @@ async def enriched_quote(
         return _ensure_status_dict({"status": "error", "error": "Engine not available"}, symbol=sym_norm, engine_source=eng_src)
 
     try:
-        out = await _get_one_quote_with_variants(
+        return await _get_one_quote_with_variants(
             eng=eng,
             eng_src=eng_src,
             sym_norm=sym_norm,
@@ -886,7 +887,6 @@ async def enriched_quote(
             fields=fields,
             debug=dbg,
         )
-        return out
     except Exception as e:
         resp: Dict[str, Any] = {
             "status": "error",
@@ -956,7 +956,7 @@ async def enriched_quotes(
     items: List[Dict[str, Any]] = []
 
     try:
-        # Batch attempt (best-effort). Use GLOBAL hint because list can mix; engine should ignore if not supported.
+        # Batch attempt (best-effort). Use GLOBAL hint because list can mix; engine should ignore if unsupported.
         method_used, raw_batch = _call_engine_batch_best_effort(
             eng,
             syms,
@@ -979,7 +979,13 @@ async def enriched_quotes(
                     elif it is None:
                         shaped.append(
                             _ensure_status_dict(
-                                {"status": "error", "symbol": sym_i, "engine_source": eng_src, "error": "Missing item in batch list", "recommendation": "HOLD"},
+                                {
+                                    "status": "error",
+                                    "symbol": sym_i,
+                                    "engine_source": eng_src,
+                                    "error": "Missing item in batch list",
+                                    "recommendation": "HOLD",
+                                },
                                 symbol=sym_i,
                                 engine_source=eng_src,
                             )
@@ -1031,7 +1037,13 @@ async def enriched_quotes(
                     elif v is None:
                         shaped2.append(
                             _ensure_status_dict(
-                                {"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response", "recommendation": "HOLD"},
+                                {
+                                    "status": "error",
+                                    "symbol": s,
+                                    "engine_source": eng_src,
+                                    "error": "Missing in batch response",
+                                    "recommendation": "HOLD",
+                                },
                                 symbol=s,
                                 engine_source=eng_src,
                             )
