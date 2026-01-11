@@ -1,20 +1,21 @@
-# core/data_engine_v2.py  (FULL REPLACEMENT)
+# core/data_engine_v2.py
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.10.0) — PROD SAFE + ROUTER FRIENDLY
-Fixes: Global output returning data_source=none / BAD due to:
-  - missing provider function discovery (eodhd exports patch-style fn names)
-  - weak symbol normalization for EODHD (AAPL -> AAPL.US)
-  - provider call signature mismatch (ticker vs symbol, positional vs kwargs)
+UNIFIED DATA ENGINE (v2.10.1) — PROD SAFE + ROUTER FRIENDLY
+
+Fixes (Global returning data_source=none / BAD):
+- ✅ Provider function discovery supports patch-style exports (eodhd_provider)
+- ✅ Uses shared symbol normalization (core/symbols/normalize.py) when present
+- ✅ Provider call signature mismatch hardened (symbol/ticker kw + positional + kwargs)
+- ✅ Never raises: always returns a dict placeholder on failure
 
 Key guarantees
 - ✅ PROD SAFE: no network at import-time
-- ✅ Never raises: always returns dict placeholder on failure
 - ✅ Global routing: EODHD primary (best-effort), then Finnhub
-- ✅ KSA routing: Yahoo (chart/provider) primary, then Argaam (+ Tadawul if configured)
+- ✅ KSA routing: Yahoo primary, then Argaam (+ Tadawul if configured)
 - ✅ Forecast-ready: fills Forecast Price/Expected ROI/Confidence/Updated
-- ✅ History analytics: returns/vol/MA/RSI (best-effort)
+- ✅ History analytics: returns/vol/MA/RSI (best-effort when raw history exists)
 - ✅ Scores + Recommendation + Badges (BUY/HOLD/REDUCE/SELL)
 - ✅ Riyadh timestamps
 
@@ -26,26 +27,24 @@ Environment knobs (optional)
 - ENGINE_CONCURRENCY                     (default 12)
 - ENGINE_INCLUDE_WARNINGS=true|false     (default false)
 - KEEP_RAW_HISTORY=true|false            (default false)
-
-Notes
-- This engine returns a stable dict schema; routers may add status/route_version.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 import math
 import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.10.0"
+ENGINE_VERSION = "2.10.1"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -57,7 +56,6 @@ _TD_1M = 21
 _TD_3M = 63
 _TD_6M = 126
 _TD_12M = 252
-
 
 # ---------------------------------------------------------------------------
 # TTLCache (best-effort) with fallback
@@ -247,6 +245,10 @@ def _is_ksa(symbol: str) -> bool:
 
 
 def _fallback_normalize_symbol(symbol: str) -> str:
+    """
+    Fallback normalizer (only used if core.symbols.normalize is missing).
+    IMPORTANT: do NOT force ".US" here; providers (EODHD) already try variants.
+    """
     s = (symbol or "").strip().upper()
     if not s:
         return ""
@@ -257,30 +259,29 @@ def _fallback_normalize_symbol(symbol: str) -> str:
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
 
-    # indices / fx / futures / crypto pairs etc (do not append .US)
-    if any(ch in s for ch in ("^", "=", "-", "/")):
+    # indices / fx / futures etc: passthrough
+    if any(ch in s for ch in ("^", "=", "/")) or s.endswith("=X") or s.endswith("=F"):
         return s
 
+    # KSA
     if s.isdigit() or re.fullmatch(r"\d{3,6}", s):
         return f"{s}.SR"
-
-    if s.endswith(".SR") or s.endswith(".US"):
+    if s.endswith(".SR"):
         return s
 
+    # Keep explicit exchange suffixes (AAPL.US, VOD.L, etc.)
     if "." in s:
         return s
 
-    # default global equity
-    return f"{s}.US"
+    # global equity: keep plain ticker
+    return s
 
 
 def normalize_symbol(symbol: str) -> str:
     """
     Preferred symbol normalizer:
-    - If core.symbols.normalize.normalize_symbol exists, uses it.
-    - Otherwise uses fallback:
-        AAPL -> AAPL.US
-        1120 -> 1120.SR
+    - Uses core.symbols.normalize.normalize_symbol if present.
+    - Else uses fallback.
     """
     try:
         from core.symbols.normalize import normalize_symbol as _ext  # type: ignore
@@ -294,23 +295,19 @@ def normalize_symbol(symbol: str) -> str:
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
     """
     Provider-specific symbol mapping:
-    - Finnhub usually expects plain tickers (AAPL) rather than AAPL.US
-    - Yahoo often expects plain tickers too, but KSA paths use .SR already
+    - Finnhub typically expects plain tickers (AAPL) rather than AAPL.US
+    - Yahoo: same
+    - EODHD: accepts AAPL or AAPL.US; its provider will try variants and add .US
     """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
 
     if k in {"finnhub"}:
-        if s.endswith(".US"):
-            return s[:-3]
-        return s
+        return s[:-3] if s.endswith(".US") else s
 
     if k.startswith("yahoo") or k in {"yfinance"}:
-        if s.endswith(".US"):
-            return s[:-3]
-        return s
+        return s[:-3] if s.endswith(".US") else s
 
-    # eodhd and others: keep normalized (AAPL.US)
     return s
 
 
@@ -332,7 +329,7 @@ def _is_tuple2(x: Any) -> bool:
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     out = fn(*args, **kwargs)
-    if asyncio.iscoroutine(out):
+    if inspect.isawaitable(out):
         return await out
     return out
 
@@ -340,7 +337,6 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
 def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
     """
     Try common signatures without assuming provider API.
-    Order: positional-first, then keyword variants.
     """
     # positional + kwargs
     try:
@@ -383,7 +379,6 @@ def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: boo
         except TypeError:
             pass
 
-    # last resort: let exception bubble to caller wrapper
     return fn(symbol)
 
 
@@ -537,7 +532,7 @@ def _tadawul_configured() -> bool:
     return bool(tq or tf)
 
 
-def _dedup_preserve(items: List[str]) -> List[str]:
+def _dedup_preserve(items: Sequence[str]) -> List[str]:
     out: List[str] = []
     seen = set()
     for x in items:
@@ -631,13 +626,7 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                         out.append((ts, fv))
                     continue
                 if isinstance(item, dict):
-                    ts = _to_epoch_seconds(
-                        item.get("t")
-                        or item.get("timestamp")
-                        or item.get("time")
-                        or item.get("date")
-                        or item.get("datetime")
-                    )
+                    ts = _to_epoch_seconds(item.get("t") or item.get("timestamp") or item.get("time") or item.get("date") or item.get("datetime"))
                     fv = _safe_float(item.get("c") or item.get("close") or item.get("adjClose") or item.get("adj_close"))
                     if ts is not None and fv is not None:
                         out.append((ts, fv))
@@ -1254,6 +1243,7 @@ class DataEngine:
             "symbol": sym_norm,
             "symbol_normalized": sym_norm,
             "symbol_input": (symbol_input or "").strip(),
+            "market": "KSA" if _is_ksa(sym_norm) else "GLOBAL",
             "last_updated_utc": _utc_iso(),
             "last_updated_riyadh": _riyadh_iso(),
         }
@@ -1282,16 +1272,15 @@ class DataEngine:
             )
 
             if patch:
-                # Treat provider 'error' as warning unless it's hard and no price came
+                # treat provider "error" as warning unless we still have no price at the end
                 p_err = patch.get("error")
                 if isinstance(p_err, str) and p_err.strip():
-                    if p_err.strip().lower().startswith(("warning", "warn")):
-                        warnings.append(f"{key}: {p_err.strip()}")
-                        try:
-                            patch = dict(patch)
-                            patch.pop("error", None)
-                        except Exception:
-                            pass
+                    warnings.append(f"{key}: {p_err.strip()}")
+                    try:
+                        patch = dict(patch)
+                        patch.pop("error", None)
+                    except Exception:
+                        pass
 
                 _merge_patch(out, patch)
 
@@ -1339,27 +1328,29 @@ class DataEngine:
 
     def _placeholder(self, symbol_input: str, err: str) -> Dict[str, Any]:
         sym_norm = normalize_symbol(symbol_input or "")
+        now_utc = _utc_iso()
+        now_riy = _riyadh_iso()
         return {
             "symbol": sym_norm or (symbol_input or ""),
             "symbol_normalized": sym_norm or (symbol_input or ""),
             "symbol_input": (symbol_input or "").strip(),
+            "market": "KSA" if _is_ksa(sym_norm) else "GLOBAL",
             "current_price": None,
             "data_source": "none",
             "data_quality": "BAD",
             "error": err,
             "recommendation": "HOLD",
             "badges": [],
-            "last_updated_utc": _utc_iso(),
-            "last_updated_riyadh": _riyadh_iso(),
-            "forecast_updated_utc": _utc_iso(),
-            "forecast_updated_riyadh": _riyadh_iso(),
+            "last_updated_utc": now_utc,
+            "last_updated_riyadh": now_riy,
+            "forecast_updated_utc": now_utc,
+            "forecast_updated_riyadh": now_riy,
             "forecast_confidence": 0.20,
         }
 
 
 # Back-compat alias names
 DataEngineV2 = DataEngine
-
 
 # ============================================================
 # Singleton accessor (preferred by main.py)
