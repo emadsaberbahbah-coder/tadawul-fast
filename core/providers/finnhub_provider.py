@@ -2,7 +2,7 @@
 """
 core/providers/finnhub_provider.py
 ============================================================
-Finnhub Provider (GLOBAL enrichment fallback) — v2.0.0
+Finnhub Provider (GLOBAL enrichment fallback) — v2.1.0
 (PROD SAFE + ENGINE PATCH + CUSTOM HEADERS + HISTORY/FORECAST + CLIENT REUSE)
 
 Role
@@ -10,20 +10,18 @@ Role
 - KSA symbols are explicitly rejected to prevent wrong routing.
 - Yahoo-special symbols (^GSPC, GC=F, EURUSD=X, etc.) are rejected per your routing design.
 
-What’s improved vs v1.7.0
-- ✅ Customized headers (base + per-endpoint overrides):
-    FINNHUB_HEADERS_JSON
-    FINNHUB_HEADERS_QUOTE_JSON
-    FINNHUB_HEADERS_PROFILE_JSON
-    FINNHUB_HEADERS_HISTORY_JSON
-- ✅ Provider-level TTL caches separated by type (quote/profile/history) with different TTLs
-- ✅ Retry/backoff on 429 + transient 5xx
-- ✅ Optional history analytics + forecast (momentum-style) from /stock/candle
-    Adds: returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d (annualized %), rsi_14,
-          expected_return_1m/3m/12m, expected_price_1m/3m/12m, confidence_score,
-          forecast_method, history_points, history_last_ts
-- ✅ Strict “clean patch” policy (no noisy empties)
-- ✅ Never crashes if env is missing or invalid; returns {"error": "..."} for fallback logic
+What’s improved vs v2.0.0
+- ✅ Uses shared canonical symbol normalizer when available (core.symbols.normalize)
+    - Accepts canonical inputs like AAPL.US and converts to Finnhub-required "AAPL"
+    - Keeps non-US exchange suffixes (e.g., VOD.L) as-is
+- ✅ Adds stable provenance fields: provider="finnhub", data_source="finnhub", provider_version
+- ✅ Adds Sheets-friendly forecast alias fields (keeps originals too):
+    • forecast_price_1m/3m/12m  (alias of expected_price_*)
+    • expected_roi_pct_1m/3m/12m (alias of expected_return_*)
+    • forecast_confidence       (alias of confidence_score)
+    • forecast_updated_utc      (ISO UTC derived from history_last_ts when available)
+- ✅ Avoids treating numeric 0 as “empty” when merging patches
+- ✅ Adds history_last_utc + forecast_source="finnhub_candle" when history is present
 
 Env vars (supported)
 Auth/Base
@@ -66,6 +64,7 @@ Exports
 
 Notes
 - Forecast is a simple momentum-style estimate (non-investment advice).
+- Returns {"error": "..."} for routing/fallback logic; never crashes on missing env.
 """
 
 from __future__ import annotations
@@ -86,7 +85,7 @@ import httpx
 
 logger = logging.getLogger("core.providers.finnhub_provider")
 
-PROVIDER_VERSION = "2.0.0"
+PROVIDER_VERSION = "2.1.0"
 PROVIDER_NAME = "finnhub"
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
@@ -106,6 +105,26 @@ USER_AGENT_DEFAULT = (
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
 
+# ---------------------------------------------------------------------------
+# Optional shared normalizer (PROD SAFE)
+# ---------------------------------------------------------------------------
+
+
+def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
+    """
+    Returns (normalize_symbol, looks_like_ksa) if available; else (None, None).
+    Never raises.
+    """
+    try:
+        from core.symbols.normalize import normalize_symbol as _ns  # type: ignore
+        from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
+
+        return _ns, _lk
+    except Exception:
+        return None, None
+
+
+_SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
 
 # ---------------------------------------------------------------------------
 # TTL cache (import-safe if cachetools missing)
@@ -338,37 +357,85 @@ async def aclose_finnhub_client() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Symbol rules
+# Symbol rules / normalization
 # ---------------------------------------------------------------------------
 _KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 
-def _is_ksa_symbol(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
+def _looks_like_ksa(symbol: str) -> bool:
+    s = (symbol or "").strip()
     if not s:
         return False
-    if s.endswith(".SR"):
+    if callable(_SHARED_LOOKS_KSA):
+        try:
+            return bool(_SHARED_LOOKS_KSA(s))
+        except Exception:
+            pass
+    u = s.strip().upper()
+    if u.endswith(".SR"):
         return True
-    return bool(_KSA_RE.match(s))
+    return bool(_KSA_RE.match(u))
 
 
 def _is_yahoo_special(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    if not s:
+    u = (symbol or "").strip().upper()
+    if not u:
         return False
-    # Yahoo "special" set often includes characters that Finnhub won't accept as symbol
-    if any(ch in s for ch in ("^", "=", "/")):
+    # Indices/FX/futures and other Yahoo "special" forms
+    if "^" in u:
         return True
-    if s.endswith("=X"):
+    if "=" in u:
+        return True
+    if "/" in u:
+        return True
+    if u.endswith("=X"):
         return True
     return False
 
 
-def _normalize_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if s.endswith(".US"):
-        s = s[:-3]
-    return s
+def _strip_prefix_wrapper(s: str) -> str:
+    """
+    Accepts e.g. "NASDAQ:AAPL" -> "AAPL"
+    Keep it conservative: only strip a single "WORD:" prefix.
+    """
+    u = (s or "").strip()
+    if not u:
+        return ""
+    if ":" in u:
+        left, right = u.split(":", 1)
+        if left and right and left.replace("_", "").replace("-", "").isalnum():
+            return right.strip()
+    return u.strip()
+
+
+def _to_finnhub_symbol(raw: str) -> str:
+    """
+    Finnhub typically expects:
+      - US equities: "AAPL" (NOT "AAPL.US")
+      - Other exchanges often: "VOD.L", "VOW3.DE", etc. (keep suffix)
+    """
+    s = _strip_prefix_wrapper(raw).strip()
+    if not s:
+        return ""
+
+    # Prefer shared canonical normalize if available (accept AAPL -> AAPL.US)
+    if callable(_SHARED_NORMALIZE):
+        try:
+            s = str(_SHARED_NORMALIZE(s) or s).strip()
+        except Exception:
+            s = s.strip()
+
+    u = s.strip().upper()
+
+    # Never allow KSA routed here
+    if _looks_like_ksa(u):
+        return ""
+
+    # Strip only .US (canonical default exchange) for Finnhub
+    if u.endswith(".US"):
+        u = u[:-3].strip()
+
+    return u
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +632,44 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     return out
 
 
+def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p or {})
+
+    # price aliases
+    if "expected_price_1m" in out and "forecast_price_1m" not in out:
+        out["forecast_price_1m"] = out.get("expected_price_1m")
+    if "expected_price_3m" in out and "forecast_price_3m" not in out:
+        out["forecast_price_3m"] = out.get("expected_price_3m")
+    if "expected_price_12m" in out and "forecast_price_12m" not in out:
+        out["forecast_price_12m"] = out.get("expected_price_12m")
+
+    # ROI aliases
+    if "expected_return_1m" in out and "expected_roi_pct_1m" not in out:
+        out["expected_roi_pct_1m"] = out.get("expected_return_1m")
+    if "expected_return_3m" in out and "expected_roi_pct_3m" not in out:
+        out["expected_roi_pct_3m"] = out.get("expected_return_3m")
+    if "expected_return_12m" in out and "expected_roi_pct_12m" not in out:
+        out["expected_roi_pct_12m"] = out.get("expected_return_12m")
+
+    # confidence alias
+    if "confidence_score" in out and "forecast_confidence" not in out:
+        out["forecast_confidence"] = out.get("confidence_score")
+
+    # updated alias (prefer history_last_utc)
+    if "history_last_utc" in out and "forecast_updated_utc" not in out:
+        out["forecast_updated_utc"] = out.get("history_last_utc")
+
+    return out
+
+
+def _with_provenance(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p or {})
+    out.setdefault("provider", PROVIDER_NAME)
+    out.setdefault("data_source", PROVIDER_NAME)
+    out.setdefault("provider_version", PROVIDER_VERSION)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -717,15 +822,20 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
     analytics = _compute_history_analytics(closes)
 
     last_ts: Optional[int] = None
+    last_iso: Optional[str] = None
     if isinstance(times_raw, list) and times_raw:
         try:
             last_ts = int(times_raw[-1])
+            last_iso = datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()
         except Exception:
             last_ts = None
+            last_iso = None
 
     patch: Dict[str, Any] = {
         "history_points": len(closes),
         "history_last_ts": int(last_ts) if last_ts else None,
+        "history_last_utc": last_iso,
+        "forecast_source": "finnhub_candle",
     }
     patch.update(analytics)
 
@@ -736,10 +846,11 @@ async def _fetch_history_patch(symbol: str) -> Tuple[Dict[str, Any], Optional[st
 # Main fetch
 # ---------------------------------------------------------------------------
 def _base_patch(symbol: str) -> Dict[str, Any]:
+    # Keep compact (clean_patch will remove Nones/empty strings)
     return {
         "symbol": symbol,
         "market": "GLOBAL",
-        "currency": None,
+        "provider": PROVIDER_NAME,
         "data_source": PROVIDER_NAME,
         "provider_version": PROVIDER_VERSION,
         "error": "",
@@ -750,6 +861,12 @@ def _base_patch(symbol: str) -> Dict[str, Any]:
         "sub_sector": None,
         "industry": None,
         "listing_date": None,
+        "currency": None,
+        "country": None,
+        "weburl": None,
+        "logo": None,
+        "market_cap": None,
+        "shares_outstanding": None,
         # price
         "current_price": None,
         "previous_close": None,
@@ -759,10 +876,7 @@ def _base_patch(symbol: str) -> Dict[str, Any]:
         "price_change": None,
         "percent_change": None,
         "volume": None,
-        "avg_volume_30d": None,
         "value_traded": None,
-        "market_cap": None,
-        "shares_outstanding": None,
         # history/forecast
         "returns_1w": None,
         "returns_1m": None,
@@ -784,6 +898,8 @@ def _base_patch(symbol: str) -> Dict[str, Any]:
         "forecast_method": None,
         "history_points": None,
         "history_last_ts": None,
+        "history_last_utc": None,
+        "forecast_source": None,
     }
 
 
@@ -793,7 +909,7 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
         return {"error": f"{PROVIDER_NAME}: empty symbol"}
 
     # Hard guard: avoid misrouting KSA to Finnhub
-    if _is_ksa_symbol(sym_in):
+    if _looks_like_ksa(sym_in):
         return {"error": f"{PROVIDER_NAME}: KSA symbol not supported"}
 
     # Guard: avoid Yahoo-special symbols in this provider
@@ -803,10 +919,11 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
     if not _token():
         return {"error": f"{PROVIDER_NAME}: not configured (FINNHUB_API_KEY)"}
 
-    sym = _normalize_symbol(sym_in)
+    sym = _to_finnhub_symbol(sym_in)
+    if not sym:
+        return {"error": f"{PROVIDER_NAME}: symbol not supported"}
 
     warns: List[str] = []
-
     out: Dict[str, Any] = _base_patch(sym)
 
     # Quote required
@@ -844,7 +961,10 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
             warns.append(f"profile: {p_err}")
         else:
             for k, v in p_patch.items():
-                if out.get(k) in (None, "", 0) and v not in (None, ""):
+                if (out.get(k) is None or (isinstance(out.get(k), str) and not str(out.get(k)).strip())) and v not in (
+                    None,
+                    "",
+                ):
                     out[k] = v
 
     # Optional history/forecast
@@ -863,10 +983,14 @@ async def _fetch(symbol_raw: str, *, want_profile: bool, want_history: bool) -> 
             warns.append(f"history: {h_err}")
         else:
             for k, v in h_patch.items():
-                if out.get(k) in (None, "", 0) and v is not None:
+                if out.get(k) is None and v is not None:
                     out[k] = v
 
     out["last_updated_utc"] = _utc_iso()
+
+    # Add aliases + provenance reinforcement
+    out = _with_provenance(out)
+    out = _add_forecast_aliases(out)
 
     if warns and _verbose_warn():
         out["_warn"] = " | ".join([w for w in warns if w])
