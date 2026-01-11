@@ -2,26 +2,30 @@
 """
 core/providers/yahoo_fundamentals_provider.py
 ============================================================
-Yahoo Fundamentals Provider (NO yfinance) — v1.5.0
+Yahoo Fundamentals Provider (NO yfinance) — v1.6.0
 PROD SAFE + ENGINE-ALIGNED (PATCH DICT) + CUSTOM HEADERS + CLIENT REUSE
 + RETRY + TTL CACHE + COOKIE WARMUP + TARGET-BASED FORECAST ENRICHMENT
 
-What’s new in v1.5.0 (your requested plan items)
-- ✅ Customized headers (shared + provider-specific + endpoint-specific)
+What’s improved in v1.6.0 (hardening + alignment)
+- ✅ Engine-aligned patch returns (Dict[str, Any] only; never throws)
+- ✅ Symbol normalization (supports: "2222", "2222.SR", "TADAWUL:2222", "2222.TADAWUL")
+- ✅ Shared Yahoo headers + provider headers + endpoint headers:
     • YAHOO_HEADERS_JSON (base for all Yahoo providers)
     • YAHOO_HEADERS_FUND_JSON (common for this provider)
     • YAHOO_HEADERS_FUND_SUMMARY_JSON (quoteSummary endpoint)
     • YAHOO_HEADERS_FUND_QUOTE_JSON   (v7 quote endpoint)
-- ✅ Forecast enrichment from Yahoo analyst targets (if available)
-    • fair_value            (maps to targetMeanPrice)
+- ✅ Retry includes 401/403 warmup flow (cookie warmup reduces edge blocks)
+- ✅ Patch includes: origin + last_updated_utc + provider metadata
+- ✅ Keeps sheet-ready normalization (percent fields -> % not fraction)
+- ✅ Forecast enrichment from Yahoo analyst targets (if available):
+    • fair_value            (targetMeanPrice)
     • upside_percent        ((fair_value/current_price - 1)*100)
-    • expected_price_12m    (same as fair_value)
-    • expected_return_12m   (same as upside_percent)
+    • expected_price_12m    (= fair_value)
+    • expected_return_12m   (= upside_percent)
     • confidence_score      (0..100, based on analyst count + target spread)
     • forecast_method       ("yahoo_analyst_targets_v1")
-- ✅ Keeps sheet-ready normalization (percent fields -> % not fraction)
-- ✅ Import-safe, no network at import-time, never throws to callers
-- ✅ Still supports KSA (.SR) + GLOBAL, with feature flags
+- ✅ Optional "do not overwrite" behavior can be implemented by engine merge policy;
+  provider only returns what it can compute best-effort.
 
 Best-effort fundamentals for symbols (KSA .SR + GLOBAL):
 - market_cap, shares_outstanding
@@ -32,7 +36,6 @@ Best-effort fundamentals for symbols (KSA .SR + GLOBAL):
 - roe (%), roa (%), beta
 - forward_eps, forward_pe
 - ps, ev_ebitda
-- currency
 - + analyst target forecast fields (best-effort)
 
 Exports (engine-friendly)
@@ -67,23 +70,28 @@ Hosts / region / lang
 - YAHOO_REGION_KSA (default "SA")
 - YAHOO_REGION_GLOBAL (default "US")
 - YAHOO_LANG (default "en-US")
+- YAHOO_FUND_ORIGIN_KEY (default "YAHOO_FUND")      # patch origin field
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
+logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
+
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "1.5.0"
+PROVIDER_VERSION = "1.6.0"
 
 # ---------------------------
 # Safe env parsing
@@ -132,12 +140,43 @@ def _env_str(name: str, default: str = "") -> str:
     return s if s else default
 
 
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _origin_key() -> str:
+    return (_env_str("YAHOO_FUND_ORIGIN_KEY", "YAHOO_FUND") or "YAHOO_FUND").strip()
+
+
 # ---------------------------
 # Feature flags
 # ---------------------------
 ENABLE_YAHOO_FUNDAMENTALS = _env_bool("ENABLE_YAHOO_FUNDAMENTALS", True)
 ENABLE_YAHOO_FUNDAMENTALS_KSA = _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True)
 ENABLE_TARGETS = _env_bool("YAHOO_FUND_ENABLE_TARGETS", True)
+
+# ---------------------------
+# Symbol normalization
+# ---------------------------
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
+
+
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"):
+        s = s.replace(".TADAWUL", "").strip()
+    # numeric Tadawul -> .SR
+    if _KSA_CODE_RE.match(s):
+        return f"{s}.SR"
+    # sometimes caller uses .US => Yahoo wants without .US
+    if s.endswith(".US"):
+        s = s[:-3]
+    return s
+
 
 # ---------------------------
 # URLs (host overridable)
@@ -153,18 +192,17 @@ _WARMUP_URL = "https://finance.yahoo.com/quote/{symbol}"
 _ALT_HOSTS = [h.strip() for h in (_env_str("YAHOO_ALT_HOSTS", "")).split(",") if h.strip()]
 _HOSTS: List[str] = []
 for h in _DEFAULT_HOSTS:
-    if h:
-        hh = h.rstrip("/")
-        if hh not in _HOSTS:
-            _HOSTS.append(hh)
+    hh = (h or "").rstrip("/")
+    if hh and hh not in _HOSTS:
+        _HOSTS.append(hh)
 for host in _ALT_HOSTS:
-    if "://" in host:
-        h2 = host.rstrip("/")
-    else:
-        h2 = f"https://{host}".rstrip("/")
+    h2 = host.rstrip("/") if "://" in host else f"https://{host}".rstrip("/")
     if h2 and h2 not in _HOSTS:
         _HOSTS.append(h2)
 
+# ---------------------------
+# HTTP config / headers
+# ---------------------------
 USER_AGENT = _env_str(
     "YAHOO_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -176,69 +214,12 @@ _ACCEPT_LANGUAGE = _env_str("YAHOO_ACCEPT_LANGUAGE", "en-US,en;q=0.8,ar;q=0.6")
 _TIMEOUT_S = _env_float("YAHOO_TIMEOUT_S", 12.0)
 _TIMEOUT = httpx.Timeout(timeout=_TIMEOUT_S, connect=min(6.0, _TIMEOUT_S))
 
-# Retries for transient Yahoo responses
 _RETRY_MAX = max(0, _env_int("YAHOO_FUND_RETRY_MAX", 2))  # additional retries (0 => no retry)
 _RETRY_BACKOFF_MS = _env_float("YAHOO_FUND_RETRY_BACKOFF_MS", 250.0)
-_RETRY_STATUSES = {403, 429, 500, 502, 503, 504}  # 403 often cookie/edge blocks
+_RETRY_STATUSES = {401, 403, 429, 500, 502, 503, 504}
 
 # TTL Cache
 _TTL_SEC = max(30.0, _env_float("YAHOO_FUND_TTL_SEC", 3600.0))
-
-# Region / language
-_REGION_KSA = (_env_str("YAHOO_REGION_KSA", "SA") or "SA").strip()
-_REGION_GLOBAL = (_env_str("YAHOO_REGION_GLOBAL", "US") or "US").strip()
-_LANG = (_env_str("YAHOO_LANG", "en-US") or "en-US").strip()
-
-# ---------------------------
-# Client reuse (keep-alive)
-# ---------------------------
-_CLIENT: Optional[httpx.AsyncClient] = None
-_CLIENT_LOCK = asyncio.Lock()
-
-# Best-effort warmup set (avoid repeated warmups)
-_WARMED: Set[str] = set()
-_WARM_LOCK = asyncio.Lock()
-
-# Minimal TTL cache (fallback if cachetools isn't installed)
-try:
-    from cachetools import TTLCache  # type: ignore
-
-    _HAS_CACHETOOLS = True
-except Exception:  # pragma: no cover
-    _HAS_CACHETOOLS = False
-
-    class TTLCache(dict):  # type: ignore
-        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
-            super().__init__()
-            self._maxsize = max(1, int(maxsize))
-            self._ttl = max(1.0, float(ttl))
-            self._exp: Dict[str, float] = {}
-
-        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
-            now = time.time()
-            exp = self._exp.get(key)
-            if exp is not None and exp < now:
-                try:
-                    super().pop(key, None)
-                except Exception:
-                    pass
-                self._exp.pop(key, None)
-                return default
-            return super().get(key, default)
-
-        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
-            if len(self) >= self._maxsize:
-                try:
-                    oldest_key = next(iter(self.keys()))
-                    super().pop(oldest_key, None)
-                    self._exp.pop(oldest_key, None)
-                except Exception:
-                    pass
-            super().__setitem__(key, value)
-            self._exp[key] = time.time() + self._ttl
-
-
-_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_TTL_SEC)
 
 
 def _json_headers(env_key: str) -> Dict[str, str]:
@@ -280,16 +261,36 @@ def _headers_for(kind: str, symbol: str) -> Dict[str, str]:
     ref = f"https://finance.yahoo.com/quote/{sym}"
 
     h = dict(_BASE_HEADERS)
-
     if kind == "summary":
         h.update(_json_headers("YAHOO_HEADERS_FUND_SUMMARY_JSON"))
     elif kind == "quote":
         h.update(_json_headers("YAHOO_HEADERS_FUND_QUOTE_JSON"))
 
-    # Dynamic (helps Yahoo edges)
+    # Dynamic (helps Yahoo edges) unless caller overrides
     h.setdefault("Referer", ref)
     h.setdefault("Origin", "https://finance.yahoo.com")
     return h
+
+
+# Region / language
+_REGION_KSA = (_env_str("YAHOO_REGION_KSA", "SA") or "SA").strip()
+_REGION_GLOBAL = (_env_str("YAHOO_REGION_GLOBAL", "US") or "US").strip()
+_LANG = (_env_str("YAHOO_LANG", "en-US") or "en-US").strip()
+
+
+def _region_for(sym: str) -> str:
+    return _REGION_KSA if sym.endswith(".SR") else _REGION_GLOBAL
+
+
+# ---------------------------
+# Client reuse (keep-alive)
+# ---------------------------
+_CLIENT: Optional[httpx.AsyncClient] = None
+_CLIENT_LOCK = asyncio.Lock()
+
+# Best-effort warmup set (avoid repeated warmups)
+_WARMED: Set[str] = set()
+_WARM_LOCK = asyncio.Lock()
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -303,6 +304,7 @@ async def _get_client() -> httpx.AsyncClient:
                 timeout=_TIMEOUT,
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
             )
+            logger.info("Yahoo fundamentals client init v%s | timeout=%.2fs", PROVIDER_VERSION, _TIMEOUT_S)
     return _CLIENT
 
 
@@ -318,12 +320,52 @@ async def aclose_yahoo_fundamentals_client() -> None:
 
 
 # ---------------------------
-# Helpers
+# TTL cache (fallback if cachetools isn't installed)
 # ---------------------------
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+try:
+    from cachetools import TTLCache  # type: ignore
+
+    _HAS_CACHETOOLS = True
+except Exception:  # pragma: no cover
+    _HAS_CACHETOOLS = False
+
+    class TTLCache(dict):  # type: ignore
+        def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
+            super().__init__()
+            self._maxsize = max(1, int(maxsize))
+            self._ttl = max(1.0, float(ttl))
+            self._exp: Dict[str, float] = {}
+
+        def get(self, key: str, default: Any = None) -> Any:  # type: ignore
+            now = time.time()
+            exp = self._exp.get(key)
+            if exp is not None and exp < now:
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                self._exp.pop(key, None)
+                return default
+            return super().get(key, default)
+
+        def __setitem__(self, key: str, value: Any) -> None:  # type: ignore
+            if len(self) >= self._maxsize:
+                try:
+                    oldest_key = next(iter(self.keys()))
+                    super().pop(oldest_key, None)
+                    self._exp.pop(oldest_key, None)
+                except Exception:
+                    pass
+            super().__setitem__(key, value)
+            self._exp[key] = time.time() + self._ttl
 
 
+_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_TTL_SEC)
+
+
+# ---------------------------
+# Value helpers
+# ---------------------------
 def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None or isinstance(x, bool):
@@ -344,15 +386,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _yahoo_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return ""
-    if s.endswith(".US"):
-        return s[:-3]
-    return s
-
-
 def _get_raw(obj: Any) -> Optional[float]:
     """Yahoo often returns { raw: ..., fmt: ... }."""
     if obj is None:
@@ -369,6 +402,14 @@ def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
         j = resp.json()
         return j if isinstance(j, dict) else {}
     except Exception:
+        # sometimes Yahoo returns JSON as text/plain
+        try:
+            txt = (resp.text or "").strip()
+            if txt.startswith("{") and txt.endswith("}"):
+                j2 = json.loads(txt)
+                return j2 if isinstance(j2, dict) else {}
+        except Exception:
+            pass
         return {}
 
 
@@ -388,8 +429,70 @@ def _to_percent(v: Optional[float]) -> Optional[float]:
         return v
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+# ---------------------------
+# Patch base / cleaning
+# ---------------------------
+def _base(sym: str) -> Dict[str, Any]:
+    is_ksa = sym.endswith(".SR")
+    return {
+        "symbol": sym,
+        "market": "KSA" if is_ksa else "GLOBAL",
+        "origin": _origin_key(),
+        "data_source": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "last_updated_utc": _now_utc_iso(),
+        "currency": None,
+        "current_price": None,
+        "market_cap": None,
+        "shares_outstanding": None,
+        "eps_ttm": None,
+        "pe_ttm": None,
+        "forward_eps": None,
+        "forward_pe": None,
+        "pb": None,
+        "ps": None,
+        "ev_ebitda": None,
+        "dividend_yield": None,  # percent
+        "dividend_rate": None,
+        "payout_ratio": None,  # percent
+        "roe": None,  # percent
+        "roa": None,  # percent
+        "beta": None,
+        # Targets / recommendation
+        "target_mean_price": None,
+        "target_high_price": None,
+        "target_low_price": None,
+        "analyst_opinions": None,
+        "recommendation_mean": None,
+        "recommendation_key": None,
+        # Forecast enrichment (targets)
+        "fair_value": None,
+        "upside_percent": None,
+        "expected_price_12m": None,
+        "expected_return_12m": None,
+        "confidence_score": None,
+        "forecast_method": None,
+        "error": None,
+    }
+
+
+def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (patch or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
+
+
 def _compute_if_possible(out: Dict[str, Any]) -> None:
-    """Compute PE and Market Cap if Yahoo didn't provide them."""
+    """Compute Market Cap and PE if missing and possible."""
     px = _safe_float(out.get("current_price"))
     sh = _safe_float(out.get("shares_outstanding"))
     eps = _safe_float(out.get("eps_ttm"))
@@ -402,10 +505,6 @@ def _compute_if_possible(out: Dict[str, Any]) -> None:
             out["pe_ttm"] = px / eps
         except Exception:
             pass
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return float(max(lo, min(hi, x)))
 
 
 def _apply_targets_forecast(out: Dict[str, Any]) -> None:
@@ -446,8 +545,7 @@ def _apply_targets_forecast(out: Dict[str, Any]) -> None:
         spread = abs(t_hi - t_lo) / max(1e-9, abs(t_mean))
         penalty = _clamp(spread * 80.0, 0.0, 45.0)  # wide spread => reduce confidence
 
-    conf = _clamp(base - penalty, 0.0, 100.0)
-    out["confidence_score"] = conf
+    out["confidence_score"] = _clamp(base - penalty, 0.0, 100.0)
 
 
 def _has_any_useful(out: Dict[str, Any]) -> bool:
@@ -471,57 +569,20 @@ def _has_any_useful(out: Dict[str, Any]) -> bool:
         "upside_percent",
         "expected_return_12m",
     )
-    return any(_safe_float(out.get(k)) is not None for k in keys)
+    for k in keys:
+        if _safe_float(out.get(k)) is not None:
+            return True
+    # recommendation_key is useful too
+    rk = out.get("recommendation_key")
+    return isinstance(rk, str) and rk.strip() != ""
 
 
-def _base(symbol: str) -> Dict[str, Any]:
-    # NOTE: "data_source"/"provider_version" aligned with your other providers.
-    return {
-        "symbol": symbol,
-        "data_source": PROVIDER_NAME,
-        "provider_version": PROVIDER_VERSION,
-        "last_updated_utc": _now_utc_iso(),
-        "currency": None,
-        "current_price": None,
-        "market_cap": None,
-        "shares_outstanding": None,
-        "eps_ttm": None,
-        "pe_ttm": None,
-        "forward_eps": None,
-        "forward_pe": None,
-        "pb": None,
-        "ps": None,
-        "ev_ebitda": None,
-        "dividend_yield": None,  # percent
-        "dividend_rate": None,
-        "payout_ratio": None,  # percent
-        "roe": None,  # percent
-        "roa": None,  # percent
-        "beta": None,
-        # Target/forecast enrichment (optional)
-        "target_mean_price": None,
-        "target_high_price": None,
-        "target_low_price": None,
-        "analyst_opinions": None,
-        "recommendation_mean": None,
-        "recommendation_key": None,
-        "fair_value": None,
-        "upside_percent": None,
-        "expected_price_12m": None,
-        "expected_return_12m": None,
-        "confidence_score": None,
-        "forecast_method": None,
-        "error": None,
-    }
-
-
+# ---------------------------
+# HTTP helpers + warmup
+# ---------------------------
 async def _sleep_backoff(attempt: int) -> None:
     base = (_RETRY_BACKOFF_MS / 1000.0) * (2**attempt)
     await asyncio.sleep(min(2.5, base + random.random() * 0.35))
-
-
-def _region_for(sym: str) -> str:
-    return _REGION_KSA if sym.endswith(".SR") else _REGION_GLOBAL
 
 
 async def _warmup_cookie(symbol: str) -> None:
@@ -568,14 +629,16 @@ async def _http_get_json(
                     return j, None
                 last_err = "invalid JSON"
             else:
-                if r.status_code in (401, 403) and not warmed:
+                sc = int(r.status_code)
+                # warmup on edge blocks once
+                if sc in (401, 403) and not warmed:
                     warmed = True
                     await _warmup_cookie(symbol)
-                    last_err = f"HTTP {r.status_code} (warmup)"
-                elif r.status_code in _RETRY_STATUSES and i < attempts - 1:
-                    last_err = f"HTTP {r.status_code}"
+                    last_err = f"HTTP {sc} (warmup)"
+                elif sc in _RETRY_STATUSES and i < attempts - 1:
+                    last_err = f"HTTP {sc}"
                 else:
-                    return None, f"HTTP {r.status_code}"
+                    return None, f"HTTP {sc}"
         except Exception as e:
             last_err = f"{e.__class__.__name__}: {e}"
 
@@ -586,29 +649,28 @@ async def _http_get_json(
 
 
 # ---------------------------
-# Core fetcher
+# Core fetcher (returns full internal dict)
 # ---------------------------
 async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, Any]:
-    sym = _yahoo_symbol(symbol)
+    sym = _normalize_symbol(symbol)
 
     # Feature flags
     if not ENABLE_YAHOO_FUNDAMENTALS:
-        return {
-            **_base(sym),
-            "error": "Yahoo fundamentals disabled (ENABLE_YAHOO_FUNDAMENTALS=false)",
-            "last_updated_utc": _now_utc_iso(),
-        }
+        out = _base(sym)
+        out["error"] = "Yahoo fundamentals disabled (ENABLE_YAHOO_FUNDAMENTALS=false)"
+        out["last_updated_utc"] = _now_utc_iso()
+        return out
 
     if sym.endswith(".SR") and not ENABLE_YAHOO_FUNDAMENTALS_KSA:
-        return {
-            **_base(sym),
-            "error": "Yahoo fundamentals disabled for KSA (ENABLE_YAHOO_FUNDAMENTALS_KSA=false)",
-            "last_updated_utc": _now_utc_iso(),
-        }
+        out = _base(sym)
+        out["error"] = "Yahoo fundamentals disabled for KSA (ENABLE_YAHOO_FUNDAMENTALS_KSA=false)"
+        out["last_updated_utc"] = _now_utc_iso()
+        return out
 
     out = _base(sym)
     if not sym:
         out["error"] = "Empty symbol"
+        out["last_updated_utc"] = _now_utc_iso()
         return out
 
     # Cache (bypass in debug)
@@ -651,9 +713,7 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
             out["current_price"] = _get_raw(price.get("regularMarketPrice")) or out["current_price"]
 
             out["market_cap"] = (
-                _get_raw(price.get("marketCap"))
-                or _get_raw(stats.get("marketCap"))
-                or out["market_cap"]
+                _get_raw(price.get("marketCap")) or _get_raw(stats.get("marketCap")) or out["market_cap"]
             )
             out["shares_outstanding"] = _get_raw(stats.get("sharesOutstanding")) or out["shares_outstanding"]
 
@@ -665,7 +725,7 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
             out["forward_eps"] = _get_raw(stats.get("forwardEps")) or out["forward_eps"]
             out["forward_pe"] = _get_raw(summ.get("forwardPE")) or _get_raw(stats.get("forwardPE")) or out["forward_pe"]
 
-            # PB (or compute using bookValue)
+            # PB (or compute using bookValue if available)
             out["pb"] = _get_raw(stats.get("priceToBook")) or out["pb"]
             if out["pb"] is None:
                 bv = _get_raw(fin.get("bookValue")) or _get_raw(stats.get("bookValue"))
@@ -707,13 +767,13 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
 
             out["beta"] = _get_raw(stats.get("beta")) or out["beta"]
 
-            # Analyst targets / recommendation (forecast enrichment)
+            # Analyst targets / recommendation
             out["target_mean_price"] = _get_raw(fin.get("targetMeanPrice")) or out["target_mean_price"]
             out["target_high_price"] = _get_raw(fin.get("targetHighPrice")) or out["target_high_price"]
             out["target_low_price"] = _get_raw(fin.get("targetLowPrice")) or out["target_low_price"]
             out["analyst_opinions"] = _get_raw(fin.get("numberOfAnalystOpinions")) or out["analyst_opinions"]
             out["recommendation_mean"] = _get_raw(fin.get("recommendationMean")) or out["recommendation_mean"]
-            # recommendationKey is a string, keep it raw
+
             try:
                 rk = fin.get("recommendationKey")
                 if isinstance(rk, str) and rk.strip():
@@ -754,6 +814,7 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
                 continue
 
             q0 = q[0] or {}
+
             out["currency"] = q0.get("currency") or out["currency"]
             out["current_price"] = _safe_float(q0.get("regularMarketPrice")) or out["current_price"]
 
@@ -779,7 +840,6 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
             if pr is not None:
                 out["payout_ratio"] = _to_percent(pr)
 
-            # Some v7 responses can include these
             roe = _safe_float(q0.get("returnOnEquity"))
             roa = _safe_float(q0.get("returnOnAssets"))
             if roe is not None:
@@ -789,8 +849,14 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
 
             out["beta"] = _safe_float(q0.get("beta")) or out["beta"]
 
+            # Some v7 payloads include these (rare). Safe if missing.
+            out["target_mean_price"] = _safe_float(q0.get("targetMeanPrice")) or out["target_mean_price"]
+            out["target_high_price"] = _safe_float(q0.get("targetHighPrice")) or out["target_high_price"]
+            out["target_low_price"] = _safe_float(q0.get("targetLowPrice")) or out["target_low_price"]
+            out["analyst_opinions"] = _safe_float(q0.get("numberOfAnalystOpinions")) or out["analyst_opinions"]
+
             _compute_if_possible(out)
-            _apply_targets_forecast(out)  # v7 may not have targets, but safe
+            _apply_targets_forecast(out)
 
             if debug:
                 out["_debug"] = {"host": host, "region": region, "lang": lang, "source": "quote_v7"}
@@ -814,18 +880,9 @@ async def yahoo_fundamentals(symbol: str, *, debug: bool = False) -> Dict[str, A
     return out
 
 
-# --- Engine adapter (DataEngineV2 patch functions) ---------------------------
-def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (patch or {}).items():
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        out[k] = v
-    return out
-
-
+# ---------------------------
+# Engine adapter (PATCH DICT)
+# ---------------------------
 async def fetch_fundamentals_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     """
     Returns a patch aligned to UnifiedQuote keys + safe extras.
@@ -837,57 +894,71 @@ async def fetch_fundamentals_patch(symbol: str, debug: bool = False) -> Dict[str
     Forecast fields are best-effort (if targets exist):
       - fair_value, upside_percent, expected_price_12m, expected_return_12m, confidence_score
     """
-    d = await yahoo_fundamentals(symbol, debug=debug)
+    try:
+        sym = _normalize_symbol(symbol)
+        d = await yahoo_fundamentals(sym, debug=debug)
 
-    patch: Dict[str, Any] = {
-        "data_source": PROVIDER_NAME,
-        "provider_version": PROVIDER_VERSION,
-        "last_updated_utc": d.get("last_updated_utc"),
+        patch: Dict[str, Any] = {
+            "symbol": sym,
+            "market": d.get("market"),
+            "origin": d.get("origin"),
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "last_updated_utc": d.get("last_updated_utc"),
 
-        "currency": d.get("currency"),
-        "current_price": d.get("current_price"),
+            "currency": d.get("currency"),
+            "current_price": d.get("current_price"),
 
-        "market_cap": d.get("market_cap"),
-        "shares_outstanding": d.get("shares_outstanding"),
+            "market_cap": d.get("market_cap"),
+            "shares_outstanding": d.get("shares_outstanding"),
 
-        "eps_ttm": d.get("eps_ttm"),
-        "pe_ttm": d.get("pe_ttm"),
+            "eps_ttm": d.get("eps_ttm"),
+            "pe_ttm": d.get("pe_ttm"),
 
-        "forward_eps": d.get("forward_eps"),
-        "forward_pe": d.get("forward_pe"),
+            "forward_eps": d.get("forward_eps"),
+            "forward_pe": d.get("forward_pe"),
 
-        "pb": d.get("pb"),
-        "ps": d.get("ps"),
-        "ev_ebitda": d.get("ev_ebitda"),
+            "pb": d.get("pb"),
+            "ps": d.get("ps"),
+            "ev_ebitda": d.get("ev_ebitda"),
 
-        "dividend_yield": d.get("dividend_yield"),
-        "dividend_rate": d.get("dividend_rate"),
-        "payout_ratio": d.get("payout_ratio"),
+            "dividend_yield": d.get("dividend_yield"),
+            "dividend_rate": d.get("dividend_rate"),
+            "payout_ratio": d.get("payout_ratio"),
 
-        "roe": d.get("roe"),
-        "roa": d.get("roa"),
-        "beta": d.get("beta"),
+            "roe": d.get("roe"),
+            "roa": d.get("roa"),
+            "beta": d.get("beta"),
 
-        # Forecast / targets (extras; engine can ignore if not used)
-        "target_mean_price": d.get("target_mean_price"),
-        "target_high_price": d.get("target_high_price"),
-        "target_low_price": d.get("target_low_price"),
-        "analyst_opinions": d.get("analyst_opinions"),
-        "recommendation_mean": d.get("recommendation_mean"),
-        "recommendation_key": d.get("recommendation_key"),
+            # Targets / recommendation (extras)
+            "target_mean_price": d.get("target_mean_price"),
+            "target_high_price": d.get("target_high_price"),
+            "target_low_price": d.get("target_low_price"),
+            "analyst_opinions": d.get("analyst_opinions"),
+            "recommendation_mean": d.get("recommendation_mean"),
+            "recommendation_key": d.get("recommendation_key"),
 
-        "fair_value": d.get("fair_value"),
-        "upside_percent": d.get("upside_percent"),
-        "expected_price_12m": d.get("expected_price_12m"),
-        "expected_return_12m": d.get("expected_return_12m"),
-        "confidence_score": d.get("confidence_score"),
-        "forecast_method": d.get("forecast_method"),
-    }
+            # Forecast / targets (extras)
+            "fair_value": d.get("fair_value"),
+            "upside_percent": d.get("upside_percent"),
+            "expected_price_12m": d.get("expected_price_12m"),
+            "expected_return_12m": d.get("expected_return_12m"),
+            "confidence_score": d.get("confidence_score"),
+            "forecast_method": d.get("forecast_method"),
+        }
 
-    # Surface warning only if provider failed (engine can still merge other providers)
-    if d.get("error"):
-        patch["error"] = f"warning: {PROVIDER_NAME}: {d.get('error')}"
-    return _clean_patch(patch)
+        # Surface warning only if provider failed (engine can still merge other providers)
+        if d.get("error"):
+            patch["error"] = f"warning: {PROVIDER_NAME}: {d.get('error')}"
+        return _clean_patch(patch)
+    except Exception as e:
+        # Never throw to callers
+        return {
+            "data_source": PROVIDER_NAME,
+            "provider_version": PROVIDER_VERSION,
+            "last_updated_utc": _now_utc_iso(),
+            "error": f"warning: {PROVIDER_NAME} crashed: {e.__class__.__name__}",
+        }
 
 
 # Engine discovery aliases
