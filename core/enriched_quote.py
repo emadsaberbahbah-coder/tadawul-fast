@@ -2,7 +2,7 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.7.0
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.7.1
 Emad Bahbah — Financial Leader Edition
 
 What this module is for
@@ -11,18 +11,12 @@ What this module is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.7.0 enhancements (this revision)
-- Stronger “Emad 59-column” mapping (Price/Prev Close/Change/Change %, Value Traded, etc.)
-- Computes missing KPIs when provider fields are missing:
-    • Change, Change %, Value Traded
-    • 52W Position %
-    • turnover_percent, free_float_market_cap, liquidity_score
-- Fair Value / Upside % / Valuation Label: computed if missing (uses fair_value/expected_price_*/MA proxies)
-- Recommendation standardized everywhere to: BUY / HOLD / REDUCE / SELL (UPPERCASE)
-- ISO parsing supports trailing 'Z'
-- Riyadh timestamp fill from UTC if missing
-- Defensive per-symbol concurrency + timeout for /quotes slow path
-- Import-safe: no hard DataEngine dependency at import time.
+✅ v2.7.1 enhancements (this revision)
+- ✅ FIX: Correct v2 engine integration:
+    • uses core.data_engine_v2.get_engine() (since v2 exports get_engine(), not module-level get_enriched_quote)
+- ✅ Fair Value proxies updated to support v2 canonical forecast fields:
+    • forecast_price_3m / forecast_price_12m (in addition to expected_price_* legacy)
+- ✅ Keeps v2.7.0 “Emad 59-column” mapping + computed KPIs + enum recommendation
 
 NOTE
 - This module is intentionally “compat + sheet-mapper”. Your newer sheet endpoints should use:
@@ -47,7 +41,7 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("core.enriched_quote")
 
-ROUTER_VERSION = "2.7.0"
+ROUTER_VERSION = "2.7.1"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -56,9 +50,9 @@ _UQ_KEYS: Optional[List[str]] = None
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Default “Emad 59-column” headers (sheet-ready)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 ENRICHED_HEADERS_59: List[str] = [
     "Rank",
     "Symbol",
@@ -551,10 +545,17 @@ def _compute_fair_value_and_upside(payload: Dict[str, Any]) -> Tuple[Optional[fl
         return None, None, None
 
     fair = _safe_float_or_none(_safe_get(payload, "fair_value"))
+    # v2 canonical forecast fields
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "forecast_price_3m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(payload, "forecast_price_12m"))
+    # legacy expected_price fields (some providers may still send them)
     if fair is None:
         fair = _safe_float_or_none(_safe_get(payload, "expected_price_3m"))
     if fair is None:
         fair = _safe_float_or_none(_safe_get(payload, "expected_price_12m"))
+    # technical proxies
     if fair is None:
         fair = _safe_float_or_none(_safe_get(payload, "ma200"))
     if fair is None:
@@ -608,7 +609,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo_date", "ipo"), None),
-
     # Prices
     "price": (("current_price", "last_price", "price"), None),
     "last price": (("current_price", "last_price", "price"), None),
@@ -620,12 +620,10 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "percent change": (("percent_change", "change_percent", "change_pct", "pct_change"), _ratio_to_percent),
     "day high": (("day_high",), None),
     "day low": (("day_low",), None),
-
     # 52W
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), _ratio_to_percent),
-
     # Volume/Liquidity
     "volume": (("volume", "vol"), None),
     "avg vol 30d": (("avg_volume_30d", "avg_volume"), None),
@@ -638,7 +636,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "free float mkt cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
     "free float market cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
     "liquidity score": (("liquidity_score",), None),
-
     # Fundamentals / ratios
     "eps (ttm)": (("eps_ttm", "eps"), None),
     "forward eps": (("forward_eps",), None),
@@ -647,7 +644,6 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "p/b": (("pb",), None),
     "p/s": (("ps",), None),
     "ev/ebitda": (("ev_ebitda",), None),
-
     # Dividends / profitability / growth
     "dividend yield": (("dividend_yield",), _ratio_to_percent),
     "dividend yield %": (("dividend_yield",), _ratio_to_percent),
@@ -666,26 +662,22 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "revenue growth %": (("revenue_growth",), _ratio_to_percent),
     "net income growth": (("net_income_growth",), _ratio_to_percent),
     "net income growth %": (("net_income_growth",), _ratio_to_percent),
-
     # Risk / technical
     "beta": (("beta",), None),
     "volatility 30d": (("volatility_30d", "vol_30d_ann", "volatility_30d_ann"), _vol_to_percent),
     "volatility (30d)": (("volatility_30d", "vol_30d_ann", "volatility_30d_ann"), _vol_to_percent),
     "rsi 14": (("rsi_14", "rsi14"), None),
     "rsi (14)": (("rsi_14", "rsi14"), None),
-
     # Valuation / scores
-    "fair value": (("fair_value", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
+    "fair value": (("fair_value", "forecast_price_3m", "forecast_price_12m", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
-
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
     "opportunity score": (("opportunity_score",), None),
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
-
     # Metadata
     "error": (("error",), None),
     "recommendation": (("recommendation",), None),
@@ -1087,7 +1079,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
     """
     Returns: (result, source, error)
     """
-    # 1) app.state.engine
+    # 1) app.state.engine (preferred)
     try:
         eng = getattr(request.app.state, "engine", None)
     except Exception:
@@ -1106,16 +1098,19 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
                     continue
         return None, "app.state.engine", last_err or "engine call failed"
 
-    # 2) v2 module singleton function (if present)
+    # 2) v2 singleton accessor (CORRECT for v2.10.x): get_engine().get_enriched_quote()
     try:
-        from core.data_engine_v2 import get_enriched_quote as v2_get  # type: ignore
+        from core.data_engine_v2 import get_engine  # type: ignore
 
-        res2 = await _maybe_await(v2_get(symbol))
-        return _unwrap_tuple_payload(res2), "core.data_engine_v2.get_enriched_quote(singleton)", None
+        eng2 = get_engine()
+        fn = getattr(eng2, "get_enriched_quote", None) or getattr(eng2, "get_quote", None)
+        if callable(fn):
+            res2 = await _maybe_await(fn(symbol))
+            return _unwrap_tuple_payload(res2), "core.data_engine_v2.get_engine().get_enriched_quote", None
     except Exception:
         pass
 
-    # 3) v2 temp engine
+    # 3) v2 temp engine (fallback)
     try:
         from core.data_engine_v2 import DataEngine as V2Engine  # type: ignore
 
@@ -1141,7 +1136,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
     except Exception:
         pass
 
-    # 4) legacy module-level singleton
+    # 4) legacy module-level singleton (v1)
     try:
         from core.data_engine import get_enriched_quote as v1_get  # type: ignore
 
@@ -1163,7 +1158,7 @@ async def _call_engine_batch_best_effort(
     if not symbols_norm:
         return None, None, "empty"
 
-    # 1) app.state.engine batch
+    # 1) app.state.engine batch (preferred)
     try:
         eng = getattr(request.app.state, "engine", None)
     except Exception:
@@ -1184,15 +1179,18 @@ async def _call_engine_batch_best_effort(
                     last_err = _safe_error_message(e)
         return None, "app.state.engine(batch)", last_err or "batch call failed"
 
-    # 2) v2 singleton batch
+    # 2) v2 singleton accessor batch (CORRECT for v2.10.x)
     try:
-        from core.data_engine_v2 import get_enriched_quotes as v2_batch  # type: ignore
+        from core.data_engine_v2 import get_engine  # type: ignore
 
-        res2 = await _maybe_await(v2_batch(symbols_norm))
-        res2 = _unwrap_tuple_payload(res2)
-        if isinstance(res2, (list, dict)):
-            return res2, "core.data_engine_v2.get_enriched_quotes(singleton)", None
-        return None, "core.data_engine_v2.get_enriched_quotes(singleton)", "batch returned non-list/non-dict"
+        eng2 = get_engine()
+        fn = getattr(eng2, "get_enriched_quotes", None) or getattr(eng2, "get_quotes", None)
+        if callable(fn):
+            res2 = await _maybe_await(fn(symbols_norm))
+            res2 = _unwrap_tuple_payload(res2)
+            if isinstance(res2, (list, dict)):
+                return res2, "core.data_engine_v2.get_engine().get_enriched_quotes", None
+            return None, "core.data_engine_v2.get_engine().get_enriched_quotes", "batch returned non-list/non-dict"
     except Exception:
         pass
 
@@ -1402,7 +1400,7 @@ async def enriched_quote(
         return JSONResponse(status_code=200, content=payload)
 
     except Exception as e:
-        out: Dict[str, Any] = {
+        out2: Dict[str, Any] = {
             "status": "error",
             "symbol": norm or raw,
             "symbol_input": raw,
@@ -1415,8 +1413,8 @@ async def enriched_quote(
             "last_updated_riyadh": "",
         }
         if dbg:
-            out["traceback"] = _clamp(traceback.format_exc(), 8000)
-        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out))
+            out2["traceback"] = _clamp(traceback.format_exc(), 8000)
+        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out2))
 
 
 @router.get("/quotes")
