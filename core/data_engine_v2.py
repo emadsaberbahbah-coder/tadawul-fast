@@ -2,27 +2,33 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.9.2) — KSA-SAFE + PROD SAFE + ROUTER FRIENDLY
-+ Forecast-ready + History analytics (returns/vol/MA/RSI)
-+ Better scoring + Overall score + Recommendation + Badges
-+ Riyadh timestamp + Bounded concurrency for batch refresh
+UNIFIED DATA ENGINE (v2.10.0) — PROD SAFE + ROUTER FRIENDLY
+Fixes: Global output returning data_source=none / BAD due to:
+  - missing provider function discovery (eodhd exports patch-style fn names)
+  - weak symbol normalization for EODHD (AAPL -> AAPL.US)
+  - provider call signature mismatch (ticker vs symbol, positional vs kwargs)
 
-Why v2.9.2
-- ✅ Fixes SyntaxError + hardens history parsing (the old file was truncated near payload.get)
-- ✅ Provider-candidate import strategy (safe if some provider modules are missing)
-- ✅ Stable, Sheets-friendly output fields (never raises; placeholder rows on errors)
-- ✅ No network at import-time (PROD SAFE)
-
-Provider strategy (best-effort)
-- Global default providers (if env empty): eodhd,finnhub
-- KSA default providers (if env empty): yahoo_chart,argaam (tadawul only if configured)
+Key guarantees
+- ✅ PROD SAFE: no network at import-time
+- ✅ Never raises: always returns dict placeholder on failure
+- ✅ Global routing: EODHD primary (best-effort), then Finnhub
+- ✅ KSA routing: Yahoo (chart/provider) primary, then Argaam (+ Tadawul if configured)
+- ✅ Forecast-ready: fills Forecast Price/Expected ROI/Confidence/Updated
+- ✅ History analytics: returns/vol/MA/RSI (best-effort)
+- ✅ Scores + Recommendation + Badges (BUY/HOLD/REDUCE/SELL)
+- ✅ Riyadh timestamps
 
 Environment knobs (optional)
-- ENABLED_PROVIDERS / PROVIDERS        (global providers list)
-- KSA_PROVIDERS                         (ksa providers list)
-- ENABLE_HISTORY_ANALYTICS=true|false   (default true)
-- ENGINE_CACHE_TTL_SEC                  (default 45)
-- ENGINE_CONCURRENCY                    (default 12)
+- ENABLED_PROVIDERS / PROVIDERS          (global providers list)
+- KSA_PROVIDERS                          (ksa providers list)
+- ENABLE_HISTORY_ANALYTICS=true|false    (default true)
+- ENGINE_CACHE_TTL_SEC                   (default 45)
+- ENGINE_CONCURRENCY                     (default 12)
+- ENGINE_INCLUDE_WARNINGS=true|false     (default false)
+- KEEP_RAW_HISTORY=true|false            (default false)
+
+Notes
+- This engine returns a stable dict schema; routers may add status/route_version.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.9.2"
+ENGINE_VERSION = "2.10.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -126,27 +132,16 @@ except Exception:  # pragma: no cover
         return default
 
 
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
-    try:
-        md = getattr(obj, "model_dump", None)
-        if callable(md):
-            d = md()
-            return d if isinstance(d, dict) else dict(d)
-    except Exception:
-        pass
-    try:
-        dct = getattr(obj, "dict", None)
-        if callable(dct):
-            d = dct()
-            return d if isinstance(d, dict) else dict(d)
-    except Exception:
-        pass
-    try:
-        return dict(getattr(obj, "__dict__", {}) or {})
-    except Exception:
-        return {}
+# ---------------------------------------------------------------------------
+# Recommendation normalizer (optional)
+# ---------------------------------------------------------------------------
+try:
+    from core.reco_normalize import normalize_recommendation as _norm_reco  # type: ignore
+except Exception:  # pragma: no cover
+
+    def _norm_reco(x: Any, default: str = "HOLD") -> str:  # type: ignore
+        s = str(x or "").strip().upper()
+        return s if s in {"BUY", "HOLD", "REDUCE", "SELL"} else (default if default in {"BUY", "HOLD", "REDUCE", "SELL"} else "HOLD")
 
 
 def _utc_iso() -> str:
@@ -215,11 +210,6 @@ def _safe_float(val: Any) -> Optional[float]:
 
 
 def _maybe_percent(v: Any) -> Optional[float]:
-    """
-    Normalize percent-like fields to percent.
-    If provider returns fraction (0.12), convert to 12.0
-    If provider already returns percent-like (12.0), keep as-is.
-    """
     x = _safe_float(v)
     if x is None:
         return None
@@ -256,16 +246,71 @@ def _is_ksa(symbol: str) -> bool:
     return s.endswith(".SR") or s.isdigit() or bool(re.fullmatch(r"\d{3,6}(\.SR)?", s))
 
 
-def normalize_symbol(symbol: str) -> str:
+def _fallback_normalize_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s:
         return ""
+    s = s.translate(_ARABIC_DIGITS).strip()
+
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
+
+    # indices / fx / futures / crypto pairs etc (do not append .US)
+    if any(ch in s for ch in ("^", "=", "-", "/")):
+        return s
+
     if s.isdigit() or re.fullmatch(r"\d{3,6}", s):
         return f"{s}.SR"
+
+    if s.endswith(".SR") or s.endswith(".US"):
+        return s
+
+    if "." in s:
+        return s
+
+    # default global equity
+    return f"{s}.US"
+
+
+def normalize_symbol(symbol: str) -> str:
+    """
+    Preferred symbol normalizer:
+    - If core.symbols.normalize.normalize_symbol exists, uses it.
+    - Otherwise uses fallback:
+        AAPL -> AAPL.US
+        1120 -> 1120.SR
+    """
+    try:
+        from core.symbols.normalize import normalize_symbol as _ext  # type: ignore
+
+        out = _ext(symbol)
+        return (out or "").strip().upper() if out else _fallback_normalize_symbol(symbol)
+    except Exception:
+        return _fallback_normalize_symbol(symbol)
+
+
+def _provider_symbol(sym_norm: str, provider_key: str) -> str:
+    """
+    Provider-specific symbol mapping:
+    - Finnhub usually expects plain tickers (AAPL) rather than AAPL.US
+    - Yahoo often expects plain tickers too, but KSA paths use .SR already
+    """
+    s = (sym_norm or "").strip().upper()
+    k = (provider_key or "").strip().lower()
+
+    if k in {"finnhub"}:
+        if s.endswith(".US"):
+            return s[:-3]
+        return s
+
+    if k.startswith("yahoo") or k in {"yfinance"}:
+        if s.endswith(".US"):
+            return s[:-3]
+        return s
+
+    # eodhd and others: keep normalized (AAPL.US)
     return s
 
 
@@ -292,11 +337,62 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
     return out
 
 
+def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
+    """
+    Try common signatures without assuming provider API.
+    Order: positional-first, then keyword variants.
+    """
+    # positional + kwargs
+    try:
+        return fn(symbol, refresh=refresh, fields=fields)
+    except TypeError:
+        pass
+    try:
+        return fn(symbol, refresh=refresh)
+    except TypeError:
+        pass
+    try:
+        return fn(symbol, fields=fields)
+    except TypeError:
+        pass
+    try:
+        return fn(symbol, refresh)
+    except TypeError:
+        pass
+    try:
+        return fn(symbol)
+    except TypeError:
+        pass
+
+    # keyword symbol variants
+    for key in ("symbol", "ticker", "sym"):
+        try:
+            return fn(**{key: symbol, "refresh": refresh, "fields": fields})
+        except TypeError:
+            pass
+        try:
+            return fn(**{key: symbol, "refresh": refresh})
+        except TypeError:
+            pass
+        try:
+            return fn(**{key: symbol, "fields": fields})
+        except TypeError:
+            pass
+        try:
+            return fn(**{key: symbol})
+        except TypeError:
+            pass
+
+    # last resort: let exception bubble to caller wrapper
+    return fn(symbol)
+
+
 async def _try_provider_call(
     module_name: str,
     fn_names: List[str],
-    *args: Any,
-    **kwargs: Any,
+    symbol: str,
+    refresh: bool,
+    fields: Optional[str],
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """
     Provider callable may return:
@@ -322,7 +418,7 @@ async def _try_provider_call(
         return {}, f"{module_name}: no callable in {fn_names}"
 
     try:
-        res = await _call_maybe_async(fn, *args, **kwargs)
+        res = await _call_maybe_async(_call_provider_best_effort, fn, symbol, refresh, fields)
         if _is_tuple2(res):
             patch, err = res
             return (patch or {}) if isinstance(patch, dict) else {}, (err if err else None)
@@ -336,8 +432,9 @@ async def _try_provider_call(
 async def _try_provider_candidates(
     module_candidates: List[str],
     fn_candidates: List[str],
-    *args: Any,
-    **kwargs: Any,
+    symbol: str,
+    refresh: bool,
+    fields: Optional[str],
 ) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     """
     Try multiple modules for the same provider key.
@@ -345,7 +442,7 @@ async def _try_provider_candidates(
     """
     last_err: Optional[str] = None
     for mod in module_candidates:
-        patch, err = await _try_provider_call(mod, fn_candidates, *args, **kwargs)
+        patch, err = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
         if patch:
             return patch, err, mod
         last_err = err
@@ -375,18 +472,15 @@ def _apply_derived(out: Dict[str, Any]) -> None:
         if cur is not None and hi is not None and lo is not None and hi != lo:
             out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
 
-    # Normalize percent-like fields to percent (sheet-ready)
     for k in ("dividend_yield", "roe", "roa", "payout_ratio", "net_margin", "ebitda_margin"):
         if out.get(k) is not None:
             out[k] = _maybe_percent(out.get(k))
 
-    # Compute market cap if possible
     if out.get("market_cap") is None:
         sh = _safe_float(out.get("shares_outstanding"))
         if cur is not None and sh is not None:
             out["market_cap"] = cur * sh
 
-    # Compute PE if possible
     if out.get("pe_ttm") is None:
         eps = _safe_float(out.get("eps_ttm"))
         if cur is not None and eps not in (None, 0.0):
@@ -395,14 +489,13 @@ def _apply_derived(out: Dict[str, Any]) -> None:
             except Exception:
                 pass
 
-    # Free float market cap if possible
     if out.get("free_float_market_cap") is None:
         ff = _safe_float(out.get("free_float"))
         mc = _safe_float(out.get("market_cap"))
         if ff is not None and mc is not None:
-            if ff > 1.5:  # already percent
+            if ff > 1.5:
                 out["free_float_market_cap"] = mc * (ff / 100.0)
-            else:  # fraction
+            else:
                 out["free_float_market_cap"] = mc * ff
 
 
@@ -487,25 +580,12 @@ def _to_epoch_seconds(x: Any) -> Optional[int]:
 
 
 def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
-    """
-    Normalize to [(ts_sec, close), ...] sorted ascending.
-
-    Supports common shapes:
-      - {"history":[{"date":"YYYY-MM-DD","close":...}, ...]}
-      - {"prices":[{"timestamp":..., "close":...}, ...]}
-      - {"candles":{"t":[...], "c":[...]}} (yahoo-style)
-      - {"t":[...], "c":[...]} or {"timestamp":[...], "close":[...]}
-      - list of dicts
-      - list of tuples (ts, close)
-    """
     out: List[Tuple[int, float]] = []
     try:
         if payload is None:
             return out
 
-        # dict shapes
         if isinstance(payload, dict):
-            # nested candles
             if isinstance(payload.get("candles"), dict):
                 c = payload.get("candles") or {}
                 t_list = c.get("t") or c.get("timestamp") or c.get("time") or []
@@ -519,7 +599,6 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                     out.sort(key=lambda x: x[0])
                     return out
 
-            # yahoo-like top-level t/c
             t_list = payload.get("t") or payload.get("timestamp") or payload.get("time") or []
             c_list = payload.get("c") or payload.get("close") or payload.get("closes") or []
             if isinstance(t_list, list) and isinstance(c_list, list) and len(t_list) == len(c_list) and len(t_list) > 1:
@@ -531,19 +610,16 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                 out.sort(key=lambda x: x[0])
                 return out
 
-            # list-of-dicts in common keys
             for key in ("history", "prices", "price_history", "ohlc", "candles_list"):
                 arr = payload.get(key)
                 if isinstance(arr, list) and arr:
-                    payload = arr  # fallthrough to list handler
+                    payload = arr
                     break
             else:
-                # sometimes payload already includes "data" wrapper
                 arr = payload.get("data")
                 if isinstance(arr, list) and arr:
                     payload = arr
 
-        # list shapes
         if isinstance(payload, list):
             for item in payload:
                 if item is None:
@@ -583,10 +659,6 @@ def _pct(a: float, b: float) -> Optional[float]:
 
 
 def _compute_returns(closes: List[float]) -> Dict[str, Optional[float]]:
-    """
-    closes: ordered oldest->newest
-    returns_* are percent
-    """
     res: Dict[str, Optional[float]] = {
         "returns_1w": None,
         "returns_1m": None,
@@ -599,12 +671,11 @@ def _compute_returns(closes: List[float]) -> Dict[str, Optional[float]]:
         return res
 
     last = closes[-1]
+
     def ret(days: int) -> Optional[float]:
         if n <= days:
             return None
         base = closes[-(days + 1)]
-        if base is None:
-            return None
         return _pct(last, base)
 
     res["returns_1w"] = ret(_TD_1W)
@@ -617,9 +688,7 @@ def _compute_returns(closes: List[float]) -> Dict[str, Optional[float]]:
 
 def _sma(vals: List[float], window: int) -> Optional[float]:
     try:
-        if window <= 0:
-            return None
-        if len(vals) < window:
+        if window <= 0 or len(vals) < window:
             return None
         chunk = vals[-window:]
         return sum(chunk) / float(window)
@@ -628,13 +697,10 @@ def _sma(vals: List[float], window: int) -> Optional[float]:
 
 
 def _volatility_30d(closes: List[float]) -> Optional[float]:
-    """
-    Annualized volatility in percent based on ~30 most recent trading days.
-    """
     try:
         if len(closes) < 35:
             return None
-        window = closes[-31:]  # need 30 returns
+        window = closes[-31:]
         rets: List[float] = []
         for i in range(1, len(window)):
             prev = window[i - 1]
@@ -647,16 +713,12 @@ def _volatility_30d(closes: List[float]) -> Optional[float]:
         mean = sum(rets) / len(rets)
         var = sum((r - mean) ** 2 for r in rets) / max(1, (len(rets) - 1))
         sd = math.sqrt(var)
-        ann = sd * math.sqrt(252.0)  # trading days
-        return ann * 100.0
+        return (sd * math.sqrt(252.0)) * 100.0
     except Exception:
         return None
 
 
 def _rsi_14(closes: List[float]) -> Optional[float]:
-    """
-    RSI(14) using simple Wilder smoothing (best-effort).
-    """
     try:
         if len(closes) < 20:
             return None
@@ -680,16 +742,11 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
 
 
 def _apply_history_analytics(out: Dict[str, Any]) -> None:
-    """
-    Uses out["history_payload"] or out["history"] if present, and fills:
-      returns_*, ma20/50/200, volatility_30d, rsi_14
-    """
     try:
         payload = out.get("history_payload") or out.get("history")
         series = _extract_close_series(payload)
         if len(series) < 10:
             return
-
         closes = [c for _, c in series if c is not None]
         if len(closes) < 10:
             return
@@ -701,18 +758,55 @@ def _apply_history_analytics(out: Dict[str, Any]) -> None:
         out.setdefault("volatility_30d", _volatility_30d(closes))
         out.setdefault("rsi_14", _rsi_14(closes))
 
-        # keep the raw series only if explicitly requested
         if not _env_bool("KEEP_RAW_HISTORY", False):
             out.pop("history_payload", None)
     except Exception:
         return
 
 
+def _coerce_confidence(v: Any) -> Optional[float]:
+    """
+    Normalize forecast confidence into 0..1
+    Accepts:
+      - 0..1 fraction
+      - 0..100 percent (confidence_score style)
+    """
+    x = _safe_float(v)
+    if x is None:
+        return None
+    if x > 1.0 and x <= 100.0:
+        return max(0.0, min(1.0, x / 100.0))
+    return max(0.0, min(1.0, x))
+
+
+def _map_forecast_aliases(out: Dict[str, Any]) -> None:
+    """
+    Map provider variants into canonical fields:
+      expected_return_*  -> expected_roi_*
+      expected_price_*   -> forecast_price_*
+      confidence_score   -> forecast_confidence (0..1)
+    """
+    for horizon in ("1m", "3m", "12m"):
+        er_k = f"expected_return_{horizon}"
+        ep_k = f"expected_price_{horizon}"
+        roi_k = f"expected_roi_{horizon}"
+        fp_k = f"forecast_price_{horizon}"
+
+        if out.get(roi_k) is None and out.get(er_k) is not None:
+            out[roi_k] = _safe_float(out.get(er_k))
+        if out.get(fp_k) is None and out.get(ep_k) is not None:
+            out[fp_k] = _safe_float(out.get(ep_k))
+
+    if out.get("forecast_confidence") is None and out.get("confidence_score") is not None:
+        out["forecast_confidence"] = _coerce_confidence(out.get("confidence_score"))
+    elif out.get("forecast_confidence") is not None:
+        out["forecast_confidence"] = _coerce_confidence(out.get("forecast_confidence"))
+
+    out.setdefault("forecast_updated_utc", _utc_iso())
+    out.setdefault("forecast_updated_riyadh", _riyadh_iso())
+
+
 def _forecast_from_momentum(out: Dict[str, Any]) -> None:
-    """
-    Fills forecast_* and expected_roi_* if missing, based on returns_* and current_price.
-    This is intentionally simple (momentum proxy) and safe for Sheets.
-    """
     cur = _safe_float(out.get("current_price"))
     if cur is None or cur <= 0:
         return
@@ -721,7 +815,6 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
     r3m = _safe_float(out.get("returns_3m"))
     r12m = _safe_float(out.get("returns_12m"))
 
-    # Expected ROI defaults (percent)
     if out.get("expected_roi_1m") is None and r1m is not None:
         out["expected_roi_1m"] = r1m
     if out.get("expected_roi_3m") is None and r3m is not None:
@@ -740,7 +833,6 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
     if out.get("forecast_price_12m") is None and er12 is not None:
         out["forecast_price_12m"] = cur * (1.0 + er12 / 100.0)
 
-    # Confidence heuristic
     if out.get("forecast_confidence") is None:
         vol = _safe_float(out.get("volatility_30d"))
         has_f = _has_any_fundamentals(out)
@@ -748,13 +840,11 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
         if vol is None:
             conf = base
         else:
-            # higher vol => lower confidence (soft clamp)
             conf = base - min(0.25, max(0.0, (vol - 20.0) / 200.0))
         conf = max(0.20, min(0.90, conf))
         out["forecast_confidence"] = conf
 
     out.setdefault("forecast_method", "momentum_returns")
-
     out.setdefault("forecast_updated_utc", _utc_iso())
     out.setdefault("forecast_updated_riyadh", _riyadh_iso())
 
@@ -762,19 +852,7 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
 # ============================================================
 # Scoring + recommendation (simple, stable, Sheets-friendly)
 # ============================================================
-def _clamp01(x: Optional[float]) -> Optional[float]:
-    if x is None:
-        return None
-    try:
-        return max(0.0, min(1.0, float(x)))
-    except Exception:
-        return None
-
-
 def _score_from_percent(x: Optional[float], lo: float, hi: float) -> float:
-    """
-    Map percent metric to 0..100.
-    """
     if x is None:
         return 50.0
     try:
@@ -789,9 +867,6 @@ def _score_from_percent(x: Optional[float], lo: float, hi: float) -> float:
 
 
 def _score_inverse_percent(x: Optional[float], lo: float, hi: float) -> float:
-    """
-    Lower is better, map percent metric to 0..100.
-    """
     if x is None:
         return 50.0
     try:
@@ -806,10 +881,6 @@ def _score_inverse_percent(x: Optional[float], lo: float, hi: float) -> float:
 
 
 def _compute_scores(out: Dict[str, Any]) -> None:
-    """
-    Produces:
-      value_score, quality_score, momentum_score, risk_score, opportunity_score, overall_score
-    """
     upside = _safe_float(out.get("upside_percent"))
     roe = _safe_float(out.get("roe"))
     roa = _safe_float(out.get("roa"))
@@ -825,22 +896,14 @@ def _compute_scores(out: Dict[str, Any]) -> None:
     vol = _safe_float(out.get("volatility_30d"))
     beta = _safe_float(out.get("beta"))
 
-    # Value: upside + low PB/PE hints (soft)
     pb = _safe_float(out.get("pb"))
     pe = _safe_float(out.get("pe_ttm"))
 
     value = 0.6 * _score_from_percent(upside, lo=-20.0, hi=60.0)
-    if pb is not None:
-        value += 0.2 * _score_inverse_percent(pb, lo=0.8, hi=6.0)  # PB lower better
-    else:
-        value += 0.2 * 50.0
-    if pe is not None:
-        value += 0.2 * _score_inverse_percent(pe, lo=8.0, hi=45.0)  # PE lower better
-    else:
-        value += 0.2 * 50.0
+    value += 0.2 * (_score_inverse_percent(pb, lo=0.8, hi=6.0) if pb is not None else 50.0)
+    value += 0.2 * (_score_inverse_percent(pe, lo=8.0, hi=45.0) if pe is not None else 50.0)
     value_score = max(0.0, min(100.0, value))
 
-    # Quality: ROE/ROA/Net margin + growth
     quality = (
         0.35 * _score_from_percent(roe, lo=0.0, hi=25.0)
         + 0.20 * _score_from_percent(roa, lo=0.0, hi=12.0)
@@ -850,31 +913,23 @@ def _compute_scores(out: Dict[str, Any]) -> None:
     )
     quality_score = max(0.0, min(100.0, quality))
 
-    # Momentum: returns + RSI balance
     mom = (
         0.45 * _score_from_percent(r1m, lo=-15.0, hi=20.0)
         + 0.35 * _score_from_percent(r3m, lo=-25.0, hi=40.0)
         + 0.10 * _score_from_percent(r12m, lo=-40.0, hi=80.0)
     )
     if rsi is not None:
-        # Prefer RSI mid-high (45..65) -> stable; too high/low reduces a bit
         rsi_score = 100.0 - min(100.0, abs(rsi - 55.0) * 3.0)
         mom += 0.10 * max(0.0, min(100.0, rsi_score))
     else:
         mom += 0.10 * 50.0
     momentum_score = max(0.0, min(100.0, mom))
 
-    # Risk: volatility + beta (lower is better)
     risk_good = 0.65 * _score_inverse_percent(vol, lo=12.0, hi=70.0) + 0.35 * _score_inverse_percent(beta, lo=0.7, hi=2.2)
     risk_score = max(0.0, min(100.0, risk_good))
 
-    # Opportunity: combine value + momentum + quality; penalize low risk score a bit
-    opportunity = 0.40 * value_score + 0.30 * momentum_score + 0.30 * quality_score
-    opportunity_score = max(0.0, min(100.0, opportunity))
-
-    # Overall: emphasize balanced outcome including risk
-    overall = 0.30 * value_score + 0.30 * quality_score + 0.25 * momentum_score + 0.15 * risk_score
-    overall_score = max(0.0, min(100.0, overall))
+    opportunity_score = max(0.0, min(100.0, (0.40 * value_score + 0.30 * momentum_score + 0.30 * quality_score)))
+    overall_score = max(0.0, min(100.0, (0.30 * value_score + 0.30 * quality_score + 0.25 * momentum_score + 0.15 * risk_score)))
 
     out.setdefault("value_score", round(value_score, 2))
     out.setdefault("quality_score", round(quality_score, 2))
@@ -902,15 +957,10 @@ def _badges(out: Dict[str, Any]) -> List[str]:
 
 
 def _recommendation(out: Dict[str, Any]) -> str:
-    """
-    BUY / HOLD / REDUCE / SELL
-    Based on overall + risk.
-    """
     overall = _safe_float(out.get("overall_score")) or 0.0
     risk = _safe_float(out.get("risk_score")) or 50.0
     mom = _safe_float(out.get("momentum_score")) or 50.0
 
-    # basic gates
     if overall >= 78 and risk >= 55:
         return "BUY"
     if overall >= 70 and mom >= 60:
@@ -925,12 +975,13 @@ def _recommendation(out: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# UnifiedQuote model (optional; dict output remains canonical)
+# UnifiedQuote model (optional)
 # ============================================================
 class UnifiedQuote(BaseModel):
     symbol: str = Field(default="")
     symbol_normalized: str = Field(default="")
     symbol_input: str = Field(default="")
+
     name: Optional[str] = None
     market: Optional[str] = None
     currency: Optional[str] = None
@@ -1027,11 +1078,32 @@ class UnifiedQuote(BaseModel):
 _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
     "eodhd": {
         "modules": ["core.providers.eodhd_provider", "providers.eodhd_provider", "eodhd_provider"],
-        "functions": ["get_quote", "get_enriched_quote", "fetch_quote", "quote", "fetch"],
+        "functions": [
+            # patch-style exports (preferred)
+            "fetch_enriched_quote_patch",
+            "fetch_enriched_patch",
+            "fetch_quote_and_enrichment_patch",
+            "fetch_quote_and_fundamentals_patch",
+            "fetch_quote_patch",
+            # common generic names
+            "get_enriched_quote",
+            "get_quote",
+            "fetch_quote",
+            "quote",
+            "fetch",
+        ],
     },
     "finnhub": {
         "modules": ["core.providers.finnhub_provider", "providers.finnhub_provider", "finnhub_provider"],
-        "functions": ["get_quote", "get_enriched_quote", "fetch_quote", "quote", "fetch"],
+        "functions": [
+            "fetch_enriched_quote_patch",
+            "fetch_quote_patch",
+            "get_enriched_quote",
+            "get_quote",
+            "fetch_quote",
+            "quote",
+            "fetch",
+        ],
     },
     "yahoo_chart": {
         "modules": [
@@ -1040,19 +1112,35 @@ _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
             "providers.yahoo_chart_provider",
             "yahoo_chart_provider",
         ],
-        "functions": ["get_quote", "get_enriched_quote", "fetch_quote", "quote", "fetch"],
+        "functions": [
+            "fetch_enriched_quote_patch",
+            "fetch_quote_patch",
+            "get_enriched_quote",
+            "get_quote",
+            "fetch_quote",
+            "quote",
+            "fetch",
+        ],
     },
     "yfinance": {
         "modules": ["core.providers.yfinance_provider", "providers.yfinance_provider", "yfinance_provider"],
-        "functions": ["get_quote", "get_enriched_quote", "fetch_quote", "quote", "fetch"],
+        "functions": ["get_enriched_quote", "get_quote", "fetch_quote", "quote", "fetch"],
     },
     "argaam": {
         "modules": ["core.providers.argaam_provider", "providers.argaam_provider", "argaam_provider"],
-        "functions": ["get_quote", "get_enriched_quote", "fetch_quote", "quote", "fetch"],
+        "functions": [
+            "fetch_enriched_quote_patch",
+            "fetch_quote_patch",
+            "get_enriched_quote",
+            "get_quote",
+            "fetch_quote",
+            "quote",
+            "fetch",
+        ],
     },
     "tadawul": {
         "modules": ["core.providers.tadawul_provider", "providers.tadawul_provider", "tadawul_provider"],
-        "functions": ["get_quote", "get_enriched_quote", "fetch_quote", "quote", "fetch"],
+        "functions": ["get_enriched_quote", "get_quote", "fetch_quote", "quote", "fetch"],
     },
 }
 
@@ -1084,7 +1172,10 @@ class DataEngine:
         if not os.getenv("KSA_PROVIDERS"):
             os.environ.setdefault("KSA_PROVIDERS", "yahoo_chart,argaam")
 
-        self.global_providers = _parse_list_env("ENABLED_PROVIDERS", fallback=os.getenv("PROVIDERS", "eodhd,finnhub") or "eodhd,finnhub")
+        self.global_providers = _parse_list_env(
+            "ENABLED_PROVIDERS",
+            fallback=(os.getenv("PROVIDERS", "eodhd,finnhub") or "eodhd,finnhub"),
+        )
         self.ksa_providers = _parse_list_env("KSA_PROVIDERS", fallback="yahoo_chart,argaam")
 
         # Tadawul provider only if configured
@@ -1097,13 +1188,14 @@ class DataEngine:
         self.enable_history = _env_bool("ENABLE_HISTORY_ANALYTICS", True)
 
         logger.info(
-            "DataEngine v%s | ttl=%ss | conc=%s | global=%s | ksa=%s | history=%s",
+            "DataEngine v%s | ttl=%ss | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s",
             ENGINE_VERSION,
             self.cache_ttl_sec,
             self.max_concurrency,
             self.global_providers,
             self.ksa_providers,
             self.enable_history,
+            _HAS_CACHETOOLS,
         )
 
     # --------------------
@@ -1111,20 +1203,22 @@ class DataEngine:
     # --------------------
     async def get_enriched_quote(self, symbol: str, refresh: bool = False, fields: Optional[str] = None) -> Dict[str, Any]:
         sym_in = symbol or ""
-        sym = normalize_symbol(sym_in)
-        if not sym:
+        sym_norm = normalize_symbol(sym_in)
+        if not sym_norm:
             return self._placeholder(sym_in, err="Missing symbol")
 
-        cache_key = f"q::{sym}"
+        cache_key = f"q::{sym_norm}"
         if not refresh:
             cached = self._cache.get(cache_key)
-            if isinstance(cached, dict) and cached.get("symbol_normalized") == sym:
+            if isinstance(cached, dict) and cached.get("symbol_normalized") == sym_norm:
                 return dict(cached)
 
-        async with self._sem:
-            out = await self._fetch_and_build(sym_in, sym, fields=fields)
+        try:
+            async with self._sem:
+                out = await self._fetch_and_build(sym_in, sym_norm, refresh=refresh, fields=fields)
+        except Exception as e:
+            out = self._placeholder(sym_in, err=f"Engine error: {e}")
 
-        # Cache only ok-ish rows
         try:
             self._cache[cache_key] = dict(out)
         except Exception:
@@ -1132,16 +1226,14 @@ class DataEngine:
         return out
 
     async def get_quote(self, symbol: str, refresh: bool = False, fields: Optional[str] = None) -> Dict[str, Any]:
-        # Alias
         return await self.get_enriched_quote(symbol, refresh=refresh, fields=fields)
 
     # --------------------
     # Public API (batch)
     # --------------------
     async def get_enriched_quotes(self, symbols: List[str], refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        syms = [normalize_symbol(s) for s in (symbols or [])]
-        # keep input order: we cache per normalized symbol but return per input index
-        tasks = [self.get_enriched_quote(symbols[i], refresh=refresh, fields=fields) for i in range(len(syms))]
+        symbols = symbols or []
+        tasks = [self.get_enriched_quote(symbols[i], refresh=refresh, fields=fields) for i in range(len(symbols))]
         res = await asyncio.gather(*tasks, return_exceptions=True)
         out: List[Dict[str, Any]] = []
         for i, r in enumerate(res):
@@ -1152,13 +1244,12 @@ class DataEngine:
         return out
 
     async def get_quotes(self, symbols: List[str], refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        # Alias
         return await self.get_enriched_quotes(symbols, refresh=refresh, fields=fields)
 
     # --------------------
     # Core build
     # --------------------
-    async def _fetch_and_build(self, symbol_input: str, sym_norm: str, fields: Optional[str]) -> Dict[str, Any]:
+    async def _fetch_and_build(self, symbol_input: str, sym_norm: str, refresh: bool, fields: Optional[str]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "symbol": sym_norm,
             "symbol_normalized": sym_norm,
@@ -1180,45 +1271,67 @@ class DataEngine:
                 warnings.append(f"{key}: unknown provider key")
                 continue
 
+            sym_for_provider = _provider_symbol(sym_norm, key)
+
             patch, err, mod_used = await _try_provider_candidates(
                 module_candidates=list(reg.get("modules") or []),
                 fn_candidates=list(reg.get("functions") or []),
-                symbol=sym_norm,  # kwargs to accommodate varying provider signatures
+                symbol=sym_for_provider,
+                refresh=refresh,
+                fields=fields,
             )
+
             if patch:
+                # Treat provider 'error' as warning unless it's hard and no price came
+                p_err = patch.get("error")
+                if isinstance(p_err, str) and p_err.strip():
+                    if p_err.strip().lower().startswith(("warning", "warn")):
+                        warnings.append(f"{key}: {p_err.strip()}")
+                        try:
+                            patch = dict(patch)
+                            patch.pop("error", None)
+                        except Exception:
+                            pass
+
                 _merge_patch(out, patch)
-                used_sources.append(key if not mod_used else f"{key}:{mod_used.split('.')[-1]}")
+
+                tag = key
+                if mod_used:
+                    tag = f"{key}:{mod_used.split('.')[-1]}"
+                used_sources.append(tag)
+
             if err:
                 warnings.append(f"{key}: {err}")
 
-        # Derived computations
+        # Derived computations + normalization
         _apply_derived(out)
         out["data_quality"] = _quality_label(out)
 
-        # History analytics if present (provider may set history/history_payload)
+        # Map provider forecast aliases (EODHD style) -> canonical
+        _map_forecast_aliases(out)
+
+        # History analytics if raw history present
         if self.enable_history:
             _apply_history_analytics(out)
 
-        # Forecast/expected fields
+        # Forecast/expected fields if still missing
         _forecast_from_momentum(out)
 
         # Score + reco + badges
         _compute_scores(out)
         out["badges"] = _badges(out)
-        out["recommendation"] = _recommendation(out)
 
-        # Source + error/warnings
-        if used_sources:
-            out["data_source"] = ",".join(_dedup_preserve(used_sources))
-        else:
-            out["data_source"] = "none"
+        computed_reco = _recommendation(out)
+        out["recommendation"] = _norm_reco(computed_reco, default="HOLD")
+
+        # Source
+        out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
 
         # If no price => hard error
         if _safe_float(out.get("current_price")) is None:
             out["error"] = "MISSING: current_price"
             out["data_quality"] = "BAD"
         else:
-            # keep warnings only when debug env is on (avoid clutter)
             if warnings and _env_bool("ENGINE_INCLUDE_WARNINGS", False):
                 out["error"] = " | ".join(warnings[:6])
 
@@ -1235,6 +1348,7 @@ class DataEngine:
             "data_quality": "BAD",
             "error": err,
             "recommendation": "HOLD",
+            "badges": [],
             "last_updated_utc": _utc_iso(),
             "last_updated_riyadh": _riyadh_iso(),
             "forecast_updated_utc": _utc_iso(),
