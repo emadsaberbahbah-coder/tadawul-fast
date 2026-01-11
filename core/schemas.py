@@ -1,21 +1,19 @@
-# core/schemas.py  — FULL REPLACEMENT — v3.7.0
+# core/schemas.py  — FULL REPLACEMENT — v3.8.0
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.7.0 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.8.0 (PROD SAFE)
 
-What changed in v3.7.0 (page-custom + forecast clarity)
-- ✅ Each page has its own customized vNext header set (no “one size fits all”).
-- ✅ Forecast columns updated to match the agreed Google Sheets naming:
+What changed in v3.8.0 (stability + enriched compatibility)
+- ✅ Keeps vNext page-custom schemas (no “one size fits all”).
+- ✅ Forecast CORE columns are the agreed Google Sheets names:
     • Forecast Price (1M/3M/12M)
     • Expected ROI % (1M/3M/12M)
     • Forecast Confidence
     • Forecast Updated (UTC)
-  (while still recognizing legacy “Expected Return/Expected Price” variants)
-- ✅ Equity pages (KSA Tadawul + Market Leaders) now include Forecast CORE columns.
-- ✅ Still backward compatible:
-    • Legacy 59 + legacy Analysis headers preserved
-    • Tolerant header normalization + synonyms maintained
+- ✅ Better tolerance for header variants used by older/compat routes:
+    • Supports "Dividend Yield" (no %) and other non-% variants safely
+    • Improved header canonicalization and synonyms coverage
 - ✅ Import-safe: no DataEngine imports, no network, no heavy deps.
 - ✅ Defensive: get_headers_for_sheet() never raises and always returns COPIES.
 """
@@ -39,7 +37,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.7.0"
+SCHEMAS_VERSION = "3.8.0"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -319,11 +317,8 @@ _VN_FORECAST_EXTENDED: List[str] = [
     "History Last (UTC)",
 ]
 
-# Full forecast block (global/funds/comfx can use this)
-_VN_FORECAST_FULL: List[str] = (
-    list(_VN_FORECAST_EXTENDED)
-    + list(_VN_FORECAST_CORE)
-)
+# Full forecast block (recommend: CORE first for readability)
+_VN_FORECAST_FULL: List[str] = list(_VN_FORECAST_CORE) + list(_VN_FORECAST_EXTENDED)
 
 _VN_META: List[str] = [
     "Error",
@@ -351,19 +346,7 @@ _VN_HEADERS_KSA_TADAWUL: List[str] = (
 )
 
 # 2) Market Leaders: equity core + forecast CORE + scores + badges
-_VN_HEADERS_MARKET_LEADERS: List[str] = (
-    _VN_IDENTITY
-    + _VN_PRICE
-    + _VN_LIQUIDITY
-    + _VN_CAP
-    + _VN_FUNDAMENTALS
-    + _VN_TECHNICALS
-    + _VN_VALUATION
-    + _VN_SCORES
-    + _VN_BADGES
-    + _VN_FORECAST_CORE
-    + _VN_META
-)
+_VN_HEADERS_MARKET_LEADERS: List[str] = list(_VN_HEADERS_KSA_TADAWUL)
 
 # 3) Global Markets: equity superset + FULL forecast/history
 _VN_HEADERS_GLOBAL: List[str] = (
@@ -520,6 +503,7 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Forecast Price (12M)",
         "Expected ROI % (12M)",
         "Forecast Confidence",
+        "Forecast Updated (UTC)",
         "Recommendation",
         "Rec Badge",
     ]
@@ -552,6 +536,16 @@ _VN_COMFX_T: Tuple[str, ...] = tuple(_VN_HEADERS_COMMODITIES_FX)
 _VN_PORTFOLIO_T: Tuple[str, ...] = tuple(_VN_HEADERS_PORTFOLIO)
 _VN_INSIGHTS_T: Tuple[str, ...] = tuple(_VN_HEADERS_INSIGHTS_ANALYSIS)
 
+# Helpful registry: known vNext schemas by page key
+VNEXT_SCHEMAS: Dict[str, Tuple[str, ...]] = {
+    "KSA_TADAWUL": _VN_KSA_T,
+    "MARKET_LEADERS": _VN_ML_T,
+    "GLOBAL_MARKETS": _VN_GLOBAL_T,
+    "MUTUAL_FUNDS": _VN_FUNDS_T,
+    "COMMODITIES_FX": _VN_COMFX_T,
+    "MY_PORTFOLIO": _VN_PORTFOLIO_T,
+    "INSIGHTS_ANALYSIS": _VN_INSIGHTS_T,
+}
 
 # =============================================================================
 # Header grouping (category-wise cross-check helper)
@@ -617,14 +611,21 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "company": "Name",
     "sub_sector": "Sub Sector",
     "subsector": "Sub Sector",
+    "sub_sector_name": "Sub Sector",
 
+    # price variants
     "last_price": "Price",
     "previous_close": "Prev Close",
+    "prev_close": "Prev Close",
     "price_change": "Change",
     "percent_change": "Change %",
+    "change_percent": "Change %",
+    "change_pct": "Change %",
 
+    # liquidity
     "avg_volume_30d": "Avg Vol 30D",
     "avg_vol_30d": "Avg Vol 30D",
+    "avg_volume": "Avg Vol 30D",
 
     "free_float_market_cap": "Free Float Mkt Cap",
     "ff_market_cap": "Free Float Mkt Cap",
@@ -633,12 +634,13 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "volatility_30d": "Volatility (30D)",
     "volatility30d": "Volatility (30D)",
     "rsi_14": "RSI (14)",
+    "rsi14": "RSI (14)",
 
     # percent label variants (accept non-% versions)
     "dividend_yield": "Dividend Yield %",
     "dividend_yield_percent": "Dividend Yield %",
     "dividend_yield_pct": "Dividend Yield %",
-
+    "dividend_yield__no_pct": "Dividend Yield %",  # internal hint
     "payout_ratio": "Payout Ratio %",
     "roe": "ROE %",
     "roa": "ROA %",
@@ -656,6 +658,7 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "broker_account": "Broker/Account",
     "portfolio_group": "Portfolio Group",
     "asset_type": "Asset Type",
+    "target_weight": "Target Weight %",
 
     # forecast aliases (support ROI/Target/Expected variants too)
     "expected_return_1m_percent": "Expected ROI % (1M)",
@@ -713,7 +716,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 
     # Prices
     "current_price": ("last_price", "price", "close", "last"),
-    "previous_close": ("prev_close",),
+    "previous_close": ("prev_close", "prior_close"),
     "price_change": ("change",),
     "percent_change": ("change_percent", "change_pct", "pct_change"),
     "day_high": ("high",),
@@ -727,12 +730,12 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     # Liquidity / Shares
     "volume": ("vol",),
     "avg_volume_30d": ("avg_volume", "avg_vol_30d", "avg_volume_30day"),
-    "value_traded": ("traded_value",),
+    "value_traded": ("traded_value", "turnover_value"),
     "turnover_percent": ("turnover", "turnover_pct"),
     "shares_outstanding": ("shares", "outstanding_shares"),
     "free_float": ("free_float_percent", "free_float_pct"),
     "market_cap": ("mkt_cap", "marketcapitalization"),
-    "free_float_market_cap": ("ff_market_cap",),
+    "free_float_market_cap": ("ff_market_cap", "free_float_mkt_cap"),
     "liquidity_score": ("liq_score",),
 
     # Fundamentals
@@ -788,6 +791,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ma50": ("sma50",),
     "ma200": ("sma200",),
 
+    # NOTE: stored as ratios or percents depending on provider; routers will coerce.
     "expected_return_1m": ("exp_return_1m", "expected_roi_1m"),
     "expected_return_3m": ("exp_return_3m", "expected_roi_3m"),
     "expected_return_12m": ("exp_return_12m", "expected_roi_12m"),
@@ -998,7 +1002,9 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Percent Change": "percent_change",
     "Avg Volume (30D)": "avg_volume_30d",
     "Free Float Market Cap": "free_float_market_cap",
-    "Dividend Yield": "dividend_yield",  # legacy/no-% variant
+
+    # IMPORTANT: allow non-% variant headers too (compat)
+    "Dividend Yield": "dividend_yield",
     "Payout Ratio": "payout_ratio",
     "ROE": "roe",
     "ROA": "roa",
@@ -1123,13 +1129,22 @@ def _register(reg: Dict[str, Tuple[str, ...]], keys: List[str], headers: Tuple[s
 _register(
     _SHEET_HEADERS_LEGACY,
     keys=[
-        "KSA_Tadawul", "ksa_tadawul", "tadawul", "ksa",
-        "Market_Leaders", "market_leaders",
-        "Mutual_Funds", "mutual_funds",
-        "Commodities_FX", "commodities_fx",
-        "My_Portfolio", "my_portfolio",
-        "Global_Markets", "global_markets",
-        "Insights_Analysis", "investment_advisor",
+        "KSA_Tadawul",
+        "ksa_tadawul",
+        "tadawul",
+        "ksa",
+        "Market_Leaders",
+        "market_leaders",
+        "Mutual_Funds",
+        "mutual_funds",
+        "Commodities_FX",
+        "commodities_fx",
+        "My_Portfolio",
+        "my_portfolio",
+        "Global_Markets",
+        "global_markets",
+        "Insights_Analysis",
+        "investment_advisor",
     ],
     headers=_DEFAULT_59_TUPLE,
 )
@@ -1143,49 +1158,74 @@ _register(
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "KSA_Tadawul", "KSA Tadawul", "ksa_tadawul", "ksa_tadawul_market", "tadawul", "ksa",
+        "KSA_Tadawul",
+        "KSA Tadawul",
+        "ksa_tadawul",
+        "ksa_tadawul_market",
+        "tadawul",
+        "ksa",
     ],
     headers=_VN_KSA_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "Market_Leaders", "Market Leaders", "market_leaders", "ksa_market_leaders",
+        "Market_Leaders",
+        "Market Leaders",
+        "market_leaders",
+        "ksa_market_leaders",
     ],
     headers=_VN_ML_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "Global_Markets", "Global Markets", "global_markets", "global",
+        "Global_Markets",
+        "Global Markets",
+        "global_markets",
+        "global",
     ],
     headers=_VN_GLOBAL_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "Mutual_Funds", "Mutual Funds", "mutual_funds", "funds",
+        "Mutual_Funds",
+        "Mutual Funds",
+        "mutual_funds",
+        "funds",
     ],
     headers=_VN_FUNDS_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "Commodities_FX", "Commodities & FX", "commodities_fx", "commodities", "fx",
+        "Commodities_FX",
+        "Commodities & FX",
+        "commodities_fx",
+        "commodities",
+        "fx",
     ],
     headers=_VN_COMFX_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "My_Portfolio", "My Portfolio", "my_portfolio", "portfolio", "my_portfolio_investment",
+        "My_Portfolio",
+        "My Portfolio",
+        "my_portfolio",
+        "portfolio",
+        "my_portfolio_investment",
     ],
     headers=_VN_PORTFOLIO_T,
 )
 _register(
     _SHEET_HEADERS_VNEXT,
     keys=[
-        "Insights_Analysis", "Insights Analysis", "insights_analysis", "insights",
+        "Insights_Analysis",
+        "Insights Analysis",
+        "insights_analysis",
+        "insights",
     ],
     headers=_VN_INSIGHTS_T,
 )
@@ -1381,6 +1421,8 @@ __all__ = [
     "is_canonical_headers",
     "coerce_headers_59",
     "validate_headers_59",
+    # vNext
+    "VNEXT_SCHEMAS",
     # Mapping exports
     "FIELD_ALIASES",
     "canonical_field",
