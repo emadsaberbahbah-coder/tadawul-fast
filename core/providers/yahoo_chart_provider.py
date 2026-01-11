@@ -2,7 +2,7 @@
 """
 core/providers/yahoo_chart_provider.py
 ============================================================
-Yahoo Quote/Chart Provider (KSA-safe) — v2.0.0
+Yahoo Quote/Chart Provider (KSA-safe) — v2.1.0
 (PATCH-ALIGNED + CUSTOM HEADERS + TTL CACHE + HISTORY/FORECAST + CLIENT REUSE)
 
 Primary goals
@@ -16,6 +16,11 @@ Primary goals
 - fetch_quote_patch / fetch_enriched_quote_patch / fetch_quote_and_enrichment_patch
   return Dict[str, Any] ONLY (NO tuples).
 
+✅ KSA safety (default)
+- By default this provider is KSA-only to avoid polluting GLOBAL pages/providers.
+- Non-KSA symbols return {} (silent) when YAHOO_KSA_ONLY=true (default).
+- If you want GLOBAL support, set YAHOO_KSA_ONLY=false.
+
 Exports (engine-compatible)
 - fetch_quote_patch(symbol, debug=False) -> dict patch (fast)
 - fetch_enriched_quote_patch(symbol, debug=False) -> dict patch (quote + (optional) history/forecast)
@@ -28,10 +33,12 @@ Exports (engine-compatible)
 Env vars (supported)
 Core
 - YAHOO_ENABLED (default true)                          # set false to disable silently
-- YAHOO_UA                                           # user agent override
+- YAHOO_KSA_ONLY (default true)                         # KSA-only guard
+- YAHOO_ORIGIN_KEY (default: YAHOO_CHART)               # origin field in patch
+- YAHOO_UA                                              # user agent override
 - YAHOO_ACCEPT_LANGUAGE (default: en-US,en;q=0.9)
-- YAHOO_TIMEOUT_S (default 8.5)                       # connects fast, keep-alive reuse
-- YAHOO_RETRY_MAX (default 2)                         # additional retries (0 => no retry)
+- YAHOO_TIMEOUT_S (default 8.5)                         # connects fast, keep-alive reuse
+- YAHOO_RETRY_MAX (default 2)                           # additional retries (0 => no retry)
 - YAHOO_RETRY_BACKOFF_MS (default 250)
 - YAHOO_ALT_HOSTS (comma-separated hosts or full base urls)
 
@@ -42,16 +49,16 @@ Headers (CUSTOMIZED)
 
 Chart behavior
 - ENABLE_YAHOO_CHART_SUPPLEMENT (default true)
-- YAHOO_CHART_RANGE (default 5d)                       # for quote fallback/supplement
+- YAHOO_CHART_RANGE (default 5d)                         # for quote fallback/supplement
 - YAHOO_CHART_INTERVAL (default 1d)
 
-History/Forecast (per your “data forecasting” plan)
+History/Forecast
 - YAHOO_ENABLE_HISTORY (default true)
 - YAHOO_ENABLE_FORECAST (default true)
-- YAHOO_HISTORY_RANGE (default 2y)                     # used by enriched mode
+- YAHOO_HISTORY_RANGE (default 2y)                       # used by enriched mode
 - YAHOO_HISTORY_INTERVAL (default 1d)
-- YAHOO_HISTORY_POINTS_MAX (default 420, min 120)      # cap arrays for speed
-- YAHOO_VERBOSE_WARNINGS (default false)               # adds _warn in patch
+- YAHOO_HISTORY_POINTS_MAX (default 420, min 120)
+- YAHOO_VERBOSE_WARNINGS (default false)                 # adds _warn in patch
 
 Caching (TTL)
 - YAHOO_TTL_QUOTE_SEC   (default 10, min 3)
@@ -67,7 +74,7 @@ Forecast outputs (best-effort; simple momentum-style)
 - expected_price_1m/3m/12m
 - confidence_score (0..100)
 - forecast_method
-- history_points, history_last_ts
+- history_points, history_last_ts, history_last_utc
 
 Notes
 - Forecast is a simple quantitative estimate (NOT investment advice).
@@ -78,17 +85,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-PROVIDER_VERSION = "2.0.0"
+logger = logging.getLogger("core.providers.yahoo_chart_provider")
+
+PROVIDER_VERSION = "2.1.0"
 PROVIDER_NAME = "yahoo_chart"
 
 # ---------------------------
@@ -138,8 +149,20 @@ def _env_str(name: str, default: str = "") -> str:
     return s if s else default
 
 
-def _configured() -> bool:
+def _enabled() -> bool:
     return _env_bool("YAHOO_ENABLED", True)
+
+
+def _ksa_only() -> bool:
+    return _env_bool("YAHOO_KSA_ONLY", True)
+
+
+def _origin_key() -> str:
+    return (_env_str("YAHOO_ORIGIN_KEY", "YAHOO_CHART") or "YAHOO_CHART").strip()
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------
@@ -298,7 +321,7 @@ def _headers_for(kind: str, symbol: str) -> Dict[str, str]:
     elif kind == "chart":
         h.update(_json_headers("YAHOO_HEADERS_CHART_JSON"))
 
-    # Always keep these dynamic (unless user explicitly overrides via headers JSON)
+    # dynamic defaults unless overridden by JSON headers
     h.setdefault("Referer", ref)
     h.setdefault("Origin", "https://finance.yahoo.com")
     return h
@@ -311,6 +334,13 @@ async def _get_client() -> httpx.AsyncClient:
     async with _CLIENT_LOCK:
         if _CLIENT is None:
             _CLIENT = httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True)
+            logger.info(
+                "Yahoo client init v%s | timeout=%.2fs | retries=%s | cachetools=%s",
+                PROVIDER_VERSION,
+                _TIMEOUT_S,
+                _RETRY_MAX,
+                _HAS_CACHETOOLS,
+            )
     return _CLIENT
 
 
@@ -330,6 +360,15 @@ async def aclose_yahoo_client() -> None:
 # ---------------------------
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 _KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
+
+
+def _is_ksa_symbol(symbol: str) -> bool:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    if s.endswith(".SR"):
+        return True
+    return bool(_KSA_RE.match(s) or _KSA_CODE_RE.match(s))
 
 
 def _is_nan(x: Any) -> bool:
@@ -382,6 +421,10 @@ def _position_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]
 
 
 def _normalize_symbol(symbol: str) -> str:
+    """
+    - Accepts: "2222", "2222.SR", "TADAWUL:2222", "2222.TADAWUL"
+    - Returns: "2222.SR" (for numeric) or original (for non-numeric)
+    """
     s = (symbol or "").strip().upper()
     if not s:
         return ""
@@ -389,7 +432,6 @@ def _normalize_symbol(symbol: str) -> str:
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "").strip()
-    # numeric Tadawul code -> .SR
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
     return s
@@ -401,49 +443,12 @@ def _base_patch(symbol: str) -> Dict[str, Any]:
     return {
         "symbol": sym,
         "market": "KSA" if is_ksa else "GLOBAL",
+        "origin": _origin_key(),
         "currency": "SAR" if is_ksa else None,
         "data_source": PROVIDER_NAME,
         "provider_version": PROVIDER_VERSION,
+        "last_updated_utc": _utc_iso(),
         "error": "",
-        # identity
-        "name": None,
-        "exchange": None,
-        # price / trading
-        "current_price": None,
-        "previous_close": None,
-        "open": None,
-        "day_high": None,
-        "day_low": None,
-        "week_52_high": None,
-        "week_52_low": None,
-        "position_52w_percent": None,
-        "volume": None,
-        "avg_volume_30d": None,
-        "market_cap": None,
-        "value_traded": None,
-        "price_change": None,
-        "percent_change": None,
-        # history/forecast extras (enriched mode)
-        "returns_1w": None,
-        "returns_1m": None,
-        "returns_3m": None,
-        "returns_6m": None,
-        "returns_12m": None,
-        "ma20": None,
-        "ma50": None,
-        "ma200": None,
-        "volatility_30d": None,
-        "rsi_14": None,
-        "expected_return_1m": None,
-        "expected_return_3m": None,
-        "expected_return_12m": None,
-        "expected_price_1m": None,
-        "expected_price_3m": None,
-        "expected_price_12m": None,
-        "confidence_score": None,
-        "forecast_method": None,
-        "history_points": None,
-        "history_last_ts": None,
     }
 
 
@@ -500,6 +505,18 @@ def _guard_52w(p: Dict[str, Any]) -> None:
         p["week_52_low"] = None
     if _to_float(p.get("week_52_low")) is None:
         p["position_52w_percent"] = None
+
+
+def _ts_to_utc_iso(ts: Any) -> Optional[str]:
+    try:
+        if ts is None:
+            return None
+        v = int(ts)
+        if v <= 0:
+            return None
+        return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 # ---------------------------
@@ -621,6 +638,7 @@ def _history_analytics(closes: List[float]) -> Dict[str, Any]:
             out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
             out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
         out["forecast_method"] = "yahoo_history_momentum_v1"
+        out["forecast_updated_utc"] = _utc_iso()
     else:
         out["forecast_method"] = "history_only"
 
@@ -657,20 +675,30 @@ async def _http_get_json(
     for i in range(attempts):
         try:
             r = await client.get(url, params=params, headers=headers)
+            sc = int(r.status_code)
 
-            if r.status_code == 200:
+            if sc == 200:
                 try:
                     js = r.json()
                     if isinstance(js, dict):
                         return js, None
                     last_err = "unexpected JSON type"
                 except Exception as je:
-                    last_err = f"JSON decode failed: {je.__class__.__name__}"
+                    # try best-effort parse from text
+                    try:
+                        txt = (r.text or "").strip()
+                        if txt.startswith("{") and txt.endswith("}"):
+                            js2 = json.loads(txt)
+                            if isinstance(js2, dict):
+                                return js2, None
+                        last_err = f"JSON decode failed: {je.__class__.__name__}"
+                    except Exception:
+                        last_err = f"JSON decode failed: {je.__class__.__name__}"
             else:
-                if r.status_code in _RETRY_STATUSES and i < attempts - 1:
-                    last_err = f"HTTP {r.status_code}"
+                if sc in _RETRY_STATUSES and i < attempts - 1:
+                    last_err = f"HTTP {sc}"
                 else:
-                    return None, f"HTTP {r.status_code}"
+                    return None, f"HTTP {sc}"
 
         except Exception as e:
             last_err = f"{e.__class__.__name__}: {e}"
@@ -690,7 +718,7 @@ async def _http_get_json_multi(
     params: Optional[Dict[str, Any]] = None,
     kind: str,
 ) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
-    last_err = None
+    last_err: Optional[str] = None
     for u in urls:
         js, err = await _http_get_json(u, symbol, params=params, kind=kind)
         if js is not None:
@@ -723,19 +751,23 @@ async def _fetch_from_quote(symbol: str, debug: bool = False) -> Tuple[Dict[str,
     except Exception:
         return patch, "yahoo_quote parse error"
 
+    # identity
     patch["name"] = _safe_str(q.get("longName") or q.get("shortName") or q.get("displayName"))
     patch["currency"] = _safe_str(q.get("currency")) or patch.get("currency")
     patch["exchange"] = _safe_str(q.get("fullExchangeName") or q.get("exchange"))
 
+    # price / trading
     patch["current_price"] = _to_float(q.get("regularMarketPrice"))
     patch["previous_close"] = _to_float(q.get("regularMarketPreviousClose"))
     patch["open"] = _to_float(q.get("regularMarketOpen"))
     patch["day_high"] = _to_float(q.get("regularMarketDayHigh"))
     patch["day_low"] = _to_float(q.get("regularMarketDayLow"))
 
+    # 52w
     patch["week_52_high"] = _to_float(q.get("fiftyTwoWeekHigh"))
     patch["week_52_low"] = _to_float(q.get("fiftyTwoWeekLow"))
 
+    # volume/cap
     patch["volume"] = _to_float(q.get("regularMarketVolume"))
     patch["avg_volume_30d"] = _to_float(q.get("averageDailyVolume3Month") or q.get("averageDailyVolume10Day"))
     patch["market_cap"] = _to_float(q.get("marketCap"))
@@ -751,6 +783,7 @@ async def _fetch_from_quote(symbol: str, debug: bool = False) -> Tuple[Dict[str,
 
     _guard_52w(patch)
     _fill_derived(patch)
+    patch["last_updated_utc"] = _utc_iso()
     return patch, None
 
 
@@ -788,18 +821,14 @@ async def _fetch_from_chart(
     }
 
     cache_key = f"{cache_kind}::{symbol}::{range_}::{interval}"
-    if cache_kind == "chart":
-        hit = _C_CACHE.get(cache_key)
-    else:
-        hit = _H_CACHE.get(cache_key)
-
+    hit = (_C_CACHE if cache_kind == "chart" else _H_CACHE).get(cache_key)
     if isinstance(hit, dict) and hit:
         return dict(hit), None
 
-    # chart URL is templated
+    # chart URL is templated; try hosts sequentially
+    js = None
     last_err = None
     used_url = None
-    js = None
 
     for templ in CHART_URLS:
         url = templ.format(symbol=symbol)
@@ -828,10 +857,12 @@ async def _fetch_from_chart(
     vols = q0.get("volume") or []
     ts = res.get("timestamp") or []
 
+    # identity
     patch["currency"] = _safe_str(meta.get("currency")) or patch.get("currency")
     patch["exchange"] = _safe_str(meta.get("exchangeName") or meta.get("fullExchangeName")) or patch.get("exchange")
     patch["name"] = _safe_str(meta.get("longName") or meta.get("shortName")) or patch.get("name")
 
+    # quote-ish fields
     patch["current_price"] = _to_float(meta.get("regularMarketPrice")) or _last_non_null(closes)
     patch["previous_close"] = _to_float(meta.get("previousClose")) or _to_float(meta.get("chartPreviousClose"))
     patch["open"] = _to_float(meta.get("regularMarketOpen")) or _last_non_null(opens)
@@ -856,10 +887,12 @@ async def _fetch_from_chart(
     except Exception:
         pass
 
-    # history info
+    # history meta
     try:
         if isinstance(ts, list) and ts:
             patch["history_last_ts"] = int(ts[-1])
+            patch["history_last_utc"] = _ts_to_utc_iso(ts[-1])
+        if isinstance(closes, list) and closes:
             patch["history_points"] = int(len([x for x in closes if _to_float(x) is not None]))
     except Exception:
         pass
@@ -874,20 +907,22 @@ async def _fetch_from_chart(
 
     _guard_52w(patch)
     _fill_derived(patch)
+    patch["last_updated_utc"] = _utc_iso()
 
-    patch2 = _clean_patch(patch)
+    out = _clean_patch(patch)
     if cache_kind == "chart":
-        _C_CACHE[cache_key] = dict(patch2)
+        _C_CACHE[cache_key] = dict(out)
     else:
-        _H_CACHE[cache_key] = dict(patch2)
+        _H_CACHE[cache_key] = dict(out)
 
-    return patch2, None
+    return out, None
 
 
 async def _fetch_history_forecast_patch(symbol: str, debug: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
-    if not (_configured() and ENABLE_HISTORY):
+    if not (_enabled() and ENABLE_HISTORY):
         return {}, None
 
+    # This call caches a light patch (no big arrays)
     p, err = await _fetch_from_chart(
         symbol,
         range_=HISTORY_RANGE,
@@ -898,9 +933,12 @@ async def _fetch_history_forecast_patch(symbol: str, debug: bool = False) -> Tup
     if err:
         return {}, err
 
-    # Pull closes again from chart for analytics (requires re-fetching JSON arrays).
-    # We do one more direct request but cache it separately for history analytics.
-    # (Keeps quote fallback fast and avoids storing huge arrays in cache.)
+    # Cache analytics separately
+    cache_key = f"hanalytics::{symbol}::{HISTORY_RANGE}::{HISTORY_INTERVAL}"
+    hit = _H_CACHE.get(cache_key)
+    if isinstance(hit, dict) and hit:
+        return dict(hit), None
+
     params = {
         "range": HISTORY_RANGE,
         "interval": HISTORY_INTERVAL,
@@ -908,11 +946,6 @@ async def _fetch_history_forecast_patch(symbol: str, debug: bool = False) -> Tup
         "events": "div|split|earn",
         "corsDomain": "finance.yahoo.com",
     }
-
-    cache_key = f"hanalytics::{symbol}::{HISTORY_RANGE}::{HISTORY_INTERVAL}"
-    hit = _H_CACHE.get(cache_key)
-    if isinstance(hit, dict) and hit:
-        return dict(hit), None
 
     js = None
     last_err = None
@@ -934,6 +967,7 @@ async def _fetch_history_forecast_patch(symbol: str, debug: bool = False) -> Tup
     ind = (res.get("indicators") or {}).get("quote") or []
     q0 = ind[0] if ind else {}
     closes_raw = q0.get("close") or []
+
     closes: List[float] = []
     for x in closes_raw if isinstance(closes_raw, list) else []:
         f = _to_float(x)
@@ -948,9 +982,11 @@ async def _fetch_history_forecast_patch(symbol: str, debug: bool = False) -> Tup
     patch: Dict[str, Any] = {}
     patch.update(analytics)
 
-    # keep last_ts + points from p (already best-effort)
+    # Keep history meta from the light patch if present
     if p.get("history_last_ts") is not None:
         patch["history_last_ts"] = p.get("history_last_ts")
+    if p.get("history_last_utc") is not None:
+        patch["history_last_utc"] = p.get("history_last_utc")
     patch["history_points"] = len(closes[-HISTORY_POINTS_MAX:])
 
     patch = _clean_patch(patch)
@@ -964,13 +1000,19 @@ async def _fetch_history_forecast_patch(symbol: str, debug: bool = False) -> Tup
 async def fetch_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     """
     FAST path: quote endpoint first; chart fallback if needed.
+
+    KSA safety:
+    - if YAHOO_KSA_ONLY=true (default) and symbol is not KSA => return {} (silent)
     """
-    if not _configured():
+    if not _enabled():
         return {}
 
     sym = _normalize_symbol(symbol)
     if not sym:
-        return {"error": f"{PROVIDER_NAME}: empty symbol"}
+        return {"error": f"warning: {PROVIDER_NAME}: empty symbol"}
+
+    if _ksa_only() and not _is_ksa_symbol(sym):
+        return {}
 
     ck = f"quote_patch::{sym}"
     hit = _Q_CACHE.get(ck)
@@ -987,16 +1029,17 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
         p2, e2 = await _fetch_from_chart(sym, range_=CHART_RANGE_FAST, interval=CHART_INTERVAL_FAST, debug=debug)
         if not e2 and _to_float(p2.get("current_price")) is not None:
             p2["error"] = ""
-            out = _clean_patch(p2)
-            _Q_CACHE[ck] = dict(out)
-            return out
+            p2["last_updated_utc"] = _utc_iso()
+            out_ok = _clean_patch(p2)
+            _Q_CACHE[ck] = dict(out_ok)
+            return out_ok
 
-        # return best-effort patch with warning (allows engine fallback)
         warns.append(e1 or e2 or "yahoo quote+chart failed")
         p1["error"] = "warning: " + (warns[0] if warns else "yahoo quote+chart failed")
-        out = _clean_patch(p1)
-        _Q_CACHE[ck] = dict(out)
-        return out
+        p1["last_updated_utc"] = _utc_iso()
+        out_warn = _clean_patch(p1)
+        _Q_CACHE[ck] = dict(out_warn)
+        return out_warn
 
     # 3) optional supplement (quote partial -> fill missing from chart)
     if ENABLE_SUPPLEMENT and _is_patch_partial(p1):
@@ -1005,7 +1048,7 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
             for k, v in (p2 or {}).items():
                 if v is None:
                     continue
-                if p1.get(k) is None or p1.get(k) == "":
+                if p1.get(k) in (None, ""):
                     p1[k] = v
             _guard_52w(p1)
             _fill_derived(p1)
@@ -1016,6 +1059,7 @@ async def fetch_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     if warns and VERBOSE_WARN:
         p1["_warn"] = " | ".join(warns)
 
+    p1["last_updated_utc"] = _utc_iso()
     out = _clean_patch(p1)
     _Q_CACHE[ck] = dict(out)
     return out
@@ -1027,12 +1071,16 @@ async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[s
     - Get quote patch (fast)
     - Add history/forecast fields (best-effort)
     """
-    if not _configured():
+    if not _enabled():
         return {}
 
     base = await fetch_quote_patch(symbol, debug=debug)
 
-    # If quote failed (only error), keep it as-is.
+    # If KSA-only and symbol is non-KSA, base may be {}.
+    if not base:
+        return {}
+
+    # If quote failed (warning + missing price), keep it as-is.
     if isinstance(base, dict) and base.get("error") and _to_float(base.get("current_price")) is None:
         return dict(base)
 
@@ -1041,6 +1089,10 @@ async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[s
 
     sym = _normalize_symbol(symbol)
     if not sym:
+        return dict(base)
+
+    # KSA-only guard again (defensive)
+    if _ksa_only() and not _is_ksa_symbol(sym):
         return dict(base)
 
     h_patch, h_err = await _fetch_history_forecast_patch(sym, debug=debug)
@@ -1056,6 +1108,7 @@ async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[s
         w = str(base.get("_warn") or "").strip()
         base["_warn"] = (w + " | " if w else "") + f"history: {h_err}"
 
+    base["last_updated_utc"] = _utc_iso()
     return _clean_patch(base)
 
 
@@ -1071,6 +1124,9 @@ async def fetch_quote(symbol: str, debug: bool = False) -> Dict[str, Any]:
     out.setdefault("data_quality", "OK" if has_price else "BAD")
     out["status"] = "success" if has_price else "error"
     out["error"] = str(out.get("error") or "")
+    out.setdefault("data_source", PROVIDER_NAME)
+    out.setdefault("provider_version", PROVIDER_VERSION)
+    out.setdefault("last_updated_utc", _utc_iso())
     return out
 
 
