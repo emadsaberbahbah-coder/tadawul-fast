@@ -2,7 +2,7 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) – v1.4.0 (Hardened)
+Routes package initialization (PROD SAFE) – v1.6.0 (Hardened)
 
 Design rules
 - ZERO heavy imports here (no FastAPI, no routers, no app state).
@@ -15,10 +15,13 @@ Design rules
 
 Router mounting MUST remain in main.py (or your app factory).
 
-Update note (v1.4.0):
+Update note (v1.6.0):
 - Track BOTH Argaam router locations:
   • routes.routes_argaam  (main router inside package)
   • routes_argaam         (repo-root shim for backward compatibility)
+- Track BOTH enriched router locations (projects vary):
+  • routes.enriched_quote
+  • routes.enriched
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import importlib.util
 import os
 from typing import Dict, List, Optional
 
-ROUTES_PACKAGE_VERSION = "1.4.0"
+ROUTES_PACKAGE_VERSION = "1.6.0"
 
 
 # -----------------------------------------------------------------------------
@@ -45,6 +48,7 @@ def get_expected_router_modules() -> List[str]:
     return [
         # Core stable routes (within package)
         "routes.enriched_quote",
+        "routes.enriched",  # optional alternate naming
         "routes.ai_analysis",
         "routes.advanced_analysis",
         "routes.legacy_service",
@@ -120,6 +124,12 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
         "routes_argaam": module_exists("routes_argaam"),
     }
 
+    # Optional: detect which enriched module(s) exist
+    enriched_layout = {
+        "routes.enriched_quote": module_exists("routes.enriched_quote"),
+        "routes.enriched": module_exists("routes.enriched"),
+    }
+
     return {
         "routes_pkg_version": ROUTES_PACKAGE_VERSION,
         "expected_count": len(expected),
@@ -128,6 +138,7 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
         "available": available,
         "missing": missing,
         "argaam_layout": argaam_layout,
+        "enriched_layout": enriched_layout,
         "env_hints": {
             "app_token_set": app_token_set,
             "backup_app_token_set": backup_token_set,
