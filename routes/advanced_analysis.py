@@ -1,8 +1,8 @@
-# routes/advanced_analysis.py  (FULL REPLACEMENT)
+# routes/advanced_analysis.py
 from __future__ import annotations
 
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.12.1) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.13.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -13,22 +13,27 @@ Design goals
   • chunking + timeout + bounded concurrency + placeholders on failures.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open mode.
 
-✅ Alignment (with core/schemas.py v3.6.1)
+✅ Alignment
 - Uses schema-driven header mapping when available:
     core.schemas.get_headers_for_sheet()
     core.schemas.header_field_candidates()
-- Supports vNext headers (Rank/Origin/Price/Prev Close/Change/Change %/.../Rec Badge etc.)
-- Recommendation standardized everywhere to:
-  BUY / HOLD / REDUCE / SELL  (always UPPERCASE, ALWAYS non-empty)
+- Supports vNext headers including:
+    Rank, Origin, Change/Change %, Value Traded, 52W Position %, Updated times,
+    Forecast/Expected columns (1M/3M/12M), Confidence, Forecast Updated,
+    and badges (Rec/Momentum/Opportunity/Risk).
 
-v3.12.1 upgrades (this revision)
-- ✅ Preserve input order for “quote_schema” sheets (no unexpected resorting).
-- ✅ Adds safe computed values when provider fields are missing:
-    Change, Change %, Value Traded, 52W Position %, Last Updated (Riyadh)
-- ✅ Adds badge columns (Rec Badge / Momentum Badge / Opportunity Badge / Risk Badge) with safe defaults.
-- ✅ Handles BOTH header styles:
-    Target Price 1M/3M/12M  AND  Expected Price 1M/3M/12M
-    Expected ROI 1M/3M/12M  AND  Expected Return 1M/3M/12M
+Standardization rules
+- Recommendation ALWAYS one of: BUY / HOLD / REDUCE / SELL (UPPERCASE, non-empty)
+- Sheets-safe error handling: always returns {status, headers, rows, error?}
+
+v3.13.0 upgrades
+- ✅ Accepts BOTH: sheet_name and sheetName (and uses whichever is provided).
+- ✅ Accepts BOTH: tickers and symbols (already supported).
+- ✅ More tolerant header matching:
+    - Expected ROI 1M %  OR Expected ROI % (1M) OR Expected Return 1M % etc.
+    - Forecast Updated (UTC) OR Forecast Updated UTC
+- ✅ Ensures Last Updated (UTC)/(Riyadh) are filled when asked for (best-effort).
+- ✅ Preserves input order for quote_schema sheets (no unexpected resorting).
 """
 
 import asyncio
@@ -55,7 +60,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.12.1"
+ADVANCED_ANALYSIS_VERSION = "3.13.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -412,7 +417,7 @@ async def _resolve_engine(request: Optional[Request]) -> Optional[Any]:
 # =============================================================================
 def _safe_int(x: Any, default: int) -> int:
     try:
-        v = int(str(x).strip())
+        v = int(float(str(x).strip()))
         return v if v > 0 else default
     except Exception:
         return default
@@ -702,8 +707,7 @@ def _compute_value_traded(uq: Any) -> Optional[float]:
 
 # ===== Badges (safe, Sheets-friendly) =====
 def _badge_from_reco(reco: Any) -> str:
-    r = _coerce_reco_enum(reco)
-    return r
+    return _coerce_reco_enum(reco)
 
 
 def _badge_strength(score_any: Any) -> str:
@@ -725,7 +729,6 @@ def _badge_risk(score_any: Any) -> str:
     s = _safe_float_or_none(score_any)
     if s is None:
         return ""
-    # higher risk score => worse
     if s <= 25:
         return "LOW"
     if s <= 50:
@@ -1019,7 +1022,10 @@ class AdvancedSheetRequest(_ExtraIgnore):
     tickers: List[str] = Field(default_factory=list)
     symbols: List[str] = Field(default_factory=list)
     top_n: Optional[int] = Field(default=50, ge=1, le=500)
+
+    # Accept both keys (Sheets service sends both; other callers may send one)
     sheet_name: Optional[str] = None
+    sheetName: Optional[str] = None
 
 
 class AdvancedSheetResponse(_ExtraIgnore):
@@ -1137,7 +1143,6 @@ def _default_advanced_headers() -> List[str]:
 
 
 def _fallback_headers_59() -> List[str]:
-    # canonical fallback if schemas not importable
     return [
         "Symbol",
         "Company Name",
@@ -1204,11 +1209,9 @@ def _fallback_headers_59() -> List[str]:
 def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
     nm = (sheet_name or "").strip().lower()
 
-    # explicit advanced mode (scoreboard-style)
     if any(k in nm for k in ("advanced", "opportunity", "advisor", "best", "scoreboard")):
         return _default_advanced_headers(), "advanced"
 
-    # Prefer headers from schemas (vNext or legacy)
     if sheet_name and callable(_get_headers_for_sheet):
         try:
             h = _get_headers_for_sheet(sheet_name)  # type: ignore
@@ -1284,8 +1287,16 @@ def _hkey(h: str) -> str:
     return s
 
 
+def _canon_field_name(f: str) -> str:
+    try:
+        if callable(_canonical_field):
+            return str(_canonical_field(f) or f)  # type: ignore
+    except Exception:
+        pass
+    return str(f)
+
+
 _FIELD_TRANSFORMS: Dict[str, Any] = {
-    # percents / ratios
     "percent_change": _ratio_to_percent,
     "position_52w_percent": _ratio_to_percent,
     "turnover_percent": _ratio_to_percent,
@@ -1299,7 +1310,6 @@ _FIELD_TRANSFORMS: Dict[str, Any] = {
     "revenue_growth": _ratio_to_percent,
     "net_income_growth": _ratio_to_percent,
     "upside_percent": _ratio_to_percent,
-    # extended returns / expected returns
     "returns_1w": _ratio_to_percent,
     "returns_1m": _ratio_to_percent,
     "returns_3m": _ratio_to_percent,
@@ -1308,12 +1318,11 @@ _FIELD_TRANSFORMS: Dict[str, Any] = {
     "expected_return_1m": _ratio_to_percent,
     "expected_return_3m": _ratio_to_percent,
     "expected_return_12m": _ratio_to_percent,
-    # vol
     "volatility_30d": _vol_to_percent,
-    # timestamps
     "last_updated_utc": _iso_or_none,
     "last_updated_riyadh": _iso_or_none,
     "history_last_utc": _iso_or_none,
+    "forecast_updated_utc": _iso_or_none,
 }
 
 
@@ -1327,10 +1336,8 @@ def _compute_expected_price_and_return(uq: Any, horizon: str) -> Tuple[Optional[
     if price is None or price <= 0:
         return None, None
 
-    key_price = f"expected_price_{horizon}"
-    exp_price = _safe_float_or_none(_safe_get(uq, key_price))
+    exp_price = _safe_float_or_none(_safe_get(uq, f"expected_price_{horizon}"))
 
-    # allow fair_value as proxy
     if exp_price is None and horizon in ("3m", "12m"):
         exp_price = (
             _safe_float_or_none(_safe_get(uq, "fair_value"))
@@ -1338,8 +1345,7 @@ def _compute_expected_price_and_return(uq: Any, horizon: str) -> Tuple[Optional[
             or _safe_float_or_none(_safe_get(uq, "expected_price_12m"))
         )
 
-    key_ret = f"expected_return_{horizon}"
-    exp_ret = _safe_float_or_none(_safe_get(uq, key_ret))
+    exp_ret = _safe_float_or_none(_safe_get(uq, f"expected_return_{horizon}"))
     if exp_ret is not None:
         try:
             return exp_price, float(_ratio_to_percent(exp_ret))  # type: ignore[arg-type]
@@ -1360,22 +1366,12 @@ def _origin_from_sheet_name(sheet_name: Optional[str]) -> str:
     return s2
 
 
-def _canon_field_name(f: str) -> str:
-    try:
-        if callable(_canonical_field):
-            return str(_canonical_field(f) or f)  # type: ignore
-    except Exception:
-        pass
-    return str(f)
-
-
 def _value_for_field_candidates(uq: Any, candidates: Sequence[str]) -> Any:
     for f in candidates:
         f2 = str(f or "").strip()
         if not f2:
             continue
 
-        # try candidate, then canonicalized variant
         val = _safe_get(uq, f2)
         if val is None:
             cf = _canon_field_name(f2)
@@ -1390,6 +1386,26 @@ def _value_for_field_candidates(uq: Any, candidates: Sequence[str]) -> Any:
     return None
 
 
+def _forecast_updated_utc_from_uq(uq: Any) -> Optional[str]:
+    v = _safe_get(uq, "forecast_updated_utc", "forecast_updated", "forecast_updatedAt", "forecast_updated_at")
+    if v:
+        return _iso_or_none(v)
+    # sometimes the engine uses history_last_utc as proxy for forecast calc
+    v2 = _safe_get(uq, "history_last_utc", "history_as_of_utc")
+    return _iso_or_none(v2) if v2 else None
+
+
+def _header_horizon(header_key: str) -> Optional[str]:
+    hk = header_key
+    if "1m" in hk or "(1m)" in hk:
+        return "1m"
+    if "3m" in hk or "(3m)" in hk:
+        return "3m"
+    if "12m" in hk or "12 m" in hk or "(12m)" in hk:
+        return "12m"
+    return None
+
+
 def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None) -> Any:
     hk = _hkey(header)
     _ensure_reco_on_obj(uq)
@@ -1401,7 +1417,7 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
         return (ctx or {}).get("origin")
 
     # computed: badges (vNext)
-    if hk == "rec badge":
+    if hk in ("rec badge", "reco badge", "recommendation badge"):
         return _badge_from_reco(_safe_get(uq, "recommendation"))
     if hk == "momentum badge":
         return _badge_strength(_safe_get(uq, "momentum_score"))
@@ -1414,7 +1430,7 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
     if hk in ("change", "price change"):
         ch, _pct = _compute_change_and_pct(uq)
         return ch
-    if hk in ("change %", "percent change"):
+    if hk in ("change %", "percent change", "change percent"):
         _ch, pct = _compute_change_and_pct(uq)
         return pct
 
@@ -1423,7 +1439,7 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
         return _compute_value_traded(uq)
 
     # computed: 52W position
-    if hk in ("52w position %", "52w position"):
+    if hk in ("52w position %", "52w position", "52w position percent"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
             return _ratio_to_percent(v)
@@ -1457,28 +1473,42 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
             v = _safe_get(uq, "recommendation")
             return _coerce_reco_enum(v) or reco or "HOLD"
 
-    # expected price/roi headers (supports both “Target …” and “Expected …”)
-    if hk in (
-        "target price 1m",
-        "target price 3m",
-        "target price 12m",
-        "expected price 1m",
-        "expected price 3m",
-        "expected price 12m",
-        "expected roi 1m %",
-        "expected roi 3m %",
-        "expected roi 12m %",
-        "expected return 1m %",
-        "expected return 3m %",
-        "expected return 12m %",
-    ):
-        horizon = "1m" if "1m" in hk else ("3m" if "3m" in hk else "12m")
-        exp_price, exp_ret = _compute_expected_price_and_return(uq, horizon)
-        if "price" in hk:
-            v = _safe_get(uq, f"expected_price_{horizon}")
-            return v if v is not None else exp_price
+    # expected / forecast support (more tolerant)
+    # Examples accepted:
+    # - "Target Price 1M" / "Expected Price 1M" / "Forecast Price (1M)"
+    # - "Expected ROI 1M %" / "Expected ROI % (1M)" / "Expected Return 1M %"
+    # - "Forecast Confidence"
+    # - "Forecast Updated (UTC)" / "Forecast Updated UTC"
+    if "forecast confidence" in hk:
+        v = _safe_get(uq, "confidence_score", "forecast_confidence", "confidence")
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return round(f * 100.0, 2) if 0.0 <= f <= 1.0 else f
+        except Exception:
+            return v
+
+    if "forecast updated" in hk and "riyadh" not in hk:
+        return _forecast_updated_utc_from_uq(uq)
+
+    # Expected/Target/Forecast Price horizons
+    if ("price" in hk) and any(x in hk for x in ("target", "expected", "forecast")) and (_header_horizon(hk) is not None):
+        horizon = _header_horizon(hk) or "3m"
+        v = _safe_get(uq, f"expected_price_{horizon}")
+        if v is not None:
+            return v
+        exp_price, _exp_ret = _compute_expected_price_and_return(uq, horizon)
+        return exp_price
+
+    # Expected ROI / Expected Return horizons
+    if any(x in hk for x in ("expected roi", "expected return")) and (_header_horizon(hk) is not None):
+        horizon = _header_horizon(hk) or "3m"
         v = _safe_get(uq, f"expected_return_{horizon}")
-        return _ratio_to_percent(v) if v is not None else exp_ret
+        if v is not None:
+            return _ratio_to_percent(v)
+        _exp_price, exp_ret = _compute_expected_price_and_return(uq, horizon)
+        return exp_ret
 
     # computed: riyadh timestamp
     if hk == "last updated (riyadh)":
@@ -1497,7 +1527,7 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
             _safe_set(uq, "last_updated_utc", v)
         return _iso_or_none(v) or v
 
-    # schema-driven mapping (supports legacy + vNext + synonyms)
+    # schema-driven mapping
     if callable(_header_field_candidates):
         try:
             candidates = _header_field_candidates(header)  # type: ignore
@@ -1549,7 +1579,11 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
+            engine_version = (
+                getattr(eng, "ENGINE_VERSION", None)
+                or getattr(eng, "engine_version", None)
+                or getattr(eng, "version", None)
+            )
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
@@ -1659,13 +1693,14 @@ async def advanced_sheet_rows(
     """
     Sheets-safe: ALWAYS returns {status, headers, rows, error?}.
     """
-    headers, mode = _select_headers(body.sheet_name)
+    sheet_name = (body.sheet_name or body.sheetName or "").strip() or None
+    headers, mode = _select_headers(sheet_name)
 
     requested = _clean_tickers((body.tickers or []) + (body.symbols or []))
     top_n = _safe_int(body.top_n or 50, 50)
     top_n = max(1, min(500, top_n))
 
-    origin = _origin_from_sheet_name(body.sheet_name)
+    origin = _origin_from_sheet_name(sheet_name)
 
     if not _auth_ok(x_app_token):
         rows: List[List[Any]] = []
