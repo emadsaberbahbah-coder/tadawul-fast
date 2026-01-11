@@ -1502,7 +1502,10 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "expected roi % (12m)": (("expected_roi_12m", "expected_return_12m"), _ratio_to_percent),
 
     "forecast confidence": (("forecast_confidence", "confidence_score", "confidence"), None),
-    "forecast updated (utc)": (("forecast_updated_utc", "forecast_updated", "last_updated_utc", "as_of_utc", "history_last_utc"), _iso_or_none),
+    "forecast updated (utc)": (
+        ("forecast_updated_utc", "forecast_updated", "last_updated_utc", "as_of_utc", "history_last_utc"),
+        _iso_or_none,
+    ),
     "forecast updated (riyadh)": (("forecast_updated_riyadh",), _iso_or_none),
 }
 
@@ -1758,7 +1761,12 @@ def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     out["forecast confidence"] = conf
 
     # updated times
-    futc = _safe_get(uq, "forecast_updated_utc") or _safe_get(uq, "last_updated_utc", "as_of_utc") or derived.get("history last (utc)") or _now_utc_iso()
+    futc = (
+        _safe_get(uq, "forecast_updated_utc")
+        or _safe_get(uq, "last_updated_utc", "as_of_utc")
+        or derived.get("history last (utc)")
+        or _now_utc_iso()
+    )
     out["forecast updated (utc)"] = _iso_or_none(futc) or futc
 
     # riyadh
