@@ -1,7 +1,7 @@
 """
-google_sheets_service.py
+integrations/google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.12.0 (Aligned + production-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.13.0 (Canonical-Order + production-hardened)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
@@ -12,18 +12,19 @@ Key guarantees
 - refresh_* functions NEVER raise (always return a status dict).
 - Always sends BOTH: symbols + tickers AND sheet_name + sheetName to sheet-rows endpoints.
 - Robust adapter:
-    • if backend returns rows as dicts -> converts to list rows using headers
+    • if backend returns rows as dicts -> converts to list rows using headers (case-insensitive key mapping)
     • if backend returns partial/mismatched -> fills placeholders
     • header union (case-insensitive) across chunked calls to prevent losing columns
+    • final output headers reordered to per-sheet canonical headers (when available)
+      and backend-extra headers appended (never dropped)
 - Handles very large ticker lists:
     • backend calls are chunked (SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL)
     • merged deterministically back to requested order when possible
 
-v3.12.0 upgrades
-- ✅ Adds header UNION (case-insensitive) across chunk responses (prevents dropped columns).
-- ✅ Supports endpoint query params (e.g., ?mode=extended) without caller needing to build URLs.
-- ✅ Supports GOOGLE_APPLICATION_CREDENTIALS / *_CREDENTIALS_FILE path as credentials source.
-- ✅ More defensive spreadsheet write: never raises to callers (refresh_* always returns status).
+v3.13.0 upgrades
+- ✅ Enforce canonical header ORDER per sheet (if schemas available), append backend extras.
+- ✅ Dict-row mapping is now header-key normalized (reduces "missing columns" due to key style).
+- ✅ Avoids heavy imports at module import-time.
 """
 
 from __future__ import annotations
@@ -45,17 +46,30 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 
-SERVICE_VERSION = "3.12.0"
+SERVICE_VERSION = "3.13.0"
 
 # =============================================================================
 # OPTIONAL SAFE IMPORTS (NO HEAVY DEPENDENCIES)
 # =============================================================================
+# Canonical headers resolver (try newest-first; never required)
+get_headers_for_sheet = None  # type: ignore
 try:
-    from core.schemas import get_headers_for_sheet  # type: ignore
+    from core.schemas.headers import get_headers_for_sheet as _gh  # type: ignore
+    if callable(_gh):
+        get_headers_for_sheet = _gh  # type: ignore
 except Exception:
-    get_headers_for_sheet = None  # type: ignore
+    pass
+
+if get_headers_for_sheet is None:
+    try:
+        from core.schemas import get_headers_for_sheet as _gh2  # type: ignore
+        if callable(_gh2):
+            get_headers_for_sheet = _gh2  # type: ignore
+    except Exception:
+        pass
 
 # Optional symbol normalization (best-effort, never required)
+# IMPORTANT: we do NOT force ".US" here; backend should normalize per provider.
 def _fallback_normalize_symbol(raw: str) -> str:
     s = (raw or "").strip().upper()
     if not s:
@@ -64,23 +78,20 @@ def _fallback_normalize_symbol(raw: str) -> str:
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
-    if any(ch in s for ch in ("^", "=")):  # indices / formula-like
+    # keep indices / special tickers as-is
+    if any(ch in s for ch in ("^", "=", "/")):
         return s
+    # numeric KSA
     if s.isdigit():
         return f"{s}.SR"
-    if s.endswith(".SR") or s.endswith(".US"):
-        return s
-    if "." in s:
-        return s
-    return f"{s}.US"
+    return s
 
 
 _NORMALIZE_SYMBOL = _fallback_normalize_symbol
 try:
-    from core.data_engine_v2 import normalize_symbol as _ns  # type: ignore
-
+    from core.symbols.normalize import normalize_symbol as _ns  # type: ignore
     if callable(_ns):
-        _NORMALIZE_SYMBOL = lambda x: (_ns(x) or "").strip().upper()  # type: ignore
+        _NORMALIZE_SYMBOL = lambda x: (str(_ns(x) or "")).strip().upper()  # type: ignore
 except Exception:
     pass
 
@@ -316,6 +327,16 @@ _USER_AGENT = (os.getenv("SHEETS_USER_AGENT", "") or "").strip() or f"TadawulFas
 
 _A1_RE = re.compile(r"^\$?([A-Za-z]+)\$?(\d+)$")
 
+# Header-key normalizer: makes "Expected ROI % (1M)" ~= "expected_roi_1m" ~= "Expected_ROI_1M"
+_HKEY_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _hkey(name: Any) -> str:
+    s = str(name or "").strip().lower()
+    if not s:
+        return ""
+    return _HKEY_RE.sub("", s)
+
 
 # =============================================================================
 # LOW-LEVEL HELPERS
@@ -492,16 +513,16 @@ def _chunk_list(items: List[str], size: int) -> List[List[str]]:
 
 def _append_missing_headers_ci(base: List[str], extra: Sequence[Any]) -> List[str]:
     """
-    Append any headers from extra that are not already in base (case-insensitive).
+    Append any headers from extra that are not already in base (case/format-insensitive).
     Keeps base order stable; new headers appended.
     """
-    seen = {str(h).strip().lower() for h in (base or []) if str(h).strip()}
+    seen = {_hkey(h) for h in (base or []) if _hkey(h)}
     out = list(base or [])
     for h in (extra or []):
         hs = str(h).strip()
-        if not hs:
+        hk = _hkey(hs)
+        if not hs or not hk:
             continue
-        hk = hs.lower()
         if hk in seen:
             continue
         seen.add(hk)
@@ -541,6 +562,72 @@ def _add_query_params(endpoint: str, params: Optional[Dict[str, Any]]) -> str:
 
     rebuilt = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_q, parsed.fragment))
     return rebuilt
+
+
+# =============================================================================
+# CANONICAL HEADERS (per sheet) + output ordering
+# =============================================================================
+_CANONICAL_CACHE: Dict[str, List[str]] = {}
+
+
+def _get_canonical_headers(sheet_name: str) -> List[str]:
+    sh = (sheet_name or "").strip()
+    if not sh:
+        return []
+    key = sh.upper()
+    if key in _CANONICAL_CACHE:
+        return list(_CANONICAL_CACHE[key])
+    headers: List[str] = []
+    if callable(get_headers_for_sheet):
+        try:
+            hh = get_headers_for_sheet(sh)  # type: ignore
+            if isinstance(hh, list):
+                headers = [str(x).strip() for x in hh if str(x).strip()]
+        except Exception:
+            headers = []
+    _CANONICAL_CACHE[key] = list(headers)
+    return list(headers)
+
+
+def _reorder_to_canonical(sheet_name: str, headers: List[str], rows: List[List[Any]]) -> Tuple[List[str], List[List[Any]]]:
+    """
+    Enforce canonical header order (if available) and append backend extras (never drop).
+    Also re-align rows accordingly by header-key.
+    """
+    canonical = _get_canonical_headers(sheet_name)
+    if not canonical:
+        return headers, rows
+
+    # Build union: canonical first, then extras
+    canonical_keys = {_hkey(h) for h in canonical if _hkey(h)}
+    extras = [h for h in (headers or []) if _hkey(h) and _hkey(h) not in canonical_keys]
+    out_headers = list(canonical) + extras
+
+    # Ensure Symbol/Ticker presence (defensive)
+    sym_like = {"symbol", "ticker"}
+    if not any(_hkey(h) in sym_like for h in out_headers):
+        # if present in incoming headers, prepend it
+        for h in headers:
+            if _hkey(h) in sym_like:
+                out_headers = [h] + out_headers
+                break
+
+    # Index mapping from incoming headers -> col index
+    in_idx = {_hkey(h): i for i, h in enumerate(headers or []) if _hkey(h)}
+    out_rows: List[List[Any]] = []
+    for r in rows or []:
+        rr = list(r) if isinstance(r, (list, tuple)) else [r]
+        new_row: List[Any] = [None] * len(out_headers)
+        for j, h in enumerate(out_headers):
+            hk = _hkey(h)
+            i = in_idx.get(hk)
+            if i is None:
+                continue
+            if i < len(rr):
+                new_row[j] = rr[i]
+        out_rows.append(new_row)
+
+    return out_headers, out_rows
 
 
 # =============================================================================
@@ -927,7 +1014,8 @@ def _call_backend_api_once(endpoint: str, payload: Dict[str, Any]) -> Dict[str, 
 
 def _find_symbol_col(headers: List[str]) -> int:
     for i, h in enumerate(headers or []):
-        if str(h).strip().lower() in ("symbol", "ticker"):
+        hk = _hkey(h)
+        if hk in ("symbol", "ticker"):
             return i
     return -1
 
@@ -936,9 +1024,9 @@ def _rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[A
     """
     Normalize backend rows:
     - list[list] -> keep (pad/trim to header length)
-    - list[dict] -> ordered list rows by headers
+    - list[dict] -> ordered list rows by headers (header-key normalized)
     """
-    hdrs = [str(h).strip() for h in (headers or []) if h and str(h).strip()]
+    hdrs = [str(h).strip() for h in (headers or []) if str(h).strip()]
     if not hdrs:
         hdrs = ["Symbol", "Error"]
 
@@ -947,7 +1035,9 @@ def _rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[A
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         for d in rows:
             dd = d if isinstance(d, dict) else {}
-            fixed_rows.append([dd.get(h, None) for h in hdrs])
+            # normalize dict keys once per row
+            km = {_hkey(k): v for k, v in dd.items()}
+            fixed_rows.append([km.get(_hkey(h), None) for h in hdrs])
         return hdrs, fixed_rows
 
     if isinstance(rows, list):
@@ -971,15 +1061,14 @@ def _merge_backend_responses(
 ) -> Tuple[List[str], List[List[Any]], str, Optional[str]]:
     """
     Merge chunked backend responses into one headers+rows in requested order when possible.
-    Enhancement: header UNION (case-insensitive) across responses.
+    - header union (case/format-insensitive) across responses
+    - preserves deterministic order by requested_symbols if symbol col exists
     """
     status = "success"
     error_msg: Optional[str] = None
 
-    # Seed headers
     headers = [str(h).strip() for h in (first_headers or []) if str(h).strip()]
 
-    # If not provided, pick first non-empty in responses
     if not headers:
         for r in responses:
             hh = r.get("headers") or []
@@ -987,7 +1076,6 @@ def _merge_backend_responses(
                 headers = [str(x).strip() for x in hh if str(x).strip()]
                 break
 
-    # Header union (case-insensitive)
     for r in responses:
         hh = r.get("headers") or []
         if isinstance(hh, list) and hh:
@@ -1000,7 +1088,9 @@ def _merge_backend_responses(
     row_map: Dict[str, List[Any]] = {}
     all_rows: List[List[Any]] = []
 
-    # Build row map per response
+    # mapping for union headers alignment
+    union_keys = [_hkey(h) for h in headers]
+
     for r in responses:
         st = str(r.get("status") or "success")
         if st in ("error", "partial"):
@@ -1012,43 +1102,35 @@ def _merge_backend_responses(
         hh, rr = _rows_to_grid(list(hh_raw) if isinstance(hh_raw, list) else headers, r.get("rows") or [])
         sym_idx = _find_symbol_col(hh)
 
+        # build alignment map from hh -> union headers
+        hh_key_to_pos = {_hkey(hh[i]): i for i in range(len(hh)) if _hkey(hh[i])}
+
         if sym_idx >= 0:
             for row in rr:
                 try:
                     sym = str(row[sym_idx] or "").strip().upper()
                 except Exception:
                     sym = ""
-                if sym:
-                    # Align row to UNION headers
-                    if hh != headers:
-                        tmp = {str(hh[i]): (row[i] if i < len(row) else None) for i in range(len(hh))}
-                        aligned = [tmp.get(h, None) for h in headers]
-                        row_map.setdefault(sym, aligned)
-                    else:
-                        if len(row) < len(headers):
-                            row = row + [None] * (len(headers) - len(row))
-                        elif len(row) > len(headers):
-                            row = row[: len(headers)]
-                        row_map.setdefault(sym, row)
-                else:
-                    # Keep un-keyed rows (rare)
-                    aligned = row
-                    if len(aligned) < len(headers):
-                        aligned = aligned + [None] * (len(headers) - len(aligned))
-                    elif len(aligned) > len(headers):
-                        aligned = aligned[: len(headers)]
-                    all_rows.append(aligned)
+                if not sym:
+                    continue
+
+                aligned = [None] * len(headers)
+                for j, uk in enumerate(union_keys):
+                    src_pos = hh_key_to_pos.get(uk)
+                    if src_pos is None:
+                        continue
+                    if src_pos < len(row):
+                        aligned[j] = row[src_pos]
+                row_map.setdefault(sym, aligned)
         else:
-            # No symbol col -> just append aligned rows
             for row in rr:
-                aligned = row
+                aligned = list(row) if isinstance(row, (list, tuple)) else [row]
                 if len(aligned) < len(headers):
-                    aligned = aligned + [None] * (len(headers) - len(aligned))
+                    aligned += [None] * (len(headers) - len(aligned))
                 elif len(aligned) > len(headers):
                     aligned = aligned[: len(headers)]
                 all_rows.append(aligned)
 
-    # Deterministic order merge (preferred)
     if symbol_col >= 0 and requested_symbols:
         merged: List[List[Any]] = []
         for s in requested_symbols:
@@ -1057,11 +1139,14 @@ def _merge_backend_responses(
             if row is None:
                 placeholder = [None] * len(headers)
                 placeholder[symbol_col] = key
-                try:
-                    err_idx = next(i for i, h in enumerate(headers) if str(h).strip().lower() == "error")
+                # best-effort Error column
+                err_idx = None
+                for i, h in enumerate(headers):
+                    if _hkey(h) == "error":
+                        err_idx = i
+                        break
+                if err_idx is not None:
                     placeholder[err_idx] = "Missing row from backend"
-                except Exception:
-                    pass
                 merged.append(placeholder)
                 status = "partial" if status == "success" else status
             else:
@@ -1121,7 +1206,7 @@ def _call_backend_api(endpoint: str, payload: Dict[str, Any], *, query_params: O
 def _normalize_tickers(tickers: Sequence[str]) -> List[str]:
     """
     Normalize + de-dup tickers in a stable order.
-    Uses best-effort engine normalize when available; otherwise safe fallback.
+    Uses best-effort project normalize; otherwise safe fallback.
     """
     out: List[str] = []
     seen = set()
@@ -1152,8 +1237,8 @@ def _payload_for_endpoint(symbols_list: List[str], sheet_name: str, *, extra: Op
         "sheetName": sheet_name,
     }
     if isinstance(extra, dict) and extra:
-        # Do NOT allow callers to remove required keys; only add/override safely
         payload.update(extra)
+        # lock required keys
         payload["symbols"] = symbols_list
         payload["tickers"] = symbols_list
         payload["sheet_name"] = sheet_name
@@ -1177,8 +1262,9 @@ def _refresh_logic(
     """
     Core logic:
     1) Call backend to get {headers, rows, status}
-    2) Optional clear old values first
-    3) Write to Google Sheet (chunked)
+    2) Enforce canonical header order per sheet (if available); append backend extras
+    3) Optional clear old values first
+    4) Write to Google Sheet (chunked)
 
     Never raises: always returns a status dict.
     """
@@ -1196,7 +1282,6 @@ def _refresh_logic(
         if not sh:
             return _safe_status_error("sheet_name", "sheet_name is required", endpoint=endpoint)
 
-        # Build query params (mode is a common one for /sheet-rows endpoints)
         qp = dict(backend_query_params or {})
         if mode and str(mode).strip():
             qp.setdefault("mode", str(mode).strip())
@@ -1217,27 +1302,26 @@ def _refresh_logic(
         headers = response.get("headers") or []
         rows = response.get("rows") or []
 
-        # fallback headers from canonical schemas if backend didn't provide
-        if (not headers) and callable(get_headers_for_sheet):
-            try:
-                headers = get_headers_for_sheet(sh)  # type: ignore
-            except Exception:
-                headers = []
+        # If backend omitted headers, use canonical (if available)
+        if not headers:
+            headers = _get_canonical_headers(sh)
 
         headers2, fixed_rows = _rows_to_grid(headers, rows)
 
-        # Final header cleanup (avoid empty header list)
-        if not headers2:
-            headers2 = ["Symbol", "Error"]
+        # Enforce canonical order (+ append extras) and realign rows accordingly
+        headers3, fixed_rows2 = _reorder_to_canonical(sh, headers2, fixed_rows)
 
-        grid = [headers2] + fixed_rows
+        if not headers3:
+            headers3 = ["Symbol", "Error"]
 
-        # 2) optional clear
+        grid = [headers3] + fixed_rows2
+
+        # 3) optional clear
         if clear:
             start_col, start_row = _parse_a1_cell(start_cell)
             end_col = _CLEAR_END_COL
             if _SMART_CLEAR:
-                end_col = _compute_clear_end_col(start_col, len(headers2))
+                end_col = _compute_clear_end_col(start_col, len(headers3))
 
             clear_rng = f"{_safe_sheet_name(sh)}!{_a1(start_col, start_row)}:{end_col}{_CLEAR_END_ROW}"
             try:
@@ -1245,7 +1329,7 @@ def _refresh_logic(
             except Exception as e:
                 logger.warning("[GoogleSheets] Clear failed (continuing): %s", e)
 
-        # 3) write
+        # 4) write
         try:
             updated_cells = write_grid_chunked(sid, sh, start_cell, grid, value_input=value_input)
         except Exception as e:
@@ -1254,8 +1338,8 @@ def _refresh_logic(
                 str(e),
                 sheet=sh,
                 endpoint=endpoint,
-                rows=len(fixed_rows),
-                headers_count=len(headers2),
+                rows=len(fixed_rows2),
+                headers_count=len(headers3),
                 backend_status=backend_status,
                 backend_error=backend_error,
             )
@@ -1271,8 +1355,8 @@ def _refresh_logic(
             "sheet": sh,
             "endpoint": endpoint,
             "mode": (mode or ""),
-            "rows_written": len(fixed_rows),
-            "headers_count": len(headers2),
+            "rows_written": len(fixed_rows2),
+            "headers_count": len(headers3),
             "cells_updated": int(updated_cells or 0),
             "backend_status": backend_status,
             "backend_error": backend_error,
