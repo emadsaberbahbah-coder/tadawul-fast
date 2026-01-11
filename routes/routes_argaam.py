@@ -1,25 +1,32 @@
-# routes/routes_argaam.py  (FULL REPLACEMENT) — v3.7.0
+# routes/routes_argaam.py  (FULL REPLACEMENT) — v3.7.1
 """
 routes/routes_argaam.py
 ===============================================================
-Argaam Router (delegate) — v3.7.0
+Argaam Router (delegate) — v3.7.1
 (PROD SAFE + Auth-Compat + Sheet-Rows + Schema-Aligned)
 
-✅ v3.7.0 improvements (over v3.6.0)
-- ✅ Stronger finalize step:
+✅ v3.7.1 improvements (over v3.7.0)
+- ✅ Await-safe everywhere (inspect.isawaitable instead of asyncio.iscoroutine)
+- ✅ Supports per-endpoint custom headers (optional):
+    • ARGAAM_HEADERS_JSON
+    • ARGAAM_HEADERS_QUOTE_JSON
+    • ARGAAM_HEADERS_PROFILE_JSON
+- ✅ Same v3.7.0 guarantees retained:
     • Normalizes percent_change (ratio→% when needed)
     • Computes value_traded = price * volume
     • Ensures last_updated_utc + last_updated_riyadh always present (when possible)
     • Sets data_quality based on presence of current_price (OK / MISSING)
-- ✅ Schema sheet-rows fills rank + origin consistently
-- ✅ Still: token via X-APP-TOKEN / Authorization: Bearer / optional ?token (if ALLOW_QUERY_TOKEN=1)
-- ✅ Always returns HTTP 200 with {status, data_quality, error?} for client simplicity
+    • Schema sheet-rows fills rank + origin consistently
+    • Token via X-APP-TOKEN / Authorization: Bearer / optional ?token (if ALLOW_QUERY_TOKEN=1)
+    • Always returns HTTP 200 with {status, data_quality, error?} for client simplicity
 
 Expected env vars
 - APP_TOKEN / BACKUP_APP_TOKEN (optional; if none set, auth is disabled)
 - ARGAAM_QUOTE_URL (optional; if missing, endpoint mode will report "not configured")
 - ARGAAM_PROFILE_URL (optional)
 - ARGAAM_HEADERS_JSON (optional; JSON dict for headers/cookies)
+- ARGAAM_HEADERS_QUOTE_JSON (optional; JSON dict override for quote endpoint calls)
+- ARGAAM_HEADERS_PROFILE_JSON (optional; JSON dict override for profile endpoint calls)
 - HTTP_TIMEOUT_SEC (default 25)
 - HTTP_RETRY_ATTEMPTS (default 3)
 - ARGAAM_QUOTE_TTL_SEC (default 20)
@@ -27,11 +34,14 @@ Expected env vars
 - DEBUG_ERRORS=1 (optional; include debug details on failures)
 - ALLOW_QUERY_TOKEN=1 (optional; allow ?token=... for quick manual testing)
 - ARGAAM_SHEET_MODE=schema|compact (optional default override)
+- ARGAAM_SHEET_MAX (default 500)
+- ARGAAM_SHEET_CONCURRENCY (default 12)
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -49,7 +59,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("routes.routes_argaam")
 
-ROUTE_VERSION = "3.7.0"
+ROUTE_VERSION = "3.7.1"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 USER_AGENT = (
@@ -177,6 +187,12 @@ def _format_url(template: str, symbol: str) -> str:
     return (template or "").replace("{code}", code).replace("{symbol}", symbol)
 
 
+async def _maybe_await(x: Any) -> Any:
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
 # =============================================================================
 # Auth helpers (APP_TOKEN / BACKUP_APP_TOKEN)
 # =============================================================================
@@ -222,16 +238,29 @@ def _auth_ok(provided_token: Optional[str]) -> bool:
 # =============================================================================
 # Optional endpoint config
 # =============================================================================
-def _headers_from_env() -> Dict[str, str]:
+def _headers_from_env(*keys: str) -> Dict[str, str]:
+    """
+    Merges ARGAAM_HEADERS_JSON with an optional per-endpoint override.
+    Later keys override earlier keys.
+    """
     hdrs: Dict[str, str] = {}
-    raw = (os.getenv("ARGAAM_HEADERS_JSON") or "").strip()
-    if raw:
+
+    def load_env(k: str) -> None:
+        raw = (os.getenv(k) or "").strip()
+        if not raw:
+            return
         try:
             obj = json.loads(raw)
             if isinstance(obj, dict):
-                hdrs.update({str(k): str(v) for k, v in obj.items()})
+                for kk, vv in obj.items():
+                    hdrs[str(kk)] = str(vv)
         except Exception:
-            pass
+            return
+
+    load_env("ARGAAM_HEADERS_JSON")
+    for k in keys:
+        if k:
+            load_env(k)
     return hdrs
 
 
@@ -292,11 +321,14 @@ except Exception:
     pass
 
 
-async def _fetch_url(url: str) -> Tuple[Optional[Union[Dict[str, Any], List[Any]]], Optional[str], int]:
+async def _fetch_url(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[Union[Dict[str, Any], List[Any]]], Optional[str], int]:
     """
     Returns (json_or_list_or_none, raw_text_or_none, status_code)
     """
-    headers = _headers_from_env() or None
     c = await _get_client()
 
     for attempt in range(max(1, HTTP_RETRY_ATTEMPTS)):
@@ -457,7 +489,7 @@ def _compute_value_traded(price: Any, volume: Any) -> Optional[float]:
 # Engine/provider integration (best-effort)
 # =============================================================================
 async def _try_engine_argaam(request: Request, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    eng = getattr(request.app.state, "engine", None)
+    eng = getattr(getattr(request.app, "state", None), "engine", None)
     if eng is None:
         return {}, "no engine"
 
@@ -471,8 +503,7 @@ async def _try_engine_argaam(request: Request, symbol: str) -> Tuple[Dict[str, A
         if callable(fn):
             try:
                 res = fn(symbol)
-                if asyncio.iscoroutine(res):
-                    res = await res
+                res = await _maybe_await(res)
                 if isinstance(res, tuple) and len(res) == 2:
                     patch, err = res
                     return (patch or {}), err
@@ -492,8 +523,7 @@ async def _try_provider_module(symbol: str) -> Tuple[Dict[str, Any], Optional[st
         fn = getattr(m, "fetch_quote_patch", None)
         if callable(fn):
             res = fn(symbol)
-            if asyncio.iscoroutine(res):
-                res = await res
+            res = await _maybe_await(res)
             if isinstance(res, tuple) and len(res) == 2:
                 patch, err = res
                 return (patch or {}), err
@@ -523,7 +553,8 @@ async def _try_profile_name(symbol: str) -> Optional[str]:
             return nm
 
     url = _format_url(ARGAAM_PROFILE_URL, sym)
-    data, raw, sc = await _fetch_url(url)
+    hdrs = _headers_from_env("ARGAAM_HEADERS_PROFILE_JSON") or None
+    data, raw, sc = await _fetch_url(url, headers=hdrs)
     if sc >= 400:
         return None
 
@@ -555,8 +586,10 @@ async def _try_configured_endpoints(symbol: str) -> Tuple[Dict[str, Any], Option
         return dict(hit), None
 
     url = _format_url(ARGAAM_QUOTE_URL, sym)
+    hdrs = _headers_from_env("ARGAAM_HEADERS_QUOTE_JSON") or None
+
     t0 = time.perf_counter()
-    data, raw, sc = await _fetch_url(url)
+    data, raw, sc = await _fetch_url(url, headers=hdrs)
     dt_ms = int((time.perf_counter() - t0) * 1000)
 
     if isinstance(data, (dict, list)):
@@ -661,7 +694,11 @@ def _finalize_quote(sym: str, out: Dict[str, Any]) -> Dict[str, Any]:
         if not out.get("last_updated_utc"):
             out["last_updated_utc"] = out.get("time_utc") or _utc_iso()
         if not out.get("last_updated_riyadh"):
-            out["last_updated_riyadh"] = _utc_to_riyadh_iso(str(out.get("last_updated_utc"))) or out.get("time_riyadh") or _riyadh_iso()
+            out["last_updated_riyadh"] = (
+                _utc_to_riyadh_iso(str(out.get("last_updated_utc")))
+                or out.get("time_riyadh")
+                or _riyadh_iso()
+            )
 
         # normalize percent_change
         if out.get("percent_change") is not None:
@@ -710,7 +747,7 @@ class SheetRowsIn(BaseModel):
 # =============================================================================
 @router.get("/health")
 async def health(request: Request) -> Dict[str, Any]:
-    eng = getattr(request.app.state, "engine", None)
+    eng = getattr(getattr(request.app, "state", None), "engine", None)
     auth_required = bool((os.getenv("APP_TOKEN") or "").strip() or (os.getenv("BACKUP_APP_TOKEN") or "").strip())
     return {
         "status": "ok",
@@ -812,8 +849,17 @@ async def quotes(
         return {"status": "error", "error": "Unauthorized: invalid or missing token", "items": [], "route_version": ROUTE_VERSION}
 
     arr = [s.strip() for s in (symbols or "").split(",") if s.strip()]
-    arr = [_normalize_ksa_symbol(x) for x in arr if _normalize_ksa_symbol(x)]
-    arr = arr[:50]
+    arr2: List[str] = []
+    seen = set()
+    for x in arr:
+        ns = _normalize_ksa_symbol(x)
+        if not ns:
+            continue
+        if ns in seen:
+            continue
+        seen.add(ns)
+        arr2.append(ns)
+    arr2 = arr2[:50]
 
     concurrency = int(_safe_float(os.getenv("ARGAAM_SHEET_CONCURRENCY")) or DEFAULT_CONCURRENCY)
     sem = asyncio.Semaphore(max(1, concurrency))
@@ -822,7 +868,7 @@ async def quotes(
         async with sem:
             return await _get_quote_payload(request, sym, debug=debug)
 
-    items = await asyncio.gather(*[asyncio.create_task(one(s)) for s in arr])
+    items = await asyncio.gather(*[one(s) for s in arr2])
     return {"status": "ok", "count": len(items), "items": items, "route_version": ROUTE_VERSION, "time_utc": _utc_iso()}
 
 
@@ -901,7 +947,7 @@ def _build_schema_rows(
     Missing fields are returned as None (safe for Sheets).
     """
     try:
-        from core.schemas import get_headers_for_sheet, header_field_candidates  # import-safe module
+        from core.schemas import get_headers_for_sheet, header_field_candidates  # type: ignore
 
         headers = get_headers_for_sheet(sheet_name)
         rows: List[List[Any]] = []
@@ -952,8 +998,9 @@ async def sheet_rows(
     mode: Optional[str] = Query(default=None, description="schema|compact (optional)"),
 ) -> Dict[str, Any]:
     provided = _extract_token(x_app_token, authorization, token)
+    eff_mode = _sheet_mode(payload, mode)
+
     if not _auth_ok(provided):
-        eff_mode = _sheet_mode(payload, mode)
         return {
             "status": "error",
             "mode": eff_mode,
@@ -980,8 +1027,6 @@ async def sheet_rows(
     max_n = int(_safe_float(os.getenv("ARGAAM_SHEET_MAX")) or DEFAULT_SHEET_MAX)
     normed = normed[: max(1, max_n)]
 
-    eff_mode = _sheet_mode(payload, mode)
-
     if not normed:
         return {
             "status": "ok",
@@ -1002,9 +1047,9 @@ async def sheet_rows(
         async with sem:
             return await _get_quote_payload(request, sym, debug=debug)
 
-    items: List[Dict[str, Any]] = await asyncio.gather(*[asyncio.create_task(one(s)) for s in normed])
+    items: List[Dict[str, Any]] = await asyncio.gather(*[one(s) for s in normed])
 
-    # If argaam isn't configured, provide a clearer top-level message
+    # clearer top-level message when not configured
     top_err = ""
     if not ARGAAM_QUOTE_URL:
         top_err = "Argaam not configured (ARGAAM_QUOTE_URL not set)."
