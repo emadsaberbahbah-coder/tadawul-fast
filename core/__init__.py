@@ -1,8 +1,8 @@
-# core/__init__.py  (FULL REPLACEMENT)
+# core/__init__.py
 """
 core/__init__.py
 ------------------------------------------------------------
-Core package initialization (PROD SAFE) — v1.4.0 (LAZY + STABLE)
+Core package initialization (PROD SAFE) — v1.5.0 (LAZY + STABLE + ENGINE SAFE)
 
 Goals:
 - Keep imports LIGHT to avoid circular-import + cold-start issues on Render.
@@ -10,12 +10,13 @@ Goals:
 - Prefer v2 engine, fallback to legacy, then schemas (last resort).
 - Never crash app startup because of optional modules.
 - Provide optional debug traces when CORE_IMPORT_DEBUG=true.
+- Provide a BEST-EFFORT get_engine() even if engine modules do not expose one.
 
-Exports (lazy):
+Exports (lazy + safe):
 - get_settings
 - DataEngine, DataEngineV2, UnifiedQuote, normalize_symbol
-- get_engine (best-effort)
-- BatchProcessRequest, get_headers_for_sheet, resolve_sheet_key
+- get_engine (best-effort singleton accessor)
+- BatchProcessRequest, get_headers_for_sheet, resolve_sheet_key, get_supported_sheets
 
 Notes:
 - Do NOT import heavy modules at import-time.
@@ -24,8 +25,12 @@ Notes:
 
 from __future__ import annotations
 
+import inspect
 import os
-from typing import Any, Optional, Dict, Callable
+from typing import Any, Callable, Dict, Optional
+
+
+CORE_INIT_VERSION = "1.5.0"
 
 # -----------------------------------------------------------------------------
 # Optional debug logging for import issues (set CORE_IMPORT_DEBUG=true)
@@ -54,7 +59,7 @@ def _try_import(module_path: str) -> Optional[Any]:
 
         return import_module(module_path)
     except Exception as e:
-        _dbg(f"Import failed: {module_path} -> {e}")
+        _dbg(f"Import failed: {module_path} -> {e.__class__.__name__}: {e}")
         return None
 
 
@@ -107,7 +112,7 @@ def get_settings() -> Any:
         fn = _resolve_get_settings_func()
         return fn() if callable(fn) else None
     except Exception as e:
-        _dbg(f"get_settings() failed -> {e}")
+        _dbg(f"get_settings() failed -> {e.__class__.__name__}: {e}")
         return None
 
 
@@ -124,7 +129,8 @@ def _resolve_engine_exports() -> Dict[str, Any]:
         "DataEngineV2": None,
         "UnifiedQuote": None,
         "normalize_symbol": None,
-        "get_engine": None,
+        "get_engine_func": None,  # internal: engine module accessor if present
+        "engine_module": None,    # internal: which module provided exports
     }
 
     # Prefer: v2 -> legacy
@@ -132,6 +138,8 @@ def _resolve_engine_exports() -> Dict[str, Any]:
         m = _try_import(mod_name)
         if not m:
             continue
+
+        exports["engine_module"] = mod_name
 
         # Engines
         if exports["DataEngine"] is None:
@@ -166,17 +174,17 @@ def _resolve_engine_exports() -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # Optional engine accessor
-        if exports["get_engine"] is None:
+        # Optional engine accessor (some engines expose get_engine singleton)
+        if exports["get_engine_func"] is None:
             try:
                 ge = getattr(m, "get_engine", None)
                 if callable(ge):
-                    exports["get_engine"] = ge
+                    exports["get_engine_func"] = ge
             except Exception:
                 pass
 
         # Stop early if we got the important ones
-        if exports["DataEngine"] and exports["UnifiedQuote"] and exports["normalize_symbol"]:
+        if exports["normalize_symbol"] and (exports["DataEngineV2"] or exports["DataEngine"]):
             break
 
     # Last resort: UnifiedQuote from schemas (if you ever expose it there)
@@ -216,14 +224,137 @@ def _resolve_schema_exports() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Best-effort engine singleton (PROD SAFE)
+# -----------------------------------------------------------------------------
+def _try_construct_engine(cls: Any, settings: Any) -> Optional[Any]:
+    """
+    Construct engine with best-effort signature matching.
+    Never raises; returns instance or None.
+    """
+    if cls is None:
+        return None
+    try:
+        sig = None
+        try:
+            sig = inspect.signature(cls)  # class constructor signature
+        except Exception:
+            sig = None
+
+        # No signature info: try no-arg then settings
+        if sig is None:
+            try:
+                return cls()
+            except Exception:
+                try:
+                    return cls(settings)
+                except Exception:
+                    return None
+
+        params = list(sig.parameters.values())
+
+        # If no params or only *args/**kwargs => try no-arg
+        if not params:
+            try:
+                return cls()
+            except Exception:
+                return None
+
+        # Build kwargs only when likely safe
+        kw: Dict[str, Any] = {}
+        names = {p.name for p in params if p.name not in ("self",)}
+
+        # Common patterns
+        if "settings" in names:
+            kw["settings"] = settings
+        elif "config" in names:
+            kw["config"] = settings
+        elif "cfg" in names:
+            kw["cfg"] = settings
+
+        # If we have kwargs, try them first
+        if kw:
+            try:
+                return cls(**kw)
+            except Exception:
+                pass
+
+        # Otherwise try no-arg
+        try:
+            return cls()
+        except Exception:
+            # Last resort: single positional settings
+            try:
+                return cls(settings)
+            except Exception:
+                return None
+    except Exception:
+        return None
+
+
+def get_engine() -> Any:
+    """
+    Best-effort engine accessor (singleton-like).
+    Safe: never raises. Returns engine instance or None.
+
+    Resolution order:
+    1) If engine module exposes get_engine(), call it (v2 preferred)
+    2) Else attempt to instantiate DataEngineV2, then DataEngine
+    """
+    cached_engine = _cached("engine_instance")
+    if cached_engine is not None:
+        return cached_engine
+
+    try:
+        ex = _resolve_engine_exports()
+        settings = get_settings()
+
+        # 1) Prefer engine module's get_engine() if exists
+        ge = ex.get("get_engine_func")
+        if callable(ge):
+            try:
+                inst = ge()
+                if inst is not None:
+                    return _set_cache("engine_instance", inst)
+            except Exception as e:
+                _dbg(f"engine get_engine() failed -> {e.__class__.__name__}: {e}")
+
+        # 2) Construct v2 then legacy
+        cls_v2 = ex.get("DataEngineV2")
+        inst = _try_construct_engine(cls_v2, settings)
+        if inst is not None:
+            return _set_cache("engine_instance", inst)
+
+        cls_legacy = ex.get("DataEngine")
+        inst = _try_construct_engine(cls_legacy, settings)
+        if inst is not None:
+            return _set_cache("engine_instance", inst)
+
+        return _set_cache("engine_instance", None)
+    except Exception as e:
+        _dbg(f"get_engine() failed -> {e.__class__.__name__}: {e}")
+        return _set_cache("engine_instance", None)
+
+
+# -----------------------------------------------------------------------------
 # Lazy attribute access (PEP 562)
 # -----------------------------------------------------------------------------
 def __getattr__(name: str) -> Any:  # pragma: no cover
     if name == "get_settings":
         return get_settings
 
-    if name in ("DataEngine", "DataEngineV2", "UnifiedQuote", "normalize_symbol", "get_engine"):
-        return _resolve_engine_exports().get(name)
+    if name == "get_engine":
+        return get_engine
+
+    if name in ("DataEngine", "DataEngineV2", "UnifiedQuote", "normalize_symbol"):
+        ex = _resolve_engine_exports()
+        if name == "DataEngine":
+            return ex.get("DataEngine")
+        if name == "DataEngineV2":
+            return ex.get("DataEngineV2")
+        if name == "UnifiedQuote":
+            return ex.get("UnifiedQuote")
+        if name == "normalize_symbol":
+            return ex.get("normalize_symbol")
 
     if name in ("BatchProcessRequest", "get_headers_for_sheet", "resolve_sheet_key", "get_supported_sheets"):
         return _resolve_schema_exports().get(name)
@@ -231,7 +362,12 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
     raise AttributeError(name)
 
 
+def __dir__() -> list[str]:  # pragma: no cover
+    return sorted(__all__)
+
+
 __all__ = [
+    "CORE_INIT_VERSION",
     "get_settings",
     "DataEngine",
     "DataEngineV2",
