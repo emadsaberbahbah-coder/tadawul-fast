@@ -2,13 +2,17 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.5.1
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.0
 
-What’s fixed / improved in v5.5.1
-- ✅ Hardens _get_one_quote_with_variants() against UnboundLocalError (always initializes `last`)
-- ✅ Hardens batch dispatcher: final fallback call is now TypeError-safe (no surprise crash)
-- ✅ More defensive alignment for batch list outputs (pads missing items with error rows)
-- ✅ Keeps v5.5.0 behavior: always HTTP 200 with status field; token guard unchanged; reco enum enforced
+What’s fixed / improved in v5.6.0
+- ✅ Prefers core.symbols.normalize.normalize_symbol (new shared normalizer) instead of importing engine for normalization
+- ✅ status auto-infers to "error" when payload contains error / BAD quality (prevents hiding failures as ok)
+- ✅ Keeps v5.5.1 guarantees:
+    • always HTTP 200 with {status,...}
+    • token guard unchanged
+    • reco enum enforced
+    • variant rescue for Global/KSA symbols
+    • batch alignment hardened
 
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
@@ -30,7 +34,7 @@ from fastapi import APIRouter, Header, Query, Request
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.5.1"
+ENRICHED_ROUTE_VERSION = "5.6.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -131,10 +135,13 @@ def _fallback_normalize(raw: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def _try_import_v2_normalizer() -> Any:
-    """Return normalize_symbol callable if available, else fallback. Never raises."""
+def _try_import_shared_normalizer() -> Any:
+    """
+    Return normalize_symbol callable if available, else fallback.
+    Never raises.
+    """
     try:
-        from core.data_engine_v2 import normalize_symbol as _NS  # type: ignore
+        from core.symbols.normalize import normalize_symbol as _NS  # type: ignore
 
         return _NS
     except Exception:
@@ -145,10 +152,8 @@ def _normalize_symbol(sym: str) -> str:
     raw = (sym or "").strip()
     if not raw:
         return ""
-    # Prefer engine normalizer when present, BUT keep router behavior safe:
-    # If engine normalizer returns empty or explodes, fallback.
     try:
-        ns = _try_import_v2_normalizer()
+        ns = _try_import_shared_normalizer()
         out = (ns(raw) or "").strip()
         return out if out else _fallback_normalize(raw)
     except Exception:
@@ -302,11 +307,10 @@ def _ensure_provenance(d: Dict[str, Any], *, engine_source: str) -> Dict[str, An
     Normalize common provider keys to:
       - data_source
       - data_quality
-    Without lying: if missing, we keep empty; only replace explicit "none"/"null" with "".
+    Without lying: only map if data exists under known keys.
     """
     out = dict(d)
 
-    # normalize data_source
     ds = (
         out.get("data_source")
         or out.get("dataSource")
@@ -317,34 +321,49 @@ def _ensure_provenance(d: Dict[str, Any], *, engine_source: str) -> Dict[str, An
     )
     ds_s = _norm_str(ds)
     if ds_s.lower() in ("none", "null", "na", "n/a"):
-        ds_s = ""
+        ds_s = "none"
     if ds_s:
         out["data_source"] = ds_s
-    else:
-        if "data_source" in out and _norm_str(out.get("data_source")).lower() in ("none", "null"):
-            out["data_source"] = ""
 
-    # normalize data_quality if present under other keys
     dq = out.get("data_quality") or out.get("dataQuality") or out.get("quality")
     dq_s = _norm_str(dq)
     if dq_s:
         out["data_quality"] = dq_s
 
-    # always keep engine_source for debugging
     out.setdefault("engine_source", engine_source)
     return out
+
+
+def _infer_status(d: Dict[str, Any]) -> str:
+    """
+    If status isn't explicitly ok/error, infer:
+    - error when error exists OR data_quality==BAD
+    - else ok
+    """
+    st = _norm_str(d.get("status")).lower()
+    if st in ("ok", "error"):
+        return st
+    if _norm_str(d.get("error")):
+        return "error"
+    if _norm_str(d.get("data_quality")).upper() == "BAD":
+        return "error"
+    return "ok"
 
 
 def _ensure_status_dict(d: Dict[str, Any], *, symbol: str = "", engine_source: str = "") -> Dict[str, Any]:
     """Ensure returned dict always includes a `status` + metadata + reco enum."""
     out = dict(d)
-    out.setdefault("status", "ok")
+
+    out["status"] = _infer_status(out)
+
     if symbol:
         out.setdefault("symbol", symbol)
     if engine_source:
         out.setdefault("engine_source", engine_source)
+
     out.setdefault("route_version", ENRICHED_ROUTE_VERSION)
     out.setdefault("time_utc", _utc_iso())
+
     out["recommendation"] = _coerce_reco_enum(out.get("recommendation"))
     out = _ensure_provenance(out, engine_source=engine_source)
     return out
@@ -659,8 +678,6 @@ def _market_hint_for(sym_norm: str) -> str:
     u = (sym_norm or "").strip().upper()
     if _is_ksa(u):
         return "KSA"
-    if _is_index_or_fx(u):
-        return "GLOBAL"
     return "GLOBAL"
 
 
@@ -672,7 +689,7 @@ def _looks_ok(d: Dict[str, Any]) -> bool:
     if st and st != "ok":
         return False
 
-    for k in ("price", "last", "close", "current_price", "last_price"):
+    for k in ("current_price", "price", "last", "close", "last_price"):
         v = d.get(k)
         try:
             if v is not None and float(v) == float(v):  # NaN-safe
@@ -680,7 +697,7 @@ def _looks_ok(d: Dict[str, Any]) -> bool:
         except Exception:
             continue
 
-    for k in ("name", "market_cap", "currency", "exchange", "timestamp", "time_utc", "updated_at"):
+    for k in ("name", "market_cap", "currency", "exchange", "timestamp", "time_utc", "updated_at", "last_updated_utc"):
         if _norm_str(d.get(k)):
             return True
 
@@ -694,11 +711,15 @@ def _needs_rescue(d: Dict[str, Any]) -> bool:
     st = _norm_str(d.get("status")).lower()
     if st and st != "ok":
         return True
+
     ds = _norm_str(d.get("data_source")).lower()
     if ds in ("none", "null"):
-        return True
+        # rescue only if also looks weak (avoid pointless extra calls if data is actually OK)
+        return not _looks_ok(d)
+
     if (not ds) and (not _looks_ok(d)):
         return True
+
     return False
 
 
@@ -734,6 +755,7 @@ async def _get_one_quote_with_variants(
     """
     hint = _market_hint_for(sym_norm)
     attempts: List[Dict[str, Any]] = []
+
     last: Dict[str, Any] = _ensure_status_dict(
         {"status": "error", "error": "No attempts executed", "recommendation": "HOLD"},
         symbol=sym_norm,
@@ -767,6 +789,7 @@ async def _get_one_quote_with_variants(
 
             if isinstance(res, dict):
                 out = _ensure_status_dict(_ensure_reco(res), symbol=s_try, engine_source=eng_src)
+                out.setdefault("requested_symbol", sym_norm)
 
                 if debug:
                     attempts.append(
@@ -779,7 +802,6 @@ async def _get_one_quote_with_variants(
                     )
 
                 if _looks_ok(out):
-                    out.setdefault("requested_symbol", sym_norm)
                     if debug:
                         out["attempts"] = attempts
                     return out
@@ -793,6 +815,7 @@ async def _get_one_quote_with_variants(
                 "symbol": s_try,
                 "engine_source": eng_src,
                 "value": _to_jsonable(res),
+                "recommendation": "HOLD",
             }
             out2 = _ensure_status_dict(wrapped, symbol=s_try, engine_source=eng_src)
             out2.setdefault("requested_symbol", sym_norm)
@@ -816,10 +839,11 @@ async def _get_one_quote_with_variants(
                 symbol=s_try,
                 engine_source=eng_src,
             )
+            last.setdefault("requested_symbol", sym_norm)
 
-    last.setdefault("requested_symbol", sym_norm)
     if debug:
         last["attempts"] = attempts
+    last.setdefault("requested_symbol", sym_norm)
     return last
 
 
@@ -930,6 +954,7 @@ async def enriched_quotes(
         }
 
     items: List[Dict[str, Any]] = []
+
     try:
         # Batch attempt (best-effort). Use GLOBAL hint because list can mix; engine should ignore if not supported.
         method_used, raw_batch = _call_engine_batch_best_effort(
@@ -943,25 +968,18 @@ async def enriched_quotes(
         if raw_batch is not None:
             res = _unwrap_tuple_payload(await _maybe_await(raw_batch))
 
-            # common: {"items":[...]} already shaped
-            if isinstance(res, dict) and isinstance(res.get("items"), list):
-                out = dict(res)
-                out.setdefault("status", "ok")
-                out.setdefault("engine_source", eng_src)
-                out.setdefault("route_version", ENRICHED_ROUTE_VERSION)
-                out.setdefault("time_utc", _utc_iso())
-
+            # list: align by index when possible (pad missing)
+            if isinstance(res, list):
                 shaped: List[Dict[str, Any]] = []
-                raw_items = out.get("items") or []
                 for i in range(len(syms)):
                     sym_i = syms[i]
-                    it = raw_items[i] if i < len(raw_items) else None
+                    it = res[i] if i < len(res) else None
                     if isinstance(it, dict):
                         shaped.append(_ensure_status_dict(_ensure_reco(it), symbol=sym_i or it.get("symbol", ""), engine_source=eng_src))
                     elif it is None:
                         shaped.append(
                             _ensure_status_dict(
-                                {"status": "error", "symbol": sym_i, "engine_source": eng_src, "error": "Missing item in batch response"},
+                                {"status": "error", "symbol": sym_i, "engine_source": eng_src, "error": "Missing item in batch list", "recommendation": "HOLD"},
                                 symbol=sym_i,
                                 engine_source=eng_src,
                             )
@@ -969,62 +987,15 @@ async def enriched_quotes(
                     else:
                         shaped.append(
                             _ensure_status_dict(
-                                {"status": "ok", "symbol": sym_i, "engine_source": eng_src, "value": _to_jsonable(it)},
+                                {"status": "ok", "symbol": sym_i, "engine_source": eng_src, "value": _to_jsonable(it), "recommendation": "HOLD"},
                                 symbol=sym_i,
                                 engine_source=eng_src,
                             )
                         )
 
-                # rescue weak items (status error or data_source none/empty and looks bad)
-                rescued: List[Dict[str, Any]] = []
-                for i, q in enumerate(shaped):
-                    sym_i = syms[i]
-                    if sym_i and _needs_rescue(q):
-                        fixed = await _get_one_quote_with_variants(
-                            eng=eng,
-                            eng_src=eng_src,
-                            sym_norm=sym_i,
-                            refresh=bool(int(refresh or 0)),
-                            fields=fields,
-                            debug=dbg,
-                        )
-                        rescued.append(fixed)
-                    else:
-                        rescued.append(q)
-
-                out["items"] = rescued
-                out["count"] = int(out.get("count") or len(rescued))
-                out["method"] = method_used or "batch"
-                return out
-
-            # list: align by index when possible (pad missing)
-            if isinstance(res, list):
-                shaped2: List[Dict[str, Any]] = []
-                for i in range(len(syms)):
-                    sym_i = syms[i]
-                    it = res[i] if i < len(res) else None
-                    if isinstance(it, dict):
-                        shaped2.append(_ensure_status_dict(_ensure_reco(it), symbol=sym_i or it.get("symbol", ""), engine_source=eng_src))
-                    elif it is None:
-                        shaped2.append(
-                            _ensure_status_dict(
-                                {"status": "error", "symbol": sym_i, "engine_source": eng_src, "error": "Missing item in batch list"},
-                                symbol=sym_i,
-                                engine_source=eng_src,
-                            )
-                        )
-                    else:
-                        shaped2.append(
-                            _ensure_status_dict(
-                                {"status": "ok", "symbol": sym_i, "engine_source": eng_src, "value": _to_jsonable(it)},
-                                symbol=sym_i,
-                                engine_source=eng_src,
-                            )
-                        )
-
-                # rescue
+                # rescue weak items
                 final_items: List[Dict[str, Any]] = []
-                for i, q in enumerate(shaped2):
+                for i, q in enumerate(shaped):
                     sym_i = syms[i]
                     if sym_i and _needs_rescue(q):
                         final_items.append(
@@ -1052,34 +1023,34 @@ async def enriched_quotes(
 
             # dict mapping {symbol: quote}
             if isinstance(res, dict):
-                shaped3: List[Dict[str, Any]] = []
+                shaped2: List[Dict[str, Any]] = []
                 for s in syms:
                     v = res.get(s) or res.get(s.upper()) or res.get(s.lower())
                     if isinstance(v, dict):
-                        shaped3.append(_ensure_status_dict(_ensure_reco(v), symbol=s, engine_source=eng_src))
+                        shaped2.append(_ensure_status_dict(_ensure_reco(v), symbol=s, engine_source=eng_src))
                     elif v is None:
-                        shaped3.append(
+                        shaped2.append(
                             _ensure_status_dict(
-                                {"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response"},
+                                {"status": "error", "symbol": s, "engine_source": eng_src, "error": "Missing in batch response", "recommendation": "HOLD"},
                                 symbol=s,
                                 engine_source=eng_src,
                             )
                         )
                     else:
-                        shaped3.append(
+                        shaped2.append(
                             _ensure_status_dict(
-                                {"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(v)},
+                                {"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(v), "recommendation": "HOLD"},
                                 symbol=s,
                                 engine_source=eng_src,
                             )
                         )
 
                 # rescue
-                final_items: List[Dict[str, Any]] = []
-                for q in shaped3:
+                final_items2: List[Dict[str, Any]] = []
+                for q in shaped2:
                     s = _norm_str(q.get("symbol"))
                     if s and _needs_rescue(q):
-                        final_items.append(
+                        final_items2.append(
                             await _get_one_quote_with_variants(
                                 eng=eng,
                                 eng_src=eng_src,
@@ -1090,7 +1061,7 @@ async def enriched_quotes(
                             )
                         )
                     else:
-                        final_items.append(q)
+                        final_items2.append(q)
 
                 return {
                     "status": "ok",
@@ -1098,8 +1069,8 @@ async def enriched_quotes(
                     "route_version": ENRICHED_ROUTE_VERSION,
                     "time_utc": _utc_iso(),
                     "method": method_used or "batch",
-                    "count": len(final_items),
-                    "items": final_items,
+                    "count": len(final_items2),
+                    "items": final_items2,
                 }
 
         # Fallback: per-symbol loop with variants
