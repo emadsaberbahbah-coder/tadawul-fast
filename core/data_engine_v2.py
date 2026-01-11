@@ -2,13 +2,14 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.10.1) — PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.11.0) — PROD SAFE + ROUTER FRIENDLY
 
 Fixes (Global returning data_source=none / BAD):
-- ✅ Provider function discovery supports patch-style exports (eodhd_provider)
+- ✅ Provider function discovery supports patch-style exports + provider objects + exports dicts
 - ✅ Uses shared symbol normalization (core/symbols/normalize.py) when present
 - ✅ Provider call signature mismatch hardened (symbol/ticker kw + positional + kwargs)
 - ✅ Never raises: always returns a dict placeholder on failure
+- ✅ Accepts optional `settings` (kw or positional) for legacy adapter compatibility
 
 Key guarantees
 - ✅ PROD SAFE: no network at import-time
@@ -24,6 +25,7 @@ Environment knobs (optional)
 - KSA_PROVIDERS                          (ksa providers list)
 - ENABLE_HISTORY_ANALYTICS=true|false    (default true)
 - ENGINE_CACHE_TTL_SEC                   (default 45)
+- ENGINE_CACHE_MAXSIZE                   (default 4096)
 - ENGINE_CONCURRENCY                     (default 12)
 - ENGINE_INCLUDE_WARNINGS=true|false     (default false)
 - KEEP_RAW_HISTORY=true|false            (default false)
@@ -44,7 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.10.1"
+ENGINE_VERSION = "2.11.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -295,9 +297,8 @@ def normalize_symbol(symbol: str) -> str:
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
     """
     Provider-specific symbol mapping:
-    - Finnhub typically expects plain tickers (AAPL) rather than AAPL.US
-    - Yahoo: same
-    - EODHD: accepts AAPL or AAPL.US; its provider will try variants and add .US
+    - Finnhub/Yahoo often expect plain tickers (AAPL) rather than AAPL.US
+    - EODHD accepts both; provider can try variants
     """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
@@ -320,11 +321,14 @@ def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
             dst[k] = v
 
 
-def _is_tuple2(x: Any) -> bool:
+def _unwrap_payload(x: Any) -> Any:
+    """Accept payload or tuples like (payload, err, ...)."""
     try:
-        return isinstance(x, tuple) and len(x) == 2
+        if isinstance(x, tuple) and len(x) >= 1:
+            return x[0]
     except Exception:
-        return False
+        pass
+    return x
 
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -382,46 +386,94 @@ def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: boo
     return fn(symbol)
 
 
+def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable[..., Any]], Optional[str]]:
+    """
+    Discovers a callable in multiple patterns:
+      1) module.<name>
+      2) module.exports / module.EXPORTS dict
+      3) module.provider / module.PROVIDER object with method
+    """
+    # 1) direct functions
+    for n in fn_names:
+        try:
+            cand = getattr(mod, n, None)
+            if callable(cand):
+                return cand, n
+        except Exception:
+            continue
+
+    # 2) dict exports
+    for export_name in ("exports", "EXPORTS"):
+        try:
+            ex = getattr(mod, export_name, None)
+            if isinstance(ex, dict):
+                for n in fn_names:
+                    cand = ex.get(n)
+                    if callable(cand):
+                        return cand, f"{export_name}.{n}"
+        except Exception:
+            continue
+
+    # 3) provider objects
+    for obj_name in ("provider", "PROVIDER"):
+        try:
+            obj = getattr(mod, obj_name, None)
+            if obj is None:
+                continue
+            for n in fn_names:
+                cand = getattr(obj, n, None)
+                if callable(cand):
+                    return cand, f"{obj_name}.{n}"
+        except Exception:
+            continue
+
+    return None, None
+
+
 async def _try_provider_call(
     module_name: str,
     fn_names: List[str],
     symbol: str,
     refresh: bool,
     fields: Optional[str],
-) -> Tuple[Dict[str, Any], Optional[str]]:
+) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     """
     Provider callable may return:
       - dict
       - (dict, error_str)
+      - (dict, error_str, meta...)
+    Returns (patch, err, fn_used)
     """
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
-        return {}, f"{module_name}: import failed ({e})"
+        return {}, f"{module_name}: import failed ({e})", None
 
-    fn = None
-    used = None
-    for n in fn_names:
-        if hasattr(mod, n):
-            cand = getattr(mod, n)
-            if callable(cand):
-                fn = cand
-                used = n
-                break
-
+    fn, used = _discover_callable(mod, fn_names)
     if fn is None:
-        return {}, f"{module_name}: no callable in {fn_names}"
+        return {}, f"{module_name}: no callable in {fn_names}", None
 
     try:
         res = await _call_maybe_async(_call_provider_best_effort, fn, symbol, refresh, fields)
-        if _is_tuple2(res):
-            patch, err = res
-            return (patch or {}) if isinstance(patch, dict) else {}, (err if err else None)
+        res = _unwrap_payload(res)
+
+        # If original was tuple, try to extract error too
+        err: Optional[str] = None
+        try:
+            if isinstance(res, tuple) and len(res) >= 2:
+                maybe_patch = res[0]
+                maybe_err = res[1]
+                res = maybe_patch
+                if isinstance(maybe_err, str) and maybe_err.strip():
+                    err = maybe_err.strip()
+        except Exception:
+            err = None
+
         if isinstance(res, dict):
-            return res, None
-        return {}, f"{module_name}.{used}: unexpected return type"
+            return res, err, used
+        return {}, f"{module_name}.{used}: unexpected return type", used
     except Exception as e:
-        return {}, f"{module_name}.{used}: call failed ({e})"
+        return {}, f"{module_name}.{used}: call failed ({e})", used
 
 
 async def _try_provider_candidates(
@@ -437,7 +489,7 @@ async def _try_provider_candidates(
     """
     last_err: Optional[str] = None
     for mod in module_candidates:
-        patch, err = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
+        patch, err, _used = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
         if patch:
             return patch, err, mod
         last_err = err
@@ -492,6 +544,29 @@ def _apply_derived(out: Dict[str, Any]) -> None:
                 out["free_float_market_cap"] = mc * (ff / 100.0)
             else:
                 out["free_float_market_cap"] = mc * ff
+
+    # Fair value / upside (best-effort)
+    cur2 = _safe_float(out.get("current_price"))
+    fv = _safe_float(out.get("fair_value"))
+    if fv is None:
+        for k in ("target_price", "analyst_target_price", "intrinsic_value", "dcf_value", "tp"):
+            fv = _safe_float(out.get(k))
+            if fv is not None:
+                out.setdefault("fair_value", fv)
+                break
+    if out.get("upside_percent") is None and cur2 not in (None, 0.0) and fv is not None:
+        try:
+            out["upside_percent"] = (fv - cur2) / cur2 * 100.0
+        except Exception:
+            pass
+    if out.get("valuation_label") is None and _safe_float(out.get("upside_percent")) is not None:
+        up = float(out["upside_percent"])
+        if up >= 15:
+            out["valuation_label"] = "UNDERVALUED"
+        elif up <= -15:
+            out["valuation_label"] = "OVERVALUED"
+        else:
+            out["valuation_label"] = "FAIR"
 
 
 def _quality_label(out: Dict[str, Any]) -> str:
@@ -964,7 +1039,7 @@ def _recommendation(out: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# UnifiedQuote model (optional)
+# UnifiedQuote model (optional / for typed consumers)
 # ============================================================
 class UnifiedQuote(BaseModel):
     symbol: str = Field(default="")
@@ -1140,52 +1215,71 @@ _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
 class DataEngine:
     """
     Router-friendly engine that returns dicts (Sheets-safe).
+
+    Accepts optional `settings` (kw or positional) for compatibility with legacy adapter.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Any = None, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+        self.settings = settings
+
         ttl = _safe_int(os.getenv("ENGINE_CACHE_TTL_SEC", "45"), 45)
         ttl = max(5, min(600, ttl))
         self.cache_ttl_sec = ttl
+
+        maxsize = _safe_int(os.getenv("ENGINE_CACHE_MAXSIZE", "4096"), 4096)
+        maxsize = max(256, min(50_000, maxsize))
 
         conc = _safe_int(os.getenv("ENGINE_CONCURRENCY", "12"), 12)
         conc = max(2, min(64, conc))
         self.max_concurrency = conc
         self._sem = asyncio.Semaphore(self.max_concurrency)
 
-        self._cache: TTLCache = TTLCache(maxsize=4096, ttl=self.cache_ttl_sec)  # type: ignore
+        self._cache: TTLCache = TTLCache(maxsize=maxsize, ttl=self.cache_ttl_sec)  # type: ignore
 
-        # Provider defaults (safe)
-        if not (os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS")):
-            os.environ.setdefault("ENABLED_PROVIDERS", "eodhd,finnhub")
-            os.environ.setdefault("PROVIDERS", os.environ["ENABLED_PROVIDERS"])
-        if not os.getenv("KSA_PROVIDERS"):
-            os.environ.setdefault("KSA_PROVIDERS", "yahoo_chart,argaam")
+        # Provider defaults (NO env mutation)
+        default_global = (os.getenv("PROVIDERS") or os.getenv("ENABLED_PROVIDERS") or "eodhd,finnhub").strip() or "eodhd,finnhub"
+        default_ksa = (os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam").strip() or "yahoo_chart,argaam"
 
-        self.global_providers = _parse_list_env(
-            "ENABLED_PROVIDERS",
-            fallback=(os.getenv("PROVIDERS", "eodhd,finnhub") or "eodhd,finnhub"),
-        )
-        self.ksa_providers = _parse_list_env("KSA_PROVIDERS", fallback="yahoo_chart,argaam")
+        # If settings provided, prefer them
+        s_global: Optional[List[str]] = None
+        s_ksa: Optional[List[str]] = None
+        try:
+            if settings is not None:
+                p = getattr(settings, "enabled_providers", None) or getattr(settings, "providers", None)
+                k = getattr(settings, "ksa_providers", None) or getattr(settings, "providers_ksa", None)
+                if isinstance(p, list):
+                    s_global = [str(x).strip().lower() for x in p if str(x).strip()]
+                if isinstance(k, list):
+                    s_ksa = [str(x).strip().lower() for x in k if str(x).strip()]
+        except Exception:
+            s_global = None
+            s_ksa = None
+
+        self.global_providers = _dedup_preserve(s_global or _parse_list_env("ENABLED_PROVIDERS", fallback=default_global))
+        self.ksa_providers = _dedup_preserve(s_ksa or _parse_list_env("KSA_PROVIDERS", fallback=default_ksa))
 
         # Tadawul provider only if configured
         if _tadawul_configured() and "tadawul" not in self.ksa_providers:
             self.ksa_providers.append("tadawul")
 
-        self.global_providers = _dedup_preserve(self.global_providers)
-        self.ksa_providers = _dedup_preserve(self.ksa_providers)
-
         self.enable_history = _env_bool("ENABLE_HISTORY_ANALYTICS", True)
+        self.include_warnings = _env_bool("ENGINE_INCLUDE_WARNINGS", False)
 
         logger.info(
-            "DataEngine v%s | ttl=%ss | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s",
+            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s",
             ENGINE_VERSION,
             self.cache_ttl_sec,
+            maxsize,
             self.max_concurrency,
             self.global_providers,
             self.ksa_providers,
             self.enable_history,
             _HAS_CACHETOOLS,
         )
+
+    async def aclose(self) -> None:
+        """Best-effort close hook (kept for legacy adapter compatibility)."""
+        return None
 
     # --------------------
     # Public API (single)
@@ -1222,14 +1316,21 @@ class DataEngine:
     # --------------------
     async def get_enriched_quotes(self, symbols: List[str], refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
         symbols = symbols or []
-        tasks = [self.get_enriched_quote(symbols[i], refresh=refresh, fields=fields) for i in range(len(symbols))]
-        res = await asyncio.gather(*tasks, return_exceptions=True)
+        if not symbols:
+            return []
+
+        # Avoid huge task lists in one gather
+        chunk = max(50, min(400, self.max_concurrency * 50))
         out: List[Dict[str, Any]] = []
-        for i, r in enumerate(res):
-            if isinstance(r, Exception):
-                out.append(self._placeholder(symbols[i], err=f"Engine error: {r}"))
-            else:
-                out.append(r if isinstance(r, dict) else self._placeholder(symbols[i], err="Unexpected quote type"))
+        for i in range(0, len(symbols), chunk):
+            batch = symbols[i : i + chunk]
+            tasks = [self.get_enriched_quote(s, refresh=refresh, fields=fields) for s in batch]
+            res = await asyncio.gather(*tasks, return_exceptions=True)
+            for j, r in enumerate(res):
+                if isinstance(r, Exception):
+                    out.append(self._placeholder(batch[j], err=f"Engine error: {r}"))
+                else:
+                    out.append(r if isinstance(r, dict) else self._placeholder(batch[j], err="Unexpected quote type"))
         return out
 
     async def get_quotes(self, symbols: List[str], refresh: bool = False, fields: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1272,7 +1373,7 @@ class DataEngine:
             )
 
             if patch:
-                # treat provider "error" as warning unless we still have no price at the end
+                # Provider can send "error" in patch; treat it as warning
                 p_err = patch.get("error")
                 if isinstance(p_err, str) and p_err.strip():
                     warnings.append(f"{key}: {p_err.strip()}")
@@ -1296,7 +1397,7 @@ class DataEngine:
         _apply_derived(out)
         out["data_quality"] = _quality_label(out)
 
-        # Map provider forecast aliases (EODHD style) -> canonical
+        # Map provider forecast aliases (EODHD/Argaam etc.) -> canonical
         _map_forecast_aliases(out)
 
         # History analytics if raw history present
@@ -1321,7 +1422,7 @@ class DataEngine:
             out["error"] = "MISSING: current_price"
             out["data_quality"] = "BAD"
         else:
-            if warnings and _env_bool("ENGINE_INCLUDE_WARNINGS", False):
+            if warnings and self.include_warnings:
                 out["error"] = " | ".join(warnings[:6])
 
         return out
@@ -1353,15 +1454,18 @@ class DataEngine:
 DataEngineV2 = DataEngine
 
 # ============================================================
-# Singleton accessor (preferred by main.py)
+# Singleton accessor (preferred by routers)
 # ============================================================
 _ENGINE_SINGLETON: Optional[DataEngine] = None
 
 
-def get_engine() -> DataEngine:
+def get_engine(settings: Any = None) -> DataEngine:
+    """
+    Singleton accessor (sync). If you pass settings on first call, it will be used.
+    """
     global _ENGINE_SINGLETON
     if _ENGINE_SINGLETON is None:
-        _ENGINE_SINGLETON = DataEngine()
+        _ENGINE_SINGLETON = DataEngine(settings=settings)
     return _ENGINE_SINGLETON
 
 
