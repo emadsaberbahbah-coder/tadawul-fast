@@ -1,8 +1,8 @@
-# core/data_engine.py  (FULL REPLACEMENT)
+# core/data_engine.py
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v3.8.2) — PROD SAFE (TRUE LAZY)
+LEGACY COMPATIBILITY ADAPTER (v3.9.0) — PROD SAFE (TRUE LAZY)
 
 What this module guarantees
 - ✅ Never crashes app startup (no hard dependency on data_engine_v2 at import-time).
@@ -19,12 +19,10 @@ What this module guarantees
 - ✅ If V2 missing/broken -> returns stub quotes with data_quality="MISSING" and error.
 - ✅ Never leaks secrets in meta/health.
 
-v3.8.2 improvements
-- ✅ Fixes Pydantic v1 fallback: avoids model_config usage when ConfigDict is unavailable.
-- ✅ More robust V2 linking: accepts UnifiedQuote from v2 OR core.schemas OR core.models.schemas fallback.
-- ✅ Better tuple-unwrapping + list normalization for both single and batch.
-- ✅ Engine singleton init: safer signature probing (settings kwarg, settings positional, none).
-- ✅ get_engine_meta reads providers from env/settings safely and can show v2 module version if present.
+v3.9.0 improvements (project-aligned)
+- ✅ Safer global symbol normalization: NO automatic ".US" suffix (keeps AAPL, SPY, etc. unchanged).
+- ✅ Stronger tuple-unwrapping: accepts (payload, err) OR longer tuples.
+- ✅ Exposes DataEngineV2 lazily via __getattr__ when available (for core/__init__.py discovery).
 """
 
 from __future__ import annotations
@@ -36,6 +34,8 @@ import threading
 from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
+
+logger = logging.getLogger("core.data_engine")
 
 # -----------------------------------------------------------------------------
 # Pydantic (best-effort) with robust fallback
@@ -70,8 +70,7 @@ except Exception:  # pragma: no cover
     ConfigDict = None  # type: ignore
 
 
-ADAPTER_VERSION = "3.8.2"
-logger = logging.getLogger("core.data_engine")
+ADAPTER_VERSION = "3.9.0"
 
 # =============================================================================
 # Legacy type kept so older type-checks don't fail
@@ -117,11 +116,14 @@ def _finalize_quote(obj: Any) -> Any:
 
 def _unwrap_payload(x: Any) -> Any:
     """
-    Some engines/providers might return (payload, err).
+    Some engines/providers might return:
+      - payload
+      - (payload, err)
+      - (payload, err, meta...)
     We always keep payload if present.
     """
     try:
-        if isinstance(x, tuple) and len(x) == 2:
+        if isinstance(x, tuple) and len(x) >= 1:
             return x[0]
     except Exception:
         pass
@@ -169,6 +171,7 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
             mod = import_module("core.data_engine_v2")
 
             v2_engine = getattr(mod, "DataEngine", None)
+            v2_engine_v2 = getattr(mod, "DataEngineV2", None)
             v2_uq = getattr(mod, "UnifiedQuote", None)
             v2_norm = getattr(mod, "normalize_symbol", None)
             v2_get_engine = getattr(mod, "get_engine", None)
@@ -184,12 +187,16 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
                     except Exception:
                         continue
 
-            if v2_engine is None or v2_uq is None:
-                raise ImportError("core.data_engine_v2 missing DataEngine and/or UnifiedQuote")
+            if v2_engine is None and v2_engine_v2 is None:
+                raise ImportError("core.data_engine_v2 missing DataEngine/DataEngineV2")
+            if v2_uq is None:
+                raise ImportError("core.data_engine_v2 missing UnifiedQuote")
 
             _V2["module"] = mod
-            _V2["DataEngine"] = v2_engine
+            _V2["DataEngine"] = v2_engine or v2_engine_v2
+            _V2["DataEngineV2"] = v2_engine_v2
             _V2["UnifiedQuote"] = v2_uq
+
             if callable(v2_norm):
                 _V2["normalize_symbol"] = v2_norm
             if callable(v2_get_engine):
@@ -219,6 +226,13 @@ def _get_v2_engine_cls() -> Type[Any]:
     if ok and _V2.get("DataEngine"):
         return _V2["DataEngine"]
     return _StubEngine  # type: ignore
+
+
+def _get_v2_engine_v2_cls() -> Optional[Type[Any]]:
+    ok, _ = _load_v2()
+    if ok and _V2.get("DataEngineV2"):
+        return _V2["DataEngineV2"]
+    return None
 
 
 # =============================================================================
@@ -401,14 +415,14 @@ def _get_engine_sync() -> Any:
 
                 async def get_quotes(self, ss):
                     clean = [str(x).strip() for x in (ss or []) if x and str(x).strip()]
-                    out: List[Any] = []
+                    out2: List[Any] = []
                     for x in clean:
                         try:
                             q = UQ(symbol=x, data_quality="MISSING", error=str(exc))
-                            out.append(_finalize_quote(q))
+                            out2.append(_finalize_quote(q))
                         except Exception:
-                            out.append(_StubUnifiedQuote(symbol=x, error=str(exc)).finalize())
-                    return out
+                            out2.append(_StubUnifiedQuote(symbol=x, error=str(exc)).finalize())
+                    return out2
 
                 async def get_enriched_quote(self, s):
                     return await self.get_quote(s)
@@ -454,9 +468,15 @@ async def close_engine() -> None:
 
 
 # =============================================================================
-# Symbol normalization
+# Symbol normalization (NO ".US" auto-suffix)
 # =============================================================================
 def normalize_symbol(symbol: str) -> str:
+    """
+    Normalization rules (legacy-safe, dashboard-friendly):
+    - Tadawul numeric code -> "####.SR"
+    - If already has a suffix (AAPL, AAPL.US, 2222.SR, GC=F, EURUSD=X) keep as-is (uppercased)
+    - Never auto-append ".US" (keeps global tickers like AAPL, SPY, QQQ unchanged)
+    """
     s = (symbol or "").strip()
     if not s:
         return ""
@@ -471,24 +491,33 @@ def normalize_symbol(symbol: str) -> str:
             pass
 
     su = s.strip().upper()
+
+    # common prefixes used by some sources
     if su.startswith("TADAWUL:"):
         su = su.split(":", 1)[1].strip()
     if su.endswith(".TADAWUL"):
-        su = su.replace(".TADAWUL", "")
+        su = su.replace(".TADAWUL", "").strip()
+
+    # Yahoo/FX/commodities/index markers: keep
     if any(ch in su for ch in ("=", "^")):
         return su
+
+    # already has a dot suffix (.SR, .US, .L, .DE, etc.) -> keep
     if "." in su:
         return su
+
+    # Tadawul numeric => .SR
     if su.isdigit():
         return f"{su}.SR"
-    if su.isalpha():
-        return f"{su}.US"
+
+    # otherwise keep unchanged (AAPL, SPY, QQQ, BTC-USD, etc.)
     return su
 
 
 def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
     """
     Cleans + dedups while trying to normalize to stable keys.
+    Returns the original raw symbol (trimmed) list, deduped by normalized key.
     """
     seen = set()
     out: List[str] = []
@@ -711,11 +740,12 @@ def get_engine_meta() -> Dict[str, Any]:
 
 def __getattr__(name: str) -> Any:  # pragma: no cover
     """
-    Provide lazy access to UnifiedQuote only.
-    DataEngine is defined above (true-lazy for importers).
+    Provide lazy access to V2 types without importing V2 at module import-time.
     """
     if name == "UnifiedQuote":
         return _get_uq_cls()
+    if name == "DataEngineV2":
+        return _get_v2_engine_v2_cls()
     if name == "ENGINE_MODE":
         return _ENGINE_MODE
     raise AttributeError(name)
@@ -726,6 +756,7 @@ __all__ = [
     "normalize_symbol",
     "UnifiedQuote",
     "DataEngine",
+    "DataEngineV2",
     "get_engine",
     "get_quote",
     "get_quotes",
