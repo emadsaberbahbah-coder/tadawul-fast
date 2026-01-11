@@ -13,12 +13,12 @@ What this script does
 4) Writes updated {headers, rows} back into the target sheets (chunked, Sheets-safe).
 
 v2.9.0 changes (safe hardening + flexibility)
-- ✅ Adds --symbols-sheet-id (read symbols from a separate spreadsheet than the write target).
-- ✅ symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not).
-- ✅ Better key normalization + friendly aliases (KSA, GLOBAL, PORTFOLIO, INSIGHTS, etc).
-- ✅ Value-input validation hardened (case-insensitive).
-- ✅ Health-check won’t crash on non-JSON bodies.
-- ✅ Never aborts entire run on one page failure; exits 2 if any failures exist.
+- Adds --symbols-sheet-id (read symbols from a separate spreadsheet than the write target).
+- symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not).
+- Better key normalization + friendly aliases (KSA, GLOBAL, PORTFOLIO, INSIGHTS, etc).
+- Value-input validation hardened (case-insensitive).
+- Health-check won’t crash on non-JSON bodies.
+- Never aborts entire run on one page failure; exits 2 if any failures exist.
 
 Exit code
 - 2 if failures exist, else 0
@@ -87,7 +87,7 @@ try:
 except Exception as e:
     logger.error("Import failed: %s", e)
     logger.error("Tip: run from project root where env.py / symbols_reader.py exist.")
-    sys.exit(1)
+    raise SystemExit(1)
 
 
 # =============================================================================
@@ -188,7 +188,6 @@ def _canon_key(user_key: str) -> str:
         "MUTUAL_FUND": "MUTUAL_FUNDS",
         "FX": "COMMODITIES_FX",
         "COMMODITIES": "COMMODITIES_FX",
-        "COMMODITIES_FX": "COMMODITIES_FX",
         "PORTFOLIO": "MY_PORTFOLIO",
         "MYPORTFOLIO": "MY_PORTFOLIO",
         "LEADERS": "MARKET_LEADERS",
@@ -217,12 +216,7 @@ def _resolve_sheet_name(task_key: str) -> Optional[str]:
     try:
         reg = getattr(symbols_reader, "PAGE_REGISTRY", None)
         if isinstance(reg, dict):
-            cfg = (
-                reg.get(key)
-                or reg.get(key.lower())
-                or reg.get(key.title())
-                or reg.get(key.replace(" ", "_"))
-            )
+            cfg = reg.get(key) or reg.get(key.lower()) or reg.get(key.title())
             if cfg is not None:
                 if isinstance(cfg, dict):
                     nm = (cfg.get("sheet_name") or cfg.get("tab") or cfg.get("name") or "").strip()
@@ -268,10 +262,10 @@ def _symbols_reader_call(key: str, *, symbols_spreadsheet_id: Optional[str]) -> 
     if callable(fn):
         if symbols_spreadsheet_id:
             try:
-                return fn(k, spreadsheet_id=symbols_spreadsheet_id)  # type: ignore
+                return fn(k, spreadsheet_id=symbols_spreadsheet_id)  # type: ignore[misc]
             except TypeError:
-                return fn(k)  # type: ignore
-        return fn(k)  # type: ignore
+                return fn(k)  # type: ignore[misc]
+        return fn(k)  # type: ignore[misc]
 
     for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
         fn2 = getattr(symbols_reader, name, None)
@@ -367,6 +361,9 @@ def _call_refresh(
 ) -> Dict[str, Any]:
     """
     Signature-aware refresh call.
+
+    Supports multiple variants of google_sheets_service refresh functions without assuming
+    a fixed signature. Always returns a dict-like result.
     """
     if not callable(fn):
         return {"status": "error", "error": "refresh function not callable"}
@@ -445,13 +442,13 @@ def _ksa_refresh_method(
     """
     KSA page can be fetched from:
     - "enriched" gateway: refresh_sheet_with_enriched_quotes (default)
-    - "argaam" gateway:  /v1/argaam/sheet-rows if sheets_service exposes _refresh_logic
+    - "argaam" gateway: /v1/argaam/sheet-rows (only if sheets_service exposes _refresh_logic)
     """
     gw = (ksa_gateway or "enriched").strip().lower()
 
     if gw == "argaam" and hasattr(sheets_service, "_refresh_logic"):
         try:
-            return sheets_service._refresh_logic(  # type: ignore
+            return sheets_service._refresh_logic(  # type: ignore[attr-defined]
                 "/v1/argaam/sheet-rows",
                 spreadsheet_id,
                 sheet_name,
@@ -499,7 +496,7 @@ def _http_get_json(url: str, timeout_sec: float = 15.0) -> Tuple[int, Optional[D
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # type: ignore
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # type: ignore[call-arg]
             raw = resp.read().decode("utf-8", errors="replace")
             code = int(getattr(resp, "status", 0) or 200)
             try:
@@ -509,7 +506,7 @@ def _http_get_json(url: str, timeout_sec: float = 15.0) -> Tuple[int, Optional[D
                 return code, None, raw[:400]
     except urllib.error.HTTPError as e:
         try:
-            raw = e.read().decode("utf-8", errors="replace")  # type: ignore
+            raw = e.read().decode("utf-8", errors="replace")  # type: ignore[attr-defined]
         except Exception:
             raw = str(e)
         return int(getattr(e, "code", 0) or 0), None, raw[:400]
@@ -545,16 +542,32 @@ def _health_check() -> Dict[str, Any]:
 # Default task map (aligned with your endpoints)
 # =============================================================================
 def _build_sync_map() -> List[SyncTask]:
-    tasks: List[SyncTask] = [
-        SyncTask("KSA_TADAWUL", sheets_service.refresh_sheet_with_enriched_quotes, "KSA Tadawul Market", "ksa"),
-        SyncTask("GLOBAL_MARKETS", sheets_service.refresh_sheet_with_enriched_quotes, "Global Markets", "enriched"),
-        SyncTask("MUTUAL_FUNDS", sheets_service.refresh_sheet_with_enriched_quotes, "Mutual Funds", "enriched"),
-        SyncTask("COMMODITIES_FX", sheets_service.refresh_sheet_with_enriched_quotes, "Commodities & FX", "enriched"),
-        SyncTask("MY_PORTFOLIO", sheets_service.refresh_sheet_with_enriched_quotes, "My Portfolio", "enriched"),
-        SyncTask("MARKET_LEADERS", sheets_service.refresh_sheet_with_enriched_quotes, "Market Leaders", "enriched"),
-        SyncTask("INSIGHTS_ANALYSIS", sheets_service.refresh_sheet_with_ai_analysis, "Insights & AI Analysis", "ai"),
-    ]
+    tasks: List[SyncTask] = []
 
+    # Enriched quotes pages (most tabs)
+    if hasattr(sheets_service, "refresh_sheet_with_enriched_quotes"):
+        tasks.extend(
+            [
+                SyncTask("KSA_TADAWUL", sheets_service.refresh_sheet_with_enriched_quotes, "KSA Tadawul Market", "ksa"),
+                SyncTask("GLOBAL_MARKETS", sheets_service.refresh_sheet_with_enriched_quotes, "Global Markets", "enriched"),
+                SyncTask("MUTUAL_FUNDS", sheets_service.refresh_sheet_with_enriched_quotes, "Mutual Funds", "enriched"),
+                SyncTask("COMMODITIES_FX", sheets_service.refresh_sheet_with_enriched_quotes, "Commodities & FX", "enriched"),
+                SyncTask("MY_PORTFOLIO", sheets_service.refresh_sheet_with_enriched_quotes, "My Portfolio", "enriched"),
+                SyncTask("MARKET_LEADERS", sheets_service.refresh_sheet_with_enriched_quotes, "Market Leaders", "enriched"),
+            ]
+        )
+    else:
+        logger.warning("google_sheets_service.refresh_sheet_with_enriched_quotes not found; enriched pages will be skipped.")
+
+    # AI analysis page
+    if hasattr(sheets_service, "refresh_sheet_with_ai_analysis"):
+        tasks.append(
+            SyncTask("INSIGHTS_ANALYSIS", sheets_service.refresh_sheet_with_ai_analysis, "Insights & AI Analysis", "ai")
+        )
+    else:
+        logger.warning("google_sheets_service.refresh_sheet_with_ai_analysis not found; insights page will be skipped.")
+
+    # Advanced pages (optional)
     if hasattr(sheets_service, "refresh_sheet_with_advanced_analysis"):
         tasks.append(
             SyncTask(
@@ -734,6 +747,11 @@ def main() -> None:
     parser.add_argument("--sleep", type=float, default=2.0, help="Seconds to sleep between pages (default 2.0)")
     parser.add_argument("--max-tickers", type=int, default=0, help="Cap tickers per page (0 = no cap)")
     parser.add_argument("--json-out", default=None, help="Write full results to a JSON file")
+    parser.add_argument(
+        "--fail-on-partial",
+        action="store_true",
+        help="Exit 2 if any page returns status=partial (in addition to errors).",
+    )
 
     parser.add_argument(
         "--value-input",
@@ -771,7 +789,7 @@ def main() -> None:
     sid = _get_spreadsheet_id(args.sheet_id)
     if not sid:
         logger.error("DEFAULT_SPREADSHEET_ID is not set in env.py or environment variables (or pass --sheet-id).")
-        sys.exit(1)
+        raise SystemExit(1)
 
     # READ symbols source (defaults to same as WRITE)
     symbols_sid = _get_symbols_spreadsheet_id(args.symbols_sheet_id, sid)
@@ -895,7 +913,9 @@ def main() -> None:
             logger.warning("Failed to write --json-out file: %s", e)
 
     if failures:
-        sys.exit(2)
+        raise SystemExit(2)
+    if args.fail_on_partial and partials:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
