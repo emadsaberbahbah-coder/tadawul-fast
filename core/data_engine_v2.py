@@ -1,8 +1,8 @@
-# core/data_engine_v2.py
+# core/data_engine_v2.py  (FULL REPLACEMENT)
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.11.0) — PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.11.1) — PROD SAFE + ROUTER FRIENDLY
 
 Fixes (Global returning data_source=none / BAD):
 - ✅ Provider function discovery supports patch-style exports + provider objects + exports dicts
@@ -10,6 +10,17 @@ Fixes (Global returning data_source=none / BAD):
 - ✅ Provider call signature mismatch hardened (symbol/ticker kw + positional + kwargs)
 - ✅ Never raises: always returns a dict placeholder on failure
 - ✅ Accepts optional `settings` (kw or positional) for legacy adapter compatibility
+
+v2.11.1 upgrades
+- ✅ Correctly captures provider tuple errors: (patch, err, ...) now preserved as warnings
+- ✅ Backward compatible forecast aliases added:
+    forecast_price_*  <-> expected_price_*
+    expected_roi_*    <-> expected_return_*
+    forecast_confidence -> confidence_score (percent)
+    forecast_updated_utc -> forecast_updated
+- ✅ Keeps canonical engine fields for Sheets:
+    forecast_price_{1m,3m,12m}, expected_roi_{1m,3m,12m},
+    forecast_confidence (0..1), forecast_updated_utc/riyadh
 
 Key guarantees
 - ✅ PROD SAFE: no network at import-time
@@ -46,7 +57,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.11.0"
+ENGINE_VERSION = "2.11.1"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -321,16 +332,6 @@ def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
             dst[k] = v
 
 
-def _unwrap_payload(x: Any) -> Any:
-    """Accept payload or tuples like (payload, err, ...)."""
-    try:
-        if isinstance(x, tuple) and len(x) >= 1:
-            return x[0]
-    except Exception:
-        pass
-    return x
-
-
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     out = fn(*args, **kwargs)
     if inspect.isawaitable(out):
@@ -454,23 +455,23 @@ async def _try_provider_call(
         return {}, f"{module_name}: no callable in {fn_names}", None
 
     try:
-        res = await _call_maybe_async(_call_provider_best_effort, fn, symbol, refresh, fields)
-        res = _unwrap_payload(res)
+        raw = await _call_maybe_async(_call_provider_best_effort, fn, symbol, refresh, fields)
 
-        # If original was tuple, try to extract error too
+        patch: Any = raw
         err: Optional[str] = None
+
+        # ✅ keep tuple error if present
         try:
-            if isinstance(res, tuple) and len(res) >= 2:
-                maybe_patch = res[0]
-                maybe_err = res[1]
-                res = maybe_patch
+            if isinstance(raw, tuple) and len(raw) >= 2:
+                patch = raw[0]
+                maybe_err = raw[1]
                 if isinstance(maybe_err, str) and maybe_err.strip():
                     err = maybe_err.strip()
         except Exception:
             err = None
 
-        if isinstance(res, dict):
-            return res, err, used
+        if isinstance(patch, dict):
+            return patch, err, used
         return {}, f"{module_name}.{used}: unexpected return type", used
     except Exception as e:
         return {}, f"{module_name}.{used}: call failed ({e})", used
@@ -870,6 +871,33 @@ def _map_forecast_aliases(out: Dict[str, Any]) -> None:
     out.setdefault("forecast_updated_riyadh", _riyadh_iso())
 
 
+def _mirror_forecast_aliases(out: Dict[str, Any]) -> None:
+    """
+    Add backward-compatible aliases (without breaking canonical fields):
+      forecast_price_*  -> expected_price_*
+      expected_roi_*    -> expected_return_*
+      forecast_confidence -> confidence_score (percent)
+      forecast_updated_utc -> forecast_updated
+    """
+    for horizon in ("1m", "3m", "12m"):
+        roi_k = f"expected_roi_{horizon}"
+        er_k = f"expected_return_{horizon}"
+        fp_k = f"forecast_price_{horizon}"
+        ep_k = f"expected_price_{horizon}"
+
+        if out.get(er_k) is None and out.get(roi_k) is not None:
+            out[er_k] = out.get(roi_k)
+        if out.get(ep_k) is None and out.get(fp_k) is not None:
+            out[ep_k] = out.get(fp_k)
+
+    fc = _coerce_confidence(out.get("forecast_confidence"))
+    if out.get("confidence_score") is None and fc is not None:
+        out["confidence_score"] = round(fc * 100.0, 2)
+
+    if out.get("forecast_updated") is None and out.get("forecast_updated_utc"):
+        out["forecast_updated"] = out.get("forecast_updated_utc")
+
+
 def _forecast_from_momentum(out: Dict[str, Any]) -> None:
     cur = _safe_float(out.get("current_price"))
     if cur is None or cur <= 0:
@@ -1116,6 +1144,16 @@ class UnifiedQuote(BaseModel):
     forecast_updated_utc: Optional[str] = None
     forecast_updated_riyadh: Optional[str] = None
 
+    # legacy aliases (often used by older routers)
+    expected_return_1m: Optional[float] = None
+    expected_return_3m: Optional[float] = None
+    expected_return_12m: Optional[float] = None
+    expected_price_1m: Optional[float] = None
+    expected_price_3m: Optional[float] = None
+    expected_price_12m: Optional[float] = None
+    confidence_score: Optional[float] = None
+    forecast_updated: Optional[str] = None
+
     value_score: Optional[float] = None
     quality_score: Optional[float] = None
     momentum_score: Optional[float] = None
@@ -1143,13 +1181,11 @@ _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
     "eodhd": {
         "modules": ["core.providers.eodhd_provider", "providers.eodhd_provider", "eodhd_provider"],
         "functions": [
-            # patch-style exports (preferred)
             "fetch_enriched_quote_patch",
             "fetch_enriched_patch",
             "fetch_quote_and_enrichment_patch",
             "fetch_quote_and_fundamentals_patch",
             "fetch_quote_patch",
-            # common generic names
             "get_enriched_quote",
             "get_quote",
             "fetch_quote",
@@ -1319,7 +1355,6 @@ class DataEngine:
         if not symbols:
             return []
 
-        # Avoid huge task lists in one gather
         chunk = max(50, min(400, self.max_concurrency * 50))
         out: List[Dict[str, Any]] = []
         for i in range(0, len(symbols), chunk):
@@ -1373,7 +1408,6 @@ class DataEngine:
             )
 
             if patch:
-                # Provider can send "error" in patch; treat it as warning
                 p_err = patch.get("error")
                 if isinstance(p_err, str) and p_err.strip():
                     warnings.append(f"{key}: {p_err.strip()}")
@@ -1397,7 +1431,7 @@ class DataEngine:
         _apply_derived(out)
         out["data_quality"] = _quality_label(out)
 
-        # Map provider forecast aliases (EODHD/Argaam etc.) -> canonical
+        # Map provider forecast aliases -> canonical
         _map_forecast_aliases(out)
 
         # History analytics if raw history present
@@ -1406,6 +1440,9 @@ class DataEngine:
 
         # Forecast/expected fields if still missing
         _forecast_from_momentum(out)
+
+        # ✅ Add backward compatible aliases after canonical is ready
+        _mirror_forecast_aliases(out)
 
         # Score + reco + badges
         _compute_scores(out)
@@ -1446,7 +1483,9 @@ class DataEngine:
             "last_updated_riyadh": now_riy,
             "forecast_updated_utc": now_utc,
             "forecast_updated_riyadh": now_riy,
+            "forecast_updated": now_utc,
             "forecast_confidence": 0.20,
+            "confidence_score": 20.0,
         }
 
 
