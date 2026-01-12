@@ -3,47 +3,54 @@
 """
 symbols_reader.py
 ===========================================================
-TADAWUL FAST BRIDGE – SYMBOLS READER (v2.4.1) – PROD SAFE
+TADAWUL FAST BRIDGE – SYMBOLS READER (v2.5.0) – PROD SAFE
 ===========================================================
 
-What’s improved vs your v2.4.0:
-- ✅ Fix: sheet names with apostrophes now work (proper A1 escaping: 'Bob''s Sheet')
-- ✅ Add: optional env sheet-name overrides (uses env keys like SHEET_MARKET_LEADERS, etc.)
-- ✅ Add: base64url credentials support (- and _), safer padding handling
-- ✅ Add: INSIGHTS_ANALYSIS + INVESTMENT_ADVISOR keys (safe; won’t break anything)
-
 Purpose
-- Provide a single, stable API for scripts (like scripts/run_market_scan.py)
-  to load symbols from your Google Sheets dashboard tabs.
+- A single, stable API to load symbols/tickers from your Google Sheets dashboard tabs.
+- Used by backend scripts (e.g., scripts/run_dashboard_sync.py, scripts/run_market_scan.py).
 
 Key guarantees
 - ✅ Never makes network calls at import-time
-- ✅ Never crashes startup (imports + env parsing are best-effort)
+- ✅ Never crashes startup (all imports + env parsing are best-effort)
 - ✅ Returns a predictable shape:
-      {"all":[...], "ksa":[...], "global":[...], "meta": {...}}
-- ✅ Supports overrides via env (no Sheets needed)
-- ✅ Google Sheets read via service account JSON in env:
-      GOOGLE_SHEETS_CREDENTIALS  (minified JSON / pretty JSON / quoted JSON / base64(JSON))
+      {
+        "all": [...],
+        "ksa": [...],
+        "global": [...],
+        "tickers": [...],   # alias (same as "all")
+        "symbols": [...],   # alias (same as "all")
+        "meta": {...}
+      }
+- ✅ Supports env overrides (no Sheets needed)
+- ✅ Google Sheets via service account JSON in env:
+      GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
+      (minified JSON / pretty JSON / quoted JSON / base64(JSON) / base64url(JSON))
 
-Used by
-- scripts/run_market_scan.py (expects PAGE_REGISTRY + get_page_symbols)
+Improvements vs v2.4.1
+- ✅ Key normalization + alias resolution:
+    accepts "market_leaders", "MARKET-LEADERS", "market leaders", etc.
+- ✅ SYMBOLS_JSON override is case-insensitive on keys.
+- ✅ More defensive header detection and fallback column selection.
+- ✅ Adds explicit "tickers" + "symbols" aliases for legacy scripts.
 
 Env (optional)
-- DEFAULT_SPREADSHEET_ID / TFB_SPREADSHEET_ID / SPREADSHEET_ID / GOOGLE_SHEETS_ID
-- GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON (JSON or base64(JSON))
-- GOOGLE_APPLICATION_CREDENTIALS (path to service account json file)
-
-Overrides (optional)
-- SYMBOLS_JSON  (JSON object mapping keys -> list or dict with "all"/"ksa"/"global")
-- SYMBOLS_<KEY> (comma-separated list for a specific key)
-  e.g. SYMBOLS_MARKET_LEADERS="1120.SR,2222.SR,GOOGL,AAPL"
-- TFB_SYMBOL_HEADER_ROW (default 5)
-- TFB_SYMBOL_START_ROW  (default 6)
-- TFB_SYMBOL_MAX_ROWS   (default 5000)
-- TFB_SYMBOLS_CACHE_TTL_SEC (default 45)
-
-Sheet name overrides (optional)
-- SHEET_MARKET_LEADERS, SHEET_GLOBAL_MARKETS, SHEET_KSA_TADAWUL, etc.
+- Spreadsheet:
+    DEFAULT_SPREADSHEET_ID / TFB_SPREADSHEET_ID / SPREADSHEET_ID / GOOGLE_SHEETS_ID
+- Credentials:
+    GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON (JSON or base64/base64url JSON)
+    GOOGLE_APPLICATION_CREDENTIALS (path to service account json file)
+- Overrides:
+    SYMBOLS_JSON  (JSON object mapping keys -> list OR dict with "all"/"ksa"/"global"/"tickers"/"symbols")
+    SYMBOLS_<KEY> (comma/space/newline separated list for a specific key)
+- Layout:
+    TFB_SYMBOL_HEADER_ROW (default 5)
+    TFB_SYMBOL_START_ROW  (default 6)
+    TFB_SYMBOL_MAX_ROWS   (default 5000)
+    TFB_SYMBOLS_CACHE_TTL_SEC (default 45)
+- Sheet name overrides:
+    SHEET_MARKET_LEADERS, SHEET_GLOBAL_MARKETS, SHEET_KSA_TADAWUL, SHEET_MUTUAL_FUNDS,
+    SHEET_COMMODITIES_FX, SHEET_MY_PORTFOLIO, SHEET_INSIGHTS_ANALYSIS, SHEET_INVESTMENT_ADVISOR
 """
 
 from __future__ import annotations
@@ -59,8 +66,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version / constants
 # -----------------------------------------------------------------------------
-VERSION = "2.4.1"
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+VERSION = "2.5.0"
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 
 # -----------------------------------------------------------------------------
 # Safe env parsing (never crash import)
@@ -86,7 +93,7 @@ _DEFAULT_START_ROW = _safe_int(os.getenv("TFB_SYMBOL_START_ROW", "6"), 6)
 _DEFAULT_MAX_ROWS = _safe_int(os.getenv("TFB_SYMBOL_MAX_ROWS", "5000"), 5000)
 
 # -----------------------------------------------------------------------------
-# Best-effort Google libs
+# Best-effort Google libs (NO network calls here)
 # -----------------------------------------------------------------------------
 _GOOGLE_OK = False
 _Credentials = None
@@ -100,7 +107,7 @@ except Exception:
     _GOOGLE_OK = False
 
 # -----------------------------------------------------------------------------
-# Simple in-process cache (avoid hammering Sheets during scans)
+# Simple in-process cache
 # -----------------------------------------------------------------------------
 _CACHE_TTL_SEC = _safe_float(os.getenv("TFB_SYMBOLS_CACHE_TTL_SEC", "45"), 45.0)
 _cache: Dict[str, Tuple[float, Any]] = {}
@@ -131,7 +138,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _get_spreadsheet_id() -> str:
-    # Support your env.py aliases + legacy names
     for k in (
         "TFB_SPREADSHEET_ID",
         "DEFAULT_SPREADSHEET_ID",
@@ -151,11 +157,15 @@ def _strip_wrapping_quotes(s: str) -> str:
     return t
 
 
-def _looks_like_b64(s: str) -> bool:
+def _looks_like_json_object(s: str) -> bool:
+    ss = (s or "").strip()
+    return ss.startswith("{") and ss.endswith("}") and len(ss) >= 2
+
+
+def _looks_like_b64ish(s: str) -> bool:
     raw = (s or "").strip()
     if len(raw) < 80:
         return False
-    # allow base64 + base64url + whitespace/newlines
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-\n\r")
     return all((c in allowed) for c in raw)
 
@@ -163,57 +173,63 @@ def _looks_like_b64(s: str) -> bool:
 def _b64_decode_any(raw: str) -> Optional[str]:
     """
     Best-effort decode base64/base64url with padding fixes.
-    Returns decoded string or None.
     """
     s = (raw or "").strip()
     if not s:
         return None
 
-    # base64url -> base64
-    s2 = s.replace("-", "+").replace("_", "/").strip()
-
-    # add padding if needed
+    # normalize base64url to urlsafe decode
+    s2 = s.strip()
     pad = len(s2) % 4
     if pad:
         s2 = s2 + ("=" * (4 - pad))
 
+    # try urlsafe first
     try:
-        dec = base64.b64decode(s2.encode("utf-8")).decode("utf-8", errors="strict").strip()
+        dec = base64.urlsafe_b64decode(s2.encode("utf-8")).decode("utf-8", errors="strict").strip()
         return dec
+    except Exception:
+        pass
+
+    # fallback: classic base64 normalization
+    try:
+        s3 = s.replace("-", "+").replace("_", "/").strip()
+        pad2 = len(s3) % 4
+        if pad2:
+            s3 = s3 + ("=" * (4 - pad2))
+        dec2 = base64.b64decode(s3.encode("utf-8")).decode("utf-8", errors="strict").strip()
+        return dec2
     except Exception:
         return None
 
 
-def _maybe_b64_decode(s: str) -> str:
-    """
-    If s looks like base64/base64url and decodes to JSON-like service account, return decoded.
-    Otherwise return original.
-    """
+def _maybe_b64_decode_json(s: str) -> str:
     raw = (s or "").strip()
     if not raw:
         return raw
-    if raw.startswith("{"):
+    if _looks_like_json_object(raw):
         return raw
-    if not _looks_like_b64(raw):
+    if not _looks_like_b64ish(raw):
         return raw
 
     dec = _b64_decode_any(raw)
     if not dec:
         return raw
-    if dec.startswith("{") and ("private_key" in dec or '"type"' in dec):
-        return dec
+
+    dec2 = dec.strip()
+    if _looks_like_json_object(dec2):
+        # verify it is valid JSON object
+        try:
+            obj = json.loads(dec2)
+            if isinstance(obj, dict):
+                return dec2
+        except Exception:
+            return raw
+
     return raw
 
 
 def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
-    """
-    Accepts:
-    - dict
-    - JSON string
-    - base64(JSON string) / base64url(JSON string)
-    - quoted JSON string
-    Returns dict or None.
-    """
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -226,10 +242,10 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
     s = _strip_wrapping_quotes(s)
-    s = _maybe_b64_decode(s)
+    s = _maybe_b64_decode_json(s)
     s = _strip_wrapping_quotes(s).strip()
 
-    if not s or not s.startswith("{"):
+    if not _looks_like_json_object(s):
         return None
 
     try:
@@ -240,12 +256,6 @@ def _try_parse_json_dict(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 def _load_service_account_info() -> Optional[Dict[str, Any]]:
-    """
-    Reads service account info from:
-    - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
-      (minified json OR pretty json OR quoted json OR base64 json OR base64url json)
-    - else GOOGLE_APPLICATION_CREDENTIALS file path
-    """
     for k in ("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS", "GOOGLE_SA_JSON"):
         raw = (os.getenv(k) or "").strip()
         if raw:
@@ -278,11 +288,6 @@ def _index_to_a1_col(idx: int) -> str:
 
 
 def _escape_sheet_name_for_a1(name: str) -> str:
-    """
-    Google Sheets A1 quoting:
-    - sheet names with special chars should be in single quotes
-    - any single quote inside name must be doubled: Bob's -> 'Bob''s'
-    """
     n = (name or "").strip()
     if not n:
         return "Sheet1"
@@ -291,15 +296,15 @@ def _escape_sheet_name_for_a1(name: str) -> str:
 
 def _safe_sheet_name(name: str) -> str:
     """
-    For A1 ranges: quote when needed.
-    Always escape embedded apostrophes correctly.
+    For A1 ranges:
+    - quote when needed
+    - escape embedded apostrophes correctly
     """
     n = (name or "").strip()
     if not n:
         return "Sheet1"
 
-    # quote if contains spaces or typical special chars (safe + consistent)
-    needs_quote = any(ch in n for ch in (" ", "-", "(", ")", ".", ",", "!", "[", "]", "{", "}", "&", "/"))
+    needs_quote = any(ch in n for ch in (" ", "-", "(", ")", ".", ",", "!", "[", "]", "{", "}", "&", "/", "\\"))
     if needs_quote or ("'" in n):
         return f"'{_escape_sheet_name_for_a1(n)}'"
     return n
@@ -309,21 +314,25 @@ def _normalize_symbol(s: str) -> str:
     x = (s or "").strip().upper().replace(" ", "")
     if not x:
         return ""
+
     if x.startswith("TADAWUL:"):
         x = x.split(":", 1)[1].strip().upper()
+
     if x.endswith(".TADAWUL"):
         x = x.replace(".TADAWUL", "")
+
     # numeric Tadawul code -> .SR
     if x.isdigit() and 3 <= len(x) <= 6:
         return f"{x}.SR"
+
     return x
 
 
 def _split_cell_into_symbols(cell: str) -> List[str]:
     """
     Accepts:
-    - single symbol: "1120.SR"
-    - comma separated: "AAPL,MSFT,GOOGL"
+    - single: "1120.SR"
+    - comma separated: "AAPL,MSFT"
     - space separated: "AAPL MSFT"
     - lines / bullets
     """
@@ -331,6 +340,8 @@ def _split_cell_into_symbols(cell: str) -> List[str]:
     if not raw:
         return []
     raw = raw.replace("•", " ").replace("·", " ").replace("\t", " ")
+
+    # split on common separators
     parts = re.split(r"[,\n;\r]+", raw)
     out: List[str] = []
     for p in parts:
@@ -372,6 +383,20 @@ def _classify(symbols: Sequence[str]) -> Tuple[List[str], List[str]]:
     return _dedupe(ksa), _dedupe(glob)
 
 
+def _norm_key(k: str) -> str:
+    """
+    Normalize page keys:
+      "market leaders" / "MARKET-LEADERS" / "market_leaders" -> "MARKET_LEADERS"
+    """
+    s = (k or "").strip().upper()
+    if not s:
+        return ""
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"[^A-Z0-9_]+", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
 # -----------------------------------------------------------------------------
 # Registry (keys -> sheet specs)
 # -----------------------------------------------------------------------------
@@ -387,7 +412,6 @@ class PageSpec:
     header_candidates: Tuple[str, ...] = ("SYMBOL", "TICKER", "CODE")
 
 
-# NOTE: Keep these keys in sync with scripts/run_market_scan.py defaults
 PAGE_REGISTRY: Dict[str, PageSpec] = {
     "MARKET_LEADERS": PageSpec(
         key="MARKET_LEADERS",
@@ -419,7 +443,7 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("My_Portfolio", "My Portfolio", "MY_PORTFOLIO"),
         header_candidates=("SYMBOL", "TICKER", "CODE"),
     ),
-    # Safe extras (won’t be used unless requested)
+    # Optional extras (safe; won't break anything)
     "INSIGHTS_ANALYSIS": PageSpec(
         key="INSIGHTS_ANALYSIS",
         sheet_names=("Insights_Analysis", "Insights Analysis", "INSIGHTS_ANALYSIS"),
@@ -430,6 +454,22 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("Investment_Advisor", "Investment Advisor", "INVESTMENT_ADVISOR"),
         header_candidates=("SYMBOL", "TICKER", "CODE"),
     ),
+}
+
+# optional key aliases (normalized)
+_KEY_ALIASES: Dict[str, str] = {
+    "MARKETLEADERS": "MARKET_LEADERS",
+    "MARKET_LEADER": "MARKET_LEADERS",
+    "MARKETLEADER": "MARKET_LEADERS",
+    "GLOBAL": "GLOBAL_MARKETS",
+    "GLOBAL_MARKET": "GLOBAL_MARKETS",
+    "KSATADAWUL": "KSA_TADAWUL",
+    "KSA": "KSA_TADAWUL",
+    "FUNDS": "MUTUAL_FUNDS",
+    "MUTUALFUND": "MUTUAL_FUNDS",
+    "COMMODITIES": "COMMODITIES_FX",
+    "FX": "COMMODITIES_FX",
+    "PORTFOLIO": "MY_PORTFOLIO",
 }
 
 _SHEET_ENV_BY_KEY: Dict[str, Tuple[str, ...]] = {
@@ -444,10 +484,22 @@ _SHEET_ENV_BY_KEY: Dict[str, Tuple[str, ...]] = {
 }
 
 
+def _resolve_key(key: str) -> str:
+    k = _norm_key(key)
+    if not k:
+        return ""
+    if k in PAGE_REGISTRY:
+        return k
+    # try alias without underscores
+    k2 = k.replace("_", "")
+    if k2 in _KEY_ALIASES:
+        return _KEY_ALIASES[k2]
+    if k in _KEY_ALIASES:
+        return _KEY_ALIASES[k]
+    return k
+
+
 def _candidate_sheet_names(spec: PageSpec) -> Tuple[str, ...]:
-    """
-    Prepend env-provided sheet name (if any) in front of registry names, deduped.
-    """
     env_keys = _SHEET_ENV_BY_KEY.get(spec.key, ())
     env_names: List[str] = []
     for ek in env_keys:
@@ -462,9 +514,10 @@ def _candidate_sheet_names(spec: PageSpec) -> Tuple[str, ...]:
         nn = (n or "").strip()
         if not nn:
             continue
-        if nn.lower() in seen:
+        low = nn.lower()
+        if low in seen:
             continue
-        seen.add(nn.lower())
+        seen.add(low)
         out.append(nn)
     return tuple(out)
 
@@ -472,8 +525,8 @@ def _candidate_sheet_names(spec: PageSpec) -> Tuple[str, ...]:
 # -----------------------------------------------------------------------------
 # Overrides via ENV
 # -----------------------------------------------------------------------------
-def _try_env_override_for_key(key: str) -> Optional[List[str]]:
-    env_name = f"SYMBOLS_{key.strip().upper()}"
+def _try_env_override_for_key(key_norm: str) -> Optional[List[str]]:
+    env_name = f"SYMBOLS_{key_norm}"
     raw = (os.getenv(env_name) or "").strip()
     if not raw:
         return None
@@ -493,6 +546,33 @@ def _try_symbols_json_override() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _symbols_from_override_value(val: Any) -> List[str]:
+    """
+    Supports:
+    - list
+    - dict with: all/symbols/tickers
+    """
+    if isinstance(val, list):
+        return _dedupe([str(x) for x in val if str(x).strip()])
+
+    if isinstance(val, dict):
+        for k in ("all", "symbols", "tickers"):
+            vv = val.get(k)
+            if isinstance(vv, list):
+                return _dedupe([str(x) for x in vv if str(x).strip()])
+        # sometimes: {"ksa":[...], "global":[...]} without "all"
+        ksa = val.get("ksa")
+        glob = val.get("global")
+        out: List[str] = []
+        if isinstance(ksa, list):
+            out.extend([str(x) for x in ksa if str(x).strip()])
+        if isinstance(glob, list):
+            out.extend([str(x) for x in glob if str(x).strip()])
+        return _dedupe(out)
+
+    return []
+
+
 # -----------------------------------------------------------------------------
 # Google Sheets reading (lazy)
 # -----------------------------------------------------------------------------
@@ -500,9 +580,6 @@ _svc = None
 
 
 def _get_sheets_service():
-    """
-    Build Google Sheets API service lazily.
-    """
     global _svc
     if _svc is not None:
         return _svc
@@ -525,8 +602,7 @@ def _get_sheets_service():
 
 def _read_values(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
     """
-    Returns values as list of rows.
-    Never raises; returns [] on any error.
+    Returns values as list of rows. Never raises; returns [] on any error.
     """
     if not spreadsheet_id or not range_a1:
         return []
@@ -556,41 +632,65 @@ def _read_values(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
         return []
 
 
+def _clean_header_text(v: Any) -> str:
+    h = str(v or "").strip().upper()
+    if not h:
+        return ""
+    h = re.sub(r"[^A-Z0-9_% ]+", " ", h).strip()
+    h = re.sub(r"\s+", " ", h).strip()
+    return h
+
+
 def _resolve_symbol_column_letter(spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Optional[str]:
     """
-    Reads the header row A:?? and finds the column where header matches candidates.
+    Reads header row A:?? and finds column where header matches candidates.
+    Falls back to common headers: SYMBOL/TICKER/CODE.
     """
     try_cols = 78  # up to BZ
     end_col = _index_to_a1_col(try_cols)
     rng = f"{_safe_sheet_name(sheet_name)}!A{spec.header_row}:{end_col}{spec.header_row}"
     rows = _read_values(spreadsheet_id, rng)
-    if not rows or not isinstance(rows, list) or not rows[0]:
+    if not rows or not rows[0]:
         return None
 
     header = rows[0]
-    cand = {c.strip().upper() for c in spec.header_candidates if c and c.strip()}
+    cand = {_clean_header_text(c) for c in spec.header_candidates if str(c).strip()}
+    cand.discard("")
+
+    # Exact or prefix match
     for idx, cell in enumerate(header, start=1):
-        h = str(cell or "").strip().upper()
-        h = re.sub(r"[^A-Z0-9_% ]+", " ", h).strip()
+        h = _clean_header_text(cell)
         if not h:
             continue
         if h in cand or any(h.startswith(c) for c in cand):
             return _index_to_a1_col(idx)
 
+    # Common fallback
     common = {"SYMBOL", "TICKER", "CODE"}
     for idx, cell in enumerate(header, start=1):
-        h = str(cell or "").strip().upper()
-        h = re.sub(r"[^A-Z0-9_% ]+", " ", h).strip()
+        h = _clean_header_text(cell)
         if h in common:
             return _index_to_a1_col(idx)
 
     return None
 
 
+def _guess_first_nonempty_column(spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> str:
+    """
+    If header detection fails, try A/B/C quickly to see which column has data.
+    """
+    candidates = ["A", "B", "C"]
+    end_row = spec.start_row + max(25, min(200, spec.max_rows)) - 1
+    for col in candidates:
+        rng = f"{_safe_sheet_name(sheet_name)}!{col}{spec.start_row}:{col}{end_row}"
+        values = _read_values(spreadsheet_id, rng)
+        for row in values or []:
+            if row and str(row[0] or "").strip():
+                return col
+    return "A"
+
+
 def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Tries the first sheet name that returns data. Returns (symbols, meta).
-    """
     meta: Dict[str, Any] = {
         "key": spec.key,
         "version": VERSION,
@@ -607,30 +707,30 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
         if not sheet:
             continue
 
-        # If fixed_range is provided, use it directly
+        # fixed range mode
         if spec.fixed_range:
             rng = f"{_safe_sheet_name(sheet)}!{spec.fixed_range}"
             values = _read_values(spreadsheet_id, rng)
             meta["sheet_used"] = sheet
             meta["range_used"] = rng
+
             syms: List[str] = []
             for row in values or []:
                 if not row:
                     continue
                 syms.extend(_split_cell_into_symbols(str(row[0] if row else "")))
+
             syms = _dedupe(syms)
             if syms:
                 return syms, meta
             continue
 
-        # Determine symbol column
+        # determine symbol column
         col = (spec.fixed_col or "").strip().upper() or None
         if not col:
             col = _resolve_symbol_column_letter(spreadsheet_id, sheet, spec)
-
-        # Fallback column if header search failed
         if not col:
-            col = "A"
+            col = _guess_first_nonempty_column(spreadsheet_id, sheet, spec)
 
         end_row = spec.start_row + max(1, spec.max_rows) - 1
         rng = f"{_safe_sheet_name(sheet)}!{col}{spec.start_row}:{col}{end_row}"
@@ -668,43 +768,72 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
         "all": [...],
         "ksa": [...],
         "global": [...],
+        "tickers": [...],   # alias of all
+        "symbols": [...],   # alias of all
         "meta": {...}
       }
 
     Never raises.
     """
-    k = (key or "").strip().upper()
-    if not k:
-        return {"all": [], "ksa": [], "global": [], "meta": {"error": "empty key", "version": VERSION}}
+    raw_key = (key or "").strip()
+    key_norm = _resolve_key(raw_key)
+
+    if not key_norm:
+        return {"all": [], "ksa": [], "global": [], "tickers": [], "symbols": [], "meta": {"error": "empty key", "version": VERSION}}
 
     # 1) Per-key env override: SYMBOLS_<KEY>
-    ov = _try_env_override_for_key(k)
+    ov = _try_env_override_for_key(key_norm)
     if ov is not None:
         ksa, glob = _classify(ov)
+        all_syms = _dedupe(ov)
         return {
-            "all": _dedupe(ov),
+            "all": all_syms,
             "ksa": ksa,
             "global": glob,
-            "meta": {"mode": "env_override", "key": k, "version": VERSION, "env": f"SYMBOLS_{k}"},
+            "tickers": all_syms,
+            "symbols": all_syms,
+            "meta": {"mode": "env_override", "key": key_norm, "requested_key": raw_key, "version": VERSION, "env": f"SYMBOLS_{key_norm}"},
         }
 
-    # 2) Bulk JSON override: SYMBOLS_JSON
+    # 2) Bulk JSON override: SYMBOLS_JSON (case-insensitive keys)
     j = _try_symbols_json_override()
-    if isinstance(j, dict) and k in j:
-        val = j.get(k)
-        if isinstance(val, list):
-            all_syms = _dedupe([str(x) for x in val])
+    if isinstance(j, dict):
+        # try exact, then normalized match
+        cand_keys = {str(k): k for k in j.keys()}
+        # build a case-insensitive lookup by normalized keys
+        norm_map: Dict[str, str] = {}
+        for k in cand_keys.keys():
+            norm_map[_resolve_key(k)] = k
+
+        pick = None
+        if key_norm in j:
+            pick = key_norm
+        elif key_norm in norm_map:
+            pick = norm_map[key_norm]
+
+        if pick is not None and pick in j:
+            all_syms = _symbols_from_override_value(j.get(pick))
             ksa, glob = _classify(all_syms)
-            return {"all": all_syms, "ksa": ksa, "global": glob, "meta": {"mode": "symbols_json", "key": k, "version": VERSION}}
-        if isinstance(val, dict):
-            all_syms = _dedupe([str(x) for x in (val.get("all") or val.get("symbols") or val.get("tickers") or [])])
-            ksa, glob = _classify(all_syms)
-            return {"all": all_syms, "ksa": ksa, "global": glob, "meta": {"mode": "symbols_json", "key": k, "version": VERSION}}
+            return {
+                "all": all_syms,
+                "ksa": ksa,
+                "global": glob,
+                "tickers": all_syms,
+                "symbols": all_syms,
+                "meta": {"mode": "symbols_json", "key": key_norm, "requested_key": raw_key, "json_key_used": str(pick), "version": VERSION},
+            }
 
     # 3) Sheets registry lookup
-    spec = PAGE_REGISTRY.get(k)
+    spec = PAGE_REGISTRY.get(key_norm)
     if spec is None:
-        return {"all": [], "ksa": [], "global": [], "meta": {"error": f"unknown key: {k}", "version": VERSION}}
+        return {
+            "all": [],
+            "ksa": [],
+            "global": [],
+            "tickers": [],
+            "symbols": [],
+            "meta": {"error": f"unknown key: {key_norm}", "requested_key": raw_key, "version": VERSION},
+        }
 
     sid = (spreadsheet_id or "").strip() or _get_spreadsheet_id()
     if not sid:
@@ -712,21 +841,45 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
             "all": [],
             "ksa": [],
             "global": [],
-            "meta": {"error": "Spreadsheet ID missing (set DEFAULT_SPREADSHEET_ID/TFB_SPREADSHEET_ID/SPREADSHEET_ID)", "key": k, "version": VERSION},
+            "tickers": [],
+            "symbols": [],
+            "meta": {
+                "error": "Spreadsheet ID missing (set DEFAULT_SPREADSHEET_ID/TFB_SPREADSHEET_ID/SPREADSHEET_ID)",
+                "key": key_norm,
+                "requested_key": raw_key,
+                "version": VERSION,
+            },
         }
 
-    # Cache per key+sheet id
-    cache_key = f"page::{sid}::{k}"
+    # cache per key+sheet
+    cache_key = f"page::{sid}::{key_norm}"
     hit = _cache_get(cache_key)
     if isinstance(hit, dict) and "all" in hit:
         return hit
 
     syms, meta = _read_symbols_from_sheet(sid, spec)
     ksa, glob = _classify(syms)
+    all_syms = _dedupe(syms)
 
-    out = {"all": syms, "ksa": ksa, "global": glob, "meta": meta}
+    meta = dict(meta or {})
+    meta["requested_key"] = raw_key
+    meta["resolved_key"] = key_norm
+    meta["count_all"] = len(all_syms)
+    meta["count_ksa"] = len(ksa)
+    meta["count_global"] = len(glob)
+
+    out = {"all": all_syms, "ksa": ksa, "global": glob, "tickers": all_syms, "symbols": all_syms, "meta": meta}
     _cache_set(cache_key, out)
     return out
+
+
+# Back-compat aliases (older scripts may import these)
+def read_symbols_for_page(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_page_symbols(key, spreadsheet_id=spreadsheet_id)
+
+
+def get_symbols_for_page(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_page_symbols(key, spreadsheet_id=spreadsheet_id)
 
 
 # -----------------------------------------------------------------------------
