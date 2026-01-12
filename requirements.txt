@@ -4,9 +4,11 @@
 # FastAPI + Uvicorn + async providers + caching + Google Sheets
 # ============================================================
 
+# Core API
 fastapi>=0.128.0
 uvicorn[standard]>=0.40.0
 
+# Env / config
 python-dotenv>=1.2.1
 
 # Rate limiting
