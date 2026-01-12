@@ -1,7 +1,7 @@
-```python
+#!/usr/bin/env python3
 # scripts/repo_hygiene_check.py
 """
-Repo Hygiene Check — PROD SAFE (v1.2.0)
+Repo Hygiene Check — PROD SAFE (v1.2.1)
 
 Goal
 - Fail CI if markdown code fences appear inside any .py file.
@@ -12,8 +12,8 @@ Why
 
 What it checks
 - Detects common fenced-code markers:
-  - three backticks
-  - three tildes
+  - triple backticks
+  - triple tildes
 - Scans all *.py files under the given root, skipping common vendor/cache folders.
 - Never crashes startup; best-effort scanning with clear reporting.
 
@@ -26,6 +26,9 @@ Usage
 - python scripts/repo_hygiene_check.py
 - python scripts/repo_hygiene_check.py --root .
 - python scripts/repo_hygiene_check.py --fail-on-read-error
+
+IMPORTANT
+- Do NOT wrap this file itself in any markdown fences when copying into the repo.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ import pathlib
 from typing import Iterable, List, Optional, Tuple
 
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 
 def _make_fence_tokens() -> List[str]:
@@ -95,7 +98,7 @@ def _gha_enabled() -> bool:
 
 
 def _print_gha_error(path: str, line: int, col: int, msg: str) -> None:
-    # GitHub Actions annotation format
+    # GitHub Actions annotation format:
     # ::error file=path,line=1,col=1::message
     print(f"::error file={path},line={line},col={col}::{msg}")
 
@@ -134,19 +137,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
 
         hit_idx = -1
-        hit_tok = ""
         for tok in bad_tokens:
             idx = text.find(tok)
             if idx != -1 and (hit_idx == -1 or idx < hit_idx):
                 hit_idx = idx
-                hit_tok = tok
 
         if hit_idx != -1:
             line, col = _line_col_from_index(text, hit_idx)
             rel = str(p.relative_to(root)) if p.is_absolute() else str(p)
             offenders.append(f"{rel}:{line}:{col} contains markdown fence token")
             offenders_gha.append((rel, line, col, "Markdown fence token found inside a .py file"))
-            _ = hit_tok  # keep for debugging if needed
 
     if read_errors:
         print("⚠️ Repo hygiene check: some files could not be read:\n")
@@ -175,4 +175,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-```
