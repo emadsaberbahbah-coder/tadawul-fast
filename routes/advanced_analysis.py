@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.13.0) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.14.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -19,21 +19,20 @@ Design goals
     core.schemas.header_field_candidates()
 - Supports vNext headers including:
     Rank, Origin, Change/Change %, Value Traded, 52W Position %, Updated times,
-    Forecast/Expected columns (1M/3M/12M), Confidence, Forecast Updated,
+    Forecast/Expected columns (1M/3M/12M), Confidence, Forecast Updated (UTC/Riyadh),
     and badges (Rec/Momentum/Opportunity/Risk).
 
 Standardization rules
 - Recommendation ALWAYS one of: BUY / HOLD / REDUCE / SELL (UPPERCASE, non-empty)
 - Sheets-safe error handling: always returns {status, headers, rows, error?}
 
-v3.13.0 upgrades
-- ✅ Accepts BOTH: sheet_name and sheetName (and uses whichever is provided).
-- ✅ Accepts BOTH: tickers and symbols (already supported).
-- ✅ More tolerant header matching:
-    - Expected ROI 1M %  OR Expected ROI % (1M) OR Expected Return 1M % etc.
-    - Forecast Updated (UTC) OR Forecast Updated UTC
-- ✅ Ensures Last Updated (UTC)/(Riyadh) are filled when asked for (best-effort).
-- ✅ Preserves input order for quote_schema sheets (no unexpected resorting).
+v3.14.0 upgrades
+- ✅ Stronger Forecast/Expected mapping:
+    - Accepts engine keys: forecast_price_* / target_price_* / expected_price_*
+    - Accepts ROI keys: forecast_roi_* / expected_roi_* / forecast_return_* / expected_return_*
+- ✅ Adds "Forecast Updated (Riyadh)" computed support (if header exists)
+- ✅ Quote-schema /sheet-rows now preserves *requested tickers order* by building rows directly
+  from requested list (avoid any symbol remap surprises).
 """
 
 import asyncio
@@ -60,7 +59,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.13.0"
+ADVANCED_ANALYSIS_VERSION = "3.14.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -455,7 +454,12 @@ def _cfg() -> Dict[str, Any]:
     max_tickers = max(10, min(2000, max_tickers))
     concurrency = max(1, min(25, concurrency))
 
-    return {"batch_size": batch_size, "timeout_sec": timeout_sec, "max_tickers": max_tickers, "concurrency": concurrency}
+    return {
+        "batch_size": batch_size,
+        "timeout_sec": timeout_sec,
+        "max_tickers": max_tickers,
+        "concurrency": concurrency,
+    }
 
 
 # =============================================================================
@@ -1318,6 +1322,15 @@ _FIELD_TRANSFORMS: Dict[str, Any] = {
     "expected_return_1m": _ratio_to_percent,
     "expected_return_3m": _ratio_to_percent,
     "expected_return_12m": _ratio_to_percent,
+    "forecast_return_1m": _ratio_to_percent,
+    "forecast_return_3m": _ratio_to_percent,
+    "forecast_return_12m": _ratio_to_percent,
+    "expected_roi_1m": _ratio_to_percent,
+    "expected_roi_3m": _ratio_to_percent,
+    "expected_roi_12m": _ratio_to_percent,
+    "forecast_roi_1m": _ratio_to_percent,
+    "forecast_roi_3m": _ratio_to_percent,
+    "forecast_roi_12m": _ratio_to_percent,
     "volatility_30d": _vol_to_percent,
     "last_updated_utc": _iso_or_none,
     "last_updated_riyadh": _iso_or_none,
@@ -1397,13 +1410,45 @@ def _forecast_updated_utc_from_uq(uq: Any) -> Optional[str]:
 
 def _header_horizon(header_key: str) -> Optional[str]:
     hk = header_key
-    if "1m" in hk or "(1m)" in hk:
+    # normalize a little more (still keep cheap)
+    hk2 = hk.replace(" ", "")
+    if "1m" in hk2 or "(1m)" in hk2 or "1mo" in hk2 or "1month" in hk2:
         return "1m"
-    if "3m" in hk or "(3m)" in hk:
+    if "3m" in hk2 or "(3m)" in hk2 or "3mo" in hk2 or "3month" in hk2:
         return "3m"
-    if "12m" in hk or "12 m" in hk or "(12m)" in hk:
+    if "12m" in hk2 or "(12m)" in hk2 or "12mo" in hk2 or "12month" in hk2 or "1y" in hk2:
         return "12m"
     return None
+
+
+def _first_present(uq: Any, keys: Sequence[str]) -> Any:
+    for k in keys:
+        v = _safe_get(uq, k)
+        if v is not None:
+            return v
+    return None
+
+
+def _forecast_price_keys(h: str) -> List[str]:
+    # h in {"1m","3m","12m"}
+    return [
+        f"forecast_price_{h}",
+        f"forecast_target_price_{h}",
+        f"target_price_{h}",
+        f"predicted_price_{h}",
+        f"price_forecast_{h}",
+        f"expected_price_{h}",
+    ]
+
+
+def _forecast_roi_keys(h: str) -> List[str]:
+    return [
+        f"forecast_roi_{h}",
+        f"expected_roi_{h}",
+        f"forecast_return_{h}",
+        f"expected_return_{h}",
+        f"predicted_return_{h}",
+    ]
 
 
 def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None) -> Any:
@@ -1473,12 +1518,10 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
             v = _safe_get(uq, "recommendation")
             return _coerce_reco_enum(v) or reco or "HOLD"
 
-    # expected / forecast support (more tolerant)
-    # Examples accepted:
-    # - "Target Price 1M" / "Expected Price 1M" / "Forecast Price (1M)"
-    # - "Expected ROI 1M %" / "Expected ROI % (1M)" / "Expected Return 1M %"
+    # expected / forecast support (tolerant)
     # - "Forecast Confidence"
     # - "Forecast Updated (UTC)" / "Forecast Updated UTC"
+    # - "Forecast Updated (Riyadh)" / "Forecast Updated Riyadh"
     if "forecast confidence" in hk:
         v = _safe_get(uq, "confidence_score", "forecast_confidence", "confidence")
         if v is None:
@@ -1489,22 +1532,25 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
         except Exception:
             return v
 
-    if "forecast updated" in hk and "riyadh" not in hk:
-        return _forecast_updated_utc_from_uq(uq)
+    if "forecast updated" in hk:
+        utc_iso = _forecast_updated_utc_from_uq(uq)
+        if "riyadh" in hk:
+            return _to_riyadh_iso(utc_iso) if utc_iso else None
+        return utc_iso
 
     # Expected/Target/Forecast Price horizons
     if ("price" in hk) and any(x in hk for x in ("target", "expected", "forecast")) and (_header_horizon(hk) is not None):
         horizon = _header_horizon(hk) or "3m"
-        v = _safe_get(uq, f"expected_price_{horizon}")
+        v = _first_present(uq, _forecast_price_keys(horizon))
         if v is not None:
             return v
         exp_price, _exp_ret = _compute_expected_price_and_return(uq, horizon)
         return exp_price
 
     # Expected ROI / Expected Return horizons
-    if any(x in hk for x in ("expected roi", "expected return")) and (_header_horizon(hk) is not None):
+    if any(x in hk for x in ("expected roi", "expected return", "forecast roi", "forecast return")) and (_header_horizon(hk) is not None):
         horizon = _header_horizon(hk) or "3m"
-        v = _safe_get(uq, f"expected_return_{horizon}")
+        v = _first_present(uq, _forecast_roi_keys(horizon))
         if v is not None:
             return _ratio_to_percent(v)
         _exp_price, exp_ret = _compute_expected_price_and_return(uq, horizon)
@@ -1746,29 +1792,17 @@ async def advanced_sheet_rows(
             max_concurrency=cfg["concurrency"],
         )
 
-        # build items in requested order
-        items: List[AdvancedItem] = []
-        for s in requested:
-            uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
-            items.append(_to_advanced_item(s, uq))
-
-        # sorting behavior:
-        # - advanced mode: sort by opportunity (scoreboard-like)
-        # - quote_schema mode: preserve requested order (sheet-safe)
-        if mode == "advanced":
-            items = sorted(items, key=_sort_key, reverse=True)
-
-        if len(items) > top_n:
-            items = items[:top_n]
-
         rows: List[List[Any]] = []
 
+        # QUOTE SCHEMA MODE:
+        # - Preserve requested order strictly by building rows from requested list.
+        # - Use EnrichedQuote mapping only when headers length == 59 (classic contract).
         if mode == "quote_schema":
             EnrichedQuote = _try_import_enriched_quote()
             can_use_eq = EnrichedQuote is not None and isinstance(headers, list) and len(headers) == 59
 
-            for idx, it in enumerate(items, start=1):
-                uq = unified_map.get(it.symbol) or _make_placeholder(it.symbol, dq="MISSING", err="No data returned")
+            for idx, s in enumerate(requested[:top_n], start=1):
+                uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
                 _ensure_reco_on_obj(uq)
                 ctx = {"rank": idx, "origin": origin}
 
@@ -1800,9 +1834,21 @@ async def advanced_sheet_rows(
                 # extended/vNext mapping
                 rows.append(_row_quote_from_headers(headers, uq, ctx=ctx))
 
-        else:
-            rows = [_row_for_headers(it, headers) for it in items]
+            status = _status_from_rows(headers, rows)
+            return AdvancedSheetResponse(status=status, headers=headers, rows=rows)
 
+        # ADVANCED MODE:
+        # - Compute AdvancedItem, sort by opportunity, return top_n.
+        items: List[AdvancedItem] = []
+        for s in requested:
+            uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
+            items.append(_to_advanced_item(s, uq))
+
+        items = sorted(items, key=_sort_key, reverse=True)
+        if len(items) > top_n:
+            items = items[:top_n]
+
+        rows = [_row_for_headers(it, headers) for it in items]
         status = _status_from_rows(headers, rows)
         return AdvancedSheetResponse(status=status, headers=headers, rows=rows)
 
@@ -1831,4 +1877,10 @@ async def advanced_sheet_rows(
         return AdvancedSheetResponse(status="error", error=str(exc), headers=headers, rows=rows)
 
 
-__all__ = ["router", "AdvancedItem", "AdvancedScoreboardResponse", "AdvancedSheetRequest", "AdvancedSheetResponse"]
+__all__ = [
+    "router",
+    "AdvancedItem",
+    "AdvancedScoreboardResponse",
+    "AdvancedSheetRequest",
+    "AdvancedSheetResponse",
+]
