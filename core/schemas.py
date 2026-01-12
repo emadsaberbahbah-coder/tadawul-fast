@@ -1,12 +1,18 @@
-# core/schemas.py  — FULL REPLACEMENT — v3.8.0
+# core/schemas.py  — FULL REPLACEMENT — v3.8.1
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.8.0 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.8.1 (PROD SAFE)
 
-What changed in v3.8.0 (stability + enriched compatibility)
+What changed in v3.8.1 (forecast alignment + stronger compatibility)
+- ✅ Forecast fields now align directly with DataEngine keys:
+    • forecast_price_1m/3m/12m
+    • expected_roi_1m/3m/12m
+    • forecast_confidence
+    • forecast_updated_utc
+  while still accepting legacy/provider variants via FIELD_ALIASES.
 - ✅ Keeps vNext page-custom schemas (no “one size fits all”).
-- ✅ Forecast CORE columns are the agreed Google Sheets names:
+- ✅ Forecast CORE columns remain the agreed Google Sheets names:
     • Forecast Price (1M/3M/12M)
     • Expected ROI % (1M/3M/12M)
     • Forecast Confidence
@@ -37,7 +43,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.8.0"
+SCHEMAS_VERSION = "3.8.1"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -261,7 +267,6 @@ _VN_FUNDAMENTALS: List[str] = [
     "Beta",
 ]
 
-# Align technical labels with legacy-safe keys used across routes.
 _VN_TECHNICALS: List[str] = [
     "Volatility (30D)",
     "RSI (14)",
@@ -330,7 +335,6 @@ _VN_META: List[str] = [
 ]
 
 # --- Page Schemas (vNext) ---
-# 1) KSA Tadawul: equity core + forecast CORE + scores + badges
 _VN_HEADERS_KSA_TADAWUL: List[str] = (
     _VN_IDENTITY
     + _VN_PRICE
@@ -345,10 +349,8 @@ _VN_HEADERS_KSA_TADAWUL: List[str] = (
     + _VN_META
 )
 
-# 2) Market Leaders: equity core + forecast CORE + scores + badges
 _VN_HEADERS_MARKET_LEADERS: List[str] = list(_VN_HEADERS_KSA_TADAWUL)
 
-# 3) Global Markets: equity superset + FULL forecast/history
 _VN_HEADERS_GLOBAL: List[str] = (
     _VN_IDENTITY
     + _VN_PRICE
@@ -363,7 +365,6 @@ _VN_HEADERS_GLOBAL: List[str] = (
     + _VN_META
 )
 
-# 4) Mutual funds: simplified + fund attributes + FULL forecast/history
 _VN_HEADERS_FUNDS: List[str] = (
     [
         "Rank",
@@ -409,7 +410,6 @@ _VN_HEADERS_FUNDS: List[str] = (
     + _VN_META
 )
 
-# 5) Commodities & FX: stripped fundamentals + FULL forecast/history
 _VN_HEADERS_COMMODITIES_FX: List[str] = (
     [
         "Rank",
@@ -447,10 +447,8 @@ _VN_HEADERS_COMMODITIES_FX: List[str] = (
     + _VN_META
 )
 
-# 6) My Portfolio: inputs + KPIs + forecast CORE (lean)
 _VN_HEADERS_PORTFOLIO: List[str] = (
     [
-        # Identity / grouping
         "Rank",
         "Symbol",
         "Origin",
@@ -462,7 +460,6 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Broker/Account",
     ]
     + [
-        # User inputs
         "Quantity",
         "Avg Cost",
         "Cost Value",
@@ -470,7 +467,6 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Notes",
     ]
     + [
-        # Market snapshot
         "Price",
         "Prev Close",
         "Change",
@@ -484,7 +480,6 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Value Traded",
     ]
     + [
-        # Position metrics
         "Market Value",
         "Unrealized P/L",
         "Unrealized P/L %",
@@ -492,7 +487,6 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Rebalance Δ",
     ]
     + [
-        # Forward-looking
         "Fair Value",
         "Upside %",
         "Valuation Label",
@@ -508,14 +502,12 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
         "Rec Badge",
     ]
     + [
-        # Risk/technicals
         "Risk Score",
         "Overall Score",
         "Volatility (30D)",
         "RSI (14)",
     ]
     + [
-        # Meta
         "Error",
         "Data Source",
         "Data Quality",
@@ -524,7 +516,6 @@ _VN_HEADERS_PORTFOLIO: List[str] = (
     ]
 )
 
-# 7) Insights_Analysis: by default uses Global schema (safe for leaderboards/tables)
 _VN_HEADERS_INSIGHTS_ANALYSIS: List[str] = list(_VN_HEADERS_GLOBAL)
 
 # Freeze vNext schemas as tuples (prevent accidental mutation)
@@ -536,7 +527,6 @@ _VN_COMFX_T: Tuple[str, ...] = tuple(_VN_HEADERS_COMMODITIES_FX)
 _VN_PORTFOLIO_T: Tuple[str, ...] = tuple(_VN_HEADERS_PORTFOLIO)
 _VN_INSIGHTS_T: Tuple[str, ...] = tuple(_VN_HEADERS_INSIGHTS_ANALYSIS)
 
-# Helpful registry: known vNext schemas by page key
 VNEXT_SCHEMAS: Dict[str, Tuple[str, ...]] = {
     "KSA_TADAWUL": _VN_KSA_T,
     "MARKET_LEADERS": _VN_ML_T,
@@ -565,7 +555,6 @@ _HEADER_GROUPS_VNEXT: Dict[str, Tuple[str, ...]] = {
     "Meta": tuple(_VN_META),
 }
 
-
 # =============================================================================
 # Header normalization (tolerant mapping)
 # =============================================================================
@@ -587,10 +576,8 @@ def _norm_header_label(h: Optional[str]) -> str:
     return s
 
 
-# Build canonical header lookup by normalized key
 _HEADER_CANON_BY_NORM: Dict[str, str] = {}
 
-# Include legacy + vNext headers in canon map
 for _h in (
     list(_DEFAULT_59_TUPLE)
     + list(_DEFAULT_ANALYSIS_TUPLE)
@@ -604,9 +591,8 @@ for _h in (
 ):
     _HEADER_CANON_BY_NORM[_norm_header_label(_h)] = str(_h)
 
-# Common synonyms/variants
 _HEADER_SYNONYMS: Dict[str, str] = {
-    # legacy vs vNext name alignment
+    # identity variants
     "company_name": "Name",
     "company": "Name",
     "sub_sector": "Sub Sector",
@@ -638,9 +624,6 @@ _HEADER_SYNONYMS: Dict[str, str] = {
 
     # percent label variants (accept non-% versions)
     "dividend_yield": "Dividend Yield %",
-    "dividend_yield_percent": "Dividend Yield %",
-    "dividend_yield_pct": "Dividend Yield %",
-    "dividend_yield__no_pct": "Dividend Yield %",  # internal hint
     "payout_ratio": "Payout Ratio %",
     "roe": "ROE %",
     "roa": "ROA %",
@@ -660,16 +643,13 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "asset_type": "Asset Type",
     "target_weight": "Target Weight %",
 
-    # forecast aliases (support ROI/Target/Expected variants too)
-    "expected_return_1m_percent": "Expected ROI % (1M)",
-    "expected_return_3m_percent": "Expected ROI % (3M)",
-    "expected_return_12m_percent": "Expected ROI % (12M)",
-    "expected_roi_1m_percent": "Expected ROI % (1M)",
-    "expected_roi_3m_percent": "Expected ROI % (3M)",
-    "expected_roi_12m_percent": "Expected ROI % (12M)",
-    "expected_roi_percent_1m": "Expected ROI % (1M)",
-    "expected_roi_percent_3m": "Expected ROI % (3M)",
-    "expected_roi_percent_12m": "Expected ROI % (12M)",
+    # forecast aliases (accept ROI/Expected variants)
+    "expected_return_1m": "Expected ROI % (1M)",
+    "expected_return_3m": "Expected ROI % (3M)",
+    "expected_return_12m": "Expected ROI % (12M)",
+    "expected_roi_1m": "Expected ROI % (1M)",
+    "expected_roi_3m": "Expected ROI % (3M)",
+    "expected_roi_12m": "Expected ROI % (12M)",
 
     "expected_price_1m": "Forecast Price (1M)",
     "expected_price_3m": "Forecast Price (3M)",
@@ -677,6 +657,9 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "target_price_1m": "Forecast Price (1M)",
     "target_price_3m": "Forecast Price (3M)",
     "target_price_12m": "Forecast Price (12M)",
+    "forecast_price_1m": "Forecast Price (1M)",
+    "forecast_price_3m": "Forecast Price (3M)",
+    "forecast_price_12m": "Forecast Price (12M)",
 
     "confidence_score": "Forecast Confidence",
     "forecast_confidence": "Forecast Confidence",
@@ -781,7 +764,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "error": ("err",),
     "recommendation": ("recommend", "action"),
 
-    # Forecast / history
+    # History / technical extras
     "returns_1w": ("return_1w", "ret_1w"),
     "returns_1m": ("return_1m", "ret_1m"),
     "returns_3m": ("return_3m", "ret_3m"),
@@ -791,23 +774,25 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ma50": ("sma50",),
     "ma200": ("sma200",),
 
-    # NOTE: stored as ratios or percents depending on provider; routers will coerce.
-    "expected_return_1m": ("exp_return_1m", "expected_roi_1m"),
-    "expected_return_3m": ("exp_return_3m", "expected_roi_3m"),
-    "expected_return_12m": ("exp_return_12m", "expected_roi_12m"),
-    "expected_price_1m": ("exp_price_1m", "target_price_1m"),
-    "expected_price_3m": ("exp_price_3m", "target_price_3m"),
-    "expected_price_12m": ("exp_price_12m", "target_price_12m"),
+    # Forecast (aligned to DataEngine canonical keys)
+    "expected_roi_1m": ("expected_return_1m", "exp_return_1m", "expected_roi_percent_1m"),
+    "expected_roi_3m": ("expected_return_3m", "exp_return_3m", "expected_roi_percent_3m"),
+    "expected_roi_12m": ("expected_return_12m", "exp_return_12m", "expected_roi_percent_12m"),
 
-    "confidence_score": ("conf_score", "forecast_confidence"),
+    "forecast_price_1m": ("expected_price_1m", "exp_price_1m", "target_price_1m"),
+    "forecast_price_3m": ("expected_price_3m", "exp_price_3m", "target_price_3m"),
+    "forecast_price_12m": ("expected_price_12m", "exp_price_12m", "target_price_12m"),
+
+    "forecast_confidence": ("confidence_score", "conf_score"),
     "forecast_method": ("forecast_model",),
 
     "history_points": ("hist_points",),
     "history_source": ("hist_source",),
     "history_last_utc": ("hist_last_utc",),
 
-    # NEW: forecast updated timestamp (separate from history_last_utc if you supply it)
     "forecast_updated_utc": ("forecast_last_utc", "forecast_asof_utc", "forecast_time_utc", "forecast_updated"),
+    # (not a sheet column by default, but accepted)
+    "forecast_updated_riyadh": ("forecast_asof_riyadh", "forecast_time_riyadh"),
 
     # Funds
     "fund_type": ("etf_type",),
@@ -948,14 +933,14 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "History Source": "history_source",
     "History Last (UTC)": "history_last_utc",
 
-    # --- Forecast CORE (agreed labels) ---
-    "Forecast Price (1M)": "expected_price_1m",
-    "Expected ROI % (1M)": "expected_return_1m",
-    "Forecast Price (3M)": "expected_price_3m",
-    "Expected ROI % (3M)": "expected_return_3m",
-    "Forecast Price (12M)": "expected_price_12m",
-    "Expected ROI % (12M)": "expected_return_12m",
-    "Forecast Confidence": "confidence_score",
+    # --- Forecast CORE (agreed labels; aligned to DataEngine keys) ---
+    "Forecast Price (1M)": "forecast_price_1m",
+    "Expected ROI % (1M)": "expected_roi_1m",
+    "Forecast Price (3M)": "forecast_price_3m",
+    "Expected ROI % (3M)": "expected_roi_3m",
+    "Forecast Price (12M)": "forecast_price_12m",
+    "Expected ROI % (12M)": "expected_roi_12m",
+    "Forecast Confidence": "forecast_confidence",
     "Forecast Updated (UTC)": "forecast_updated_utc",
 
     # --- Fund specific ---
@@ -1016,24 +1001,22 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "RSI 14": "rsi_14",
 
     # ROI/Target legacy variants (tolerant)
-    "Expected Return 1M %": "expected_return_1m",
-    "Expected Return 3M %": "expected_return_3m",
-    "Expected Return 12M %": "expected_return_12m",
-    "Expected Price 1M": "expected_price_1m",
-    "Expected Price 3M": "expected_price_3m",
-    "Expected Price 12M": "expected_price_12m",
-    "Confidence Score": "confidence_score",
+    "Expected Return 1M %": "expected_roi_1m",
+    "Expected Return 3M %": "expected_roi_3m",
+    "Expected Return 12M %": "expected_roi_12m",
+    "Expected Price 1M": "forecast_price_1m",
+    "Expected Price 3M": "forecast_price_3m",
+    "Expected Price 12M": "forecast_price_12m",
+    "Confidence Score": "forecast_confidence",
 }
 
-# Multi-field fallback candidates per header (preferred first, then aliases)
 HEADER_FIELD_CANDIDATES: Dict[str, Tuple[str, ...]] = {}
 for h, f in HEADER_TO_FIELD.items():
     canon = canonical_field(f)
     aliases = FIELD_ALIASES.get(canon, ())
     HEADER_FIELD_CANDIDATES[h] = (canon,) + tuple(a for a in aliases if a)
 
-# Build FIELD_TO_HEADER that recognizes both canonical fields and known aliases.
-# Preference: keep vNext ROI/Forecast headers as “preferred” even if legacy variants exist.
+# Prefer these headers if there are multiple possible headers for a field
 _PREFERRED_HEADERS: Tuple[str, ...] = (
     "Forecast Price (1M)",
     "Expected ROI % (1M)",
@@ -1113,7 +1096,6 @@ def _norm_sheet_name(name: Optional[str]) -> str:
     return s.strip("_")
 
 
-# Internal registries stored as tuples to prevent mutation leaks
 _SHEET_HEADERS_LEGACY: Dict[str, Tuple[str, ...]] = {}
 _SHEET_HEADERS_VNEXT: Dict[str, Tuple[str, ...]] = {}
 
@@ -1243,9 +1225,7 @@ def _get_schema_mode_from_settings() -> Tuple[bool, str]:
     """
     enabled = True
     version = "vNext"
-
     try:
-        # Import inside function (avoid import-time coupling)
         from core.config import get_settings  # type: ignore
 
         s = get_settings()
@@ -1253,7 +1233,6 @@ def _get_schema_mode_from_settings() -> Tuple[bool, str]:
         version = str(getattr(s, "sheet_schema_version", "vNext") or "vNext")
     except Exception:
         pass
-
     version = (version or "vNext").strip()
     return enabled, version
 
@@ -1286,7 +1265,6 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Opti
         reg = _pick_registry(schema_version)
 
         if not key:
-            # Default fallback: vNext KSA (common), else legacy 59
             if reg is _SHEET_HEADERS_VNEXT:
                 return list(_VN_KSA_T)
             return list(_DEFAULT_59_TUPLE)
@@ -1295,12 +1273,10 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Opti
         if isinstance(v, tuple) and v:
             return list(v)
 
-        # contains / prefix matching (best-effort)
         for k, vv in reg.items():
             if key == k or key.startswith(k) or k in key:
                 return list(vv)
 
-        # Final fallback
         if reg is _SHEET_HEADERS_VNEXT:
             return list(_VN_KSA_T)
         return list(_DEFAULT_59_TUPLE)
