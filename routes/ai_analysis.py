@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.0) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.1) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,21 +12,11 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forecast/Expected + Valuation + Overall + Recommendation.
 
-v4.4.0 upgrades (to address your missing-columns findings)
-- ✅ Adds FORECAST columns expected by your dashboard:
-    Forecast Price (1M/3M/12M), Expected ROI % (1M/3M/12M),
-    Forecast Confidence, Forecast Updated (UTC/Riyadh).
-- ✅ Adds BADGES columns expected by your dashboard:
-    Rec Badge, Momentum Badge, Opportunity Badge, Risk Badge.
-- ✅ Stronger per-sheet header completion:
-    If core.schemas returns headers but is missing known required columns, we append them safely (no duplicates).
-- ✅ Stronger alias mapping for "Price/Prev Close/Change/Change %/Avg Vol 30D/Volatility 30D" variants.
-- ✅ Fills Forecast Updated (Riyadh) when only UTC exists.
-- ✅ Best-effort engine calling: tries include_history/include_fundamentals flags when supported.
-
-Important note
-- If the engine/provider returns NO data (data_source='none' or data_quality='BAD'), this router cannot invent fundamentals.
-  It will still compute what it can from history_points (if any) and from cross-field heuristics.
+v4.4.1 upgrades (completeness + GLOBAL readiness)
+- ✅ Stronger engine calling: passes sheet/page context when supported (page_key/sheet_name/market).
+- ✅ Adds cross-field computed fills (Change/Change%, Market Cap, Free Float Mkt Cap, Dividend Rate, Payout, etc.)
+  so GLOBAL pages can populate more even when providers return partial fields.
+- ✅ Keeps v4.4.0 forecasting + badges columns and schema-completion.
 """
 
 from __future__ import annotations
@@ -57,7 +47,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.4.0"
+AI_ANALYSIS_VERSION = "4.4.1"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -486,7 +476,6 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     roe: Optional[float] = None
     roa: Optional[float] = None
 
-    # History / expectations
     returns_1w: Optional[float] = None
     returns_1m: Optional[float] = None
     returns_3m: Optional[float] = None
@@ -781,8 +770,8 @@ def _history_parse_points(hp: Any) -> Tuple[List[float], List[float], Optional[s
       - list[dict] with keys close/c/cAdj, volume/v, t/time/date
       - list[list/tuple] (t, o, h, l, c, v) or similar
     """
-    closes: List[Tuple[float, float]] = []  # (t_epoch, close)
-    vols: List[Tuple[float, float]] = []  # (t_epoch, vol)
+    closes: List[Tuple[float, float]] = []
+    vols: List[Tuple[float, float]] = []
     last_dt: Optional[datetime] = None
 
     if not hp:
@@ -988,6 +977,41 @@ def _compute_forward_eps(price: Any, forward_pe: Any) -> Optional[float]:
     return round(p / fp, 6)
 
 
+def _compute_change_and_pct(price: Any, prev_close: Any) -> Tuple[Optional[float], Optional[float]]:
+    p = _safe_float_or_none(price)
+    pc = _safe_float_or_none(prev_close)
+    if p is None or pc is None:
+        return None, None
+    ch = p - pc
+    if pc == 0:
+        return round(ch, 6), None
+    pct = (ch / pc) * 100.0
+    return round(ch, 6), round(pct, 4)
+
+
+def _compute_market_cap(price: Any, shares_out: Any) -> Optional[float]:
+    p = _safe_float_or_none(price)
+    so = _safe_float_or_none(shares_out)
+    if p is None or so is None:
+        return None
+    if p <= 0 or so <= 0:
+        return None
+    return round(p * so, 2)
+
+
+def _compute_free_float_mkt_cap(market_cap: Any, free_float_pct: Any) -> Optional[float]:
+    mc = _safe_float_or_none(market_cap)
+    ff = _safe_float_or_none(free_float_pct)
+    if mc is None or ff is None:
+        return None
+    # ff might be 0..1 or 0..100
+    if 0.0 <= ff <= 1.0:
+        return round(mc * ff, 2)
+    if 1.0 < ff <= 100.0:
+        return round(mc * (ff / 100.0), 2)
+    return None
+
+
 def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
     if price is None or price <= 0:
@@ -1081,11 +1105,241 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[f
     return round(score, 2), reco, conf01
 
 
+def _derive_from_history(uq: Any) -> Dict[str, Any]:
+    """
+    Derived metrics from history_points when present.
+    Keys are LOWERCASED HEADER KEYS (hk style).
+    """
+    out: Dict[str, Any] = {}
+
+    hp = _safe_get(uq, "history_points", "history", "chart_points", "price_history", "bars")
+    closes, vols, last_iso = _history_parse_points(hp)
+
+    if closes:
+        if len(closes) >= 2:
+            out["prev close"] = closes[-2]
+            out["previous close"] = closes[-2]
+
+        out["ma20"] = _sma(closes, 20)
+        out["ma50"] = _sma(closes, 50)
+        out["ma200"] = _sma(closes, 200)
+
+        out["returns 1w %"] = _returns_from_close(closes, 5)
+        out["returns 1m %"] = _returns_from_close(closes, 21)
+        out["returns 3m %"] = _returns_from_close(closes, 63)
+        out["returns 6m %"] = _returns_from_close(closes, 126)
+        out["returns 12m %"] = _returns_from_close(closes, 252)
+
+        out["rsi (14)"] = _rsi_14(closes)
+        out["volatility 30d"] = _vol_30d_ann(closes)
+        out["volatility (30d)"] = out["volatility 30d"]
+
+        look = closes[-252:] if len(closes) >= 252 else closes
+        try:
+            out["52w high"] = max(look) if look else None
+            out["52w low"] = min(look) if look else None
+        except Exception:
+            pass
+
+    if vols:
+        take = vols[-30:] if len(vols) >= 30 else vols
+        avg = _mean(take)
+        if avg is not None:
+            out["avg vol 30d"] = avg
+            out["avg volume (30d)"] = avg
+        out["volume"] = vols[-1]
+
+    if isinstance(hp, list):
+        out["history points"] = len(hp)
+    elif isinstance(hp, dict):
+        for k in ("points", "data", "bars", "history"):
+            if isinstance(hp.get(k), list):
+                out["history points"] = len(hp[k])
+                break
+
+    if last_iso:
+        out["history last (utc)"] = last_iso
+
+    if hp:
+        out["history source"] = _safe_get(uq, "history_source") or "history_points"
+
+    return out
+
+
+def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cross-field best-effort fills to improve completeness when providers give partial fields.
+    Keys are header-key style (lowercase).
+    """
+    out: Dict[str, Any] = {}
+
+    price = _safe_get(uq, "current_price", "last_price", "price")
+    prev = _safe_get(uq, "previous_close", "prev_close") or derived.get("prev close") or derived.get("previous close")
+
+    # Change + Change %
+    ch = _safe_get(uq, "price_change", "change")
+    pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
+    if ch is None or pct is None:
+        ch2, pct2 = _compute_change_and_pct(price, prev)
+        if ch is None and ch2 is not None:
+            out["change"] = ch2
+            out["price change"] = ch2
+        if pct is None and pct2 is not None:
+            out["change %"] = pct2
+            out["percent change"] = pct2
+
+    # Market cap from shares * price
+    mc = _safe_get(uq, "market_cap")
+    so = _safe_get(uq, "shares_outstanding", "shares", "shares_out")
+    if mc is None:
+        mc2 = _compute_market_cap(price, so)
+        if mc2 is not None:
+            out["market cap"] = mc2
+
+    # Free float market cap
+    ffmc = _safe_get(uq, "free_float_market_cap", "free_float_mkt_cap")
+    ff = _safe_get(uq, "free_float", "free_float_percent")
+    if ffmc is None:
+        mc_src = mc if mc is not None else out.get("market cap")
+        ffmc2 = _compute_free_float_mkt_cap(mc_src, ff)
+        if ffmc2 is not None:
+            out["free float mkt cap"] = ffmc2
+            out["free float market cap"] = ffmc2
+            out["free float mkt cap"] = ffmc2
+
+    # Dividend rate from yield% * price
+    dy = _safe_get(uq, "dividend_yield", "div_yield")
+    dr = _safe_get(uq, "dividend_rate", "dividend_per_share")
+    if dr is None and dy is not None:
+        dr2 = _compute_dividend_rate(_ratio_to_percent(dy), price)
+        if dr2 is not None:
+            out["dividend rate"] = dr2
+
+    # Payout ratio from dividend rate / EPS
+    pr = _safe_get(uq, "payout_ratio")
+    if pr is None:
+        eps = _safe_get(uq, "eps_ttm", "eps")
+        dr_src = dr if dr is not None else out.get("dividend rate")
+        pr2 = _compute_payout_ratio_pct(dr_src, eps)
+        if pr2 is not None:
+            out["payout ratio %"] = pr2
+
+    # Forward PE / Forward EPS mutual fill
+    fpe = _safe_get(uq, "forward_pe", "pe_forward")
+    feps = _safe_get(uq, "forward_eps", "eps_forward")
+    if fpe is None and feps is not None:
+        fpe2 = _compute_forward_pe(price, feps)
+        if fpe2 is not None:
+            out["forward p/e"] = fpe2
+    if feps is None and fpe is not None:
+        feps2 = _compute_forward_eps(price, fpe)
+        if feps2 is not None:
+            out["forward eps"] = feps2
+
+    # 52W Position % if high/low exist
+    pos = _safe_get(uq, "position_52w_percent", "position_52w")
+    if pos is None:
+        lo = _safe_get(uq, "week_52_low", "low_52w") or derived.get("52w low")
+        hi = _safe_get(uq, "week_52_high", "high_52w") or derived.get("52w high")
+        pos2 = _compute_52w_position_pct(price, lo, hi)
+        if pos2 is not None:
+            out["52w position %"] = pos2
+
+    # Turnover % fallback
+    trn = _safe_get(uq, "turnover_percent")
+    if trn is None:
+        out_trn = _compute_turnover_pct(
+            _safe_get(uq, "volume") or derived.get("volume"),
+            so,
+            _safe_get(uq, "value_traded"),
+            mc if mc is not None else out.get("market cap"),
+        )
+        if out_trn is not None:
+            out["turnover %"] = out_trn
+
+    return out
+
+
+# =============================================================================
+# Forecast helpers
+# =============================================================================
+def _coerce_confidence_to_0_100(v: Any) -> Optional[float]:
+    x = _safe_float_or_none(v)
+    if x is None:
+        return None
+    if 0.0 <= x <= 1.0:
+        return round(x * 100.0, 2)
+    if 1.0 < x <= 100.0:
+        return round(x, 2)
+    return None
+
+
+def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort fill for dashboard FORECAST columns using:
+    - forecast_price_* / expected_price_* (engine)
+    - expected_roi_* / expected_return_* (engine)
+    - derived returns from history if needed
+    """
+    out: Dict[str, Any] = {}
+
+    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
+    if price is None:
+        return out
+
+    roi_1m = _safe_float_or_none(_safe_get(uq, "expected_roi_1m", "expected_return_1m"))
+    roi_3m = _safe_float_or_none(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
+    roi_12m = _safe_float_or_none(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
+
+    if roi_1m is None:
+        roi_1m = _safe_float_or_none(derived.get("returns 1m %"))
+    if roi_3m is None:
+        roi_3m = _safe_float_or_none(derived.get("returns 3m %"))
+    if roi_12m is None:
+        roi_12m = _safe_float_or_none(derived.get("returns 12m %"))
+
+    fp1 = _safe_float_or_none(_safe_get(uq, "forecast_price_1m", "expected_price_1m"))
+    fp3 = _safe_float_or_none(_safe_get(uq, "forecast_price_3m", "expected_price_3m"))
+    fp12 = _safe_float_or_none(_safe_get(uq, "forecast_price_12m", "expected_price_12m"))
+
+    if fp1 is None and roi_1m is not None:
+        fp1 = round(price * (1.0 + roi_1m / 100.0), 6)
+    if fp3 is None and roi_3m is not None:
+        fp3 = round(price * (1.0 + roi_3m / 100.0), 6)
+    if fp12 is None and roi_12m is not None:
+        fp12 = round(price * (1.0 + roi_12m / 100.0), 6)
+
+    out["forecast price (1m)"] = fp1
+    out["forecast price (3m)"] = fp3
+    out["forecast price (12m)"] = fp12
+
+    out["expected roi % (1m)"] = roi_1m
+    out["expected roi % (3m)"] = roi_3m
+    out["expected roi % (12m)"] = roi_12m
+
+    conf = _coerce_confidence_to_0_100(_safe_get(uq, "forecast_confidence", "confidence_score", "confidence"))
+    out["forecast confidence"] = conf
+
+    futc = (
+        _safe_get(uq, "forecast_updated_utc")
+        or _safe_get(uq, "last_updated_utc", "as_of_utc")
+        or derived.get("history last (utc)")
+        or _now_utc_iso()
+    )
+    out["forecast updated (utc)"] = _iso_or_none(futc) or futc
+
+    friy = _safe_get(uq, "forecast_updated_riyadh")
+    if not friy:
+        friy = _to_riyadh_iso(futc) or ""
+    out["forecast updated (riyadh)"] = _iso_or_none(friy) or friy
+
+    return out
+
+
 # =============================================================================
 # Headers – safe completion for missing “required” dashboard columns
 # =============================================================================
 _REQUIRED_DASHBOARD_COLS: Tuple[str, ...] = (
-    # Forecast set (your agreed columns)
     "Forecast Price (1M)",
     "Expected ROI % (1M)",
     "Forecast Price (3M)",
@@ -1095,23 +1349,18 @@ _REQUIRED_DASHBOARD_COLS: Tuple[str, ...] = (
     "Forecast Confidence",
     "Forecast Updated (UTC)",
     "Forecast Updated (Riyadh)",
-    # Technical set
     "Volatility 30D",
     "MA20",
     "MA50",
     "MA200",
-    # Badges
     "Rec Badge",
     "Momentum Badge",
     "Opportunity Badge",
     "Risk Badge",
-    # Context
     "Rank",
     "Origin",
 )
 
-
-# Fallback defaults (only used when core.schemas not present)
 _DEFAULT_HEADERS_BASE: List[str] = [
     "Rank",
     "Symbol",
@@ -1222,30 +1471,16 @@ def _append_missing_columns(base: List[str], extras: Sequence[str]) -> List[str]
 
 
 def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]:
-    """
-    Preference order:
-    1) core.schemas.get_headers_for_sheet(sheet_name)
-    2) fallback defaults
-
-    Enhancement:
-    - Always ensure required dashboard columns exist (forecast + badges + rank/origin),
-      because your KSA/GLOBAL completeness test showed missing headers (e.g. Forecast Updated Riyadh).
-    """
     m = (mode or "").strip().lower()
 
     h = _schemas_get_headers(sheet_name)
     if h and len(h) >= 10:
         hh = list(h)
-
-        # Always ensure our required dashboard columns exist
         hh = _append_missing_columns(hh, _REQUIRED_DASHBOARD_COLS)
-
-        # If extended mode, add extended fallback columns that may not be in schemas
         if m in ("ext", "extended", "full"):
             hh = _append_missing_columns(hh, _DEFAULT_HEADERS_EXTENDED)
         return hh
 
-    # No schemas -> fallback list
     if m in ("ext", "extended", "full"):
         return list(_DEFAULT_HEADERS_EXTENDED)
 
@@ -1253,7 +1488,6 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
     if any(k in sn for k in ("global", "insight", "opportun", "advisor", "analysis")):
         return list(_DEFAULT_HEADERS_EXTENDED)
 
-    # Base + required dashboard cols
     return _append_missing_columns(list(_DEFAULT_HEADERS_BASE), _REQUIRED_DASHBOARD_COLS)
 
 
@@ -1359,14 +1593,10 @@ _RATIO_HEADERS = {
 
 _VOL_HEADERS = {"volatility 30d", "volatility (30d)"}
 
-
-# Local header map: (candidate_fields, transform)
 _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
-    # context
     "rank": (("rank",), None),
     "origin": (("origin",), None),
 
-    # identity
     "symbol": (("symbol",), None),
     "company name": (("name", "company_name"), None),
     "name": (("name", "company_name"), None),
@@ -1379,7 +1609,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo", "ipo_date"), None),
 
-    # price/liquidity
     "price": (("current_price", "last_price", "price", "last"), None),
     "last price": (("current_price", "last_price", "price", "last"), None),
 
@@ -1406,7 +1635,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "value traded": (("value_traded", "value", "turnover_value"), None),
     "liquidity score": (("liquidity_score",), None),
 
-    # fundamentals/valuation
     "shares outstanding": (("shares_outstanding", "shares", "shares_out"), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
     "market cap": (("market_cap",), None),
@@ -1432,7 +1660,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "revenue growth %": (("revenue_growth", "revenue_growth_pct"), _ratio_to_percent),
     "net income growth %": (("net_income_growth", "net_income_growth_pct"), _ratio_to_percent),
 
-    # risk/tech
     "beta": (("beta",), None),
     "volatility 30d": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
@@ -1441,7 +1668,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "ma50": (("ma50",), None),
     "ma200": (("ma200",), None),
 
-    # valuation/scores/reco
     "fair value": (("fair_value",), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
@@ -1454,13 +1680,11 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "overall score": (("overall_score",), None),
     "recommendation": (("recommendation",), None),
 
-    # badges
     "rec badge": (("rec_badge",), None),
     "momentum badge": (("momentum_badge",), None),
     "opportunity badge": (("opportunity_badge",), None),
     "risk badge": (("risk_badge",), None),
 
-    # provenance
     "data source": (("data_source", "source", "provider"), None),
     "data quality": (("data_quality",), None),
 
@@ -1469,14 +1693,12 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
 
     "error": (("error",), None),
 
-    # extended: returns
     "returns 1w %": (("returns_1w",), _ratio_to_percent),
     "returns 1m %": (("returns_1m",), _ratio_to_percent),
     "returns 3m %": (("returns_3m",), _ratio_to_percent),
     "returns 6m %": (("returns_6m",), _ratio_to_percent),
     "returns 12m %": (("returns_12m",), _ratio_to_percent),
 
-    # extended: expected (engine)
     "expected return 1m %": (("expected_return_1m",), _ratio_to_percent),
     "expected return 3m %": (("expected_return_3m",), _ratio_to_percent),
     "expected return 12m %": (("expected_return_12m",), _ratio_to_percent),
@@ -1492,7 +1714,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "history source": (("history_source",), None),
     "history last (utc)": (("history_last_utc",), _iso_or_none),
 
-    # FORECAST: your sheet columns (map to engine expected_* or forecast_*)
     "forecast price (1m)": (("forecast_price_1m", "expected_price_1m"), None),
     "forecast price (3m)": (("forecast_price_3m", "expected_price_3m"), None),
     "forecast price (12m)": (("forecast_price_12m", "expected_price_12m"), None),
@@ -1592,10 +1813,7 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
 
         schema_field = _schemas_header_to_field_cached(h)
         local = _LOCAL_HEADER_MAP.get(hk)
-        if local:
-            lf, lt = local
-        else:
-            lf, lt = None, None
+        lf, lt = (local[0], local[1]) if local else (None, None)
 
         metas.append(
             _HeaderMeta(
@@ -1637,147 +1855,6 @@ def _apply_common_transforms(hk: str, v: Any) -> Any:
     return v
 
 
-def _derive_from_history(uq: Any) -> Dict[str, Any]:
-    """
-    Derived metrics from history_points when present.
-    Keys are LOWERCASED HEADER KEYS (hk style).
-    """
-    out: Dict[str, Any] = {}
-
-    hp = _safe_get(uq, "history_points", "history", "chart_points", "price_history", "bars")
-    closes, vols, last_iso = _history_parse_points(hp)
-
-    if closes:
-        if len(closes) >= 2:
-            out["prev close"] = closes[-2]
-            out["previous close"] = closes[-2]
-
-        out["ma20"] = _sma(closes, 20)
-        out["ma50"] = _sma(closes, 50)
-        out["ma200"] = _sma(closes, 200)
-
-        out["returns 1w %"] = _returns_from_close(closes, 5)
-        out["returns 1m %"] = _returns_from_close(closes, 21)
-        out["returns 3m %"] = _returns_from_close(closes, 63)
-        out["returns 6m %"] = _returns_from_close(closes, 126)
-        out["returns 12m %"] = _returns_from_close(closes, 252)
-
-        out["rsi (14)"] = _rsi_14(closes)
-        out["volatility 30d"] = _vol_30d_ann(closes)
-        out["volatility (30d)"] = out["volatility 30d"]
-
-        # 52W fallback bounds
-        look = closes[-252:] if len(closes) >= 252 else closes
-        try:
-            out["52w high"] = max(look) if look else None
-            out["52w low"] = min(look) if look else None
-        except Exception:
-            pass
-
-    if vols:
-        take = vols[-30:] if len(vols) >= 30 else vols
-        avg = _mean(take)
-        if avg is not None:
-            out["avg vol 30d"] = avg
-            out["avg volume (30d)"] = avg
-        out["volume"] = vols[-1]
-
-    # history meta
-    if isinstance(hp, list):
-        out["history points"] = len(hp)
-    elif isinstance(hp, dict):
-        for k in ("points", "data", "bars", "history"):
-            if isinstance(hp.get(k), list):
-                out["history points"] = len(hp[k])
-                break
-
-    if last_iso:
-        out["history last (utc)"] = last_iso
-
-    if hp:
-        out["history source"] = _safe_get(uq, "history_source") or "history_points"
-
-    return out
-
-
-def _coerce_confidence_to_0_100(v: Any) -> Optional[float]:
-    x = _safe_float_or_none(v)
-    if x is None:
-        return None
-    if 0.0 <= x <= 1.0:
-        return round(x * 100.0, 2)
-    if 1.0 < x <= 100.0:
-        return round(x, 2)
-    return None
-
-
-def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Best-effort fill for dashboard FORECAST columns using:
-    - forecast_price_* / expected_price_* (engine)
-    - expected_roi_* / expected_return_* (engine)
-    - derived returns from history if needed
-    """
-    out: Dict[str, Any] = {}
-
-    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
-    if price is None:
-        return out
-
-    # ROI sources (prefer expected_return_* then expected_roi_* then derived returns)
-    roi_1m = _safe_float_or_none(_safe_get(uq, "expected_roi_1m", "expected_return_1m"))
-    roi_3m = _safe_float_or_none(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
-    roi_12m = _safe_float_or_none(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
-
-    if roi_1m is None:
-        roi_1m = _safe_float_or_none(derived.get("returns 1m %"))
-    if roi_3m is None:
-        roi_3m = _safe_float_or_none(derived.get("returns 3m %"))
-    if roi_12m is None:
-        roi_12m = _safe_float_or_none(derived.get("returns 12m %"))
-
-    # prices (prefer forecast_price_* then expected_price_* then compute from ROI)
-    fp1 = _safe_float_or_none(_safe_get(uq, "forecast_price_1m", "expected_price_1m"))
-    fp3 = _safe_float_or_none(_safe_get(uq, "forecast_price_3m", "expected_price_3m"))
-    fp12 = _safe_float_or_none(_safe_get(uq, "forecast_price_12m", "expected_price_12m"))
-
-    if fp1 is None and roi_1m is not None:
-        fp1 = round(price * (1.0 + roi_1m / 100.0), 6)
-    if fp3 is None and roi_3m is not None:
-        fp3 = round(price * (1.0 + roi_3m / 100.0), 6)
-    if fp12 is None and roi_12m is not None:
-        fp12 = round(price * (1.0 + roi_12m / 100.0), 6)
-
-    out["forecast price (1m)"] = fp1
-    out["forecast price (3m)"] = fp3
-    out["forecast price (12m)"] = fp12
-
-    out["expected roi % (1m)"] = roi_1m
-    out["expected roi % (3m)"] = roi_3m
-    out["expected roi % (12m)"] = roi_12m
-
-    # confidence
-    conf = _coerce_confidence_to_0_100(_safe_get(uq, "forecast_confidence", "confidence_score", "confidence"))
-    out["forecast confidence"] = conf
-
-    # updated times
-    futc = (
-        _safe_get(uq, "forecast_updated_utc")
-        or _safe_get(uq, "last_updated_utc", "as_of_utc")
-        or derived.get("history last (utc)")
-        or _now_utc_iso()
-    )
-    out["forecast updated (utc)"] = _iso_or_none(futc) or futc
-
-    # riyadh
-    friy = _safe_get(uq, "forecast_updated_riyadh")
-    if not friy:
-        friy = _to_riyadh_iso(futc) or ""
-    out["forecast updated (riyadh)"] = _iso_or_none(friy) or friy
-
-    return out
-
-
 def _value_for_meta(
     meta: _HeaderMeta,
     uq: Any,
@@ -1785,13 +1862,13 @@ def _value_for_meta(
     row_index_1based: int,
     origin: str,
     derived: Dict[str, Any],
+    cross: Dict[str, Any],
     forecast: Dict[str, Any],
     fair_pack: Optional[Tuple[Any, Any, Any]],
     overall_pack: Optional[Tuple[Any, Any, Any]],
 ) -> Any:
     hk = meta.hk
 
-    # Sheet-level
     if hk == "rank":
         v = _safe_get(uq, "rank")
         return v if not _is_blank(v) else row_index_1based
@@ -1800,17 +1877,17 @@ def _value_for_meta(
         v = _safe_get(uq, "origin")
         return v if not _is_blank(v) else origin
 
-    # 52w position %
     if hk in ("52w position %", "52w position"):
         v = _safe_get(uq, "position_52w_percent", "position_52w")
         if v is not None:
             return _ratio_to_percent(v)
+        if hk in cross:
+            return cross.get(hk)
         cp = _safe_get(uq, "current_price", "last_price", "price")
         lo = _safe_get(uq, "week_52_low", "low_52w") or derived.get("52w low")
         hi = _safe_get(uq, "week_52_high", "high_52w") or derived.get("52w high")
         return _compute_52w_position_pct(cp, lo, hi)
 
-    # Updated timestamps
     if hk == "last updated (utc)":
         v = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         return _iso_or_none(v)
@@ -1822,11 +1899,9 @@ def _value_for_meta(
             v = _to_riyadh_iso(u) or ""
         return _iso_or_none(v) or v
 
-    # Forecast columns (prefer explicit forecast dict)
     if hk in forecast and not _is_blank(forecast.get(hk)):
         return _apply_common_transforms(hk, forecast.get(hk))
 
-    # Valuation pack
     if hk in ("fair value", "upside %", "valuation label"):
         fair, upside, label = fair_pack or (None, None, None)
         if hk == "fair value":
@@ -1840,7 +1915,6 @@ def _value_for_meta(
             v = _safe_get(uq, "valuation_label")
             return v if v is not None else label
 
-    # Overall/reco pack
     if hk in ("overall score", "recommendation"):
         overall_calc, reco_calc, _conf01 = overall_pack or (None, "HOLD", None)
         if hk == "overall score":
@@ -1851,14 +1925,12 @@ def _value_for_meta(
             raw = v if v is not None else reco_calc
             return _normalize_recommendation(raw)
 
-    # 1) schemas mapping
     if meta.schema_field:
         v = _safe_get(uq, meta.schema_field)
         v = _apply_common_transforms(hk, v)
         if not _is_blank(v):
             return v
 
-    # 2) local map
     if meta.local_fields:
         val = _safe_get(uq, *meta.local_fields)
         if meta.local_transform and val is not None:
@@ -1870,56 +1942,27 @@ def _value_for_meta(
         if not _is_blank(val):
             return val
 
-    # 3) derived from history
+    if hk in cross and not _is_blank(cross.get(hk)):
+        return _apply_common_transforms(hk, cross.get(hk))
+
     if hk in derived and not _is_blank(derived.get(hk)):
         return _apply_common_transforms(hk, derived.get(hk))
 
-    # 4) snake guess
     val = _safe_get(uq, meta.guess)
     val = _apply_common_transforms(hk, val)
     if not _is_blank(val):
         return val
 
-    # 5) computed cross-field fallbacks
-    if hk == "forward p/e":
-        price = _safe_get(uq, "current_price", "last_price", "price")
-        feps = _safe_get(uq, "forward_eps")
-        return _compute_forward_pe(price, feps)
+    # extra cross-field fallbacks keyed by hk
+    if hk in ("change", "price change", "change %", "percent change", "market cap", "free float mkt cap", "dividend rate", "payout ratio %", "turnover %"):
+        if hk in cross:
+            return _apply_common_transforms(hk, cross.get(hk))
 
-    if hk == "forward eps":
-        price = _safe_get(uq, "current_price", "last_price", "price")
-        fpe = _safe_get(uq, "forward_pe")
-        return _compute_forward_eps(price, fpe)
-
-    if hk == "dividend rate":
-        dy = _ratio_to_percent(_safe_get(uq, "dividend_yield"))
-        price = _safe_get(uq, "current_price", "last_price", "price")
-        return _compute_dividend_rate(dy, price)
-
-    if hk == "payout ratio %":
-        dr = _safe_get(uq, "dividend_rate")
-        if _is_blank(dr):
-            dy = _ratio_to_percent(_safe_get(uq, "dividend_yield"))
-            price = _safe_get(uq, "current_price", "last_price", "price")
-            dr = _compute_dividend_rate(dy, price)
-        eps = _safe_get(uq, "eps_ttm", "eps")
-        return _compute_payout_ratio_pct(dr, eps)
-
-    if hk == "turnover %":
-        return _compute_turnover_pct(
-            _safe_get(uq, "volume") or derived.get("volume"),
-            _safe_get(uq, "shares_outstanding"),
-            _safe_get(uq, "value_traded"),
-            _safe_get(uq, "market_cap"),
-        )
-
-    # If Data Source missing, use history_source as fallback
     if hk == "data source":
         hs = _safe_get(uq, "history_source")
         if not _is_blank(hs):
             return str(hs)
 
-    # If Data Quality missing, infer
     if hk == "data quality":
         p = _safe_get(uq, "current_price", "last_price", "price")
         if not _is_blank(p):
@@ -1945,6 +1988,12 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
         except Exception:
             derived = {}
 
+    cross: Dict[str, Any] = {}
+    try:
+        cross = _derive_cross_fields(uq, derived)
+    except Exception:
+        cross = {}
+
     forecast: Dict[str, Any] = {}
     if plan.needs_forecast_fill:
         try:
@@ -1952,7 +2001,6 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
         except Exception:
             forecast = {}
 
-    # Ensure Riyadh timestamp exists if requested
     if plan.need_last_riyadh:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         last_riy = _safe_get(uq, "last_updated_riyadh")
@@ -1973,6 +2021,7 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
             row_index_1based=row_index_1based,
             origin=origin,
             derived=derived,
+            cross=cross,
             forecast=forecast,
             fair_pack=fair_pack,
             overall_pack=overall_pack,
@@ -1985,7 +2034,7 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
 
 
 # =============================================================================
-# Engine calls (defensive batching)
+# Engine calls (defensive batching) + supported-kwargs filter
 # =============================================================================
 async def _maybe_await(x: Any) -> Any:
     if inspect.isawaitable(x):
@@ -1999,35 +2048,70 @@ def _unwrap_tuple_payload(x: Any) -> Any:
     return x
 
 
-def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str]) -> Any:
+def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Calls fn(*args, **filtered_kwargs) where kwargs are filtered to what fn accepts.
+    If fn has **kwargs, passes all kwargs.
+    """
+    if not kwargs:
+        return fn(*args)
+
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return fn(*args, **kwargs)
+
+        allowed = set(params.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+        return fn(*args, **filtered)
+    except Exception:
+        # fall back to naive call (may TypeError)
+        return fn(*args, **kwargs)
+
+
+def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Any:
     """
     Best effort calling pattern:
     - tries refresh=False with optional include_history/include_fundamentals (if supported)
-    - falls back to plain call(s) if signature doesn't accept kwargs
+    - also passes ctx keys (sheet_name/page_key/page/market/region) when supported
     """
     fn = getattr(engine, fn_name, None)
     if not callable(fn):
         return None
 
-    # Try richer kwargs first
+    ctx = ctx or {}
+    ctx_try = {
+        # common naming variants across engines
+        "sheet_name": ctx.get("sheet_name"),
+        "sheet": ctx.get("sheet_name"),
+        "page_key": ctx.get("page_key"),
+        "page": ctx.get("page_key") or ctx.get("sheet_name"),
+        "market": ctx.get("market"),
+        "region": ctx.get("market") or ctx.get("region"),
+    }
+    # remove nulls
+    ctx_try = {k: v for k, v in ctx_try.items() if v not in (None, "", [])}
+
     kw_attempts = [
         {"refresh": False, "include_history": True, "include_fundamentals": True},
         {"refresh": False, "include_history": True},
         {"refresh": False},
-        {},  # plain
+        {},
     ]
 
     last_exc: Optional[Exception] = None
     for kw in kw_attempts:
         try:
-            return fn(syms, **kw)  # type: ignore[arg-type]
+            merged = dict(ctx_try)
+            merged.update(kw)
+            return _call_with_supported_kwargs(fn, syms, **merged)
         except TypeError as e:
             last_exc = e
             continue
         except Exception:
             raise
 
-    # Final fallback: call without kwargs
     try:
         return fn(syms)
     except Exception:
@@ -2062,17 +2146,17 @@ def _index_keys_for_quote(q: Any) -> List[str]:
     return out
 
 
-async def _engine_get_quotes_any(engine: Any, syms: List[str]) -> Union[List[Any], Dict[str, Any]]:
+async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Union[List[Any], Dict[str, Any]]:
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
-        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms)))
+        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms, ctx=ctx)))
         if isinstance(res, (list, dict)):
             return res
         return list(res or [])
 
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
-        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_quotes", syms)))
+        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_quotes", syms, ctx=ctx)))
         if isinstance(res, (list, dict)):
             return res
         return list(res or [])
@@ -2081,11 +2165,11 @@ async def _engine_get_quotes_any(engine: Any, syms: List[str]) -> Union[List[Any
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
         if callable(fn3):
-            out.append(_unwrap_tuple_payload(await _maybe_await(fn3(s))))
+            out.append(_unwrap_tuple_payload(await _maybe_await(_call_with_supported_kwargs(fn3, s, **(ctx or {})))))
             continue
         fn4 = getattr(engine, "get_quote", None)
         if callable(fn4):
-            out.append(_unwrap_tuple_payload(await _maybe_await(fn4(s))))
+            out.append(_unwrap_tuple_payload(await _maybe_await(_call_with_supported_kwargs(fn4, s, **(ctx or {})))))
             continue
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
@@ -2098,6 +2182,7 @@ async def _get_quotes_chunked(
     batch_size: int,
     timeout_sec: float,
     max_concurrency: int,
+    ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     clean = _clean_symbols(symbols)
     if not clean:
@@ -2113,7 +2198,7 @@ async def _get_quotes_chunked(
     async def _run_chunk(chunk_syms: List[str]) -> Tuple[List[str], Union[Union[List[Any], Dict[str, Any]], Exception]]:
         async with sem:
             try:
-                res = await asyncio.wait_for(_engine_get_quotes_any(engine, chunk_syms), timeout=timeout_sec)
+                res = await asyncio.wait_for(_engine_get_quotes_any(engine, chunk_syms, ctx=ctx), timeout=timeout_sec)
                 return chunk_syms, res
             except Exception as e:
                 return chunk_syms, e
@@ -2316,7 +2401,14 @@ async def analyze_single_quote(
         return SingleAnalysisResponse(symbol="", data_quality="MISSING", error="Symbol is required")
 
     cfg = _cfg()
-    m = await _get_quotes_chunked(request, [t], batch_size=1, timeout_sec=cfg["timeout_sec"], max_concurrency=1)
+    m = await _get_quotes_chunked(
+        request,
+        [t],
+        batch_size=1,
+        timeout_sec=cfg["timeout_sec"],
+        max_concurrency=1,
+        ctx=None,
+    )
 
     key = _normalize_any(t) or t.strip().upper()
     uq = m.get(key) or _make_placeholder(key, dq="MISSING", err="No data returned")
@@ -2346,6 +2438,7 @@ async def analyze_batch_quotes(
         batch_size=cfg["batch_size"],
         timeout_sec=cfg["timeout_sec"],
         max_concurrency=cfg["concurrency"],
+        ctx=None,
     )
 
     results: List[SingleAnalysisResponse] = []
@@ -2391,6 +2484,13 @@ async def analyze_for_sheet(
 
     plan = _build_header_plan(tuple(headers))
 
+    # context for engines that can route providers by page
+    ctx = {
+        "sheet_name": sheet_name,
+        "page_key": sheet_name,
+        "market": "GLOBAL" if (sheet_name or "").upper().startswith("GLOBAL") else None,
+    }
+
     try:
         m = await _get_quotes_chunked(
             request,
@@ -2398,6 +2498,7 @@ async def analyze_for_sheet(
             batch_size=cfg["batch_size"],
             timeout_sec=cfg["timeout_sec"],
             max_concurrency=cfg["concurrency"],
+            ctx=ctx,
         )
 
         rows: List[List[Any]] = []
