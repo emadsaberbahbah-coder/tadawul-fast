@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-# test_endpoints.py  (FULL REPLACEMENT)
+# tests/test_endpoints.py  (FULL REPLACEMENT)
 """
-SMOKE TESTER for Tadawul Fast Bridge API – v2.5.0 (Prod-aligned)
+SMOKE TESTER for Tadawul Fast Bridge API – v2.6.0 (Prod-aligned + safer)
 
 What it tests (based on your deployed reality):
 - GET /, /healthz, /readyz, /health
-- Router health: /v1/enriched/health, /v1/analysis/health, /v1/advanced/health, /v1/argaam/health, /system/settings
-- Single quotes: /v1/enriched/quote?symbol=...
-- Batch quotes (GET): /v1/enriched/quotes?symbols=SYM1,SYM2,...
+- Router health:
+    /v1/enriched/health
+    /v1/analysis/health
+    /v1/advanced/health
+    /v1/argaam/health
+    /system/settings
+- Single quote:
+    GET /v1/enriched/quote?symbol=...
+- Batch quotes (GET):
+    GET /v1/enriched/quotes?symbols=SYM1,SYM2,...
 
-Notes:
-- /system/routes is NOT deployed (404) -> removed
-- /v1/enriched/sheet-rows is NOT deployed (404) -> removed
+Notes
+- /system/routes is NOT deployed (404) -> not tested
+- /v1/enriched/sheet-rows is NOT deployed (404) -> not tested
 - Batch endpoint expects "symbols" query param (NOT "tickers")
+- Token header: X-APP-TOKEN (plus Authorization Bearer for back-compat)
 
 Usage:
-  python test_endpoints.py
-  TFB_BASE_URL=https://tadawul-fast-bridge.onrender.com python test_endpoints.py
-  python test_endpoints.py --ksa 1120.SR --global AAPL
+  python tests/test_endpoints.py
+  TFB_BASE_URL=https://tadawul-fast-bridge.onrender.com python tests/test_endpoints.py
+  python tests/test_endpoints.py --ksa 1120.SR --global AAPL
+  python tests/test_endpoints.py --base-url http://127.0.0.1:8000 --no-color
 """
 
 from __future__ import annotations
@@ -28,14 +37,17 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
+SCRIPT_VERSION = "2.6.0"
+
 DEFAULT_BASE_URL = (
     os.getenv("TFB_BASE_URL")
     or os.getenv("BACKEND_BASE_URL")
+    or os.getenv("BASE_URL")
     or "http://127.0.0.1:8000"
 ).rstrip("/")
 
@@ -53,10 +65,15 @@ TIMEOUT_SHORT = float(os.getenv("TFB_TIMEOUT_SHORT", "15") or "15")
 TIMEOUT_MED = float(os.getenv("TFB_TIMEOUT_MED", "25") or "25")
 TIMEOUT_LONG = float(os.getenv("TFB_TIMEOUT_LONG", "90") or "90")
 
-USER_AGENT = os.getenv("TFB_USER_AGENT", "TadawulFastBridge-EndpointTester/2.5.0") or "TadawulFastBridge-EndpointTester/2.5.0"
+USER_AGENT = os.getenv(
+    "TFB_USER_AGENT",
+    f"TadawulFastBridge-EndpointTester/{SCRIPT_VERSION}",
+) or f"TadawulFastBridge-EndpointTester/{SCRIPT_VERSION}"
 
 
-def _colors_enabled() -> bool:
+def _colors_enabled(force_off: bool = False) -> bool:
+    if force_off:
+        return False
     if os.getenv("NO_COLOR"):
         return False
     try:
@@ -65,16 +82,22 @@ def _colors_enabled() -> bool:
         return False
 
 
-_USE_COLOR = _colors_enabled()
-
-
 class C:
-    HEADER = "\033[95m" if _USE_COLOR else ""
-    OKBLUE = "\033[94m" if _USE_COLOR else ""
-    OKGREEN = "\033[92m" if _USE_COLOR else ""
-    WARNING = "\033[93m" if _USE_COLOR else ""
-    FAIL = "\033[91m" if _USE_COLOR else ""
-    ENDC = "\033[0m" if _USE_COLOR else ""
+    HEADER: str = ""
+    OKBLUE: str = ""
+    OKGREEN: str = ""
+    WARNING: str = ""
+    FAIL: str = ""
+    ENDC: str = ""
+
+
+def _init_colors(use_color: bool) -> None:
+    C.HEADER = "\033[95m" if use_color else ""
+    C.OKBLUE = "\033[94m" if use_color else ""
+    C.OKGREEN = "\033[92m" if use_color else ""
+    C.WARNING = "\033[93m" if use_color else ""
+    C.FAIL = "\033[91m" if use_color else ""
+    C.ENDC = "\033[0m" if use_color else ""
 
 
 def log(msg: str, typ: str = "info") -> None:
@@ -155,8 +178,15 @@ def request_any(
 def check_server(sess: requests.Session, base_url: str, headers: Dict[str, str]) -> bool:
     log("Checking Server Connectivity...", "header")
 
-    for ep, critical in [("/", True), ("/healthz", True), ("/health", False), ("/readyz", False)]:
-        r, dt, err = request_any(sess, "GET", f"{base_url}{ep}", headers=headers, timeout=TIMEOUT_MED)
+    checks = [
+        ("/", True, TIMEOUT_MED),
+        ("/healthz", True, TIMEOUT_MED),
+        ("/health", False, TIMEOUT_MED),
+        ("/readyz", False, TIMEOUT_MED),
+    ]
+
+    for ep, critical, tmo in checks:
+        r, dt, err = request_any(sess, "GET", f"{base_url}{ep}", headers=headers, timeout=tmo)
         if err or r is None:
             log(f"GET {ep} -> Exception: {err}", "fail" if critical else "warn")
             if critical:
@@ -196,10 +226,15 @@ def check_router_health(sess: requests.Session, base_url: str, headers: Dict[str
         if err or r is None:
             log(f"{ep.ljust(26)} -> Exception: {err}", "fail")
             continue
+
         if r.status_code == 200:
             j = safe_json(r) or {}
-            ver = j.get("version") or j.get("route_version") or ""
-            status = j.get("status") or "ok"
+            ver = ""
+            if isinstance(j, dict):
+                ver = str(j.get("version") or j.get("route_version") or "").strip()
+                status = str(j.get("status") or "ok").strip()
+            else:
+                status = "ok"
             extra = f" v={ver}" if ver else ""
             log(f"{ep.ljust(26)} -> {status} ({fmt_dt(dt)}){extra}", "success")
         else:
@@ -221,13 +256,14 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
     if err or r is None:
         log(f"/v1/enriched/quote -> Exception: {err}", "fail")
         return
+
     if r.status_code != 200:
         log(f"/v1/enriched/quote -> HTTP {r.status_code} ({fmt_dt(dt)}) body={body_preview(r)!r}", "fail")
         return
 
     data = safe_json(r)
     if not isinstance(data, dict):
-        log(f"/v1/enriched/quote -> Non-JSON response ({fmt_dt(dt)})", "fail")
+        log(f"/v1/enriched/quote -> Non-JSON response ({fmt_dt(dt)}) body={body_preview(r)!r}", "fail")
         return
 
     price = data.get("current_price")
@@ -236,7 +272,7 @@ def check_quote(sess: requests.Session, base_url: str, headers: Dict[str, str], 
     dq = data.get("data_quality")
     err_msg = data.get("error") or ""
 
-    log(f"status={status} price={price} dq={dq} src={src} ({fmt_dt(dt)})", "success" if price else "warn")
+    log(f"status={status} price={price} dq={dq} src={src} ({fmt_dt(dt)})", "success" if price is not None else "warn")
     if err_msg:
         log(f"warning/error: {err_msg}", "warn")
 
@@ -257,13 +293,14 @@ def check_batch_quotes(sess: requests.Session, base_url: str, headers: Dict[str,
     if err or r is None:
         log(f"/v1/enriched/quotes -> Exception: {err}", "fail")
         return
+
     if r.status_code != 200:
         log(f"/v1/enriched/quotes -> HTTP {r.status_code} ({fmt_dt(dt)}) body={body_preview(r)!r}", "fail")
         return
 
     data = safe_json(r)
     if not isinstance(data, dict):
-        log(f"/v1/enriched/quotes -> Non-JSON response ({fmt_dt(dt)})", "fail")
+        log(f"/v1/enriched/quotes -> Non-JSON response ({fmt_dt(dt)}) body={body_preview(r)!r}", "fail")
         return
 
     items = data.get("items") or []
@@ -286,12 +323,16 @@ def main() -> int:
     p.add_argument("--token", default=DEFAULT_TOKEN)
     p.add_argument("--ksa", default=KSA_TEST_SYMBOL)
     p.add_argument("--global", dest="global_sym", default=GLOBAL_TEST_SYMBOL)
+    p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    p.add_argument("--verbose", action="store_true", help="Print JSON previews for health endpoints")
     args = p.parse_args()
 
     base_url = str(args.base_url).rstrip("/")
     token = str(args.token).strip()
 
-    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.5.0{C.ENDC}")
+    _init_colors(_colors_enabled(force_off=bool(args.no_color)))
+
+    print(f"{C.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v{SCRIPT_VERSION}{C.ENDC}")
     print(f"BASE_URL={base_url} | TOKEN={'SET' if token else 'NOT SET'}")
     print(f"KSA_TEST_SYMBOL={args.ksa} | GLOBAL_TEST_SYMBOL={args.global_sym}")
 
@@ -302,7 +343,18 @@ def main() -> int:
         print("\n❌ Cannot proceed (server connectivity failed).")
         return 2
 
+    # Router health (optionally show JSON previews)
     check_router_health(sess, base_url, hdrs)
+    if args.verbose:
+        log("Verbose health JSON previews", "header")
+        for ep in ["/v1/enriched/health", "/v1/analysis/health", "/v1/advanced/health", "/v1/argaam/health", "/system/settings"]:
+            r, dt, err = request_any(sess, "GET", f"{base_url}{ep}", headers=hdrs, timeout=TIMEOUT_MED)
+            if err or r is None:
+                log(f"{ep} -> Exception: {err}", "warn")
+                continue
+            j = safe_json(r)
+            log(f"{ep} ({fmt_dt(dt)}) -> {json_pretty(j)}", "info")
+
     check_quote(sess, base_url, hdrs, str(args.ksa))
     check_quote(sess, base_url, hdrs, str(args.global_sym))
     check_batch_quotes(sess, base_url, hdrs, [str(args.ksa), str(args.global_sym)])
