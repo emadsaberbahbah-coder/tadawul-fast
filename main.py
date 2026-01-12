@@ -2,7 +2,7 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.3
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.4
 
 Key guarantees
 - ✅ Never-crash startup: all heavy imports are deferred + best-effort
@@ -10,7 +10,7 @@ Key guarantees
 - ✅ Router imports happen in worker threads; app.include_router() happens on event loop thread
 - ✅ /readyz always returns without touching routers/engine internals
 - ✅ Backward-compatible settings resolution:
-      ENV -> env.py -> repo-root config.py -> core.config (shim safe)
+      ENV -> env.py -> core.config -> repo-root config.py (all best-effort)
 
 Entrypoint for Render/uvicorn:
   uvicorn main:app
@@ -44,9 +44,9 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.3.3"
+APP_ENTRY_VERSION = "5.3.4"
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
 
@@ -188,7 +188,7 @@ def _apply_runtime_env_aliases_last_resort() -> None:
     if os.getenv("HTTP_TIMEOUT") and not os.getenv("HTTP_TIMEOUT_SEC"):
         _export_env_if_missing("HTTP_TIMEOUT_SEC", os.getenv("HTTP_TIMEOUT"))
 
-    # Feature defaults for consistency
+    # Feature defaults for consistency (never override explicit values)
     os.environ.setdefault("ENABLE_YAHOO_CHART_KSA", "true")
     os.environ.setdefault("ENABLE_YAHOO_CHART_SUPPLEMENT", "true")
     os.environ.setdefault("ENABLE_YFINANCE_KSA", "false")
@@ -218,7 +218,7 @@ def _apply_provider_defaults_if_missing() -> None:
 
 
 # ---------------------------------------------------------------------
-# Settings resolution (ENV -> env.py -> config.py/core.config)
+# Settings resolution (ENV -> env.py -> core.config -> config.py)
 # ---------------------------------------------------------------------
 def _load_env_module() -> Optional[object]:
     try:
@@ -231,18 +231,19 @@ def _load_env_module() -> Optional[object]:
 
 def _try_load_settings() -> Tuple[Optional[object], Optional[str]]:
     """
-    Prefer repo-root config.py. Fall back to core.config (shim safe).
+    Prefer core.config (canonical). Fall back to repo-root config.py.
+    Never raises.
     """
-    try:
-        from config import get_settings  # type: ignore
-
-        return get_settings(), "config.get_settings"
-    except Exception:
-        pass
     try:
         from core.config import get_settings  # type: ignore
 
         return get_settings(), "core.config.get_settings"
+    except Exception:
+        pass
+    try:
+        from config import get_settings  # type: ignore
+
+        return get_settings(), "config.get_settings"
     except Exception:
         return None, None
 
@@ -311,7 +312,14 @@ def _resolve_env_name(settings: Optional[object], env_mod: Optional[object]) -> 
 
 
 def _cors_allow_origins(settings: Optional[object], env_mod: Optional[object]) -> List[str]:
-    cors_all = _truthy(_get(settings, env_mod, "CORS_ALL_ORIGINS", _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", "true")))
+    cors_all = _truthy(
+        _get(
+            settings,
+            env_mod,
+            "CORS_ALL_ORIGINS",
+            _get(settings, env_mod, "ENABLE_CORS_ALL_ORIGINS", "true"),
+        )
+    )
     if cors_all:
         return ["*"]
     raw = str(_get(settings, env_mod, "CORS_ORIGINS", "") or "").strip()
@@ -344,7 +352,9 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     if ai_enabled:
         routers.append(("ai_analysis", ["routes.ai_analysis", "ai_analysis", "routes.analysis", "core.ai_analysis"]))
     if adv_enabled:
-        routers.append(("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "routes.adv_analysis", "core.advanced_analysis"]))
+        routers.append(
+            ("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "routes.adv_analysis", "core.advanced_analysis"])
+        )
 
     # Optional routers (not required)
     routers.append(("argaam", ["routes.argaam", "routes.routes_argaam", "routes_argaam", "core.routes_argaam"]))
@@ -523,7 +533,7 @@ async def _mount_all_routers_async(app_: FastAPI) -> None:
 async def _background_boot(app_: FastAPI) -> None:
     try:
         await _mount_all_routers_async(app_)
-        init_engine = _truthy(getattr(app_.state, "init_engine_on_boot", True))
+        init_engine = bool(getattr(app_.state, "init_engine_on_boot", True))
         if init_engine:
             await _init_engine_best_effort_async(app_)
         app_.state.boot_error = None
@@ -592,6 +602,24 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
     }
 
 
+def _docs_config(settings: Optional[object], env_mod: Optional[object]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Optional: control docs in production without breaking anything.
+    ENV flags (default ON):
+      ENABLE_SWAGGER=true/false
+      ENABLE_REDOC=true/false
+      ENABLE_OPENAPI=true/false
+    """
+    enable_openapi = _feature_enabled(settings, env_mod, "ENABLE_OPENAPI", True)
+    enable_swagger = _feature_enabled(settings, env_mod, "ENABLE_SWAGGER", True)
+    enable_redoc = _feature_enabled(settings, env_mod, "ENABLE_REDOC", True)
+
+    openapi_url = "/openapi.json" if enable_openapi else None
+    docs_url = "/docs" if (enable_openapi and enable_swagger) else None
+    redoc_url = "/redoc" if (enable_openapi and enable_redoc) else None
+    return openapi_url, docs_url, redoc_url
+
+
 # ---------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------
@@ -613,6 +641,7 @@ def create_app() -> FastAPI:
     allow_credentials = False if allow_origins == ["*"] else True
 
     routers_to_mount, required_default = _router_plan(settings, env_mod)
+    openapi_url, docs_url, redoc_url = _docs_config(settings, env_mod)
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
@@ -639,12 +668,13 @@ def create_app() -> FastAPI:
         app_.state.defer_router_mount = _truthy(defer_val) if isinstance(defer_val, str) else bool(defer_val)
         app_.state.init_engine_on_boot = _truthy(init_val) if isinstance(init_val, str) else bool(init_val)
 
+        enabled, ksa = _providers_from_settings(settings, env_mod)
+
         logger.info("==============================================")
         logger.info("🚀 Tadawul Fast Bridge starting")
         logger.info("   Env: %s | Version: %s | Entry: %s", app_env, version, APP_ENTRY_VERSION)
         logger.info("   Settings source: %s", settings_source or "(none)")
         logger.info("   Defer router mount: %s | Init engine on boot: %s", app_.state.defer_router_mount, app_.state.init_engine_on_boot)
-        enabled, ksa = _providers_from_settings(settings, env_mod)
         logger.info("   Providers (GLOBAL): %s", ",".join(enabled) if enabled else "(not set)")
         logger.info("   KSA Providers: %s", ",".join(ksa) if ksa else "(not set)")
         logger.info("   Required routers: %s", ",".join(app_.state.required_routers))
@@ -670,7 +700,14 @@ def create_app() -> FastAPI:
 
         await _maybe_close_engine(app_)
 
-    app_ = FastAPI(title=str(title), version=str(version), lifespan=lifespan)
+    app_ = FastAPI(
+        title=str(title),
+        version=str(version),
+        lifespan=lifespan,
+        openapi_url=openapi_url,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+    )
 
     # CORS
     app_.add_middleware(
@@ -690,7 +727,10 @@ def create_app() -> FastAPI:
 
     @app_.exception_handler(RequestValidationError)
     async def _validation_exc_handler(request, exc: RequestValidationError):  # noqa: ANN001
-        return JSONResponse(status_code=422, content={"status": "error", "detail": "Validation error", "errors": exc.errors()})
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "detail": "Validation error", "errors": exc.errors()},
+        )
 
     @app_.exception_handler(Exception)
     async def _unhandled_exc_handler(request, exc: Exception):  # noqa: ANN001
