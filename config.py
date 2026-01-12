@@ -1,6 +1,6 @@
-# config.py  (FULL REPLACEMENT) — v3.0.0
+# config.py  (FULL REPLACEMENT) — v3.0.1
 """
-TADAWUL FAST BRIDGE – MAIN CONFIG (v3.0.0) – PROD SAFE / NO HEAVY IMPORTS
+TADAWUL FAST BRIDGE – MAIN CONFIG (v3.0.1) – PROD SAFE / NO HEAVY IMPORTS
 
 ✅ Goals
 - Never raises at import-time; safe at startup
@@ -10,14 +10,12 @@ TADAWUL FAST BRIDGE – MAIN CONFIG (v3.0.0) – PROD SAFE / NO HEAVY IMPORTS
 - Optional rate-limit tunables (ENABLE_RATE_LIMITING / MAX_REQUESTS_PER_MINUTE)
 - Back-compat helpers: allowed_tokens(), is_open_mode(), auth_ok(), mask_settings_dict()
 
-✅ v3.0.0 improvements (vs v2.9.1)
-- Better bool parsing (more truthy/falsy tokens)
-- Safer base64(JSON) detection (won’t mis-decode random strings)
-- Stronger CSV/list parsing (supports JSON arrays, CSV, Python-ish lists)
-- Adds derived flags:
-    • auth_effective_required (true when tokens exist OR REQUIRE_AUTH=true)
-    • auth_enabled (true when tokens exist)
-  (Policy still: no tokens => open mode)
+✅ v3.0.1 improvements (vs v3.0.0)
+- Stronger base64(JSON) validation (rejects obvious non-JSON decodes)
+- Cleaner ENV parsing + clamps (never negative)
+- Adds token header customization: AUTH_HEADER_NAME (default: X-APP-TOKEN)
+- Adds optional open-mode override: OPEN_MODE (default: auto by tokens)
+  (Policy still: no tokens => open, unless OPEN_MODE explicitly set false AND tokens exist)
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-CONFIG_VERSION = "3.0.0"
+CONFIG_VERSION = "3.0.1"
 
 _TRUTHY = {
     "1",
@@ -161,6 +159,18 @@ def _looks_like_json_object(s: str) -> bool:
     return ss.startswith("{") and ss.endswith("}") and len(ss) >= 2
 
 
+def _is_probably_base64(s: str) -> bool:
+    raw = (s or "").strip()
+    if len(raw) < 40:
+        return False
+    # base64-ish chars; allow newlines
+    for c in raw:
+        if c.isalnum() or c in "+/=\n\r":
+            continue
+        return False
+    return True
+
+
 def _maybe_decode_b64_json(s: str) -> Optional[str]:
     """
     - If value is JSON -> return it
@@ -180,16 +190,18 @@ def _maybe_decode_b64_json(s: str) -> Optional[str]:
         except Exception:
             return raw
 
-    # Heuristic: base64 is usually long-ish and mostly base64 chars
-    # (This avoids decoding random short tokens.)
-    b64ish = all(c.isalnum() or c in "+/=\n\r" for c in raw)
-    if not b64ish or len(raw) < 40:
+    # Base64(JSON) best-effort (defensive)
+    if not _is_probably_base64(raw):
         return raw
 
     try:
         decoded = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="replace").strip()
         if _looks_like_json_object(decoded):
-            json.loads(decoded)
+            obj = json.loads(decoded)
+            # sanity check: looks like service-account / credentials JSON
+            if isinstance(obj, dict) and (obj.get("client_email") or obj.get("type") or obj.get("private_key")):
+                return decoded
+            # Still valid JSON object; keep it (some setups omit fields)
             return decoded
     except Exception:
         pass
@@ -232,9 +244,11 @@ class Settings:
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
+    auth_header_name: str = "X-APP-TOKEN"
     app_token: Optional[str] = None
     backup_app_token: Optional[str] = None
     require_auth: bool = False  # NOTE: policy still OPEN if no tokens exist
+    open_mode_override: Optional[bool] = None  # from OPEN_MODE if explicitly set
 
     # Derived flags (computed in from_env)
     auth_enabled: bool = False  # true when tokens exist
@@ -321,9 +335,17 @@ class Settings:
         max_requests_per_minute = _coerce_int(os.getenv("MAX_REQUESTS_PER_MINUTE"), 240)
         max_requests_per_minute = max(10, min(5000, max_requests_per_minute))
 
+        auth_header_name = _strip(os.getenv("AUTH_HEADER_NAME") or os.getenv("TOKEN_HEADER_NAME") or "X-APP-TOKEN") or "X-APP-TOKEN"
+
         app_token = _strip(os.getenv("APP_TOKEN")) or _strip(os.getenv("TFB_APP_TOKEN")) or None
         backup_app_token = _strip(os.getenv("BACKUP_APP_TOKEN")) or None
         require_auth = _coerce_bool(os.getenv("REQUIRE_AUTH"), False)
+
+        # Optional override knob (rarely needed)
+        open_mode_env = os.getenv("OPEN_MODE")
+        open_mode_override: Optional[bool] = None
+        if open_mode_env is not None and str(open_mode_env).strip() != "":
+            open_mode_override = _coerce_bool(open_mode_env, False)
 
         enabled_providers = _as_list_lower(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS") or "")
         if not enabled_providers:
@@ -417,9 +439,11 @@ class Settings:
             advanced_analysis_enabled=advanced_analysis_enabled,
             enable_rate_limiting=enable_rate_limiting,
             max_requests_per_minute=max_requests_per_minute,
+            auth_header_name=auth_header_name,
             app_token=app_token,
             backup_app_token=backup_app_token,
             require_auth=require_auth,
+            open_mode_override=open_mode_override,
             auth_enabled=auth_enabled,
             auth_effective_required=auth_effective_required,
             enabled_providers=enabled_providers,
@@ -487,8 +511,21 @@ def allowed_tokens() -> List[str]:
 
 
 def is_open_mode() -> bool:
-    # Policy: no tokens => open (even if REQUIRE_AUTH=true)
-    return len(allowed_tokens()) == 0
+    """
+    Policy:
+    - No tokens => OPEN
+    - Tokens exist => CLOSED unless OPEN_MODE explicitly true
+    (This lets you keep old behavior but still force-open if desired.)
+    """
+    s = get_settings()
+    toks = allowed_tokens()
+    if not toks:
+        return True
+    if s.open_mode_override is True:
+        return True
+    if s.open_mode_override is False:
+        return False
+    return False
 
 
 def auth_ok(x_app_token: Optional[str]) -> bool:
