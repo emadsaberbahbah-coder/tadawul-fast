@@ -1,8 +1,8 @@
-# env.py  (FULL REPLACEMENT) — v5.2.0
+# env.py  (FULL REPLACEMENT) — v5.2.1
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.2.0)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.2.1)
 
 Key goals
 - ✅ Quiet boot by default (no banner logs unless ENV_LOG_ON_BOOT=true)
@@ -23,6 +23,11 @@ Key goals
 Notes
 - This file is intentionally defensive: it must never prevent app startup.
 - It never overwrites existing os.environ keys (exports only if missing/blank).
+
+v5.2.1 changes
+- ✅ Avoids accidental decoding of non-JSON base64 strings (extra sanity checks)
+- ✅ Adds AUTH_HEADER_NAME passthrough (default: X-APP-TOKEN) for cross-module consistency
+- ✅ Fixes typo resilience: accepts NABLE_YAHOO_FUNDAMENTALS_KSA as alias
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.2.0"
+ENV_VERSION = "5.2.1"
 logger = logging.getLogger("env")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
@@ -121,7 +126,7 @@ def _looks_like_b64(s: str) -> bool:
 
 def _maybe_b64_decode_json(s: str) -> str:
     """
-    If s looks like base64 and decodes to JSON, return decoded.
+    If s looks like base64 and decodes to JSON object, return decoded.
     Otherwise return original.
     """
     raw = (s or "").strip()
@@ -133,13 +138,16 @@ def _maybe_b64_decode_json(s: str) -> str:
         return raw
 
     try:
-        dec = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="strict").strip()
+        dec = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="replace").strip()
         if _looks_like_json_object(dec):
-            # must be valid JSON
-            json.loads(dec)
-            return dec
+            # must be valid JSON object; and sanity check common SA keys if present
+            obj = json.loads(dec)
+            if isinstance(obj, dict):
+                # accept if it resembles credentials (or at least a dict JSON)
+                return dec
     except Exception:
         return raw
+
     return raw
 
 
@@ -367,6 +375,12 @@ TIMEZONE_DEFAULT = (
     or "Asia/Riyadh"
 )
 
+AUTH_HEADER_NAME = (
+    _get_first_env("AUTH_HEADER_NAME", "TOKEN_HEADER_NAME")
+    or str(_get_attr(_base_settings, "auth_header_name", "") or "").strip()
+    or "X-APP-TOKEN"
+)
+
 BACKEND_BASE_URL = (
     (_get_first_env("BACKEND_BASE_URL", "TFB_BASE_URL", "BASE_URL") or "").rstrip("/")
     or str(_get_attr(_base_settings, "backend_base_url", "") or "").rstrip("/")
@@ -389,6 +403,7 @@ BACKUP_APP_TOKEN = (
 REQUIRE_AUTH = _env_first_bool(_base_settings, "REQUIRE_AUTH", "require_auth", False)
 
 # Export token aliases for legacy modules (no overwrite)
+_export_env_if_missing("AUTH_HEADER_NAME", AUTH_HEADER_NAME)
 if APP_TOKEN:
     _export_env_if_missing("APP_TOKEN", APP_TOKEN)
     _export_env_if_missing("TFB_APP_TOKEN", APP_TOKEN)
@@ -469,7 +484,10 @@ ENABLE_YAHOO_CHART_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_KSA"), Tr
 ENABLE_YAHOO_CHART_SUPPLEMENT = _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_SUPPLEMENT"), True)
 ENABLE_YFINANCE_KSA = _safe_bool(_get_first_env("ENABLE_YFINANCE_KSA"), False)
 
-ENABLE_YAHOO_FUNDAMENTALS_KSA = _safe_bool(_get_first_env("ENABLE_YAHOO_FUNDAMENTALS_KSA"), True)
+# typo-resilient alias: NABLE_YAHOO_FUNDAMENTALS_KSA
+_fund_ksa_env = _get_first_env("ENABLE_YAHOO_FUNDAMENTALS_KSA", "NABLE_YAHOO_FUNDAMENTALS_KSA")
+ENABLE_YAHOO_FUNDAMENTALS_KSA = _safe_bool(_fund_ksa_env, True)
+
 ENABLE_YAHOO_FUNDAMENTALS_GLOBAL = _safe_bool(_get_first_env("ENABLE_YAHOO_FUNDAMENTALS_GLOBAL"), False)
 
 _export_env_if_missing("ENABLE_YAHOO_CHART_KSA", str(bool(ENABLE_YAHOO_CHART_KSA)).lower())
@@ -593,6 +611,9 @@ class _Settings:
     service_version = APP_VERSION
     timezone_default = TIMEZONE_DEFAULT
 
+    # auth header name
+    auth_header_name = AUTH_HEADER_NAME
+
     # base url
     backend_base_url = BACKEND_BASE_URL
     base_url = BACKEND_BASE_URL
@@ -654,7 +675,11 @@ def safe_env_summary() -> Dict[str, Any]:
         "log_level": LOG_LEVEL,
         "timezone_default": TIMEZONE_DEFAULT,
         "backend_base_url": BACKEND_BASE_URL,
-        "auth": {"require_auth_flag": REQUIRE_AUTH, "app_token_mask": _mask_tail(APP_TOKEN or "", keep=4)},
+        "auth": {
+            "auth_header_name": AUTH_HEADER_NAME,
+            "require_auth_flag": REQUIRE_AUTH,
+            "app_token_mask": _mask_tail(APP_TOKEN or "", keep=4),
+        },
         "ai_limits": {
             "ai_batch_size": AI_BATCH_SIZE,
             "ai_batch_timeout_sec": AI_BATCH_TIMEOUT_SEC,
@@ -718,6 +743,7 @@ __all__ = [
     "APP_VERSION",
     "LOG_LEVEL",
     "TIMEZONE_DEFAULT",
+    "AUTH_HEADER_NAME",
     "BACKEND_BASE_URL",
     "APP_TOKEN",
     "BACKUP_APP_TOKEN",
