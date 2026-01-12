@@ -1,23 +1,31 @@
-# .github/workflows/daily_sync.yml
+# .github/workflows/daily_sync.yml  (FULL REPLACEMENT)
 name: Tadawul Dashboard Sync
 
 on:
   schedule:
     # Run every hour (at minute 0)
-    - cron: '0 * * * *'
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       backend_url:
-        description: 'Backend URL (e.g. https://...onrender.com)'
+        description: "Backend URL (e.g. https://...onrender.com)"
         required: false
-        default: 'https://tadawul-fast-bridge.onrender.com'
+        default: "https://tadawul-fast-bridge.onrender.com"
       sheet_id:
-        description: 'Spreadsheet ID (Optional override)'
+        description: "Spreadsheet ID (Optional override)"
         required: false
-        default: '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw'
+        default: "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw"
       google_creds_json:
-        description: 'Service Account JSON (Paste here if Secret fails)'
+        description: "Service Account JSON (Paste here if Secret fails)"
         required: false
+      run_health_only:
+        description: "If true: only /readyz + script --health, no sheet writes"
+        required: false
+        default: "false"
+      keys:
+        description: "Optional override keys list (space/comma separated). Default uses standard pages."
+        required: false
+        default: "MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS"
 
 # Prevent overlapping hourly runs
 concurrency:
@@ -40,8 +48,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install Dependencies
         shell: bash
@@ -59,10 +67,80 @@ jobs:
           ls -la
           test -f scripts/run_dashboard_sync.py && echo "OK: scripts/run_dashboard_sync.py found" || (echo "::error::Missing scripts/run_dashboard_sync.py" && exit 1)
 
+      - name: Resolve Inputs / Defaults
+        id: resolve
+        shell: bash
+        env:
+          DISPATCH_BACKEND_URL: ${{ github.event.inputs.backend_url }}
+          DISPATCH_SHEET_ID: ${{ github.event.inputs.sheet_id }}
+          DISPATCH_CREDS: ${{ github.event.inputs.google_creds_json }}
+          DISPATCH_KEYS: ${{ github.event.inputs.keys }}
+          DISPATCH_HEALTH_ONLY: ${{ github.event.inputs.run_health_only }}
+          VAR_BACKEND_URL: ${{ vars.BACKEND_BASE_URL }}
+          SECRET_BACKEND_URL: ${{ secrets.BACKEND_BASE_URL }}
+          VAR_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          SECRET_SHEET_ID: ${{ secrets.DEFAULT_SPREADSHEET_ID }}
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+
+          pick_first_nonempty() {
+            for v in "$@"; do
+              if [ -n "${v:-}" ]; then
+                printf "%s" "$v"
+                return 0
+              fi
+            done
+            return 0
+          }
+
+          BACKEND_BASE_URL="$(pick_first_nonempty "${DISPATCH_BACKEND_URL:-}" "${VAR_BACKEND_URL:-}" "${SECRET_BACKEND_URL:-}" "https://tadawul-fast-bridge.onrender.com")"
+          DEFAULT_SPREADSHEET_ID="$(pick_first_nonempty "${DISPATCH_SHEET_ID:-}" "${VAR_SHEET_ID:-}" "${SECRET_SHEET_ID:-}" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")"
+          GOOGLE_SHEETS_CREDENTIALS="$(pick_first_nonempty "${DISPATCH_CREDS:-}" "${SECRET_CREDS:-}")"
+          KEYS_RAW="$(pick_first_nonempty "${DISPATCH_KEYS:-}" "MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS")"
+
+          # normalize keys: allow comma or spaces
+          KEYS_NORM="$(printf "%s" "$KEYS_RAW" | tr ',' ' ' | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+
+          HEALTH_ONLY_RAW="$(printf "%s" "${DISPATCH_HEALTH_ONLY:-false}" | tr '[:upper:]' '[:lower:]')"
+          case "$HEALTH_ONLY_RAW" in
+            1|true|yes|y|on) HEALTH_ONLY="true" ;;
+            *)               HEALTH_ONLY="false" ;;
+          esac
+
+          {
+            echo "BACKEND_BASE_URL=$BACKEND_BASE_URL"
+            echo "DEFAULT_SPREADSHEET_ID=$DEFAULT_SPREADSHEET_ID"
+            echo "KEYS_NORM=$KEYS_NORM"
+            echo "HEALTH_ONLY=$HEALTH_ONLY"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved:"
+          echo "  BACKEND_BASE_URL       = $BACKEND_BASE_URL"
+          echo "  DEFAULT_SPREADSHEET_ID = $DEFAULT_SPREADSHEET_ID"
+          echo "  KEYS                   = $KEYS_NORM"
+          echo "  HEALTH_ONLY            = $HEALTH_ONLY"
+          echo "  CREDS_SET              = $( [ -n "${GOOGLE_SHEETS_CREDENTIALS:-}" ] && echo yes || echo no )"
+
+          # export for subsequent steps without echoing secrets
+          {
+            echo "BACKEND_BASE_URL=$BACKEND_BASE_URL"
+            echo "DEFAULT_SPREADSHEET_ID=$DEFAULT_SPREADSHEET_ID"
+            echo "KEYS_NORM=$KEYS_NORM"
+            echo "HEALTH_ONLY=$HEALTH_ONLY"
+          } >> "$GITHUB_ENV"
+
+          # only export creds to env if present (do not print)
+          if [ -n "${GOOGLE_SHEETS_CREDENTIALS:-}" ]; then
+            echo "GOOGLE_SHEETS_CREDENTIALS<<EOF" >> "$GITHUB_ENV"
+            echo "$GOOGLE_SHEETS_CREDENTIALS" >> "$GITHUB_ENV"
+            echo "EOF" >> "$GITHUB_ENV"
+          fi
+
       - name: Wake up Render Backend
         shell: bash
         env:
-          URL: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.backend_url) || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+          URL: ${{ steps.resolve.outputs.BACKEND_BASE_URL }}
         run: |
           set -euo pipefail
           if [ -z "${URL:-}" ]; then
@@ -72,14 +150,12 @@ jobs:
           echo "Pinging backend (best-effort): $URL/readyz"
           curl -fsS --max-time 25 --retry 3 --retry-delay 3 "$URL/readyz" >/dev/null || echo "Ping failed (backend may be cold), continuing..."
 
-      - name: Run Dashboard Sync
+      - name: Validate Required Config
         shell: bash
         env:
-          # Priority: Manual Input -> Repo Variable -> Repo Secret -> Hardcoded Fallback
-          BACKEND_BASE_URL: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.backend_url) || vars.BACKEND_BASE_URL || secrets.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
-          DEFAULT_SPREADSHEET_ID: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.sheet_id) || vars.DEFAULT_SPREADSHEET_ID || secrets.DEFAULT_SPREADSHEET_ID || '19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw' }}
-          # Priority: Manual Input -> Repo Secret
-          GOOGLE_SHEETS_CREDENTIALS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.google_creds_json) || secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          BACKEND_BASE_URL: ${{ steps.resolve.outputs.BACKEND_BASE_URL }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.resolve.outputs.DEFAULT_SPREADSHEET_ID }}
+          HEALTH_ONLY: ${{ steps.resolve.outputs.HEALTH_ONLY }}
         run: |
           set -euo pipefail
 
@@ -93,15 +169,45 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]; then
+          # Credentials are required unless health-only is enabled
+          if [ "${HEALTH_ONLY:-false}" != "true" ] && [ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]; then
             echo "::error::GOOGLE_SHEETS_CREDENTIALS is missing! Add it in Settings > Secrets and variables > Actions."
+            echo "Tip: You can run workflow_dispatch with run_health_only=true to test backend without writing sheets."
             exit 1
           fi
 
           echo "Configuration OK."
           echo "Target Backend: ${BACKEND_BASE_URL}"
           echo "Target Sheet  : ${DEFAULT_SPREADSHEET_ID}"
+          echo "Health Only   : ${HEALTH_ONLY}"
 
-          python scripts/run_dashboard_sync.py \
-            --health \
-            --keys MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS
+      - name: Run Dashboard Sync
+        shell: bash
+        env:
+          BACKEND_BASE_URL: ${{ steps.resolve.outputs.BACKEND_BASE_URL }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.resolve.outputs.DEFAULT_SPREADSHEET_ID }}
+          KEYS_NORM: ${{ steps.resolve.outputs.KEYS_NORM }}
+          HEALTH_ONLY: ${{ steps.resolve.outputs.HEALTH_ONLY }}
+        run: |
+          set -euo pipefail
+
+          # Build args
+          ARGS=( "--health" )
+
+          # If health-only, don't attempt writes (script should respect it if supported)
+          # Still pass keys so it exercises endpoints.
+          if [ -n "${KEYS_NORM:-}" ]; then
+            # shellcheck disable=SC2206
+            KEYS_ARR=( $KEYS_NORM )
+            ARGS+=( "--keys" )
+            ARGS+=( "${KEYS_ARR[@]}" )
+          fi
+
+          if [ "${HEALTH_ONLY:-false}" = "true" ]; then
+            echo "Running in health-only mode (no sheet writes expected)."
+            ARGS+=( "--dry-run" )
+          fi
+
+          echo "Executing:"
+          echo "  python scripts/run_dashboard_sync.py ${ARGS[*]}"
+          python scripts/run_dashboard_sync.py "${ARGS[@]}"
