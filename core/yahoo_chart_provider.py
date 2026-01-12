@@ -1,8 +1,8 @@
-# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.1
+# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.2
 """
 core/yahoo_chart_provider.py
 ===========================================================
-Compatibility + Repo-Hygiene Shim — v0.3.1 (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.3.2 (PROD SAFE)
 
 Why this exists
 - The canonical Yahoo Chart provider lives here:
@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("core.yahoo_chart_provider_shim")
 
-SHIM_VERSION = "0.3.1"
+SHIM_VERSION = "0.3.2"
 
 # Backward-compat constant (not necessarily used by canonical provider)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
@@ -173,12 +173,13 @@ try:
     ) -> Dict[str, Any]:
         """
         Returns a PATCH dict suitable for merging into an existing quote dict.
-        When canonical patch exists, prefer it. Else merge full quote.
+        When canonical patch exists, prefer it. Else merge full quote into base.
         """
         try:
             if callable(_get_quote_patch):
                 r = await _call_maybe_async(_get_quote_patch, symbol, base, *args, **kwargs)
                 return _ensure_dict(symbol, r, err="unexpected return type from get_quote_patch")
+
             if callable(_fetch_quote_patch):
                 r = await _call_maybe_async(_fetch_quote_patch, symbol, *args, **kwargs)
                 if isinstance(r, dict):
@@ -284,19 +285,20 @@ try:
             except Exception:
                 pass
 
-except Exception as e:  # pragma: no cover
+except Exception as _import_exc:  # pragma: no cover
     # Quiet boot: do not log at import-time
+    _IMPORT_ERROR = f"{_import_exc.__class__.__name__}: {_import_exc}"
     PROVIDER_VERSION = "fallback"
 
     class YahooChartProvider:  # type: ignore
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self._error = f"{e.__class__.__name__}: {e}"
+            self._error = _IMPORT_ERROR
 
         async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             return _err_payload(symbol, self._error, base=base)
 
     async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+        return _err_payload(symbol, _IMPORT_ERROR)
 
     async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await fetch_quote(symbol, *args, **kwargs)
@@ -307,16 +309,16 @@ except Exception as e:  # pragma: no cover
         *args: Any,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        return _err_payload(symbol, f"{e.__class__.__name__}: {e}", base=base)
+        return _err_payload(symbol, _IMPORT_ERROR, base=base)
 
     async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+        return _err_payload(symbol, _IMPORT_ERROR)
 
     async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+        return _err_payload(symbol, _IMPORT_ERROR)
 
     async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return _err_payload(symbol, f"{e.__class__.__name__}: {e}")
+        return _err_payload(symbol, _IMPORT_ERROR)
 
     async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await get_quote(symbol, *args, **kwargs)
