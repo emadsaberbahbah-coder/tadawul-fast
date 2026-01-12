@@ -1,5 +1,5 @@
 # .gitignore  (FULL REPLACEMENT)
-# Tadawul Fast Bridge / FastAPI + Render + Google Sheets — v1.2.0 (PROD SAFE)
+# Tadawul Fast Bridge / FastAPI + Render + Google Sheets — v1.3.0 (PROD SAFE)
 
 # ------------------------------
 # Python / FastAPI
@@ -87,6 +87,12 @@ client_secret*.json
 oauth*.json
 google_sa.json
 
+# Also ignore any downloaded Google service-account keys in common patterns
+*service-account*.json
+*service_account*.json
+*google*credentials*.json
+*google*service*account*.json
+
 # If you sometimes download keys into folders:
 secrets/
 keys/
@@ -140,3 +146,21 @@ pnpm-debug.log*
 /.snapshots/
 /data/
 /tmp/
+
+# ------------------------------
+# Repo-local runtime state (PROD SAFE)
+# ------------------------------
+*.dump
+*.pid
+*.pid.lock
+*.lock.bak
+
+# If you store local output exports
+/exports/
+/reports/
+/artifacts/
+
+# ------------------------------
+# IDE + local scripts
+# ------------------------------
+*.code-workspace
