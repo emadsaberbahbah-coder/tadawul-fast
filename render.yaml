@@ -1,7 +1,7 @@
 # render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.1)
+# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.2)
 # ============================================================
 #
 # Goals
@@ -164,6 +164,14 @@ services:
       - key: INIT_ENGINE_ON_BOOT
         value: "true"
 
+      # Optional docs toggles (supported by main.py v5.3.4)
+      - key: ENABLE_OPENAPI
+        value: "true"
+      - key: ENABLE_SWAGGER
+        value: "true"
+      - key: ENABLE_REDOC
+        value: "true"
+
       # -------------------------
       # App identity (compat keys)
       # -------------------------
@@ -178,15 +186,15 @@ services:
       - key: ENVIRONMENT
         value: "production"
 
-      # Version (align with deployed)
+      # Version (align with deployed code)
       - key: APP_VERSION
-        value: "5.3.1"
+        value: "5.3.4"
       - key: SERVICE_VERSION
-        value: "5.3.1"
+        value: "5.3.4"
       - key: VERSION
-        value: "5.3.1"
+        value: "5.3.4"
       - key: RELEASE
-        value: "5.3.1"
+        value: "5.3.4"
 
       # Base URLs
       - key: BACKEND_BASE_URL
