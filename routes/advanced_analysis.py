@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.14.0) – PROD SAFE (ALIGNED)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.15.0) – PROD SAFE (ALIGNED)
 
 Design goals
 - 100% engine-driven (prefer app.state.engine; fallback singleton).
@@ -19,20 +19,17 @@ Design goals
     core.schemas.header_field_candidates()
 - Supports vNext headers including:
     Rank, Origin, Change/Change %, Value Traded, 52W Position %, Updated times,
-    Forecast/Expected columns (1M/3M/12M), Confidence, Forecast Updated (UTC/Riyadh),
-    and badges (Rec/Momentum/Opportunity/Risk).
+    Forecast/Expected columns (1M/3M/12M), Confidence, Forecast Updated (UTC/Riyadh).
 
 Standardization rules
 - Recommendation ALWAYS one of: BUY / HOLD / REDUCE / SELL (UPPERCASE, non-empty)
 - Sheets-safe error handling: always returns {status, headers, rows, error?}
 
-v3.14.0 upgrades
-- ✅ Stronger Forecast/Expected mapping:
-    - Accepts engine keys: forecast_price_* / target_price_* / expected_price_*
-    - Accepts ROI keys: forecast_roi_* / expected_roi_* / forecast_return_* / expected_return_*
-- ✅ Adds "Forecast Updated (Riyadh)" computed support (if header exists)
-- ✅ Quote-schema /sheet-rows now preserves *requested tickers order* by building rows directly
-  from requested list (avoid any symbol remap surprises).
+v3.15.0 upgrades
+- ✅ Adds robust local header→field candidates fallback (works even if core.schemas is absent)
+  so vNext columns like "52W High", "P/E (TTM)", "Free Float Mkt Cap", etc. still map correctly.
+- ✅ Adds per-page fallback headers (customized per known pages) when schemas are unavailable.
+- ✅ Keeps quote-schema /sheet-rows preserving requested tickers order.
 """
 
 import asyncio
@@ -59,7 +56,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.14.0"
+ADVANCED_ANALYSIS_VERSION = "3.15.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -709,117 +706,9 @@ def _compute_value_traded(uq: Any) -> Optional[float]:
     return round(price * vol, 4)
 
 
-# ===== Badges (safe, Sheets-friendly) =====
-def _badge_from_reco(reco: Any) -> str:
-    return _coerce_reco_enum(reco)
-
-
-def _badge_strength(score_any: Any) -> str:
-    s = _safe_float_or_none(score_any)
-    if s is None:
-        return ""
-    if s >= 75:
-        return "STRONG"
-    if s >= 55:
-        return "GOOD"
-    if s >= 40:
-        return "OK"
-    if s >= 25:
-        return "WEAK"
-    return "VERY WEAK"
-
-
-def _badge_risk(score_any: Any) -> str:
-    s = _safe_float_or_none(score_any)
-    if s is None:
-        return ""
-    if s <= 25:
-        return "LOW"
-    if s <= 50:
-        return "MED"
-    if s <= 70:
-        return "HIGH"
-    return "VERY HIGH"
-
-
-def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
-    if price is None or price <= 0:
-        return None, None, None
-
-    fair = _safe_float_or_none(_safe_get(uq, "fair_value"))
-    if fair is None:
-        fair = _safe_float_or_none(_safe_get(uq, "expected_price_3m"))
-    if fair is None:
-        fair = _safe_float_or_none(_safe_get(uq, "expected_price_12m"))
-    if fair is None:
-        fair = _safe_float_or_none(_safe_get(uq, "ma200"))
-    if fair is None:
-        fair = _safe_float_or_none(_safe_get(uq, "ma50"))
-
-    if fair is None or fair <= 0:
-        return None, None, None
-
-    upside = (fair / price - 1.0) * 100.0
-    label = "Fairly Valued"
-    if upside >= 15:
-        label = "Undervalued"
-    elif upside <= -15:
-        label = "Overvalued"
-
-    return fair, round(upside, 2), label
-
-
-def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str]:
-    """
-    Best-effort overall score + standardized recommendation when missing.
-    Score in 0..100.
-    Recommendation ALWAYS one of: BUY/HOLD/REDUCE/SELL
-    """
-    opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
-    val = _safe_float_or_none(_safe_get(uq, "value_score"))
-    qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
-    mom = _safe_float_or_none(_safe_get(uq, "momentum_score"))
-    risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
-    conf = _safe_float_or_none(_safe_get(uq, "confidence_score", "confidence"))
-
-    parts: List[float] = []
-    if opp is not None:
-        parts.append(0.45 * opp)
-    if val is not None:
-        parts.append(0.20 * val)
-    if qual is not None:
-        parts.append(0.20 * qual)
-    if mom is not None:
-        parts.append(0.15 * mom)
-
-    if not parts:
-        return None, "HOLD"
-
-    score = sum(parts)
-    if risk is not None:
-        score -= 0.15 * risk
-
-    if conf is not None:
-        if 0.0 <= conf <= 1.0:
-            score += 0.05 * ((conf * 100.0) - 50.0)
-        elif 1.0 < conf <= 100.0:
-            score += 0.05 * (conf - 50.0)
-
-    score = max(0.0, min(100.0, score))
-
-    if score >= 70:
-        reco = "BUY"
-    elif score >= 50:
-        reco = "HOLD"
-    elif score >= 35:
-        reco = "REDUCE"
-    else:
-        reco = "SELL"
-
-    return round(score, 2), reco
-
-
+# =============================================================================
+# Index keys (safe)
+# =============================================================================
 def _index_keys_for_quote(q: Any) -> List[str]:
     keys: List[str] = []
 
@@ -1116,6 +1005,84 @@ def _sort_key(it: AdvancedItem) -> float:
     return (opp * 1_000_000.0) + (conf * 1_000.0) + (up * 10.0) + ov
 
 
+def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
+    if price is None or price <= 0:
+        return None, None, None
+
+    fair = _safe_float_or_none(_safe_get(uq, "fair_value"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "expected_price_3m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "expected_price_12m"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "ma200"))
+    if fair is None:
+        fair = _safe_float_or_none(_safe_get(uq, "ma50"))
+
+    if fair is None or fair <= 0:
+        return None, None, None
+
+    upside = (fair / price - 1.0) * 100.0
+    label = "Fairly Valued"
+    if upside >= 15:
+        label = "Undervalued"
+    elif upside <= -15:
+        label = "Overvalued"
+
+    return fair, round(upside, 2), label
+
+
+def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str]:
+    """
+    Best-effort overall score + standardized recommendation when missing.
+    Score in 0..100.
+    Recommendation ALWAYS one of: BUY/HOLD/REDUCE/SELL
+    """
+    opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
+    val = _safe_float_or_none(_safe_get(uq, "value_score"))
+    qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
+    mom = _safe_float_or_none(_safe_get(uq, "momentum_score"))
+    risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
+    conf = _safe_float_or_none(_safe_get(uq, "confidence_score", "confidence"))
+
+    parts: List[float] = []
+    if opp is not None:
+        parts.append(0.45 * opp)
+    if val is not None:
+        parts.append(0.20 * val)
+    if qual is not None:
+        parts.append(0.20 * qual)
+    if mom is not None:
+        parts.append(0.15 * mom)
+
+    if not parts:
+        return None, "HOLD"
+
+    score = sum(parts)
+    if risk is not None:
+        score -= 0.15 * risk
+
+    if conf is not None:
+        if 0.0 <= conf <= 1.0:
+            score += 0.05 * ((conf * 100.0) - 50.0)
+        elif 1.0 < conf <= 100.0:
+            score += 0.05 * (conf - 50.0)
+
+    score = max(0.0, min(100.0, score))
+
+    if score >= 70:
+        reco = "BUY"
+    elif score >= 50:
+        reco = "HOLD"
+    elif score >= 35:
+        reco = "REDUCE"
+    else:
+        reco = "SELL"
+
+    return round(score, 2), reco
+
+
 # =============================================================================
 # Headers / modes
 # =============================================================================
@@ -1210,12 +1177,120 @@ def _fallback_headers_59() -> List[str]:
     ]
 
 
+def _vnext_quote_headers() -> List[str]:
+    # Safe vNext fallback when core.schemas isn't available
+    return [
+        "Rank",
+        "Symbol",
+        "Origin",
+        "Name",
+        "Sector",
+        "Sub Sector",
+        "Market",
+        "Currency",
+        "Listing Date",
+        "Price",
+        "Prev Close",
+        "Change",
+        "Change %",
+        "Day High",
+        "Day Low",
+        "52W High",
+        "52W Low",
+        "52W Position %",
+        "Volume",
+        "Avg Vol 30D",
+        "Value Traded",
+        "Turnover %",
+        "Liquidity Score",
+        "Shares Outstanding",
+        "Free Float %",
+        "Market Cap",
+        "Free Float Mkt Cap",
+        "EPS (TTM)",
+        "Forward EPS",
+        "P/E (TTM)",
+        "Forward P/E",
+        "P/B",
+        "P/S",
+        "EV/EBITDA",
+        "Dividend Yield",
+        "Dividend Rate",
+        "Payout Ratio",
+        "ROE",
+        "ROA",
+        "Net Margin",
+        "EBITDA Margin",
+        "Revenue Growth",
+        "Net Income Growth",
+        "Beta",
+        "Volatility 30D",
+        "RSI 14",
+        "Risk Bucket",
+        "Confidence Bucket",
+        "Fair Value",
+        "Upside %",
+        "Valuation Label",
+        "Value Score",
+        "Quality Score",
+        "Momentum Score",
+        "Opportunity Score",
+        "Risk Score",
+        "Overall Score",
+        "Forecast Price (1M)",
+        "Expected ROI % (1M)",
+        "Forecast Price (3M)",
+        "Expected ROI % (3M)",
+        "Forecast Price (12M)",
+        "Expected ROI % (12M)",
+        "Forecast Confidence",
+        "Forecast Updated (UTC)",
+        "Forecast Updated (Riyadh)",
+        "Last Updated (UTC)",
+        "Last Updated (Riyadh)",
+        "Data Source",
+        "Data Quality",
+        "Error",
+        "Recommendation",
+    ]
+
+
+def _norm_sheet_key(name: Optional[str]) -> str:
+    s = (name or "").strip().lower()
+    if not s:
+        return ""
+    # normalize underscores/spaces/dashes
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+_FALLBACK_HEADERS_BY_SHEET: Dict[str, List[str]] = {
+    # KSA / Tadawul
+    "ksa_tadawul": _vnext_quote_headers(),
+    "tadawul": _vnext_quote_headers(),
+    # Global pages
+    "global_markets": _vnext_quote_headers(),
+    "global_shares": _vnext_quote_headers(),
+    "global_shares_tracker": _vnext_quote_headers(),
+    # Portfolio pages
+    "market_leaders": _vnext_quote_headers(),
+    "my_portfolio": _vnext_quote_headers(),
+    # Others
+    "mutual_funds": _vnext_quote_headers(),
+    "commodities_fx": _vnext_quote_headers(),
+    "insights_analysis": _vnext_quote_headers(),
+}
+
+
 def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
     nm = (sheet_name or "").strip().lower()
 
+    # Dedicated "advanced" sheet views
     if any(k in nm for k in ("advanced", "opportunity", "advisor", "best", "scoreboard")):
         return _default_advanced_headers(), "advanced"
 
+    # Prefer core.schemas per-page headers when available
     if sheet_name and callable(_get_headers_for_sheet):
         try:
             h = _get_headers_for_sheet(sheet_name)  # type: ignore
@@ -1224,6 +1299,12 @@ def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
         except Exception:
             pass
 
+    # If schemas missing, return per-page fallback headers (customized)
+    sk = _norm_sheet_key(sheet_name)
+    if sk and sk in _FALLBACK_HEADERS_BY_SHEET:
+        return list(_FALLBACK_HEADERS_BY_SHEET[sk]), "quote_schema"
+
+    # Else: classic 59 headers if available, fallback 59
     if _SCHEMAS_DEFAULT_59 is not None:
         try:
             return [str(x) for x in list(_SCHEMAS_DEFAULT_59)], "quote_schema"  # type: ignore
@@ -1338,6 +1419,98 @@ _FIELD_TRANSFORMS: Dict[str, Any] = {
     "forecast_updated_utc": _iso_or_none,
 }
 
+# Local fallback header→field candidates (for when core.schemas isn't present)
+# Keys are normalized with _hkey(header)
+_FALLBACK_HEADER_CANDIDATES: Dict[str, List[str]] = {
+    "symbol": ["symbol", "symbol_normalized", "ticker"],
+    "ticker": ["symbol", "symbol_normalized", "ticker"],
+    "company name": ["name", "company_name", "short_name", "long_name"],
+    "name": ["name", "company_name", "short_name", "long_name"],
+    "sector": ["sector"],
+    "sub-sector": ["sub_sector", "industry", "sub_industry"],
+    "sub sector": ["sub_sector", "industry", "sub_industry"],
+    "market": ["market", "exchange", "market_region"],
+    "currency": ["currency"],
+    "listing date": ["listing_date", "ipo_date", "listed_date"],
+
+    "price": ["current_price", "last_price", "price", "close"],
+    "last price": ["current_price", "last_price", "price", "close"],
+    "prev close": ["previous_close", "prev_close", "prior_close"],
+    "previous close": ["previous_close", "prev_close", "prior_close"],
+
+    "day high": ["day_high", "high"],
+    "day low": ["day_low", "low"],
+    "52w high": ["week_52_high", "high_52w", "fifty_two_week_high", "52_week_high"],
+    "52w low": ["week_52_low", "low_52w", "fifty_two_week_low", "52_week_low"],
+
+    "volume": ["volume", "vol"],
+    "avg vol 30d": ["avg_volume_30d", "avg_volume", "average_volume_30d"],
+    "avg volume (30d)": ["avg_volume_30d", "avg_volume", "average_volume_30d"],
+
+    "value traded": ["value_traded", "traded_value", "turnover_value", "value"],
+    "turnover %": ["turnover_percent", "turnover_pct", "turnover"],
+    "liquidity score": ["liquidity_score"],
+
+    "shares outstanding": ["shares_outstanding", "shares", "outstanding_shares"],
+    "free float %": ["free_float", "free_float_percent", "free_float_pct"],
+    "free float mkt cap": ["free_float_market_cap", "free_float_mkt_cap"],
+    "free float market cap": ["free_float_market_cap", "free_float_mkt_cap"],
+    "market cap": ["market_cap"],
+
+    "eps (ttm)": ["eps_ttm", "eps", "ttm_eps"],
+    "forward eps": ["forward_eps", "eps_forward"],
+    "p/e (ttm)": ["pe_ttm", "pe", "ttm_pe"],
+    "forward p/e": ["forward_pe", "pe_forward"],
+    "p/b": ["pb", "price_to_book"],
+    "p/s": ["ps", "price_to_sales"],
+    "ev/ebitda": ["ev_ebitda", "ev_to_ebitda"],
+
+    "dividend yield": ["dividend_yield", "div_yield"],
+    "dividend yield %": ["dividend_yield", "div_yield"],
+    "dividend rate": ["dividend_rate"],
+    "payout ratio": ["payout_ratio"],
+    "payout ratio %": ["payout_ratio"],
+
+    "roe": ["roe"],
+    "roe %": ["roe"],
+    "roa": ["roa"],
+    "roa %": ["roa"],
+    "net margin": ["net_margin"],
+    "net margin %": ["net_margin"],
+    "ebitda margin": ["ebitda_margin"],
+    "ebitda margin %": ["ebitda_margin"],
+    "revenue growth": ["revenue_growth"],
+    "revenue growth %": ["revenue_growth"],
+    "net income growth": ["net_income_growth"],
+    "net income growth %": ["net_income_growth"],
+
+    "beta": ["beta"],
+    "volatility 30d": ["volatility_30d"],
+    "volatility (30d)": ["volatility_30d"],
+    "rsi 14": ["rsi_14"],
+    "rsi (14)": ["rsi_14"],
+
+    "risk bucket": ["risk_bucket"],
+    "confidence bucket": ["confidence_bucket"],
+
+    "fair value": ["fair_value"],
+    "upside %": ["upside_percent"],
+    "valuation label": ["valuation_label"],
+
+    "value score": ["value_score"],
+    "quality score": ["quality_score"],
+    "momentum score": ["momentum_score"],
+    "opportunity score": ["opportunity_score"],
+    "risk score": ["risk_score"],
+    "overall score": ["overall_score"],
+
+    "data source": ["data_source", "provider", "source"],
+    "provider": ["data_source", "provider", "source"],
+    "data quality": ["data_quality"],
+    "error": ["error"],
+    "recommendation": ["recommendation"],
+}
+
 
 def _compute_expected_price_and_return(uq: Any, horizon: str) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -1410,7 +1583,6 @@ def _forecast_updated_utc_from_uq(uq: Any) -> Optional[str]:
 
 def _header_horizon(header_key: str) -> Optional[str]:
     hk = header_key
-    # normalize a little more (still keep cheap)
     hk2 = hk.replace(" ", "")
     if "1m" in hk2 or "(1m)" in hk2 or "1mo" in hk2 or "1month" in hk2:
         return "1m"
@@ -1430,7 +1602,6 @@ def _first_present(uq: Any, keys: Sequence[str]) -> Any:
 
 
 def _forecast_price_keys(h: str) -> List[str]:
-    # h in {"1m","3m","12m"}
     return [
         f"forecast_price_{h}",
         f"forecast_target_price_{h}",
@@ -1461,16 +1632,6 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
     if hk == "origin":
         return (ctx or {}).get("origin")
 
-    # computed: badges (vNext)
-    if hk in ("rec badge", "reco badge", "recommendation badge"):
-        return _badge_from_reco(_safe_get(uq, "recommendation"))
-    if hk == "momentum badge":
-        return _badge_strength(_safe_get(uq, "momentum_score"))
-    if hk == "opportunity badge":
-        return _badge_strength(_safe_get(uq, "opportunity_score"))
-    if hk == "risk badge":
-        return _badge_risk(_safe_get(uq, "risk_score"))
-
     # computed: Change / Change %
     if hk in ("change", "price change"):
         ch, _pct = _compute_change_and_pct(uq)
@@ -1493,7 +1654,7 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
         hi = _safe_get(uq, "week_52_high", "high_52w")
         return _compute_52w_position_pct(cp, lo, hi)
 
-    # computed bundle
+    # computed bundle (ensures standardized enums)
     if hk in ("fair value", "upside %", "valuation label", "overall score", "recommendation"):
         fair, upside, label = _compute_fair_value_and_upside(uq)
         overall, reco = _compute_overall_and_reco(uq)
@@ -1518,10 +1679,7 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
             v = _safe_get(uq, "recommendation")
             return _coerce_reco_enum(v) or reco or "HOLD"
 
-    # expected / forecast support (tolerant)
-    # - "Forecast Confidence"
-    # - "Forecast Updated (UTC)" / "Forecast Updated UTC"
-    # - "Forecast Updated (Riyadh)" / "Forecast Updated Riyadh"
+    # Forecast Confidence / Forecast Updated (UTC/Riyadh)
     if "forecast confidence" in hk:
         v = _safe_get(uq, "confidence_score", "forecast_confidence", "confidence")
         if v is None:
@@ -1573,7 +1731,14 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
             _safe_set(uq, "last_updated_utc", v)
         return _iso_or_none(v) or v
 
-    # schema-driven mapping
+    # ✅ Local robust fallback mapping (works without core.schemas)
+    cand = _FALLBACK_HEADER_CANDIDATES.get(hk)
+    if cand:
+        v = _value_for_field_candidates(uq, cand)
+        if v is not None:
+            return v
+
+    # schema-driven mapping (preferred when available)
     if callable(_header_field_candidates):
         try:
             candidates = _header_field_candidates(header)  # type: ignore
@@ -1586,7 +1751,6 @@ def _value_for_header(header: str, uq: Any, ctx: Optional[Dict[str, Any]] = None
     # fallback: snake guess
     guess = re.sub(r"_+", "_", re.sub(r"[^\w]+", "_", (header or "").strip().lower())).strip("_")
     v = _safe_get(uq, guess)
-
     tf = _FIELD_TRANSFORMS.get(_canon_field_name(guess)) or _FIELD_TRANSFORMS.get(guess)
     return tf(v) if callable(tf) else v
 
