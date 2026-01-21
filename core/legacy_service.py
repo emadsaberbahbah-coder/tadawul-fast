@@ -4,7 +4,7 @@ from __future__ import annotations
 """
 core/legacy_service.py
 ------------------------------------------------------------
-Compatibility shim (quiet + useful) — v1.7.0
+Compatibility shim (quiet + useful) — v1.7.2  (PROD SAFE)
 
 Goals
 - Provide a stable legacy router that NEVER breaks app startup.
@@ -12,16 +12,19 @@ Goals
 - Best-effort engine discovery:
     1) request.app.state.engine
     2) core.data_engine_v2.get_engine() (singleton) if available  ✅ (sync OR async supported)
-    3) core.data_engine_v2.DataEngine() temp
-    4) core.data_engine.DataEngine() temp
+    3) core.data_engine_v2.DataEngine() temp (per-request)       ✅ (auto-close after use)
+    4) core.data_engine.DataEngine() temp (per-request)          ✅ (auto-close after use)
 - Support BOTH async and sync engine method implementations.
 - Accept both {"symbols":[...]} and {"tickers":[...]} payload shapes.
+- Batch-first; if batch is missing/fails, fallback per-symbol with bounded concurrency.
 - Optional external override router (if you have one) via env flag.
 
 Env
 - ENABLE_EXTERNAL_LEGACY_ROUTER=false (default)
 - LOG_EXTERNAL_LEGACY_IMPORT_FAILURE=false (default)
 - DEBUG_ERRORS=1 (adds traceback if ?debug=1 too)
+- LEGACY_CONCURRENCY=8
+- LEGACY_TIMEOUT_SEC=25
 """
 
 import asyncio
@@ -36,7 +39,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-VERSION = "1.7.0"
+VERSION = "1.7.2"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -48,8 +51,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(v).strip().lower() in _TRUTHY
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(str(os.getenv(name, "")).strip() or default)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = float(str(os.getenv(name, "")).strip() or default)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
 ENABLE_EXTERNAL_LEGACY_ROUTER = _env_bool("ENABLE_EXTERNAL_LEGACY_ROUTER", False)
 LOG_EXTERNAL_IMPORT_FAILURE = _env_bool("LOG_EXTERNAL_LEGACY_IMPORT_FAILURE", False)
+
+LEGACY_CONCURRENCY = max(1, min(25, _env_int("LEGACY_CONCURRENCY", 8)))
+LEGACY_TIMEOUT_SEC = max(3.0, min(90.0, _env_float("LEGACY_TIMEOUT_SEC", 25.0)))
 
 _external_loaded_from: Optional[str] = None
 
@@ -143,7 +165,7 @@ class SheetRowsIn(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Engine discovery / calling helpers
+# Helpers
 # -----------------------------------------------------------------------------
 def _safe_err(e: BaseException) -> str:
     msg = str(e).strip()
@@ -164,9 +186,47 @@ async def _maybe_await(x: Any) -> Any:
     return x
 
 
-async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str]:
+def _normalize_symbol_best_effort(sym: str) -> str:
     """
-    Returns (engine, source_label).
+    Do NOT hard-fail if normalizer isn't available.
+    """
+    s = (sym or "").strip()
+    if not s:
+        return ""
+    try:
+        from core.data_engine_v2 import normalize_symbol  # type: ignore
+
+        out = normalize_symbol(s)
+        return str(out or "").strip() or s
+    except Exception:
+        return s
+
+
+async def _close_engine_best_effort(engine: Any) -> None:
+    """
+    Close temp engines safely if they have aclose()/close().
+    Never raises.
+    """
+    if engine is None:
+        return
+    try:
+        aclose = getattr(engine, "aclose", None)
+        if callable(aclose):
+            await _maybe_await(aclose())
+            return
+    except Exception:
+        pass
+    try:
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str, bool]:
+    """
+    Returns (engine, source_label, should_close_after_use).
     """
     # 1) already attached
     try:
@@ -175,7 +235,7 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str]
         eng = None
 
     if eng is not None:
-        return eng, "app.state.engine"
+        return eng, "app.state.engine", False
 
     # 2) v2 singleton getter (sync OR async supported)
     try:
@@ -188,35 +248,27 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str]
                 request.app.state.engine = eng2
             except Exception:
                 pass
-            return eng2, "core.data_engine_v2.get_engine(singleton)"
+            return eng2, "core.data_engine_v2.get_engine(singleton)", False
     except Exception:
         pass
 
-    # 3) v2 temp class
+    # 3) v2 temp class (per-request)
     try:
         from core.data_engine_v2 import DataEngine as V2Engine  # type: ignore
 
         eng3 = V2Engine()
-        try:
-            request.app.state.engine = eng3
-        except Exception:
-            pass
-        return eng3, "core.data_engine_v2.DataEngine(temp)"
+        return eng3, "core.data_engine_v2.DataEngine(temp)", True
     except Exception:
         pass
 
-    # 4) legacy v1 temp class
+    # 4) legacy v1 temp class (per-request)
     try:
         from core.data_engine import DataEngine as V1Engine  # type: ignore
 
         eng4 = V1Engine()
-        try:
-            request.app.state.engine = eng4
-        except Exception:
-            pass
-        return eng4, "core.data_engine.DataEngine(temp)"
+        return eng4, "core.data_engine.DataEngine(temp)", True
     except Exception:
-        return None, "none"
+        return None, "none", False
 
 
 async def _call_engine_method(engine: Any, method_names: Sequence[str], *args, **kwargs) -> Tuple[Optional[Any], str]:
@@ -272,24 +324,25 @@ def _headers_fallback(sheet_name: str) -> List[str]:
     ]
 
 
+def _quote_dict(q: Any) -> Dict[str, Any]:
+    if isinstance(q, dict):
+        return q
+    try:
+        if hasattr(q, "model_dump"):
+            return q.model_dump()  # type: ignore
+        if hasattr(q, "dict"):
+            return q.dict()  # type: ignore
+        return dict(getattr(q, "__dict__", {}) or {})
+    except Exception:
+        return {}
+
+
 def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
     """
     Convert a quote dict/model into a row aligned with headers.
     We only fill what we can.
     """
-    d: Dict[str, Any] = {}
-    if isinstance(q, dict):
-        d = q
-    else:
-        try:
-            if hasattr(q, "model_dump"):
-                d = q.model_dump()  # type: ignore
-            elif hasattr(q, "dict"):
-                d = q.dict()  # type: ignore
-            else:
-                d = dict(getattr(q, "__dict__", {}) or {})
-        except Exception:
-            d = {}
+    d = _quote_dict(q)
 
     def g(*keys: str) -> Any:
         for k in keys:
@@ -319,6 +372,47 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
     return row
 
 
+def _items_to_ordered_list(items: Any, symbols: List[str]) -> List[Any]:
+    """
+    Engine may return:
+    - list[quote]  (ideal)
+    - dict[symbol -> quote]
+    - single quote (for 1 item)
+    This function returns a list aligned to input symbols if possible.
+    """
+    if items is None:
+        return []
+
+    if isinstance(items, list):
+        return items
+
+    if isinstance(items, dict):
+        mp: Dict[str, Any] = {}
+        for k, v in items.items():
+            kk = str(k or "").strip().upper()
+            if kk:
+                mp[kk] = v
+            dv = _quote_dict(v)
+            s2 = str(dv.get("symbol_normalized") or dv.get("symbol") or dv.get("ticker") or "").strip().upper()
+            if s2 and s2 not in mp:
+                mp[s2] = v
+
+        ordered: List[Any] = []
+        for s in symbols:
+            su = str(s or "").strip().upper()
+            ordered.append(mp.get(su))
+        # If all Nones, just return dict values as list to not lose data
+        if all(x is None for x in ordered):
+            return list(items.values())
+        return ordered
+
+    # single item
+    if len(symbols) == 1:
+        return [items]
+
+    return []
+
+
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
@@ -333,6 +427,8 @@ async def legacy_health(request: Request):
         "mode": "internal",
         "engine_present": eng is not None,
         "external_router_enabled": ENABLE_EXTERNAL_LEGACY_ROUTER,
+        "legacy_concurrency": LEGACY_CONCURRENCY,
+        "legacy_timeout_sec": LEGACY_TIMEOUT_SEC,
     }
 
     try:
@@ -354,9 +450,12 @@ async def legacy_health(request: Request):
 
     # Try to resolve a working engine (soft)
     try:
-        e2, src = await _get_engine_best_effort(request)
+        e2, src, should_close = await _get_engine_best_effort(request)
         info["engine_resolve_source"] = src
         info["engine_resolved"] = bool(e2 is not None)
+        info["engine_temp_should_close"] = bool(should_close)
+        if should_close and e2 is not None:
+            await _close_engine_best_effort(e2)
     except Exception:
         info["engine_resolve_source"] = "error"
         info["engine_resolved"] = False
@@ -371,24 +470,32 @@ async def legacy_quote(
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
+    raw = (symbol or "").strip()
+    sym = _normalize_symbol_best_effort(raw)
+
+    eng = None
+    src = "none"
+    should_close = False
 
     try:
-        eng, src = await _get_engine_best_effort(request)
+        eng, src, should_close = await _get_engine_best_effort(request)
         if eng is None:
             out = {
                 "status": "error",
-                "symbol": (symbol or "").strip(),
+                "symbol": raw,
+                "symbol_normalized": sym,
                 "data_quality": "MISSING",
                 "data_source": "none",
                 "error": "Legacy engine not available (no working provider).",
             }
             return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
-        q, used = await _call_engine_method(eng, ("get_quote", "get_enriched_quote"), symbol)
+        q, used = await _call_engine_method(eng, ("get_quote", "get_enriched_quote"), sym)
         if q is None:
             out = {
                 "status": "error",
-                "symbol": (symbol or "").strip(),
+                "symbol": raw,
+                "symbol_normalized": sym,
                 "data_quality": "MISSING",
                 "data_source": "none",
                 "error": f"Engine call failed (source={src}, method={used}).",
@@ -400,14 +507,23 @@ async def legacy_quote(
     except Exception as e:
         out: Dict[str, Any] = {
             "status": "error",
-            "symbol": (symbol or "").strip(),
+            "symbol": raw,
+            "symbol_normalized": sym,
             "data_quality": "MISSING",
             "data_source": "none",
             "error": _safe_err(e),
         }
         if dbg:
             out["traceback"] = traceback.format_exc()[:8000]
+            out["engine_source"] = src
         return JSONResponse(status_code=200, content=jsonable_encoder(out))
+
+    finally:
+        if should_close and eng is not None:
+            try:
+                await _close_engine_best_effort(eng)
+            except Exception:
+                pass
 
 
 @router.post("/quotes", summary="Legacy batch quotes endpoint (list[UnifiedQuote])")
@@ -421,12 +537,19 @@ async def legacy_quotes(
     """
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
 
-    symbols = payload.normalized()
-    if not symbols:
+    raw_symbols = payload.normalized()
+    if not raw_symbols:
         return JSONResponse(status_code=200, content=jsonable_encoder([]))
 
+    # normalize for engine calls, but keep output compatible
+    symbols = [_normalize_symbol_best_effort(s) for s in raw_symbols]
+
+    eng = None
+    src = "none"
+    should_close = False
+
     try:
-        eng, src = await _get_engine_best_effort(request)
+        eng, src, should_close = await _get_engine_best_effort(request)
         if eng is None:
             out = [
                 {
@@ -436,27 +559,63 @@ async def legacy_quotes(
                     "data_source": "none",
                     "error": "Legacy engine not available (no working provider).",
                 }
-                for s in symbols
+                for s in raw_symbols
             ]
             return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
+        # batch-first
         items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
-        if items is None:
-            out = [
-                {
-                    "status": "error",
-                    "symbol": s,
-                    "data_quality": "MISSING",
-                    "data_source": "none",
-                    "error": f"Engine call failed (source={src}, method={used}).",
-                }
-                for s in symbols
-            ]
-            if dbg:
-                out.append({"debug": True, "engine_source": src, "method": used})
-            return JSONResponse(status_code=200, content=jsonable_encoder(out))
+        if items is not None:
+            ordered = _items_to_ordered_list(items, symbols)
+            # If engine returned something usable but not aligned, just pass through as list
+            if ordered:
+                return JSONResponse(status_code=200, content=jsonable_encoder(ordered))
+            if isinstance(items, list):
+                return JSONResponse(status_code=200, content=jsonable_encoder(items))
+            # fallback to error list if unknown shape
+            items = None
 
-        return JSONResponse(status_code=200, content=jsonable_encoder(items))
+        # fallback: per-symbol if batch missing/fails
+        sem = asyncio.Semaphore(LEGACY_CONCURRENCY)
+
+        async def _one(sym_i: str, raw_i: str) -> Any:
+            async with sem:
+                try:
+                    q_i, used_i = await asyncio.wait_for(
+                        _call_engine_method(eng, ("get_quote", "get_enriched_quote"), sym_i),
+                        timeout=LEGACY_TIMEOUT_SEC,
+                    )
+                    if q_i is None:
+                        return {
+                            "status": "error",
+                            "symbol": raw_i,
+                            "data_quality": "MISSING",
+                            "data_source": "none",
+                            "error": f"Engine call failed (source={src}, method={used_i}).",
+                        }
+                    return q_i
+                except asyncio.TimeoutError:
+                    return {
+                        "status": "error",
+                        "symbol": raw_i,
+                        "data_quality": "MISSING",
+                        "data_source": "none",
+                        "error": "timeout",
+                    }
+                except Exception as ee:
+                    return {
+                        "status": "error",
+                        "symbol": raw_i,
+                        "data_quality": "MISSING",
+                        "data_source": "none",
+                        "error": _safe_err(ee),
+                    }
+
+        results = await asyncio.gather(*[_one(symbols[i], raw_symbols[i]) for i in range(len(symbols))])
+        if dbg:
+            # append a tiny debug trailer (keeps list shape)
+            results.append({"debug": True, "engine_source": src, "fallback": "per_symbol"})
+        return JSONResponse(status_code=200, content=jsonable_encoder(results))
 
     except Exception as e:
         out = [
@@ -467,11 +626,18 @@ async def legacy_quotes(
                 "data_source": "none",
                 "error": _safe_err(e),
             }
-            for s in symbols
+            for s in raw_symbols
         ]
         if dbg:
-            out.append({"debug": True, "traceback": traceback.format_exc()[:8000]})
+            out.append({"debug": True, "traceback": traceback.format_exc()[:8000], "engine_source": src})
         return JSONResponse(status_code=200, content=jsonable_encoder(out))
+
+    finally:
+        if should_close and eng is not None:
+            try:
+                await _close_engine_best_effort(eng)
+            except Exception:
+                pass
 
 
 @router.post("/sheet-rows", summary="Legacy sheet-rows helper (headers + rows)")
@@ -488,70 +654,107 @@ async def legacy_sheet_rows(
     """
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
 
+    eng = None
+    src = "none"
+    should_close = False
+
     try:
         symbols_in = SymbolsIn(symbols=payload.symbols or [], tickers=payload.tickers or [])
-        symbols = symbols_in.normalized()
-        if not symbols:
+        raw_symbols = symbols_in.normalized()
+        if not raw_symbols:
             return JSONResponse(
                 status_code=200,
                 content=jsonable_encoder({"status": "skipped", "headers": [], "rows": [], "error": "No symbols provided"}),
             )
 
+        # normalize for engine calls
+        symbols = [_normalize_symbol_best_effort(s) for s in raw_symbols]
+
         sheet_name = _sheet_name_from(payload)
         headers = _headers_fallback(sheet_name)
 
-        eng, src = await _get_engine_best_effort(request)
+        eng, src, should_close = await _get_engine_best_effort(request)
         if eng is None:
             rows = [
-                [s, None, None, None, None, None, None, None, None, None, "MISSING", "none", "Legacy engine not available"]
-                for s in symbols
+                [
+                    s,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "MISSING",
+                    "none",
+                    "Legacy engine not available",
+                ]
+                for s in raw_symbols
             ]
             return JSONResponse(
                 status_code=200,
                 content=jsonable_encoder(
-                    {
-                        "status": "error",
-                        "headers": headers,
-                        "rows": rows,
-                        "error": "Legacy engine not available",
-                        "engine_source": src,
-                    }
+                    {"status": "error", "headers": headers, "rows": rows, "error": "Legacy engine not available", "engine_source": src}
                 ),
             )
 
+        # batch-first
         items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
 
-        if not isinstance(items, list):
+        if items is None:
+            # fallback per-symbol
+            sem = asyncio.Semaphore(LEGACY_CONCURRENCY)
+
+            async def _one(sym_i: str) -> Any:
+                async with sem:
+                    try:
+                        q_i, _used_i = await asyncio.wait_for(
+                            _call_engine_method(eng, ("get_quote", "get_enriched_quote"), sym_i),
+                            timeout=LEGACY_TIMEOUT_SEC,
+                        )
+                        return q_i
+                    except Exception:
+                        return None
+
+            items_list = await asyncio.gather(*[_one(s) for s in symbols])
+            items = items_list
+            used = "per_symbol_fallback"
+
+        ordered_items = _items_to_ordered_list(items, symbols)
+
+        if not isinstance(ordered_items, list) or not ordered_items:
             rows = [
-                [s, None, None, None, None, None, None, None, None, None, "MISSING", "none", f"Engine returned non-list (method={used})"]
-                for s in symbols
+                [
+                    s,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "MISSING",
+                    "none",
+                    f"Engine returned non-list (method={used})",
+                ]
+                for s in raw_symbols
             ]
             return JSONResponse(
                 status_code=200,
                 content=jsonable_encoder(
-                    {
-                        "status": "error",
-                        "headers": headers,
-                        "rows": rows,
-                        "error": "Engine returned non-list",
-                        "engine_source": src,
-                        "method": used,
-                    }
+                    {"status": "error", "headers": headers, "rows": rows, "error": "Engine returned non-list", "engine_source": src, "method": used}
                 ),
             )
 
-        rows = [_quote_to_row(q, headers) for q in items]
+        rows = [_quote_to_row(q, headers) if q is not None else _quote_to_row({}, headers) for q in ordered_items]
         return JSONResponse(
             status_code=200,
             content=jsonable_encoder(
-                {
-                    "status": "success",
-                    "headers": headers,
-                    "rows": rows,
-                    "count": len(rows),
-                    "engine_source": src,
-                    "method": used,
-                }
+                {"status": "success", "headers": headers, "rows": rows, "count": len(rows), "engine_source": src, "method": used}
             ),
         )
 
@@ -559,7 +762,15 @@ async def legacy_sheet_rows(
         out: Dict[str, Any] = {"status": "error", "headers": [], "rows": [], "error": _safe_err(e)}
         if dbg:
             out["traceback"] = traceback.format_exc()[:8000]
+            out["engine_source"] = src
         return JSONResponse(status_code=200, content=jsonable_encoder(out))
+
+    finally:
+        if should_close and eng is not None:
+            try:
+                await _close_engine_best_effort(eng)
+            except Exception:
+                pass
 
 
 # -----------------------------------------------------------------------------
