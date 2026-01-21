@@ -1,4 +1,2 @@
-# Procfile (FULL REPLACEMENT)
-# Tadawul Fast Bridge — PROD SAFE (uvicorn workers + access-log toggle + defensive env parsing)
-
-web: sh -c 'set -eu; LOG_LEVEL_LC="$(printf "%s" "${LOG_LEVEL:-info}" | tr "[:upper:]" "[:lower:]")"; PORT_VAL="${PORT:-8000}"; KEEPALIVE_VAL="${UVICORN_KEEPALIVE:-75}"; GRACE_VAL="${UVICORN_GRACEFUL_TIMEOUT:-30}"; CONC="${WEB_CONCURRENCY:-1}"; ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")"; case "$PORT_VAL" in (""|*[!0-9]*) PORT_VAL="8000";; esac; case "$KEEPALIVE_VAL" in (""|*[!0-9]*) KEEPALIVE_VAL="75";; esac; case "$GRACE_VAL" in (""|*[!0-9]*) GRACE_VAL="30";; esac; case "$CONC" in (""|*[!0-9]*) CONC="1";; esac; if [ "$CONC" -lt 1 ]; then CONC="1"; fi; WORKERS=""; if [ "$CONC" -gt 1 ]; then WORKERS="--workers $CONC"; fi; ACCESS_FLAG="--access-log"; case "$ACCESS_RAW" in (0|false|no|off) ACCESS_FLAG="--no-access-log";; esac; exec uvicorn main:app --host 0.0.0.0 --port "$PORT_VAL" --proxy-headers --forwarded-allow-ips "*" --lifespan on --timeout-keep-alive "$KEEPALIVE_VAL" --timeout-graceful-shutdown "$GRACE_VAL" --log-level "$LOG_LEVEL_LC" $ACCESS_FLAG $WORKERS --no-server-header'
+# Tadawul Fast Bridge — PROD SAFE start (delegates to repo script)
+web: sh scripts/start_web.sh
