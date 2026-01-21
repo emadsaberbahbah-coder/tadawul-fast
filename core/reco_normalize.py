@@ -2,7 +2,7 @@
 """
 core/reco_normalize.py
 ------------------------------------------------------------
-Recommendation Normalization — v1.1.0 (PROD SAFE)
+Recommendation Normalization — v1.2.0 (PROD SAFE)
 
 Purpose
 - Provide ONE canonical recommendation enum across the whole app.
@@ -20,12 +20,19 @@ Rules (high level)
     * 1..3  => 1=BUY, 2=HOLD, 3=SELL
 - Supports dict/list inputs (best-effort extraction)
 - Includes minimal Arabic mappings (useful for KSA contexts)
+
+Notes (v1.2.0)
+- More robust Arabic matching (contains + normalization) while still conservative.
+- Better numeric parsing: handles "3/5", "4 of 5", "2.5", "2,0", "rating 4" safely.
+- Prevents misclassifying confidence/probability 0..1 as rating even without explicit keywords.
 """
 
 from __future__ import annotations
 
 import re
 from typing import Any, Optional, Sequence
+
+VERSION = "1.2.0"
 
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
@@ -45,6 +52,8 @@ _NO_RATING = {
     "UNDER REVIEW",
     "NOT COVERED",
     "NO COVERAGE",
+    "NOT APPLICABLE",
+    "NIL",
 }
 
 # Exact phrase mappings (after normalization)
@@ -66,6 +75,7 @@ _BUY_LIKE = {
     "BUYING",
     "SPECULATIVE BUY",
     "CONVICTION BUY",
+    "RECOMMENDED BUY",
 }
 
 _HOLD_LIKE = {
@@ -85,6 +95,7 @@ _HOLD_LIKE = {
     "STABLE",
     "WATCH",
     "MONITOR",
+    "NO ACTION",
 }
 
 _REDUCE_LIKE = {
@@ -98,6 +109,7 @@ _REDUCE_LIKE = {
     "DECREASE",
     "WEAKEN",
     "CAUTIOUS",
+    "PROFIT TAKING",
 }
 
 _SELL_LIKE = {
@@ -113,14 +125,27 @@ _SELL_LIKE = {
     "NEGATIVE",
     "SELLING",
     "DOWNGRADE",
+    "RED FLAG",
 }
 
 # Minimal Arabic mappings (best-effort)
 # Note: we intentionally keep this small and conservative.
-_AR_BUY = {"شراء", "اشتر", "اشترِ", "تجميع", "زيادة", "ايجابي", "إيجابي"}
-_AR_HOLD = {"احتفاظ", "محايد", "انتظار", "مراقبة", "ثبات", "استقرار"}
-_AR_REDUCE = {"تقليص", "تخفيف", "جني ارباح", "جني أرباح"}
-_AR_SELL = {"بيع", "تخارج", "سلبي", "سلبى", "تجنب"}
+_AR_BUY = {"شراء", "اشتر", "اشترِ", "تجميع", "زيادة", "ايجابي", "إيجابي", "فرصة شراء"}
+_AR_HOLD = {"احتفاظ", "محايد", "انتظار", "مراقبة", "ثبات", "استقرار", "تمسك"}
+_AR_REDUCE = {"تقليص", "تخفيف", "جني ارباح", "جني أرباح", "تقليل", "تخفيض"}
+_AR_SELL = {"بيع", "تخارج", "سلبي", "سلبى", "تجنب", "خروج"}
+
+# Patterns (contains) — ordered by severity
+_PAT_SELL = re.compile(r"\b(SELL|EXIT|AVOID|UNDERPERFORM|SHORT|DOWNGRADE)\b")
+_PAT_REDUCE = re.compile(r"\b(REDUCE|TRIM|TAKE PROFIT|TAKE PROFITS|UNDERWEIGHT|LIGHTEN|DECREASE)\b")
+_PAT_HOLD = re.compile(
+    r"\b(HOLD|NEUTRAL|MAINTAIN|EQUAL WEIGHT|MARKET PERFORM|SECTOR PERFORM|IN LINE|FAIR VALUE|WAIT|WATCH|MONITOR)\b"
+)
+_PAT_BUY = re.compile(r"\b(BUY|ACCUMULATE|ADD|OUTPERFORM|OVERWEIGHT|UPGRADE|TOP PICK|LONG)\b")
+
+# Numeric / rating hints
+_PAT_RATING_HINT = re.compile(r"\b(RATING|SCORE|RANK|RECOMMENDATION)\b")
+_PAT_RATIO = re.compile(r"(\d+(?:[.,]\d+)?)\s*(/|OF)\s*(\d+(?:[.,]\d+)?)")
 
 
 def _first_non_empty_str(items: Sequence[Any]) -> Optional[str]:
@@ -155,6 +180,7 @@ def _extract_candidate(x: Any) -> Any:
             "signal",
             "analyst_rating",
             "analystRecommendation",
+            "analyst_recommendation",
         ):
             v = x.get(k)
             if v is not None and str(v).strip():
@@ -170,6 +196,21 @@ def _extract_candidate(x: Any) -> Any:
     return x
 
 
+def _normalize_arabic(s: str) -> str:
+    """
+    Light Arabic normalization (conservative):
+    - trim, collapse spaces
+    - normalize Arabic alef variants minimally
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s).strip()
+    # Normalize common alef forms to "ا" (very light)
+    s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    return s
+
+
 def _try_parse_numeric_rating(s: str) -> Optional[str]:
     """
     Parse numeric-style ratings, e.g.:
@@ -178,19 +219,59 @@ def _try_parse_numeric_rating(s: str) -> Optional[str]:
       "rating: 4"
     Returns canonical enum or None if not parsed.
     """
-    # Grab the first number that looks like a rating
-    m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+    if not s:
+        return None
+
+    su = s.upper()
+
+    # If it clearly looks like a probability/confidence, do not treat as rating.
+    # Covers cases like "0.73", "0.8" when accompanied by common context words.
+    if re.search(r"\b(CONFIDENCE|PROB|PROBABILITY|CHANCE|LIKELIHOOD)\b", su):
+        if re.search(r"\b0\.\d+|\b1\.0\b|\b0\b", su):
+            return None
+
+    # If it's a ratio "x/y" or "x of y", prefer that
+    mratio = _PAT_RATIO.search(su)
+    if mratio:
+        try:
+            x = float(mratio.group(1).replace(",", "."))
+            y = float(mratio.group(3).replace(",", "."))
+        except Exception:
+            x = None
+            y = None
+
+        if x is not None and y is not None and y > 0:
+            # Typical 1..5 or 1..3 scales (1 best)
+            # We treat x as the rating value, y as max.
+            # If y is 5 or 3, map directly.
+            n = int(round(x))
+            if int(round(y)) == 5:
+                if n <= 2:
+                    return "BUY"
+                if n == 3:
+                    return "HOLD"
+                return "SELL"
+            if int(round(y)) == 3:
+                if n == 1:
+                    return "BUY"
+                if n == 2:
+                    return "HOLD"
+                return "SELL"
+            # Unknown max: do not guess
+            return None
+
+    # Otherwise, grab first number
+    m = re.search(r"(-?\d+(?:[.,]\d+)?)", su)
     if not m:
         return None
 
     try:
-        num = float(m.group(1))
+        num = float(m.group(1).replace(",", "."))
     except Exception:
         return None
 
-    # If it clearly looks like a percent/confidence (0..1) => do not treat as reco rating
-    # (avoid mapping 0.7 to HOLD/BUY, etc.)
-    if 0.0 <= num <= 1.0 and re.search(r"\b(CONFIDENCE|PROB|PROBABILITY)\b", s):
+    # Avoid treating 0..1 as rating unless strong hint exists
+    if 0.0 <= num <= 1.0 and not _PAT_RATING_HINT.search(su):
         return None
 
     # Common broker scale 1..5 (1 best)
@@ -216,21 +297,19 @@ def _try_parse_numeric_rating(s: str) -> Optional[str]:
 
 def _normalize_text(s: str) -> str:
     """
-    Normalize separators, punctuation, camel-ish blobs, and whitespace.
+    Normalize separators, punctuation, and whitespace (English focus).
     """
     s = (s or "").strip()
     if not s:
         return ""
 
-    # Keep Arabic text as-is for Arabic mapping checks
-    # For English tokens, work in uppercase
     su = s.upper()
 
     # Replace typical separators with spaces
     su = re.sub(r"[\t\r\n]+", " ", su)
     su = re.sub(r"[\-_/]+", " ", su)
 
-    # Remove brackets/parentheses content markers but keep words
+    # Remove brackets content markers but keep words
     su = su.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ").replace("{", " ").replace("}", " ")
 
     # Collapse whitespace
@@ -259,26 +338,36 @@ def normalize_recommendation(x: Any) -> str:
         else:
             # numeric direct (int/float)
             if isinstance(x2, (int, float)) and not isinstance(x2, bool):
-                # Treat common numeric scales
-                s_num = str(x2)
-                out_num = _try_parse_numeric_rating(s_num)
+                out_num = _try_parse_numeric_rating(str(x2))
                 return out_num or "HOLD"
 
-        # Arabic mapping (check before upper normalization destroys Arabic)
+        # Arabic mapping (check before English normalization)
         try:
-            s_ar = str(x2).strip()
+            s_ar_raw = str(x2).strip()
         except Exception:
-            s_ar = ""
-        if s_ar:
-            s_ar_clean = re.sub(r"\s+", " ", s_ar).strip()
-            if s_ar_clean in _AR_BUY:
+            s_ar_raw = ""
+
+        if s_ar_raw:
+            s_ar = _normalize_arabic(s_ar_raw)
+            if s_ar in _AR_BUY:
                 return "BUY"
-            if s_ar_clean in _AR_HOLD:
+            if s_ar in _AR_HOLD:
                 return "HOLD"
-            if s_ar_clean in _AR_REDUCE:
+            if s_ar in _AR_REDUCE:
                 return "REDUCE"
-            if s_ar_clean in _AR_SELL:
+            if s_ar in _AR_SELL:
                 return "SELL"
+
+            # Conservative contains (Arabic) — only if clearly present
+            # (avoid over-mapping long Arabic sentences)
+            if any(tok in s_ar for tok in ("شراء", "اشتر", "تجميع", "زيادة")):
+                return "BUY"
+            if any(tok in s_ar for tok in ("بيع", "تخارج", "تجنب")):
+                return "SELL"
+            if any(tok in s_ar for tok in ("جني ارباح", "جني ارباح", "تخفيف", "تقليص", "تقليل")):
+                return "REDUCE"
+            if any(tok in s_ar for tok in ("احتفاظ", "محايد", "انتظار", "مراقبة", "استقرار")):
+                return "HOLD"
 
         s = _normalize_text(str(x2))
         if not s:
@@ -300,24 +389,17 @@ def normalize_recommendation(x: Any) -> str:
 
         # Numeric embedded in text (e.g., "Rating: 4/5")
         out_num = _try_parse_numeric_rating(s)
-        if out_num is not None and re.search(r"\b(RATING|SCORE|RANK)\b|\d+\s*(/|OF)\s*\d+", s):
+        if out_num is not None and (_PAT_RATING_HINT.search(s) or _PAT_RATIO.search(s)):
             return out_num
 
         # Heuristics (contains) — ordered by severity
-        # SELL signals
-        if re.search(r"\b(SELL|EXIT|AVOID|UNDERPERFORM|SHORT|DOWNGRADE)\b", s):
+        if _PAT_SELL.search(s):
             return "SELL"
-
-        # REDUCE signals
-        if re.search(r"\b(REDUCE|TRIM|TAKE PROFIT|TAKE PROFITS|UNDERWEIGHT|LIGHTEN|DECREASE)\b", s):
+        if _PAT_REDUCE.search(s):
             return "REDUCE"
-
-        # HOLD signals
-        if re.search(r"\b(HOLD|NEUTRAL|MAINTAIN|EQUAL WEIGHT|MARKET PERFORM|SECTOR PERFORM|IN LINE|FAIR VALUE|WAIT)\b", s):
+        if _PAT_HOLD.search(s):
             return "HOLD"
-
-        # BUY signals
-        if re.search(r"\b(BUY|ACCUMULATE|ADD|OUTPERFORM|OVERWEIGHT|UPGRADE|TOP PICK|LONG)\b", s):
+        if _PAT_BUY.search(s):
             return "BUY"
 
         return "HOLD"
@@ -325,4 +407,4 @@ def normalize_recommendation(x: Any) -> str:
         return "HOLD"
 
 
-__all__ = ["normalize_recommendation"]
+__all__ = ["normalize_recommendation", "VERSION"]
