@@ -1,34 +1,29 @@
-# core/data_engine_v2.py  (FULL REPLACEMENT)
+# core/data_engine_v2.py
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.11.2) — PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.12.0) — PROD SAFE + ROUTER FRIENDLY (FULL REPLACEMENT)
 
-Fixes (Global returning data_source=none / BAD):
-- ✅ Provider function discovery supports patch-style exports + provider objects + exports dicts
-- ✅ Uses shared symbol normalization (core/symbols/normalize.py) when present
-- ✅ Provider call signature mismatch hardened (symbol/ticker kw + positional + kwargs)
-- ✅ Never raises: always returns a dict placeholder on failure
-- ✅ Accepts optional `settings` (kw or positional) for legacy adapter compatibility
-
-v2.11.2 upgrades (alignment + completeness)
-- ✅ Stronger recommendation normalization integration (core.reco_normalize)
-- ✅ Adds common field alias mapping (price/last/close, prevClose, 52w fields, mktCap, etc.)
-- ✅ Cache key includes `fields` to avoid cross-request pollution
-- ✅ Provider tuple errors preserved as warnings (patch, err, meta...) best-effort
-- ✅ Forecast aliases mapped both directions (canonical + back-compat)
-- ✅ Keeps canonical engine fields for Sheets:
+Design goals
+- ✅ PROD SAFE: no network at import-time, no provider imports at import-time
+- ✅ Router-friendly: returns dicts (Sheets-safe) and never raises outward
+- ✅ Provider discovery supports:
+    1) module.<callable>
+    2) module.exports / module.EXPORTS dict
+    3) module.provider / module.PROVIDER object exposing callable
+- ✅ Signature hardening: supports positional + keyword variants (symbol/ticker/sym)
+- ✅ Tuple return hardening: accepts (patch, err) / (patch, err, meta...)
+- ✅ Patch merge semantics: never overwrite existing non-empty values
+- ✅ Uses shared symbol normalization when available: core.symbols.normalize.normalize_symbol
+- ✅ Cache key includes (symbol_norm + fields) to avoid cross-request cache pollution
+- ✅ Forecast canonical fields + back-compat aliases:
     forecast_price_{1m,3m,12m}, expected_roi_{1m,3m,12m},
     forecast_confidence (0..1), forecast_updated_utc/riyadh
+    plus expected_price_*, expected_return_*, confidence_score, forecast_updated
 
-Key guarantees
-- ✅ PROD SAFE: no network at import-time
-- ✅ Global routing: EODHD primary (best-effort), then Finnhub
-- ✅ KSA routing: Yahoo primary, then Argaam (+ Tadawul if configured)
-- ✅ Forecast-ready: fills Forecast Price/Expected ROI/Confidence/Updated
-- ✅ History analytics: returns/vol/MA/RSI (best-effort when raw history exists)
-- ✅ Scores + Recommendation + Badges (BUY/HOLD/REDUCE/SELL)
-- ✅ Riyadh timestamps
+Routing (default)
+- GLOBAL: eodhd -> finnhub
+- KSA: yahoo_chart -> argaam (+ tadawul if configured)
 
 Environment knobs (optional)
 - ENABLED_PROVIDERS / PROVIDERS          (global providers list)
@@ -51,12 +46,12 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.11.2"
+ENGINE_VERSION = "2.12.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -155,11 +150,6 @@ except Exception:  # pragma: no cover
 
 
 def _norm_reco(x: Any, default: str = "HOLD") -> str:
-    """
-    Safe wrapper around normalize_recommendation.
-    - Always returns BUY/HOLD/REDUCE/SELL
-    - Uses `default` if input is missing/unrecognized.
-    """
     d = str(default or "HOLD").strip().upper()
     if d not in {"BUY", "HOLD", "REDUCE", "SELL"}:
         d = "HOLD"
@@ -273,6 +263,20 @@ def _parse_list_env(name: str, fallback: str = "") -> List[str]:
     return out
 
 
+def _dedup_preserve(items: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in items:
+        s = (x or "").strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def _is_ksa(symbol: str) -> bool:
     s = (symbol or "").strip().upper()
     return s.endswith(".SR") or s.isdigit() or bool(re.fullmatch(r"\d{3,6}(\.SR)?", s))
@@ -328,15 +332,13 @@ def normalize_symbol(symbol: str) -> str:
 
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
     """
-    Provider-specific symbol mapping (conservative).
+    Provider-specific mapping (conservative).
     """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
 
-    if k in {"finnhub"}:
-        return s[:-3] if s.endswith(".US") else s
-
-    if k.startswith("yahoo") or k in {"yfinance"}:
+    # Some sources want no ".US" (we do NOT add it; only strip if already present)
+    if k in {"finnhub", "yahoo_chart", "yahoo", "yfinance"}:
         return s[:-3] if s.endswith(".US") else s
 
     return s
@@ -351,11 +353,10 @@ def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
             dst[k] = v
 
 
-async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    out = fn(*args, **kwargs)
-    if inspect.isawaitable(out):
-        return await out
-    return out
+async def _call_maybe_async(x: Any) -> Any:
+    if inspect.isawaitable(x):
+        return await x
+    return x
 
 
 def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
@@ -474,12 +475,12 @@ async def _try_provider_call(
         return {}, f"{module_name}: no callable in {fn_names}", None
 
     try:
-        raw = await _call_maybe_async(_call_provider_best_effort, fn, symbol, refresh, fields)
+        raw = _call_provider_best_effort(fn, symbol, refresh, fields)
+        raw = await _call_maybe_async(raw)
 
         patch: Any = raw
         err: Optional[str] = None
 
-        # Keep tuple error if present (patch, err, ...)
         try:
             if isinstance(raw, tuple) and len(raw) >= 2:
                 patch = raw[0]
@@ -487,7 +488,6 @@ async def _try_provider_call(
                 if isinstance(maybe_err, str) and maybe_err.strip():
                     err = maybe_err.strip()
                 elif maybe_err is not None:
-                    # Some providers return Exception/object here
                     err = str(maybe_err)
         except Exception:
             err = None
@@ -506,10 +506,6 @@ async def _try_provider_candidates(
     refresh: bool,
     fields: Optional[str],
 ) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
-    """
-    Try multiple modules for the same provider key.
-    Returns (patch, err, module_used) where err is non-fatal warning.
-    """
     last_err: Optional[str] = None
     for mod in module_candidates:
         patch, err, _used = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
@@ -519,238 +515,10 @@ async def _try_provider_candidates(
     return {}, last_err, None
 
 
-def _map_common_aliases(out: Dict[str, Any]) -> None:
-    """
-    Map common provider field names into canonical engine fields (only if missing).
-    This increases compatibility across providers without breaking schema.
-    """
-    # Prices
-    if out.get("current_price") is None:
-        for k in ("price", "last", "last_price", "regularMarketPrice", "close", "c"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["current_price"] = v
-                break
-
-    if out.get("previous_close") is None:
-        for k in ("prev_close", "previousClose", "regularMarketPreviousClose", "pc"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["previous_close"] = v
-                break
-
-    if out.get("day_high") is None:
-        for k in ("high", "dayHigh", "regularMarketDayHigh", "h"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["day_high"] = v
-                break
-
-    if out.get("day_low") is None:
-        for k in ("low", "dayLow", "regularMarketDayLow", "l"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["day_low"] = v
-                break
-
-    # 52w
-    if out.get("week_52_high") is None:
-        for k in ("52_week_high", "fiftyTwoWeekHigh", "week52High", "w52High"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["week_52_high"] = v
-                break
-
-    if out.get("week_52_low") is None:
-        for k in ("52_week_low", "fiftyTwoWeekLow", "week52Low", "w52Low"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["week_52_low"] = v
-                break
-
-    # Volume
-    if out.get("volume") is None:
-        for k in ("vol", "regularMarketVolume", "v"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["volume"] = v
-                break
-
-    # Identity
-    if out.get("name") is None:
-        for k in ("shortName", "longName", "companyName", "name_en", "name_ar"):
-            vv = out.get(k)
-            if vv is not None and str(vv).strip():
-                out["name"] = str(vv).strip()
-                break
-
-    if out.get("currency") is None:
-        for k in ("cur", "currency_code", "quoteCurrency", "financialCurrency"):
-            vv = out.get(k)
-            if vv is not None and str(vv).strip():
-                out["currency"] = str(vv).strip()
-                break
-
-    # Fundamentals
-    if out.get("market_cap") is None:
-        for k in ("mktCap", "marketCap", "market_capitalization", "marketCapitalization"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["market_cap"] = v
-                break
-
-    if out.get("shares_outstanding") is None:
-        for k in ("sharesOutstanding", "shares", "share_count"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["shares_outstanding"] = v
-                break
-
-    if out.get("dividend_yield") is None:
-        for k in ("divYield", "dividendYield", "trailingAnnualDividendYield"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["dividend_yield"] = _maybe_percent(v)
-                break
-
-    if out.get("pe_ttm") is None:
-        for k in ("pe", "trailingPE", "peRatio", "PERatio"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["pe_ttm"] = v
-                break
-
-    if out.get("pb") is None:
-        for k in ("pbRatio", "priceToBook", "PBRatio"):
-            v = _safe_float(out.get(k))
-            if v is not None:
-                out["pb"] = v
-                break
-
-
-def _apply_derived(out: Dict[str, Any]) -> None:
-    cur = _safe_float(out.get("current_price"))
-    prev = _safe_float(out.get("previous_close"))
-    vol = _safe_float(out.get("volume"))
-
-    if out.get("price_change") is None and cur is not None and prev is not None:
-        out["price_change"] = cur - prev
-
-    if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        try:
-            out["percent_change"] = (cur - prev) / prev * 100.0
-        except Exception:
-            pass
-
-    if out.get("value_traded") is None and cur is not None and vol is not None:
-        out["value_traded"] = cur * vol
-
-    if out.get("position_52w_percent") is None:
-        hi = _safe_float(out.get("week_52_high"))
-        lo = _safe_float(out.get("week_52_low"))
-        if cur is not None and hi is not None and lo is not None and hi != lo:
-            out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
-
-    for k in ("dividend_yield", "roe", "roa", "payout_ratio", "net_margin", "ebitda_margin"):
-        if out.get(k) is not None:
-            out[k] = _maybe_percent(out.get(k))
-
-    if out.get("market_cap") is None:
-        sh = _safe_float(out.get("shares_outstanding"))
-        if cur is not None and sh is not None:
-            out["market_cap"] = cur * sh
-
-    if out.get("pe_ttm") is None:
-        eps = _safe_float(out.get("eps_ttm"))
-        if cur is not None and eps not in (None, 0.0):
-            try:
-                out["pe_ttm"] = cur / eps
-            except Exception:
-                pass
-
-    if out.get("free_float_market_cap") is None:
-        ff = _safe_float(out.get("free_float"))
-        mc = _safe_float(out.get("market_cap"))
-        if ff is not None and mc is not None:
-            if ff > 1.5:
-                out["free_float_market_cap"] = mc * (ff / 100.0)
-            else:
-                out["free_float_market_cap"] = mc * ff
-
-    # Fair value / upside (best-effort)
-    cur2 = _safe_float(out.get("current_price"))
-    fv = _safe_float(out.get("fair_value"))
-    if fv is None:
-        for k in ("target_price", "analyst_target_price", "intrinsic_value", "dcf_value", "tp"):
-            fv = _safe_float(out.get(k))
-            if fv is not None:
-                out.setdefault("fair_value", fv)
-                break
-    if out.get("upside_percent") is None and cur2 not in (None, 0.0) and fv is not None:
-        try:
-            out["upside_percent"] = (fv - cur2) / cur2 * 100.0
-        except Exception:
-            pass
-    if out.get("valuation_label") is None and _safe_float(out.get("upside_percent")) is not None:
-        up = float(out["upside_percent"])
-        if up >= 15:
-            out["valuation_label"] = "UNDERVALUED"
-        elif up <= -15:
-            out["valuation_label"] = "OVERVALUED"
-        else:
-            out["valuation_label"] = "FAIR"
-
-
-def _quality_label(out: Dict[str, Any]) -> str:
-    must = ["current_price", "previous_close", "day_high", "day_low", "volume"]
-    ok = all(_safe_float(out.get(k)) is not None for k in must)
-    if _safe_float(out.get("current_price")) is None:
-        return "BAD"
-    return "FULL" if ok else "PARTIAL"
-
-
-def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
-    for k in (
-        "market_cap",
-        "pe_ttm",
-        "eps_ttm",
-        "dividend_yield",
-        "dividend_rate",
-        "payout_ratio",
-        "pb",
-        "ps",
-        "ev_ebitda",
-        "shares_outstanding",
-        "free_float",
-        "roe",
-        "roa",
-        "beta",
-        "forward_eps",
-        "forward_pe",
-    ):
-        if _safe_float(out.get(k)) is not None:
-            return True
-    return False
-
-
 def _tadawul_configured() -> bool:
     tq = (os.getenv("TADAWUL_QUOTE_URL") or "").strip()
     tf = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip()
     return bool(tq or tf)
-
-
-def _dedup_preserve(items: Sequence[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in items:
-        s = (x or "").strip()
-        if not s:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
 
 
 # ============================================================
@@ -966,13 +734,223 @@ def _apply_history_analytics(out: Dict[str, Any]) -> None:
         return
 
 
+# ============================================================
+# Canonical + alias mapping
+# ============================================================
+def _map_common_aliases(out: Dict[str, Any]) -> None:
+    # Prices
+    if out.get("current_price") is None:
+        for k in ("price", "last", "last_price", "regularMarketPrice", "close", "c"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["current_price"] = v
+                break
+
+    if out.get("previous_close") is None:
+        for k in ("prev_close", "previousClose", "regularMarketPreviousClose", "pc"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["previous_close"] = v
+                break
+
+    if out.get("day_high") is None:
+        for k in ("high", "dayHigh", "regularMarketDayHigh", "h"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["day_high"] = v
+                break
+
+    if out.get("day_low") is None:
+        for k in ("low", "dayLow", "regularMarketDayLow", "l"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["day_low"] = v
+                break
+
+    # 52w
+    if out.get("week_52_high") is None:
+        for k in ("52_week_high", "fiftyTwoWeekHigh", "week52High", "w52High"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["week_52_high"] = v
+                break
+
+    if out.get("week_52_low") is None:
+        for k in ("52_week_low", "fiftyTwoWeekLow", "week52Low", "w52Low"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["week_52_low"] = v
+                break
+
+    # Volume
+    if out.get("volume") is None:
+        for k in ("vol", "regularMarketVolume", "v"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["volume"] = v
+                break
+
+    # Identity
+    if out.get("name") is None:
+        for k in ("shortName", "longName", "companyName", "name_en", "name_ar"):
+            vv = out.get(k)
+            if vv is not None and str(vv).strip():
+                out["name"] = str(vv).strip()
+                break
+
+    if out.get("currency") is None:
+        for k in ("cur", "currency_code", "quoteCurrency", "financialCurrency"):
+            vv = out.get(k)
+            if vv is not None and str(vv).strip():
+                out["currency"] = str(vv).strip()
+                break
+
+    # Fundamentals
+    if out.get("market_cap") is None:
+        for k in ("mktCap", "marketCap", "market_capitalization", "marketCapitalization"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["market_cap"] = v
+                break
+
+    if out.get("shares_outstanding") is None:
+        for k in ("sharesOutstanding", "shares", "share_count"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["shares_outstanding"] = v
+                break
+
+    if out.get("dividend_yield") is None:
+        for k in ("divYield", "dividendYield", "trailingAnnualDividendYield"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["dividend_yield"] = _maybe_percent(v)
+                break
+
+    if out.get("pe_ttm") is None:
+        for k in ("pe", "trailingPE", "peRatio", "PERatio"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["pe_ttm"] = v
+                break
+
+    if out.get("pb") is None:
+        for k in ("pbRatio", "priceToBook", "PBRatio"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["pb"] = v
+                break
+
+
+def _apply_derived(out: Dict[str, Any]) -> None:
+    cur = _safe_float(out.get("current_price"))
+    prev = _safe_float(out.get("previous_close"))
+    vol = _safe_float(out.get("volume"))
+
+    if out.get("price_change") is None and cur is not None and prev is not None:
+        out["price_change"] = cur - prev
+
+    if out.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
+        try:
+            out["percent_change"] = (cur - prev) / prev * 100.0
+        except Exception:
+            pass
+
+    if out.get("value_traded") is None and cur is not None and vol is not None:
+        out["value_traded"] = cur * vol
+
+    if out.get("position_52w_percent") is None:
+        hi = _safe_float(out.get("week_52_high"))
+        lo = _safe_float(out.get("week_52_low"))
+        if cur is not None and hi is not None and lo is not None and hi != lo:
+            out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
+
+    for k in ("dividend_yield", "roe", "roa", "payout_ratio", "net_margin", "ebitda_margin"):
+        if out.get(k) is not None:
+            out[k] = _maybe_percent(out.get(k))
+
+    if out.get("market_cap") is None:
+        sh = _safe_float(out.get("shares_outstanding"))
+        if cur is not None and sh is not None:
+            out["market_cap"] = cur * sh
+
+    if out.get("pe_ttm") is None:
+        eps = _safe_float(out.get("eps_ttm"))
+        if cur is not None and eps not in (None, 0.0):
+            try:
+                out["pe_ttm"] = cur / eps
+            except Exception:
+                pass
+
+    if out.get("free_float_market_cap") is None:
+        ff = _safe_float(out.get("free_float"))
+        mc = _safe_float(out.get("market_cap"))
+        if ff is not None and mc is not None:
+            if ff > 1.5:
+                out["free_float_market_cap"] = mc * (ff / 100.0)
+            else:
+                out["free_float_market_cap"] = mc * ff
+
+    # Fair value / upside (best-effort)
+    cur2 = _safe_float(out.get("current_price"))
+    fv = _safe_float(out.get("fair_value"))
+    if fv is None:
+        for k in ("target_price", "analyst_target_price", "intrinsic_value", "dcf_value", "tp"):
+            fv = _safe_float(out.get(k))
+            if fv is not None:
+                out.setdefault("fair_value", fv)
+                break
+    if out.get("upside_percent") is None and cur2 not in (None, 0.0) and fv is not None:
+        try:
+            out["upside_percent"] = (fv - cur2) / cur2 * 100.0
+        except Exception:
+            pass
+    if out.get("valuation_label") is None and _safe_float(out.get("upside_percent")) is not None:
+        up = float(out["upside_percent"])
+        if up >= 15:
+            out["valuation_label"] = "UNDERVALUED"
+        elif up <= -15:
+            out["valuation_label"] = "OVERVALUED"
+        else:
+            out["valuation_label"] = "FAIR"
+
+
+def _quality_label(out: Dict[str, Any]) -> str:
+    must = ["current_price", "previous_close", "day_high", "day_low", "volume"]
+    ok = all(_safe_float(out.get(k)) is not None for k in must)
+    if _safe_float(out.get("current_price")) is None:
+        return "BAD"
+    return "FULL" if ok else "PARTIAL"
+
+
+def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
+    for k in (
+        "market_cap",
+        "pe_ttm",
+        "eps_ttm",
+        "dividend_yield",
+        "dividend_rate",
+        "payout_ratio",
+        "pb",
+        "ps",
+        "ev_ebitda",
+        "shares_outstanding",
+        "free_float",
+        "roe",
+        "roa",
+        "beta",
+        "forward_eps",
+        "forward_pe",
+    ):
+        if _safe_float(out.get(k)) is not None:
+            return True
+    return False
+
+
+# ============================================================
+# Forecast alias mapping (both directions)
+# ============================================================
 def _coerce_confidence(v: Any) -> Optional[float]:
-    """
-    Normalize forecast confidence into 0..1
-    Accepts:
-      - 0..1 fraction
-      - 0..100 percent (confidence_score style)
-    """
     x = _safe_float(v)
     if x is None:
         return None
@@ -982,12 +960,6 @@ def _coerce_confidence(v: Any) -> Optional[float]:
 
 
 def _map_forecast_aliases(out: Dict[str, Any]) -> None:
-    """
-    Map provider variants into canonical fields:
-      expected_return_*  -> expected_roi_*
-      expected_price_*   -> forecast_price_*
-      confidence_score   -> forecast_confidence (0..1)
-    """
     for horizon in ("1m", "3m", "12m"):
         er_k = f"expected_return_{horizon}"
         ep_k = f"expected_price_{horizon}"
@@ -1009,13 +981,6 @@ def _map_forecast_aliases(out: Dict[str, Any]) -> None:
 
 
 def _mirror_forecast_aliases(out: Dict[str, Any]) -> None:
-    """
-    Add backward-compatible aliases (without breaking canonical fields):
-      forecast_price_*  -> expected_price_*
-      expected_roi_*    -> expected_return_*
-      forecast_confidence -> confidence_score (percent)
-      forecast_updated_utc -> forecast_updated
-    """
     for horizon in ("1m", "3m", "12m"):
         roi_k = f"expected_roi_{horizon}"
         er_k = f"expected_return_{horizon}"
@@ -1185,7 +1150,7 @@ def _badges(out: Dict[str, Any]) -> List[str]:
     return b
 
 
-def _recommendation(out: Dict[str, Any]) -> str:
+def _recommendation_from_scores(out: Dict[str, Any]) -> str:
     overall = _safe_float(out.get("overall_score")) or 0.0
     risk = _safe_float(out.get("risk_score")) or 50.0
     mom = _safe_float(out.get("momentum_score")) or 50.0
@@ -1409,11 +1374,9 @@ class DataEngine:
 
         self._cache: TTLCache = TTLCache(maxsize=maxsize, ttl=self.cache_ttl_sec)  # type: ignore
 
-        # Provider defaults (NO env mutation)
         default_global = (os.getenv("PROVIDERS") or os.getenv("ENABLED_PROVIDERS") or "eodhd,finnhub").strip() or "eodhd,finnhub"
         default_ksa = (os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam").strip() or "yahoo_chart,argaam"
 
-        # If settings provided, prefer them
         s_global: Optional[List[str]] = None
         s_ksa: Optional[List[str]] = None
         try:
@@ -1431,7 +1394,6 @@ class DataEngine:
         self.global_providers = _dedup_preserve(s_global or _parse_list_env("ENABLED_PROVIDERS", fallback=default_global))
         self.ksa_providers = _dedup_preserve(s_ksa or _parse_list_env("KSA_PROVIDERS", fallback=default_ksa))
 
-        # Tadawul provider only if configured
         if _tadawul_configured() and "tadawul" not in self.ksa_providers:
             self.ksa_providers.append("tadawul")
 
@@ -1451,7 +1413,6 @@ class DataEngine:
         )
 
     async def aclose(self) -> None:
-        """Best-effort close hook (kept for legacy adapter compatibility)."""
         return None
 
     # --------------------
@@ -1527,7 +1488,6 @@ class DataEngine:
         used_sources: List[str] = []
         warnings: List[str] = []
 
-        # Provider loop (patch-style)
         for key in providers:
             reg = _PROVIDER_REGISTRY.get(key)
             if not reg:
@@ -1545,6 +1505,7 @@ class DataEngine:
             )
 
             if patch:
+                # move provider error into warnings (patch-style)
                 p_err = patch.get("error")
                 if isinstance(p_err, str) and p_err.strip():
                     warnings.append(f"{key}: {p_err.strip()}")
@@ -1564,32 +1525,29 @@ class DataEngine:
             if err:
                 warnings.append(f"{key}: {err}")
 
-        # Alias mapping + derived computations
         _map_common_aliases(out)
         _apply_derived(out)
         out["data_quality"] = _quality_label(out)
 
-        # Forecast aliases -> canonical
+        # forecast aliases -> canonical
         _map_forecast_aliases(out)
 
-        # History analytics (best-effort)
+        # history analytics (best-effort)
         if self.enable_history:
             _apply_history_analytics(out)
 
-        # Forecast fallback (momentum) if still missing
+        # forecast fallback (momentum) if still missing
         _forecast_from_momentum(out)
 
-        # Backward compatible aliases after canonical is ready
+        # back-compat aliases after canonical is ready
         _mirror_forecast_aliases(out)
 
-        # Score + reco + badges
+        # score + reco + badges
         _compute_scores(out)
         out["badges"] = _badges(out)
+        out["recommendation"] = _norm_reco(_recommendation_from_scores(out), default="HOLD")
 
-        # Always compute recommendation from engine scores (canonical enum)
-        out["recommendation"] = _norm_reco(_recommendation(out), default="HOLD")
-
-        # Source
+        # source
         out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
 
         # If no price => hard error
@@ -1627,7 +1585,7 @@ class DataEngine:
         }
 
 
-# Back-compat alias names
+# Back-compat alias name
 DataEngineV2 = DataEngine
 
 # ============================================================
