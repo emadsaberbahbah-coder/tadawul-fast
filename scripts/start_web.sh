@@ -1,243 +1,122 @@
+#!/usr/bin/env sh
 # ============================================================
-# Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Backward-Compatible env var names (v1.1.7)
+# Tadawul Fast Bridge — PROD SAFE Start Script
+# - workers + access-log toggle
+# - defensive env parsing
+# - uvicorn graceful flag auto-detect (version-safe)
 # ============================================================
-#
-# v1.1.7 changes vs v1.1.6
-# - ✅ Move inline startCommand into repo script: scripts/start_web.sh
-# - ✅ Auto-detect uvicorn graceful flag across versions
-#
-# Notes
-# - Secrets must be set in Render Environment UI or via `sync: false` placeholders below.
-# - If you rename the service, update BACKEND_BASE_URL/TFB_BASE_URL (or set in Render dashboard).
 
-services:
-  - type: web
-    name: tadawul-fast-bridge
-    env: python
-    plan: free
-    autoDeploy: true
+set -eu
 
-    buildCommand: pip install -r requirements.txt
+# ----------------------------
+# Helpers
+# ----------------------------
+as_int() {
+  raw="${1:-}"
+  def="${2:-0}"
+  case "$raw" in
+    ""|*[!0-9]*) printf "%s" "$def" ;;
+    *)           printf "%s" "$raw" ;;
+  esac
+}
 
-    # Clean deterministic startup
-    startCommand: sh scripts/start_web.sh
+clamp_min_1() {
+  v="$(as_int "${1:-}" "1")"
+  if [ "$v" -lt 1 ]; then v="1"; fi
+  printf "%s" "$v"
+}
 
-    healthCheckPath: /healthz
+loglvl() {
+  v="$(printf "%s" "${1:-info}" | tr "[:upper:]" "[:lower:]")"
+  case "$v" in
+    critical|error|warning|info|debug|trace) printf "%s" "$v" ;;
+    *)                                       printf "%s" "info" ;;
+  esac
+}
 
-    envVars:
-      # -------------------------
-      # Runtime
-      # -------------------------
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: TZ
-        value: "Asia/Riyadh"
+pos_int_or_empty() {
+  raw="${1:-}"
+  case "$raw" in
+    ""|*[!0-9]*) printf "%s" "" ;;
+    *)
+      if [ "$raw" -gt 0 ]; then printf "%s" "$raw"; else printf "%s" ""; fi
+      ;;
+  esac
+}
 
-      # Concurrency / Uvicorn
-      - key: WEB_CONCURRENCY
-        value: "1"
-      - key: UVICORN_KEEPALIVE
-        value: "75"
-      - key: UVICORN_GRACEFUL_TIMEOUT
-        value: "30"
-      - key: UVICORN_ACCESS_LOG
-        value: "1"
+detect_grace_flag() {
+  # Your logs show --timeout-graceful-shutdown works, but detect for safety.
+  help="$(python -m uvicorn --help 2>&1 || true)"
+  if printf "%s" "$help" | grep -q -- "--timeout-graceful-shutdown"; then
+    printf "%s" "--timeout-graceful-shutdown"
+    return 0
+  fi
+  if printf "%s" "$help" | grep -q -- "--graceful-timeout"; then
+    printf "%s" "--graceful-timeout"
+    return 0
+  fi
+  printf "%s" ""
+}
 
-      - key: LOG_LEVEL
-        value: "info"
-      - key: LOG_JSON
-        value: "false"
-      - key: DEBUG
-        value: "false"
+# ----------------------------
+# Read env (defensive)
+# ----------------------------
+LL="$(loglvl "${LOG_LEVEL:-info}")"
+P="$(clamp_min_1 "$(as_int "${PORT:-8000}" "8000")")"
+KA="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")"
+GR="$(clamp_min_1 "$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")")"
+WC="$(clamp_min_1 "$(as_int "${WEB_CONCURRENCY:-1}" "1")")"
 
-      # Fast-boot controls
-      - key: DEFER_ROUTER_MOUNT
-        value: "true"
-      - key: INIT_ENGINE_ON_BOOT
-        value: "true"
+ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")"
 
-      # -------------------------
-      # App identity (compat keys)
-      # -------------------------
-      - key: APP_NAME
-        value: "Tadawul Fast Bridge"
-      - key: SERVICE_NAME
-        value: "Tadawul Fast Bridge"
-      - key: APP_TITLE
-        value: "Tadawul Fast Bridge"
-      - key: APP_ENV
-        value: "production"
-      - key: ENVIRONMENT
-        value: "production"
+LC="$(pos_int_or_empty "${UVICORN_LIMIT_CONCURRENCY:-}")"
+LMR="$(pos_int_or_empty "${UVICORN_LIMIT_MAX_REQUESTS:-}")"
+BL="$(pos_int_or_empty "${UVICORN_BACKLOG:-}")"
+RP="${UVICORN_ROOT_PATH:-}"
 
-      # Version (align with deployed)
-      - key: APP_VERSION
-        value: "5.3.1"
-      - key: SERVICE_VERSION
-        value: "5.3.1"
-      - key: VERSION
-        value: "5.3.1"
+GRACE_FLAG="$(detect_grace_flag)"
 
-      # Base URLs
-      - key: BACKEND_BASE_URL
-        value: "https://tadawul-fast-bridge.onrender.com"
-      - key: TFB_BASE_URL
-        value: "https://tadawul-fast-bridge.onrender.com"
+# ----------------------------
+# Build argv (no eval)
+# ----------------------------
+set -- python -m uvicorn main:app \
+  --host 0.0.0.0 \
+  --port "$P" \
+  --proxy-headers \
+  --forwarded-allow-ips "*" \
+  --lifespan on \
+  --timeout-keep-alive "$KA" \
+  --log-level "$LL" \
+  --no-server-header
 
-      # -------------------------
-      # Security / auth
-      # -------------------------
-      - key: REQUIRE_AUTH
-        value: "false"
-      - key: APP_TOKEN
-        sync: false
-      - key: BACKUP_APP_TOKEN
-        sync: false
-      - key: TFB_APP_TOKEN
-        sync: false
+# graceful shutdown flag (only if supported)
+if [ -n "$GRACE_FLAG" ]; then
+  set -- "$@" "$GRACE_FLAG" "$GR"
+fi
 
-      # -------------------------
-      # Feature flags
-      # -------------------------
-      - key: AI_ANALYSIS_ENABLED
-        value: "true"
-      - key: ADVANCED_ANALYSIS_ENABLED
-        value: "true"
-      - key: ENABLE_RATE_LIMITING
-        value: "true"
-      - key: MAX_REQUESTS_PER_MINUTE
-        value: "240"
+# access log toggle
+case "$ACCESS_RAW" in
+  0|false|no|off) set -- "$@" --no-access-log ;;
+  *)              set -- "$@" --access-log ;;
+esac
 
-      # -------------------------
-      # Providers policy (GLOBAL)
-      # -------------------------
-      - key: ENABLED_PROVIDERS
-        value: "eodhd,finnhub"
-      - key: PROVIDERS
-        value: "eodhd,finnhub"
-      - key: PRIMARY_PROVIDER
-        value: "eodhd"
+# workers only if > 1
+if [ "$WC" -gt 1 ]; then
+  set -- "$@" --workers "$WC"
+fi
 
-      # -------------------------
-      # KSA routing order (Option A: quiet + stable)
-      # -------------------------
-      - key: KSA_PROVIDERS
-        value: "yahoo_chart"
+# optional tuning flags
+if [ -n "$LC" ]; then
+  set -- "$@" --limit-concurrency "$LC"
+fi
+if [ -n "$LMR" ]; then
+  set -- "$@" --limit-max-requests "$LMR"
+fi
+if [ -n "$BL" ]; then
+  set -- "$@" --backlog "$BL"
+fi
+if [ -n "$RP" ]; then
+  set -- "$@" --root-path "$RP"
+fi
 
-      # Hard safety: never use EODHD for KSA
-      - key: KSA_DISALLOW_EODHD
-        value: "true"
-
-      # Yahoo Chart fallbacks
-      - key: ENABLE_YAHOO_CHART_KSA
-        value: "true"
-      - key: ENABLE_YAHOO_CHART_SUPPLEMENT
-        value: "true"
-
-      # yfinance policy (if engine references it)
-      - key: ENABLE_YFINANCE
-        value: "true"
-      - key: ENABLE_YFINANCE_KSA
-        value: "false"
-
-      # Yahoo fundamentals toggles (if your engine supports them)
-      - key: ENABLE_YAHOO_FUNDAMENTALS_KSA
-        value: "true"
-      - key: ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
-        value: "false"
-
-      # -------------------------
-      # Provider keys (SECRETS)
-      # -------------------------
-      - key: FMP_API_KEY
-        sync: false
-      - key: EODHD_API_KEY
-        sync: false
-      - key: FINNHUB_API_KEY
-        sync: false
-      - key: ALPHA_VANTAGE_API_KEY
-        sync: false
-      - key: ARGAAM_API_KEY
-        sync: false
-
-      # Optional explicit URLs (empty is fine)
-      - key: TADAWUL_QUOTE_URL
-        value: ""
-      - key: TADAWUL_FUNDAMENTALS_URL
-        value: ""
-      - key: ARGAAM_GATEWAY_URL
-        value: ""
-
-      # -------------------------
-      # HTTP + caching (compat)
-      # -------------------------
-      - key: HTTP_TIMEOUT_SEC
-        value: "25"
-      - key: HTTP_TIMEOUT
-        value: "25"
-
-      - key: CACHE_TTL_SEC
-        value: "20"
-      - key: CACHE_DEFAULT_TTL
-        value: "20"
-
-      - key: ENGINE_CACHE_TTL_SEC
-        value: "20"
-
-      - key: QUOTE_TTL_SEC
-        value: "30"
-      - key: FUNDAMENTALS_TTL_SEC
-        value: "21600"
-      - key: ARGAAM_SNAPSHOT_TTL_SEC
-        value: "30"
-
-      # -------------------------
-      # Batch controls
-      # -------------------------
-      - key: ENRICHED_BATCH_SIZE
-        value: "40"
-      - key: ENRICHED_MAX_TICKERS
-        value: "250"
-      - key: ENRICHED_BATCH_CONCURRENCY
-        value: "5"
-      - key: ENRICHED_CONCURRENCY
-        value: "5"
-      - key: ENRICHED_TIMEOUT_SEC
-        value: "45"
-
-      - key: AI_BATCH_SIZE
-        value: "20"
-      - key: AI_MAX_TICKERS
-        value: "500"
-      - key: AI_CONCURRENCY
-        value: "5"
-      - key: AI_TIMEOUT_SEC
-        value: "45"
-
-      - key: ADV_BATCH_SIZE
-        value: "25"
-      - key: ADV_MAX_TICKERS
-        value: "500"
-      - key: ADV_CONCURRENCY
-        value: "6"
-      - key: ADV_TIMEOUT_SEC
-        value: "45"
-
-      # -------------------------
-      # Google Sheets integration (SECRETS)
-      # -------------------------
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-
-      # -------------------------
-      # CORS
-      # -------------------------
-      - key: ENABLE_CORS_ALL_ORIGINS
-        value: "true"
-      - key: CORS_ALL_ORIGINS
-        value: "true"
-      - key: CORS_ORIGINS
-        value: "*"
+exec "$@"
