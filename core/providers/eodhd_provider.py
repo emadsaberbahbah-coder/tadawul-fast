@@ -2,22 +2,26 @@
 """
 core/providers/eodhd_provider.py
 ============================================================
-EODHD Provider — v2.2.0 (GLOBAL PRIMARY + SYMBOL VARIANTS + HISTORY/FCAST + ENGINE-DISCOVERY SAFE)
+EODHD Provider — v2.3.0 (GLOBAL PRIMARY + SPECIAL SYMBOL NORMALIZATION + HISTORY/FCAST)
 
-Key goals
-- ✅ Engine-discovery compatible: exposes get_quote / get_enriched_quote / fetch_quote / quote / fetch
-  (because your engine registry probes these names in order).
-- ✅ Global symbol fix: AAPL -> AAPL.US (via EODHD_DEFAULT_EXCHANGE, default US)
-- ✅ Variants for tricky tickers: BRK.B.US + BRK-B.US
-- ✅ Best-effort: even if realtime fails, still attempts fundamentals/history (unless disabled)
-- ✅ Aligns forecast fields with your canonical schema:
+Why this revision
+- Fixes noisy 404/422 requests caused by Yahoo-style symbols:
+    • ^GSPC, ^DJI, ^NDX, ^FTSE  ->  GSPC.INDX, DJI.INDX, NDX.INDX, FTSE.INDX
+    • GC=F, SI=F, CL=F, BZ=F   ->  best-effort mappings (FOREX CFD) + COMM fallbacks
+    • EURUSD=X                 ->  EURUSD.FOREX (and EUR.FOREX fallback)
+- Reduces doomed fundamentals calls for symbol types that typically don't support them.
+- Keeps engine-discovery compatibility:
+    get_quote / get_enriched_quote / fetch_quote / quote / fetch
+- Keeps global symbol fix: AAPL -> AAPL.US (via EODHD_DEFAULT_EXCHANGE, default US)
+- Keeps variants for tricky tickers: BRK.B.US + BRK-B.US
+- Best-effort: realtime + fundamentals + history/forecast where possible
+- Aligns forecast fields with canonical schema:
     expected_roi_1m/3m/12m, forecast_price_1m/3m/12m, forecast_confidence (0..1),
     forecast_method, forecast_updated_utc, forecast_updated_riyadh
   (and still provides returns_*, ma*, volatility_30d, rsi_14)
-- ✅ Import-safe: no network at import time, lazy AsyncClient + TTL caches
 
 KSA handling
-- Default: KSA is BLOCKED (safe) to avoid routing confusion.
+- Default: KSA is BLOCKED (safe) to avoid routing confusion for numeric/.SR tickers.
 - Enable KSA via: ALLOW_EODHD_KSA=true  (or EODHD_ALLOW_KSA=true)
 
 Env vars (supported)
@@ -25,9 +29,11 @@ Auth/Base
 - EODHD_API_KEY (preferred)
 - EODHD_API_TOKEN / EODHD_TOKEN (legacy)
 - EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
+
+Exchange behavior
 - EODHD_DEFAULT_EXCHANGE (default: US)
 
-Behavior
+Behavior toggles
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
 - EODHD_ENABLE_HISTORY (default: true)
 - EODHD_ENABLE_FORECAST (default: true)
@@ -47,9 +53,14 @@ History window
 - EODHD_HISTORY_DAYS (default: 400, min 60)
 - EODHD_HISTORY_POINTS_MAX (default: 400, min 100)
 
+Optional symbol maps (JSON dicts)
+- EODHD_INDEX_ALIASES_JSON     e.g. {"TASI":"TASI.INDX","NOMU":"NOMU.INDX"}
+- EODHD_COMMODITY_ALIASES_JSON e.g. {"GC=F":"XAUUSD.FOREX","BZ=F":"XBRUSD.FOREX"}
+- EODHD_FOREX_ALIASES_JSON     e.g. {"SAR=X":"SAR.FOREX","EURUSD=X":"EURUSD.FOREX"}
+
 Notes
 - Forecast here is a simple momentum-style estimate (non-investment advice).
-- This provider is meant for GLOBAL symbols primarily; KSA is off by default.
+- This provider is meant for GLOBAL symbols primarily; KSA numeric/.SR is off by default.
 """
 
 from __future__ import annotations
@@ -70,7 +81,7 @@ import httpx
 
 logger = logging.getLogger("core.providers.eodhd_provider")
 
-PROVIDER_VERSION = "2.2.0"
+PROVIDER_VERSION = "2.3.0"
 PROVIDER_NAME = "eodhd"
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -226,6 +237,25 @@ def _history_points_max() -> int:
     return max(100, int(n))
 
 
+def _json_env_map(name: str) -> Dict[str, str]:
+    raw = _env_str(name, "")
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            out: Dict[str, str] = {}
+            for k, v in obj.items():
+                ks = str(k).strip()
+                vs = str(v).strip()
+                if ks and vs:
+                    out[ks.upper()] = vs
+            return out
+    except Exception:
+        return {}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # TTL cache (import-safe if cachetools missing)
 # ---------------------------------------------------------------------------
@@ -272,7 +302,6 @@ _QUOTE_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_quote_ttl_sec())
 _FUND_CACHE: TTLCache = TTLCache(maxsize=4000, ttl=_fund_ttl_sec())
 _HIST_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
 
-
 # ---------------------------------------------------------------------------
 # Customized headers
 # ---------------------------------------------------------------------------
@@ -311,9 +340,10 @@ def _endpoint_headers(kind: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Symbol guards + variants
+# Symbol guards + normalization (INDX/FOREX/COMM + Yahoo-style aliases)
 # ---------------------------------------------------------------------------
 _KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
+_EXCH_SUFFIX_RE = re.compile(r"^(.+)\.([A-Z0-9]{2,10})$")
 
 
 def _looks_like_ksa(symbol: str) -> bool:
@@ -327,21 +357,7 @@ def _looks_like_ksa(symbol: str) -> bool:
     return bool(_KSA_RE.match(s))
 
 
-def _is_index_or_fx(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    if not s:
-        return False
-    # indices / yahoo-style FX/commodities
-    return ("^" in s) or ("=" in s) or s.endswith("=X") or s.endswith("=F")
-
-
-_EXCH_SUFFIX_RE = re.compile(r"^(.+)\.([A-Z0-9]{2,6})$")
-
-
 def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
-    """
-    If sym ends in .US/.L/.TO/... treat last segment as exchange suffix.
-    """
     s = (sym or "").strip().upper()
     if not s:
         return "", None
@@ -355,43 +371,171 @@ def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
     return base, exch
 
 
+def _safe_alnum(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (s or "").strip().upper())
+
+
+# Defaults (can be overridden/extended via env JSON maps)
+_DEFAULT_INDEX_ALIASES: Dict[str, str] = {
+    "TASI": "TASI.INDX",
+    "NOMU": "NOMU.INDX",
+}
+_DEFAULT_COMMODITY_ALIASES: Dict[str, str] = {
+    # Yahoo futures -> try equivalent CFD/spot (FOREX venue)
+    "GC=F": "XAUUSD.FOREX",  # Gold
+    "SI=F": "XAGUSD.FOREX",  # Silver
+    "CL=F": "XTIUSD.FOREX",  # WTI crude
+    "BZ=F": "XBRUSD.FOREX",  # Brent crude
+}
+_DEFAULT_FOREX_ALIASES: Dict[str, str] = {
+    # Example of single currency vs USD sometimes supported as XXX.FOREX
+    "SAR=X": "SAR.FOREX",
+}
+
+_INDEX_ALIASES = {**_DEFAULT_INDEX_ALIASES, **_json_env_map("EODHD_INDEX_ALIASES_JSON")}
+_COMMODITY_ALIASES = {**_DEFAULT_COMMODITY_ALIASES, **_json_env_map("EODHD_COMMODITY_ALIASES_JSON")}
+_FOREX_ALIASES = {**_DEFAULT_FOREX_ALIASES, **_json_env_map("EODHD_FOREX_ALIASES_JSON")}
+
+
+def _special_variants(raw_symbol: str) -> Tuple[List[str], str]:
+    """
+    Returns (variants, kind)
+    kind in: equity | index | forex | commodity | unknown
+    """
+    s = (raw_symbol or "").strip().upper()
+    if not s:
+        return [], "unknown"
+
+    # already EODHD-style (has exchange suffix) => treat as equity-ish and let normalizer handle
+    _, exch = _split_exchange_suffix(s)
+    if exch is not None:
+        # could be INDX/FOREX/COMM/CC/etc — we treat as-is
+        if exch in ("INDX", "FOREX", "COMM", "CC", "EUFUND", "GBOND", "MONEY"):
+            k = "index" if exch == "INDX" else ("forex" if exch == "FOREX" else ("commodity" if exch == "COMM" else "equity"))
+            return [s], k
+        return [s], "equity"
+
+    # Explicit alias maps
+    if s in _INDEX_ALIASES:
+        return [_INDEX_ALIASES[s], s], "index"
+    if s in _COMMODITY_ALIASES:
+        # include COMM fallback too (strip "=F")
+        base = _safe_alnum(s.replace("=F", ""))
+        fallbacks = []
+        if base:
+            fallbacks = [f"{base}.COMM", f"{base}.COM"]
+        return [_COMMODITY_ALIASES[s]] + fallbacks + [s], "commodity"
+    if s in _FOREX_ALIASES:
+        return [_FOREX_ALIASES[s], s], "forex"
+
+    # Yahoo index form: ^GSPC -> GSPC.INDX
+    if s.startswith("^"):
+        base = _safe_alnum(s[1:])
+        if base:
+            return [f"{base}.INDX", base, s], "index"
+        return [s], "index"
+
+    # Yahoo FX form: EURUSD=X -> EURUSD.FOREX and EUR.FOREX fallback
+    if s.endswith("=X"):
+        base = _safe_alnum(s[:-2])
+        if not base:
+            return [s], "forex"
+        out = [f"{base}.FOREX"]
+        if len(base) >= 3:
+            out.append(f"{base[:3]}.FOREX")
+        out.append(s)
+        # de-dupe
+        final: List[str] = []
+        seen = set()
+        for x in out:
+            if x and x not in seen:
+                seen.add(x)
+                final.append(x)
+        return final, "forex"
+
+    # Yahoo futures form: GC=F -> (mapping if known) else try COMM fallbacks
+    if s.endswith("=F") or "=" in s:
+        base = _safe_alnum(s.replace("=F", "").replace("=X", ""))
+        out2: List[str] = []
+        if base:
+            out2.extend([f"{base}.COMM", f"{base}.COM"])
+        out2.append(s)
+        final2: List[str] = []
+        seen2 = set()
+        for x in out2:
+            if x and x not in seen2:
+                seen2.add(x)
+                final2.append(x)
+        return final2, "commodity"
+
+    return [s], "equity"
+
+
 def _provider_symbol_variants(raw_symbol: str) -> List[str]:
     """
-    Best-effort variants to increase hit rate:
-    - AAPL -> AAPL.US (using EODHD_DEFAULT_EXCHANGE)
-    - AAPL.US -> AAPL.US
-    - BRK.B -> BRK.B.US then BRK-B.US
-    - BRK-B -> BRK-B.US then BRK.B.US
-    Indices/FX => keep as-is
-    KSA => keep as-is (but usually blocked unless allowed)
+    Provider variants:
+    - For special symbols, use special variants first (INDX/FOREX/COMM).
+    - For equities:
+        AAPL -> AAPL.US (via EODHD_DEFAULT_EXCHANGE)
+        BRK.B -> BRK.B.US then BRK-B.US
     """
     s = (raw_symbol or "").strip().upper()
     if not s:
         return []
 
-    if _is_index_or_fx(s):
-        return [s]
+    special, _kind = _special_variants(s)
+    if special:
+        # If the best candidate already has a suffix (e.g., GSPC.INDX), we keep it as primary.
+        # If it's still a plain equity ticker, normal equity expansion continues below.
+        primary = special[0]
+    else:
+        primary = s
+        special = [s]
 
-    # KSA: keep as-is; engine/router should route elsewhere unless explicitly enabled
-    if _looks_like_ksa(s):
-        if s.isdigit():
-            return [f"{s}.SR", s]
-        if s.endswith(".SR"):
-            return [s, s.replace(".SR", "")]
-        return [s]
+    # KSA numeric/.SR: keep as-is (but usually blocked unless allowed)
+    if _looks_like_ksa(primary):
+        if primary.isdigit():
+            return [f"{primary}.SR", primary]
+        if primary.endswith(".SR"):
+            return [primary, primary.replace(".SR", "")]
+        return [primary]
 
-    base, exch = _split_exchange_suffix(s)
+    # If primary already has a suffix, honor it and only add dot/dash internal variants.
+    base0, exch0 = _split_exchange_suffix(primary)
+    if exch0 is not None:
+        out: List[str] = [primary]
+        # dot/dash swap inside BASE (not exchange separator)
+        b1 = base0.replace(".", "-")
+        b2 = base0.replace("-", ".")
+        if b1 != base0:
+            out.append(f"{b1}.{exch0}")
+        if b2 != base0 and b2 != b1:
+            out.append(f"{b2}.{exch0}")
+        # include any other specials after
+        for x in special[1:]:
+            if x and x not in out:
+                out.append(x)
+        # de-dupe keep order
+        seen = set()
+        final: List[str] = []
+        for x in out:
+            if x and x not in seen:
+                seen.add(x)
+                final.append(x)
+        return final
+
+    # Equity expansion (no suffix)
+    base, exch = _split_exchange_suffix(primary)
     if exch is None:
         exch = _default_exchange()
-        primary = f"{base}.{exch}"
+        primary2 = f"{base}.{exch}"
         also = base
     else:
-        primary = f"{base}.{exch}"
+        primary2 = f"{base}.{exch}"
         also = base
 
-    out: List[str] = [primary]
+    out = [primary2]
 
-    # dot/dash swap inside BASE (not the exchange separator)
     base_dot_to_dash = base.replace(".", "-")
     base_dash_to_dot = base.replace("-", ".")
 
@@ -400,13 +544,15 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
     if base_dash_to_dot != base and base_dash_to_dot != base_dot_to_dash:
         out.append(f"{base_dash_to_dot}.{exch}")
 
-    # last resort: try without exchange
     if also and also not in out:
         out.append(also)
 
-    # de-dupe preserve order
+    for x in special[1:]:
+        if x and x not in out:
+            out.append(x)
+
     seen = set()
-    final: List[str] = []
+    final = []
     for x in out:
         if not x:
             continue
@@ -473,11 +619,6 @@ def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
-    """
-    Merge src into dst:
-    - Fill blanks/missing in dst
-    - Force overwrite for keys in force_keys
-    """
     fset = set(force_keys or ())
     for k, v in (src or {}).items():
         if v is None:
@@ -526,20 +667,14 @@ def _fill_derived(patch: Dict[str, Any]) -> None:
 
 
 def _data_quality(patch: Dict[str, Any], warns: List[str]) -> str:
-    """
-    Heuristic quality for upstream (GOOD/OK/BAD).
-    """
     cur = _to_float(patch.get("current_price"))
     if cur is not None:
         return "GOOD"
 
-    # if we have meaningful partials (fundamentals/history), not totally dead
     for k in ("market_cap", "pe_ttm", "name", "week_52_high", "week_52_low", "returns_1m", "ma50"):
         if patch.get(k) is not None and str(patch.get(k)).strip() != "":
             return "OK"
 
-    if warns:
-        return "BAD"
     return "BAD"
 
 
@@ -624,7 +759,6 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out["ma50"] = ma(50)
     out["ma200"] = ma(200)
 
-    # volatility_30d from last 31 closes
     if len(closes) >= 31:
         window = closes[-31:]
         rets: List[float] = []
@@ -639,7 +773,6 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     out["rsi_14"] = _compute_rsi_14(closes)
 
-    # momentum forecast (canonical fields)
     def mean_daily_return(n_days: int) -> Optional[float]:
         if len(closes) < (n_days + 2):
             return None
@@ -669,8 +802,6 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     else:
         out["forecast_method"] = "history_only"
 
-    # confidence score:
-    # - compute 0..100 then map to 0..1 for forecast_confidence (canonical)
     pts = len(closes)
     base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
     vol = _to_float(out.get("volatility_30d"))
@@ -859,9 +990,6 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 
 
 async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
-    """
-    Returns (patch, err, used_symbol)
-    """
     if not _token():
         return {}, "not configured (EODHD_API_KEY)", None
 
@@ -871,7 +999,8 @@ async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, A
         js, err = await _get_json_dict(url, {}, kind="realtime")
         if js is None:
             last_err = err
-            if err and err.startswith("HTTP 404"):
+            # 404/422 -> try next variant
+            if err and (err.startswith("HTTP 404") or err.startswith("HTTP 422")):
                 continue
             continue
 
@@ -900,8 +1029,8 @@ async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, A
     return {}, f"realtime failed: {last_err or 'unknown'}", None
 
 
-async def _fetch_fundamentals_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
-    if not _enable_fundamentals():
+async def _fetch_fundamentals_patch(symbol_variants: List[str], *, enabled: bool) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+    if not enabled or not _enable_fundamentals():
         return {}, None, None
     if not _token():
         return {}, "not configured (EODHD_API_KEY)", None
@@ -912,7 +1041,7 @@ async def _fetch_fundamentals_patch(symbol_variants: List[str]) -> Tuple[Dict[st
         js, err = await _get_json_dict(url, {}, kind="fundamentals")
         if js is None:
             last_err = err
-            if err and err.startswith("HTTP 404"):
+            if err and (err.startswith("HTTP 404") or err.startswith("HTTP 422")):
                 continue
             continue
 
@@ -993,7 +1122,7 @@ async def _fetch_history_patch(symbol_variants: List[str]) -> Tuple[Dict[str, An
         )
         if js_list is None:
             last_err = err
-            if err and err.startswith("HTTP 404"):
+            if err and (err.startswith("HTTP 404") or err.startswith("HTTP 422")):
                 continue
             continue
 
@@ -1034,6 +1163,26 @@ async def _fetch_history_patch(symbol_variants: List[str]) -> Tuple[Dict[str, An
 # ---------------------------------------------------------------------------
 
 
+def _fundamentals_allowed_for_symbol(symbol: str) -> bool:
+    """
+    Heuristic:
+    - equities: yes
+    - INDX: yes (EODHD supports index fundamentals)
+    - FOREX/COMM: typically no (avoid extra 404s); allow only if user overrides via env map.
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return False
+    _, exch = _split_exchange_suffix(s)
+    if exch is None:
+        return True
+    if exch == "INDX":
+        return True
+    if exch in ("FOREX", "COMM"):
+        return False
+    return True
+
+
 async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) -> Dict[str, Any]:
     sym_in = (symbol or "").strip()
     if not sym_in:
@@ -1046,7 +1195,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
             "last_updated_riyadh": _riyadh_iso(),
         }
 
-    # Controlled KSA enablement
+    # Controlled KSA enablement (numeric/.SR only)
     if _looks_like_ksa(sym_in) and not _allow_ksa():
         return _clean_patch(
             {
@@ -1108,8 +1257,11 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
         out["provider_symbol"] = rt_used
     _merge_into(out, rt_patch)
 
+    # Decide fundamentals enablement based on symbol type (avoid extra 404s)
+    fundamentals_ok = want_fundamentals and _enable_fundamentals() and _fundamentals_allowed_for_symbol(out.get("provider_symbol", variants[0]))
+
     # --- fundamentals (cached) ---
-    if want_fundamentals and _enable_fundamentals():
+    if fundamentals_ok:
         ck_f = f"f::{variants[0]}"
         hitf = _FUND_CACHE.get(ck_f)
         if isinstance(hitf, dict) and hitf:
@@ -1117,7 +1269,7 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
             f_err = None
             f_used = variants[0]
         else:
-            f_patch, f_err, f_used = await _fetch_fundamentals_patch(variants)
+            f_patch, f_err, f_used = await _fetch_fundamentals_patch(variants, enabled=True)
             if f_patch:
                 _FUND_CACHE[ck_f] = dict(f_patch)
 
@@ -1171,7 +1323,6 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
     _fill_derived(out)
     out["data_quality"] = _data_quality(out, warns)
 
-    # Non-fatal warning marker (avoid forcing engine 'error')
     if warns:
         out.setdefault("provider_warning", warns[0])
 
@@ -1185,7 +1336,6 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
 
 
 async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # Enriched by default (so engine gets history/forecast columns)
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
 
@@ -1194,7 +1344,6 @@ async def get_enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str
 
 
 async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # Alias many engines probe
     return await get_quote(symbol, *args, **kwargs)
 
 
@@ -1236,19 +1385,16 @@ class EodhdProvider:
 
 
 __all__ = [
-    # engine discovery
     "get_quote",
     "get_enriched_quote",
     "fetch_quote",
     "quote",
     "fetch",
-    # legacy names
     "fetch_quote_patch",
     "fetch_enriched_quote_patch",
     "fetch_quote_and_enrichment_patch",
     "fetch_quote_and_fundamentals_patch",
     "fetch_enriched_patch",
-    # client cleanup + metadata
     "aclose_eodhd_client",
     "PROVIDER_VERSION",
     "PROVIDER_NAME",
