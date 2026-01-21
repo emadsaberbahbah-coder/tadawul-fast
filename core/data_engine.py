@@ -2,27 +2,32 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v3.9.0) — PROD SAFE (TRUE LAZY)
+LEGACY COMPATIBILITY ADAPTER (v4.0.0) — PROD SAFE (TRUE LAZY)
 
 What this module guarantees
-- ✅ Never crashes app startup (no hard dependency on data_engine_v2 at import-time).
+- ✅ Never crashes app startup (NO hard dependency on data_engine_v2 at import-time).
 - ✅ Best-effort delegation to core.data_engine_v2 when available.
-- ✅ Provides stable legacy API surface:
+- ✅ Stable legacy API surface:
     - normalize_symbol()
     - get_quote / get_quotes
     - get_enriched_quote / get_enriched_quotes
     - close_engine()
     - get_engine_meta()
     - DataEngine wrapper class (lazy, safe)
-- ✅ Works whether V2 methods are async OR sync (auto await).
-- ✅ Handles V2 returning list OR dict OR (payload, err) tuples (defensive).
+- ✅ Works whether V2 methods are async OR sync (auto-await).
+- ✅ Defensive return-shapes:
+    - payload
+    - (payload, err) / (payload, err, meta...)
+    - dict[symbol->payload] / list[payload]
 - ✅ If V2 missing/broken -> returns stub quotes with data_quality="MISSING" and error.
 - ✅ Never leaks secrets in meta/health.
 
-v3.9.0 improvements (project-aligned)
-- ✅ Safer global symbol normalization: NO automatic ".US" suffix (keeps AAPL, SPY, etc. unchanged).
-- ✅ Stronger tuple-unwrapping: accepts (payload, err) OR longer tuples.
-- ✅ Exposes DataEngineV2 lazily via __getattr__ when available (for core/__init__.py discovery).
+v4.0.0 improvements
+- ✅ Stronger method fallbacks: supports v2 engines exposing get_quote/get_enriched_quote OR fetch_quote/quote/fetch
+- ✅ Batch result coercion preserves input order even if V2 returns dict
+- ✅ Optional disable switch: DATA_ENGINE_V2_DISABLED=true (forces stub mode)
+- ✅ More robust UnifiedQuote lookup (schemas variants) + safer finalize()
+- ✅ More informative get_engine_meta() without importing heavy modules at import time
 """
 
 from __future__ import annotations
@@ -70,7 +75,7 @@ except Exception:  # pragma: no cover
     ConfigDict = None  # type: ignore
 
 
-ADAPTER_VERSION = "3.9.0"
+ADAPTER_VERSION = "4.0.0"
 
 # =============================================================================
 # Legacy type kept so older type-checks don't fail
@@ -136,9 +141,15 @@ def _as_list(x: Any) -> List[Any]:
     if isinstance(x, list):
         return x
     if isinstance(x, dict):
-        # dict[symbol -> quote] style
         return list(x.values())
     return [x]
+
+
+def _truthy_env(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
 
 
 # =============================================================================
@@ -150,6 +161,18 @@ _V2_LOAD_ERR: Optional[str] = None
 _V2_LOAD_LOCK = threading.Lock()
 
 
+def _find_unified_quote_fallback() -> Optional[Any]:
+    for path in ("core.schemas", "core.models.schemas", "schemas"):
+        try:
+            m = import_module(path)
+            uq = getattr(m, "UnifiedQuote", None)
+            if uq is not None:
+                return uq
+        except Exception:
+            continue
+    return None
+
+
 def _load_v2() -> Tuple[bool, Optional[str]]:
     """
     Best-effort import of core.data_engine_v2.
@@ -159,6 +182,11 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
 
     if _V2:
         return True, None
+
+    if _truthy_env("DATA_ENGINE_V2_DISABLED", False):
+        _ENGINE_MODE = "stub"
+        _V2_LOAD_ERR = "V2 disabled by env: DATA_ENGINE_V2_DISABLED=true"
+        return False, _V2_LOAD_ERR
 
     if _ENGINE_MODE == "stub" and _V2_LOAD_ERR:
         return False, _V2_LOAD_ERR
@@ -178,19 +206,12 @@ def _load_v2() -> Tuple[bool, Optional[str]]:
 
             # UnifiedQuote may live elsewhere depending on repo evolution
             if v2_uq is None:
-                for path in ("core.schemas", "core.models.schemas", "schemas"):
-                    try:
-                        schemas = import_module(path)
-                        v2_uq = getattr(schemas, "UnifiedQuote", None)
-                        if v2_uq is not None:
-                            break
-                    except Exception:
-                        continue
+                v2_uq = _find_unified_quote_fallback()
 
             if v2_engine is None and v2_engine_v2 is None:
                 raise ImportError("core.data_engine_v2 missing DataEngine/DataEngineV2")
             if v2_uq is None:
-                raise ImportError("core.data_engine_v2 missing UnifiedQuote")
+                raise ImportError("UnifiedQuote not found (v2 or schemas)")
 
             _V2["module"] = mod
             _V2["DataEngine"] = v2_engine or v2_engine_v2
@@ -382,9 +403,7 @@ def _instantiate_engine(EngineCls: Type[Any]) -> Any:
 
 
 def _get_engine_sync() -> Any:
-    """
-    Internal sync getter for engine singleton.
-    """
+    """Internal sync getter for engine singleton."""
     global _engine_instance
 
     if _engine_instance is not None:
@@ -475,7 +494,7 @@ def normalize_symbol(symbol: str) -> str:
     Normalization rules (legacy-safe, dashboard-friendly):
     - Tadawul numeric code -> "####.SR"
     - If already has a suffix (AAPL, AAPL.US, 2222.SR, GC=F, EURUSD=X) keep as-is (uppercased)
-    - Never auto-append ".US" (keeps global tickers like AAPL, SPY, QQQ unchanged)
+    - Never auto-append ".US" (keeps AAPL, SPY, QQQ unchanged)
     """
     s = (symbol or "").strip()
     if not s:
@@ -510,7 +529,6 @@ def normalize_symbol(symbol: str) -> str:
     if su.isdigit():
         return f"{su}.SR"
 
-    # otherwise keep unchanged (AAPL, SPY, QQQ, BTC-USD, etc.)
     return su
 
 
@@ -536,6 +554,66 @@ def _clean_symbols(symbols: Sequence[Any]) -> List[str]:
 
 
 # =============================================================================
+# Engine call helpers (more tolerant to v2 naming)
+# =============================================================================
+async def _call_engine_single(eng: Any, symbol: str, *, enriched: bool) -> Any:
+    """
+    Try a small priority list of method names (enriched first when requested).
+    """
+    sym = symbol
+    # Preferred names
+    preferred = ["get_enriched_quote", "get_quote"] if enriched else ["get_quote", "get_enriched_quote"]
+    # Common alternates
+    alternates = ["fetch_quote", "quote", "fetch"]
+    for name in preferred + alternates:
+        fn = getattr(eng, name, None)
+        if callable(fn):
+            return await _maybe_await(fn(sym))
+    raise AttributeError("Engine method mismatch: no single-quote method found")
+
+
+async def _call_engine_batch(eng: Any, symbols: List[str], *, enriched: bool) -> Any:
+    preferred = ["get_enriched_quotes", "get_quotes"] if enriched else ["get_quotes", "get_enriched_quotes"]
+    alternates = ["fetch_quotes", "quotes", "fetch_many"]
+    for name in preferred + alternates:
+        fn = getattr(eng, name, None)
+        if callable(fn):
+            return await _maybe_await(fn(symbols))
+    # fallback: per-symbol
+    out: List[Any] = []
+    for s in symbols:
+        out.append(await _call_engine_single(eng, s, enriched=enriched))
+    return out
+
+
+def _coerce_batch_in_order(res: Any, normed_symbols: List[str]) -> List[Any]:
+    """
+    Ensures output is a list aligned with normed_symbols order.
+    If res is dict[symbol->quote], we map by normalized key best-effort.
+    Otherwise treat as list-like.
+    """
+    if isinstance(res, dict):
+        # build a normalized-key lookup
+        lookup: Dict[str, Any] = {}
+        for k, v in res.items():
+            try:
+                nk = normalize_symbol(str(k)) or str(k).strip().upper()
+            except Exception:
+                nk = str(k).strip().upper()
+            lookup[nk] = v
+        out: List[Any] = []
+        for s in normed_symbols:
+            key = normalize_symbol(s) or s.strip().upper()
+            out.append(lookup.get(key))
+        return out
+
+    # list-ish
+    arr = _as_list(res)
+    # if lengths mismatch, just return what we have (caller will wrap stubs if needed)
+    return arr
+
+
+# =============================================================================
 # Public API (legacy)
 # =============================================================================
 async def get_enriched_quote(symbol: str) -> Any:
@@ -553,19 +631,8 @@ async def get_enriched_quote(symbol: str) -> Any:
 
     eng = await get_engine()
     try:
-        if hasattr(eng, "get_enriched_quote"):
-            res = await _maybe_await(eng.get_enriched_quote(sym))
-            return _finalize_quote(_unwrap_payload(res))
-        if hasattr(eng, "get_quote"):
-            res = await _maybe_await(eng.get_quote(sym))
-            return _finalize_quote(_unwrap_payload(res))
-
-        try:
-            q = UQ(symbol=sym, data_quality="MISSING", error="Engine method mismatch: no get_enriched_quote/get_quote")
-            return _finalize_quote(q)
-        except Exception:
-            return _StubUnifiedQuote(symbol=sym, error="Engine method mismatch").finalize()
-
+        res = await _call_engine_single(eng, sym, enriched=True)
+        return _finalize_quote(_unwrap_payload(res))
     except Exception as exc:
         logger.error("Legacy Adapter Error (Single): %s", exc)
         try:
@@ -583,27 +650,33 @@ async def get_enriched_quotes(symbols: List[str]) -> List[Any]:
     eng = await get_engine()
     UQ = _get_uq_cls()
 
+    normed = [normalize_symbol(x) or x for x in clean]
+
     try:
-        normed = [normalize_symbol(x) or x for x in clean]
+        res = await _call_engine_batch(eng, normed, enriched=True)
+        coerced = _coerce_batch_in_order(_unwrap_payload(res), normed)
 
-        if hasattr(eng, "get_enriched_quotes"):
-            res = await _maybe_await(eng.get_enriched_quotes(normed))
-            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
-        if hasattr(eng, "get_quotes"):
-            res = await _maybe_await(eng.get_quotes(normed))
-            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
-
-        # fallback: per-symbol
         out: List[Any] = []
-        for s in clean:
-            out.append(await get_enriched_quote(s))
+        for i, sym in enumerate(normed):
+            item = coerced[i] if i < len(coerced) else None
+            item = _unwrap_payload(item)
+
+            if item is None:
+                # fill stub in-position
+                try:
+                    q = UQ(symbol=sym, data_quality="MISSING", error="Missing quote in batch result")
+                    out.append(_finalize_quote(q))
+                except Exception:
+                    out.append(_StubUnifiedQuote(symbol=sym, error="Missing quote in batch result").finalize())
+                continue
+
+            out.append(_finalize_quote(item))
         return out
 
     except Exception as exc:
         logger.error("Legacy Adapter Error (Batch): %s", exc)
         out: List[Any] = []
-        for s in clean:
-            sym = normalize_symbol(s) or s
+        for sym in normed:
             try:
                 q = UQ(symbol=sym, data_quality="MISSING", error=str(exc))
                 out.append(_finalize_quote(q))
@@ -641,32 +714,39 @@ class DataEngine:
 
     async def get_quote(self, symbol: str) -> Any:
         eng = await self._ensure()
-        if hasattr(eng, "get_quote"):
-            return _finalize_quote(_unwrap_payload(await _maybe_await(eng.get_quote(symbol))))
-        return await get_quote(symbol)
+        try:
+            res = await _call_engine_single(eng, symbol, enriched=False)
+            return _finalize_quote(_unwrap_payload(res))
+        except Exception:
+            return await get_quote(symbol)
 
     async def get_quotes(self, symbols: List[str]) -> List[Any]:
         eng = await self._ensure()
-        if hasattr(eng, "get_quotes"):
-            res = await _maybe_await(eng.get_quotes(symbols))
-            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
-        return await get_quotes(symbols)
+        try:
+            res = await _call_engine_batch(eng, symbols, enriched=False)
+            arr = _as_list(_unwrap_payload(res))
+            return [_finalize_quote(_unwrap_payload(x)) for x in arr]
+        except Exception:
+            return await get_quotes(symbols)
 
     async def get_enriched_quote(self, symbol: str) -> Any:
         eng = await self._ensure()
-        if hasattr(eng, "get_enriched_quote"):
-            return _finalize_quote(_unwrap_payload(await _maybe_await(eng.get_enriched_quote(symbol))))
-        return await get_enriched_quote(symbol)
+        try:
+            res = await _call_engine_single(eng, symbol, enriched=True)
+            return _finalize_quote(_unwrap_payload(res))
+        except Exception:
+            return await get_enriched_quote(symbol)
 
     async def get_enriched_quotes(self, symbols: List[str]) -> List[Any]:
         eng = await self._ensure()
-        if hasattr(eng, "get_enriched_quotes"):
-            res = await _maybe_await(eng.get_enriched_quotes(symbols))
-            return [_finalize_quote(_unwrap_payload(x)) for x in _as_list(res)]
-        return await get_enriched_quotes(symbols)
+        try:
+            res = await _call_engine_batch(eng, symbols, enriched=True)
+            arr = _as_list(_unwrap_payload(res))
+            return [_finalize_quote(_unwrap_payload(x)) for x in arr]
+        except Exception:
+            return await get_enriched_quotes(symbols)
 
     async def aclose(self) -> None:
-        # closes shared engine instance
         await close_engine()
 
 
@@ -730,6 +810,7 @@ def get_engine_meta() -> Dict[str, Any]:
         "mode": _ENGINE_MODE,
         "is_stub": _ENGINE_MODE == "stub",
         "adapter_version": ADAPTER_VERSION,
+        "v2_disabled": _truthy_env("DATA_ENGINE_V2_DISABLED", False),
         "v2_loaded": bool(ok),
         "v2_error": err or _V2_LOAD_ERR,
         "v2_version": v2_version,
