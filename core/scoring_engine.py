@@ -1,4 +1,4 @@
-# core/scoring_engine.py  — FULL REPLACEMENT — v1.6.0
+# core/scoring_engine.py  — FULL REPLACEMENT — v1.6.1
 """
 core/scoring_engine.py
 ===========================================================
@@ -16,15 +16,18 @@ Produces (0–100):
 - confidence              (0–100, reflects data completeness + data_quality)
 
 Forecast outputs (best-effort, deterministic):
-- fair_value                  (pass-through if upstream provides it; may be used to derive upside)
-- upside_percent              (best-effort)
-- expected_price_1m/3m/12m     (FORECAST PRICE, derived from gross expected return)
-- expected_return_1m/3m/12m    (EXPECTED ROI %, risk+confidence adjusted)  ✅ aligns with Sheets "Expected ROI %"
-- expected_roi_1m/3m/12m       (same as expected_return_*; kept for back-compat/debug)
-- forecast_confidence          (0–100)
-- confidence_score             (alias to forecast_confidence for header mapping compatibility)
-- forecast_method              (string, e.g. simple_horizon_scaling_v2)
-- forecast_updated_utc         (pass-through if upstream provides it; else None)
+CANONICAL (preferred; aligns with core/schemas.py v3.8.1):
+- forecast_price_1m/3m/12m        (FORECAST PRICE, derived from gross expected return)
+- expected_roi_1m/3m/12m          (EXPECTED ROI %, risk+confidence adjusted)  ✅ aligns with Sheets "Expected ROI %"
+- forecast_confidence             (0–100)
+- forecast_updated_utc            (pass-through if upstream provides it; else None)
+- forecast_method                 (string, e.g. simple_horizon_scaling_v2)
+
+COMPAT ALIASES (kept for older code/routes):
+- expected_price_1m/3m/12m        (alias of forecast_price_*)
+- expected_return_1m/3m/12m       (alias of expected_roi_*)
+- confidence_score                (alias of forecast_confidence)
+- expected_return_gross_1m/3m/12m (audit only)
 
 Design goals
 ✅ Deterministic + simple + explainable
@@ -55,7 +58,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCORING_ENGINE_VERSION = "1.6.0"
+SCORING_ENGINE_VERSION = "1.6.1"
 
 # Recommendation enum (MUST match routers normalization)
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
@@ -82,9 +85,27 @@ class AssetScores(BaseModel):
 
     confidence: float = Field(50.0, ge=0, le=100)
 
+    # Optional badges (helpful for sheets/UI)
+    rec_badge: Optional[str] = None
+    momentum_badge: Optional[str] = None
+    opportunity_badge: Optional[str] = None
+    risk_badge: Optional[str] = None
+
     # Forecast outputs (optional, best-effort)
-    # NOTE: expected_return_* is "Expected ROI % (Horizon)" (risk-adjusted),
-    # aligned with the sheet column naming.
+    # Canonical (preferred)
+    expected_roi_1m: Optional[float] = None
+    expected_roi_3m: Optional[float] = None
+    expected_roi_12m: Optional[float] = None
+
+    forecast_price_1m: Optional[float] = None
+    forecast_price_3m: Optional[float] = None
+    forecast_price_12m: Optional[float] = None
+
+    forecast_confidence: Optional[float] = None
+    forecast_method: Optional[str] = None
+    forecast_updated_utc: Optional[str] = None
+
+    # Compat aliases (kept)
     expected_return_1m: Optional[float] = None
     expected_return_3m: Optional[float] = None
     expected_return_12m: Optional[float] = None
@@ -93,20 +114,12 @@ class AssetScores(BaseModel):
     expected_price_3m: Optional[float] = None
     expected_price_12m: Optional[float] = None
 
-    # kept for compatibility / debugging (same as expected_return_*)
-    expected_roi_1m: Optional[float] = None
-    expected_roi_3m: Optional[float] = None
-    expected_roi_12m: Optional[float] = None
+    confidence_score: Optional[float] = None  # alias (some routes/providers expect this)
 
     # gross (unadjusted) returns for audit/debug (NOT mapped to sheets by default)
     expected_return_gross_1m: Optional[float] = None
     expected_return_gross_3m: Optional[float] = None
     expected_return_gross_12m: Optional[float] = None
-
-    forecast_confidence: Optional[float] = None
-    confidence_score: Optional[float] = None  # alias (some routes/providers expect this)
-    forecast_method: Optional[str] = None
-    forecast_updated_utc: Optional[str] = None
 
 
 # ---------------------------------------------------------------------
@@ -249,6 +262,37 @@ def _normalize_reco(x: Any) -> str:
     return "HOLD"
 
 
+def _badge_3level(score: Optional[float], *, high: float, low: float, invert: bool = False) -> str:
+    """
+    Returns one of: Low / Moderate / High
+    - invert=True: higher score -> "High" meaning *worse* (used for risk)
+    """
+    s = _to_float(score)
+    if s is None:
+        return "Moderate"
+    if invert:
+        if s >= high:
+            return "High"
+        if s <= low:
+            return "Low"
+        return "Moderate"
+    else:
+        if s >= high:
+            return "High"
+        if s <= low:
+            return "Low"
+        return "Moderate"
+
+
+def _rec_badge_from_reco(reco: str, overall: float, confidence: float) -> str:
+    r = _normalize_reco(reco)
+    if r == "BUY" and overall >= 82 and confidence >= 65:
+        return "STRONG BUY"
+    if r == "SELL" and overall <= 22 and confidence >= 45:
+        return "STRONG SELL"
+    return r
+
+
 def _forecast_scale(days: int) -> float:
     """
     Conservative horizon scaling for returns using sqrt(time):
@@ -275,18 +319,23 @@ def _compute_forecast(
 ) -> Dict[str, Any]:
     """
     Best-effort forecast outputs:
-    - expected_return_gross_* (%): unadjusted horizon returns
-    - expected_price_* (price): derived from gross returns
-    - expected_return_* (%): "Expected ROI %" risk+confidence adjusted (SHEETS)
-    - expected_roi_* (%): alias of expected_return_*
-    - forecast_confidence (0..100), confidence_score alias, forecast_method
+    CANONICAL:
+      - forecast_price_* (price): derived from gross returns
+      - expected_roi_* (%): "Expected ROI %" risk+confidence adjusted (SHEETS)
+      - forecast_confidence (0..100), forecast_method, forecast_updated_utc
+
+    COMPAT:
+      - expected_price_* (alias of forecast_price_*)
+      - expected_return_* (alias of expected_roi_*)
+      - confidence_score (alias of forecast_confidence)
+      - expected_return_gross_* (%): unadjusted horizon returns (audit)
     """
     out: Dict[str, Any] = {}
 
     cp = current_price if (current_price is not None and current_price > 0) else None
     fv = fair_value if (fair_value is not None and fair_value > 0) else None
 
-    # 1) Base 12m gross expected return (prefer explicit input)
+    # 1) Base 12m gross expected return (prefer explicit gross input)
     er12_gross = expected_return_12m_gross_in
     if er12_gross is None:
         if upside_percent is not None:
@@ -297,17 +346,16 @@ def _compute_forecast(
     if er12_gross is None or cp is None:
         return out
 
-    # 2) Horizon gross returns
+    # 2) Horizon gross returns (percent)
     er1_gross = er12_gross * _forecast_scale(30)
     er3_gross = er12_gross * _forecast_scale(90)
 
-    # 3) Forecast prices from GROSS returns (not risk-adjusted)
-    ep1 = cp * (1.0 + er1_gross / 100.0)
-    ep3 = cp * (1.0 + er3_gross / 100.0)
-    ep12 = cp * (1.0 + er12_gross / 100.0)
+    # 3) Forecast prices from GROSS returns
+    fp1 = cp * (1.0 + er1_gross / 100.0)
+    fp3 = cp * (1.0 + er3_gross / 100.0)
+    fp12 = cp * (1.0 + er12_gross / 100.0)
 
     # 4) Forecast confidence:
-    # Prefer upstream confidence_score if present; else fallback to completeness confidence.
     fc = forecast_conf_in if forecast_conf_in is not None else confidence_fallback
     fc = _clamp(fc, 0.0, 100.0, 50.0)
 
@@ -315,7 +363,7 @@ def _compute_forecast(
     # risk_score: 0..100 => multiplier ~ 1.00..0.25 (floored)
     risk_mult = max(0.25, 1.0 - (risk_score / 140.0))
 
-    # 6) Expected ROI% (risk + confidence adjusted)
+    # 6) Expected ROI% (risk + confidence adjusted)  [already in percent scale]
     roi1 = er1_gross * (fc / 100.0) * risk_mult
     roi3 = er3_gross * (fc / 100.0) * risk_mult
     roi12 = er12_gross * (fc / 100.0) * risk_mult
@@ -327,25 +375,30 @@ def _compute_forecast(
             "expected_return_gross_3m": float(er3_gross),
             "expected_return_gross_12m": float(er12_gross),
 
-            # Forecast prices (Sheets: Forecast Price)
-            "expected_price_1m": float(ep1),
-            "expected_price_3m": float(ep3),
-            "expected_price_12m": float(ep12),
+            # CANONICAL prices (Sheets: Forecast Price)
+            "forecast_price_1m": float(fp1),
+            "forecast_price_3m": float(fp3),
+            "forecast_price_12m": float(fp12),
 
-            # Sheets: Expected ROI %  (mapped via schemas to expected_return_*)
-            "expected_return_1m": float(roi1),
-            "expected_return_3m": float(roi3),
-            "expected_return_12m": float(roi12),
-
-            # Alias / compatibility
+            # CANONICAL ROI (Sheets: Expected ROI %)
             "expected_roi_1m": float(roi1),
             "expected_roi_3m": float(roi3),
             "expected_roi_12m": float(roi12),
 
             "forecast_confidence": float(fc),
-            "confidence_score": float(fc),
             "forecast_method": str(forecast_method_in or "simple_horizon_scaling_v2"),
             "forecast_updated_utc": str(forecast_updated_utc) if forecast_updated_utc else None,
+
+            # COMPAT aliases
+            "expected_price_1m": float(fp1),
+            "expected_price_3m": float(fp3),
+            "expected_price_12m": float(fp12),
+
+            "expected_return_1m": float(roi1),
+            "expected_return_3m": float(roi3),
+            "expected_return_12m": float(roi12),
+
+            "confidence_score": float(fc),
         }
     )
     return out
@@ -375,13 +428,28 @@ def compute_scores(q: Any) -> AssetScores:
     # Forecast inputs (provider-enriched best-effort)
     fair_value = _to_float(_get_any(q, "fair_value", "target_mean_price", "intrinsic_value"))
     upside = _to_percent(_get_any(q, "upside_percent", "upside_pct"))
-    # gross return hint (if provider supplies): can be decimals or percents
+
+    # Prefer explicit *gross* 12m hint if provider supplies it (avoid recursion into our own outputs)
     expected_return_12m_gross_in = _to_percent(
-        _get_any(q, "expected_return_12m_gross", "expected_return_12m", "expected_return", "expected_roi_12m_gross")
+        _get_any(
+            q,
+            "expected_return_gross_12m",
+            "expected_return_12m_gross",
+            "expected_roi_12m_gross",
+            "expected_return_unadjusted_12m",
+        )
     )
+
     forecast_method_in = _get_any(q, "forecast_method", "forecast_model")
     forecast_conf_in = _to_float(_get_any(q, "confidence_score", "forecast_confidence", "confidence"))
-    forecast_updated_utc = _get_any(q, "forecast_updated_utc", "forecast_last_utc", "as_of_utc", "last_updated_utc")
+    forecast_updated_utc = _get_any(
+        q,
+        "forecast_updated_utc",
+        "forecast_last_utc",
+        "forecast_asof_utc",
+        "as_of_utc",
+        "last_updated_utc",
+    )
 
     # Quality
     roe = _to_percent(_get_any(q, "roe", "return_on_equity"))
@@ -433,15 +501,24 @@ def compute_scores(q: Any) -> AssetScores:
         value_score = 0.70 * value_score + 0.30 * pe_val
 
     if pb is not None and pb > 0:
-        pb_val = _score_band_linear(pb, bands=[(0.6, 80.0), (1.0, 70.0), (2.0, 60.0), (4.0, 50.0), (6.0, 40.0), (10.0, 30.0)])
+        pb_val = _score_band_linear(
+            pb,
+            bands=[(0.6, 80.0), (1.0, 70.0), (2.0, 60.0), (4.0, 50.0), (6.0, 40.0), (10.0, 30.0)],
+        )
         value_score = 0.80 * value_score + 0.20 * pb_val
 
     if ps is not None and ps > 0:
-        ps_val = _score_band_linear(ps, bands=[(0.7, 75.0), (1.5, 65.0), (3.0, 55.0), (6.0, 45.0), (10.0, 35.0), (20.0, 25.0)])
+        ps_val = _score_band_linear(
+            ps,
+            bands=[(0.7, 75.0), (1.5, 65.0), (3.0, 55.0), (6.0, 45.0), (10.0, 35.0), (20.0, 25.0)],
+        )
         value_score = 0.85 * value_score + 0.15 * ps_val
 
     if ev is not None and ev > 0:
-        ev_val = _score_band_linear(ev, bands=[(5.0, 80.0), (8.0, 70.0), (12.0, 60.0), (18.0, 45.0), (25.0, 35.0), (40.0, 25.0)])
+        ev_val = _score_band_linear(
+            ev,
+            bands=[(5.0, 80.0), (8.0, 70.0), (12.0, 60.0), (18.0, 45.0), (25.0, 35.0), (40.0, 25.0)],
+        )
         value_score = 0.85 * value_score + 0.15 * ev_val
 
     if dy is not None and dy >= 0:
@@ -490,9 +567,19 @@ def compute_scores(q: Any) -> AssetScores:
 
     # Growth adds small bonus/penalty (bounded)
     if rev_g is not None:
-        quality_score += _clamp(_score_band_linear(rev_g, bands=[(-30.0, -6.0), (-10.0, -3.0), (0.0, 0.0), (10.0, 2.0), (20.0, 4.0), (40.0, 6.0)]), -6.0, 6.0, 0.0)
+        quality_score += _clamp(
+            _score_band_linear(rev_g, bands=[(-30.0, -6.0), (-10.0, -3.0), (0.0, 0.0), (10.0, 2.0), (20.0, 4.0), (40.0, 6.0)]),
+            -6.0,
+            6.0,
+            0.0,
+        )
     if ni_g is not None:
-        quality_score += _clamp(_score_band_linear(ni_g, bands=[(-30.0, -6.0), (-10.0, -3.0), (0.0, 0.0), (10.0, 2.0), (20.0, 4.0), (40.0, 6.0)]), -6.0, 6.0, 0.0)
+        quality_score += _clamp(
+            _score_band_linear(ni_g, bands=[(-30.0, -6.0), (-10.0, -3.0), (0.0, 0.0), (10.0, 2.0), (20.0, 4.0), (40.0, 6.0)]),
+            -6.0,
+            6.0,
+            0.0,
+        )
 
     if dte is not None:
         if dte > 2.5:
@@ -596,7 +683,6 @@ def compute_scores(q: Any) -> AssetScores:
     # -----------------------------
     # OPPORTUNITY + OVERALL
     # -----------------------------
-    # penalty is negative when risk < 50 (helps), positive when risk > 50 (hurts)
     risk_penalty = ((risk_score - 50.0) / 50.0) * 14.0  # -14..+14
     opportunity_score = _clamp(0.46 * value_score + 0.30 * momentum_score + 0.24 * quality_score - risk_penalty)
     overall_score = _clamp(0.36 * value_score + 0.32 * quality_score + 0.22 * momentum_score + 0.10 * opportunity_score)
@@ -655,9 +741,9 @@ def compute_scores(q: Any) -> AssetScores:
     # -----------------------------
     reco = "HOLD"
 
-    # Use risk-adjusted ROI (our expected_return_* outputs)
-    roi3 = _to_percent(forecast_out.get("expected_return_3m"))
-    roi1 = _to_percent(forecast_out.get("expected_return_1m"))
+    # ROI values from forecast_out are already in percent scale (do NOT re-normalize with _to_percent)
+    roi3 = _to_float(forecast_out.get("expected_roi_3m", forecast_out.get("expected_return_3m")))
+    roi1 = _to_float(forecast_out.get("expected_roi_1m", forecast_out.get("expected_return_1m")))
 
     if overall_score >= 74 and confidence >= 55 and risk_score <= 78:
         reco = "BUY"
@@ -683,6 +769,12 @@ def compute_scores(q: Any) -> AssetScores:
 
     reco = _normalize_reco(reco)
 
+    # Badges (optional, Sheets-friendly)
+    rec_badge = _rec_badge_from_reco(reco, overall_score, confidence)
+    momentum_badge = _badge_3level(momentum_score, high=70.0, low=45.0, invert=False)
+    opportunity_badge = _badge_3level(opportunity_score, high=70.0, low=45.0, invert=False)
+    risk_badge = _badge_3level(risk_score, high=62.0, low=40.0, invert=True)
+
     return AssetScores(
         value_score=_clamp(value_score),
         quality_score=_clamp(quality_score),
@@ -693,6 +785,25 @@ def compute_scores(q: Any) -> AssetScores:
         recommendation=reco,
         confidence=float(confidence),
 
+        rec_badge=rec_badge,
+        momentum_badge=momentum_badge,
+        opportunity_badge=opportunity_badge,
+        risk_badge=risk_badge,
+
+        # Canonical forecast outputs
+        expected_roi_1m=forecast_out.get("expected_roi_1m"),
+        expected_roi_3m=forecast_out.get("expected_roi_3m"),
+        expected_roi_12m=forecast_out.get("expected_roi_12m"),
+
+        forecast_price_1m=forecast_out.get("forecast_price_1m"),
+        forecast_price_3m=forecast_out.get("forecast_price_3m"),
+        forecast_price_12m=forecast_out.get("forecast_price_12m"),
+
+        forecast_confidence=forecast_out.get("forecast_confidence"),
+        forecast_method=forecast_out.get("forecast_method"),
+        forecast_updated_utc=forecast_out.get("forecast_updated_utc"),
+
+        # Compat aliases
         expected_return_1m=forecast_out.get("expected_return_1m"),
         expected_return_3m=forecast_out.get("expected_return_3m"),
         expected_return_12m=forecast_out.get("expected_return_12m"),
@@ -701,18 +812,11 @@ def compute_scores(q: Any) -> AssetScores:
         expected_price_3m=forecast_out.get("expected_price_3m"),
         expected_price_12m=forecast_out.get("expected_price_12m"),
 
-        expected_roi_1m=forecast_out.get("expected_roi_1m"),
-        expected_roi_3m=forecast_out.get("expected_roi_3m"),
-        expected_roi_12m=forecast_out.get("expected_roi_12m"),
+        confidence_score=forecast_out.get("confidence_score"),
 
         expected_return_gross_1m=forecast_out.get("expected_return_gross_1m"),
         expected_return_gross_3m=forecast_out.get("expected_return_gross_3m"),
         expected_return_gross_12m=forecast_out.get("expected_return_gross_12m"),
-
-        forecast_confidence=forecast_out.get("forecast_confidence"),
-        confidence_score=forecast_out.get("confidence_score"),
-        forecast_method=forecast_out.get("forecast_method"),
-        forecast_updated_utc=forecast_out.get("forecast_updated_utc"),
     )
 
 
@@ -748,29 +852,40 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
         "confidence": float(scores.confidence),
         "scoring_version": SCORING_ENGINE_VERSION,
 
-        # forecast (Sheets mapping)
-        "expected_price_1m": scores.expected_price_1m,
-        "expected_price_3m": scores.expected_price_3m,
-        "expected_price_12m": scores.expected_price_12m,
+        # badges (optional but useful for Sheets)
+        "rec_badge": scores.rec_badge,
+        "momentum_badge": scores.momentum_badge,
+        "opportunity_badge": scores.opportunity_badge,
+        "risk_badge": scores.risk_badge,
 
-        # IMPORTANT: expected_return_* is "Expected ROI % (Horizon)" (risk-adjusted)
-        "expected_return_1m": scores.expected_return_1m,
-        "expected_return_3m": scores.expected_return_3m,
-        "expected_return_12m": scores.expected_return_12m,
+        # CANONICAL forecast fields (preferred)
+        "forecast_price_1m": scores.forecast_price_1m,
+        "forecast_price_3m": scores.forecast_price_3m,
+        "forecast_price_12m": scores.forecast_price_12m,
 
-        # aliases / compat
         "expected_roi_1m": scores.expected_roi_1m,
         "expected_roi_3m": scores.expected_roi_3m,
         "expected_roi_12m": scores.expected_roi_12m,
 
+        "forecast_confidence": scores.forecast_confidence,
+        "forecast_method": scores.forecast_method,
+        "forecast_updated_utc": scores.forecast_updated_utc,
+
+        # COMPAT aliases (kept)
+        "expected_price_1m": scores.expected_price_1m,
+        "expected_price_3m": scores.expected_price_3m,
+        "expected_price_12m": scores.expected_price_12m,
+
+        "expected_return_1m": scores.expected_return_1m,
+        "expected_return_3m": scores.expected_return_3m,
+        "expected_return_12m": scores.expected_return_12m,
+
+        "confidence_score": scores.confidence_score,
+
+        # audit/debug
         "expected_return_gross_1m": scores.expected_return_gross_1m,
         "expected_return_gross_3m": scores.expected_return_gross_3m,
         "expected_return_gross_12m": scores.expected_return_gross_12m,
-
-        "forecast_confidence": scores.forecast_confidence,
-        "confidence_score": scores.confidence_score,
-        "forecast_method": scores.forecast_method,
-        "forecast_updated_utc": scores.forecast_updated_utc,
     }
 
     # Pydantic v2
