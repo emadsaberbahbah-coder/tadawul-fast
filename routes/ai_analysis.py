@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.1) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.2) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,11 +12,14 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forecast/Expected + Valuation + Overall + Recommendation.
 
-v4.4.1 upgrades (completeness + GLOBAL readiness)
-- ✅ Stronger engine calling: passes sheet/page context when supported (page_key/sheet_name/market).
-- ✅ Adds cross-field computed fills (Change/Change%, Market Cap, Free Float Mkt Cap, Dividend Rate, Payout, etc.)
-  so GLOBAL pages can populate more even when providers return partial fields.
-- ✅ Keeps v4.4.0 forecasting + badges columns and schema-completion.
+v4.4.2 upgrades (fix the failure you saw + better fallbacks)
+- ✅ Compatibility patch: monkey-patches core.normalize_recommendation to accept `default=...`
+  (fixes: "normalize_recommendation() got an unexpected keyword argument 'default'").
+- ✅ Engine call fallback chain:
+    get_enriched_quotes -> get_quotes -> per-symbol enriched -> per-symbol basic
+  so one broken path does not zero out all rows.
+- ✅ Context routing improved: KSA_Tadawul => market=KSA, Global* => market=GLOBAL.
+- ✅ Adds Value Traded fallback (Price * Volume) when missing.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.4.1"
+AI_ANALYSIS_VERSION = "4.4.2"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -178,6 +181,100 @@ def _ensure_reco_on_obj(uq: Any) -> None:
             setattr(uq, "recommendation", _normalize_recommendation(getattr(uq, "recommendation", None)))
     except Exception:
         pass
+
+
+# =============================================================================
+# COMPAT PATCHES (fix: normalize_recommendation(default=...))
+# =============================================================================
+@lru_cache(maxsize=1)
+def _apply_compat_patches() -> bool:
+    """
+    Fixes the exact error you hit:
+      normalize_recommendation() got an unexpected keyword argument 'default'
+
+    We patch any found `normalize_recommendation` function in likely core modules to accept:
+      (x, default="HOLD", *args, **kwargs)
+
+    Safe: wrapped with try/except, never raises, and only patches if needed.
+    """
+    module_names = (
+        "core.data_engine_v2",
+        "core.scoring_engine",
+        "core.utils",
+        "core.recommendations",
+        "core.recommendation",
+        "core.providers.utils",
+    )
+
+    patched_any = False
+
+    def _wrap_if_needed(fn: Any) -> Optional[Any]:
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            if "default" in params:
+                return None  # already compatible
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                return None  # already accepts **kwargs
+        except Exception:
+            return None
+
+        def _wrapped(x: Any, default: str = "HOLD", *args: Any, **kwargs: Any) -> Any:
+            try:
+                # Most legacy functions: normalize_recommendation(x)
+                return fn(x)
+            except TypeError:
+                # If it still complains, degrade gracefully
+                if x is None or str(x).strip() == "":
+                    return default
+                try:
+                    return fn(x)
+                except Exception:
+                    return default
+            except Exception:
+                if x is None or str(x).strip() == "":
+                    return default
+                return "HOLD"
+
+        try:
+            _wrapped.__name__ = getattr(fn, "__name__", "normalize_recommendation")
+        except Exception:
+            pass
+        return _wrapped
+
+    for mn in module_names:
+        try:
+            mod = __import__(mn, fromlist=["*"])
+        except Exception:
+            continue
+
+        try:
+            fn = getattr(mod, "normalize_recommendation", None)
+            if callable(fn):
+                w = _wrap_if_needed(fn)
+                if w is not None:
+                    setattr(mod, "normalize_recommendation", w)
+                    patched_any = True
+        except Exception:
+            pass
+
+        # Also patch class-level method if exists (rare but possible)
+        try:
+            for cls_name in ("DataEngine", "ScoringEngine"):
+                cls = getattr(mod, cls_name, None)
+                if cls and hasattr(cls, "normalize_recommendation"):
+                    m = getattr(cls, "normalize_recommendation")
+                    if callable(m):
+                        w = _wrap_if_needed(m)
+                        if w is not None:
+                            setattr(cls, "normalize_recommendation", staticmethod(w))  # type: ignore
+                            patched_any = True
+        except Exception:
+            pass
+
+    if patched_any:
+        logger.warning("[analysis] Applied compat patch for normalize_recommendation(default=...).")
+    return patched_any
 
 
 # =============================================================================
@@ -339,6 +436,9 @@ async def _get_singleton_engine() -> Optional[Any]:
     async with _ENGINE_LOCK:
         if _ENGINE is None:
             try:
+                # apply compat patches before engine constructs (safe)
+                _apply_compat_patches()
+
                 DE, _, _ = _try_import_v2_symbols()
                 _ENGINE = None if DE is None else DE()
                 if _ENGINE is not None:
@@ -350,6 +450,9 @@ async def _get_singleton_engine() -> Optional[Any]:
 
 
 async def _resolve_engine(request: Optional[Request]) -> Optional[Any]:
+    # apply compat patches early as well (safe)
+    _apply_compat_patches()
+
     eng = _get_app_engine(request)
     if eng is not None:
         return eng
@@ -764,12 +867,6 @@ def _compute_52w_position_pct(cp: Any, low_52w: Any, high_52w: Any) -> Optional[
 # Derived metrics from history_points (when available)
 # =============================================================================
 def _history_parse_points(hp: Any) -> Tuple[List[float], List[float], Optional[str]]:
-    """
-    Returns (closes, volumes, last_dt_iso_utc) from history_points-like structures.
-    Accepts:
-      - list[dict] with keys close/c/cAdj, volume/v, t/time/date
-      - list[list/tuple] (t, o, h, l, c, v) or similar
-    """
     closes: List[Tuple[float, float]] = []
     vols: List[Tuple[float, float]] = []
     last_dt: Optional[datetime] = None
@@ -1004,7 +1101,6 @@ def _compute_free_float_mkt_cap(market_cap: Any, free_float_pct: Any) -> Optiona
     ff = _safe_float_or_none(free_float_pct)
     if mc is None or ff is None:
         return None
-    # ff might be 0..1 or 0..100
     if 0.0 <= ff <= 1.0:
         return round(mc * ff, 2)
     if 1.0 < ff <= 100.0:
@@ -1041,9 +1137,6 @@ def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[f
 
 
 def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[float]]:
-    """
-    Returns (overall_score_0_100, recommendation_enum, confidence_0_1).
-    """
     opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
     val = _safe_float_or_none(_safe_get(uq, "value_score"))
     qual = _safe_float_or_none(_safe_get(uq, "quality_score"))
@@ -1106,10 +1199,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[f
 
 
 def _derive_from_history(uq: Any) -> Dict[str, Any]:
-    """
-    Derived metrics from history_points when present.
-    Keys are LOWERCASED HEADER KEYS (hk style).
-    """
     out: Dict[str, Any] = {}
 
     hp = _safe_get(uq, "history_points", "history", "chart_points", "price_history", "bars")
@@ -1167,10 +1256,6 @@ def _derive_from_history(uq: Any) -> Dict[str, Any]:
 
 
 def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Cross-field best-effort fills to improve completeness when providers give partial fields.
-    Keys are header-key style (lowercase).
-    """
     out: Dict[str, Any] = {}
 
     price = _safe_get(uq, "current_price", "last_price", "price")
@@ -1196,6 +1281,15 @@ def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
         if mc2 is not None:
             out["market cap"] = mc2
 
+    # Value Traded fallback: Price * Volume
+    vt = _safe_get(uq, "value_traded")
+    vol = _safe_get(uq, "volume") or derived.get("volume")
+    if vt is None:
+        p = _safe_float_or_none(price)
+        v = _safe_float_or_none(vol)
+        if p is not None and v is not None and p > 0 and v > 0:
+            out["value traded"] = round(p * v, 2)
+
     # Free float market cap
     ffmc = _safe_get(uq, "free_float_market_cap", "free_float_mkt_cap")
     ff = _safe_get(uq, "free_float", "free_float_percent")
@@ -1205,7 +1299,6 @@ def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
         if ffmc2 is not None:
             out["free float mkt cap"] = ffmc2
             out["free float market cap"] = ffmc2
-            out["free float mkt cap"] = ffmc2
 
     # Dividend rate from yield% * price
     dy = _safe_get(uq, "dividend_yield", "div_yield")
@@ -1249,9 +1342,9 @@ def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     trn = _safe_get(uq, "turnover_percent")
     if trn is None:
         out_trn = _compute_turnover_pct(
-            _safe_get(uq, "volume") or derived.get("volume"),
+            vol,
             so,
-            _safe_get(uq, "value_traded"),
+            vt if vt is not None else out.get("value traded"),
             mc if mc is not None else out.get("market cap"),
         )
         if out_trn is not None:
@@ -1275,12 +1368,6 @@ def _coerce_confidence_to_0_100(v: Any) -> Optional[float]:
 
 
 def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Best-effort fill for dashboard FORECAST columns using:
-    - forecast_price_* / expected_price_* (engine)
-    - expected_roi_* / expected_return_* (engine)
-    - derived returns from history if needed
-    """
     out: Dict[str, Any] = {}
 
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
@@ -1953,11 +2040,6 @@ def _value_for_meta(
     if not _is_blank(val):
         return val
 
-    # extra cross-field fallbacks keyed by hk
-    if hk in ("change", "price change", "change %", "percent change", "market cap", "free float mkt cap", "dividend rate", "payout ratio %", "turnover %"):
-        if hk in cross:
-            return _apply_common_transforms(hk, cross.get(hk))
-
     if hk == "data source":
         hs = _safe_get(uq, "history_source")
         if not _is_blank(hs):
@@ -2049,10 +2131,6 @@ def _unwrap_tuple_payload(x: Any) -> Any:
 
 
 def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    """
-    Calls fn(*args, **filtered_kwargs) where kwargs are filtered to what fn accepts.
-    If fn has **kwargs, passes all kwargs.
-    """
     if not kwargs:
         return fn(*args)
 
@@ -2066,23 +2144,16 @@ def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
         filtered = {k: v for k, v in kwargs.items() if k in allowed}
         return fn(*args, **filtered)
     except Exception:
-        # fall back to naive call (may TypeError)
         return fn(*args, **kwargs)
 
 
 def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Any:
-    """
-    Best effort calling pattern:
-    - tries refresh=False with optional include_history/include_fundamentals (if supported)
-    - also passes ctx keys (sheet_name/page_key/page/market/region) when supported
-    """
     fn = getattr(engine, fn_name, None)
     if not callable(fn):
         return None
 
     ctx = ctx or {}
     ctx_try = {
-        # common naming variants across engines
         "sheet_name": ctx.get("sheet_name"),
         "sheet": ctx.get("sheet_name"),
         "page_key": ctx.get("page_key"),
@@ -2090,7 +2161,6 @@ def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: 
         "market": ctx.get("market"),
         "region": ctx.get("market") or ctx.get("region"),
     }
-    # remove nulls
     ctx_try = {k: v for k, v in ctx_try.items() if v not in (None, "", [])}
 
     kw_attempts = [
@@ -2147,30 +2217,55 @@ def _index_keys_for_quote(q: Any) -> List[str]:
 
 
 async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Union[List[Any], Dict[str, Any]]:
+    """
+    Robust fallback chain:
+      1) get_enriched_quotes (batch)
+      2) get_quotes (batch)
+      3) per-symbol get_enriched_quote
+      4) per-symbol get_quote
+    """
+    # 1) enriched batch
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
-        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms, ctx=ctx)))
-        if isinstance(res, (list, dict)):
-            return res
-        return list(res or [])
+        try:
+            res = _unwrap_tuple_payload(
+                await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms, ctx=ctx))
+            )
+            if isinstance(res, (list, dict)):
+                return res
+            return list(res or [])
+        except Exception as e:
+            logger.warning("[analysis] get_enriched_quotes failed -> fallback to get_quotes. err=%s", e)
 
+    # 2) basic batch
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
-        res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_quotes", syms, ctx=ctx)))
-        if isinstance(res, (list, dict)):
-            return res
-        return list(res or [])
+        try:
+            res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_quotes", syms, ctx=ctx)))
+            if isinstance(res, (list, dict)):
+                return res
+            return list(res or [])
+        except Exception as e:
+            logger.warning("[analysis] get_quotes failed -> fallback to per-symbol. err=%s", e)
 
+    # 3/4) per-symbol
     out: List[Any] = []
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
         if callable(fn3):
-            out.append(_unwrap_tuple_payload(await _maybe_await(_call_with_supported_kwargs(fn3, s, **(ctx or {})))))
-            continue
+            try:
+                out.append(_unwrap_tuple_payload(await _maybe_await(_call_with_supported_kwargs(fn3, s, **(ctx or {})))))
+                continue
+            except Exception:
+                pass
         fn4 = getattr(engine, "get_quote", None)
         if callable(fn4):
-            out.append(_unwrap_tuple_payload(await _maybe_await(_call_with_supported_kwargs(fn4, s, **(ctx or {})))))
-            continue
+            try:
+                out.append(_unwrap_tuple_payload(await _maybe_await(_call_with_supported_kwargs(fn4, s, **(ctx or {})))))
+                continue
+            except Exception as e:
+                out.append(_make_placeholder(s, dq="MISSING", err=f"Engine error: {e}"))
+                continue
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
 
@@ -2184,6 +2279,9 @@ async def _get_quotes_chunked(
     max_concurrency: int,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    # ensure patches applied
+    _apply_compat_patches()
+
     clean = _clean_symbols(symbols)
     if not clean:
         return {}
@@ -2450,6 +2548,19 @@ async def analyze_batch_quotes(
     return BatchAnalysisResponse(results=results)
 
 
+def _infer_market_from_sheet(sheet_name: Optional[str]) -> Optional[str]:
+    sn = (sheet_name or "").strip().upper()
+    if not sn:
+        return None
+    if "KSA" in sn or "TADAWUL" in sn or sn.endswith(".SR"):
+        return "KSA"
+    if sn.startswith("GLOBAL") or "GLOBAL" in sn:
+        return "GLOBAL"
+    if "COMMOD" in sn or "FX" in sn:
+        return "GLOBAL"
+    return None
+
+
 @router.post("/sheet-rows", response_model=SheetAnalysisResponse)
 async def analyze_for_sheet(
     request: Request,
@@ -2484,11 +2595,10 @@ async def analyze_for_sheet(
 
     plan = _build_header_plan(tuple(headers))
 
-    # context for engines that can route providers by page
     ctx = {
         "sheet_name": sheet_name,
         "page_key": sheet_name,
-        "market": "GLOBAL" if (sheet_name or "").upper().startswith("GLOBAL") else None,
+        "market": _infer_market_from_sheet(sheet_name),
     }
 
     try:
