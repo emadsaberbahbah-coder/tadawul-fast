@@ -2,7 +2,7 @@
 """
 core/__init__.py
 ------------------------------------------------------------
-Core package initialization (PROD SAFE) — v1.5.0 (LAZY + STABLE + ENGINE SAFE)
+Core package initialization (PROD SAFE) — v1.6.0 (LAZY + STABLE + ENGINE SAFE)
 
 Goals:
 - Keep imports LIGHT to avoid circular-import + cold-start issues on Render.
@@ -12,11 +12,17 @@ Goals:
 - Provide optional debug traces when CORE_IMPORT_DEBUG=true.
 - Provide a BEST-EFFORT get_engine() even if engine modules do not expose one.
 
-Exports (lazy + safe):
+Key improvement in v1.6.0
+- ✅ Export schema helpers as REAL wrappers (not None), so:
+    from core import get_headers_for_sheet
+  never imports None and then crashes later. Wrappers remain lazy + safe.
+
+Exports (safe):
 - get_settings
-- DataEngine, DataEngineV2, UnifiedQuote, normalize_symbol
+- DataEngine, DataEngineV2, UnifiedQuote, normalize_symbol (lazy attr or wrapper)
 - get_engine (best-effort singleton accessor)
-- BatchProcessRequest, get_headers_for_sheet, resolve_sheet_key, get_supported_sheets
+- BatchProcessRequest (lazy)
+- get_headers_for_sheet / resolve_sheet_key / get_supported_sheets (safe wrappers)
 
 Notes:
 - Do NOT import heavy modules at import-time.
@@ -27,10 +33,10 @@ from __future__ import annotations
 
 import inspect
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
-CORE_INIT_VERSION = "1.5.0"
+CORE_INIT_VERSION = "1.6.0"
 
 # -----------------------------------------------------------------------------
 # Optional debug logging for import issues (set CORE_IMPORT_DEBUG=true)
@@ -46,7 +52,6 @@ _DEBUG_IMPORTS = str(os.getenv("CORE_IMPORT_DEBUG", "false")).strip().lower() in
 
 def _dbg(msg: str) -> None:
     if _DEBUG_IMPORTS:
-        # Keep minimal: avoid importing logging here.
         try:
             print(f"[core.__init__] {msg}")  # noqa: T201
         except Exception:
@@ -141,47 +146,41 @@ def _resolve_engine_exports() -> Dict[str, Any]:
 
         exports["engine_module"] = mod_name
 
-        # Engines
-        if exports["DataEngine"] is None:
-            try:
-                if hasattr(m, "DataEngine"):
-                    exports["DataEngine"] = getattr(m, "DataEngine")
-            except Exception:
-                pass
+        try:
+            if exports["DataEngine"] is None and hasattr(m, "DataEngine"):
+                exports["DataEngine"] = getattr(m, "DataEngine")
+        except Exception:
+            pass
 
-        if exports["DataEngineV2"] is None:
-            try:
-                if hasattr(m, "DataEngineV2"):
-                    exports["DataEngineV2"] = getattr(m, "DataEngineV2")
-            except Exception:
-                pass
+        try:
+            if exports["DataEngineV2"] is None and hasattr(m, "DataEngineV2"):
+                exports["DataEngineV2"] = getattr(m, "DataEngineV2")
+        except Exception:
+            pass
 
-        # UnifiedQuote (may be pydantic model)
-        if exports["UnifiedQuote"] is None:
-            try:
+        try:
+            if exports["UnifiedQuote"] is None:
                 uq = getattr(m, "UnifiedQuote", None)
                 if uq is not None:
                     exports["UnifiedQuote"] = uq
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        # Symbol normalizer
-        if exports["normalize_symbol"] is None:
-            try:
+        try:
+            if exports["normalize_symbol"] is None:
                 ns = getattr(m, "normalize_symbol", None)
                 if callable(ns):
                     exports["normalize_symbol"] = ns
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        # Optional engine accessor (some engines expose get_engine singleton)
-        if exports["get_engine_func"] is None:
-            try:
+        try:
+            if exports["get_engine_func"] is None:
                 ge = getattr(m, "get_engine", None)
                 if callable(ge):
                     exports["get_engine_func"] = ge
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # Stop early if we got the important ones
         if exports["normalize_symbol"] and (exports["DataEngineV2"] or exports["DataEngine"]):
@@ -224,6 +223,55 @@ def _resolve_schema_exports() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Safe schema wrappers (real callables; still lazy)
+# -----------------------------------------------------------------------------
+def get_headers_for_sheet(sheet_key: str, *args: Any, **kwargs: Any) -> List[str]:
+    """
+    Safe wrapper. Never raises. Returns [] if schema function is unavailable.
+    """
+    try:
+        fn = _resolve_schema_exports().get("get_headers_for_sheet")
+        if callable(fn):
+            out = fn(sheet_key, *args, **kwargs)
+            return list(out) if out is not None else []
+        return []
+    except Exception as e:
+        _dbg(f"get_headers_for_sheet() failed -> {e.__class__.__name__}: {e}")
+        return []
+
+
+def resolve_sheet_key(sheet_key: str, *args: Any, **kwargs: Any) -> str:
+    """
+    Safe wrapper. Never raises. Returns original key if resolver is unavailable.
+    """
+    try:
+        fn = _resolve_schema_exports().get("resolve_sheet_key")
+        if callable(fn):
+            out = fn(sheet_key, *args, **kwargs)
+            s = str(out).strip() if out is not None else ""
+            return s or str(sheet_key or "").strip()
+        return str(sheet_key or "").strip()
+    except Exception as e:
+        _dbg(f"resolve_sheet_key() failed -> {e.__class__.__name__}: {e}")
+        return str(sheet_key or "").strip()
+
+
+def get_supported_sheets(*args: Any, **kwargs: Any) -> List[str]:
+    """
+    Safe wrapper. Never raises. Returns [] if schema function is unavailable.
+    """
+    try:
+        fn = _resolve_schema_exports().get("get_supported_sheets")
+        if callable(fn):
+            out = fn(*args, **kwargs)
+            return list(out) if out is not None else []
+        return []
+    except Exception as e:
+        _dbg(f"get_supported_sheets() failed -> {e.__class__.__name__}: {e}")
+        return []
+
+
+# -----------------------------------------------------------------------------
 # Best-effort engine singleton (PROD SAFE)
 # -----------------------------------------------------------------------------
 def _try_construct_engine(cls: Any, settings: Any) -> Optional[Any]:
@@ -240,7 +288,6 @@ def _try_construct_engine(cls: Any, settings: Any) -> Optional[Any]:
         except Exception:
             sig = None
 
-        # No signature info: try no-arg then settings
         if sig is None:
             try:
                 return cls()
@@ -252,18 +299,15 @@ def _try_construct_engine(cls: Any, settings: Any) -> Optional[Any]:
 
         params = list(sig.parameters.values())
 
-        # If no params or only *args/**kwargs => try no-arg
         if not params:
             try:
                 return cls()
             except Exception:
                 return None
 
-        # Build kwargs only when likely safe
         kw: Dict[str, Any] = {}
         names = {p.name for p in params if p.name not in ("self",)}
 
-        # Common patterns
         if "settings" in names:
             kw["settings"] = settings
         elif "config" in names:
@@ -271,18 +315,15 @@ def _try_construct_engine(cls: Any, settings: Any) -> Optional[Any]:
         elif "cfg" in names:
             kw["cfg"] = settings
 
-        # If we have kwargs, try them first
         if kw:
             try:
                 return cls(**kw)
             except Exception:
                 pass
 
-        # Otherwise try no-arg
         try:
             return cls()
         except Exception:
-            # Last resort: single positional settings
             try:
                 return cls(settings)
             except Exception:
@@ -308,7 +349,6 @@ def get_engine() -> Any:
         ex = _resolve_engine_exports()
         settings = get_settings()
 
-        # 1) Prefer engine module's get_engine() if exists
         ge = ex.get("get_engine_func")
         if callable(ge):
             try:
@@ -318,7 +358,6 @@ def get_engine() -> Any:
             except Exception as e:
                 _dbg(f"engine get_engine() failed -> {e.__class__.__name__}: {e}")
 
-        # 2) Construct v2 then legacy
         cls_v2 = ex.get("DataEngineV2")
         inst = _try_construct_engine(cls_v2, settings)
         if inst is not None:
@@ -339,12 +378,13 @@ def get_engine() -> Any:
 # Lazy attribute access (PEP 562)
 # -----------------------------------------------------------------------------
 def __getattr__(name: str) -> Any:  # pragma: no cover
+    # Direct functions
     if name == "get_settings":
         return get_settings
-
     if name == "get_engine":
         return get_engine
 
+    # Engine exports (lazy)
     if name in ("DataEngine", "DataEngineV2", "UnifiedQuote", "normalize_symbol"):
         ex = _resolve_engine_exports()
         if name == "DataEngine":
@@ -356,13 +396,14 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         if name == "normalize_symbol":
             return ex.get("normalize_symbol")
 
-    if name in ("BatchProcessRequest", "get_headers_for_sheet", "resolve_sheet_key", "get_supported_sheets"):
-        return _resolve_schema_exports().get(name)
+    # Schema exports (BatchProcessRequest stays lazy)
+    if name == "BatchProcessRequest":
+        return _resolve_schema_exports().get("BatchProcessRequest")
 
     raise AttributeError(name)
 
 
-def __dir__() -> list[str]:  # pragma: no cover
+def __dir__() -> List[str]:  # pragma: no cover
     return sorted(__all__)
 
 
