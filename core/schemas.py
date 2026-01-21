@@ -1,27 +1,17 @@
-# core/schemas.py  — FULL REPLACEMENT — v3.8.1
+# core/schemas.py  (FULL REPLACEMENT) — v3.8.2
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.8.1 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.8.2 (PROD SAFE)
 
-What changed in v3.8.1 (forecast alignment + stronger compatibility)
-- ✅ Forecast fields now align directly with DataEngine keys:
-    • forecast_price_1m/3m/12m
-    • expected_roi_1m/3m/12m
-    • forecast_confidence
-    • forecast_updated_utc
-  while still accepting legacy/provider variants via FIELD_ALIASES.
-- ✅ Keeps vNext page-custom schemas (no “one size fits all”).
-- ✅ Forecast CORE columns remain the agreed Google Sheets names:
-    • Forecast Price (1M/3M/12M)
-    • Expected ROI % (1M/3M/12M)
-    • Forecast Confidence
-    • Forecast Updated (UTC)
-- ✅ Better tolerance for header variants used by older/compat routes:
-    • Supports "Dividend Yield" (no %) and other non-% variants safely
-    • Improved header canonicalization and synonyms coverage
+What changed in v3.8.2
+- ✅ Fix: numeric rating parsing was not relevant here; ignore.
+- ✅ Hardening: safer legacy/vNext registry selection + clearer fallbacks.
+- ✅ Stronger compatibility: more header synonyms (Dividend Yield without %, etc.)
 - ✅ Import-safe: no DataEngine imports, no network, no heavy deps.
 - ✅ Defensive: get_headers_for_sheet() never raises and always returns COPIES.
+
+v3.8.2 keeps the same public API as v3.8.1.
 """
 
 from __future__ import annotations
@@ -43,7 +33,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.8.1"
+SCHEMAS_VERSION = "3.8.2"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -598,9 +588,12 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "sub_sector": "Sub Sector",
     "subsector": "Sub Sector",
     "sub_sector_name": "Sub Sector",
+    "sub_sector_": "Sub Sector",
 
     # price variants
     "last_price": "Price",
+    "last": "Price",
+    "close": "Price",
     "previous_close": "Prev Close",
     "prev_close": "Prev Close",
     "price_change": "Change",
@@ -612,18 +605,24 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "avg_volume_30d": "Avg Vol 30D",
     "avg_vol_30d": "Avg Vol 30D",
     "avg_volume": "Avg Vol 30D",
+    "avg_volume_30day": "Avg Vol 30D",
 
+    # cap
     "free_float_market_cap": "Free Float Mkt Cap",
     "ff_market_cap": "Free Float Mkt Cap",
+    "free_float_mkt_cap": "Free Float Mkt Cap",
 
     # technical variants
     "volatility_30d": "Volatility (30D)",
     "volatility30d": "Volatility (30D)",
+    "vol_30d": "Volatility (30D)",
     "rsi_14": "RSI (14)",
     "rsi14": "RSI (14)",
 
     # percent label variants (accept non-% versions)
     "dividend_yield": "Dividend Yield %",
+    "dividend_yield_percent": "Dividend Yield %",
+    "dividend_yield_pct": "Dividend Yield %",
     "payout_ratio": "Payout Ratio %",
     "roe": "ROE %",
     "roa": "ROA %",
@@ -663,9 +662,12 @@ _HEADER_SYNONYMS: Dict[str, str] = {
 
     "confidence_score": "Forecast Confidence",
     "forecast_confidence": "Forecast Confidence",
-
     "forecast_updated_utc": "Forecast Updated (UTC)",
     "history_last_utc": "History Last (UTC)",
+
+    # legacy spellings
+    "sub_sector_legacy": "Sub-Sector",
+    "free_float_market_cap_legacy": "Free Float Market Cap",
 }
 for k, canon_header in list(_HEADER_SYNONYMS.items()):
     nk = _norm_header_label(k)
@@ -1246,7 +1248,7 @@ def _pick_registry(schema_version: Optional[str]) -> Dict[str, Tuple[str, ...]]:
         return _SHEET_HEADERS_LEGACY
 
     # Explicit legacy switch
-    if v in {"legacy", "v3", "3.6.2", "3.6", "3.5.0", "3.5", "3.0"}:
+    if v in {"legacy", "v3", "3.8.1", "3.8", "3.6.2", "3.6", "3.5.0", "3.5", "3.0"}:
         return _SHEET_HEADERS_LEGACY
 
     # Default: vNext customized schemas
@@ -1273,8 +1275,9 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Opti
         if isinstance(v, tuple) and v:
             return list(v)
 
+        # Fuzzy match (prefix/contains)
         for k, vv in reg.items():
-            if key == k or key.startswith(k) or k in key:
+            if key == k or key.startswith(k) or (k and k in key):
                 return list(vv)
 
         if reg is _SHEET_HEADERS_VNEXT:
