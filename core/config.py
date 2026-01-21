@@ -1,6 +1,6 @@
 # core/config.py
 """
-TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v2.9.0-shim) – PROD SAFE
+TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.0.0-shim) – PROD SAFE
 
 Purpose
 - Backward compatibility for imports like:
@@ -9,9 +9,11 @@ Purpose
 - Never crashes startup (defensive import + safe fallbacks)
 - Avoid circular imports: do NOT import anything else from core at import-time.
 
-Behavior
-- Prefer repo-root `config.py` as the canonical settings source.
-- If missing/unavailable, expose a minimal OPEN-MODE fallback that keeps the app usable.
+Improvements in v3.0.0-shim
+- ✅ Robust canonical import: supports missing optional exports (mask_settings_dict, etc.)
+- ✅ OPEN fallback still works even if root config.py changes shape
+- ✅ Minimal debug tracing via CORE_CONFIG_DEBUG=true (no logging import)
+- ✅ Safer Settings export: always a usable type (real Settings class if present, else object)
 
 Exports (stable)
 - CONFIG_VERSION
@@ -26,8 +28,19 @@ Exports (stable)
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import os
 
-CONFIG_VERSION = "2.9.0-shim"
+CONFIG_VERSION = "3.0.0-shim"
+
+_DEBUG = str(os.getenv("CORE_CONFIG_DEBUG", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _dbg(msg: str) -> None:
+    if _DEBUG:
+        try:
+            print(f"[core.config] {msg}")  # noqa: T201
+        except Exception:
+            pass
 
 
 def _fallback_settings_obj() -> object:
@@ -35,61 +48,109 @@ def _fallback_settings_obj() -> object:
     return object()
 
 
+def _safe_list(x: Any) -> List[str]:
+    try:
+        if isinstance(x, (list, tuple)):
+            return [str(i) for i in x if str(i).strip()]
+        return []
+    except Exception:
+        return []
+
+
+def _safe_bool(x: Any, default: bool = True) -> bool:
+    try:
+        return bool(x)
+    except Exception:
+        return default
+
+
+def _safe_dict(x: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if default is None:
+        default = {}
+    try:
+        return x if isinstance(x, dict) else dict(default)
+    except Exception:
+        return dict(default)
+
+
 # ----------------------------
 # Canonical import (repo-root)
 # ----------------------------
 try:
-    # Canonical source (repo-root config.py)
-    from config import (  # type: ignore
-        CONFIG_VERSION as _MAIN_CONFIG_VERSION,
-        Settings as _Settings,
-        allowed_tokens as _allowed_tokens,
-        auth_ok as _auth_ok,
-        get_settings as _get_settings,
-        is_open_mode as _is_open_mode,
-        mask_settings_dict as _mask_settings_dict,
-    )
+    # Import module first (more resilient than importing many names at once)
+    from importlib import import_module
 
-    # Re-export canonical symbols
-    CONFIG_VERSION = str(_MAIN_CONFIG_VERSION)
+    _m = import_module("config")
 
-    Settings = _Settings  # type: ignore
+    # Optional: root may expose CONFIG_VERSION or version
+    _root_ver = getattr(_m, "CONFIG_VERSION", None) or getattr(_m, "version", None) or getattr(_m, "__version__", None)
+    if _root_ver is not None:
+        CONFIG_VERSION = str(_root_ver)
+
+    # Settings class/type (optional)
+    _Settings = getattr(_m, "Settings", None)
+    Settings = _Settings if _Settings is not None else object  # type: ignore
+
+    _get_settings = getattr(_m, "get_settings", None)
+    _allowed_tokens = getattr(_m, "allowed_tokens", None)
+    _is_open_mode = getattr(_m, "is_open_mode", None)
+    _auth_ok = getattr(_m, "auth_ok", None)
+    _mask_settings_dict = getattr(_m, "mask_settings_dict", None)
 
     def get_settings() -> Any:
         try:
-            return _get_settings()
-        except Exception:
-            # Keep startup/runtime safe if canonical get_settings ever fails.
+            if callable(_get_settings):
+                return _get_settings()
+            # If root doesn't expose get_settings, still stay safe.
+            return _fallback_settings_obj()
+        except Exception as e:
+            _dbg(f"get_settings() failed -> {e.__class__.__name__}: {e}")
             return _fallback_settings_obj()
 
     def allowed_tokens() -> List[str]:
         try:
-            v = _allowed_tokens()
-            return list(v) if isinstance(v, (list, tuple)) else []
-        except Exception:
+            if callable(_allowed_tokens):
+                return _safe_list(_allowed_tokens())
+            # If root doesn't expose allowed_tokens, assume open mode
+            return []
+        except Exception as e:
+            _dbg(f"allowed_tokens() failed -> {e.__class__.__name__}: {e}")
             return []
 
     def is_open_mode() -> bool:
         try:
-            return bool(_is_open_mode())
-        except Exception:
+            if callable(_is_open_mode):
+                return _safe_bool(_is_open_mode(), True)
+            # No function => treat as open mode
+            return True
+        except Exception as e:
+            _dbg(f"is_open_mode() failed -> {e.__class__.__name__}: {e}")
             return True
 
     def auth_ok(x_app_token: Optional[str]) -> bool:
         try:
-            # canonical logic (supports open mode / allow list)
-            return bool(_auth_ok(x_app_token))
-        except Exception:
+            if callable(_auth_ok):
+                return _safe_bool(_auth_ok(x_app_token), True)
+            # No function => open
+            return True
+        except Exception as e:
+            _dbg(f"auth_ok() failed -> {e.__class__.__name__}: {e}")
             return True
 
     def mask_settings_dict() -> Dict[str, Any]:
         try:
-            d = _mask_settings_dict()
-            return d if isinstance(d, dict) else {"status": "ok", "config_version": CONFIG_VERSION}
-        except Exception:
+            if callable(_mask_settings_dict):
+                d = _mask_settings_dict()
+                return _safe_dict(d, {"status": "ok", "config_version": CONFIG_VERSION})
+            # If root doesn't expose it, provide a safe minimal shape
+            return {"status": "ok", "open_mode": is_open_mode(), "config_version": CONFIG_VERSION}
+        except Exception as e:
+            _dbg(f"mask_settings_dict() failed -> {e.__class__.__name__}: {e}")
             return {"status": "fallback", "open_mode": True, "config_version": CONFIG_VERSION}
 
-except Exception:
+except Exception as e:
+    _dbg(f"Canonical import failed -> {e.__class__.__name__}: {e}")
+
     # ----------------------------
     # Ultra-light fallback
     # ----------------------------
