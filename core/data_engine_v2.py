@@ -2,7 +2,7 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.11.1) — PROD SAFE + ROUTER FRIENDLY
+UNIFIED DATA ENGINE (v2.11.2) — PROD SAFE + ROUTER FRIENDLY
 
 Fixes (Global returning data_source=none / BAD):
 - ✅ Provider function discovery supports patch-style exports + provider objects + exports dicts
@@ -11,13 +11,12 @@ Fixes (Global returning data_source=none / BAD):
 - ✅ Never raises: always returns a dict placeholder on failure
 - ✅ Accepts optional `settings` (kw or positional) for legacy adapter compatibility
 
-v2.11.1 upgrades
-- ✅ Correctly captures provider tuple errors: (patch, err, ...) now preserved as warnings
-- ✅ Backward compatible forecast aliases added:
-    forecast_price_*  <-> expected_price_*
-    expected_roi_*    <-> expected_return_*
-    forecast_confidence -> confidence_score (percent)
-    forecast_updated_utc -> forecast_updated
+v2.11.2 upgrades (alignment + completeness)
+- ✅ Stronger recommendation normalization integration (core.reco_normalize)
+- ✅ Adds common field alias mapping (price/last/close, prevClose, 52w fields, mktCap, etc.)
+- ✅ Cache key includes `fields` to avoid cross-request pollution
+- ✅ Provider tuple errors preserved as warnings (patch, err, meta...) best-effort
+- ✅ Forecast aliases mapped both directions (canonical + back-compat)
 - ✅ Keeps canonical engine fields for Sheets:
     forecast_price_{1m,3m,12m}, expected_roi_{1m,3m,12m},
     forecast_confidence (0..1), forecast_updated_utc/riyadh
@@ -57,7 +56,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.11.1"
+ENGINE_VERSION = "2.11.2"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -147,12 +146,34 @@ except Exception:  # pragma: no cover
 # Recommendation normalizer (optional)
 # ---------------------------------------------------------------------------
 try:
-    from core.reco_normalize import normalize_recommendation as _norm_reco  # type: ignore
+    from core.reco_normalize import normalize_recommendation as _normalize_recommendation  # type: ignore
 except Exception:  # pragma: no cover
 
-    def _norm_reco(x: Any, default: str = "HOLD") -> str:  # type: ignore
+    def _normalize_recommendation(x: Any) -> str:  # type: ignore
         s = str(x or "").strip().upper()
-        return s if s in {"BUY", "HOLD", "REDUCE", "SELL"} else (default if default in {"BUY", "HOLD", "REDUCE", "SELL"} else "HOLD")
+        return s if s in {"BUY", "HOLD", "REDUCE", "SELL"} else "HOLD"
+
+
+def _norm_reco(x: Any, default: str = "HOLD") -> str:
+    """
+    Safe wrapper around normalize_recommendation.
+    - Always returns BUY/HOLD/REDUCE/SELL
+    - Uses `default` if input is missing/unrecognized.
+    """
+    d = str(default or "HOLD").strip().upper()
+    if d not in {"BUY", "HOLD", "REDUCE", "SELL"}:
+        d = "HOLD"
+    try:
+        if x is None or str(x).strip() == "":
+            return d
+    except Exception:
+        return d
+    try:
+        out = _normalize_recommendation(x)
+        out = str(out or "").strip().upper()
+        return out if out in {"BUY", "HOLD", "REDUCE", "SELL"} else d
+    except Exception:
+        return d
 
 
 def _utc_iso() -> str:
@@ -187,7 +208,7 @@ def _safe_float(val: Any) -> Optional[float]:
     if val is None:
         return None
     try:
-        if isinstance(val, (int, float)):
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
             f = float(val)
             if math.isnan(f) or math.isinf(f):
                 return None
@@ -260,7 +281,7 @@ def _is_ksa(symbol: str) -> bool:
 def _fallback_normalize_symbol(symbol: str) -> str:
     """
     Fallback normalizer (only used if core.symbols.normalize is missing).
-    IMPORTANT: do NOT force ".US" here; providers (EODHD) already try variants.
+    IMPORTANT: do NOT force ".US" here.
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -307,9 +328,7 @@ def normalize_symbol(symbol: str) -> str:
 
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
     """
-    Provider-specific symbol mapping:
-    - Finnhub/Yahoo often expect plain tickers (AAPL) rather than AAPL.US
-    - EODHD accepts both; provider can try variants
+    Provider-specific symbol mapping (conservative).
     """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
@@ -460,13 +479,16 @@ async def _try_provider_call(
         patch: Any = raw
         err: Optional[str] = None
 
-        # ✅ keep tuple error if present
+        # Keep tuple error if present (patch, err, ...)
         try:
             if isinstance(raw, tuple) and len(raw) >= 2:
                 patch = raw[0]
                 maybe_err = raw[1]
                 if isinstance(maybe_err, str) and maybe_err.strip():
                     err = maybe_err.strip()
+                elif maybe_err is not None:
+                    # Some providers return Exception/object here
+                    err = str(maybe_err)
         except Exception:
             err = None
 
@@ -495,6 +517,115 @@ async def _try_provider_candidates(
             return patch, err, mod
         last_err = err
     return {}, last_err, None
+
+
+def _map_common_aliases(out: Dict[str, Any]) -> None:
+    """
+    Map common provider field names into canonical engine fields (only if missing).
+    This increases compatibility across providers without breaking schema.
+    """
+    # Prices
+    if out.get("current_price") is None:
+        for k in ("price", "last", "last_price", "regularMarketPrice", "close", "c"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["current_price"] = v
+                break
+
+    if out.get("previous_close") is None:
+        for k in ("prev_close", "previousClose", "regularMarketPreviousClose", "pc"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["previous_close"] = v
+                break
+
+    if out.get("day_high") is None:
+        for k in ("high", "dayHigh", "regularMarketDayHigh", "h"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["day_high"] = v
+                break
+
+    if out.get("day_low") is None:
+        for k in ("low", "dayLow", "regularMarketDayLow", "l"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["day_low"] = v
+                break
+
+    # 52w
+    if out.get("week_52_high") is None:
+        for k in ("52_week_high", "fiftyTwoWeekHigh", "week52High", "w52High"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["week_52_high"] = v
+                break
+
+    if out.get("week_52_low") is None:
+        for k in ("52_week_low", "fiftyTwoWeekLow", "week52Low", "w52Low"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["week_52_low"] = v
+                break
+
+    # Volume
+    if out.get("volume") is None:
+        for k in ("vol", "regularMarketVolume", "v"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["volume"] = v
+                break
+
+    # Identity
+    if out.get("name") is None:
+        for k in ("shortName", "longName", "companyName", "name_en", "name_ar"):
+            vv = out.get(k)
+            if vv is not None and str(vv).strip():
+                out["name"] = str(vv).strip()
+                break
+
+    if out.get("currency") is None:
+        for k in ("cur", "currency_code", "quoteCurrency", "financialCurrency"):
+            vv = out.get(k)
+            if vv is not None and str(vv).strip():
+                out["currency"] = str(vv).strip()
+                break
+
+    # Fundamentals
+    if out.get("market_cap") is None:
+        for k in ("mktCap", "marketCap", "market_capitalization", "marketCapitalization"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["market_cap"] = v
+                break
+
+    if out.get("shares_outstanding") is None:
+        for k in ("sharesOutstanding", "shares", "share_count"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["shares_outstanding"] = v
+                break
+
+    if out.get("dividend_yield") is None:
+        for k in ("divYield", "dividendYield", "trailingAnnualDividendYield"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["dividend_yield"] = _maybe_percent(v)
+                break
+
+    if out.get("pe_ttm") is None:
+        for k in ("pe", "trailingPE", "peRatio", "PERatio"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["pe_ttm"] = v
+                break
+
+    if out.get("pb") is None:
+        for k in ("pbRatio", "priceToBook", "PBRatio"):
+            v = _safe_float(out.get(k))
+            if v is not None:
+                out["pb"] = v
+                break
 
 
 def _apply_derived(out: Dict[str, Any]) -> None:
@@ -629,7 +760,7 @@ def _to_epoch_seconds(x: Any) -> Optional[int]:
     try:
         if x is None:
             return None
-        if isinstance(x, (int, float)):
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
             v = int(x)
             if v > 10_000_000_000:  # ms
                 v = int(v / 1000)
@@ -702,7 +833,13 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                         out.append((ts, fv))
                     continue
                 if isinstance(item, dict):
-                    ts = _to_epoch_seconds(item.get("t") or item.get("timestamp") or item.get("time") or item.get("date") or item.get("datetime"))
+                    ts = _to_epoch_seconds(
+                        item.get("t")
+                        or item.get("timestamp")
+                        or item.get("time")
+                        or item.get("date")
+                        or item.get("datetime")
+                    )
                     fv = _safe_float(item.get("c") or item.get("close") or item.get("adjClose") or item.get("adj_close"))
                     if ts is not None and fv is not None:
                         out.append((ts, fv))
@@ -1326,7 +1463,7 @@ class DataEngine:
         if not sym_norm:
             return self._placeholder(sym_in, err="Missing symbol")
 
-        cache_key = f"q::{sym_norm}"
+        cache_key = f"q::{sym_norm}::{(fields or '').strip()}"
         if not refresh:
             cached = self._cache.get(cache_key)
             if isinstance(cached, dict) and cached.get("symbol_normalized") == sym_norm:
@@ -1427,29 +1564,30 @@ class DataEngine:
             if err:
                 warnings.append(f"{key}: {err}")
 
-        # Derived computations + normalization
+        # Alias mapping + derived computations
+        _map_common_aliases(out)
         _apply_derived(out)
         out["data_quality"] = _quality_label(out)
 
-        # Map provider forecast aliases -> canonical
+        # Forecast aliases -> canonical
         _map_forecast_aliases(out)
 
-        # History analytics if raw history present
+        # History analytics (best-effort)
         if self.enable_history:
             _apply_history_analytics(out)
 
-        # Forecast/expected fields if still missing
+        # Forecast fallback (momentum) if still missing
         _forecast_from_momentum(out)
 
-        # ✅ Add backward compatible aliases after canonical is ready
+        # Backward compatible aliases after canonical is ready
         _mirror_forecast_aliases(out)
 
         # Score + reco + badges
         _compute_scores(out)
         out["badges"] = _badges(out)
 
-        computed_reco = _recommendation(out)
-        out["recommendation"] = _norm_reco(computed_reco, default="HOLD")
+        # Always compute recommendation from engine scores (canonical enum)
+        out["recommendation"] = _norm_reco(_recommendation(out), default="HOLD")
 
         # Source
         out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
