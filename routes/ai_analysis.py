@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.2) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.3) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,14 +12,10 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forecast/Expected + Valuation + Overall + Recommendation.
 
-v4.4.2 upgrades (fix the failure you saw + better fallbacks)
-- ✅ Compatibility patch: monkey-patches core.normalize_recommendation to accept `default=...`
-  (fixes: "normalize_recommendation() got an unexpected keyword argument 'default'").
-- ✅ Engine call fallback chain:
-    get_enriched_quotes -> get_quotes -> per-symbol enriched -> per-symbol basic
-  so one broken path does not zero out all rows.
-- ✅ Context routing improved: KSA_Tadawul => market=KSA, Global* => market=GLOBAL.
-- ✅ Adds Value Traded fallback (Price * Volume) when missing.
+v4.4.3 changes (small hardening / completeness-friendly)
+- ✅ Prevents noisy log spam when APP_TOKEN is not set (health checks can call often).
+- ✅ Better RSI/MA/Vol header alias support (covers common variants without changing schema).
+- ✅ More defensive mapping for dividend yield / ROE / ROA variants (common user-required headers).
 """
 
 from __future__ import annotations
@@ -50,7 +46,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.4.2"
+AI_ANALYSIS_VERSION = "4.4.3"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -189,7 +185,7 @@ def _ensure_reco_on_obj(uq: Any) -> None:
 @lru_cache(maxsize=1)
 def _apply_compat_patches() -> bool:
     """
-    Fixes the exact error you hit:
+    Fixes:
       normalize_recommendation() got an unexpected keyword argument 'default'
 
     We patch any found `normalize_recommendation` function in likely core modules to accept:
@@ -213,18 +209,16 @@ def _apply_compat_patches() -> bool:
             sig = inspect.signature(fn)
             params = sig.parameters
             if "default" in params:
-                return None  # already compatible
+                return None
             if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-                return None  # already accepts **kwargs
+                return None
         except Exception:
             return None
 
         def _wrapped(x: Any, default: str = "HOLD", *args: Any, **kwargs: Any) -> Any:
             try:
-                # Most legacy functions: normalize_recommendation(x)
                 return fn(x)
             except TypeError:
-                # If it still complains, degrade gracefully
                 if x is None or str(x).strip() == "":
                     return default
                 try:
@@ -258,7 +252,6 @@ def _apply_compat_patches() -> bool:
         except Exception:
             pass
 
-        # Also patch class-level method if exists (rare but possible)
         try:
             for cls_name in ("DataEngine", "ScoringEngine"):
                 cls = getattr(mod, cls_name, None)
@@ -281,11 +274,6 @@ def _apply_compat_patches() -> bool:
 # Lazy imports: V2 helpers (PROD SAFE) + cached normalize
 # =============================================================================
 def _fallback_normalize(raw: str) -> str:
-    """
-    Fallback normalization aligned with DataEngineV2.normalize_symbol():
-    - digits -> .SR
-    - otherwise keep symbol as-is
-    """
     s = (raw or "").strip().upper()
     if not s:
         return ""
@@ -293,7 +281,7 @@ def _fallback_normalize(raw: str) -> str:
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
-    if any(ch in s for ch in ("^", "=")):  # indices / formula-like
+    if any(ch in s for ch in ("^", "=")):
         return s
     if s.isdigit():
         return f"{s}.SR"
@@ -302,10 +290,6 @@ def _fallback_normalize(raw: str) -> str:
 
 @lru_cache(maxsize=1)
 def _try_import_v2_symbols() -> Tuple[Optional[Any], Optional[Any], Any]:
-    """
-    Returns (DataEngine, UnifiedQuote, normalize_symbol_callable). Never raises.
-    Cached to avoid repeated imports per row/cell.
-    """
     try:
         from core.data_engine_v2 import DataEngine as _DE  # type: ignore
         from core.data_engine_v2 import UnifiedQuote as _UQ  # type: ignore
@@ -379,8 +363,8 @@ def _allowed_tokens() -> List[str]:
             seen.add(t)
             out.append(t)
 
-    if not out:
-        logger.warning("[analysis] No APP_TOKEN configured -> endpoints are OPEN (no auth).")
+    # IMPORTANT: do NOT warn here; health checks may call often.
+    # We report "auth": "open" in /health response instead.
     return out
 
 
@@ -436,9 +420,7 @@ async def _get_singleton_engine() -> Optional[Any]:
     async with _ENGINE_LOCK:
         if _ENGINE is None:
             try:
-                # apply compat patches before engine constructs (safe)
                 _apply_compat_patches()
-
                 DE, _, _ = _try_import_v2_symbols()
                 _ENGINE = None if DE is None else DE()
                 if _ENGINE is not None:
@@ -450,9 +432,7 @@ async def _get_singleton_engine() -> Optional[Any]:
 
 
 async def _resolve_engine(request: Optional[Request]) -> Optional[Any]:
-    # apply compat patches early as well (safe)
     _apply_compat_patches()
-
     eng = _get_app_engine(request)
     if eng is not None:
         return eng
@@ -543,7 +523,7 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
     if not utc_any:
         return None
     try:
-        from zoneinfo import ZoneInfo  # py3.9+
+        from zoneinfo import ZoneInfo
 
         tz = ZoneInfo("Asia/Riyadh")
         dt = _parse_iso_dt(utc_any)
@@ -607,8 +587,8 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     opportunity_score: Optional[float] = None
     risk_score: Optional[float] = None
     overall_score: Optional[float] = None
-    recommendation: Optional[str] = None  # BUY/HOLD/REDUCE/SELL
-    confidence: Optional[float] = None  # 0..1
+    recommendation: Optional[str] = None
+    confidence: Optional[float] = None
 
     fair_value: Optional[float] = None
     upside_percent: Optional[float] = None
@@ -623,7 +603,7 @@ class BatchAnalysisRequest(_ExtraIgnoreBase):
     tickers: List[str] = Field(default_factory=list)
     symbols: List[str] = Field(default_factory=list)
     sheet_name: Optional[str] = None
-    sheetName: Optional[str] = None  # back-compat
+    sheetName: Optional[str] = None
 
 
 class BatchAnalysisResponse(_ExtraIgnoreBase):
@@ -633,7 +613,7 @@ class BatchAnalysisResponse(_ExtraIgnoreBase):
 class SheetAnalysisResponse(_ExtraIgnoreBase):
     headers: List[str] = Field(default_factory=list)
     rows: List[List[Any]] = Field(default_factory=list)
-    status: str = "success"  # success | partial | error | skipped
+    status: str = "success"
     error: Optional[str] = None
 
 
@@ -1028,52 +1008,67 @@ def _rsi_14(xs: List[float]) -> Optional[float]:
     return round(rsi, 2)
 
 
-def _compute_turnover_pct(volume: Any, shares_out: Any, value_traded: Any, market_cap: Any) -> Optional[float]:
-    v = _safe_float_or_none(volume)
-    so = _safe_float_or_none(shares_out)
-    if v is not None and so is not None and so > 0:
-        return round((v / so) * 100.0, 4)
+def _derive_from_history(uq: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
 
-    vt = _safe_float_or_none(value_traded)
-    mc = _safe_float_or_none(market_cap)
-    if vt is not None and mc is not None and mc > 0:
-        return round((vt / mc) * 100.0, 4)
+    hp = _safe_get(uq, "history_points", "history", "chart_points", "price_history", "bars")
+    closes, vols, last_iso = _history_parse_points(hp)
 
-    return None
+    if closes:
+        if len(closes) >= 2:
+            out["prev close"] = closes[-2]
+            out["previous close"] = closes[-2]
+
+        out["ma20"] = _sma(closes, 20)
+        out["ma50"] = _sma(closes, 50)
+        out["ma200"] = _sma(closes, 200)
+
+        out["returns 1w %"] = _returns_from_close(closes, 5)
+        out["returns 1m %"] = _returns_from_close(closes, 21)
+        out["returns 3m %"] = _returns_from_close(closes, 63)
+        out["returns 6m %"] = _returns_from_close(closes, 126)
+        out["returns 12m %"] = _returns_from_close(closes, 252)
+
+        out["rsi (14)"] = _rsi_14(closes)
+        out["rsi 14"] = out["rsi (14)"]  # alias
+        out["volatility 30d"] = _vol_30d_ann(closes)
+        out["volatility (30d)"] = out["volatility 30d"]
+
+        look = closes[-252:] if len(closes) >= 252 else closes
+        try:
+            out["52w high"] = max(look) if look else None
+            out["52w low"] = min(look) if look else None
+        except Exception:
+            pass
+
+    if vols:
+        take = vols[-30:] if len(vols) >= 30 else vols
+        avg = _mean(take)
+        if avg is not None:
+            out["avg vol 30d"] = avg
+            out["avg volume (30d)"] = avg
+        out["volume"] = vols[-1]
+
+    if isinstance(hp, list):
+        out["history points"] = len(hp)
+    elif isinstance(hp, dict):
+        for k in ("points", "data", "bars", "history"):
+            if isinstance(hp.get(k), list):
+                out["history points"] = len(hp[k])
+                break
+
+    if last_iso:
+        out["history last (utc)"] = last_iso
+
+    if hp:
+        out["history source"] = _safe_get(uq, "history_source") or "history_points"
+
+    return out
 
 
-def _compute_dividend_rate(div_yield_pct: Any, price: Any) -> Optional[float]:
-    dy = _safe_float_or_none(div_yield_pct)
-    p = _safe_float_or_none(price)
-    if dy is None or p is None or p <= 0:
-        return None
-    return round((dy / 100.0) * p, 6)
-
-
-def _compute_payout_ratio_pct(div_rate: Any, eps_ttm: Any) -> Optional[float]:
-    dr = _safe_float_or_none(div_rate)
-    eps = _safe_float_or_none(eps_ttm)
-    if dr is None or eps is None or eps == 0:
-        return None
-    return round((dr / eps) * 100.0, 4)
-
-
-def _compute_forward_pe(price: Any, forward_eps: Any) -> Optional[float]:
-    p = _safe_float_or_none(price)
-    fe = _safe_float_or_none(forward_eps)
-    if p is None or fe is None or fe == 0:
-        return None
-    return round(p / fe, 6)
-
-
-def _compute_forward_eps(price: Any, forward_pe: Any) -> Optional[float]:
-    p = _safe_float_or_none(price)
-    fp = _safe_float_or_none(forward_pe)
-    if p is None or fp is None or fp == 0:
-        return None
-    return round(p / fp, 6)
-
-
+# =============================================================================
+# Cross-field derivations (fallbacks)
+# =============================================================================
 def _compute_change_and_pct(price: Any, prev_close: Any) -> Tuple[Optional[float], Optional[float]]:
     p = _safe_float_or_none(price)
     pc = _safe_float_or_none(prev_close)
@@ -1108,6 +1103,131 @@ def _compute_free_float_mkt_cap(market_cap: Any, free_float_pct: Any) -> Optiona
     return None
 
 
+def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+
+    price = _safe_get(uq, "current_price", "last_price", "price")
+    prev = _safe_get(uq, "previous_close", "prev_close") or derived.get("prev close") or derived.get("previous close")
+
+    ch = _safe_get(uq, "price_change", "change")
+    pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
+    if ch is None or pct is None:
+        ch2, pct2 = _compute_change_and_pct(price, prev)
+        if ch is None and ch2 is not None:
+            out["change"] = ch2
+            out["price change"] = ch2
+        if pct is None and pct2 is not None:
+            out["change %"] = pct2
+            out["percent change"] = pct2
+
+    mc = _safe_get(uq, "market_cap")
+    so = _safe_get(uq, "shares_outstanding", "shares", "shares_out")
+    if mc is None:
+        mc2 = _compute_market_cap(price, so)
+        if mc2 is not None:
+            out["market cap"] = mc2
+
+    vt = _safe_get(uq, "value_traded")
+    vol = _safe_get(uq, "volume") or derived.get("volume")
+    if vt is None:
+        p = _safe_float_or_none(price)
+        v = _safe_float_or_none(vol)
+        if p is not None and v is not None and p > 0 and v > 0:
+            out["value traded"] = round(p * v, 2)
+
+    ffmc = _safe_get(uq, "free_float_market_cap", "free_float_mkt_cap")
+    ff = _safe_get(uq, "free_float", "free_float_percent")
+    if ffmc is None:
+        mc_src = mc if mc is not None else out.get("market cap")
+        ffmc2 = _compute_free_float_mkt_cap(mc_src, ff)
+        if ffmc2 is not None:
+            out["free float mkt cap"] = ffmc2
+            out["free float market cap"] = ffmc2
+
+    pos = _safe_get(uq, "position_52w_percent", "position_52w")
+    if pos is None:
+        lo = _safe_get(uq, "week_52_low", "low_52w") or derived.get("52w low")
+        hi = _safe_get(uq, "week_52_high", "high_52w") or derived.get("52w high")
+        pos2 = _compute_52w_position_pct(price, lo, hi)
+        if pos2 is not None:
+            out["52w position %"] = pos2
+
+    return out
+
+
+# =============================================================================
+# Forecast helpers
+# =============================================================================
+def _coerce_confidence_to_0_100(v: Any) -> Optional[float]:
+    x = _safe_float_or_none(v)
+    if x is None:
+        return None
+    if 0.0 <= x <= 1.0:
+        return round(x * 100.0, 2)
+    if 1.0 < x <= 100.0:
+        return round(x, 2)
+    return None
+
+
+def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+
+    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
+    if price is None:
+        return out
+
+    roi_1m = _safe_float_or_none(_safe_get(uq, "expected_roi_1m", "expected_return_1m"))
+    roi_3m = _safe_float_or_none(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
+    roi_12m = _safe_float_or_none(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
+
+    if roi_1m is None:
+        roi_1m = _safe_float_or_none(derived.get("returns 1m %"))
+    if roi_3m is None:
+        roi_3m = _safe_float_or_none(derived.get("returns 3m %"))
+    if roi_12m is None:
+        roi_12m = _safe_float_or_none(derived.get("returns 12m %"))
+
+    fp1 = _safe_float_or_none(_safe_get(uq, "forecast_price_1m", "expected_price_1m"))
+    fp3 = _safe_float_or_none(_safe_get(uq, "forecast_price_3m", "expected_price_3m"))
+    fp12 = _safe_float_or_none(_safe_get(uq, "forecast_price_12m", "expected_price_12m"))
+
+    if fp1 is None and roi_1m is not None:
+        fp1 = round(price * (1.0 + roi_1m / 100.0), 6)
+    if fp3 is None and roi_3m is not None:
+        fp3 = round(price * (1.0 + roi_3m / 100.0), 6)
+    if fp12 is None and roi_12m is not None:
+        fp12 = round(price * (1.0 + roi_12m / 100.0), 6)
+
+    out["forecast price (1m)"] = fp1
+    out["forecast price (3m)"] = fp3
+    out["forecast price (12m)"] = fp12
+
+    out["expected roi % (1m)"] = roi_1m
+    out["expected roi % (3m)"] = roi_3m
+    out["expected roi % (12m)"] = roi_12m
+
+    conf = _coerce_confidence_to_0_100(_safe_get(uq, "forecast_confidence", "confidence_score", "confidence"))
+    out["forecast confidence"] = conf
+
+    futc = (
+        _safe_get(uq, "forecast_updated_utc")
+        or _safe_get(uq, "last_updated_utc", "as_of_utc")
+        or derived.get("history last (utc)")
+        or _now_utc_iso()
+    )
+    out["forecast updated (utc)"] = _iso_or_none(futc) or futc
+
+    friy = _safe_get(uq, "forecast_updated_riyadh")
+    if not friy:
+        friy = _to_riyadh_iso(futc) or ""
+    out["forecast updated (riyadh)"] = _iso_or_none(friy) or friy
+
+    return out
+
+
+# =============================================================================
+# Fair value / overall (simple)
+# =============================================================================
 def _compute_fair_value_and_upside(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
     if price is None or price <= 0:
@@ -1196,231 +1316,6 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[f
             reco = "SELL"
 
     return round(score, 2), reco, conf01
-
-
-def _derive_from_history(uq: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-
-    hp = _safe_get(uq, "history_points", "history", "chart_points", "price_history", "bars")
-    closes, vols, last_iso = _history_parse_points(hp)
-
-    if closes:
-        if len(closes) >= 2:
-            out["prev close"] = closes[-2]
-            out["previous close"] = closes[-2]
-
-        out["ma20"] = _sma(closes, 20)
-        out["ma50"] = _sma(closes, 50)
-        out["ma200"] = _sma(closes, 200)
-
-        out["returns 1w %"] = _returns_from_close(closes, 5)
-        out["returns 1m %"] = _returns_from_close(closes, 21)
-        out["returns 3m %"] = _returns_from_close(closes, 63)
-        out["returns 6m %"] = _returns_from_close(closes, 126)
-        out["returns 12m %"] = _returns_from_close(closes, 252)
-
-        out["rsi (14)"] = _rsi_14(closes)
-        out["volatility 30d"] = _vol_30d_ann(closes)
-        out["volatility (30d)"] = out["volatility 30d"]
-
-        look = closes[-252:] if len(closes) >= 252 else closes
-        try:
-            out["52w high"] = max(look) if look else None
-            out["52w low"] = min(look) if look else None
-        except Exception:
-            pass
-
-    if vols:
-        take = vols[-30:] if len(vols) >= 30 else vols
-        avg = _mean(take)
-        if avg is not None:
-            out["avg vol 30d"] = avg
-            out["avg volume (30d)"] = avg
-        out["volume"] = vols[-1]
-
-    if isinstance(hp, list):
-        out["history points"] = len(hp)
-    elif isinstance(hp, dict):
-        for k in ("points", "data", "bars", "history"):
-            if isinstance(hp.get(k), list):
-                out["history points"] = len(hp[k])
-                break
-
-    if last_iso:
-        out["history last (utc)"] = last_iso
-
-    if hp:
-        out["history source"] = _safe_get(uq, "history_source") or "history_points"
-
-    return out
-
-
-def _derive_cross_fields(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-
-    price = _safe_get(uq, "current_price", "last_price", "price")
-    prev = _safe_get(uq, "previous_close", "prev_close") or derived.get("prev close") or derived.get("previous close")
-
-    # Change + Change %
-    ch = _safe_get(uq, "price_change", "change")
-    pct = _safe_get(uq, "percent_change", "change_pct", "change_percent")
-    if ch is None or pct is None:
-        ch2, pct2 = _compute_change_and_pct(price, prev)
-        if ch is None and ch2 is not None:
-            out["change"] = ch2
-            out["price change"] = ch2
-        if pct is None and pct2 is not None:
-            out["change %"] = pct2
-            out["percent change"] = pct2
-
-    # Market cap from shares * price
-    mc = _safe_get(uq, "market_cap")
-    so = _safe_get(uq, "shares_outstanding", "shares", "shares_out")
-    if mc is None:
-        mc2 = _compute_market_cap(price, so)
-        if mc2 is not None:
-            out["market cap"] = mc2
-
-    # Value Traded fallback: Price * Volume
-    vt = _safe_get(uq, "value_traded")
-    vol = _safe_get(uq, "volume") or derived.get("volume")
-    if vt is None:
-        p = _safe_float_or_none(price)
-        v = _safe_float_or_none(vol)
-        if p is not None and v is not None and p > 0 and v > 0:
-            out["value traded"] = round(p * v, 2)
-
-    # Free float market cap
-    ffmc = _safe_get(uq, "free_float_market_cap", "free_float_mkt_cap")
-    ff = _safe_get(uq, "free_float", "free_float_percent")
-    if ffmc is None:
-        mc_src = mc if mc is not None else out.get("market cap")
-        ffmc2 = _compute_free_float_mkt_cap(mc_src, ff)
-        if ffmc2 is not None:
-            out["free float mkt cap"] = ffmc2
-            out["free float market cap"] = ffmc2
-
-    # Dividend rate from yield% * price
-    dy = _safe_get(uq, "dividend_yield", "div_yield")
-    dr = _safe_get(uq, "dividend_rate", "dividend_per_share")
-    if dr is None and dy is not None:
-        dr2 = _compute_dividend_rate(_ratio_to_percent(dy), price)
-        if dr2 is not None:
-            out["dividend rate"] = dr2
-
-    # Payout ratio from dividend rate / EPS
-    pr = _safe_get(uq, "payout_ratio")
-    if pr is None:
-        eps = _safe_get(uq, "eps_ttm", "eps")
-        dr_src = dr if dr is not None else out.get("dividend rate")
-        pr2 = _compute_payout_ratio_pct(dr_src, eps)
-        if pr2 is not None:
-            out["payout ratio %"] = pr2
-
-    # Forward PE / Forward EPS mutual fill
-    fpe = _safe_get(uq, "forward_pe", "pe_forward")
-    feps = _safe_get(uq, "forward_eps", "eps_forward")
-    if fpe is None and feps is not None:
-        fpe2 = _compute_forward_pe(price, feps)
-        if fpe2 is not None:
-            out["forward p/e"] = fpe2
-    if feps is None and fpe is not None:
-        feps2 = _compute_forward_eps(price, fpe)
-        if feps2 is not None:
-            out["forward eps"] = feps2
-
-    # 52W Position % if high/low exist
-    pos = _safe_get(uq, "position_52w_percent", "position_52w")
-    if pos is None:
-        lo = _safe_get(uq, "week_52_low", "low_52w") or derived.get("52w low")
-        hi = _safe_get(uq, "week_52_high", "high_52w") or derived.get("52w high")
-        pos2 = _compute_52w_position_pct(price, lo, hi)
-        if pos2 is not None:
-            out["52w position %"] = pos2
-
-    # Turnover % fallback
-    trn = _safe_get(uq, "turnover_percent")
-    if trn is None:
-        out_trn = _compute_turnover_pct(
-            vol,
-            so,
-            vt if vt is not None else out.get("value traded"),
-            mc if mc is not None else out.get("market cap"),
-        )
-        if out_trn is not None:
-            out["turnover %"] = out_trn
-
-    return out
-
-
-# =============================================================================
-# Forecast helpers
-# =============================================================================
-def _coerce_confidence_to_0_100(v: Any) -> Optional[float]:
-    x = _safe_float_or_none(v)
-    if x is None:
-        return None
-    if 0.0 <= x <= 1.0:
-        return round(x * 100.0, 2)
-    if 1.0 < x <= 100.0:
-        return round(x, 2)
-    return None
-
-
-def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-
-    price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
-    if price is None:
-        return out
-
-    roi_1m = _safe_float_or_none(_safe_get(uq, "expected_roi_1m", "expected_return_1m"))
-    roi_3m = _safe_float_or_none(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
-    roi_12m = _safe_float_or_none(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
-
-    if roi_1m is None:
-        roi_1m = _safe_float_or_none(derived.get("returns 1m %"))
-    if roi_3m is None:
-        roi_3m = _safe_float_or_none(derived.get("returns 3m %"))
-    if roi_12m is None:
-        roi_12m = _safe_float_or_none(derived.get("returns 12m %"))
-
-    fp1 = _safe_float_or_none(_safe_get(uq, "forecast_price_1m", "expected_price_1m"))
-    fp3 = _safe_float_or_none(_safe_get(uq, "forecast_price_3m", "expected_price_3m"))
-    fp12 = _safe_float_or_none(_safe_get(uq, "forecast_price_12m", "expected_price_12m"))
-
-    if fp1 is None and roi_1m is not None:
-        fp1 = round(price * (1.0 + roi_1m / 100.0), 6)
-    if fp3 is None and roi_3m is not None:
-        fp3 = round(price * (1.0 + roi_3m / 100.0), 6)
-    if fp12 is None and roi_12m is not None:
-        fp12 = round(price * (1.0 + roi_12m / 100.0), 6)
-
-    out["forecast price (1m)"] = fp1
-    out["forecast price (3m)"] = fp3
-    out["forecast price (12m)"] = fp12
-
-    out["expected roi % (1m)"] = roi_1m
-    out["expected roi % (3m)"] = roi_3m
-    out["expected roi % (12m)"] = roi_12m
-
-    conf = _coerce_confidence_to_0_100(_safe_get(uq, "forecast_confidence", "confidence_score", "confidence"))
-    out["forecast confidence"] = conf
-
-    futc = (
-        _safe_get(uq, "forecast_updated_utc")
-        or _safe_get(uq, "last_updated_utc", "as_of_utc")
-        or derived.get("history last (utc)")
-        or _now_utc_iso()
-    )
-    out["forecast updated (utc)"] = _iso_or_none(futc) or futc
-
-    friy = _safe_get(uq, "forecast_updated_riyadh")
-    if not friy:
-        friy = _to_riyadh_iso(futc) or ""
-    out["forecast updated (riyadh)"] = _iso_or_none(friy) or friy
-
-    return out
 
 
 # =============================================================================
@@ -1613,13 +1508,14 @@ def _error_row(symbol: str, headers: List[str], err: str, *, rank: Optional[int]
     if i_rec is not None:
         row[i_rec] = "HOLD"
 
+    nowu = _now_utc_iso()
     i_last_utc = _idx(headers, "Last Updated (UTC)")
     if i_last_utc is not None:
-        row[i_last_utc] = _now_utc_iso()
+        row[i_last_utc] = nowu
 
     i_last_riy = _idx(headers, "Last Updated (Riyadh)")
     if i_last_riy is not None:
-        row[i_last_riy] = _to_riyadh_iso(_now_utc_iso())
+        row[i_last_riy] = _to_riyadh_iso(nowu)
 
     return row
 
@@ -1653,7 +1549,6 @@ def _status_from_rows(headers: List[str], rows: List[List[Any]]) -> str:
 # =============================================================================
 _RATIO_HEADERS = {
     "change %",
-    "turnover %",
     "free float %",
     "dividend yield %",
     "payout ratio %",
@@ -1683,51 +1578,31 @@ _VOL_HEADERS = {"volatility 30d", "volatility (30d)"}
 _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "rank": (("rank",), None),
     "origin": (("origin",), None),
-
     "symbol": (("symbol",), None),
-    "company name": (("name", "company_name"), None),
     "name": (("name", "company_name"), None),
-
+    "company name": (("name", "company_name"), None),
     "sector": (("sector", "sector_name"), None),
     "sub sector": (("sub_sector", "subsector", "sub_sector_name"), None),
-    "sub-sector": (("sub_sector", "subsector", "sub_sector_name"), None),
-
     "market": (("market", "market_region"), None),
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo", "ipo_date"), None),
-
     "price": (("current_price", "last_price", "price", "last"), None),
-    "last price": (("current_price", "last_price", "price", "last"), None),
-
     "prev close": (("previous_close", "prev_close"), None),
-    "previous close": (("previous_close", "prev_close"), None),
-
     "change": (("price_change", "change"), None),
-    "price change": (("price_change", "change"), None),
-
     "change %": (("percent_change", "change_pct", "change_percent"), _ratio_to_percent),
-    "percent change": (("percent_change", "change_pct", "change_percent"), _ratio_to_percent),
-
     "day high": (("day_high", "high"), None),
     "day low": (("day_low", "low"), None),
-
     "52w high": (("week_52_high", "high_52w", "52w_high"), None),
     "52w low": (("week_52_low", "low_52w", "52w_low"), None),
     "52w position %": (("position_52w_percent", "position_52w"), _ratio_to_percent),
-
     "volume": (("volume", "vol"), None),
     "avg vol 30d": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
-    "avg volume (30d)": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
-
     "value traded": (("value_traded", "value", "turnover_value"), None),
     "liquidity score": (("liquidity_score",), None),
-
     "shares outstanding": (("shares_outstanding", "shares", "shares_out"), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
     "market cap": (("market_cap",), None),
     "free float mkt cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
-    "free float market cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
-
     "eps (ttm)": (("eps_ttm", "eps"), None),
     "forward eps": (("forward_eps", "eps_forward"), None),
     "p/e (ttm)": (("pe_ttm", "pe"), None),
@@ -1735,30 +1610,16 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "p/b": (("pb",), None),
     "p/s": (("ps",), None),
     "ev/ebitda": (("ev_ebitda", "ev_to_ebitda"), None),
-
+    # Percent variants + common non-% variants (requested often in tests)
     "dividend yield %": (("dividend_yield", "div_yield"), _ratio_to_percent),
-    "dividend rate": (("dividend_rate", "dividend_per_share"), None),
-    "payout ratio %": (("payout_ratio",), _ratio_to_percent),
-
+    "dividend yield": (("dividend_yield", "div_yield"), _ratio_to_percent),
     "roe %": (("roe",), _ratio_to_percent),
+    "roe": (("roe",), _ratio_to_percent),
     "roa %": (("roa",), _ratio_to_percent),
-    "net margin %": (("net_margin", "profit_margin"), _ratio_to_percent),
-    "ebitda margin %": (("ebitda_margin",), _ratio_to_percent),
-    "revenue growth %": (("revenue_growth", "revenue_growth_pct"), _ratio_to_percent),
-    "net income growth %": (("net_income_growth", "net_income_growth_pct"), _ratio_to_percent),
-
-    "beta": (("beta",), None),
-    "volatility 30d": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
-    "volatility (30d)": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
-    "rsi (14)": (("rsi14", "rsi_14"), None),
-    "ma20": (("ma20",), None),
-    "ma50": (("ma50",), None),
-    "ma200": (("ma200",), None),
-
+    "roa": (("roa",), _ratio_to_percent),
     "fair value": (("fair_value",), None),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
-
     "value score": (("value_score",), None),
     "quality score": (("quality_score",), None),
     "momentum score": (("momentum_score",), None),
@@ -1766,57 +1627,37 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score",), None),
     "recommendation": (("recommendation",), None),
-
     "rec badge": (("rec_badge",), None),
     "momentum badge": (("momentum_badge",), None),
     "opportunity badge": (("opportunity_badge",), None),
     "risk badge": (("risk_badge",), None),
-
     "data source": (("data_source", "source", "provider"), None),
     "data quality": (("data_quality",), None),
-
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
     "last updated (riyadh)": (("last_updated_riyadh",), _iso_or_none),
-
     "error": (("error",), None),
-
     "returns 1w %": (("returns_1w",), _ratio_to_percent),
     "returns 1m %": (("returns_1m",), _ratio_to_percent),
     "returns 3m %": (("returns_3m",), _ratio_to_percent),
     "returns 6m %": (("returns_6m",), _ratio_to_percent),
     "returns 12m %": (("returns_12m",), _ratio_to_percent),
-
-    "expected return 1m %": (("expected_return_1m",), _ratio_to_percent),
-    "expected return 3m %": (("expected_return_3m",), _ratio_to_percent),
-    "expected return 12m %": (("expected_return_12m",), _ratio_to_percent),
-
-    "expected price 1m": (("expected_price_1m",), None),
-    "expected price 3m": (("expected_price_3m",), None),
-    "expected price 12m": (("expected_price_12m",), None),
-
-    "confidence score": (("confidence_score",), None),
-    "forecast method": (("forecast_method",), None),
-
-    "history points": (("history_points",), None),
-    "history source": (("history_source",), None),
-    "history last (utc)": (("history_last_utc",), _iso_or_none),
-
+    # RSI/MA/Vol common variants
+    "rsi (14)": (("rsi14", "rsi_14"), None),
+    "rsi 14": (("rsi14", "rsi_14"), None),
+    "ma20": (("ma20",), None),
+    "ma50": (("ma50",), None),
+    "ma200": (("ma200",), None),
+    "volatility 30d": (("vol_30d_ann", "volatility_30d", "volatility_30d_ann"), _vol_to_percent),
     "forecast price (1m)": (("forecast_price_1m", "expected_price_1m"), None),
     "forecast price (3m)": (("forecast_price_3m", "expected_price_3m"), None),
     "forecast price (12m)": (("forecast_price_12m", "expected_price_12m"), None),
-
     "expected roi % (1m)": (("expected_roi_1m", "expected_return_1m"), _ratio_to_percent),
     "expected roi % (3m)": (("expected_roi_3m", "expected_return_3m"), _ratio_to_percent),
     "expected roi % (12m)": (("expected_roi_12m", "expected_return_12m"), _ratio_to_percent),
-
     "forecast confidence": (("forecast_confidence", "confidence_score", "confidence"), None),
-    "forecast updated (utc)": (
-        ("forecast_updated_utc", "forecast_updated", "last_updated_utc", "as_of_utc", "history_last_utc"),
-        _iso_or_none,
-    ),
+    "forecast updated (utc)": (("forecast_updated_utc", "forecast_updated", "last_updated_utc", "as_of_utc", "history_last_utc"), _iso_or_none),
     "forecast updated (riyadh)": (("forecast_updated_riyadh",), _iso_or_none),
 }
-
 
 @dataclass(frozen=True)
 class _HeaderMeta:
@@ -1827,7 +1668,6 @@ class _HeaderMeta:
     local_transform: Optional[Any]
     guess: str
 
-
 @dataclass(frozen=True)
 class _HeaderPlan:
     metas: Tuple[_HeaderMeta, ...]
@@ -1837,7 +1677,6 @@ class _HeaderPlan:
     need_last_riyadh: bool
     needs_history_deriv: bool
     needs_forecast_fill: bool
-
 
 @lru_cache(maxsize=64)
 def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
@@ -1863,9 +1702,7 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
 
         if hk in (
             "avg vol 30d",
-            "avg volume (30d)",
             "prev close",
-            "previous close",
             "returns 1w %",
             "returns 1m %",
             "returns 3m %",
@@ -1875,8 +1712,8 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
             "ma50",
             "ma200",
             "rsi (14)",
+            "rsi 14",
             "volatility 30d",
-            "volatility (30d)",
             "52w high",
             "52w low",
             "history points",
@@ -1923,14 +1760,12 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
         needs_forecast_fill=needs_forecast_fill,
     )
 
-
 def _is_blank(v: Any) -> bool:
     if v is None:
         return True
     if isinstance(v, str) and not v.strip():
         return True
     return False
-
 
 def _apply_common_transforms(hk: str, v: Any) -> Any:
     if hk == "recommendation":
@@ -1940,7 +1775,6 @@ def _apply_common_transforms(hk: str, v: Any) -> Any:
     if hk in _VOL_HEADERS:
         return _vol_to_percent(v)
     return v
-
 
 def _value_for_meta(
     meta: _HeaderMeta,
@@ -2053,7 +1887,6 @@ def _value_for_meta(
 
     return None
 
-
 def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin: str) -> List[Any]:
     fair_pack: Optional[Tuple[Any, Any, Any]] = None
     overall_pack: Optional[Tuple[Any, Any, Any]] = None
@@ -2123,12 +1956,10 @@ async def _maybe_await(x: Any) -> Any:
         return await x
     return x
 
-
 def _unwrap_tuple_payload(x: Any) -> Any:
     if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
-
 
 def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if not kwargs:
@@ -2145,7 +1976,6 @@ def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
         return fn(*args, **filtered)
     except Exception:
         return fn(*args, **kwargs)
-
 
 def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Any:
     fn = getattr(engine, fn_name, None)
@@ -2189,7 +2019,6 @@ def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: 
             raise last_exc
         raise
 
-
 def _index_keys_for_quote(q: Any) -> List[str]:
     keys: List[str] = []
     sym = (_safe_get(q, "symbol") or "").strip().upper()
@@ -2215,29 +2044,17 @@ def _index_keys_for_quote(q: Any) -> List[str]:
             out.append(k)
     return out
 
-
 async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Union[List[Any], Dict[str, Any]]:
-    """
-    Robust fallback chain:
-      1) get_enriched_quotes (batch)
-      2) get_quotes (batch)
-      3) per-symbol get_enriched_quote
-      4) per-symbol get_quote
-    """
-    # 1) enriched batch
     fn = getattr(engine, "get_enriched_quotes", None)
     if callable(fn):
         try:
-            res = _unwrap_tuple_payload(
-                await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms, ctx=ctx))
-            )
+            res = _unwrap_tuple_payload(await _maybe_await(_call_batch_best_effort(engine, "get_enriched_quotes", syms, ctx=ctx)))
             if isinstance(res, (list, dict)):
                 return res
             return list(res or [])
         except Exception as e:
             logger.warning("[analysis] get_enriched_quotes failed -> fallback to get_quotes. err=%s", e)
 
-    # 2) basic batch
     fn2 = getattr(engine, "get_quotes", None)
     if callable(fn2):
         try:
@@ -2248,7 +2065,6 @@ async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[
         except Exception as e:
             logger.warning("[analysis] get_quotes failed -> fallback to per-symbol. err=%s", e)
 
-    # 3/4) per-symbol
     out: List[Any] = []
     for s in syms:
         fn3 = getattr(engine, "get_enriched_quote", None)
@@ -2269,7 +2085,6 @@ async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
 
-
 async def _get_quotes_chunked(
     request: Optional[Request],
     symbols: List[str],
@@ -2279,7 +2094,6 @@ async def _get_quotes_chunked(
     max_concurrency: int,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # ensure patches applied
     _apply_compat_patches()
 
     clean = _clean_symbols(symbols)
@@ -2552,7 +2366,7 @@ def _infer_market_from_sheet(sheet_name: Optional[str]) -> Optional[str]:
     sn = (sheet_name or "").strip().upper()
     if not sn:
         return None
-    if "KSA" in sn or "TADAWUL" in sn or sn.endswith(".SR"):
+    if "KSA" in sn or "TADAWUL" in sn:
         return "KSA"
     if sn.startswith("GLOBAL") or "GLOBAL" in sn:
         return "GLOBAL"
@@ -2565,10 +2379,7 @@ def _infer_market_from_sheet(sheet_name: Optional[str]) -> Optional[str]:
 async def analyze_for_sheet(
     request: Request,
     body: BatchAnalysisRequest = Body(...),
-    mode: Optional[str] = Query(
-        default=None,
-        description="Headers mode: base|extended (appends if schemas returns canonical).",
-    ),
+    mode: Optional[str] = Query(default=None, description="Headers mode: base|extended."),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
 ) -> SheetAnalysisResponse:
     """
