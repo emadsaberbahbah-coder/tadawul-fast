@@ -1,14 +1,19 @@
-# routes/enriched_quote.py  (FULL REPLACEMENT)
+# routes/enriched_quote.py           # routes/enriched_quote.py  (FULL REPLACEMENT)
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.1
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.2
 
-What’s fixed / improved in v5.6.1
-- ✅ Prefers core.symbols.normalize.normalize_symbol (shared normalizer) with safe fallback
-- ✅ Always HTTP 200 with {status,...} (no FastAPI exceptions for auth/symbol errors)
+What’s fixed / improved in v5.6.2
+- ✅ Accepts common query aliases (your failing tests):
+    - /v1/enriched/quotes?symbols=...
+    - /v1/enriched/quotes?tickers=...
+    - /v1/enriched/quotes?ticker=...
+    - /v1/enriched/quotes?symbol=...
+    - /v1/enriched/quotes?symbols=... (existing)
+    - /v1/enriched/quote?symbol=... (existing)
+- ✅ Keeps HTTP 200 with {status,...} (no FastAPI exceptions for auth/symbol errors)
 - ✅ Token guard unchanged (X-APP-TOKEN / Authorization: Bearer / optional ?token when ALLOW_QUERY_TOKEN=1)
-- ✅ status auto-infers "error" when payload contains error / BAD quality
 - ✅ Recommendation enum enforced (BUY/HOLD/REDUCE/SELL)
 - ✅ Variant rescue for Global/KSA symbols (AAPL <-> AAPL.US, 1120 <-> 1120.SR)
 - ✅ Batch alignment hardened (list/dict responses)
@@ -17,6 +22,8 @@ What’s fixed / improved in v5.6.1
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
 - GET /v1/enriched/quotes?symbols=AAPL,MSFT,1120.SR
+- GET /v1/enriched/quotes?tickers=1120.SR,2222.SR
+- GET /v1/enriched/quotes?ticker=1120.SR
 - GET /v1/enriched/health
 """
 
@@ -35,7 +42,7 @@ from fastapi import APIRouter, Header, Query, Request
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.6.1"
+ENRICHED_ROUTE_VERSION = "5.6.2"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -728,6 +735,44 @@ def _needs_rescue(d: Dict[str, Any]) -> bool:
 
 
 # =============================================================================
+# Query alias resolution (fix your "No valid symbols" cases)
+# =============================================================================
+def _first_nonempty(*vals: Optional[str]) -> str:
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _resolve_symbols_from_query(
+    *,
+    symbols: Optional[str],
+    tickers: Optional[str],
+    ticker: Optional[str],
+    symbol: Optional[str],
+) -> List[str]:
+    """
+    Accepts multiple aliases and returns a normalized list.
+    Priority:
+      1) symbols / tickers (multi)
+      2) ticker / symbol (single)
+    """
+    multi_raw = _first_nonempty(symbols, tickers)
+    if multi_raw:
+        return _parse_symbols_list(multi_raw)
+
+    single_raw = _first_nonempty(ticker, symbol)
+    if single_raw:
+        s = _normalize_symbol(single_raw)
+        return [s] if s else []
+
+    return []
+
+
+# =============================================================================
 # Routes
 # =============================================================================
 @router.get("/v1/enriched/health")
@@ -903,7 +948,12 @@ async def enriched_quote(
 @router.get("/v1/enriched/quotes")
 async def enriched_quotes(
     request: Request,
-    symbols: str = Query("", description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
+    # ✅ keep existing param name
+    symbols: Optional[str] = Query("", description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
+    # ✅ add aliases that your tests used
+    tickers: Optional[str] = Query(None, description="Alias of symbols (comma/space-separated)"),
+    ticker: Optional[str] = Query(None, description="Single symbol alias (e.g. 1120.SR)"),
+    symbol: Optional[str] = Query(None, description="Single symbol alias (e.g. 1120.SR)"),
     refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
     fields: Optional[str] = Query(None, description="Optional hint to engine (comma/space-separated fields)"),
     debug: int = Query(0, description="debug=1 includes a traceback on failure (or set DEBUG_ERRORS=1)"),
@@ -927,7 +977,9 @@ async def enriched_quotes(
             "items": [],
         }
 
-    syms = _parse_symbols_list(symbols)
+    # ✅ resolve from aliases
+    syms = _resolve_symbols_from_query(symbols=symbols, tickers=tickers, ticker=ticker, symbol=symbol)
+
     if max_symbols and max_symbols > 0 and len(syms) > max_symbols:
         syms = syms[:max_symbols]
 
