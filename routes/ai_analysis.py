@@ -1,21 +1,23 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.3) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.4) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
 - PROD SAFE: DO NOT import core.data_engine_v2 at module import-time.
 - Defensive batching: chunking + timeout + bounded concurrency.
 - Sheets-safe: /sheet-rows ALWAYS returns HTTP 200 with {headers, rows, status}.
-- Canonical headers: core.schemas.get_headers_for_sheet (when available); fallback defaults.
+- Canonical headers: core.schemas.get_headers_for_sheet (when available); fallback per-page defaults.
 - Token guard via X-APP-TOKEN (APP_TOKEN / BACKUP_APP_TOKEN). If no token is set => open.
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forecast/Expected + Valuation + Overall + Recommendation.
 
-v4.4.3 changes (small hardening / completeness-friendly)
-- ✅ Prevents noisy log spam when APP_TOKEN is not set (health checks can call often).
-- ✅ Better RSI/MA/Vol header alias support (covers common variants without changing schema).
-- ✅ More defensive mapping for dividend yield / ROE / ROA variants (common user-required headers).
+v4.4.4 changes (headers + forecast/reco clarity)
+- ✅ Per-page customized fallback headers (MARKET_LEADERS / KSA_TADAWUL / GLOBAL_MARKETS / MUTUAL_FUNDS / COMMODITIES_FX / MY_PORTFOLIO / INSIGHTS_ANALYSIS).
+- ✅ Forecast ROI/Expected Return coercion fixed: handles 0..1 ratios correctly (prevents wrong forecast prices).
+- ✅ Badges are now auto-derived when engine doesn’t provide them (Rec/Momentum/Opportunity/Risk badges).
+- ✅ Adds Risk Bucket / Confidence Bucket header aliases (common in your schema/tests).
+- ✅ Minor completeness: adds Turnover % to fallback schema; improves market inference.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.4.3"
+AI_ANALYSIS_VERSION = "4.4.4"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -739,6 +741,8 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "momentum_badge": None,
         "opportunity_badge": None,
         "risk_badge": None,
+        "risk_bucket": None,
+        "confidence_bucket": None,
         "recommendation": "HOLD",
         "confidence": None,
         "data_source": "none",
@@ -1169,17 +1173,31 @@ def _coerce_confidence_to_0_100(v: Any) -> Optional[float]:
     return None
 
 
+def _pct_float(x: Any) -> Optional[float]:
+    """Coerce ratios or percents into a percent float (e.g., 0.14 -> 14.0; 14 -> 14.0)."""
+    y = _ratio_to_percent(x)
+    try:
+        return None if y is None or y == "" else float(y)
+    except Exception:
+        return None
+
+
 def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Forecast columns for Sheets.
+    IMPORTANT: ROI/Expected Return may arrive as ratios (0..1). We normalize to percent.
+    """
     out: Dict[str, Any] = {}
 
     price = _safe_float_or_none(_safe_get(uq, "current_price", "last_price", "price"))
     if price is None:
         return out
 
-    roi_1m = _safe_float_or_none(_safe_get(uq, "expected_roi_1m", "expected_return_1m"))
-    roi_3m = _safe_float_or_none(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
-    roi_12m = _safe_float_or_none(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
+    roi_1m = _pct_float(_safe_get(uq, "expected_roi_1m", "expected_return_1m"))
+    roi_3m = _pct_float(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
+    roi_12m = _pct_float(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
 
+    # fallback to derived historical returns (already in %)
     if roi_1m is None:
         roi_1m = _safe_float_or_none(derived.get("returns 1m %"))
     if roi_3m is None:
@@ -1191,6 +1209,7 @@ def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     fp3 = _safe_float_or_none(_safe_get(uq, "forecast_price_3m", "expected_price_3m"))
     fp12 = _safe_float_or_none(_safe_get(uq, "forecast_price_12m", "expected_price_12m"))
 
+    # If no forecast prices, compute from ROI% (now correct even if ROI came as ratio)
     if fp1 is None and roi_1m is not None:
         fp1 = round(price * (1.0 + roi_1m / 100.0), 6)
     if fp3 is None and roi_3m is not None:
@@ -1202,9 +1221,14 @@ def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     out["forecast price (3m)"] = fp3
     out["forecast price (12m)"] = fp12
 
+    # Both “Expected ROI” and “Expected Return” are filled consistently (clarity)
     out["expected roi % (1m)"] = roi_1m
     out["expected roi % (3m)"] = roi_3m
     out["expected roi % (12m)"] = roi_12m
+
+    out["expected return 1m %"] = roi_1m
+    out["expected return 3m %"] = roi_3m
+    out["expected return 12m %"] = roi_12m
 
     conf = _coerce_confidence_to_0_100(_safe_get(uq, "forecast_confidence", "confidence_score", "confidence"))
     out["forecast confidence"] = conf
@@ -1318,6 +1342,103 @@ def _compute_overall_and_reco(uq: Any) -> Tuple[Optional[float], str, Optional[f
     return round(score, 2), reco, conf01
 
 
+def _risk_bucket_from_score(risk_score: Optional[float]) -> Optional[str]:
+    if risk_score is None:
+        return None
+    try:
+        r = float(risk_score)
+    except Exception:
+        return None
+    if r < 35:
+        return "Low"
+    if r < 70:
+        return "Moderate"
+    return "High"
+
+
+def _confidence_bucket_from_conf(conf_score_any: Any) -> Optional[str]:
+    if conf_score_any is None:
+        return None
+    try:
+        x = float(conf_score_any)
+        if 0.0 <= x <= 1.0:
+            x = x * 100.0
+        if x >= 70:
+            return "High"
+        if x >= 45:
+            return "Moderate"
+        return "Low"
+    except Exception:
+        return None
+
+
+def _compute_badges(uq: Any, derived: Dict[str, Any], overall_pack: Optional[Tuple[Any, Any, Any]]) -> Dict[str, Any]:
+    """
+    Fill badges if engine didn’t provide them.
+    Output keys are header-keys (lowercase) to match hk comparisons.
+    """
+    out: Dict[str, Any] = {}
+
+    reco = _normalize_recommendation(_safe_get(uq, "recommendation")) or "HOLD"
+    if overall_pack:
+        _overall, reco_calc, _conf01 = overall_pack
+        if not _safe_get(uq, "recommendation"):
+            reco = _normalize_recommendation(reco_calc)
+
+    # Rec badge
+    if not _safe_get(uq, "rec_badge"):
+        badge = {"BUY": "✅ BUY", "HOLD": "🟡 HOLD", "REDUCE": "🟠 REDUCE", "SELL": "🔴 SELL"}.get(reco, "🟡 HOLD")
+        out["rec badge"] = badge
+
+    # Momentum badge (prefer RSI if available; else momentum_score)
+    if not _safe_get(uq, "momentum_badge"):
+        rsi = _safe_float_or_none(_safe_get(uq, "rsi14", "rsi_14")) or _safe_float_or_none(derived.get("rsi (14)"))
+        mom_score = _safe_float_or_none(_safe_get(uq, "momentum_score"))
+        if rsi is not None:
+            if rsi >= 70:
+                out["momentum badge"] = "⚠️ Overbought"
+            elif rsi <= 30:
+                out["momentum badge"] = "✅ Oversold"
+            else:
+                out["momentum badge"] = "↔️ Neutral"
+        elif mom_score is not None:
+            if mom_score >= 70:
+                out["momentum badge"] = "📈 Strong"
+            elif mom_score >= 45:
+                out["momentum badge"] = "↗️ Moderate"
+            else:
+                out["momentum badge"] = "↘️ Weak"
+
+    # Opportunity badge
+    if not _safe_get(uq, "opportunity_badge"):
+        opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
+        if opp is not None:
+            if opp >= 80:
+                out["opportunity badge"] = "⭐ Top Pick"
+            elif opp >= 60:
+                out["opportunity badge"] = "👀 Watch"
+            else:
+                out["opportunity badge"] = "—"
+
+    # Risk badge + bucket
+    if not _safe_get(uq, "risk_badge"):
+        risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
+        bucket = _risk_bucket_from_score(risk)
+        if bucket:
+            out["risk badge"] = {"Low": "🟢 Low", "Moderate": "🟠 Moderate", "High": "🔴 High"}.get(bucket, bucket)
+            if not _safe_get(uq, "risk_bucket"):
+                out["risk bucket"] = bucket
+
+    # Confidence bucket
+    if not _safe_get(uq, "confidence_bucket"):
+        conf_any = _safe_get(uq, "confidence_score", "confidence")
+        bucket = _confidence_bucket_from_conf(conf_any)
+        if bucket:
+            out["confidence bucket"] = bucket
+
+    return out
+
+
 # =============================================================================
 # Headers – safe completion for missing “required” dashboard columns
 # =============================================================================
@@ -1365,6 +1486,7 @@ _DEFAULT_HEADERS_BASE: List[str] = [
     "Volume",
     "Avg Vol 30D",
     "Value Traded",
+    "Turnover %",
     "Liquidity Score",
     "Shares Outstanding",
     "Free Float %",
@@ -1388,6 +1510,8 @@ _DEFAULT_HEADERS_BASE: List[str] = [
     "Net Income Growth %",
     "Beta",
     "RSI (14)",
+    "Risk Bucket",
+    "Confidence Bucket",
     "Fair Value",
     "Upside %",
     "Valuation Label",
@@ -1441,6 +1565,93 @@ _DEFAULT_HEADERS_EXTENDED: List[str] = _DEFAULT_HEADERS_BASE + [
     "History Last (UTC)",
 ]
 
+# Per-page customized fallback headers (used only if core.schemas is unavailable)
+_HEADERS_BY_SHEET_FALLBACK: Dict[str, List[str]] = {
+    "MARKET_LEADERS": list(_DEFAULT_HEADERS_EXTENDED),
+    "KSA_TADAWUL": list(_DEFAULT_HEADERS_EXTENDED),
+    "GLOBAL_MARKETS": list(_DEFAULT_HEADERS_EXTENDED),
+    "MY_PORTFOLIO": list(_DEFAULT_HEADERS_EXTENDED),
+    "INSIGHTS_ANALYSIS": list(_DEFAULT_HEADERS_EXTENDED),
+    # Funds/Commodities are typically lighter (still include forecast block for your dashboard)
+    "MUTUAL_FUNDS": _append_missing_columns(
+        [
+            "Rank",
+            "Symbol",
+            "Origin",
+            "Name",
+            "Market",
+            "Currency",
+            "Price",
+            "Prev Close",
+            "Change",
+            "Change %",
+            "Volume",
+            "Value Traded",
+            "Risk Bucket",
+            "Confidence Bucket",
+            "Rec Badge",
+            "Recommendation",
+            "Overall Score",
+            "Forecast Price (1M)",
+            "Expected ROI % (1M)",
+            "Forecast Price (3M)",
+            "Expected ROI % (3M)",
+            "Forecast Price (12M)",
+            "Expected ROI % (12M)",
+            "Forecast Confidence",
+            "Forecast Updated (UTC)",
+            "Forecast Updated (Riyadh)",
+            "Data Source",
+            "Data Quality",
+            "Last Updated (UTC)",
+            "Last Updated (Riyadh)",
+            "Error",
+        ],
+        _REQUIRED_DASHBOARD_COLS,
+    ),
+    "COMMODITIES_FX": _append_missing_columns(
+        [
+            "Rank",
+            "Symbol",
+            "Origin",
+            "Name",
+            "Market",
+            "Currency",
+            "Price",
+            "Prev Close",
+            "Change",
+            "Change %",
+            "Day High",
+            "Day Low",
+            "52W High",
+            "52W Low",
+            "52W Position %",
+            "Volatility 30D",
+            "MA20",
+            "MA50",
+            "MA200",
+            "Rec Badge",
+            "Recommendation",
+            "Overall Score",
+            "Forecast Price (1M)",
+            "Expected ROI % (1M)",
+            "Forecast Price (3M)",
+            "Expected ROI % (3M)",
+            "Forecast Price (12M)",
+            "Expected ROI % (12M)",
+            "Forecast Confidence",
+            "Forecast Updated (UTC)",
+            "Forecast Updated (Riyadh)",
+            "Data Source",
+            "Data Quality",
+            "Last Updated (UTC)",
+            "Last Updated (Riyadh)",
+            "Error",
+        ],
+        _REQUIRED_DASHBOARD_COLS,
+    ),
+}
+
 
 def _append_missing_columns(base: List[str], extras: Sequence[str]) -> List[str]:
     base_ci = {str(x).strip().lower() for x in base}
@@ -1452,9 +1663,32 @@ def _append_missing_columns(base: List[str], extras: Sequence[str]) -> List[str]
     return out
 
 
+def _sheet_key(sheet_name: Optional[str]) -> str:
+    sn = (sheet_name or "").strip().upper()
+    if not sn:
+        return ""
+    # normalize some common variants
+    if sn in ("MARKET_LEADERS", "MARKETLEADERS"):
+        return "MARKET_LEADERS"
+    if sn in ("KSA_TADAWUL", "KSA", "TADAWUL", "KSA-TADAWUL"):
+        return "KSA_TADAWUL"
+    if sn in ("GLOBAL_MARKETS", "GLOBAL", "GLOBAL-MARKETS"):
+        return "GLOBAL_MARKETS"
+    if sn in ("MUTUAL_FUNDS", "FUNDS", "MUTUAL-FUNDS"):
+        return "MUTUAL_FUNDS"
+    if sn in ("COMMODITIES_FX", "COMMODITIES", "FX", "COMMODITIES-FX"):
+        return "COMMODITIES_FX"
+    if sn in ("MY_PORTFOLIO", "PORTFOLIO"):
+        return "MY_PORTFOLIO"
+    if sn in ("INSIGHTS_ANALYSIS", "INSIGHTS", "ANALYSIS"):
+        return "INSIGHTS_ANALYSIS"
+    return sn
+
+
 def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]:
     m = (mode or "").strip().lower()
 
+    # 1) Canonical schemas (preferred)
     h = _schemas_get_headers(sheet_name)
     if h and len(h) >= 10:
         hh = list(h)
@@ -1463,11 +1697,20 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
             hh = _append_missing_columns(hh, _DEFAULT_HEADERS_EXTENDED)
         return hh
 
+    # 2) Per-page customized fallbacks (requested)
+    sk = _sheet_key(sheet_name)
+    if sk and sk in _HEADERS_BY_SHEET_FALLBACK:
+        base = list(_HEADERS_BY_SHEET_FALLBACK[sk])
+        if m in ("ext", "extended", "full"):
+            base = _append_missing_columns(base, _DEFAULT_HEADERS_EXTENDED)
+        return _append_missing_columns(base, _REQUIRED_DASHBOARD_COLS)
+
+    # 3) Generic fallbacks
     if m in ("ext", "extended", "full"):
         return list(_DEFAULT_HEADERS_EXTENDED)
 
     sn = (sheet_name or "").strip().lower()
-    if any(k in sn for k in ("global", "insight", "opportun", "advisor", "analysis")):
+    if any(k in sn for k in ("global", "insight", "opportun", "advisor", "analysis", "portfolio", "ksa", "tadawul")):
         return list(_DEFAULT_HEADERS_EXTENDED)
 
     return _append_missing_columns(list(_DEFAULT_HEADERS_BASE), _REQUIRED_DASHBOARD_COLS)
@@ -1571,6 +1814,7 @@ _RATIO_HEADERS = {
     "expected roi % (3m)",
     "expected roi % (12m)",
     "52w position %",
+    "turnover %",
 }
 
 _VOL_HEADERS = {"volatility 30d", "volatility (30d)"}
@@ -1598,6 +1842,7 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "volume": (("volume", "vol"), None),
     "avg vol 30d": (("avg_volume_30d", "avg_volume", "avg_vol_30d"), None),
     "value traded": (("value_traded", "value", "turnover_value"), None),
+    "turnover %": (("turnover_percent", "turnover", "turnover_pct"), _ratio_to_percent),
     "liquidity score": (("liquidity_score",), None),
     "shares outstanding": (("shares_outstanding", "shares", "shares_out"), None),
     "free float %": (("free_float", "free_float_percent"), _ratio_to_percent),
@@ -1610,7 +1855,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "p/b": (("pb",), None),
     "p/s": (("ps",), None),
     "ev/ebitda": (("ev_ebitda", "ev_to_ebitda"), None),
-    # Percent variants + common non-% variants (requested often in tests)
     "dividend yield %": (("dividend_yield", "div_yield"), _ratio_to_percent),
     "dividend yield": (("dividend_yield", "div_yield"), _ratio_to_percent),
     "roe %": (("roe",), _ratio_to_percent),
@@ -1631,6 +1875,8 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "momentum badge": (("momentum_badge",), None),
     "opportunity badge": (("opportunity_badge",), None),
     "risk badge": (("risk_badge",), None),
+    "risk bucket": (("risk_bucket",), None),
+    "confidence bucket": (("confidence_bucket",), None),
     "data source": (("data_source", "source", "provider"), None),
     "data quality": (("data_quality",), None),
     "last updated (utc)": (("last_updated_utc", "as_of_utc"), _iso_or_none),
@@ -1641,7 +1887,6 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "returns 3m %": (("returns_3m",), _ratio_to_percent),
     "returns 6m %": (("returns_6m",), _ratio_to_percent),
     "returns 12m %": (("returns_12m",), _ratio_to_percent),
-    # RSI/MA/Vol common variants
     "rsi (14)": (("rsi14", "rsi_14"), None),
     "rsi 14": (("rsi14", "rsi_14"), None),
     "ma20": (("ma20",), None),
@@ -1654,10 +1899,22 @@ _LOCAL_HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "expected roi % (1m)": (("expected_roi_1m", "expected_return_1m"), _ratio_to_percent),
     "expected roi % (3m)": (("expected_roi_3m", "expected_return_3m"), _ratio_to_percent),
     "expected roi % (12m)": (("expected_roi_12m", "expected_return_12m"), _ratio_to_percent),
+    "expected return 1m %": (("expected_return_1m", "expected_roi_1m"), _ratio_to_percent),
+    "expected return 3m %": (("expected_return_3m", "expected_roi_3m"), _ratio_to_percent),
+    "expected return 12m %": (("expected_return_12m", "expected_roi_12m"), _ratio_to_percent),
+    "expected price 1m": (("expected_price_1m", "forecast_price_1m"), None),
+    "expected price 3m": (("expected_price_3m", "forecast_price_3m"), None),
+    "expected price 12m": (("expected_price_12m", "forecast_price_12m"), None),
     "forecast confidence": (("forecast_confidence", "confidence_score", "confidence"), None),
     "forecast updated (utc)": (("forecast_updated_utc", "forecast_updated", "last_updated_utc", "as_of_utc", "history_last_utc"), _iso_or_none),
     "forecast updated (riyadh)": (("forecast_updated_riyadh",), _iso_or_none),
+    "confidence score": (("confidence_score",), None),
+    "forecast method": (("forecast_method",), None),
+    "history points": (("history_points",), None),
+    "history source": (("history_source",), None),
+    "history last (utc)": (("history_last_utc",), _iso_or_none),
 }
+
 
 @dataclass(frozen=True)
 class _HeaderMeta:
@@ -1668,6 +1925,7 @@ class _HeaderMeta:
     local_transform: Optional[Any]
     guess: str
 
+
 @dataclass(frozen=True)
 class _HeaderPlan:
     metas: Tuple[_HeaderMeta, ...]
@@ -1677,6 +1935,9 @@ class _HeaderPlan:
     need_last_riyadh: bool
     needs_history_deriv: bool
     needs_forecast_fill: bool
+    needs_badges: bool
+    needs_buckets: bool
+
 
 @lru_cache(maxsize=64)
 def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
@@ -1687,6 +1948,8 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
     need_last_riyadh = False
     needs_history_deriv = False
     needs_forecast_fill = False
+    needs_badges = False
+    needs_buckets = False
 
     for h in headers:
         hk = _hkey(h)
@@ -1732,8 +1995,20 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
             "forecast confidence",
             "forecast updated (utc)",
             "forecast updated (riyadh)",
+            "expected return 1m %",
+            "expected return 3m %",
+            "expected return 12m %",
+            "expected price 1m",
+            "expected price 3m",
+            "expected price 12m",
         ):
             needs_forecast_fill = True
+
+        if hk in ("rec badge", "momentum badge", "opportunity badge", "risk badge"):
+            needs_badges = True
+
+        if hk in ("risk bucket", "confidence bucket"):
+            needs_buckets = True
 
         schema_field = _schemas_header_to_field_cached(h)
         local = _LOCAL_HEADER_MAP.get(hk)
@@ -1758,7 +2033,10 @@ def _build_header_plan(headers: Tuple[str, ...]) -> _HeaderPlan:
         need_last_riyadh=need_last_riyadh,
         needs_history_deriv=needs_history_deriv,
         needs_forecast_fill=needs_forecast_fill,
+        needs_badges=needs_badges,
+        needs_buckets=needs_buckets,
     )
+
 
 def _is_blank(v: Any) -> bool:
     if v is None:
@@ -1766,6 +2044,7 @@ def _is_blank(v: Any) -> bool:
     if isinstance(v, str) and not v.strip():
         return True
     return False
+
 
 def _apply_common_transforms(hk: str, v: Any) -> Any:
     if hk == "recommendation":
@@ -1776,6 +2055,7 @@ def _apply_common_transforms(hk: str, v: Any) -> Any:
         return _vol_to_percent(v)
     return v
 
+
 def _value_for_meta(
     meta: _HeaderMeta,
     uq: Any,
@@ -1785,6 +2065,7 @@ def _value_for_meta(
     derived: Dict[str, Any],
     cross: Dict[str, Any],
     forecast: Dict[str, Any],
+    badges: Dict[str, Any],
     fair_pack: Optional[Tuple[Any, Any, Any]],
     overall_pack: Optional[Tuple[Any, Any, Any]],
 ) -> Any:
@@ -1820,8 +2101,13 @@ def _value_for_meta(
             v = _to_riyadh_iso(u) or ""
         return _iso_or_none(v) or v
 
+    # Forecast fill (derived)
     if hk in forecast and not _is_blank(forecast.get(hk)):
         return _apply_common_transforms(hk, forecast.get(hk))
+
+    # Badges (derived)
+    if hk in badges and not _is_blank(badges.get(hk)):
+        return badges.get(hk)
 
     if hk in ("fair value", "upside %", "valuation label"):
         fair, upside, label = fair_pack or (None, None, None)
@@ -1846,12 +2132,14 @@ def _value_for_meta(
             raw = v if v is not None else reco_calc
             return _normalize_recommendation(raw)
 
+    # schema mapping
     if meta.schema_field:
         v = _safe_get(uq, meta.schema_field)
         v = _apply_common_transforms(hk, v)
         if not _is_blank(v):
             return v
 
+    # local mapping
     if meta.local_fields:
         val = _safe_get(uq, *meta.local_fields)
         if meta.local_transform and val is not None:
@@ -1869,6 +2157,7 @@ def _value_for_meta(
     if hk in derived and not _is_blank(derived.get(hk)):
         return _apply_common_transforms(hk, derived.get(hk))
 
+    # guess
     val = _safe_get(uq, meta.guess)
     val = _apply_common_transforms(hk, val)
     if not _is_blank(val):
@@ -1887,13 +2176,14 @@ def _value_for_meta(
 
     return None
 
+
 def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin: str) -> List[Any]:
     fair_pack: Optional[Tuple[Any, Any, Any]] = None
     overall_pack: Optional[Tuple[Any, Any, Any]] = None
 
     if plan.need_val:
         fair_pack = _compute_fair_value_and_upside(uq)
-    if plan.need_overall:
+    if plan.need_overall or plan.needs_badges or plan.needs_buckets:
         overall_pack = _compute_overall_and_reco(uq)
 
     derived: Dict[str, Any] = {}
@@ -1916,6 +2206,7 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
         except Exception:
             forecast = {}
 
+    # ensure last_updated_riyadh on uq when requested
     if plan.need_last_riyadh:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         last_riy = _safe_get(uq, "last_updated_riyadh")
@@ -1929,6 +2220,14 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
             except Exception:
                 pass
 
+    # badges + buckets (derived) for clarity
+    badges: Dict[str, Any] = {}
+    if plan.needs_badges or plan.needs_buckets:
+        try:
+            badges = _compute_badges(uq, derived, overall_pack)
+        except Exception:
+            badges = {}
+
     row = [
         _value_for_meta(
             m,
@@ -1938,6 +2237,7 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
             derived=derived,
             cross=cross,
             forecast=forecast,
+            badges=badges,
             fair_pack=fair_pack,
             overall_pack=overall_pack,
         )
@@ -1956,10 +2256,12 @@ async def _maybe_await(x: Any) -> Any:
         return await x
     return x
 
+
 def _unwrap_tuple_payload(x: Any) -> Any:
     if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
+
 
 def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if not kwargs:
@@ -1976,6 +2278,7 @@ def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
         return fn(*args, **filtered)
     except Exception:
         return fn(*args, **kwargs)
+
 
 def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Any:
     fn = getattr(engine, fn_name, None)
@@ -2019,6 +2322,7 @@ def _call_batch_best_effort(engine: Any, fn_name: str, syms: List[str], *, ctx: 
             raise last_exc
         raise
 
+
 def _index_keys_for_quote(q: Any) -> List[str]:
     keys: List[str] = []
     sym = (_safe_get(q, "symbol") or "").strip().upper()
@@ -2043,6 +2347,7 @@ def _index_keys_for_quote(q: Any) -> List[str]:
             seen.add(k)
             out.append(k)
     return out
+
 
 async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[Dict[str, Any]] = None) -> Union[List[Any], Dict[str, Any]]:
     fn = getattr(engine, "get_enriched_quotes", None)
@@ -2084,6 +2389,7 @@ async def _engine_get_quotes_any(engine: Any, syms: List[str], *, ctx: Optional[
                 continue
         out.append(_make_placeholder(s, dq="MISSING", err="Engine missing quote methods"))
     return out
+
 
 async def _get_quotes_chunked(
     request: Optional[Request],
@@ -2368,10 +2674,14 @@ def _infer_market_from_sheet(sheet_name: Optional[str]) -> Optional[str]:
         return None
     if "KSA" in sn or "TADAWUL" in sn:
         return "KSA"
+    if "MUTUAL" in sn or "FUND" in sn:
+        return "GLOBAL"
     if sn.startswith("GLOBAL") or "GLOBAL" in sn:
         return "GLOBAL"
     if "COMMOD" in sn or "FX" in sn:
         return "GLOBAL"
+    if "PORTFOLIO" in sn:
+        return "MIXED"
     return None
 
 
