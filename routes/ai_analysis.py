@@ -1,6 +1,6 @@
 # routes/ai_analysis.py  (FULL REPLACEMENT)
 """
-AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.4) – PROD SAFE / LOW-MISSING
+AI & QUANT ANALYSIS ROUTES – GOOGLE SHEETS FRIENDLY (v4.4.5) – PROD SAFE / LOW-MISSING
 
 Key goals
 - Engine-driven only: prefer request.app.state.engine; fallback singleton (lazy).
@@ -12,12 +12,9 @@ Key goals
 - Header-driven row mapping + computed 52W position + Riyadh timestamp fill.
 - Plan-aligned: Current + Historical + Forecast/Expected + Valuation + Overall + Recommendation.
 
-v4.4.4 changes (headers + forecast/reco clarity)
-- ✅ Per-page customized fallback headers (MARKET_LEADERS / KSA_TADAWUL / GLOBAL_MARKETS / MUTUAL_FUNDS / COMMODITIES_FX / MY_PORTFOLIO / INSIGHTS_ANALYSIS).
-- ✅ Forecast ROI/Expected Return coercion fixed: handles 0..1 ratios correctly (prevents wrong forecast prices).
-- ✅ Badges are now auto-derived when engine doesn’t provide them (Rec/Momentum/Opportunity/Risk badges).
-- ✅ Adds Risk Bucket / Confidence Bucket header aliases (common in your schema/tests).
-- ✅ Minor completeness: adds Turnover % to fallback schema; improves market inference.
+v4.4.5 (IMPORT-SAFE hotfix)
+- ✅ FIX: `_append_missing_columns()` is defined before it’s used in fallback header maps.
+- ✅ Keeps v4.4.4 behavior: per-page fallback headers, ROI ratio coercion, derived badges/buckets, turnover %, etc.
 """
 
 from __future__ import annotations
@@ -48,7 +45,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.4.4"
+AI_ANALYSIS_VERSION = "4.4.5"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -64,6 +61,87 @@ except Exception:  # pragma: no cover
 
         def get_settings():  # type: ignore
             return None
+
+
+# =============================================================================
+# Generic helpers (MUST be defined before any module-level computed constants)
+# =============================================================================
+def _append_missing_columns(base: List[str], extras: Sequence[str]) -> List[str]:
+    base_ci = {str(x).strip().lower() for x in base}
+    out = list(base)
+    for e in extras:
+        ee = str(e).strip()
+        if ee.lower() not in base_ci:
+            out.append(ee)
+            base_ci.add(ee.lower())
+    return out
+
+
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        v = int(str(x).strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _safe_float_pos(x: Any, default: float) -> float:
+    try:
+        v = float(str(x).strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_utc_iso() -> str:
+    return _now_utc().isoformat()
+
+
+def _parse_iso_dt(x: Any) -> Optional[datetime]:
+    if x is None or x == "":
+        return None
+    try:
+        if isinstance(x, datetime):
+            dt = x
+        else:
+            s = str(x).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _iso_or_none(x: Any) -> Optional[str]:
+    dt = _parse_iso_dt(x)
+    if dt is not None:
+        return dt.isoformat()
+    try:
+        return str(x) if x is not None else None
+    except Exception:
+        return None
+
+
+def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
+    if not utc_any:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Riyadh")
+        dt = _parse_iso_dt(utc_any)
+        if dt is None:
+            return None
+        return dt.astimezone(tz).isoformat()
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -365,8 +443,6 @@ def _allowed_tokens() -> List[str]:
             seen.add(t)
             out.append(t)
 
-    # IMPORTANT: do NOT warn here; health checks may call often.
-    # We report "auth": "open" in /health response instead.
     return out
 
 
@@ -444,22 +520,6 @@ async def _resolve_engine(request: Optional[Request]) -> Optional[Any]:
 # =============================================================================
 # Settings / defaults
 # =============================================================================
-def _safe_int(x: Any, default: int) -> int:
-    try:
-        v = int(str(x).strip())
-        return v if v > 0 else default
-    except Exception:
-        return default
-
-
-def _safe_float_pos(x: Any, default: float) -> float:
-    try:
-        v = float(str(x).strip())
-        return v if v > 0 else default
-    except Exception:
-        return default
-
-
 def _cfg() -> Dict[str, Any]:
     s = None
     try:
@@ -483,57 +543,6 @@ def _cfg() -> Dict[str, Any]:
     max_tickers = max(10, min(3000, max_tickers))
 
     return {"batch_size": batch_size, "timeout_sec": timeout_sec, "concurrency": concurrency, "max_tickers": max_tickers}
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _now_utc_iso() -> str:
-    return _now_utc().isoformat()
-
-
-def _parse_iso_dt(x: Any) -> Optional[datetime]:
-    if x is None or x == "":
-        return None
-    try:
-        if isinstance(x, datetime):
-            dt = x
-        else:
-            s = str(x).strip()
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-
-def _iso_or_none(x: Any) -> Optional[str]:
-    dt = _parse_iso_dt(x)
-    if dt is not None:
-        return dt.isoformat()
-    try:
-        return str(x) if x is not None else None
-    except Exception:
-        return None
-
-
-def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
-    if not utc_any:
-        return None
-    try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo("Asia/Riyadh")
-        dt = _parse_iso_dt(utc_any)
-        if dt is None:
-            return None
-        return dt.astimezone(tz).isoformat()
-    except Exception:
-        return None
 
 
 # =============================================================================
@@ -1034,7 +1043,7 @@ def _derive_from_history(uq: Any) -> Dict[str, Any]:
         out["returns 12m %"] = _returns_from_close(closes, 252)
 
         out["rsi (14)"] = _rsi_14(closes)
-        out["rsi 14"] = out["rsi (14)"]  # alias
+        out["rsi 14"] = out["rsi (14)"]
         out["volatility 30d"] = _vol_30d_ann(closes)
         out["volatility (30d)"] = out["volatility 30d"]
 
@@ -1197,7 +1206,6 @@ def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     roi_3m = _pct_float(_safe_get(uq, "expected_roi_3m", "expected_return_3m"))
     roi_12m = _pct_float(_safe_get(uq, "expected_roi_12m", "expected_return_12m"))
 
-    # fallback to derived historical returns (already in %)
     if roi_1m is None:
         roi_1m = _safe_float_or_none(derived.get("returns 1m %"))
     if roi_3m is None:
@@ -1209,7 +1217,6 @@ def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     fp3 = _safe_float_or_none(_safe_get(uq, "forecast_price_3m", "expected_price_3m"))
     fp12 = _safe_float_or_none(_safe_get(uq, "forecast_price_12m", "expected_price_12m"))
 
-    # If no forecast prices, compute from ROI% (now correct even if ROI came as ratio)
     if fp1 is None and roi_1m is not None:
         fp1 = round(price * (1.0 + roi_1m / 100.0), 6)
     if fp3 is None and roi_3m is not None:
@@ -1221,7 +1228,6 @@ def _forecast_fill(uq: Any, derived: Dict[str, Any]) -> Dict[str, Any]:
     out["forecast price (3m)"] = fp3
     out["forecast price (12m)"] = fp12
 
-    # Both “Expected ROI” and “Expected Return” are filled consistently (clarity)
     out["expected roi % (1m)"] = roi_1m
     out["expected roi % (3m)"] = roi_3m
     out["expected roi % (12m)"] = roi_12m
@@ -1373,10 +1379,6 @@ def _confidence_bucket_from_conf(conf_score_any: Any) -> Optional[str]:
 
 
 def _compute_badges(uq: Any, derived: Dict[str, Any], overall_pack: Optional[Tuple[Any, Any, Any]]) -> Dict[str, Any]:
-    """
-    Fill badges if engine didn’t provide them.
-    Output keys are header-keys (lowercase) to match hk comparisons.
-    """
     out: Dict[str, Any] = {}
 
     reco = _normalize_recommendation(_safe_get(uq, "recommendation")) or "HOLD"
@@ -1385,12 +1387,10 @@ def _compute_badges(uq: Any, derived: Dict[str, Any], overall_pack: Optional[Tup
         if not _safe_get(uq, "recommendation"):
             reco = _normalize_recommendation(reco_calc)
 
-    # Rec badge
     if not _safe_get(uq, "rec_badge"):
         badge = {"BUY": "✅ BUY", "HOLD": "🟡 HOLD", "REDUCE": "🟠 REDUCE", "SELL": "🔴 SELL"}.get(reco, "🟡 HOLD")
         out["rec badge"] = badge
 
-    # Momentum badge (prefer RSI if available; else momentum_score)
     if not _safe_get(uq, "momentum_badge"):
         rsi = _safe_float_or_none(_safe_get(uq, "rsi14", "rsi_14")) or _safe_float_or_none(derived.get("rsi (14)"))
         mom_score = _safe_float_or_none(_safe_get(uq, "momentum_score"))
@@ -1409,7 +1409,6 @@ def _compute_badges(uq: Any, derived: Dict[str, Any], overall_pack: Optional[Tup
             else:
                 out["momentum badge"] = "↘️ Weak"
 
-    # Opportunity badge
     if not _safe_get(uq, "opportunity_badge"):
         opp = _safe_float_or_none(_safe_get(uq, "opportunity_score"))
         if opp is not None:
@@ -1420,7 +1419,6 @@ def _compute_badges(uq: Any, derived: Dict[str, Any], overall_pack: Optional[Tup
             else:
                 out["opportunity badge"] = "—"
 
-    # Risk badge + bucket
     if not _safe_get(uq, "risk_badge"):
         risk = _safe_float_or_none(_safe_get(uq, "risk_score"))
         bucket = _risk_bucket_from_score(risk)
@@ -1429,7 +1427,6 @@ def _compute_badges(uq: Any, derived: Dict[str, Any], overall_pack: Optional[Tup
             if not _safe_get(uq, "risk_bucket"):
                 out["risk bucket"] = bucket
 
-    # Confidence bucket
     if not _safe_get(uq, "confidence_bucket"):
         conf_any = _safe_get(uq, "confidence_score", "confidence")
         bucket = _confidence_bucket_from_conf(conf_any)
@@ -1565,6 +1562,28 @@ _DEFAULT_HEADERS_EXTENDED: List[str] = _DEFAULT_HEADERS_BASE + [
     "History Last (UTC)",
 ]
 
+
+def _sheet_key(sheet_name: Optional[str]) -> str:
+    sn = (sheet_name or "").strip().upper()
+    if not sn:
+        return ""
+    if sn in ("MARKET_LEADERS", "MARKETLEADERS"):
+        return "MARKET_LEADERS"
+    if sn in ("KSA_TADAWUL", "KSA", "TADAWUL", "KSA-TADAWUL"):
+        return "KSA_TADAWUL"
+    if sn in ("GLOBAL_MARKETS", "GLOBAL", "GLOBAL-MARKETS"):
+        return "GLOBAL_MARKETS"
+    if sn in ("MUTUAL_FUNDS", "FUNDS", "MUTUAL-FUNDS"):
+        return "MUTUAL_FUNDS"
+    if sn in ("COMMODITIES_FX", "COMMODITIES", "FX", "COMMODITIES-FX"):
+        return "COMMODITIES_FX"
+    if sn in ("MY_PORTFOLIO", "PORTFOLIO"):
+        return "MY_PORTFOLIO"
+    if sn in ("INSIGHTS_ANALYSIS", "INSIGHTS", "ANALYSIS"):
+        return "INSIGHTS_ANALYSIS"
+    return sn
+
+
 # Per-page customized fallback headers (used only if core.schemas is unavailable)
 _HEADERS_BY_SHEET_FALLBACK: Dict[str, List[str]] = {
     "MARKET_LEADERS": list(_DEFAULT_HEADERS_EXTENDED),
@@ -1572,7 +1591,6 @@ _HEADERS_BY_SHEET_FALLBACK: Dict[str, List[str]] = {
     "GLOBAL_MARKETS": list(_DEFAULT_HEADERS_EXTENDED),
     "MY_PORTFOLIO": list(_DEFAULT_HEADERS_EXTENDED),
     "INSIGHTS_ANALYSIS": list(_DEFAULT_HEADERS_EXTENDED),
-    # Funds/Commodities are typically lighter (still include forecast block for your dashboard)
     "MUTUAL_FUNDS": _append_missing_columns(
         [
             "Rank",
@@ -1653,42 +1671,9 @@ _HEADERS_BY_SHEET_FALLBACK: Dict[str, List[str]] = {
 }
 
 
-def _append_missing_columns(base: List[str], extras: Sequence[str]) -> List[str]:
-    base_ci = {str(x).strip().lower() for x in base}
-    out = list(base)
-    for e in extras:
-        if str(e).strip().lower() not in base_ci:
-            out.append(e)
-            base_ci.add(str(e).strip().lower())
-    return out
-
-
-def _sheet_key(sheet_name: Optional[str]) -> str:
-    sn = (sheet_name or "").strip().upper()
-    if not sn:
-        return ""
-    # normalize some common variants
-    if sn in ("MARKET_LEADERS", "MARKETLEADERS"):
-        return "MARKET_LEADERS"
-    if sn in ("KSA_TADAWUL", "KSA", "TADAWUL", "KSA-TADAWUL"):
-        return "KSA_TADAWUL"
-    if sn in ("GLOBAL_MARKETS", "GLOBAL", "GLOBAL-MARKETS"):
-        return "GLOBAL_MARKETS"
-    if sn in ("MUTUAL_FUNDS", "FUNDS", "MUTUAL-FUNDS"):
-        return "MUTUAL_FUNDS"
-    if sn in ("COMMODITIES_FX", "COMMODITIES", "FX", "COMMODITIES-FX"):
-        return "COMMODITIES_FX"
-    if sn in ("MY_PORTFOLIO", "PORTFOLIO"):
-        return "MY_PORTFOLIO"
-    if sn in ("INSIGHTS_ANALYSIS", "INSIGHTS", "ANALYSIS"):
-        return "INSIGHTS_ANALYSIS"
-    return sn
-
-
 def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]:
     m = (mode or "").strip().lower()
 
-    # 1) Canonical schemas (preferred)
     h = _schemas_get_headers(sheet_name)
     if h and len(h) >= 10:
         hh = list(h)
@@ -1697,7 +1682,6 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
             hh = _append_missing_columns(hh, _DEFAULT_HEADERS_EXTENDED)
         return hh
 
-    # 2) Per-page customized fallbacks (requested)
     sk = _sheet_key(sheet_name)
     if sk and sk in _HEADERS_BY_SHEET_FALLBACK:
         base = list(_HEADERS_BY_SHEET_FALLBACK[sk])
@@ -1705,7 +1689,6 @@ def _select_headers(sheet_name: Optional[str], mode: Optional[str]) -> List[str]
             base = _append_missing_columns(base, _DEFAULT_HEADERS_EXTENDED)
         return _append_missing_columns(base, _REQUIRED_DASHBOARD_COLS)
 
-    # 3) Generic fallbacks
     if m in ("ext", "extended", "full"):
         return list(_DEFAULT_HEADERS_EXTENDED)
 
@@ -2101,11 +2084,9 @@ def _value_for_meta(
             v = _to_riyadh_iso(u) or ""
         return _iso_or_none(v) or v
 
-    # Forecast fill (derived)
     if hk in forecast and not _is_blank(forecast.get(hk)):
         return _apply_common_transforms(hk, forecast.get(hk))
 
-    # Badges (derived)
     if hk in badges and not _is_blank(badges.get(hk)):
         return badges.get(hk)
 
@@ -2132,14 +2113,12 @@ def _value_for_meta(
             raw = v if v is not None else reco_calc
             return _normalize_recommendation(raw)
 
-    # schema mapping
     if meta.schema_field:
         v = _safe_get(uq, meta.schema_field)
         v = _apply_common_transforms(hk, v)
         if not _is_blank(v):
             return v
 
-    # local mapping
     if meta.local_fields:
         val = _safe_get(uq, *meta.local_fields)
         if meta.local_transform and val is not None:
@@ -2157,7 +2136,6 @@ def _value_for_meta(
     if hk in derived and not _is_blank(derived.get(hk)):
         return _apply_common_transforms(hk, derived.get(hk))
 
-    # guess
     val = _safe_get(uq, meta.guess)
     val = _apply_common_transforms(hk, val)
     if not _is_blank(val):
@@ -2206,7 +2184,6 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
         except Exception:
             forecast = {}
 
-    # ensure last_updated_riyadh on uq when requested
     if plan.need_last_riyadh:
         last_utc = _safe_get(uq, "last_updated_utc", "as_of_utc") or _now_utc_iso()
         last_riy = _safe_get(uq, "last_updated_riyadh")
@@ -2220,7 +2197,6 @@ def _row_from_plan(plan: _HeaderPlan, uq: Any, *, row_index_1based: int, origin:
             except Exception:
                 pass
 
-    # badges + buckets (derived) for clarity
     badges: Dict[str, Any] = {}
     if plan.needs_badges or plan.needs_buckets:
         try:
@@ -2573,11 +2549,7 @@ async def analysis_health(request: Request) -> Dict[str, Any]:
     try:
         if eng is not None:
             engine_name = type(eng).__name__
-            engine_version = (
-                getattr(eng, "ENGINE_VERSION", None)
-                or getattr(eng, "engine_version", None)
-                or getattr(eng, "version", None)
-            )
+            engine_version = getattr(eng, "ENGINE_VERSION", None) or getattr(eng, "engine_version", None) or getattr(eng, "version", None)
             for attr in ("providers_global", "providers_ksa", "providers", "enabled_providers"):
                 v = getattr(eng, attr, None)
                 if isinstance(v, list) and v:
