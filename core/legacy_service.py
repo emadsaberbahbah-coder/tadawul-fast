@@ -1,10 +1,9 @@
-# core/legacy_service.py  (FULL REPLACEMENT)
 from __future__ import annotations
 
 """
 core/legacy_service.py
 ------------------------------------------------------------
-Compatibility shim (quiet + useful) — v1.7.2  (PROD SAFE)
+Compatibility shim (quiet + useful) — v1.7.3  (PROD SAFE)
 
 Goals
 - Provide a stable legacy router that NEVER breaks app startup.
@@ -12,8 +11,8 @@ Goals
 - Best-effort engine discovery:
     1) request.app.state.engine
     2) core.data_engine_v2.get_engine() (singleton) if available  ✅ (sync OR async supported)
-    3) core.data_engine_v2.DataEngine() temp (per-request)       ✅ (auto-close after use)
-    4) core.data_engine.DataEngine() temp (per-request)          ✅ (auto-close after use)
+    3) core.data_engine_v2.DataEngineV2/DataEngine temp (per-request) ✅ (auto-close after use)
+    4) core.data_engine.DataEngine() temp (per-request)               ✅ (auto-close after use)
 - Support BOTH async and sync engine method implementations.
 - Accept both {"symbols":[...]} and {"tickers":[...]} payload shapes.
 - Batch-first; if batch is missing/fails, fallback per-symbol with bounded concurrency.
@@ -39,7 +38,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -83,6 +82,11 @@ def _safe_mod_file(mod: Any) -> str:
         return ""
 
 
+def _looks_like_this_file(path: str) -> bool:
+    p = (path or "").replace("\\", "/")
+    return p.endswith("/core/legacy_service.py")
+
+
 def _try_import_external_router() -> Optional[APIRouter]:
     """
     Optional override:
@@ -92,9 +96,10 @@ def _try_import_external_router() -> Optional[APIRouter]:
     Guard against circular import.
     """
     global _external_loaded_from
+
     try:
         mod = importlib.import_module("legacy_service")
-        if _safe_mod_file(mod).replace("\\", "/").endswith("/core/legacy_service.py"):
+        if _looks_like_this_file(_safe_mod_file(mod)):
             raise RuntimeError("circular import: legacy_service points to core.legacy_service")
         r = getattr(mod, "router", None)
         if isinstance(r, APIRouter):
@@ -104,6 +109,10 @@ def _try_import_external_router() -> Optional[APIRouter]:
     except Exception as exc1:
         try:
             mod2 = importlib.import_module("routes.legacy_service")
+            # If routes.legacy_service is only a shim (expected), do NOT treat it as external override.
+            # We only accept it as external override if it isn't pointing back here.
+            if _looks_like_this_file(_safe_mod_file(mod2)):
+                raise RuntimeError("circular import: routes.legacy_service points to core.legacy_service")
             r2 = getattr(mod2, "router", None)
             if isinstance(r2, APIRouter):
                 _external_loaded_from = "routes.legacy_service"
@@ -124,16 +133,10 @@ def _try_import_external_router() -> Optional[APIRouter]:
 router: APIRouter = APIRouter(prefix="/v1/legacy", tags=["legacy_compat"])
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Models
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 class SymbolsIn(BaseModel):
-    """
-    Accepts BOTH shapes:
-      {"symbols":[...]}
-      {"tickers":[...]}
-    """
-
     symbols: List[str] = []
     tickers: List[str] = []
 
@@ -154,30 +157,21 @@ class SymbolsIn(BaseModel):
 
 
 class SheetRowsIn(BaseModel):
-    """
-    Lightweight compatibility payload for sheet-rows-like output.
-    """
-
     symbols: List[str] = []
     tickers: List[str] = []
     sheet_name: str = ""
     sheetName: str = ""
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def _safe_err(e: BaseException) -> str:
     msg = str(e).strip()
     return msg or e.__class__.__name__
 
 
 async def _maybe_await(x: Any) -> Any:
-    """
-    Supports:
-    - async functions returning coroutine/future/task
-    - sync functions returning value
-    """
     try:
         if inspect.isawaitable(x):
             return await x
@@ -187,9 +181,6 @@ async def _maybe_await(x: Any) -> Any:
 
 
 def _normalize_symbol_best_effort(sym: str) -> str:
-    """
-    Do NOT hard-fail if normalizer isn't available.
-    """
     s = (sym or "").strip()
     if not s:
         return ""
@@ -203,10 +194,6 @@ def _normalize_symbol_best_effort(sym: str) -> str:
 
 
 async def _close_engine_best_effort(engine: Any) -> None:
-    """
-    Close temp engines safely if they have aclose()/close().
-    Never raises.
-    """
     if engine is None:
         return
     try:
@@ -225,19 +212,15 @@ async def _close_engine_best_effort(engine: Any) -> None:
 
 
 async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str, bool]:
-    """
-    Returns (engine, source_label, should_close_after_use).
-    """
     # 1) already attached
     try:
         eng = getattr(request.app.state, "engine", None)
     except Exception:
         eng = None
-
     if eng is not None:
         return eng, "app.state.engine", False
 
-    # 2) v2 singleton getter (sync OR async supported)
+    # 2) v2 singleton getter
     try:
         from core.data_engine_v2 import get_engine as v2_get_engine  # type: ignore
 
@@ -252,16 +235,17 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str,
     except Exception:
         pass
 
-    # 3) v2 temp class (per-request)
+    # 3) v2 temp engine (support multiple class names)
     try:
-        from core.data_engine_v2 import DataEngine as V2Engine  # type: ignore
-
-        eng3 = V2Engine()
-        return eng3, "core.data_engine_v2.DataEngine(temp)", True
+        mod = importlib.import_module("core.data_engine_v2")
+        V2Engine = getattr(mod, "DataEngineV2", None) or getattr(mod, "DataEngine", None)
+        if V2Engine is not None:
+            eng3 = V2Engine()
+            return eng3, "core.data_engine_v2.(DataEngineV2/DataEngine)(temp)", True
     except Exception:
         pass
 
-    # 4) legacy v1 temp class (per-request)
+    # 4) v1 temp engine
     try:
         from core.data_engine import DataEngine as V1Engine  # type: ignore
 
@@ -272,10 +256,6 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str,
 
 
 async def _call_engine_method(engine: Any, method_names: Sequence[str], *args, **kwargs) -> Tuple[Optional[Any], str]:
-    """
-    Try first callable method from method_names.
-    Returns (result, method_name_used_or_error).
-    """
     for name in method_names:
         fn = getattr(engine, name, None)
         if callable(fn):
@@ -293,10 +273,6 @@ def _sheet_name_from(payload: SheetRowsIn) -> str:
 
 
 def _headers_fallback(sheet_name: str) -> List[str]:
-    """
-    Best-effort: use core.schemas.get_headers_for_sheet if available.
-    Otherwise a small stable legacy set.
-    """
     try:
         from core.schemas import get_headers_for_sheet  # type: ignore
 
@@ -337,11 +313,13 @@ def _quote_dict(q: Any) -> Dict[str, Any]:
         return {}
 
 
+def _extract_symbol_from_quote(q: Any) -> str:
+    d = _quote_dict(q)
+    s = d.get("symbol_normalized") or d.get("symbol") or d.get("ticker") or ""
+    return str(s or "").strip().upper()
+
+
 def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
-    """
-    Convert a quote dict/model into a row aligned with headers.
-    We only fill what we can.
-    """
     d = _quote_dict(q)
 
     def g(*keys: str) -> Any:
@@ -373,17 +351,20 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
 
 
 def _items_to_ordered_list(items: Any, symbols: List[str]) -> List[Any]:
-    """
-    Engine may return:
-    - list[quote]  (ideal)
-    - dict[symbol -> quote]
-    - single quote (for 1 item)
-    This function returns a list aligned to input symbols if possible.
-    """
     if items is None:
         return []
 
     if isinstance(items, list):
+        # attempt to align list by symbol if list items have symbol fields
+        sym_map: Dict[str, Any] = {}
+        for it in items:
+            k = _extract_symbol_from_quote(it)
+            if k and k not in sym_map:
+                sym_map[k] = it
+        if sym_map:
+            ordered = [sym_map.get(str(s or "").strip().upper()) for s in symbols]
+            if not all(x is None for x in ordered):
+                return ordered
         return items
 
     if isinstance(items, dict):
@@ -392,8 +373,7 @@ def _items_to_ordered_list(items: Any, symbols: List[str]) -> List[Any]:
             kk = str(k or "").strip().upper()
             if kk:
                 mp[kk] = v
-            dv = _quote_dict(v)
-            s2 = str(dv.get("symbol_normalized") or dv.get("symbol") or dv.get("ticker") or "").strip().upper()
+            s2 = _extract_symbol_from_quote(v)
             if s2 and s2 not in mp:
                 mp[s2] = v
 
@@ -401,21 +381,20 @@ def _items_to_ordered_list(items: Any, symbols: List[str]) -> List[Any]:
         for s in symbols:
             su = str(s or "").strip().upper()
             ordered.append(mp.get(su))
-        # If all Nones, just return dict values as list to not lose data
+
         if all(x is None for x in ordered):
             return list(items.values())
         return ordered
 
-    # single item
     if len(symbols) == 1:
         return [items]
 
     return []
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Routes
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 @router.get("/health", summary="Legacy compatibility health")
 async def legacy_health(request: Request):
     eng = getattr(request.app.state, "engine", None)
@@ -448,7 +427,6 @@ async def legacy_health(request: Request):
         except Exception:
             pass
 
-    # Try to resolve a working engine (soft)
     try:
         e2, src, should_close = await _get_engine_best_effort(request)
         info["engine_resolve_source"] = src
@@ -532,16 +510,12 @@ async def legacy_quotes(
     payload: SymbolsIn,
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
-    """
-    IMPORTANT: keep legacy shape as LIST (not dict) for maximum compatibility.
-    """
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
 
     raw_symbols = payload.normalized()
     if not raw_symbols:
         return JSONResponse(status_code=200, content=jsonable_encoder([]))
 
-    # normalize for engine calls, but keep output compatible
     symbols = [_normalize_symbol_best_effort(s) for s in raw_symbols]
 
     eng = None
@@ -552,30 +526,20 @@ async def legacy_quotes(
         eng, src, should_close = await _get_engine_best_effort(request)
         if eng is None:
             out = [
-                {
-                    "status": "error",
-                    "symbol": s,
-                    "data_quality": "MISSING",
-                    "data_source": "none",
-                    "error": "Legacy engine not available (no working provider).",
-                }
+                {"status": "error", "symbol": s, "data_quality": "MISSING", "data_source": "none", "error": "Legacy engine not available (no working provider)."}
                 for s in raw_symbols
             ]
             return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
-        # batch-first
         items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
         if items is not None:
             ordered = _items_to_ordered_list(items, symbols)
-            # If engine returned something usable but not aligned, just pass through as list
             if ordered:
                 return JSONResponse(status_code=200, content=jsonable_encoder(ordered))
             if isinstance(items, list):
                 return JSONResponse(status_code=200, content=jsonable_encoder(items))
-            # fallback to error list if unknown shape
             items = None
 
-        # fallback: per-symbol if batch missing/fails
         sem = asyncio.Semaphore(LEGACY_CONCURRENCY)
 
         async def _one(sym_i: str, raw_i: str) -> Any:
@@ -586,48 +550,20 @@ async def legacy_quotes(
                         timeout=LEGACY_TIMEOUT_SEC,
                     )
                     if q_i is None:
-                        return {
-                            "status": "error",
-                            "symbol": raw_i,
-                            "data_quality": "MISSING",
-                            "data_source": "none",
-                            "error": f"Engine call failed (source={src}, method={used_i}).",
-                        }
+                        return {"status": "error", "symbol": raw_i, "data_quality": "MISSING", "data_source": "none", "error": f"Engine call failed (source={src}, method={used_i})."}
                     return q_i
                 except asyncio.TimeoutError:
-                    return {
-                        "status": "error",
-                        "symbol": raw_i,
-                        "data_quality": "MISSING",
-                        "data_source": "none",
-                        "error": "timeout",
-                    }
+                    return {"status": "error", "symbol": raw_i, "data_quality": "MISSING", "data_source": "none", "error": "timeout"}
                 except Exception as ee:
-                    return {
-                        "status": "error",
-                        "symbol": raw_i,
-                        "data_quality": "MISSING",
-                        "data_source": "none",
-                        "error": _safe_err(ee),
-                    }
+                    return {"status": "error", "symbol": raw_i, "data_quality": "MISSING", "data_source": "none", "error": _safe_err(ee)}
 
         results = await asyncio.gather(*[_one(symbols[i], raw_symbols[i]) for i in range(len(symbols))])
         if dbg:
-            # append a tiny debug trailer (keeps list shape)
             results.append({"debug": True, "engine_source": src, "fallback": "per_symbol"})
         return JSONResponse(status_code=200, content=jsonable_encoder(results))
 
     except Exception as e:
-        out = [
-            {
-                "status": "error",
-                "symbol": s,
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": _safe_err(e),
-            }
-            for s in raw_symbols
-        ]
+        out = [{"status": "error", "symbol": s, "data_quality": "MISSING", "data_source": "none", "error": _safe_err(e)} for s in raw_symbols]
         if dbg:
             out.append({"debug": True, "traceback": traceback.format_exc()[:8000], "engine_source": src})
         return JSONResponse(status_code=200, content=jsonable_encoder(out))
@@ -646,12 +582,6 @@ async def legacy_sheet_rows(
     payload: SheetRowsIn,
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
-    """
-    Returns a Sheets-friendly payload:
-      { status, headers, rows, error? }
-
-    This is optional convenience and does not replace /v1/enriched/sheet-rows.
-    """
     dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
 
     eng = None
@@ -662,12 +592,8 @@ async def legacy_sheet_rows(
         symbols_in = SymbolsIn(symbols=payload.symbols or [], tickers=payload.tickers or [])
         raw_symbols = symbols_in.normalized()
         if not raw_symbols:
-            return JSONResponse(
-                status_code=200,
-                content=jsonable_encoder({"status": "skipped", "headers": [], "rows": [], "error": "No symbols provided"}),
-            )
+            return JSONResponse(status_code=200, content=jsonable_encoder({"status": "skipped", "headers": [], "rows": [], "error": "No symbols provided"}))
 
-        # normalize for engine calls
         symbols = [_normalize_symbol_best_effort(s) for s in raw_symbols]
 
         sheet_name = _sheet_name_from(payload)
@@ -675,36 +601,15 @@ async def legacy_sheet_rows(
 
         eng, src, should_close = await _get_engine_best_effort(request)
         if eng is None:
-            rows = [
-                [
-                    s,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "MISSING",
-                    "none",
-                    "Legacy engine not available",
-                ]
-                for s in raw_symbols
-            ]
+            rows = [[s, None, None, None, None, None, None, None, None, None, "MISSING", "none", "Legacy engine not available"] for s in raw_symbols]
             return JSONResponse(
                 status_code=200,
-                content=jsonable_encoder(
-                    {"status": "error", "headers": headers, "rows": rows, "error": "Legacy engine not available", "engine_source": src}
-                ),
+                content=jsonable_encoder({"status": "error", "headers": headers, "rows": rows, "error": "Legacy engine not available", "engine_source": src}),
             )
 
-        # batch-first
         items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
 
         if items is None:
-            # fallback per-symbol
             sem = asyncio.Semaphore(LEGACY_CONCURRENCY)
 
             async def _one(sym_i: str) -> Any:
@@ -718,44 +623,22 @@ async def legacy_sheet_rows(
                     except Exception:
                         return None
 
-            items_list = await asyncio.gather(*[_one(s) for s in symbols])
-            items = items_list
+            items = await asyncio.gather(*[_one(s) for s in symbols])
             used = "per_symbol_fallback"
 
         ordered_items = _items_to_ordered_list(items, symbols)
 
         if not isinstance(ordered_items, list) or not ordered_items:
-            rows = [
-                [
-                    s,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "MISSING",
-                    "none",
-                    f"Engine returned non-list (method={used})",
-                ]
-                for s in raw_symbols
-            ]
+            rows = [[s, None, None, None, None, None, None, None, None, None, "MISSING", "none", f"Engine returned non-list (method={used})"] for s in raw_symbols]
             return JSONResponse(
                 status_code=200,
-                content=jsonable_encoder(
-                    {"status": "error", "headers": headers, "rows": rows, "error": "Engine returned non-list", "engine_source": src, "method": used}
-                ),
+                content=jsonable_encoder({"status": "error", "headers": headers, "rows": rows, "error": "Engine returned non-list", "engine_source": src, "method": used}),
             )
 
         rows = [_quote_to_row(q, headers) if q is not None else _quote_to_row({}, headers) for q in ordered_items]
         return JSONResponse(
             status_code=200,
-            content=jsonable_encoder(
-                {"status": "success", "headers": headers, "rows": rows, "count": len(rows), "engine_source": src, "method": used}
-            ),
+            content=jsonable_encoder({"status": "success", "headers": headers, "rows": rows, "count": len(rows), "engine_source": src, "method": used}),
         )
 
     except Exception as e:
@@ -773,9 +656,9 @@ async def legacy_sheet_rows(
                 pass
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Optional external override router
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 if ENABLE_EXTERNAL_LEGACY_ROUTER:
     ext = _try_import_external_router()
     if ext is not None:
