@@ -1,8 +1,8 @@
-# main.py  (FULL REPLACEMENT)
+# main.py
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.3.4
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.0
 
 Key guarantees
 - ✅ Never-crash startup: all heavy imports are deferred + best-effort
@@ -11,6 +11,7 @@ Key guarantees
 - ✅ /readyz always returns without touching routers/engine internals
 - ✅ Backward-compatible settings resolution:
       ENV -> env.py -> core.config -> repo-root config.py (all best-effort)
+- ✅ Optional deterministic router import plan via routes.get_recommended_imports() (NO router imports)
 
 Entrypoint for Render/uvicorn:
   uvicorn main:app
@@ -44,7 +45,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.3.4"
+APP_ENTRY_VERSION = "5.4.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -340,7 +341,7 @@ def _feature_enabled(settings: Optional[object], env_mod: Optional[object], key:
 
 
 # ---------------------------------------------------------------------
-# Routers plan
+# Routers plan (fallback)
 # ---------------------------------------------------------------------
 def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[Tuple[str, List[str]]], List[str]]:
     ai_enabled = _feature_enabled(settings, env_mod, "AI_ANALYSIS_ENABLED", True)
@@ -352,12 +353,10 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     if ai_enabled:
         routers.append(("ai_analysis", ["routes.ai_analysis", "ai_analysis", "routes.analysis", "core.ai_analysis"]))
     if adv_enabled:
-        routers.append(
-            ("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "routes.adv_analysis", "core.advanced_analysis"])
-        )
+        routers.append(("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "routes.adv_analysis", "core.advanced_analysis"]))
 
     # Optional routers (not required)
-    routers.append(("argaam", ["routes.argaam", "routes.routes_argaam", "routes_argaam", "core.routes_argaam"]))
+    routers.append(("argaam", ["routes.routes_argaam", "routes_argaam", "routes.argaam", "core.routes_argaam"]))
     routers.append(("legacy_service", ["routes.legacy_service", "core.legacy_service", "legacy_service"]))
 
     required: List[str] = ["enriched_quote"]
@@ -366,6 +365,60 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     if adv_enabled:
         required.append("advanced_analysis")
     return routers, required
+
+
+def _router_plan_from_routes_pkg_or_fallback(settings: Optional[object], env_mod: Optional[object]) -> Tuple[List[Tuple[str, List[str]]], List[str], Optional[Dict[str, Any]]]:
+    """
+    Prefer routes.get_recommended_imports() (no router imports, just module discovery).
+    Fall back to _router_plan().
+    Returns (routers_to_mount, required_routers, routes_snapshot_or_none)
+    """
+    routes_snapshot = None
+
+    ai_enabled = _feature_enabled(settings, env_mod, "AI_ANALYSIS_ENABLED", True)
+    adv_enabled = _feature_enabled(settings, env_mod, "ADVANCED_ANALYSIS_ENABLED", True)
+
+    try:
+        from routes import get_recommended_imports, get_routes_debug_snapshot  # type: ignore
+
+        routes_snapshot = get_routes_debug_snapshot()
+        rec = get_recommended_imports()
+
+        # rec: [(key, module_path), ...]
+        # we still keep candidate fallbacks per key (for safety)
+        module_map = {k: m for k, m in rec}
+
+        routers_to_mount: List[Tuple[str, List[str]]] = []
+
+        # enriched is required always
+        enriched_mod = module_map.get("enriched") or "routes.enriched_quote"
+        routers_to_mount.append(("enriched_quote", [enriched_mod, "routes.enriched_quote", "routes.enriched"]))
+
+        if ai_enabled:
+            ai_mod = module_map.get("ai_analysis") or "routes.ai_analysis"
+            routers_to_mount.append(("ai_analysis", [ai_mod, "routes.ai_analysis"]))
+
+        if adv_enabled:
+            adv_mod = module_map.get("advanced_analysis") or "routes.advanced_analysis"
+            routers_to_mount.append(("advanced_analysis", [adv_mod, "routes.advanced_analysis"]))
+
+        # optional
+        argaam_mod = module_map.get("argaam") or "routes.routes_argaam"
+        routers_to_mount.append(("argaam", [argaam_mod, "routes.routes_argaam", "routes_argaam"]))
+        legacy_mod = module_map.get("legacy_service") or "routes.legacy_service"
+        routers_to_mount.append(("legacy_service", [legacy_mod, "routes.legacy_service"]))
+
+        required: List[str] = ["enriched_quote"]
+        if ai_enabled:
+            required.append("ai_analysis")
+        if adv_enabled:
+            required.append("advanced_analysis")
+
+        return routers_to_mount, required, routes_snapshot
+
+    except Exception:
+        routers_to_mount, required = _router_plan(settings, env_mod)
+        return routers_to_mount, required, routes_snapshot
 
 
 # ---------------------------------------------------------------------
@@ -640,13 +693,14 @@ def create_app() -> FastAPI:
     allow_origins = _cors_allow_origins(settings, env_mod)
     allow_credentials = False if allow_origins == ["*"] else True
 
-    routers_to_mount, required_default = _router_plan(settings, env_mod)
+    routers_to_mount, required_default, routes_snapshot = _router_plan_from_routes_pkg_or_fallback(settings, env_mod)
     openapi_url, docs_url, redoc_url = _docs_config(settings, env_mod)
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
         app_.state.settings = settings
         app_.state.settings_source = settings_source
+        app_.state.routes_snapshot = routes_snapshot
         app_.state.app_env = app_env
         app_.state.start_time_utc = datetime.now(timezone.utc).isoformat()
 
@@ -800,6 +854,7 @@ def create_app() -> FastAPI:
             "env": getattr(app_.state, "app_env", "unknown"),
             "entry_version": APP_ENTRY_VERSION,
             "settings_source": getattr(app_.state, "settings_source", None),
+            "routes_snapshot": getattr(app_.state, "routes_snapshot", None),
             "boot_completed": bool(getattr(app_.state, "boot_completed", False)),
             "boot_task_running": bool(boot_task is not None and not boot_task.done()),
             "routers_ready": bool(getattr(app_.state, "routers_ready", False)),
