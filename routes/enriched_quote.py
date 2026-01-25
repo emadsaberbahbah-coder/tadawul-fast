@@ -1,19 +1,19 @@
-# routes/enriched_quote.py           # routes/enriched_quote.py  (FULL REPLACEMENT)
+# routes/enriched_quote.py
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.2
+Enriched Quote Router — PROD SAFE (await-safe + singleton-engine friendly) — v5.6.3
 
-What’s fixed / improved in v5.6.2
-- ✅ Accepts common query aliases (your failing tests):
-    - /v1/enriched/quotes?symbols=...
-    - /v1/enriched/quotes?tickers=...
-    - /v1/enriched/quotes?ticker=...
-    - /v1/enriched/quotes?symbol=...
-    - /v1/enriched/quotes?symbols=... (existing)
-    - /v1/enriched/quote?symbol=... (existing)
-- ✅ Keeps HTTP 200 with {status,...} (no FastAPI exceptions for auth/symbol errors)
-- ✅ Token guard unchanged (X-APP-TOKEN / Authorization: Bearer / optional ?token when ALLOW_QUERY_TOKEN=1)
+v5.6.3 changes
+- ✅ Accepts BOTH comma/space strings AND repeated query params:
+    /v1/enriched/quotes?symbols=AAPL&symbols=MSFT
+    /v1/enriched/quotes?tickers=1120.SR&tickers=2222.SR
+- ✅ Stronger batch dict matching (case-insensitive + symbol variants)
+- ✅ Batch items include requested_symbol consistently (debug + Sheets mapping)
+
+Keeps
+- ✅ HTTP 200 always with {status,...} (no FastAPI exceptions)
+- ✅ Token guard (X-APP-TOKEN / Authorization: Bearer / optional ?token when ALLOW_QUERY_TOKEN=1)
 - ✅ Recommendation enum enforced (BUY/HOLD/REDUCE/SELL)
 - ✅ Variant rescue for Global/KSA symbols (AAPL <-> AAPL.US, 1120 <-> 1120.SR)
 - ✅ Batch alignment hardened (list/dict responses)
@@ -22,6 +22,7 @@ What’s fixed / improved in v5.6.2
 Endpoints
 - GET /v1/enriched/quote?symbol=1120.SR
 - GET /v1/enriched/quotes?symbols=AAPL,MSFT,1120.SR
+- GET /v1/enriched/quotes?symbols=AAPL&symbols=MSFT
 - GET /v1/enriched/quotes?tickers=1120.SR,2222.SR
 - GET /v1/enriched/quotes?ticker=1120.SR
 - GET /v1/enriched/health
@@ -36,13 +37,13 @@ import re
 import traceback
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from fastapi import APIRouter, Header, Query, Request
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.6.2"
+ENRICHED_ROUTE_VERSION = "5.6.3"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -120,6 +121,10 @@ def _norm_str(x: Any) -> str:
         return (str(x) if x is not None else "").strip()
     except Exception:
         return ""
+
+
+def _norm_key(x: Any) -> str:
+    return _norm_str(x).strip().upper()
 
 
 # =============================================================================
@@ -205,6 +210,27 @@ def _parse_symbols_list(raw: str) -> List[str]:
         seen.add(k)
         final.append(x)
     return final
+
+
+def _flatten_query_value(v: Any) -> str:
+    """
+    v can be:
+    - None
+    - "AAPL,MSFT"
+    - ["AAPL", "MSFT"]
+    - ["AAPL,MSFT"]  (when user passes comma string but param typed as list)
+    Returns a single string that _parse_symbols_list can handle.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        parts: List[str] = []
+        for it in v:
+            s = _norm_str(it)
+            if s:
+                parts.append(s)
+        return ",".join(parts)
+    return _norm_str(v)
 
 
 def _to_jsonable(payload: Any) -> Any:
@@ -735,13 +761,11 @@ def _needs_rescue(d: Dict[str, Any]) -> bool:
 
 
 # =============================================================================
-# Query alias resolution (fix your "No valid symbols" cases)
+# Query alias resolution (fix "No valid symbols")
 # =============================================================================
-def _first_nonempty(*vals: Optional[str]) -> str:
+def _first_nonempty(*vals: Any) -> str:
     for v in vals:
-        if v is None:
-            continue
-        s = str(v).strip()
+        s = _flatten_query_value(v)
         if s:
             return s
     return ""
@@ -749,8 +773,8 @@ def _first_nonempty(*vals: Optional[str]) -> str:
 
 def _resolve_symbols_from_query(
     *,
-    symbols: Optional[str],
-    tickers: Optional[str],
+    symbols: Any,
+    tickers: Any,
     ticker: Optional[str],
     symbol: Optional[str],
 ) -> List[str]:
@@ -759,17 +783,64 @@ def _resolve_symbols_from_query(
     Priority:
       1) symbols / tickers (multi)
       2) ticker / symbol (single)
+    Supports:
+      - comma/space strings
+      - repeated query params (list)
     """
     multi_raw = _first_nonempty(symbols, tickers)
     if multi_raw:
         return _parse_symbols_list(multi_raw)
 
-    single_raw = _first_nonempty(ticker, symbol)
+    single_raw = _norm_str(ticker) or _norm_str(symbol)
     if single_raw:
         s = _normalize_symbol(single_raw)
         return [s] if s else []
 
     return []
+
+
+def _case_insensitive_mapping_get(m: Dict[str, Any], key: str) -> Any:
+    if not isinstance(m, dict):
+        return None
+    if key in m:
+        return m.get(key)
+    kU = key.upper()
+    kL = key.lower()
+    if kU in m:
+        return m.get(kU)
+    if kL in m:
+        return m.get(kL)
+
+    # scan once (only when needed)
+    target = key.strip().upper()
+    for kk, vv in m.items():
+        if _norm_key(kk) == target:
+            return vv
+    return None
+
+
+def _mapping_get_with_variants(m: Dict[str, Any], sym: str) -> Any:
+    """
+    Batch dict responses sometimes key by variants:
+      requested: AAPL
+      returned:  AAPL.US
+    This tries exact + case-insensitive + variants.
+    """
+    if not isinstance(m, dict):
+        return None
+
+    # direct + case-insensitive
+    v = _case_insensitive_mapping_get(m, sym)
+    if v is not None:
+        return v
+
+    # try normalized variants
+    for s2 in _symbol_variants(sym):
+        v2 = _case_insensitive_mapping_get(m, s2)
+        if v2 is not None:
+            return v2
+
+    return None
 
 
 # =============================================================================
@@ -948,10 +1019,13 @@ async def enriched_quote(
 @router.get("/v1/enriched/quotes")
 async def enriched_quotes(
     request: Request,
-    # ✅ keep existing param name
-    symbols: Optional[str] = Query("", description="Comma/space-separated list, e.g. AAPL,MSFT,1120.SR"),
-    # ✅ add aliases that your tests used
-    tickers: Optional[str] = Query(None, description="Alias of symbols (comma/space-separated)"),
+    # NOTE: accept repeated params too (v5.6.3)
+    symbols: Optional[List[str]] = Query(
+        default=None, description="Comma/space-separated OR repeated, e.g. symbols=AAPL,MSFT OR symbols=AAPL&symbols=MSFT"
+    ),
+    tickers: Optional[List[str]] = Query(
+        default=None, description="Alias of symbols (comma/space-separated OR repeated)"
+    ),
     ticker: Optional[str] = Query(None, description="Single symbol alias (e.g. 1120.SR)"),
     symbol: Optional[str] = Query(None, description="Single symbol alias (e.g. 1120.SR)"),
     refresh: int = Query(0, description="refresh=1 asks engine to bypass cache (if supported)"),
@@ -977,7 +1051,6 @@ async def enriched_quotes(
             "items": [],
         }
 
-    # ✅ resolve from aliases
     syms = _resolve_symbols_from_query(symbols=symbols, tickers=tickers, ticker=ticker, symbol=symbol)
 
     if max_symbols and max_symbols > 0 and len(syms) > max_symbols:
@@ -1008,7 +1081,6 @@ async def enriched_quotes(
     items: List[Dict[str, Any]] = []
 
     try:
-        # Batch attempt (best-effort). Use GLOBAL hint because list can mix; engine should ignore if unsupported.
         method_used, raw_batch = _call_engine_batch_best_effort(
             eng,
             syms,
@@ -1027,7 +1099,9 @@ async def enriched_quotes(
                     sym_i = syms[i]
                     it = res[i] if i < len(res) else None
                     if isinstance(it, dict):
-                        shaped.append(_ensure_status_dict(_ensure_reco(it), symbol=sym_i or it.get("symbol", ""), engine_source=eng_src))
+                        out = _ensure_status_dict(_ensure_reco(it), symbol=sym_i or it.get("symbol", ""), engine_source=eng_src)
+                        out.setdefault("requested_symbol", sym_i)
+                        shaped.append(out)
                     elif it is None:
                         shaped.append(
                             _ensure_status_dict(
@@ -1037,6 +1111,7 @@ async def enriched_quotes(
                                     "engine_source": eng_src,
                                     "error": "Missing item in batch list",
                                     "recommendation": "HOLD",
+                                    "requested_symbol": sym_i,
                                 },
                                 symbol=sym_i,
                                 engine_source=eng_src,
@@ -1045,7 +1120,14 @@ async def enriched_quotes(
                     else:
                         shaped.append(
                             _ensure_status_dict(
-                                {"status": "ok", "symbol": sym_i, "engine_source": eng_src, "value": _to_jsonable(it), "recommendation": "HOLD"},
+                                {
+                                    "status": "ok",
+                                    "symbol": sym_i,
+                                    "engine_source": eng_src,
+                                    "value": _to_jsonable(it),
+                                    "recommendation": "HOLD",
+                                    "requested_symbol": sym_i,
+                                },
                                 symbol=sym_i,
                                 engine_source=eng_src,
                             )
@@ -1083,9 +1165,11 @@ async def enriched_quotes(
             if isinstance(res, dict):
                 shaped2: List[Dict[str, Any]] = []
                 for s in syms:
-                    v = res.get(s) or res.get(s.upper()) or res.get(s.lower())
+                    v = _mapping_get_with_variants(res, s)
                     if isinstance(v, dict):
-                        shaped2.append(_ensure_status_dict(_ensure_reco(v), symbol=s, engine_source=eng_src))
+                        out = _ensure_status_dict(_ensure_reco(v), symbol=s, engine_source=eng_src)
+                        out.setdefault("requested_symbol", s)
+                        shaped2.append(out)
                     elif v is None:
                         shaped2.append(
                             _ensure_status_dict(
@@ -1095,6 +1179,7 @@ async def enriched_quotes(
                                     "engine_source": eng_src,
                                     "error": "Missing in batch response",
                                     "recommendation": "HOLD",
+                                    "requested_symbol": s,
                                 },
                                 symbol=s,
                                 engine_source=eng_src,
@@ -1103,7 +1188,14 @@ async def enriched_quotes(
                     else:
                         shaped2.append(
                             _ensure_status_dict(
-                                {"status": "ok", "symbol": s, "engine_source": eng_src, "value": _to_jsonable(v), "recommendation": "HOLD"},
+                                {
+                                    "status": "ok",
+                                    "symbol": s,
+                                    "engine_source": eng_src,
+                                    "value": _to_jsonable(v),
+                                    "recommendation": "HOLD",
+                                    "requested_symbol": s,
+                                },
                                 symbol=s,
                                 engine_source=eng_src,
                             )
@@ -1156,6 +1248,7 @@ async def enriched_quotes(
                     "engine_source": eng_src,
                     "error": _clamp(ex),
                     "recommendation": "HOLD",
+                    "requested_symbol": s,
                 }
                 if dbg:
                     err_item["trace"] = _clamp(traceback.format_exc(), 4000)
