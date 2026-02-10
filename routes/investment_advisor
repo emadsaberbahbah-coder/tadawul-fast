@@ -1,0 +1,128 @@
+# routes/investment_advisor.py
+# Tadawul Fast Bridge — Investment Advisor Router
+# Version: 0.1.0
+# Author: Emad Bahbah project
+#
+# Endpoints:
+# - GET  /v1/advisor/health  -> safe check (used by GAS "Test Health")
+# - POST /v1/advisor/run     -> main advisor run (returns headers + rows for Sheets)
+#
+# Notes:
+# - This file is designed to NOT crash the server if core/schemas are not yet added.
+#   It will return a clear HTTP 501 until core/investment_advisor.py is added.
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+
+TT_ADVISOR_ROUTE_VERSION = "0.1.0"
+
+router = APIRouter(prefix="/v1/advisor", tags=["Advisor"])
+
+
+# -----------------------------------------------------------------------------
+# Optional imports (schemas + core). We keep fallbacks so the API can boot
+# even if you add scripts one by one.
+# -----------------------------------------------------------------------------
+try:
+    # Will be added later: schemas/advisor.py
+    from schemas.advisor import AdvisorRequest, AdvisorResponse  # type: ignore
+except Exception:
+    class AdvisorRequest(BaseModel):
+        # Minimal fallback contract (will be replaced by schemas/advisor.py later)
+        sources: List[str] = Field(default_factory=lambda: ["ALL"], description="Sheets/pages to include or ['ALL']")
+        risk: str = Field(default="Moderate", description="Risk bucket from Sheets dropdown")
+        confidence: str = Field(default="High", description="Confidence bucket from Sheets dropdown")
+        required_roi_1m: float = Field(default=0.05, description="Required ROI in 1 month (e.g., 0.05 = 5%)")
+        required_roi_3m: float = Field(default=0.10, description="Required ROI in 3 months (e.g., 0.10 = 10%)")
+        top_n: int = Field(default=10, ge=1, le=200, description="How many symbols to return")
+        invest_amount: float = Field(default=10000.0, ge=0, description="Total amount to allocate")
+
+        # Optional knobs for later
+        currency: str = Field(default="SAR")
+        include_news: bool = Field(default=True)
+        as_of_utc: Optional[str] = Field(default=None, description="Optional timestamp override (UTC ISO)")
+
+    class AdvisorResponse(BaseModel):
+        ok: bool = True
+        headers: List[str] = Field(default_factory=list)
+        rows: List[List[Any]] = Field(default_factory=list)
+        meta: Dict[str, Any] = Field(default_factory=dict)
+        error: Optional[str] = None
+
+
+try:
+    # Will be added later: core/investment_advisor.py
+    from core.investment_advisor import run_investment_advisor  # type: ignore
+except Exception:
+    run_investment_advisor = None
+
+
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@router.get("/health")
+def advisor_health() -> Dict[str, Any]:
+    """
+    Simple health check used by GAS to avoid "REFRESH BLOCKED (SAFE MODE)".
+    """
+    return {
+        "ok": True,
+        "service": "investment_advisor",
+        "route_version": TT_ADVISOR_ROUTE_VERSION,
+        "core_ready": bool(run_investment_advisor),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Main run endpoint
+# -----------------------------------------------------------------------------
+@router.post("/run", response_model=AdvisorResponse)
+def advisor_run(payload: AdvisorRequest) -> AdvisorResponse:
+    """
+    Sheets -> GAS -> POST /v1/advisor/run -> returns Sheets-ready {headers, rows, meta}
+
+    Output design (stable idea):
+    - headers: list of column names
+    - rows: list of row arrays aligned to headers
+    - meta: includes criteria + run diagnostics
+    """
+    if run_investment_advisor is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Advisor core is not installed yet. "
+                "Add core/investment_advisor.py (run_investment_advisor) then retry."
+            ),
+        )
+
+    try:
+        result: Dict[str, Any] = run_investment_advisor(payload.model_dump())  # core returns dict
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Advisor run failed: {exc}")
+
+    # Normalize to the response contract
+    headers = result.get("headers") or []
+    rows = result.get("rows") or []
+    meta = result.get("meta") or {}
+
+    # Hard safety: Sheets expects list types
+    if not isinstance(headers, list) or not isinstance(rows, list):
+        raise HTTPException(status_code=500, detail="Advisor returned invalid format (headers/rows).")
+
+    return AdvisorResponse(
+        ok=True,
+        headers=headers,
+        rows=rows,
+        meta={
+            "criteria": payload.model_dump(),
+            "route_version": TT_ADVISOR_ROUTE_VERSION,
+            **meta,
+        },
+        error=None,
+    )
