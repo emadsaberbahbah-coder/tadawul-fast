@@ -2,7 +2,7 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.12.0) — PROD SAFE + ROUTER FRIENDLY (FULL REPLACEMENT)
+UNIFIED DATA ENGINE (v2.13.0) — PROD SAFE + ROUTER FRIENDLY (FULL REPLACEMENT)
 
 Design goals
 - ✅ PROD SAFE: no network at import-time, no provider imports at import-time
@@ -21,19 +21,19 @@ Design goals
     forecast_confidence (0..1), forecast_updated_utc/riyadh
     plus expected_price_*, expected_return_*, confidence_score, forecast_updated
 
-Routing (default)
-- GLOBAL: eodhd -> finnhub
-- KSA: yahoo_chart -> argaam (+ tadawul if configured)
+NEW in v2.13.0 (Advisor Performance)
+- ✅ Adds a second TTL cache for "Sheet Snapshot" data across pages:
+    - Market_Leaders / Global_Markets / Mutual_Funds / Commodities_FX
+  This allows Investment Advisor to reuse cached sheet data and avoid duplicate fetches.
 
 Environment knobs (optional)
-- ENABLED_PROVIDERS / PROVIDERS          (global providers list)
-- KSA_PROVIDERS                          (ksa providers list)
-- ENABLE_HISTORY_ANALYTICS=true|false    (default true)
 - ENGINE_CACHE_TTL_SEC                   (default 45)
 - ENGINE_CACHE_MAXSIZE                   (default 4096)
 - ENGINE_CONCURRENCY                     (default 12)
 - ENGINE_INCLUDE_WARNINGS=true|false     (default false)
 - KEEP_RAW_HISTORY=true|false            (default false)
+- SHEET_CACHE_TTL_SEC                    (default 180)  <-- NEW
+- SHEET_CACHE_MAXSIZE                    (default 64)   <-- NEW
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.12.0"
+ENGINE_VERSION = "2.13.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -283,10 +283,6 @@ def _is_ksa(symbol: str) -> bool:
 
 
 def _fallback_normalize_symbol(symbol: str) -> str:
-    """
-    Fallback normalizer (only used if core.symbols.normalize is missing).
-    IMPORTANT: do NOT force ".US" here.
-    """
     s = (symbol or "").strip().upper()
     if not s:
         return ""
@@ -297,30 +293,21 @@ def _fallback_normalize_symbol(symbol: str) -> str:
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "")
 
-    # indices / fx / futures etc: passthrough
     if any(ch in s for ch in ("^", "=", "/")) or s.endswith("=X") or s.endswith("=F"):
         return s
 
-    # KSA
     if s.isdigit() or re.fullmatch(r"\d{3,6}", s):
         return f"{s}.SR"
     if s.endswith(".SR"):
         return s
 
-    # Keep explicit exchange suffixes (AAPL.US, VOD.L, etc.)
     if "." in s:
         return s
 
-    # global equity: keep plain ticker
     return s
 
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    Preferred symbol normalizer:
-    - Uses core.symbols.normalize.normalize_symbol if present.
-    - Else uses fallback.
-    """
     try:
         from core.symbols.normalize import normalize_symbol as _ext  # type: ignore
 
@@ -331,21 +318,14 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
-    """
-    Provider-specific mapping (conservative).
-    """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
-
-    # Some sources want no ".US" (we do NOT add it; only strip if already present)
     if k in {"finnhub", "yahoo_chart", "yahoo", "yfinance"}:
         return s[:-3] if s.endswith(".US") else s
-
     return s
 
 
 def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    """Patch-style merge: does NOT override existing non-empty values in dst."""
     for k, v in (src or {}).items():
         if v is None:
             continue
@@ -360,10 +340,6 @@ async def _call_maybe_async(x: Any) -> Any:
 
 
 def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
-    """
-    Try common signatures without assuming provider API.
-    """
-    # positional + kwargs
     try:
         return fn(symbol, refresh=refresh, fields=fields)
     except TypeError:
@@ -385,7 +361,6 @@ def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: boo
     except TypeError:
         pass
 
-    # keyword symbol variants
     for key in ("symbol", "ticker", "sym"):
         try:
             return fn(**{key: symbol, "refresh": refresh, "fields": fields})
@@ -408,13 +383,6 @@ def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: boo
 
 
 def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable[..., Any]], Optional[str]]:
-    """
-    Discovers a callable in multiple patterns:
-      1) module.<name>
-      2) module.exports / module.EXPORTS dict
-      3) module.provider / module.PROVIDER object with method
-    """
-    # 1) direct functions
     for n in fn_names:
         try:
             cand = getattr(mod, n, None)
@@ -423,7 +391,6 @@ def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable
         except Exception:
             continue
 
-    # 2) dict exports
     for export_name in ("exports", "EXPORTS"):
         try:
             ex = getattr(mod, export_name, None)
@@ -435,7 +402,6 @@ def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable
         except Exception:
             continue
 
-    # 3) provider objects
     for obj_name in ("provider", "PROVIDER"):
         try:
             obj = getattr(mod, obj_name, None)
@@ -458,13 +424,6 @@ async def _try_provider_call(
     refresh: bool,
     fields: Optional[str],
 ) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
-    """
-    Provider callable may return:
-      - dict
-      - (dict, error_str)
-      - (dict, error_str, meta...)
-    Returns (patch, err, fn_used)
-    """
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
@@ -530,7 +489,7 @@ def _to_epoch_seconds(x: Any) -> Optional[int]:
             return None
         if isinstance(x, (int, float)) and not isinstance(x, bool):
             v = int(x)
-            if v > 10_000_000_000:  # ms
+            if v > 10_000_000_000:
                 v = int(v / 1000)
             return v if v > 0 else None
         s = str(x).strip()
@@ -738,7 +697,6 @@ def _apply_history_analytics(out: Dict[str, Any]) -> None:
 # Canonical + alias mapping
 # ============================================================
 def _map_common_aliases(out: Dict[str, Any]) -> None:
-    # Prices
     if out.get("current_price") is None:
         for k in ("price", "last", "last_price", "regularMarketPrice", "close", "c"):
             v = _safe_float(out.get(k))
@@ -767,7 +725,6 @@ def _map_common_aliases(out: Dict[str, Any]) -> None:
                 out["day_low"] = v
                 break
 
-    # 52w
     if out.get("week_52_high") is None:
         for k in ("52_week_high", "fiftyTwoWeekHigh", "week52High", "w52High"):
             v = _safe_float(out.get(k))
@@ -782,7 +739,6 @@ def _map_common_aliases(out: Dict[str, Any]) -> None:
                 out["week_52_low"] = v
                 break
 
-    # Volume
     if out.get("volume") is None:
         for k in ("vol", "regularMarketVolume", "v"):
             v = _safe_float(out.get(k))
@@ -790,7 +746,6 @@ def _map_common_aliases(out: Dict[str, Any]) -> None:
                 out["volume"] = v
                 break
 
-    # Identity
     if out.get("name") is None:
         for k in ("shortName", "longName", "companyName", "name_en", "name_ar"):
             vv = out.get(k)
@@ -805,7 +760,6 @@ def _map_common_aliases(out: Dict[str, Any]) -> None:
                 out["currency"] = str(vv).strip()
                 break
 
-    # Fundamentals
     if out.get("market_cap") is None:
         for k in ("mktCap", "marketCap", "market_capitalization", "marketCapitalization"):
             v = _safe_float(out.get(k))
@@ -891,7 +845,6 @@ def _apply_derived(out: Dict[str, Any]) -> None:
             else:
                 out["free_float_market_cap"] = mc * ff
 
-    # Fair value / upside (best-effort)
     cur2 = _safe_float(out.get("current_price"))
     fv = _safe_float(out.get("fair_value"))
     if fv is None:
@@ -947,9 +900,6 @@ def _has_any_fundamentals(out: Dict[str, Any]) -> bool:
     return False
 
 
-# ============================================================
-# Forecast alias mapping (both directions)
-# ============================================================
 def _coerce_confidence(v: Any) -> Optional[float]:
     x = _safe_float(v)
     if x is None:
@@ -1043,9 +993,6 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
     out.setdefault("forecast_updated_riyadh", _riyadh_iso())
 
 
-# ============================================================
-# Scoring + recommendation (simple, stable, Sheets-friendly)
-# ============================================================
 def _score_from_percent(x: Optional[float], lo: float, hi: float) -> float:
     if x is None:
         return 50.0
@@ -1246,7 +1193,6 @@ class UnifiedQuote(BaseModel):
     forecast_updated_utc: Optional[str] = None
     forecast_updated_riyadh: Optional[str] = None
 
-    # legacy aliases (often used by older routers)
     expected_return_1m: Optional[float] = None
     expected_return_3m: Optional[float] = None
     expected_return_12m: Optional[float] = None
@@ -1354,7 +1300,7 @@ class DataEngine:
     """
     Router-friendly engine that returns dicts (Sheets-safe).
 
-    Accepts optional `settings` (kw or positional) for compatibility with legacy adapter.
+    Adds a second cache for "Sheet Snapshots" so Investment Advisor can reuse page data.
     """
 
     def __init__(self, settings: Any = None, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
@@ -1373,6 +1319,15 @@ class DataEngine:
         self._sem = asyncio.Semaphore(self.max_concurrency)
 
         self._cache: TTLCache = TTLCache(maxsize=maxsize, ttl=self.cache_ttl_sec)  # type: ignore
+
+        # NEW: Sheet snapshot cache (small)
+        sheet_ttl = _safe_int(os.getenv("SHEET_CACHE_TTL_SEC", "180"), 180)
+        sheet_ttl = max(30, min(3600, sheet_ttl))
+        sheet_max = _safe_int(os.getenv("SHEET_CACHE_MAXSIZE", "64"), 64)
+        sheet_max = max(8, min(512, sheet_max))
+
+        self.sheet_cache_ttl_sec = sheet_ttl
+        self._sheet_cache: TTLCache = TTLCache(maxsize=sheet_max, ttl=self.sheet_cache_ttl_sec)  # type: ignore
 
         default_global = (os.getenv("PROVIDERS") or os.getenv("ENABLED_PROVIDERS") or "eodhd,finnhub").strip() or "eodhd,finnhub"
         default_ksa = (os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam").strip() or "yahoo_chart,argaam"
@@ -1401,7 +1356,7 @@ class DataEngine:
         self.include_warnings = _env_bool("ENGINE_INCLUDE_WARNINGS", False)
 
         logger.info(
-            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s",
+            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s | sheet_ttl=%ss | sheet_max=%s",
             ENGINE_VERSION,
             self.cache_ttl_sec,
             maxsize,
@@ -1410,10 +1365,97 @@ class DataEngine:
             self.ksa_providers,
             self.enable_history,
             _HAS_CACHETOOLS,
+            self.sheet_cache_ttl_sec,
+            sheet_max,
         )
 
     async def aclose(self) -> None:
         return None
+
+    # ============================================================
+    # NEW: Sheet Snapshot Cache API (Advisor performance)
+    # ============================================================
+    def _sheet_key(self, sheet_name: str) -> str:
+        return f"sheet::{(sheet_name or '').strip()}"
+
+    def set_cached_sheet_snapshot(
+        self,
+        sheet_name: str,
+        headers: List[str],
+        rows: List[List[Any]],
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Store a Sheets-ready snapshot. This is designed to be called by routers after they fetch data,
+        and later reused by Investment Advisor during the same TTL window.
+        """
+        try:
+            name = (sheet_name or "").strip()
+            if not name:
+                return
+            payload = {
+                "sheet": name,
+                "headers": list(headers or []),
+                "rows": list(rows or []),
+                "meta": dict(meta or {}),
+                "cached_at_utc": _utc_iso(),
+                "cached_at_riyadh": _riyadh_iso(),
+                "engine_version": ENGINE_VERSION,
+            }
+            self._sheet_cache[self._sheet_key(name)] = payload  # type: ignore[index]
+        except Exception:
+            return
+
+    def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns the cached snapshot if present, else None.
+        """
+        try:
+            name = (sheet_name or "").strip()
+            if not name:
+                return None
+            v = self._sheet_cache.get(self._sheet_key(name))
+            return dict(v) if isinstance(v, dict) else None
+        except Exception:
+            return None
+
+    def get_cached_multi_sheet_snapshots(self, sheet_names: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Returns {sheet_name: snapshot} for all hits.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            for s in (sheet_names or []):
+                snap = self.get_cached_sheet_snapshot(s)
+                if snap:
+                    out[str(s)] = snap
+        except Exception:
+            pass
+        return out
+
+    def clear_sheet_cache(self, sheet_name: Optional[str] = None) -> None:
+        """
+        Clears the entire sheet cache, or only one sheet snapshot.
+        """
+        try:
+            if not sheet_name:
+                try:
+                    self._sheet_cache.clear()
+                except Exception:
+                    # fallback for dict-like
+                    for k in list(getattr(self._sheet_cache, "keys", lambda: [])()):
+                        try:
+                            self._sheet_cache.pop(k, None)
+                        except Exception:
+                            pass
+                return
+            key = self._sheet_key(sheet_name)
+            try:
+                self._sheet_cache.pop(key, None)
+            except Exception:
+                pass
+        except Exception:
+            return
 
     # --------------------
     # Public API (single)
@@ -1437,7 +1479,7 @@ class DataEngine:
             out = self._placeholder(sym_in, err=f"Engine error: {e}")
 
         try:
-            self._cache[cache_key] = dict(out)
+            self._cache[cache_key] = dict(out)  # type: ignore[index]
         except Exception:
             pass
         return out
@@ -1505,7 +1547,6 @@ class DataEngine:
             )
 
             if patch:
-                # move provider error into warnings (patch-style)
                 p_err = patch.get("error")
                 if isinstance(p_err, str) and p_err.strip():
                     warnings.append(f"{key}: {p_err.strip()}")
@@ -1529,28 +1570,20 @@ class DataEngine:
         _apply_derived(out)
         out["data_quality"] = _quality_label(out)
 
-        # forecast aliases -> canonical
         _map_forecast_aliases(out)
 
-        # history analytics (best-effort)
         if self.enable_history:
             _apply_history_analytics(out)
 
-        # forecast fallback (momentum) if still missing
         _forecast_from_momentum(out)
-
-        # back-compat aliases after canonical is ready
         _mirror_forecast_aliases(out)
 
-        # score + reco + badges
         _compute_scores(out)
         out["badges"] = _badges(out)
         out["recommendation"] = _norm_reco(_recommendation_from_scores(out), default="HOLD")
 
-        # source
         out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
 
-        # If no price => hard error
         if _safe_float(out.get("current_price")) is None:
             out["error"] = "MISSING: current_price"
             out["data_quality"] = "BAD"
@@ -1585,19 +1618,12 @@ class DataEngine:
         }
 
 
-# Back-compat alias name
 DataEngineV2 = DataEngine
 
-# ============================================================
-# Singleton accessor (preferred by routers)
-# ============================================================
 _ENGINE_SINGLETON: Optional[DataEngine] = None
 
 
 def get_engine(settings: Any = None) -> DataEngine:
-    """
-    Singleton accessor (sync). If you pass settings on first call, it will be used.
-    """
     global _ENGINE_SINGLETON
     if _ENGINE_SINGLETON is None:
         _ENGINE_SINGLETON = DataEngine(settings=settings)
