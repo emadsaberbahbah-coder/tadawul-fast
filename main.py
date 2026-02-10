@@ -2,12 +2,13 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.2
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.3
 
-Changes vs v5.4.1
+Enhancements vs v5.4.2
+- ✅ FIX: Removes invalid getattr(settings, env_mod, ...) call that crashes startup.
 - ✅ Adds Investment Advisor router mount plan:
-    - routes.investment_advisor (name: investment_advisor)
-- ✅ Keeps startup behavior identical (never-crash boot, optional router semantics)
+    - routes.investment_advisor (name: investment_advisor) (optional by default)
+- ✅ Keeps startup behavior identical (never-crash boot, deferred mounts, optional router semantics)
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.4.2"
+APP_ENTRY_VERSION = "5.4.3"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -599,6 +600,37 @@ def create_app() -> FastAPI:
     routers_to_mount, required_default, optional_default = _router_plan(settings, env_mod)
     openapi_url, docs_url, redoc_url = _docs_config(settings, env_mod)
 
+    def _settings_bool(settings_obj: Optional[object], attr_name: str, default: bool) -> bool:
+        """
+        Safe accessor for nested 'settings.<something>.<attr_name>' patterns.
+        This avoids invalid getattr() calls and keeps boot never-crash.
+        """
+        if settings_obj is None:
+            return default
+        try:
+            direct = getattr(settings_obj, attr_name, None)
+            if direct is not None:
+                return bool(direct)
+        except Exception:
+            pass
+
+        # Common nesting patterns:
+        # - settings.runtime.init_engine_on_boot
+        # - settings.app.init_engine_on_boot
+        # - settings.core.init_engine_on_boot
+        for container_name in ("runtime", "app", "core"):
+            try:
+                container = getattr(settings_obj, container_name, None)
+                if container is None:
+                    continue
+                v = getattr(container, attr_name, None)
+                if v is not None:
+                    return bool(v)
+            except Exception:
+                continue
+
+        return default
+
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
         app_.state.settings = settings
@@ -619,8 +651,11 @@ def create_app() -> FastAPI:
         app_.state.boot_error = None
         app_.state.boot_completed = False
 
-        defer_val = _get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)
-        init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, env_mod, "init_engine_on_boot", True) if settings else True)
+        defer_default = _settings_bool(settings, "defer_router_mount", True) if settings else True
+        init_default = _settings_bool(settings, "init_engine_on_boot", True) if settings else True
+
+        defer_val = _get(settings, env_mod, "DEFER_ROUTER_MOUNT", defer_default)
+        init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", init_default)
 
         app_.state.defer_router_mount = _truthy(defer_val) if isinstance(defer_val, str) else bool(defer_val)
         app_.state.init_engine_on_boot = _truthy(init_val) if isinstance(init_val, str) else bool(init_val)
@@ -689,13 +724,7 @@ def create_app() -> FastAPI:
 
     @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
-        return {
-            "status": "ok",
-            "app": app_.title,
-            "version": app_.version,
-            "env": getattr(app_.state, "app_env", "unknown"),
-            "entry_version": APP_ENTRY_VERSION,
-        }
+        return {"status": "ok", "app": app_.title, "version": app_.version, "env": getattr(app_.state, "app_env", "unknown"), "entry_version": APP_ENTRY_VERSION}
 
     @app_.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
     async def favicon():
@@ -758,15 +787,7 @@ def create_app() -> FastAPI:
             "providers": providers,
             "ksa_providers": ksa_providers,
             "routers_mounted": [m["name"] for m in mounted],
-            "routers_failed": [
-                {
-                    "name": f["name"],
-                    "optional": bool(f.get("optional")),
-                    "loaded_from": f.get("loaded_from"),
-                    "error": _clamp_str(f.get("error") or "", 2000),
-                }
-                for f in failed
-            ],
+            "routers_failed": [{"name": f["name"], "optional": bool(f.get("optional")), "loaded_from": f.get("loaded_from"), "error": _clamp_str(f.get("error") or "", 2000)} for f in failed],
             "time_utc": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -785,23 +806,11 @@ def create_app() -> FastAPI:
             except Exception:
                 safe_settings = None
 
-        return {
-            "settings_source": getattr(app_.state, "settings_source", None),
-            "env_snapshot": _safe_env_snapshot(settings, env_mod),
-            "settings_safe": safe_settings,
-        }
+        return {"settings_source": getattr(app_.state, "settings_source", None), "env_snapshot": _safe_env_snapshot(settings, env_mod), "settings_safe": safe_settings}
 
     @app_.get("/system/info", tags=["system"])
     async def system_info():
-        return {
-            "service": app_.title,
-            "version": app_.version,
-            "entry_version": APP_ENTRY_VERSION,
-            "environment": getattr(app_.state, "app_env", "unknown"),
-            "start_time_utc": getattr(app_.state, "start_time_utc", None),
-            "render_git_commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:40],
-            "python": sys.version.split(" ")[0],
-        }
+        return {"service": app_.title, "version": app_.version, "entry_version": APP_ENTRY_VERSION, "environment": getattr(app_.state, "app_env", "unknown"), "start_time_utc": getattr(app_.state, "start_time_utc", None), "render_git_commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:40], "python": sys.version.split(" ")[0]}
 
     return app_
 
