@@ -2,11 +2,12 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.1
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.2
 
-Changes vs v5.4.0
-- ✅ Makes optional router failures explicit as "optional" in mount report/logs
-- ✅ Keeps behavior identical (never-crash startup, deferred mounts, engine best-effort)
+Changes vs v5.4.1
+- ✅ Adds Investment Advisor router mount plan:
+    - routes.investment_advisor (name: investment_advisor)
+- ✅ Keeps startup behavior identical (never-crash boot, optional router semantics)
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.4.1"
+APP_ENTRY_VERSION = "5.4.2"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -302,6 +303,9 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     ai_enabled = _feature_enabled(settings, env_mod, "AI_ANALYSIS_ENABLED", True)
     adv_enabled = _feature_enabled(settings, env_mod, "ADVANCED_ANALYSIS_ENABLED", True)
 
+    # NEW: Advisor feature toggle (default ON but optional mount)
+    advisor_enabled = _feature_enabled(settings, env_mod, "ADVISOR_ENABLED", True)
+
     routers: List[Tuple[str, List[str]]] = [
         ("enriched_quote", ["routes.enriched_quote", "routes.enriched", "enriched_quote", "core.enriched_quote"]),
     ]
@@ -309,6 +313,10 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
         routers.append(("ai_analysis", ["routes.ai_analysis", "ai_analysis", "routes.analysis", "core.ai_analysis"]))
     if adv_enabled:
         routers.append(("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "routes.adv_analysis", "core.advanced_analysis"]))
+
+    # NEW: Investment Advisor router (kept optional by default)
+    if advisor_enabled:
+        routers.append(("investment_advisor", ["routes.investment_advisor"]))
 
     # optional routers
     routers.append(("argaam", ["routes.routes_argaam", "routes_argaam", "routes.argaam", "core.routes_argaam"]))
@@ -319,8 +327,12 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
         required.append("ai_analysis")
     if adv_enabled:
         required.append("advanced_analysis")
+    # NOTE: advisor is NOT required by default (so boot never fails)
 
     optional: List[str] = ["argaam", "legacy_service"]
+    if advisor_enabled:
+        optional.append("investment_advisor")
+
     return routers, required, optional
 
 
@@ -547,6 +559,7 @@ def _safe_env_snapshot(settings: Optional[object], env_mod: Optional[object]) ->
         "KSA_PROVIDERS": ksa,
         "DEFER_ROUTER_MOUNT": str(_get(settings, env_mod, "DEFER_ROUTER_MOUNT", "true")),
         "INIT_ENGINE_ON_BOOT": str(_get(settings, env_mod, "INIT_ENGINE_ON_BOOT", "true")),
+        "ADVISOR_ENABLED": str(_get(settings, env_mod, "ADVISOR_ENABLED", "true")),
         "AUTH_MODE": token_mode,
         "RENDER_GIT_COMMIT": (os.getenv("RENDER_GIT_COMMIT") or "")[:12],
     }
@@ -607,7 +620,7 @@ def create_app() -> FastAPI:
         app_.state.boot_completed = False
 
         defer_val = _get(settings, env_mod, "DEFER_ROUTER_MOUNT", getattr(settings, "defer_router_mount", True) if settings else True)
-        init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, "init_engine_on_boot", True) if settings else True)
+        init_val = _get(settings, env_mod, "INIT_ENGINE_ON_BOOT", getattr(settings, env_mod, "init_engine_on_boot", True) if settings else True)
 
         app_.state.defer_router_mount = _truthy(defer_val) if isinstance(defer_val, str) else bool(defer_val)
         app_.state.init_engine_on_boot = _truthy(init_val) if isinstance(init_val, str) else bool(init_val)
@@ -676,7 +689,13 @@ def create_app() -> FastAPI:
 
     @app_.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
-        return {"status": "ok", "app": app_.title, "version": app_.version, "env": getattr(app_.state, "app_env", "unknown"), "entry_version": APP_ENTRY_VERSION}
+        return {
+            "status": "ok",
+            "app": app_.title,
+            "version": app_.version,
+            "env": getattr(app_.state, "app_env", "unknown"),
+            "entry_version": APP_ENTRY_VERSION,
+        }
 
     @app_.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
     async def favicon():
@@ -740,7 +759,12 @@ def create_app() -> FastAPI:
             "ksa_providers": ksa_providers,
             "routers_mounted": [m["name"] for m in mounted],
             "routers_failed": [
-                {"name": f["name"], "optional": bool(f.get("optional")), "loaded_from": f.get("loaded_from"), "error": _clamp_str(f.get("error") or "", 2000)}
+                {
+                    "name": f["name"],
+                    "optional": bool(f.get("optional")),
+                    "loaded_from": f.get("loaded_from"),
+                    "error": _clamp_str(f.get("error") or "", 2000),
+                }
                 for f in failed
             ],
             "time_utc": datetime.now(timezone.utc).isoformat(),
@@ -761,7 +785,11 @@ def create_app() -> FastAPI:
             except Exception:
                 safe_settings = None
 
-        return {"settings_source": getattr(app_.state, "settings_source", None), "env_snapshot": _safe_env_snapshot(settings, env_mod), "settings_safe": safe_settings}
+        return {
+            "settings_source": getattr(app_.state, "settings_source", None),
+            "env_snapshot": _safe_env_snapshot(settings, env_mod),
+            "settings_safe": safe_settings,
+        }
 
     @app_.get("/system/info", tags=["system"])
     async def system_info():
