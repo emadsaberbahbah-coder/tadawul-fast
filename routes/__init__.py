@@ -2,7 +2,7 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) – v1.7.0 (Hardened++)
+Routes package initialization (PROD SAFE) – v1.8.0 (Advisor-aware)
 
 Design rules
 - ZERO heavy imports here (no FastAPI, no routers, no app state).
@@ -15,14 +15,13 @@ Design rules
 
 Router mounting MUST remain in main.py (or your app factory).
 
-v1.7.0 changes
-- ✅ Adds optional "safe router discovery" helper (still no imports):
-    get_router_discovery()
-  Provides a structured view of which preferred module path exists per router.
-- ✅ Keeps expected list but adds grouping (core/kSA/optional) for clarity.
-- ✅ Adds SAFE environment hint flags (no secret leakage), including:
-    ALLOW_QUERY_TOKEN, DEBUG_ERRORS, LOG_LEVEL, APP_ENV
-- ✅ Provides "recommended_imports" field to make main.py mounting deterministic.
+v1.8.0 changes
+- ✅ Adds Investment Advisor module to expected lists & groups:
+    - routes.investment_advisor
+- ✅ Adds discovery entry for investment_advisor
+- ✅ Adds safe env hint flags related to advisor:
+    - ADVISOR_ENABLED
+- ✅ Keeps everything import-safe (find_spec only)
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ import importlib.util
 import os
 from typing import Dict, List, Optional, Tuple
 
-ROUTES_PACKAGE_VERSION = "1.7.0"
+ROUTES_PACKAGE_VERSION = "1.8.0"
 
 
 # -----------------------------------------------------------------------------
@@ -53,6 +52,9 @@ def get_expected_router_modules() -> List[str]:
         "routes.ai_analysis",
         "routes.advanced_analysis",
         "routes.legacy_service",
+
+        # Investment Advisor (optional)
+        "routes.investment_advisor",
 
         # KSA gateway (main router inside package)
         "routes.routes_argaam",
@@ -77,6 +79,9 @@ def get_expected_router_groups() -> Dict[str, List[str]]:
             "routes.ai_analysis",
             "routes.advanced_analysis",
             "routes.legacy_service",
+        ],
+        "advisor": [
+            "routes.investment_advisor",
         ],
         "ksa": [
             "routes.routes_argaam",
@@ -144,11 +149,11 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
 
     Example output keys:
       - enriched: preferred module path is routes.enriched_quote (or routes.enriched)
+      - investment_advisor: preferred module path is routes.investment_advisor
       - argaam: preferred module path is routes.routes_argaam (or routes_argaam)
     """
     discovery: Dict[str, Dict[str, object]] = {}
 
-    # Enriched router can be in two common places
     enriched_candidates = ["routes.enriched_quote", "routes.enriched"]
     enriched_selected = _first_existing(enriched_candidates)
     discovery["enriched"] = {
@@ -157,7 +162,6 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
         "exists": bool(enriched_selected),
     }
 
-    # AI analysis routes
     ai_candidates = ["routes.ai_analysis"]
     ai_selected = _first_existing(ai_candidates)
     discovery["ai_analysis"] = {
@@ -166,7 +170,6 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
         "exists": bool(ai_selected),
     }
 
-    # Advanced analysis routes
     adv_candidates = ["routes.advanced_analysis"]
     adv_selected = _first_existing(adv_candidates)
     discovery["advanced_analysis"] = {
@@ -175,7 +178,6 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
         "exists": bool(adv_selected),
     }
 
-    # Legacy service routes
     legacy_candidates = ["routes.legacy_service"]
     legacy_selected = _first_existing(legacy_candidates)
     discovery["legacy_service"] = {
@@ -184,7 +186,15 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
         "exists": bool(legacy_selected),
     }
 
-    # Argaam router (package + repo-root shim)
+    # NEW: Investment Advisor (optional but discoverable)
+    advisor_candidates = ["routes.investment_advisor"]
+    advisor_selected = _first_existing(advisor_candidates)
+    discovery["investment_advisor"] = {
+        "candidates": advisor_candidates,
+        "selected": advisor_selected,
+        "exists": bool(advisor_selected),
+    }
+
     argaam_candidates = ["routes.routes_argaam", "routes_argaam"]
     argaam_selected = _first_existing(argaam_candidates)
     discovery["argaam"] = {
@@ -193,7 +203,6 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
         "exists": bool(argaam_selected),
     }
 
-    # Optional config router/module
     config_candidates = ["routes.config"]
     config_selected = _first_existing(config_candidates)
     discovery["config"] = {
@@ -210,12 +219,10 @@ def get_recommended_imports() -> List[Tuple[str, str]]:
     Returns a deterministic list of recommended module imports for main.py
     in the form: [(router_name, module_path), ...]
     WITHOUT importing anything.
-
-    main.py can use these to decide which router modules to import/mount.
     """
     d = get_router_discovery()
     out: List[Tuple[str, str]] = []
-    for key in ("enriched", "ai_analysis", "advanced_analysis", "legacy_service", "argaam", "config"):
+    for key in ("enriched", "ai_analysis", "advanced_analysis", "legacy_service", "investment_advisor", "argaam", "config"):
         sel = d.get(key, {}).get("selected")
         if isinstance(sel, str) and sel:
             out.append((key, sel))
@@ -243,6 +250,7 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
     # Minimal environment hints (do NOT leak secrets)
     app_token_set = _env_flag("APP_TOKEN")
     backup_token_set = _env_flag("BACKUP_APP_TOKEN")
+    tfb_token_set = _env_flag("TFB_APP_TOKEN")
 
     # Extra safe hints (still no leakage)
     allow_query_token = (os.getenv("ALLOW_QUERY_TOKEN") or "").strip().lower() in ("1", "true", "yes", "on")
@@ -250,16 +258,21 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
     log_level = (os.getenv("LOG_LEVEL") or "").strip().lower() or ""
     app_env = (os.getenv("APP_ENV") or "").strip().lower() or ""
 
-    # Optional: detect which Argaam module(s) exist
+    advisor_enabled = (os.getenv("ADVISOR_ENABLED") or "").strip().lower() in ("", "1", "true", "yes", "on")
+    # (empty => treated as enabled by default in main.py logic)
+
     argaam_layout = {
         "routes.routes_argaam": module_exists("routes.routes_argaam"),
         "routes_argaam": module_exists("routes_argaam"),
     }
 
-    # Optional: detect which enriched module(s) exist
     enriched_layout = {
         "routes.enriched_quote": module_exists("routes.enriched_quote"),
         "routes.enriched": module_exists("routes.enriched"),
+    }
+
+    advisor_layout = {
+        "routes.investment_advisor": module_exists("routes.investment_advisor"),
     }
 
     discovery = get_router_discovery()
@@ -277,13 +290,16 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
         "recommended_imports": recommended_imports,
         "argaam_layout": argaam_layout,
         "enriched_layout": enriched_layout,
+        "advisor_layout": advisor_layout,
         "env_hints": {
             "app_token_set": app_token_set,
             "backup_app_token_set": backup_token_set,
+            "tfb_app_token_set": tfb_token_set,
             "allow_query_token": allow_query_token,
             "debug_errors": debug_errors,
             "log_level": log_level,
             "app_env": app_env,
+            "advisor_enabled": advisor_enabled,
         },
     }
 
