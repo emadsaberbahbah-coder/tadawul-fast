@@ -2,13 +2,19 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.3
+Tadawul Fast Bridge – FastAPI Entry Point (PROD SAFE + FAST BOOT) — v5.4.4
 
-Enhancements vs v5.4.2
-- ✅ FIX: Removes invalid getattr(settings, env_mod, ...) call that crashes startup.
-- ✅ Adds Investment Advisor router mount plan:
-    - routes.investment_advisor (name: investment_advisor) (optional by default)
-- ✅ Keeps startup behavior identical (never-crash boot, deferred mounts, optional router semantics)
+✅ Fix for your 404: /v1/advisor/run
+- Adds *safe advisor prefixing*:
+  If the investment_advisor router has no "/v1" prefix, we mount it with prefix="/v1".
+  This prevents the common mismatch where the router defines "/advisor/run" but the client calls "/v1/advisor/run".
+
+- Expands advisor import candidates (still prefers routes.investment_advisor).
+- Keeps NEVER-CRASH boot behavior, optional router semantics, and background deferred mounting.
+
+Notes:
+- This file alone can’t create /v1/advisor/run if the route is not implemented in routes/investment_advisor.py,
+  but it fixes the most common cause: router mounted without /v1 prefix.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.4.3"
+APP_ENTRY_VERSION = "5.4.4"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -304,7 +310,7 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     ai_enabled = _feature_enabled(settings, env_mod, "AI_ANALYSIS_ENABLED", True)
     adv_enabled = _feature_enabled(settings, env_mod, "ADVANCED_ANALYSIS_ENABLED", True)
 
-    # NEW: Advisor feature toggle (default ON but optional mount)
+    # Advisor feature toggle (default ON but optional mount)
     advisor_enabled = _feature_enabled(settings, env_mod, "ADVISOR_ENABLED", True)
 
     routers: List[Tuple[str, List[str]]] = [
@@ -315,9 +321,19 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
     if adv_enabled:
         routers.append(("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis", "routes.adv_analysis", "core.advanced_analysis"]))
 
-    # NEW: Investment Advisor router (kept optional by default)
+    # Investment Advisor router (optional)
     if advisor_enabled:
-        routers.append(("investment_advisor", ["routes.investment_advisor"]))
+        routers.append(
+            (
+                "investment_advisor",
+                [
+                    "routes.investment_advisor",         # ✅ expected path
+                    "routes.advisor",                    # fallback
+                    "routes.investmentAdvisor",          # fallback (rare)
+                    "core.investment_advisor",           # fallback
+                ],
+            )
+        )
 
     # optional routers
     routers.append(("argaam", ["routes.routes_argaam", "routes_argaam", "routes.argaam", "core.routes_argaam"]))
@@ -328,7 +344,7 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
         required.append("ai_analysis")
     if adv_enabled:
         required.append("advanced_analysis")
-    # NOTE: advisor is NOT required by default (so boot never fails)
+    # advisor not required (boot never fails)
 
     optional: List[str] = ["argaam", "legacy_service"]
     if advisor_enabled:
@@ -448,6 +464,28 @@ def _load_router_object_sync(
     return None, loaded_from, None, _clamp_str(f"Module '{loaded_from}' imported but no router found (tried {list(attr_candidates)}).", 3000)
 
 
+def _router_prefix(router_obj: Any) -> str:
+    try:
+        p = getattr(router_obj, "prefix", "")
+        return str(p or "")
+    except Exception:
+        return ""
+
+
+def _should_force_v1_prefix(router_name: str, router_obj: Any) -> bool:
+    """
+    ONLY for investment_advisor:
+    - If router already has prefix starting with "/v1" => do NOT add.
+    - If router prefix is "" or not starting with "/v1" => add prefix="/v1" to match GAS client.
+    """
+    if router_name != "investment_advisor":
+        return False
+    pref = _router_prefix(router_obj).strip()
+    if not pref:
+        return True
+    return not pref.startswith("/v1")
+
+
 async def _mount_router_async(app_: FastAPI, name: str, candidates: List[str], *, optional: bool) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "name": name,
@@ -456,6 +494,8 @@ async def _mount_router_async(app_: FastAPI, name: str, candidates: List[str], *
         "mounted": False,
         "loaded_from": None,
         "router_attr": None,
+        "router_prefix": None,
+        "mounted_prefix": None,
         "error": None,
     }
 
@@ -473,11 +513,22 @@ async def _mount_router_async(app_: FastAPI, name: str, candidates: List[str], *
         return report
 
     try:
-        app_.include_router(router_obj)  # type: ignore[arg-type]
+        rp = _router_prefix(router_obj)
+        report["router_prefix"] = rp
+
+        # ✅ Advisor-safe prefixing to fix /v1/advisor/run 404
+        if _should_force_v1_prefix(name, router_obj):
+            app_.include_router(router_obj, prefix="/v1")  # type: ignore[arg-type]
+            report["mounted_prefix"] = "/v1"
+            logger.info("Mounted router (forced /v1 prefix): %s (%s.%s) router_prefix=%s", name, loaded_from, router_attr, rp)
+        else:
+            app_.include_router(router_obj)  # type: ignore[arg-type]
+            report["mounted_prefix"] = None
+            logger.info("Mounted router: %s (%s.%s) router_prefix=%s", name, loaded_from, router_attr, rp)
+
         report["mounted"] = True
         report["loaded_from"] = loaded_from
         report["router_attr"] = router_attr
-        logger.info("Mounted router: %s (%s.%s)", name, loaded_from, router_attr)
         return report
     except Exception:
         report["error"] = _clamp_str(f"include_router failed:\n{traceback.format_exc()}", 8000)
@@ -601,10 +652,6 @@ def create_app() -> FastAPI:
     openapi_url, docs_url, redoc_url = _docs_config(settings, env_mod)
 
     def _settings_bool(settings_obj: Optional[object], attr_name: str, default: bool) -> bool:
-        """
-        Safe accessor for nested 'settings.<something>.<attr_name>' patterns.
-        This avoids invalid getattr() calls and keeps boot never-crash.
-        """
         if settings_obj is None:
             return default
         try:
@@ -613,11 +660,6 @@ def create_app() -> FastAPI:
                 return bool(direct)
         except Exception:
             pass
-
-        # Common nesting patterns:
-        # - settings.runtime.init_engine_on_boot
-        # - settings.app.init_engine_on_boot
-        # - settings.core.init_engine_on_boot
         for container_name in ("runtime", "app", "core"):
             try:
                 container = getattr(settings_obj, container_name, None)
@@ -628,7 +670,6 @@ def create_app() -> FastAPI:
                     return bool(v)
             except Exception:
                 continue
-
         return default
 
     @asynccontextmanager
@@ -787,7 +828,17 @@ def create_app() -> FastAPI:
             "providers": providers,
             "ksa_providers": ksa_providers,
             "routers_mounted": [m["name"] for m in mounted],
-            "routers_failed": [{"name": f["name"], "optional": bool(f.get("optional")), "loaded_from": f.get("loaded_from"), "error": _clamp_str(f.get("error") or "", 2000)} for f in failed],
+            "routers_failed": [
+                {
+                    "name": f["name"],
+                    "optional": bool(f.get("optional")),
+                    "loaded_from": f.get("loaded_from"),
+                    "router_prefix": f.get("router_prefix"),
+                    "mounted_prefix": f.get("mounted_prefix"),
+                    "error": _clamp_str(f.get("error") or "", 2000),
+                }
+                for f in failed
+            ],
             "time_utc": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -806,11 +857,23 @@ def create_app() -> FastAPI:
             except Exception:
                 safe_settings = None
 
-        return {"settings_source": getattr(app_.state, "settings_source", None), "env_snapshot": _safe_env_snapshot(settings, env_mod), "settings_safe": safe_settings}
+        return {
+            "settings_source": getattr(app_.state, "settings_source", None),
+            "env_snapshot": _safe_env_snapshot(settings, env_mod),
+            "settings_safe": safe_settings,
+        }
 
     @app_.get("/system/info", tags=["system"])
     async def system_info():
-        return {"service": app_.title, "version": app_.version, "entry_version": APP_ENTRY_VERSION, "environment": getattr(app_.state, "app_env", "unknown"), "start_time_utc": getattr(app_.state, "start_time_utc", None), "render_git_commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:40], "python": sys.version.split(" ")[0]}
+        return {
+            "service": app_.title,
+            "version": app_.version,
+            "entry_version": APP_ENTRY_VERSION,
+            "environment": getattr(app_.state, "app_env", "unknown"),
+            "start_time_utc": getattr(app_.state, "start_time_utc", None),
+            "render_git_commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:40],
+            "python": sys.version.split(" ")[0],
+        }
 
     return app_
 
