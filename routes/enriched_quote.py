@@ -38,14 +38,14 @@ Endpoints
 
 from __future__ import annotations
 
-import inspect
 import importlib
+import inspect
 import os
 import re
 import traceback
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Header, Query, Request
 
@@ -553,6 +553,7 @@ async def _get_engine_from_request(request: Request) -> Tuple[Optional[Any], str
 
 
 def _call_engine_method_best_effort(
+    *,
     eng: Any,
     method_name: str,
     symbol: str,
@@ -611,6 +612,7 @@ def _call_engine_method_best_effort(
 
 
 def _call_engine_batch_best_effort(
+    *,
     eng: Any,
     symbols: List[str],
     refresh: bool,
@@ -874,10 +876,8 @@ def _group_symbols_by_hint(syms: List[str]) -> Dict[str, List[str]]:
     groups: Dict[str, List[str]] = {"GLOBAL": [], "KSA": [], "INDEXFX": []}
     for s in syms:
         h = _market_hint_for(s)
-        if h not in groups:
-            groups[h] = []
+        groups.setdefault(h, [])
         groups[h].append(s)
-    # remove empties
     return {k: v for k, v in groups.items() if v}
 
 
@@ -1280,8 +1280,8 @@ async def enriched_quotes(
 
         for hint, gsyms in groups.items():
             method_used, raw_batch = _call_engine_batch_best_effort(
-                eng,
-                gsyms,
+                eng=eng,
+                symbols=gsyms,
                 refresh=bool(int(refresh or 0)),
                 fields=fields,
                 hint=hint if hint != "INDEXFX" else None,  # many engines ignore/skip hint for indices/FX
