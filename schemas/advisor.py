@@ -1,16 +1,18 @@
 # schemas/advisor.py
 """
 Tadawul Fast Bridge — Advisor Schemas (Request/Response Contract)
-Version: 0.2.0
+Version: 0.3.0
 
-Purpose
-- Validate inbound criteria from Google Sheets / GAS
-- Enforce stable, Sheets-safe outbound structure
-- Prevent breaking changes over time
+Key Fixes in v0.3.0
+- Accepts payload.tickers / payload.symbols (list OR comma string) without breaking Pydantic validation.
+- Keeps response Sheets-safe even when no opportunities are found:
+  -> headers are ALWAYS non-empty for status="ok"
+  -> rows may be empty (0 items), but schema stays renderable in Google Sheets.
+- Still ignores unknown fields (Sheets often sends extras).
 
 Design principles
 - Inputs are forgiving (strings, percent, ratio); normalized to stable internal types
-- Unknown fields are ignored (Sheets often sends extra columns)
+- Unknown fields are ignored
 - Response is stable: headers + rows + meta (always present)
 """
 
@@ -20,8 +22,7 @@ from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-TT_ADVISOR_SCHEMA_VERSION = "0.2.0"
-
+TT_ADVISOR_SCHEMA_VERSION = "0.3.0"
 
 # -----------------------------------------------------------------------------
 # Enums / Literals (keep aligned with your Sheets dropdowns)
@@ -35,6 +36,33 @@ AdvisorSource = Literal[
     "Global_Markets",
     "Mutual_Funds",
     "Commodities_FX",
+]
+
+# -----------------------------------------------------------------------------
+# Stable default headers (Sheets-safe even when result set is empty)
+# IMPORTANT: backend may return richer "items" payload; but the stable contract
+# for Sheets writing is headers+rows.
+# -----------------------------------------------------------------------------
+TT_ADVISOR_DEFAULT_HEADERS: List[str] = [
+    "Rank",
+    "Symbol",
+    "Origin",
+    "Name",
+    "Market",
+    "Currency",
+    "Price",
+    "Advisor Score",
+    "Action",
+    "Allocation %",
+    "Allocation Amount",
+    "Expected ROI % (1M)",
+    "Expected ROI % (3M)",
+    "Risk Bucket",
+    "Confidence Bucket",
+    "Reason (Explain)",
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
 ]
 
 
@@ -83,7 +111,6 @@ def _roi_to_ratio(v: Any) -> float:
         # if user typed 5 or 10 (percent), convert to 0.05 / 0.10
         if f > 1.5:
             return f / 100.0
-        # already ratio
         return f
 
     return 0.0
@@ -128,6 +155,56 @@ def _normalize_sources(v: Any) -> List[str]:
     return ["ALL"]
 
 
+def _normalize_tickers(v: Any) -> List[str]:
+    """
+    Accept:
+    - ["1120.SR", "AAPL.US"]
+    - "1120.SR,AAPL.US"
+    - "1120.SR"
+    - None -> []
+    Returns uppercase, trimmed, de-duplicated (stable order).
+    """
+    if v is None:
+        return []
+
+    items: List[str] = []
+
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        items = parts
+
+    elif isinstance(v, list):
+        for it in v:
+            if it is None:
+                continue
+            s = str(it).strip()
+            if s:
+                items.append(s)
+
+    else:
+        s = str(v).strip()
+        if s:
+            items = [s]
+
+    # normalize + dedupe preserving order
+    seen = set()
+    out: List[str] = []
+    for t in items:
+        u = t.strip().upper()
+        if not u or u == "SYMBOL":
+            continue
+        if u.startswith("#"):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Request
 # -----------------------------------------------------------------------------
@@ -140,7 +217,12 @@ class AdvisorRequest(BaseModel):
         - ratio: 0.10 means 10%
         - percent: 10 means 10%
         - string: "10%" supported
+    - tickers/symbols: can be list OR comma-separated string
     """
+
+    # NEW (compat with GAS + existing backend routes)
+    tickers: List[str] = Field(default_factory=list, description="Universe tickers list (optional).")
+    symbols: List[str] = Field(default_factory=list, description="Alias for tickers (optional).")
 
     sources: List[AdvisorSource] = Field(
         default_factory=lambda: ["ALL"],
@@ -153,13 +235,13 @@ class AdvisorRequest(BaseModel):
     required_roi_1m: float = Field(
         default=0.05,
         ge=0.0,
-        le=5.0,  # ratio upper bound; enforced after normalization
+        le=5.0,
         description="Required ROI for 1M. Accepts ratio (0.05) or percent (5). Normalized to ratio.",
     )
     required_roi_3m: float = Field(
         default=0.10,
         ge=0.0,
-        le=10.0,  # ratio upper bound; enforced after normalization
+        le=10.0,
         description="Required ROI for 3M. Accepts ratio (0.10) or percent (10). Normalized to ratio.",
     )
 
@@ -175,7 +257,7 @@ class AdvisorRequest(BaseModel):
     min_price: Optional[float] = Field(default=None, ge=0.0)
     max_price: Optional[float] = Field(default=None, ge=0.0)
 
-    model_config = {"extra": "ignore"}  # IMPORTANT: ignore unknown fields from Sheets to avoid breaking
+    model_config = {"extra": "ignore"}  # IMPORTANT: ignore unknown fields from Sheets
 
     # -------------------------
     # Validators (Pydantic v2)
@@ -184,6 +266,16 @@ class AdvisorRequest(BaseModel):
     @classmethod
     def _v_sources(cls, v: Any) -> Any:
         return _normalize_sources(v)
+
+    @field_validator("tickers", mode="before")
+    @classmethod
+    def _v_tickers(cls, v: Any) -> Any:
+        return _normalize_tickers(v)
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def _v_symbols(cls, v: Any) -> Any:
+        return _normalize_tickers(v)
 
     @field_validator("required_roi_1m", mode="before")
     @classmethod
@@ -207,13 +299,28 @@ class AdvisorRequest(BaseModel):
         return _to_float_safe(v, 10000.0)
 
     @model_validator(mode="after")
-    def _v_price_range(self) -> "AdvisorRequest":
+    def _v_post(self) -> "AdvisorRequest":
         # Swap min/max if user reversed them
         if self.min_price is not None and self.max_price is not None and self.max_price < self.min_price:
             self.min_price, self.max_price = self.max_price, self.min_price
-        # If sources contains invalid entries, Pydantic will raise; keep stability by ensuring ["ALL"] if empty
+
+        # If sources somehow empty, keep stable default
         if not self.sources:
             self.sources = ["ALL"]  # type: ignore
+
+        # Merge symbols into tickers if tickers is empty or partial
+        # (backend routes may use either name)
+        if self.symbols:
+            if not self.tickers:
+                self.tickers = list(self.symbols)
+            else:
+                # union preserve order
+                seen = set(self.tickers)
+                for s in self.symbols:
+                    if s not in seen:
+                        self.tickers.append(s)
+                        seen.add(s)
+
         return self
 
 
@@ -224,8 +331,8 @@ class AdvisorResponse(BaseModel):
     """
     Stable output for Sheets writing.
 
-    - status: "ok" or "error" (preferred, consistent with other routes)
-    - headers: list of strings (must be non-empty for successful run)
+    - status: "ok" or "error"
+    - headers: list of strings (must be non-empty for status="ok")
     - rows: list of arrays aligned with headers
     - meta: run metadata, diagnostics, criteria echo
     - error: optional error message when status="error"
@@ -243,22 +350,43 @@ class AdvisorResponse(BaseModel):
 
     @model_validator(mode="after")
     def _v_response_consistency(self) -> "AdvisorResponse":
-        # If error exists, force status=error
+        # Force status=error when error exists
         if self.error and self.status != "error":
             self.status = "error"  # type: ignore
 
-        # If status=error, headers/rows can be empty; if ok, keep them as lists
+        # Ensure containers exist
         if self.headers is None:
             self.headers = []  # type: ignore
         if self.rows is None:
             self.rows = []  # type: ignore
         if self.meta is None:
             self.meta = {}  # type: ignore
+
+        # CRITICAL FIX:
+        # If status="ok" but no opportunities found, we STILL return stable headers
+        # so Google Sheets can render the report without "0 columns" errors.
+        if self.status == "ok" and (not self.headers or len(self.headers) == 0):
+            self.headers = list(TT_ADVISOR_DEFAULT_HEADERS)
+
+        # If rows exist, normalize row widths to match headers
+        if self.headers and self.rows:
+            w = len(self.headers)
+            normalized: List[List[Any]] = []
+            for r in self.rows:
+                rr = list(r) if isinstance(r, list) else []
+                if len(rr) < w:
+                    rr.extend([""] * (w - len(rr)))
+                elif len(rr) > w:
+                    rr = rr[:w]
+                normalized.append(rr)
+            self.rows = normalized
+
         return self
 
 
 __all__ = [
     "TT_ADVISOR_SCHEMA_VERSION",
+    "TT_ADVISOR_DEFAULT_HEADERS",
     "RiskBucket",
     "ConfidenceBucket",
     "AdvisorSource",
