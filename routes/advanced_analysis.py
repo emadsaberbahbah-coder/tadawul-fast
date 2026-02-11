@@ -1,3 +1,4 @@
+# routes/advanced_analysis.py
 """
 TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.15.1) – PROD SAFE (ALIGNED + PUSH-CACHE FIX)
 
@@ -5,7 +6,7 @@ TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.15.1) – PROD SAFE (ALIGNE
 - POST /v1/advanced/sheet-rows now supports TWO MODES:
   1) PUSH MODE (Google Sheets -> Backend cache):
      Body contains: {"items":[{"sheet":"Market_Leaders","headers":[...],"rows":[...]}], ...}
-     -> Writes payload into data_engine_v2 cache using best-effort engine method probing.
+     -> Writes payload into engine cache using best-effort engine method probing.
   2) COMPUTE MODE (Backend -> Sheets rows):
      Body contains: {"tickers":[...], "sheet_name":"Market_Leaders"} (existing behavior)
 
@@ -321,6 +322,8 @@ def _engine_capable(obj: Any) -> bool:
     # also allow "cache" engine (for push)
     if callable(getattr(obj, "cache_write_sheet", None)) or callable(getattr(obj, "write_sheet_cache", None)):
         return True
+    if callable(getattr(obj, "set_cached_sheet_snapshot", None)) or callable(getattr(obj, "set_sheet_snapshot", None)):
+        return True
     return False
 
 
@@ -494,7 +497,8 @@ def _chunk(items: List[str], size: int) -> List[List[str]]:
 def _to_sheet_key(sheet_name: str) -> str:
     """
     Canonicalize sheet identifier so both writers/readers match.
-    IMPORTANT: investment_advisor.py should use the SAME canonicalization.
+    This normalizes spaces -> underscores but does NOT force upper-case,
+    because some engines key by exact sheet name. We always try both.
     """
     s = (sheet_name or "").strip()
     s = re.sub(r"\s+", "_", s)
@@ -512,14 +516,28 @@ async def _engine_cache_write_sheet(
     """
     Try multiple possible engine methods without importing data_engine_v2 directly.
     Returns (ok, method_used_or_error).
+
+    IMPORTANT:
+    - We write using BOTH "sheet name" and "sheet key" variants when possible,
+      to maximize hit rate for downstream readers.
     """
     if engine is None:
         return False, "engine_none"
 
-    sheet_key = _to_sheet_key(sheet)
+    raw_sheet = (sheet or "").strip()
+    if not raw_sheet:
+        return False, "sheet_empty"
 
+    sheet_key = _to_sheet_key(raw_sheet)
+    sheet_key_upper = sheet_key.upper()
+
+    # Prefer explicit snapshot setter names first (your DataEngine v2.14 uses snapshot wording)
     candidates = [
-        # preferred explicit methods
+        "set_cached_sheet_snapshot",
+        "set_sheet_snapshot",
+        "set_cached_snapshot",
+        "cache_set_sheet_snapshot",
+        # then older/alternate names
         "cache_write_sheet",
         "write_sheet_cache",
         "set_sheet_cache",
@@ -535,35 +553,50 @@ async def _engine_cache_write_sheet(
         "cache_put",
     ]
 
-    payload = {
-        "sheet": sheet_key,
+    base_payload = {
         "headers": headers or [],
         "rows": rows or [],
         "meta": meta or {},
         "updated_at_utc": _now_utc_iso(),
     }
 
+    # We'll try writing under several ids to match any reader convention.
+    # Order matters: try raw tab name first, then normalized, then UPPER key.
+    sheet_variants = []
+    if raw_sheet:
+        sheet_variants.append(raw_sheet)
+    if sheet_key and sheet_key not in sheet_variants:
+        sheet_variants.append(sheet_key)
+    if sheet_key_upper and sheet_key_upper not in sheet_variants:
+        sheet_variants.append(sheet_key_upper)
+
+    last_err = "no_cache_writer_found"
+
     # 1) method probing on engine itself
     for name in candidates:
         fn = getattr(engine, name, None)
         if not callable(fn):
             continue
-        try:
-            # common signatures in the wild
-            # (sheet, headers, rows, meta=?)
+
+        for sv in sheet_variants:
+            payload = dict(base_payload)
+            payload["sheet"] = sv
+
             try:
-                r = fn(sheet_key, headers, rows, meta or {})
-            except TypeError:
-                # (payload)
-                r = fn(payload)
-            r2 = await _maybe_await(r)
-            # treat "False" as failure, everything else as ok
-            if r2 is False:
-                continue
-            return True, f"engine.{name}"
-        except Exception as exc:
-            last = f"engine.{name} failed: {exc}"
-            logger.warning("[advanced][push] %s", last)
+                # common signatures:
+                #  - fn(sheet, headers, rows, meta)
+                #  - fn(payload_dict)
+                try:
+                    r = fn(sv, headers, rows, meta or {})
+                except TypeError:
+                    r = fn(payload)
+                r2 = await _maybe_await(r)
+                if r2 is False:
+                    continue
+                return True, f"engine.{name} ({sv})"
+            except Exception as exc:
+                last_err = f"engine.{name}({sv}) failed: {exc}"
+                logger.warning("[advanced][push] %s", last_err)
 
     # 2) if engine has a .cache object, probe that too
     cache_obj = getattr(engine, "cache", None)
@@ -572,20 +605,25 @@ async def _engine_cache_write_sheet(
             fn = getattr(cache_obj, name, None)
             if not callable(fn):
                 continue
-            try:
-                try:
-                    r = fn(sheet_key, headers, rows, meta or {})
-                except TypeError:
-                    r = fn(payload)
-                r2 = await _maybe_await(r)
-                if r2 is False:
-                    continue
-                return True, f"engine.cache.{name}"
-            except Exception as exc:
-                last = f"engine.cache.{name} failed: {exc}"
-                logger.warning("[advanced][push] %s", last)
 
-    return False, "no_cache_writer_found"
+            for sv in sheet_variants:
+                payload = dict(base_payload)
+                payload["sheet"] = sv
+
+                try:
+                    try:
+                        r = fn(sv, headers, rows, meta or {})
+                    except TypeError:
+                        r = fn(payload)
+                    r2 = await _maybe_await(r)
+                    if r2 is False:
+                        continue
+                    return True, f"engine.cache.{name} ({sv})"
+                except Exception as exc:
+                    last_err = f"engine.cache.{name}({sv}) failed: {exc}"
+                    logger.warning("[advanced][push] %s", last_err)
+
+    return False, last_err
 
 
 # =============================================================================
@@ -606,9 +644,7 @@ class PushSheetItem(_ExtraIgnore):
 
 
 class PushSheetRowsRequest(_ExtraIgnore):
-    # GAS sends items for multiple sheets
     items: List[PushSheetItem] = Field(default_factory=list)
-    # optional metadata
     universe_rows: Optional[int] = None
     source: Optional[str] = None
 
@@ -753,7 +789,6 @@ def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
             pass
 
     if want_adv:
-        # keep it simple here: most of your advanced headers are driven by schema anyway
         return ["Rank", "Origin"] + _fallback_headers_59(), "advanced"
 
     if _SCHEMAS_DEFAULT_59 is not None:
@@ -766,7 +801,7 @@ def _select_headers(sheet_name: Optional[str]) -> Tuple[List[str], str]:
 
 
 # =============================================================================
-# Engine calls (compat shim + chunking)  [unchanged behavior]
+# Engine calls (compat shim + chunking)
 # =============================================================================
 def _unwrap_tuple_payload(x: Any) -> Any:
     if isinstance(x, tuple) and len(x) == 2:
@@ -927,7 +962,6 @@ async def advanced_scoreboard(
         max_concurrency=cfg["concurrency"],
     )
 
-    # keep scoreboard minimal here (your original file had a large AdvancedItem implementation)
     items = []
     for s in requested[:top_n]:
         uq = unified_map.get(s.upper()) or _make_placeholder(s)
@@ -963,7 +997,11 @@ async def advanced_sheet_rows(
       -> returns {headers, rows}
     """
     if not _auth_ok(x_app_token):
-        return {"status": "error", "error": "Unauthorized (invalid or missing X-APP-TOKEN).", "version": ADVANCED_ANALYSIS_VERSION}
+        return {
+            "status": "error",
+            "error": "Unauthorized (invalid or missing X-APP-TOKEN).",
+            "version": ADVANCED_ANALYSIS_VERSION,
+        }
 
     # ----------------------------
     # 1) PUSH MODE (detect by "items")
@@ -996,7 +1034,6 @@ async def advanced_sheet_rows(
                 }
             )
 
-        # IMPORTANT: this response is what you should see in logs to confirm it wrote
         return PushSheetRowsResponse(status="success", version=ADVANCED_ANALYSIS_VERSION, written=written)
 
     # ----------------------------
@@ -1057,9 +1094,8 @@ async def advanced_sheet_rows(
                 except Exception as exc:
                     _safe_set(uq, "error", f"Row mapping failed: {exc}")
 
-            # very safe fallback: only ensures width
-            row2 = [None] * len(headers)
-            rows.append(row2)
+            # very safe fallback: placeholder row of correct width
+            rows.append([None] * len(headers))
 
         return AdvancedSheetResponse(status="success", headers=headers, rows=rows)
 
