@@ -1,23 +1,17 @@
 # routes/investment_advisor.py
 """
 Tadawul Fast Bridge — Investment Advisor Routes (GOOGLE SHEETS SAFE)
-Full Replacement — v1.5.0
+FULL REPLACEMENT — v1.5.0
 
-What changed vs your v1.4.0
-- ✅ FIX (CACHE READ): Investment Advisor now asks the engine for snapshots using multiple
-  naming variants (sheet names + sheet keys), matching DataEngine v2.14.0 key-stable cache.
-- ✅ Stronger payload normalization:
-    - sources: supports ALL / array / comma string
-    - risk/confidence: trimmed defaults
-    - required_roi_1m / required_roi_3m: percent-ish -> ratio (0.05 means 5%)
-    - amount: number coercion
-    - max_items/top_n: safe int clamp (1..200)
-- ✅ Sheets-safe outputs: headers never empty when status="ok"
-- ✅ Diagnostics meta includes cache hits per source + which sheets were found in cache
-- ✅ Still prod-safe (lazy import of core), token guard unchanged.
+What this route does
+- Token guard (open if no token configured)
+- Normalizes GAS payload into core payload
+- Calls: core.investment_advisor.run_investment_advisor(payload, engine=app.state.engine)
+- Ensures Sheets-safe output (headers never empty when status="ok")
+- Adds cache-hit diagnostics for engine snapshots
 
 NOTE
-- This route does NOT fetch sheets itself — it depends on /v1/advanced/sheet-rows
+- This route DOES NOT fetch sheets. It depends on /v1/advanced/sheet-rows (or similar)
   having already populated engine.set_cached_sheet_snapshot(...).
 """
 
@@ -357,7 +351,8 @@ def _probe_engine_snapshots(engine: Any, sources: List[str]) -> Tuple[Dict[str, 
     Returns:
       - hits: {source: True/False}
       - hit_count
-    We probe both sheet-name and sheetKey variants so we can report accurate diagnostics.
+
+    We probe both sheet-name and sheetKey variants so diagnostics match DataEngine v2.14 cache keys.
     """
     hits: Dict[str, bool] = {}
     hit_count = 0
@@ -372,35 +367,35 @@ def _probe_engine_snapshots(engine: Any, sources: List[str]) -> Tuple[Dict[str, 
             hits[s] = False
         return hits, 0
 
-    # Probe using both original sources and known sheetKey variants for max intersection
+    tab_to_key = {
+        "MARKET_LEADERS": "MARKET_LEADERS",
+        "GLOBAL_MARKETS": "GLOBAL_MARKETS",
+        "MUTUAL_FUNDS": "MUTUAL_FUNDS",
+        "COMMODITIES_FX": "COMMODITIES_FX",
+        "MARKET_LEADERS".lower(): "MARKET_LEADERS",
+        "GLOBAL_MARKETS".lower(): "GLOBAL_MARKETS",
+        "MUTUAL_FUNDS".lower(): "MUTUAL_FUNDS",
+        "COMMODITIES_FX".lower(): "COMMODITIES_FX",
+        "Market_Leaders".upper(): "MARKET_LEADERS",
+        "Global_Markets".upper(): "GLOBAL_MARKETS",
+        "Mutual_Funds".upper(): "MUTUAL_FUNDS",
+        "Commodities_FX".upper(): "COMMODITIES_FX",
+    }
+
     for s in sources:
         ok = False
+
+        # try exact
         try:
             snap = getter(s)
             ok = bool(isinstance(snap, dict) and isinstance(snap.get("rows"), list))
         except Exception:
             ok = False
 
-        # if not found, try mapping to common sheetKey (if they passed tab name)
+        # try mapped key variant
         if not ok:
-            up = str(s or "").strip().upper()
-            alt = None
-            if up in {"MARKET_LEADERS", "GLOBAL_MARKETS", "MUTUAL_FUNDS", "COMMODITIES_FX"}:
-                alt = up
-            else:
-                # tab-name -> key-name
-                m = {
-                    "MARKET_LEADERS": "MARKET_LEADERS",
-                    "Market_Leaders".upper(): "MARKET_LEADERS",
-                    "GLOBAL_MARKETS": "GLOBAL_MARKETS",
-                    "Global_Markets".upper(): "GLOBAL_MARKETS",
-                    "MUTUAL_FUNDS": "MUTUAL_FUNDS",
-                    "Mutual_Funds".upper(): "MUTUAL_FUNDS",
-                    "COMMODITIES_FX": "COMMODITIES_FX",
-                    "Commodities_FX".upper(): "COMMODITIES_FX",
-                }
-                alt = m.get(up)
-
+            up = str(s or "").strip()
+            alt = tab_to_key.get(up.upper()) or tab_to_key.get(up.lower())
             if alt:
                 try:
                     snap2 = getter(alt)
@@ -508,7 +503,6 @@ async def _run_core(request: Request, payload: Dict[str, Any], *, debug: int = 0
     cache_hits, cache_hit_count = _probe_engine_snapshots(engine, payload.get("sources") or [])
 
     try:
-        # core is sync; keep it simple
         result = run_investment_advisor(payload, engine=engine)  # type: ignore
         if not isinstance(result, dict):
             return _ensure_ok_headers(
