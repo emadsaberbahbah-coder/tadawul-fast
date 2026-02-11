@@ -1,26 +1,17 @@
-# tadawul-fast/routes/investment_advisor.py
+# routes/investment_advisor.py
 """
 Tadawul Fast Bridge — Investment Advisor Routes (GOOGLE SHEETS SAFE)
-Full Replacement — v1.3.2
+Full Replacement — v1.4.0
 
-Fixes in v1.3.2
-- ✅ NEVER returns empty headers when status="ok"
-  - If engine returns {count:0, items:[], headers:[]} -> we inject default headers and rows=[]
-- ✅ Supports payload.tickers / payload.symbols (list OR comma string)
-- ✅ Supports both engine output modes:
-  1) items[] (dicts)  -> converted to headers+rows
-  2) headers+rows     -> used as-is, but headers are enforced non-empty for ok
-- ✅ Keeps endpoints:
-  - GET  /v1/advisor/health
-  - GET  /v1/advisor/ping
-  - POST /v1/advisor/recommendations
-  - POST /v1/advisor/run  (alias)
-- ✅ Token guard (same behavior as your v1.2.0)
-- ✅ PROD SAFE: lazy engine import, never crashes startup
-
-NOTE
-- Your Render log shows this file is the one mounted:
-  Mounted router: investment_advisor (routes.investment_advisor.router) router_prefix=/v1/advisor
+Why this revision (vs your v1.3.2 text)
+- ✅ FIX #1 (most important): map GAS payload -> advisor core correctly
+  GAS sends: amount / max_items / required_roi_1m (percent) / required_roi_3m (percent)
+  Your core expects: invest_amount / top_n / required_roi_1m (ratio) / required_roi_3m (ratio)
+  This mismatch is why you got: tickers_count=1262 but Universe Scan Size = 0 candidates.
+- ✅ FIX #2: call the revised core: core.investment_advisor.run_investment_advisor(..., engine=app.state.engine)
+  so it can actually read cached sheet rows from the ENGINE instance.
+- ✅ Still keeps your endpoints and token guard.
+- ✅ Always returns Sheets-safe headers (never empty when status="ok").
 """
 
 from __future__ import annotations
@@ -35,13 +26,13 @@ from fastapi import APIRouter, Body, Header, Query, Request
 
 logger = logging.getLogger("routes.investment_advisor")
 
-ADVISOR_ROUTE_VERSION = "1.3.2"
+ADVISOR_ROUTE_VERSION = "1.4.0"
 router = APIRouter(prefix="/v1/advisor", tags=["investment_advisor"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
 
-# Sheets-safe default headers (must match your schemas/advisor.py v0.3.0 default headers)
+# Sheets-safe default headers (for GAS write safety)
 TT_ADVISOR_DEFAULT_HEADERS: List[str] = [
     "Rank",
     "Symbol",
@@ -187,6 +178,17 @@ def _parse_percentish(v: Any, *, default: Optional[float] = None) -> Optional[fl
     return x
 
 
+def _percent_to_ratio(p: Any, *, default_ratio: float) -> float:
+    """
+    Accept percent-ish and return ratio.
+    """
+    pct = _parse_percentish(p, default=default_ratio * 100.0)
+    try:
+        return float(pct or 0.0) / 100.0
+    except Exception:
+        return default_ratio
+
+
 def _normalize_sources(v: Any) -> List[str]:
     if v is None:
         return list(DEFAULT_SOURCES)
@@ -251,100 +253,75 @@ def _normalize_tickers(v: Any) -> List[str]:
 
 def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Produces a stable engine-friendly payload while staying backward compatible.
-    Also carries tickers/symbols through.
+    Produces:
+      - advisor_core_payload: keys that core.investment_advisor.run_investment_advisor expects
+      - also keeps original extras in meta/logs if needed
     """
-    out = dict(body or {})
+    raw = dict(body or {})
 
-    # sources
-    out["sources"] = _normalize_sources(out.get("sources"))
+    sources = _normalize_sources(raw.get("sources"))
 
-    # risk/confidence
-    out["risk"] = (out.get("risk") or "Moderate")
-    out["confidence"] = (out.get("confidence") or "High")
+    risk = raw.get("risk") or "Moderate"
+    confidence = raw.get("confidence") or "High"
 
-    # tickers/symbols universe
-    out["tickers"] = _normalize_tickers(out.get("tickers"))
-    out["symbols"] = _normalize_tickers(out.get("symbols"))
+    # carry tickers for diagnostics only (core currently scans cached sheets)
+    tickers = _normalize_tickers(raw.get("tickers") or raw.get("symbols"))
 
-    # amount
-    if out.get("invest_amount") is not None and out.get("amount") is None:
-        out["amount"] = out.get("invest_amount")
+    # GAS sends amount OR invest_amount
+    amount = raw.get("amount")
+    if amount is None:
+        amount = raw.get("invest_amount")
     try:
-        out["amount"] = float(out.get("amount") or 0)
+        amount_f = float(amount or 0.0)
     except Exception:
-        out["amount"] = 0.0
+        amount_f = 0.0
 
-    # top_n / max_items
-    if out.get("top_n") is not None and out.get("max_items") is None:
-        out["max_items"] = out.get("top_n")
-    if out.get("max_positions") is not None and out.get("max_items") is None:
-        out["max_items"] = out.get("max_positions")
+    # GAS sends max_items OR top_n OR max_positions
+    max_items = raw.get("max_items")
+    if max_items is None:
+        max_items = raw.get("top_n")
+    if max_items is None:
+        max_items = raw.get("max_positions")
     try:
-        out["max_items"] = int(out.get("max_items") or 10)
+        max_items_i = int(max_items or 10)
     except Exception:
-        out["max_items"] = 10
+        max_items_i = 10
 
     # include_news
-    if out.get("include_news") is None:
-        out["include_news"] = out.get("includeNews")
-    out["include_news"] = bool(_truthy(out["include_news"])) if isinstance(out.get("include_news"), str) else bool(out.get("include_news"))
+    include_news = raw.get("include_news")
+    if include_news is None:
+        include_news = raw.get("includeNews")
+    include_news_b = bool(_truthy(include_news)) if isinstance(include_news, str) else bool(include_news if include_news is not None else True)
 
-    # ROI (percent, for engine compatibility; your schema may convert to ratios elsewhere)
-    out["required_roi_1m"] = _parse_percentish(out.get("required_roi_1m"), default=_parse_percentish(out.get("target_roi_1m"), default=5.0))
-    out["required_roi_3m"] = _parse_percentish(out.get("required_roi_3m"), default=_parse_percentish(out.get("target_roi_3m"), default=10.0))
+    # REQUIRED ROI:
+    # routes receives percent-ish; core expects ratio
+    req_1m_ratio = _percent_to_ratio(raw.get("required_roi_1m") or raw.get("target_roi_1m"), default_ratio=0.05)
+    req_3m_ratio = _percent_to_ratio(raw.get("required_roi_3m") or raw.get("target_roi_3m"), default_ratio=0.10)
 
-    # currency
-    cur = str(out.get("currency") or "SAR").strip().upper()
-    out["currency"] = cur or "SAR"
+    currency = str(raw.get("currency") or "SAR").strip().upper() or "SAR"
 
-    return out
+    advisor_core_payload: Dict[str, Any] = {
+        "sources": sources,
+        "risk": risk,
+        "confidence": confidence,
+        "required_roi_1m": req_1m_ratio,
+        "required_roi_3m": req_3m_ratio,
+        "top_n": max_items_i,
+        "invest_amount": amount_f,
+        "include_news": include_news_b,
+        "currency": currency,
+    }
+
+    # keep some diagnostics
+    advisor_core_payload["_diag_tickers_count"] = len(tickers)
+    advisor_core_payload["_diag_tickers"] = tickers[:50]  # avoid huge
+    return advisor_core_payload
 
 
 # ---------------------------------------------------------------------
 # Table conversion + safety enforcement
 # ---------------------------------------------------------------------
-def _items_to_table(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Convert engine items into Sheets table with stable headers.
-    """
-    headers = list(TT_ADVISOR_DEFAULT_HEADERS)
-    rows: List[List[Any]] = []
-
-    for i, it in enumerate(items or [], start=1):
-        rows.append(
-            [
-                i,
-                it.get("symbol", "") or it.get("ticker", "") or "",
-                it.get("origin", "") or "",
-                it.get("name", "") or "",
-                it.get("market", "") or "",
-                it.get("currency", "") or "",
-                it.get("price", "") or it.get("current_price", "") or "",
-                it.get("advisor_score", "") or it.get("score", "") or "",
-                it.get("action", "") or it.get("recommendation", "") or "",
-                it.get("allocation_pct", "") or it.get("allocation_percent", "") or "",
-                it.get("allocation_amount", "") or it.get("amount", "") or "",
-                it.get("expected_roi_1m_pct", "") or it.get("roi_1m_pct", "") or "",
-                it.get("expected_roi_3m_pct", "") or it.get("roi_3m_pct", "") or "",
-                it.get("risk_bucket", "") or it.get("risk", "") or "",
-                it.get("confidence_bucket", "") or it.get("confidence", "") or "",
-                it.get("reason", "") or it.get("explain", "") or "",
-                it.get("data_source", "") or it.get("source", "") or "",
-                it.get("data_quality", "") or it.get("quality", "") or "",
-                it.get("last_updated_utc", "") or it.get("updated_at_utc", "") or "",
-            ]
-        )
-
-    return {"headers": headers, "rows": rows}
-
-
 def _ensure_ok_headers(resp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    CRITICAL:
-    If status is ok but headers empty -> set default headers and keep rows (or empty).
-    Also normalize row widths when rows exist.
-    """
     status = str(resp.get("status") or "ok").lower()
     headers = resp.get("headers")
     rows = resp.get("rows")
@@ -357,7 +334,6 @@ def _ensure_ok_headers(resp: Dict[str, Any]) -> Dict[str, Any]:
     if status == "ok" and len(headers) == 0:
         headers = list(TT_ADVISOR_DEFAULT_HEADERS)
 
-    # normalize row widths
     if headers and rows:
         w = len(headers)
         fixed_rows: List[List[Any]] = []
@@ -418,75 +394,71 @@ def _auth_guard_or_envelope(
     return None
 
 
-async def _run_engine(request: Request, payload: Dict[str, Any], *, debug: int = 0) -> Dict[str, Any]:
+async def _run_core(request: Request, payload: Dict[str, Any], *, debug: int = 0) -> Dict[str, Any]:
+    """
+    Calls core.investment_advisor.run_investment_advisor(..., engine=app.state.engine)
+    """
     # Lazy import (prod safe)
     try:
-        from core.investment_advisor_engine import build_recommendations  # type: ignore
+        from core.investment_advisor import run_investment_advisor  # type: ignore
     except Exception as exc:
-        logger.exception("Advisor engine import failed: %s", exc)
+        logger.exception("Advisor core import failed: %s", exc)
         return _ensure_ok_headers(
             _envelope_error(
-                f"Advisor engine missing: {exc}",
+                f"Advisor core missing: {exc}",
                 extra={"headers": list(TT_ADVISOR_DEFAULT_HEADERS), "rows": [], "items": []},
             )
         )
 
+    engine = None
     try:
-        result = await build_recommendations(request=request, payload=payload)  # type: ignore
+        st = getattr(request.app, "state", None)
+        engine = getattr(st, "engine", None) if st else None
+    except Exception:
+        engine = None
+
+    try:
+        result = run_investment_advisor(payload, engine=engine)  # type: ignore
         if not isinstance(result, dict):
             return _ensure_ok_headers(
                 _envelope_error(
-                    "Advisor engine returned non-dict result",
+                    "Advisor core returned non-dict result",
                     extra={"headers": list(TT_ADVISOR_DEFAULT_HEADERS), "rows": [], "items": []},
                 )
             )
 
-        # normalize shape
-        result.setdefault("meta", {})
-        result.setdefault("items", [])
-        result.setdefault("headers", [])
-        result.setdefault("rows", [])
-
-        # If engine returned items (recommended path), convert to table when headers empty
-        items = result.get("items") if isinstance(result.get("items"), list) else []
         headers = result.get("headers") if isinstance(result.get("headers"), list) else []
         rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+        meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
 
-        if items and (not headers or len(headers) == 0):
-            table = _items_to_table(items)  # stable headers+rows
-            headers = table["headers"]
-            rows = table["rows"]
-
-        # If count==0 and headers still empty => fixed later by _ensure_ok_headers
         out = _envelope_ok(
             {
-                **result,
                 "headers": headers,
                 "rows": rows,
-                "engine_version": result.get("engine_version") or result.get("engine") or None,
+                "items": [],  # core returns table
+                "count": len(rows or []),
+                "meta": meta,
+                "engine_version": meta.get("engine_version") or None,
             }
         )
 
-        # Always ensure headers not empty for ok
-        out = _ensure_ok_headers(out)
-
-        # Add safe diagnostics
+        # add route diagnostics
         try:
-            meta = out.get("meta") if isinstance(out.get("meta"), dict) else {}
-            meta.update(
+            out_meta = out.get("meta") if isinstance(out.get("meta"), dict) else {}
+            out_meta.update(
                 {
                     "route_version": ADVISOR_ROUTE_VERSION,
-                    "tickers_count": len(payload.get("tickers") or payload.get("symbols") or []),
+                    "diag_tickers_count": payload.get("_diag_tickers_count", 0),
                 }
             )
-            out["meta"] = meta
+            out["meta"] = out_meta
         except Exception:
             pass
 
-        return out
+        return _ensure_ok_headers(out)
 
     except Exception as exc:
-        logger.exception("Advisor engine execution failed: %s", exc)
+        logger.exception("Advisor core execution failed: %s", exc)
         extra: Dict[str, Any] = {"headers": list(TT_ADVISOR_DEFAULT_HEADERS), "rows": [], "items": []}
         if int(debug or 0):
             extra["trace"] = str(exc)
@@ -508,16 +480,18 @@ async def advisor_recommendations(
 
     payload = _normalize_payload(body or {})
 
-    # Helpful server log
     try:
-        logger.info("[Advisor] /recommendations tickers=%s symbols=%s sources=%s",
-                    len(payload.get("tickers") or []),
-                    len(payload.get("symbols") or []),
-                    ",".join(payload.get("sources") or []))
+        logger.info(
+            "[Advisor] /recommendations sources=%s top_n=%s amount=%s diag_tickers=%s",
+            ",".join(payload.get("sources") or []),
+            payload.get("top_n"),
+            payload.get("invest_amount"),
+            payload.get("_diag_tickers_count"),
+        )
     except Exception:
         pass
 
-    return await _run_engine(request, payload, debug=debug)
+    return await _run_core(request, payload, debug=debug)
 
 
 @router.post("/run")
@@ -539,14 +513,17 @@ async def advisor_run(
     payload = _normalize_payload(body or {})
 
     try:
-        logger.info("[Advisor] /run tickers=%s symbols=%s sources=%s",
-                    len(payload.get("tickers") or []),
-                    len(payload.get("symbols") or []),
-                    ",".join(payload.get("sources") or []))
+        logger.info(
+            "[Advisor] /run sources=%s top_n=%s amount=%s diag_tickers=%s",
+            ",".join(payload.get("sources") or []),
+            payload.get("top_n"),
+            payload.get("invest_amount"),
+            payload.get("_diag_tickers_count"),
+        )
     except Exception:
         pass
 
-    return await _run_engine(request, payload, debug=debug)
+    return await _run_core(request, payload, debug=debug)
 
 
 __all__ = ["router"]
