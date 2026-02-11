@@ -2,7 +2,22 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.13.0) — PROD SAFE + ROUTER FRIENDLY (FULL REPLACEMENT)
+UNIFIED DATA ENGINE (v2.14.0) — PROD SAFE + ROUTER FRIENDLY (FULL REPLACEMENT)
+
+✅ Key Fix in v2.14.0 (YOUR BUG)
+- The Investment Advisor reads "sheet snapshot" cache using a cache key variant
+  that was NOT guaranteed to match what /v1/advanced/sheet-rows writes.
+- This revision makes the sheet snapshot cache **key-stable + backward compatible**
+  by storing AND reading under **multiple deterministic key variants**:
+    - raw sheet name
+    - normalized (casefold/trim)
+    - UPPER, lower
+    - canonical underscore version
+    - standard sheetKey variants (MARKET_LEADERS, GLOBAL_MARKETS, MUTUAL_FUNDS, COMMODITIES_FX)
+
+Result:
+- POST /v1/advanced/sheet-rows can write any sheet name,
+  and routes/investment_advisor.py can read it reliably even if it uses a different naming form.
 
 Design goals
 - ✅ PROD SAFE: no network at import-time, no provider imports at import-time
@@ -16,15 +31,7 @@ Design goals
 - ✅ Patch merge semantics: never overwrite existing non-empty values
 - ✅ Uses shared symbol normalization when available: core.symbols.normalize.normalize_symbol
 - ✅ Cache key includes (symbol_norm + fields) to avoid cross-request cache pollution
-- ✅ Forecast canonical fields + back-compat aliases:
-    forecast_price_{1m,3m,12m}, expected_roi_{1m,3m,12m},
-    forecast_confidence (0..1), forecast_updated_utc/riyadh
-    plus expected_price_*, expected_return_*, confidence_score, forecast_updated
-
-NEW in v2.13.0 (Advisor Performance)
-- ✅ Adds a second TTL cache for "Sheet Snapshot" data across pages:
-    - Market_Leaders / Global_Markets / Mutual_Funds / Commodities_FX
-  This allows Investment Advisor to reuse cached sheet data and avoid duplicate fetches.
+- ✅ Forecast canonical fields + back-compat aliases
 
 Environment knobs (optional)
 - ENGINE_CACHE_TTL_SEC                   (default 45)
@@ -32,8 +39,8 @@ Environment knobs (optional)
 - ENGINE_CONCURRENCY                     (default 12)
 - ENGINE_INCLUDE_WARNINGS=true|false     (default false)
 - KEEP_RAW_HISTORY=true|false            (default false)
-- SHEET_CACHE_TTL_SEC                    (default 180)  <-- NEW
-- SHEET_CACHE_MAXSIZE                    (default 64)   <-- NEW
+- SHEET_CACHE_TTL_SEC                    (default 180)
+- SHEET_CACHE_MAXSIZE                    (default 64)
 """
 
 from __future__ import annotations
@@ -51,7 +58,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.13.0"
+ENGINE_VERSION = "2.14.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -1292,6 +1299,109 @@ _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# ============================================================
+# Sheet-name canonicalization (KEY-STABLE cache)
+# ============================================================
+_SHEET_ALIASES: Dict[str, str] = {
+    # canonical (underscore) -> canonical (underscore)
+    "market_leaders": "market_leaders",
+    "global_markets": "global_markets",
+    "mutual_funds": "mutual_funds",
+    "commodities_fx": "commodities_fx",
+    # common variants
+    "market leaders": "market_leaders",
+    "global markets": "global_markets",
+    "mutual funds": "mutual_funds",
+    "commodities fx": "commodities_fx",
+    "commodities&fx": "commodities_fx",
+    "commodities/fx": "commodities_fx",
+}
+
+_SHEETKEY_BY_CANON: Dict[str, str] = {
+    "market_leaders": "MARKET_LEADERS",
+    "global_markets": "GLOBAL_MARKETS",
+    "mutual_funds": "MUTUAL_FUNDS",
+    "commodities_fx": "COMMODITIES_FX",
+}
+
+_CANON_BY_SHEETKEY: Dict[str, str] = {v: k for k, v in _SHEETKEY_BY_CANON.items()}
+
+
+def _canon_sheet_name(name: str) -> str:
+    s = (name or "").strip()
+    if not s:
+        return ""
+    s2 = re.sub(r"\s+", " ", s).strip()
+    low = s2.casefold()
+    low = low.replace("-", " ").replace(".", " ").replace("__", " ")
+    low = low.replace("&", "&").strip()
+    low = re.sub(r"\s+", " ", low)
+
+    if low in _SHEET_ALIASES:
+        return _SHEET_ALIASES[low]
+
+    # try underscore form
+    unders = re.sub(r"[^a-z0-9]+", "_", low).strip("_")
+    if unders in _SHEET_ALIASES:
+        return _SHEET_ALIASES[unders]
+
+    # if user passed a sheetKey already
+    up = s2.strip().upper()
+    if up in _CANON_BY_SHEETKEY:
+        return _CANON_BY_SHEETKEY[up]
+
+    return unders or low
+
+
+def _sheet_key_variants(sheet_name: str) -> List[str]:
+    """
+    Generate a deterministic set of cache keys so writers/readers always intersect.
+
+    IMPORTANT:
+    - We keep the original "sheet::<raw>" form (back-compat).
+    - We add normalized and canonical variants.
+    - We also add "sheet::<SHEETKEY>" variant for advisor code that uses sheetKey.
+    """
+    raw = (sheet_name or "").strip()
+    if not raw:
+        return []
+
+    canon = _canon_sheet_name(raw)  # e.g. market_leaders
+    sheetkey = _SHEETKEY_BY_CANON.get(canon, "")
+
+    raw_norm = raw.casefold().strip()
+    raw_upper = raw.upper().strip()
+    raw_lower = raw.lower().strip()
+    raw_unders = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")  # Market_Leaders -> Market_Leaders
+
+    variants: List[str] = []
+
+    def add(x: str) -> None:
+        if not x:
+            return
+        k = f"sheet::{x}"
+        if k not in variants:
+            variants.append(k)
+
+    # legacy + common
+    add(raw)
+    add(raw_norm)
+    add(raw_upper)
+    add(raw_lower)
+    add(raw_unders)
+
+    # canonical (recommended)
+    add(canon)                # market_leaders
+    add(canon.upper())        # MARKET_LEADERS (but without sheetkey logic)
+    add(canon.lower())        # market_leaders
+
+    # sheetKey (strong)
+    if sheetkey:
+        add(sheetkey)         # MARKET_LEADERS
+        add(sheetkey.lower()) # market_leaders (redundant but safe)
+
+    return variants
+
 
 # ============================================================
 # Engine
@@ -1320,7 +1430,7 @@ class DataEngine:
 
         self._cache: TTLCache = TTLCache(maxsize=maxsize, ttl=self.cache_ttl_sec)  # type: ignore
 
-        # NEW: Sheet snapshot cache (small)
+        # Sheet snapshot cache (small)
         sheet_ttl = _safe_int(os.getenv("SHEET_CACHE_TTL_SEC", "180"), 180)
         sheet_ttl = max(30, min(3600, sheet_ttl))
         sheet_max = _safe_int(os.getenv("SHEET_CACHE_MAXSIZE", "64"), 64)
@@ -1373,11 +1483,8 @@ class DataEngine:
         return None
 
     # ============================================================
-    # NEW: Sheet Snapshot Cache API (Advisor performance)
+    # Sheet Snapshot Cache API (KEY-STABLE)
     # ============================================================
-    def _sheet_key(self, sheet_name: str) -> str:
-        return f"sheet::{(sheet_name or '').strip()}"
-
     def set_cached_sheet_snapshot(
         self,
         sheet_name: str,
@@ -1386,36 +1493,59 @@ class DataEngine:
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
-        Store a Sheets-ready snapshot. This is designed to be called by routers after they fetch data,
-        and later reused by Investment Advisor during the same TTL window.
+        Store a Sheets-ready snapshot.
+
+        IMPORTANT: Stored under multiple deterministic key variants so
+        writers/readers always intersect even if they use different sheet naming.
         """
         try:
             name = (sheet_name or "").strip()
             if not name:
                 return
+
             payload = {
                 "sheet": name,
+                "sheet_canon": _canon_sheet_name(name),
+                "sheet_key": _SHEETKEY_BY_CANON.get(_canon_sheet_name(name), None),
                 "headers": list(headers or []),
                 "rows": list(rows or []),
                 "meta": dict(meta or {}),
+                "headers_count": len(headers or []),
+                "rows_count": len(rows or []),
                 "cached_at_utc": _utc_iso(),
                 "cached_at_riyadh": _riyadh_iso(),
                 "engine_version": ENGINE_VERSION,
             }
-            self._sheet_cache[self._sheet_key(name)] = payload  # type: ignore[index]
+
+            # write under all variants (back-compat + forward-safe)
+            for k in _sheet_key_variants(name):
+                try:
+                    self._sheet_cache[k] = payload  # type: ignore[index]
+                except Exception:
+                    pass
         except Exception:
             return
 
     def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
         """
-        Returns the cached snapshot if present, else None.
+        Read the cached snapshot if present, else None.
+        Tries multiple key variants (raw, normalized, canonical, sheetKey).
         """
         try:
             name = (sheet_name or "").strip()
             if not name:
                 return None
-            v = self._sheet_cache.get(self._sheet_key(name))
-            return dict(v) if isinstance(v, dict) else None
+
+            # 1) try all deterministic variants
+            for k in _sheet_key_variants(name):
+                v = self._sheet_cache.get(k)
+                if isinstance(v, dict):
+                    return dict(v)
+
+            # 2) final fallback: older code may have used EXACT sheet::<name> only
+            legacy = f"sheet::{name}"
+            v2 = self._sheet_cache.get(legacy)
+            return dict(v2) if isinstance(v2, dict) else None
         except Exception:
             return None
 
@@ -1435,25 +1565,26 @@ class DataEngine:
 
     def clear_sheet_cache(self, sheet_name: Optional[str] = None) -> None:
         """
-        Clears the entire sheet cache, or only one sheet snapshot.
+        Clears the entire sheet cache, or only one sheet snapshot (all key variants).
         """
         try:
             if not sheet_name:
                 try:
                     self._sheet_cache.clear()
                 except Exception:
-                    # fallback for dict-like
                     for k in list(getattr(self._sheet_cache, "keys", lambda: [])()):
                         try:
                             self._sheet_cache.pop(k, None)
                         except Exception:
                             pass
                 return
-            key = self._sheet_key(sheet_name)
-            try:
-                self._sheet_cache.pop(key, None)
-            except Exception:
-                pass
+
+            # remove all variants
+            for k in _sheet_key_variants(sheet_name):
+                try:
+                    self._sheet_cache.pop(k, None)
+                except Exception:
+                    pass
         except Exception:
             return
 
