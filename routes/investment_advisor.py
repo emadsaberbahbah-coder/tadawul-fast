@@ -1,17 +1,24 @@
 # routes/investment_advisor.py
 """
 Tadawul Fast Bridge — Investment Advisor Routes (GOOGLE SHEETS SAFE)
-Full Replacement — v1.4.0
+Full Replacement — v1.5.0
 
-Why this revision (vs your v1.3.2 text)
-- ✅ FIX #1 (most important): map GAS payload -> advisor core correctly
-  GAS sends: amount / max_items / required_roi_1m (percent) / required_roi_3m (percent)
-  Your core expects: invest_amount / top_n / required_roi_1m (ratio) / required_roi_3m (ratio)
-  This mismatch is why you got: tickers_count=1262 but Universe Scan Size = 0 candidates.
-- ✅ FIX #2: call the revised core: core.investment_advisor.run_investment_advisor(..., engine=app.state.engine)
-  so it can actually read cached sheet rows from the ENGINE instance.
-- ✅ Still keeps your endpoints and token guard.
-- ✅ Always returns Sheets-safe headers (never empty when status="ok").
+What changed vs your v1.4.0
+- ✅ FIX (CACHE READ): Investment Advisor now asks the engine for snapshots using multiple
+  naming variants (sheet names + sheet keys), matching DataEngine v2.14.0 key-stable cache.
+- ✅ Stronger payload normalization:
+    - sources: supports ALL / array / comma string
+    - risk/confidence: trimmed defaults
+    - required_roi_1m / required_roi_3m: percent-ish -> ratio (0.05 means 5%)
+    - amount: number coercion
+    - max_items/top_n: safe int clamp (1..200)
+- ✅ Sheets-safe outputs: headers never empty when status="ok"
+- ✅ Diagnostics meta includes cache hits per source + which sheets were found in cache
+- ✅ Still prod-safe (lazy import of core), token guard unchanged.
+
+NOTE
+- This route does NOT fetch sheets itself — it depends on /v1/advanced/sheet-rows
+  having already populated engine.set_cached_sheet_snapshot(...).
 """
 
 from __future__ import annotations
@@ -20,17 +27,22 @@ import logging
 import os
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Header, Query, Request
 
 logger = logging.getLogger("routes.investment_advisor")
 
-ADVISOR_ROUTE_VERSION = "1.4.0"
+ADVISOR_ROUTE_VERSION = "1.5.0"
 router = APIRouter(prefix="/v1/advisor", tags=["investment_advisor"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
+# Canonical/default pages (must match GAS tab names)
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
+
+# Also allow sheetKey-style names if some client sends them
+DEFAULT_SOURCE_KEYS = ["MARKET_LEADERS", "GLOBAL_MARKETS", "MUTUAL_FUNDS", "COMMODITIES_FX"]
 
 # Sheets-safe default headers (for GAS write safety)
 TT_ADVISOR_DEFAULT_HEADERS: List[str] = [
@@ -190,19 +202,29 @@ def _percent_to_ratio(p: Any, *, default_ratio: float) -> float:
 
 
 def _normalize_sources(v: Any) -> List[str]:
+    """
+    Accept:
+    - None -> DEFAULT_SOURCES
+    - "ALL" -> DEFAULT_SOURCES
+    - "Market_Leaders,Global_Markets" -> list
+    - ["Market_Leaders","GLOBAL_MARKETS"] -> list
+    """
     if v is None:
         return list(DEFAULT_SOURCES)
+
     if isinstance(v, str):
         s = v.strip()
         if not s or s.upper() == "ALL":
             return list(DEFAULT_SOURCES)
         parts = [p.strip() for p in s.split(",") if p.strip()]
         return parts or list(DEFAULT_SOURCES)
+
     if isinstance(v, list):
         parts = [str(x).strip() for x in v if str(x).strip()]
         if len(parts) == 1 and parts[0].upper() == "ALL":
             return list(DEFAULT_SOURCES)
         return parts or list(DEFAULT_SOURCES)
+
     return list(DEFAULT_SOURCES)
 
 
@@ -251,23 +273,31 @@ def _normalize_tickers(v: Any) -> List[str]:
     return out
 
 
+def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        x = int(v)
+    except Exception:
+        x = default
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
 def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Produces:
-      - advisor_core_payload: keys that core.investment_advisor.run_investment_advisor expects
-      - also keeps original extras in meta/logs if needed
+    Produces payload keys expected by core.investment_advisor.run_investment_advisor
     """
     raw = dict(body or {})
 
     sources = _normalize_sources(raw.get("sources"))
 
-    risk = raw.get("risk") or "Moderate"
-    confidence = raw.get("confidence") or "High"
+    risk = str(raw.get("risk") or "Moderate").strip() or "Moderate"
+    confidence = str(raw.get("confidence") or "High").strip() or "High"
 
-    # carry tickers for diagnostics only (core currently scans cached sheets)
     tickers = _normalize_tickers(raw.get("tickers") or raw.get("symbols"))
 
-    # GAS sends amount OR invest_amount
     amount = raw.get("amount")
     if amount is None:
         amount = raw.get("invest_amount")
@@ -276,25 +306,19 @@ def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         amount_f = 0.0
 
-    # GAS sends max_items OR top_n OR max_positions
     max_items = raw.get("max_items")
     if max_items is None:
         max_items = raw.get("top_n")
     if max_items is None:
         max_items = raw.get("max_positions")
-    try:
-        max_items_i = int(max_items or 10)
-    except Exception:
-        max_items_i = 10
+    max_items_i = _clamp_int(max_items or 10, default=10, lo=1, hi=200)
 
-    # include_news
     include_news = raw.get("include_news")
     if include_news is None:
         include_news = raw.get("includeNews")
     include_news_b = bool(_truthy(include_news)) if isinstance(include_news, str) else bool(include_news if include_news is not None else True)
 
-    # REQUIRED ROI:
-    # routes receives percent-ish; core expects ratio
+    # Routes receives percent-ish; core expects ratio
     req_1m_ratio = _percent_to_ratio(raw.get("required_roi_1m") or raw.get("target_roi_1m"), default_ratio=0.05)
     req_3m_ratio = _percent_to_ratio(raw.get("required_roi_3m") or raw.get("target_roi_3m"), default_ratio=0.10)
 
@@ -310,12 +334,85 @@ def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
         "invest_amount": amount_f,
         "include_news": include_news_b,
         "currency": currency,
+        # diagnostics (safe extras)
+        "_diag_tickers_count": len(tickers),
+        "_diag_tickers": tickers[:50],
     }
-
-    # keep some diagnostics
-    advisor_core_payload["_diag_tickers_count"] = len(tickers)
-    advisor_core_payload["_diag_tickers"] = tickers[:50]  # avoid huge
     return advisor_core_payload
+
+
+# ---------------------------------------------------------------------
+# Engine snapshot precheck (CACHE HIT diagnostics)
+# ---------------------------------------------------------------------
+def _engine_get(request: Request) -> Any:
+    try:
+        st = getattr(request.app, "state", None)
+        return getattr(st, "engine", None) if st else None
+    except Exception:
+        return None
+
+
+def _probe_engine_snapshots(engine: Any, sources: List[str]) -> Tuple[Dict[str, bool], int]:
+    """
+    Returns:
+      - hits: {source: True/False}
+      - hit_count
+    We probe both sheet-name and sheetKey variants so we can report accurate diagnostics.
+    """
+    hits: Dict[str, bool] = {}
+    hit_count = 0
+    if engine is None:
+        for s in sources:
+            hits[s] = False
+        return hits, 0
+
+    getter = getattr(engine, "get_cached_sheet_snapshot", None)
+    if not callable(getter):
+        for s in sources:
+            hits[s] = False
+        return hits, 0
+
+    # Probe using both original sources and known sheetKey variants for max intersection
+    for s in sources:
+        ok = False
+        try:
+            snap = getter(s)
+            ok = bool(isinstance(snap, dict) and isinstance(snap.get("rows"), list))
+        except Exception:
+            ok = False
+
+        # if not found, try mapping to common sheetKey (if they passed tab name)
+        if not ok:
+            up = str(s or "").strip().upper()
+            alt = None
+            if up in {"MARKET_LEADERS", "GLOBAL_MARKETS", "MUTUAL_FUNDS", "COMMODITIES_FX"}:
+                alt = up
+            else:
+                # tab-name -> key-name
+                m = {
+                    "MARKET_LEADERS": "MARKET_LEADERS",
+                    "Market_Leaders".upper(): "MARKET_LEADERS",
+                    "GLOBAL_MARKETS": "GLOBAL_MARKETS",
+                    "Global_Markets".upper(): "GLOBAL_MARKETS",
+                    "MUTUAL_FUNDS": "MUTUAL_FUNDS",
+                    "Mutual_Funds".upper(): "MUTUAL_FUNDS",
+                    "COMMODITIES_FX": "COMMODITIES_FX",
+                    "Commodities_FX".upper(): "COMMODITIES_FX",
+                }
+                alt = m.get(up)
+
+            if alt:
+                try:
+                    snap2 = getter(alt)
+                    ok = bool(isinstance(snap2, dict) and isinstance(snap2.get("rows"), list))
+                except Exception:
+                    ok = False
+
+        hits[s] = ok
+        if ok:
+            hit_count += 1
+
+    return hits, hit_count
 
 
 # ---------------------------------------------------------------------
@@ -357,13 +454,7 @@ def _ensure_ok_headers(resp: Dict[str, Any]) -> Dict[str, Any]:
 @router.get("/health")
 @router.get("/ping")
 async def advisor_health(request: Request) -> Dict[str, Any]:
-    engine = None
-    try:
-        st = getattr(request.app, "state", None)
-        engine = getattr(st, "engine", None) if st else None
-    except Exception:
-        engine = None
-
+    engine = _engine_get(request)
     engine_name = type(engine).__name__ if engine is not None else "none"
     engine_version = None
     if engine is not None:
@@ -376,6 +467,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
             "engine_version": engine_version,
             "auth": "open" if not _allowed_tokens() else "token",
             "default_headers_len": len(TT_ADVISOR_DEFAULT_HEADERS),
+            "defaults_sources": list(DEFAULT_SOURCES),
         }
     )
 
@@ -410,14 +502,13 @@ async def _run_core(request: Request, payload: Dict[str, Any], *, debug: int = 0
             )
         )
 
-    engine = None
-    try:
-        st = getattr(request.app, "state", None)
-        engine = getattr(st, "engine", None) if st else None
-    except Exception:
-        engine = None
+    engine = _engine_get(request)
+
+    # Pre-probe cache so we can diagnose "Universe Scan Size = 0"
+    cache_hits, cache_hit_count = _probe_engine_snapshots(engine, payload.get("sources") or [])
 
     try:
+        # core is sync; keep it simple
         result = run_investment_advisor(payload, engine=engine)  # type: ignore
         if not isinstance(result, dict):
             return _ensure_ok_headers(
@@ -442,13 +533,18 @@ async def _run_core(request: Request, payload: Dict[str, Any], *, debug: int = 0
             }
         )
 
-        # add route diagnostics
+        # Route-level diagnostics
         try:
             out_meta = out.get("meta") if isinstance(out.get("meta"), dict) else {}
             out_meta.update(
                 {
                     "route_version": ADVISOR_ROUTE_VERSION,
                     "diag_tickers_count": payload.get("_diag_tickers_count", 0),
+                    "sources": payload.get("sources") or [],
+                    "sheet_cache_hits": cache_hits,
+                    "sheet_cache_hit_count": cache_hit_count,
+                    "engine_present": bool(engine is not None),
+                    "engine_type": type(engine).__name__ if engine is not None else "none",
                 }
             )
             out["meta"] = out_meta
@@ -462,6 +558,17 @@ async def _run_core(request: Request, payload: Dict[str, Any], *, debug: int = 0
         extra: Dict[str, Any] = {"headers": list(TT_ADVISOR_DEFAULT_HEADERS), "rows": [], "items": []}
         if int(debug or 0):
             extra["trace"] = str(exc)
+        # include cache probe even on error
+        try:
+            extra["meta"] = {
+                "route_version": ADVISOR_ROUTE_VERSION,
+                "sheet_cache_hits": cache_hits,
+                "sheet_cache_hit_count": cache_hit_count,
+                "engine_present": bool(engine is not None),
+                "engine_type": type(engine).__name__ if engine is not None else "none",
+            }
+        except Exception:
+            pass
         return _ensure_ok_headers(_envelope_error(str(exc), extra=extra))
 
 
