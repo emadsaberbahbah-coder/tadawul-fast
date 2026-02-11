@@ -1,495 +1,599 @@
 # core/investment_advisor_engine.py
 """
-Investment Advisor Engine (v1.1.0) — PROD SAFE + SCHEMA VALIDATED
+Tadawul Fast Bridge — Investment Advisor Engine (Google Sheets Friendly)
+File: core/investment_advisor_engine.py
+Version: 1.0.0
 
-What’s new in v1.1.0
-- ✅ Uses schemas/advisor.py (AdvisorRequest / AdvisorResponse) when available
-- ✅ Accepts tickers as:
-    - payload.tickers (list or string "AAPL,1120.SR")
-    - payload.symbols (alias)
-    - payload.symbol (single)
-- ✅ Mixed-market support:
-    - Calls engine in ONE batch if possible (engine handles hints)
-    - Falls back per-symbol using engine.get_enriched_quote/get_quote when batch weak
-- ✅ Stable, Sheets-friendly output modes:
-    - Returns {status, items, ...} (API-friendly)
-    - AND if caller requests `output_mode="sheet"` returns {status, headers, rows, meta, ...}
-- ✅ Filters/criteria:
-    - risk/confidence bucket filters
-    - required ROI thresholds (supports percent or ratio)
-    - top_n / max_items compatibility
-    - invest_amount / amount compatibility
-- ✅ No heavy AI/news in v1 (keeps prod safe)
+Purpose
+- This is the engine module expected by: routes/investment_advisor.py
+  -> from core.investment_advisor_engine import build_recommendations
+- It scans cached sheet pages (Market_Leaders / Global_Markets / Mutual_Funds / Commodities_FX)
+  and produces a Sheets-safe output:
+    { "items": [...], "headers": [...], "rows": [...], "count": int, "meta": {...} }
+
+Key Fixes vs your current core/investment_advisor.py (0.1.0)
+- ✅ Correct module name that your route imports: core/investment_advisor_engine.py
+- ✅ Works even if headers have small differences (case/spacing) using normalized key lookup
+- ✅ Reads pages from the *engine instance* (request.app.state.engine) instead of assuming module-level
+  functions exist in core/data_engine_v2.py
+- ✅ Never crashes: returns stable headers even when 0 candidates are found
 """
 
 from __future__ import annotations
 
-import inspect
-import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import math
+import time
+
+ENGINE_VERSION = "1.0.0"
 
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
-ENGINE_VERSION = "1.1.0"
+
+DEFAULT_HEADERS: List[str] = [
+    "Rank",
+    "Symbol",
+    "Origin",
+    "Name",
+    "Market",
+    "Currency",
+    "Price",
+    "Advisor Score",
+    "Action",
+    "Allocation %",
+    "Allocation Amount",
+    "Expected ROI % (1M)",
+    "Expected ROI % (3M)",
+    "Risk Bucket",
+    "Confidence Bucket",
+    "Reason (Explain)",
+    "Data Source",
+    "Data Quality",
+    "Last Updated (UTC)",
+]
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 
 
-# ---------------------------------------------------------------------
-# Time / utilities
-# ---------------------------------------------------------------------
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _maybe_await(v: Any) -> Any:
-    if inspect.isawaitable(v):
-        return await v
-    return v
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    s = str(v or "").strip().lower()
+    return s in _TRUTHY
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None or x == "":
-            return None
-        if isinstance(x, str):
-            s = x.strip().replace(",", "")
-            if not s:
-                return None
-            return float(s)
-        return float(x)
-    except Exception:
-        return None
+# -----------------------------------------------------------------------------
+# Normalization helpers
+# -----------------------------------------------------------------------------
+def _norm_key(k: Any) -> str:
+    s = str(k or "").strip().lower()
+    s = " ".join(s.split())  # collapse whitespace
+    return s
 
 
-def _roi_to_percent(v: Any) -> Optional[float]:
+def _get_any(row: Dict[str, Any], *names: str) -> Any:
     """
-    Accept ratio or percent and return percent:
-      0.10 -> 10
-      10 -> 10
-      "10%" -> 10
+    Case/space-insensitive key lookup.
+    Example: "Expected ROI % (1M)" will match "expected roi % (1m)" etc.
     """
-    if v is None:
+    if not row:
         return None
-    if isinstance(v, str):
-        s = v.strip().replace(",", "").replace("%", "")
-        if not s:
-            return None
-        try:
-            v = float(s)
-        except Exception:
-            return None
-    if isinstance(v, (int, float)):
-        f = float(v)
-        if -1.5 <= f <= 1.5:
-            return f * 100.0
-        return f
-    return None
+    if len(names) == 1:
+        # allow passing a single comma-joined string by mistake
+        if "," in names[0]:
+            names = tuple([p.strip() for p in names[0].split(",") if p.strip()])  # type: ignore
 
-
-def _norm_str(x: Any) -> str:
-    try:
-        return (str(x) if x is not None else "").strip()
-    except Exception:
-        return ""
-
-
-def _get(obj: Any, *names: str) -> Any:
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        for n in names:
-            if n in obj and obj[n] is not None:
-                return obj[n]
-        return None
+    # direct tries first
     for n in names:
-        try:
-            v = getattr(obj, n, None)
-            if v is not None:
-                return v
-        except Exception:
-            pass
+        if n in row:
+            return row.get(n)
+
+    # normalized map
+    nmap = row.get("_nmap")
+    if not isinstance(nmap, dict):
+        nmap = {}
+        for k in row.keys():
+            if k == "_nmap":
+                continue
+            nk = _norm_key(k)
+            if nk and nk not in nmap:
+                nmap[nk] = k
+        row["_nmap"] = nmap
+
+    for n in names:
+        nk = _norm_key(n)
+        k0 = nmap.get(nk)
+        if k0 is not None:
+            return row.get(k0)
+
     return None
 
 
-def _parse_listish(v: Any) -> List[str]:
-    """
-    Accept:
-      - ["AAPL", "1120.SR"]
-      - "AAPL,1120.SR"
-      - "AAPL 1120.SR"
-      - "AAPL, 1120.SR"
-    """
-    if v is None:
-        return []
-    if isinstance(v, list):
-        out: List[str] = []
-        for it in v:
-            s = _norm_str(it)
-            if s:
-                out.append(s)
-        return out
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return []
-        parts = re.split(r"[\s,]+", s)
-        return [p.strip() for p in parts if p.strip()]
-    return []
-
-
-def _normalize_bucket(x: Any) -> Optional[str]:
+def _to_float(x: Any) -> Optional[float]:
     if x is None:
         return None
-    s = str(x).strip().capitalize()
-    # allow "Very High" too, but treat it as "High" for v1 filters
-    if s in ("Low", "Moderate", "High", "Very high", "Very High"):
-        return "High" if s.lower() == "very high" else s
-    # allow numeric
+    if isinstance(x, (int, float)):
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return None
+        return float(x)
+    s = str(x).strip().replace(",", "")
+    if not s or s.lower() in {"na", "n/a", "null", "none", "-"}:
+        return None
+    s = s.replace("%", "")
     try:
-        f = float(x)
-        if f >= 70:
-            return "High"
-        if f >= 45:
-            return "Moderate"
+        return float(s)
+    except Exception:
+        return None
+
+
+def _to_int(x: Any) -> Optional[int]:
+    f = _to_float(x)
+    if f is None:
+        return None
+    try:
+        return int(round(f))
+    except Exception:
+        return None
+
+
+def _as_ratio(x: Any) -> Optional[float]:
+    """
+    Accept:
+      - 0.10 -> 0.10
+      - 10   -> 0.10
+      - "10%" -> 0.10
+    """
+    f = _to_float(x)
+    if f is None:
+        return None
+    if f > 1.5:
+        return f / 100.0
+    return f
+
+
+def _norm_bucket(x: Any) -> str:
+    if not isinstance(x, str):
+        return str(x).strip().title() if x is not None else ""
+    s = x.strip().lower()
+    if s in ("low", "low risk", "low-risk", "conservative"):
         return "Low"
-    except Exception:
-        return None
+    if s in ("moderate", "medium", "mid", "balanced"):
+        return "Moderate"
+    if s in ("high", "aggressive", "high risk", "high-risk"):
+        return "High"
+    if s in ("very high", "very-high", "speculative"):
+        return "Very High"
+    if s in ("high confidence", "high-conf", "highconf"):
+        return "High"
+    if s in ("moderate confidence", "medium confidence", "mid confidence"):
+        return "Moderate"
+    if s in ("low confidence", "low-conf"):
+        return "Low"
+    return x.strip().title()
 
 
-def _passes_bucket_filter(val: Optional[str], want: Optional[str]) -> bool:
-    if not want:
-        return True
-    if not val:
-        return False
-    return val.strip().capitalize() == want.strip().capitalize()
+def _safe_str(x: Any) -> str:
+    return "" if x is None else str(x).strip()
 
 
-def _gain_loss(amount: float, roi_pct: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    if amount <= 0 or roi_pct is None:
-        return None, None
-    gain = amount * (roi_pct / 100.0)
-    # simple symmetric risk placeholder — later replace with VaR/vol-based band
-    loss = amount * (abs(min(roi_pct, 0.0)) / 100.0) if roi_pct < 0 else amount * (roi_pct / 200.0)
-    return round(gain, 2), round(loss, 2)
+# -----------------------------------------------------------------------------
+# Engine -> sheet cache adapters
+# -----------------------------------------------------------------------------
+def _rows_to_dicts(headers: List[Any], rows: List[Any], sheet_name: str, limit: int) -> List[Dict[str, Any]]:
+    h = [str(x).strip() for x in (headers or [])]
+    out: List[Dict[str, Any]] = []
+    for i, r in enumerate(rows or []):
+        if i >= limit:
+            break
+        if not isinstance(r, list):
+            continue
+        d = {h[j]: (r[j] if j < len(r) else None) for j in range(len(h))}
+        d["_Sheet"] = sheet_name
+        out.append(d)
+    return out
 
 
-def _extract_roi_and_forecast(uq: Any) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def _engine_fetch_sheet(engine: Any, sheet_name: str) -> Tuple[List[Any], List[Any]]:
     """
-    Returns:
-      roi_1m_pct, roi_3m_pct, fp1, fp3
+    Tries multiple method names safely.
+    Must return (headers, rows). If nothing works => ([], [])
     """
-    roi_1m = _roi_to_percent(_get(uq, "expected_roi_1m", "expected_return_1m"))
-    roi_3m = _roi_to_percent(_get(uq, "expected_roi_3m", "expected_return_3m"))
+    if engine is None:
+        return [], []
 
-    fp1 = _safe_float(_get(uq, "forecast_price_1m", "expected_price_1m"))
-    fp3 = _safe_float(_get(uq, "forecast_price_3m", "expected_price_3m"))
-
-    price = _safe_float(_get(uq, "current_price", "last_price", "price"))
-    if price is not None and price > 0:
-        if fp1 is None and roi_1m is not None:
-            fp1 = price * (1.0 + roi_1m / 100.0)
-        if fp3 is None and roi_3m is not None:
-            fp3 = price * (1.0 + roi_3m / 100.0)
-
-    return roi_1m, roi_3m, fp1, fp3
-
-
-# ---------------------------------------------------------------------
-# Engine resolution
-# ---------------------------------------------------------------------
-async def _resolve_engine(request) -> Optional[Any]:
-    try:
-        st = getattr(getattr(request, "app", None), "state", None)
-        if st:
-            engine = getattr(st, "engine", None)
-            if engine is not None:
-                return engine
-    except Exception:
-        pass
-
-    # fallback singleton (lazy, safe)
-    try:
-        from core.data_engine_v2 import get_engine  # type: ignore
-
-        return await _maybe_await(get_engine())
-    except Exception:
-        return None
-
-
-async def _fetch_batch(engine: Any, tickers: List[str]) -> Any:
-    fn = getattr(engine, "get_enriched_quotes", None) or getattr(engine, "get_quotes", None)
-    if not callable(fn):
-        raise RuntimeError("Engine does not support batch quotes")
-
-    # try rich signature first
-    try:
-        return await _maybe_await(fn(tickers, refresh=False, include_history=True, include_fundamentals=True))
-    except TypeError:
-        pass
-    try:
-        return await _maybe_await(fn(tickers, refresh=False))
-    except TypeError:
-        pass
-
-    return await _maybe_await(fn(tickers))
-
-
-async def _fetch_one(engine: Any, ticker: str) -> Any:
-    # prefer enriched
-    fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
-    if not callable(fn):
-        raise RuntimeError("Engine does not support single quote")
-    try:
-        return await _maybe_await(fn(ticker, refresh=False))
-    except TypeError:
-        return await _maybe_await(fn(ticker))
-
-
-def _coerce_sources(sources_in: Any) -> List[str]:
-    if isinstance(sources_in, str):
-        if sources_in.strip().upper() == "ALL":
-            return list(DEFAULT_SOURCES)
-        parts = _parse_listish(sources_in)
-        return parts or list(DEFAULT_SOURCES)
-    if isinstance(sources_in, list) and sources_in:
-        if any(_norm_str(x).upper() == "ALL" for x in sources_in):
-            return list(DEFAULT_SOURCES)
-        out = [_norm_str(x) for x in sources_in if _norm_str(x)]
-        return out or list(DEFAULT_SOURCES)
-    return list(DEFAULT_SOURCES)
-
-
-def _coerce_output_mode(v: Any) -> str:
-    s = _norm_str(v).lower()
-    if s in ("sheet", "sheets", "gsheets"):
-        return "sheet"
-    return "items"
-
-
-def _build_sheet_headers() -> List[str]:
-    return [
-        "Symbol",
-        "Name",
-        "Price",
-        "Risk Bucket",
-        "Confidence Bucket",
-        "Overall Score",
-        "Recommendation",
-        "ROI 1M %",
-        "ROI 3M %",
-        "Forecast Price 1M",
-        "Forecast Price 3M",
-        "Invest Amount",
-        "Expected Gain 1M",
-        "Expected Loss 1M",
-        "Expected Gain 3M",
-        "Expected Loss 3M",
+    candidates = [
+        "get_cached_sheet_rows",
+        "get_sheet_rows_cached",
+        "get_sheet_cached",
+        "get_sheet_rows",
+        "get_sheet",
+        "sheet_rows",
     ]
 
+    for fn_name in candidates:
+        fn = getattr(engine, fn_name, None)
+        if not callable(fn):
+            continue
+        try:
+            resp = fn(sheet_name)  # type: ignore[misc]
+            if isinstance(resp, dict):
+                headers = resp.get("headers") or []
+                rows = resp.get("rows") or []
+                return headers, rows
+            # some engines may return tuple
+            if isinstance(resp, (list, tuple)) and len(resp) == 2:
+                return resp[0] or [], resp[1] or []
+        except Exception:
+            continue
 
-def _item_to_sheet_row(it: Dict[str, Any]) -> List[Any]:
-    return [
-        it.get("symbol"),
-        it.get("name"),
-        it.get("price"),
-        it.get("risk_bucket"),
-        it.get("confidence_bucket"),
-        it.get("overall_score"),
-        it.get("recommendation"),
-        it.get("roi_1m_pct"),
-        it.get("roi_3m_pct"),
-        it.get("forecast_price_1m"),
-        it.get("forecast_price_3m"),
-        it.get("amount"),
-        it.get("expected_gain_1m"),
-        it.get("expected_loss_1m"),
-        it.get("expected_gain_3m"),
-        it.get("expected_loss_3m"),
-    ]
+    return [], []
 
 
-# ---------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------
-async def build_recommendations(*, request, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _get_universe_rows_from_engine(
+    engine: Any,
+    sources: List[str],
+    *,
+    max_rows_per_source: int = 5000,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    meta: Dict[str, Any] = {"sources": sources, "engine": type(engine).__name__ if engine is not None else "none", "items": []}
+
+    normalized = [s.strip() for s in (sources or []) if isinstance(s, str) and s.strip()]
+    if not normalized or any(s.upper() == "ALL" for s in normalized):
+        normalized = list(DEFAULT_SOURCES)
+
+    out_rows: List[Dict[str, Any]] = []
+    for sheet in normalized:
+        headers, rows = _engine_fetch_sheet(engine, sheet)
+        meta["items"].append({"sheet": sheet, "headers": len(headers or []), "rows": len(rows or [])})
+        out_rows.extend(_rows_to_dicts(headers, rows, sheet_name=sheet, limit=max_rows_per_source))
+
+    return out_rows, meta
+
+
+# -----------------------------------------------------------------------------
+# Scoring model
+# -----------------------------------------------------------------------------
+@dataclass
+class Candidate:
+    symbol: str
+    name: str
+    sheet: str
+    market: str
+    currency: str
+    price: Optional[float]
+    risk_bucket: str
+    confidence_bucket: str
+
+    exp_roi_1m: Optional[float]  # ratio
+    exp_roi_3m: Optional[float]  # ratio
+
+    overall_score: Optional[float]
+    risk_score: Optional[float]
+    momentum_score: Optional[float]
+    value_score: Optional[float]
+    quality_score: Optional[float]
+
+    advisor_score: float = 0.0
+    reason: str = ""
+
+
+def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
+    symbol = _safe_str(_get_any(row, "Symbol", "Ticker", "Code", "Fund Symbol"))
+    if not symbol:
+        return None
+
+    name = _safe_str(_get_any(row, "Name", "Company Name", "Fund Name", "Instrument"))
+    sheet = _safe_str(_get_any(row, "_Sheet", "Origin")) or ""
+    market = _safe_str(_get_any(row, "Market")) or ""
+    currency = _safe_str(_get_any(row, "Currency")) or ""
+
+    price = _to_float(_get_any(row, "Price", "Last", "Close", "NAV per Share"))
+
+    risk_bucket = _norm_bucket(_get_any(row, "Risk Bucket", "Risk", "Risk Level") or "")
+    confidence_bucket = _norm_bucket(_get_any(row, "Confidence Bucket", "Confidence") or "")
+
+    exp_roi_1m = _as_ratio(_get_any(row, "Expected ROI % (1M)", "Expected ROI 1M", "ROI 1M", "Expected ROI (1M)"))
+    exp_roi_3m = _as_ratio(_get_any(row, "Expected ROI % (3M)", "Expected ROI 3M", "ROI 3M", "Expected ROI (3M)"))
+
+    overall_score = _to_float(_get_any(row, "Overall Score", "Opportunity Score", "Score"))
+    risk_score = _to_float(_get_any(row, "Risk Score"))
+    momentum_score = _to_float(_get_any(row, "Momentum Score"))
+    value_score = _to_float(_get_any(row, "Value Score"))
+    quality_score = _to_float(_get_any(row, "Quality Score"))
+
+    return Candidate(
+        symbol=symbol,
+        name=name,
+        sheet=sheet,
+        market=market,
+        currency=currency,
+        price=price,
+        risk_bucket=risk_bucket,
+        confidence_bucket=confidence_bucket,
+        exp_roi_1m=exp_roi_1m,
+        exp_roi_3m=exp_roi_3m,
+        overall_score=overall_score,
+        risk_score=risk_score,
+        momentum_score=momentum_score,
+        value_score=value_score,
+        quality_score=quality_score,
+    )
+
+
+def _passes_filters(
+    c: Candidate,
+    risk: str,
+    confidence: str,
+    req_roi_1m: Optional[float],
+    req_roi_3m: Optional[float],
+) -> Tuple[bool, str]:
+    # risk/confidence only filter when candidate has those buckets
+    if risk and c.risk_bucket and _norm_bucket(risk) != _norm_bucket(c.risk_bucket):
+        return False, "Risk filter"
+    if confidence and c.confidence_bucket and _norm_bucket(confidence) != _norm_bucket(c.confidence_bucket):
+        return False, "Confidence filter"
+
+    # ROI filters are strict: if missing ROI => fail
+    if req_roi_1m is not None:
+        if c.exp_roi_1m is None or c.exp_roi_1m < req_roi_1m:
+            return False, "ROI 1M"
+    if req_roi_3m is not None:
+        if c.exp_roi_3m is None or c.exp_roi_3m < req_roi_3m:
+            return False, "ROI 3M"
+
+    return True, ""
+
+
+def _compute_advisor_score(c: Candidate, req_roi_1m: Optional[float], req_roi_3m: Optional[float]) -> Tuple[float, str]:
+    base = c.overall_score if c.overall_score is not None else 50.0
+    score = float(base)
+    reasons: List[str] = []
+
+    # ROI reward
+    if c.exp_roi_1m is not None:
+        thr = req_roi_1m if req_roi_1m is not None else 0.0
+        uplift = max(0.0, (c.exp_roi_1m - thr)) * 100.0
+        score += min(15.0, uplift * 0.4)
+        reasons.append(f"ROI1M={c.exp_roi_1m:.2%}")
+
+    if c.exp_roi_3m is not None:
+        thr = req_roi_3m if req_roi_3m is not None else 0.0
+        uplift = max(0.0, (c.exp_roi_3m - thr)) * 100.0
+        score += min(20.0, uplift * 0.35)
+        reasons.append(f"ROI3M={c.exp_roi_3m:.2%}")
+
+    # Factor boosts
+    for label, val, cap, weight in (
+        ("Quality", c.quality_score, 6.0, 0.06),
+        ("Momentum", c.momentum_score, 6.0, 0.06),
+        ("Value", c.value_score, 6.0, 0.06),
+    ):
+        if val is not None:
+            score += min(cap, max(0.0, val) * weight)
+            reasons.append(f"{label}={val:.1f}")
+
+    # Risk penalty (assume higher = riskier)
+    if c.risk_score is not None:
+        penalty = max(0.0, c.risk_score - 50.0) * 0.10
+        score -= min(12.0, penalty)
+        reasons.append(f"RiskScore={c.risk_score:.1f}")
+
+    score = max(0.0, min(100.0, score))
+    return score, "; ".join(reasons[:6])
+
+
+def _allocate_amount(picks: List[Candidate], total_amount: float) -> Dict[str, Dict[str, float]]:
+    if not picks:
+        return {}
+    total_amount = float(total_amount or 0.0)
+    if total_amount <= 0:
+        return {c.symbol: {"weight": 0.0, "amount": 0.0} for c in picks}
+
+    scores = [max(1.0, c.advisor_score) for c in picks]
+    ssum = sum(scores) or 1.0
+    weights = [s / ssum for s in scores]
+
+    min_amt = total_amount * 0.01
+    if min_amt * len(picks) > total_amount:
+        min_amt = 0.0
+
+    alloc = [min_amt for _ in picks]
+    remaining = total_amount - sum(alloc)
+
+    if remaining > 0:
+        for i, w in enumerate(weights):
+            alloc[i] += remaining * w
+
+    drift = total_amount - sum(alloc)
+    if abs(drift) > 1e-6:
+        alloc[0] += drift
+
+    out: Dict[str, Dict[str, float]] = {}
+    for c, w, a in zip(picks, weights, alloc):
+        out[c.symbol] = {"weight": float(w), "amount": float(a)}
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Public entry: used by routes/investment_advisor.py
+# -----------------------------------------------------------------------------
+async def build_recommendations(request: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Main entry used by routes/investment_advisor.py
-    Returns stable envelope with HTTP 200-safe JSON.
+    Called by routes/investment_advisor.py
+
+    Must return dict (never throws):
+      - items: list[dict]
+      - headers: list[str]
+      - rows: list[list]
+      - count: int
+      - meta: dict
     """
-    # Try to validate/normalize with schemas if present (optional dependency)
-    req_obj = None
+    t0 = time.time()
+
+    # read engine
+    engine = None
     try:
-        from schemas.advisor import AdvisorRequest  # type: ignore
-
-        req_obj = AdvisorRequest.model_validate(payload)
+        engine = getattr(getattr(request, "app", None), "state", None)
+        engine = getattr(engine, "engine", None) if engine is not None else None
     except Exception:
-        req_obj = None
+        engine = None
 
-    # Normalize inputs (schema-first, fallback to raw)
-    sources = _coerce_sources(getattr(req_obj, "sources", None) if req_obj else (payload.get("sources") or payload.get("source") or "ALL"))
+    # inputs
+    sources = payload.get("sources") or ["ALL"]
+    if isinstance(sources, str):
+        sources = [sources]
+    sources = [str(s).strip() for s in sources if str(s).strip()] or ["ALL"]
+    if any(s.upper() == "ALL" for s in sources):
+        sources = list(DEFAULT_SOURCES)
 
-    risk_want = _normalize_bucket(getattr(req_obj, "risk", None) if req_obj else payload.get("risk"))
-    conf_want = _normalize_bucket(getattr(req_obj, "confidence", None) if req_obj else payload.get("confidence"))
+    risk = _norm_bucket(payload.get("risk") or "")
+    confidence = _norm_bucket(payload.get("confidence") or "")
 
-    # Required ROI thresholds in percent
-    req_roi_1m = _roi_to_percent(getattr(req_obj, "required_roi_1m", None) if req_obj else payload.get("required_roi_1m"))
-    req_roi_3m = _roi_to_percent(getattr(req_obj, "required_roi_3m", None) if req_obj else payload.get("required_roi_3m"))
+    # IMPORTANT:
+    # routes/investment_advisor.py normalizes these as PERCENT numbers (e.g., 5.0 / 10.0)
+    # We convert safely to ratio.
+    req_roi_1m = _as_ratio(payload.get("required_roi_1m"))
+    req_roi_3m = _as_ratio(payload.get("required_roi_3m"))
 
-    # top_n / max_items compatibility
-    top_n_raw = getattr(req_obj, "top_n", None) if req_obj else None
-    max_items_raw = payload.get("max_items") if payload else None
-    top_n = int(_safe_float(top_n_raw) or _safe_float(max_items_raw) or 10)
+    top_n = _to_int(payload.get("top_n") or payload.get("max_items") or 10) or 10
     top_n = max(1, min(200, top_n))
 
-    # invest_amount / amount compatibility
-    amt_raw = getattr(req_obj, "invest_amount", None) if req_obj else None
-    amount = float(_safe_float(amt_raw) or _safe_float(payload.get("amount")) or _safe_float(payload.get("invest_amount")) or 0.0)
-    if amount < 0:
-        amount = 0.0
+    invest_amount = _to_float(payload.get("amount") or payload.get("invest_amount") or 0.0) or 0.0
+    include_news = _truthy(payload.get("include_news", True))
+    currency = _safe_str(payload.get("currency") or "SAR") or "SAR"
 
-    output_mode = _coerce_output_mode(payload.get("output_mode") or payload.get("mode") or "items")
+    # 1) Fetch universe from engine cache
+    universe_rows, fetch_meta = _get_universe_rows_from_engine(engine, sources)
 
-    # tickers: accept tickers/symbols/symbol
-    tickers = []
-    tickers = _parse_listish(payload.get("tickers") or payload.get("symbols") or [])
-    if not tickers:
-        one = _norm_str(payload.get("symbol"))
-        if one:
-            tickers = [one]
+    # 2) Candidates
+    dropped = {"no_symbol": 0, "filter": 0, "bad_row": 0}
+    candidates: List[Candidate] = []
 
-    # Engine
-    engine = await _resolve_engine(request)
-    if engine is None:
-        return {
-            "status": "error",
-            "error": "Engine unavailable",
-            "items": [],
-            "timestamp_utc": _utc_iso(),
-            "sources_used": sources,
-        }
-
-    if not tickers:
-        return {
-            "status": "error",
-            "error": "No tickers provided. Provide payload.tickers (list or comma string) or payload.symbol(s).",
-            "items": [],
-            "timestamp_utc": _utc_iso(),
-            "sources_used": sources,
-        }
-
-    # Fetch batch (best effort)
-    try:
-        res = await _fetch_batch(engine, tickers)
-    except Exception as exc:
-        return {
-            "status": "error",
-            "error": f"Engine fetch error: {exc}",
-            "items": [],
-            "timestamp_utc": _utc_iso(),
-            "sources_used": sources,
-        }
-
-    # Normalize quotes iterable
-    quotes: List[Any] = []
-    if isinstance(res, dict):
-        quotes = list(res.values())
-    elif isinstance(res, list):
-        quotes = res
-    else:
+    for r in universe_rows:
         try:
-            quotes = list(res or [])
+            c = _extract_candidate(r)
+            if c is None:
+                dropped["no_symbol"] += 1
+                continue
+
+            ok, _why = _passes_filters(c, risk, confidence, req_roi_1m, req_roi_3m)
+            if not ok:
+                dropped["filter"] += 1
+                continue
+
+            c.advisor_score, c.reason = _compute_advisor_score(c, req_roi_1m, req_roi_3m)
+            candidates.append(c)
         except Exception:
-            quotes = []
+            dropped["bad_row"] += 1
 
-    # Build items
+    candidates.sort(
+        key=lambda x: (x.advisor_score, (x.exp_roi_3m or 0.0), (x.exp_roi_1m or 0.0)),
+        reverse=True,
+    )
+
+    picks = candidates[:top_n]
+    alloc_map = _allocate_amount(picks, invest_amount)
+
+    # 3) Build items + Sheets table
     items: List[Dict[str, Any]] = []
-
-    for uq in quotes:
-        sym = _norm_str(_get(uq, "symbol")).upper()
-        if not sym:
-            continue
-
-        price = _safe_float(_get(uq, "current_price", "last_price", "price"))
-        risk_bucket = _normalize_bucket(_get(uq, "risk_bucket"))
-        conf_bucket = _normalize_bucket(_get(uq, "confidence_bucket"))
-
-        if not _passes_bucket_filter(risk_bucket, risk_want):
-            continue
-        if not _passes_bucket_filter(conf_bucket, conf_want):
-            continue
-
-        roi_1m, roi_3m, fp1, fp3 = _extract_roi_and_forecast(uq)
-
-        if req_roi_1m is not None and (roi_1m is None or roi_1m < req_roi_1m):
-            continue
-        if req_roi_3m is not None and (roi_3m is None or roi_3m < req_roi_3m):
-            continue
-
-        gain1, loss1 = _gain_loss(amount, roi_1m)
-        gain3, loss3 = _gain_loss(amount, roi_3m)
+    rows: List[List[Any]] = []
+    for i, c in enumerate(picks, start=1):
+        alloc = alloc_map.get(c.symbol, {"weight": 0.0, "amount": 0.0})
+        w = float(alloc.get("weight") or 0.0)
+        amt = float(alloc.get("amount") or 0.0)
 
         items.append(
             {
-                "symbol": sym,
-                "name": _get(uq, "name", "company_name"),
-                "price": price,
-                "risk_bucket": risk_bucket,
-                "confidence_bucket": conf_bucket,
-                "overall_score": _safe_float(_get(uq, "overall_score")),
-                "recommendation": _get(uq, "recommendation"),
-                "roi_1m_pct": roi_1m,
-                "roi_3m_pct": roi_3m,
-                "forecast_price_1m": fp1,
-                "forecast_price_3m": fp3,
-                "amount": amount,
-                "expected_gain_1m": gain1,
-                "expected_loss_1m": loss1,
-                "expected_gain_3m": gain3,
-                "expected_loss_3m": loss3,
+                "rank": i,
+                "symbol": c.symbol,
+                "origin": c.sheet,
+                "name": c.name,
+                "market": c.market,
+                "currency": c.currency or currency,
+                "price": c.price,
+                "advisor_score": round(c.advisor_score, 4),
+                "action": "BUY" if (c.exp_roi_3m or 0.0) > 0 else "WATCH",
+                "allocation_pct": round(w * 100.0, 4),
+                "allocation_amount": round(amt, 2),
+                "expected_roi_1m_pct": round((c.exp_roi_1m or 0.0) * 100.0, 4),
+                "expected_roi_3m_pct": round((c.exp_roi_3m or 0.0) * 100.0, 4),
+                "risk_bucket": c.risk_bucket,
+                "confidence_bucket": c.confidence_bucket,
+                "reason": c.reason,
+                "data_source": c.sheet,
+                "data_quality": "",
+                "last_updated_utc": "",
             }
         )
 
-    # Rank: higher overall_score then higher roi_3m
-    def _key(it: Dict[str, Any]) -> Tuple[float, float]:
-        s = it.get("overall_score")
-        r = it.get("roi_3m_pct")
-        return (float(s) if s is not None else 0.0, float(r) if r is not None else -999.0)
+        rows.append(
+            [
+                i,
+                c.symbol,
+                c.sheet,
+                c.name,
+                c.market,
+                c.currency or currency,
+                c.price,
+                round(c.advisor_score, 4),
+                "BUY" if (c.exp_roi_3m or 0.0) > 0 else "WATCH",
+                round(w * 100.0, 4),
+                round(amt, 2),
+                round((c.exp_roi_1m or 0.0) * 100.0, 4),
+                round((c.exp_roi_3m or 0.0) * 100.0, 4),
+                c.risk_bucket,
+                c.confidence_bucket,
+                c.reason,
+                c.sheet,
+                "",
+                "",
+            ]
+        )
 
-    items.sort(key=_key, reverse=True)
-    items = items[:top_n]
-
-    base_envelope: Dict[str, Any] = {
-        "status": "ok",
+    meta: Dict[str, Any] = {
         "engine_version": ENGINE_VERSION,
-        "sources_used": sources,
-        "filters": {
-            "risk": risk_want,
-            "confidence": conf_want,
-            "required_roi_1m_pct": req_roi_1m,
-            "required_roi_3m_pct": req_roi_3m,
+        "include_news": include_news,
+        "criteria": {
+            "sources": sources,
+            "risk": risk,
+            "confidence": confidence,
+            "required_roi_1m_ratio": req_roi_1m,
+            "required_roi_3m_ratio": req_roi_3m,
             "top_n": top_n,
-            "amount": amount,
-            "output_mode": output_mode,
+            "amount": invest_amount,
+            "currency": currency,
         },
-        "count": len(items),
+        "fetch": fetch_meta,
+        "counts": {
+            "universe_rows": len(universe_rows),
+            "candidates_after_filters": len(candidates),
+            "returned": len(picks),
+            "dropped": dropped,
+        },
+        "runtime_ms": int((time.time() - t0) * 1000),
+        "time_utc": _utc_iso(),
+    }
+
+    # Always Sheets-safe (headers never empty)
+    headers = list(DEFAULT_HEADERS)
+
+    # If nothing matched, still return stable table (headers + empty rows)
+    if not rows:
+        meta["warning"] = "No candidates matched your filters/ROI thresholds (or ROI columns are missing/blank)."
+
+    return {
         "items": items,
+        "count": int(len(items)),
+        "headers": headers,
+        "rows": rows,
+        "meta": meta,
         "timestamp_utc": _utc_iso(),
     }
 
-    # Optional Sheets mode
-    if output_mode == "sheet":
-        headers = _build_sheet_headers()
-        rows = [_item_to_sheet_row(it) for it in items]
-        base_envelope.pop("items", None)
-        base_envelope["headers"] = headers
-        base_envelope["rows"] = rows
-        base_envelope["meta"] = {
-            "schema_version": "schemas.advisor/0.2.0" if req_obj is not None else "none",
-            "sources_used": sources,
-            "filters": base_envelope.get("filters", {}),
-            "timestamp_utc": base_envelope.get("timestamp_utc"),
-        }
 
-    return base_envelope
-
-
-__all__ = ["build_recommendations"]
+__all__ = ["build_recommendations", "ENGINE_VERSION", "DEFAULT_HEADERS"]
