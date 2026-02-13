@@ -1,62 +1,29 @@
 #!/usr/bin/env python3
-# scripts/run_market_scan.py  (FULL REPLACEMENT)
+# scripts/run_market_scan.py
 """
 run_market_scan.py
 ===========================================================
-TADAWUL FAST BRIDGE – MARKET SCANNER (v1.4.1) – Sheets-ready
+TADAWUL FAST BRIDGE – AI MARKET SCANNER (v1.6.0)
 ===========================================================
+INTELLIGENT PRODUCTION EDITION
 
-What this script does
-- Reads symbols from one or more dashboard pages via symbols_reader.get_page_symbols()
-- Calls backend AI Analysis endpoint in chunks:
-      POST /v1/analysis/quotes   { tickers:[...], symbols:[...] }
-- Produces a ranked "opportunities" table
-- Optionally writes the ranked table to a Google Sheet tab (chunked write)
+What this script does:
+1) Aggregates symbols from across all major dashboards (KSA, Global, Leaders).
+2) Performs a high-fidelity batch AI/Quant analysis via the backend.
+3) Ranks results using the v1.7.0 Scoring Engine (Opportunity + ROI + Risk).
+4) Generates a "Top Opportunities" summary tab in Google Sheets.
 
-Defaults (safe)
-- Reads from: MARKET_LEADERS + GLOBAL_MARKETS + KSA_TADAWUL
-- Ranks by: opportunity_score (desc) then overall_score (desc) then quality_score (desc)
-- Writes to: sheet "Market_Scan" starting at A5 (unless --no-sheet)
-
-Key upgrades (v1.4.0 baseline)
-- Symbols-sheet ID selection:
-    * --symbols-sheet-id (read symbols from a specific spreadsheet)
-    * default: uses --sheet-id if provided, else DEFAULT_SPREADSHEET_ID (env/settings)
-- Calls symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not)
-- Origin map uses normalized symbols (more stable)
-- Percent normalization: change %, dividend yield %, ROE/ROA %, upside %, expected ROI % (handles 0..1 fractions)
-- Adds Forecast/History columns (best-effort) if backend returns them:
-    returns_1w/1m/3m/6m/12m, ma20/ma50/ma200, volatility_30d, rsi_14,
-    expected_price_1m/3m/12m, expected_return_1m/3m/12m, confidence_score, forecast_method, forecast_source
-- Never crashes on one bad batch; inserts per-symbol error rows for traceability
-- More defensive backend shape parsing + last-updated field fallbacks
-
-v1.4.1 patch
-- Adds key alias normalization (KSA/GLOBAL/LEADERS/etc) like dashboard sync.
-- Quotes sheet names for update_values A1 ranges.
-- Adds Forecast Updated (UTC) column (best-effort) if backend returns it.
-
-Usage examples
-  python scripts/run_market_scan.py
-  python scripts/run_market_scan.py --keys MARKET_LEADERS GLOBAL_MARKETS
-  python scripts/run_market_scan.py --keys "MARKET_LEADERS,GLOBAL_MARKETS"
-  python scripts/run_market_scan.py --ksa-only
-  python scripts/run_market_scan.py --global-only
-  python scripts/run_market_scan.py --top 25 --min-quality OK
-  python scripts/run_market_scan.py --out-json market_scan.json
-  python scripts/run_market_scan.py --no-sheet
-  python scripts/run_market_scan.py --clear --smart-clear --value-input USER_ENTERED
-
-Notes
-- Uses env.py settings when available:
-    backend_base_url, app_token, backup_app_token, default_spreadsheet_id
-- Uses google_sheets_service for sheet writing (service account required).
+Key Upgrades in v1.6.0:
+- ✅ **Scoring Integrated**: Captures `rec_badge` and `scoring_reason`.
+- ✅ **ROI Standardized**: Uses 'expected_roi_1m/3m/12m' canonical keys.
+- ✅ **Riyadh Localized**: Includes UTC+3 timestamps for dashboard alignment.
+- ✅ **Rich UI Grid**: Adds Technical (RSI/MA) and Badge columns to the output.
+- ✅ **Resilient Chunking**: Optimized for high-volume scanning (up to 1000 symbols).
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import os
@@ -66,1068 +33,250 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.4.1"
-
+# =============================================================================
+# Version & Logging
+# =============================================================================
+SCRIPT_VERSION = "1.6.0"
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
+
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("MarketScan")
 
-_A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
-
-
 # =============================================================================
-# Path safety
+# Path & Dependency Alignment
 # =============================================================================
 def _ensure_project_root_on_path() -> None:
-    """
-    Allows running from:
-      - project root: python scripts/run_market_scan.py
-      - scripts folder: python run_market_scan.py
-    """
     try:
-        here = os.path.dirname(os.path.abspath(__file__))  # .../scripts
-        parent = os.path.dirname(here)  # project root
+        here = os.path.dirname(os.path.abspath(__file__))
+        parent = os.path.dirname(here)
         for p in (here, parent):
             if p and p not in sys.path:
                 sys.path.insert(0, p)
     except Exception:
         pass
 
-
 _ensure_project_root_on_path()
 
-
-# =============================================================================
-# Imports (project)
-# =============================================================================
 try:
-    from env import settings  # type: ignore
-except Exception:
-    settings = None  # type: ignore
-
-try:
-    import symbols_reader  # type: ignore
+    from env import settings # type: ignore
+    import symbols_reader # type: ignore
+    import google_sheets_service as sheets_service # type: ignore
 except Exception as e:
-    logger.error("Import failed (symbols_reader): %s", e)
-    logger.error("Tip: run from project root where symbols_reader.py exists.")
+    logger.error("Project dependency import failed: %s", e)
     raise SystemExit(1)
 
-# Sheets writing is optional
-try:
-    import google_sheets_service as sheets_service  # type: ignore
-except Exception:
-    sheets_service = None  # type: ignore
-
-
 # =============================================================================
-# Config helpers
+# Dashboard Schema Definition
 # =============================================================================
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _get_backend_base_url() -> str:
-    if settings is not None:
-        v = (getattr(settings, "backend_base_url", "") or "").strip()
-        if v:
-            return v.rstrip("/")
-    return (os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000") or "http://127.0.0.1:8000").rstrip("/")
-
-
-def _get_tokens() -> Tuple[str, str]:
-    primary = ""
-    backup = ""
-    if settings is not None:
-        primary = (getattr(settings, "app_token", None) or "").strip()
-        backup = (getattr(settings, "backup_app_token", None) or "").strip()
-    if not primary:
-        primary = (os.getenv("APP_TOKEN", "") or "").strip()
-    if not backup:
-        backup = (os.getenv("BACKUP_APP_TOKEN", "") or "").strip()
-    return primary, backup
-
-
-def _get_default_spreadsheet_id() -> str:
-    # env.py preferred
-    if settings is not None:
-        sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip()
-        if sid:
-            return sid
-    # env fallbacks
-    for k in ("DEFAULT_SPREADSHEET_ID", "TFB_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"):
-        v = (os.getenv(k, "") or "").strip()
-        if v:
-            return v
-    return ""
-
-
-def _safe_int(x: Any, default: int) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def _safe_float(x: Any, default: float) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
-    if not keys:
-        return []
-    out: List[str] = []
-    for x in keys:
-        if x is None:
-            continue
-        s = str(x).strip()
-        if not s:
-            continue
-        out.extend([p.strip() for p in s.split(",") if p.strip()])
-
-    seen = set()
-    final: List[str] = []
-    for k in out:
-        ku = k.strip().upper()
-        if not ku or ku in seen:
-            continue
-        seen.add(ku)
-        final.append(ku)
-    return final
-
-
-def _canon_key(user_key: str) -> str:
-    """
-    Normalize key / accept common aliases (match dashboard sync behavior).
-    """
-    k = (user_key or "").strip().upper()
-    k = k.replace("-", "_").replace(" ", "_")
-
-    aliases = {
-        "KSA": "KSA_TADAWUL",
-        "TADAWUL": "KSA_TADAWUL",
-        "KSA_TASI": "KSA_TADAWUL",
-        "GLOBAL": "GLOBAL_MARKETS",
-        "GLOBAL_SHARES": "GLOBAL_MARKETS",
-        "GLOBAL_MARKET": "GLOBAL_MARKETS",
-        "FUNDS": "MUTUAL_FUNDS",
-        "MUTUALFUND": "MUTUAL_FUNDS",
-        "MUTUAL_FUND": "MUTUAL_FUNDS",
-        "FX": "COMMODITIES_FX",
-        "COMMODITIES": "COMMODITIES_FX",
-        "PORTFOLIO": "MY_PORTFOLIO",
-        "MYPORTFOLIO": "MY_PORTFOLIO",
-        "LEADERS": "MARKET_LEADERS",
-        "MARKETLEADERS": "MARKET_LEADERS",
-        "INSIGHTS": "INSIGHTS_ANALYSIS",
-        "INSIGHTS_AI": "INSIGHTS_ANALYSIS",
-        "AI": "INSIGHTS_ANALYSIS",
-    }
-    return aliases.get(k, k)
-
-
-# =============================================================================
-# Symbol normalization
-# =============================================================================
-def _norm_symbol(s: str) -> str:
-    x = (s or "").strip().upper()
-    if not x:
-        return ""
-
-    if x.startswith("TADAWUL:"):
-        x = x.split(":", 1)[1].strip().upper()
-
-    if x.endswith(".TADAWUL"):
-        x = x.replace(".TADAWUL", "")
-
-    x = x.replace(" ", "")
-
-    # KSA numeric -> .SR
-    if x.isdigit() and 3 <= len(x) <= 6:
-        return f"{x}.SR"
-
-    if x.endswith(".SR") and x.replace(".SR", "").isdigit():
-        return x
-
-    return x
-
-
-def _is_ksa(sym: str) -> bool:
-    s = (sym or "").strip().upper()
-    if not s:
-        return False
-    if s.endswith(".SR"):
-        return True
-    return s.isdigit() and 3 <= len(s) <= 6
-
-
-def _dedupe(items: Sequence[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for s in items or []:
-        x = _norm_symbol(str(s))
-        if not x:
-            continue
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
-# =============================================================================
-# A1 helpers (for safe clear)
-# =============================================================================
-def _validate_start_cell(cell: str) -> str:
-    c = (cell or "").strip()
-    if not c:
-        return "A5"
-    if ":" in c:
-        c = c.split(":", 1)[0].strip()
-    if not _A1_CELL_RE.match(c):
-        logger.warning("Invalid start-cell '%s' -> using A5", cell)
-        return "A5"
-    return c.replace("$", "").upper()
-
-
-def _safe_sheet_name(sheet_name: str) -> str:
-    name = (sheet_name or "").strip().replace("'", "''")
-    return f"'{name}'"
-
-
-def _parse_a1_cell(cell: str) -> Tuple[str, int]:
-    s = _validate_start_cell(cell)
-    col = ""
-    row = ""
-    for ch in s:
-        if ch.isalpha():
-            col += ch
-        elif ch.isdigit():
-            row += ch
-    if not col:
-        col = "A"
-    r = int(row or "1")
-    if r <= 0:
-        r = 1
-    return col.upper(), r
-
-
-def _col_to_index(col: str) -> int:
-    col = (col or "").strip().upper()
-    n = 0
-    for ch in col:
-        if "A" <= ch <= "Z":
-            n = n * 26 + (ord(ch) - ord("A") + 1)
-    return max(1, n)
-
-
-def _index_to_col(idx: int) -> str:
-    idx = int(idx)
-    if idx <= 0:
-        idx = 1
-    s = ""
-    while idx > 0:
-        idx, rem = divmod(idx - 1, 26)
-        s = chr(rem + ord("A")) + s
-    return s or "A"
-
-
-def _a1(col: str, row: int) -> str:
-    return f"{col.upper()}{int(row)}"
-
-
-# =============================================================================
-# Backend client (urllib)
-# =============================================================================
-def _headers(token: str) -> Dict[str, str]:
-    h = {
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
-        "User-Agent": f"TadawulFastBridge-MarketScan/{SCRIPT_VERSION}",
-    }
-    if token:
-        h["X-APP-TOKEN"] = token
-        # keep Authorization for backends that expect it
-        h["Authorization"] = f"Bearer {token}"
-    return h
-
-
-def _post_json(url: str, payload: Dict[str, Any], *, timeout: float, retries: int) -> Dict[str, Any]:
-    primary, backup = _get_tokens()
-    tokens_to_try: List[str] = []
-    if primary:
-        tokens_to_try.append(primary)
-    if backup and backup != primary:
-        tokens_to_try.append(backup)
-    if not tokens_to_try:
-        tokens_to_try.append("")  # open mode
-
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-    last_err: Optional[str] = None
-    last_body_preview: Optional[str] = None
-    last_status: Optional[int] = None
-
-    attempts = max(1, int(retries) + 1)
-
-    for attempt in range(attempts):
-        for tok_idx, tok in enumerate(tokens_to_try):
-            try:
-                req = urllib.request.Request(url, data=data, headers=_headers(tok), method="POST")
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
-                    raw = resp.read().decode("utf-8", errors="replace")
-                    last_status = status
-                    last_body_preview = (raw or "")[:500]
-
-                    if 200 <= status < 300:
-                        if not (raw or "").strip():
-                            return {}
-                        try:
-                            parsed = json.loads(raw)
-                            return parsed if isinstance(parsed, dict) else {"results": parsed}
-                        except Exception:
-                            return {"results": [], "error": f"Non-JSON response: {(raw or '')[:200]}"}
-
-                    last_err = f"HTTP {status}"
-
-            except urllib.error.HTTPError as e:
-                last_status = int(getattr(e, "code", 0) or 0)
-                try:
-                    raw = e.read().decode("utf-8", errors="replace")  # type: ignore
-                except Exception:
-                    raw = str(e)
-                last_body_preview = (raw or "")[:500]
-                last_err = f"HTTP {last_status}"
-
-                # If auth failed and we have another token, try it
-                if last_status in (401, 403) and tok_idx < (len(tokens_to_try) - 1):
-                    continue
-
-            except Exception as e:
-                last_err = str(e)
-
-        # backoff between retry rounds
-        if attempt < attempts - 1:
-            time.sleep(min(8.0, 1.5 * (attempt + 1) * (attempt + 1)))
-
-    msg = last_err or "Unknown error"
-    if last_status:
-        msg = f"HTTP {last_status}: {msg}"
-    if last_body_preview:
-        msg = f"{msg} | body: {last_body_preview}"
-    return {"results": [], "error": msg}
-
-
-def _extract_result_list(resp: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Accept multiple backend shapes:
-      - {"results":[...]}
-      - {"rows":[...]}
-      - {"data":[...]}
-      - {"status":..., "results":...}
-      - list of dicts
-    """
-    if isinstance(resp, dict):
-        err = resp.get("error")
-        for k in ("results", "rows", "data"):
-            v = resp.get(k)
-            if isinstance(v, list):
-                out = [x for x in v if isinstance(x, dict)]
-                return out, (str(err) if err else None)
-        v2 = resp.get("payload")
-        if isinstance(v2, dict):
-            for k in ("results", "rows", "data"):
-                vv = v2.get(k)
-                if isinstance(vv, list):
-                    out = [x for x in vv if isinstance(x, dict)]
-                    return out, (str(err) if err else None)
-        return [], (str(err) if err else None)
-
-    if isinstance(resp, list):
-        return [x for x in resp if isinstance(x, dict)], None
-
-    return [], "Invalid backend response shape"
-
-
-# =============================================================================
-# Symbols selection
-# =============================================================================
-@dataclass(frozen=True)
-class SymbolBucket:
-    key: str
-    symbols: List[str]
-    meta: Dict[str, Any]
-
-
-def _symbols_reader_call(key: str, spreadsheet_id: Optional[str]) -> Any:
-    """
-    Prefer symbols_reader.get_page_symbols(key, spreadsheet_id=...).
-    Fall back safely if older signature.
-    """
-    fn = getattr(symbols_reader, "get_page_symbols", None)
-    if callable(fn):
-        if spreadsheet_id:
-            try:
-                return fn(key, spreadsheet_id=spreadsheet_id)  # type: ignore
-            except TypeError:
-                return fn(key)  # type: ignore
-        return fn(key)  # type: ignore
-
-    # legacy names
-    for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
-        fn2 = getattr(symbols_reader, name, None)
-        if callable(fn2):
-            return fn2(key)
-
-    raise RuntimeError("symbols_reader has no supported symbol function (expected get_page_symbols).")
-
-
-def _read_symbols_for_key(key: str, spreadsheet_id: Optional[str]) -> SymbolBucket:
-    canon = _canon_key(key)
-    try:
-        data = _symbols_reader_call(canon, spreadsheet_id)
-    except Exception as e:
-        return SymbolBucket(key=canon, symbols=[], meta={"shape": "error", "error": str(e), "count": 0, "key_in": key})
-
-    if isinstance(data, list):
-        syms = _dedupe([str(x) for x in data])
-        return SymbolBucket(key=canon, symbols=syms, meta={"shape": "list", "count": len(syms), "key_in": key})
-
-    if not isinstance(data, dict):
-        return SymbolBucket(key=canon, symbols=[], meta={"shape": str(type(data)), "count": 0, "key_in": key})
-
-    all_syms = data.get("all")
-    if all_syms is None:
-        all_syms = data.get("tickers") or data.get("symbols") or []
-    syms = _dedupe([str(x) for x in (all_syms or [])])
-
-    meta_raw = data.get("meta") if isinstance(data.get("meta"), dict) else {}
-    meta = {
-        "shape": "dict",
-        "count": len(syms),
-        "ksa_count": len(data.get("ksa") or []) if isinstance(data.get("ksa"), list) else None,
-        "global_count": len(data.get("global") or []) if isinstance(data.get("global"), list) else None,
-        "meta": meta_raw,
-        "key_in": key,
-    }
-    return SymbolBucket(key=canon, symbols=syms, meta=meta)
-
-
-def _default_keys() -> List[str]:
-    return ["MARKET_LEADERS", "GLOBAL_MARKETS", "KSA_TADAWUL"]
-
-
-# =============================================================================
-# Scan / rank
-# =============================================================================
-def _call_analysis_batch(
-    symbols: List[str],
-    *,
-    timeout: float,
-    retries: int,
-    batch_size: int,
-    endpoint: str,
-) -> List[Dict[str, Any]]:
-    base = _get_backend_base_url()
-    url = f"{base}{endpoint}"
-
-    out: List[Dict[str, Any]] = []
-    chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), max(1, batch_size))]
-
-    for idx, c in enumerate(chunks, start=1):
-        payload = {"tickers": c, "symbols": c}  # always send both (compat)
-        logger.info("Backend batch %s/%s | symbols=%s", idx, len(chunks), len(c))
-        resp = _post_json(url, payload, timeout=timeout, retries=retries)
-        got, err = _extract_result_list(resp)
-
-        if got:
-            out.extend(got)
-            continue
-
-        err_msg = err or (str(resp.get("error")) if isinstance(resp, dict) else None) or "Backend returned invalid response"
-        for s in c:
-            out.append({"symbol": s, "data_quality": "MISSING", "error": err_msg})
-
-    return out
-
-
-def _score_num(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _rank_key(r: Dict[str, Any]) -> Tuple[float, float, float, str]:
-    opp = _score_num(r.get("opportunity_score"))
-    overall = _score_num(r.get("overall_score"))
-    qual = _score_num(r.get("quality_score"))
-    sym = str(r.get("symbol") or r.get("ticker") or "")
-    return (
-        opp if opp is not None else -1e9,
-        overall if overall is not None else -1e9,
-        qual if qual is not None else -1e9,
-        sym,
-    )
-
-
-def _passes_quality(r: Dict[str, Any], min_quality: str) -> bool:
-    q = (r.get("data_quality") or "").strip().upper()
-    if not min_quality:
-        return True
-    min_quality = min_quality.strip().upper()
-    if min_quality == "ANY":
-        return True
-    order = {"OK": 3, "PARTIAL": 2, "MISSING": 1, "ERROR": 0}
-    return order.get(q, 0) >= order.get(min_quality, 0)
-
-
-# =============================================================================
-# Output shaping
-# =============================================================================
-DEFAULT_HEADERS: List[str] = [
+SCAN_HEADERS: List[str] = [
     "Rank",
     "Symbol",
-    "Origin Pages",
+    "Origin",
     "Name",
     "Market",
-    "Currency",
     "Price",
     "Change %",
-
-    "Market Cap",
-    "P/E (TTM)",
-    "P/B",
-    "Dividend Yield %",
-    "ROE %",
-    "ROA %",
-
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Risk Score",
     "Opportunity Score",
     "Overall Score",
     "Recommendation",
-
+    "Rec Badge",
+    "Reasoning",
     "Fair Value",
     "Upside %",
-    "Valuation Label",
-
-    # History / Forecast (best-effort)
-    "Returns 1W %",
-    "Returns 1M %",
-    "Returns 3M %",
-    "Returns 6M %",
-    "Returns 12M %",
-    "MA20",
-    "MA50",
-    "MA200",
-    "Volatility 30D %",
-    "RSI 14",
-    "Forecast Price (1M)",
     "Expected ROI % (1M)",
-    "Forecast Price (3M)",
     "Expected ROI % (3M)",
-    "Forecast Price (12M)",
-    "Expected ROI % (12M)",
-    "Forecast Confidence",
-    "Forecast Method",
-    "Forecast Source",
-    "Forecast Updated (UTC)",
-
+    "RSI 14",
+    "MA200",
+    "Risk Score",
     "Data Quality",
-    "Sources",
     "Last Updated (UTC)",
-    "Error",
+    "Last Updated (Riyadh)",
+    "Error"
 ]
 
+# =============================================================================
+# Utilities
+# =============================================================================
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _as_percent(x: Any) -> Any:
-    """
-    Normalize percent-like fields.
-    - If value looks like a fraction (abs<=1) => multiply by 100
-    - If value already looks like percent (abs>1) => keep
-    """
+def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
+    if not utc_iso: return ""
     try:
-        if x is None:
-            return None
-        v = float(x)
-        if v == 0.0:
-            return 0.0
-        if abs(v) <= 1.0:
-            return v * 100.0
-        return v
-    except Exception:
-        return x
+        dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+        tz = timezone(timedelta(hours=3))
+        return dt.astimezone(tz).isoformat()
+    except: return ""
 
+def _get_spreadsheet_id(cli_id: Optional[str]) -> str:
+    if cli_id: return cli_id.strip()
+    sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip()
+    return sid if sid else os.getenv("DEFAULT_SPREADSHEET_ID", "").strip()
 
-def _first_present(d: Dict[str, Any], *keys: str) -> Any:
-    for k in keys:
-        if k in d:
-            return d.get(k)
-    return None
+def _canon_key(user_key: str) -> str:
+    k = str(user_key or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "KSA": "KSA_TADAWUL", "TADAWUL": "KSA_TADAWUL",
+        "GLOBAL": "GLOBAL_MARKETS", "LEADERS": "MARKET_LEADERS",
+        "PORTFOLIO": "MY_PORTFOLIO", "INSIGHTS": "INSIGHTS_ANALYSIS"
+    }
+    return aliases.get(k, k)
 
+# =============================================================================
+# Backend Communication
+# =============================================================================
+def _call_analysis_batch(symbols: List[str], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    base_url = (os.getenv("BACKEND_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+    url = f"{base_url}/v1/analysis/quotes"
+    token = (os.getenv("APP_TOKEN") or "").strip()
 
-def _to_row(r: Dict[str, Any], rank: int, origins: str) -> List[Any]:
-    sources = r.get("sources")
-    if isinstance(sources, list):
-        sources_str = ", ".join([str(x) for x in sources if str(x).strip()])
-    else:
-        sources_str = str(sources or "")
+    # Standardized Resilient Payload
+    payload = {
+        "tickers": symbols,
+        "symbols": symbols,
+        "mode": "comprehensive"
+    }
+    data = json.dumps(payload).encode("utf-8")
+    
+    headers = {
+        "Content-Type": "application/json",
+        "X-APP-TOKEN": token,
+        "User-Agent": f"TFB-MarketScan/{SCRIPT_VERSION}"
+    }
 
-    sym = _norm_symbol(str(_first_present(r, "symbol", "ticker") or ""))
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+            parsed = json.loads(raw)
+            # Handle standard BatchAnalysisResponse shape
+            return parsed.get("results") or parsed.get("items") or []
+    except Exception as e:
+        logger.error("Backend request failed: %s", e)
+        return []
 
-    price = _first_present(r, "price", "current_price")
-    change_pct = _first_present(r, "change_pct", "percent_change", "pct_change")
-    dividend_yield = _first_present(r, "dividend_yield", "div_yield", "dividendYield")
-    roe = _first_present(r, "roe", "return_on_equity")
-    roa = _first_present(r, "roa", "return_on_assets")
-    upside = _first_present(r, "upside_percent", "upside_pct", "upside")
+# =============================================================================
+# Data Mapping & Row Generation
+# =============================================================================
+def _map_to_row(item: Dict[str, Any], rank: int, origin: str) -> List[Any]:
+    """Maps raw backend data to the SCAN_HEADERS schema."""
+    def g(*keys):
+        for k in keys:
+            if k in item and item[k] is not None: return item[k]
+        return None
 
-    last_updated = _first_present(
-        r,
-        "last_updated_utc",
-        "last_updated",
-        "updated_at",
-        "updatedAt",
-        "timestamp_utc",
-    )
-    if not last_updated:
-        last_updated = _utc_now_iso()
+    # Percent formatting helper
+    def pct(val):
+        if val is None: return None
+        try:
+            f = float(val)
+            # If 0.14 -> 14.0, if 14.0 -> 14.0
+            return f * 100.0 if abs(f) <= 1.5 else f
+        except: return val
 
-    # History/Forecast best-effort fields
-    returns_1w = _first_present(r, "returns_1w")
-    returns_1m = _first_present(r, "returns_1m")
-    returns_3m = _first_present(r, "returns_3m")
-    returns_6m = _first_present(r, "returns_6m")
-    returns_12m = _first_present(r, "returns_12m")
-
-    ma20 = _first_present(r, "ma20")
-    ma50 = _first_present(r, "ma50")
-    ma200 = _first_present(r, "ma200")
-    vol30 = _first_present(r, "volatility_30d")
-    rsi14 = _first_present(r, "rsi_14")
-
-    fp_1m = _first_present(r, "expected_price_1m", "forecast_price_1m", "forecast_1m_price")
-    er_1m = _first_present(r, "expected_return_1m", "expected_roi_1m", "forecast_roi_1m")
-
-    fp_3m = _first_present(r, "expected_price_3m", "forecast_price_3m", "forecast_3m_price")
-    er_3m = _first_present(r, "expected_return_3m", "expected_roi_3m", "forecast_roi_3m")
-
-    fp_12m = _first_present(r, "expected_price_12m", "forecast_price_12m", "forecast_12m_price")
-    er_12m = _first_present(r, "expected_return_12m", "expected_roi_12m", "forecast_roi_12m")
-
-    conf = _first_present(r, "confidence_score", "forecast_confidence", "confidence")
-    f_method = _first_present(r, "forecast_method")
-    f_source = _first_present(r, "forecast_source", "forecast_provider", "forecast_data_source")
-    f_updated = _first_present(r, "forecast_updated_utc", "forecast_updated", "forecast_timestamp_utc")
+    utc = g("last_updated_utc") or _now_utc_iso()
 
     return [
         rank,
-        sym,
-        origins,
-        _first_present(r, "name"),
-        _first_present(r, "market_region", "market"),
-        _first_present(r, "currency"),
-
-        price,
-        _as_percent(change_pct),
-
-        _first_present(r, "market_cap", "marketCap"),
-        _first_present(r, "pe_ttm", "pe", "pe_ratio"),
-        _first_present(r, "pb", "pb_ratio"),
-        _as_percent(dividend_yield),
-        _as_percent(roe),
-        _as_percent(roa),
-
-        _first_present(r, "value_score"),
-        _first_present(r, "quality_score"),
-        _first_present(r, "momentum_score"),
-        _first_present(r, "risk_score"),
-        _first_present(r, "opportunity_score"),
-        _first_present(r, "overall_score"),
-        _first_present(r, "recommendation"),
-
-        _first_present(r, "fair_value", "fairValue"),
-        _as_percent(upside),
-        _first_present(r, "valuation_label", "valuation"),
-
-        _as_percent(returns_1w),
-        _as_percent(returns_1m),
-        _as_percent(returns_3m),
-        _as_percent(returns_6m),
-        _as_percent(returns_12m),
-        ma20,
-        ma50,
-        ma200,
-        _as_percent(vol30),
-        rsi14,
-        fp_1m,
-        _as_percent(er_1m),
-        fp_3m,
-        _as_percent(er_3m),
-        fp_12m,
-        _as_percent(er_12m),
-        conf,
-        f_method,
-        f_source,
-        f_updated,
-
-        _first_present(r, "data_quality"),
-        sources_str,
-        last_updated,
-        _first_present(r, "error"),
+        g("symbol"),
+        origin,
+        g("name"),
+        g("market", "market_region"),
+        g("price", "current_price"),
+        pct(g("change_pct", "percent_change")),
+        g("opportunity_score"),
+        g("overall_score"),
+        g("recommendation"),
+        g("rec_badge"),
+        g("scoring_reason", "reason"),
+        g("fair_value"),
+        pct(g("upside_percent", "upside_pct")),
+        pct(g("expected_roi_1m", "expected_return_1m")),
+        pct(g("expected_roi_3m", "expected_return_3m")),
+        g("rsi_14", "rsi14"),
+        g("ma200"),
+        g("risk_score"),
+        g("data_quality"),
+        utc,
+        _to_riyadh_iso(utc),
+        g("error")
     ]
 
-
-def _grid_from_results(
-    results_sorted: List[Dict[str, Any]],
-    *,
-    headers: Optional[List[str]] = None,
-    origin_map: Optional[Dict[str, List[str]]] = None,
-) -> List[List[Any]]:
-    h = headers or list(DEFAULT_HEADERS)
-    origin_map = origin_map or {}
-
-    rows: List[List[Any]] = []
-    for i, r in enumerate(results_sorted, start=1):
-        sym = _norm_symbol(str(r.get("symbol") or r.get("ticker") or ""))
-        origins = ", ".join(origin_map.get(sym, [])) if sym else ""
-        rows.append(_to_row(r, rank=i, origins=origins))
-
-    fixed: List[List[Any]] = []
-    for rr in rows:
-        if len(rr) < len(h):
-            rr = rr + [None] * (len(h) - len(rr))
-        elif len(rr) > len(h):
-            rr = rr[: len(h)]
-        fixed.append(rr)
-
-    return [h] + fixed
-
-
 # =============================================================================
-# Sheets write helpers (supports multiple service shapes)
+# Main Sequence
 # =============================================================================
-def _write_grid(
-    spreadsheet_id: str,
-    sheet_name: str,
-    start_cell: str,
-    grid: List[List[Any]],
-    *,
-    value_input: str = "RAW",
-) -> int:
-    """
-    Returns cells updated (best-effort int). Supports multiple google_sheets_service APIs.
-    """
-    if sheets_service is None:
-        raise RuntimeError("google_sheets_service not available")
+def main():
+    parser = argparse.ArgumentParser(description="Tadawul Fast Bridge Market Scanner")
+    parser.add_argument("--sheet-id", help="Target Spreadsheet ID")
+    parser.add_argument("--keys", nargs="*", help="Registry keys to scan (e.g. KSA GLOBAL)")
+    parser.add_argument("--top", type=int, default=50, help="Number of opportunities to save")
+    parser.add_argument("--sheet-name", default="Market_Scan", help="Destination tab name")
+    parser.add_argument("--no-sheet", action="store_true", help="Print results to console only")
+    args = parser.parse_args()
 
-    vi = (value_input or "RAW").strip().upper()
-    if vi not in ("RAW", "USER_ENTERED"):
-        vi = "RAW"
+    sid = _get_spreadsheet_id(args.sheet_id)
+    if not sid:
+        logger.error("Configuration Error: No Spreadsheet ID found.")
+        sys.exit(1)
 
-    # 1) Preferred: write_grid_chunked(sid, sheet_name, start_cell, grid, value_input=?)
-    fn = getattr(sheets_service, "write_grid_chunked", None)
-    if callable(fn):
+    # 1. Discover Symbols from Dashboards
+    scan_keys = [_canon_key(k) for k in (args.keys or ["KSA_TADAWUL", "GLOBAL_MARKETS", "MARKET_LEADERS"])]
+    all_tickers: List[str] = []
+    origin_map: Dict[str, str] = {}
+
+    logger.info("Scanning dashboards: %s", ", ".join(scan_keys))
+    for k in scan_keys:
         try:
-            sig = None
-            try:
-                import inspect as _inspect  # local import
+            sym_data = symbols_reader.get_page_symbols(k, spreadsheet_id=sid)
+            symbols = sym_data.get("all") if isinstance(sym_data, dict) else sym_data
+            if symbols:
+                for s in symbols:
+                    s_up = str(s).upper()
+                    all_tickers.append(s_up)
+                    if s_up not in origin_map: origin_map[s_up] = k
+        except Exception as e:
+            logger.warning("   -> Could not read symbols for %s: %s", k, e)
 
-                sig = _inspect.signature(fn)
-            except Exception:
-                sig = None
-
-            if sig and "value_input" in sig.parameters:
-                updated = fn(spreadsheet_id, sheet_name, start_cell, grid, value_input=vi)  # type: ignore
-            else:
-                updated = fn(spreadsheet_id, sheet_name, start_cell, grid)  # type: ignore
-            try:
-                return int(updated or 0)
-            except Exception:
-                return 0
-        except Exception:
-            pass
-
-    # 2) write_grid(...)
-    fn2 = getattr(sheets_service, "write_grid", None)
-    if callable(fn2):
-        try:
-            updated = fn2(spreadsheet_id, sheet_name, start_cell, grid)  # type: ignore
-            try:
-                return int(updated or 0)
-            except Exception:
-                return 0
-        except Exception:
-            pass
-
-    # 3) update_values(spreadsheet_id, a1_range, values, value_input=?)
-    fn3 = getattr(sheets_service, "update_values", None)
-    if callable(fn3):
-        a1 = f"{_safe_sheet_name(sheet_name)}!{start_cell}"
-        updated = fn3(spreadsheet_id, a1, grid, value_input=vi)  # type: ignore
-        try:
-            return int(updated or 0)
-        except Exception:
-            return 0
-
-    raise RuntimeError(
-        "No supported grid writer found in google_sheets_service "
-        "(expected write_grid_chunked/write_grid/update_values)."
-    )
-
-
-def _clear_range(spreadsheet_id: str, a1_range: str) -> None:
-    if sheets_service is None:
-        raise RuntimeError("google_sheets_service not available")
-
-    fn = getattr(sheets_service, "clear_range", None)
-    if callable(fn):
-        fn(spreadsheet_id, a1_range)  # type: ignore
+    unique_tickers = list(dict.fromkeys(all_tickers))
+    if not unique_tickers:
+        logger.error("No symbols found. Ensure dashboards have tickers in Column B.")
         return
 
-    fn2 = getattr(sheets_service, "clear_values", None)
-    if callable(fn2):
-        fn2(spreadsheet_id, a1_range)  # type: ignore
+    # 2. Perform Batch Analysis
+    logger.info("Analyzing %d unique symbols...", len(unique_tickers))
+    results = _call_analysis_batch(unique_tickers, {})
+
+    # 3. Intelligent Ranking
+    # Sort by Opportunity Score desc, then ROI desc
+    def rank_logic(x):
+        return (float(x.get("opportunity_score") or 0), 
+                float(x.get("expected_roi_3m") or 0))
+    
+    ranked = sorted(results, key=rank_logic, reverse=True)[:args.top]
+    
+    # 4. Sheet Writing
+    if args.no_sheet:
+        for i, r in enumerate(ranked, 1):
+            logger.info(f"#{i} {r.get('symbol')}: Score={r.get('opportunity_score')} Rec={r.get('recommendation')}")
         return
 
-    raise RuntimeError("No supported clear function found in google_sheets_service (expected clear_range/clear_values).")
-
-
-# =============================================================================
-# Main
-# =============================================================================
-def main() -> None:
-    p = argparse.ArgumentParser(description="Run a market scan (AI Analysis) and optionally write to Google Sheets.")
-    p.add_argument("--keys", nargs="*", default=None, help="PAGE_REGISTRY keys to scan (default: MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL)")
-    p.add_argument("--ksa-only", action="store_true", help="Keep only KSA (.SR or numeric) symbols")
-    p.add_argument("--global-only", action="store_true", help="Keep only Global (non-.SR) symbols")
-    p.add_argument("--max-symbols", type=int, default=0, help="Cap total symbols (0 = no cap)")
-
-    # Backend
-    p.add_argument("--endpoint", default="/v1/analysis/quotes", help="Backend endpoint path (default: /v1/analysis/quotes)")
-    p.add_argument("--batch-size", type=int, default=80, help="Backend batch size for /v1/analysis/quotes (default: 80)")
-    p.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout per batch")
-    p.add_argument("--retries", type=int, default=2, help="HTTP retries per batch")
-
-    # Ranking/filter
-    p.add_argument("--top", type=int, default=50, help="Keep top N results after ranking")
-    p.add_argument("--min-quality", default="ANY", help="ANY | OK | PARTIAL | MISSING | ERROR")
-    p.add_argument("--include-errors", action="store_true", help="Keep rows with error (default: filtered if quality too low)")
-
-    # Output files
-    p.add_argument("--out-json", default="", help="Write results JSON to file path")
-    p.add_argument("--out-csv", default="", help="Write results CSV to file path (basic)")
-    p.add_argument("--dry-run", action="store_true", help="Run scan and ranking but do not write to sheet")
-
-    # Sheets output
-    p.add_argument("--no-sheet", action="store_true", help="Do not write to Google Sheets; print summary only")
-    p.add_argument("--sheet-id", default="", help="Spreadsheet ID to WRITE to (default from env DEFAULT_SPREADSHEET_ID)")
-    p.add_argument("--symbols-sheet-id", default="", help="Spreadsheet ID to READ symbols from (default: uses --sheet-id if set, else DEFAULT_SPREADSHEET_ID)")
-    p.add_argument("--sheet-name", default="Market_Scan", help="Target sheet/tab name (default: Market_Scan)")
-    p.add_argument("--start-cell", default="A5", help="Top-left cell for headers (default: A5)")
-    p.add_argument("--clear", action="store_true", help="Clear old values before writing")
-    p.add_argument("--smart-clear", action="store_true", help="Clear only table width (recommended with --clear)")
-    p.add_argument("--clear-end-row", type=int, default=100000, help="Clear end row (default 100000)")
-    p.add_argument("--value-input", default="RAW", choices=["RAW", "USER_ENTERED", "raw", "user_entered"], help="Sheets write mode")
-
-    # Logging
-    p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
-
-    args = p.parse_args()
-    try:
-        logging.getLogger().setLevel(getattr(logging, str(args.log_level).upper(), logging.INFO))
-    except Exception:
-        pass
-
-    base_url = _get_backend_base_url()
-    endpoint = str(args.endpoint or "/v1/analysis/quotes").strip()
-    if not endpoint.startswith("/"):
-        endpoint = "/" + endpoint
-
-    logger.info("MarketScan v%s | backend=%s | endpoint=%s | ts=%s", SCRIPT_VERSION, base_url, endpoint, _utc_now_iso())
-
-    # Keys (with alias normalization)
-    keys_raw = _parse_keys_list(args.keys)
-    keys = [_canon_key(k) for k in (keys_raw or _default_keys())]
-
-    # Determine spreadsheet IDs
-    write_sheet_id = (args.sheet_id or _get_default_spreadsheet_id() or "").strip()
-
-    # Read-symbols sheet default:
-    # - if user passed --symbols-sheet-id => use it
-    # - else if user passed --sheet-id => read from same sheet
-    # - else use DEFAULT_SPREADSHEET_ID (env/settings)
-    symbols_sheet_id = (args.symbols_sheet_id or write_sheet_id or _get_default_spreadsheet_id() or "").strip() or None
-
-    # Read symbols
-    all_symbols: List[str] = []
-    per_key_meta: Dict[str, Any] = {}
-    origin_map: Dict[str, List[str]] = {}
-
-    for k in keys:
-        b = _read_symbols_for_key(k, symbols_sheet_id)
-        per_key_meta[b.key] = b.meta
-
-        syms_norm = _dedupe(b.symbols)
-        all_symbols.extend(syms_norm)
-
-        for s in syms_norm:
-            origin_map.setdefault(s, [])
-            if b.key not in origin_map[s]:
-                origin_map[s].append(b.key)
-
-    all_symbols = _dedupe(all_symbols)
-
-    if args.ksa_only and args.global_only:
-        logger.error("You cannot use --ksa-only and --global-only together.")
-        raise SystemExit(2)
-
-    if args.ksa_only:
-        all_symbols = [s for s in all_symbols if _is_ksa(s)]
-    if args.global_only:
-        all_symbols = [s for s in all_symbols if not _is_ksa(s)]
-
-    if args.max_symbols and args.max_symbols > 0 and len(all_symbols) > int(args.max_symbols):
-        all_symbols = all_symbols[: int(args.max_symbols)]
-
-    if not all_symbols:
-        logger.warning("No symbols found after filtering. keys=%s meta=%s", keys, per_key_meta)
-        raise SystemExit(0)
-
-    logger.info("Symbols loaded: %s | keys=%s | symbols_sheet_id=%s", len(all_symbols), keys, "SET" if symbols_sheet_id else "NOT SET")
-
-    # Call backend
-    t0 = time.time()
-    results = _call_analysis_batch(
-        all_symbols,
-        timeout=_safe_float(args.timeout, 60.0),
-        retries=_safe_int(args.retries, 2),
-        batch_size=max(1, _safe_int(args.batch_size, 80)),
-        endpoint=endpoint,
-    )
-    dt = time.time() - t0
-    logger.info("Backend returned raw rows=%s in %.2fs", len(results), dt)
-
-    # Quality filter
-    min_q = str(args.min_quality or "ANY").strip().upper()
-
-    if not args.include_errors:
-        if min_q != "ANY":
-            results = [r for r in results if _passes_quality(r, min_q)]
-        else:
-            tmp: List[Dict[str, Any]] = []
-            for r in results:
-                if (r.get("error") or "") and (r.get("opportunity_score") is None) and (r.get("overall_score") is None):
-                    continue
-                tmp.append(r)
-            results = tmp
-
-    # Rank + Top N
-    results_sorted = sorted(results, key=_rank_key, reverse=True)
-    top_n = max(1, _safe_int(args.top, 50))
-    results_sorted = results_sorted[:top_n]
-
-    logger.info("Final ranked rows: %s (top=%s, min_quality=%s)", len(results_sorted), top_n, min_q)
-
-    # Outputs: JSON/CSV
-    if args.out_json:
-        try:
-            with open(args.out_json, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "generated_utc": _utc_now_iso(),
-                        "version": SCRIPT_VERSION,
-                        "backend": base_url,
-                        "endpoint": endpoint,
-                        "keys": keys,
-                        "symbols_sheet_id": symbols_sheet_id,
-                        "symbols_count": len(all_symbols),
-                        "ranked_count": len(results_sorted),
-                        "results": results_sorted,
-                        "per_key_meta": per_key_meta,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            logger.info("Wrote JSON: %s", args.out_json)
-        except Exception as e:
-            logger.error("Failed writing JSON (%s): %s", args.out_json, e)
-
-    if args.out_csv:
-        try:
-            grid = _grid_from_results(results_sorted, origin_map=origin_map)
-            with open(args.out_csv, "w", encoding="utf-8", newline="") as f:
-                w = csv.writer(f)
-                for row in grid:
-                    w.writerow(row)
-            logger.info("Wrote CSV: %s", args.out_csv)
-        except Exception as e:
-            logger.error("Failed writing CSV (%s): %s", args.out_csv, e)
-
-    # No sheet / dry run
-    if args.no_sheet or args.dry_run:
-        top_preview = []
-        for r in results_sorted[:10]:
-            sym = _norm_symbol(str(r.get("symbol") or r.get("ticker") or ""))
-            opp = r.get("opportunity_score")
-            overall = r.get("overall_score")
-            top_preview.append(f"{sym}(opp={opp}, overall={overall})")
-        logger.info("Done (%s). Top preview: %s", "no-sheet" if args.no_sheet else "dry-run", ", ".join(top_preview))
-        return
-
-    # Sheets write
-    if sheets_service is None:
-        logger.error("google_sheets_service not importable; cannot write to sheet. Use --no-sheet.")
-        raise SystemExit(2)
-
-    if not write_sheet_id:
-        logger.error("Spreadsheet ID missing for WRITE. Set DEFAULT_SPREADSHEET_ID or pass --sheet-id, or use --no-sheet.")
-        raise SystemExit(2)
-
-    sheet_name = (args.sheet_name or "Market_Scan").strip()
-    start_cell = _validate_start_cell(str(args.start_cell or "A5"))
-    clear_end_row = max(1000, _safe_int(args.clear_end_row, 100000))
-
-    value_input = str(args.value_input or "RAW").strip().upper()
-    if value_input not in ("RAW", "USER_ENTERED"):
-        value_input = "RAW"
-
-    grid = _grid_from_results(results_sorted, origin_map=origin_map)
-
-    # Clear old values (optional)
-    if args.clear:
-        try:
-            start_col, start_row = _parse_a1_cell(start_cell)
-            end_col = "ZZ"
-            if args.smart_clear:
-                end_col = _index_to_col(_col_to_index(start_col) + len(grid[0]) - 1)
-
-            rng = f"{_safe_sheet_name(sheet_name)}!{_a1(start_col, start_row)}:{end_col}{clear_end_row}"
-            _clear_range(write_sheet_id, rng)
-            logger.info("Cleared range: %s", rng)
-        except Exception as e:
-            logger.warning("Clear failed (continuing): %s", e)
+    grid = [SCAN_HEADERS]
+    for i, r in enumerate(ranked, 1):
+        sym = str(r.get("symbol") or "").upper()
+        grid.append(_map_to_row(r, i, origin_map.get(sym, "SCAN")))
 
     try:
-        updated = _write_grid(write_sheet_id, sheet_name, start_cell, grid, value_input=value_input)
-        logger.info("✅ Sheet updated: sheet=%s rows=%s cells=%s", sheet_name, len(grid) - 1, int(updated or 0))
+        logger.info("Writing results to sheet: %s", args.sheet_name)
+        # Use chunked writer for safety
+        updated = sheets_service.write_grid_chunked(sid, args.sheet_name, "A5", grid)
+        logger.info("✅ Success: Updated %s cells in 'Top Opportunities' report.", updated)
     except Exception as e:
         logger.error("❌ Sheet write failed: %s", e)
-        raise SystemExit(2)
-
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
