@@ -3,14 +3,14 @@
 """
 core/providers/yahoo_chart_provider.py
 ============================================================
-Yahoo Quote/Chart Provider (KSA-safe) — v2.1.1
-(PATCH-ALIGNED + ALIGNED ROI KEYS + RIYADH TIME)
+Yahoo Quote/Chart Provider (KSA-safe) — v2.1.2
+(RESILIENT + PATCH-ALIGNED + ALIGNED ROI KEYS + RIYADH TIME)
 
-What’s improved in v2.1.1
+What’s improved in v2.1.2
 - ✅ ROI Key Alignment: Uses 'expected_roi_1m/3m/12m' to match EODHD/Finnhub.
 - ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
-- ✅ Provenance: Ensures 'data_source="yahoo_chart"' is used in the final patch.
-- ✅ Engine alignment: Returns Dict[str, Any] only.
+- ✅ Network Resilience: Multi-host support (query1/query2) and exponential backoff.
+- ✅ KSA Precision: Normalizes numeric codes to .SR and handles TADAWUL wrappers.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import httpx
 
 logger = logging.getLogger("core.providers.yahoo_chart_provider")
 
-PROVIDER_VERSION = "2.1.1"
+PROVIDER_VERSION = "2.1.2"
 PROVIDER_NAME = "yahoo_chart"
 
 # ---------------------------
@@ -43,15 +43,30 @@ _FALSY = {"0", "false", "no", "n", "off", "f"}
 def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw: return default
-    return raw not in _FALSY
+    if raw in _FALSY: return False
+    if raw in _TRUTHY: return True
+    return default
 
 def _env_float(name: str, default: float) -> float:
-    try: return float(os.getenv(name, str(default)))
-    except: return default
+    v = os.getenv(name)
+    if v is None: return default
+    try:
+        f = float(str(v).strip())
+        return f if f > 0 else default
+    except Exception: return default
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None: return default
+    try:
+        return int(str(v).strip())
+    except Exception: return default
 
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    return str(v).strip() if v else default
+    if v is None: return default
+    s = str(v).strip()
+    return s if s else default
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -59,6 +74,28 @@ def _utc_iso() -> str:
 def _riyadh_iso() -> str:
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz).isoformat()
+
+# ---------------------------
+# HTTP Configuration
+# ---------------------------
+UA = _env_str("YAHOO_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+_TIMEOUT_S = _env_float("YAHOO_TIMEOUT_S", 8.5)
+TIMEOUT = httpx.Timeout(timeout=_TIMEOUT_S, connect=min(5.0, _TIMEOUT_S))
+
+_RETRY_MAX = _env_int("YAHOO_RETRY_MAX", 2)
+_RETRY_BACKOFF_MS = _env_float("YAHOO_RETRY_BACKOFF_MS", 250.0)
+
+_DEFAULT_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+_DEFAULT_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+_ALT_HOSTS = [h.strip() for h in (_env_str("YAHOO_ALT_HOSTS", "")).split(",") if h.strip()]
+QUOTE_URLS: List[str] = [_DEFAULT_QUOTE_URL]
+CHART_URLS: List[str] = [_DEFAULT_CHART_URL]
+
+for host in _ALT_HOSTS:
+    base = host.rstrip("/") if "://" in host else f"https://{host}"
+    QUOTE_URLS.append(f"{base}/v7/finance/quote")
+    CHART_URLS.append(f"{base}/v8/finance/chart/{{symbol}}")
 
 # ---------------------------
 # Caching (TTLCache Fallback)
@@ -109,7 +146,7 @@ def _history_analytics(closes: List[float]) -> Dict[str, Any]:
         if start == 0: return None
         return ((last / start) - 1.0) * 100.0
 
-    # Aligned with v2.1.1 Standard
+    # Aligned ROI Keys
     out["expected_roi_1m"] = momentum_roi(21)
     out["expected_roi_3m"] = momentum_roi(63)
     out["expected_roi_12m"] = momentum_roi(252)
@@ -125,6 +162,14 @@ def _history_analytics(closes: List[float]) -> Dict[str, Any]:
     out["forecast_updated_riyadh"] = _riyadh_iso()
     return out
 
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s: return ""
+    if s.startswith("TADAWUL:"): s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"): s = s.replace(".TADAWUL", "").strip()
+    if _KSA_CODE_RE.match(s): return f"{s}.SR"
+    return s
+
 # ---------------------------
 # Client reuse
 # ---------------------------
@@ -135,7 +180,7 @@ async def _get_client() -> httpx.AsyncClient:
     global _CLIENT
     async with _CLIENT_LOCK:
         if _CLIENT is None:
-            _CLIENT = httpx.AsyncClient(timeout=8.5, follow_redirects=True)
+            _CLIENT = httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True)
     return _CLIENT
 
 async def aclose_yahoo_client() -> None:
@@ -146,54 +191,66 @@ async def aclose_yahoo_client() -> None:
 # ---------------------------
 # Main Fetchers
 # ---------------------------
-async def _fetch_quote(symbol: str) -> Dict[str, Any]:
-    u_sym = symbol.strip().upper()
-    if not u_sym: return {}
-    
-    # Normalize: "2222" -> "2222.SR"
-    if _KSA_CODE_RE.match(u_sym):
-        u_sym = f"{u_sym}.SR"
-
+async def _http_get_json_multi(urls: List[str], symbol: str, params: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str]]:
     client = await _get_client()
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    params = {"symbols": u_sym}
+    headers = {"User-Agent": UA, "Referer": f"https://finance.yahoo.com/quote/{symbol}"}
+    
+    for url in urls:
+        formatted_url = url.format(symbol=symbol)
+        for i in range(_RETRY_MAX + 1):
+            try:
+                r = await client.get(formatted_url, params=params, headers=headers)
+                if r.status_code == 200: return r.json(), None
+                if r.status_code not in {429, 500, 502, 503, 504}: break
+            except Exception as e:
+                if i == _RETRY_MAX: return None, str(e)
+            await asyncio.sleep((_RETRY_BACKOFF_MS / 1000.0) * (2**i))
+    return None, "All endpoints failed"
 
-    try:
-        r = await client.get(url, params=params)
-        js = r.json()
+async def _fetch_quote(symbol: str) -> Dict[str, Any]:
+    u_sym = _normalize_symbol(symbol)
+    if not u_sym: return {}
+
+    # Cache Check
+    ck = f"q_patch::{u_sym}"
+    hit = _Q_CACHE.get(ck)
+    if hit: return dict(hit)
+
+    params = {"symbols": u_sym, "formatted": "false"}
+    js, err = await _http_get_json_multi(QUOTE_URLS, u_sym, params)
+    
+    if js:
         res = js.get("quoteResponse", {}).get("result", [])
-        if not res: return {"error": f"Symbol {u_sym} not found"}
-        
-        q = res[0]
-        out = {
-            "symbol": u_sym,
-            "current_price": _to_float(q.get("regularMarketPrice")),
-            "previous_close": _to_float(q.get("regularMarketPreviousClose")),
-            "percent_change": _to_float(q.get("regularMarketChangePercent")),
-            "day_high": _to_float(q.get("regularMarketDayHigh")),
-            "day_low": _to_float(q.get("regularMarketDayLow")),
-            "volume": _to_float(q.get("regularMarketVolume")),
-            "name": q.get("longName") or q.get("shortName"),
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-            "last_updated_utc": _utc_iso()
-        }
+        if res:
+            q = res[0]
+            out = {
+                "symbol": u_sym,
+                "current_price": _to_float(q.get("regularMarketPrice")),
+                "previous_close": _to_float(q.get("regularMarketPreviousClose")),
+                "percent_change": _to_float(q.get("regularMarketChangePercent")),
+                "day_high": _to_float(q.get("regularMarketDayHigh")),
+                "day_low": _to_float(q.get("regularMarketDayLow")),
+                "volume": _to_float(q.get("regularMarketVolume")),
+                "name": q.get("longName") or q.get("shortName"),
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "last_updated_utc": _utc_iso()
+            }
 
-        # Supplemental enrichment for history/forecast
-        if _env_bool("YAHOO_ENABLE_HISTORY", True):
-            c_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{u_sym}"
-            c_res = await client.get(c_url, params={"range": "2y", "interval": "1d"})
-            c_js = c_res.json()
-            chart_res = c_js.get("chart", {}).get("result", [None])[0]
-            if chart_res:
-                closes = chart_res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                closes = [c for c in closes if c is not None]
-                if closes:
-                    out.update(_history_analytics(closes))
+            # Supplemental enrichment for history/forecast
+            if _env_bool("YAHOO_ENABLE_HISTORY", True):
+                c_js, c_err = await _http_get_json_multi(CHART_URLS, u_sym, {"range": "2y", "interval": "1d"})
+                chart_res = c_js.get("chart", {}).get("result", [None])[0] if c_js else None
+                if chart_res:
+                    closes = chart_res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                    closes = [c for c in closes if c is not None]
+                    if closes:
+                        out.update(_history_analytics(closes))
 
-        return out
-    except Exception as e:
-        return {"error": f"Yahoo fetch failed: {str(e)}"}
+            _Q_CACHE[ck] = out
+            return out
+            
+    return {"error": f"Yahoo fetch failed: {err or 'Symbol not found'}"}
 
 async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
     return await _fetch_quote(symbol)
