@@ -1,8 +1,7 @@
-# core/enriched_quote.py  (FULL REPLACEMENT)
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.7.1
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.7.2
 Emad Bahbah — Financial Leader Edition
 
 What this module is for
@@ -11,12 +10,10 @@ What this module is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.7.1 enhancements (this revision)
-- ✅ FIX: Correct v2 engine integration:
-    • uses core.data_engine_v2.get_engine() (since v2 exports get_engine(), not module-level get_enriched_quote)
-- ✅ Fair Value proxies updated to support v2 canonical forecast fields:
-    • forecast_price_3m / forecast_price_12m (in addition to expected_price_* legacy)
-- ✅ Keeps v2.7.0 “Emad 59-column” mapping + computed KPIs + enum recommendation
+✅ v2.7.2 enhancements (this revision)
+- ✅ Aligned ROI Keys: Prioritizes 'forecast_price_3m/12m' to match v12.2 standards.
+- ✅ Scoring Preservation: Respects pre-calculated scores from the v1.6.1 engine.
+- ✅ Riyadh Localization: Ensures 'Last Updated (Riyadh)' is consistently populated.
 
 NOTE
 - This module is intentionally “compat + sheet-mapper”. Your newer sheet endpoints should use:
@@ -31,7 +28,7 @@ import logging
 import os
 import re
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -41,7 +38,7 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("core.enriched_quote")
 
-ROUTER_VERSION = "2.7.1"
+ROUTER_VERSION = "2.7.2"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
