@@ -1,8 +1,8 @@
-# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.2
+# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.3
 """
 core/yahoo_chart_provider.py
 ===========================================================
-Compatibility + Repo-Hygiene Shim — v0.3.2 (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.3.3 (PROD SAFE)
 
 Why this exists
 - The canonical Yahoo Chart provider lives here:
@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("core.yahoo_chart_provider_shim")
 
-SHIM_VERSION = "0.3.2"
+SHIM_VERSION = "0.3.3"
 
 # Backward-compat constant (not necessarily used by canonical provider)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
@@ -122,6 +122,9 @@ try:
 
     _fetch_enriched_quote_patch = getattr(_canon, "fetch_enriched_quote_patch", None)
     _fetch_quote_and_enrichment_patch = getattr(_canon, "fetch_quote_and_enrichment_patch", None)
+    
+    # Alias fundamentals to enriched for charts (best-effort)
+    _fetch_quote_and_fundamentals_patch = getattr(_canon, "fetch_quote_and_fundamentals_patch", None) or _fetch_enriched_quote_patch
 
     # -------- History helpers (optional pass-through) --------
     _fetch_price_history = getattr(_canon, "fetch_price_history", None)
@@ -131,7 +134,8 @@ try:
     _fetch_prices = getattr(_canon, "fetch_prices", None)
 
     # -------- Client closer (optional) --------
-    _aclose = getattr(_canon, "aclose_yahoo_chart_client", None)
+    # Try new name first, then old name
+    _aclose = getattr(_canon, "aclose_yahoo_client", None) or getattr(_canon, "aclose_yahoo_chart_client", None)
 
     # If canonical provider class is missing, provide a thin adapter that uses patch funcs.
     if YahooChartProvider is None:
@@ -142,6 +146,9 @@ try:
 
             async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 return await get_quote_patch(symbol, base)
+            
+            async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
+                 return await fetch_quote(symbol, debug=debug)
 
     async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         try:
@@ -245,6 +252,22 @@ try:
         except Exception as ex:
             return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
 
+    async def fetch_quote_and_fundamentals_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        try:
+            if callable(_fetch_quote_and_fundamentals_patch):
+                 r = await _call_with_optional_kw(
+                    _fetch_quote_and_fundamentals_patch,
+                    kw_name="debug",
+                    kw_value=debug,
+                    args=(symbol,) + tuple(args),
+                    kwargs=dict(kwargs),
+                )
+                 return _ensure_dict(symbol, r)
+            # Fallback to enriched if fundamentals specific patch missing
+            return await fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
+        except Exception as ex:
+            return _err_payload(symbol, f"{ex.__class__.__name__}: {ex}")
+
     # Backward compatible alias (older code may call yahoo_chart_quote)
     async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await get_quote(symbol, *args, **kwargs)
@@ -296,6 +319,9 @@ except Exception as _import_exc:  # pragma: no cover
 
         async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             return _err_payload(symbol, self._error, base=base)
+        
+        async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
+             return _err_payload(symbol, self._error)
 
     async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return _err_payload(symbol, _IMPORT_ERROR)
@@ -318,6 +344,9 @@ except Exception as _import_exc:  # pragma: no cover
         return _err_payload(symbol, _IMPORT_ERROR)
 
     async def fetch_quote_and_enrichment_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _err_payload(symbol, _IMPORT_ERROR)
+    
+    async def fetch_quote_and_fundamentals_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return _err_payload(symbol, _IMPORT_ERROR)
 
     async def yahoo_chart_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -354,6 +383,7 @@ __all__ = [
     "fetch_quote_patch",
     "fetch_enriched_quote_patch",
     "fetch_quote_and_enrichment_patch",
+    "fetch_quote_and_fundamentals_patch",
     "yahoo_chart_quote",
     # History API (best-effort)
     "fetch_price_history",
