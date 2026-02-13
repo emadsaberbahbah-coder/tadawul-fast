@@ -1,8 +1,9 @@
+#!/usr/bin/env python3
 # integrations/symbols_reader.py
 """
 integrations/symbols_reader.py
 ===========================================================
-Compatibility + Repo-Hygiene Shim — v0.2.0 (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.3.0 (PROD SAFE)
 
 Why this file exists
 - Some older modules may import: `from integrations.symbols_reader import ...`
@@ -32,12 +33,14 @@ Notes
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 logger = logging.getLogger("integrations.symbols_reader_shim")
 
-SHIM_VERSION = "0.2.0"
+SHIM_VERSION = "0.3.0"
 
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 try:
     # ✅ Canonical module (repo root)
@@ -84,12 +87,18 @@ except Exception as _import_exc:  # pragma: no cover
             "meta": meta,
         }
 
+    def _normalize_fallback(s: str) -> str:
+        if not s: return ""
+        s = s.strip().upper().translate(_ARABIC_DIGITS)
+        s = re.sub(r"[\u200b\u200e\u200f]", "", s)
+        return s
+
     def split_tickers_by_market(tickers: Sequence[str]) -> Tuple[list, list]:  # type: ignore
         """
         Fallback minimal split:
         - KSA: endswith .SR OR numeric 3-6 digits (treated as Tadawul)
         - Global: everything else
-        Returns (ksa, global) tuple (to match canonical contract).
+        - Returns (ksa, global) tuple (to match canonical contract).
         """
         seen_ksa = set()
         seen_glb = set()
@@ -97,16 +106,17 @@ except Exception as _import_exc:  # pragma: no cover
         glob: list = []
 
         for t in (tickers or []):
-            s = str(t or "").strip()
+            s = _normalize_fallback(str(t))
             if not s:
                 continue
-            u = s.upper()
 
+            u = s
             if u.startswith("TADAWUL:"):
-                u = u.split(":", 1)[1].strip().upper()
+                u = u.split(":", 1)[1].strip()
             if u.endswith(".TADAWUL"):
                 u = u[: -len(".TADAWUL")].strip()
 
+            # KSA Detection Logic
             if u.endswith(".SR") or (u.isdigit() and 3 <= len(u) <= 6):
                 sym = u if u.endswith(".SR") else f"{u}.SR"
                 if sym not in seen_ksa:
