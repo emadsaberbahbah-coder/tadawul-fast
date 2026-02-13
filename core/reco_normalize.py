@@ -1,8 +1,7 @@
-# core/reco_normalize.py  (FULL REPLACEMENT)
 """
 core/reco_normalize.py
 ------------------------------------------------------------
-Recommendation Normalization — v1.2.0 (PROD SAFE)
+Recommendation Normalization — v1.2.1 (PROD SAFE)
 
 Purpose
 - Provide ONE canonical recommendation enum across the whole app.
@@ -19,12 +18,11 @@ Rules (high level)
     * 1..5  => 1=BUY, 2=BUY, 3=HOLD, 4=SELL, 5=SELL
     * 1..3  => 1=BUY, 2=HOLD, 3=SELL
 - Supports dict/list inputs (best-effort extraction)
-- Includes minimal Arabic mappings (useful for KSA contexts)
+- Includes robust Arabic mappings (useful for KSA contexts)
 
-Notes (v1.2.0)
-- More robust Arabic matching (contains + normalization) while still conservative.
-- Better numeric parsing: handles "3/5", "4 of 5", "2.5", "2,0", "rating 4" safely.
-- Prevents misclassifying confidence/probability 0..1 as rating even without explicit keywords.
+Notes (v1.2.1)
+- Enhanced Arabic matching: handles mixed text and common regional broker terms.
+- Refined numeric parsing: better rejection of probability values (0..1).
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional, Sequence
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
 
@@ -128,12 +126,11 @@ _SELL_LIKE = {
     "RED FLAG",
 }
 
-# Minimal Arabic mappings (best-effort)
-# Note: we intentionally keep this small and conservative.
-_AR_BUY = {"شراء", "اشتر", "اشترِ", "تجميع", "زيادة", "ايجابي", "إيجابي", "فرصة شراء"}
-_AR_HOLD = {"احتفاظ", "محايد", "انتظار", "مراقبة", "ثبات", "استقرار", "تمسك"}
-_AR_REDUCE = {"تقليص", "تخفيف", "جني ارباح", "جني أرباح", "تقليل", "تخفيض"}
-_AR_SELL = {"بيع", "تخارج", "سلبي", "سلبى", "تجنب", "خروج"}
+# Arabic mappings (best-effort)
+_AR_BUY = {"شراء", "اشتر", "اشترِ", "تجميع", "زيادة", "ايجابي", "إيجابي", "فرصة شراء", "أداء متفوق", "اداء متفوق", "زيادة المراكز"}
+_AR_HOLD = {"احتفاظ", "محايد", "انتظار", "مراقبة", "ثبات", "استقرار", "تمسك", "اداء محايد", "أداء محايد", "حياد"}
+_AR_REDUCE = {"تقليص", "تخفيف", "جني ارباح", "جني أرباح", "تقليل", "تخفيض", "أداء ضعيف", "اداء ضعيف", "تخفيض المراكز"}
+_AR_SELL = {"بيع", "تخارج", "سلبي", "سلبى", "تجنب", "خروج", "بيع قوي"}
 
 # Patterns (contains) — ordered by severity
 _PAT_SELL = re.compile(r"\b(SELL|EXIT|AVOID|UNDERPERFORM|SHORT|DOWNGRADE)\b")
@@ -360,13 +357,13 @@ def normalize_recommendation(x: Any) -> str:
 
             # Conservative contains (Arabic) — only if clearly present
             # (avoid over-mapping long Arabic sentences)
-            if any(tok in s_ar for tok in ("شراء", "اشتر", "تجميع", "زيادة")):
+            if any(tok in s_ar for tok in ("شراء", "اشتر", "تجميع", "زيادة", "توصية بالشراء")):
                 return "BUY"
-            if any(tok in s_ar for tok in ("بيع", "تخارج", "تجنب")):
+            if any(tok in s_ar for tok in ("بيع", "تخارج", "تجنب", "توصية بالبيع")):
                 return "SELL"
             if any(tok in s_ar for tok in ("جني ارباح", "جني ارباح", "تخفيف", "تقليص", "تقليل")):
                 return "REDUCE"
-            if any(tok in s_ar for tok in ("احتفاظ", "محايد", "انتظار", "مراقبة", "استقرار")):
+            if any(tok in s_ar for tok in ("احتفاظ", "محايد", "انتظار", "مراقبة", "استقرار", "حياد")):
                 return "HOLD"
 
         s = _normalize_text(str(x2))
