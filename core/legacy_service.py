@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 """
 core/legacy_service.py
 ------------------------------------------------------------
-Compatibility shim (quiet + useful) — v1.7.3  (PROD SAFE)
+Compatibility shim (quiet + useful) — v1.7.4 (PROD SAFE)
 
 Goals
 - Provide a stable legacy router that NEVER breaks app startup.
@@ -12,7 +10,7 @@ Goals
     1) request.app.state.engine
     2) core.data_engine_v2.get_engine() (singleton) if available  ✅ (sync OR async supported)
     3) core.data_engine_v2.DataEngineV2/DataEngine temp (per-request) ✅ (auto-close after use)
-    4) core.data_engine.DataEngine() temp (per-request)               ✅ (auto-close after use)
+    4) core.data_engine.DataEngine() temp (per-request)                ✅ (auto-close after use)
 - Support BOTH async and sync engine method implementations.
 - Accept both {"symbols":[...]} and {"tickers":[...]} payload shapes.
 - Batch-first; if batch is missing/fails, fallback per-symbol with bounded concurrency.
@@ -26,6 +24,8 @@ Env
 - LEGACY_TIMEOUT_SEC=25
 """
 
+from __future__ import annotations
+
 import asyncio
 import importlib
 import inspect
@@ -38,7 +38,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
