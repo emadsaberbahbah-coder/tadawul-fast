@@ -1,46 +1,20 @@
-# core/data_engine_v2.py
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.14.0) — PROD SAFE + ROUTER FRIENDLY (FULL REPLACEMENT)
+UNIFIED DATA ENGINE (v2.14.1) — PROD SAFE + SCORING INTEGRATED
 
-✅ Key Fix in v2.14.0 (YOUR BUG)
-- The Investment Advisor reads "sheet snapshot" cache using a cache key variant
-  that was NOT guaranteed to match what /v1/advanced/sheet-rows writes.
-- This revision makes the sheet snapshot cache **key-stable + backward compatible**
-  by storing AND reading under **multiple deterministic key variants**:
-    - raw sheet name
-    - normalized (casefold/trim)
-    - UPPER, lower
-    - canonical underscore version
-    - standard sheetKey variants (MARKET_LEADERS, GLOBAL_MARKETS, MUTUAL_FUNDS, COMMODITIES_FX)
-
-Result:
-- POST /v1/advanced/sheet-rows can write any sheet name,
-  and routes/investment_advisor.py can read it reliably even if it uses a different naming form.
+What’s improved in v2.14.1
+- ✅ Scoring Integration: Delegates scoring, badges, and recommendation logic
+     to `core.scoring_engine.enrich_with_scores` (Single Source of Truth).
+- ✅ Reduced Code Duplication: Removed local score computation helpers.
+- ✅ Key Stability: Maintains the sheet snapshot caching logic (v2.14.0) that fixes the Advisor 404s.
+- ✅ Import Safety: Lazy import of scoring engine to prevent circular deps.
 
 Design goals
-- ✅ PROD SAFE: no network at import-time, no provider imports at import-time
-- ✅ Router-friendly: returns dicts (Sheets-safe) and never raises outward
-- ✅ Provider discovery supports:
-    1) module.<callable>
-    2) module.exports / module.EXPORTS dict
-    3) module.provider / module.PROVIDER object exposing callable
-- ✅ Signature hardening: supports positional + keyword variants (symbol/ticker/sym)
-- ✅ Tuple return hardening: accepts (patch, err) / (patch, err, meta...)
-- ✅ Patch merge semantics: never overwrite existing non-empty values
-- ✅ Uses shared symbol normalization when available: core.symbols.normalize.normalize_symbol
-- ✅ Cache key includes (symbol_norm + fields) to avoid cross-request cache pollution
-- ✅ Forecast canonical fields + back-compat aliases
-
-Environment knobs (optional)
-- ENGINE_CACHE_TTL_SEC                   (default 45)
-- ENGINE_CACHE_MAXSIZE                   (default 4096)
-- ENGINE_CONCURRENCY                     (default 12)
-- ENGINE_INCLUDE_WARNINGS=true|false     (default false)
-- KEEP_RAW_HISTORY=true|false            (default false)
-- SHEET_CACHE_TTL_SEC                    (default 180)
-- SHEET_CACHE_MAXSIZE                    (default 64)
+- ✅ PROD SAFE: no network at import-time.
+- ✅ Router-friendly: returns dicts (Sheets-safe) and never raises outward.
+- ✅ Provider discovery: module.<callable> or module.exports.
+- ✅ Cache key includes (symbol_norm + fields).
 """
 
 from __future__ import annotations
@@ -58,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.14.0"
+ENGINE_VERSION = "2.14.1"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -145,6 +119,19 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
+# Scoring Engine Import (Lazy)
+# ---------------------------------------------------------------------------
+def _enrich_with_scores(q: Any) -> Any:
+    """Delegates to core.scoring_engine to add scores, badges, and reco."""
+    try:
+        from core.scoring_engine import enrich_with_scores
+        return enrich_with_scores(q)
+    except Exception:
+        # Fallback if scoring engine missing
+        return q
+
+
+# ---------------------------------------------------------------------------
 # Recommendation normalizer (optional)
 # ---------------------------------------------------------------------------
 try:
@@ -163,12 +150,7 @@ def _norm_reco(x: Any, default: str = "HOLD") -> str:
     try:
         if x is None or str(x).strip() == "":
             return d
-    except Exception:
-        return d
-    try:
-        out = _normalize_recommendation(x)
-        out = str(out or "").strip().upper()
-        return out if out in {"BUY", "HOLD", "REDUCE", "SELL"} else d
+        return _normalize_recommendation(x)
     except Exception:
         return d
 
@@ -1000,128 +982,6 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
     out.setdefault("forecast_updated_riyadh", _riyadh_iso())
 
 
-def _score_from_percent(x: Optional[float], lo: float, hi: float) -> float:
-    if x is None:
-        return 50.0
-    try:
-        v = float(x)
-        if v <= lo:
-            return 0.0
-        if v >= hi:
-            return 100.0
-        return (v - lo) / (hi - lo) * 100.0
-    except Exception:
-        return 50.0
-
-
-def _score_inverse_percent(x: Optional[float], lo: float, hi: float) -> float:
-    if x is None:
-        return 50.0
-    try:
-        v = float(x)
-        if v <= lo:
-            return 100.0
-        if v >= hi:
-            return 0.0
-        return (hi - v) / (hi - lo) * 100.0
-    except Exception:
-        return 50.0
-
-
-def _compute_scores(out: Dict[str, Any]) -> None:
-    upside = _safe_float(out.get("upside_percent"))
-    roe = _safe_float(out.get("roe"))
-    roa = _safe_float(out.get("roa"))
-    nm = _safe_float(out.get("net_margin"))
-    rg = _safe_float(out.get("revenue_growth"))
-    ng = _safe_float(out.get("net_income_growth"))
-
-    r1m = _safe_float(out.get("returns_1m"))
-    r3m = _safe_float(out.get("returns_3m"))
-    r12m = _safe_float(out.get("returns_12m"))
-    rsi = _safe_float(out.get("rsi_14"))
-
-    vol = _safe_float(out.get("volatility_30d"))
-    beta = _safe_float(out.get("beta"))
-
-    pb = _safe_float(out.get("pb"))
-    pe = _safe_float(out.get("pe_ttm"))
-
-    value = 0.6 * _score_from_percent(upside, lo=-20.0, hi=60.0)
-    value += 0.2 * (_score_inverse_percent(pb, lo=0.8, hi=6.0) if pb is not None else 50.0)
-    value += 0.2 * (_score_inverse_percent(pe, lo=8.0, hi=45.0) if pe is not None else 50.0)
-    value_score = max(0.0, min(100.0, value))
-
-    quality = (
-        0.35 * _score_from_percent(roe, lo=0.0, hi=25.0)
-        + 0.20 * _score_from_percent(roa, lo=0.0, hi=12.0)
-        + 0.20 * _score_from_percent(nm, lo=0.0, hi=20.0)
-        + 0.15 * _score_from_percent(rg, lo=-10.0, hi=25.0)
-        + 0.10 * _score_from_percent(ng, lo=-15.0, hi=35.0)
-    )
-    quality_score = max(0.0, min(100.0, quality))
-
-    mom = (
-        0.45 * _score_from_percent(r1m, lo=-15.0, hi=20.0)
-        + 0.35 * _score_from_percent(r3m, lo=-25.0, hi=40.0)
-        + 0.10 * _score_from_percent(r12m, lo=-40.0, hi=80.0)
-    )
-    if rsi is not None:
-        rsi_score = 100.0 - min(100.0, abs(rsi - 55.0) * 3.0)
-        mom += 0.10 * max(0.0, min(100.0, rsi_score))
-    else:
-        mom += 0.10 * 50.0
-    momentum_score = max(0.0, min(100.0, mom))
-
-    risk_good = 0.65 * _score_inverse_percent(vol, lo=12.0, hi=70.0) + 0.35 * _score_inverse_percent(beta, lo=0.7, hi=2.2)
-    risk_score = max(0.0, min(100.0, risk_good))
-
-    opportunity_score = max(0.0, min(100.0, (0.40 * value_score + 0.30 * momentum_score + 0.30 * quality_score)))
-    overall_score = max(0.0, min(100.0, (0.30 * value_score + 0.30 * quality_score + 0.25 * momentum_score + 0.15 * risk_score)))
-
-    out.setdefault("value_score", round(value_score, 2))
-    out.setdefault("quality_score", round(quality_score, 2))
-    out.setdefault("momentum_score", round(momentum_score, 2))
-    out.setdefault("risk_score", round(risk_score, 2))
-    out.setdefault("opportunity_score", round(opportunity_score, 2))
-    out.setdefault("overall_score", round(overall_score, 2))
-
-
-def _badges(out: Dict[str, Any]) -> List[str]:
-    b: List[str] = []
-    if _safe_float(out.get("overall_score")) is None:
-        return b
-    if (_safe_float(out.get("value_score")) or 0) >= 75:
-        b.append("Value")
-    if (_safe_float(out.get("quality_score")) or 0) >= 75:
-        b.append("Quality")
-    if (_safe_float(out.get("momentum_score")) or 0) >= 75:
-        b.append("Momentum")
-    if (_safe_float(out.get("risk_score")) or 0) >= 75:
-        b.append("Low Risk")
-    if (_safe_float(out.get("opportunity_score")) or 0) >= 80:
-        b.append("Top Opportunity")
-    return b
-
-
-def _recommendation_from_scores(out: Dict[str, Any]) -> str:
-    overall = _safe_float(out.get("overall_score")) or 0.0
-    risk = _safe_float(out.get("risk_score")) or 50.0
-    mom = _safe_float(out.get("momentum_score")) or 50.0
-
-    if overall >= 78 and risk >= 55:
-        return "BUY"
-    if overall >= 70 and mom >= 60:
-        return "BUY"
-    if overall < 40 and mom < 40:
-        return "SELL"
-    if overall < 50 and risk < 35:
-        return "REDUCE"
-    if overall < 55:
-        return "HOLD"
-    return "HOLD"
-
-
 # ============================================================
 # UnifiedQuote model (optional / for typed consumers)
 # ============================================================
@@ -1709,9 +1569,15 @@ class DataEngine:
         _forecast_from_momentum(out)
         _mirror_forecast_aliases(out)
 
-        _compute_scores(out)
-        out["badges"] = _badges(out)
-        out["recommendation"] = _norm_reco(_recommendation_from_scores(out), default="HOLD")
+        # -----------------------------
+        # SCORING INTEGRATION (v2.14.1)
+        # -----------------------------
+        # Delegate scoring, badges, and reco to the central scoring engine.
+        # This replaces the older local _compute_scores logic.
+        out = _enrich_with_scores(out)
+
+        # Ensure recommendation is standardized even if scoring engine didn't set it (fallback)
+        out["recommendation"] = _norm_reco(out.get("recommendation"), default="HOLD")
 
         out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
 
