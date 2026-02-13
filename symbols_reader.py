@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# symbols_reader.py  (FULL REPLACEMENT)
+# symbols_reader.py
 """
 symbols_reader.py
 ===========================================================
@@ -26,31 +26,6 @@ Key guarantees
 - ✅ Google Sheets via service account JSON in env:
       GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
       (minified JSON / pretty JSON / quoted JSON / base64(JSON) / base64url(JSON))
-
-Improvements vs v2.4.1
-- ✅ Key normalization + alias resolution:
-    accepts "market_leaders", "MARKET-LEADERS", "market leaders", etc.
-- ✅ SYMBOLS_JSON override is case-insensitive on keys.
-- ✅ More defensive header detection and fallback column selection.
-- ✅ Adds explicit "tickers" + "symbols" aliases for legacy scripts.
-
-Env (optional)
-- Spreadsheet:
-    DEFAULT_SPREADSHEET_ID / TFB_SPREADSHEET_ID / SPREADSHEET_ID / GOOGLE_SHEETS_ID
-- Credentials:
-    GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON (JSON or base64/base64url JSON)
-    GOOGLE_APPLICATION_CREDENTIALS (path to service account json file)
-- Overrides:
-    SYMBOLS_JSON  (JSON object mapping keys -> list OR dict with "all"/"ksa"/"global"/"tickers"/"symbols")
-    SYMBOLS_<KEY> (comma/space/newline separated list for a specific key)
-- Layout:
-    TFB_SYMBOL_HEADER_ROW (default 5)
-    TFB_SYMBOL_START_ROW  (default 6)
-    TFB_SYMBOL_MAX_ROWS   (default 5000)
-    TFB_SYMBOLS_CACHE_TTL_SEC (default 45)
-- Sheet name overrides:
-    SHEET_MARKET_LEADERS, SHEET_GLOBAL_MARKETS, SHEET_KSA_TADAWUL, SHEET_MUTUAL_FUNDS,
-    SHEET_COMMODITIES_FX, SHEET_MY_PORTFOLIO, SHEET_INSIGHTS_ANALYSIS, SHEET_INVESTMENT_ADVISOR
 """
 
 from __future__ import annotations
@@ -99,8 +74,8 @@ _GOOGLE_OK = False
 _Credentials = None
 _build = None
 try:
-    from google.oauth2.service_account import Credentials as _Credentials  # type: ignore
-    from googleapiclient.discovery import build as _build  # type: ignore
+    from google.oauth2.service_account import Credentials as _Credentials
+    from googleapiclient.discovery import build as _build
 
     _GOOGLE_OK = True
 except Exception:
@@ -178,20 +153,17 @@ def _b64_decode_any(raw: str) -> Optional[str]:
     if not s:
         return None
 
-    # normalize base64url to urlsafe decode
     s2 = s.strip()
     pad = len(s2) % 4
     if pad:
         s2 = s2 + ("=" * (4 - pad))
 
-    # try urlsafe first
     try:
         dec = base64.urlsafe_b64decode(s2.encode("utf-8")).decode("utf-8", errors="strict").strip()
         return dec
     except Exception:
         pass
 
-    # fallback: classic base64 normalization
     try:
         s3 = s.replace("-", "+").replace("_", "/").strip()
         pad2 = len(s3) % 4
@@ -218,7 +190,6 @@ def _maybe_b64_decode_json(s: str) -> str:
 
     dec2 = dec.strip()
     if _looks_like_json_object(dec2):
-        # verify it is valid JSON object
         try:
             obj = json.loads(dec2)
             if isinstance(obj, dict):
@@ -295,11 +266,6 @@ def _escape_sheet_name_for_a1(name: str) -> str:
 
 
 def _safe_sheet_name(name: str) -> str:
-    """
-    For A1 ranges:
-    - quote when needed
-    - escape embedded apostrophes correctly
-    """
     n = (name or "").strip()
     if not n:
         return "Sheet1"
@@ -321,7 +287,6 @@ def _normalize_symbol(s: str) -> str:
     if x.endswith(".TADAWUL"):
         x = x.replace(".TADAWUL", "")
 
-    # numeric Tadawul code -> .SR
     if x.isdigit() and 3 <= len(x) <= 6:
         return f"{x}.SR"
 
@@ -329,19 +294,11 @@ def _normalize_symbol(s: str) -> str:
 
 
 def _split_cell_into_symbols(cell: str) -> List[str]:
-    """
-    Accepts:
-    - single: "1120.SR"
-    - comma separated: "AAPL,MSFT"
-    - space separated: "AAPL MSFT"
-    - lines / bullets
-    """
     raw = str(cell or "").strip()
     if not raw:
         return []
     raw = raw.replace("•", " ").replace("·", " ").replace("\t", " ")
 
-    # split on common separators
     parts = re.split(r"[,\n;\r]+", raw)
     out: List[str] = []
     for p in parts:
@@ -384,10 +341,6 @@ def _classify(symbols: Sequence[str]) -> Tuple[List[str], List[str]]:
 
 
 def _norm_key(k: str) -> str:
-    """
-    Normalize page keys:
-      "market leaders" / "MARKET-LEADERS" / "market_leaders" -> "MARKET_LEADERS"
-    """
     s = (k or "").strip().upper()
     if not s:
         return ""
@@ -398,7 +351,7 @@ def _norm_key(k: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Registry (keys -> sheet specs)
+# Registry
 # -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PageSpec:
@@ -443,7 +396,6 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("My_Portfolio", "My Portfolio", "MY_PORTFOLIO"),
         header_candidates=("SYMBOL", "TICKER", "CODE"),
     ),
-    # Optional extras (safe; won't break anything)
     "INSIGHTS_ANALYSIS": PageSpec(
         key="INSIGHTS_ANALYSIS",
         sheet_names=("Insights_Analysis", "Insights Analysis", "INSIGHTS_ANALYSIS"),
@@ -456,7 +408,6 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
     ),
 }
 
-# optional key aliases (normalized)
 _KEY_ALIASES: Dict[str, str] = {
     "MARKETLEADERS": "MARKET_LEADERS",
     "MARKET_LEADER": "MARKET_LEADERS",
@@ -472,25 +423,12 @@ _KEY_ALIASES: Dict[str, str] = {
     "PORTFOLIO": "MY_PORTFOLIO",
 }
 
-_SHEET_ENV_BY_KEY: Dict[str, Tuple[str, ...]] = {
-    "MARKET_LEADERS": ("SHEET_MARKET_LEADERS",),
-    "GLOBAL_MARKETS": ("SHEET_GLOBAL_MARKETS",),
-    "KSA_TADAWUL": ("SHEET_KSA_TADAWUL",),
-    "MUTUAL_FUNDS": ("SHEET_MUTUAL_FUNDS",),
-    "COMMODITIES_FX": ("SHEET_COMMODITIES_FX",),
-    "MY_PORTFOLIO": ("SHEET_MY_PORTFOLIO",),
-    "INSIGHTS_ANALYSIS": ("SHEET_INSIGHTS_ANALYSIS",),
-    "INVESTMENT_ADVISOR": ("SHEET_INVESTMENT_ADVISOR",),
-}
-
-
 def _resolve_key(key: str) -> str:
     k = _norm_key(key)
     if not k:
         return ""
     if k in PAGE_REGISTRY:
         return k
-    # try alias without underscores
     k2 = k.replace("_", "")
     if k2 in _KEY_ALIASES:
         return _KEY_ALIASES[k2]
@@ -500,7 +438,7 @@ def _resolve_key(key: str) -> str:
 
 
 def _candidate_sheet_names(spec: PageSpec) -> Tuple[str, ...]:
-    env_keys = _SHEET_ENV_BY_KEY.get(spec.key, ())
+    env_keys = (f"SHEET_{spec.key}",)
     env_names: List[str] = []
     for ek in env_keys:
         v = (os.getenv(ek) or "").strip()
@@ -523,7 +461,7 @@ def _candidate_sheet_names(spec: PageSpec) -> Tuple[str, ...]:
 
 
 # -----------------------------------------------------------------------------
-# Overrides via ENV
+# Overrides
 # -----------------------------------------------------------------------------
 def _try_env_override_for_key(key_norm: str) -> Optional[List[str]]:
     env_name = f"SYMBOLS_{key_norm}"
@@ -547,20 +485,13 @@ def _try_symbols_json_override() -> Optional[Dict[str, Any]]:
 
 
 def _symbols_from_override_value(val: Any) -> List[str]:
-    """
-    Supports:
-    - list
-    - dict with: all/symbols/tickers
-    """
     if isinstance(val, list):
         return _dedupe([str(x) for x in val if str(x).strip()])
-
     if isinstance(val, dict):
         for k in ("all", "symbols", "tickers"):
             vv = val.get(k)
             if isinstance(vv, list):
                 return _dedupe([str(x) for x in vv if str(x).strip()])
-        # sometimes: {"ksa":[...], "global":[...]} without "all"
         ksa = val.get("ksa")
         glob = val.get("global")
         out: List[str] = []
@@ -569,60 +500,46 @@ def _symbols_from_override_value(val: Any) -> List[str]:
         if isinstance(glob, list):
             out.extend([str(x) for x in glob if str(x).strip()])
         return _dedupe(out)
-
     return []
 
 
 # -----------------------------------------------------------------------------
-# Google Sheets reading (lazy)
+# Google Sheets
 # -----------------------------------------------------------------------------
 _svc = None
-
 
 def _get_sheets_service():
     global _svc
     if _svc is not None:
         return _svc
-
     if not _GOOGLE_OK:
         return None
-
     info = _load_service_account_info()
     if not info:
         return None
-
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-        creds = _Credentials.from_service_account_info(info, scopes=scopes)  # type: ignore
-        _svc = _build("sheets", "v4", credentials=creds, cache_discovery=False)  # type: ignore
+        creds = _Credentials.from_service_account_info(info, scopes=scopes)
+        _svc = _build("sheets", "v4", credentials=creds, cache_discovery=False)
         return _svc
     except Exception:
         return None
 
 
 def _read_values(spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
-    """
-    Returns values as list of rows. Never raises; returns [] on any error.
-    """
     if not spreadsheet_id or not range_a1:
         return []
-
     cache_key = f"values::{spreadsheet_id}::{range_a1}"
     hit = _cache_get(cache_key)
     if hit is not None:
         return hit
-
     svc = _get_sheets_service()
     if svc is None:
         return []
-
     try:
-        res = (
-            svc.spreadsheets()
-            .values()
-            .get(spreadsheetId=spreadsheet_id, range=range_a1, valueRenderOption="UNFORMATTED_VALUE")
-            .execute()
-        )
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=range_a1, valueRenderOption="UNFORMATTED_VALUE"
+        ).execute()
         values = res.get("values") or []
         if not isinstance(values, list):
             values = []
@@ -642,43 +559,30 @@ def _clean_header_text(v: Any) -> str:
 
 
 def _resolve_symbol_column_letter(spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Optional[str]:
-    """
-    Reads header row A:?? and finds column where header matches candidates.
-    Falls back to common headers: SYMBOL/TICKER/CODE.
-    """
     try_cols = 78  # up to BZ
     end_col = _index_to_a1_col(try_cols)
     rng = f"{_safe_sheet_name(sheet_name)}!A{spec.header_row}:{end_col}{spec.header_row}"
     rows = _read_values(spreadsheet_id, rng)
     if not rows or not rows[0]:
         return None
-
     header = rows[0]
     cand = {_clean_header_text(c) for c in spec.header_candidates if str(c).strip()}
     cand.discard("")
-
-    # Exact or prefix match
     for idx, cell in enumerate(header, start=1):
         h = _clean_header_text(cell)
         if not h:
             continue
         if h in cand or any(h.startswith(c) for c in cand):
             return _index_to_a1_col(idx)
-
-    # Common fallback
     common = {"SYMBOL", "TICKER", "CODE"}
     for idx, cell in enumerate(header, start=1):
         h = _clean_header_text(cell)
         if h in common:
             return _index_to_a1_col(idx)
-
     return None
 
 
 def _guess_first_nonempty_column(spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> str:
-    """
-    If header detection fails, try A/B/C quickly to see which column has data.
-    """
     candidates = ["A", "B", "C"]
     end_row = spec.start_row + max(25, min(200, spec.max_rows)) - 1
     for col in candidates:
@@ -706,26 +610,21 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
         sheet = (sheet or "").strip()
         if not sheet:
             continue
-
-        # fixed range mode
         if spec.fixed_range:
             rng = f"{_safe_sheet_name(sheet)}!{spec.fixed_range}"
             values = _read_values(spreadsheet_id, rng)
             meta["sheet_used"] = sheet
             meta["range_used"] = rng
-
             syms: List[str] = []
             for row in values or []:
                 if not row:
                     continue
                 syms.extend(_split_cell_into_symbols(str(row[0] if row else "")))
-
             syms = _dedupe(syms)
             if syms:
                 return syms, meta
             continue
 
-        # determine symbol column
         col = (spec.fixed_col or "").strip().upper() or None
         if not col:
             col = _resolve_symbol_column_letter(spreadsheet_id, sheet, spec)
@@ -735,17 +634,14 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
         end_row = spec.start_row + max(1, spec.max_rows) - 1
         rng = f"{_safe_sheet_name(sheet)}!{col}{spec.start_row}:{col}{end_row}"
         values = _read_values(spreadsheet_id, rng)
-
         meta["sheet_used"] = sheet
         meta["range_used"] = rng
         meta["col_used"] = col
-
         syms2: List[str] = []
         for row in values or []:
             if not row:
                 continue
             syms2.extend(_split_cell_into_symbols(str(row[0] if row else "")))
-
         syms2 = _dedupe(syms2)
         if syms2:
             return syms2, meta
@@ -757,31 +653,13 @@ def _read_symbols_from_sheet(spreadsheet_id: str, spec: PageSpec) -> Tuple[List[
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
-def list_keys() -> List[str]:
-    return sorted(PAGE_REGISTRY.keys())
-
-
 def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "all": [...],
-        "ksa": [...],
-        "global": [...],
-        "tickers": [...],   # alias of all
-        "symbols": [...],   # alias of all
-        "meta": {...}
-      }
-
-    Never raises.
-    """
     raw_key = (key or "").strip()
     key_norm = _resolve_key(raw_key)
 
     if not key_norm:
         return {"all": [], "ksa": [], "global": [], "tickers": [], "symbols": [], "meta": {"error": "empty key", "version": VERSION}}
 
-    # 1) Per-key env override: SYMBOLS_<KEY>
     ov = _try_env_override_for_key(key_norm)
     if ov is not None:
         ksa, glob = _classify(ov)
@@ -792,25 +670,13 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
             "global": glob,
             "tickers": all_syms,
             "symbols": all_syms,
-            "meta": {"mode": "env_override", "key": key_norm, "requested_key": raw_key, "version": VERSION, "env": f"SYMBOLS_{key_norm}"},
+            "meta": {"mode": "env_override", "key": key_norm, "version": VERSION},
         }
 
-    # 2) Bulk JSON override: SYMBOLS_JSON (case-insensitive keys)
     j = _try_symbols_json_override()
     if isinstance(j, dict):
-        # try exact, then normalized match
-        cand_keys = {str(k): k for k in j.keys()}
-        # build a case-insensitive lookup by normalized keys
-        norm_map: Dict[str, str] = {}
-        for k in cand_keys.keys():
-            norm_map[_resolve_key(k)] = k
-
-        pick = None
-        if key_norm in j:
-            pick = key_norm
-        elif key_norm in norm_map:
-            pick = norm_map[key_norm]
-
+        norm_map: Dict[str, str] = { _resolve_key(k): k for k in j.keys() }
+        pick = key_norm if key_norm in j else norm_map.get(key_norm)
         if pick is not None and pick in j:
             all_syms = _symbols_from_override_value(j.get(pick))
             ksa, glob = _classify(all_syms)
@@ -820,38 +686,17 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
                 "global": glob,
                 "tickers": all_syms,
                 "symbols": all_syms,
-                "meta": {"mode": "symbols_json", "key": key_norm, "requested_key": raw_key, "json_key_used": str(pick), "version": VERSION},
+                "meta": {"mode": "symbols_json", "key": key_norm, "version": VERSION},
             }
 
-    # 3) Sheets registry lookup
     spec = PAGE_REGISTRY.get(key_norm)
     if spec is None:
-        return {
-            "all": [],
-            "ksa": [],
-            "global": [],
-            "tickers": [],
-            "symbols": [],
-            "meta": {"error": f"unknown key: {key_norm}", "requested_key": raw_key, "version": VERSION},
-        }
+        return {"all": [], "ksa": [], "global": [], "tickers": [], "symbols": [], "meta": {"error": f"unknown key: {key_norm}", "version": VERSION}}
 
     sid = (spreadsheet_id or "").strip() or _get_spreadsheet_id()
     if not sid:
-        return {
-            "all": [],
-            "ksa": [],
-            "global": [],
-            "tickers": [],
-            "symbols": [],
-            "meta": {
-                "error": "Spreadsheet ID missing (set DEFAULT_SPREADSHEET_ID/TFB_SPREADSHEET_ID/SPREADSHEET_ID)",
-                "key": key_norm,
-                "requested_key": raw_key,
-                "version": VERSION,
-            },
-        }
+        return {"all": [], "ksa": [], "global": [], "tickers": [], "symbols": [], "meta": {"error": "Spreadsheet ID missing", "version": VERSION}}
 
-    # cache per key+sheet
     cache_key = f"page::{sid}::{key_norm}"
     hit = _cache_get(cache_key)
     if isinstance(hit, dict) and "all" in hit:
@@ -860,47 +705,8 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
     syms, meta = _read_symbols_from_sheet(sid, spec)
     ksa, glob = _classify(syms)
     all_syms = _dedupe(syms)
-
     meta = dict(meta or {})
-    meta["requested_key"] = raw_key
     meta["resolved_key"] = key_norm
-    meta["count_all"] = len(all_syms)
-    meta["count_ksa"] = len(ksa)
-    meta["count_global"] = len(glob)
-
     out = {"all": all_syms, "ksa": ksa, "global": glob, "tickers": all_syms, "symbols": all_syms, "meta": meta}
     _cache_set(cache_key, out)
     return out
-
-
-# Back-compat aliases (older scripts may import these)
-def read_symbols_for_page(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    return get_page_symbols(key, spreadsheet_id=spreadsheet_id)
-
-
-def get_symbols_for_page(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    return get_page_symbols(key, spreadsheet_id=spreadsheet_id)
-
-
-# -----------------------------------------------------------------------------
-# Optional CLI (safe)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    sid = _get_spreadsheet_id()
-    print(f"symbols_reader v{VERSION}")
-    print(f"Spreadsheet ID: {'SET' if sid else 'NOT SET'}")
-    print("Keys:", ", ".join(list_keys()))
-    print()
-
-    for k in list_keys():
-        data = get_page_symbols(k, spreadsheet_id=sid)
-        all_syms = data.get("all") or []
-        meta = data.get("meta") or {}
-        print(f"[{k}] count={len(all_syms)} mode={meta.get('mode','')} sheet={meta.get('sheet_used','')}")
-        if all_syms:
-            print("  first:", all_syms[:10])
-        else:
-            err = meta.get("error")
-            if err:
-                print("  error:", err)
-        print()
