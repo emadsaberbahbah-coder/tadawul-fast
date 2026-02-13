@@ -1,12 +1,12 @@
-# routes/config.py  (FULL REPLACEMENT)
 """
-ROUTES CONFIG SHIM – PROD SAFE (v1.2.0)
+ROUTES CONFIG SHIM – PROD SAFE (v1.2.1)
 
 Purpose
 - Backward compatibility for older imports like:
     from routes.config import get_settings, auth_ok, allowed_tokens, Settings
 - Single source of truth lives in repo-root `config.py`
 - Never crashes app startup (defensive import + safe fallbacks)
+- Exposes `AUTH_HEADER_NAME` for dynamic auth configuration
 
 Notes
 - If the root `config.py` exists but is missing some helpers, this shim provides
@@ -16,12 +16,14 @@ Notes
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any, Dict, List, Optional
 
-CONFIG_VERSION = "1.2.0-shim"
+CONFIG_VERSION = "1.2.1-shim"
 
 # Fallback stubs (used if root config can't be imported OR is missing fields)
 class _FallbackSettings:
+    auth_header_name: str = "X-APP-TOKEN"
     pass
 
 
@@ -33,19 +35,31 @@ def get_settings() -> object:  # type: ignore[override]
 
 
 def allowed_tokens() -> List[str]:
-    return []
+    # Try direct ENV read if config is broken
+    toks = []
+    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
+        v = (os.getenv(k) or "").strip()
+        if v: toks.append(v)
+    return toks
 
 
 def is_open_mode() -> bool:
-    return True
+    return len(allowed_tokens()) == 0
 
 
 def auth_ok(x_app_token: Optional[str]) -> bool:  # noqa: ARG001
-    return True
+    toks = allowed_tokens()
+    if not toks: return True
+    return bool(x_app_token and x_app_token.strip() in toks)
 
 
 def mask_settings_dict() -> Dict[str, Any]:
-    return {"status": "fallback", "open_mode": True, "config_version": CONFIG_VERSION}
+    return {
+        "status": "fallback", 
+        "open_mode": is_open_mode(), 
+        "config_version": CONFIG_VERSION,
+        "auth_header": "X-APP-TOKEN"
+    }
 
 
 def _safe_getattr(mod: Any, name: str) -> Any:
@@ -148,7 +162,7 @@ if _root is not None:
             try:
                 s = get_settings()
                 d: Dict[str, Any] = {}
-                for k in ("ai_batch_size", "ai_batch_timeout_sec", "ai_batch_concurrency", "ai_max_tickers"):
+                for k in ("ai_batch_size", "ai_batch_timeout_sec", "ai_batch_concurrency", "ai_max_tickers", "auth_header_name"):
                     try:
                         v = getattr(s, k, None)
                         if v is not None:
