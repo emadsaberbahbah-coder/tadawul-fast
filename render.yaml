@@ -1,10 +1,10 @@
-# render.yaml  (FULL REPLACEMENT)
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.2)
+# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.3)
 # ============================================================
 #
 # Goals
+# - Aligned with main.py v5.4.4
 # - Deterministic boot (no "integer expression expected" crashes)
 # - No invalid uvicorn flags
 # - Backward-compatible env var names (legacy + *_SEC style)
@@ -164,7 +164,11 @@ services:
       - key: INIT_ENGINE_ON_BOOT
         value: "true"
 
-      # Optional docs toggles (supported by main.py v5.3.4)
+      # Advisor Feature
+      - key: ADVISOR_ENABLED
+        value: "true"
+
+      # Optional docs toggles (supported by main.py v5.4.4)
       - key: ENABLE_OPENAPI
         value: "true"
       - key: ENABLE_SWAGGER
@@ -186,15 +190,15 @@ services:
       - key: ENVIRONMENT
         value: "production"
 
-      # Version (align with deployed code)
+      # Version (align with main.py v5.4.4)
       - key: APP_VERSION
-        value: "5.3.4"
+        value: "5.4.4"
       - key: SERVICE_VERSION
-        value: "5.3.4"
+        value: "5.4.4"
       - key: VERSION
-        value: "5.3.4"
+        value: "5.4.4"
       - key: RELEASE
-        value: "5.3.4"
+        value: "5.4.4"
 
       # Base URLs
       - key: BACKEND_BASE_URL
@@ -263,7 +267,7 @@ services:
         value: "false"
 
       # -------------------------
-      # Provider feature toggles (explicit; aligns with v2.0.0 providers)
+      # Provider feature toggles
       # -------------------------
       # EODHD
       - key: EODHD_ENABLE_FUNDAMENTALS
@@ -310,29 +314,6 @@ services:
         value: "https://finnhub.io/api/v1"
 
       # -------------------------
-      # Custom headers (optional JSON dict strings; empty = off)
-      # -------------------------
-      # EODHD headers
-      - key: EODHD_HEADERS_JSON
-        value: ""
-      - key: EODHD_HEADERS_REALTIME_JSON
-        value: ""
-      - key: EODHD_HEADERS_FUNDAMENTALS_JSON
-        value: ""
-      - key: EODHD_HEADERS_HISTORY_JSON
-        value: ""
-
-      # FINNHUB headers
-      - key: FINNHUB_HEADERS_JSON
-        value: ""
-      - key: FINNHUB_HEADERS_QUOTE_JSON
-        value: ""
-      - key: FINNHUB_HEADERS_PROFILE_JSON
-        value: ""
-      - key: FINNHUB_HEADERS_HISTORY_JSON
-        value: ""
-
-      # -------------------------
       # Provider keys (SECRETS)
       # -------------------------
       - key: FMP_API_KEY
@@ -345,16 +326,6 @@ services:
         sync: false
       - key: ARGAAM_API_KEY
         sync: false
-
-      # Optional explicit URLs (empty is fine)
-      - key: TADAWUL_QUOTE_URL
-        value: ""
-      - key: TADAWUL_FUNDAMENTALS_URL
-        value: ""
-      - key: ARGAAM_BASE_URL
-        value: ""
-      - key: ARGAAM_GATEWAY_URL
-        value: ""
 
       # -------------------------
       # HTTP + caching (compat)
@@ -370,13 +341,6 @@ services:
         value: "20"
       - key: ENGINE_CACHE_TTL_SEC
         value: "20"
-
-      - key: QUOTE_TTL_SEC
-        value: "30"
-      - key: FUNDAMENTALS_TTL_SEC
-        value: "21600"
-      - key: ARGAAM_SNAPSHOT_TTL_SEC
-        value: "30"
 
       # -------------------------
       # Batch controls
