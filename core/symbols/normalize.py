@@ -1,30 +1,21 @@
+#!/usr/bin/env python3
 # core/symbols/normalize.py
 """
 core/symbols/normalize.py
 ============================================================
-Symbol Normalization — v1.0.0 (PROD SAFE / NO NETWORK)
+Symbol Normalization — v1.1.0 (PROD SAFE / NO NETWORK)
 
 Purpose
-- Provide ONE consistent normalization layer for:
-  - routers (/enriched, /analysis)
-  - engine selection (GLOBAL vs KSA)
-  - provider formatting (esp. EODHD exchange suffix like .US)
+- Provide ONE consistent normalization layer for the entire system.
+- Translates Arabic numerals and cleans non-printable artifacts.
+- Manages exchange suffixes for EODHD and Finnhub.
 
-Design rules (important)
-- normalize_symbol() does NOT force ".US" for GLOBAL tickers.
-  It returns a clean canonical *request* symbol:
-    - "1120"      -> "1120.SR"
-    - "1120.SR"   -> "1120.SR"
-    - "AAPL"      -> "AAPL"
-    - "AAPL.US"   -> "AAPL.US"
-    - "^GSPC"     -> "^GSPC"
-    - "EURUSD=X"  -> "EURUSD=X"
-- Providers/routers can then try variants:
-  - GLOBAL: [AAPL, AAPL.US] (and BRK.B/BRK-B swaps)
-  - KSA:    [1120.SR, 1120]
-  - FX/Indices/Commodities: [itself only]
-
-This file must stay import-safe (no network, no heavy imports).
+Standard Behavior:
+- "1120"      -> "1120.SR"
+- "١١٢٠"      -> "1120.SR" (Arabic digits support)
+- "AAPL"      -> "AAPL"
+- "AAPL.US"   -> "AAPL.US"
+- "^GSPC"     -> "^GSPC" (Passthrough for indices)
 """
 
 from __future__ import annotations
@@ -35,6 +26,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "normalize_symbol",
+    "normalize_ksa_symbol",
     "normalize_symbols_list",
     "symbol_variants",
     "market_hint_for",
@@ -44,323 +36,175 @@ __all__ = [
     "eodhd_symbol_variants",
 ]
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY = {"0", "false", "no", "n", "off", "f"}
+# Arabic to ASCII translation table
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 # KSA: naked digits or digits.SR
 _KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
+_KSA_CODE_ONLY = re.compile(r"^\d{3,6}$")
 
 # Exchange suffix like .US / .L / .TO ... (2..6 chars)
 _EXCH_SUFFIX_RE = re.compile(r"^(.+)\.([A-Z0-9]{2,6})$")
 
-# Common prefixes you may get from some feeds
-_PREFIXES = ("TADAWUL:",)
+# Common noise patterns
+_PREFIXES = ("TADAWUL:", "STOCK:", "TICKER:")
+_SUFFIXES = (".TADAWUL", ".JK")
 
 
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip()
-    return s if s else default
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _FALSY:
-        return False
-    if raw in _TRUTHY:
-        return True
-    return default
+    return str(v).strip() if v else default
 
 
 def is_index_or_fx(sym: str) -> bool:
-    """
-    Treat Yahoo-style indices/FX/commodities as passthrough:
-      - indices: ^GSPC
-      - FX: EURUSD=X
-      - commodities: GC=F, BZ=F
-    """
+    """Detects Yahoo-style special symbols for Indices, FX, and Commodities."""
     s = (sym or "").strip().upper()
-    if not s:
-        return False
+    if not s: return False
     return ("^" in s) or ("=" in s) or s.endswith("=X") or s.endswith("=F")
 
 
 def is_ksa(sym: str) -> bool:
-    s = (sym or "").strip().upper()
-    if not s:
-        return False
-    if s.endswith(".SR"):
-        return True
-    if s.isdigit():
-        return True
+    """Checks if a symbol is a valid Saudi Tadawul code."""
+    s = (sym or "").strip().upper().translate(_ARABIC_DIGITS)
+    if not s: return False
+    if s.endswith(".SR"): return True
+    if s.isdigit(): return True
     return bool(_KSA_RE.match(s))
 
 
-def _strip_known_prefixes(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    u = s.upper()
+def normalize_ksa_symbol(symbol: str) -> str:
+    """
+    STRICT KSA Normalization:
+    Ensures Saudi symbols always follow the '####.SR' format.
+    """
+    s = (symbol or "").strip().upper().translate(_ARABIC_DIGITS)
+    if not s: return ""
+    
+    # Strip common noise
     for p in _PREFIXES:
-        if u.startswith(p):
-            return s.split(":", 1)[1].strip()
-    return s
-
-
-def _strip_known_suffixes(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    u = s.upper()
-    # some feeds use ".TADAWUL"
-    if u.endswith(".TADAWUL"):
-        s = s[: -len(".TADAWUL")]
-    return s.strip()
-
-
-def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
-    """
-    If sym ends in .US/.L/.TO/... treat last segment as exchange suffix.
-    Returns (base, exch_or_none).
-    """
-    s = (sym or "").strip().upper()
-    if not s:
-        return "", None
-    m = _EXCH_SUFFIX_RE.match(s)
-    if not m:
-        return s, None
-    base = (m.group(1) or "").strip()
-    exch = (m.group(2) or "").strip()
-    if not base or not exch:
-        return s, None
-    return base, exch
+        if s.startswith(p): s = s.split(":", 1)[1]
+    for suf in _SUFFIXES:
+        if s.endswith(suf): s = s.replace(suf, "")
+        
+    s = s.strip()
+    if s.endswith(".SR"):
+        code = s[:-3]
+        return f"{code}.SR" if _KSA_CODE_ONLY.match(code) else ""
+    
+    if _KSA_CODE_ONLY.match(s):
+        return f"{s}.SR"
+    
+    return ""
 
 
 def normalize_symbol(raw: str) -> str:
     """
-    Canonical router/engine normalization.
-    - Keeps indices/FX/commodities unchanged (upper)
-    - KSA digits -> digits.SR
-    - Keeps explicit suffix (.SR/.US/...) unchanged (upper)
-    - Plain tickers -> UPPER (no forced .US here)
+    Primary Canonical Normalizer:
+    - Resolves Arabic digits.
+    - Standardizes KSA to .SR.
+    - Preserves Index/FX formats.
+    - Cleans whitespace and hidden artifacts.
     """
-    s = _strip_known_prefixes(raw)
-    s = _strip_known_suffixes(s)
-    s = (s or "").strip()
-    if not s:
-        return ""
-
+    if not raw: return ""
+    
+    # 1. Basic Cleaning
+    s = str(raw).translate(_ARABIC_DIGITS).strip()
+    s = re.sub(r"[\u200b\u200e\u200f]", "", s) # Strip zero-width artifacts
+    
     u = s.upper()
+    if not u: return ""
 
+    # 2. Passthrough for special types
     if is_index_or_fx(u):
         return u
 
-    # KSA: digits -> digits.SR
-    if u.isdigit():
-        return f"{u}.SR"
+    # 3. Handle KSA specifically
+    if is_ksa(u):
+        return normalize_ksa_symbol(u)
 
-    # KSA explicit .SR
-    if u.endswith(".SR"):
-        return u
-
-    # Keep any explicit suffix like .US/.L/.TO etc as-is
-    if "." in u:
-        return u
-
-    return u
+    # 4. Standardize Global Tickers
+    # Strip known prefixes
+    for p in _PREFIXES:
+        if u.startswith(p): u = u.split(":", 1)[1]
+        
+    return u.strip()
 
 
 def normalize_symbols_list(raw: str, *, limit: int = 0) -> List[str]:
-    """
-    Accepts:
-      "AAPL,MSFT,1120.SR"
-      "AAPL MSFT 1120.SR"
-      "AAPL, MSFT  ,1120.SR"
-    Returns a clean list (keeps order), normalized, de-duped (case-insensitive).
-    """
-    s = (raw or "").strip()
-    if not s:
-        return []
-    parts = re.split(r"[\s,]+", s)
+    """Parses a string of tickers (comma or space separated) into a unique list."""
+    if not raw: return []
+    parts = re.split(r"[\s,]+", str(raw))
+    
     out: List[str] = []
+    seen = set()
+    
     for p in parts:
-        if not p or not p.strip():
-            continue
-        out.append(normalize_symbol(p))
-
-    seen = set()
-    final: List[str] = []
-    for x in out:
-        if not x:
-            continue
-        k = x.upper()
-        if k in seen:
-            continue
-        seen.add(k)
-        final.append(x)
-        if limit and limit > 0 and len(final) >= limit:
-            break
-    return final
-
-
-def market_hint_for(sym_norm: str) -> str:
-    """
-    Minimal hint string used by routers/engines.
-    """
-    u = (sym_norm or "").strip().upper()
-    if is_ksa(u):
-        return "KSA"
-    return "GLOBAL"
-
-
-def symbol_variants(sym_norm: str) -> List[str]:
-    """
-    Safe router-level variants:
-    - GLOBAL: AAPL -> [AAPL, AAPL.US]
-             AAPL.US -> [AAPL.US, AAPL]
-             BRK.B -> [BRK.B, BRK.B.US, BRK-B.US]
-             BRK-B -> [BRK-B, BRK-B.US, BRK.B.US]
-    - KSA: 1120.SR -> [1120.SR, 1120]
-           1120 -> [1120.SR, 1120]
-    - Indices/FX/Commodities: [itself]
-    """
-    s = (sym_norm or "").strip()
-    if not s:
-        return []
-
-    u = s.upper()
-
-    if is_index_or_fx(u):
-        return [u]
-
-    out: List[str] = []
-
-    # KSA
-    if is_ksa(u):
-        if u.isdigit():
-            out.extend([f"{u}.SR", u])
-        elif u.endswith(".SR"):
-            out.extend([u, u.replace(".SR", "")])
-        else:
-            out.append(u)
-        return _dedupe_preserve(out)
-
-    # GLOBAL
-    out.append(u)
-
-    # If has explicit exchange suffix, also try base
-    base, exch = _split_exchange_suffix(u)
-    if exch is not None:
-        if base and base != u:
-            out.append(base)
-        return _dedupe_preserve(out)
-
-    # Plain ticker: add .US variant (common for EODHD)
-    if "." not in u:
-        out.append(f"{u}.{_default_exchange()}")
-
-    # Class share dot/dash swaps (BRK.B <-> BRK-B)
-    # Only do this for BASE, not for the exchange separator.
-    if "." in u and u.count(".") == 1:
-        # e.g., BRK.B (class share style) -> also BRK-B
-        out.append(u.replace(".", "-"))
-        out.append(f"{u}.{_default_exchange()}")
-        out.append(f"{u.replace('.', '-')}.{_default_exchange()}")
-    elif "-" in u and "." not in u:
-        # e.g., BRK-B -> also BRK.B
-        out.append(u.replace("-", "."))
-        out.append(f"{u}.{_default_exchange()}")
-        out.append(f"{u.replace('-', '.')}.{_default_exchange()}")
-
-    return _dedupe_preserve(out)
-
-
-def _default_exchange() -> str:
-    ex = _env_str("EODHD_DEFAULT_EXCHANGE", "US").strip().upper()
-    return ex or "US"
-
-
-def _dedupe_preserve(xs: Sequence[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in xs:
-        if not x:
-            continue
-        k = x.upper()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(x)
+        norm = normalize_symbol(p)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+            if limit > 0 and len(out) >= limit: break
+            
     return out
 
 
+def market_hint_for(sym_norm: str) -> str:
+    """Returns 'KSA' or 'GLOBAL' to help router selection."""
+    return "KSA" if is_ksa(sym_norm) else "GLOBAL"
+
+
+def _default_exchange() -> str:
+    return _env_str("EODHD_DEFAULT_EXCHANGE", "US").upper() or "US"
+
+
+def symbol_variants(sym_norm: str) -> List[str]:
+    """Generates a list of variant symbols for fallback provider attempts."""
+    u = (sym_norm or "").upper()
+    if not u: return []
+    if is_index_or_fx(u): return [u]
+
+    out = [u]
+    
+    # KSA Fallbacks
+    if is_ksa(u):
+        if u.endswith(".SR"): out.append(u[:-3])
+        else: out.insert(0, f"{u}.SR")
+    
+    # Global Fallbacks (dot/dash swap)
+    elif "." in u:
+        out.append(u.replace(".", "-"))
+    elif "-" in u:
+        out.append(u.replace("-", "."))
+        
+    # De-dupe keeping order
+    seen = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
+
+
 def to_eodhd_symbol(sym_norm: str, *, default_exchange: Optional[str] = None) -> str:
-    """
-    Convert a normalized *GLOBAL* symbol to EODHD "BASE.EXCH" format when needed.
-    - If symbol already has exchange suffix => keep as-is.
-    - If symbol is index/fx/commodity => keep as-is.
-    - If symbol is KSA => keep as-is (EODHD KSA is blocked by default in provider anyway).
-    - Else: AAPL -> AAPL.US (or default_exchange / EODHD_DEFAULT_EXCHANGE).
-    """
-    s = (sym_norm or "").strip().upper()
-    if not s:
-        return ""
-    if is_index_or_fx(s) or is_ksa(s):
+    """Formats a global ticker for EODHD's required 'TICKER.EXCH' format."""
+    s = (sym_norm or "").upper()
+    if not s or is_index_or_fx(s) or is_ksa(s) or "." in s:
         return s
-    if "." in s:
-        return s
-    ex = (default_exchange or _default_exchange()).strip().upper() or "US"
+    ex = (default_exchange or _default_exchange())
     return f"{s}.{ex}"
 
 
 def eodhd_symbol_variants(sym_norm: str, *, default_exchange: Optional[str] = None) -> List[str]:
-    """
-    Provider-oriented variants for EODHD:
-    - AAPL -> [AAPL.US, AAPL]
-    - BRK.B -> [BRK.B.US, BRK-B.US, BRK.B]
-    - BRK-B -> [BRK-B.US, BRK.B.US, BRK-B]
-    """
-    s = (sym_norm or "").strip().upper()
-    if not s:
-        return []
-    if is_index_or_fx(s) or is_ksa(s):
+    """Specific variant generator optimized for EODHD routing."""
+    s = (sym_norm or "").upper()
+    if not s or is_index_or_fx(s) or is_ksa(s):
         return [s]
 
-    ex = (default_exchange or _default_exchange()).strip().upper() or "US"
-
-    out: List[str] = []
-
-    base, exch = _split_exchange_suffix(s)
-    if exch is not None:
-        # already in BASE.EXCH form -> try as-is, then base
-        out.append(f"{base}.{exch}")
-        if base:
-            out.append(base)
-        return _dedupe_preserve(out)
-
-    # Plain ticker
-    if "." not in s and "-" not in s:
-        out.extend([f"{s}.{ex}", s])
-        return _dedupe_preserve(out)
-
-    # Class shares / special tickers
-    # BRK.B
-    if "." in s:
-        out.append(f"{s}.{ex}")
-        out.append(f"{s.replace('.', '-')}.{ex}")
-        out.append(s)
-        return _dedupe_preserve(out)
-
-    # BRK-B
-    if "-" in s:
-        out.append(f"{s}.{ex}")
-        out.append(f"{s.replace('-', '.')}.{ex}")
-        out.append(s)
-        return _dedupe_preserve(out)
-
-    out.extend([f"{s}.{ex}", s])
-    return _dedupe_preserve(out)
+    ex = (default_exchange or _default_exchange())
+    base = s.split(".")[0]
+    
+    # For global symbols, always try the exchange-suffixed version first
+    variants = [f"{base}.{ex}", base]
+    
+    # Handle class share separators
+    if "-" in base: variants.insert(1, base.replace("-", ".") + f".{ex}")
+    if "." in base: variants.insert(1, base.replace(".", "-") + f".{ex}")
+    
+    seen = set()
+    return [x for x in variants if not (x in seen or seen.add(x))]
