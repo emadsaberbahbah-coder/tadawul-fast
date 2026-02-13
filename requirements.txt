@@ -1,47 +1,59 @@
-# requirements.txt  (FULL REPLACEMENT)
-# ============================================================
-# Tadawul Fast Bridge — requirements.txt (PROD SAFE / Render)
-# FastAPI + Uvicorn + async providers + caching + Google Sheets
-# ============================================================
+============================================================
 
-# Core API
+Tadawul Fast Bridge — requirements.txt (PROD SAFE / Render)
+
+FastAPI + Uvicorn + async providers + caching + Google Sheets
+
+============================================================
+
+Core API
+
 fastapi>=0.128.0
 uvicorn[standard]>=0.40.0
 
-# Env / config
+Env / config
+
 python-dotenv>=1.2.1
 
-# Rate limiting
+Rate limiting
+
 slowapi>=0.1.9
 limits>=5.6.0
 
-# Pydantic / settings
+Pydantic / settings
+
 pydantic>=2.12.0
 pydantic-settings>=2.12.0
 
-# JSON + caching
+JSON + caching
+
 orjson>=3.11.0
 cachetools>=5.5.0,<6.0.0
 typing-extensions>=4.15.0,<5.0.0
 
-# HTTP clients
+HTTP clients
+
 httpx>=0.28.1
 requests>=2.32.5
 aiohttp>=3.13.0
 
-# HTML parsing (Argaam / scraping)
+HTML parsing (Argaam / scraping)
+
 beautifulsoup4>=4.14.0
 lxml>=6.0.0
 html5lib>=1.1
 
-# Market data (pin below 1.0 to avoid breaking changes)
+Market data (pin below 1.0 to avoid breaking changes)
+
 yfinance>=0.2.43,<1.0.0
 
-# Data processing
+Data processing
+
 pandas>=2.3.0
 numpy>=2.4.0
 
-# Google APIs (Sheets via service account)
+Google APIs (Sheets via service account)
+
 google-api-python-client>=2.187.0,<3.0.0
 google-auth>=2.47.0,<3.0.0
 google-auth-httplib2>=0.3.0,<1.0.0
