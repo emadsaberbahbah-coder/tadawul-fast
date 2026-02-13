@@ -1,7 +1,8 @@
-# core/news_intelligence.py
 """
-Tadawul Fast Bridge — News Intelligence (Sentiment + Qualitative Boost)
-Version: 0.2.0
+core/news_intelligence.py
+============================================================
+Tadawul Fast Bridge — News Intelligence (v0.3.0)
+(SENTIMENT + QUALITATIVE BOOST + RESILIENT FETCH)
 
 Goal
 - Fetch recent news (headlines/snippets) for each symbol/company
@@ -12,10 +13,10 @@ Safety
 - If anything fails (network blocked, RSS unavailable), return neutral scores.
 - No heavy ML dependencies. Uses a lexicon-based scorer (fast + stable).
 
-Operational improvements in v0.2.0
-- TTL cache to reduce RSS traffic and latency
-- Concurrent batch fetch with safe concurrency limit
-- Env-configurable sources + timeouts
+Operational improvements in v0.3.0
+- Enhanced headers to mimic browser behavior (reduces RSS blocks)
+- Expanded financial lexicon for better sentiment accuracy
+- Robust XML parsing fallback
 """
 
 from __future__ import annotations
@@ -33,12 +34,12 @@ except Exception:
     httpx = None  # type: ignore
 
 
-TT_NEWS_VERSION = "0.2.0"
+TT_NEWS_VERSION = "0.3.0"
 
 # -----------------------------------------------------------------------------
 # Config (env overrides)
 # -----------------------------------------------------------------------------
-DEFAULT_TIMEOUT_SECONDS = 6.0
+DEFAULT_TIMEOUT_SECONDS = 8.0
 DEFAULT_MAX_ARTICLES = 8
 DEFAULT_CACHE_TTL_SECONDS = 300  # 5 min
 DEFAULT_CONCURRENCY = 6
@@ -47,6 +48,7 @@ DEFAULT_CONCURRENCY = 6
 DEFAULT_RSS_SOURCES: List[str] = [
     "https://feeds.reuters.com/reuters/businessNews",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html",
 ]
 
 
@@ -110,17 +112,19 @@ _POS_WORDS = {
     "beat", "beats", "surge", "surges", "soar", "soars", "strong", "record", "growth",
     "profit", "profits", "upgrade", "upgraded", "outperform", "buy", "bullish",
     "rebound", "expansion", "wins", "win", "contract", "contracts", "award", "awarded",
-    "raises", "raise", "raised", "higher", "guidance", "buyback",
+    "raises", "raise", "raised", "higher", "guidance", "buyback", "dividend", "hike",
+    "jump", "jumps", "gain", "gains", "rally", "rallies", "positive", "success"
 }
 _NEG_WORDS = {
     "miss", "misses", "plunge", "plunges", "weak", "warning", "downgrade", "downgraded",
     "sell", "bearish", "lawsuit", "probe", "investigation", "fraud", "default",
     "loss", "losses", "cuts", "cut", "cutting", "layoff", "layoffs",
     "bankruptcy", "recall", "halt", "suspends", "suspended", "sanction", "sanctions",
+    "drop", "drops", "fall", "falls", "slide", "slides", "negative", "fail", "failure"
 }
 
-_NEG_PHRASES = {"profit warning", "guidance cut", "regulatory probe"}
-_POS_PHRASES = {"record profit", "raises guidance", "share buyback", "share repurchase"}
+_NEG_PHRASES = {"profit warning", "guidance cut", "regulatory probe", "accounting scandal", "sales miss"}
+_POS_PHRASES = {"record profit", "raises guidance", "share buyback", "share repurchase", "sales beat"}
 
 
 def _normalize_text(s: str) -> str:
@@ -243,15 +247,25 @@ def _cache_set(key: str, val: NewsResult) -> None:
 async def _fetch_text(url: str, timeout_s: float) -> str:
     if httpx is None:
         raise RuntimeError("httpx is not installed/available.")
+    
+    # Browser-like headers to reduce blocks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    
     async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
-        r = await client.get(url, headers={"User-Agent": "TadawulFastBridge/NewsIntelligence"})
+        r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.text
 
 
 def _parse_rss_items(xml_text: str, source_url: str, max_items: int) -> List[NewsArticle]:
     txt = xml_text or ""
+    # Try items (RSS 2.0)
     items = re.findall(r"<item\b.*?</item>", txt, flags=re.IGNORECASE | re.DOTALL)
+    # Try entries (Atom)
     if not items:
         items = re.findall(r"<entry\b.*?</entry>", txt, flags=re.IGNORECASE | re.DOTALL)
 
@@ -260,7 +274,7 @@ def _parse_rss_items(xml_text: str, source_url: str, max_items: int) -> List[New
         title = _strip_html(_extract_xml_tag(blk, "title"))
         link = _extract_link(blk)
         pub = _extract_xml_tag(blk, "pubDate") or _extract_xml_tag(blk, "updated")
-        desc = _extract_xml_tag(blk, "description") or _extract_xml_tag(blk, "summary")
+        desc = _extract_xml_tag(blk, "description") or _extract_xml_tag(blk, "summary") or _extract_xml_tag(blk, "content")
 
         out.append(
             NewsArticle(
@@ -327,6 +341,7 @@ async def get_news_intelligence(
 
     all_articles: List[NewsArticle] = []
 
+    # Sequential fetch to be polite but resilient
     for src in rss_sources:
         try:
             xml = await _fetch_text(src, timeout_s=timeout_s)
