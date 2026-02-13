@@ -1,20 +1,24 @@
-# tadawul-fast/routes/advisor.py
+# routes/advisor.py
 """
-Tadawul Fast Bridge — Advisor Routes
-Version: 1.3.0
+routes/advisor.py
+------------------------------------------------------------
+Tadawul Fast Bridge — Advisor Routes (v1.3.1)
+(ADVANCED + ENGINE-AWARE + RESILIENT)
 
-Fixes in v1.3.0
-- Always returns Sheets-safe response: headers are NEVER empty when status="ok"
-- Converts engine 'items' output to headers+rows
-- Supports payload.tickers / payload.symbols
-- When 0 opportunities matched, returns default headers and rows=[]
+Updates in v1.3.1:
+- ✅ Engine Injection: Uses app.state.engine if available for shared caching.
+- ✅ Resilient Import: gracefully handles missing service modules.
+- ✅ Enhanced Metadata: Returns processing time and engine status diagnostics.
+- ✅ Dual-Mode Input: Accepts both `tickers` (list) and `symbols` (list).
 """
 
 from __future__ import annotations
 
+import time
+import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from schemas.advisor import (
     AdvisorRequest,
@@ -22,7 +26,12 @@ from schemas.advisor import (
     TT_ADVISOR_DEFAULT_HEADERS,
 )
 
+# Configure Logger
+logger = logging.getLogger("routes.advisor")
+
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
+
+ADVISOR_ROUTE_VERSION = "1.3.1"
 
 
 def _items_to_table(items: List[Dict[str, Any]]) -> tuple[List[str], List[List[Any]]]:
@@ -62,77 +71,124 @@ def _items_to_table(items: List[Dict[str, Any]]) -> tuple[List[str], List[List[A
 
 
 @router.post("/recommendations", response_model=AdvisorResponse)
-def advisor_recommendations(req: AdvisorRequest) -> AdvisorResponse:
+async def advisor_recommendations(req: AdvisorRequest, request: Request) -> AdvisorResponse:
     """
     Main advisor endpoint used by Google Sheets.
 
-    Expected behavior:
-    - If no matches (count=0), still returns headers (non-empty) + rows=[]
+    Features:
+    - Normalizes input tickers.
+    - Injects shared DataEngine for caching.
+    - Returns standardized headers even on empty results.
     """
+    start_time = time.time()
+
     # -----------------------------
-    # Normalize tickers universe
+    # 1. Normalize tickers universe
     # -----------------------------
     tickers = list(req.tickers or [])
     if not tickers and req.symbols:
         tickers = list(req.symbols)
 
-    # If still empty, return an error response (client can show message)
+    # If still empty, return an error response immediately
     if not tickers:
         return AdvisorResponse(
             status="error",
-            error="No tickers provided. Provide payload.tickers (list or comma string) or payload.symbol(s).",
+            error="No tickers provided. Provide payload.tickers (list) or payload.symbols.",
             headers=list(TT_ADVISOR_DEFAULT_HEADERS),
             rows=[],
-            meta={"route_version": "1.3.0"},
+            meta={"route_version": ADVISOR_ROUTE_VERSION},
         )
 
     # -----------------------------
-    # Run your advisor engine
+    # 2. Resolve Engine (Shared State)
     # -----------------------------
-    # NOTE: Replace this import/call with your actual engine function.
-    # It must return dict with: items (list), count (int), filters/meta optional.
-    from services.advisor_engine import run_advisor  # adjust to your codebase
+    engine = None
+    try:
+        if hasattr(request.app.state, "engine"):
+            engine = request.app.state.engine
+    except Exception:
+        pass
 
-    result: Dict[str, Any] = run_advisor(
-        tickers=tickers,
-        sources=req.sources,
-        risk=req.risk,
-        confidence=req.confidence,
-        required_roi_1m=req.required_roi_1m,
-        required_roi_3m=req.required_roi_3m,
-        top_n=req.top_n,
-        invest_amount=req.invest_amount,
-        currency=req.currency,
-        include_news=req.include_news,
-        as_of_utc=req.as_of_utc,
-        min_price=req.min_price,
-        max_price=req.max_price,
-    )
+    # -----------------------------
+    # 3. Run Advisor Logic (Resilient Import)
+    # -----------------------------
+    try:
+        # Dynamic import to avoid crash if service layer is missing/broken
+        from core.investment_advisor import run_investment_advisor
+        
+        # Prepare payload compatible with core logic
+        core_payload = {
+            "sources": req.sources,
+            "risk": req.risk,
+            "confidence": req.confidence,
+            "required_roi_1m": req.required_roi_1m,
+            "required_roi_3m": req.required_roi_3m,
+            "top_n": req.top_n,
+            "invest_amount": req.invest_amount,
+            "currency": req.currency,
+            "include_news": req.include_news,
+            "as_of_utc": req.as_of_utc,
+            "min_price": req.min_price,
+            "max_price": req.max_price,
+        }
 
+        # Execute Core Logic
+        # Note: core.investment_advisor.run_investment_advisor handles the Universe scanning
+        # using the passed engine to fetch cached snapshots.
+        result = run_investment_advisor(core_payload, engine=engine)
+    
+    except ImportError:
+        logger.error("core.investment_advisor module not found.")
+        return AdvisorResponse(
+            status="error",
+            error="Advisor service module missing on server.",
+            headers=list(TT_ADVISOR_DEFAULT_HEADERS),
+            rows=[],
+            meta={"route_version": ADVISOR_ROUTE_VERSION},
+        )
+    except Exception as e:
+        logger.exception("Advisor execution failed.")
+        return AdvisorResponse(
+            status="error",
+            error=f"Advisor execution failed: {str(e)}",
+            headers=list(TT_ADVISOR_DEFAULT_HEADERS),
+            rows=[],
+            meta={"route_version": ADVISOR_ROUTE_VERSION},
+        )
+
+    # -----------------------------
+    # 4. Format Output
+    # -----------------------------
     items = result.get("items") or []
-    count = int(result.get("count") or len(items))
+    # If core returns pre-formatted headers/rows, use them; otherwise convert items
+    if "headers" in result and "rows" in result:
+        headers = result["headers"]
+        rows = result["rows"]
+    else:
+        headers, rows = _items_to_table(items)
 
-    headers, rows = _items_to_table(items)
+    count = len(items) if items else len(rows)
 
     # -----------------------------
-    # Build stable response (CRITICAL)
+    # 5. Build Final Response
     # -----------------------------
-    # Always return headers for ok, even if count == 0
     meta = result.get("meta") or {}
+    
+    # Inject route-level diagnostics
+    processing_time = round((time.time() - start_time) * 1000, 2)
     meta.update(
         {
-            "route_version": "1.3.0",
-            "filters": {
+            "route_version": ADVISOR_ROUTE_VERSION,
+            "engine_status": "injected" if engine else "fallback",
+            "processing_time_ms": processing_time,
+            "filters_applied": {
                 "risk": req.risk,
                 "confidence": req.confidence,
-                "required_roi_1m_pct": round(req.required_roi_1m * 100, 4),
-                "required_roi_3m_pct": round(req.required_roi_3m * 100, 4),
+                "roi_1m_target": req.required_roi_1m,
                 "top_n": req.top_n,
-                "amount": req.invest_amount,
-                "output_mode": "items",
             },
-            "tickers_count": len(tickers),
-            "count": count,
+            "tickers_scanned": len(tickers),
+            "opportunities_found": count,
         }
     )
 
