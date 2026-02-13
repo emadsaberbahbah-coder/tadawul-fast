@@ -1,6 +1,5 @@
-# core/config.py
 """
-TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.0.0-shim) – PROD SAFE
+TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.0.1-shim) – PROD SAFE
 
 Purpose
 - Backward compatibility for imports like:
@@ -9,11 +8,11 @@ Purpose
 - Never crashes startup (defensive import + safe fallbacks)
 - Avoid circular imports: do NOT import anything else from core at import-time.
 
-Improvements in v3.0.0-shim
-- ✅ Robust canonical import: supports missing optional exports (mask_settings_dict, etc.)
-- ✅ OPEN fallback still works even if root config.py changes shape
-- ✅ Minimal debug tracing via CORE_CONFIG_DEBUG=true (no logging import)
-- ✅ Safer Settings export: always a usable type (real Settings class if present, else object)
+Improvements in v3.0.1-shim
+- ✅ Robust canonical import: supports missing optional exports.
+- ✅ OPEN fallback still works even if root config.py changes shape.
+- ✅ Minimal debug tracing via CORE_CONFIG_DEBUG=true.
+- ✅ Aligned with root config.py v3.0.1 (Auth Header support).
 
 Exports (stable)
 - CONFIG_VERSION
@@ -30,7 +29,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 import os
 
-CONFIG_VERSION = "3.0.0-shim"
+CONFIG_VERSION = "3.0.1-shim"
 
 _DEBUG = str(os.getenv("CORE_CONFIG_DEBUG", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
