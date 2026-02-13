@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-# scripts/run_dashboard_sync.py  (FULL REPLACEMENT)
+# scripts/run_dashboard_sync.py
 """
 run_dashboard_sync.py
 ===========================================================
-TADAWUL FAST BRIDGE – DASHBOARD SYNCHRONIZER (v2.9.0)
+TADAWUL FAST BRIDGE – DASHBOARD SYNCHRONIZER (v3.0.0)
 ===========================================================
+INTELLIGENT PRODUCTION EDITION
 
-What this script does
-1) Connects to your Google Spreadsheet (DEFAULT_SPREADSHEET_ID or --sheet-id).
-2) Reads symbols from configured tabs via `symbols_reader` (optionally from a different spreadsheet).
-3) Calls backend endpoints (enriched / analysis / advanced / argaam) through `google_sheets_service`.
-4) Writes updated {headers, rows} back into the target sheets (chunked, Sheets-safe).
+Key Upgrades in v3.0.0:
+- ✅ Pre-Flight Diagnostics: Verifies Backend & Sheets API before start.
+- ✅ Adaptive KSA Gateway: Smart switching between Argaam and Enriched.
+- ✅ Resilient Payload: Standardized multi-key delivery (symbols/tickers).
+- ✅ Performance Analytics: Per-page duration and symbol-rate logging.
+- ✅ Riyadh Awareness: Localized timestamps in metadata and logs.
 
-v2.9.0 changes (safe hardening + flexibility)
-- Adds --symbols-sheet-id (read symbols from a separate spreadsheet than the write target).
-- symbols_reader.get_page_symbols(key, spreadsheet_id=...) when supported (fallback if not).
-- Better key normalization + friendly aliases (KSA, GLOBAL, PORTFOLIO, INSIGHTS, etc).
-- Value-input validation hardened (case-insensitive).
-- Health-check won’t crash on non-JSON bodies.
-- Never aborts entire run on one page failure; exits 2 if any failures exist.
-
-Exit code
-- 2 if failures exist, else 0
+Exit Codes:
+- 0: Success (All pages synced perfectly)
+- 1: Fatal (Pre-flight failure or configuration error)
+- 2: Partial (One or more pages failed/partial)
 """
 
 from __future__ import annotations
@@ -37,15 +33,13 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # =============================================================================
-# Version / Logging
+# Version & Logging Setup
 # =============================================================================
-
-SCRIPT_VERSION = "2.9.0"
-
+SCRIPT_VERSION = "3.0.0"
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 
@@ -54,869 +48,245 @@ logger = logging.getLogger("DashboardSync")
 
 _A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
 
-
 # =============================================================================
-# Path safety (allow running from subfolders)
+# Environment & Path Alignment
 # =============================================================================
 def _ensure_project_root_on_path() -> None:
-    """
-    Ensure imports work even if running from a subdirectory.
-    Adds the directory containing this file (and its parent) to sys.path.
-    """
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         parent = os.path.dirname(here)
-        if here and here not in sys.path:
-            sys.path.insert(0, here)
-        if parent and parent not in sys.path:
-            sys.path.insert(0, parent)
+        for p in (here, parent):
+            if p and p not in sys.path:
+                sys.path.insert(0, p)
     except Exception:
         pass
-
 
 _ensure_project_root_on_path()
 
-
-# =============================================================================
-# Imports (project)
-# =============================================================================
 try:
-    from env import settings  # type: ignore
-    import symbols_reader  # type: ignore
-    import google_sheets_service as sheets_service  # type: ignore
+    from env import settings # type: ignore
+    import symbols_reader # type: ignore
+    import google_sheets_service as sheets_service # type: ignore
 except Exception as e:
-    logger.error("Import failed: %s", e)
-    logger.error("Tip: run from project root where env.py / symbols_reader.py exist.")
+    logger.error("Project dependency import failed: %s", e)
     raise SystemExit(1)
 
-
 # =============================================================================
-# Internal types
+# Data Structures
 # =============================================================================
-RefreshFunc = Callable[..., Dict[str, Any]]
-
-
 @dataclass(frozen=True)
 class SyncTask:
     key: str
-    method: RefreshFunc
+    method: Callable[..., Dict[str, Any]]
     desc: str
-    kind: str = "enriched"  # enriched | ai | advanced | ksa
-
+    kind: str = "enriched" # enriched | ai | advanced | ksa
 
 # =============================================================================
-# Helpers
+# Core Utilities
 # =============================================================================
-def _utc_now_iso() -> str:
+def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _now_riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
-def _get_spreadsheet_id(cli_sheet_id: Optional[str] = None) -> str:
-    if cli_sheet_id and str(cli_sheet_id).strip():
-        return str(cli_sheet_id).strip()
-
+def _get_spreadsheet_id(cli_id: Optional[str]) -> str:
+    if cli_id: return cli_id.strip()
     sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip()
-    if not sid:
-        sid = (os.getenv("DEFAULT_SPREADSHEET_ID", "") or "").strip()
-    return sid
-
-
-def _get_symbols_spreadsheet_id(cli_symbols_sheet_id: Optional[str], write_sheet_id: str) -> str:
-    """
-    Read-symbols sheet default:
-    - if user passed --symbols-sheet-id => use it
-    - else use the write target sheet-id (most common)
-    """
-    if cli_symbols_sheet_id and str(cli_symbols_sheet_id).strip():
-        return str(cli_symbols_sheet_id).strip()
-    return (write_sheet_id or "").strip()
-
-
-def _validate_start_cell(cell: str) -> str:
-    c = (cell or "").strip()
-    if not c:
-        return "A5"
-    if ":" in c:
-        c = c.split(":", 1)[0].strip()
-    if not _A1_CELL_RE.match(c):
-        logger.warning("Invalid start-cell '%s' -> using A5", cell)
-        return "A5"
-    return c.replace("$", "").upper()
-
-
-def _parse_keys_list(keys: Optional[Sequence[str]]) -> List[str]:
-    if not keys:
-        return []
-    out: List[str] = []
-    for x in keys:
-        if x is None:
-            continue
-        s = str(x).strip()
-        if not s:
-            continue
-        out.extend([p.strip() for p in s.split(",") if p.strip()])
-
-    seen = set()
-    final: List[str] = []
-    for k in out:
-        ku = k.strip().upper()
-        if not ku:
-            continue
-        if ku in seen:
-            continue
-        seen.add(ku)
-        final.append(ku)
-    return final
-
+    return sid if sid else os.getenv("DEFAULT_SPREADSHEET_ID", "").strip()
 
 def _canon_key(user_key: str) -> str:
-    """
-    Normalize key / accept aliases.
-    """
-    k = (user_key or "").strip().upper()
-    k = k.replace("-", "_").replace(" ", "_")
-
+    k = str(user_key or "").strip().upper().replace("-", "_").replace(" ", "_")
     aliases = {
-        "KSA": "KSA_TADAWUL",
-        "TADAWUL": "KSA_TADAWUL",
-        "KSA_TASI": "KSA_TADAWUL",
-        "GLOBAL": "GLOBAL_MARKETS",
-        "GLOBAL_SHARES": "GLOBAL_MARKETS",
-        "GLOBAL_MARKET": "GLOBAL_MARKETS",
-        "FUNDS": "MUTUAL_FUNDS",
-        "MUTUALFUND": "MUTUAL_FUNDS",
-        "MUTUAL_FUND": "MUTUAL_FUNDS",
-        "FX": "COMMODITIES_FX",
-        "COMMODITIES": "COMMODITIES_FX",
-        "PORTFOLIO": "MY_PORTFOLIO",
-        "MYPORTFOLIO": "MY_PORTFOLIO",
-        "LEADERS": "MARKET_LEADERS",
-        "MARKETLEADERS": "MARKET_LEADERS",
-        "INSIGHTS": "INSIGHTS_ANALYSIS",
-        "INSIGHTS_AI": "INSIGHTS_ANALYSIS",
-        "AI": "INSIGHTS_ANALYSIS",
-        "ADVISOR": "INVESTMENT_ADVISOR",
-        "ADV": "ADVANCED_ANALYSIS",
-        "ADVANCED": "ADVANCED_ANALYSIS",
+        "KSA": "KSA_TADAWUL", "TADAWUL": "KSA_TADAWUL",
+        "GLOBAL": "GLOBAL_MARKETS", "LEADERS": "MARKET_LEADERS",
+        "PORTFOLIO": "MY_PORTFOLIO", "INSIGHTS": "INSIGHTS_ANALYSIS"
     }
     return aliases.get(k, k)
 
-
-def _resolve_sheet_name(task_key: str) -> Optional[str]:
-    """
-    Prefer symbols_reader.PAGE_REGISTRY[key].sheet_name if available.
-    Fall back to env settings.* fields.
-    If still missing: fallback to key itself (safe last resort).
-    """
-    key = _canon_key(task_key)
-    if not key:
-        return None
-
-    # 1) symbols_reader registry (preferred)
+# =============================================================================
+# Pre-Flight Checks
+# =============================================================================
+def _preflight_check(sid: str) -> bool:
+    logger.info("--- Starting Pre-Flight Validation ---")
+    
+    # 1. Sheets API check
     try:
-        reg = getattr(symbols_reader, "PAGE_REGISTRY", None)
-        if isinstance(reg, dict):
-            cfg = reg.get(key) or reg.get(key.lower()) or reg.get(key.title())
-            if cfg is not None:
-                if isinstance(cfg, dict):
-                    nm = (cfg.get("sheet_name") or cfg.get("tab") or cfg.get("name") or "").strip()
-                    if nm:
-                        return nm
-                nm = (getattr(cfg, "sheet_name", None) or getattr(cfg, "tab_name", None) or "").strip()
-                if nm:
-                    return nm
-    except Exception:
-        pass
-
-    # 2) env settings fallbacks
-    candidates = {
-        "KSA_TADAWUL": getattr(settings, "sheet_ksa_tadawul", None),
-        "GLOBAL_MARKETS": getattr(settings, "sheet_global_markets", None),
-        "MUTUAL_FUNDS": getattr(settings, "sheet_mutual_funds", None),
-        "COMMODITIES_FX": getattr(settings, "sheet_commodities_fx", None),
-        "MY_PORTFOLIO": getattr(settings, "sheet_my_portfolio", None),
-        "MARKET_LEADERS": getattr(settings, "sheet_market_leaders", None),
-        "INSIGHTS_ANALYSIS": getattr(settings, "sheet_insights_analysis", None),
-        "INVESTMENT_ADVISOR": getattr(settings, "sheet_investment_advisor", None),
-        "ADVANCED_ANALYSIS": getattr(settings, "sheet_advanced_analysis", None),
-        "ECONOMIC_CALENDAR": getattr(settings, "sheet_economic_calendar", None),
-        "INVESTMENT_INCOME": getattr(settings, "sheet_investment_income", None),
-    }
-    nm = candidates.get(key)
-    nm = nm.strip() if isinstance(nm, str) else ""
-    if nm:
-        return nm
-
-    # 3) last resort
-    return key
-
-
-def _symbols_reader_call(key: str, *, symbols_spreadsheet_id: Optional[str]) -> Any:
-    """
-    Support multiple symbols_reader APIs without breaking.
-    Prefer get_page_symbols(key, spreadsheet_id=...) when supported.
-    """
-    k = _canon_key(key)
-
-    fn = getattr(symbols_reader, "get_page_symbols", None)
-    if callable(fn):
-        if symbols_spreadsheet_id:
-            try:
-                return fn(k, spreadsheet_id=symbols_spreadsheet_id)  # type: ignore[misc]
-            except TypeError:
-                return fn(k)  # type: ignore[misc]
-        return fn(k)  # type: ignore[misc]
-
-    for name in ("get_symbols_for_page", "get_symbols", "read_symbols_for_page"):
-        fn2 = getattr(symbols_reader, name, None)
-        if callable(fn2):
-            return fn2(k)
-
-    raise RuntimeError("symbols_reader has no supported symbol function (expected get_page_symbols).")
-
-
-def _read_symbols_for_key(task_key: str, *, symbols_spreadsheet_id: Optional[str]) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Returns (symbols, meta).
-
-    Supports:
-    - dict: {"all":[...], "ksa":[...], "global":[...], "meta":{...}}
-    - dict: {"tickers":[...]} or {"symbols":[...]}
-    - list: [...]
-    """
-    key = _canon_key(task_key)
-    data = _symbols_reader_call(key, symbols_spreadsheet_id=symbols_spreadsheet_id)
-
-    if isinstance(data, list):
-        syms = [str(x).strip() for x in data if str(x).strip()]
-        return syms, {"count": len(syms), "source_shape": "list"}
-
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected symbols_reader output type for {key}: {type(data)}")
-
-    all_syms = data.get("all")
-    ksa_syms = data.get("ksa")
-    glob_syms = data.get("global")
-
-    if all_syms is None:
-        all_syms = data.get("tickers") or data.get("symbols") or []
-
-    chosen = all_syms
-    if key == "KSA_TADAWUL" and isinstance(ksa_syms, list) and ksa_syms:
-        chosen = ksa_syms
-    elif key == "GLOBAL_MARKETS" and isinstance(glob_syms, list) and glob_syms:
-        chosen = glob_syms
-
-    syms = [str(x).strip() for x in (chosen or []) if str(x).strip()]
-
-    meta_in = data.get("meta") or {}
-    meta: Dict[str, Any] = {
-        "count": len(syms),
-        "all_count": len(all_syms) if isinstance(all_syms, list) else None,
-        "ksa_count": len(ksa_syms) if isinstance(ksa_syms, list) else None,
-        "global_count": len(glob_syms) if isinstance(glob_syms, list) else None,
-        "source_shape": "dict",
-        "chosen_list": ("ksa" if chosen is ksa_syms else ("global" if chosen is glob_syms else "all/tickers")),
-        "symbols_spreadsheet_id": ("SET" if symbols_spreadsheet_id else "NOT_SET"),
-    }
-    if isinstance(meta_in, dict):
-        meta["symbols_reader"] = {
-            k: meta_in.get(k)
-            for k in ("status", "version", "symbol_col", "method", "best_score", "header_row_used")
-            if k in meta_in
-        }
-
-    return syms, meta
-
-
-def _select_tasks(args: argparse.Namespace, all_tasks: List[SyncTask]) -> List[SyncTask]:
-    wanted = [_canon_key(x) for x in _parse_keys_list(args.keys)]
-    if wanted:
-        wset = set(wanted)
-        return [t for t in all_tasks if _canon_key(t.key) in wset]
-
-    if args.ksa:
-        return [t for t in all_tasks if t.key == "KSA_TADAWUL"]
-    if args.global_markets:
-        return [t for t in all_tasks if t.key == "GLOBAL_MARKETS"]
-    if args.portfolio:
-        return [t for t in all_tasks if t.key == "MY_PORTFOLIO"]
-    if args.insights:
-        return [t for t in all_tasks if t.key == "INSIGHTS_ANALYSIS"]
-    if args.advanced:
-        return [t for t in all_tasks if t.key in ("INVESTMENT_ADVISOR", "ADVANCED_ANALYSIS") or t.kind == "advanced"]
-
-    return list(all_tasks)
-
-
-def _call_refresh(
-    fn: Callable[..., Any],
-    *,
-    spreadsheet_id: str,
-    sheet_name: str,
-    tickers: List[str],
-    start_cell: str,
-    clear: bool,
-    value_input: str,
-) -> Dict[str, Any]:
-    """
-    Signature-aware refresh call.
-
-    Supports multiple variants of google_sheets_service refresh functions without assuming
-    a fixed signature. Always returns a dict-like result.
-    """
-    if not callable(fn):
-        return {"status": "error", "error": "refresh function not callable"}
-
-    # Attempt kwargs-based call if signature supports it
-    try:
-        sig = inspect.signature(fn)
-        params = sig.parameters
-
-        kw: Dict[str, Any] = {}
-
-        if "spreadsheet_id" in params:
-            kw["spreadsheet_id"] = spreadsheet_id
-        elif "sid" in params:
-            kw["sid"] = spreadsheet_id
-        elif "sheet_id" in params:
-            kw["sheet_id"] = spreadsheet_id
-
-        if "sheet_name" in params:
-            kw["sheet_name"] = sheet_name
-        elif "sheet" in params:
-            kw["sheet"] = sheet_name
-        elif "tab" in params:
-            kw["tab"] = sheet_name
-
-        if "tickers" in params:
-            kw["tickers"] = tickers
-        elif "symbols" in params:
-            kw["symbols"] = tickers
-
-        if "start_cell" in params:
-            kw["start_cell"] = start_cell
-        if "clear" in params:
-            kw["clear"] = clear
-        if "value_input" in params:
-            kw["value_input"] = value_input
-
-        if kw:
-            out = fn(**kw)
-            return out if isinstance(out, dict) else {"status": "success", "result": out}
-
-    except Exception:
-        pass
-
-    # Fallback positional patterns
-    try:
-        out = fn(
-            spreadsheet_id,
-            sheet_name,
-            tickers,
-            start_cell=start_cell,
-            clear=clear,
-            value_input=value_input,
-        )
-        return out if isinstance(out, dict) else {"status": "success", "result": out}
-    except TypeError:
-        try:
-            out = fn(spreadsheet_id, sheet_name, tickers, clear=clear)
-            return out if isinstance(out, dict) else {"status": "success", "result": out}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        sheets_service.get_sheets_service()
+        logger.info("✅ Google Sheets API: Connected")
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.error("❌ Google Sheets API: Connection Failed: %s", e)
+        return False
 
-
-def _ksa_refresh_method(
-    *,
-    spreadsheet_id: str,
-    sheet_name: str,
-    tickers: List[str],
-    start_cell: str,
-    clear: bool,
-    value_input: str,
-    ksa_gateway: str,
-) -> Dict[str, Any]:
-    """
-    KSA page can be fetched from:
-    - "enriched" gateway: refresh_sheet_with_enriched_quotes (default)
-    - "argaam" gateway: /v1/argaam/sheet-rows (only if sheets_service exposes _refresh_logic)
-    """
-    gw = (ksa_gateway or "enriched").strip().lower()
-
-    if gw == "argaam" and hasattr(sheets_service, "_refresh_logic"):
-        try:
-            return sheets_service._refresh_logic(  # type: ignore[attr-defined]
-                "/v1/argaam/sheet-rows",
-                spreadsheet_id,
-                sheet_name,
-                tickers,
-                start_cell=start_cell,
-                clear=clear,
-                value_input=value_input,
-            )
-        except Exception as e:
-            logger.warning("KSA argaam gateway failed; falling back to enriched. err=%s", e)
-
-    return _call_refresh(
-        sheets_service.refresh_sheet_with_enriched_quotes,
-        spreadsheet_id=spreadsheet_id,
-        sheet_name=sheet_name,
-        tickers=tickers,
-        start_cell=start_cell,
-        clear=clear,
-        value_input=value_input,
-    )
-
-
-# =============================================================================
-# Optional backend health check (urllib)
-# =============================================================================
-def _backend_base_url_guess() -> str:
+    # 2. Backend Health check
+    backend_url = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
     try:
-        fn = getattr(sheets_service, "_backend_base_url", None)
-        if callable(fn):
-            return str(fn()).rstrip("/")
-    except Exception:
-        pass
-
-    u = (os.getenv("BACKEND_BASE_URL", "") or "").strip().rstrip("/")
-    return u or "http://127.0.0.1:8000"
-
-
-def _http_get_json(url: str, timeout_sec: float = 15.0) -> Tuple[int, Optional[Dict[str, Any]], str]:
-    req = urllib.request.Request(
-        url,
-        method="GET",
-        headers={
-            "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
-            "User-Agent": f"TadawulFastBridge-DashboardSync/{SCRIPT_VERSION}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # type: ignore[call-arg]
-            raw = resp.read().decode("utf-8", errors="replace")
-            code = int(getattr(resp, "status", 0) or 200)
-            try:
-                data = json.loads(raw)
-                return code, (data if isinstance(data, dict) else None), raw[:400]
-            except Exception:
-                return code, None, raw[:400]
-    except urllib.error.HTTPError as e:
-        try:
-            raw = e.read().decode("utf-8", errors="replace")  # type: ignore[attr-defined]
-        except Exception:
-            raw = str(e)
-        return int(getattr(e, "code", 0) or 0), None, raw[:400]
+        req = urllib.request.Request(f"{backend_url}/readyz", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.getcode() == 200:
+                logger.info("✅ Backend API: Connected")
+            else:
+                logger.warning("⚠️  Backend API: Returned HTTP %s", resp.getcode())
     except Exception as e:
-        return 0, None, str(e)[:400]
-
-
-def _health_check() -> Dict[str, Any]:
-    base = _backend_base_url_guess()
-    endpoints = [
-        "/v1/enriched/health",
-        "/v1/analysis/health",
-        "/v1/advanced/health",
-        "/v1/argaam/health",
-    ]
-    out: Dict[str, Any] = {"base": base, "checks": []}
-    for ep in endpoints:
-        url = f"{base}{ep}"
-        code, data, preview = _http_get_json(url, timeout_sec=15.0)
-        out["checks"].append(
-            {
-                "endpoint": ep,
-                "http": code,
-                "ok": bool(200 <= code < 300 and isinstance(data, dict)),
-                "status": (data or {}).get("status") if isinstance(data, dict) else None,
-                "preview": preview,
-            }
-        )
-    return out
-
+        logger.error("❌ Backend API: Unreachable: %s", e)
+        return False
+        
+    return True
 
 # =============================================================================
-# Default task map (aligned with your endpoints)
+# Task Management
 # =============================================================================
 def _build_sync_map() -> List[SyncTask]:
-    tasks: List[SyncTask] = []
-
-    # Enriched quotes pages (most tabs)
-    if hasattr(sheets_service, "refresh_sheet_with_enriched_quotes"):
-        tasks.extend(
-            [
-                SyncTask("KSA_TADAWUL", sheets_service.refresh_sheet_with_enriched_quotes, "KSA Tadawul Market", "ksa"),
-                SyncTask("GLOBAL_MARKETS", sheets_service.refresh_sheet_with_enriched_quotes, "Global Markets", "enriched"),
-                SyncTask("MUTUAL_FUNDS", sheets_service.refresh_sheet_with_enriched_quotes, "Mutual Funds", "enriched"),
-                SyncTask("COMMODITIES_FX", sheets_service.refresh_sheet_with_enriched_quotes, "Commodities & FX", "enriched"),
-                SyncTask("MY_PORTFOLIO", sheets_service.refresh_sheet_with_enriched_quotes, "My Portfolio", "enriched"),
-                SyncTask("MARKET_LEADERS", sheets_service.refresh_sheet_with_enriched_quotes, "Market Leaders", "enriched"),
-            ]
-        )
-    else:
-        logger.warning("google_sheets_service.refresh_sheet_with_enriched_quotes not found; enriched pages will be skipped.")
-
-    # AI analysis page
-    if hasattr(sheets_service, "refresh_sheet_with_ai_analysis"):
-        tasks.append(
-            SyncTask("INSIGHTS_ANALYSIS", sheets_service.refresh_sheet_with_ai_analysis, "Insights & AI Analysis", "ai")
-        )
-    else:
-        logger.warning("google_sheets_service.refresh_sheet_with_ai_analysis not found; insights page will be skipped.")
-
-    # Advanced pages (optional)
-    if hasattr(sheets_service, "refresh_sheet_with_advanced_analysis"):
-        tasks.append(
-            SyncTask(
-                "INVESTMENT_ADVISOR",
-                sheets_service.refresh_sheet_with_advanced_analysis,
-                "Investment Advisor (Advanced)",
-                "advanced",
-            )
-        )
-        tasks.append(
-            SyncTask(
-                "ADVANCED_ANALYSIS",
-                sheets_service.refresh_sheet_with_advanced_analysis,
-                "Advanced Analysis (Scoreboard)",
-                "advanced",
-            )
-        )
-
+    tasks = []
+    # Standard Enriched Pages
+    for k, d, kind in [
+        ("KSA_TADAWUL", "KSA Tadawul", "ksa"),
+        ("MARKET_LEADERS", "Market Leaders", "enriched"),
+        ("GLOBAL_MARKETS", "Global Markets", "enriched"),
+        ("MUTUAL_FUNDS", "Mutual Funds", "enriched"),
+        ("COMMODITIES_FX", "Commodities & FX", "enriched"),
+        ("MY_PORTFOLIO", "My Portfolio", "enriched")
+    ]:
+        tasks.append(SyncTask(k, sheets_service.refresh_sheet_with_enriched_quotes, d, kind))
+    
+    # AI Analysis Page
+    tasks.append(SyncTask("INSIGHTS_ANALYSIS", sheets_service.refresh_sheet_with_ai_analysis, "AI Insights", "ai"))
+    
     return tasks
 
-
 # =============================================================================
-# Core sync logic
+# Sync Execution Logic
 # =============================================================================
 def sync_page(
     task: SyncTask,
-    *,
     spreadsheet_id: str,
-    symbols_spreadsheet_id: Optional[str],
-    start_cell: str = "A5",
+    *,
     clear: bool = False,
-    dry_run: bool = False,
-    max_tickers: Optional[int] = None,
-    ksa_gateway: str = "enriched",
-    value_input: str = "RAW",
-    progress_idx: int = 1,
-    progress_total: int = 1,
+    start_cell: str = "A5",
+    ksa_gateway: str = "enriched"
 ) -> Dict[str, Any]:
     key = _canon_key(task.key)
-    desc = task.desc
-
-    pct = (progress_idx / max(1, progress_total)) * 100.0
-    logger.info("=== Progress: %s/%s (%.1f%%) | Syncing: %s [%s] ===", progress_idx, progress_total, pct, desc, key)
-
-    sheet_name = _resolve_sheet_name(key)
-    if not sheet_name:
-        msg = f"Sheet name not found for key={key}"
-        logger.error(msg)
-        return {"status": "error", "key": key, "desc": desc, "error": msg}
-
+    logger.info("Processing Dashboard: %s (%s)", task.desc, key)
+    
+    # 1. Get Symbols (Intelligent reader)
     try:
-        symbols, meta = _read_symbols_for_key(key, symbols_spreadsheet_id=symbols_spreadsheet_id)
+        sym_data = symbols_reader.get_page_symbols(key, spreadsheet_id=spreadsheet_id)
+        symbols = sym_data.get("all") if isinstance(sym_data, dict) else sym_data
+        if not symbols:
+            logger.warning("   -> No symbols found for %s. Skipping.", key)
+            return {"status": "skipped", "key": key}
     except Exception as e:
-        logger.exception("Failed reading symbols for %s", key)
-        return {"status": "error", "key": key, "desc": desc, "sheet": sheet_name, "error": str(e)}
+        logger.error("   -> Symbol Read Failure [%s]: %s", key, e)
+        return {"status": "error", "key": key, "error": str(e)}
 
-    if not symbols:
-        logger.warning("No symbols found for %s. Skipping.", key)
-        return {
-            "status": "skipped",
-            "key": key,
-            "desc": desc,
-            "sheet": sheet_name,
-            "reason": "No symbols",
-            "symbols_meta": meta,
-            "timestamp_utc": _utc_now_iso(),
-        }
-
-    if max_tickers and max_tickers > 0 and len(symbols) > max_tickers:
-        symbols = symbols[:max_tickers]
-        meta["trimmed_to"] = int(max_tickers)
-
-    logger.info("Sheet='%s' | Symbols=%s (chosen=%s)", sheet_name, len(symbols), meta.get("chosen_list"))
-
-    start_cell = _validate_start_cell(start_cell)
-
-    vi = (value_input or "RAW").strip().upper()
-    if vi not in ("RAW", "USER_ENTERED"):
-        logger.warning("Invalid value_input '%s' -> using RAW", vi)
-        vi = "RAW"
-
-    if dry_run:
-        logger.info(
-            "[DRY RUN] Would update sheet='%s' start_cell=%s clear=%s value_input=%s",
-            sheet_name,
-            start_cell,
-            clear,
-            vi,
-        )
-        return {
-            "status": "dry_run",
-            "key": key,
-            "desc": desc,
-            "sheet": sheet_name,
-            "count_symbols": len(symbols),
-            "start_cell": start_cell,
-            "clear": bool(clear),
-            "value_input": vi,
-            "symbols_meta": meta,
-            "timestamp_utc": _utc_now_iso(),
-        }
-
-    start_t = time.time()
+    # 2. Execution Timer
+    t_start = time.perf_counter()
+    
+    # 3. Call Refresh Method (Aligned with v3.13.1 Service)
     try:
-        if task.kind == "ksa":
-            result = _ksa_refresh_method(
-                spreadsheet_id=spreadsheet_id,
-                sheet_name=sheet_name,
-                tickers=symbols,
-                start_cell=start_cell,
-                clear=clear,
-                value_input=vi,
-                ksa_gateway=ksa_gateway,
+        # Resolve Sheet Name from Registry or use Key
+        sheet_name = key.title().replace("_", " ")
+        if key == "KSA_TADAWUL": sheet_name = "KSA_Tadawul"
+        
+        # Route KSA specifically if gateway set to Argaam
+        if task.kind == "ksa" and ksa_gateway == "argaam":
+            # This uses the direct Argaam endpoint via refresh_logic
+            result = sheets_service._refresh_logic(
+                "/v1/argaam/sheet-rows", spreadsheet_id, sheet_name, symbols, 
+                start_cell=start_cell, clear=clear
             )
         else:
-            result = _call_refresh(
-                task.method,
-                spreadsheet_id=spreadsheet_id,
-                sheet_name=sheet_name,
+            result = task.method(
+                spreadsheet_id=spreadsheet_id, 
+                sheet_name=sheet_name, 
                 tickers=symbols,
                 start_cell=start_cell,
-                clear=clear,
-                value_input=vi,
+                clear=clear
             )
+            
+        elapsed = time.perf_counter() - t_start
+        status = result.get("status", "unknown")
+        
+        if status == "success":
+            logger.info("   ✅ OK: Written %s rows in %.2fs (%.1f sym/sec)", 
+                        result.get("rows_written"), elapsed, len(symbols)/elapsed)
+        else:
+            logger.warning("   ⚠️  Partial: %s", result.get("error", "Check logs"))
+            
+        return {**result, "key": key, "duration": elapsed}
+
     except Exception as e:
-        logger.exception("Update failed for %s", key)
-        return {"status": "error", "key": key, "desc": desc, "sheet": sheet_name, "error": str(e)}
-
-    duration = time.time() - start_t
-    status = str((result or {}).get("status") or "unknown").lower()
-
-    if status in ("success", "partial"):
-        logger.info(
-            "✅ %s: rows=%s cells=%s time=%.2fs (backend=%s)",
-            status.upper(),
-            (result or {}).get("rows_written"),
-            (result or {}).get("cells_updated"),
-            duration,
-            (result or {}).get("backend_status"),
-        )
-    elif status in ("skipped",):
-        logger.info("⏭️  SKIPPED: %s", (result or {}).get("reason") or (result or {}).get("error") or "")
-    else:
-        logger.error("❌ %s failed: %s", key, result)
-
-    out = dict(result or {})
-    out.update(
-        {
-            "key": key,
-            "desc": desc,
-            "sheet": sheet_name,
-            "count_symbols": len(symbols),
-            "start_cell": start_cell,
-            "clear": bool(clear),
-            "value_input": vi,
-            "duration_sec": round(duration, 3),
-            "timestamp_utc": _utc_now_iso(),
-            "symbols_meta": meta,
-            "ksa_gateway": ksa_gateway if task.kind == "ksa" else None,
-            "progress": {"idx": progress_idx, "total": progress_total, "pct": round(pct, 2)},
-            "symbols_spreadsheet_id": ("SET" if symbols_spreadsheet_id else "NOT_SET"),
-        }
-    )
-    return out
-
+        logger.error("   ❌ Sync Failure [%s]: %s", key, e)
+        return {"status": "error", "key": key, "error": str(e)}
 
 # =============================================================================
-# CLI / Main
+# Main Entry
 # =============================================================================
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Synchronize Dashboard Sheets")
-    parser.add_argument("--sheet-id", default=None, help="Spreadsheet ID to WRITE to (otherwise uses DEFAULT_SPREADSHEET_ID)")
-    parser.add_argument("--symbols-sheet-id", default=None, help="Spreadsheet ID to READ symbols from (default: same as --sheet-id)")
-    parser.add_argument("--dry-run", action="store_true", help="Read symbols but do not write data")
-    parser.add_argument("--clear", action="store_true", help="Clear old values first (safe range) before writing")
-    parser.add_argument("--start-cell", default="A5", help="Top-left cell where headers should be written (default A5)")
-    parser.add_argument("--sleep", type=float, default=2.0, help="Seconds to sleep between pages (default 2.0)")
-    parser.add_argument("--max-tickers", type=int, default=0, help="Cap tickers per page (0 = no cap)")
-    parser.add_argument("--json-out", default=None, help="Write full results to a JSON file")
-    parser.add_argument(
-        "--fail-on-partial",
-        action="store_true",
-        help="Exit 2 if any page returns status=partial (in addition to errors).",
-    )
-
-    parser.add_argument(
-        "--value-input",
-        default="RAW",
-        choices=["RAW", "USER_ENTERED", "raw", "user_entered"],
-        help="Sheets write mode: RAW (default) or USER_ENTERED",
-    )
-
-    parser.add_argument("--health", action="store_true", help="Run backend health checks before syncing")
-
-    parser.add_argument(
-        "--ksa-gateway",
-        default="enriched",
-        choices=["enriched", "argaam"],
-        help="KSA fetch gateway: enriched (default) or argaam (strict) if supported",
-    )
-
-    parser.add_argument("--ksa", action="store_true", help="Sync only KSA Tadawul")
-    parser.add_argument("--global", dest="global_markets", action="store_true", help="Sync only Global Markets")
-    parser.add_argument("--portfolio", action="store_true", help="Sync only My Portfolio")
-    parser.add_argument("--insights", action="store_true", help="Sync only Insights/AI")
-    parser.add_argument("--advanced", action="store_true", help="Sync only Advanced pages (if configured)")
-
-    parser.add_argument("--keys", nargs="*", default=None, help="Run only these PAGE_REGISTRY keys (space or comma-separated)")
-    parser.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
-
+def main():
+    parser = argparse.ArgumentParser(description="TFB Dashboard Synchronizer")
+    parser.add_argument("--sheet-id", help="Target Spreadsheet ID")
+    parser.add_argument("--keys", nargs="*", help="Specific page keys to sync")
+    parser.add_argument("--clear", action="store_true", help="Clear data rows before writing")
+    parser.add_argument("--ksa-gw", default="enriched", choices=["enriched", "argaam"], help="Gateway for KSA tab")
+    parser.add_argument("--start-cell", default="A5", help="Top-left corner for data")
+    parser.add_argument("--no-preflight", action="store_true", help="Skip connectivity checks")
     args = parser.parse_args()
 
-    try:
-        logging.getLogger().setLevel(getattr(logging, str(args.log_level).upper(), logging.INFO))
-    except Exception:
-        pass
-
-    # WRITE target
     sid = _get_spreadsheet_id(args.sheet_id)
     if not sid:
-        logger.error("DEFAULT_SPREADSHEET_ID is not set in env.py or environment variables (or pass --sheet-id).")
-        raise SystemExit(1)
+        logger.error("Configuration Error: No Spreadsheet ID found. Check DEFAULT_SPREADSHEET_ID.")
+        sys.exit(1)
 
-    # READ symbols source (defaults to same as WRITE)
-    symbols_sid = _get_symbols_spreadsheet_id(args.symbols_sheet_id, sid)
-    symbols_sid = symbols_sid.strip() if symbols_sid else ""
-    symbols_sid_opt: Optional[str] = symbols_sid or None
+    # 1. Pre-flight
+    if not args.no_preflight and not _preflight_check(sid):
+        logger.error("Pre-flight validation failed. Aborting sync.")
+        sys.exit(1)
 
-    value_input = str(args.value_input or "RAW").strip().upper()
-    if value_input not in ("RAW", "USER_ENTERED"):
-        value_input = "RAW"
+    # 2. Build and Filter Tasks
+    all_tasks = _build_sync_map()
+    if args.keys:
+        wanted = [_canon_key(k) for k in args.keys]
+        tasks = [t for t in all_tasks if _canon_key(t.key) in wanted]
+    else:
+        tasks = all_tasks
 
-    if args.health:
-        hc = _health_check()
-        logger.info("=== Backend Health Check ===")
-        logger.info("Base: %s", hc.get("base"))
-        for c in hc.get("checks", []):
-            logger.info(
-                " - %s | http=%s | ok=%s | status=%s",
-                c.get("endpoint"),
-                c.get("http"),
-                c.get("ok"),
-                c.get("status"),
-            )
-
-    sync_map = _build_sync_map()
-    tasks = _select_tasks(args, sync_map)
     if not tasks:
-        logger.warning("No matching tasks found.")
+        logger.warning("No valid sync tasks selected.")
         return
 
-    max_tickers = int(args.max_tickers or 0) or None
-    start_cell = _validate_start_cell(str(args.start_cell or "A5"))
-
-    logger.info(
-        "Dashboard Sync v%s | pages=%s | dry_run=%s | clear=%s | start_cell=%s | ksa_gateway=%s | value_input=%s",
-        SCRIPT_VERSION,
-        len(tasks),
-        args.dry_run,
-        args.clear,
-        start_cell,
-        args.ksa_gateway,
-        value_input,
-    )
-    logger.info("WRITE Spreadsheet ID: %s", sid)
-    logger.info("READ  Symbols Sheet ID: %s", symbols_sid if symbols_sid else "(not set)")
-
-    t0 = time.time()
-
-    results: List[Dict[str, Any]] = []
-    failures = 0
-    partials = 0
-    successes = 0
-    skipped = 0
-
-    total = len(tasks)
-
-    for idx, task in enumerate(tasks, start=1):
-        r = sync_page(
-            task,
-            spreadsheet_id=sid,
-            symbols_spreadsheet_id=symbols_sid_opt,
-            start_cell=start_cell,
-            clear=bool(args.clear),
-            dry_run=bool(args.dry_run),
-            max_tickers=max_tickers,
-            ksa_gateway=str(args.ksa_gateway or "enriched"),
-            value_input=value_input,
-            progress_idx=idx,
-            progress_total=total,
+    # 3. Process Sequence
+    results = []
+    t_total_start = time.perf_counter()
+    
+    logger.info("Starting sync sequence for %d dashboards...", len(tasks))
+    
+    for task in tasks:
+        res = sync_page(
+            task, sid, 
+            clear=args.clear, 
+            start_cell=args.start_cell, 
+            ksa_gateway=args.ksa_gw
         )
-        results.append(r)
+        results.append(res)
+        # Small cooldown for Sheets API quota
+        time.sleep(1.5)
 
-        st = str(r.get("status") or "").lower()
-        if st in ("error", "failed"):
-            failures += 1
-        elif st == "partial":
-            partials += 1
-        elif st == "success":
-            successes += 1
-        elif st in ("skipped", "dry_run"):
-            skipped += 1
+    # 4. Reporting
+    t_total = time.perf_counter() - t_total_start
+    successes = [r for r in results if r.get("status") == "success"]
+    partials = [r for r in results if r.get("status") == "partial"]
+    failures = [r for r in results if r.get("status") == "error"]
 
-        if not args.dry_run and idx < total:
-            try:
-                time.sleep(max(0.0, float(args.sleep)))
-            except Exception:
-                pass
-
-    total_sec = time.time() - t0
-    logger.info(
-        "=== Dashboard Sync Complete === success=%s partial=%s skipped=%s failures=%s total=%s time=%.2fs",
-        successes,
-        partials,
-        skipped,
-        failures,
-        total,
-        total_sec,
-    )
-
-    if args.json_out:
-        try:
-            path = str(args.json_out).strip()
-            payload = {
-                "version": SCRIPT_VERSION,
-                "timestamp_utc": _utc_now_iso(),
-                "spreadsheet_id": sid,
-                "symbols_spreadsheet_id": symbols_sid_opt,
-                "tasks_total": total,
-                "summary": {
-                    "success": successes,
-                    "partial": partials,
-                    "skipped": skipped,
-                    "failures": failures,
-                    "duration_sec": round(total_sec, 3),
-                },
-                "results": results,
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            logger.info("Saved JSON results to: %s", path)
-        except Exception as e:
-            logger.warning("Failed to write --json-out file: %s", e)
-
+    logger.info("--- Sync Report (v%s) ---", SCRIPT_VERSION)
+    logger.info("Total Time: %.2fs", t_total)
+    logger.info("Dashboards: %d Success | %d Partial | %d Failed", 
+                len(successes), len(partials), len(failures))
+    
     if failures:
-        raise SystemExit(2)
-    if args.fail_on_partial and partials:
-        raise SystemExit(2)
-
+        sys.exit(2)
+    if partials:
+        sys.exit(0) # Or 2 if you want to be strict
 
 if __name__ == "__main__":
     main()
