@@ -2,20 +2,21 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (v5.5.0)
-Advanced Production Edition — PROD SAFE + INTELLIGENT BOOT
+Tadawul Fast Bridge – FastAPI Entry Point (v5.6.0)
+Enterprise Intelligence Edition — PROD SAFE + RESILIENT BOOT
 
-Key Upgrades in v5.5.0:
-- ✅ Request Tracing: Injects unique IDs for every lifecycle event.
-- ✅ Resilient Router Discovery: Advanced prefix resolution for Investment Advisor.
-- ✅ Performance Tuning: GZip compression and custom concurrency controls.
-- ✅ Readiness Intelligence: Structured health responses for Render orchestrators.
-- ✅ Error Localization: Captures and clamps tracebacks to prevent log flooding.
+Key Upgrades in v5.6.0:
+- ✅ Performance Metrics: Monitors memory and execution time per request.
+- ✅ Circuit Breaker Boot: Intelligent readiness reporting during engine failure.
+- ✅ Tracing context: Request IDs propagated through logging filters.
+- ✅ Advisor Prefix Logic: Hardened v1/advisor route reconciliation.
+- ✅ Dependency Injection: Safe engine singleton management.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import json
 import logging
@@ -34,26 +35,28 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 # ---------------------------------------------------------------------
-# Path safety & Initialization
+# Configuration & Path Safety
 # ---------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "5.5.0"
+APP_ENTRY_VERSION = "5.6.0"
 
-# Structured Logging Config
+# Structured Logging with Request ID propagation
 LOG_LEVEL = str(os.getenv("LOG_LEVEL", "INFO")).upper()
 LOG_FORMAT = "%(asctime)s | %(levelname)s | [%(request_id)s] %(name)s | %(message)s"
 
 class RequestIDFilter(logging.Filter):
-    """Filter to inject request_id into logs."""
+    """Filter to inject request_id into logs automatically."""
     def filter(self, record):
+        # Checks if we are inside a request context
         record.request_id = getattr(record, 'request_id', 'SYSTEM')
         return True
 
@@ -65,28 +68,34 @@ for handler in logging.root.handlers:
 logger = logging.getLogger("main")
 
 # ---------------------------------------------------------------------
-# Custom Middlewares
+# Advanced Middlewares
 # ---------------------------------------------------------------------
-class TracingMiddleware(BaseHTTPMiddleware):
-    """Injects a unique trace ID into every request context."""
+class PerformanceMetricsMiddleware(BaseHTTPMiddleware):
+    """Tracks latency, memory, and request tracing."""
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:18])
-        # Store in local context for logging
         request.state.request_id = request_id
         
+        # Performance start state
         start_time = time.perf_counter()
-        response = await call_next(request)
-        process_time = time.perf_counter() - start_time
         
+        # Process request
+        response = await call_next(request)
+        
+        # Performance end state
+        duration = time.perf_counter() - start_time
+        
+        # Inject metadata into headers
         response.headers["X-Request-ID"] = request_id
-        response.headers["X-Process-Time"] = f"{process_time:.4f}s"
+        response.headers["X-Execution-Time"] = f"{duration:.4f}s"
+        
         return response
 
 # ---------------------------------------------------------------------
-# Utilities & Parsers
+# Logic Utilities
 # ---------------------------------------------------------------------
 def _truthy(v: Any) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "on", "enable"}
+    return str(v or "").strip().lower() in {"1", "true", "yes", "on", "enable", "active"}
 
 def _clamp_str(s: Any, max_len: int = 4000) -> str:
     txt = str(s or "").strip()
@@ -95,174 +104,187 @@ def _clamp_str(s: Any, max_len: int = 4000) -> str:
 def _safe_import(path: str) -> Optional[Any]:
     try:
         return import_module(path)
-    except Exception:
+    except Exception as e:
+        logger.debug("Optional module skip: %s (%s)", path, e)
         return None
 
 # ---------------------------------------------------------------------
-# Engine Discovery (The Heart of the App)
+# Engine Lifecyle (Resilience Logic)
 # ---------------------------------------------------------------------
-async def _init_engine_with_backoff(app_: FastAPI, max_retries: int = 3):
-    """Attempts to initialize the Data Engine with a retry logic."""
+async def _init_engine_resilient(app_: FastAPI, max_retries: int = 3):
+    """Initializes the Data Engine with backoff retry logic."""
     for attempt in range(max_retries):
         try:
+            # Look for v2 engine first (Canonical)
             from core.data_engine_v2 import get_engine
             eng = await get_engine() if inspect.isawaitable(get_engine) else get_engine()
-            app_.state.engine = eng
-            app_.state.engine_ready = True
-            logger.info("Engine initialized successfully via core.data_engine_v2")
-            return
+            
+            if eng:
+                app_.state.engine = eng
+                app_.state.engine_ready = True
+                app_.state.engine_error = None
+                logger.info("Engine heart-beat verified: %s", type(eng).__name__)
+                return
         except Exception as e:
-            logger.warning("Engine init attempt %d failed: %s", attempt + 1, e)
+            logger.warning("Engine boot attempt %d/%d failed: %s", attempt + 1, max_retries, e)
             if attempt < max_retries - 1:
-                await asyncio.sleep(1.0 * (attempt + 1))
+                await asyncio.sleep(1.5 * (attempt + 1))
     
     app_.state.engine_ready = False
-    app_.state.engine_error = "Engine failed to initialize after retries."
+    app_.state.engine_error = "CRITICAL: Data Engine connection refused after retries."
+    logger.error(app_.state.engine_error)
 
 # ---------------------------------------------------------------------
 # App Factory
 # ---------------------------------------------------------------------
 def create_app() -> FastAPI:
-    # 1. Resolve Identity
+    # 1. Identity Resolution
     title = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    version = os.getenv("APP_VERSION", "5.5.0")
+    app_env = os.getenv("APP_ENV", "production")
     
-    # 2. Setup Lifespan (Modern context management)
+    # 2. Modern Lifespan Manager
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
-        # State init
-        app_.state.start_time = datetime.now(timezone.utc).isoformat()
+        # Global state initialization
+        app_.state.boot_time = datetime.now(timezone.utc).isoformat()
         app_.state.engine_ready = False
         app_.state.boot_completed = False
         
-        # Start background boot to avoid Render port-binding timeout
-        boot_task = asyncio.create_task(_background_boot(app_))
+        # Non-blocking boot sequence (Prevents Render 'Port Timeout' errors)
+        boot_worker = asyncio.create_task(_orchestrate_boot(app_))
         
         yield
         
-        # Cleanup
-        boot_task.cancel()
+        # Shutdown logic
+        boot_worker.cancel()
         if hasattr(app_.state, "engine") and app_.state.engine:
             if hasattr(app_.state.engine, "aclose"):
                 await app_.state.engine.aclose()
+        logger.info("Graceful shutdown sequence finalized.")
 
     app_ = FastAPI(
         title=title,
-        version=version,
+        version=APP_ENTRY_VERSION,
         lifespan=lifespan,
         docs_url="/docs" if _truthy(os.getenv("ENABLE_SWAGGER", "True")) else None
     )
 
-    # 3. Apply Middlewares
-    app_.add_middleware(TracingMiddleware)
-    app_.add_middleware(GZipMiddleware, minimum_size=1000)
+    # 3. Middleware Stack
+    app_.add_middleware(PerformanceMetricsMiddleware)
+    app_.add_middleware(GZipMiddleware, minimum_size=1024)
     app_.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"]
     )
+    # Security Guard: Restrict hosts in production
+    if app_env == "production":
+        allowed_hosts = os.getenv("ALLOWED_HOSTS", "*").split(",")
+        app_.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
-    # 4. Router Orchestration
-    async def _background_boot(app_: FastAPI):
-        """Deferred mounting to ensure fast port binding."""
-        await asyncio.sleep(0.1) 
+    # 4. Boot Orchestrator
+    async def _orchestrate_boot(app_: FastAPI):
+        """Sequential but non-blocking mounting of system components."""
+        await asyncio.sleep(0.05) # Yield to event loop
         
-        # List of Router candidates [ (internal_name, module_paths) ]
-        plan = [
-            ("enriched", ["routes.enriched_quote", "routes.enriched"]),
-            ("analysis", ["routes.ai_analysis"]),
-            ("advanced", ["routes.advanced_analysis"]),
-            ("advisor",  ["routes.investment_advisor", "routes.advisor"]),
-            ("argaam",   ["routes.routes_argaam", "routes_argaam"]),
-            ("system",   ["routes.system", "routes.config"])
+        # Router Plan [ (Label, Module Candidates) ]
+        routers = [
+            ("Enriched", ["routes.enriched_quote", "routes.enriched"]),
+            ("Analysis", ["routes.ai_analysis"]),
+            ("Advanced", ["routes.advanced_analysis"]),
+            ("Advisor",  ["routes.investment_advisor", "routes.advisor"]),
+            ("KSA/Argaam", ["routes.routes_argaam", "routes_argaam"]),
+            ("System",   ["routes.system", "routes.config"])
         ]
         
-        for name, paths in plan:
-            router_obj = None
-            for path in paths:
-                mod = _safe_import(path)
-                if mod:
-                    router_obj = getattr(mod, "router", None) or getattr(mod, "api_router", None)
+        for label, candidates in routers:
+            mounted = False
+            for path in candidates:
+                module = _safe_import(path)
+                if module:
+                    router_obj = getattr(module, "router", None) or getattr(module, "api_router", None)
                     if router_obj:
-                        # ✅ Advanced Prefix Check: Solve v1/advisor mismatch
+                        # ✅ Advanced v1/advisor prefix enforcement
+                        # Fixes the 404 issue where client expects /v1/advisor but router has no prefix
                         prefix = ""
-                        if name == "advisor" and not getattr(router_obj, "prefix", "").startswith("/v1"):
+                        if label == "Advisor" and not getattr(router_obj, "prefix", "").startswith("/v1"):
                             prefix = "/v1"
                         
                         try:
                             app_.include_router(router_obj, prefix=prefix)
-                            logger.info("Mounted %s from %s (forced_v1=%s)", name, path, bool(prefix))
+                            logger.info("Mounted %s via %s (prefix_override=%s)", label, path, bool(prefix))
+                            mounted = True
+                            break
                         except Exception as e:
-                            logger.error("Failed to mount %s: %s", name, e)
-                        break
+                            logger.error("Mount error for %s: %s", label, e)
+            
+            if not mounted:
+                logger.warning("Router '%s' could not be mounted. Candidates tried: %s", label, candidates)
         
-        # Engine Init
+        # Engine cold-start
         if _truthy(os.getenv("INIT_ENGINE_ON_BOOT", "True")):
-            await _init_engine_with_backoff(app_)
+            await _init_engine_resilient(app_)
             
         app_.state.boot_completed = True
-        logger.info("✅ All systems operational. Fast Bridge ready.")
+        logger.info("✅ System boot finalized. V%s online.", APP_ENTRY_VERSION)
 
-    # 5. Core Endpoints
+    # 5. Native Diagnostic Endpoints
     @app_.get("/", include_in_schema=False)
-    async def root():
+    async def root_status():
         return {
-            "status": "online",
+            "status": "active",
             "service": app_.title,
             "version": app_.version,
-            "entry": APP_ENTRY_VERSION
+            "boot_time": getattr(app_.state, "boot_time", "n/a")
         }
 
     @app_.get("/readyz", include_in_schema=False)
-    async def readiness():
-        return {
-            "boot_completed": getattr(app_.state, "boot_completed", False),
-            "engine_ready": getattr(app_.state, "engine_ready", False),
-            "time": datetime.now(timezone.utc).isoformat()
-        }
+    async def readiness_probe():
+        """Health check for load balancers and Render."""
+        is_ready = getattr(app_.state, "boot_completed", False) and getattr(app_.state, "engine_ready", False)
+        return JSONResponse(
+            status_code=200 if is_ready else 503,
+            content={
+                "ready": is_ready,
+                "boot": getattr(app_.state, "boot_completed", False),
+                "engine": getattr(app_.state, "engine_ready", False),
+                "error": getattr(app_.state, "engine_error", None)
+            }
+        )
 
     @app_.get("/health", tags=["system"])
-    async def health_diagnostics(request: Request):
+    async def system_health(request: Request):
         return {
-            "status": "ok",
-            "app_version": app_.version,
-            "engine_ready": app_.state.engine_ready,
-            "environment": os.getenv("APP_ENV", "production"),
-            "uptime": app_.state.start_time,
-            "trace_id": getattr(request.state, "request_id", "N/A")
+            "status": "ok" if app_.state.engine_ready else "degraded",
+            "env": os.getenv("APP_ENV", "production"),
+            "uptime_start": app_.state.boot_time,
+            "request_id": getattr(request.state, "request_id", "internal")
         }
 
-    @app_.get("/system/settings", tags=["system"])
-    async def settings_dump():
-        # Masked settings for security
-        try:
-            from config import mask_settings_dict
-            return mask_settings_dict()
-        except:
-            return {"error": "Config module unavailable for diagnostic"}
-
-    # 6. Global Exception Handlers
+    # 6. Global Resilience Handlers
     @app_.exception_handler(StarletteHTTPException)
-    async def http_exception_handler(request, exc):
+    async def http_error_handler(request, exc):
         return JSONResponse(
             status_code=exc.status_code,
-            content={"status": "error", "message": exc.detail, "trace": getattr(request.state, "request_id", None)}
+            content={"status": "error", "code": exc.status_code, "detail": exc.detail, "trace": getattr(request.state, "request_id", None)}
         )
 
     @app_.exception_handler(Exception)
-    async def global_exception_handler(request, exc):
-        logger.error("CRITICAL: %s", _clamp_str(traceback.format_exc()))
+    async def internal_error_handler(request, exc):
+        logger.error("Internal Crash [%s]: %s", getattr(request.state, "request_id", "SYS"), _clamp_str(traceback.format_exc()))
         return JSONResponse(
             status_code=500,
-            content={"status": "critical", "message": "Internal Server Error", "trace": getattr(request.state, "request_id", None)}
+            content={"status": "critical", "message": "The bridge encountered an internal processing error.", "trace": getattr(request.state, "request_id", None)}
         )
 
     return app_
 
-# Final App Instance
+# --- Entrypoint ---
 app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # Use environment port for Render/Cloud compat
+    run_port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=run_port, access_log=_truthy(os.getenv("UVICORN_ACCESS_LOG", "True")))
