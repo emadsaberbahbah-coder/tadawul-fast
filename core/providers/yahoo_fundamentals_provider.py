@@ -3,13 +3,13 @@
 """
 core/providers/yahoo_fundamentals_provider.py
 ============================================================
-Yahoo Fundamentals Provider (NO yfinance) — v1.6.1
-PROD SAFE + ENGINE-ALIGNED + ALIGNED ROI KEYS + RIYADH TIME
+Yahoo Fundamentals Provider (NO yfinance) — v1.6.2
+PROD SAFE + SHARED NORMALIZATION + ALIGNED ROI KEYS + RIYADH TIME
 
-What’s improved in v1.6.1
-- ✅ ROI Key Alignment: Uses 'expected_roi_12m' to match EODHD/Finnhub/Tadawul.
-- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
-- ✅ Provenance: Explicitly sets 'data_source="yahoo_fundamentals"'.
+What’s improved in v1.6.2
+- ✅ Shared Normalization: Uses core.symbols.normalize for consistent ticker handling.
+- ✅ Aligned ROI Keys: Uses 'expected_roi_12m' to match v1.6.1 Scoring Engine.
+- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3) for Saudi dashboards.
 - ✅ Cookie Warmup: Retains robust 401/403 bypass logic for production stability.
 """
 
@@ -28,10 +28,22 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import httpx
 
+# ---------------------------------------------------------------------------
+# Shared Normalizer Import (PROD SAFE)
+# ---------------------------------------------------------------------------
+try:
+    from core.symbols.normalize import normalize_symbol, is_ksa
+except Exception:
+    # Local fallback if shared module is not reachable
+    def is_ksa(s: str) -> bool: return ".SR" in s.upper() or s.isdigit()
+    def normalize_symbol(s: str) -> str:
+        s = s.strip().upper()
+        return f"{s}.SR" if s.isdigit() else s
+
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "1.6.1"
+PROVIDER_VERSION = "1.6.2"
 
 # ---------------------------
 # Safe env parsing
@@ -58,19 +70,6 @@ def _utc_iso() -> str:
 def _riyadh_iso() -> str:
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz).isoformat()
-
-# ---------------------------
-# Symbol Normalization
-# ---------------------------
-_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
-
-def _normalize_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-    if not s: return ""
-    if s.startswith("TADAWUL:"): s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"): s = s.replace(".TADAWUL", "").strip()
-    if _KSA_CODE_RE.match(s): return f"{s}.SR"
-    return s
 
 # ---------------------------
 # Client reuse (keep-alive)
@@ -126,7 +125,7 @@ def _apply_targets_forecast(out: Dict[str, Any]) -> None:
     out["expected_price_12m"] = t_mean
     out["forecast_method"] = "yahoo_analyst_targets_v1"
     
-    # Confidence based on analyst count
+    # Confidence based on analyst count (Logarithmic scale)
     n = _to_float(out.get("analyst_opinions")) or 0
     base_conf = min(85, 20 + (10 * math.log2(n + 1)))
     out["confidence_score"] = float(base_conf)
@@ -136,43 +135,53 @@ def _apply_targets_forecast(out: Dict[str, Any]) -> None:
 # Core Fetcher
 # ---------------------------
 async def fetch_fundamentals_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
-    u_sym = _normalize_symbol(symbol)
+    # Use Shared Normalizer (e.g., "1120" -> "1120.SR")
+    u_sym = normalize_symbol(symbol)
     if not u_sym: return {}
     
-    if u_sym.endswith(".SR") and not _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True):
+    # Respect KSA toggle
+    if is_ksa(u_sym) and not _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True):
         return {}
 
     client = await _get_client()
     url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{u_sym}"
     params = {
-        "modules": "summaryDetail,defaultKeyStatistics,financialData",
+        "modules": "price,summaryDetail,defaultKeyStatistics,financialData",
         "lang": "en-US",
         "region": "SA" if u_sym.endswith(".SR") else "US"
     }
 
     try:
         r = await client.get(url, params=params)
+        # Handle cookie-based blocking
         if r.status_code in {401, 403}:
             await _warmup_cookie(u_sym)
             r = await client.get(url, params=params)
 
         js = r.json()
         res = js.get("quoteSummary", {}).get("result", [])
-        if not res: return {"error": "No fundamental data found"}
+        if not res: return {"error": f"warning: {PROVIDER_NAME}: fundamentals not found"}
         
         data = res[0]
+        price_mod = data.get("price", {})
         summ = data.get("summaryDetail", {})
         stats = data.get("defaultKeyStatistics", {})
         fin = data.get("financialData", {})
 
         out = {
             "symbol": u_sym,
+            "current_price": _get_raw(price_mod.get("regularMarketPrice")),
             "market_cap": _get_raw(summ.get("marketCap")),
             "shares_outstanding": _get_raw(stats.get("sharesOutstanding")),
             "pe_ttm": _get_raw(summ.get("trailingPE")),
             "eps_ttm": _get_raw(stats.get("trailingEps")),
+            "forward_pe": _get_raw(summ.get("forwardPE")),
+            "forward_eps": _get_raw(stats.get("forwardEps")),
+            "pb": _get_raw(summ.get("priceToBook")),
             "dividend_yield": _get_raw(summ.get("dividendYield")) * 100.0 if _get_raw(summ.get("dividendYield")) else None,
             "roe": _get_raw(fin.get("returnOnEquity")) * 100.0 if _get_raw(fin.get("returnOnEquity")) else None,
+            "roa": _get_raw(fin.get("returnOnAssets")) * 100.0 if _get_raw(fin.get("returnOnAssets")) else None,
+            "beta": _get_raw(stats.get("beta")),
             "target_mean_price": _get_raw(fin.get("targetMeanPrice")),
             "analyst_opinions": _get_raw(fin.get("numberOfAnalystOpinions")),
             "data_source": PROVIDER_NAME,
@@ -181,18 +190,23 @@ async def fetch_fundamentals_patch(symbol: str, debug: bool = False) -> Dict[str
             "forecast_updated_riyadh": _riyadh_iso()
         }
 
-        # Apply standardized forecast keys
+        # Apply standardized forecast keys based on analyst targets
         _apply_targets_forecast(out)
 
-        # Cleanup Nones
+        # Cleanup: Return only valid keys
         return {k: v for k, v in out.items() if v is not None}
 
     except Exception as e:
-        return {"error": f"Yahoo fundamentals failed: {str(e)}"}
+        logger.error("Yahoo fundamentals failed for %s: %s", u_sym, e)
+        return {"error": f"warning: {PROVIDER_NAME} failed"}
 
 async def aclose_yahoo_fundamentals_client():
     global _CLIENT
     if _CLIENT: await _CLIENT.aclose()
     _CLIENT = None
 
-__all__ = ["fetch_fundamentals_patch", "aclose_yahoo_fundamentals_client", "PROVIDER_NAME"]
+# Aliases for engine discovery
+async def fetch_enriched_quote_patch(symbol: str, **kwargs) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol)
+
+__all__ = ["fetch_fundamentals_patch", "fetch_enriched_quote_patch", "aclose_yahoo_fundamentals_client", "PROVIDER_NAME"]
