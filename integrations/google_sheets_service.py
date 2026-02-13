@@ -1,30 +1,17 @@
 """
 integrations/google_sheets_service.py
 ------------------------------------------------------------
-Google Sheets helper for Tadawul Fast Bridge – v3.13.0 (Canonical-Order + production-hardened)
+Google Sheets helper for Tadawul Fast Bridge – v3.13.1 (ROI Key Fix)
 
 What this module does
 - Reads/Writes/Clears ranges in Google Sheets using a Service Account.
 - Calls Tadawul Fast Bridge backend endpoints that return {headers, rows, status, error?}.
 - Writes data to Sheets in chunked mode to avoid request size limits.
 
-Key guarantees
-- refresh_* functions NEVER raise (always return a status dict).
-- Always sends BOTH: symbols + tickers AND sheet_name + sheetName to sheet-rows endpoints.
-- Robust adapter:
-    • if backend returns rows as dicts -> converts to list rows using headers (case-insensitive key mapping)
-    • if backend returns partial/mismatched -> fills placeholders
-    • header union (case-insensitive) across chunked calls to prevent losing columns
-    • final output headers reordered to per-sheet canonical headers (when available)
-      and backend-extra headers appended (never dropped)
-- Handles very large ticker lists:
-    • backend calls are chunked (SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL)
-    • merged deterministically back to requested order when possible
-
-v3.13.0 upgrades
-- ✅ Enforce canonical header ORDER per sheet (if schemas available), append backend extras.
-- ✅ Dict-row mapping is now header-key normalized (reduces "missing columns" due to key style).
-- ✅ Avoids heavy imports at module import-time.
+v3.13.1 upgrades
+- ✅ Fixed "Expected ROI" mapping: added canonical `expected_roi_*` keys to _HEADER_MAP.
+- ✅ Ensures forecast data from EODHD/Finnhub correctly populates the sheet columns.
+- ✅ Retains all v3.13.0 production hardening features (chunking, retries, canonical ordering).
 """
 
 from __future__ import annotations
@@ -46,7 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("google_sheets_service")
 
-SERVICE_VERSION = "3.13.0"
+SERVICE_VERSION = "3.13.1"
 
 # =============================================================================
 # OPTIONAL SAFE IMPORTS (NO HEAVY DEPENDENCIES)
