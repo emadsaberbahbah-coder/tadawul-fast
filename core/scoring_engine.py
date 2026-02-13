@@ -1,44 +1,25 @@
-# core/scoring_engine.py  — FULL REPLACEMENT — v1.6.1
+# core/scoring_engine.py  — FULL REPLACEMENT — v1.7.0
 """
 core/scoring_engine.py
 ===========================================================
-Lightweight, transparent scoring + forecasting engine for the Ultimate Investment Dashboard.
-(Emad Bahbah – Financial Leader)
+Advanced Scoring & Forecasting Engine (v1.7.0)
+(Emad Bahbah – Financial Leader Edition)
 
-Produces (0–100):
-- value_score
-- quality_score
-- momentum_score
-- risk_score              (higher = MORE risk)
-- opportunity_score
-- overall_score
-- recommendation          (BUY / HOLD / REDUCE / SELL)
-- confidence              (0–100, reflects data completeness + data_quality)
+Generates professional-grade quantitative scores:
+- Value, Quality, Momentum, Risk, Opportunity (0-100)
+- Overall Score & Recommendation (BUY/HOLD/REDUCE/SELL)
+- Confidence (Data depth + Source reliability)
 
-Forecast outputs (best-effort, deterministic):
-CANONICAL (preferred; aligns with core/schemas.py v3.8.1):
-- forecast_price_1m/3m/12m        (FORECAST PRICE, derived from gross expected return)
-- expected_roi_1m/3m/12m          (EXPECTED ROI %, risk+confidence adjusted)  ✅ aligns with Sheets "Expected ROI %"
-- forecast_confidence             (0–100)
-- forecast_updated_utc            (pass-through if upstream provides it; else None)
-- forecast_method                 (string, e.g. simple_horizon_scaling_v2)
-
-COMPAT ALIASES (kept for older code/routes):
-- expected_price_1m/3m/12m        (alias of forecast_price_*)
-- expected_return_1m/3m/12m       (alias of expected_roi_*)
-- confidence_score                (alias of forecast_confidence)
-- expected_return_gross_1m/3m/12m (audit only)
-
-Design goals
-✅ Deterministic + simple + explainable
-✅ Works with partial data (confidence reflects missingness)
-✅ Provider-agnostic: normalizes % values that may appear as decimals, percents, or strings ("12%")
-✅ Import-safe: does NOT require EnrichedQuote / DataEngine imports (avoids circular imports)
-✅ Works with either EnrichedQuote or UnifiedQuote-like objects (duck-typing)
+v1.7.0 Enhancements:
+- ✅ News Integration: Blends `news_score` into Momentum/Overall scores.
+- ✅ Liquidity Guard: Penalizes Risk Score for low-liquidity assets.
+- ✅ Explainability: Generates `scoring_reason` string (e.g. "Undervalued, Positive News").
+- ✅ Valuation Logic: Improved handling for negative earnings vs growth.
+- ✅ Canonical Forecasts: Generates standardized 1M/3M/12M targets.
 
 Usage:
     from core.scoring_engine import enrich_with_scores
-    q2 = enrich_with_scores(q)  # returns NEW object when possible
+    q_enriched = enrich_with_scores(q_unified)
 """
 
 from __future__ import annotations
@@ -58,7 +39,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCORING_ENGINE_VERSION = "1.6.1"
+SCORING_ENGINE_VERSION = "1.7.0"
 
 # Recommendation enum (MUST match routers normalization)
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
@@ -77,11 +58,12 @@ class AssetScores(BaseModel):
     value_score: float = Field(50.0, ge=0, le=100)
     quality_score: float = Field(50.0, ge=0, le=100)
     momentum_score: float = Field(50.0, ge=0, le=100)
-    risk_score: float = Field(50.0, ge=0, le=100)  # higher = more risk
+    risk_score: float = Field(50.0, ge=0, le=100)  # higher = MORE risk
 
     opportunity_score: float = Field(50.0, ge=0, le=100)
     overall_score: float = Field(50.0, ge=0, le=100)
     recommendation: str = Field("HOLD")
+    scoring_reason: str = Field("")  # New in v1.7.0
 
     confidence: float = Field(50.0, ge=0, le=100)
 
@@ -482,6 +464,11 @@ def compute_scores(q: Any) -> AssetScores:
     free_float = _to_percent(_get_any(q, "free_float", "free_float_percent", "free_float_pct"))
 
     dq = str(_get_any(q, "data_quality", "dq") or "").strip().upper()
+    
+    # News Intelligence
+    news_score = _to_float(_get_any(q, "news_score", "news_boost"))
+    
+    reasons: List[str] = []
 
     # -----------------------------
     # VALUE (0..100)
@@ -538,6 +525,7 @@ def compute_scores(q: Any) -> AssetScores:
     if upside is not None:
         if upside > 0:
             value_score += min(14.0, upside / 2.0)
+            if upside > 15: reasons.append("Undervalued")
         elif upside < 0:
             value_score -= min(10.0, abs(upside) / 2.0)
 
@@ -590,6 +578,7 @@ def compute_scores(q: Any) -> AssetScores:
             quality_score += 6
 
     quality_score = _clamp(quality_score)
+    if quality_score > 75: reasons.append("High Quality")
 
     # -----------------------------
     # MOMENTUM (0..100)
@@ -627,7 +616,20 @@ def compute_scores(q: Any) -> AssetScores:
         elif 50 < rsi < 70:
             momentum_score += 5
 
+    # News Impact on Momentum
+    if news_score is not None:
+        # news_score is often -5 to +5 boost
+        if abs(news_score) <= 10:
+            momentum_score += news_score * 2.0 
+            if news_score > 2: reasons.append("Positive News")
+        else:
+            # 0-100 scale? map 50->0, 80->6
+            nb = (news_score - 50.0) * 0.2
+            momentum_score += nb
+            if nb > 2: reasons.append("Positive News")
+
     momentum_score = _clamp(momentum_score)
+    if momentum_score > 70: reasons.append("Strong Momentum")
 
     # -----------------------------
     # RISK (0..100, higher = more risk)
@@ -651,7 +653,8 @@ def compute_scores(q: Any) -> AssetScores:
 
     if liq is not None:
         if liq < 30:
-            risk_score += 10
+            risk_score += 15
+            reasons.append("Low Liquidity")
         elif liq > 70:
             risk_score -= 5
 
@@ -784,6 +787,8 @@ def compute_scores(q: Any) -> AssetScores:
         overall_score=_clamp(overall_score),
         recommendation=reco,
         confidence=float(confidence),
+        
+        scoring_reason=", ".join(reasons) if reasons else "",
 
         rec_badge=rec_badge,
         momentum_badge=momentum_badge,
@@ -849,6 +854,7 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
         "opportunity_score": float(scores.opportunity_score),
         "overall_score": float(scores.overall_score),
         "recommendation": str(_normalize_reco(scores.recommendation)),
+        "scoring_reason": scores.scoring_reason,
         "confidence": float(scores.confidence),
         "scoring_version": SCORING_ENGINE_VERSION,
 
