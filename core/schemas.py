@@ -1,4 +1,4 @@
-# core/schemas.py  (FULL REPLACEMENT) — v3.8.2
+# core/schemas.py  (FULL REPLACEMENT) — v3.8.2
 """
 core/schemas.py
 ===========================================================
