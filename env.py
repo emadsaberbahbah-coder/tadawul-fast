@@ -3,20 +3,19 @@
 """
 env.py
 ------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v5.2.2)
+Backward-compatible environment exports for Tadawul Fast Bridge (v5.2.3)
 
 Key goals
 - ✅ Row 5 Standard: Exports TFB_SYMBOL_HEADER_ROW/START_ROW for dashboard alignment.
 - ✅ Advisor Enabled: Syncs with main.py v5.4.4 feature flags.
-- ✅ Version resolves from ENV FIRST: APP_VERSION / SERVICE_VERSION / VERSION / RELEASE
-- ✅ Prefers core.config.get_settings() (canonical), then repo-root config.get_settings()
+- ✅ Argaam v1.8.0 Aligned: Exposes Argaam configuration for KSA enrichment.
+- ✅ Version resolves from ENV FIRST: APP_VERSION / SERVICE_VERSION / VERSION / RELEASE.
 - ✅ Robust GOOGLE_SHEETS_CREDENTIALS parsing (JSON / base64 / quoted).
 
-v5.2.2 changes
-- ✅ Adds TFB_SYMBOL_HEADER_ROW=5 and TFB_SYMBOL_START_ROW=6 exports.
-- ✅ Includes ADVISOR_ENABLED in compatibility settings.
-- ✅ Adds ADV and ENRICHED batch constants for complete config mirroring.
-- ✅ Maintains typo resilience for ENABLE_YAHOO_FUNDAMENTALS_KSA.
+v5.2.3 changes
+- ✅ Adds ARGAAM_API_KEY to exports and __all__.
+- ✅ Includes Argaam configuration status in safe_env_summary.
+- ✅ Maps Argaam provider URLs into the compatibility Settings shim.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-ENV_VERSION = "5.2.2"
+ENV_VERSION = "5.2.3"
 logger = logging.getLogger("env")
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
@@ -129,7 +128,6 @@ def _maybe_b64_decode_json(s: str) -> str:
     try:
         dec = base64.b64decode(raw.encode("utf-8"), validate=False).decode("utf-8", errors="replace").strip()
         if _looks_like_json_object(dec):
-            # sanity check common SA keys if present
             obj = json.loads(dec)
             if isinstance(obj, dict):
                 return dec
@@ -223,7 +221,7 @@ def _as_list_lower(v: Any) -> List[str]:
 
 
 # ---------------------------------------------------------------------
-# Load Settings Object (Canonical Resolution)
+# Load Settings Object
 # ---------------------------------------------------------------------
 _SETTINGS_OBJ: Optional[object] = None
 
@@ -231,13 +229,11 @@ def _try_load_settings() -> Optional[object]:
     global _SETTINGS_OBJ
     if _SETTINGS_OBJ: return _SETTINGS_OBJ
     try:
-        # 1) Try core.config (preferred)
         from core.config import get_settings
         _SETTINGS_OBJ = get_settings()
         return _SETTINGS_OBJ
     except Exception:
         try:
-            # 2) Try repo-root config
             from config import get_settings
             _SETTINGS_OBJ = get_settings()
             return _SETTINGS_OBJ
@@ -255,7 +251,7 @@ def _get_attr(obj: Optional[object], name: str, default: Any = None) -> Any:
 _base_settings = _try_load_settings()
 
 # ---------------------------------------------------------------------
-# Primary Exports (Aligned with v12.2 Dashboard Plan)
+# Primary Exports
 # ---------------------------------------------------------------------
 APP_NAME = _get_first_env("APP_NAME", "SERVICE_NAME") or _get_attr(_base_settings, "service_name", "Tadawul Fast Bridge")
 APP_VERSION = _normalize_version(_get_first_env("APP_VERSION", "VERSION")) or _get_attr(_base_settings, "app_version", "dev")
@@ -265,7 +261,7 @@ LOG_LEVEL = str(_get_first_env("LOG_LEVEL") or "INFO").upper()
 TIMEZONE_DEFAULT = _get_first_env("TIMEZONE_DEFAULT", "TZ") or "Asia/Riyadh"
 AUTH_HEADER_NAME = _get_first_env("AUTH_HEADER_NAME", "TOKEN_HEADER_NAME") or "X-APP-TOKEN"
 
-# Row 5 Dashboard Standard (Enforced for Symbols Reader & Sync)
+# Row 5 Dashboard Standard
 TFB_SYMBOL_HEADER_ROW = _safe_int(_get_first_env("TFB_SYMBOL_HEADER_ROW"), 5)
 TFB_SYMBOL_START_ROW = _safe_int(_get_first_env("TFB_SYMBOL_START_ROW"), 6)
 
@@ -276,22 +272,28 @@ _export_env_if_missing("TFB_SYMBOL_START_ROW", str(TFB_SYMBOL_START_ROW))
 APP_TOKEN = _get_first_env("APP_TOKEN", "TFB_APP_TOKEN") or _get_attr(_base_settings, "app_token")
 BACKUP_APP_TOKEN = _get_first_env("BACKUP_APP_TOKEN") or _get_attr(_base_settings, "backup_app_token")
 
+# Argaam Provider URLs (v1.8.0)
+ARGAAM_QUOTE_URL = _get_first_env("ARGAAM_QUOTE_URL") or ""
+ARGAAM_PROFILE_URL = _get_first_env("ARGAAM_PROFILE_URL") or ""
+ARGAAM_HISTORY_URL = _get_first_env("ARGAAM_HISTORY_URL") or _get_first_env("ARGAAM_CANDLES_URL") or ""
+ARGAAM_API_KEY = _get_first_env("ARGAAM_API_KEY") or ""
+
 # Feature Flags
 ADVISOR_ENABLED = _safe_bool(_get_first_env("ADVISOR_ENABLED"), True)
 
-# Batch Limits (Mirroring config.py v3.0.1)
+# Batch Limits
 AI_BATCH_SIZE = _safe_int(_get_first_env("AI_BATCH_SIZE"), 20)
 AI_MAX_TICKERS = _safe_int(_get_first_env("AI_MAX_TICKERS"), 500)
 ADV_BATCH_SIZE = _safe_int(_get_first_env("ADV_BATCH_SIZE"), 25)
 ENRICHED_BATCH_SIZE = _safe_int(_get_first_env("ENRICHED_BATCH_SIZE"), 40)
 
-# Google Sheets Configuration
+# Google Sheets
 _creds_raw = _get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS") or ""
 GOOGLE_SHEETS_CREDENTIALS = _try_parse_json_dict(_creds_raw)
 DEFAULT_SPREADSHEET_ID = _get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID") or ""
 
 # ---------------------------------------------------------------------
-# Compatibility Shim (For legacy modules importing env.settings)
+# Compatibility Shim
 # ---------------------------------------------------------------------
 class _Settings:
     app_name = APP_NAME
@@ -305,12 +307,14 @@ class _Settings:
     ai_max_tickers = AI_MAX_TICKERS
     adv_batch_size = ADV_BATCH_SIZE
     enriched_batch_size = ENRICHED_BATCH_SIZE
+    argaam_quote_url = ARGAAM_QUOTE_URL
+    argaam_profile_url = ARGAAM_PROFILE_URL
     google_sheets_credentials = GOOGLE_SHEETS_CREDENTIALS
     default_spreadsheet_id = DEFAULT_SPREADSHEET_ID
 
 settings: object = _Settings()
 
-# Summaries
+# Summaries for Diagnostics
 def safe_env_summary() -> Dict[str, Any]:
     return {
         "app": APP_NAME,
@@ -319,6 +323,7 @@ def safe_env_summary() -> Dict[str, Any]:
         "tfb_layout": {"header": TFB_SYMBOL_HEADER_ROW, "start": TFB_SYMBOL_START_ROW},
         "auth_header": AUTH_HEADER_NAME,
         "advisor_enabled": ADVISOR_ENABLED,
+        "argaam_configured": bool(ARGAAM_QUOTE_URL or ARGAAM_PROFILE_URL),
         "sheets_configured": bool(GOOGLE_SHEETS_CREDENTIALS and DEFAULT_SPREADSHEET_ID)
     }
 
@@ -333,6 +338,7 @@ __all__ = [
     "TFB_SYMBOL_START_ROW",
     "APP_TOKEN",
     "ADVISOR_ENABLED",
+    "ARGAAM_API_KEY",
     "GOOGLE_SHEETS_CREDENTIALS",
     "DEFAULT_SPREADSHEET_ID"
 ]
