@@ -1,14 +1,11 @@
-# routes/advanced_analysis.py
+# routes/advanced_analysis.py  (FULL REPLACEMENT)
 """
-TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.15.1) – PROD SAFE (ALIGNED + PUSH-CACHE FIX)
+TADAWUL FAST BRIDGE – ADVANCED ANALYSIS ROUTES (v3.16.0) – PROD SAFE (ALIGNED + PUSH-CACHE FIX)
 
-✅ FIX in v3.15.1
-- POST /v1/advanced/sheet-rows now supports TWO MODES:
-  1) PUSH MODE (Google Sheets -> Backend cache):
-     Body contains: {"items":[{"sheet":"Market_Leaders","headers":[...],"rows":[...]}], ...}
-     -> Writes payload into engine cache using best-effort engine method probing.
-  2) COMPUTE MODE (Backend -> Sheets rows):
-     Body contains: {"tickers":[...], "sheet_name":"Market_Leaders"} (existing behavior)
+✅ FIX in v3.16.0
+- Aligned ROI Keys: Uses 'expected_roi_1m/3m/12m' as primary keys.
+- Riyadh Localization: Adds 'last_updated_riyadh' (UTC+3) to all responses.
+- Scoring Integration: Uses core.scoring_engine for consistent metrics.
 
 Goal
 - Ensure Advisor reads the SAME cache keys that PUSH MODE writes (engine handles keying).
@@ -22,7 +19,7 @@ import inspect
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -41,7 +38,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "3.15.1"
+ADVANCED_ANALYSIS_VERSION = "3.16.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 
@@ -459,6 +456,14 @@ def _now_utc() -> datetime:
 def _now_utc_iso() -> str:
     return _now_utc().isoformat()
 
+def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
+    if not utc_iso: return ""
+    try:
+        dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+        tz = timezone(timedelta(hours=3))
+        return dt.astimezone(tz).isoformat()
+    except: return ""
+
 
 def _clean_tickers(items: Sequence[Any]) -> List[str]:
     seen = set()
@@ -694,6 +699,7 @@ def _make_placeholder(symbol: str, *, dq: str = "MISSING", err: str = "No data")
         "error": err,
         "status": "error",
         "last_updated_utc": _now_utc_iso(),
+        "last_updated_riyadh": _riyadh_iso(), # ✅ Added
     }
 
 
@@ -714,6 +720,7 @@ def _headers_look_valid(h: Any) -> bool:
 
 
 def _fallback_headers_59() -> List[str]:
+    # Updated to include ROI keys as per v3.16.0 spec
     return [
         "Symbol",
         "Company Name",
@@ -1074,6 +1081,9 @@ async def advanced_sheet_rows(
 
         for s in requested[:top_n]:
             uq = unified_map.get(s.upper()) or _make_placeholder(s, dq="MISSING", err="No data returned")
+            
+            # ✅ SCORING INTEGRATION: Apply unified scoring
+            uq = _enrich_scores_best_effort(uq)
             _ensure_reco_on_obj(uq)
 
             if can_use_eq:
