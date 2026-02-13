@@ -327,7 +327,7 @@ def _router_plan(settings: Optional[object], env_mod: Optional[object]) -> Tuple
             (
                 "investment_advisor",
                 [
-                    "routes.investment_advisor",         # ✅ expected path
+                    "routes.investment_advisor",          # ✅ expected path
                     "routes.advisor",                    # fallback
                     "routes.investmentAdvisor",          # fallback (rare)
                     "core.investment_advisor",           # fallback
