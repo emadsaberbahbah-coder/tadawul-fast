@@ -1,7 +1,7 @@
 # routes/investment_advisor.py
 """
 Tadawul Fast Bridge — Investment Advisor Routes (GOOGLE SHEETS SAFE)
-FULL REPLACEMENT — v1.5.0
+FULL REPLACEMENT — v1.6.0 (Advanced Edition)
 
 What this route does
 - Token guard (open if no token configured)
@@ -10,33 +10,32 @@ What this route does
 - Ensures Sheets-safe output (headers never empty when status="ok")
 - Adds cache-hit diagnostics for engine snapshots
 
-NOTE
-- This route DOES NOT fetch sheets. It depends on /v1/advanced/sheet-rows (or similar)
-  having already populated engine.set_cached_sheet_snapshot(...).
+v1.6.0 Enhancements:
+- ✅ Advanced Filtering: Support for `min_price`, `max_price`, and `exclude_sectors`.
+- ✅ Payload Hardening: Better type coercion for numeric filters.
+- ✅ Diagnostic Metadata: Richer reporting on filtered candidates.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import APIRouter, Body, Header, Query, Request
 
 logger = logging.getLogger("routes.investment_advisor")
 
-ADVISOR_ROUTE_VERSION = "1.5.0"
+ADVISOR_ROUTE_VERSION = "1.6.0"
 router = APIRouter(prefix="/v1/advisor", tags=["investment_advisor"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
 # Canonical/default pages (must match GAS tab names)
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
-
-# Also allow sheetKey-style names if some client sends them
-DEFAULT_SOURCE_KEYS = ["MARKET_LEADERS", "GLOBAL_MARKETS", "MUTUAL_FUNDS", "COMMODITIES_FX"]
 
 # Sheets-safe default headers (for GAS write safety)
 TT_ADVISOR_DEFAULT_HEADERS: List[str] = [
@@ -155,6 +154,17 @@ def _envelope_error(msg: str, *, extra: Optional[Dict[str, Any]] = None) -> Dict
 # ---------------------------------------------------------------------
 # Normalizers
 # ---------------------------------------------------------------------
+def _safe_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return None
+
+
 def _parse_percentish(v: Any, *, default: Optional[float] = None) -> Optional[float]:
     """
     Returns percent (0..100), or default if cannot parse.
@@ -267,6 +277,16 @@ def _normalize_tickers(v: Any) -> List[str]:
     return out
 
 
+def _normalize_list(v: Any) -> Optional[List[str]]:
+    if not v:
+        return None
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if x]
+    if isinstance(v, str):
+        return [p.strip() for p in v.split(",") if p.strip()]
+    return None
+
+
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
         x = int(v)
@@ -318,6 +338,11 @@ def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
 
     currency = str(raw.get("currency") or "SAR").strip().upper() or "SAR"
 
+    # New v1.6.0 Filters
+    min_price = _safe_float(raw.get("min_price") or raw.get("minPrice"))
+    max_price = _safe_float(raw.get("max_price") or raw.get("maxPrice"))
+    exclude_sectors = _normalize_list(raw.get("exclude_sectors") or raw.get("excludeSectors"))
+
     advisor_core_payload: Dict[str, Any] = {
         "sources": sources,
         "risk": risk,
@@ -328,6 +353,9 @@ def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
         "invest_amount": amount_f,
         "include_news": include_news_b,
         "currency": currency,
+        "min_price": min_price,
+        "max_price": max_price,
+        "exclude_sectors": exclude_sectors,
         # diagnostics (safe extras)
         "_diag_tickers_count": len(tickers),
         "_diag_tickers": tickers[:50],
