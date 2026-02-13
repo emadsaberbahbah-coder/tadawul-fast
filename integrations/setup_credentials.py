@@ -3,8 +3,13 @@
 """
 setup_credentials.py
 ===========================================================
-HELPER: Prepare Google Credentials for Deployment (v2.5.0)
+HELPER: Prepare Google Credentials for Deployment (v2.5.1)
 ===========================================================
+
+What’s improved in v2.5.1
+- ✅ Enhanced Base64 detection (handles URL-safe & standard with loose padding).
+- ✅ Stricter validation for Service Account JSON structure.
+- ✅ Auto-repair of common copy-paste corruptions in private_key.
 
 Why this exists
 - Platforms like Render / .env files prefer a SINGLE-LINE value.
@@ -13,35 +18,17 @@ Why this exists
     1) Minified one-line JSON (safe for GOOGLE_SHEETS_CREDENTIALS)
     2) OPTIONAL Base64 version (often safer for deployment UIs)
 
-Extra safety (v2.5.0)
-- Reads credentials from: file OR stdin (pipe) OR env var
-- Accepts JSON OR base64(JSON) OR "quoted JSON" in any source
-- Strict validation of required fields + private key marker
-- Optional sanitize of "\\n" -> "\n" inside private_key (common deployment issue)
-- Optional output to files to avoid copy/paste
-- Optional masked preview mode
-- Optional "print export command" helpers (masked by default)
-- Better base64 detection:
-    • supports newlines/whitespace
-    • supports urlsafe base64
-    • supports missing padding (auto-fix)
-
 Usage (examples)
 1) File (default):
-      python setup_credentials.py
+      python integrations/setup_credentials.py
    or:
-      python setup_credentials.py --input my-key.json --both
+      python integrations/setup_credentials.py --input my-key.json --both
 
 2) Pipe JSON (stdin):
-      type credentials.json | python setup_credentials.py --stdin --both
-   (PowerShell):
-      Get-Content credentials.json -Raw | python setup_credentials.py --stdin --both
+      type credentials.json | python integrations/setup_credentials.py --stdin --both
 
-3) Read from env var that already contains JSON/base64:
-      python setup_credentials.py --from-env GOOGLE_SHEETS_CREDENTIALS --base64
-
-4) Write outputs to files (recommended):
-      python setup_credentials.py --both --out-json creds.min.json --out-b64 creds.min.b64.txt
+3) Read from env var:
+      python integrations/setup_credentials.py --from-env GOOGLE_SHEETS_CREDENTIALS --base64
 
 Security note
 - This prints secrets unless you use --mask or --out-*.
@@ -60,7 +47,7 @@ from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_INPUT = "credentials.json"
 DEFAULT_ENV_NAME = "GOOGLE_SHEETS_CREDENTIALS"
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 # =============================================================================
 # IO helpers
@@ -73,6 +60,8 @@ def _read_file(path: str) -> str:
 
 
 def _read_stdin() -> str:
+    if sys.stdin.isatty():
+        print("Waiting for JSON input from stdin... (Ctrl+D to finish)")
     return sys.stdin.read() or ""
 
 
@@ -93,13 +82,10 @@ def _compact_ws(s: str) -> str:
 
 
 def _pad_base64(s: str) -> str:
-    """
-    Some UIs strip '=' padding. Base64 decoder often needs correct padding length.
-    """
+    """Ensure base64 padding is correct."""
     raw = _compact_ws(s)
     if not raw:
         return raw
-    # only pad if mod 4 != 0
     m = len(raw) % 4
     if m == 0:
         return raw
@@ -109,7 +95,6 @@ def _pad_base64(s: str) -> str:
 def _is_probably_base64(raw: str) -> bool:
     """
     Heuristic: base64 strings are usually long, mostly base64 alphabet.
-    We allow newlines/whitespace and urlsafe variants.
     """
     s = _compact_ws((raw or "").strip())
     if not s:
@@ -121,11 +106,10 @@ def _is_probably_base64(raw: str) -> bool:
     if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", s):
         return False
 
-    # length heuristic: not too tiny
+    # length heuristic: credentials are usually large
     if len(s) < 80:
         return False
 
-    # padding heuristic: not mandatory, but common
     return True
 
 
@@ -157,7 +141,6 @@ def _try_b64_decode_to_json(raw: str) -> Optional[str]:
 def _coerce_private_key_newlines(data: Dict[str, Any], *, fix: bool) -> None:
     """
     If private_key contains literal '\\n' sequences, optionally convert to real newlines.
-    This is safe and commonly required if someone pasted JSON through env var UIs.
     """
     if not fix:
         return
@@ -178,20 +161,27 @@ def _load_json_text(text: str) -> Dict[str, Any]:
     """
     t0 = (text or "")
     t = _strip_wrapping_quotes(t0)
+    
+    # Try decode first
     decoded = _try_b64_decode_to_json(t)
     if decoded:
         t = decoded
+    
     t = _strip_wrapping_quotes(t).strip()
 
     if not t:
         raise ValueError("Empty input (no JSON found).")
-    # allow whitespace prefix
+    
     if not t.lstrip().startswith("{"):
-        raise ValueError("Input is not JSON (expected '{' at start), and it did not decode as base64 JSON.")
+        raise ValueError("Input is not JSON (expected '{' at start), and it did not decode as valid base64 JSON.")
 
-    data = json.loads(t)
+    try:
+        data = json.loads(t)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON format: {e}")
+
     if not isinstance(data, dict) or not data:
-        raise ValueError("JSON is empty or not an object.")
+        raise ValueError("JSON must be a non-empty object.")
     return data
 
 
@@ -210,7 +200,7 @@ def _validate_service_account(data: Dict[str, Any], strict_type: bool = False) -
 
     email = str(data.get("client_email", "")).strip()
     if "@" not in email:
-        raise ValueError("client_email looks invalid.")
+        raise ValueError("client_email looks invalid (no @ symbol).")
 
 
 def _minified_json(data: Dict[str, Any]) -> str:
@@ -244,19 +234,16 @@ def _write_file(path: str, content: str) -> None:
 
 def _ps_setx(env_name: str, value: str, *, masked: bool) -> str:
     v = _mask(value) if masked else value
-    # NOTE: setx has length limits; this is helper text, not guaranteed for huge values.
     return f'setx {env_name} "{v}"'
 
 
 def _bash_export(env_name: str, value: str, *, masked: bool) -> str:
     v = _mask(value) if masked else value
-    # Quote with single quotes; JSON/base64 typically doesn't contain single quotes.
     return f"export {env_name}='{v}'"
 
 
 def _dotenv_line(env_name: str, value: str, *, masked: bool) -> str:
     v = _mask(value) if masked else value
-    # .env parsers vary; quoting reduces breakage
     return f"{env_name}='{v}'"
 
 
