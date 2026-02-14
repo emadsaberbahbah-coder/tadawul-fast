@@ -1,6 +1,4 @@
-============================================================
-
-Tadawul Fast Bridge — requirements.txt (v1.6.0)
+Tadawul Fast Bridge — requirements.txt (v1.6.1)
 
 PRODUCTION ARCHITECT EDITION
 
@@ -10,6 +8,9 @@ PRODUCTION ARCHITECT EDITION
 
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
+
+uvloop and httptools are for Linux/Render optimization
+
 uvloop>=0.19.0; sys_platform != 'win32'
 httptools>=0.6.1; sys_platform != 'win32'
 
