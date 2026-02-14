@@ -3,16 +3,16 @@
 """
 audit_data_quality.py
 ===========================================================
-TADAWUL FAST BRIDGE – DATA & STRATEGY AUDITOR (v1.1.0)
+TADAWUL FAST BRIDGE – DATA & STRATEGY AUDITOR (v1.2.0)
 ===========================================================
-FINANCIAL LEADER EDITION
+ADVANCED ANALYTICS EDITION
 
 Purpose:
 - Scans all configured symbols in your Dashboards.
 - Identifies "Zombie" tickers (stale data, zero price, delisted).
-- **NEW**: Performs "System Self-Review" by back-testing current scores against realized performance.
-- Flags low-quality forecasts (low confidence, missing history).
-- Generates a "Clean-Up Report" and "Strategy Performance" summary.
+- **NEW**: Validates Technical Integrity (History depth for MACD/Trend).
+- **NEW**: "Reality Check" compares AI Trend Signals vs Realized 1W Returns.
+- Generates a "Clean-Up Report" and "System Self-Diagnosis".
 
 Usage:
   python scripts/audit_data_quality.py
@@ -63,14 +63,15 @@ except ImportError as e:
 # =============================================================================
 # Audit Rules & Logic
 # =============================================================================
-AUDIT_VERSION = "1.1.0"
+AUDIT_VERSION = "1.2.0"
 
 # Thresholds for "Bad Data"
 THRESHOLDS = {
-    "stale_hours": 72,      # Data older than 3 days is suspect (weekends excluded logic simplified)
+    "stale_hours": 72,      # Data older than 3 days is suspect
     "min_price": 0.01,      # Price below this is considered "Zero/Null"
     "min_confidence": 30.0, # Forecast confidence below 30% is weak
-    "min_history": 20       # Fewer than 20 history points is insufficient for analysis
+    "min_history": 35,      # Need 35+ pts for MACD(26) + signal(9) calc
+    "trend_tolerance": 4.0  # % move against trend to trigger a flag
 }
 
 def _parse_iso_time(iso_str: Optional[str]) -> Optional[datetime]:
@@ -82,48 +83,51 @@ def _parse_iso_time(iso_str: Optional[str]) -> Optional[datetime]:
 
 def _is_stale(last_updated: Optional[str]) -> bool:
     dt = _parse_iso_time(last_updated)
-    if not dt: return True # Missing time = Stale
-    
-    # Simple check: Is it older than threshold?
-    # (In a real trading app, we'd handle weekends, but 72h covers Friday-Sunday gaps usually)
+    if not dt: return True
     delta = datetime.now(timezone.utc) - dt
     return delta.total_seconds() > (THRESHOLDS["stale_hours"] * 3600)
 
 def _perform_self_review(q: Dict[str, Any]) -> List[str]:
     """
-    Analyzes the 'Strategy Quality' by comparing scores vs reality.
-    This creates a feedback loop for self-learning.
+    Advanced Self-Review: Checks if Technicals/AI match Reality.
     """
     reviews = []
     
-    # 1. Momentum Validation (Did high momentum align with recent gains?)
-    # Score 0-100 vs Returns %
-    mom_score = float(q.get("momentum_score") or 50)
-    ret_1m = float(q.get("returns_1m") or 0)
-    
-    if mom_score > 75 and ret_1m < -5.0:
-        reviews.append("MOM_FAIL_BULL") # System said UP, Market went DOWN
-    elif mom_score < 25 and ret_1m > 5.0:
-        reviews.append("MOM_FAIL_BEAR") # System said DOWN, Market went UP
-        
-    # 2. Risk Calibration (Did high risk score match high volatility?)
-    risk_score = float(q.get("risk_score") or 50)
+    # Extract Metrics
+    trend_sig = str(q.get("trend_signal") or "NEUTRAL").upper()
+    ret_1w = float(q.get("returns_1w") or 0)
     vol_30d = float(q.get("volatility_30d") or 0)
-    
-    if risk_score > 80 and vol_30d < 15.0:
-        reviews.append("RISK_OVEREST") # Flagging safe stocks as risky?
-    elif risk_score < 30 and vol_30d > 50.0:
-        reviews.append("RISK_UNDEREST") # Missing dangerous volatility?
-        
-    # 3. Forecast Plausibility (Is the 1M target unrealistically far from trend?)
     exp_roi_1m = float(q.get("expected_roi_1m") or 0)
-    if exp_roi_1m > 20.0 and ret_1m < -10.0:
-        reviews.append("FCST_CONTRARIAN") # Betting on a massive V-shape recovery
+    macd_hist = float(q.get("macd_hist") or 0)
+    
+    # 1. Trend Reality Check
+    # If AI says UPTREND but we lost >4% this week -> Trend Broken or Lagging
+    if trend_sig == "UPTREND" and ret_1w < -THRESHOLDS["trend_tolerance"]:
+        reviews.append("TREND_BREAK_BEAR")
+    # If AI says DOWNTREND but we gained >4% this week -> Trend Reversal
+    elif trend_sig == "DOWNTREND" and ret_1w > THRESHOLDS["trend_tolerance"]:
+        reviews.append("TREND_BREAK_BULL")
+        
+    # 2. Momentum Divergence
+    # MACD says bullish (pos hist) but price falling hard
+    if macd_hist > 0 and ret_1w < -5.0:
+        reviews.append("MOM_DIVERGENCE_BEAR")
+        
+    # 3. Forecast Plausibility
+    # Forecasting +20% month on a low vol stock is suspicious
+    if exp_roi_1m > 20.0 and vol_30d < 10.0:
+        reviews.append("AGGRESSIVE_FORECAST")
+        
+    # 4. Risk Calibration
+    risk_score = float(q.get("risk_score") or 50)
+    # High risk score but very low volatility? System might be too conservative.
+    if risk_score > 85 and vol_30d < 10.0:
+        reviews.append("RISK_OVEREST")
 
     return reviews
 
 def _audit_quote(symbol: str, q: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyzes a single quote for quality issues AND strategy performance."""
+    """Analyzes data integrity AND technical sufficiency."""
     issues = []
     
     # 1. Price Integrity
@@ -136,15 +140,11 @@ def _audit_quote(symbol: str, q: Dict[str, Any]) -> Dict[str, Any]:
     if _is_stale(last_upd):
         issues.append("STALE_DATA")
 
-    # 3. Forecast Quality
-    conf = float(q.get("forecast_confidence") or 0) * 100
-    if conf < THRESHOLDS["min_confidence"]:
-        issues.append("LOW_CONFIDENCE")
-        
+    # 3. Technical Integrity (New in v1.2.0)
     hist_pts = int(q.get("history_points") or 0)
     if hist_pts < THRESHOLDS["min_history"]:
-        issues.append("NO_HISTORY")
-
+        issues.append(f"INSUFFICIENT_HISTORY ({hist_pts}<{THRESHOLDS['min_history']})")
+    
     # 4. Meta
     err = q.get("error")
     if err:
@@ -159,7 +159,13 @@ def _audit_quote(symbol: str, q: Dict[str, Any]) -> Dict[str, Any]:
     elif issues:
         status = "WARNING"
     elif strategy_notes:
-        status = "REVIEW" # Data is good, but strategy might be misaligned
+        status = "REVIEW" # Data valid, but model divergent
+
+    # Ensure Confidence is float
+    conf = 0.0
+    try:
+        conf = float(q.get("forecast_confidence") or 0) * 100
+    except: pass
 
     return {
         "symbol": symbol,
@@ -169,7 +175,8 @@ def _audit_quote(symbol: str, q: Dict[str, Any]) -> Dict[str, Any]:
         "price": price,
         "last_updated": last_upd,
         "source": q.get("data_source", "unknown"),
-        "confidence": round(conf, 1)
+        "confidence": round(conf, 1),
+        "history_points": hist_pts
     }
 
 # =============================================================================
@@ -184,7 +191,13 @@ async def _run_audit(keys: List[str], sid: str):
     logger.info("🚀 Starting Data Quality & Strategy Audit (v%s)", AUDIT_VERSION)
     
     all_reports = []
-    strategy_stats = {"reviewed": 0, "divergences": 0}
+    # Statistics for System Self-Diagnosis
+    stats = {
+        "total_assets": 0,
+        "trend_breaks": 0,
+        "data_holes": 0,
+        "aggressive_forecasts": 0
+    }
     
     for key in keys:
         logger.info("🔍 Scanning Page: %s", key)
@@ -201,14 +214,12 @@ async def _run_audit(keys: List[str], sid: str):
             logger.info("   -> Empty page.")
             continue
 
-        # 2. Fetch Data (Force Refresh)
+        # 2. Fetch Data (Force Refresh to check live provider health)
         logger.info("   -> Fetching data for %d symbols...", len(symbols))
-        # Using batch fetch from engine
         if hasattr(engine, "get_enriched_quotes"):
             quotes_list = await engine.get_enriched_quotes(symbols, refresh=True)
             quotes_map = {s: q for s, q in zip(symbols, quotes_list)}
         else:
-            # Fallback serial
             quotes_map = {}
             for s in symbols:
                 quotes_map[s] = await engine.get_enriched_quote(s, refresh=True)
@@ -216,21 +227,26 @@ async def _run_audit(keys: List[str], sid: str):
         # 3. Analyze
         page_issues = 0
         for sym in symbols:
+            stats["total_assets"] += 1
             q = quotes_map.get(sym) or {}
             report = _audit_quote(sym, q)
             report["origin_page"] = key
             
-            if report["strategy_notes"]:
-                strategy_stats["divergences"] += 1
-            strategy_stats["reviewed"] += 1
+            # Aggregate stats
+            for note in report["strategy_notes"]:
+                if "TREND_BREAK" in note: stats["trend_breaks"] += 1
+                if "AGGRESSIVE" in note: stats["aggressive_forecasts"] += 1
             
+            for issue in report["issues"]:
+                if "INSUFFICIENT" in issue or "ZERO_PRICE" in issue: stats["data_holes"] += 1
+
             if report["status"] != "OK":
                 page_issues += 1
                 all_reports.append(report)
         
-        logger.info("   -> Found %d issues/alerts on %s", page_issues, key)
+        logger.info("   -> Found %d alerts on %s", page_issues, key)
 
-    return all_reports, strategy_stats
+    return all_reports, stats
 
 # =============================================================================
 # Main
@@ -242,19 +258,15 @@ def main():
     parser.add_argument("--sheet-id", help="Override Spreadsheet ID")
     args = parser.parse_args()
 
-    # Resolve Sheet ID
     sid = args.sheet_id or getattr(settings, "default_spreadsheet_id", "") or os.getenv("DEFAULT_SPREADSHEET_ID")
     if not sid:
         logger.error("No Spreadsheet ID found.")
         sys.exit(1)
 
-    # Resolve Keys
     target_keys = args.keys
     if not target_keys:
-        # Default to all known keys in registry
         target_keys = list(symbols_reader.PAGE_REGISTRY.keys())
 
-    # Run Async Loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -262,41 +274,49 @@ def main():
     finally:
         loop.close()
 
-    # Summary
     if not reports:
-        logger.info("\n✅ AUDIT COMPLETE: No data quality issues found! Your dashboard is clean.")
+        logger.info("\n✅ AUDIT COMPLETE: System is 100% healthy.")
         return
 
-    logger.info("\n=== ⚠️  AUDIT REPORT: %d ITEMS ===", len(reports))
+    logger.info("\n=== ⚠️  AUDIT REPORT: %d ITEMS REQUIRING ATTENTION ===", len(reports))
     print(f"{'SYMBOL':<12} | {'STATUS':<10} | {'SOURCE':<10} | {'DETAILS'}")
-    print("-" * 80)
+    print("-" * 100)
     
     for r in reports:
-        # Combine issues and strategy notes
         details = r["issues"] + r["strategy_notes"]
         details_str = ", ".join(details)
         print(f"{r['symbol']:<12} | {r['status']:<10} | {r['source']:<10} | {details_str}")
 
-    print("-" * 80)
+    print("-" * 100)
     
-    # Self-Learning / Strategy Review Section
-    div_rate = (stats['divergences'] / stats['reviewed'] * 100) if stats['reviewed'] else 0
-    logger.info("🧠 SYSTEM SELF-REVIEW:")
-    logger.info(f"   Analyzed {stats['reviewed']} assets.")
-    logger.info(f"   Strategy Divergence Rate: {div_rate:.1f}%")
-    if div_rate > 20:
-        logger.warning("   -> High divergence detected. Consider adjusting Scoring Engine weights.")
+    # SYSTEM DIAGNOSIS
+    total = stats["total_assets"] or 1
+    trend_fail_rate = (stats["trend_breaks"] / total) * 100
+    data_fail_rate = (stats["data_holes"] / total) * 100
+
+    logger.info("🧠 SYSTEM DIAGNOSIS (v%s):", AUDIT_VERSION)
+    logger.info(f"   Analyzed: {total} Assets")
+    
+    if data_fail_rate > 10:
+        logger.warning(f"   🔴 Data Integrity Critical: {data_fail_rate:.1f}% of assets have broken data/history.")
+        logger.warning("      Action: Check provider API keys or clean up delisted tickers.")
     else:
-        logger.info("   -> Strategy is tracking well with market reality.")
-    
+        logger.info(f"   🟢 Data Integrity: Healthy ({data_fail_rate:.1f}% failure rate)")
+
+    if trend_fail_rate > 25:
+        logger.warning(f"   🟠 Strategy Divergence: {trend_fail_rate:.1f}% of assets moving against Trend Signal.")
+        logger.warning("      Action: Market may be choppy. Consider increasing 'trend_30d' sensitivity in engine.")
+    else:
+        logger.info(f"   🟢 Strategy Alignment: Good ({trend_fail_rate:.1f}% divergence)")
+
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump({
                 "audit_time": _utc_now_iso(), 
-                "stats": stats,
-                "issues": reports
+                "system_stats": stats,
+                "alerts": reports
             }, f, indent=2)
-        logger.info("Report saved to %s", args.json_out)
+        logger.info("Detailed report saved to %s", args.json_out)
 
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
