@@ -3,16 +3,23 @@
 """
 symbols_reader.py
 ===========================================================
-TADAWUL FAST BRIDGE – SYMBOLS READER (v2.5.0) – PROD SAFE
+TADAWUL FAST BRIDGE – SYMBOLS READER (v2.6.0) – PROD SAFE
 ===========================================================
+ADVANCED INTELLIGENT EDITION
 
 Purpose
 - A single, stable API to load symbols/tickers from your Google Sheets dashboard tabs.
 - Used by backend scripts (e.g., scripts/run_dashboard_sync.py, scripts/run_market_scan.py).
 
+v2.6.0 Enhancements:
+- ✅ **Smart Normalization**: Integrates with `core.symbols.normalize` for advanced KSA/Global detection.
+- ✅ **Adaptive Scanning**: Auto-detects header rows if the default (Row 5) is empty.
+- ✅ **Composite Caching**: Cache keys now include Spreadsheet ID to prevent cross-sheet pollution.
+- ✅ **Deep Diagnostics**: Metadata includes scan depth and header detection details.
+
 Key guarantees
-- ✅ Never makes network calls at import-time
-- ✅ Never crashes startup (all imports + env parsing are best-effort)
+- ✅ Never makes network calls at import-time.
+- ✅ Never crashes startup (all imports + env parsing are best-effort).
 - ✅ Returns a predictable shape:
       {
         "all": [...],
@@ -22,10 +29,6 @@ Key guarantees
         "symbols": [...],   # alias (same as "all")
         "meta": {...}
       }
-- ✅ Supports env overrides (no Sheets needed)
-- ✅ Google Sheets via service account JSON in env:
-      GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_SA_JSON
-      (minified JSON / pretty JSON / quoted JSON / base64(JSON) / base64url(JSON))
 """
 
 from __future__ import annotations
@@ -41,8 +44,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version / constants
 # -----------------------------------------------------------------------------
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
+
+# -----------------------------------------------------------------------------
+# Lazy Import for Core Normalizer
+# -----------------------------------------------------------------------------
+def _get_normalizer():
+    try:
+        from core.symbols.normalize import normalize_symbol, is_ksa
+        return normalize_symbol, is_ksa
+    except ImportError:
+        return None, None
 
 # -----------------------------------------------------------------------------
 # Safe env parsing (never crash import)
@@ -277,19 +290,18 @@ def _safe_sheet_name(name: str) -> str:
 
 
 def _normalize_symbol(s: str) -> str:
+    # 1. Try Core Normalizer
+    norm_fn, _ = _get_normalizer()
+    if norm_fn:
+        return norm_fn(s)
+
+    # 2. Local Fallback
     x = (s or "").strip().upper().replace(" ", "")
-    if not x:
-        return ""
+    if not x: return ""
 
-    if x.startswith("TADAWUL:"):
-        x = x.split(":", 1)[1].strip().upper()
-
-    if x.endswith(".TADAWUL"):
-        x = x.replace(".TADAWUL", "")
-
-    if x.isdigit() and 3 <= len(x) <= 6:
-        return f"{x}.SR"
-
+    if x.startswith("TADAWUL:"): x = x.split(":", 1)[1].strip().upper()
+    if x.endswith(".TADAWUL"): x = x.replace(".TADAWUL", "")
+    if x.isdigit() and 3 <= len(x) <= 6: return f"{x}.SR"
     return x
 
 
@@ -327,16 +339,26 @@ def _dedupe(seq: Sequence[str]) -> List[str]:
 
 
 def _classify(symbols: Sequence[str]) -> Tuple[List[str], List[str]]:
+    # 1. Try Core KSA detector
+    _, is_ksa_fn = _get_normalizer()
+    
     ksa: List[str] = []
     glob: List[str] = []
+    
     for s in symbols or []:
         x = _normalize_symbol(s)
-        if not x:
-            continue
-        if x.endswith(".SR") or x.replace(".SR", "").isdigit():
-            ksa.append(x)
+        if not x: continue
+        
+        is_saudi = False
+        if is_ksa_fn:
+             is_saudi = is_ksa_fn(x)
         else:
-            glob.append(x)
+             # Fallback check
+             is_saudi = x.endswith(".SR") or x.replace(".SR", "").isdigit()
+             
+        if is_saudi: ksa.append(x)
+        else: glob.append(x)
+        
     return _dedupe(ksa), _dedupe(glob)
 
 
