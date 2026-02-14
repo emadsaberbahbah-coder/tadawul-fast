@@ -2,14 +2,15 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (v6.1.0)
-Ultra-Resilient Edition — SELF-HEALING + MEMORY SAFE
+Tadawul Fast Bridge – FastAPI Entry Point (v6.2.0)
+Mission Critical Edition — OBSERVE + PROTECT + SCALE
 
-Key Upgrades in v6.1.0:
-- ✅ Memory Guard: Active RAM monitoring with auto-GC trigger.
-- ✅ Graceful Degrade: Auto-switches to partial service on engine failure.
-- ✅ Turbo Boot: Parallelized mounting for faster cold starts.
-- ✅ Deep Vitals: Detailed system telemetry in /health.
+Key Upgrades in v6.2.0:
+- ✅ Loop Heartbeat: Active monitoring of async event loop latency.
+- ✅ Route Inventory: Logs all mounted endpoints at startup for verification.
+- ✅ Shutdown Safety: Enforced timeouts on cleanup to prevent zombie processes.
+- ✅ Memory Opt: Post-boot garbage collection to minimize RAM footprint.
+- ✅ Enhanced Health: Reports system load status dynamically.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "6.1.0"
+APP_ENTRY_VERSION = "6.2.0"
 PROCESS = psutil.Process(os.getpid())
 
 # Structured Logging
@@ -116,20 +117,33 @@ class SystemGuardian:
     def stop(self):
         self.running = False
 
-guardian = SystemGuardian()
+    def get_status(self) -> str:
+        if self.latency_ms > 150: return "overloaded"
+        if self.latency_ms > 50: return "heavy"
+        return "nominal"
+
+monitor = SystemGuardian()
+guardian = monitor # Alias for compatibility
 
 class TelemetryMiddleware(BaseHTTPMiddleware):
+    """Captures request telemetry, performance IDs, and security headers."""
     async def dispatch(self, request: Request, call_next: Callable):
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:18])
         request.state.request_id = request_id
         
         start_time = time.perf_counter()
-        response = await call_next(request)
-        duration = time.perf_counter() - start_time
         
+        response = await call_next(request)
+        
+        duration = time.perf_counter() - start_time
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = f"{duration:.4f}s"
-        response.headers["X-Server-Load"] = "High" if guardian.degraded_mode else "Normal"
+        response.headers["X-System-Load"] = monitor.get_status()
+        
+        # Security Headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         
         return response
 
@@ -147,21 +161,22 @@ def _safe_import(path: str) -> Optional[Any]:
     try:
         return import_module(path)
     except Exception as e:
-        logger.debug("Module skip: %s (%s)", path, e)
+        logger.debug("Optional module skip: %s (%s)", path, e)
         return None
 
 # ---------------------------------------------------------------------
-# Engine Lifecycle
+# Engine Lifecycle (Resilient)
 # ---------------------------------------------------------------------
 async def get_engine_dep(request: Request) -> Any:
-    """Safe Engine Accessor."""
+    """Dependency Injection for Routes."""
     engine = getattr(request.app.state, "engine", None)
     if not engine:
-        raise StarletteHTTPException(status_code=503, detail="System initializing.")
+        # Fail fast if engine is missing in production
+        raise StarletteHTTPException(status_code=503, detail="Data Engine unavailable.")
     return engine
 
 async def _init_engine_resilient(app_: FastAPI, max_retries: int = 3):
-    """Parallelized Engine Boot."""
+    """Boot the Data Engine with backoff."""
     for attempt in range(max_retries):
         try:
             from core.data_engine_v2 import get_engine
@@ -172,21 +187,24 @@ async def _init_engine_resilient(app_: FastAPI, max_retries: int = 3):
                 app_.state.engine = eng
                 app_.state.engine_ready = True
                 app_.state.engine_error = None
-                logger.info("✅ Data Engine Connected: %s", type(eng).__name__)
+                logger.info("Data Engine verified: %s", type(eng).__name__)
                 return
         except Exception as e:
-            logger.warning("Engine boot retry %d/%d: %s", attempt + 1, max_retries, e)
-            await asyncio.sleep(1.0)
+            logger.warning("Engine boot attempt %d/%d failed: %s", attempt + 1, max_retries, e)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2.0 * (attempt + 1))
     
     app_.state.engine_ready = False
-    app_.state.engine_error = "Engine Failed."
+    app_.state.engine_error = "CRITICAL: Engine connection refused."
+    logger.error(app_.state.engine_error)
 
 # ---------------------------------------------------------------------
 # App Factory
 # ---------------------------------------------------------------------
 def create_app() -> FastAPI:
     title = os.getenv("APP_NAME", "Tadawul Fast Bridge")
-    
+    app_env = os.getenv("APP_ENV", "production").lower()
+
     if HAS_LIMITER:
         limiter = Limiter(key_func=get_remote_address, default_limits=["300 per minute"])
     else:
@@ -194,22 +212,32 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
+        # 1. State Init
         app_.state.boot_time = datetime.now(timezone.utc).isoformat()
         app_.state.engine_ready = False
         app_.state.boot_completed = False
         
-        # Start Guardian & Boot in Parallel
-        monitor_task = asyncio.create_task(guardian.start())
+        # 2. Start Monitors
+        monitor_task = asyncio.create_task(monitor.start())
         boot_task = asyncio.create_task(_orchestrate_boot(app_))
         
         yield
         
-        # Cleanup
+        # 3. Shutdown Sequence
+        logger.info("Initiating shutdown...")
         boot_task.cancel()
-        monitor_task.cancel()
+        monitor.stop()
+        
+        # Engine Cleanup (Time-boxed)
         if hasattr(app_.state, "engine") and app_.state.engine:
             if hasattr(app_.state.engine, "aclose"):
-                await asyncio.wait_for(app_.state.engine.aclose(), timeout=5.0)
+                try:
+                    await asyncio.wait_for(app_.state.engine.aclose(), timeout=5.0)
+                    logger.info("Engine shutdown complete.")
+                except asyncio.TimeoutError:
+                    logger.warning("Engine shutdown timed out. Forcing exit.")
+                except Exception as e:
+                    logger.error("Engine shutdown error: %s", e)
 
     app_ = FastAPI(
         title=title,
@@ -218,39 +246,73 @@ def create_app() -> FastAPI:
         docs_url="/docs" if _truthy(os.getenv("ENABLE_SWAGGER", "True")) else None
     )
 
+    # Middlewares
     if HAS_LIMITER:
         app_.state.limiter = limiter
         app_.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     
     app_.add_middleware(TelemetryMiddleware)
     app_.add_middleware(GZipMiddleware, minimum_size=512)
-    app_.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    app_.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"]
+    )
+    if app_env == "production":
+        allowed = os.getenv("ALLOWED_HOSTS", "*").split(",")
+        app_.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed)
 
+    # Boot Logic
     async def _orchestrate_boot(app_: FastAPI):
         """Turbo Boot Sequence."""
         await asyncio.sleep(0.01) # Yield
         
         # Parallel Router Mounting
         router_modules = [
-            "routes.enriched_quote", "routes.ai_analysis", "routes.advanced_analysis",
-            "routes.investment_advisor", "routes.routes_argaam", "routes.system"
+            ("Enriched", ["routes.enriched_quote", "routes.enriched"]),
+            ("Analysis", ["routes.ai_analysis"]),
+            ("Advanced", ["routes.advanced_analysis"]),
+            ("Advisor",  ["routes.investment_advisor", "routes.advisor"]),
+            ("KSA",      ["routes.routes_argaam", "routes_argaam"]),
+            ("System",   ["routes.system", "routes.config"])
         ]
         
-        for path in router_modules:
-            mod = _safe_import(path)
-            if mod:
-                router_obj = getattr(mod, "router", None)
-                if router_obj:
-                    # Fix Prefix for Advisor
-                    prefix = ""
-                    if "advisor" in path and not getattr(router_obj, "prefix", "").startswith("/v1"):
-                        prefix = "/v1"
-                    app_.include_router(router_obj, prefix=prefix)
+        for label, candidates in router_modules:
+            mounted = False
+            for path in candidates:
+                module = _safe_import(path)
+                if module:
+                    router_obj = getattr(module, "router", None) or getattr(module, "api_router", None)
+                    if router_obj:
+                        # Fix Prefix for Advisor
+                        prefix = ""
+                        if label == "Advisor" and not getattr(router_obj, "prefix", "").startswith("/v1"):
+                            prefix = "/v1"
+                        
+                        try:
+                            app_.include_router(router_obj, prefix=prefix)
+                            logger.info("Mounted %s via %s", label, path)
+                            mounted = True
+                            break
+                        except Exception as e:
+                            logger.error("Failed to mount %s: %s", label, e)
+            if not mounted:
+                logger.warning("Router '%s' could not be mounted.", label)
+
+        # Log Route Inventory
+        logger.info("--- Active Routes ---")
+        for route in app_.routes:
+            if isinstance(route, Route):
+                logger.info(f"📍 {route.path} [{','.join(route.methods)}]")
+        logger.info("---------------------")
 
         # Engine Start
         if _truthy(os.getenv("INIT_ENGINE_ON_BOOT", "True")):
             await _init_engine_resilient(app_)
             
+        # Post-Boot Optimization
+        gc.collect()
         app_.state.boot_completed = True
         logger.info("🚀 V%s Ready. Memory: %.1fMB", APP_ENTRY_VERSION, guardian.memory_mb)
 
@@ -264,24 +326,30 @@ def create_app() -> FastAPI:
         is_ready = getattr(app_.state, "boot_completed", False)
         return JSONResponse(
             status_code=200 if is_ready else 503,
-            content={"ready": is_ready, "load": "high" if guardian.degraded_mode else "ok"}
+            content={"ready": is_ready, "load": monitor.get_status()}
         )
 
     @app_.get("/health", tags=["system"])
-    async def health():
+    async def health(request: Request):
         return {
             "status": "ok" if app_.state.engine_ready else "degraded",
             "vitals": {
                 "memory_mb": round(guardian.memory_mb, 1),
                 "cpu_pct": guardian.cpu_pct,
-                "latency_ms": round(guardian.latency_ms, 1)
+                "latency_ms": round(guardian.latency_ms, 1),
+                "load_status": monitor.get_status()
             },
-            "uptime": app_.state.boot_time
+            "uptime": app_.state.boot_time,
+            "trace_id": getattr(request.state, "request_id", "n/a")
         }
 
     # Error Handling
+    @app_.exception_handler(StarletteHTTPException)
+    async def http_handler(request, exc):
+        return JSONResponse(status_code=exc.status_code, content={"status": "error", "message": exc.detail})
+
     @app_.exception_handler(Exception)
-    async def global_error(request, exc):
+    async def global_handler(request, exc):
         logger.error("Crash: %s", _clamp_str(traceback.format_exc()))
         return JSONResponse(status_code=500, content={"status": "critical", "message": "System Error"})
 
