@@ -1,226 +1,67 @@
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# PROD-SAFE + Numeric-safe uvicorn tunables (v1.3.3)
+# EDITION: Advanced Production (v1.4.0)
 # ============================================================
 #
-# Goals
-# - Aligned with main.py v5.4.4
-# - Deterministic boot (no "integer expression expected" crashes)
-# - No invalid uvicorn flags
-# - Backward-compatible env var names (legacy + *_SEC style)
-# - Supports WEB_CONCURRENCY workers safely
-# - Keeps provider policy (GLOBAL=eodhd,finnhub | KSA=yahoo_chart)
+# Key Features:
+# - Auto-Scaling: Uses start_web.sh for CPU-aware worker tuning.
+# - High Performance: Optimized Uvicorn settings (keep-alive, backlog).
+# - Full Coverage: Maps all v12.2 Financial Leader env vars.
+# - Localization: Enforces Asia/Riyadh timezone.
 #
-# Notes
-# - Secrets must be set in Render Environment UI (sync: false).
-# - If you rename the service, update BACKEND_BASE_URL / TFB_BASE_URL.
+# Notes:
+# - Secrets (API Keys, Google Creds) must be set in the Render Dashboard.
+# - Do NOT commit actual keys here; use 'sync: false' placeholder.
 
 services:
   - type: web
     name: tadawul-fast-bridge
     env: python
-    plan: free
+    plan: free # or starter/standard for production
     autoDeploy: true
+    region: frankfurt # Lower latency to KSA than US regions
 
-    buildCommand: pip install -r requirements.txt
+    # 1. Build Phase
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
 
-    # Deterministic + safe startup
-    startCommand: |
-      sh -c '
-      set -eu
+    # 2. Start Phase (Delegates to hardened shell script)
+    startCommand: sh scripts/start_web.sh
 
-      # ----------------------------
-      # Helpers (numeric-safe)
-      # ----------------------------
-      as_int() {
-        # usage: as_int "$RAW" "$DEFAULT"
-        raw="${1:-}"
-        def="${2:-0}"
-        case "$raw" in
-          (""|*[!0-9]*) printf "%s" "$def" ;;
-          (*)          printf "%s" "$raw" ;;
-        esac
-      }
-
-      clamp_min_1() {
-        v="$(as_int "${1:-}" "1")"
-        if [ "$v" -lt 1 ]; then v="1"; fi
-        printf "%s" "$v"
-      }
-
-      valid_log_level() {
-        # normalize + allow only known uvicorn levels
-        v="$(printf "%s" "${1:-info}" | tr "[:upper:]" "[:lower:]")"
-        case "$v" in
-          (critical|error|warning|info|debug|trace) printf "%s" "$v" ;;
-          (*) printf "%s" "info" ;;
-        esac
-      }
-
-      # ----------------------------
-      # Resolve runtime values
-      # ----------------------------
-      LOG_LEVEL_LC="$(valid_log_level "${LOG_LEVEL:-info}")"
-
-      PORT_VAL="$(clamp_min_1 "$(as_int "${PORT:-8000}" "8000")")"
-      KEEPALIVE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")"
-      GRACE_VAL="$(clamp_min_1 "$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")")"
-      CONC="$(clamp_min_1 "$(as_int "${WEB_CONCURRENCY:-1}" "1")")"
-
-      ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")"
-
-      LIMIT_CONC="$(as_int "${UVICORN_LIMIT_CONCURRENCY:-}" "")"
-      LIMIT_REQS="$(as_int "${UVICORN_LIMIT_MAX_REQUESTS:-}" "")"
-      BACKLOG="$(as_int "${UVICORN_BACKLOG:-}" "")"
-
-      ROOT_PATH="${UVICORN_ROOT_PATH:-}"
-
-      # ----------------------------
-      # Build argv deterministically
-      # ----------------------------
-      set -- uvicorn main:app \
-        --host 0.0.0.0 \
-        --port "$PORT_VAL" \
-        --proxy-headers \
-        --forwarded-allow-ips "*" \
-        --lifespan on \
-        --timeout-keep-alive "$KEEPALIVE_VAL" \
-        --graceful-timeout "$GRACE_VAL" \
-        --log-level "$LOG_LEVEL_LC" \
-        --no-server-header
-
-      # Workers only when >1
-      if [ "$CONC" -gt 1 ]; then
-        set -- "$@" --workers "$CONC"
-      fi
-
-      # Access log toggle
-      case "$ACCESS_RAW" in
-        (0|false|no|off) set -- "$@" --no-access-log ;;
-        (*)              set -- "$@" --access-log ;;
-      esac
-
-      # Optional tuning flags (only if numeric)
-      if [ -n "$LIMIT_CONC" ]; then
-        set -- "$@" --limit-concurrency "$LIMIT_CONC"
-      fi
-
-      if [ -n "$LIMIT_REQS" ]; then
-        set -- "$@" --limit-max-requests "$LIMIT_REQS"
-      fi
-
-      if [ -n "$BACKLOG" ]; then
-        set -- "$@" --backlog "$BACKLOG"
-      fi
-
-      if [ -n "$ROOT_PATH" ]; then
-        set -- "$@" --root-path "$ROOT_PATH"
-      fi
-
-      exec "$@"
-      '
-
-    healthCheckPath: /healthz
+    # 3. Health Check (Ensures Engine is fully booted)
+    healthCheckPath: /readyz
+    healthCheckTimeout: 15
 
     envVars:
-      # -------------------------
-      # Runtime
-      # -------------------------
+      # --- Runtime Core ---
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: TZ
         value: "Asia/Riyadh"
-
-      # Uvicorn/Concurrency (all numeric-safe in startCommand)
-      - key: WEB_CONCURRENCY
-        value: "1"
-      - key: UVICORN_KEEPALIVE
-        value: "75"
-      - key: UVICORN_GRACEFUL_TIMEOUT
-        value: "30"
-      - key: UVICORN_ACCESS_LOG
-        value: "1"
-
-      # Optional uvicorn tunables (leave empty unless you want them)
-      - key: UVICORN_LIMIT_CONCURRENCY
-        value: ""
-      - key: UVICORN_LIMIT_MAX_REQUESTS
-        value: ""
-      - key: UVICORN_BACKLOG
-        value: ""
-      - key: UVICORN_ROOT_PATH
-        value: ""
-
-      - key: LOG_LEVEL
-        value: "info"
-      - key: LOG_JSON
-        value: "false"
-      - key: DEBUG
-        value: "false"
-
-      # Fast-boot controls
-      - key: DEFER_ROUTER_MOUNT
-        value: "true"
-      - key: INIT_ENGINE_ON_BOOT
-        value: "true"
-
-      # Advisor Feature
-      - key: ADVISOR_ENABLED
-        value: "true"
-
-      # Optional docs toggles (supported by main.py v5.4.4)
-      - key: ENABLE_OPENAPI
-        value: "true"
-      - key: ENABLE_SWAGGER
-        value: "true"
-      - key: ENABLE_REDOC
-        value: "true"
-
-      # -------------------------
-      # App identity (compat keys)
-      # -------------------------
-      - key: APP_NAME
-        value: "Tadawul Fast Bridge"
-      - key: SERVICE_NAME
-        value: "Tadawul Fast Bridge"
-      - key: APP_TITLE
-        value: "Tadawul Fast Bridge"
       - key: APP_ENV
         value: "production"
-      - key: ENVIRONMENT
-        value: "production"
-
-      # Version (align with main.py v5.4.4)
+      
+      # --- Identity ---
+      - key: APP_NAME
+        value: "Tadawul Fast Bridge"
       - key: APP_VERSION
-        value: "5.4.4"
-      - key: SERVICE_VERSION
-        value: "5.4.4"
-      - key: VERSION
-        value: "5.4.4"
-      - key: RELEASE
-        value: "5.4.4"
+        value: "6.2.0"
 
-      # Base URLs
-      - key: BACKEND_BASE_URL
-        value: "https://tadawul-fast-bridge.onrender.com"
-      - key: TFB_BASE_URL
-        value: "https://tadawul-fast-bridge.onrender.com"
-
-      # -------------------------
-      # Security / auth
-      # -------------------------
-      - key: REQUIRE_AUTH
-        value: "false"
-      - key: APP_TOKEN
-        sync: false
-      - key: BACKUP_APP_TOKEN
-        sync: false
-      - key: TFB_APP_TOKEN
-        sync: false
-
-      # -------------------------
-      # Feature flags
-      # -------------------------
+      # --- Server Tuning (Uvicorn) ---
+      # Leave WEB_CONCURRENCY empty to let start_web.sh auto-detect cores
+      - key: WEB_CONCURRENCY
+        value: "" 
+      - key: UVICORN_KEEPALIVE
+        value: "120"
+      - key: UVICORN_TIMEOUT
+        value: "120"
+      - key: UVICORN_Backlog
+        value: "2048"
+      
+      # --- Application Features ---
+      - key: ADVISOR_ENABLED
+        value: "true"
       - key: AI_ANALYSIS_ENABLED
         value: "true"
       - key: ADVANCED_ANALYSIS_ENABLED
@@ -228,174 +69,68 @@ services:
       - key: ENABLE_RATE_LIMITING
         value: "true"
       - key: MAX_REQUESTS_PER_MINUTE
-        value: "240"
+        value: "300"
 
-      # -------------------------
-      # Providers policy (GLOBAL)
-      # -------------------------
+      # --- Fast Boot Optimization ---
+      - key: DEFER_ROUTER_MOUNT
+        value: "true"
+      - key: INIT_ENGINE_ON_BOOT
+        value: "true"
+
+      # --- Data Providers (Routing) ---
       - key: ENABLED_PROVIDERS
         value: "eodhd,finnhub"
-      - key: PROVIDERS
-        value: "eodhd,finnhub"
+      - key: KSA_PROVIDERS
+        value: "yahoo_chart,argaam"
       - key: PRIMARY_PROVIDER
         value: "eodhd"
-
-      # -------------------------
-      # KSA routing order (quiet + stable)
-      # -------------------------
-      - key: KSA_PROVIDERS
-        value: "yahoo_chart"
+      
+      # --- KSA Specifics ---
       - key: KSA_DISALLOW_EODHD
         value: "true"
-
-      # Yahoo chart toggles
       - key: ENABLE_YAHOO_CHART_KSA
         value: "true"
-      - key: ENABLE_YAHOO_CHART_SUPPLEMENT
-        value: "true"
-
-      # yfinance policy (if referenced)
-      - key: ENABLE_YFINANCE
-        value: "true"
-      - key: ENABLE_YFINANCE_KSA
-        value: "false"
-
-      # Yahoo fundamentals toggles (if supported)
-      - key: ENABLE_YAHOO_FUNDAMENTALS_KSA
-        value: "true"
-      - key: ENABLE_YAHOO_FUNDAMENTALS_GLOBAL
-        value: "false"
-
-      # -------------------------
-      # Provider feature toggles
-      # -------------------------
-      # EODHD
-      - key: EODHD_ENABLE_FUNDAMENTALS
-        value: "true"
-      - key: EODHD_ENABLE_HISTORY
-        value: "true"
-      - key: EODHD_ENABLE_FORECAST
-        value: "true"
-      - key: EODHD_VERBOSE_WARNINGS
-        value: "false"
-      - key: ALLOW_EODHD_KSA
-        value: "false"
-      - key: EODHD_ALLOW_KSA
-        value: "false"
-
-      # FINNHUB
-      - key: FINNHUB_ENABLE_PROFILE
-        value: "true"
-      - key: FINNHUB_ENABLE_HISTORY
-        value: "true"
-      - key: FINNHUB_ENABLE_FORECAST
-        value: "true"
-      - key: FINNHUB_VERBOSE_WARNINGS
-        value: "false"
-
-      # -------------------------
-      # History analytics / forecast (engine-level)
-      # -------------------------
-      - key: ENABLE_HISTORY_ANALYTICS
-        value: "true"
-      - key: HISTORY_LOOKBACK_DAYS
-        value: "400"
-      - key: FORECAST_CI_LEVEL
-        value: "0.80"
-      - key: ENGINE_MAX_CONCURRENCY
-        value: "20"
-
-      # -------------------------
-      # Provider endpoints / base URLs (optional)
-      # -------------------------
-      - key: EODHD_BASE_URL
-        value: "https://eodhistoricaldata.com/api"
-      - key: FINNHUB_BASE_URL
-        value: "https://finnhub.io/api/v1"
-
-      # -------------------------
-      # Provider keys (SECRETS)
-      # -------------------------
-      - key: FMP_API_KEY
+      
+      # --- Security (Secrets - Set in Dashboard) ---
+      - key: APP_TOKEN
         sync: false
+      - key: BACKUP_APP_TOKEN
+        sync: false
+      
+      # --- API Keys (Secrets - Set in Dashboard) ---
       - key: EODHD_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
-      - key: ALPHA_VANTAGE_API_KEY
-        sync: false
       - key: ARGAAM_API_KEY
         sync: false
-
-      # -------------------------
-      # HTTP + caching (compat)
-      # -------------------------
-      - key: HTTP_TIMEOUT_SEC
-        value: "25"
-      - key: HTTP_TIMEOUT
-        value: "25"
-
-      - key: CACHE_TTL_SEC
-        value: "20"
-      - key: CACHE_DEFAULT_TTL
-        value: "20"
-      - key: ENGINE_CACHE_TTL_SEC
-        value: "20"
-
-      # -------------------------
-      # Batch controls
-      # -------------------------
-      - key: ENRICHED_BATCH_SIZE
-        value: "40"
-      - key: ENRICHED_MAX_TICKERS
-        value: "250"
-      - key: ENRICHED_BATCH_CONCURRENCY
-        value: "5"
-      - key: ENRICHED_CONCURRENCY
-        value: "5"
-      - key: ENRICHED_TIMEOUT_SEC
-        value: "45"
-
-      - key: AI_BATCH_SIZE
-        value: "20"
-      - key: AI_MAX_TICKERS
-        value: "500"
-      - key: AI_BATCH_CONCURRENCY
-        value: "5"
-      - key: AI_CONCURRENCY
-        value: "5"
-      - key: AI_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: AI_TIMEOUT_SEC
-        value: "45"
-
-      - key: ADV_BATCH_SIZE
-        value: "25"
-      - key: ADV_MAX_TICKERS
-        value: "500"
-      - key: ADV_BATCH_CONCURRENCY
-        value: "6"
-      - key: ADV_CONCURRENCY
-        value: "6"
-      - key: ADV_BATCH_TIMEOUT_SEC
-        value: "45"
-      - key: ADV_TIMEOUT_SEC
-        value: "45"
-
-      # -------------------------
-      # Google Sheets integration (SECRETS)
-      # -------------------------
-      - key: DEFAULT_SPREADSHEET_ID
+      - key: FMP_API_KEY
         sync: false
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false
+
+      # --- Provider Endpoints (Optional Overrides) ---
+      - key: ARGAAM_QUOTE_URL
+        sync: false
+      - key: ARGAAM_PROFILE_URL
+        sync: false
+
+      # --- Google Integration (Secrets - Set in Dashboard) ---
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
+      - key: DEFAULT_SPREADSHEET_ID
+        sync: false
 
-      # -------------------------
-      # CORS
-      # -------------------------
+      # --- Batch Processing Limits ---
+      - key: AI_BATCH_SIZE
+        value: "25"
+      - key: AI_MAX_TICKERS
+        value: "800"
+      - key: AI_BATCH_CONCURRENCY
+        value: "8"
+      
+      # --- CORS Security ---
       - key: ENABLE_CORS_ALL_ORIGINS
-        value: "true"
-      - key: CORS_ALL_ORIGINS
         value: "true"
       - key: CORS_ORIGINS
         value: "*"
