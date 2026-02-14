@@ -1,8 +1,8 @@
-# core/scoring_engine.py  — FULL REPLACEMENT — v1.7.0
+# core/scoring_engine.py  — FULL REPLACEMENT — v1.7.1
 """
 core/scoring_engine.py
 ===========================================================
-Advanced Scoring & Forecasting Engine (v1.7.0)
+Advanced Scoring & Forecasting Engine (v1.7.1)
 (Emad Bahbah – Financial Leader Edition)
 
 Generates professional-grade quantitative scores:
@@ -10,16 +10,12 @@ Generates professional-grade quantitative scores:
 - Overall Score & Recommendation (BUY/HOLD/REDUCE/SELL)
 - Confidence (Data depth + Source reliability)
 
-v1.7.0 Enhancements:
-- ✅ News Integration: Blends `news_score` into Momentum/Overall scores.
-- ✅ Liquidity Guard: Penalizes Risk Score for low-liquidity assets.
-- ✅ Explainability: Generates `scoring_reason` string (e.g. "Undervalued, Positive News").
-- ✅ Valuation Logic: Improved handling for negative earnings vs growth.
-- ✅ Canonical Forecasts: Generates standardized 1M/3M/12M targets.
-
-Usage:
-    from core.scoring_engine import enrich_with_scores
-    q_enriched = enrich_with_scores(q_unified)
+v1.7.1 Enhancements (Advanced Analytics):
+- ✅ **Trend Integration**: Uses `trend_signal` (UPTREND/DOWNTREND) to weight Opportunity/Risk.
+- ✅ **Technical Boost**: Uses MACD Histogram and RSI for precise momentum scoring.
+- ✅ **News Intelligence**: Blends `news_score` into scores (if available).
+- ✅ **Liquidity Guard**: Penalizes Risk Score for low-liquidity assets.
+- ✅ **Explainability**: Generates rich `scoring_reason` strings.
 """
 
 from __future__ import annotations
@@ -39,7 +35,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCORING_ENGINE_VERSION = "1.7.0"
+SCORING_ENGINE_VERSION = "1.7.1"
 
 # Recommendation enum (MUST match routers normalization)
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
@@ -63,7 +59,7 @@ class AssetScores(BaseModel):
     opportunity_score: float = Field(50.0, ge=0, le=100)
     overall_score: float = Field(50.0, ge=0, le=100)
     recommendation: str = Field("HOLD")
-    scoring_reason: str = Field("")  # New in v1.7.0
+    scoring_reason: str = Field("")
 
     confidence: float = Field(50.0, ge=0, le=100)
 
@@ -297,6 +293,7 @@ def _compute_forecast(
     forecast_conf_in: Optional[float],
     confidence_fallback: float,
     risk_score: float,
+    trend_signal: str,
     forecast_updated_utc: Optional[str],
 ) -> Dict[str, Any]:
     """
@@ -305,12 +302,6 @@ def _compute_forecast(
       - forecast_price_* (price): derived from gross returns
       - expected_roi_* (%): "Expected ROI %" risk+confidence adjusted (SHEETS)
       - forecast_confidence (0..100), forecast_method, forecast_updated_utc
-
-    COMPAT:
-      - expected_price_* (alias of forecast_price_*)
-      - expected_return_* (alias of expected_roi_*)
-      - confidence_score (alias of forecast_confidence)
-      - expected_return_gross_* (%): unadjusted horizon returns (audit)
     """
     out: Dict[str, Any] = {}
 
@@ -340,15 +331,28 @@ def _compute_forecast(
     # 4) Forecast confidence:
     fc = forecast_conf_in if forecast_conf_in is not None else confidence_fallback
     fc = _clamp(fc, 0.0, 100.0, 50.0)
+    
+    # Advanced: Boost confidence if trend aligns with forecast direction
+    # If forecasting UP and Trend is UPTREND -> Confidence++
+    if trend_signal == "UPTREND" and er3_gross > 0:
+        fc = min(100.0, fc * 1.1)
+    # If forecasting UP but Trend is DOWNTREND -> Confidence--
+    elif trend_signal == "DOWNTREND" and er3_gross > 0:
+        fc = max(10.0, fc * 0.8)
 
     # 5) Risk adjustment (higher risk => lower expected ROI)
     # risk_score: 0..100 => multiplier ~ 1.00..0.25 (floored)
     risk_mult = max(0.25, 1.0 - (risk_score / 140.0))
+    
+    # Advanced: Penalize ROI if fighting the trend
+    trend_mult = 1.0
+    if trend_signal == "DOWNTREND" and er3_gross > 0:
+        trend_mult = 0.8  # dampen bullish forecast in downtrend
 
-    # 6) Expected ROI% (risk + confidence adjusted)  [already in percent scale]
-    roi1 = er1_gross * (fc / 100.0) * risk_mult
-    roi3 = er3_gross * (fc / 100.0) * risk_mult
-    roi12 = er12_gross * (fc / 100.0) * risk_mult
+    # 6) Expected ROI% (risk + confidence + trend adjusted)
+    roi1 = er1_gross * (fc / 100.0) * risk_mult * trend_mult
+    roi3 = er3_gross * (fc / 100.0) * risk_mult * trend_mult
+    roi12 = er12_gross * (fc / 100.0) * risk_mult * trend_mult
 
     out.update(
         {
@@ -368,7 +372,7 @@ def _compute_forecast(
             "expected_roi_12m": float(roi12),
 
             "forecast_confidence": float(fc),
-            "forecast_method": str(forecast_method_in or "simple_horizon_scaling_v2"),
+            "forecast_method": str(forecast_method_in or "trend_aware_horizon_scaling"),
             "forecast_updated_utc": str(forecast_updated_utc) if forecast_updated_utc else None,
 
             # COMPAT aliases
@@ -446,6 +450,10 @@ def compute_scores(q: Any) -> AssetScores:
     vol = _to_percent(_get_any(q, "volatility_30d", "vol_30d_ann", "vol30d", "vol_30d"))
     rsi = _to_float(_get_any(q, "rsi_14", "rsi14"))
 
+    # Advanced Tech: Trend & MACD (v1.7.1)
+    trend_sig = str(_get_any(q, "trend_signal") or "NEUTRAL").upper()
+    macd_hist = _to_float(_get_any(q, "macd_hist"))
+
     # Momentum / price context
     pc = _to_percent(_get_any(q, "percent_change", "change_percent", "change_pct", "pct_change"))
 
@@ -480,7 +488,16 @@ def compute_scores(q: Any) -> AssetScores:
         if cand is not None and cand > 0:
             pe_like = cand
             break
-    if pe_like is not None:
+    
+    # Advanced Valuation: If P/E missing or negative but Growth is high, use P/S
+    if pe_like is None and ps is not None and (rev_g or 0) > 15.0:
+        ps_val = _score_band_linear(
+            ps,
+            bands=[(0.7, 75.0), (1.5, 65.0), (3.0, 55.0), (6.0, 45.0), (10.0, 35.0), (20.0, 25.0)],
+        )
+        value_score = 0.70 * value_score + 0.30 * ps_val
+        reasons.append("Valuation: Growth (P/S)")
+    elif pe_like is not None:
         pe_val = _score_band_linear(
             pe_like,
             bands=[(5.0, 85.0), (10.0, 75.0), (18.0, 60.0), (25.0, 50.0), (40.0, 35.0), (60.0, 25.0)],
@@ -493,13 +510,6 @@ def compute_scores(q: Any) -> AssetScores:
             bands=[(0.6, 80.0), (1.0, 70.0), (2.0, 60.0), (4.0, 50.0), (6.0, 40.0), (10.0, 30.0)],
         )
         value_score = 0.80 * value_score + 0.20 * pb_val
-
-    if ps is not None and ps > 0:
-        ps_val = _score_band_linear(
-            ps,
-            bands=[(0.7, 75.0), (1.5, 65.0), (3.0, 55.0), (6.0, 45.0), (10.0, 35.0), (20.0, 25.0)],
-        )
-        value_score = 0.85 * value_score + 0.15 * ps_val
 
     if ev is not None and ev > 0:
         ev_val = _score_band_linear(
@@ -616,6 +626,16 @@ def compute_scores(q: Any) -> AssetScores:
         elif 50 < rsi < 70:
             momentum_score += 5
 
+    # Advanced Tech: MACD / Trend Boost
+    if macd_hist is not None and macd_hist > 0:
+        momentum_score += 5.0  # Bullish momentum building
+    
+    if trend_sig == "UPTREND":
+        momentum_score += 10.0
+        reasons.append("Uptrend")
+    elif trend_sig == "DOWNTREND":
+        momentum_score -= 10.0
+
     # News Impact on Momentum
     if news_score is not None:
         # news_score is often -5 to +5 boost
@@ -650,6 +670,10 @@ def compute_scores(q: Any) -> AssetScores:
         risk_score = 0.80 * risk_score + 0.20 * _score_band_linear(
             dte, bands=[(0.0, 40.0), (0.5, 45.0), (1.0, 52.0), (1.5, 60.0), (2.5, 75.0), (4.0, 88.0)]
         )
+        
+    # Advanced: Trend Risk
+    if trend_sig == "DOWNTREND":
+        risk_score += 10.0 # Fighting the trend is risky
 
     if liq is not None:
         if liq < 30:
@@ -736,6 +760,7 @@ def compute_scores(q: Any) -> AssetScores:
         forecast_conf_in=forecast_conf_in,
         confidence_fallback=confidence,
         risk_score=risk_score,
+        trend_signal=trend_sig, # Pass trend signal
         forecast_updated_utc=str(forecast_updated_utc) if forecast_updated_utc else None,
     )
 
