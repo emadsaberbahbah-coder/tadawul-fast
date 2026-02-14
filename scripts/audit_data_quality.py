@@ -3,15 +3,16 @@
 """
 audit_data_quality.py
 ===========================================================
-TADAWUL FAST BRIDGE – DATA QUALITY AUDITOR (v1.0.0)
+TADAWUL FAST BRIDGE – DATA & STRATEGY AUDITOR (v1.1.0)
 ===========================================================
 FINANCIAL LEADER EDITION
 
 Purpose:
 - Scans all configured symbols in your Dashboards.
 - Identifies "Zombie" tickers (stale data, zero price, delisted).
+- **NEW**: Performs "System Self-Review" by back-testing current scores against realized performance.
 - Flags low-quality forecasts (low confidence, missing history).
-- Generates a "Clean-Up Report" to help you maintain a high-performance sheet.
+- Generates a "Clean-Up Report" and "Strategy Performance" summary.
 
 Usage:
   python scripts/audit_data_quality.py
@@ -62,7 +63,7 @@ except ImportError as e:
 # =============================================================================
 # Audit Rules & Logic
 # =============================================================================
-AUDIT_VERSION = "1.0.0"
+AUDIT_VERSION = "1.1.0"
 
 # Thresholds for "Bad Data"
 THRESHOLDS = {
@@ -88,8 +89,41 @@ def _is_stale(last_updated: Optional[str]) -> bool:
     delta = datetime.now(timezone.utc) - dt
     return delta.total_seconds() > (THRESHOLDS["stale_hours"] * 3600)
 
+def _perform_self_review(q: Dict[str, Any]) -> List[str]:
+    """
+    Analyzes the 'Strategy Quality' by comparing scores vs reality.
+    This creates a feedback loop for self-learning.
+    """
+    reviews = []
+    
+    # 1. Momentum Validation (Did high momentum align with recent gains?)
+    # Score 0-100 vs Returns %
+    mom_score = float(q.get("momentum_score") or 50)
+    ret_1m = float(q.get("returns_1m") or 0)
+    
+    if mom_score > 75 and ret_1m < -5.0:
+        reviews.append("MOM_FAIL_BULL") # System said UP, Market went DOWN
+    elif mom_score < 25 and ret_1m > 5.0:
+        reviews.append("MOM_FAIL_BEAR") # System said DOWN, Market went UP
+        
+    # 2. Risk Calibration (Did high risk score match high volatility?)
+    risk_score = float(q.get("risk_score") or 50)
+    vol_30d = float(q.get("volatility_30d") or 0)
+    
+    if risk_score > 80 and vol_30d < 15.0:
+        reviews.append("RISK_OVEREST") # Flagging safe stocks as risky?
+    elif risk_score < 30 and vol_30d > 50.0:
+        reviews.append("RISK_UNDEREST") # Missing dangerous volatility?
+        
+    # 3. Forecast Plausibility (Is the 1M target unrealistically far from trend?)
+    exp_roi_1m = float(q.get("expected_roi_1m") or 0)
+    if exp_roi_1m > 20.0 and ret_1m < -10.0:
+        reviews.append("FCST_CONTRARIAN") # Betting on a massive V-shape recovery
+
+    return reviews
+
 def _audit_quote(symbol: str, q: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyzes a single quote for quality issues."""
+    """Analyzes a single quote for quality issues AND strategy performance."""
     issues = []
     
     # 1. Price Integrity
@@ -115,17 +149,23 @@ def _audit_quote(symbol: str, q: Dict[str, Any]) -> Dict[str, Any]:
     err = q.get("error")
     if err:
         issues.append(f"PROVIDER_ERROR: {str(err)[:30]}...")
-
+        
+    # 5. Self Review (Strategy Check)
+    strategy_notes = _perform_self_review(q)
+    
     status = "OK"
     if "ZERO_PRICE" in issues or "PROVIDER_ERROR" in issues:
         status = "CRITICAL"
     elif issues:
         status = "WARNING"
+    elif strategy_notes:
+        status = "REVIEW" # Data is good, but strategy might be misaligned
 
     return {
         "symbol": symbol,
         "status": status,
         "issues": issues,
+        "strategy_notes": strategy_notes,
         "price": price,
         "last_updated": last_upd,
         "source": q.get("data_source", "unknown"),
@@ -141,10 +181,10 @@ async def _run_audit(keys: List[str], sid: str):
         logger.error("Failed to initialize Data Engine.")
         return
 
-    logger.info("🚀 Starting Data Quality Audit (v%s)", AUDIT_VERSION)
-    logger.info("   Thresholds: Stale > %dh | Min Price < %.2f", THRESHOLDS["stale_hours"], THRESHOLDS["min_price"])
+    logger.info("🚀 Starting Data Quality & Strategy Audit (v%s)", AUDIT_VERSION)
     
     all_reports = []
+    strategy_stats = {"reviewed": 0, "divergences": 0}
     
     for key in keys:
         logger.info("🔍 Scanning Page: %s", key)
@@ -166,8 +206,6 @@ async def _run_audit(keys: List[str], sid: str):
         # Using batch fetch from engine
         if hasattr(engine, "get_enriched_quotes"):
             quotes_list = await engine.get_enriched_quotes(symbols, refresh=True)
-            # Map list back to dict for easier access if needed, or iterate
-            # get_enriched_quotes returns a list in order
             quotes_map = {s: q for s, q in zip(symbols, quotes_list)}
         else:
             # Fallback serial
@@ -182,19 +220,23 @@ async def _run_audit(keys: List[str], sid: str):
             report = _audit_quote(sym, q)
             report["origin_page"] = key
             
+            if report["strategy_notes"]:
+                strategy_stats["divergences"] += 1
+            strategy_stats["reviewed"] += 1
+            
             if report["status"] != "OK":
                 page_issues += 1
                 all_reports.append(report)
         
-        logger.info("   -> Found %d issues on %s", page_issues, key)
+        logger.info("   -> Found %d issues/alerts on %s", page_issues, key)
 
-    return all_reports
+    return all_reports, strategy_stats
 
 # =============================================================================
 # Main
 # =============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="TFB Data Quality Auditor")
+    parser = argparse.ArgumentParser(description="TFB Data Quality & Strategy Auditor")
     parser.add_argument("--keys", nargs="*", default=None, help="Specific pages to audit")
     parser.add_argument("--json-out", help="Save report to JSON file")
     parser.add_argument("--sheet-id", help="Override Spreadsheet ID")
@@ -216,7 +258,7 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        reports = loop.run_until_complete(_run_audit(target_keys, sid))
+        reports, stats = loop.run_until_complete(_run_audit(target_keys, sid))
     finally:
         loop.close()
 
@@ -225,20 +267,35 @@ def main():
         logger.info("\n✅ AUDIT COMPLETE: No data quality issues found! Your dashboard is clean.")
         return
 
-    logger.info("\n=== ⚠️  AUDIT REPORT: %d ISSUES FOUND ===", len(reports))
-    print(f"{'SYMBOL':<12} | {'STATUS':<10} | {'SOURCE':<10} | {'ISSUES'}")
+    logger.info("\n=== ⚠️  AUDIT REPORT: %d ITEMS ===", len(reports))
+    print(f"{'SYMBOL':<12} | {'STATUS':<10} | {'SOURCE':<10} | {'DETAILS'}")
     print("-" * 80)
     
     for r in reports:
-        issues_str = ", ".join(r["issues"])
-        print(f"{r['symbol']:<12} | {r['status']:<10} | {r['source']:<10} | {issues_str}")
+        # Combine issues and strategy notes
+        details = r["issues"] + r["strategy_notes"]
+        details_str = ", ".join(details)
+        print(f"{r['symbol']:<12} | {r['status']:<10} | {r['source']:<10} | {details_str}")
 
     print("-" * 80)
-    logger.info("Recommendation: Remove 'CRITICAL' symbols from your sheets to improve sync speed.")
+    
+    # Self-Learning / Strategy Review Section
+    div_rate = (stats['divergences'] / stats['reviewed'] * 100) if stats['reviewed'] else 0
+    logger.info("🧠 SYSTEM SELF-REVIEW:")
+    logger.info(f"   Analyzed {stats['reviewed']} assets.")
+    logger.info(f"   Strategy Divergence Rate: {div_rate:.1f}%")
+    if div_rate > 20:
+        logger.warning("   -> High divergence detected. Consider adjusting Scoring Engine weights.")
+    else:
+        logger.info("   -> Strategy is tracking well with market reality.")
     
     if args.json_out:
         with open(args.json_out, "w") as f:
-            json.dump({"audit_time": _utc_now_iso(), "issues": reports}, f, indent=2)
+            json.dump({
+                "audit_time": _utc_now_iso(), 
+                "stats": stats,
+                "issues": reports
+            }, f, indent=2)
         logger.info("Report saved to %s", args.json_out)
 
 def _utc_now_iso():
