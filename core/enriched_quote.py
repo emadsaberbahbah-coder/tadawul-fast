@@ -1,7 +1,7 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.8.0
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.9.0
 Emad Bahbah — Financial Leader Edition
 
 What this module is for
@@ -10,10 +10,22 @@ What this module is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.8.0 enhancements (this revision)
-- ✅ Aligned ROI Keys: Prioritizes 'forecast_price_3m/12m' to match v12.2 standards.
-- ✅ Scoring Preservation: Respects pre-calculated scores from the v1.6.1 engine.
-- ✅ Riyadh Localization: Ensures 'Last Updated (Riyadh)' is consistently populated.
+✅ v2.9.0 enhancements (this revision)
+- ✅ Query parsing is more robust:
+    * Supports comma/space strings AND repeated query params:
+      /v1/enriched/quotes?symbols=AAPL&symbols=MSFT
+      /v1/enriched/quotes?tickers=1120.SR&tickers=2222.SR
+    * Accepts aliases: symbols/tickers/symbol (best-effort)
+- ✅ Batch unwrapping is more robust:
+    * Handles engine batch returns as list, dict, or dict with {"items":[...]}
+- ✅ Optional sheet-ready output:
+    * include_headers=1 to return headers
+    * include_rows=1 to return rows aligned to ENRICHED_HEADERS_59
+- ✅ Stronger payload finalization:
+    * Fills origin default (KSA_TADAWUL / GLOBAL_MARKETS)
+    * Better data_quality heuristic (MISSING/PARTIAL/GOOD)
+    * Adds requested_symbol to each item (stable mapping for Sheets)
+- ✅ Riyadh localization hardened with fallback to +03:00 if ZoneInfo not available
 
 NOTE
 - This module is intentionally “compat + sheet-mapper”. Your newer sheet endpoints should use:
@@ -38,7 +50,7 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("core.enriched_quote")
 
-ROUTER_VERSION = "2.8.0"
+ROUTER_VERSION = "2.9.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
@@ -213,6 +225,70 @@ def _unwrap_tuple_payload(x: Any) -> Any:
     return x
 
 
+def _unwrap_engine_container(x: Any) -> Any:
+    """
+    Engines sometimes return:
+      - list[payload]
+      - dict[symbol->payload]
+      - dict with {"items":[payload], ...}
+      - dict with {"data":[...], ...}
+    This helper unwraps common containers safely.
+    """
+    x = _unwrap_tuple_payload(x)
+    if isinstance(x, dict):
+        for k in ("items", "data", "quotes", "results"):
+            v = x.get(k)
+            if isinstance(v, (list, dict)):
+                return v
+    return x
+
+
+def _getlist_any(request: Request, *names: str) -> List[str]:
+    out: List[str] = []
+    try:
+        qp = request.query_params
+        for n in names:
+            try:
+                vals = qp.getlist(n)  # type: ignore[attr-defined]
+            except Exception:
+                vals = []
+            for v in vals or []:
+                if v is not None and str(v).strip():
+                    out.append(str(v).strip())
+    except Exception:
+        return out
+    return out
+
+
+def _extract_symbols_from_request(request: Request, symbols_fallback: Optional[str]) -> List[str]:
+    """
+    Supports:
+      - symbols=comma/space list
+      - repeated: ?symbols=AAPL&symbols=MSFT
+      - tickers alias: ?tickers=1120.SR&tickers=2222.SR
+      - also accepts 'symbol' (single or repeated) best-effort
+    """
+    raw_chunks: List[str] = []
+    raw_chunks.extend(_getlist_any(request, "symbols", "tickers", "symbol"))
+    if symbols_fallback:
+        raw_chunks.append(symbols_fallback)
+
+    out: List[str] = []
+    for chunk in raw_chunks:
+        out.extend(_split_symbols(chunk))
+    # de-empty + preserve order
+    cleaned: List[str] = []
+    seen: set = set()
+    for s in out:
+        s2 = (s or "").strip()
+        if not s2:
+            continue
+        if s2 not in seen:
+            seen.add(s2)
+            cleaned.append(s2)
+    return cleaned
+
+
 # =============================================================================
 # Recommendation normalization (ONE ENUM everywhere)
 # =============================================================================
@@ -377,6 +453,9 @@ def _parse_iso_dt(x: Any) -> Optional[datetime]:
     try:
         if isinstance(x, datetime):
             dt = x
+        elif isinstance(x, (int, float)):
+            # epoch seconds (best-effort)
+            dt = datetime.fromtimestamp(float(x), tz=timezone.utc)
         else:
             s = str(x).strip()
             if s.endswith("Z"):
@@ -409,7 +488,12 @@ def _to_riyadh_iso(utc_any: Any) -> Optional[str]:
         tz = ZoneInfo("Asia/Riyadh")
         return dt.astimezone(tz).isoformat()
     except Exception:
-        return None
+        # fallback fixed offset (+03:00) – Saudi has no DST
+        try:
+            tz = timezone(timedelta(hours=3))
+            return dt.astimezone(tz).isoformat()
+        except Exception:
+            return None
 
 
 # =============================================================================
@@ -590,6 +674,36 @@ def _payload_symbol_key(p: Dict[str, Any]) -> str:
     return ""
 
 
+def _origin_default_from_payload(p: Dict[str, Any]) -> str:
+    sym = str(p.get("symbol_normalized") or p.get("symbol") or "").upper()
+    mkt = str(p.get("market") or p.get("market_region") or "").upper()
+    if sym.endswith(".SR") or mkt == "KSA" or mkt == "SA" or mkt == "TADAWUL":
+        return "KSA_TADAWUL"
+    if sym.startswith("^") or "=" in sym:
+        return "GLOBAL_MARKETS"
+    return "GLOBAL_MARKETS"
+
+
+def _has_price(p: Dict[str, Any]) -> bool:
+    return _safe_get(p, "current_price", "last_price", "price") is not None
+
+
+def _compute_data_quality(p: Dict[str, Any]) -> str:
+    """
+    Minimal, stable heuristic (do not overfit):
+      - MISSING: no price
+      - GOOD: price + (market_cap OR volume) + (prev_close OR day_high/day_low)
+      - PARTIAL: otherwise (but has price)
+    """
+    if not _has_price(p):
+        return "MISSING"
+    has_liq = _safe_get(p, "market_cap") is not None or _safe_get(p, "volume", "vol") is not None
+    has_ref = _safe_get(p, "previous_close", "prev_close", "prior_close") is not None or (
+        _safe_get(p, "day_high") is not None and _safe_get(p, "day_low") is not None
+    )
+    return "GOOD" if (has_liq and has_ref) else "PARTIAL"
+
+
 # =============================================================================
 # Header mapping (robust synonyms for your 59 columns)
 # =============================================================================
@@ -666,7 +780,10 @@ _HEADER_MAP: Dict[str, Tuple[Tuple[str, ...], Optional[Any]]] = {
     "rsi 14": (("rsi_14", "rsi14"), None),
     "rsi (14)": (("rsi_14", "rsi14"), None),
     # Valuation / scores
-    "fair value": (("fair_value", "forecast_price_3m", "forecast_price_12m", "expected_price_3m", "expected_price_12m", "ma200", "ma50"), None),
+    "fair value": (
+        ("fair_value", "forecast_price_3m", "forecast_price_12m", "expected_price_3m", "expected_price_12m", "ma200", "ma50"),
+        None,
+    ),
     "upside %": (("upside_percent",), _ratio_to_percent),
     "valuation label": (("valuation_label",), None),
     "value score": (("value_score",), None),
@@ -803,6 +920,20 @@ class EnrichedQuote:
         except Exception:
             pass
 
+        # --- origin default
+        try:
+            if not p.get("origin"):
+                p["origin"] = _origin_default_from_payload(p)
+        except Exception:
+            pass
+
+        # --- data_quality default
+        try:
+            if not p.get("data_quality"):
+                p["data_quality"] = _compute_data_quality(p)
+        except Exception:
+            pass
+
         # --- overall_score default
         try:
             if p.get("overall_score") is None:
@@ -813,13 +944,7 @@ class EnrichedQuote:
         return cls(p)
 
     def _origin_default(self) -> str:
-        sym = str(self.payload.get("symbol_normalized") or self.payload.get("symbol") or "").upper()
-        mkt = str(self.payload.get("market") or "").upper()
-        if sym.endswith(".SR") or mkt == "KSA":
-            return "KSA_TADAWUL"
-        if sym.startswith("^") or "=" in sym:
-            return "GLOBAL_MARKETS"
-        return "GLOBAL_MARKETS"
+        return _origin_default_from_payload(self.payload)
 
     def _value_for_header(self, header: str) -> Any:
         sch = _try_import_schemas()
@@ -1089,6 +1214,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
             if callable(fn):
                 try:
                     res = await _maybe_await(fn(symbol))
+                    res = _unwrap_engine_container(res)
                     return _unwrap_tuple_payload(res), f"app.state.engine.{fn_name}", None
                 except Exception as e:
                     last_err = _safe_error_message(e)
@@ -1103,6 +1229,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
         fn = getattr(eng2, "get_enriched_quote", None) or getattr(eng2, "get_quote", None)
         if callable(fn):
             res2 = await _maybe_await(fn(symbol))
+            res2 = _unwrap_engine_container(res2)
             return _unwrap_tuple_payload(res2), "core.data_engine_v2.get_engine().get_enriched_quote", None
     except Exception:
         pass
@@ -1116,6 +1243,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
             fn = getattr(tmp, "get_enriched_quote", None) or getattr(tmp, "get_quote", None)
             if callable(fn):
                 res3 = await _maybe_await(fn(symbol))
+                res3 = _unwrap_engine_container(res3)
                 return _unwrap_tuple_payload(res3), "core.data_engine_v2.DataEngine(temp)", None
         finally:
             aclose = getattr(tmp, "aclose", None)
@@ -1138,6 +1266,7 @@ async def _call_engine_best_effort(request: Request, symbol: str) -> Tuple[Optio
         from core.data_engine import get_enriched_quote as v1_get  # type: ignore
 
         res4 = await _maybe_await(v1_get(symbol))
+        res4 = _unwrap_engine_container(res4)
         return _unwrap_tuple_payload(res4), "core.data_engine.get_enriched_quote", None
     except Exception:
         pass
@@ -1168,6 +1297,7 @@ async def _call_engine_batch_best_effort(
             if callable(fn):
                 try:
                     res = await _maybe_await(fn(symbols_norm))
+                    res = _unwrap_engine_container(res)
                     res = _unwrap_tuple_payload(res)
                     if isinstance(res, (list, dict)):
                         return res, f"app.state.engine.{fn_name}", None
@@ -1184,6 +1314,7 @@ async def _call_engine_batch_best_effort(
         fn = getattr(eng2, "get_enriched_quotes", None) or getattr(eng2, "get_quotes", None)
         if callable(fn):
             res2 = await _maybe_await(fn(symbols_norm))
+            res2 = _unwrap_engine_container(res2)
             res2 = _unwrap_tuple_payload(res2)
             if isinstance(res2, (list, dict)):
                 return res2, "core.data_engine_v2.get_engine().get_enriched_quotes", None
@@ -1204,6 +1335,11 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         payload.setdefault("symbol", sym)
         payload["symbol_input"] = payload.get("symbol_input") or raw
         payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
+        payload["requested_symbol"] = raw  # stable mapping for sheet clients
+
+        # origin default
+        if not payload.get("origin"):
+            payload["origin"] = _origin_default_from_payload(payload)
 
         # recommendation enum
         payload["recommendation"] = _normalize_recommendation(payload.get("recommendation"))
@@ -1225,7 +1361,7 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         if not payload.get("data_source"):
             payload["data_source"] = source or "unknown"
         if not payload.get("data_quality"):
-            payload["data_quality"] = "MISSING" if payload.get("current_price") is None else "PARTIAL"
+            payload["data_quality"] = _compute_data_quality(payload)
 
         # timestamps
         if not payload.get("last_updated_utc"):
@@ -1303,6 +1439,8 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
                 "symbol": sym,
                 "symbol_input": raw,
                 "symbol_normalized": sym,
+                "requested_symbol": raw,
+                "origin": _origin_default_from_payload({"symbol_normalized": sym}),
                 "recommendation": "HOLD",
                 "data_quality": "MISSING",
                 "data_source": source or "unknown",
@@ -1345,11 +1483,18 @@ def _cfg() -> Dict[str, Any]:
 # =============================================================================
 # Routes
 # =============================================================================
+@router.get("/headers", include_in_schema=False)
+async def enriched_headers():
+    return JSONResponse(status_code=200, content={"status": "success", "headers": ENRICHED_HEADERS_59, "version": ROUTER_VERSION})
+
+
 @router.get("/quote")
 async def enriched_quote(
     request: Request,
     symbol: str = Query(..., description="Ticker symbol (AAPL, MSFT.US, 1120.SR, ^GSPC, GC=F)"),
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
+    include_headers: int = Query(0, description="Set 1 to include headers in response"),
+    include_rows: int = Query(0, description="Set 1 to include sheet-ready row aligned to headers"),
 ):
     dbg = _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(debug)
 
@@ -1363,6 +1508,8 @@ async def enriched_quote(
                 "symbol": "",
                 "symbol_input": "",
                 "symbol_normalized": "",
+                "requested_symbol": "",
+                "origin": "",
                 "recommendation": "HOLD",
                 "data_quality": "MISSING",
                 "data_source": "none",
@@ -1371,7 +1518,14 @@ async def enriched_quote(
                 "last_updated_riyadh": "",
             }
         )
-        return JSONResponse(status_code=200, content=out)
+        body: Dict[str, Any] = out
+        if include_headers:
+            body = dict(body)
+            body["headers"] = ENRICHED_HEADERS_59
+        if include_rows:
+            body = dict(body)
+            body["rows"] = [EnrichedQuote.from_unified(out).to_row(ENRICHED_HEADERS_59)]
+        return JSONResponse(status_code=200, content=body)
 
     try:
         result, source, err = await _call_engine_best_effort(request, norm or raw)
@@ -1382,6 +1536,8 @@ async def enriched_quote(
                     "symbol": norm or raw,
                     "symbol_input": raw,
                     "symbol_normalized": norm or raw,
+                    "requested_symbol": raw,
+                    "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                     "recommendation": "HOLD",
                     "data_quality": "MISSING",
                     "data_source": "none",
@@ -1390,11 +1546,26 @@ async def enriched_quote(
                     "last_updated_riyadh": "",
                 }
             )
-            return JSONResponse(status_code=200, content=out)
+            body2: Dict[str, Any] = out
+            if include_headers:
+                body2 = dict(body2)
+                body2["headers"] = ENRICHED_HEADERS_59
+            if include_rows:
+                body2 = dict(body2)
+                body2["rows"] = [EnrichedQuote.from_unified(out).to_row(ENRICHED_HEADERS_59)]
+            return JSONResponse(status_code=200, content=body2)
 
         payload = _as_payload(result)
         payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
-        return JSONResponse(status_code=200, content=payload)
+
+        body3: Dict[str, Any] = payload
+        if include_headers:
+            body3 = dict(body3)
+            body3["headers"] = ENRICHED_HEADERS_59
+        if include_rows:
+            body3 = dict(body3)
+            body3["rows"] = [EnrichedQuote.from_unified(payload).to_row(ENRICHED_HEADERS_59)]
+        return JSONResponse(status_code=200, content=body3)
 
     except Exception as e:
         out2: Dict[str, Any] = {
@@ -1402,6 +1573,8 @@ async def enriched_quote(
             "symbol": norm or raw,
             "symbol_input": raw,
             "symbol_normalized": norm or raw,
+            "requested_symbol": raw,
+            "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
             "recommendation": "HOLD",
             "data_quality": "MISSING",
             "data_source": "none",
@@ -1411,20 +1584,37 @@ async def enriched_quote(
         }
         if dbg:
             out2["traceback"] = _clamp(traceback.format_exc(), 8000)
-        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out2))
+
+        out2 = _schema_fill_best_effort(out2)
+
+        body4: Dict[str, Any] = out2
+        if include_headers:
+            body4 = dict(body4)
+            body4["headers"] = ENRICHED_HEADERS_59
+        if include_rows:
+            body4 = dict(body4)
+            body4["rows"] = [EnrichedQuote.from_unified(out2).to_row(ENRICHED_HEADERS_59)]
+        return JSONResponse(status_code=200, content=body4)
 
 
 @router.get("/quotes")
 async def enriched_quotes(
     request: Request,
-    symbols: str = Query(..., description="Comma/space-separated symbols, e.g. AAPL,MSFT,1120.SR"),
+    symbols: Optional[str] = Query(None, description="Comma/space-separated symbols, e.g. AAPL,MSFT,1120.SR"),
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
+    include_headers: int = Query(0, description="Set 1 to include headers in response"),
+    include_rows: int = Query(0, description="Set 1 to include sheet-ready rows aligned to headers"),
 ):
     dbg = _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(debug)
 
-    raw_list = _split_symbols(symbols)
+    raw_list = _extract_symbols_from_request(request, symbols)
     if not raw_list:
-        return JSONResponse(status_code=200, content={"status": "error", "error": "Empty symbols list", "items": []})
+        body = {"status": "error", "error": "Empty symbols list", "items": []}
+        if include_headers:
+            body["headers"] = ENRICHED_HEADERS_59
+        if include_rows:
+            body["rows"] = []
+        return JSONResponse(status_code=200, content=body)
 
     norms = [_normalize_symbol_safe(r) or (r or "").strip() for r in raw_list]
     norms = [n for n in norms if n]
@@ -1456,6 +1646,8 @@ async def enriched_quotes(
                         "symbol": norm,
                         "symbol_input": raw,
                         "symbol_normalized": norm,
+                        "requested_symbol": raw,
+                        "origin": _origin_default_from_payload({"symbol_normalized": norm}),
                         "recommendation": "HOLD",
                         "data_quality": "MISSING",
                         "data_source": "none",
@@ -1469,49 +1661,54 @@ async def enriched_quotes(
                 else:
                     items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
 
-            return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
+        else:
+            # list case
+            payloads: List[Dict[str, Any]] = [_as_payload(_unwrap_tuple_payload(x)) for x in list(batch_res)]
 
-        # list case
-        payloads: List[Dict[str, Any]] = [_as_payload(_unwrap_tuple_payload(x)) for x in list(batch_res)]
-
-        # If list length matches request, map by order
-        if len(payloads) == len(raw_list):
-            for i, raw in enumerate(raw_list):
-                norm = _normalize_symbol_safe(raw) or raw
-                p = payloads[i] if i < len(payloads) else {}
-                items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
-            return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
-
-        # else build dict by symbol key
-        mp2: Dict[str, Dict[str, Any]] = {}
-        for p in payloads:
-            k = _payload_symbol_key(p)
-            if k and k not in mp2:
-                mp2[k] = p
-
-        for raw in raw_list:
-            norm = (_normalize_symbol_safe(raw) or raw).strip().upper()
-            p = mp2.get(norm)
-            if p is None:
-                out = {
-                    "status": "error",
-                    "symbol": norm,
-                    "symbol_input": raw,
-                    "symbol_normalized": norm,
-                    "recommendation": "HOLD",
-                    "data_quality": "MISSING",
-                    "data_source": "none",
-                    "error": "Engine returned no item for this symbol.",
-                    "last_updated_utc": _now_utc().isoformat(),
-                    "last_updated_riyadh": "",
-                }
-                if dbg and batch_err:
-                    out["batch_error_hint"] = _clamp(batch_err, 1200)
-                items.append(_schema_fill_best_effort(out))
+            # If list length matches request, map by order
+            if len(payloads) == len(raw_list):
+                for i, raw in enumerate(raw_list):
+                    norm = _normalize_symbol_safe(raw) or raw
+                    p = payloads[i] if i < len(payloads) else {}
+                    items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
             else:
-                items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
+                # else build dict by symbol key
+                mp2: Dict[str, Dict[str, Any]] = {}
+                for p in payloads:
+                    k = _payload_symbol_key(p)
+                    if k and k not in mp2:
+                        mp2[k] = p
 
-        return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
+                for raw in raw_list:
+                    norm = (_normalize_symbol_safe(raw) or raw).strip().upper()
+                    p = mp2.get(norm)
+                    if p is None:
+                        out = {
+                            "status": "error",
+                            "symbol": norm,
+                            "symbol_input": raw,
+                            "symbol_normalized": norm,
+                            "requested_symbol": raw,
+                            "origin": _origin_default_from_payload({"symbol_normalized": norm}),
+                            "recommendation": "HOLD",
+                            "data_quality": "MISSING",
+                            "data_source": "none",
+                            "error": "Engine returned no item for this symbol.",
+                            "last_updated_utc": _now_utc().isoformat(),
+                            "last_updated_riyadh": "",
+                        }
+                        if dbg and batch_err:
+                            out["batch_error_hint"] = _clamp(batch_err, 1200)
+                        items.append(_schema_fill_best_effort(out))
+                    else:
+                        items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
+
+        body_ok: Dict[str, Any] = {"status": "success", "count": len(items), "items": items}
+        if include_headers:
+            body_ok["headers"] = ENRICHED_HEADERS_59
+        if include_rows:
+            body_ok["rows"] = [EnrichedQuote.from_unified(it).to_row(ENRICHED_HEADERS_59) for it in items]
+        return JSONResponse(status_code=200, content=body_ok)
 
     # SLOW PATH: per-symbol (bounded concurrency + timeout)
     cfg = _cfg()
@@ -1530,6 +1727,8 @@ async def enriched_quotes(
                         "symbol": norm or raw,
                         "symbol_input": raw,
                         "symbol_normalized": norm or raw,
+                        "requested_symbol": raw,
+                        "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                         "recommendation": "HOLD",
                         "data_quality": "MISSING",
                         "data_source": "none",
@@ -1550,6 +1749,8 @@ async def enriched_quotes(
                     "symbol": norm or raw,
                     "symbol_input": raw,
                     "symbol_normalized": norm or raw,
+                    "requested_symbol": raw,
+                    "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                     "recommendation": "HOLD",
                     "data_quality": "MISSING",
                     "data_source": "none",
@@ -1565,6 +1766,8 @@ async def enriched_quotes(
                     "symbol": norm or raw,
                     "symbol_input": raw,
                     "symbol_normalized": norm or raw,
+                    "requested_symbol": raw,
+                    "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                     "recommendation": "HOLD",
                     "data_quality": "MISSING",
                     "data_source": "none",
@@ -1579,7 +1782,13 @@ async def enriched_quotes(
                 return _schema_fill_best_effort(out2)
 
     items = await asyncio.gather(*[_one(r) for r in raw_list])
-    return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items})
+
+    body_ok2: Dict[str, Any] = {"status": "success", "count": len(items), "items": items}
+    if include_headers:
+        body_ok2["headers"] = ENRICHED_HEADERS_59
+    if include_rows:
+        body_ok2["rows"] = [EnrichedQuote.from_unified(it).to_row(ENRICHED_HEADERS_59) for it in items]
+    return JSONResponse(status_code=200, content=body_ok2)
 
 
 @router.get("/health", include_in_schema=False)
