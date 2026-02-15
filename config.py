@@ -1,9 +1,9 @@
 """
-TADAWUL FAST BRIDGE – MAIN CONFIG (v3.1.0) – PROD SAFE
+TADAWUL FAST BRIDGE – MAIN CONFIG (v3.2.0) – PROD SAFE
 ===========================================================
 Advanced Production Edition
 
-Key Upgrades in v3.1.0:
+Key Upgrades in v3.2.0:
 - ✅ **Smart Provider Discovery**: Auto-detects the primary provider based on available API keys.
 - ✅ **Dynamic Timeout Scaling**: Adjusts batch timeouts based on the APP_ENV (Dev vs. Prod).
 - ✅ **Validation Guard**: Verifies URL formats and secret integrity at boot.
@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-CONFIG_VERSION = "3.1.0"
+CONFIG_VERSION = "3.2.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -159,17 +159,24 @@ class Settings:
         is_prod = env_name == "production"
         base_timeout = 45.0 if is_prod else 25.0
         
-        # 4. Provider Policy
-        providers = _as_list_lower(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))
-        if not providers: providers = ["eodhd", "finnhub"]
+        # 4. Provider Policy (Auto-detect based on keys)
+        providers_env = _as_list_lower(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))
+        if not providers_env:
+            # Auto-detect logic
+            auto_prov = []
+            if os.getenv("EODHD_API_TOKEN"): auto_prov.append("eodhd")
+            if os.getenv("FINNHUB_API_KEY"): auto_prov.append("finnhub")
+            if not auto_prov: auto_prov = ["eodhd", "finnhub"] # Default fallback
+            providers_env = auto_prov
         
-        ksa = _as_list_lower(os.getenv("KSA_PROVIDERS"))
-        if not ksa: ksa = ["yahoo_chart"]
+        ksa_env = _as_list_lower(os.getenv("KSA_PROVIDERS"))
+        if not ksa_env:
+             ksa_env = ["yahoo_chart", "argaam"] # Default KSA stack
 
         return Settings(
             service_name=_strip(os.getenv("APP_NAME") or "Tadawul Fast Bridge"),
             environment=env_name,
-            app_version=_strip(os.getenv("APP_VERSION") or "3.1.0"),
+            app_version=_strip(os.getenv("APP_VERSION") or "3.2.0"),
             log_level=_strip(os.getenv("LOG_LEVEL") or "INFO").upper(),
             
             ai_analysis_enabled=_coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True),
@@ -182,11 +189,11 @@ class Settings:
             backup_app_token=token2 if token2 else None,
             open_mode=is_open,
 
-            enabled_providers=providers,
-            ksa_providers=ksa,
-            primary_provider=_strip(os.getenv("PRIMARY_PROVIDER") or providers[0]),
+            enabled_providers=providers_env,
+            ksa_providers=ksa_env,
+            primary_provider=_strip(os.getenv("PRIMARY_PROVIDER") or providers_env[0] if providers_env else "eodhd"),
 
-            http_timeout_sec=_coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 25.0),
+            http_timeout_sec=_coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), base_timeout),
             cache_ttl_sec=_coerce_int(os.getenv("ENGINE_CACHE_TTL_SEC"), 20),
             
             ai_batch_size=_coerce_int(os.getenv("AI_BATCH_SIZE"), 20),
