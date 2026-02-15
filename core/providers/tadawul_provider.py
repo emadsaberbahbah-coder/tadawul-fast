@@ -3,10 +3,10 @@
 """
 core/providers/tadawul_provider.py
 ===============================================================
-Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v1.13.1
+Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v1.14.0
 PROD SAFE + Async + ALIGNED ROI KEYS + RIYADH TIME
 
-What this revision guarantees (v1.13.1)
+What this revision guarantees (v1.14.0)
 - ✅ Aligned ROI Keys: Uses 'expected_roi_1m/3m/12m' as primary keys.
 - ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
 - ✅ Provenance: Sets 'provider="tadawul"' and 'data_source="tadawul"'.
@@ -31,7 +31,7 @@ import httpx
 logger = logging.getLogger("core.providers.tadawul_provider")
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "1.13.1"
+PROVIDER_VERSION = "1.14.0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
