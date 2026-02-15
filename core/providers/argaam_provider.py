@@ -3,24 +3,47 @@
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA optional enrichment + optional history/forecast) — v1.9.0
+Argaam Provider (KSA optional enrichment + optional history/forecast) — v2.2.0
 PROD SAFE + ASYNC + ENGINE PATCH-STYLE + SILENT WHEN NOT CONFIGURED
 
-What’s improved in v1.9.0
-- ✅ Aligned ROI Keys: Uses 'expected_roi_1m/3m/12m' as primary keys.
-- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
-- ✅ Enhanced Aliasing: Ensure forecast_price_* and expected_roi_pct_* exist.
-- ✅ Uses shared canonical symbol normalizer when available (core.symbols.normalize) with strict KSA gating
-- ✅ Adds stable provenance fields in patches: data_source="argaam", provider="argaam"
-- ✅ Symbol normalization now translates Arabic digits and is wrapper-safe
-- ✅ Keeps v1.7.0 guarantees: silent when not configured, strict KSA-only, no network at import-time
+What’s improved in v2.2.0 (vs your v1.9.0)
+- ✅ Stronger KSA-only normalization (Arabic digits, Tadawul prefixes, .SR enforcement)
+- ✅ Adds requested_symbol + normalized_symbol for perfect traceability
+- ✅ Safe async concurrency controls + optional rate limiting (token bucket)
+- ✅ Circuit breaker (optional) to avoid hammering a failing upstream
+- ✅ More robust JSON unwrapping + history parsing (dict/list/arrays best-effort)
+- ✅ Better derived fields: compute change / change% if missing but price+prev_close exist
+- ✅ Advanced history analytics:
+    - returns (1W/1M/3M/6M/12M), MA20/50/200, RSI(14), volatility(30D annualized),
+      max_drawdown, trend slopes, R²
+    - Forecast uses log-price regression (more stable than mean-daily-return)
+    - Confidence uses points + R² + volatility penalty
+- ✅ Riyadh timestamp conversion based on history_last_utc when available (not “now”)
+- ✅ Keeps key guarantees:
+    - import-safe (cachetools optional)
+    - no network at import-time
+    - silent {} when not configured
+    - strict KSA-only (non-KSA ignored)
+    - patch returns only useful fields + optional _warn when enabled
 
-Key guarantees
-- Import-safe even if cachetools is missing (tiny TTL cache fallback).
-- Strict KSA-only: non-KSA symbols are silently ignored.
-- No network calls at import-time; AsyncClient is created lazily.
-- Patch is CLEAN (only useful fields + optional _warn if enabled).
-- Enriched call merges profile identity into quote patch (fills blanks only).
+Environment variables (optional)
+- ARGAAM_ENABLED=true/false
+- ARGAAM_QUOTE_URL / ARGAAM_PROFILE_URL / ARGAAM_HISTORY_URL or ARGAAM_CANDLES_URL
+  Templates can use {symbol} (e.g., 1120.SR) and {code} (e.g., 1120) and {days}
+- ARGAAM_TIMEOUT_SEC (or HTTP_TIMEOUT_SEC / HTTP_TIMEOUT)
+- ARGAAM_RETRY_ATTEMPTS (or HTTP_RETRY_ATTEMPTS / MAX_RETRIES)
+- ARGAAM_RETRY_DELAY_SEC
+- ARGAAM_TTL_SEC, ARGAAM_PROFILE_TTL_SEC, ARGAAM_HISTORY_TTL_SEC
+- ARGAAM_ENABLE_HISTORY=true/false
+- ARGAAM_ENABLE_FORECAST=true/false
+- ARGAAM_VERBOSE_WARNINGS=true/false
+
+Advanced controls
+- ARGAAM_MAX_CONCURRENCY (default 20)
+- ARGAAM_RATE_LIMIT_PER_SEC (0 disables; default 0)
+- ARGAAM_CIRCUIT_BREAKER=true/false (default true)
+- ARGAAM_CB_FAIL_THRESHOLD (default 6)
+- ARGAAM_CB_COOLDOWN_SEC (default 30)
 """
 
 from __future__ import annotations
@@ -41,7 +64,7 @@ import httpx
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "1.9.0"
+PROVIDER_VERSION = "2.2.0"
 
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_RETRY_ATTEMPTS = 2
@@ -59,10 +82,9 @@ _FALSY = {"0", "false", "no", "n", "off", "f"}
 # KSA code: 3-6 digits
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 
-
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Optional shared normalizer (PROD SAFE)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
     """
     Returns (normalize_symbol, looks_like_ksa) if available; else (None, None).
@@ -79,16 +101,24 @@ def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
 
 _SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
 
-
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Env + safe helpers
-# ---------------------------------------------------------------------------
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ------------------------------------------------------------
+def _utc_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or datetime.now(timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).isoformat()
 
-def _riyadh_iso() -> str:
+
+def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
     tz = timezone(timedelta(hours=3))
-    return datetime.now(tz).isoformat()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).isoformat()
+
 
 def _safe_str(x: Any) -> Optional[str]:
     if x is None:
@@ -217,13 +247,34 @@ def _forecast_enabled() -> bool:
     return _env_bool("ARGAAM_ENABLE_FORECAST", True)
 
 
-# ---------------------------------------------------------------------------
+def _max_concurrency() -> int:
+    return max(2, _env_int("ARGAAM_MAX_CONCURRENCY", 20))
+
+
+def _rate_limit_per_sec() -> float:
+    # 0 => disabled
+    return max(0.0, _env_float("ARGAAM_RATE_LIMIT_PER_SEC", 0.0))
+
+
+def _cb_enabled() -> bool:
+    return _env_bool("ARGAAM_CIRCUIT_BREAKER", True)
+
+
+def _cb_fail_threshold() -> int:
+    return max(2, _env_int("ARGAAM_CB_FAIL_THRESHOLD", 6))
+
+
+def _cb_cooldown_sec() -> float:
+    return max(5.0, _env_float("ARGAAM_CB_COOLDOWN_SEC", 30.0))
+
+
+# ------------------------------------------------------------
 # Symbol helpers (KSA strict)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 def _normalize_ksa_symbol(symbol: str) -> str:
     """
     Strict KSA normalization:
-    - Accepts "1234", "1234.SR", "TADAWUL:1234", "TADAWUL:1234.SR", "1234.TADAWUL"
+    - Accepts: "1234", "1234.SR", "TADAWUL:1234", "TADAWUL:1234.SR", "1234.TADAWUL"
     - Translates Arabic digits to ASCII
     - Returns canonical "####.SR" OR "" when non-KSA/invalid
     """
@@ -246,13 +297,15 @@ def _normalize_ksa_symbol(symbol: str) -> str:
         except Exception:
             pass
 
-    # Local fallback (keep provider self-contained)
-    s = raw.strip().upper()
+    s = raw.upper().strip()
+
+    # common prefixes/suffixes
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"):
         s = s.replace(".TADAWUL", "").strip()
 
+    # enforce SR
     if s.endswith(".SR"):
         code = s[:-3].strip()
         return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
@@ -276,9 +329,9 @@ def _format_url(tpl: str, symbol: str, *, days: Optional[int] = None) -> str:
     return u
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Tiny TTL cache fallback if cachetools missing (import-safe)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 try:
     from cachetools import TTLCache  # type: ignore
 
@@ -317,9 +370,9 @@ except Exception:  # pragma: no cover
             self._exp[key] = time.time() + self._ttl
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Parsing helpers
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 def _safe_float(val: Any) -> Optional[float]:
     if val is None:
         return None
@@ -384,9 +437,9 @@ def _unwrap_common_envelopes(js: Union[dict, list]) -> Union[dict, list]:
     Bounded (prevents loops).
     """
     cur: Any = js
-    for _ in range(3):
+    for _ in range(4):
         if isinstance(cur, dict):
-            for k in ("data", "result", "payload", "quote", "profile", "response"):
+            for k in ("data", "result", "payload", "quote", "profile", "response", "items"):
                 if k in cur and isinstance(cur[k], (dict, list)):
                     cur = cur[k]
                     break
@@ -407,7 +460,7 @@ def _coerce_dict(data: Union[dict, list]) -> dict:
     return {}
 
 
-def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 7, max_nodes: int = 3000) -> Any:
+def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 7, max_nodes: int = 3500) -> Any:
     if obj is None:
         return None
     keyset = {str(k).strip().lower() for k in keys if k}
@@ -462,9 +515,9 @@ def _pick_str(obj: Any, *keys: str) -> Optional[str]:
     return _safe_str(_find_first_value(obj, keys))
 
 
-# ---------------------------------------------------------------------------
-# History analytics
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# History parsing + analytics
+# ------------------------------------------------------------
 def _safe_dt(x: Any) -> Optional[datetime]:
     try:
         if x is None:
@@ -483,13 +536,16 @@ def _safe_dt(x: Any) -> Optional[datetime]:
             s = s[:-1] + "+00:00"
         if len(s) == 10 and s[4] == "-" and s[7] == "-":
             return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
 
 def _find_first_list_of_dicts(
-    obj: Any, *, required_keys: Sequence[str], max_depth: int = 7, max_nodes: int = 5000
+    obj: Any, *, required_keys: Sequence[str], max_depth: int = 7, max_nodes: int = 6000
 ) -> Optional[List[Dict[str, Any]]]:
     if obj is None:
         return None
@@ -535,55 +591,89 @@ def _find_first_list_of_dicts(
     return None
 
 
-def _extract_close_series(history_json: Any, *, max_points: int) -> Tuple[List[float], Optional[str]]:
+def _extract_close_series(history_json: Any, *, max_points: int) -> Tuple[List[float], Optional[datetime], Optional[str]]:
+    """
+    Returns (closes, last_dt_utc, source_hint).
+
+    Supports:
+    - list of dicts with close/c/price/last/value
+    - dict containing such a list under common keys
+    - list of arrays [t,o,h,l,c,v] (best-effort)
+    """
     try:
+        # 1) list of dicts
         items = _find_first_list_of_dicts(
             history_json,
-            required_keys=("close", "c", "price", "last", "tradingPrice", "value"),
+            required_keys=("close", "c", "price", "last", "tradingPrice", "value", "date", "timestamp", "t"),
         )
-        if not items:
-            return [], None
+        if items:
+            rows: List[Tuple[Optional[datetime], float]] = []
+            last_dt: Optional[datetime] = None
 
-        rows: List[Tuple[Optional[datetime], float]] = []
-        last_dt: Optional[datetime] = None
+            for it in items:
+                close = (
+                    _safe_float(it.get("close"))
+                    or _safe_float(it.get("c"))
+                    or _safe_float(it.get("price"))
+                    or _safe_float(it.get("last"))
+                    or _safe_float(it.get("tradingPrice"))
+                    or _safe_float(it.get("value"))
+                )
+                if close is None:
+                    continue
 
-        for it in items:
-            close = (
-                _safe_float(it.get("close"))
-                or _safe_float(it.get("c"))
-                or _safe_float(it.get("price"))
-                or _safe_float(it.get("last"))
-                or _safe_float(it.get("tradingPrice"))
-                or _safe_float(it.get("value"))
-            )
-            if close is None:
-                continue
+                dt = (
+                    _safe_dt(it.get("date"))
+                    or _safe_dt(it.get("datetime"))
+                    or _safe_dt(it.get("time"))
+                    or _safe_dt(it.get("timestamp"))
+                    or _safe_dt(it.get("t"))
+                )
 
-            dt = (
-                _safe_dt(it.get("date"))
-                or _safe_dt(it.get("datetime"))
-                or _safe_dt(it.get("time"))
-                or _safe_dt(it.get("timestamp"))
-                or _safe_dt(it.get("t"))
-            )
+                if dt and (last_dt is None or dt > last_dt):
+                    last_dt = dt
 
-            if dt and (last_dt is None or dt > last_dt):
-                last_dt = dt
+                rows.append((dt, float(close)))
 
-            rows.append((dt, float(close)))
+            if not rows:
+                return [], None, None
 
-        if not rows:
-            return [], None
+            have_dt = any(dt is not None for dt, _ in rows)
+            if have_dt:
+                rows = sorted(rows, key=lambda x: (x[0] or datetime(1970, 1, 1, tzinfo=timezone.utc)))
 
-        have_dt = any(dt is not None for dt, _ in rows)
-        if have_dt:
-            rows = sorted(rows, key=lambda x: (x[0] or datetime(1970, 1, 1, tzinfo=timezone.utc)))
+            closes = [c for _, c in rows][-max_points:]
+            return closes, last_dt, "dict_series"
 
-        closes = [c for _, c in rows][-max_points:]
-        last_iso = (last_dt.isoformat() if last_dt else None)
-        return closes, last_iso
+        # 2) list of arrays: [t,o,h,l,c,v] or [t,c]
+        if isinstance(history_json, list) and history_json and isinstance(history_json[0], (list, tuple)):
+            rows2: List[Tuple[Optional[datetime], float]] = []
+            last_dt2: Optional[datetime] = None
+
+            for arr in history_json:
+                if not isinstance(arr, (list, tuple)) or len(arr) < 2:
+                    continue
+                dt = _safe_dt(arr[0])
+                c = _safe_float(arr[4] if len(arr) >= 5 else arr[1])
+                if c is None:
+                    continue
+                if dt and (last_dt2 is None or dt > last_dt2):
+                    last_dt2 = dt
+                rows2.append((dt, float(c)))
+
+            if not rows2:
+                return [], None, None
+
+            have_dt = any(dt is not None for dt, _ in rows2)
+            if have_dt:
+                rows2 = sorted(rows2, key=lambda x: (x[0] or datetime(1970, 1, 1, tzinfo=timezone.utc)))
+
+            closes2 = [c for _, c in rows2][-max_points:]
+            return closes2, last_dt2, "array_series"
+
+        return [], None, None
     except Exception:
-        return [], None
+        return [], None, None
 
 
 def _return_pct(last: float, prior: float) -> Optional[float]:
@@ -634,89 +724,181 @@ def _compute_rsi_14(closes: List[float]) -> Optional[float]:
         return None
 
 
+def _max_drawdown_pct(closes: List[float]) -> Optional[float]:
+    try:
+        if len(closes) < 2:
+            return None
+        peak = closes[0]
+        mdd = 0.0
+        for p in closes[1:]:
+            if p > peak:
+                peak = p
+            if peak > 0:
+                dd = (p / peak) - 1.0
+                if dd < mdd:
+                    mdd = dd
+        return float(mdd * 100.0)
+    except Exception:
+        return None
+
+
+def _log_regression(prices: List[float]) -> Optional[Dict[str, float]]:
+    """
+    Fits y = a + b*x on y=log(price) with x=0..n-1.
+    Returns slope b (per-step log return), r2, and n.
+    """
+    try:
+        n = len(prices)
+        if n < 12:
+            return None
+        ys = []
+        for p in prices:
+            if p is None or p <= 0:
+                return None
+            ys.append(math.log(float(p)))
+
+        xs = list(range(n))
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(ys) / n
+
+        sxx = sum((x - x_mean) ** 2 for x in xs)
+        if sxx == 0:
+            return None
+
+        sxy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+        b = sxy / sxx
+        a = y_mean - b * x_mean
+
+        # r2
+        y_hat = [a + b * x for x in xs]
+        ss_tot = sum((y - y_mean) ** 2 for y in ys)
+        ss_res = sum((y - yh) ** 2 for y, yh in zip(ys, y_hat))
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        if math.isnan(b) or math.isinf(b) or math.isnan(r2) or math.isinf(r2):
+            return None
+
+        return {"slope": float(b), "r2": float(max(0.0, min(1.0, r2))), "n": float(n)}
+    except Exception:
+        return None
+
+
 def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if not closes:
         return out
 
-    last = closes[-1]
+    last = float(closes[-1])
 
-    idx = {
-        "returns_1w": 5,
-        "returns_1m": 21,
-        "returns_3m": 63,
-        "returns_6m": 126,
-        "returns_12m": 252,
-    }
+    # Returns
+    idx = {"returns_1w": 5, "returns_1m": 21, "returns_3m": 63, "returns_6m": 126, "returns_12m": 252}
     for k, n in idx.items():
         if len(closes) > n:
-            prior = closes[-(n + 1)]
+            prior = float(closes[-(n + 1)])
             out[k] = _return_pct(last, prior)
 
+    # MAs
     def ma(n: int) -> Optional[float]:
         if len(closes) < n:
             return None
         xs = closes[-n:]
-        return sum(xs) / float(n)
+        return float(sum(xs) / float(n))
 
     out["ma20"] = ma(20)
     out["ma50"] = ma(50)
     out["ma200"] = ma(200)
 
+    # Volatility (30D annualized)
     if len(closes) >= 31:
         rets: List[float] = []
         window = closes[-31:]
         for i in range(1, len(window)):
-            p0 = window[i - 1]
-            p1 = window[i]
+            p0 = float(window[i - 1])
+            p1 = float(window[i])
             if p0 != 0:
                 rets.append((p1 / p0) - 1.0)
         sd = _stddev(rets)
         if sd is not None:
             out["volatility_30d"] = float(sd * math.sqrt(252.0) * 100.0)
 
+    # RSI + Max Drawdown
     out["rsi_14"] = _compute_rsi_14(closes)
+    out["max_drawdown_pct"] = _max_drawdown_pct(closes)
 
-    # Forecast (momentum-style)
-    def mean_daily_return(n_days: int) -> Optional[float]:
-        if len(closes) < (n_days + 2):
+    # Forecast via log-regression on different windows
+    def reg_on_last(n: int) -> Optional[Dict[str, float]]:
+        if len(closes) < n:
             return None
-        start = closes[-(n_days + 1)]
-        if start == 0:
+        return _log_regression([float(x) for x in closes[-n:]])
+
+    reg_1m = reg_on_last(min(len(closes), 84))   # ~4 months cap for stability
+    reg_3m = reg_on_last(min(len(closes), 252))  # up to 12 months
+    reg_12m = reg_on_last(min(len(closes), 400)) # cap
+
+    def roi_from_reg(reg: Optional[Dict[str, float]], horizon_days: int) -> Optional[float]:
+        if not reg:
             return None
-        total = (last / start) - 1.0
-        return total / float(n_days)
+        b = reg.get("slope")
+        if b is None:
+            return None
+        # expected multiplicative change over horizon
+        r = math.exp(float(b) * float(horizon_days)) - 1.0
+        return float(r * 100.0)
 
-    r1m_d = mean_daily_return(21)
-    r3m_d = mean_daily_return(63)
-    r12m_d = mean_daily_return(252)
+    roi_1m = roi_from_reg(reg_1m, 21)
+    roi_3m = roi_from_reg(reg_3m, 63)
+    roi_12m = roi_from_reg(reg_12m, 252)
 
-    if r1m_d is not None:
-        out["expected_roi_1m"] = float(r1m_d * 21.0 * 100.0)
-        out["expected_price_1m"] = float(last * (1.0 + (out["expected_roi_1m"] / 100.0)))
-    if r3m_d is not None:
-        out["expected_roi_3m"] = float(r3m_d * 63.0 * 100.0)
-        out["expected_price_3m"] = float(last * (1.0 + (out["expected_roi_3m"] / 100.0)))
-    if r12m_d is not None:
-        out["expected_roi_12m"] = float(r12m_d * 252.0 * 100.0)
-        out["expected_price_12m"] = float(last * (1.0 + (out["expected_roi_12m"] / 100.0)))
+    # Respect forecast toggle
+    if _forecast_enabled():
+        if roi_1m is not None:
+            out["expected_roi_1m"] = roi_1m
+            out["expected_price_1m"] = float(last * (1.0 + (roi_1m / 100.0)))
+        if roi_3m is not None:
+            out["expected_roi_3m"] = roi_3m
+            out["expected_price_3m"] = float(last * (1.0 + (roi_3m / 100.0)))
+        if roi_12m is not None:
+            out["expected_roi_12m"] = roi_12m
+            out["expected_price_12m"] = float(last * (1.0 + (roi_12m / 100.0)))
 
-    pts = len(closes)
-    base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
-    vol = _safe_float(out.get("volatility_30d"))
-    if vol is None:
-        conf = base * 0.75
+        # Trend diagnostics (helpful for debugging dashboards)
+        if reg_1m:
+            out["trend_slope_1m"] = float(reg_1m.get("slope", 0.0))
+            out["trend_r2_1m"] = float(reg_1m.get("r2", 0.0))
+        if reg_3m:
+            out["trend_slope_3m"] = float(reg_3m.get("slope", 0.0))
+            out["trend_r2_3m"] = float(reg_3m.get("r2", 0.0))
+        if reg_12m:
+            out["trend_slope_12m"] = float(reg_12m.get("slope", 0.0))
+            out["trend_r2_12m"] = float(reg_12m.get("r2", 0.0))
+
+        # Confidence: points + r2 - volatility penalty
+        pts = len(closes)
+        base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
+
+        # choose the most relevant r2 (3m if present else 1m else 12m)
+        r2 = None
+        for reg in (reg_3m, reg_1m, reg_12m):
+            if reg and isinstance(reg.get("r2"), (int, float)):
+                r2 = float(reg["r2"])
+                break
+        if r2 is None:
+            r2 = 0.25
+
+        vol = _safe_float(out.get("volatility_30d"))
+        vol_pen = 0.0 if vol is None else min(55.0, max(0.0, (vol / 100.0) * 35.0))
+
+        conf = (0.55 * base) + (0.45 * (r2 * 100.0)) - vol_pen
+        conf = max(0.0, min(100.0, conf))
+        out["confidence_score"] = float(conf)
+        out["forecast_method"] = "argaam_history_logreg_v2"
     else:
-        penalty = min(60.0, max(0.0, (vol / 100.0) * 35.0))
-        conf = max(0.0, min(100.0, base - penalty))
-
-    out["confidence_score"] = float(conf)
-    out["forecast_method"] = "argaam_history_momentum_v1"
+        out["forecast_method"] = "history_only"
 
     return out
 
 
-def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
+def _add_forecast_aliases(p: Dict[str, Any], *, history_last_dt: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Adds alias fields for Sheets readability while keeping the original keys.
     Does not overwrite existing values.
@@ -739,19 +921,25 @@ def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
     if "expected_roi_12m" in out and "expected_roi_pct_12m" not in out:
         out["expected_roi_pct_12m"] = out.get("expected_roi_12m")
 
-    # confidence/update aliases
+    # confidence aliases
     if "confidence_score" in out and "forecast_confidence" not in out:
         out["forecast_confidence"] = out.get("confidence_score")
+
+    # updated timestamps based on actual history last dt (better than "now")
     if "history_last_utc" in out and "forecast_updated_utc" not in out:
         out["forecast_updated_utc"] = out.get("history_last_utc")
-        out["forecast_updated_riyadh"] = _riyadh_iso()
+
+    if "forecast_updated_riyadh" not in out:
+        r = _to_riyadh_iso(history_last_dt)
+        if r:
+            out["forecast_updated_riyadh"] = r
 
     return out
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Header builder
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 def _base_headers() -> Dict[str, str]:
     h = {
         "User-Agent": USER_AGENT,
@@ -797,9 +985,75 @@ def _endpoint_headers(kind: str) -> Dict[str, str]:
     return {}
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Rate limiter + circuit breaker (async-safe)
+# ------------------------------------------------------------
+class _TokenBucket:
+    def __init__(self, rate_per_sec: float) -> None:
+        self.rate = max(0.0, float(rate_per_sec))
+        self.capacity = max(1.0, self.rate) if self.rate > 0 else 0.0
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        if self.rate <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self.last)
+            self.last = now
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return
+
+            need = 1.0 - self.tokens
+            wait = need / self.rate if self.rate > 0 else 0.0
+        if wait > 0:
+            await asyncio.sleep(min(2.0, wait + random.random() * 0.05))
+        async with self._lock:
+            self.tokens = max(0.0, self.tokens - 1.0)
+
+
+class _CircuitBreaker:
+    def __init__(self, enabled: bool, fail_threshold: int, cooldown_sec: float) -> None:
+        self.enabled = bool(enabled)
+        self.fail_threshold = max(2, int(fail_threshold))
+        self.cooldown_sec = max(5.0, float(cooldown_sec))
+
+        self._fail_count = 0
+        self._open_until = 0.0
+        self._lock = asyncio.Lock()
+
+    async def allow(self) -> bool:
+        if not self.enabled:
+            return True
+        async with self._lock:
+            if self._open_until > time.monotonic():
+                return False
+            return True
+
+    async def on_success(self) -> None:
+        if not self.enabled:
+            return
+        async with self._lock:
+            self._fail_count = 0
+            self._open_until = 0.0
+
+    async def on_failure(self) -> None:
+        if not self.enabled:
+            return
+        async with self._lock:
+            self._fail_count += 1
+            if self._fail_count >= self.fail_threshold:
+                self._open_until = time.monotonic() + self.cooldown_sec
+
+
+# ------------------------------------------------------------
 # HTTP client (lazy singleton)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 class ArgaamClient:
     def __init__(self) -> None:
         self.timeout_sec = _timeout_seconds()
@@ -821,8 +1075,12 @@ class ArgaamClient:
         self._profile_cache: TTLCache = TTLCache(maxsize=3000, ttl=_profile_ttl_sec())
         self._hist_cache: TTLCache = TTLCache(maxsize=2000, ttl=_history_ttl_sec())
 
+        self._sem = asyncio.Semaphore(_max_concurrency())
+        self._bucket = _TokenBucket(_rate_limit_per_sec())
+        self._cb = _CircuitBreaker(_cb_enabled(), _cb_fail_threshold(), _cb_cooldown_sec())
+
         logger.info(
-            "Argaam client init v%s | quote_url_set=%s | profile_url_set=%s | hist_url_set=%s | timeout=%.1fs | retries=%s | cachetools=%s",
+            "Argaam client init v%s | quote_url_set=%s | profile_url_set=%s | hist_url_set=%s | timeout=%.1fs | retries=%s | cachetools=%s | max_conc=%s | rate/s=%.2f | cb=%s",
             PROVIDER_VERSION,
             bool(self.quote_url),
             bool(self.profile_url),
@@ -830,6 +1088,9 @@ class ArgaamClient:
             self.timeout_sec,
             self.retry_attempts,
             _HAS_CACHETOOLS,
+            _max_concurrency(),
+            _rate_limit_per_sec(),
+            _cb_enabled(),
         )
 
     async def aclose(self) -> None:
@@ -839,58 +1100,73 @@ class ArgaamClient:
             pass
 
     async def _get_json(self, url: str, *, kind: str) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
+        # circuit breaker
+        if not await self._cb.allow():
+            return None, "circuit_open"
+
         retries = max(1, int(self.retry_attempts))
         base_delay = _retry_delay_sec()
-        last_err: Optional[str] = None
-
         req_headers = _endpoint_headers(kind)
 
-        for attempt in range(retries):
-            try:
-                r = await self._client.get(url, headers=req_headers if req_headers else None)
-                sc = int(r.status_code)
+        last_err: Optional[str] = None
 
-                if sc == 429 or 500 <= sc < 600:
-                    last_err = f"HTTP {sc}"
+        # concurrency + rate limit guard
+        async with self._sem:
+            await self._bucket.acquire()
+
+            for attempt in range(retries):
+                try:
+                    r = await self._client.get(url, headers=req_headers if req_headers else None)
+                    sc = int(r.status_code)
+
+                    if sc == 429 or 500 <= sc < 600:
+                        last_err = f"HTTP {sc}"
+                        if attempt < retries - 1:
+                            await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
+                            continue
+                        await self._cb.on_failure()
+                        return None, last_err
+
+                    if sc >= 400:
+                        await self._cb.on_failure()
+                        return None, f"HTTP {sc}"
+
+                    try:
+                        js = r.json()
+                    except Exception:
+                        txt = (r.text or "").strip()
+                        if txt.startswith("{") or txt.startswith("["):
+                            try:
+                                js = json.loads(txt)
+                            except Exception:
+                                await self._cb.on_failure()
+                                return None, "invalid JSON"
+                        else:
+                            await self._cb.on_failure()
+                            return None, "non-JSON response"
+
+                    if not isinstance(js, (dict, list)):
+                        await self._cb.on_failure()
+                        return None, "unexpected JSON type"
+
+                    js = _unwrap_common_envelopes(js)
+                    await self._cb.on_success()
+                    return js, None
+
+                except Exception as e:
+                    last_err = f"{e.__class__.__name__}: {e}"
                     if attempt < retries - 1:
                         await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
                         continue
+                    await self._cb.on_failure()
                     return None, last_err
-
-                if sc >= 400:
-                    return None, f"HTTP {sc}"
-
-                try:
-                    js = r.json()
-                except Exception:
-                    txt = (r.text or "").strip()
-                    if txt.startswith("{") or txt.startswith("["):
-                        try:
-                            js = json.loads(txt)
-                        except Exception:
-                            return None, "invalid JSON"
-                    else:
-                        return None, "non-JSON response"
-
-                if not isinstance(js, (dict, list)):
-                    return None, "unexpected JSON type"
-
-                js = _unwrap_common_envelopes(js)
-                return js, None
-
-            except Exception as e:
-                last_err = f"{e.__class__.__name__}: {e}"
-                if attempt < retries - 1:
-                    await asyncio.sleep(base_delay * (2**attempt) + random.random() * 0.25)
-                    continue
-                return None, last_err
 
         return None, last_err or "request failed"
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Mapping (best-effort)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 def _map_payload(root: Any) -> Dict[str, Any]:
     """
     Best-effort mapping for common JSON payload shapes.
@@ -961,8 +1237,16 @@ def _map_payload(root: Any) -> Dict[str, Any]:
         patch["sub_sector"] = sub_sector
 
     # Currency hint (KSA)
-    if patch.get("currency") is None:
-        patch["currency"] = "SAR"
+    patch.setdefault("currency", "SAR")
+
+    # Derive change / change% if missing but price + prev_close exist
+    cp = _safe_float(patch.get("current_price"))
+    pc = _safe_float(patch.get("previous_close"))
+    if cp is not None and pc is not None and pc != 0:
+        if _safe_float(patch.get("price_change")) is None:
+            patch["price_change"] = float(cp - pc)
+        if _safe_float(patch.get("percent_change")) is None:
+            patch["percent_change"] = float(((cp / pc) - 1.0) * 100.0)
 
     return _clean_patch(patch)
 
@@ -983,9 +1267,9 @@ def _with_provenance(patch: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Lazy singleton
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 _CLIENT_SINGLETON: Optional[ArgaamClient] = None
 _CLIENT_LOCK = asyncio.Lock()
 
@@ -1007,9 +1291,9 @@ async def aclose_argaam_client() -> None:
         await c.aclose()
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Fetchers (DICT PATCH RETURNS)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
     if not _configured():
         return {}
@@ -1048,7 +1332,10 @@ async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
             return {}
 
         patch = _with_provenance(dict(mapped))
+        patch["requested_symbol"] = symbol
+        patch["normalized_symbol"] = sym
         patch = _clean_patch(patch)
+
         c._quote_cache[ck] = dict(patch)
         return patch
 
@@ -1070,6 +1357,8 @@ async def _fetch_quote_patch(symbol: str) -> Dict[str, Any]:
             return {}
 
         patch = _with_provenance(dict(mapped))
+        patch["requested_symbol"] = symbol
+        patch["normalized_symbol"] = sym
         if _emit_warnings():
             warns.append("argaam: used profile endpoint as quote fallback")
             patch["_warn"] = " | ".join(warns)
@@ -1090,7 +1379,6 @@ async def _fetch_profile_identity_patch(symbol: str) -> Dict[str, Any]:
         return {}
 
     c = await get_argaam_client()
-
     if not c.profile_url:
         return {}
 
@@ -1116,6 +1404,8 @@ async def _fetch_profile_identity_patch(symbol: str) -> Dict[str, Any]:
         return {}
 
     identity = _with_provenance(identity)
+    identity["requested_symbol"] = symbol
+    identity["normalized_symbol"] = sym
     identity = _clean_patch(identity)
 
     c._profile_cache[ck] = dict(identity)
@@ -1150,7 +1440,7 @@ async def _fetch_history_patch(symbol: str) -> Dict[str, Any]:
             return {"_warn": f"argaam history failed: {err}"}
         return {}
 
-    closes, last_iso = _extract_close_series(js, max_points=_history_points_max())
+    closes, last_dt, source_hint = _extract_close_series(js, max_points=_history_points_max())
     if not closes:
         if _emit_warnings():
             return {"_warn": "argaam history parsed but no close series found"}
@@ -1158,39 +1448,27 @@ async def _fetch_history_patch(symbol: str) -> Dict[str, Any]:
 
     analytics = _compute_history_analytics(closes)
 
-    # Respect forecast toggle
-    if not _forecast_enabled():
-        for k in (
-            "expected_roi_1m",
-            "expected_roi_3m",
-            "expected_roi_12m",
-            "expected_price_1m",
-            "expected_price_3m",
-            "expected_price_12m",
-            "confidence_score",
-            "forecast_method",
-        ):
-            analytics.pop(k, None)
-        analytics["forecast_method"] = "history_only"
-
     patch: Dict[str, Any] = {
+        "requested_symbol": symbol,
+        "normalized_symbol": sym,
         "history_points": len(closes),
-        "history_last_utc": last_iso or _utc_iso(),
+        "history_last_utc": _utc_iso(last_dt) if last_dt else _utc_iso(),
+        "history_source": source_hint or "unknown",
         "forecast_source": "argaam_history",
     }
     patch.update(analytics)
 
     patch = _with_provenance(patch)
-    patch = _add_forecast_aliases(patch)
+    patch = _add_forecast_aliases(patch, history_last_dt=last_dt)
     patch = _clean_patch(patch)
 
     c._hist_cache[ck] = dict(patch)
     return patch
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Engine-compatible exported callables (DICT RETURNS)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch_quote_patch(symbol)
 
