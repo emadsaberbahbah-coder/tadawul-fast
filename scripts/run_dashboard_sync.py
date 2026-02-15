@@ -3,11 +3,11 @@
 """
 run_dashboard_sync.py
 ===========================================================
-TADAWUL FAST BRIDGE – DASHBOARD SYNCHRONIZER (v3.0.0)
+TADAWUL FAST BRIDGE – DASHBOARD SYNCHRONIZER (v3.1.0)
 ===========================================================
 INTELLIGENT PRODUCTION EDITION
 
-Key Upgrades in v3.0.0:
+Key Upgrades in v3.1.0:
 - ✅ Pre-Flight Diagnostics: Verifies Backend & Sheets API before start.
 - ✅ Adaptive KSA Gateway: Smart switching between Argaam and Enriched.
 - ✅ Resilient Payload: Standardized multi-key delivery (symbols/tickers).
@@ -39,7 +39,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 # =============================================================================
 # Version & Logging Setup
 # =============================================================================
-SCRIPT_VERSION = "3.0.0"
+SCRIPT_VERSION = "3.1.0"
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 
