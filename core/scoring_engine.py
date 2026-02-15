@@ -1,8 +1,8 @@
-# core/scoring_engine.py  — FULL REPLACEMENT — v1.7.1
+# core/scoring_engine.py
 """
 core/scoring_engine.py
 ===========================================================
-Advanced Scoring & Forecasting Engine (v1.7.1)
+Advanced Scoring & Forecasting Engine (v1.7.2)
 (Emad Bahbah – Financial Leader Edition)
 
 Generates professional-grade quantitative scores:
@@ -10,18 +10,20 @@ Generates professional-grade quantitative scores:
 - Overall Score & Recommendation (BUY/HOLD/REDUCE/SELL)
 - Confidence (Data depth + Source reliability)
 
-v1.7.1 Enhancements (Advanced Analytics):
-- ✅ **Trend Integration**: Uses `trend_signal` (UPTREND/DOWNTREND) to weight Opportunity/Risk.
-- ✅ **Technical Boost**: Uses MACD Histogram and RSI for precise momentum scoring.
-- ✅ **News Intelligence**: Blends `news_score` into scores (if available).
-- ✅ **Liquidity Guard**: Penalizes Risk Score for low-liquidity assets.
-- ✅ **Explainability**: Generates rich `scoring_reason` strings.
+v1.7.2 Enhancements:
+- ✅ Aligned Forecast Keys: Strict output for forecast_price_* and expected_roi_*.
+- ✅ Riyadh Localization: Adds forecast_updated_riyadh (UTC+3).
+- ✅ Trend Integration: Uses `trend_signal` to weight Opportunity/Risk.
+- ✅ Technical Boost: Uses MACD Histogram and RSI for precise momentum scoring.
+- ✅ News Intelligence: Blends `news_score` into scores (if available).
+- ✅ Liquidity Guard: Penalizes Risk Score for low-liquidity assets.
 """
 
 from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 # Pydantic best-effort (import-safe)
 try:
@@ -35,10 +37,15 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCORING_ENGINE_VERSION = "1.7.1"
+SCORING_ENGINE_VERSION = "1.7.2"
 
 # Recommendation enum (MUST match routers normalization)
 _RECO_ENUM = ("BUY", "HOLD", "REDUCE", "SELL")
+
+
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
 
 class AssetScores(BaseModel):
@@ -82,6 +89,7 @@ class AssetScores(BaseModel):
     forecast_confidence: Optional[float] = None
     forecast_method: Optional[str] = None
     forecast_updated_utc: Optional[str] = None
+    forecast_updated_riyadh: Optional[str] = None
 
     # Compat aliases (kept)
     expected_return_1m: Optional[float] = None
@@ -165,7 +173,7 @@ def _to_float(x: Any) -> Optional[float]:
 def _to_percent(x: Any) -> Optional[float]:
     """
     Normalize any percent-like value to 0..100 scale:
-    - If abs(val) <= 1 -> treat as fraction and multiply by 100
+    - If abs(val) <= 1.5 -> treat as fraction and multiply by 100
     - Else assume it's already percent
     - Strings like "12%" supported
     """
@@ -174,7 +182,7 @@ def _to_percent(x: Any) -> Optional[float]:
         return None
     if v == 0.0:
         return 0.0
-    if abs(v) <= 1.0:
+    if abs(v) <= 1.5:
         return v * 100.0
     return v
 
@@ -374,6 +382,7 @@ def _compute_forecast(
             "forecast_confidence": float(fc),
             "forecast_method": str(forecast_method_in or "trend_aware_horizon_scaling"),
             "forecast_updated_utc": str(forecast_updated_utc) if forecast_updated_utc else None,
+            "forecast_updated_riyadh": _riyadh_iso(),
 
             # COMPAT aliases
             "expected_price_1m": float(fp1),
@@ -450,7 +459,7 @@ def compute_scores(q: Any) -> AssetScores:
     vol = _to_percent(_get_any(q, "volatility_30d", "vol_30d_ann", "vol30d", "vol_30d"))
     rsi = _to_float(_get_any(q, "rsi_14", "rsi14"))
 
-    # Advanced Tech: Trend & MACD (v1.7.1)
+    # Advanced Tech: Trend & MACD (v1.7.2)
     trend_sig = str(_get_any(q, "trend_signal") or "NEUTRAL").upper()
     macd_hist = _to_float(_get_any(q, "macd_hist"))
 
@@ -832,6 +841,7 @@ def compute_scores(q: Any) -> AssetScores:
         forecast_confidence=forecast_out.get("forecast_confidence"),
         forecast_method=forecast_out.get("forecast_method"),
         forecast_updated_utc=forecast_out.get("forecast_updated_utc"),
+        forecast_updated_riyadh=forecast_out.get("forecast_updated_riyadh"),
 
         # Compat aliases
         expected_return_1m=forecast_out.get("expected_return_1m"),
@@ -844,6 +854,7 @@ def compute_scores(q: Any) -> AssetScores:
 
         confidence_score=forecast_out.get("confidence_score"),
 
+        # audit/debug
         expected_return_gross_1m=forecast_out.get("expected_return_gross_1m"),
         expected_return_gross_3m=forecast_out.get("expected_return_gross_3m"),
         expected_return_gross_12m=forecast_out.get("expected_return_gross_12m"),
@@ -901,6 +912,7 @@ def enrich_with_scores(q: Any, *, prefer_existing_risk_score: bool = True) -> An
         "forecast_confidence": scores.forecast_confidence,
         "forecast_method": scores.forecast_method,
         "forecast_updated_utc": scores.forecast_updated_utc,
+        "forecast_updated_riyadh": scores.forecast_updated_riyadh,
 
         # COMPAT aliases (kept)
         "expected_price_1m": scores.expected_price_1m,
