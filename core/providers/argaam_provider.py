@@ -1,18 +1,17 @@
+#!/usr/bin/env python3
 # core/providers/argaam_provider.py
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA optional enrichment + optional history/forecast) — v1.8.0
+Argaam Provider (KSA optional enrichment + optional history/forecast) — v1.9.0
 PROD SAFE + ASYNC + ENGINE PATCH-STYLE + SILENT WHEN NOT CONFIGURED
 
-What’s improved in v1.8.0
+What’s improved in v1.9.0
+- ✅ Aligned ROI Keys: Uses 'expected_roi_1m/3m/12m' as primary keys.
+- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
+- ✅ Enhanced Aliasing: Ensure forecast_price_* and expected_roi_pct_* exist.
 - ✅ Uses shared canonical symbol normalizer when available (core.symbols.normalize) with strict KSA gating
 - ✅ Adds stable provenance fields in patches: data_source="argaam", provider="argaam"
-- ✅ Adds forecast alias fields for Sheets friendliness (keeps old keys too):
-    • forecast_price_1m/3m/12m  (alias of expected_price_*)
-    • expected_roi_pct_1m/3m/12m (alias of expected_return_*)
-    • forecast_confidence       (alias of confidence_score)
-    • forecast_updated_utc      (alias of history_last_utc)
 - ✅ Symbol normalization now translates Arabic digits and is wrapper-safe
 - ✅ Keeps v1.7.0 guarantees: silent when not configured, strict KSA-only, no network at import-time
 
@@ -34,7 +33,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import httpx
@@ -42,7 +41,7 @@ import httpx
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "1.8.0"
+PROVIDER_VERSION = "1.9.0"
 
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_RETRY_ATTEMPTS = 2
@@ -87,6 +86,9 @@ _SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
 def _safe_str(x: Any) -> Optional[str]:
     if x is None:
@@ -690,14 +692,14 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     r12m_d = mean_daily_return(252)
 
     if r1m_d is not None:
-        out["expected_return_1m"] = float(r1m_d * 21.0 * 100.0)
-        out["expected_price_1m"] = float(last * (1.0 + (out["expected_return_1m"] / 100.0)))
+        out["expected_roi_1m"] = float(r1m_d * 21.0 * 100.0)
+        out["expected_price_1m"] = float(last * (1.0 + (out["expected_roi_1m"] / 100.0)))
     if r3m_d is not None:
-        out["expected_return_3m"] = float(r3m_d * 63.0 * 100.0)
-        out["expected_price_3m"] = float(last * (1.0 + (out["expected_return_3m"] / 100.0)))
+        out["expected_roi_3m"] = float(r3m_d * 63.0 * 100.0)
+        out["expected_price_3m"] = float(last * (1.0 + (out["expected_roi_3m"] / 100.0)))
     if r12m_d is not None:
-        out["expected_return_12m"] = float(r12m_d * 252.0 * 100.0)
-        out["expected_price_12m"] = float(last * (1.0 + (out["expected_return_12m"] / 100.0)))
+        out["expected_roi_12m"] = float(r12m_d * 252.0 * 100.0)
+        out["expected_price_12m"] = float(last * (1.0 + (out["expected_roi_12m"] / 100.0)))
 
     pts = len(closes)
     base = max(0.0, min(100.0, (pts / 252.0) * 100.0))
@@ -730,18 +732,19 @@ def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
         out["forecast_price_12m"] = out.get("expected_price_12m")
 
     # ROI aliases
-    if "expected_return_1m" in out and "expected_roi_pct_1m" not in out:
-        out["expected_roi_pct_1m"] = out.get("expected_return_1m")
-    if "expected_return_3m" in out and "expected_roi_pct_3m" not in out:
-        out["expected_roi_pct_3m"] = out.get("expected_return_3m")
-    if "expected_return_12m" in out and "expected_roi_pct_12m" not in out:
-        out["expected_roi_pct_12m"] = out.get("expected_return_12m")
+    if "expected_roi_1m" in out and "expected_roi_pct_1m" not in out:
+        out["expected_roi_pct_1m"] = out.get("expected_roi_1m")
+    if "expected_roi_3m" in out and "expected_roi_pct_3m" not in out:
+        out["expected_roi_pct_3m"] = out.get("expected_roi_3m")
+    if "expected_roi_12m" in out and "expected_roi_pct_12m" not in out:
+        out["expected_roi_pct_12m"] = out.get("expected_roi_12m")
 
     # confidence/update aliases
     if "confidence_score" in out and "forecast_confidence" not in out:
         out["forecast_confidence"] = out.get("confidence_score")
     if "history_last_utc" in out and "forecast_updated_utc" not in out:
         out["forecast_updated_utc"] = out.get("history_last_utc")
+        out["forecast_updated_riyadh"] = _riyadh_iso()
 
     return out
 
@@ -1158,9 +1161,9 @@ async def _fetch_history_patch(symbol: str) -> Dict[str, Any]:
     # Respect forecast toggle
     if not _forecast_enabled():
         for k in (
-            "expected_return_1m",
-            "expected_return_3m",
-            "expected_return_12m",
+            "expected_roi_1m",
+            "expected_roi_3m",
+            "expected_roi_12m",
             "expected_price_1m",
             "expected_price_3m",
             "expected_price_12m",
