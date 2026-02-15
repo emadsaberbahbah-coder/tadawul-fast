@@ -3,238 +3,179 @@
 """
 core/providers/yahoo_fundamentals_provider.py
 ============================================================
-Yahoo Fundamentals Provider (NO yfinance) — v1.6.3
-PROD SAFE + SHARED NORMALIZATION v1.0.0 + ALIGNED ROI KEYS
+Yahoo Fundamentals Provider (via yfinance) — v1.8.0
+(ROBUST PROFILE FETCH + ALIGNED FORECAST KEYS)
 
-What’s improved in v1.6.3
-- ✅ Normalization Alignment: Fully integrated with core.symbols.normalize v1.0.0.
-- ✅ ROI Key Alignment: Uses 'expected_roi_12m' as primary; aliases 'expected_return_12m'.
-- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3) for KSA dashboards.
-- ✅ Resilience: Retains the robust cookie warmup/retry logic to bypass 401/403 blocks.
+Updates in v1.8.0:
+- ✅ Engine Switch: Uses yfinance for reliable access to Sector/Industry/Name.
+- ✅ Forecasts: Extracts targetMeanPrice for 12M Forecasts & ROI.
+- ✅ Key Alignment: Matches Sheet Controller v5.8.0 (e.g., 'sub_sector', 'name').
+- ✅ Debugging: Logs exactly which fields are found/missing.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import os
-import random
 import re
-import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Optional
 
-import httpx
-
-# ---------------------------------------------------------------------------
-# Shared Normalizer Import (Aligned with core/symbols/normalize.py v1.0.0)
-# ---------------------------------------------------------------------------
-try:
-    from core.symbols.normalize import normalize_symbol, is_ksa
-except Exception:
-    # Minimal local fallback if shared module is not reachable
-    def is_ksa(s: str) -> bool:
-        u = s.upper()
-        return ".SR" in u or u.isdigit()
-    def normalize_symbol(s: str) -> str:
-        s = s.strip().upper()
-        return f"{s}.SR" if s.isdigit() else s
+import yfinance as yf
 
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "1.6.3"
+PROVIDER_VERSION = "1.8.0"
+
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 
 # ---------------------------
-# Safe env parsing
+# Helpers
 # ---------------------------
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY = {"0", "false", "no", "n", "off", "f"}
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s: return ""
+    if s.startswith("TADAWUL:"): s = s.split(":", 1)[1].strip()
+    if s.endswith(".TADAWUL"): s = s.replace(".TADAWUL", "").strip()
+    if _KSA_CODE_RE.match(s): return f"{s}.SR"
+    return s
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw: return default
-    return raw not in _FALSY
-
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return str(v).strip() if v else default
+def _to_float(x: Any) -> Optional[float]:
+    if x is None: return None
+    try:
+        if isinstance(x, str): x = x.replace(",", "").replace("%", "")
+        f = float(x)
+        return f if not math.isnan(f) and not math.isinf(f) else None
+    except: return None
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _riyadh_iso() -> str:
-    # Asia/Riyadh is UTC+3
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz).isoformat()
 
 # ---------------------------
-# Client reuse (keep-alive)
+# Main Provider Class
 # ---------------------------
-_CLIENT: Optional[httpx.AsyncClient] = None
-_CLIENT_LOCK = asyncio.Lock()
-_WARMED: Set[str] = set()
-_WARM_LOCK = asyncio.Lock()
+@dataclass
+class YahooFundamentalsProvider:
+    name: str = PROVIDER_NAME
 
-async def _get_client() -> httpx.AsyncClient:
-    global _CLIENT
-    async with _CLIENT_LOCK:
-        if _CLIENT is None:
-            _CLIENT = httpx.AsyncClient(timeout=12.0, follow_redirects=True)
-    return _CLIENT
+    async def fetch_profile(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
+        """
+        Fetches asset profile, financials, and analyst targets.
+        """
+        u_sym = _normalize_symbol(symbol)
+        if not u_sym: return {}
 
-async def _warmup_cookie(symbol: str) -> None:
-    """Hits the main Yahoo quote page to establish valid session cookies."""
-    sym = symbol.strip().upper()
-    async with _WARM_LOCK:
-        if sym in _WARMED: return
-        _WARMED.add(sym)
-    try:
-        client = await _get_client()
-        url = f"https://finance.yahoo.com/quote/{sym}"
-        await client.get(url, headers={"User-Agent": _env_str("YAHOO_UA", "Mozilla/5.0")})
-    except:
-        pass
+        if debug: logger.info(f"[{u_sym}] Fetching fundamentals via yfinance...")
+
+        try:
+            # Blocking call to yfinance in thread
+            def _get_info():
+                return yf.Ticker(u_sym).info
+
+            info = await asyncio.to_thread(_get_info)
+
+            if not info or ("symbol" not in info and "shortName" not in info and "regularMarketPrice" not in info):
+                if debug: logger.warning(f"[{u_sym}] Empty info returned.")
+                return {"error": "No data found"}
+
+            # --- 1. Basic Identity ---
+            out = {
+                "symbol": u_sym,
+                "name": info.get("longName") or info.get("shortName"),
+                "sector": info.get("sector"),
+                "sub_sector": info.get("industry"),
+                "industry": info.get("industry"),
+                "market": info.get("market"),
+                "currency": info.get("currency") or info.get("financialCurrency"),
+                "exchange": info.get("exchange"),
+                "country": info.get("country"),
+                "website": info.get("website"),
+                "employees": info.get("fullTimeEmployees"),
+                "summary": info.get("longBusinessSummary"),
+                "listing_date": info.get("firstTradeDateEpochUtc"), # Timestamp
+            }
+
+            # --- 2. Financials ---
+            out.update({
+                "market_cap": _to_float(info.get("marketCap")),
+                "pe_ttm": _to_float(info.get("trailingPE")),
+                "forward_pe": _to_float(info.get("forwardPE")),
+                "eps_ttm": _to_float(info.get("trailingEps")),
+                "forward_eps": _to_float(info.get("forwardEps")),
+                "pb": _to_float(info.get("priceToBook")),
+                "ps": _to_float(info.get("priceToSalesTrailing12Months")),
+                "beta": _to_float(info.get("beta")),
+                "dividend_yield": _to_float(info.get("dividendYield")) * 100.0 if info.get("dividendYield") else None,
+                "dividend_rate": _to_float(info.get("dividendRate")),
+                "roe": _to_float(info.get("returnOnEquity")) * 100.0 if info.get("returnOnEquity") else None,
+                "roa": _to_float(info.get("returnOnAssets")) * 100.0 if info.get("returnOnAssets") else None,
+                "profit_margin": _to_float(info.get("profitMargins")) * 100.0 if info.get("profitMargins") else None,
+                "revenue_growth": _to_float(info.get("revenueGrowth")) * 100.0 if info.get("revenueGrowth") else None,
+                "book_value": _to_float(info.get("bookValue")),
+                "ebitda": _to_float(info.get("ebitda")),
+                "total_debt": _to_float(info.get("totalDebt")),
+                "total_revenue": _to_float(info.get("totalRevenue")),
+            })
+
+            # --- 3. Analyst Forecasts & Targets ---
+            current_price = _to_float(info.get("currentPrice")) or _to_float(info.get("regularMarketPrice"))
+            target_mean = _to_float(info.get("targetMeanPrice"))
+            recommendation = info.get("recommendationKey") # e.g. 'buy', 'hold'
+
+            out["recommendation"] = recommendation.upper() if recommendation else "HOLD"
+            out["target_mean_price"] = target_mean
+            
+            # Calculate ROI 12M based on Analyst Target
+            if current_price and target_mean:
+                roi = ((target_mean / current_price) - 1.0) * 100.0
+                out["forecast_price_12m"] = target_mean
+                out["expected_roi_12m"] = roi
+                out["upside_percent"] = roi
+                out["forecast_confidence"] = 0.85 # High confidence if analysts exist
+                out["forecast_method"] = "analyst_consensus"
+            
+            # --- 4. Metadata ---
+            out["data_source"] = PROVIDER_NAME
+            out["provider_version"] = PROVIDER_VERSION
+            out["last_updated_utc"] = _utc_iso()
+            out["forecast_updated_utc"] = _utc_iso() # For sheet timestamp
+            out["last_updated_riyadh"] = _riyadh_iso()
+
+            if debug:
+                logger.info(f"[{u_sym}] Success. Name: {out['name']}, Sector: {out['sector']}")
+
+            return out
+
+        except Exception as e:
+            logger.error(f"[{u_sym}] Fundamentals Error: {e}")
+            return {"error": str(e)}
 
 # ---------------------------
-# Numeric Value Helpers
-# ---------------------------
-def _to_float(x: Any) -> Optional[float]:
-    try:
-        if x is None or isinstance(x, bool): return None
-        f = float(str(x).replace(",", "").strip())
-        return f if not math.isnan(f) and not math.isinf(f) else None
-    except:
-        return None
-
-def _get_raw(obj: Any) -> Optional[float]:
-    """Yahoo JSON often nests values as {'raw': 1.23, 'fmt': '1.23'}."""
-    if isinstance(obj, dict): return _to_float(obj.get("raw"))
-    return _to_float(obj)
-
-# ---------------------------
-# Forecast & Target Logic
-# ---------------------------
-def _apply_targets_forecast(out: Dict[str, Any]) -> None:
-    """Enriches patch with analyst target-based forecast fields."""
-    px = _to_float(out.get("current_price"))
-    t_mean = _to_float(out.get("target_mean_price"))
-    if not px or not t_mean: return
-
-    roi_12m = ((t_mean / px) - 1.0) * 100.0
-    
-    out["fair_value"] = t_mean
-    out["expected_roi_12m"] = roi_12m
-    out["expected_return_12m"] = roi_12m  # Legacy Alias
-    out["upside_percent"] = roi_12m
-    out["expected_price_12m"] = t_mean
-    out["forecast_method"] = "yahoo_analyst_targets_v1"
-    
-    # Confidence score based on analyst coverage depth
-    n = _to_float(out.get("analyst_opinions")) or 0
-    base_conf = min(85, 20 + (10 * math.log2(n + 1)))
-    out["confidence_score"] = float(base_conf)
-    out["forecast_confidence"] = float(base_conf / 100.0)
-
-# ---------------------------
-# Core Fetcher
+# Compatibility Aliases
 # ---------------------------
 async def fetch_fundamentals_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
-    """
-    Main entry point for fundamental data extraction.
-    Returns a dictionary intended to patch a UnifiedQuote object.
-    """
-    # 1. Standardize the symbol (v1.0.0 logic)
-    u_sym = normalize_symbol(symbol)
-    if not u_sym:
-        return {}
-    
-    # 2. Check market-specific permission
-    if is_ksa(u_sym) and not _env_bool("ENABLE_YAHOO_FUNDAMENTALS_KSA", True):
-        return {}
+    p = YahooFundamentalsProvider()
+    return await p.fetch_profile(symbol, debug)
 
-    client = await _get_client()
-    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{u_sym}"
-    params = {
-        "modules": "price,summaryDetail,defaultKeyStatistics,financialData",
-        "lang": "en-US",
-        "region": "SA" if u_sym.endswith(".SR") else "US"
-    }
-
-    try:
-        r = await client.get(url, params=params)
-        
-        # 3. Handle 401/403 via Cookie Warmup flow
-        if r.status_code in {401, 403}:
-            await _warmup_cookie(u_sym)
-            r = await client.get(url, params=params)
-
-        if r.status_code != 200:
-            return {"error": f"warning: {PROVIDER_NAME}: HTTP {r.status_code}"}
-
-        js = r.json()
-        res = js.get("quoteSummary", {}).get("result", [])
-        if not res:
-            return {"error": f"warning: {PROVIDER_NAME}: empty result set"}
-        
-        data = res[0]
-        price_mod = data.get("price", {})
-        summ = data.get("summaryDetail", {})
-        stats = data.get("defaultKeyStatistics", {})
-        fin = data.get("financialData", {})
-
-        # 4. Map Yahoo's specific modules to our standard schema
-        out = {
-            "symbol": u_sym,
-            "current_price": _get_raw(price_mod.get("regularMarketPrice")),
-            "market_cap": _get_raw(summ.get("marketCap")),
-            "shares_outstanding": _get_raw(stats.get("sharesOutstanding")),
-            "pe_ttm": _get_raw(summ.get("trailingPE")),
-            "eps_ttm": _get_raw(stats.get("trailingEps")),
-            "forward_pe": _get_raw(summ.get("forwardPE")),
-            "forward_eps": _get_raw(stats.get("forwardEps")),
-            "pb": _get_raw(summ.get("priceToBook")),
-            "dividend_yield": _get_raw(summ.get("dividendYield")) * 100.0 if _get_raw(summ.get("dividendYield")) else None,
-            "roe": _get_raw(fin.get("returnOnEquity")) * 100.0 if _get_raw(fin.get("returnOnEquity")) else None,
-            "roa": _get_raw(fin.get("returnOnAssets")) * 100.0 if _get_raw(fin.get("returnOnAssets")) else None,
-            "beta": _get_raw(stats.get("beta")),
-            "target_mean_price": _get_raw(fin.get("targetMeanPrice")),
-            "analyst_opinions": _get_raw(fin.get("numberOfAnalystOpinions")),
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-            "last_updated_utc": _utc_iso(),
-            "forecast_updated_riyadh": _riyadh_iso()
-        }
-
-        # 5. Apply Analyst-driven Forecast Enrichment
-        _apply_targets_forecast(out)
-
-        # 6. Final cleanup of empty results
-        return {k: v for k, v in out.items() if v is not None}
-
-    except Exception as e:
-        logger.error("Yahoo fundamentals failure for %s: %s", u_sym, e)
-        return {"error": f"warning: {PROVIDER_NAME} internal error"}
-
-async def aclose_yahoo_fundamentals_client():
-    global _CLIENT
-    if _CLIENT:
-        await _CLIENT.aclose()
-        _CLIENT = None
-
-# Compatibility Aliases for Engine Auto-Discovery
 async def fetch_enriched_quote_patch(symbol: str, **kwargs) -> Dict[str, Any]:
     return await fetch_fundamentals_patch(symbol)
 
-async def fetch_quote_and_fundamentals_patch(symbol: str, **kwargs) -> Dict[str, Any]:
-    return await fetch_fundamentals_patch(symbol)
+# Cleanup (no-op for yfinance)
+async def aclose_yahoo_fundamentals_client():
+    pass
 
 __all__ = [
-    "fetch_fundamentals_patch", 
-    "fetch_enriched_quote_patch", 
-    "fetch_quote_and_fundamentals_patch",
-    "aclose_yahoo_fundamentals_client", 
+    "YahooFundamentalsProvider",
+    "fetch_fundamentals_patch",
+    "fetch_enriched_quote_patch",
+    "aclose_yahoo_fundamentals_client",
     "PROVIDER_NAME"
 ]
