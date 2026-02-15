@@ -1,17 +1,18 @@
-# core/schemas.py  (FULL REPLACEMENT) — v3.8.2
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.8.2 (PROD SAFE)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.9.0 (PROD SAFE + ALIGNED)
 
-What changed in v3.8.2
-- ✅ Fix: numeric rating parsing was not relevant here; ignore.
+What changed in v3.9.0
+- ✅ Forecast Alignment: Strict mapping for forecast_price_* and expected_roi_*.
+- ✅ Riyadh Support: Added mappings for Last Updated (Riyadh) and Forecast Updated (Riyadh).
+- ✅ Trend Signal: Added support for trend_signal field.
 - ✅ Hardening: safer legacy/vNext registry selection + clearer fallbacks.
-- ✅ Stronger compatibility: more header synonyms (Dividend Yield without %, etc.)
+- ✅ Stronger compatibility: more header synonyms.
 - ✅ Import-safe: no DataEngine imports, no network, no heavy deps.
 - ✅ Defensive: get_headers_for_sheet() never raises and always returns COPIES.
 
-v3.8.2 keeps the same public API as v3.8.1.
+v3.9.0 keeps the same public API as v3.8.2.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.8.2"
+SCHEMAS_VERSION = "3.9.0"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -260,6 +261,7 @@ _VN_FUNDAMENTALS: List[str] = [
 _VN_TECHNICALS: List[str] = [
     "Volatility (30D)",
     "RSI (14)",
+    "Trend Signal",
 ]
 
 _VN_VALUATION: List[str] = [
@@ -294,6 +296,7 @@ _VN_FORECAST_CORE: List[str] = [
     "Expected ROI % (12M)",
     "Forecast Confidence",
     "Forecast Updated (UTC)",
+    "Forecast Updated (Riyadh)",
 ]
 
 # Forecast EXTENDED (optional analytics + provenance)
@@ -618,6 +621,7 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "vol_30d": "Volatility (30D)",
     "rsi_14": "RSI (14)",
     "rsi14": "RSI (14)",
+    "trend_signal": "Trend Signal",
 
     # percent label variants (accept non-% versions)
     "dividend_yield": "Dividend Yield %",
@@ -635,6 +639,7 @@ _HEADER_SYNONYMS: Dict[str, str] = {
     "last_updated_utc": "Last Updated (UTC)",
     "last_updated_riyadh": "Last Updated (Riyadh)",
     "last_updated_ksa": "Last Updated (Riyadh)",
+    "forecast_updated_riyadh": "Forecast Updated (Riyadh)",
 
     # portfolio header variants
     "broker_account": "Broker/Account",
@@ -745,6 +750,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     # Technicals
     "volatility_30d": ("vol_30d_ann", "vol30d", "vol_30d"),
     "rsi_14": ("rsi14",),
+    "trend_signal": ("trend", "signal"),
 
     # Valuation / targets
     "fair_value": ("intrinsic_value",),
@@ -793,7 +799,6 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "history_last_utc": ("hist_last_utc",),
 
     "forecast_updated_utc": ("forecast_last_utc", "forecast_asof_utc", "forecast_time_utc", "forecast_updated"),
-    # (not a sheet column by default, but accepted)
     "forecast_updated_riyadh": ("forecast_asof_riyadh", "forecast_time_riyadh"),
 
     # Funds
@@ -903,6 +908,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     # --- vNext Technicals ---
     "Volatility (30D)": "volatility_30d",
     "RSI (14)": "rsi_14",
+    "Trend Signal": "trend_signal",
 
     # --- vNext Valuation ---
     "Fair Value": "fair_value",
@@ -944,6 +950,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Expected ROI % (12M)": "expected_roi_12m",
     "Forecast Confidence": "forecast_confidence",
     "Forecast Updated (UTC)": "forecast_updated_utc",
+    "Forecast Updated (Riyadh)": "forecast_updated_riyadh",
 
     # --- Fund specific ---
     "Fund Type": "fund_type",
@@ -1028,6 +1035,7 @@ _PREFERRED_HEADERS: Tuple[str, ...] = (
     "Expected ROI % (12M)",
     "Forecast Confidence",
     "Forecast Updated (UTC)",
+    "Forecast Updated (Riyadh)",
 )
 
 _FIELD_TO_HEADER: Dict[str, str] = {}
