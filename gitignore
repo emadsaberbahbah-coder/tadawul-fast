@@ -1,54 +1,125 @@
-# Tadawul Fast Bridge — Git Configuration (v1.5.0)
+# Tadawul Fast Bridge — Git Ignore Rules (v1.7.0)
 # =============================================================================
-# PROD SAFE EXCLUSION LIST
-# Prevents secrets, local environments, and runtime artifacts from being committed.
+# PROD-SAFE EXCLUSION LIST
+# Prevent secrets, local envs, caches, build outputs, and runtime artifacts
+# from being committed.
+#
+# Notes
+# - Keep `.env.example` tracked as a template.
+# - Keep `.github/` tracked (workflows).
+# - Add only what is safe to ignore globally (avoid ignoring real source).
 # =============================================================================
 
-# ------------------------------
+# -----------------------------------------------------------------------------
 # Python / FastAPI Core
-# ------------------------------
+# -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyd
 *.so
+*.dylib
 .python-version
 .ipynb_checkpoints/
+.pyenv/
+.venv.bak/
 
-# ------------------------------
+# -----------------------------------------------------------------------------
 # Virtual Environments
-# ------------------------------
+# -----------------------------------------------------------------------------
 venv/
 .venv/
 env/
 ENV/
 .ENV/
 env.bak/
+.conda/
+conda/
+pip-wheel-metadata/
 
-# ------------------------------
-# Distribution / Build
-# ------------------------------
+# -----------------------------------------------------------------------------
+# Packaging / Build / Distribution
+# -----------------------------------------------------------------------------
 build/
-develop-eggs/
 dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
+wheels/
+sdist/
+develop-eggs/
+parts/
+var/
 MANIFEST
+.installed.cfg
 
-# ------------------------------
+# -----------------------------------------------------------------------------
+# Logs / Runtime Artifacts
+# -----------------------------------------------------------------------------
+*.log
+logs/
+*.out
+*.err
+*.pid
+*.pid.lock
+*.prof
+*.profile
+celerybeat-schedule
+celerybeat.pid
+
+# -----------------------------------------------------------------------------
+# Testing / Coverage / Tooling Caches
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.pyre/
+.pytype/
+.pylint.d/
+.pyright/
+.dmypy.json
+
+# -----------------------------------------------------------------------------
+# Local Databases / Snapshots / Exports
+# -----------------------------------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.bak
+*.swp
+*.swo
+*.tmp
+*.temp
+*.lock
+*.lock.bak
+
+.snapshots/
+tmp/
+cache/
+exports/
+reports/
+artifacts/
+data/
+
+# Keep sample datasets if you use them:
+# !data/samples/
+# !data/README.md
+
+# -----------------------------------------------------------------------------
 # Security & Secrets (CRITICAL)
-# ------------------------------
-# General Env files
+# -----------------------------------------------------------------------------
+# Env files (track only `.env.example`)
 .env
 .env.*
 !.env.example
@@ -58,6 +129,7 @@ env.local
 .env.local
 .env.production.local
 .env.development.local
+.env.test.local
 
 # Google Cloud / Service Account JSONs (Aggressive Guard)
 credentials.json
@@ -76,7 +148,9 @@ oauth*.json
 gcp-*.json
 *.json.key
 
-# Private Keys / Certificates
+# Generic secret patterns (use cautiously)
+*.secret
+*.secrets
 *.pem
 *.key
 *.crt
@@ -85,54 +159,9 @@ gcp-*.json
 *.csr
 *.der
 
-# ------------------------------
-# Logs & Performance Metrics
-# ------------------------------
-*.log
-logs/
-*.out
-*.err
-*.pid
-*.pid.lock
-celerybeat-schedule
-celerybeat.pid
-
-# ------------------------------
-# Modern Python Tooling Caches
-# ------------------------------
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.cache/
-.coverage
-.coverage.*
-coverage.xml
-htmlcov/
-.tox/
-.nox/
-.hypothesis/
-.pyre/
-.pytype/
-.pylint.d/
-
-# ------------------------------
-# Local Databases & Snapshots
-# ------------------------------
-*.sqlite
-*.sqlite3
-*.db
-*.dump
-.snapshots/
-data/
-tmp/
-cache/
-exports/
-reports/
-artifacts/
-
-# ------------------------------
-# IDE & System Garbage
-# ------------------------------
+# -----------------------------------------------------------------------------
+# IDE / Editor / OS
+# -----------------------------------------------------------------------------
 # VS Code
 .vscode/
 !.vscode/settings.json
@@ -141,13 +170,13 @@ artifacts/
 !.vscode/extensions.json
 *.code-workspace
 
-# JetBrains (PyCharm)
+# JetBrains (PyCharm/IntelliJ)
 .idea/
 *.iws
 *.iml
 *.ipr
 
-# OS Specific
+# macOS / Windows
 .DS_Store
 .DS_Store?
 ._*
@@ -157,23 +186,47 @@ ehthumbs.db
 Thumbs.db
 Desktop.ini
 
-# ------------------------------
-# Local Deployment / Serverless
-# ------------------------------
+# -----------------------------------------------------------------------------
+# Node / Frontend (in case you have any tooling)
+# -----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+dist-ssr/
+
+# -----------------------------------------------------------------------------
+# Local Deployment / Platforms
+# -----------------------------------------------------------------------------
 .render/
 .vercel/
 .serverless/
-pip-log.txt
-pip-delete-this-directory.txt
 .elasticbeanstalk/
+firebase-debug.log*
+.firebaserc
 
-# ------------------------------
-# Application Runtime State
-# ------------------------------
-*.bak
-*.swp
-*.swo
-*.tmp
-*.temp
-*.lock
-*.lock.bak
+# Docker / Compose local overrides
+docker-compose.override.yml
+compose.override.yml
+
+# -----------------------------------------------------------------------------
+# Render / Gunicorn / Uvicorn runtime
+# -----------------------------------------------------------------------------
+gunicorn.conf.local.py
+uvicorn.conf.local.py
+
+# -----------------------------------------------------------------------------
+# LLM / Copy-Paste Artifact Files (optional safety)
+# -----------------------------------------------------------------------------
+*.md.backup
+*.txt.backup
+
+# -----------------------------------------------------------------------------
+# Do NOT ignore source code folders like:
+# core/, routes/, schemas/, scripts/  (keep tracked)
+# -----------------------------------------------------------------------------
