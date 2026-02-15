@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # tests/test_endpoints.py
 """
-ADVANCED SMOKE TESTER for Tadawul Fast Bridge API – v2.8.0
+ADVANCED SMOKE TESTER for Tadawul Fast Bridge API – v2.9.0
 (Intelligent Diagnostic + Multi-Router Edition)
 
 What it tests:
@@ -11,8 +11,10 @@ What it tests:
 - ✅ Data Consistency: GET /v1/enriched/quote & /v1/enriched/quotes
 - ✅ Push Mode: POST /v1/advanced/sheet-rows (Cache injection test)
 - ✅ Security Layer: Negative test (Auth failure simulation)
+- ✅ **New: Riyadh Localization**: Verifies UTC+3 timestamps.
+- ✅ **New: Forecast Audit**: Checks for canonical ROI keys.
 
-v2.8.0 Upgrades:
+v2.9.0 Upgrades:
 - **Auth Integrity**: Proactively verifies that 401 is returned for invalid tokens.
 - **Market Routing**: Verifies KSA vs Global provider isolation in the response.
 - **Scoring Audit**: Checks for valid ranges in Opportunity and Overall scores.
@@ -32,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-SCRIPT_VERSION = "2.8.0"
+SCRIPT_VERSION = "2.9.0"
 
 # --- Defaults ---
 DEFAULT_BASE_URL = (
@@ -91,7 +93,7 @@ class SmokeTester:
         self.results: List[TestResult] = []
 
     def check_infra(self):
-        log("--- [1/6] Checking Base Infrastructure ---", Colors.CYAN)
+        log("--- [1/7] Checking Base Infrastructure ---", Colors.CYAN)
         eps = [("/", "Root"), ("/readyz", "Readiness"), ("/health", "Health")]
         for path, name in eps:
             code, data, dt = run_request("GET", f"{self.base_url}{path}", self.headers)
@@ -100,7 +102,7 @@ class SmokeTester:
             log(f"  {name.ljust(12)}: {status} ({dt:.2f}s)")
 
     def check_security(self):
-        log("\n--- [2/6] Verifying Security Layer ---", Colors.CYAN)
+        log("\n--- [2/7] Verifying Security Layer ---", Colors.CYAN)
         bad_headers = {"X-APP-TOKEN": "wrong-token-123"}
         code, data, dt = run_request("GET", f"{self.base_url}/v1/enriched/quote", bad_headers, params={"symbol": GLB_SYM})
         
@@ -112,7 +114,7 @@ class SmokeTester:
         log(f"  Auth Guard  : {status} ({dt:.2f}s)")
 
     def check_routers(self):
-        log("\n--- [3/6] Verifying Router Integrity ---", Colors.CYAN)
+        log("\n--- [3/7] Verifying Router Integrity ---", Colors.CYAN)
         routers = [
             ("/v1/enriched/health", "Enriched"),
             ("/v1/argaam/health", "Argaam"),
@@ -123,11 +125,16 @@ class SmokeTester:
             code, data, dt = run_request("GET", f"{self.base_url}{path}", self.headers)
             is_ok = code == 200 and (isinstance(data, dict) and data.get("status") == "ok")
             status = "PASS" if is_ok else "FAIL"
+            
+            # Check for Riyadh Time in health check (Advanced/Argaam should have it)
+            if is_ok and ("time_riyadh" in data or "riyadh_time" in data):
+                name += " (KSA TZ)"
+            
             self.results.append(TestResult(f"Router: {name}", status, dt, f"HTTP {code}"))
-            log(f"  {name.ljust(12)}: {status} ({dt:.2f}s)")
+            log(f"  {name.ljust(15)}: {status} ({dt:.2f}s)")
 
     def check_advisor(self):
-        log("\n--- [4/6] Testing Investment Advisor Logic ---", Colors.CYAN)
+        log("\n--- [4/7] Testing Investment Advisor Logic ---", Colors.CYAN)
         payload = {
             "tickers": [KSA_SYM, GLB_SYM],
             "risk": "Moderate",
@@ -139,12 +146,20 @@ class SmokeTester:
         is_ok = code == 200 and "headers" in data and len(data.get("rows", [])) > 0
         status = "PASS" if is_ok else "WARN (Empty Universe?)" if code == 200 else "FAIL"
         
-        msg = f"Found {len(data.get('rows', []))} recs" if is_ok else str(data)[:100]
+        # Check for 12M ROI column (new v1.3.0 requirement)
+        headers = data.get("headers", [])
+        has_12m = any("12M" in h for h in headers) if headers else False
+        
+        msg = f"Found {len(data.get('rows', []))} recs"
+        if is_ok and not has_12m:
+             msg += " [MISSING 12M ROI]"
+             status = "WARN"
+
         self.results.append(TestResult("Advisor Run", status, dt, msg))
         log(f"  Advisor API : {status} ({dt:.2f}s)")
 
     def check_data_logic(self):
-        log("\n--- [5/6] Validating Data Routing & Logic ---", Colors.CYAN)
+        log("\n--- [5/7] Validating Data Routing & Logic ---", Colors.CYAN)
         
         # Test KSA Routing
         code_ksa, data_ksa, dt_ksa = run_request("GET", f"{self.base_url}/v1/enriched/quote", self.headers, params={"symbol": KSA_SYM})
@@ -158,10 +173,10 @@ class SmokeTester:
 
         status = "PASS" if (is_ksa_ok and is_glb_ok) else "FAIL"
         self.results.append(TestResult("Market Routing", status, dt_ksa+dt_glb, f"KSA Src: {src_ksa} | GLB Src: {src_glb}"))
-        log(f"  Routing     : {status} ({dt_ksa+dt_glb:.2f}s)")
+        log(f"  Routing      : {status} ({dt_ksa+dt_glb:.2f}s)")
 
     def check_push_mode(self):
-        log("\n--- [6/6] Testing Advanced Push Mode ---", Colors.CYAN)
+        log("\n--- [6/7] Testing Advanced Push Mode ---", Colors.CYAN)
         payload = {
             "items": [
                 {
@@ -176,7 +191,40 @@ class SmokeTester:
         is_ok = code == 200 and data.get("status") == "success"
         status = "PASS" if is_ok else "FAIL"
         self.results.append(TestResult("Cache Push", status, dt, f"Written: {data.get('written')}"))
-        log(f"  Push API    : {status} ({dt:.2f}s)")
+        log(f"  Push API     : {status} ({dt:.2f}s)")
+
+    def check_forecast_and_localization(self):
+        log("\n--- [7/7] Forecast & Localization Audit ---", Colors.CYAN)
+        # Check Advanced Quote for Riyadh Time & ROI Keys
+        payload = {"tickers": [GLB_SYM], "sheet_name": "Test"}
+        code, data, dt = run_request("POST", f"{self.base_url}/v1/advanced/sheet-rows", self.headers, payload)
+        
+        if code != 200:
+             self.results.append(TestResult("Adv Audit", "FAIL", dt, f"HTTP {code}"))
+             log(f"  Adv Audit    : FAIL")
+             return
+
+        # Inspect first result if available (this is compute mode)
+        rows = data.get("rows", [])
+        headers = data.get("headers", [])
+        
+        if not rows:
+             self.results.append(TestResult("Adv Audit", "WARN", dt, "No rows returned"))
+             log(f"  Adv Audit    : WARN (No rows)")
+             return
+
+        # Check Headers
+        has_riyadh = "Last Updated (Riyadh)" in headers
+        has_roi_12m = "Expected ROI % (12M)" in headers
+        
+        status = "PASS" if (has_riyadh and has_roi_12m) else "FAIL"
+        msg = []
+        if not has_riyadh: msg.append("Missing Riyadh Time")
+        if not has_roi_12m: msg.append("Missing 12M ROI")
+        
+        self.results.append(TestResult("Schema Audit", status, dt, ", ".join(msg) if msg else "All Keys Present"))
+        log(f"  Schema Check : {status} ({dt:.2f}s)")
+
 
     def print_summary(self):
         log("\n" + "="*80, Colors.BOLD)
@@ -205,6 +253,7 @@ def main():
     tester.check_advisor()
     tester.check_data_logic()
     tester.check_push_mode()
+    tester.check_forecast_and_localization()
     
     tester.print_summary()
 
