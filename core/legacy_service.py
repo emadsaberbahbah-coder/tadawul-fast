@@ -1,7 +1,9 @@
+# core/legacy_service.py
 """
 core/legacy_service.py
 ------------------------------------------------------------
-Compatibility shim (quiet + useful) — v1.8.0 (PROD SAFE + ADVANCED MAPPING)
+Compatibility shim (quiet + useful) — v1.9.0
+(PROD SAFE + ADVANCED MAPPING + SNAPSHOT BRIDGE + SMART % SCALING)
 
 Goals
 - Provide a stable legacy router that NEVER breaks app startup.
@@ -15,10 +17,18 @@ Goals
 - Accept both {"symbols":[...]} and {"tickers":[...]} payload shapes.
 - Batch-first; if batch is missing/fails, fallback per-symbol with bounded concurrency.
 
-v1.8.0 Improvements:
-- ✅ Expanded Header Mapping: Supports all 59 columns (Forecasts, ROI, Scores, Technicals).
-- ✅ Riyadh Time Support: Explicitly maps Riyadh timestamps.
-- ✅ Robust Fallbacks: Better handling of missing engine methods.
+v1.9.0 Improvements
+- ✅ Snapshot Bridge: /sheet-rows will best-effort call engine.set_cached_sheet_snapshot(...)
+  so your Investment Advisor can consume cached pages reliably.
+- ✅ Smarter method fallback: if a method exists but fails, it tries the next.
+- ✅ Percent scaling: if header contains "%", auto-convert ratios (0.12 -> 12) safely.
+- ✅ Stable master headers fallback: if schemas missing, returns a rich set (forecasts, scores, technicals).
+- ✅ Better ordering/alignment in batch responses (list/dict/single item).
+- ✅ Always fills Last Updated UTC/Riyadh if missing.
+- ✅ Adds lightweight diagnostics in responses (engine_source + method).
+
+Notes
+- This file must remain import-safe (no heavy imports at module level).
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ import importlib
 import inspect
 import os
 import traceback
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Query, Request
@@ -35,9 +46,9 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -65,11 +76,22 @@ def _env_float(name: str, default: float) -> float:
 
 ENABLE_EXTERNAL_LEGACY_ROUTER = _env_bool("ENABLE_EXTERNAL_LEGACY_ROUTER", False)
 LOG_EXTERNAL_IMPORT_FAILURE = _env_bool("LOG_EXTERNAL_LEGACY_IMPORT_FAILURE", False)
+DEBUG_ERRORS = _env_bool("DEBUG_ERRORS", False)
 
 LEGACY_CONCURRENCY = max(1, min(25, _env_int("LEGACY_CONCURRENCY", 8)))
 LEGACY_TIMEOUT_SEC = max(3.0, min(90.0, _env_float("LEGACY_TIMEOUT_SEC", 25.0)))
+LEGACY_MAX_SYMBOLS = max(50, min(5000, _env_int("LEGACY_MAX_SYMBOLS", 2500)))
 
 _external_loaded_from: Optional[str] = None
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
 
 def _safe_mod_file(mod: Any) -> str:
@@ -89,7 +111,6 @@ def _try_import_external_router() -> Optional[APIRouter]:
     Optional override:
       - legacy_service.router
       - routes.legacy_service.router
-
     Guard against circular import.
     """
     global _external_loaded_from
@@ -106,7 +127,6 @@ def _try_import_external_router() -> Optional[APIRouter]:
     except Exception as exc1:
         try:
             mod2 = importlib.import_module("routes.legacy_service")
-            # If routes.legacy_service is only a shim (expected), do NOT treat it as external override.
             if _looks_like_this_file(_safe_mod_file(mod2)):
                 raise RuntimeError("circular import: routes.legacy_service points to core.legacy_service")
             r2 = getattr(mod2, "router", None)
@@ -140,7 +160,7 @@ class SymbolsIn(BaseModel):
         items = self.symbols or self.tickers or []
         out: List[str] = []
         seen = set()
-        for x in items:
+        for x in items[:LEGACY_MAX_SYMBOLS]:
             s = str(x or "").strip()
             if not s:
                 continue
@@ -180,13 +200,17 @@ def _normalize_symbol_best_effort(sym: str) -> str:
     s = (sym or "").strip()
     if not s:
         return ""
+    # conservative normalization: .SA -> .SR and uppercase
+    su = s.upper().replace(" ", "")
+    if su.endswith(".SA"):
+        su = su[:-3] + ".SR"
     try:
         from core.data_engine_v2 import normalize_symbol  # type: ignore
 
-        out = normalize_symbol(s)
-        return str(out or "").strip() or s
+        out = normalize_symbol(su)
+        return str(out or "").strip() or su
     except Exception:
-        return s
+        return su
 
 
 async def _close_engine_best_effort(engine: Any) -> None:
@@ -251,21 +275,63 @@ async def _get_engine_best_effort(request: Request) -> Tuple[Optional[Any], str,
         return None, "none", False
 
 
-async def _call_engine_method(engine: Any, method_names: Sequence[str], *args, **kwargs) -> Tuple[Optional[Any], str]:
+async def _call_engine_method(
+    engine: Any,
+    method_names: Sequence[str],
+    *args,
+    **kwargs,
+) -> Tuple[Optional[Any], str]:
+    """
+    Tries methods in order:
+    - If method missing: continue
+    - If method exists but fails: continue to next (keep last error)
+    Returns: (result or None, used_method_or_error)
+    """
+    last_err = "missing"
     for name in method_names:
         fn = getattr(engine, name, None)
-        if callable(fn):
-            try:
-                res = fn(*args, **kwargs)
-                res2 = await _maybe_await(res)
-                return res2, name
-            except Exception as e:
-                return None, f"{name} failed: {_safe_err(e)}"
-    return None, "missing"
+        if not callable(fn):
+            continue
+        try:
+            res = fn(*args, **kwargs)
+            res2 = await _maybe_await(res)
+            return res2, name
+        except Exception as e:
+            last_err = f"{name} failed: {_safe_err(e)}"
+            continue
+    return None, last_err
 
 
 def _sheet_name_from(payload: SheetRowsIn) -> str:
     return (payload.sheet_name or payload.sheetName or "").strip()
+
+
+def _headers_master_default() -> List[str]:
+    # A generous default covering the common "59+ columns" universe.
+    return [
+        # Identity
+        "Rank", "Symbol", "Origin", "Name", "Sector", "Sub Sector", "Market", "Currency", "Listing Date",
+        # Prices
+        "Price", "Prev Close", "Change", "Change %", "Day High", "Day Low", "52W High", "52W Low", "52W Position %",
+        # Liquidity
+        "Volume", "Avg Vol 30D", "Value Traded", "Turnover %", "Shares Outstanding", "Free Float %", "Market Cap",
+        "Free Float Mkt Cap", "Liquidity Score",
+        # Fundamentals
+        "EPS (TTM)", "Forward EPS", "P/E (TTM)", "Forward P/E", "P/B", "P/S", "EV/EBITDA",
+        "Dividend Yield", "Dividend Rate", "Payout Ratio", "ROE", "ROA", "Net Margin", "EBITDA Margin",
+        "Revenue Growth", "Net Income Growth", "Beta",
+        # Technicals & Scores
+        "Volatility 30D", "RSI 14", "Fair Value", "Upside %", "Valuation Label",
+        "Value Score", "Quality Score", "Momentum Score", "Opportunity Score", "Risk Score", "Overall Score",
+        "Recommendation", "Rec Badge",
+        # Forecasts
+        "Forecast Price (1M)", "Expected ROI % (1M)",
+        "Forecast Price (3M)", "Expected ROI % (3M)",
+        "Forecast Price (12M)", "Expected ROI % (12M)",
+        "Forecast Confidence", "Forecast Updated (UTC)", "Forecast Updated (Riyadh)",
+        # Metadata
+        "News Score", "Data Quality", "Data Source", "Error", "Last Updated (UTC)", "Last Updated (Riyadh)",
+    ]
 
 
 def _headers_fallback(sheet_name: str) -> List[str]:
@@ -279,22 +345,7 @@ def _headers_fallback(sheet_name: str) -> List[str]:
     except Exception:
         pass
 
-    # Fallback to a generous default if schemas missing
-    return [
-        "Symbol",
-        "Name",
-        "Market",
-        "Currency",
-        "Price",
-        "Change",
-        "Change %",
-        "Volume",
-        "Market Cap",
-        "P/E (TTM)",
-        "Data Quality",
-        "Data Source",
-        "Error",
-    ]
+    return _headers_master_default()
 
 
 def _quote_dict(q: Any) -> Dict[str, Any]:
@@ -312,27 +363,81 @@ def _quote_dict(q: Any) -> Dict[str, Any]:
 
 def _extract_symbol_from_quote(q: Any) -> str:
     d = _quote_dict(q)
-    s = d.get("symbol_normalized") or d.get("symbol") or d.get("ticker") or ""
+    s = d.get("symbol_normalized") or d.get("symbol") or d.get("ticker") or d.get("requested_symbol") or ""
     return str(s or "").strip().upper()
+
+
+def _looks_like_percent_header(h: str) -> bool:
+    s = (h or "").strip()
+    if not s:
+        return False
+    if "%" in s:
+        return True
+    # common percent-ish fields without %
+    s2 = s.lower()
+    return s2.endswith("yield") or "margin" in s2 or s2.endswith("growth")
+
+
+def _to_float_best(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        try:
+            return float(x)
+        except Exception:
+            return None
+    try:
+        s = str(x).strip().replace(",", "")
+        if not s or s.lower() in {"na", "n/a", "null", "none", "-", "—"}:
+            return None
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        return float(s)
+    except Exception:
+        return None
+
+
+def _coerce_for_header(header: str, val: Any) -> Any:
+    """
+    Smart coercion:
+    - If header is percent-ish and value looks like ratio (-2..2), scale to percent (x100).
+    - Keep non-numeric values as-is.
+    """
+    if val is None:
+        return None
+
+    # strings might be dates, keep if not numeric
+    f = _to_float_best(val)
+    if f is None:
+        return val
+
+    if _looks_like_percent_header(header):
+        # ratio -> percent
+        if -2.0 <= f <= 2.0:
+            return f * 100.0
+        return f
+
+    return f
 
 
 def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
     d = _quote_dict(q)
 
-    # Robust getter to handle multiple keys and safe string/float handling
     def g(*keys: str) -> Any:
         for k in keys:
             if k in d:
                 return d.get(k)
         return None
-    
-    # Advanced mapping (Aligned with v5.8.0 Sheet Controller)
+
+    # Advanced mapping (best-effort / stable)
     mapped: Dict[str, Any] = {
         # Identity
         "Rank": g("rank", "market_rank"),
-        "Symbol": g("symbol", "symbol_normalized", "ticker"),
-        "Origin": g("origin", "exchange"),
-        "Name": g("name", "company_name"),
+        "Symbol": g("symbol_normalized", "symbol", "ticker", "requested_symbol"),
+        "Origin": g("origin", "exchange", "source_sheet"),
+        "Name": g("name", "company_name", "long_name", "short_name"),
         "Sector": g("sector", "sector_name"),
         "Sub Sector": g("sub_sector", "industry"),
         "Market": g("market", "market_region"),
@@ -340,7 +445,7 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         "Listing Date": g("listing_date", "ipo_date"),
 
         # Prices
-        "Price": g("current_price", "last_price", "price"),
+        "Price": g("current_price", "last_price", "price", "close"),
         "Prev Close": g("previous_close", "prev_close", "prior_close"),
         "Change": g("price_change", "change"),
         "Change %": g("percent_change", "change_pct", "change_percent"),
@@ -349,11 +454,11 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         "52W High": g("week_52_high", "high_52w"),
         "52W Low": g("week_52_low", "low_52w"),
         "52W Position %": g("position_52w_percent", "position_52w"),
-        
+
         # Liquidity
         "Volume": g("volume"),
         "Avg Vol 30D": g("avg_volume_30d", "avg_vol"),
-        "Value Traded": g("value_traded"),
+        "Value Traded": g("value_traded", "turnover_value"),
         "Turnover %": g("turnover_percent"),
         "Shares Outstanding": g("shares_outstanding"),
         "Free Float %": g("free_float", "free_float_percent"),
@@ -379,10 +484,10 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         "Revenue Growth": g("revenue_growth"),
         "Net Income Growth": g("net_income_growth"),
         "Beta": g("beta"),
-        
+
         # Technicals & Scores
-        "Volatility 30D": g("volatility_30d"),
-        "RSI 14": g("rsi_14"),
+        "Volatility 30D": g("volatility_30d", "volatility (30d)", "volatility_30d_ratio"),
+        "RSI 14": g("rsi_14", "rsi (14)"),
         "Fair Value": g("fair_value", "intrinsic_value"),
         "Upside %": g("upside_percent"),
         "Valuation Label": g("valuation_label"),
@@ -393,7 +498,8 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         "Risk Score": g("risk_score"),
         "Overall Score": g("overall_score"),
         "Recommendation": g("recommendation"),
-        
+        "Rec Badge": g("rec_badge"),
+
         # Forecasts
         "Forecast Price (1M)": g("forecast_price_1m", "target_price_1m"),
         "Expected ROI % (1M)": g("expected_roi_1m", "roi_1m"),
@@ -406,38 +512,43 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         "Forecast Updated (Riyadh)": g("forecast_updated_riyadh"),
 
         # Metadata
+        "News Score": g("news_score", "news_sentiment", "sentiment_score", "news_boost"),
         "Data Quality": g("data_quality"),
         "Data Source": g("data_source", "source", "provider"),
         "Error": g("error"),
+
         "Last Updated (UTC)": g("last_updated_utc", "as_of_utc"),
         "Last Updated (Riyadh)": g("last_updated_riyadh"),
     }
 
+    # Ensure updated timestamps
+    if not mapped.get("Last Updated (UTC)"):
+        mapped["Last Updated (UTC)"] = _utc_iso()
+    if not mapped.get("Last Updated (Riyadh)"):
+        mapped["Last Updated (Riyadh)"] = _riyadh_iso()
+
     row: List[Any] = []
     for h in headers:
-        # Case-insensitive lookup in mapped dict
-        found = False
-        target_val = None
-        
-        # 1. Exact match
+        # 1) exact mapped
         if h in mapped:
-            target_val = mapped[h]
-            found = True
+            v = mapped[h]
         else:
-            # 2. Case-insensitive match
-            h_low = h.lower().strip()
-            for k, v in mapped.items():
-                if k.lower().strip() == h_low:
-                    target_val = v
-                    found = True
+            # 2) case-insensitive match in mapped keys
+            h_low = (h or "").strip().lower()
+            v = None
+            for k, vv in mapped.items():
+                if (k or "").strip().lower() == h_low:
+                    v = vv
                     break
-        
-        # 3. Direct lookup in quote dict (fallback)
-        if not found:
-             target_val = d.get(h) or d.get(h.lower().replace(" ", "_"))
 
-        row.append(target_val)
-        
+            # 3) raw dict fallbacks
+            if v is None:
+                v = d.get(h)
+                if v is None:
+                    v = d.get(h_low.replace(" ", "_"))
+
+        row.append(_coerce_for_header(h, v))
+
     return row
 
 
@@ -446,7 +557,6 @@ def _items_to_ordered_list(items: Any, symbols: List[str]) -> List[Any]:
         return []
 
     if isinstance(items, list):
-        # attempt to align list by symbol if list items have symbol fields
         sym_map: Dict[str, Any] = {}
         for it in items:
             k = _extract_symbol_from_quote(it)
@@ -483,6 +593,22 @@ def _items_to_ordered_list(items: Any, symbols: List[str]) -> List[Any]:
     return []
 
 
+async def _try_cache_snapshot(engine: Any, sheet_name: str, headers: List[str], rows: List[List[Any]], meta: Dict[str, Any]) -> None:
+    """
+    Bridge: store snapshot for later use by Investment Advisor universe fetch.
+    No-op if engine doesn't support it.
+    """
+    if engine is None or not sheet_name or not headers:
+        return
+    fn = getattr(engine, "set_cached_sheet_snapshot", None)
+    if callable(fn):
+        try:
+            res = fn(sheet_name, headers, rows, meta)  # type: ignore[misc]
+            await _maybe_await(res)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
@@ -499,12 +625,13 @@ async def legacy_health(request: Request):
         "external_router_enabled": ENABLE_EXTERNAL_LEGACY_ROUTER,
         "legacy_concurrency": LEGACY_CONCURRENCY,
         "legacy_timeout_sec": LEGACY_TIMEOUT_SEC,
+        "legacy_max_symbols": LEGACY_MAX_SYMBOLS,
     }
 
     try:
-        from core.data_engine_v2 import ENGINE_VERSION  # type: ignore
+        from core.data_engine_v2 import ENGINE_VERSION as V2_ENGINE_VERSION  # type: ignore
 
-        info["engine_version"] = ENGINE_VERSION
+        info["engine_version"] = V2_ENGINE_VERSION
     except Exception:
         info["engine_version"] = "unknown"
 
@@ -538,7 +665,7 @@ async def legacy_quote(
     symbol: str = Query(..., min_length=1),
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
-    dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
+    dbg = DEBUG_ERRORS or bool(debug)
     raw = (symbol or "").strip()
     sym = _normalize_symbol_best_effort(raw)
 
@@ -567,8 +694,11 @@ async def legacy_quote(
                 "symbol_normalized": sym,
                 "data_quality": "MISSING",
                 "data_source": "none",
-                "error": f"Engine call failed (source={src}, method={used}).",
+                "error": f"Engine call failed (source={src}, detail={used}).",
             }
+            if dbg:
+                out["engine_source"] = src
+                out["method_detail"] = used
             return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
         return JSONResponse(status_code=200, content=jsonable_encoder(q))
@@ -601,7 +731,7 @@ async def legacy_quotes(
     payload: SymbolsIn,
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
-    dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
+    dbg = DEBUG_ERRORS or bool(debug)
 
     raw_symbols = payload.normalized()
     if not raw_symbols:
@@ -617,12 +747,21 @@ async def legacy_quotes(
         eng, src, should_close = await _get_engine_best_effort(request)
         if eng is None:
             out = [
-                {"status": "error", "symbol": s, "data_quality": "MISSING", "data_source": "none", "error": "Legacy engine not available (no working provider)."}
+                {"status": "error", "symbol": s, "data_quality": "MISSING", "data_source": "none",
+                 "error": "Legacy engine not available (no working provider)."}
                 for s in raw_symbols
             ]
             return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
-        items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
+        # try batch
+        try:
+            items, used = await asyncio.wait_for(
+                _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols),
+                timeout=LEGACY_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            items, used = None, "get_quotes timeout"
+
         if items is not None:
             ordered = _items_to_ordered_list(items, symbols)
             if ordered:
@@ -631,6 +770,7 @@ async def legacy_quotes(
                 return JSONResponse(status_code=200, content=jsonable_encoder(items))
             items = None
 
+        # per-symbol fallback
         sem = asyncio.Semaphore(LEGACY_CONCURRENCY)
 
         async def _one(sym_i: str, raw_i: str) -> Any:
@@ -641,12 +781,21 @@ async def legacy_quotes(
                         timeout=LEGACY_TIMEOUT_SEC,
                     )
                     if q_i is None:
-                        return {"status": "error", "symbol": raw_i, "data_quality": "MISSING", "data_source": "none", "error": f"Engine call failed (source={src}, method={used_i})."}
+                        return {
+                            "status": "error",
+                            "symbol": raw_i,
+                            "symbol_normalized": sym_i,
+                            "data_quality": "MISSING",
+                            "data_source": "none",
+                            "error": f"Engine call failed (source={src}, detail={used_i}).",
+                        }
                     return q_i
                 except asyncio.TimeoutError:
-                    return {"status": "error", "symbol": raw_i, "data_quality": "MISSING", "data_source": "none", "error": "timeout"}
+                    return {"status": "error", "symbol": raw_i, "symbol_normalized": sym_i,
+                            "data_quality": "MISSING", "data_source": "none", "error": "timeout"}
                 except Exception as ee:
-                    return {"status": "error", "symbol": raw_i, "data_quality": "MISSING", "data_source": "none", "error": _safe_err(ee)}
+                    return {"status": "error", "symbol": raw_i, "symbol_normalized": sym_i,
+                            "data_quality": "MISSING", "data_source": "none", "error": _safe_err(ee)}
 
         results = await asyncio.gather(*[_one(symbols[i], raw_symbols[i]) for i in range(len(symbols))])
         if dbg:
@@ -673,7 +822,7 @@ async def legacy_sheet_rows(
     payload: SheetRowsIn,
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
 ):
-    dbg = _env_bool("DEBUG_ERRORS", False) or bool(debug)
+    dbg = DEBUG_ERRORS or bool(debug)
 
     eng = None
     src = "none"
@@ -683,7 +832,10 @@ async def legacy_sheet_rows(
         symbols_in = SymbolsIn(symbols=payload.symbols or [], tickers=payload.tickers or [])
         raw_symbols = symbols_in.normalized()
         if not raw_symbols:
-            return JSONResponse(status_code=200, content=jsonable_encoder({"status": "skipped", "headers": [], "rows": [], "error": "No symbols provided"}))
+            return JSONResponse(
+                status_code=200,
+                content=jsonable_encoder({"status": "skipped", "headers": [], "rows": [], "error": "No symbols provided"}),
+            )
 
         symbols = [_normalize_symbol_best_effort(s) for s in raw_symbols]
 
@@ -698,9 +850,17 @@ async def legacy_sheet_rows(
                 content=jsonable_encoder({"status": "error", "headers": headers, "rows": rows, "error": "Legacy engine not available", "engine_source": src}),
             )
 
-        items, used = await _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols)
+        # batch quotes first (preferred)
+        try:
+            items, used = await asyncio.wait_for(
+                _call_engine_method(eng, ("get_quotes", "get_enriched_quotes"), symbols),
+                timeout=LEGACY_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            items, used = None, "get_quotes timeout"
 
         if items is None:
+            # per symbol
             sem = asyncio.Semaphore(LEGACY_CONCURRENCY)
 
             async def _one(sym_i: str) -> Any:
@@ -720,20 +880,39 @@ async def legacy_sheet_rows(
         ordered_items = _items_to_ordered_list(items, symbols)
 
         if not isinstance(ordered_items, list) or not ordered_items:
-            rows = [[s, None, None, None, None, None, None, None, None, None, "MISSING", "none", f"Engine returned non-list (method={used})"] for s in raw_symbols]
-            return JSONResponse(
-                status_code=200,
-                content=jsonable_encoder({"status": "error", "headers": headers, "rows": rows, "error": "Engine returned non-list", "engine_source": src, "method": used}),
-            )
+            rows = [[s, None, None, None, None, None, None, None, None, None, "MISSING", "none", f"Engine returned non-list (detail={used})"] for s in raw_symbols]
+            out = {"status": "error", "headers": headers, "rows": rows, "error": "Engine returned non-list", "engine_source": src, "method": used}
+            if dbg:
+                out["debug"] = True
+            return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
         rows = [_quote_to_row(q, headers) if q is not None else _quote_to_row({}, headers) for q in ordered_items]
-        return JSONResponse(
-            status_code=200,
-            content=jsonable_encoder({"status": "success", "headers": headers, "rows": rows, "count": len(rows), "engine_source": src, "method": used}),
-        )
+
+        # Snapshot Bridge: cache this sheet page for later (Investment Advisor universe)
+        snap_meta = {
+            "router": "core.legacy_service",
+            "version": VERSION,
+            "engine_source": src,
+            "method": used,
+            "cached_at_utc": _utc_iso(),
+        }
+        await _try_cache_snapshot(eng, sheet_name, headers, rows, snap_meta)
+
+        out = {
+            "status": "success",
+            "headers": headers,
+            "rows": rows,
+            "count": len(rows),
+            "engine_source": src,
+            "method": used,
+        }
+        if dbg:
+            out["debug"] = True
+            out["sheet_name"] = sheet_name
+        return JSONResponse(status_code=200, content=jsonable_encoder(out))
 
     except Exception as e:
-        out: Dict[str, Any] = {"status": "error", "headers": [], "rows": [], "error": _safe_err(e)}
+        out: Dict[str, Any] = {"status": "error", "headers": _headers_master_default(), "rows": [], "error": _safe_err(e)}
         if dbg:
             out["traceback"] = traceback.format_exc()[:8000]
             out["engine_source"] = src
@@ -760,4 +939,4 @@ def get_router() -> APIRouter:
     return router
 
 
-__all__ = ["router", "get_router"]
+__all__ = ["router", "get_router", "VERSION"]
