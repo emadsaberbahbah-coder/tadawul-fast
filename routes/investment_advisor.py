@@ -14,18 +14,19 @@ v1.6.0 Enhancements:
 - ✅ Advanced Filtering: Support for `min_price`, `max_price`, and `exclude_sectors`.
 - ✅ Payload Hardening: Better type coercion for numeric filters.
 - ✅ Diagnostic Metadata: Richer reporting on filtered candidates.
+- ✅ Riyadh Localization: Injects Riyadh timestamps.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import APIRouter, Body, Header, Query, Request
+from fastapi import APIRouter, Body, Header, Request
 
 logger = logging.getLogger("routes.investment_advisor")
 
@@ -52,12 +53,14 @@ TT_ADVISOR_DEFAULT_HEADERS: List[str] = [
     "Allocation Amount",
     "Expected ROI % (1M)",
     "Expected ROI % (3M)",
+    "Expected ROI % (12M)", # Added v1.6.0
     "Risk Bucket",
     "Confidence Bucket",
     "Reason (Explain)",
     "Data Source",
     "Data Quality",
     "Last Updated (UTC)",
+    "Last Updated (Riyadh)", # Added v1.6.0
 ]
 
 
@@ -67,6 +70,10 @@ def _truthy(v: Any) -> bool:
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
 
 # ---------------------------------------------------------------------
@@ -164,16 +171,13 @@ def _safe_float(v: Any) -> Optional[float]:
     except Exception:
         return None
 
+def _to_int(x: Any) -> Optional[int]:
+    try:
+        return int(float(str(x).strip()))
+    except:
+        return None
 
 def _parse_percentish(v: Any, *, default: Optional[float] = None) -> Optional[float]:
-    """
-    Returns percent (0..100), or default if cannot parse.
-    Accepts:
-      - 0.05 (ratio) => 5.0
-      - 5 => 5.0
-      - "5%" => 5.0
-      - "0.05" => 5.0 (treated as ratio if <= 1)
-    """
     if v is None or v == "":
         return default
     try:
@@ -195,9 +199,6 @@ def _parse_percentish(v: Any, *, default: Optional[float] = None) -> Optional[fl
 
 
 def _percent_to_ratio(p: Any, *, default_ratio: float) -> float:
-    """
-    Accept percent-ish and return ratio.
-    """
     pct = _parse_percentish(p, default=default_ratio * 100.0)
     try:
         return float(pct or 0.0) / 100.0
@@ -206,13 +207,6 @@ def _percent_to_ratio(p: Any, *, default_ratio: float) -> float:
 
 
 def _normalize_sources(v: Any) -> List[str]:
-    """
-    Accept:
-    - None -> DEFAULT_SOURCES
-    - "ALL" -> DEFAULT_SOURCES
-    - "Market_Leaders,Global_Markets" -> list
-    - ["Market_Leaders","GLOBAL_MARKETS"] -> list
-    """
     if v is None:
         return list(DEFAULT_SOURCES)
 
@@ -233,14 +227,6 @@ def _normalize_sources(v: Any) -> List[str]:
 
 
 def _normalize_tickers(v: Any) -> List[str]:
-    """
-    Accept:
-    - ["1120.SR", "AAPL.US"]
-    - "1120.SR,AAPL.US"
-    - "1120.SR"
-    - None -> []
-    Returns uppercase, trimmed, de-duplicated (stable order).
-    """
     if v is None:
         return []
 
@@ -359,6 +345,8 @@ def _normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
         # diagnostics (safe extras)
         "_diag_tickers_count": len(tickers),
         "_diag_tickers": tickers[:50],
+        # If explicit tickers provided, pass them (overrides sources)
+        "tickers": tickers if tickers else None
     }
     return advisor_core_payload
 
@@ -375,13 +363,6 @@ def _engine_get(request: Request) -> Any:
 
 
 def _probe_engine_snapshots(engine: Any, sources: List[str]) -> Tuple[Dict[str, bool], int]:
-    """
-    Returns:
-      - hits: {source: True/False}
-      - hit_count
-
-    We probe both sheet-name and sheetKey variants so diagnostics match DataEngine v2.14 cache keys.
-    """
     hits: Dict[str, bool] = {}
     hit_count = 0
     if engine is None:
@@ -395,6 +376,7 @@ def _probe_engine_snapshots(engine: Any, sources: List[str]) -> Tuple[Dict[str, 
             hits[s] = False
         return hits, 0
 
+    # Extended map for better hit rate
     tab_to_key = {
         "MARKET_LEADERS": "MARKET_LEADERS",
         "GLOBAL_MARKETS": "GLOBAL_MARKETS",
@@ -404,15 +386,10 @@ def _probe_engine_snapshots(engine: Any, sources: List[str]) -> Tuple[Dict[str, 
         "GLOBAL_MARKETS".lower(): "GLOBAL_MARKETS",
         "MUTUAL_FUNDS".lower(): "MUTUAL_FUNDS",
         "COMMODITIES_FX".lower(): "COMMODITIES_FX",
-        "Market_Leaders".upper(): "MARKET_LEADERS",
-        "Global_Markets".upper(): "GLOBAL_MARKETS",
-        "Mutual_Funds".upper(): "MUTUAL_FUNDS",
-        "Commodities_FX".upper(): "COMMODITIES_FX",
     }
 
     for s in sources:
         ok = False
-
         # try exact
         try:
             snap = getter(s)
@@ -491,6 +468,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
             "auth": "open" if not _allowed_tokens() else "token",
             "default_headers_len": len(TT_ADVISOR_DEFAULT_HEADERS),
             "defaults_sources": list(DEFAULT_SOURCES),
+            "riyadh_time": _riyadh_iso(),
         }
     )
 
@@ -567,6 +545,7 @@ async def _run_core(request: Request, payload: Dict[str, Any], *, debug: int = 0
                     "sheet_cache_hit_count": cache_hit_count,
                     "engine_present": bool(engine is not None),
                     "engine_type": type(engine).__name__ if engine is not None else "none",
+                    "last_updated_riyadh": _riyadh_iso(), # ✅ Explicit Riyadh Time
                 }
             )
             out["meta"] = out_meta
