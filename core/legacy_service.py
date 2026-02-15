@@ -1,27 +1,24 @@
 """
 core/legacy_service.py
 ------------------------------------------------------------
-Compatibility shim (quiet + useful) — v1.7.4 (PROD SAFE)
+Compatibility shim (quiet + useful) — v1.8.0 (PROD SAFE + ADVANCED MAPPING)
 
 Goals
 - Provide a stable legacy router that NEVER breaks app startup.
 - Never raise outward from endpoints (always HTTP 200 with a JSON body).
 - Best-effort engine discovery:
     1) request.app.state.engine
-    2) core.data_engine_v2.get_engine() (singleton) if available  ✅ (sync OR async supported)
-    3) core.data_engine_v2.DataEngineV2/DataEngine temp (per-request) ✅ (auto-close after use)
-    4) core.data_engine.DataEngine() temp (per-request)                ✅ (auto-close after use)
+    2) core.data_engine_v2.get_engine() (singleton) if available
+    3) core.data_engine_v2.DataEngineV2/DataEngine temp
+    4) core.data_engine.DataEngine() temp
 - Support BOTH async and sync engine method implementations.
 - Accept both {"symbols":[...]} and {"tickers":[...]} payload shapes.
 - Batch-first; if batch is missing/fails, fallback per-symbol with bounded concurrency.
-- Optional external override router (if you have one) via env flag.
 
-Env
-- ENABLE_EXTERNAL_LEGACY_ROUTER=false (default)
-- LOG_EXTERNAL_LEGACY_IMPORT_FAILURE=false (default)
-- DEBUG_ERRORS=1 (adds traceback if ?debug=1 too)
-- LEGACY_CONCURRENCY=8
-- LEGACY_TIMEOUT_SEC=25
+v1.8.0 Improvements:
+- ✅ Expanded Header Mapping: Supports all 59 columns (Forecasts, ROI, Scores, Technicals).
+- ✅ Riyadh Time Support: Explicitly maps Riyadh timestamps.
+- ✅ Robust Fallbacks: Better handling of missing engine methods.
 """
 
 from __future__ import annotations
@@ -38,7 +35,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-VERSION = "1.7.4"
+VERSION = "1.8.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -110,7 +107,6 @@ def _try_import_external_router() -> Optional[APIRouter]:
         try:
             mod2 = importlib.import_module("routes.legacy_service")
             # If routes.legacy_service is only a shim (expected), do NOT treat it as external override.
-            # We only accept it as external override if it isn't pointing back here.
             if _looks_like_this_file(_safe_mod_file(mod2)):
                 raise RuntimeError("circular import: routes.legacy_service points to core.legacy_service")
             r2 = getattr(mod2, "router", None)
@@ -283,6 +279,7 @@ def _headers_fallback(sheet_name: str) -> List[str]:
     except Exception:
         pass
 
+    # Fallback to a generous default if schemas missing
     return [
         "Symbol",
         "Name",
@@ -322,31 +319,125 @@ def _extract_symbol_from_quote(q: Any) -> str:
 def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
     d = _quote_dict(q)
 
+    # Robust getter to handle multiple keys and safe string/float handling
     def g(*keys: str) -> Any:
         for k in keys:
             if k in d:
                 return d.get(k)
         return None
-
+    
+    # Advanced mapping (Aligned with v5.8.0 Sheet Controller)
     mapped: Dict[str, Any] = {
+        # Identity
+        "Rank": g("rank", "market_rank"),
         "Symbol": g("symbol", "symbol_normalized", "ticker"),
+        "Origin": g("origin", "exchange"),
         "Name": g("name", "company_name"),
+        "Sector": g("sector", "sector_name"),
+        "Sub Sector": g("sub_sector", "industry"),
         "Market": g("market", "market_region"),
-        "Currency": g("currency"),
+        "Currency": g("currency", "currency_code"),
+        "Listing Date": g("listing_date", "ipo_date"),
+
+        # Prices
         "Price": g("current_price", "last_price", "price"),
+        "Prev Close": g("previous_close", "prev_close", "prior_close"),
         "Change": g("price_change", "change"),
         "Change %": g("percent_change", "change_pct", "change_percent"),
+        "Day High": g("day_high", "high"),
+        "Day Low": g("day_low", "low"),
+        "52W High": g("week_52_high", "high_52w"),
+        "52W Low": g("week_52_low", "low_52w"),
+        "52W Position %": g("position_52w_percent", "position_52w"),
+        
+        # Liquidity
         "Volume": g("volume"),
+        "Avg Vol 30D": g("avg_volume_30d", "avg_vol"),
+        "Value Traded": g("value_traded"),
+        "Turnover %": g("turnover_percent"),
+        "Shares Outstanding": g("shares_outstanding"),
+        "Free Float %": g("free_float", "free_float_percent"),
         "Market Cap": g("market_cap"),
+        "Free Float Mkt Cap": g("free_float_market_cap"),
+        "Liquidity Score": g("liquidity_score"),
+
+        # Fundamentals
+        "EPS (TTM)": g("eps_ttm", "eps"),
+        "Forward EPS": g("forward_eps"),
         "P/E (TTM)": g("pe_ttm", "pe"),
+        "Forward P/E": g("forward_pe"),
+        "P/B": g("pb", "price_to_book"),
+        "P/S": g("ps", "price_to_sales"),
+        "EV/EBITDA": g("ev_ebitda"),
+        "Dividend Yield": g("dividend_yield"),
+        "Dividend Rate": g("dividend_rate"),
+        "Payout Ratio": g("payout_ratio"),
+        "ROE": g("roe"),
+        "ROA": g("roa"),
+        "Net Margin": g("net_margin", "profit_margin"),
+        "EBITDA Margin": g("ebitda_margin"),
+        "Revenue Growth": g("revenue_growth"),
+        "Net Income Growth": g("net_income_growth"),
+        "Beta": g("beta"),
+        
+        # Technicals & Scores
+        "Volatility 30D": g("volatility_30d"),
+        "RSI 14": g("rsi_14"),
+        "Fair Value": g("fair_value", "intrinsic_value"),
+        "Upside %": g("upside_percent"),
+        "Valuation Label": g("valuation_label"),
+        "Value Score": g("value_score"),
+        "Quality Score": g("quality_score"),
+        "Momentum Score": g("momentum_score"),
+        "Opportunity Score": g("opportunity_score"),
+        "Risk Score": g("risk_score"),
+        "Overall Score": g("overall_score"),
+        "Recommendation": g("recommendation"),
+        
+        # Forecasts
+        "Forecast Price (1M)": g("forecast_price_1m", "target_price_1m"),
+        "Expected ROI % (1M)": g("expected_roi_1m", "roi_1m"),
+        "Forecast Price (3M)": g("forecast_price_3m", "target_price_3m"),
+        "Expected ROI % (3M)": g("expected_roi_3m", "roi_3m"),
+        "Forecast Price (12M)": g("forecast_price_12m", "target_price_12m"),
+        "Expected ROI % (12M)": g("expected_roi_12m", "roi_12m"),
+        "Forecast Confidence": g("forecast_confidence"),
+        "Forecast Updated (UTC)": g("forecast_updated_utc"),
+        "Forecast Updated (Riyadh)": g("forecast_updated_riyadh"),
+
+        # Metadata
         "Data Quality": g("data_quality"),
         "Data Source": g("data_source", "source", "provider"),
         "Error": g("error"),
+        "Last Updated (UTC)": g("last_updated_utc", "as_of_utc"),
+        "Last Updated (Riyadh)": g("last_updated_riyadh"),
     }
 
     row: List[Any] = []
     for h in headers:
-        row.append(mapped.get(h, d.get(h)))
+        # Case-insensitive lookup in mapped dict
+        found = False
+        target_val = None
+        
+        # 1. Exact match
+        if h in mapped:
+            target_val = mapped[h]
+            found = True
+        else:
+            # 2. Case-insensitive match
+            h_low = h.lower().strip()
+            for k, v in mapped.items():
+                if k.lower().strip() == h_low:
+                    target_val = v
+                    found = True
+                    break
+        
+        # 3. Direct lookup in quote dict (fallback)
+        if not found:
+             target_val = d.get(h) or d.get(h.lower().replace(" ", "_"))
+
+        row.append(target_val)
+        
     return row
 
 
