@@ -1,17 +1,17 @@
-# routes/ai_analysis.py  (FULL REPLACEMENT)
+# routes/ai_analysis.py
 """
-TADAWUL FAST BRIDGE – AI ANALYSIS ROUTES (v4.5.0) – PROD SAFE
+TADAWUL FAST BRIDGE – AI ANALYSIS ROUTES (v4.6.0) – PROD SAFE
 
 Advanced Analysis Router
 - Handles: /v1/analysis/quotes (Batch/Single)
 - Handles: /v1/analysis/sheet-rows (Dual Mode: Push Cache / Compute Grid)
 - Handles: /v1/analysis/scoreboard
 
-Key Upgrades in v4.5.0:
-- ✅ Scoring Integration: Native hook into core.scoring_engine v1.7.0.
-- ✅ ROI Alignment: Standardized on 'expected_roi_1m/3m/12m'.
+Key Upgrades in v4.6.0:
+- ✅ Scoring Integration: Native hook into core.scoring_engine v1.7.2.
+- ✅ ROI Alignment: Standardized on 'expected_roi_1m/3m/12m' (canonical).
 - ✅ Smart Push: Detects 'items' payload to update Engine Snapshot Cache.
-- ✅ Riyadh Time: Enforces localized timestamps for KSA users.
+- ✅ Riyadh Time: Enforces localized timestamps (UTC+3) for KSA users.
 - ✅ Robust Fallbacks: Never crashes on missing providers or engines.
 """
 
@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "4.5.0"
+AI_ANALYSIS_VERSION = "4.6.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 
@@ -93,13 +93,17 @@ def _cfg() -> Dict[str, Any]:
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
+
 def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
     if not utc_iso: return ""
     try:
-        # Simple offset +3 for KSA
+        # Standardize Z to offset for fromisoformat compatibility
         dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
-        ksa_dt = dt.astimezone(timezone(timedelta(hours=3)))
-        return ksa_dt.isoformat()
+        tz = timezone(timedelta(hours=3))
+        return dt.astimezone(tz).isoformat()
     except:
         return ""
 
@@ -175,6 +179,7 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     expected_roi_12m: Optional[float] = None
     forecast_price_1m: Optional[float] = None
     forecast_price_3m: Optional[float] = None
+    forecast_price_12m: Optional[float] = None
     forecast_confidence: Optional[float] = None
     forecast_updated_utc: Optional[str] = None
     
@@ -207,6 +212,7 @@ class SheetAnalysisResponse(_ExtraIgnoreBase):
     rows: List[List[Any]] = Field(default_factory=list)
     status: str = "success"
     error: Optional[str] = None
+    version: str = AI_ANALYSIS_VERSION
 
 
 # =============================================================================
@@ -308,11 +314,15 @@ def _quote_to_response(q: Any) -> SingleAnalysisResponse:
         risk_score=d.get("risk_score"),
         overall_score=d.get("overall_score"),
         recommendation=d.get("recommendation", "HOLD"),
+        # Canonical ROI Mapping
         expected_roi_1m=d.get("expected_roi_1m"),
         expected_roi_3m=d.get("expected_roi_3m"),
         expected_roi_12m=d.get("expected_roi_12m"),
+        # Canonical Price Mapping
         forecast_price_1m=d.get("forecast_price_1m"),
         forecast_price_3m=d.get("forecast_price_3m"),
+        forecast_price_12m=d.get("forecast_price_12m"),
+        
         forecast_confidence=d.get("forecast_confidence"),
         data_quality=d.get("data_quality", "OK"),
         error=d.get("error"),
@@ -330,7 +340,8 @@ async def health(request: Request):
         "status": "ok",
         "version": AI_ANALYSIS_VERSION,
         "engine": type(eng).__name__ if eng else "none",
-        "time": _now_utc_iso()
+        "time_utc": _now_utc_iso(),
+        "time_riyadh": _riyadh_iso()
     }
 
 @router.post("/quotes", response_model=BatchAnalysisResponse)
@@ -363,19 +374,17 @@ async def sheet_rows(
     request: Request,
     body: Dict[str, Any] = Body(...),
     x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN")
-):
+) -> Union[SheetAnalysisResponse, Dict[str, Any]]:
     """
     Dual-Mode Endpoint:
     1. Push Mode: Receives {"items": [...]} from Sheets to cache snapshots.
     2. Compute Mode: Receives {"tickers": [...]} to return analyzed grid rows.
     """
-    # Auth Check (using env.py logic ideally, but simple check here)
-    # In prod, middleware or dependency handles this. 
     
     # 1. PUSH MODE
     if "items" in body and isinstance(body["items"], list):
         try:
-            req = PushSheetRowsRequest(**body)
+            req = PushSheetRowsRequest.model_validate(body) if _PYDANTIC_V2 else PushSheetRowsRequest.parse_obj(body) # type: ignore
             engine = await _resolve_engine(request)
             
             if not engine or not hasattr(engine, "set_cached_sheet_snapshot"):
@@ -392,7 +401,7 @@ async def sheet_rows(
                 )
                 written.append(item.sheet)
                 
-            return {"status": "success", "written": written, "mode": "push"}
+            return {"status": "success", "written": written, "mode": "push", "version": AI_ANALYSIS_VERSION}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -401,7 +410,7 @@ async def sheet_rows(
     sheet_name = body.get("sheet_name") or "Analysis"
     
     if not tickers:
-        return {"status": "skipped", "error": "No tickers"}
+        return SheetAnalysisResponse(status="skipped", error="No tickers", headers=[], rows=[])
 
     cfg = _cfg()
     engine = await _resolve_engine(request)
@@ -413,7 +422,7 @@ async def sheet_rows(
     if schemas:
         headers = schemas.get_headers_for_sheet(sheet_name)
     
-    # Fallback Headers (v4.5.0 Standard)
+    # Fallback Headers (v4.6.0 Standard)
     if not headers:
         headers = [
             "Symbol", "Name", "Price", "Change %", 
@@ -429,11 +438,14 @@ async def sheet_rows(
     for t in tickers:
         q = quotes_map.get(t) or _make_placeholder(t)
         
-        # Ensure Scoring
+        # Ensure Scoring & Localization
         q = _enrich_scores_best_effort(q)
+        if isinstance(q, dict):
+            q["last_updated_riyadh"] = _to_riyadh_iso(q.get("last_updated_utc"))
+            q["forecast_updated_riyadh"] = _riyadh_iso()
         
         # Row Mapping
-        if EnrichedQuote:
+        if EnrichedQuote and isinstance(q, dict):
             try:
                 eq = EnrichedQuote.from_unified(q)
                 rows.append(eq.to_row(headers))
@@ -443,12 +455,11 @@ async def sheet_rows(
             # Simple fallback mapping
             rows.append([t, "Missing EnrichedQuote lib", "", "", ""])
 
-    return {
-        "status": "success",
-        "headers": headers,
-        "rows": rows,
-        "count": len(rows),
-        "mode": "compute"
-    }
+    return SheetAnalysisResponse(
+        status="success",
+        headers=headers,
+        rows=rows,
+        version=AI_ANALYSIS_VERSION
+    )
 
 __all__ = ["router"]
