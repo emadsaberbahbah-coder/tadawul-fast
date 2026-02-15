@@ -2,26 +2,24 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (v5.8.0)
+Enriched Quote Router — PROD SAFE (v5.9.0)
 (SCORING INTEGRATED + NORMALIZATION AWARE + RIYADH TIME)
 
-v5.8.0 Advanced Features:
+v5.9.0 Advanced Features:
 - ✅ **Native Scoring**: Automatically applies `core.scoring_engine` to raw quotes.
 - ✅ **Canonical Normalization**: Uses `core.symbols.normalize` for robust TADAWUL/Arabic support.
-- ✅ **Riyadh Localization**: Injects `last_updated_riyadh` (UTC+3) into all responses.
-- ✅ **Forecast Alignment**: Standardizes ROI/Target keys for the v12.2 Dashboard.
+- ✅ **Riyadh Localization**: Injects `last_updated_riyadh` AND `forecast_updated_riyadh` (UTC+3).
+- ✅ **Forecast Alignment**: Full 1m/3m/12m alias mapping for Sheets compatibility.
 - ✅ **Resilient Batching**: Groups by market (KSA/Global) to optimize provider routing.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
 import inspect
 import logging
 import os
 import re
-import time
 import traceback
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
@@ -32,7 +30,7 @@ from fastapi.responses import JSONResponse
 
 router = APIRouter(tags=["enriched"])
 
-ENRICHED_ROUTE_VERSION = "5.8.0"
+ENRICHED_ROUTE_VERSION = "5.9.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
@@ -67,12 +65,20 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _riyadh_iso(utc_iso: Optional[str] = None) -> str:
+    """Returns ISO string in Riyadh time (UTC+3). If utc_iso provided, converts it."""
     try:
-        dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00")) if utc_iso else datetime.now(timezone.utc)
+        if utc_iso:
+             # Handle Z or offset
+             s = utc_iso.replace("Z", "+00:00")
+             dt = datetime.fromisoformat(s)
+        else:
+             dt = datetime.now(timezone.utc)
+        
         ksa_tz = timezone(timedelta(hours=3))
         return dt.astimezone(ksa_tz).isoformat()
     except Exception:
-        return ""
+        # Fallback to current Riyadh time if parsing fails
+        return datetime.now(timezone(timedelta(hours=3))).isoformat()
 
 def _clamp(s: Any, n: int = 2000) -> str:
     t = (str(s) if s is not None else "").strip()
@@ -88,11 +94,6 @@ def _unwrap_tuple_payload(x: Any) -> Any:
     if isinstance(x, tuple) and len(x) == 2:
         return x[0]
     return x
-
-def _debug_enabled(debug_q: int) -> bool:
-    if int(debug_q or 0): return True
-    v = (os.getenv("DEBUG_ERRORS") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
 
 def _norm_str(x: Any) -> str:
     try:
@@ -216,16 +217,34 @@ def _enrich_item(item: Dict[str, Any], requested_symbol: str) -> Dict[str, Any]:
     utc = item.get("last_updated_utc") or _utc_iso()
     item["last_updated_utc"] = utc
     item["last_updated_riyadh"] = _riyadh_iso(utc)
+    
+    # Forecast timestamp
+    f_utc = item.get("forecast_updated_utc") or utc
+    item["forecast_updated_riyadh"] = _riyadh_iso(f_utc)
 
     # 4. Metadata
     item.setdefault("symbol", requested_symbol)
     item.setdefault("data_quality", "MISSING" if not item.get("current_price") else "OK")
     
-    # 5. Forecast Aliases (Sheets Compatibility)
-    if "expected_roi_1m" in item:
-        item["expected_return_1m"] = item["expected_roi_1m"]
-    if "forecast_price_1m" in item:
-        item["expected_price_1m"] = item["forecast_price_1m"]
+    # 5. Forecast Aliases (Sheets Compatibility - Full Coverage)
+    # Ensure expected_roi_X and expected_return_X mirror each other
+    for horizon in ["1m", "3m", "12m"]:
+        k_canon = f"expected_roi_{horizon}"
+        k_leg = f"expected_return_{horizon}"
+        
+        val = item.get(k_canon) or item.get(k_leg)
+        if val is not None:
+            item[k_canon] = val
+            item[k_leg] = val
+            
+        p_canon = f"forecast_price_{horizon}"
+        p_leg = f"expected_price_{horizon}"
+        target_leg = f"target_price_{horizon}" # Also cover target_price legacy
+        
+        pval = item.get(p_canon) or item.get(p_leg) or item.get(target_leg)
+        if pval is not None:
+            item[p_canon] = pval
+            item[p_leg] = pval
 
     return item
 
@@ -401,3 +420,5 @@ async def get_batch_quotes(
         "version": ENRICHED_ROUTE_VERSION,
         "time_utc": _utc_iso()
     }
+
+__all__ = ["router"]
