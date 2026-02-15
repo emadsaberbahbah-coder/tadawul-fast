@@ -1,20 +1,20 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.16.0) — PROD SAFE + ADVANCED ANALYTICS
+UNIFIED DATA ENGINE (v2.17.0) — PROD SAFE + ADVANCED ANALYTICS
 
-What’s improved in v2.16.0
-- ✅ Native Technical Analysis: Added internal MACD (12,26,9) and EMA calculations.
-- ✅ Trend Intelligence: Added Linear Regression Slope (Trend 30D) and Trend Signals (UP/DOWN).
-- ✅ Smart Forecasting: Forecast confidence now weighted by Trend Alignment.
-- ✅ Expanded Schema: UnifiedQuote now includes macd_line, macd_signal, trend_signal.
-- ✅ Scoring Integration: Delegates to core.scoring_engine v1.7.0.
-- ✅ Strict ROI Mapping: Ensures expected_roi_* keys are prioritized.
+What’s improved in v2.17.0
+- ✅ Non-blocking provider calls: sync providers run in a thread via asyncio.to_thread (prevents event-loop blocking).
+- ✅ Provider timeouts: optional per-provider timeout via PROVIDER_TIMEOUT_SEC (default 12s).
+- ✅ Clearer provider diagnostics: captures module/function used + exception class.
+- ✅ Trend intelligence hardened: slope uses last N bars, adds neutral threshold, keeps backward-compatible keys.
+- ✅ Safer math: guards for None/NaN/Inf everywhere (best-effort, never raises outward).
+- ✅ Cache stability preserved: cache key remains (symbol_norm + fields); sheet snapshot keys remain deterministic.
 
 Design goals
 - ✅ PROD SAFE: Pure Python math (no pandas/numpy hard deps) for fast boot.
 - ✅ Router-friendly: Returns dicts (Sheets-safe) and never raises outward.
-- ✅ Cache key includes (symbol_norm + fields).
+- ✅ Cache key includes (symbol_norm + fields) and remains stable.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.16.0"
+ENGINE_VERSION = "2.17.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -44,6 +44,30 @@ _TD_1M = 21
 _TD_3M = 63
 _TD_6M = 126
 _TD_12M = 252
+
+# Provider runtime controls
+_PROVIDER_TIMEOUT_SEC_DEFAULT = 12  # seconds
+_PROVIDER_TIMEOUT_SEC = None  # lazy env read
+
+
+def _provider_timeout_sec() -> float:
+    global _PROVIDER_TIMEOUT_SEC
+    if _PROVIDER_TIMEOUT_SEC is not None:
+        return _PROVIDER_TIMEOUT_SEC
+    raw = (os.getenv("PROVIDER_TIMEOUT_SEC") or "").strip()
+    if not raw:
+        _PROVIDER_TIMEOUT_SEC = float(_PROVIDER_TIMEOUT_SEC_DEFAULT)
+        return _PROVIDER_TIMEOUT_SEC
+    try:
+        v = float(raw)
+        if v <= 0:
+            v = float(_PROVIDER_TIMEOUT_SEC_DEFAULT)
+        _PROVIDER_TIMEOUT_SEC = float(min(120.0, max(2.0, v)))
+        return _PROVIDER_TIMEOUT_SEC
+    except Exception:
+        _PROVIDER_TIMEOUT_SEC = float(_PROVIDER_TIMEOUT_SEC_DEFAULT)
+        return _PROVIDER_TIMEOUT_SEC
+
 
 # ---------------------------------------------------------------------------
 # TTLCache (best-effort) with fallback
@@ -105,16 +129,16 @@ except Exception:  # pragma: no cover
     ConfigDict = None  # type: ignore
 
     class BaseModel:  # type: ignore
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: Any):
             self.__dict__.update(kwargs)
 
-        def model_dump(self, *a, **k):
+        def model_dump(self, *a: Any, **k: Any) -> Dict[str, Any]:
             return dict(self.__dict__)
 
-        def dict(self, *a, **k):
+        def dict(self, *a: Any, **k: Any) -> Dict[str, Any]:
             return dict(self.__dict__)
 
-    def Field(default=None, **kwargs):  # type: ignore
+    def Field(default: Any = None, **kwargs: Any) -> Any:  # type: ignore
         return default
 
 
@@ -125,9 +149,9 @@ def _enrich_with_scores(q: Any) -> Any:
     """Delegates to core.scoring_engine to add scores, badges, and reco."""
     try:
         from core.scoring_engine import enrich_with_scores
+
         return enrich_with_scores(q)
     except Exception:
-        # Fallback if scoring engine missing
         return q
 
 
@@ -290,9 +314,6 @@ def _fallback_normalize_symbol(symbol: str) -> str:
     if s.endswith(".SR"):
         return s
 
-    if "." in s:
-        return s
-
     return s
 
 
@@ -307,10 +328,18 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
+    """
+    Provider-specific symbol adjustments (best-effort).
+    """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
+
+    # Most providers accept the canonical symbol as-is.
+    # Keep rule minimal; do not break KSA (.SR) handling.
     if k in {"finnhub", "yahoo_chart", "yahoo", "yfinance"}:
+        # If some upstream code ever produces ".US", strip it for Yahoo-style consumers.
         return s[:-3] if s.endswith(".US") else s
+
     return s
 
 
@@ -322,13 +351,11 @@ def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
             dst[k] = v
 
 
-async def _call_maybe_async(x: Any) -> Any:
-    if inspect.isawaitable(x):
-        return await x
-    return x
-
-
 def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
+    """
+    Calls a provider in a compatibility manner, trying multiple common signatures.
+    This function is synchronous; if fn is async it will return an awaitable.
+    """
     try:
         return fn(symbol, refresh=refresh, fields=fields)
     except TypeError:
@@ -369,6 +396,35 @@ def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: boo
             pass
 
     return fn(symbol)
+
+
+async def _call_provider_nonblocking(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
+    """
+    Non-blocking wrapper:
+    - If provider is async/coro -> await it.
+    - If provider is sync -> run in thread via asyncio.to_thread.
+    - Always applies a timeout (best-effort) with asyncio.wait_for.
+    """
+    timeout = _provider_timeout_sec()
+
+    async def _runner() -> Any:
+        if inspect.iscoroutinefunction(fn):
+            raw = _call_provider_best_effort(fn, symbol, refresh, fields)
+            if inspect.isawaitable(raw):
+                return await raw
+            return raw
+        # sync provider: execute in thread to avoid blocking loop
+        raw = await asyncio.to_thread(_call_provider_best_effort, fn, symbol, refresh, fields)
+        if inspect.isawaitable(raw):
+            return await raw
+        return raw
+
+    try:
+        return await asyncio.wait_for(_runner(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise
+    except Exception:
+        raise
 
 
 def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable[..., Any]], Optional[str]]:
@@ -416,15 +472,14 @@ async def _try_provider_call(
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
-        return {}, f"{module_name}: import failed ({e})", None
+        return {}, f"{module_name}: import failed ({e.__class__.__name__}: {e})", None
 
     fn, used = _discover_callable(mod, fn_names)
     if fn is None:
         return {}, f"{module_name}: no callable in {fn_names}", None
 
     try:
-        raw = _call_provider_best_effort(fn, symbol, refresh, fields)
-        raw = await _call_maybe_async(raw)
+        raw = await _call_provider_nonblocking(fn, symbol, refresh, fields)
 
         patch: Any = raw
         err: Optional[str] = None
@@ -443,8 +498,11 @@ async def _try_provider_call(
         if isinstance(patch, dict):
             return patch, err, used
         return {}, f"{module_name}.{used}: unexpected return type", used
+
+    except asyncio.TimeoutError:
+        return {}, f"{module_name}.{used}: timeout after {_provider_timeout_sec():g}s", used
     except Exception as e:
-        return {}, f"{module_name}.{used}: call failed ({e})", used
+        return {}, f"{module_name}.{used}: call failed ({e.__class__.__name__}: {e})", used
 
 
 async def _try_provider_candidates(
@@ -455,12 +513,14 @@ async def _try_provider_candidates(
     fields: Optional[str],
 ) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     last_err: Optional[str] = None
+    last_used: Optional[str] = None
     for mod in module_candidates:
-        patch, err, _used = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
+        patch, err, used = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
         if patch:
             return patch, err, mod
         last_err = err
-    return {}, last_err, None
+        last_used = used
+    return {}, last_err, last_used
 
 
 def _tadawul_configured() -> bool:
@@ -571,63 +631,76 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
 # Technical Analysis Mathematics (Pure Python)
 # ============================================================
 def _ema(values: List[float], period: int) -> List[Optional[float]]:
+    if period <= 1:
+        return [float(v) for v in values]  # type: ignore[list-item]
     if len(values) < period:
         return [None] * len(values)
+
     alpha = 2.0 / (period + 1.0)
-    ema: List[Optional[float]] = []
-    
+
     # Simple MA for first point
-    sma_first = sum(values[:period]) / period
-    ema = [None] * (period - 1) + [sma_first]
-    
+    sma_first = sum(values[:period]) / float(period)
+    ema: List[Optional[float]] = [None] * (period - 1) + [sma_first]
+
     for v in values[period:]:
-        curr = (v * alpha) + (ema[-1] * (1.0 - alpha))  # type: ignore
+        prev = ema[-1]
+        if prev is None:
+            prev = v
+        curr = (v * alpha) + (float(prev) * (1.0 - alpha))
         ema.append(curr)
+
     return ema
 
+
 def _macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    # MACD(12, 26, 9)
-    if len(closes) < 35: return None, None, None
+    # MACD(12, 26, 9) - last values
+    if len(closes) < 35:
+        return None, None, None
+
     ema12 = _ema(closes, 12)
     ema26 = _ema(closes, 26)
-    
-    macd_line = []
+
+    macd_line: List[Optional[float]] = []
     for i in range(len(closes)):
-        if ema12[i] is not None and ema26[i] is not None:
-            macd_line.append(ema12[i] - ema26[i]) # type: ignore
-        else:
-            macd_line.append(None)
-            
-    # Valid MACD values for signal line calc
+        a = ema12[i]
+        b = ema26[i]
+        macd_line.append((a - b) if (a is not None and b is not None) else None)
+
     valid_macd = [m for m in macd_line if m is not None]
-    if len(valid_macd) < 9: return None, None, None
-    
-    signal_line = _ema(valid_macd, 9)
-    
+    if len(valid_macd) < 9:
+        return None, None, None
+
+    signal_line = _ema([float(x) for x in valid_macd], 9)
     last_macd = valid_macd[-1]
     last_signal = signal_line[-1]
-    
-    if last_macd is None or last_signal is None: return None, None, None
-    
-    hist = last_macd - last_signal
-    return last_macd, last_signal, hist
+
+    if last_macd is None or last_signal is None:
+        return None, None, None
+
+    hist = float(last_macd) - float(last_signal)
+    return float(last_macd), float(last_signal), float(hist)
+
 
 def _linear_slope(values: List[float]) -> Optional[float]:
-    """Calculates linear regression slope (simple trend)"""
+    """Simple linear regression slope."""
     n = len(values)
-    if n < 2: return None
+    if n < 2:
+        return None
     x = list(range(n))
     y = values
+
     sum_x = sum(x)
     sum_y = sum(y)
-    sum_xy = sum(i*j for i, j in zip(x, y))
-    sum_xx = sum(i*i for i in x)
-    
+    sum_xy = sum(i * j for i, j in zip(x, y))
+    sum_xx = sum(i * i for i in x)
+
     denominator = (n * sum_xx - sum_x * sum_x)
-    if denominator == 0: return 0.0
-    
+    if denominator == 0:
+        return 0.0
+
     slope = (n * sum_xy - sum_x * sum_y) / denominator
-    return slope # dollars per bar
+    return float(slope)
+
 
 # ============================================================
 # Basic Math Helpers
@@ -639,6 +712,7 @@ def _pct(a: float, b: float) -> Optional[float]:
         return (a - b) / b * 100.0
     except Exception:
         return None
+
 
 def _compute_returns(closes: List[float]) -> Dict[str, Optional[float]]:
     res: Dict[str, Optional[float]] = {
@@ -667,6 +741,7 @@ def _compute_returns(closes: List[float]) -> Dict[str, Optional[float]]:
     res["returns_12m"] = ret(_TD_12M)
     return res
 
+
 def _sma(vals: List[float], window: int) -> Optional[float]:
     try:
         if window <= 0 or len(vals) < window:
@@ -675,6 +750,7 @@ def _sma(vals: List[float], window: int) -> Optional[float]:
         return sum(chunk) / float(window)
     except Exception:
         return None
+
 
 def _volatility_30d(closes: List[float]) -> Optional[float]:
     try:
@@ -696,6 +772,7 @@ def _volatility_30d(closes: List[float]) -> Optional[float]:
         return (sd * math.sqrt(252.0)) * 100.0
     except Exception:
         return None
+
 
 def _rsi_14(closes: List[float]) -> Optional[float]:
     try:
@@ -719,6 +796,7 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
     except Exception:
         return None
 
+
 def _apply_history_analytics(out: Dict[str, Any]) -> None:
     try:
         payload = out.get("history_payload") or out.get("history")
@@ -736,26 +814,37 @@ def _apply_history_analytics(out: Dict[str, Any]) -> None:
         out.setdefault("volatility_30d", _volatility_30d(closes))
         out.setdefault("rsi_14", _rsi_14(closes))
 
-        # Advanced Technicals (New in v2.15.0)
         macd, sig, hist = _macd(closes)
         out.setdefault("macd_line", macd)
         out.setdefault("macd_signal", sig)
         out.setdefault("macd_hist", hist)
-        
-        # Trend Analysis
-        slope = _linear_slope(closes[-30:]) # last 30 days
+
+        # Trend Analysis (last 30 bars by default)
+        window = min(30, len(closes))
+        slope = _linear_slope(closes[-window:])
         out.setdefault("trend_30d", slope)
-        
+
+        # Trend signal with a small neutral threshold (avoid noisy flips)
         trend_sig = "NEUTRAL"
         if slope is not None:
-             if slope > 0: trend_sig = "UPTREND"
-             elif slope < 0: trend_sig = "DOWNTREND"
+            thr = float(os.getenv("TREND_SLOPE_THRESHOLD", "0") or "0")
+            # If not provided, derive a tiny threshold from recent price scale
+            if thr == 0.0:
+                last = closes[-1]
+                thr = max(0.0, abs(last) * 0.00002)  # ~0.002% of price per bar
+            if slope > thr:
+                trend_sig = "UPTREND"
+            elif slope < -thr:
+                trend_sig = "DOWNTREND"
+            else:
+                trend_sig = "NEUTRAL"
         out.setdefault("trend_signal", trend_sig)
 
         if not _env_bool("KEEP_RAW_HISTORY", False):
             out.pop("history_payload", None)
     except Exception:
         return
+
 
 # ============================================================
 # Canonical + alias mapping
@@ -974,14 +1063,12 @@ def _coerce_confidence(v: Any) -> Optional[float]:
 
 
 def _map_forecast_aliases(out: Dict[str, Any]) -> None:
-    # Ensure expected_roi_* keys exist (priority)
     for horizon in ("1m", "3m", "12m"):
         er_k = f"expected_return_{horizon}"
         ep_k = f"expected_price_{horizon}"
         roi_k = f"expected_roi_{horizon}"
         fp_k = f"forecast_price_{horizon}"
 
-        # If we have legacy keys but not canonical keys, fill canonical
         if out.get(roi_k) is None and out.get(er_k) is not None:
             out[roi_k] = _safe_float(out.get(er_k))
         if out.get(fp_k) is None and out.get(ep_k) is not None:
@@ -997,7 +1084,6 @@ def _map_forecast_aliases(out: Dict[str, Any]) -> None:
 
 
 def _mirror_forecast_aliases(out: Dict[str, Any]) -> None:
-    # Mirror canonical keys back to legacy keys for backward compat
     for horizon in ("1m", "3m", "12m"):
         roi_k = f"expected_roi_{horizon}"
         er_k = f"expected_return_{horizon}"
@@ -1032,16 +1118,13 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
         out["expected_roi_3m"] = r3m
     if out.get("expected_roi_12m") is None and r12m is not None:
         out["expected_roi_12m"] = r12m
-    
-    # Advanced: trend dampening (v2.15.0)
-    # If we detected a DOWNTREND, reduce the bullish forecast
+
     trend_sig = out.get("trend_signal")
     if trend_sig == "DOWNTREND":
-        # Dampen positive ROI expectations
-        if out.get("expected_roi_1m") and out["expected_roi_1m"] > 0:
-            out["expected_roi_1m"] *= 0.5
-        if out.get("expected_roi_3m") and out["expected_roi_3m"] > 0:
-            out["expected_roi_3m"] *= 0.7
+        if out.get("expected_roi_1m") is not None and float(out["expected_roi_1m"]) > 0:
+            out["expected_roi_1m"] = float(out["expected_roi_1m"]) * 0.5
+        if out.get("expected_roi_3m") is not None and float(out["expected_roi_3m"]) > 0:
+            out["expected_roi_3m"] = float(out["expected_roi_3m"]) * 0.7
 
     er1 = _safe_float(out.get("expected_roi_1m"))
     er3 = _safe_float(out.get("expected_roi_3m"))
@@ -1062,13 +1145,12 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
             conf = base
         else:
             conf = base - min(0.25, max(0.0, (vol - 20.0) / 200.0))
-            
-        # Boost confidence if trend matches momentum
+
         if trend_sig == "UPTREND" and (er3 or 0) > 0:
-            conf += 0.1
+            conf += 0.10
         elif trend_sig == "DOWNTREND" and (er3 or 0) < 0:
-            conf += 0.1
-            
+            conf += 0.10
+
         conf = max(0.20, min(0.90, conf))
         out["forecast_confidence"] = conf
 
@@ -1131,7 +1213,6 @@ class UnifiedQuote(BaseModel):
     volatility_30d: Optional[float] = None
     rsi_14: Optional[float] = None
 
-    # New Technicals (v2.15.0)
     macd_line: Optional[float] = None
     macd_signal: Optional[float] = None
     macd_hist: Optional[float] = None
@@ -1265,12 +1346,10 @@ _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
 # Sheet-name canonicalization (KEY-STABLE cache)
 # ============================================================
 _SHEET_ALIASES: Dict[str, str] = {
-    # canonical (underscore) -> canonical (underscore)
     "market_leaders": "market_leaders",
     "global_markets": "global_markets",
     "mutual_funds": "mutual_funds",
     "commodities_fx": "commodities_fx",
-    # common variants
     "market leaders": "market_leaders",
     "global markets": "global_markets",
     "mutual funds": "mutual_funds",
@@ -1295,19 +1374,16 @@ def _canon_sheet_name(name: str) -> str:
         return ""
     s2 = re.sub(r"\s+", " ", s).strip()
     low = s2.casefold()
-    low = low.replace("-", " ").replace(".", " ").replace("__", " ")
-    low = low.replace("&", "&").strip()
+    low = low.replace("-", " ").replace(".", " ").replace("__", " ").strip()
     low = re.sub(r"\s+", " ", low)
 
     if low in _SHEET_ALIASES:
         return _SHEET_ALIASES[low]
 
-    # try underscore form
     unders = re.sub(r"[^a-z0-9]+", "_", low).strip("_")
     if unders in _SHEET_ALIASES:
         return _SHEET_ALIASES[unders]
 
-    # if user passed a sheetKey already
     up = s2.strip().upper()
     if up in _CANON_BY_SHEETKEY:
         return _CANON_BY_SHEETKEY[up]
@@ -1316,25 +1392,17 @@ def _canon_sheet_name(name: str) -> str:
 
 
 def _sheet_key_variants(sheet_name: str) -> List[str]:
-    """
-    Generate a deterministic set of cache keys so writers/readers always intersect.
-
-    IMPORTANT:
-    - We keep the original "sheet::<raw>" form (back-compat).
-    - We add normalized and canonical variants.
-    - We also add "sheet::<SHEETKEY>" variant for advisor code that uses sheetKey.
-    """
     raw = (sheet_name or "").strip()
     if not raw:
         return []
 
-    canon = _canon_sheet_name(raw)  # e.g. market_leaders
+    canon = _canon_sheet_name(raw)
     sheetkey = _SHEETKEY_BY_CANON.get(canon, "")
 
     raw_norm = raw.casefold().strip()
     raw_upper = raw.upper().strip()
     raw_lower = raw.lower().strip()
-    raw_unders = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")  # Market_Leaders -> Market_Leaders
+    raw_unders = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
 
     variants: List[str] = []
 
@@ -1345,22 +1413,19 @@ def _sheet_key_variants(sheet_name: str) -> List[str]:
         if k not in variants:
             variants.append(k)
 
-    # legacy + common
     add(raw)
     add(raw_norm)
     add(raw_upper)
     add(raw_lower)
     add(raw_unders)
 
-    # canonical (recommended)
-    add(canon)                # market_leaders
-    add(canon.upper())        # MARKET_LEADERS (but without sheetkey logic)
-    add(canon.lower())        # market_leaders
+    add(canon)
+    add(canon.upper())
+    add(canon.lower())
 
-    # sheetKey (strong)
     if sheetkey:
-        add(sheetkey)         # MARKET_LEADERS
-        add(sheetkey.lower()) # market_leaders (redundant but safe)
+        add(sheetkey)
+        add(sheetkey.lower())
 
     return variants
 
@@ -1371,7 +1436,6 @@ def _sheet_key_variants(sheet_name: str) -> List[str]:
 class DataEngine:
     """
     Router-friendly engine that returns dicts (Sheets-safe).
-
     Adds a second cache for "Sheet Snapshots" so Investment Advisor can reuse page data.
     """
 
@@ -1392,7 +1456,6 @@ class DataEngine:
 
         self._cache: TTLCache = TTLCache(maxsize=maxsize, ttl=self.cache_ttl_sec)  # type: ignore
 
-        # Sheet snapshot cache (small)
         sheet_ttl = _safe_int(os.getenv("SHEET_CACHE_TTL_SEC", "180"), 180)
         sheet_ttl = max(30, min(3600, sheet_ttl))
         sheet_max = _safe_int(os.getenv("SHEET_CACHE_MAXSIZE", "64"), 64)
@@ -1428,7 +1491,7 @@ class DataEngine:
         self.include_warnings = _env_bool("ENGINE_INCLUDE_WARNINGS", False)
 
         logger.info(
-            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s | sheet_ttl=%ss | sheet_max=%s",
+            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s | sheet_ttl=%ss | sheet_max=%s | provider_timeout=%ss",
             ENGINE_VERSION,
             self.cache_ttl_sec,
             maxsize,
@@ -1439,6 +1502,7 @@ class DataEngine:
             _HAS_CACHETOOLS,
             self.sheet_cache_ttl_sec,
             sheet_max,
+            _provider_timeout_sec(),
         )
 
     async def aclose(self) -> None:
@@ -1454,12 +1518,6 @@ class DataEngine:
         rows: List[List[Any]],
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Store a Sheets-ready snapshot.
-
-        IMPORTANT: Stored under multiple deterministic key variants so
-        writers/readers always intersect even if they use different sheet naming.
-        """
         try:
             name = (sheet_name or "").strip()
             if not name:
@@ -1479,7 +1537,6 @@ class DataEngine:
                 "engine_version": ENGINE_VERSION,
             }
 
-            # write under all variants (back-compat + forward-safe)
             for k in _sheet_key_variants(name):
                 try:
                     self._sheet_cache[k] = payload  # type: ignore[index]
@@ -1489,22 +1546,16 @@ class DataEngine:
             return
 
     def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Read the cached snapshot if present, else None.
-        Tries multiple key variants (raw, normalized, canonical, sheetKey).
-        """
         try:
             name = (sheet_name or "").strip()
             if not name:
                 return None
 
-            # 1) try all deterministic variants
             for k in _sheet_key_variants(name):
                 v = self._sheet_cache.get(k)
                 if isinstance(v, dict):
                     return dict(v)
 
-            # 2) final fallback: older code may have used EXACT sheet::<name> only
             legacy = f"sheet::{name}"
             v2 = self._sheet_cache.get(legacy)
             return dict(v2) if isinstance(v2, dict) else None
@@ -1512,9 +1563,6 @@ class DataEngine:
             return None
 
     def get_cached_multi_sheet_snapshots(self, sheet_names: List[str]) -> Dict[str, Dict[str, Any]]:
-        """
-        Returns {sheet_name: snapshot} for all hits.
-        """
         out: Dict[str, Dict[str, Any]] = {}
         try:
             for s in (sheet_names or []):
@@ -1526,9 +1574,6 @@ class DataEngine:
         return out
 
     def clear_sheet_cache(self, sheet_name: Optional[str] = None) -> None:
-        """
-        Clears the entire sheet cache, or only one sheet snapshot (all key variants).
-        """
         try:
             if not sheet_name:
                 try:
@@ -1541,7 +1586,6 @@ class DataEngine:
                             pass
                 return
 
-            # remove all variants
             for k in _sheet_key_variants(sheet_name):
                 try:
                     self._sheet_cache.pop(k, None)
@@ -1569,7 +1613,7 @@ class DataEngine:
             async with self._sem:
                 out = await self._fetch_and_build(sym_in, sym_norm, refresh=refresh, fields=fields)
         except Exception as e:
-            out = self._placeholder(sym_in, err=f"Engine error: {e}")
+            out = self._placeholder(sym_in, err=f"Engine error: {e.__class__.__name__}: {e}")
 
         try:
             self._cache[cache_key] = dict(out)  # type: ignore[index]
@@ -1596,7 +1640,7 @@ class DataEngine:
             res = await asyncio.gather(*tasks, return_exceptions=True)
             for j, r in enumerate(res):
                 if isinstance(r, Exception):
-                    out.append(self._placeholder(batch[j], err=f"Engine error: {r}"))
+                    out.append(self._placeholder(batch[j], err=f"Engine error: {r.__class__.__name__}: {r}"))
                 else:
                     out.append(r if isinstance(r, dict) else self._placeholder(batch[j], err="Unexpected quote type"))
         return out
@@ -1671,14 +1715,8 @@ class DataEngine:
         _forecast_from_momentum(out)
         _mirror_forecast_aliases(out)
 
-        # -----------------------------
-        # SCORING INTEGRATION (v2.14.1)
-        # -----------------------------
-        # Delegate scoring, badges, and reco to the central scoring engine.
-        # This replaces the older local _compute_scores logic.
+        # Scoring integration
         out = _enrich_with_scores(out)
-
-        # Ensure recommendation is standardized even if scoring engine didn't set it (fallback)
         out["recommendation"] = _norm_reco(out.get("recommendation"), default="HOLD")
 
         out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
