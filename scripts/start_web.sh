@@ -1,12 +1,13 @@
 #!/usr/bin/env sh
 # ============================================================
-# Tadawul Fast Bridge — PROD SAFE Start Script (v1.4.0)
+# Tadawul Fast Bridge — PROD SAFE Start Script (v1.5.0)
 # ============================================================
 # Optimized for high-concurrency FastAPI/Render environments.
-# 
+#
 # Features:
-# - Auto-worker calculation (CPU-aware)
-# - Robust Uvicorn flag auto-detection
+# - Auto-worker calculation (CPU-aware + RAM-safe caps)
+# - Robust Uvicorn/Gunicorn flag auto-detection
+# - Performance tuning (uvloop/httptools detection)
 # - Pre-flight dependency & file checks
 # - Signal-safe process execution (exec)
 # ============================================================
@@ -35,26 +36,20 @@ loglvl() {
   v="$(printf "%s" "${1:-info}" | tr "[:upper:]" "[:lower:]")"
   case "$v" in
     critical|error|warning|info|debug|trace) printf "%s" "$v" ;;
-    *)                                       printf "%s" "info" ;;
-  esac
-}
-
-pos_int_or_empty() {
-  raw="${1:-}"
-  case "$raw" in
-    ""|*[!0-9]*) printf "%s" "" ;;
-    *) [ "$raw" -gt 0 ] && printf "%s" "$raw" || printf "%s" "" ;;
+    *)                                      printf "%s" "info" ;;
   esac
 }
 
 # Advanced: Detect CPU cores for auto-scaling workers
+# Includes a safety cap to prevent OOM on small instances
 detect_workers() {
+  # Manual override
   if [ -n "${WEB_CONCURRENCY:-}" ] && [ "$(as_int "$WEB_CONCURRENCY" 0)" -gt 0 ]; then
     printf "%s" "$WEB_CONCURRENCY"
     return 0
   fi
   
-  # Try to detect CPU count (Linux/MacOS)
+  # Try to detect CPU count (Linux/MacOS/Container)
   cpus=1
   if [ -f /proc/cpuinfo ]; then
     cpus=$(grep -c ^processor /proc/cpuinfo)
@@ -64,9 +59,17 @@ detect_workers() {
     cpus=$(sysctl -n hw.ncpu || echo 1)
   fi
   
-  # Formula: (2 x cores) + 1 is typical for Uvicorn/Gunicorn
-  # But for async FastAPI, 1-2 workers per core is safer on constrained RAM
+  # Default multiplier: 1 worker per core is safe for async I/O bound apps
+  # On very high core machines, we might want to cap it.
   calc_workers=$((cpus * 1))
+  
+  # Apply Max Cap (default 4 to be safe on standard cloud tiers)
+  max_workers="$(as_int "${WEB_CONCURRENCY_MAX:-4}" "4")"
+  
+  if [ "$calc_workers" -gt "$max_workers" ]; then
+    calc_workers="$max_workers"
+  fi
+  
   [ "$calc_workers" -lt 1 ] && calc_workers=1
   printf "%s" "$calc_workers"
 }
@@ -86,7 +89,7 @@ detect_grace_flag() {
 # ----------------------------
 # Pre-Flight Checks
 # ----------------------------
-printf "🚀 Initializing Tadawul Fast Bridge Boot Sequence...\n"
+printf "🚀 Initializing Tadawul Fast Bridge Boot Sequence (v1.5.0)...\n"
 
 if [ ! -f "main.py" ]; then
   printf "❌ Error: main.py not found in current directory (%s).\n" "$(pwd)"
@@ -153,7 +156,7 @@ esac
 
 # Worker Scaling
 if [ "$WC" -gt 1 ]; then
-  printf "🌐 Scaling: Starting with %s workers.\n" "$WC"
+  printf "🌐 Scaling: Starting with %s workers (Auto-detected).\n" "$WC"
   set -- "$@" --workers "$WC"
 else
   printf "🌐 Scaling: Single worker mode.\n"
@@ -164,7 +167,7 @@ fi
 [ -n "${UVICORN_LIMIT_MAX_REQUESTS:-}" ] && set -- "$@" --limit-max-requests "$(as_int "$UVICORN_LIMIT_MAX_REQUESTS" 0)"
 [ -n "${UVICORN_ROOT_PATH:-}" ] && set -- "$@" --root-path "$UVICORN_ROOT_PATH"
 
-printf "✅ Configuration locked. Executing server...\n"
+printf "✅ Configuration locked. Executing server on port %s...\n" "$P"
 printf "------------------------------------------------------------\n"
 
 # Use exec to ensure Python receives signals directly from the OS/Render
