@@ -3,34 +3,20 @@
 """
 core/providers/tadawul_provider.py
 ===============================================================
-Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v2.6.0
+Tadawul Provider / Client (KSA quote + fundamentals + optional history) — v2.7.1
 PROD SAFE + ASYNC + ENGINE PATCH-STYLE + ALIGNED ROI KEYS + RIYADH TIME
 
-FULL REPLACEMENT (v2.6.0) — What’s improved
-- ✅ Import-safe, no network calls at import-time
-- ✅ Strict KSA-only routing with Arabic-digit normalization
-- ✅ Shared normalizer integration when available (core.symbols.normalize)
-- ✅ Lazy singleton AsyncClient with:
-    - concurrency limit (TADAWUL_MAX_CONCURRENCY)
-    - optional token-bucket rate limiter (TADAWUL_RATE_LIMIT_PER_SEC)
-    - circuit breaker (TADAWUL_CIRCUIT_BREAKER, threshold + cooldown)
-- ✅ Robust retries with backoff + jitter for 429/5xx
-- ✅ Patch-style output: only useful fields, always includes provenance:
-    provider="tadawul", data_source="tadawul", provider_version, last_updated_utc/riyadh
-- ✅ Quote mapping:
-    - current_price, previous_close, open, day_high/low, volume, value_traded
-    - price_change + percent_change derived if missing
-    - 52w high/low best-effort
-- ✅ Fundamentals mapping (best-effort, tolerant JSON):
-    - name, sector, industry, sub_sector
-    - market_cap, shares_outstanding
-    - pe_ttm, pb, eps_ttm, dividend_yield, beta
-- ✅ History analytics (if enabled + configured):
-    - returns (1W/1M/3M/6M/12M), MA20/50/200, RSI14, vol_30d, max_drawdown
-    - forecast via log-price regression (stable) with confidence score
-    - outputs expected_roi_1m/3m/12m and forecast_price_1m/3m/12m
-    - forecast_updated_utc + forecast_updated_riyadh derived from last candle time if available
-- ✅ Silent when not configured (returns {}), unless TADAWUL_VERBOSE_WARNINGS=true
+FULL REPLACEMENT (v2.7.1) — What’s improved vs v2.6.0
+- ✅ Singleflight (anti-stampede): concurrent requests for same symbol share one HTTP call
+- ✅ Error backoff cache (short TTL): avoids hammering endpoints on repeated failures
+- ✅ Confidence alignment: forecast_confidence is 0..1 (keeps confidence_score 0..100)
+- ✅ Better candle parsing: supports {c,h,l,t} arrays OR list-of-candles objects
+- ✅ Adds computed helpers when possible:
+    - week_52_position_pct
+    - day_range_pct
+    - atr_14 (if highs/lows available)
+- ✅ Keeps patch-style: only meaningful fields returned; silent if not configured
+- ✅ Provenance always: provider/data_source/provider_version + last_updated_utc/riyadh
 
 Environment variables
 - TADAWUL_ENABLED=true/false (default true)
@@ -45,11 +31,14 @@ HTTP controls
 - TADAWUL_TIMEOUT_SEC (default 25)
 - TADAWUL_RETRY_ATTEMPTS (default 3)
 - TADAWUL_RETRY_DELAY_SEC (default 0.25)
+- TADAWUL_USER_AGENT
+- TADAWUL_HEADERS_JSON (optional JSON string of extra headers)
 
 Caches
 - TADAWUL_QUOTE_TTL_SEC (default 15)
 - TADAWUL_FUNDAMENTALS_TTL_SEC (default 6 hours)
 - TADAWUL_HISTORY_TTL_SEC (default 1200)
+- TADAWUL_ERROR_TTL_SEC (default 6)
 
 Toggles
 - TADAWUL_ENABLE_FUNDAMENTALS=true/false (default true)
@@ -83,7 +72,7 @@ import httpx
 logger = logging.getLogger("core.providers.tadawul_provider")
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "2.6.0"
+PROVIDER_VERSION = "2.7.1"
 
 USER_AGENT_DEFAULT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -157,10 +146,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _safe_str(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s or None
+
+
 def _configured() -> bool:
     if not _env_bool("TADAWUL_ENABLED", True):
         return False
-    return bool(_safe_str(os.getenv("TADAWUL_QUOTE_URL", "")))
+    return bool(_safe_str(_env_str("TADAWUL_QUOTE_URL", "")))
 
 
 def _emit_warnings() -> bool:
@@ -209,6 +205,11 @@ def _hist_ttl_sec() -> float:
     return max(60.0, float(ttl))
 
 
+def _err_ttl_sec() -> float:
+    ttl = _env_float("TADAWUL_ERROR_TTL_SEC", 6.0)
+    return max(2.0, float(ttl))
+
+
 def _history_days() -> int:
     d = _env_int("TADAWUL_HISTORY_DAYS", 400)
     return max(60, int(d))
@@ -239,6 +240,28 @@ def _cb_cooldown_sec() -> float:
     return max(5.0, _env_float("TADAWUL_CB_COOLDOWN_SEC", 30.0))
 
 
+def _extra_headers() -> Dict[str, str]:
+    """
+    Optional JSON: {"Authorization":"Bearer ...","X-KEY":"..."}
+    """
+    raw = _env_str("TADAWUL_HEADERS_JSON", "")
+    if not raw:
+        return {}
+    try:
+        js = json.loads(raw)
+        if isinstance(js, dict):
+            out: Dict[str, str] = {}
+            for k, v in js.items():
+                ks = _safe_str(k)
+                vs = _safe_str(v)
+                if ks and vs:
+                    out[ks] = vs
+            return out
+    except Exception:
+        pass
+    return {}
+
+
 def _utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(timezone.utc)
     if d.tzinfo is None:
@@ -258,13 +281,6 @@ def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
 def _riyadh_now_iso() -> str:
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz).isoformat()
-
-
-def _safe_str(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s or None
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +390,13 @@ def _coerce_dict(data: Union[dict, list]) -> dict:
     return {}
 
 
-def _find_first_value(obj: Any, keys: Sequence[str], *, max_depth: int = 7, max_nodes: int = 3000) -> Any:
+def _find_first_value(
+    obj: Any,
+    keys: Sequence[str],
+    *,
+    max_depth: int = 7,
+    max_nodes: int = 3000,
+) -> Any:
     if obj is None:
         return None
     keyset = {str(k).strip().lower() for k in keys if k}
@@ -428,7 +450,6 @@ def _pick_pct(obj: Any, *keys: str) -> Optional[float]:
     v = _to_float(_find_first_value(obj, keys))
     if v is None:
         return None
-    # if in fraction, convert
     return v * 100.0 if abs(v) <= 1.0 else v
 
 
@@ -442,11 +463,9 @@ def _normalize_ksa_symbol(symbol: str) -> str:
 
     raw = raw.translate(_ARABIC_DIGITS).strip()
 
-    # Prefer shared normalizer if available
     if callable(_SHARED_NORM_KSA):
         try:
             s = (_SHARED_NORM_KSA(raw) or "").strip().upper()
-            # shared should return ####.SR
             if s.endswith(".SR"):
                 code = s[:-3].strip()
                 return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
@@ -648,7 +667,25 @@ def _roi_from_reg(reg: Optional[Dict[str, float]], horizon_days: int) -> Optiona
         return None
 
 
-def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
+def _compute_atr_14(highs: List[float], lows: List[float], closes: List[float]) -> Optional[float]:
+    try:
+        n = min(len(highs), len(lows), len(closes))
+        if n < 15:
+            return None
+        trs: List[float] = []
+        # use last 14 TRs
+        for i in range(n - 14, n):
+            h = float(highs[i])
+            l = float(lows[i])
+            prev_c = float(closes[i - 1])
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+        return float(sum(trs) / 14.0)
+    except Exception:
+        return None
+
+
+def _compute_history_analytics(closes: List[float], highs: Optional[List[float]] = None, lows: Optional[List[float]] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if not closes:
         return out
@@ -687,6 +724,11 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out["rsi_14"] = _compute_rsi_14(closes)
     out["max_drawdown_pct"] = _max_drawdown_pct(closes)
 
+    if highs and lows:
+        atr = _compute_atr_14(highs, lows, closes)
+        if atr is not None:
+            out["atr_14"] = float(atr)
+
     if _enable_forecast():
         reg_1m = _log_regression([float(x) for x in closes[-min(len(closes), 84):]])
         reg_3m = _log_regression([float(x) for x in closes[-min(len(closes), 252):]])
@@ -720,16 +762,46 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
         vol = _to_float(out.get("volatility_30d"))
         vol_pen = 0.0 if vol is None else min(55.0, max(0.0, (vol / 100.0) * 35.0))
 
-        conf = (0.55 * base) + (0.45 * (r2 * 100.0)) - vol_pen
-        conf = max(0.0, min(100.0, conf))
+        conf_pct = (0.55 * base) + (0.45 * (r2 * 100.0)) - vol_pen
+        conf_pct = max(0.0, min(100.0, conf_pct))
 
-        out["confidence_score"] = float(conf)
-        out["forecast_confidence"] = float(conf)
-        out["forecast_method"] = "tadawul_history_logreg_v2"
+        out["confidence_score"] = float(conf_pct)                     # 0..100 (human readable)
+        out["forecast_confidence"] = float(conf_pct / 100.0)          # 0..1 (engine-friendly)
+        out["forecast_method"] = "tadawul_history_logreg_v3"
     else:
         out["forecast_method"] = "history_only"
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Singleflight helper (avoid stampede)
+# ---------------------------------------------------------------------------
+class _SingleFlight:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._futs: Dict[str, asyncio.Future] = {}
+
+    async def run(self, key: str, coro_fn):
+        async with self._lock:
+            fut = self._futs.get(key)
+            if fut is not None:
+                return await fut
+            fut = asyncio.get_event_loop().create_future()
+            self._futs[key] = fut
+
+        try:
+            val = await coro_fn()
+            if not fut.done():
+                fut.set_result(val)
+            return val
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            async with self._lock:
+                self._futs.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -742,27 +814,33 @@ class TadawulClient:
         self.base_delay = _retry_delay_sec()
 
         timeout = httpx.Timeout(self.timeout_sec, connect=min(10.0, self.timeout_sec))
+
+        headers = {
+            "User-Agent": _env_str("TADAWUL_USER_AGENT", USER_AGENT_DEFAULT),
+            "Accept": "application/json,text/plain,*/*",
+        }
+        headers.update(_extra_headers())
+
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers={"User-Agent": _env_str("TADAWUL_USER_AGENT", USER_AGENT_DEFAULT)},
+            headers=headers,
             limits=httpx.Limits(max_keepalive_connections=25, max_connections=50),
         )
 
         self.quote_url = _safe_str(_env_str("TADAWUL_QUOTE_URL", ""))
         self.fundamentals_url = _safe_str(_env_str("TADAWUL_FUNDAMENTALS_URL", ""))
-        self.history_url = (
-            _safe_str(_env_str("TADAWUL_HISTORY_URL", ""))
-            or _safe_str(_env_str("TADAWUL_CANDLES_URL", ""))
-        )
+        self.history_url = _safe_str(_env_str("TADAWUL_HISTORY_URL", "")) or _safe_str(_env_str("TADAWUL_CANDLES_URL", ""))
 
         self._q_cache: TTLCache = TTLCache(maxsize=7000, ttl=_quote_ttl_sec())
         self._f_cache: TTLCache = TTLCache(maxsize=4000, ttl=_fund_ttl_sec())
         self._h_cache: TTLCache = TTLCache(maxsize=2500, ttl=_hist_ttl_sec())
+        self._e_cache: TTLCache = TTLCache(maxsize=4000, ttl=_err_ttl_sec())
 
         self._sem = asyncio.Semaphore(_max_concurrency())
         self._bucket = _TokenBucket(_rate_limit_per_sec())
         self._cb = _CircuitBreaker(_cb_enabled(), _cb_fail_threshold(), _cb_cooldown_sec())
+        self._sf = _SingleFlight()
 
         logger.info(
             "Tadawul client init v%s | quote=%s | fund=%s | hist=%s | timeout=%.1fs | retries=%s | cachetools=%s | max_conc=%s | rate/s=%.2f | cb=%s",
@@ -850,16 +928,7 @@ class TadawulClient:
     def _map_quote(self, root: Any) -> Dict[str, Any]:
         patch: Dict[str, Any] = {}
 
-        patch["current_price"] = _pick_num(
-            root,
-            "last",
-            "last_price",
-            "price",
-            "close",
-            "c",
-            "tradingPrice",
-            "regularMarketPrice",
-        )
+        patch["current_price"] = _pick_num(root, "last", "last_price", "price", "close", "c", "tradingPrice", "regularMarketPrice")
         patch["previous_close"] = _pick_num(root, "previous_close", "prev_close", "pc", "PreviousClose", "prevClose")
         patch["open"] = _pick_num(root, "open", "o", "Open", "openPrice")
         patch["day_high"] = _pick_num(root, "high", "day_high", "h", "High", "dayHigh", "sessionHigh")
@@ -873,13 +942,23 @@ class TadawulClient:
         patch["price_change"] = _pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
         patch["percent_change"] = _pick_pct(root, "change_pct", "change_percent", "dp", "percent_change", "pctChange", "changePercent")
 
-        # derive changes if absent
         cp = _to_float(patch.get("current_price"))
         pc = _to_float(patch.get("previous_close"))
+
         if patch.get("price_change") is None and cp is not None and pc is not None:
             patch["price_change"] = float(cp - pc)
         if patch.get("percent_change") is None and cp is not None and pc is not None and pc != 0:
             patch["percent_change"] = float(((cp / pc) - 1.0) * 100.0)
+
+        hi = _to_float(patch.get("day_high"))
+        lo = _to_float(patch.get("day_low"))
+        if cp is not None and hi is not None and lo is not None and cp != 0:
+            patch["day_range_pct"] = float(((hi - lo) / cp) * 100.0)
+
+        w52h = _to_float(patch.get("week_52_high"))
+        w52l = _to_float(patch.get("week_52_low"))
+        if cp is not None and w52h is not None and w52l is not None and w52h != w52l:
+            patch["week_52_position_pct"] = float(((cp - w52l) / (w52h - w52l)) * 100.0)
 
         patch["currency"] = patch.get("currency") or "SAR"
         return _clean_patch(patch)
@@ -918,6 +997,82 @@ class TadawulClient:
         return _clean_patch(patch)
 
     # ---------------------------
+    # Candle parsing (supports arrays or list-of-objects)
+    # ---------------------------
+    def _parse_candles(self, js: Any) -> Tuple[List[float], List[float], List[float], Optional[datetime]]:
+        closes: List[float] = []
+        highs: List[float] = []
+        lows: List[float] = []
+        last_dt: Optional[datetime] = None
+
+        if isinstance(js, dict):
+            c_raw = js.get("c") or js.get("close") or js.get("closes")
+            h_raw = js.get("h") or js.get("high") or js.get("highs")
+            l_raw = js.get("l") or js.get("low") or js.get("lows")
+            t_raw = js.get("t") or js.get("time") or js.get("timestamp") or js.get("timestamps")
+
+            if isinstance(c_raw, list):
+                for x in c_raw:
+                    fx = _to_float(x)
+                    if fx is not None:
+                        closes.append(float(fx))
+            if isinstance(h_raw, list):
+                for x in h_raw:
+                    fx = _to_float(x)
+                    if fx is not None:
+                        highs.append(float(fx))
+            if isinstance(l_raw, list):
+                for x in l_raw:
+                    fx = _to_float(x)
+                    if fx is not None:
+                        lows.append(float(fx))
+
+            if isinstance(t_raw, list) and t_raw:
+                t_last = t_raw[-1]
+                try:
+                    if isinstance(t_last, (int, float)):
+                        last_dt = datetime.fromtimestamp(float(t_last), tz=timezone.utc)
+                except Exception:
+                    last_dt = None
+
+            # list-of-candles embedded
+            if not closes:
+                candles = js.get("candles") or js.get("data") or js.get("items") or js.get("prices")
+                if isinstance(candles, list) and candles and isinstance(candles[0], dict):
+                    for it in candles:
+                        c = _to_float(it.get("c") or it.get("close") or it.get("price"))
+                        h = _to_float(it.get("h") or it.get("high"))
+                        l = _to_float(it.get("l") or it.get("low"))
+                        t = it.get("t") or it.get("time") or it.get("timestamp") or it.get("date")
+                        if c is not None:
+                            closes.append(float(c))
+                        if h is not None:
+                            highs.append(float(h))
+                        if l is not None:
+                            lows.append(float(l))
+                        if last_dt is None and t is not None:
+                            try:
+                                if isinstance(t, (int, float)):
+                                    last_dt = datetime.fromtimestamp(float(t), tz=timezone.utc)
+                            except Exception:
+                                pass
+                    if candles:
+                        t_last2 = candles[-1].get("t") or candles[-1].get("time") or candles[-1].get("timestamp")
+                        try:
+                            if isinstance(t_last2, (int, float)):
+                                last_dt = datetime.fromtimestamp(float(t_last2), tz=timezone.utc)
+                        except Exception:
+                            pass
+
+        # clamp all lists to same max points
+        maxp = _history_points_max()
+        closes = closes[-maxp:]
+        highs = highs[-maxp:]
+        lows = lows[-maxp:]
+
+        return closes, highs, lows, last_dt
+
+    # ---------------------------
     # Fetch methods
     # ---------------------------
     async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
@@ -936,32 +1091,42 @@ class TadawulClient:
         if isinstance(hit, dict) and hit:
             return dict(hit)
 
-        url = _format_url(self.quote_url, sym)
-        js, err = await self._get_json(url)
-        if js is None:
-            return {} if not _emit_warnings() else {"_warn": f"tadawul quote failed: {err}"}
+        # short error backoff
+        if self._e_cache.get(ck):
+            return {} if not _emit_warnings() else {"_warn": "tadawul quote temporarily backed off"}
 
-        root = _coerce_dict(js)
-        mapped = self._map_quote(root)
+        async def _do():
+            url = _format_url(self.quote_url, sym)
+            js, err = await self._get_json(url)
+            if js is None:
+                if err:
+                    self._e_cache[ck] = err
+                return {} if not _emit_warnings() else {"_warn": f"tadawul quote failed: {err}"}
 
-        if _to_float(mapped.get("current_price")) is None:
-            return {} if not _emit_warnings() else {"_warn": "tadawul quote returned no price"}
+            root = _coerce_dict(js)
+            mapped = self._map_quote(root)
 
-        patch = dict(mapped)
-        patch.update(
-            {
-                "requested_symbol": symbol,
-                "symbol": sym,
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-                "last_updated_utc": _utc_iso(),
-                "last_updated_riyadh": _riyadh_now_iso(),
-            }
-        )
-        patch = _clean_patch(patch)
-        self._q_cache[ck] = dict(patch)
-        return patch
+            if _to_float(mapped.get("current_price")) is None:
+                self._e_cache[ck] = "no_price"
+                return {} if not _emit_warnings() else {"_warn": "tadawul quote returned no price"}
+
+            patch = dict(mapped)
+            patch.update(
+                {
+                    "requested_symbol": symbol,
+                    "symbol": sym,
+                    "provider": PROVIDER_NAME,
+                    "data_source": PROVIDER_NAME,
+                    "provider_version": PROVIDER_VERSION,
+                    "last_updated_utc": _utc_iso(),
+                    "last_updated_riyadh": _riyadh_now_iso(),
+                }
+            )
+            patch = _clean_patch(patch)
+            self._q_cache[ck] = dict(patch)
+            return patch
+
+        return await self._sf.run(ck, _do)
 
     async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
         if not _configured() or not _enable_fundamentals():
@@ -979,27 +1144,36 @@ class TadawulClient:
         if isinstance(hit, dict) and hit:
             return dict(hit)
 
-        url = _format_url(self.fundamentals_url, sym)
-        js, err = await self._get_json(url)
-        if js is None:
-            return {} if not _emit_warnings() else {"_warn": f"tadawul fundamentals failed: {err}"}
+        if self._e_cache.get(ck):
+            return {}
 
-        root = _coerce_dict(js)
-        mapped = self._map_fundamentals(root)
-        if not mapped:
-            return {} if not _emit_warnings() else {"_warn": "tadawul fundamentals had no useful fields"}
+        async def _do():
+            url = _format_url(self.fundamentals_url, sym)
+            js, err = await self._get_json(url)
+            if js is None:
+                if err:
+                    self._e_cache[ck] = err
+                return {} if not _emit_warnings() else {"_warn": f"tadawul fundamentals failed: {err}"}
 
-        patch = dict(mapped)
-        patch.update(
-            {
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-            }
-        )
-        patch = _clean_patch(patch)
-        self._f_cache[ck] = dict(patch)
-        return patch
+            root = _coerce_dict(js)
+            mapped = self._map_fundamentals(root)
+            if not mapped:
+                self._e_cache[ck] = "no_useful_fields"
+                return {} if not _emit_warnings() else {"_warn": "tadawul fundamentals had no useful fields"}
+
+            patch = dict(mapped)
+            patch.update(
+                {
+                    "provider": PROVIDER_NAME,
+                    "data_source": PROVIDER_NAME,
+                    "provider_version": PROVIDER_VERSION,
+                }
+            )
+            patch = _clean_patch(patch)
+            self._f_cache[ck] = dict(patch)
+            return patch
+
+        return await self._sf.run(ck, _do)
 
     async def fetch_history_patch(self, symbol: str) -> Dict[str, Any]:
         if not _configured() or not _enable_history():
@@ -1018,60 +1192,47 @@ class TadawulClient:
         if isinstance(hit, dict) and hit:
             return dict(hit)
 
-        url = _format_url(self.history_url, sym, days=days)
-        js, err = await self._get_json(url)
-        if js is None:
-            return {} if not _emit_warnings() else {"_warn": f"tadawul history failed: {err}"}
+        if self._e_cache.get(ck):
+            return {}
 
-        # candles-style expected keys: c(close) + t(time) (best-effort)
-        root: Any = js
-        if isinstance(root, dict):
-            closes_raw = root.get("c") or root.get("close") or root.get("closes") or []
-            times_raw = root.get("t") or root.get("time") or root.get("timestamp") or []
-        else:
-            closes_raw = []
-            times_raw = []
+        async def _do():
+            url = _format_url(self.history_url, sym, days=days)
+            js, err = await self._get_json(url)
+            if js is None:
+                if err:
+                    self._e_cache[ck] = err
+                return {} if not _emit_warnings() else {"_warn": f"tadawul history failed: {err}"}
 
-        closes: List[float] = []
-        for x in closes_raw if isinstance(closes_raw, list) else []:
-            fx = _to_float(x)
-            if fx is not None:
-                closes.append(float(fx))
-        closes = closes[-_history_points_max():]
+            closes, highs, lows, last_dt = self._parse_candles(js)
+            if not closes:
+                self._e_cache[ck] = "no_closes"
+                return {} if not _emit_warnings() else {"_warn": "tadawul history parsed but no closes found"}
 
-        last_dt: Optional[datetime] = None
-        try:
-            if isinstance(times_raw, list) and times_raw:
-                t_last = times_raw[-1]
-                if isinstance(t_last, (int, float)):
-                    last_dt = datetime.fromtimestamp(float(t_last), tz=timezone.utc)
-        except Exception:
-            last_dt = None
+            analytics = _compute_history_analytics(closes, highs if highs else None, lows if lows else None)
 
-        if not closes:
-            return {} if not _emit_warnings() else {"_warn": "tadawul history parsed but no closes found"}
+            patch: Dict[str, Any] = {
+                "history_points": len(closes),
+                "history_last_utc": _utc_iso(last_dt) if last_dt else _utc_iso(),
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+            }
 
-        analytics = _compute_history_analytics(closes)
+            # forecast timestamps (only if forecast outputs exist)
+            if any(k in analytics for k in ("expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_method")):
+                patch["forecast_updated_utc"] = _utc_iso(last_dt) if last_dt else _utc_iso()
+                riyadh = _to_riyadh_iso(last_dt)
+                if riyadh:
+                    patch["forecast_updated_riyadh"] = riyadh
+                patch["forecast_source"] = "tadawul_history"
 
-        patch: Dict[str, Any] = {
-            "history_points": len(closes),
-            "history_last_utc": _utc_iso(last_dt) if last_dt else _utc_iso(),
-            "forecast_updated_utc": _utc_iso(last_dt) if last_dt else _utc_iso(),
-            "forecast_source": "tadawul_history",
-            "provider": PROVIDER_NAME,
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-        }
+            patch.update(analytics)
+            patch = _clean_patch(patch)
 
-        riyadh = _to_riyadh_iso(last_dt)
-        if riyadh:
-            patch["forecast_updated_riyadh"] = riyadh
+            self._h_cache[ck] = dict(patch)
+            return patch
 
-        patch.update(analytics)
-
-        patch = _clean_patch(patch)
-        self._h_cache[ck] = dict(patch)
-        return patch
+        return await self._sf.run(ck, _do)
 
     async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
         """
@@ -1105,7 +1266,6 @@ class TadawulClient:
                 if k not in out and v is not None:
                     out[k] = v
 
-        # Ensure provenance
         out.setdefault("provider", PROVIDER_NAME)
         out.setdefault("data_source", PROVIDER_NAME)
         out.setdefault("provider_version", PROVIDER_VERSION)
