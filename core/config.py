@@ -1,5 +1,5 @@
 """
-TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.0.1-shim) – PROD SAFE
+TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.1.0-shim) – PROD SAFE
 
 Purpose
 - Backward compatibility for imports like:
@@ -8,11 +8,11 @@ Purpose
 - Never crashes startup (defensive import + safe fallbacks)
 - Avoid circular imports: do NOT import anything else from core at import-time.
 
-Improvements in v3.0.1-shim
+Improvements in v3.1.0-shim
 - ✅ Robust canonical import: supports missing optional exports.
 - ✅ OPEN fallback still works even if root config.py changes shape.
 - ✅ Minimal debug tracing via CORE_CONFIG_DEBUG=true.
-- ✅ Aligned with root config.py v3.0.1 (Auth Header support).
+- ✅ Aligned with root config.py v3.1.0 (Auth Header support).
 
 Exports (stable)
 - CONFIG_VERSION
@@ -26,10 +26,10 @@ Exports (stable)
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 import os
 
-CONFIG_VERSION = "3.0.1-shim"
+CONFIG_VERSION = "3.1.0-shim"
 
 _DEBUG = str(os.getenv("CORE_CONFIG_DEBUG", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
