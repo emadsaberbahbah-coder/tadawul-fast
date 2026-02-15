@@ -1,15 +1,15 @@
-# routes/routes_argaam.py  (FULL REPLACEMENT)
+# routes/routes_argaam.py (FULL REPLACEMENT)
 """
 routes/routes_argaam.py
 ===============================================================
-Argaam Router (delegate) — v3.8.0
-(PROD SAFE + Auth-Compat + Sheet-Rows + Schema-Aligned)
+Argaam Router (delegate) — v3.9.0
+(PROD SAFE + SCORING AWARE + SCHEMA MAPPING + RIYADH TIME)
 
-v3.8.0 improvements (Advanced Edition)
-- ✅ Shared Normalization: Integrates with core.symbols.normalize for consistent KSA handling.
-- ✅ Explicit Timezone: Uses central Riyadh time helper.
-- ✅ Robust Error Handling: Enhanced error messages and fallback behavior.
-- ✅ Schema Alignment: Defaults to vNext headers if core.schemas is available.
+v3.9.0 Improvements:
+- ✅ **Full Schema Mapping**: Uses EnrichedQuote to support dynamic Sheet headers (59 cols).
+- ✅ **Scoring Integration**: Applies core.scoring_engine to generate metrics on the fly.
+- ✅ **Riyadh Localization**: Injects 'last_updated_riyadh' (UTC+3).
+- ✅ **Robust Batching**: Handles mixed success/failure in sheet-rows without crashing.
 """
 
 from __future__ import annotations
@@ -18,11 +18,10 @@ import asyncio
 import inspect
 import json
 import logging
-import math
 import os
-import random
 import re
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -34,7 +33,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("routes.routes_argaam")
 
-ROUTE_VERSION = "3.8.0"
+ROUTE_VERSION = "3.9.0"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 USER_AGENT = (
@@ -50,9 +49,8 @@ DEFAULT_CONCURRENCY = 12
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 
-
 # =============================================================================
-# Lazy Imports
+# Lazy Imports (Safety First)
 # =============================================================================
 @lru_cache(maxsize=1)
 def _get_ksa_normalizer():
@@ -65,8 +63,24 @@ def _get_ksa_normalizer():
 @lru_cache(maxsize=1)
 def _get_headers_helper():
     try:
-        from core.schemas import get_headers_for_sheet
-        return get_headers_for_sheet
+        from core.schemas import get_headers_for_sheet, DEFAULT_HEADERS_59
+        return get_headers_for_sheet, DEFAULT_HEADERS_59
+    except ImportError:
+        return None, None
+
+@lru_cache(maxsize=1)
+def _get_scoring_enricher():
+    try:
+        from core.scoring_engine import enrich_with_scores
+        return enrich_with_scores
+    except ImportError:
+        return None
+
+@lru_cache(maxsize=1)
+def _get_enriched_quote_class():
+    try:
+        from core.enriched_quote import EnrichedQuote
+        return EnrichedQuote
     except ImportError:
         return None
 
@@ -84,12 +98,12 @@ def _riyadh_iso() -> str:
     return datetime.now(tz).isoformat()
 
 def _utc_to_riyadh_iso(utc_iso: Optional[str]) -> Optional[str]:
-    if not utc_iso: return None
+    if not utc_iso: return _riyadh_iso()
     try:
         dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
         tz = timezone(timedelta(hours=3))
         return dt.astimezone(tz).isoformat()
-    except: return None
+    except: return _riyadh_iso()
 
 def _safe_str(x: Any) -> Optional[str]:
     if x is None: return None
@@ -120,6 +134,19 @@ async def _maybe_await(x: Any) -> Any:
     return x
 
 # =============================================================================
+# Enrichment Logic
+# =============================================================================
+def _enrich_item_scores(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Applies scoring engine to raw Argaam data."""
+    enricher = _get_scoring_enricher()
+    if enricher and item.get("current_price"):
+        try:
+            return enricher(item)
+        except Exception:
+            pass
+    return item
+
+# =============================================================================
 # Auth
 # =============================================================================
 def _extract_token(x_token: Optional[str], auth_header: Optional[str], query_token: Optional[str]) -> Optional[str]:
@@ -141,7 +168,10 @@ def _auth_ok(provided: Optional[str]) -> bool:
 # Argaam Specifics
 # =============================================================================
 ARGAAM_QUOTE_URL = _safe_str(os.getenv("ARGAAM_QUOTE_URL"))
-ARGAAM_PROFILE_URL = _safe_str(os.getenv("ARGAAM_PROFILE_URL"))
+# Optional fallbacks if env not set
+if not ARGAAM_QUOTE_URL:
+    # Placeholder to prevent crash, though it won't fetch data
+    pass 
 
 _quote_cache = TTLCache(maxsize=4000, ttl=20.0)
 
@@ -171,20 +201,31 @@ async def _get_quote_payload(request: Request, symbol: str, debug: int = 0) -> D
     if not data:
         return {"status": "error", "error": err or "No data", "symbol": sym}
 
-    # Normalize response
+    # Normalize response to UnifiedQuote-like shape
+    now_utc = _utc_iso()
     out = {
         "status": "ok",
         "symbol": sym,
+        "symbol_normalized": sym,
         "market": "KSA",
         "currency": "SAR",
-        "current_price": data.get("last") or data.get("price"),
-        "previous_close": data.get("previous_close"),
-        "change": data.get("change"),
-        "change_pct": data.get("change_pct"),
+        # Map fields (adjust keys based on actual Argaam API response)
+        "current_price": data.get("last") or data.get("price") or data.get("close"),
+        "previous_close": data.get("previous_close") or data.get("prev_close"),
+        "price_change": data.get("change"),
+        "percent_change": data.get("change_pct") or data.get("percentage_change"),
+        "volume": data.get("volume"),
+        "name": data.get("companyName") or data.get("nameAr") or data.get("nameEn"),
+        "sector": data.get("sectorName"),
+        
         "data_source": "argaam",
-        "last_updated_utc": _utc_iso(),
-        "last_updated_riyadh": _riyadh_iso()
+        "data_quality": "OK" if data.get("last") else "PARTIAL",
+        "last_updated_utc": now_utc,
+        "last_updated_riyadh": _utc_to_riyadh_iso(now_utc)
     }
+    
+    # Enrich with Scores
+    out = _enrich_item_scores(out)
     
     _quote_cache[ck] = out
     return out
@@ -250,23 +291,37 @@ async def sheet_rows(
             
     items = await asyncio.gather(*[one(s) for s in normed])
     
-    # Headers logic
-    headers = ["Symbol", "Price", "Change %", "Last Updated"]
-    get_headers = _get_headers_helper()
+    # Determine Headers
+    get_headers, default_headers = _get_headers_helper()
+    headers = default_headers if default_headers else ["Symbol", "Price", "Change %", "Last Updated"]
+    
     if get_headers and payload.sheet_name:
         h = get_headers(payload.sheet_name)
         if h: headers = h
 
-    # Map Rows (Simple mapping for this specific route)
+    # Map Rows
+    EnrichedQuote = _get_enriched_quote_class()
     rows = []
+    
     for it in items:
-        # This is a basic map; advanced mapping happens in advanced_analysis
-        rows.append([
-            it.get("symbol"),
-            it.get("current_price"),
-            it.get("change_pct"),
-            it.get("last_updated_riyadh")
-        ])
+        if EnrichedQuote and isinstance(it, dict) and "error" not in it:
+            try:
+                # Use powerful EnrichedQuote mapper to align with any schema (59 cols etc)
+                eq = EnrichedQuote.from_unified(it)
+                rows.append(eq.to_row(headers))
+            except Exception:
+                # Fallback if mapping fails
+                rows.append([it.get("symbol"), "Map Error"] + [""] * (len(headers)-2))
+        else:
+            # Basic fallback for errors or missing EnrichedQuote
+            row = [it.get("symbol", "UNKNOWN")] + [""] * (len(headers)-1)
+            # Try to place error message if "Error" header exists
+            try:
+                err_idx = headers.index("Error")
+                row[err_idx] = it.get("error", "")
+            except ValueError:
+                pass
+            rows.append(row)
 
     return {
         "status": "ok",
