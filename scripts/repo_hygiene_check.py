@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # scripts/repo_hygiene_check.py
 """
-Repo Hygiene Check — PROD SAFE (v1.4.0)
+Repo Hygiene Check — PROD SAFE (v1.4.1)
 
 Goal
 - Fail CI if markdown code fences or other common LLM copy-paste artifacts
@@ -13,7 +13,7 @@ Why
 
 What it checks
 - Detects common fenced-code markers:
-  - triple backticks (```)
+  - triple backticks (``` )
   - triple tildes (~~~)
   - "```python" or "```sh" remnants
   - Common LLM placeholders like "[your code here]"
@@ -43,7 +43,7 @@ import pathlib
 import sys
 from typing import Iterable, List, Optional, Tuple, Set
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.4.1"
 
 # Default skip directories (expanded)
 SKIP_DIRS = {
@@ -54,55 +54,57 @@ SKIP_DIRS = {
     "htmlcov", "site-packages", "coverage"
 }
 
+
 def _make_bad_tokens() -> List[str]:
     """
     Return tokens that should trigger a failure.
-    We construct them dynamically to avoiding triggering this script on itself.
+    We construct them dynamically to avoid embedding literal fences in this file.
     """
     bt = "".join((chr(0x60), chr(0x60), chr(0x60)))  # backtick x3
     td = "".join((chr(0x7E), chr(0x7E), chr(0x7E)))  # tilde x3
-    
+
     # Common artifacts
     py_fence = bt + "python"
     sh_fence = bt + "sh"
     bash_fence = bt + "bash"
-    
-    # LLM placeholders
+
+    # LLM placeholders (must be NON-EMPTY)
     placeholder_1 = "[your code here]"
-    placeholder_2 = ""
-    
-    return [bt, td, py_fence, sh_fence, bash_fence, placeholder_1, placeholder_2]
+
+    tokens = [bt, td, py_fence, sh_fence, bash_fence, placeholder_1]
+
+    # ✅ CRITICAL FIX:
+    # Never allow empty tokens (""), because text.find("") == 0 for all files,
+    # which would falsely flag every .py file at 1:1 with Artifact found: ''.
+    tokens = [t for t in tokens if isinstance(t, str) and t != ""]
+
+    # De-dupe while preserving order
+    seen = set()
+    out: List[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 def _should_skip(path: pathlib.Path, skip_set: Set[str]) -> bool:
     # Check if any part of the path is in the skip set
     # Also skip hidden files/dirs starting with . (except .github which is useful to check)
-    parts = path.parts
-    for p in parts:
-        p_lower = p.lower()
+    for part in path.parts:
+        p_lower = part.lower()
         if p_lower in skip_set:
             return True
-        # Skip hidden folders generally, unless it's the current dir "."
-        if p.startswith(".") and p != "." and p_lower not in {".github"}: 
-             return True
+        if part.startswith(".") and part != "." and p_lower not in {".github"}:
+            return True
     return False
 
 
 def _iter_py_files(root: pathlib.Path, skip_set: Set[str]) -> Iterable[pathlib.Path]:
     try:
-        # Walk efficiently
-        for p in root.rglob("*"):
-            if p.is_dir():
-                # Optimization: if dir is skipped, don't recurse? 
-                # rglob doesn't support prune easily, so we just filter results.
-                continue
-            
-            if p.suffix.lower() != ".py":
-                continue
-                
+        for p in root.rglob("*.py"):
             if _should_skip(p, skip_set):
                 continue
-                
             yield p
     except OSError as e:
         print(f"Warning: Error walking directory {root}: {e}")
@@ -116,17 +118,13 @@ def _line_col_from_index(text: str, idx: int) -> Tuple[int, int]:
         return 0, 0
     if idx == 0:
         return 1, 1
-        
-    # Count newlines up to idx
+
     line = text.count("\n", 0, idx) + 1
-    
-    # Find last newline before idx
     last_nl = text.rfind("\n", 0, idx)
     if last_nl == -1:
         col = idx + 1
     else:
         col = idx - last_nl
-        
     return line, col
 
 
@@ -149,24 +147,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="If set, unreadable files cause a non-zero exit (1) even if no offenders found.",
     )
     ap.add_argument("--exclude", nargs="+", help="Additional directories to exclude")
-    
+
     args = ap.parse_args(argv)
 
     root = pathlib.Path(args.root).resolve()
     this_file = pathlib.Path(__file__).resolve()
-    
+
     # Build skip set
     skip_set = SKIP_DIRS.copy()
     if args.exclude:
         for ex in args.exclude:
-            skip_set.add(ex.lower())
+            if ex:
+                skip_set.add(str(ex).lower())
 
     bad_tokens = _make_bad_tokens()
 
     offenders: List[str] = []
     offenders_gha: List[Tuple[str, int, int, str]] = []
     read_errors: List[str] = []
-    
+
     checked_count = 0
     skipped_count = 0
 
@@ -190,39 +189,36 @@ def main(argv: Optional[List[str]] = None) -> int:
             read_errors.append(f"{p}  (read error: {e})")
             continue
 
-        # Check for bad tokens
-        # We find the *first* occurrence of any bad token
+        # Find the *first* occurrence of any bad token
         found_token = None
         found_idx = -1
-        
+
         for tok in bad_tokens:
             idx = text.find(tok)
-            if idx != -1:
-                # If we haven't found one yet, or this one is earlier
-                if found_idx == -1 or idx < found_idx:
-                    found_idx = idx
-                    found_token = tok
+            if idx != -1 and (found_idx == -1 or idx < found_idx):
+                found_idx = idx
+                found_token = tok
 
         if found_idx != -1:
             line, col = _line_col_from_index(text, found_idx)
-            
-            # Make path relative for cleaner output
+
             try:
                 rel_path = p.relative_to(root)
             except ValueError:
                 rel_path = p
-                
+
             msg = f"Artifact found: {repr(found_token)}"
             offenders.append(f"{rel_path}:{line}:{col} -> {msg}")
             offenders_gha.append((str(rel_path), line, col, msg))
 
-    # Reporting
     print(f"\n--- Summary ---")
     print(f"Checked: {checked_count} files")
-    
+    if skipped_count:
+        print(f"Skipped (self): {skipped_count} file(s)")
+
     if read_errors:
         print(f"\n⚠️  Repo hygiene check: {len(read_errors)} files could not be read:")
-        for o in read_errors[:10]: # Limit output
+        for o in read_errors[:10]:
             print(" -", o)
         if len(read_errors) > 10:
             print(f" ... and {len(read_errors) - 10} more.")
