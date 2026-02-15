@@ -1,7 +1,7 @@
 """
 core/enriched_quote.py
 ------------------------------------------------------------
-Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.7.2
+Compatibility Router + Row Mapper: Enriched Quote (PROD SAFE) — v2.8.0
 Emad Bahbah — Financial Leader Edition
 
 What this module is for
@@ -10,7 +10,7 @@ What this module is for
 - Works with BOTH async and sync engines
 - Attempts batch fast-path first; falls back per-symbol safely (bounded concurrency + timeout)
 
-✅ v2.7.2 enhancements (this revision)
+✅ v2.8.0 enhancements (this revision)
 - ✅ Aligned ROI Keys: Prioritizes 'forecast_price_3m/12m' to match v12.2 standards.
 - ✅ Scoring Preservation: Respects pre-calculated scores from the v1.6.1 engine.
 - ✅ Riyadh Localization: Ensures 'Last Updated (Riyadh)' is consistently populated.
@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger("core.enriched_quote")
 
-ROUTER_VERSION = "2.7.2"
+ROUTER_VERSION = "2.8.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
