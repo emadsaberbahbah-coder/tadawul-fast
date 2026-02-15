@@ -3,165 +3,37 @@
 """
 core/providers/yahoo_chart_provider.py
 ============================================================
-Yahoo Quote/Chart Provider (KSA-safe) — v2.1.2
-(RESILIENT + PATCH-ALIGNED + ALIGNED ROI KEYS + RIYADH TIME)
+Yahoo Quote/Chart Provider (via yfinance) — v2.2.0
+(RELIABLE PRICE/HISTORY FETCH + MOMENTUM FORECASTS)
 
-What’s improved in v2.1.2
-- ✅ ROI Key Alignment: Uses 'expected_roi_1m/3m/12m' to match EODHD/Finnhub.
-- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
-- ✅ Network Resilience: Multi-host support (query1/query2) and exponential backoff.
-- ✅ KSA Precision: Normalizes numeric codes to .SR and handles TADAWUL wrappers.
+Updates in v2.2.0:
+- ✅ Engine Switch: Uses yfinance for reliable price & history data.
+- ✅ Momentum Forecasts: Calculates ROI based on historical closes.
+- ✅ Resilience: Bypasses direct HTTP blocks by using yfinance's internal handling.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
-import os
-import random
 import re
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
-import httpx
+import yfinance as yf
 
 logger = logging.getLogger("core.providers.yahoo_chart_provider")
 
-PROVIDER_VERSION = "2.1.2"
+PROVIDER_VERSION = "2.2.0"
 PROVIDER_NAME = "yahoo_chart"
 
-# ---------------------------
-# Safe env parsing
-# ---------------------------
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY = {"0", "false", "no", "n", "off", "f"}
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw: return default
-    if raw in _FALSY: return False
-    if raw in _TRUTHY: return True
-    return default
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None: return default
-    try:
-        f = float(str(v).strip())
-        return f if f > 0 else default
-    except Exception: return default
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None: return default
-    try:
-        return int(str(v).strip())
-    except Exception: return default
-
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None: return default
-    s = str(v).strip()
-    return s if s else default
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _riyadh_iso() -> str:
-    tz = timezone(timedelta(hours=3))
-    return datetime.now(tz).isoformat()
-
-# ---------------------------
-# HTTP Configuration
-# ---------------------------
-UA = _env_str("YAHOO_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-_TIMEOUT_S = _env_float("YAHOO_TIMEOUT_S", 8.5)
-TIMEOUT = httpx.Timeout(timeout=_TIMEOUT_S, connect=min(5.0, _TIMEOUT_S))
-
-_RETRY_MAX = _env_int("YAHOO_RETRY_MAX", 2)
-_RETRY_BACKOFF_MS = _env_float("YAHOO_RETRY_BACKOFF_MS", 250.0)
-
-_DEFAULT_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
-_DEFAULT_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-
-_ALT_HOSTS = [h.strip() for h in (_env_str("YAHOO_ALT_HOSTS", "")).split(",") if h.strip()]
-QUOTE_URLS: List[str] = [_DEFAULT_QUOTE_URL]
-CHART_URLS: List[str] = [_DEFAULT_CHART_URL]
-
-for host in _ALT_HOSTS:
-    base = host.rstrip("/") if "://" in host else f"https://{host}"
-    QUOTE_URLS.append(f"{base}/v7/finance/quote")
-    CHART_URLS.append(f"{base}/v8/finance/chart/{{symbol}}")
-
-# ---------------------------
-# Caching (TTLCache Fallback)
-# ---------------------------
-try:
-    from cachetools import TTLCache
-    _HAS_CACHETOOLS = True
-except Exception:
-    _HAS_CACHETOOLS = False
-    class TTLCache(dict):
-        def __init__(self, maxsize: int, ttl: float):
-            super().__init__()
-            self._ttl = ttl
-            self._exp = {}
-        def get(self, key, default=None):
-            if key in self._exp and self._exp[key] < time.time():
-                self.pop(key, None)
-                return default
-            return super().get(key, default)
-        def __setitem__(self, key, value):
-            super().__setitem__(key, value)
-            self._exp[key] = time.time() + self._ttl
-
-_Q_CACHE = TTLCache(maxsize=9000, ttl=10.0)
-_C_CACHE = TTLCache(maxsize=5000, ttl=20.0)
-_H_CACHE = TTLCache(maxsize=2500, ttl=900.0)
-
-# ---------------------------
-# Logic & Helpers
-# ---------------------------
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 
-def _to_float(x: Any) -> Optional[float]:
-    try:
-        if x is None: return None
-        f = float(str(x).replace(",", "").strip())
-        return f if not math.isnan(f) and not math.isinf(f) else None
-    except: return None
-
-def _history_analytics(closes: List[float]) -> Dict[str, Any]:
-    out = {}
-    if not closes: return out
-    last = closes[-1]
-    
-    def momentum_roi(days: int) -> Optional[float]:
-        if len(closes) < (days + 1): return None
-        start = closes[-(days + 1)]
-        if start == 0: return None
-        return ((last / start) - 1.0) * 100.0
-
-    # Aligned ROI Keys
-    out["expected_roi_1m"] = momentum_roi(21)
-    out["expected_roi_3m"] = momentum_roi(63)
-    out["expected_roi_12m"] = momentum_roi(252)
-
-    if out["expected_roi_1m"] is not None:
-        out["forecast_price_1m"] = last * (1.0 + (out["expected_roi_1m"] / 100.0))
-    if out["expected_roi_3m"] is not None:
-        out["forecast_price_3m"] = last * (1.0 + (out["expected_roi_3m"] / 100.0))
-    
-    out["forecast_confidence"] = 0.80
-    out["forecast_method"] = "yahoo_momentum_v1"
-    out["forecast_updated_utc"] = _utc_iso()
-    out["forecast_updated_riyadh"] = _riyadh_iso()
-    return out
-
+# ---------------------------
+# Helpers
+# ---------------------------
 def _normalize_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
     if not s: return ""
@@ -170,101 +42,155 @@ def _normalize_symbol(symbol: str) -> str:
     if _KSA_CODE_RE.match(s): return f"{s}.SR"
     return s
 
-# ---------------------------
-# Client reuse
-# ---------------------------
-_CLIENT: Optional[httpx.AsyncClient] = None
-_CLIENT_LOCK = asyncio.Lock()
+def _to_float(x: Any) -> Optional[float]:
+    if x is None: return None
+    try:
+        if isinstance(x, str): x = x.replace(",", "").replace("%", "")
+        f = float(x)
+        return f if not math.isnan(f) and not math.isinf(f) else None
+    except: return None
 
-async def _get_client() -> httpx.AsyncClient:
-    global _CLIENT
-    async with _CLIENT_LOCK:
-        if _CLIENT is None:
-            _CLIENT = httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True)
-    return _CLIENT
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-async def aclose_yahoo_client() -> None:
-    global _CLIENT
-    if _CLIENT: await _CLIENT.aclose()
-    _CLIENT = None
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
-# ---------------------------
-# Main Fetchers
-# ---------------------------
-async def _http_get_json_multi(urls: List[str], symbol: str, params: Dict[str, Any]) -> Tuple[Optional[dict], Optional[str]]:
-    client = await _get_client()
-    headers = {"User-Agent": UA, "Referer": f"https://finance.yahoo.com/quote/{symbol}"}
+def _calculate_momentum_forecasts(closes: List[float]) -> Dict[str, Any]:
+    """Calculates simple momentum-based forecasts from historical closes."""
+    out = {}
+    if not closes: return out
     
-    for url in urls:
-        formatted_url = url.format(symbol=symbol)
-        for i in range(_RETRY_MAX + 1):
-            try:
-                r = await client.get(formatted_url, params=params, headers=headers)
-                if r.status_code == 200: return r.json(), None
-                if r.status_code not in {429, 500, 502, 503, 504}: break
-            except Exception as e:
-                if i == _RETRY_MAX: return None, str(e)
-            await asyncio.sleep((_RETRY_BACKOFF_MS / 1000.0) * (2**i))
-    return None, "All endpoints failed"
+    last = closes[-1]
+    n = len(closes)
 
-async def _fetch_quote(symbol: str) -> Dict[str, Any]:
-    u_sym = _normalize_symbol(symbol)
-    if not u_sym: return {}
+    # Helper to get ROI over 'days' ago
+    def get_roi(days_ago: int) -> Optional[float]:
+        if n > days_ago and closes[-(days_ago+1)] > 0:
+            start_price = closes[-(days_ago+1)]
+            return ((last / start_price) - 1.0) * 100.0
+        return None
 
-    # Cache Check
-    ck = f"q_patch::{u_sym}"
-    hit = _Q_CACHE.get(ck)
-    if hit: return dict(hit)
+    # Calculate ROIs (1M~21d, 3M~63d, 12M~252d)
+    roi_1m = get_roi(21)
+    roi_3m = get_roi(63)
+    roi_12m = get_roi(252)
 
-    params = {"symbols": u_sym, "formatted": "false"}
-    js, err = await _http_get_json_multi(QUOTE_URLS, u_sym, params)
+    # Project future price based on past momentum (Simple Projection)
+    # Note: This is a technical projection, distinct from Analyst Targets in Fundamentals
+    if roi_1m is not None:
+        out["expected_roi_1m"] = roi_1m
+        out["forecast_price_1m"] = last * (1 + (roi_1m / 100.0))
     
-    if js:
-        res = js.get("quoteResponse", {}).get("result", [])
-        if res:
-            q = res[0]
+    if roi_3m is not None:
+        out["expected_roi_3m"] = roi_3m
+        out["forecast_price_3m"] = last * (1 + (roi_3m / 100.0))
+
+    # For 12M, we often prefer analyst targets, but if missing, use momentum
+    if roi_12m is not None:
+        out["momentum_roi_12m"] = roi_12m # Distinct key to avoid overwriting analyst target
+
+    out["forecast_method"] = "technical_momentum"
+    out["forecast_confidence"] = 0.60 # Lower confidence than analysts
+    out["forecast_updated_utc"] = _utc_iso()
+    out["forecast_updated_riyadh"] = _riyadh_iso()
+    
+    return out
+
+# ---------------------------
+# Main Provider Class
+# ---------------------------
+@dataclass
+class YahooChartProvider:
+    name: str = PROVIDER_NAME
+
+    async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
+        """
+        Fetches current price and historical context via yfinance.
+        """
+        u_sym = _normalize_symbol(symbol)
+        if not u_sym: return {}
+
+        try:
+            # Blocking call to yfinance in thread
+            def _get_data():
+                ticker = yf.Ticker(u_sym)
+                # Fast price check
+                # Note: .fast_info is often faster/more reliable for current price than .info
+                price = ticker.fast_info.last_price
+                prev_close = ticker.fast_info.previous_close
+                
+                # Fetch history for charts/momentum
+                hist = ticker.history(period="1y") # 1 year for 12m momentum
+                return price, prev_close, hist
+
+            current_price, prev_close, history = await asyncio.to_thread(_get_data)
+
+            if current_price is None:
+                return {"error": "Price not found"}
+
+            # Basic Quote Data
             out = {
                 "symbol": u_sym,
-                "current_price": _to_float(q.get("regularMarketPrice")),
-                "previous_close": _to_float(q.get("regularMarketPreviousClose")),
-                "percent_change": _to_float(q.get("regularMarketChangePercent")),
-                "day_high": _to_float(q.get("regularMarketDayHigh")),
-                "day_low": _to_float(q.get("regularMarketDayLow")),
-                "volume": _to_float(q.get("regularMarketVolume")),
-                "name": q.get("longName") or q.get("shortName"),
+                "current_price": float(current_price),
+                "previous_close": float(prev_close) if prev_close else None,
                 "data_source": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
                 "last_updated_utc": _utc_iso()
             }
 
-            # Supplemental enrichment for history/forecast
-            if _env_bool("YAHOO_ENABLE_HISTORY", True):
-                c_js, c_err = await _http_get_json_multi(CHART_URLS, u_sym, {"range": "2y", "interval": "1d"})
-                chart_res = c_js.get("chart", {}).get("result", [None])[0] if c_js else None
-                if chart_res:
-                    closes = chart_res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                    closes = [c for c in closes if c is not None]
-                    if closes:
-                        out.update(_history_analytics(closes))
+            # Calc basic change if possible
+            if out["previous_close"]:
+                diff = out["current_price"] - out["previous_close"]
+                out["change"] = diff
+                out["percent_change"] = (diff / out["previous_close"]) * 100.0
 
-            _Q_CACHE[ck] = out
+            # Add History/Forecasts
+            if not history.empty and "Close" in history:
+                closes = history["Close"].tolist()
+                # Clean NaNs
+                closes = [c for c in closes if c is not None and not math.isnan(c)]
+                
+                if closes:
+                    # Enrich with Day/Year High/Low from history
+                    out["day_high"] = max(closes[-5:]) # Approx recent high
+                    out["day_low"] = min(closes[-5:])
+                    out["high_52w"] = max(closes)
+                    out["low_52w"] = min(closes)
+                    
+                    # 52W Position
+                    if out["high_52w"] > out["low_52w"]:
+                        out["position_52w"] = ((out["current_price"] - out["low_52w"]) / 
+                                              (out["high_52w"] - out["low_52w"])) * 100.0
+
+                    # Momentum Forecasts
+                    forecasts = _calculate_momentum_forecasts(closes)
+                    out.update(forecasts)
+
+            if debug:
+                logger.info(f"[{u_sym}] Price: {out['current_price']}")
+
             return out
-            
-    return {"error": f"Yahoo fetch failed: {err or 'Symbol not found'}"}
 
+        except Exception as e:
+            logger.error(f"[{u_sym}] Chart Error: {e}")
+            return {"error": str(e)}
+
+# ---------------------------
+# Compatibility Aliases
+# ---------------------------
 async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[str, Any]:
-    return await _fetch_quote(symbol)
+    p = YahooChartProvider()
+    return await p.fetch_quote(symbol, debug)
 
-# Compatibility Class
-@dataclass
-class YahooChartProvider:
-    name: str = PROVIDER_NAME
-    async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
-        return await _fetch_quote(symbol)
+# Cleanup (no-op for yfinance)
+async def aclose_yahoo_client():
+    pass
 
 __all__ = [
+    "YahooChartProvider",
     "fetch_enriched_quote_patch",
     "aclose_yahoo_client",
-    "PROVIDER_NAME",
-    "YahooChartProvider",
+    "PROVIDER_NAME"
 ]
