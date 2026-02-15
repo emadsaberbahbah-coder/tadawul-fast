@@ -1,6 +1,6 @@
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# EDITION: Advanced Production (v1.4.0)
+# EDITION: Advanced Production (v1.5.0)
 # ============================================================
 #
 # Key Features:
@@ -27,11 +27,11 @@ services:
       pip install -r requirements.txt
 
     # 2. Start Phase (Delegates to hardened shell script)
-    startCommand: sh scripts/start_web.sh
+    startCommand: ./scripts/start_web.sh
 
     # 3. Health Check (Ensures Engine is fully booted)
     healthCheckPath: /readyz
-    healthCheckTimeout: 15
+    healthCheckTimeout: 30
 
     envVars:
       # --- Runtime Core ---
@@ -46,12 +46,16 @@ services:
       - key: APP_NAME
         value: "Tadawul Fast Bridge"
       - key: APP_VERSION
-        value: "6.2.0"
+        value: "6.3.0"
+      - key: LOG_LEVEL
+        value: "INFO"
 
       # --- Server Tuning (Uvicorn) ---
       # Leave WEB_CONCURRENCY empty to let start_web.sh auto-detect cores
       - key: WEB_CONCURRENCY
         value: "" 
+      - key: WEB_CONCURRENCY_MAX
+        value: "4" 
       - key: UVICORN_KEEPALIVE
         value: "120"
       - key: UVICORN_TIMEOUT
@@ -72,8 +76,6 @@ services:
         value: "300"
 
       # --- Fast Boot Optimization ---
-      - key: DEFER_ROUTER_MOUNT
-        value: "true"
       - key: INIT_ENGINE_ON_BOOT
         value: "true"
 
@@ -81,7 +83,7 @@ services:
       - key: ENABLED_PROVIDERS
         value: "eodhd,finnhub"
       - key: KSA_PROVIDERS
-        value: "yahoo_chart,argaam"
+        value: "yahoo_chart,argaam,tadawul"
       - key: PRIMARY_PROVIDER
         value: "eodhd"
       
@@ -104,15 +106,15 @@ services:
         sync: false
       - key: ARGAAM_API_KEY
         sync: false
-      - key: FMP_API_KEY
-        sync: false
-      - key: ALPHA_VANTAGE_API_KEY
-        sync: false
 
       # --- Provider Endpoints (Optional Overrides) ---
       - key: ARGAAM_QUOTE_URL
         sync: false
       - key: ARGAAM_PROFILE_URL
+        sync: false
+      - key: TADAWUL_QUOTE_URL
+        sync: false
+      - key: TADAWUL_FUNDAMENTALS_URL
         sync: false
 
       # --- Google Integration (Secrets - Set in Dashboard) ---
@@ -128,6 +130,8 @@ services:
         value: "800"
       - key: AI_BATCH_CONCURRENCY
         value: "8"
+      - key: ADV_BATCH_SIZE
+        value: "25"
       
       # --- CORS Security ---
       - key: ENABLE_CORS_ALL_ORIGINS
