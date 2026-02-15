@@ -1,5 +1,5 @@
 """
-ROUTES CONFIG SHIM – PROD SAFE (v1.2.1)
+ROUTES CONFIG SHIM – PROD SAFE (v1.2.2)
 
 Purpose
 - Backward compatibility for older imports like:
@@ -19,12 +19,15 @@ import importlib
 import os
 from typing import Any, Dict, List, Optional
 
-CONFIG_VERSION = "1.2.1-shim"
+CONFIG_VERSION = "1.2.2-shim"
 
 # Fallback stubs (used if root config can't be imported OR is missing fields)
 class _FallbackSettings:
     auth_header_name: str = "X-APP-TOKEN"
-    pass
+    ai_batch_size: int = 20
+    ai_batch_timeout_sec: float = 45.0
+    ai_batch_concurrency: int = 5
+    ai_max_tickers: int = 500
 
 
 Settings = _FallbackSettings  # type: ignore[assignment]
@@ -40,7 +43,7 @@ def allowed_tokens() -> List[str]:
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
         v = (os.getenv(k) or "").strip()
         if v: toks.append(v)
-    return toks
+    return list(set(toks))
 
 
 def is_open_mode() -> bool:
@@ -76,7 +79,11 @@ def _load_root_config() -> Optional[Any]:
         return None
 
 
+# -----------------------------------------------------------------------------
+# Dynamic Proxy Logic (Prefer root config, fallback to stubs)
+# -----------------------------------------------------------------------------
 _root = _load_root_config()
+
 if _root is not None:
     # Prefer root CONFIG_VERSION if present
     _v = _safe_getattr(_root, "CONFIG_VERSION")
@@ -101,7 +108,7 @@ if _root is not None:
     if callable(_allowed_tokens):
         allowed_tokens = _allowed_tokens  # type: ignore[assignment]
     else:
-
+        # Redefine using the *actual* get_settings we just resolved
         def allowed_tokens() -> List[str]:  # type: ignore[override]
             try:
                 # Try common patterns on settings object
@@ -114,14 +121,13 @@ if _root is not None:
                             toks.append(v.strip())
                     except Exception:
                         pass
+                
+                # Also check ENV vars directly as a safety net
+                for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
+                    v = (os.getenv(k) or "").strip()
+                    if v: toks.append(v)
 
-                out: List[str] = []
-                seen = set()
-                for t in toks:
-                    if t not in seen:
-                        seen.add(t)
-                        out.append(t)
-                return out
+                return list(set(toks))
             except Exception:
                 return []
 
@@ -130,7 +136,6 @@ if _root is not None:
     if callable(_is_open_mode):
         is_open_mode = _is_open_mode  # type: ignore[assignment]
     else:
-
         def is_open_mode() -> bool:  # type: ignore[override]
             try:
                 return len(allowed_tokens()) == 0
@@ -142,7 +147,6 @@ if _root is not None:
     if callable(_auth_ok):
         auth_ok = _auth_ok  # type: ignore[assignment]
     else:
-
         def auth_ok(x_app_token: Optional[str]) -> bool:  # type: ignore[override]
             try:
                 toks = allowed_tokens()
@@ -157,7 +161,6 @@ if _root is not None:
     if callable(_mask_settings_dict):
         mask_settings_dict = _mask_settings_dict  # type: ignore[assignment]
     else:
-
         def mask_settings_dict() -> Dict[str, Any]:  # type: ignore[override]
             try:
                 s = get_settings()
