@@ -1,26 +1,29 @@
+# core/investment_advisor.py
 """
 Tadawul Fast Bridge — Investment Advisor Core (GOOGLE SHEETS SAFE)
 File: core/investment_advisor.py
 
-FULL REPLACEMENT — v1.4.0 (ADVANCED + STABLE OUTPUT + TICKERS OVERRIDE)
+FULL REPLACEMENT — v1.4.2 (ADVANCED + STABLE OUTPUT + TICKERS OVERRIDE + DEDUPE)
 
 Public contract:
-  run_investment_advisor(payload_dict, engine=...) -> {"headers":[...], "rows":[...], "meta":{...}}
+  run_investment_advisor(payload_dict, engine=...) -> {"headers":[...], "rows":[...], "meta":{...}, "items":[...]}
 
-v1.4.0 Enhancements:
-- ✅ Tickers Override: payload may include tickers/symbols to restrict universe (even if sources=ALL).
-- ✅ Stable Schema: headers are ALWAYS present (GAS-safe).
+v1.4.2 Enhancements (on top of v1.4.0):
+- ✅ Tickers Override: supports symbol variants (1120 <-> 1120.SR, .SA -> .SR).
+- ✅ Stable Schema: headers ALWAYS present (GAS-safe), even on errors.
 - ✅ Adds 12M columns: Forecast Price (12M), Expected ROI % (12M), Expected Gain/Loss (12M).
 - ✅ Expected Gain/Loss: computed from Allocation Amount * ROI (1M/3M/12M).
 - ✅ Include-News Switch: news impact applied ONLY if include_news=True.
 - ✅ Liquidity Guard: uses Liquidity Score OR proxy from Value Traded / Volume if available.
-- ✅ Volatility-aware penalty: stronger penalty for Low risk profile.
-- ✅ Allocation Constraints: optional caps + min allocation threshold with redistribution.
+- ✅ Volatility-aware penalty: stronger penalty for Low/Moderate risk profile.
+- ✅ Allocation Constraints: optional caps + min allocation threshold with redistribution (robust even if all fall below min).
 - ✅ Riyadh Localization: outputs Last Updated (Riyadh) column.
 - ✅ Better fallback scoring if Overall Score missing (composite factors).
+- ✅ De-duplication: if same symbol appears in multiple sources, keeps best-scoring candidate.
 
 Notes:
-- Expects sheet snapshots to be cached via engine.set_cached_sheet_snapshot()
+- Expects sheet snapshots to be cached via:
+    engine.set_cached_sheet_snapshot(sheet_name, headers, rows, meta)
   after each sheet refresh (Market_Leaders, Global_Markets, Mutual_Funds, Commodities_FX).
 """
 
@@ -32,7 +35,7 @@ import math
 import time
 from datetime import datetime, timezone, timedelta
 
-TT_ADVISOR_CORE_VERSION = "1.4.0"
+TT_ADVISOR_CORE_VERSION = "1.4.2"
 
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
 
@@ -58,11 +61,50 @@ def _safe_str(x: Any) -> str:
 
 
 def _norm_symbol(x: Any) -> str:
+    """
+    Normalize common symbol formats. Keep it conservative:
+    - uppercase
+    - remove spaces
+    - .SA => .SR (common KSA mismatch)
+    """
     s = _safe_str(x).upper().replace(" ", "")
-    # common normalization
-    if s.endswith(".SA"):  # sometimes appears
+    if not s:
+        return ""
+    if s.endswith(".SA"):
         s = s[:-3] + ".SR"
     return s
+
+
+def _symbol_variants(sym: str) -> Set[str]:
+    """
+    Build a small set of common variants for matching.
+    Examples:
+      - "1120" -> {"1120", "1120.SR"}
+      - "1120.SR" -> {"1120.SR", "1120"}
+      - "AAPL" -> {"AAPL"}
+      - "AAPL.US" -> {"AAPL.US", "AAPL"}
+    """
+    s = _norm_symbol(sym)
+    out: Set[str] = set()
+    if not s:
+        return out
+    out.add(s)
+
+    # KSA: digits with/without .SR
+    if s.endswith(".SR"):
+        out.add(s[:-3])
+    else:
+        # if numeric code, add .SR
+        if s.isdigit():
+            out.add(s + ".SR")
+
+    # Global sometimes appears with .US or similar
+    if "." in s:
+        base = s.split(".", 1)[0]
+        if base:
+            out.add(base)
+
+    return out
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -99,8 +141,8 @@ def _to_int(x: Any) -> Optional[int]:
 def _as_ratio(x: Any) -> Optional[float]:
     """
     Accepts percent-ish or ratio and returns ratio:
-      - 0.10 => 0.10
-      - 10   => 0.10
+      - 0.10  => 0.10
+      - 10    => 0.10
       - "10%" => 0.10
       - "0.10" => 0.10
     """
@@ -188,7 +230,6 @@ def _parse_iso_to_dt(v: Any) -> Optional[datetime]:
     if not s:
         return None
     try:
-        # allow both with/without tz
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -208,6 +249,18 @@ def _iso_riyadh(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(tz_riyadh).isoformat()
+
+
+def _round2(x: Any) -> Any:
+    try:
+        if isinstance(x, bool) or x is None:
+            return x
+        if isinstance(x, (int, float)):
+            return round(float(x), 2)
+        f = _to_float(x)
+        return round(float(f), 2) if f is not None else x
+    except Exception:
+        return x
 
 
 # ---------------------------------------------------------------------
@@ -349,7 +402,7 @@ def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
     sheet = _safe_str(_get_any(row, "_Sheet", "Origin")) or ""
     sector = _safe_str(_get_any(row, "Sector", "Industry", "Category"))
 
-    market = _safe_str(_get_any(row, "Market")) or ("KSA" if symbol.endswith(".SR") else "GLOBAL")
+    market = _safe_str(_get_any(row, "Market")) or ("KSA" if symbol.endswith(".SR") or symbol.isdigit() else "GLOBAL")
     currency = _safe_str(_get_any(row, "Currency")) or ""
 
     price = _to_float(_get_any(row, "Price", "Last", "Close", "NAV per Share", "NAV", "Last Price"))
@@ -414,23 +467,25 @@ def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
 def _liquidity_proxy_score(c: Candidate) -> Optional[float]:
     """
     If liquidity_score missing, attempt a rough proxy from value_traded or volume.
-    Returns 0..100 (approx), or None.
+    Returns approx 0..100, or None.
     """
     if c.liquidity_score is not None:
-        return float(c.liquidity_score)
+        try:
+            return float(c.liquidity_score)
+        except Exception:
+            pass
 
-    # Prefer value_traded (often in local currency units)
     vt = c.value_traded
     if vt is not None and vt > 0:
         # log scaling: 10k -> low, 10m -> high
-        x = math.log10(max(1.0, vt))
+        x = math.log10(max(1.0, float(vt)))
         # map roughly: 4..8 -> 20..95
         score = (x - 4.0) / (8.0 - 4.0) * 75.0 + 20.0
         return max(0.0, min(100.0, score))
 
     vol = c.volume
     if vol is not None and vol > 0:
-        x = math.log10(max(1.0, vol))
+        x = math.log10(max(1.0, float(vol)))
         # map roughly: 3..7 -> 20..95
         score = (x - 3.0) / (7.0 - 3.0) * 75.0 + 20.0
         return max(0.0, min(100.0, score))
@@ -449,8 +504,9 @@ def _passes_filters(
     max_price: Optional[float] = None,
     exclude_sectors: Optional[List[str]] = None,
     liquidity_min: float = 25.0,
+    min_advisor_score: Optional[float] = None,  # optional advanced guard
 ) -> Tuple[bool, str]:
-    # Risk filter (if user asked for risk, require candidate risk bucket known)
+    # Risk filter
     if risk:
         user_rb = _norm_bucket(risk)
         cand_rb = _norm_bucket(c.risk_bucket)
@@ -466,7 +522,7 @@ def _passes_filters(
         if cand_rb not in allowed:
             return False, f"Risk mismatch (Req: {user_rb}, Got: {cand_rb})"
 
-    # Confidence filter (if user asked, require known + minimum level)
+    # Confidence filter
     if confidence:
         user_cb = _norm_bucket(confidence)
         cand_cb = _norm_bucket(c.confidence_bucket)
@@ -489,13 +545,17 @@ def _passes_filters(
         return False, "Price too high"
 
     if exclude_sectors and c.sector:
-        if any(s.lower() in c.sector.lower() for s in exclude_sectors):
+        if any(str(s).lower() in c.sector.lower() for s in exclude_sectors if _safe_str(s)):
             return False, f"Sector excluded: {c.sector}"
 
     # Liquidity Safety Guard (direct or proxy)
     liq = _liquidity_proxy_score(c)
     if liq is not None and liq < float(liquidity_min):
         return False, "Low Liquidity"
+
+    # Optional min score guard (applied after scoring; caller can re-check)
+    if min_advisor_score is not None and c.advisor_score < float(min_advisor_score):
+        return False, "Advisor score too low"
 
     return True, ""
 
@@ -507,9 +567,11 @@ def _fallback_base_score(c: Candidate) -> float:
     parts: List[float] = []
     for v in (c.quality_score, c.momentum_score, c.value_score):
         if v is not None:
-            parts.append(float(v))
+            try:
+                parts.append(float(v))
+            except Exception:
+                pass
     if parts:
-        # normalize to similar 0..100 scale (assumes factors are 0..100 already)
         return max(0.0, min(100.0, sum(parts) / len(parts)))
     return 50.0
 
@@ -526,7 +588,7 @@ def _compute_advisor_score(
     score = float(base)
     reasons: List[str] = []
 
-    # 1) ROI Uplift (diminishing, capped)
+    # 1) ROI uplift (capped, diminishing)
     if c.exp_roi_1m is not None:
         thr = req_roi_1m if req_roi_1m is not None else 0.0
         uplift = max(0.0, (c.exp_roi_1m - thr)) * 100.0
@@ -541,25 +603,30 @@ def _compute_advisor_score(
         if uplift > 1.0:
             reasons.append(f"ROI3M={c.exp_roi_3m:.1%}")
 
-    # Optional small credit for strong 12M ROI (if present)
+    # 12M optional credit
     if c.exp_roi_12m is not None:
-        bonus = max(0.0, min(8.0, c.exp_roi_12m * 12.0))  # e.g., 30% -> 3.6 pts
+        bonus = max(0.0, min(8.0, float(c.exp_roi_12m) * 12.0))  # 30% -> 3.6
         if bonus > 1.0:
             score += bonus
             reasons.append("ROI12M+")
 
-    # 2) Factor boosts (quality/momentum/value)
+    # 2) Factor boosts
     for label, val, cap, weight in (
         ("Quality", c.quality_score, 7.5, 0.075),
         ("Momentum", c.momentum_score, 7.5, 0.075),
         ("Value", c.value_score, 7.5, 0.075),
     ):
-        if val is not None and val > 60:
-            boost = min(cap, (float(val) - 50.0) * weight)
-            score += boost
-            reasons.append(f"{label}++")
+        if val is not None:
+            try:
+                v = float(val)
+            except Exception:
+                v = None
+            if v is not None and v > 60:
+                boost = min(cap, (v - 50.0) * weight)
+                score += boost
+                reasons.append(f"{label}++")
 
-    # 3) Risk penalty based on profile
+    # 3) Risk penalty by profile
     risk_tol = _norm_bucket(risk_profile)
     risk_val = float(c.risk_score) if c.risk_score is not None else 50.0
 
@@ -581,18 +648,16 @@ def _compute_advisor_score(
     # 4) Volatility penalty (stronger for Low/Moderate)
     if c.volatility is not None:
         vol = float(c.volatility)
-        # Accept both ratio-like (0.25) and percent-like (25)
         if vol > 1.5:
             vol = vol / 100.0
         if vol > 0:
             if risk_tol == "Low":
-                score -= min(10.0, vol * 30.0)  # 0.30 -> -9
+                score -= min(10.0, vol * 30.0)
                 reasons.append("Vol-")
             elif risk_tol == "Moderate":
                 score -= min(6.0, vol * 18.0)
-            # High risk: no penalty
 
-    # 5) News intelligence integration (ONLY if enabled)
+    # 5) News integration only if enabled
     if include_news and c.news_score is not None and c.news_score != 0:
         ns = float(c.news_score)
         if abs(ns) <= 10:
@@ -607,7 +672,7 @@ def _compute_advisor_score(
             if nb > 1:
                 reasons.append("News+")
 
-    # 6) Trend intelligence
+    # 6) Trend
     if c.trend_signal == "UPTREND":
         score += 4.5
         reasons.append("TrendUp")
@@ -615,7 +680,7 @@ def _compute_advisor_score(
         score -= 4.5
         reasons.append("TrendDown")
 
-    # 7) Liquidity mild boost/penalty
+    # 7) Liquidity mild effect
     liq = _liquidity_proxy_score(c)
     if liq is not None:
         if liq >= 80:
@@ -632,7 +697,7 @@ def _compute_advisor_score(
 
 
 # ---------------------------------------------------------------------
-# Allocation (with caps + min allocation + redistribution)
+# Allocation (caps + floor + redistribution, robust)
 # ---------------------------------------------------------------------
 def _allocate_amount(
     ranked: List[Candidate],
@@ -650,55 +715,93 @@ def _allocate_amount(
     if total_amount <= 0:
         return [{"symbol": c.symbol, "weight": 0.0, "amount": 0.0} for c in picks]
 
-    # Conviction weights (score^2) -> normalize
+    # conviction weights: score^2
     raw = [math.pow(max(1.0, float(c.advisor_score)), 2) for c in picks]
     ssum = sum(raw) or 1.0
-    w = [r / ssum for r in raw]
+    weights = [r / ssum for r in raw]
 
-    # Apply max cap then redistribute remainder
+    # sanitize params
     max_position_pct = float(max(0.05, min(1.0, max_position_pct)))
     min_position_pct = float(max(0.0, min(0.20, min_position_pct)))
 
-    def _cap_and_redistribute(weights: List[float]) -> List[float]:
-        weights = [max(0.0, float(x)) for x in weights]
-        total = sum(weights) or 1.0
-        weights = [x / total for x in weights]
+    def normalize(ws: List[float]) -> List[float]:
+        s = sum(max(0.0, float(x)) for x in ws) or 1.0
+        return [max(0.0, float(x)) / s for x in ws]
 
-        # cap
-        capped = [min(max_position_pct, x) for x in weights]
-        used = sum(capped)
-        remainder = 1.0 - used
+    def apply_cap(ws: List[float]) -> List[float]:
+        ws = normalize(ws)
+        capped = ws[:]
+        # iterative redistribute for stability
+        for _ in range(10):
+            over = [i for i, x in enumerate(capped) if x > max_position_pct + 1e-12]
+            if not over:
+                break
+            excess = 0.0
+            for i in over:
+                excess += capped[i] - max_position_pct
+                capped[i] = max_position_pct
+            under = [i for i, x in enumerate(capped) if x < max_position_pct - 1e-12]
+            if not under or excess <= 1e-12:
+                break
+            under_sum = sum(capped[i] for i in under) or 1.0
+            for i in under:
+                capped[i] += excess * (capped[i] / under_sum)
+        return normalize(capped)
 
-        # redistribute to those under cap proportionally to their original weight
-        if remainder > 1e-9:
-            room_idx = [i for i, x in enumerate(capped) if x < max_position_pct - 1e-9]
-            if room_idx:
-                room_total = sum(weights[i] for i in room_idx) or 1.0
-                for i in room_idx:
-                    add = remainder * (weights[i] / room_total)
-                    capped[i] = min(max_position_pct, capped[i] + add)
+    def apply_floor(ws: List[float]) -> List[float]:
+        ws = normalize(ws)
+        if min_position_pct <= 0:
+            return ws
 
-        # renormalize
-        total2 = sum(capped) or 1.0
-        return [x / total2 for x in capped]
+        kept = [i for i, x in enumerate(ws) if x >= min_position_pct]
+        if not kept:
+            # if everything below floor, keep the top pick only
+            out = [0.0] * len(ws)
+            out[0] = 1.0
+            return out
 
-    w = _cap_and_redistribute(w)
+        out = [0.0] * len(ws)
+        kept_sum = sum(ws[i] for i in kept) or 1.0
+        for i in kept:
+            out[i] = ws[i] / kept_sum
+        return out
 
-    # Floor tiny allocations then redistribute again
-    if min_position_pct > 0:
-        kept_idx = [i for i, x in enumerate(w) if x >= min_position_pct]
-        if kept_idx:
-            w2 = [0.0] * len(w)
-            kept_sum = sum(w[i] for i in kept_idx) or 1.0
-            for i in kept_idx:
-                w2[i] = w[i] / kept_sum
-            w = _cap_and_redistribute(w2)
+    weights = apply_cap(weights)
+    weights = apply_floor(weights)
+    weights = apply_cap(weights)  # cap again after floor
 
     out: List[Dict[str, Any]] = []
-    for c, ww in zip(picks, w):
-        amt = total_amount * ww
-        out.append({"symbol": c.symbol, "weight": ww, "amount": amt})
+    for c, w in zip(picks, weights):
+        amt = total_amount * float(w)
+        out.append({"symbol": c.symbol, "weight": float(w), "amount": float(amt)})
     return out
+
+
+def _dedupe_best(cands: List[Candidate]) -> List[Candidate]:
+    """
+    If same symbol appears in multiple sources, keep the best one.
+    Tie-breakers: advisor_score, exp_roi_3m, exp_roi_1m, overall_score.
+    """
+    best: Dict[str, Candidate] = {}
+    for c in cands:
+        key = c.symbol
+        cur = best.get(key)
+        if cur is None:
+            best[key] = c
+            continue
+
+        def k(x: Candidate) -> Tuple[float, float, float, float]:
+            return (
+                float(x.advisor_score or 0.0),
+                float(x.exp_roi_3m or 0.0),
+                float(x.exp_roi_1m or 0.0),
+                float(x.overall_score or 0.0),
+            )
+
+        if k(c) > k(cur):
+            best[key] = c
+
+    return list(best.values())
 
 
 # ---------------------------------------------------------------------
@@ -707,10 +810,10 @@ def _allocate_amount(
 def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Dict[str, Any]:
     """
     Router should call: run_investment_advisor(payload, engine=app.state.engine)
+    Returns GAS-safe structure: headers always present.
     """
     t0 = time.time()
 
-    # GAS-safe stable headers (never empty)
     headers = [
         "Rank",
         "Symbol",
@@ -747,17 +850,20 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             sources = [sources]
         sources = [str(s).strip() for s in sources if str(s).strip()] or ["ALL"]
 
-        # Optional tickers override (restrict to these symbols)
+        # Optional tickers override
         tickers_in = payload.get("tickers") or payload.get("symbols")
-        tickers: List[str] = []
+        tickers_raw: List[str] = []
         if isinstance(tickers_in, str):
-            # allow "AAPL,MSFT 1120.SR"
-            split = tickers_in.replace(",", " ").split()
-            tickers = [_norm_symbol(x) for x in split if _safe_str(x)]
+            tickers_raw = [x for x in tickers_in.replace(",", " ").split() if _safe_str(x)]
         elif isinstance(tickers_in, list):
-            tickers = [_norm_symbol(x) for x in tickers_in if _safe_str(x)]
-        tickers = [t for t in tickers if t]
-        tickers_set: Optional[Set[str]] = set(tickers) if tickers else None
+            tickers_raw = [str(x) for x in tickers_in if _safe_str(x)]
+
+        tickers_variants: Set[str] = set()
+        for t in tickers_raw:
+            tickers_variants |= _symbol_variants(t)
+
+        tickers_override = sorted(tickers_variants) if tickers_variants else []
+        tickers_set: Optional[Set[str]] = set(tickers_variants) if tickers_variants else None
 
         risk = _norm_bucket(payload.get("risk") or "")
         confidence = _norm_bucket(payload.get("confidence") or "")
@@ -769,10 +875,10 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         top_n = max(1, min(200, top_n))
 
         invest_amount = _to_float(payload.get("invest_amount")) or 0.0
-        currency = _safe_str(payload.get("currency") or "SAR").upper() or "SAR"
+        default_currency = _safe_str(payload.get("currency") or "SAR").upper() or "SAR"
         include_news = bool(_truthy(payload.get("include_news", True)))
 
-        # Extra filters / controls
+        # Extra filters/controls
         min_price = _to_float(payload.get("min_price"))
         max_price = _to_float(payload.get("max_price"))
         exclude_sectors = payload.get("exclude_sectors")
@@ -782,20 +888,23 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         liquidity_min = _to_float(payload.get("liquidity_min"))
         liquidity_min = float(liquidity_min) if liquidity_min is not None else 25.0
 
-        max_position_pct = _as_ratio(payload.get("max_position_pct"))
-        if max_position_pct is None:
-            max_position_pct = 0.35
-        min_position_pct = _as_ratio(payload.get("min_position_pct"))
-        if min_position_pct is None:
-            min_position_pct = 0.02
+        min_advisor_score = _to_float(payload.get("min_advisor_score"))
 
-        # "as_of_utc" can be provided by caller (for reproducible timestamps)
+        max_position_pct = _as_ratio(payload.get("max_position_pct")) or 0.35
+        min_position_pct = _as_ratio(payload.get("min_position_pct")) or 0.02
+
+        # as_of
         as_of_dt = _parse_iso_to_dt(payload.get("as_of_utc")) or datetime.now(timezone.utc)
 
         universe_rows, fetch_meta, fetch_err = _try_get_universe_rows(sources, engine=engine)
 
         candidates: List[Candidate] = []
-        dropped = {"no_symbol": 0, "ticker_not_requested": 0, "filter": 0, "bad_row": 0}
+        dropped = {
+            "no_symbol": 0,
+            "ticker_not_requested": 0,
+            "filter": 0,
+            "bad_row": 0,
+        }
 
         for r in universe_rows:
             try:
@@ -804,9 +913,16 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     dropped["no_symbol"] += 1
                     continue
 
-                if tickers_set is not None and c.symbol not in tickers_set:
-                    dropped["ticker_not_requested"] += 1
-                    continue
+                # tickers override match with variants
+                if tickers_set is not None:
+                    if c.symbol not in tickers_set and not (_symbol_variants(c.symbol) & tickers_set):
+                        dropped["ticker_not_requested"] += 1
+                        continue
+
+                # compute score first (so optional min_advisor_score can be used)
+                c.advisor_score, c.reason = _compute_advisor_score(
+                    c, req_roi_1m, req_roi_3m, risk, include_news=include_news
+                )
 
                 ok, _why = _passes_filters(
                     c,
@@ -818,19 +934,21 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     max_price=max_price,
                     exclude_sectors=exclude_sectors,
                     liquidity_min=liquidity_min,
+                    min_advisor_score=min_advisor_score,
                 )
                 if not ok:
                     dropped["filter"] += 1
                     continue
 
-                c.advisor_score, c.reason = _compute_advisor_score(
-                    c, req_roi_1m, req_roi_3m, risk, include_news=include_news
-                )
                 candidates.append(c)
+
             except Exception:
                 dropped["bad_row"] += 1
 
-        # Sort: Advisor score, then 3M ROI, then 1M ROI
+        # Deduplicate by symbol (best wins)
+        candidates = _dedupe_best(candidates)
+
+        # Sort
         candidates.sort(
             key=lambda x: (x.advisor_score, (x.exp_roi_3m or 0.0), (x.exp_roi_1m or 0.0)),
             reverse=True,
@@ -846,17 +964,17 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         alloc_map = {a["symbol"]: a for a in allocations}
 
         rows: List[List[Any]] = []
+        items: List[Dict[str, Any]] = []
+
         for i, c in enumerate(candidates[:top_n], start=1):
             alloc = alloc_map.get(c.symbol, {"weight": 0.0, "amount": 0.0})
             w = float(alloc.get("weight", 0.0) or 0.0)
             amt = float(alloc.get("amount", 0.0) or 0.0)
 
-            # ROI % values (for sheet display)
             exp1_pct = (c.exp_roi_1m * 100.0) if c.exp_roi_1m is not None else None
             exp3_pct = (c.exp_roi_3m * 100.0) if c.exp_roi_3m is not None else None
             exp12_pct = (c.exp_roi_12m * 100.0) if c.exp_roi_12m is not None else None
 
-            # Expected gain/loss based on allocation amount
             gl1 = (amt * c.exp_roi_1m) if (c.exp_roi_1m is not None) else None
             gl3 = (amt * c.exp_roi_3m) if (c.exp_roi_3m is not None) else None
             gl12 = (amt * c.exp_roi_12m) if (c.exp_roi_12m is not None) else None
@@ -875,8 +993,11 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             quality = "FULL"
             if c.price is None:
                 quality = "PARTIAL"
-            if c.exp_roi_1m is None and c.exp_roi_3m is None:
+            if c.exp_roi_1m is None and c.exp_roi_3m is None and c.exp_roi_12m is None:
                 quality = "PARTIAL"
+
+            last_utc = _iso_utc(as_of_dt)
+            last_riy = _iso_riyadh(as_of_dt)
 
             rows.append(
                 [
@@ -885,29 +1006,61 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     c.sheet,
                     c.name,
                     c.market,
-                    c.currency or currency,
+                    c.currency or default_currency,
                     c.price,
-                    round(c.advisor_score, 2),
+                    _round2(c.advisor_score),
                     action,
-                    round(w * 100.0, 2),
-                    round(amt, 2),
+                    _round2(w * 100.0),
+                    _round2(amt),
                     c.forecast_1m,
-                    exp1_pct,
-                    round(gl1, 2) if isinstance(gl1, (int, float)) else gl1,
+                    _round2(exp1_pct),
+                    _round2(gl1),
                     c.forecast_3m,
-                    exp3_pct,
-                    round(gl3, 2) if isinstance(gl3, (int, float)) else gl3,
+                    _round2(exp3_pct),
+                    _round2(gl3),
                     c.forecast_12m,
-                    exp12_pct,
-                    round(gl12, 2) if isinstance(gl12, (int, float)) else gl12,
+                    _round2(exp12_pct),
+                    _round2(gl12),
                     c.risk_bucket,
                     c.confidence_bucket,
                     c.reason,
                     "engine_snapshot",
                     quality,
-                    _iso_utc(as_of_dt),
-                    _iso_riyadh(as_of_dt),
+                    last_utc,
+                    last_riy,
                 ]
+            )
+
+            items.append(
+                {
+                    "rank": i,
+                    "symbol": c.symbol,
+                    "origin": c.sheet,
+                    "name": c.name,
+                    "market": c.market,
+                    "currency": c.currency or default_currency,
+                    "price": c.price,
+                    "advisor_score": _round2(c.advisor_score),
+                    "action": action,
+                    "allocation_pct": _round2(w * 100.0),
+                    "allocation_amount": _round2(amt),
+                    "forecast_price_1m": c.forecast_1m,
+                    "expected_roi_1m_pct": _round2(exp1_pct),
+                    "expected_gain_loss_1m": _round2(gl1),
+                    "forecast_price_3m": c.forecast_3m,
+                    "expected_roi_3m_pct": _round2(exp3_pct),
+                    "expected_gain_loss_3m": _round2(gl3),
+                    "forecast_price_12m": c.forecast_12m,
+                    "expected_roi_12m_pct": _round2(exp12_pct),
+                    "expected_gain_loss_12m": _round2(gl12),
+                    "risk_bucket": c.risk_bucket,
+                    "confidence_bucket": c.confidence_bucket,
+                    "reason": c.reason,
+                    "data_source": "engine_snapshot",
+                    "data_quality": quality,
+                    "last_updated_utc": last_utc,
+                    "last_updated_riyadh": last_riy,
+                }
             )
 
         meta = {
@@ -916,18 +1069,19 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             "include_news": include_news,
             "criteria": {
                 "sources": sources,
-                "tickers_override": tickers if tickers else None,
+                "tickers_override": tickers_override if tickers_override else None,
                 "risk": risk,
                 "confidence": confidence,
                 "required_roi_1m_ratio": req_roi_1m,
                 "required_roi_3m_ratio": req_roi_3m,
                 "top_n": top_n,
                 "invest_amount": invest_amount,
-                "currency": currency,
+                "currency": default_currency,
                 "min_price": min_price,
                 "max_price": max_price,
                 "exclude_sectors": exclude_sectors,
                 "liquidity_min": liquidity_min,
+                "min_advisor_score": min_advisor_score,
                 "max_position_pct": float(max_position_pct),
                 "min_position_pct": float(min_position_pct),
                 "as_of_utc": _iso_utc(as_of_dt),
@@ -945,9 +1099,9 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         if fetch_err:
             meta["warning"] = fetch_err
         if not rows and not fetch_err:
-            meta["warning"] = "No candidates matched your filters (Risk/Confidence/ROI/Liquidity) or universe is empty."
+            meta["warning"] = "No candidates matched your filters (Risk/Confidence/ROI/Liquidity/Score) or universe is empty."
 
-        return {"headers": headers, "rows": rows, "meta": meta}
+        return {"headers": headers, "rows": rows, "items": items, "meta": meta}
 
     except Exception as exc:
         meta = {
@@ -956,7 +1110,7 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             "error": str(exc),
             "runtime_ms": int((time.time() - t0) * 1000),
         }
-        return {"headers": headers, "rows": [], "meta": meta}
+        return {"headers": headers, "rows": [], "items": [], "meta": meta}
 
 
 __all__ = ["run_investment_advisor", "TT_ADVISOR_CORE_VERSION"]
