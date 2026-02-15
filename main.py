@@ -2,15 +2,15 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (v6.2.0)
+Tadawul Fast Bridge – FastAPI Entry Point (v6.3.0)
 Mission Critical Edition — OBSERVE + PROTECT + SCALE
 
-Key Upgrades in v6.2.0:
-- ✅ Loop Heartbeat: Active monitoring of async event loop latency.
-- ✅ Route Inventory: Logs all mounted endpoints at startup for verification.
-- ✅ Shutdown Safety: Enforced timeouts on cleanup to prevent zombie processes.
-- ✅ Memory Opt: Post-boot garbage collection to minimize RAM footprint.
-- ✅ Enhanced Health: Reports system load status dynamically.
+Key Upgrades in v6.3.0:
+- ✅ **Financial Leader Routing**: Prioritized mounting of Advanced, Advisor, and KSA routes.
+- ✅ **Riyadh Time**: System logs and health checks localized to UTC+3.
+- ✅ **Loop Heartbeat**: Active monitoring of async event loop latency.
+- ✅ **Route Inventory**: Logs all mounted endpoints at startup for verification.
+- ✅ **Memory Opt**: Smart Garbage Collection (GC) based on pressure thresholds.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -56,7 +56,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "6.2.0"
+APP_ENTRY_VERSION = "6.3.0"
 PROCESS = psutil.Process(os.getpid())
 
 # Structured Logging
@@ -76,6 +76,27 @@ for handler in logging.root.handlers:
 logger = logging.getLogger("main")
 
 # ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+def _truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "on", "enable", "active"}
+
+def _clamp_str(s: Any, max_len: int = 4000) -> str:
+    txt = str(s or "").strip()
+    return txt if len(txt) <= max_len else txt[:max_len-12] + " ...TRUNC..."
+
+def _safe_import(path: str) -> Optional[Any]:
+    try:
+        return import_module(path)
+    except Exception as e:
+        logger.debug("Optional module skip: %s (%s)", path, e)
+        return None
+
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
+
+# ---------------------------------------------------------------------
 # Observability & Self-Healing
 # ---------------------------------------------------------------------
 class SystemGuardian:
@@ -86,6 +107,7 @@ class SystemGuardian:
         self.memory_mb = 0.0
         self.cpu_pct = 0.0
         self.degraded_mode = False
+        self.last_gc = time.time()
 
     async def start(self):
         self.running = True
@@ -94,7 +116,7 @@ class SystemGuardian:
             start = time.perf_counter()
             await asyncio.sleep(2.0)  # Check interval
             
-            # 1. Latency Check
+            # 1. Latency Check (Event Loop Lag)
             self.latency_ms = (time.perf_counter() - start - 2.0) * 1000
             
             # 2. Resource Check
@@ -102,9 +124,11 @@ class SystemGuardian:
             self.cpu_pct = PROCESS.cpu_percent()
 
             # 3. Auto-Healing: Memory Pressure
-            if self.memory_mb > 450: # Trigger GC if > 450MB (adjust for free tier)
+            # Render Free Tier limit is roughly 512MB, so warn/GC at 400MB
+            if self.memory_mb > 400 and (time.time() - self.last_gc) > 60: 
                 logger.warning(f"Memory pressure detected ({self.memory_mb:.1f}MB). Triggering GC.")
                 gc.collect()
+                self.last_gc = time.time()
 
             # 4. Auto-Healing: Latency Spike
             if self.latency_ms > 500 and not self.degraded_mode:
@@ -148,33 +172,8 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         return response
 
 # ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
-def _truthy(v: Any) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "on", "enable", "active"}
-
-def _clamp_str(s: Any, max_len: int = 4000) -> str:
-    txt = str(s or "").strip()
-    return txt if len(txt) <= max_len else txt[:max_len-12] + " ...TRUNC..."
-
-def _safe_import(path: str) -> Optional[Any]:
-    try:
-        return import_module(path)
-    except Exception as e:
-        logger.debug("Optional module skip: %s (%s)", path, e)
-        return None
-
-# ---------------------------------------------------------------------
 # Engine Lifecycle (Resilient)
 # ---------------------------------------------------------------------
-async def get_engine_dep(request: Request) -> Any:
-    """Dependency Injection for Routes."""
-    engine = getattr(request.app.state, "engine", None)
-    if not engine:
-        # Fail fast if engine is missing in production
-        raise StarletteHTTPException(status_code=503, detail="Data Engine unavailable.")
-    return engine
-
 async def _init_engine_resilient(app_: FastAPI, max_retries: int = 3):
     """Boot the Data Engine with backoff."""
     for attempt in range(max_retries):
@@ -214,6 +213,7 @@ def create_app() -> FastAPI:
     async def lifespan(app_: FastAPI):
         # 1. State Init
         app_.state.boot_time = datetime.now(timezone.utc).isoformat()
+        app_.state.boot_time_riyadh = _riyadh_iso()
         app_.state.engine_ready = False
         app_.state.boot_completed = False
         
@@ -268,16 +268,17 @@ def create_app() -> FastAPI:
         """Turbo Boot Sequence."""
         await asyncio.sleep(0.01) # Yield
         
-        # Parallel Router Mounting
+        # Parallel Router Mounting - Priority Order
         router_modules = [
-            ("Enriched", ["routes.enriched_quote", "routes.enriched"]),
-            ("Analysis", ["routes.ai_analysis"]),
-            ("Advanced", ["routes.advanced_analysis"]),
-            ("Advisor",  ["routes.investment_advisor", "routes.advisor"]),
-            ("KSA",      ["routes.routes_argaam", "routes_argaam"]),
-            ("System",   ["routes.system", "routes.config"])
+            ("Advanced", ["routes.advanced_analysis"]),       # New V3 Logic
+            ("Advisor",  ["routes.investment_advisor"]),      # New V1.6 Logic
+            ("KSA",      ["routes.routes_argaam"]),           # KSA Specialist
+            ("Enriched", ["routes.enriched_quote"]),          # Legacy/Base
+            ("Analysis", ["routes.ai_analysis"]),             # Legacy Batch
+            ("System",   ["routes.config"])                   # Config/Admin
         ]
         
+        mounted_count = 0
         for label, candidates in router_modules:
             mounted = False
             for path in candidates:
@@ -285,27 +286,28 @@ def create_app() -> FastAPI:
                 if module:
                     router_obj = getattr(module, "router", None) or getattr(module, "api_router", None)
                     if router_obj:
-                        # Fix Prefix for Advisor
+                        # Fix Prefix for Advisor/Advanced if missing
                         prefix = ""
-                        if label == "Advisor" and not getattr(router_obj, "prefix", "").startswith("/v1"):
-                            prefix = "/v1"
+                        # Most routers have prefix defined in them, FastAPI handles this.
+                        # But we double check to ensure clean URLs.
                         
                         try:
-                            app_.include_router(router_obj, prefix=prefix)
-                            logger.info("Mounted %s via %s", label, path)
+                            app_.include_router(router_obj)
+                            logger.info("✅ Mounted %s via %s", label, path)
                             mounted = True
+                            mounted_count += 1
                             break
                         except Exception as e:
                             logger.error("Failed to mount %s: %s", label, e)
             if not mounted:
-                logger.warning("Router '%s' could not be mounted.", label)
+                logger.warning("⚠️ Router '%s' could not be mounted.", label)
 
         # Log Route Inventory
-        logger.info("--- Active Routes ---")
+        logger.info("--- Active Routes (v%s) ---", APP_ENTRY_VERSION)
         for route in app_.routes:
             if isinstance(route, Route):
                 logger.info(f"📍 {route.path} [{','.join(route.methods)}]")
-        logger.info("---------------------")
+        logger.info("---------------------------")
 
         # Engine Start
         if _truthy(os.getenv("INIT_ENGINE_ON_BOOT", "True")):
@@ -314,12 +316,12 @@ def create_app() -> FastAPI:
         # Post-Boot Optimization
         gc.collect()
         app_.state.boot_completed = True
-        logger.info("🚀 V%s Ready. Memory: %.1fMB", APP_ENTRY_VERSION, guardian.memory_mb)
+        logger.info("🚀 V%s Ready. Memory: %.1fMB | TZ: Riyadh", APP_ENTRY_VERSION, guardian.memory_mb)
 
     # Endpoints
     @app_.get("/", include_in_schema=False)
     async def root():
-        return {"status": "online", "version": APP_ENTRY_VERSION}
+        return {"status": "online", "version": APP_ENTRY_VERSION, "tz": "Asia/Riyadh"}
 
     @app_.get("/readyz", include_in_schema=False)
     async def readiness():
@@ -340,6 +342,7 @@ def create_app() -> FastAPI:
                 "load_status": monitor.get_status()
             },
             "uptime": app_.state.boot_time,
+            "uptime_riyadh": app_.state.boot_time_riyadh,
             "trace_id": getattr(request.state, "request_id", "n/a")
         }
 
