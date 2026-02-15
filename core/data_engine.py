@@ -1,7 +1,7 @@
 """
 core/data_engine.py
 ===============================================================
-LEGACY COMPATIBILITY ADAPTER (v4.0.0) — PROD SAFE (TRUE LAZY)
+LEGACY COMPATIBILITY ADAPTER (v4.1.0) — PROD SAFE (TRUE LAZY)
 
 What this module guarantees
 - ✅ Never crashes app startup (NO hard dependency on data_engine_v2 at import-time).
@@ -21,12 +21,12 @@ What this module guarantees
 - ✅ If V2 missing/broken -> returns stub quotes with data_quality="MISSING" and error.
 - ✅ Never leaks secrets in meta/health.
 
-v4.0.0 improvements
+v4.1.0 improvements
+- ✅ Schema Parity: StubUnifiedQuote now includes all forecast/ROI fields (1m/3m/12m).
+- ✅ Symbol Logic: Uses shared normalization if available.
 - ✅ Stronger method fallbacks: supports v2 engines exposing get_quote/get_enriched_quote OR fetch_quote/quote/fetch
 - ✅ Batch result coercion preserves input order even if V2 returns dict
 - ✅ Optional disable switch: DATA_ENGINE_V2_DISABLED=true (forces stub mode)
-- ✅ More robust UnifiedQuote lookup (schemas variants) + safer finalize()
-- ✅ More informative get_engine_meta() without importing heavy modules at import time
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ except Exception:  # pragma: no cover
     ConfigDict = None  # type: ignore
 
 
-ADAPTER_VERSION = "4.0.0"
+ADAPTER_VERSION = "4.1.0"
 
 # =============================================================================
 # Legacy type kept so older type-checks don't fail
@@ -298,11 +298,23 @@ class _StubUnifiedQuote(BaseModel):
     eps_forward: Optional[float] = None
     dividend_yield: Optional[float] = None
 
+    # Scores
     quality_score: Optional[float] = None
     value_score: Optional[float] = None
     momentum_score: Optional[float] = None
     risk_score: Optional[float] = None
     opportunity_score: Optional[float] = None
+
+    # Forecasts (Aligned with v5 Sheet Controller)
+    forecast_price_1m: Optional[float] = None
+    expected_roi_1m: Optional[float] = None
+    forecast_price_3m: Optional[float] = None
+    expected_roi_3m: Optional[float] = None
+    forecast_price_12m: Optional[float] = None
+    expected_roi_12m: Optional[float] = None
+    forecast_confidence: Optional[float] = None
+    forecast_updated_utc: Optional[str] = None
+    forecast_updated_riyadh: Optional[str] = None
 
     data_source: str = "none"
     data_quality: str = "MISSING"
