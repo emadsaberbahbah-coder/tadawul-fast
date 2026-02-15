@@ -1,14 +1,15 @@
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.15.0) — PROD SAFE + ADVANCED ANALYTICS
+UNIFIED DATA ENGINE (v2.16.0) — PROD SAFE + ADVANCED ANALYTICS
 
-What’s improved in v2.15.0
+What’s improved in v2.16.0
 - ✅ Native Technical Analysis: Added internal MACD (12,26,9) and EMA calculations.
 - ✅ Trend Intelligence: Added Linear Regression Slope (Trend 30D) and Trend Signals (UP/DOWN).
 - ✅ Smart Forecasting: Forecast confidence now weighted by Trend Alignment.
 - ✅ Expanded Schema: UnifiedQuote now includes macd_line, macd_signal, trend_signal.
 - ✅ Scoring Integration: Delegates to core.scoring_engine v1.7.0.
+- ✅ Strict ROI Mapping: Ensures expected_roi_* keys are prioritized.
 
 Design goals
 - ✅ PROD SAFE: Pure Python math (no pandas/numpy hard deps) for fast boot.
@@ -31,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.15.0"
+ENGINE_VERSION = "2.16.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -973,12 +974,14 @@ def _coerce_confidence(v: Any) -> Optional[float]:
 
 
 def _map_forecast_aliases(out: Dict[str, Any]) -> None:
+    # Ensure expected_roi_* keys exist (priority)
     for horizon in ("1m", "3m", "12m"):
         er_k = f"expected_return_{horizon}"
         ep_k = f"expected_price_{horizon}"
         roi_k = f"expected_roi_{horizon}"
         fp_k = f"forecast_price_{horizon}"
 
+        # If we have legacy keys but not canonical keys, fill canonical
         if out.get(roi_k) is None and out.get(er_k) is not None:
             out[roi_k] = _safe_float(out.get(er_k))
         if out.get(fp_k) is None and out.get(ep_k) is not None:
@@ -994,6 +997,7 @@ def _map_forecast_aliases(out: Dict[str, Any]) -> None:
 
 
 def _mirror_forecast_aliases(out: Dict[str, Any]) -> None:
+    # Mirror canonical keys back to legacy keys for backward compat
     for horizon in ("1m", "3m", "12m"):
         roi_k = f"expected_roi_{horizon}"
         er_k = f"expected_return_{horizon}"
