@@ -1,22 +1,23 @@
 """
 core/news_intelligence.py
 ============================================================
-Tadawul Fast Bridge — News Intelligence (v0.3.0)
-(SENTIMENT + QUALITATIVE BOOST + RESILIENT FETCH)
+Tadawul Fast Bridge — News Intelligence (v0.4.0)
+(SENTIMENT + QUALITATIVE BOOST + RESILIENT FETCH + LOCALIZATION)
 
 Goal
 - Fetch recent news (headlines/snippets) for each symbol/company
 - Score sentiment [-1..+1] and confidence [0..1]
 - Provide a "news_boost" value you can add into advisor_score
+- Localize timestamps to Riyadh time
 
 Safety
 - If anything fails (network blocked, RSS unavailable), return neutral scores.
 - No heavy ML dependencies. Uses a lexicon-based scorer (fast + stable).
 
-Operational improvements in v0.3.0
-- Enhanced headers to mimic browser behavior (reduces RSS blocks)
-- Expanded financial lexicon for better sentiment accuracy
-- Robust XML parsing fallback
+v0.4.0 Enhancements:
+- ✅ Riyadh Localization: Adds 'published_riyadh' to articles.
+- ✅ Expanded Lexicon: More financial terms.
+- ✅ Robust Typing: Stronger dataclasses.
 """
 
 from __future__ import annotations
@@ -25,8 +26,9 @@ import asyncio
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 try:
     import httpx  # lightweight async client
@@ -34,7 +36,7 @@ except Exception:
     httpx = None  # type: ignore
 
 
-TT_NEWS_VERSION = "0.3.0"
+TT_NEWS_VERSION = "0.4.0"
 
 # -----------------------------------------------------------------------------
 # Config (env overrides)
@@ -83,6 +85,27 @@ NEWS_CONCURRENCY = max(1, min(20, _env_int("NEWS_CONCURRENCY", DEFAULT_CONCURREN
 NEWS_RSS_SOURCES = _env_list("NEWS_RSS_SOURCES", DEFAULT_RSS_SOURCES)
 
 
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
+
+def _to_riyadh_iso(utc_str: Optional[str]) -> Optional[str]:
+    if not utc_str: return None
+    try:
+        # Simple/naive conversion if isoformat
+        if utc_str.endswith("Z"):
+            dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(utc_str)
+        
+        tz_riyadh = timezone(timedelta(hours=3))
+        return dt.astimezone(tz_riyadh).isoformat()
+    except Exception:
+        return None
+
 # -----------------------------------------------------------------------------
 # Data structures
 # -----------------------------------------------------------------------------
@@ -92,6 +115,7 @@ class NewsArticle:
     url: str = ""
     source: str = ""
     published_utc: Optional[str] = None
+    published_riyadh: Optional[str] = None
     snippet: str = ""
 
 
@@ -102,7 +126,7 @@ class NewsResult:
     sentiment: float  # -1..+1
     confidence: float  # 0..1
     news_boost: float  # points to add to advisor score (e.g., -5..+5)
-    articles: List[NewsArticle]
+    articles: List[NewsArticle] = field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -113,18 +137,20 @@ _POS_WORDS = {
     "profit", "profits", "upgrade", "upgraded", "outperform", "buy", "bullish",
     "rebound", "expansion", "wins", "win", "contract", "contracts", "award", "awarded",
     "raises", "raise", "raised", "higher", "guidance", "buyback", "dividend", "hike",
-    "jump", "jumps", "gain", "gains", "rally", "rallies", "positive", "success"
+    "jump", "jumps", "gain", "gains", "rally", "rallies", "positive", "success",
+    "merger", "acquisition", "partnership", "deal", "approval", "approved"
 }
 _NEG_WORDS = {
     "miss", "misses", "plunge", "plunges", "weak", "warning", "downgrade", "downgraded",
     "sell", "bearish", "lawsuit", "probe", "investigation", "fraud", "default",
     "loss", "losses", "cuts", "cut", "cutting", "layoff", "layoffs",
     "bankruptcy", "recall", "halt", "suspends", "suspended", "sanction", "sanctions",
-    "drop", "drops", "fall", "falls", "slide", "slides", "negative", "fail", "failure"
+    "drop", "drops", "fall", "falls", "slide", "slides", "negative", "fail", "failure",
+    "scandal", "litigation", "fine", "fined", "breach", "violation"
 }
 
-_NEG_PHRASES = {"profit warning", "guidance cut", "regulatory probe", "accounting scandal", "sales miss"}
-_POS_PHRASES = {"record profit", "raises guidance", "share buyback", "share repurchase", "sales beat"}
+_NEG_PHRASES = {"profit warning", "guidance cut", "regulatory probe", "accounting scandal", "sales miss", "lower guidance", "net loss"}
+_POS_PHRASES = {"record profit", "raises guidance", "share buyback", "share repurchase", "sales beat", "net profit", "record revenue"}
 
 
 def _normalize_text(s: str) -> str:
@@ -275,13 +301,16 @@ def _parse_rss_items(xml_text: str, source_url: str, max_items: int) -> List[New
         link = _extract_link(blk)
         pub = _extract_xml_tag(blk, "pubDate") or _extract_xml_tag(blk, "updated")
         desc = _extract_xml_tag(blk, "description") or _extract_xml_tag(blk, "summary") or _extract_xml_tag(blk, "content")
+        
+        pub_clean = _strip_html(pub) if pub else None
 
         out.append(
             NewsArticle(
                 title=title,
                 url=link,
                 source=source_url,
-                published_utc=_strip_html(pub) if pub else None,
+                published_utc=pub_clean,
+                published_riyadh=_to_riyadh_iso(pub_clean),
                 snippet=_strip_html(desc)[:240] if desc else "",
             )
         )
@@ -427,6 +456,7 @@ async def batch_news_intelligence(
                     "url": a.url,
                     "source": a.source,
                     "published_utc": a.published_utc,
+                    "published_riyadh": a.published_riyadh,
                     "snippet": a.snippet,
                 }
                 for a in r.articles
