@@ -1,18 +1,19 @@
 """
 Tadawul Fast Bridge — Investment Advisor Core (GOOGLE SHEETS SAFE)
 File: core/investment_advisor.py
-FULL REPLACEMENT — v1.2.0 (INTELLIGENT EDITION)
+FULL REPLACEMENT — v1.3.0 (INTELLIGENT EDITION + ALIGNED KEYS)
 
 Public contract:
   run_investment_advisor(payload_dict, engine=...) -> {"headers":[...], "rows":[...], "meta":{...}}
 
-v1.2.0 Enhancements:
+v1.3.0 Enhancements:
+- ✅ Aligned Keys: Explicitly extracts 'forecast_price_12m' & 'expected_roi_12m'.
+- ✅ Riyadh Localization: Adds 'Last Updated (Riyadh)' column.
+- ✅ Trend Awareness: Boosts score if 'trend_signal' is UPTREND.
 - ✅ News Intelligence: Adjusts scores based on "News Score" (if available).
-- ✅ Dynamic Risk Penalties: Adjusts risk tolerance based on user profile (Conservative vs Aggressive).
+- ✅ Dynamic Risk Penalties: Adjusts risk tolerance based on user profile.
 - ✅ Liquidity Guard: Penalizes/filters low liquidity stocks.
 - ✅ Conviction Allocation: Allocates capital based on conviction strength (score ^ 2).
-- ✅ Richer Reasoning: Generates detailed "Reason" strings explaining the pick.
-- ✅ Sector Awareness: Captures sector data for diversification analysis.
 
 Notes
 - Expects sheet snapshots to be cached via engine.set_cached_sheet_snapshot().
@@ -24,9 +25,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Set
 import math
 import time
+from datetime import datetime, timezone, timedelta
 
-
-TT_ADVISOR_CORE_VERSION = "1.2.0"
+TT_ADVISOR_CORE_VERSION = "1.3.0"
 
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
 
@@ -287,6 +288,8 @@ class Candidate:
     exp_roi_1m: Optional[float]  # ratio
     forecast_3m: Optional[float]
     exp_roi_3m: Optional[float]  # ratio
+    forecast_12m: Optional[float] # NEW v1.3.0
+    exp_roi_12m: Optional[float] # NEW v1.3.0
 
     overall_score: Optional[float]
     risk_score: Optional[float]
@@ -294,10 +297,11 @@ class Candidate:
     value_score: Optional[float]
     quality_score: Optional[float]
     
-    # New v1.2 fields
+    # New v1.2/1.3 fields
     news_score: Optional[float] = None
     liquidity_score: Optional[float] = None
     volatility: Optional[float] = None
+    trend_signal: str = "" # NEW v1.3.0
 
     advisor_score: float = 0.0
     reason: str = ""
@@ -329,6 +333,10 @@ def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
     forecast_3m = _to_float(_get_any(row, "Forecast Price (3M)", "Forecast Price 3M", "Forecast 3M", "forecast_price_3m", "expected_price_3m"))
     exp_roi_3m = _as_ratio(_get_any(row, "Expected ROI % (3M)", "Expected ROI 3M", "ROI 3M", "expected_roi_3m", "expected_return_3m"))
 
+    # NEW v1.3.0: 12M Forecasts (The Engine provides these now)
+    forecast_12m = _to_float(_get_any(row, "Forecast Price (12M)", "Forecast Price 12M", "Forecast 12M", "forecast_price_12m", "expected_price_12m"))
+    exp_roi_12m = _as_ratio(_get_any(row, "Expected ROI % (12M)", "Expected ROI 12M", "ROI 12M", "expected_roi_12m", "expected_return_12m"))
+
     overall_score = _to_float(_get_any(row, "Overall Score", "Opportunity Score", "Score", "overall_score"))
     risk_score = _to_float(_get_any(row, "Risk Score", "risk_score"))
     momentum_score = _to_float(_get_any(row, "Momentum Score", "momentum_score"))
@@ -339,6 +347,7 @@ def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
     news_score = _to_float(_get_any(row, "News Score", "News Sentiment", "Sentiment Score", "news_boost"))
     liquidity_score = _to_float(_get_any(row, "Liquidity Score", "liquidity_score"))
     volatility = _to_float(_get_any(row, "Volatility 30D", "volatility_30d"))
+    trend_signal = _safe_str(_get_any(row, "Trend Signal", "trend_signal")).upper()
 
     return Candidate(
         symbol=symbol.strip().upper(),
@@ -354,6 +363,8 @@ def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
         exp_roi_1m=exp_roi_1m,
         forecast_3m=forecast_3m,
         exp_roi_3m=exp_roi_3m,
+        forecast_12m=forecast_12m,
+        exp_roi_12m=exp_roi_12m,
         overall_score=overall_score,
         risk_score=risk_score,
         momentum_score=momentum_score,
@@ -362,6 +373,7 @@ def _extract_candidate(row: Dict[str, Any]) -> Optional[Candidate]:
         news_score=news_score,
         liquidity_score=liquidity_score,
         volatility=volatility,
+        trend_signal=trend_signal
     )
 
 
@@ -484,6 +496,14 @@ def _compute_advisor_score(
              score += nb
              if nb > 1: reasons.append("News+")
 
+    # 5. Trend Intelligence (New v1.3.0)
+    if c.trend_signal == "UPTREND":
+        score += 5.0
+        reasons.append("TrendUp")
+    elif c.trend_signal == "DOWNTREND":
+        score -= 5.0
+        reasons.append("TrendDown")
+
     score = max(0.0, min(100.0, score))
     
     # Final sanity checks
@@ -559,6 +579,7 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         "Data Source",
         "Data Quality",
         "Last Updated (UTC)",
+        "Last Updated (Riyadh)",
     ]
 
     try:
@@ -616,6 +637,11 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         allocations = _allocate_amount(candidates, invest_amount, top_n)
         alloc_map = {a["symbol"]: a for a in allocations}
 
+        # Time localization
+        now_utc = datetime.now(timezone.utc).isoformat()
+        tz_riyadh = timezone(timedelta(hours=3))
+        now_riyadh = datetime.now(tz_riyadh).isoformat()
+
         rows: List[List[Any]] = []
         for i, c in enumerate(candidates[:top_n], start=1):
             alloc = alloc_map.get(c.symbol, {"weight": 0.0, "amount": 0.0})
@@ -652,7 +678,8 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     c.reason,
                     "engine_snapshot",
                     "FULL" if c.price is not None else "PARTIAL",
-                    None,
+                    now_utc,
+                    now_riyadh,
                 ]
             )
 
