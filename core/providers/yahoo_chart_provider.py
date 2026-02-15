@@ -3,13 +3,14 @@
 """
 core/providers/yahoo_chart_provider.py
 ============================================================
-Yahoo Quote/Chart Provider (via yfinance) — v2.2.0
-(RELIABLE PRICE/HISTORY FETCH + MOMENTUM FORECASTS)
+Yahoo Quote/Chart Provider (via yfinance) — v2.3.0
+(RELIABLE PRICE/HISTORY FETCH + ALIGNED MOMENTUM FORECASTS)
 
-Updates in v2.2.0:
-- ✅ Engine Switch: Uses yfinance for reliable price & history data.
-- ✅ Momentum Forecasts: Calculates ROI based on historical closes.
+Updates in v2.3.0:
+- ✅ Key Alignment: Strictly uses 'expected_roi_1m/3m/12m' and 'forecast_price_*'.
+- ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
 - ✅ Resilience: Bypasses direct HTTP blocks by using yfinance's internal handling.
+- ✅ History Analytics: Calculates Momentum ROI for 1M/3M/12M.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import yfinance as yf
 
 logger = logging.getLogger("core.providers.yahoo_chart_provider")
 
-PROVIDER_VERSION = "2.2.0"
+PROVIDER_VERSION = "2.3.0"
 PROVIDER_NAME = "yahoo_chart"
 
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$")
@@ -78,7 +79,7 @@ def _calculate_momentum_forecasts(closes: List[float]) -> Dict[str, Any]:
     roi_12m = get_roi(252)
 
     # Project future price based on past momentum (Simple Projection)
-    # Note: This is a technical projection, distinct from Analyst Targets in Fundamentals
+    # Note: These keys must match the Sheet Controller's expectations
     if roi_1m is not None:
         out["expected_roi_1m"] = roi_1m
         out["forecast_price_1m"] = last * (1 + (roi_1m / 100.0))
@@ -87,9 +88,10 @@ def _calculate_momentum_forecasts(closes: List[float]) -> Dict[str, Any]:
         out["expected_roi_3m"] = roi_3m
         out["forecast_price_3m"] = last * (1 + (roi_3m / 100.0))
 
-    # For 12M, we often prefer analyst targets, but if missing, use momentum
+    # For 12M, we align with the key 'expected_roi_12m' used by other providers
     if roi_12m is not None:
-        out["momentum_roi_12m"] = roi_12m # Distinct key to avoid overwriting analyst target
+        out["expected_roi_12m"] = roi_12m 
+        out["forecast_price_12m"] = last * (1 + (roi_12m / 100.0))
 
     out["forecast_method"] = "technical_momentum"
     out["forecast_confidence"] = 0.60 # Lower confidence than analysts
@@ -113,16 +115,17 @@ class YahooChartProvider:
         if not u_sym: return {}
 
         try:
-            # Blocking call to yfinance in thread
+            # Blocking call to yfinance in thread to avoid event loop blocking
             def _get_data():
                 ticker = yf.Ticker(u_sym)
                 # Fast price check
-                # Note: .fast_info is often faster/more reliable for current price than .info
+                # .fast_info is generally faster for realtime/delayed price
                 price = ticker.fast_info.last_price
                 prev_close = ticker.fast_info.previous_close
                 
                 # Fetch history for charts/momentum
-                hist = ticker.history(period="1y") # 1 year for 12m momentum
+                # 1y history is sufficient for 12m momentum calculation
+                hist = ticker.history(period="1y") 
                 return price, prev_close, hist
 
             current_price, prev_close, history = await asyncio.to_thread(_get_data)
@@ -130,7 +133,7 @@ class YahooChartProvider:
             if current_price is None:
                 return {"error": "Price not found"}
 
-            # Basic Quote Data
+            # Basic Quote Data - keys aligned with data engine
             out = {
                 "symbol": u_sym,
                 "current_price": float(current_price),
@@ -149,12 +152,13 @@ class YahooChartProvider:
             # Add History/Forecasts
             if not history.empty and "Close" in history:
                 closes = history["Close"].tolist()
-                # Clean NaNs
+                # Clean NaNs and non-numeric values
                 closes = [c for c in closes if c is not None and not math.isnan(c)]
                 
                 if closes:
                     # Enrich with Day/Year High/Low from history
-                    out["day_high"] = max(closes[-5:]) # Approx recent high
+                    # Using history for high/low is a good fallback if realtime data is sparse
+                    out["day_high"] = max(closes[-5:]) # Approx recent high (last 5 days)
                     out["day_low"] = min(closes[-5:])
                     out["high_52w"] = max(closes)
                     out["low_52w"] = min(closes)
@@ -184,7 +188,7 @@ async def fetch_enriched_quote_patch(symbol: str, debug: bool = False) -> Dict[s
     p = YahooChartProvider()
     return await p.fetch_quote(symbol, debug)
 
-# Cleanup (no-op for yfinance)
+# Cleanup (no-op for yfinance as it manages its own sessions)
 async def aclose_yahoo_client():
     pass
 
