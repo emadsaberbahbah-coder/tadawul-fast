@@ -1,35 +1,20 @@
-# core/schemas.py
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v4.2.0 (PROD SAFE + ADVANCED NORMALIZATION)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.9.1 (PROD SAFE + ALIGNED)
 
-Design Goals
-- Import-safe: no network, no DataEngine imports, no heavy deps.
-- Deterministic + defensive: never raises from public helpers.
-- Backward compatible: keeps the legacy 59-column schema + public API from v3.x.
-- vNext-first: customized per-page schemas by default (unless disabled / legacy selected).
-- Strong tolerance: header synonyms + field aliases + fuzzy sheet name resolution.
+v3.9.1 improvements (safe / no breaking API):
+- ✅ Stronger header normalization & synonym tolerance (more variants handled).
+- ✅ Hardening: more defensive fallbacks in registry selection.
+- ✅ Import-safe: still no DataEngine imports, no network, no heavy deps.
+- ✅ get_headers_for_sheet(): never raises, always returns COPIES, stable defaults.
+- ✅ Clearer internal separation: legacy vs vNext, with safer fuzzy matching.
 
-v4.2.0 Enhancements
-- ✅ Stronger sheet name normalization + richer aliases for common page names.
-- ✅ Canonical header normalization upgraded (handles %/parentheses/underscores better).
-- ✅ Synonym engine expanded (covers more real-world variants from Sheets + providers).
-- ✅ Field alias mapping expanded and unified.
-- ✅ New safe helpers: canonicalize_headers(), build_header_index(), validate_sheet_headers(),
-  get_schema_info(), and safe mapping utilities (all optional; do not break old callers).
-- ✅ Settings resolution hardened: ENV overrides + optional core.config.get_settings().
-
-Public API preserved:
-- get_headers_for_sheet(), get_supported_sheets(), get_header_groups()
-- header_to_field(), header_field_candidates(), field_to_header(), canonical_field()
-- BatchProcessRequest model compatible with Pydantic v1/v2
-
+Keeps the same public API as v3.9.0.
 """
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -47,12 +32,12 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "4.2.0"
+SCHEMAS_VERSION = "3.9.1"
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
 # =============================================================================
-# NOTE: Do not change order lightly. Older routes/scripts assume this exact order.
+# NOTE: Do not change order lightly. Many older routes/scripts assume this.
 DEFAULT_HEADERS_59: List[str] = [
     # Identity
     "Symbol",
@@ -124,7 +109,7 @@ DEFAULT_HEADERS_59: List[str] = [
     "Last Updated (Riyadh)",
 ]
 
-# Legacy "analysis extras" (kept)
+# Legacy "analysis extras" (old names kept)
 _LEGACY_ANALYSIS_EXTRAS: List[str] = [
     "Returns 1W %",
     "Returns 1M %",
@@ -166,7 +151,7 @@ def _ensure_len_59(headers: Sequence[str]) -> Tuple[str, ...]:
 _DEFAULT_59_TUPLE: Tuple[str, ...] = _ensure_len_59(DEFAULT_HEADERS_59)
 _DEFAULT_ANALYSIS_TUPLE: Tuple[str, ...] = tuple(str(x) for x in DEFAULT_HEADERS_ANALYSIS)
 
-# Normalize exported lists to canonical if edited accidentally
+# Normalize exported lists to canonical (if someone edited accidentally)
 if len(DEFAULT_HEADERS_59) != 59:  # pragma: no cover
     DEFAULT_HEADERS_59 = list(_DEFAULT_59_TUPLE)
 
@@ -210,6 +195,7 @@ def validate_headers_59(headers: Any) -> Dict[str, Any]:
 # vNext: Page-customized schemas (what your Sheets should use)
 # =============================================================================
 
+# --- Common blocks (vNext labels aligned to routes transforms) ---
 _VN_IDENTITY: List[str] = [
     "Rank",
     "Symbol",
@@ -249,6 +235,7 @@ _VN_CAP: List[str] = [
     "Liquidity Score",
 ]
 
+# IMPORTANT: percent fields include "%" to allow robust ratio->percent transforms.
 _VN_FUNDAMENTALS: List[str] = [
     "EPS (TTM)",
     "Forward EPS",
@@ -297,7 +284,7 @@ _VN_BADGES: List[str] = [
     "Risk Badge",
 ]
 
-# Forecast CORE (agreed)
+# Forecast CORE (agreed columns) — includes Riyadh timestamp
 _VN_FORECAST_CORE: List[str] = [
     "Forecast Price (1M)",
     "Expected ROI % (1M)",
@@ -310,6 +297,7 @@ _VN_FORECAST_CORE: List[str] = [
     "Forecast Updated (Riyadh)",
 ]
 
+# Forecast EXTENDED (optional analytics + provenance)
 _VN_FORECAST_EXTENDED: List[str] = [
     "Returns 1W %",
     "Returns 1M %",
@@ -325,6 +313,7 @@ _VN_FORECAST_EXTENDED: List[str] = [
     "History Last (UTC)",
 ]
 
+# Full forecast block (recommend: CORE first for readability)
 _VN_FORECAST_FULL: List[str] = list(_VN_FORECAST_CORE) + list(_VN_FORECAST_EXTENDED)
 
 _VN_META: List[str] = [
@@ -449,6 +438,7 @@ _VN_HEADERS_COMMODITIES_FX: List[str] = (
     + _VN_META
 )
 
+# NOTE: Portfolio schema intentionally remains stable (does not force Forecast Updated Riyadh column)
 _VN_HEADERS_PORTFOLIO: List[str] = (
     [
         "Rank",
@@ -560,209 +550,133 @@ _HEADER_GROUPS_VNEXT: Dict[str, Tuple[str, ...]] = {
 # =============================================================================
 # Header normalization (tolerant mapping)
 # =============================================================================
-_PAT_SPACES = re.compile(r"\s+")
-_PAT_NON_ALNUM = re.compile(r"[^a-z0-9]+")
-
-
 def _norm_header_label(h: Optional[str]) -> str:
     """
     Normalize header labels for tolerant lookups.
-
-    Examples:
+    Example:
       "Avg Vol 30D" -> "avg_vol_30d"
       "Sub Sector" -> "sub_sector"
       "Last Updated (Riyadh)" -> "last_updated_riyadh"
-      "Unrealized P/L %" -> "unrealized_p_l_percent"
     """
-    try:
-        s = str(h or "").strip().lower()
-    except Exception:
-        return ""
+    s = str(h or "").strip().lower()
     if not s:
         return ""
-
-    # keep semantic tokens
+    # unify percent tokens
     s = s.replace("%", " percent ")
-    s = s.replace("Δ", " delta ")
-    s = s.replace("/", " ")
-    s = s.replace("&", " and ")
-
-    # remove brackets
+    # keep meaning but remove brackets
     s = re.sub(r"[()\[\]{}]", " ", s)
-
-    # collapse/normalize
-    s = _PAT_SPACES.sub(" ", s).strip()
-    s = _PAT_NON_ALNUM.sub("_", s)
+    # normalize separators
+    s = re.sub(r"[^a-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
 _HEADER_CANON_BY_NORM: Dict[str, str] = {}
 
+for _h in (
+    list(_DEFAULT_59_TUPLE)
+    + list(_DEFAULT_ANALYSIS_TUPLE)
+    + list(_VN_KSA_T)
+    + list(_VN_ML_T)
+    + list(_VN_GLOBAL_T)
+    + list(_VN_FUNDS_T)
+    + list(_VN_COMFX_T)
+    + list(_VN_PORTFOLIO_T)
+    + list(_VN_INSIGHTS_T)
+):
+    _HEADER_CANON_BY_NORM[_norm_header_label(_h)] = str(_h)
 
-def _seed_canon_headers(headers: Sequence[str]) -> None:
-    for hh in headers:
-        nh = _norm_header_label(hh)
-        if nh:
-            _HEADER_CANON_BY_NORM[nh] = str(hh)
-
-
-_seed_canon_headers(_DEFAULT_59_TUPLE)
-_seed_canon_headers(_DEFAULT_ANALYSIS_TUPLE)
-_seed_canon_headers(_VN_KSA_T)
-_seed_canon_headers(_VN_ML_T)
-_seed_canon_headers(_VN_GLOBAL_T)
-_seed_canon_headers(_VN_FUNDS_T)
-_seed_canon_headers(_VN_COMFX_T)
-_seed_canon_headers(_VN_PORTFOLIO_T)
-_seed_canon_headers(_VN_INSIGHTS_T)
-
-# Expanded header synonyms: normalized_key -> canonical header label
 _HEADER_SYNONYMS: Dict[str, str] = {
-    # Identity
+    # identity variants
     "company_name": "Name",
     "company": "Name",
-    "long_name": "Name",
-    "issuer": "Name",
-    "subsector": "Sub Sector",
     "sub_sector": "Sub Sector",
-    "sub_sector_name": "Sub Sector",
-    "industry": "Sub Sector",
-    "exchange": "Market",
-    "market_region": "Market",
-    "listing_exchange": "Market",
-    "ccy": "Currency",
-    "currency_code": "Currency",
-    "ipo_date": "Listing Date",
-    "listed_at": "Listing Date",
+    "subsector": "Sub Sector",
 
-    # Prices
+    # price variants
     "last_price": "Price",
     "last": "Price",
     "close": "Price",
-    "current_price": "Price",
     "previous_close": "Prev Close",
     "prev_close": "Prev Close",
-    "prior_close": "Prev Close",
     "price_change": "Change",
-    "pct_change": "Change %",
     "percent_change": "Change %",
-    "change_pct": "Change %",
     "change_percent": "Change %",
-    "high": "Day High",
-    "low": "Day Low",
+    "change_pct": "Change %",
 
-    # 52W
-    "high_52w": "52W High",
-    "52w_high": "52W High",
-    "low_52w": "52W Low",
-    "52w_low": "52W Low",
-    "position_52w": "52W Position %",
-    "position_52w_percent": "52W Position %",
-    "pos_52w_pct": "52W Position %",
-
-    # Liquidity/cap
+    # liquidity
     "avg_volume_30d": "Avg Vol 30D",
     "avg_vol_30d": "Avg Vol 30D",
     "avg_volume": "Avg Vol 30D",
     "avg_volume_30day": "Avg Vol 30D",
-    "traded_value": "Value Traded",
-    "turnover_value": "Value Traded",
-    "turnover": "Turnover %",
-    "turnover_pct": "Turnover %",
-    "free_float_percent": "Free Float %",
-    "free_float_pct": "Free Float %",
-    "mkt_cap": "Market Cap",
-    "marketcapitalization": "Market Cap",
+    "avg_vol_30day": "Avg Vol 30D",
+
+    # cap
     "free_float_market_cap": "Free Float Mkt Cap",
-    "free_float_mkt_cap": "Free Float Mkt Cap",
     "ff_market_cap": "Free Float Mkt Cap",
-    "liq_score": "Liquidity Score",
+    "free_float_mkt_cap": "Free Float Mkt Cap",
 
-    # Fundamentals (percent tolerant)
-    "dividend_yield": "Dividend Yield %",
-    "dividend_yield_pct": "Dividend Yield %",
-    "dividend_yield_percent": "Dividend Yield %",
-    "payout_ratio": "Payout Ratio %",
-    "payout_pct": "Payout Ratio %",
-    "return_on_equity": "ROE %",
-    "roe": "ROE %",
-    "return_on_assets": "ROA %",
-    "roa": "ROA %",
-    "profit_margin": "Net Margin %",
-    "net_margin": "Net Margin %",
-    "margin_ebitda": "EBITDA Margin %",
-    "ebitda_margin": "EBITDA Margin %",
-    "rev_growth": "Revenue Growth %",
-    "revenue_growth": "Revenue Growth %",
-    "ni_growth": "Net Income Growth %",
-    "net_income_growth": "Net Income Growth %",
-
-    # Technicals
+    # technical variants
     "volatility_30d": "Volatility (30D)",
-    "vol30d": "Volatility (30D)",
+    "volatility30d": "Volatility (30D)",
     "vol_30d": "Volatility (30D)",
     "rsi_14": "RSI (14)",
     "rsi14": "RSI (14)",
     "trend_signal": "Trend Signal",
 
-    # Forecast (aligned)
-    "forecast_price_1m": "Forecast Price (1M)",
-    "target_price_1m": "Forecast Price (1M)",
-    "expected_price_1m": "Forecast Price (1M)",
-    "forecast_price_3m": "Forecast Price (3M)",
-    "target_price_3m": "Forecast Price (3M)",
-    "expected_price_3m": "Forecast Price (3M)",
-    "forecast_price_12m": "Forecast Price (12M)",
-    "target_price_12m": "Forecast Price (12M)",
-    "expected_price_12m": "Forecast Price (12M)",
+    # percent label variants (accept non-% versions)
+    "dividend_yield": "Dividend Yield %",
+    "dividend_yield_percent": "Dividend Yield %",
+    "dividend_yield_pct": "Dividend Yield %",
+    "payout_ratio": "Payout Ratio %",
+    "roe": "ROE %",
+    "roa": "ROA %",
+    "net_margin": "Net Margin %",
+    "ebitda_margin": "EBITDA Margin %",
+    "revenue_growth": "Revenue Growth %",
+    "net_income_growth": "Net Income Growth %",
 
-    "expected_roi_1m": "Expected ROI % (1M)",
+    # timestamps
+    "last_updated_utc": "Last Updated (UTC)",
+    "last_updated_riyadh": "Last Updated (Riyadh)",
+    "last_updated_ksa": "Last Updated (Riyadh)",
+    "forecast_updated_riyadh": "Forecast Updated (Riyadh)",
+    "forecast_updated_ksa": "Forecast Updated (Riyadh)",
+
+    # portfolio header variants
+    "broker_account": "Broker/Account",
+    "portfolio_group": "Portfolio Group",
+    "asset_type": "Asset Type",
+    "target_weight": "Target Weight %",
+
+    # forecast aliases (accept ROI/Expected variants)
     "expected_return_1m": "Expected ROI % (1M)",
-    "roi_1m": "Expected ROI % (1M)",
-    "expected_roi_3m": "Expected ROI % (3M)",
     "expected_return_3m": "Expected ROI % (3M)",
-    "roi_3m": "Expected ROI % (3M)",
-    "expected_roi_12m": "Expected ROI % (12M)",
     "expected_return_12m": "Expected ROI % (12M)",
-    "roi_12m": "Expected ROI % (12M)",
+    "expected_roi_1m": "Expected ROI % (1M)",
+    "expected_roi_3m": "Expected ROI % (3M)",
+    "expected_roi_12m": "Expected ROI % (12M)",
+
+    "expected_price_1m": "Forecast Price (1M)",
+    "expected_price_3m": "Forecast Price (3M)",
+    "expected_price_12m": "Forecast Price (12M)",
+    "target_price_1m": "Forecast Price (1M)",
+    "target_price_3m": "Forecast Price (3M)",
+    "target_price_12m": "Forecast Price (12M)",
+    "forecast_price_1m": "Forecast Price (1M)",
+    "forecast_price_3m": "Forecast Price (3M)",
+    "forecast_price_12m": "Forecast Price (12M)",
 
     "confidence_score": "Forecast Confidence",
     "forecast_confidence": "Forecast Confidence",
     "forecast_updated_utc": "Forecast Updated (UTC)",
-    "forecast_updated_riyadh": "Forecast Updated (Riyadh)",
-
-    "hist_last_utc": "History Last (UTC)",
     "history_last_utc": "History Last (UTC)",
 
-    # Meta timestamps
-    "as_of_utc": "Last Updated (UTC)",
-    "last_updated_utc": "Last Updated (UTC)",
-    "as_of_riyadh": "Last Updated (Riyadh)",
-    "last_updated_ksa": "Last Updated (Riyadh)",
-    "last_updated_riyadh": "Last Updated (Riyadh)",
-
-    # Portfolio
-    "broker_account": "Broker/Account",
-    "account": "Broker/Account",
-    "target_weight": "Target Weight %",
-    "target_weight_percent": "Target Weight %",
-    "unrealized_pnl": "Unrealized P/L",
-    "unrealized_pl": "Unrealized P/L",
-    "unrealized_pnl_percent": "Unrealized P/L %",
-    "weight": "Weight %",
-
-    # Legacy labels supported
+    # legacy spellings
     "sub_sector_legacy": "Sub-Sector",
-    "avg_volume_30d_legacy": "Avg Volume (30D)",
     "free_float_market_cap_legacy": "Free Float Market Cap",
-    "last_price_legacy": "Last Price",
-    "previous_close_legacy": "Previous Close",
-    "price_change_legacy": "Price Change",
-    "percent_change_legacy": "Percent Change",
 }
 
-# Bind synonyms into canonical table
 for k, canon_header in list(_HEADER_SYNONYMS.items()):
     nk = _norm_header_label(k)
     if nk and canon_header:
@@ -771,10 +685,7 @@ for k, canon_header in list(_HEADER_SYNONYMS.items()):
 
 def _canonical_header_label(header: str) -> str:
     """Best-effort variant header -> canonical header label. Never raises."""
-    try:
-        h = str(header or "").strip()
-    except Exception:
-        return ""
+    h = str(header or "").strip()
     if not h:
         return ""
     nh = _norm_header_label(h)
@@ -786,58 +697,58 @@ def _canonical_header_label(header: str) -> str:
 # =============================================================================
 FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     # Identity
-    "rank": ("row_rank", "position", "rank_num", "market_rank"),
-    "symbol": ("symbol_normalized", "symbol_input", "ticker", "code", "instrument", "ric"),
-    "origin": ("page_key", "sheet_key", "source_page", "exchange"),
-    "name": ("company_name", "long_name", "issuer", "display_name"),
-    "sector": ("sector_name", "industry_sector"),
-    "sub_sector": ("subsector", "industry", "industry_group"),
-    "market": ("market_region", "listing_exchange", "market_name"),
-    "currency": ("ccy", "currency_code", "currency_symbol"),
-    "listing_date": ("ipo_date", "listed_at", "listingDate"),
+    "rank": ("row_rank", "position", "rank_num"),
+    "symbol": ("symbol_normalized", "symbol_input", "ticker", "code"),
+    "origin": ("page_key", "sheet_key", "source_page"),
+    "name": ("company_name", "long_name"),
+    "sector": ("industry",),
+    "sub_sector": ("subsector",),
+    "market": ("market_region", "exchange", "listing_exchange"),
+    "currency": ("ccy",),
+    "listing_date": ("ipo_date", "listed_at"),
 
     # Prices
-    "current_price": ("last_price", "price", "close", "last", "lastTradePrice", "regularMarketPrice"),
-    "previous_close": ("prev_close", "prior_close", "previousClose", "regularMarketPreviousClose"),
-    "price_change": ("change", "priceChange"),
-    "percent_change": ("change_percent", "change_pct", "pct_change", "percentChange"),
-    "day_high": ("high", "dayHigh", "regularMarketDayHigh"),
-    "day_low": ("low", "dayLow", "regularMarketDayLow"),
+    "current_price": ("last_price", "price", "close", "last"),
+    "previous_close": ("prev_close", "prior_close"),
+    "price_change": ("change",),
+    "percent_change": ("change_percent", "change_pct", "pct_change"),
+    "day_high": ("high",),
+    "day_low": ("low",),
 
     # 52W
-    "week_52_high": ("high_52w", "52w_high", "fiftyTwoWeekHigh"),
-    "week_52_low": ("low_52w", "52w_low", "fiftyTwoWeekLow"),
-    "position_52w_percent": ("position_52w", "pos_52w_pct", "fiftyTwoWeekRangePosition"),
+    "week_52_high": ("high_52w", "52w_high"),
+    "week_52_low": ("low_52w", "52w_low"),
+    "position_52w_percent": ("position_52w", "pos_52w_pct"),
 
     # Liquidity / Shares
-    "volume": ("vol", "regularMarketVolume"),
-    "avg_volume_30d": ("avg_volume", "avg_vol_30d", "avg_volume_30day", "averageDailyVolume3Month"),
+    "volume": ("vol",),
+    "avg_volume_30d": ("avg_volume", "avg_vol_30d", "avg_volume_30day"),
     "value_traded": ("traded_value", "turnover_value"),
     "turnover_percent": ("turnover", "turnover_pct"),
-    "shares_outstanding": ("shares", "outstanding_shares", "sharesOutstanding"),
+    "shares_outstanding": ("shares", "outstanding_shares"),
     "free_float": ("free_float_percent", "free_float_pct"),
-    "market_cap": ("mkt_cap", "marketcapitalization", "marketCap"),
-    "free_float_market_cap": ("ff_market_cap", "free_float_mkt_cap", "freeFloatMarketCap"),
+    "market_cap": ("mkt_cap", "marketcapitalization"),
+    "free_float_market_cap": ("ff_market_cap", "free_float_mkt_cap"),
     "liquidity_score": ("liq_score",),
 
     # Fundamentals
-    "eps_ttm": ("eps", "trailingEps"),
-    "forward_eps": ("eps_forward", "forwardEps"),
-    "pe_ttm": ("pe", "trailingPE"),
-    "forward_pe": ("pe_forward", "forwardPE"),
-    "pb": ("p_b", "priceToBook"),
-    "ps": ("p_s", "priceToSalesTrailing12Months"),
-    "ev_ebitda": ("evebitda", "enterpriseToEbitda"),
-    "dividend_yield": ("div_yield", "dividend_yield_pct", "dividend_yield_percent", "dividendYield"),
-    "dividend_rate": ("div_rate", "dividendRate"),
-    "payout_ratio": ("payout", "payout_pct", "payoutRatio"),
+    "eps_ttm": ("eps",),
+    "forward_eps": ("eps_forward",),
+    "pe_ttm": ("pe",),
+    "forward_pe": ("pe_forward",),
+    "pb": ("p_b",),
+    "ps": ("p_s",),
+    "ev_ebitda": ("evebitda",),
+    "dividend_yield": ("div_yield", "dividend_yield_pct", "dividend_yield_percent"),
+    "dividend_rate": ("div_rate",),
+    "payout_ratio": ("payout", "payout_pct"),
     "roe": ("return_on_equity",),
     "roa": ("return_on_assets",),
-    "net_margin": ("profit_margin", "profitMargins"),
+    "net_margin": ("profit_margin",),
     "ebitda_margin": ("margin_ebitda",),
-    "revenue_growth": ("rev_growth", "revenueGrowth"),
+    "revenue_growth": ("rev_growth",),
     "net_income_growth": ("ni_growth",),
-    "beta": ("beta_5y", "beta3Year", "beta"),
+    "beta": ("beta_5y",),
 
     # Technicals
     "volatility_30d": ("vol_30d_ann", "vol30d", "vol_30d"),
@@ -849,20 +760,20 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "upside_percent": ("upside_pct",),
     "valuation_label": ("valuation",),
 
-    # Scores / badges
+    # Scores / recommendation
     "value_score": ("score_value",),
     "quality_score": ("score_quality",),
     "momentum_score": ("score_momentum",),
     "opportunity_score": ("score_opportunity",),
     "risk_score": ("score_risk",),
-    "overall_score": ("score", "total_score", "advisor_score"),
+    "overall_score": ("score", "total_score"),
     "rec_badge": ("recommendation_badge",),
     "momentum_badge": ("mom_badge",),
     "opportunity_badge": ("opp_badge",),
     "risk_badge": ("rk_badge",),
 
     "error": ("err",),
-    "recommendation": ("recommend", "action", "signal_text"),
+    "recommendation": ("recommend", "action"),
 
     # History / technical extras
     "returns_1w": ("return_1w", "ret_1w"),
@@ -874,10 +785,10 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ma50": ("sma50",),
     "ma200": ("sma200",),
 
-    # Forecast (aligned)
-    "expected_roi_1m": ("expected_return_1m", "exp_return_1m", "roi_1m", "expected_roi_percent_1m"),
-    "expected_roi_3m": ("expected_return_3m", "exp_return_3m", "roi_3m", "expected_roi_percent_3m"),
-    "expected_roi_12m": ("expected_return_12m", "exp_return_12m", "roi_12m", "expected_roi_percent_12m"),
+    # Forecast (aligned to canonical keys)
+    "expected_roi_1m": ("expected_return_1m", "exp_return_1m", "expected_roi_percent_1m"),
+    "expected_roi_3m": ("expected_return_3m", "exp_return_3m", "expected_roi_percent_3m"),
+    "expected_roi_12m": ("expected_return_12m", "exp_return_12m", "expected_roi_percent_12m"),
 
     "forecast_price_1m": ("expected_price_1m", "exp_price_1m", "target_price_1m"),
     "forecast_price_3m": ("expected_price_3m", "exp_price_3m", "target_price_3m"),
@@ -888,7 +799,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 
     "history_points": ("hist_points",),
     "history_source": ("hist_source",),
-    "history_last_utc": ("hist_last_utc", "history_last"),
+    "history_last_utc": ("hist_last_utc",),
 
     "forecast_updated_utc": ("forecast_last_utc", "forecast_asof_utc", "forecast_time_utc", "forecast_updated"),
     "forecast_updated_riyadh": ("forecast_asof_riyadh", "forecast_time_riyadh"),
@@ -911,7 +822,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("as_of_utc",),
     "last_updated_riyadh": ("as_of_riyadh", "last_updated_ksa"),
 
-    # Portfolio
+    # Portfolio (sheet inputs / computed)
     "asset_type": ("instrument_type", "security_type"),
     "portfolio_group": ("group",),
     "broker_account": ("account",),
@@ -930,15 +841,12 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 _ALIAS_TO_CANON: Dict[str, str] = {}
 for canon, aliases in FIELD_ALIASES.items():
     for a in aliases:
-        _ALIAS_TO_CANON[str(a)] = canon
+        _ALIAS_TO_CANON[a] = canon
 
 
 def canonical_field(field: str) -> str:
     """Best-effort alias -> canonical field. Example: high_52w -> week_52_high"""
-    try:
-        f = str(field or "").strip()
-    except Exception:
-        return ""
+    f = str(field or "").strip()
     if not f:
         return ""
     return _ALIAS_TO_CANON.get(f, f)
@@ -1082,7 +990,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Last Updated (UTC)": "last_updated_utc",
     "Last Updated (Riyadh)": "last_updated_riyadh",
 
-    # --- Legacy labels still supported ---
+    # --- Legacy labels still supported (do not remove) ---
     "Company Name": "name",
     "Sub-Sector": "sub_sector",
     "Last Price": "current_price",
@@ -1092,7 +1000,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Avg Volume (30D)": "avg_volume_30d",
     "Free Float Market Cap": "free_float_market_cap",
 
-    # compat non-% variants
+    # Compat percent header variants
     "Dividend Yield": "dividend_yield",
     "Payout Ratio": "payout_ratio",
     "ROE": "roe",
@@ -1104,7 +1012,7 @@ HEADER_TO_FIELD: Dict[str, str] = {
     "Volatility 30D": "volatility_30d",
     "RSI 14": "rsi_14",
 
-    # ROI/Target legacy variants
+    # ROI/Target legacy variants (tolerant)
     "Expected Return 1M %": "expected_roi_1m",
     "Expected Return 3M %": "expected_roi_3m",
     "Expected Return 12M %": "expected_roi_12m",
@@ -1120,7 +1028,7 @@ for h, f in HEADER_TO_FIELD.items():
     aliases = FIELD_ALIASES.get(canon, ())
     HEADER_FIELD_CANDIDATES[h] = (canon,) + tuple(a for a in aliases if a)
 
-# Prefer these headers if multiple could map to same field
+# Prefer these headers if there are multiple possible headers for a field
 _PREFERRED_HEADERS: Tuple[str, ...] = (
     "Forecast Price (1M)",
     "Expected ROI % (1M)",
@@ -1184,7 +1092,6 @@ def field_to_header(field: str) -> str:
 def _norm_sheet_name(name: Optional[str]) -> str:
     """
     Normalizes sheet names from Google Sheets (spaces/case/punctuations).
-
     Examples:
       "Global_Markets" -> "global_markets"
       "Insights Analysis" -> "insights_analysis"
@@ -1194,11 +1101,9 @@ def _norm_sheet_name(name: Optional[str]) -> str:
     s = (name or "").strip().lower()
     if not s:
         return ""
-    # replace common separators
-    for ch in ["-", " ", ".", "/", "\\", "|", ":", ";", ",", "&"]:
+    for ch in ["-", " ", ".", "/", "\\", "|", ":", ";", ",", "#", "@", "&"]:
         s = s.replace(ch, "_")
     s = s.replace("(", "_").replace(")", "_")
-    # collapse
     while "__" in s:
         s = s.replace("__", "_")
     return s.strip("_")
@@ -1235,13 +1140,12 @@ _register(
         "global_markets",
         "Insights_Analysis",
         "investment_advisor",
-        "advisor",
     ],
     headers=_DEFAULT_59_TUPLE,
 )
 _register(
     _SHEET_HEADERS_LEGACY,
-    keys=["Global_Markets", "Insights_Analysis", "Investment_Advisor", "advisor", "insights"],
+    keys=["Global_Markets", "Insights_Analysis", "Investment_Advisor"],
     headers=_DEFAULT_ANALYSIS_TUPLE,
 )
 
@@ -1255,8 +1159,6 @@ _register(
         "ksa_tadawul_market",
         "tadawul",
         "ksa",
-        "tasi",
-        "saudi",
     ],
     headers=_VN_KSA_T,
 )
@@ -1267,7 +1169,6 @@ _register(
         "Market Leaders",
         "market_leaders",
         "ksa_market_leaders",
-        "leaders",
     ],
     headers=_VN_ML_T,
 )
@@ -1278,7 +1179,6 @@ _register(
         "Global Markets",
         "global_markets",
         "global",
-        "world",
     ],
     headers=_VN_GLOBAL_T,
 )
@@ -1289,8 +1189,6 @@ _register(
         "Mutual Funds",
         "mutual_funds",
         "funds",
-        "etf",
-        "etfs",
     ],
     headers=_VN_FUNDS_T,
 )
@@ -1302,8 +1200,6 @@ _register(
         "commodities_fx",
         "commodities",
         "fx",
-        "forex",
-        "commodities_and_fx",
     ],
     headers=_VN_COMFX_T,
 )
@@ -1314,8 +1210,7 @@ _register(
         "My Portfolio",
         "my_portfolio",
         "portfolio",
-        "holdings",
-        "positions",
+        "my_portfolio_investment",
     ],
     headers=_VN_PORTFOLIO_T,
 )
@@ -1326,8 +1221,6 @@ _register(
         "Insights Analysis",
         "insights_analysis",
         "insights",
-        "analysis",
-        "advisor_output",
     ],
     headers=_VN_INSIGHTS_T,
 )
@@ -1338,52 +1231,22 @@ def resolve_sheet_key(sheet_name: Optional[str]) -> str:
     return _norm_sheet_name(sheet_name)
 
 
-# =============================================================================
-# Settings resolution (ENV + optional config)
-# =============================================================================
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in _TRUTHY
-
-
-def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return str(v).strip() if v is not None and str(v).strip() else default
-
-
 def _get_schema_mode_from_settings() -> Tuple[bool, str]:
     """
     Read schema settings (import-safe).
-    Order:
-      1) ENV overrides
-      2) core.config.get_settings() if exists
-      3) defaults
     Returns: (schemas_enabled, schema_version)
     """
-    enabled_default = True
-    version_default = "vNext"
+    enabled = True
+    version = "vNext"
+    try:
+        from core.config import get_settings  # type: ignore
 
-    # ENV overrides (strongest)
-    enabled = _env_bool("SHEET_SCHEMAS_ENABLED", enabled_default)
-    version = _env_str("SHEET_SCHEMA_VERSION", "")
-
-    # Optional config fallback
-    if not version:
-        try:
-            from core.config import get_settings  # type: ignore
-
-            s = get_settings()
-            enabled = bool(getattr(s, "sheet_schemas_enabled", enabled))
-            version = str(getattr(s, "sheet_schema_version", version_default) or version_default)
-        except Exception:
-            version = version_default
-
-    version = (version or version_default).strip()
+        s = get_settings()
+        enabled = bool(getattr(s, "sheet_schemas_enabled", True))
+        version = str(getattr(s, "sheet_schema_version", "vNext") or "vNext")
+    except Exception:
+        pass
+    version = (version or "vNext").strip()
     return enabled, version
 
 
@@ -1396,7 +1259,7 @@ def _pick_registry(schema_version: Optional[str]) -> Dict[str, Tuple[str, ...]]:
         return _SHEET_HEADERS_LEGACY
 
     # Explicit legacy switch
-    if v in {"legacy", "v3", "3.9.0", "3.8.2", "3.8.1", "3.8", "3.6.2", "3.6", "3.5.0", "3.5", "3.0"}:
+    if v in {"legacy", "v3", "3.8.1", "3.8", "3.6.2", "3.6", "3.5.0", "3.5", "3.0"}:
         return _SHEET_HEADERS_LEGACY
 
     # Default: vNext customized schemas
@@ -1415,24 +1278,18 @@ def get_headers_for_sheet(sheet_name: Optional[str] = None, schema_version: Opti
         reg = _pick_registry(schema_version)
 
         if not key:
-            # sensible defaults
-            if reg is _SHEET_HEADERS_VNEXT:
-                return list(_VN_KSA_T)
-            return list(_DEFAULT_59_TUPLE)
+            return list(_VN_KSA_T) if (reg is _SHEET_HEADERS_VNEXT) else list(_DEFAULT_59_TUPLE)
 
         v = reg.get(key)
         if isinstance(v, tuple) and v:
             return list(v)
 
-        # Fuzzy match (prefix/contains)
+        # Fuzzy match (exact/prefix/contains)
         for k, vv in reg.items():
             if key == k or key.startswith(k) or (k and k in key):
                 return list(vv)
 
-        # last resort default
-        if reg is _SHEET_HEADERS_VNEXT:
-            return list(_VN_KSA_T)
-        return list(_DEFAULT_59_TUPLE)
+        return list(_VN_KSA_T) if (reg is _SHEET_HEADERS_VNEXT) else list(_DEFAULT_59_TUPLE)
 
     except Exception:
         return list(_DEFAULT_59_TUPLE)
@@ -1456,120 +1313,6 @@ def get_header_groups() -> Dict[str, List[str]]:
         return {k: list(v) for k, v in _HEADER_GROUPS_VNEXT.items()}
     except Exception:
         return {}
-
-
-# =============================================================================
-# New safe helpers (optional; do not break old code)
-# =============================================================================
-def canonicalize_headers(headers: Any) -> List[str]:
-    """
-    Converts a headers list to canonical labels using the synonym engine.
-    Never raises. Returns [] if headers is not list-like.
-    """
-    try:
-        if not isinstance(headers, (list, tuple)):
-            return []
-        out: List[str] = []
-        for h in headers:
-            out.append(_canonical_header_label(str(h)))
-        return out
-    except Exception:
-        return []
-
-
-def build_header_index(headers: Sequence[str]) -> Dict[str, int]:
-    """
-    Returns a tolerant index map for headers:
-      - keys include both canonical label normalized forms and raw normalized forms
-      - values are the column index
-    Useful for fast row mapping.
-    Never raises.
-    """
-    mp: Dict[str, int] = {}
-    try:
-        for i, h in enumerate(list(headers or [])):
-            hh = str(h or "")
-            mp[_norm_header_label(hh)] = i
-            mp[_norm_header_label(_canonical_header_label(hh))] = i
-        return mp
-    except Exception:
-        return {}
-
-
-def validate_sheet_headers(
-    headers: Any,
-    sheet_name: Optional[str],
-    *,
-    schema_version: Optional[str] = None,
-    strict_order: bool = True,
-) -> Dict[str, Any]:
-    """
-    Validates that headers match the expected schema for the given sheet.
-    Never raises.
-
-    strict_order=True  -> exact order match required
-    strict_order=False -> just checks membership + length
-    """
-    try:
-        expected = get_headers_for_sheet(sheet_name, schema_version=schema_version)
-        got = canonicalize_headers(headers)
-
-        if not expected:
-            return {"ok": False, "reason": "expected_empty", "expected_len": 0, "got_len": len(got)}
-
-        if not got:
-            return {"ok": False, "reason": "got_empty", "expected_len": len(expected), "got_len": 0}
-
-        if strict_order:
-            ok = (got == expected)
-        else:
-            ok = (len(got) == len(expected) and set(got) == set(expected))
-
-        # small diff summary
-        exp_set = set(expected)
-        got_set = set(got)
-        missing = [h for h in expected if h not in got_set]
-        extra = [h for h in got if h not in exp_set]
-
-        return {
-            "ok": bool(ok),
-            "strict_order": bool(strict_order),
-            "expected_len": len(expected),
-            "got_len": len(got),
-            "missing_count": len(missing),
-            "extra_count": len(extra),
-            "missing": missing[:25],
-            "extra": extra[:25],
-        }
-    except Exception as e:
-        return {"ok": False, "reason": "error", "error": str(e)}
-
-
-def get_schema_info(sheet_name: Optional[str] = None, schema_version: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Returns debug-safe info describing which schema will be used and why.
-    Never raises.
-    """
-    try:
-        enabled, ver = _get_schema_mode_from_settings()
-        reg = _pick_registry(schema_version)
-        key = _norm_sheet_name(sheet_name)
-        headers = get_headers_for_sheet(sheet_name, schema_version=schema_version)
-        mode = "vNext" if reg is _SHEET_HEADERS_VNEXT else "legacy"
-        return {
-            "schemas_version": SCHEMAS_VERSION,
-            "schemas_enabled": bool(enabled),
-            "requested_schema_version": (schema_version or None),
-            "resolved_schema_version": ver,
-            "mode": mode,
-            "sheet_name": sheet_name or "",
-            "sheet_key": key,
-            "headers_len": len(headers),
-            "headers_preview": headers[:12],
-            "supported_sheets_count": len(reg),
-        }
-    except Exception:
-        return {"schemas_version": SCHEMAS_VERSION, "ok": False}
 
 
 # =============================================================================
@@ -1680,11 +1423,6 @@ __all__ = [
     "get_headers_for_sheet",
     "get_supported_sheets",
     "get_header_groups",
-    # New helpers (safe)
-    "canonicalize_headers",
-    "build_header_index",
-    "validate_sheet_headers",
-    "get_schema_info",
     # Request models
     "BatchProcessRequest",
 ]
