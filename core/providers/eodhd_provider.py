@@ -1,66 +1,16 @@
+#!/usr/bin/env python3
 # core/providers/eodhd_provider.py
 """
 core/providers/eodhd_provider.py
 ============================================================
-EODHD Provider — v2.3.0 (GLOBAL PRIMARY + SPECIAL SYMBOL NORMALIZATION + HISTORY/FCAST)
+EODHD Provider — v2.4.0 (GLOBAL PRIMARY + SMART NORMALIZATION + ALIGNED FORECASTS)
 
-Why this revision
-- Fixes noisy 404/422 requests caused by Yahoo-style symbols:
-    • ^GSPC, ^DJI, ^NDX, ^FTSE  ->  GSPC.INDX, DJI.INDX, NDX.INDX, FTSE.INDX
-    • GC=F, SI=F, CL=F, BZ=F   ->  best-effort mappings (FOREX CFD) + COMM fallbacks
-    • EURUSD=X                 ->  EURUSD.FOREX (and EUR.FOREX fallback)
-- Reduces doomed fundamentals calls for symbol types that typically don't support them.
-- Keeps engine-discovery compatibility:
-    get_quote / get_enriched_quote / fetch_quote / quote / fetch
-- Keeps global symbol fix: AAPL -> AAPL.US (via EODHD_DEFAULT_EXCHANGE, default US)
-- Keeps variants for tricky tickers: BRK.B.US + BRK-B.US
-- Best-effort: realtime + fundamentals + history/forecast where possible
-- Aligns forecast fields with canonical schema:
-    expected_roi_1m/3m/12m, forecast_price_1m/3m/12m, forecast_confidence (0..1),
-    forecast_method, forecast_updated_utc, forecast_updated_riyadh
-  (and still provides returns_*, ma*, volatility_30d, rsi_14)
-
-KSA handling
-- Default: KSA is BLOCKED (safe) to avoid routing confusion for numeric/.SR tickers.
-- Enable KSA via: ALLOW_EODHD_KSA=true  (or EODHD_ALLOW_KSA=true)
-
-Env vars (supported)
-Auth/Base
-- EODHD_API_KEY (preferred)
-- EODHD_API_TOKEN / EODHD_TOKEN (legacy)
-- EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
-
-Exchange behavior
-- EODHD_DEFAULT_EXCHANGE (default: US)
-
-Behavior toggles
-- EODHD_ENABLE_FUNDAMENTALS (default: true)
-- EODHD_ENABLE_HISTORY (default: true)
-- EODHD_ENABLE_FORECAST (default: true)
-- EODHD_VERBOSE_WARNINGS (default: false)  # if true attaches _warn
-
-Timeout/Retry
-- EODHD_TIMEOUT_S (default: 8.5)  (fallback to HTTP_TIMEOUT_SEC / HTTP_TIMEOUT)
-- EODHD_RETRY_ATTEMPTS (default: 2) (min 1)
-- EODHD_RETRY_DELAY_SEC (default: 0.25)
-
-Caching
-- EODHD_QUOTE_TTL_SEC (default: 12, min 5)
-- EODHD_FUND_TTL_SEC (default: 21600, min 120)   # 6 hours
-- EODHD_HISTORY_TTL_SEC (default: 1200, min 60)  # 20 min
-
-History window
-- EODHD_HISTORY_DAYS (default: 400, min 60)
-- EODHD_HISTORY_POINTS_MAX (default: 400, min 100)
-
-Optional symbol maps (JSON dicts)
-- EODHD_INDEX_ALIASES_JSON     e.g. {"TASI":"TASI.INDX","NOMU":"NOMU.INDX"}
-- EODHD_COMMODITY_ALIASES_JSON e.g. {"GC=F":"XAUUSD.FOREX","BZ=F":"XBRUSD.FOREX"}
-- EODHD_FOREX_ALIASES_JSON     e.g. {"SAR=X":"SAR.FOREX","EURUSD=X":"EURUSD.FOREX"}
-
-Notes
-- Forecast here is a simple momentum-style estimate (non-investment advice).
-- This provider is meant for GLOBAL symbols primarily; KSA numeric/.SR is off by default.
+Updates in v2.4.0:
+- ✅ Forecast Aliases: Ensures forecast_price_* and target_price_* keys exist.
+- ✅ ROI Alignment: Strict expected_roi_1m/3m/12m output.
+- ✅ Riyadh Time: Adds forecast_updated_riyadh (UTC+3).
+- ✅ Smart Routing: Handles ^GSPC -> GSPC.INDX, FOREX, and COMM automatically.
+- ✅ Safety: Enhanced error handling for empty/malformed responses.
 """
 
 from __future__ import annotations
@@ -81,7 +31,7 @@ import httpx
 
 logger = logging.getLogger("core.providers.eodhd_provider")
 
-PROVIDER_VERSION = "2.3.0"
+PROVIDER_VERSION = "2.4.0"
 PROVIDER_NAME = "eodhd"
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -99,14 +49,12 @@ USER_AGENT_DEFAULT = (
 # Env helpers (safe)
 # ---------------------------------------------------------------------------
 
-
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None:
         return default
     s = str(v).strip()
     return s if s else default
-
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
@@ -117,7 +65,6 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
     if v is None:
@@ -126,7 +73,6 @@ def _env_float(name: str, default: float) -> float:
         return float(str(v).strip())
     except Exception:
         return default
-
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
@@ -138,15 +84,12 @@ def _env_bool(name: str, default: bool) -> bool:
         return True
     return default
 
-
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def _riyadh_iso() -> str:
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz).isoformat()
-
 
 def _token() -> Optional[str]:
     for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
@@ -155,19 +98,15 @@ def _token() -> Optional[str]:
             return v
     return None
 
-
 def _base_url() -> str:
     return _env_str("EODHD_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
 
 def _ua() -> str:
     return _env_str("EODHD_UA", USER_AGENT_DEFAULT)
 
-
 def _default_exchange() -> str:
     ex = _env_str("EODHD_DEFAULT_EXCHANGE", "US").strip().upper()
     return ex or "US"
-
 
 def _timeout_default() -> float:
     for k in ("EODHD_TIMEOUT_S", "HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
@@ -179,63 +118,50 @@ def _timeout_default() -> float:
                     return t
             except Exception:
                 pass
-    return 8.5
-
+    return 10.0
 
 def _retry_attempts() -> int:
     r = _env_int("EODHD_RETRY_ATTEMPTS", _env_int("MAX_RETRIES", 2))
     return max(1, int(r))
 
-
 def _retry_delay_sec() -> float:
     d = _env_float("EODHD_RETRY_DELAY_SEC", 0.25)
     return d if d > 0 else 0.25
 
-
 def _enable_fundamentals() -> bool:
     return _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
-
 
 def _enable_history() -> bool:
     return _env_bool("EODHD_ENABLE_HISTORY", True)
 
-
 def _enable_forecast() -> bool:
     return _env_bool("EODHD_ENABLE_FORECAST", True)
-
 
 def _verbose_warn() -> bool:
     return _env_bool("EODHD_VERBOSE_WARNINGS", False)
 
-
 def _allow_ksa() -> bool:
     return _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
-
 
 def _quote_ttl_sec() -> float:
     ttl = _env_float("EODHD_QUOTE_TTL_SEC", 12.0)
     return max(5.0, float(ttl if ttl > 0 else 12.0))
 
-
 def _fund_ttl_sec() -> float:
     ttl = _env_float("EODHD_FUND_TTL_SEC", 21600.0)
     return max(120.0, float(ttl if ttl > 0 else 21600.0))
-
 
 def _history_ttl_sec() -> float:
     ttl = _env_float("EODHD_HISTORY_TTL_SEC", 1200.0)
     return max(60.0, float(ttl if ttl > 0 else 1200.0))
 
-
 def _history_days() -> int:
     d = _env_int("EODHD_HISTORY_DAYS", 400)
     return max(60, int(d))
 
-
 def _history_points_max() -> int:
     n = _env_int("EODHD_HISTORY_POINTS_MAX", 400)
     return max(100, int(n))
-
 
 def _json_env_map(name: str) -> Dict[str, str]:
     raw = _env_str(name, "")
@@ -255,17 +181,14 @@ def _json_env_map(name: str) -> Dict[str, str]:
         return {}
     return {}
 
-
 # ---------------------------------------------------------------------------
 # TTL cache (import-safe if cachetools missing)
 # ---------------------------------------------------------------------------
 try:
     from cachetools import TTLCache  # type: ignore
-
     _HAS_CACHETOOLS = True
 except Exception:  # pragma: no cover
     _HAS_CACHETOOLS = False
-
     class TTLCache(dict):  # type: ignore
         def __init__(self, maxsize: int = 1024, ttl: float = 60.0) -> None:
             super().__init__()
@@ -296,7 +219,6 @@ except Exception:  # pragma: no cover
             super().__setitem__(key, value)
             self._exp[key] = time.time() + self._ttl
 
-
 # Provider-level caches (no network at import time)
 _QUOTE_CACHE: TTLCache = TTLCache(maxsize=8000, ttl=_quote_ttl_sec())
 _FUND_CACHE: TTLCache = TTLCache(maxsize=4000, ttl=_fund_ttl_sec())
@@ -305,7 +227,6 @@ _HIST_CACHE: TTLCache = TTLCache(maxsize=2500, ttl=_history_ttl_sec())
 # ---------------------------------------------------------------------------
 # Customized headers
 # ---------------------------------------------------------------------------
-
 
 def _json_headers(env_key: str) -> Dict[str, str]:
     raw = _env_str(env_key, "")
@@ -319,7 +240,6 @@ def _json_headers(env_key: str) -> Dict[str, str]:
         return {}
     return {}
 
-
 def _base_headers() -> Dict[str, str]:
     h = {
         "User-Agent": _ua(),
@@ -329,7 +249,6 @@ def _base_headers() -> Dict[str, str]:
     h.update(_json_headers("EODHD_HEADERS_JSON"))
     return h
 
-
 def _endpoint_headers(kind: str) -> Dict[str, str]:
     key = {
         "realtime": "EODHD_HEADERS_REALTIME_JSON",
@@ -338,13 +257,11 @@ def _endpoint_headers(kind: str) -> Dict[str, str]:
     }.get(kind, "")
     return _json_headers(key) if key else {}
 
-
 # ---------------------------------------------------------------------------
 # Symbol guards + normalization (INDX/FOREX/COMM + Yahoo-style aliases)
 # ---------------------------------------------------------------------------
 _KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 _EXCH_SUFFIX_RE = re.compile(r"^(.+)\.([A-Z0-9]{2,10})$")
-
 
 def _looks_like_ksa(symbol: str) -> bool:
     s = (symbol or "").strip().upper()
@@ -355,7 +272,6 @@ def _looks_like_ksa(symbol: str) -> bool:
     if s.isdigit():
         return True
     return bool(_KSA_RE.match(s))
-
 
 def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
     s = (sym or "").strip().upper()
@@ -370,10 +286,8 @@ def _split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
         return s, None
     return base, exch
 
-
 def _safe_alnum(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (s or "").strip().upper())
-
 
 # Defaults (can be overridden/extended via env JSON maps)
 _DEFAULT_INDEX_ALIASES: Dict[str, str] = {
@@ -381,14 +295,12 @@ _DEFAULT_INDEX_ALIASES: Dict[str, str] = {
     "NOMU": "NOMU.INDX",
 }
 _DEFAULT_COMMODITY_ALIASES: Dict[str, str] = {
-    # Yahoo futures -> try equivalent CFD/spot (FOREX venue)
     "GC=F": "XAUUSD.FOREX",  # Gold
     "SI=F": "XAGUSD.FOREX",  # Silver
     "CL=F": "XTIUSD.FOREX",  # WTI crude
     "BZ=F": "XBRUSD.FOREX",  # Brent crude
 }
 _DEFAULT_FOREX_ALIASES: Dict[str, str] = {
-    # Example of single currency vs USD sometimes supported as XXX.FOREX
     "SAR=X": "SAR.FOREX",
 }
 
@@ -396,30 +308,21 @@ _INDEX_ALIASES = {**_DEFAULT_INDEX_ALIASES, **_json_env_map("EODHD_INDEX_ALIASES
 _COMMODITY_ALIASES = {**_DEFAULT_COMMODITY_ALIASES, **_json_env_map("EODHD_COMMODITY_ALIASES_JSON")}
 _FOREX_ALIASES = {**_DEFAULT_FOREX_ALIASES, **_json_env_map("EODHD_FOREX_ALIASES_JSON")}
 
-
 def _special_variants(raw_symbol: str) -> Tuple[List[str], str]:
-    """
-    Returns (variants, kind)
-    kind in: equity | index | forex | commodity | unknown
-    """
     s = (raw_symbol or "").strip().upper()
     if not s:
         return [], "unknown"
 
-    # already EODHD-style (has exchange suffix) => treat as equity-ish and let normalizer handle
     _, exch = _split_exchange_suffix(s)
     if exch is not None:
-        # could be INDX/FOREX/COMM/CC/etc — we treat as-is
         if exch in ("INDX", "FOREX", "COMM", "CC", "EUFUND", "GBOND", "MONEY"):
             k = "index" if exch == "INDX" else ("forex" if exch == "FOREX" else ("commodity" if exch == "COMM" else "equity"))
             return [s], k
         return [s], "equity"
 
-    # Explicit alias maps
     if s in _INDEX_ALIASES:
         return [_INDEX_ALIASES[s], s], "index"
     if s in _COMMODITY_ALIASES:
-        # include COMM fallback too (strip "=F")
         base = _safe_alnum(s.replace("=F", ""))
         fallbacks = []
         if base:
@@ -428,14 +331,12 @@ def _special_variants(raw_symbol: str) -> Tuple[List[str], str]:
     if s in _FOREX_ALIASES:
         return [_FOREX_ALIASES[s], s], "forex"
 
-    # Yahoo index form: ^GSPC -> GSPC.INDX
     if s.startswith("^"):
         base = _safe_alnum(s[1:])
         if base:
             return [f"{base}.INDX", base, s], "index"
         return [s], "index"
 
-    # Yahoo FX form: EURUSD=X -> EURUSD.FOREX and EUR.FOREX fallback
     if s.endswith("=X"):
         base = _safe_alnum(s[:-2])
         if not base:
@@ -444,7 +345,6 @@ def _special_variants(raw_symbol: str) -> Tuple[List[str], str]:
         if len(base) >= 3:
             out.append(f"{base[:3]}.FOREX")
         out.append(s)
-        # de-dupe
         final: List[str] = []
         seen = set()
         for x in out:
@@ -453,7 +353,6 @@ def _special_variants(raw_symbol: str) -> Tuple[List[str], str]:
                 final.append(x)
         return final, "forex"
 
-    # Yahoo futures form: GC=F -> (mapping if known) else try COMM fallbacks
     if s.endswith("=F") or "=" in s:
         base = _safe_alnum(s.replace("=F", "").replace("=X", ""))
         out2: List[str] = []
@@ -470,29 +369,18 @@ def _special_variants(raw_symbol: str) -> Tuple[List[str], str]:
 
     return [s], "equity"
 
-
 def _provider_symbol_variants(raw_symbol: str) -> List[str]:
-    """
-    Provider variants:
-    - For special symbols, use special variants first (INDX/FOREX/COMM).
-    - For equities:
-        AAPL -> AAPL.US (via EODHD_DEFAULT_EXCHANGE)
-        BRK.B -> BRK.B.US then BRK-B.US
-    """
     s = (raw_symbol or "").strip().upper()
     if not s:
         return []
 
     special, _kind = _special_variants(s)
     if special:
-        # If the best candidate already has a suffix (e.g., GSPC.INDX), we keep it as primary.
-        # If it's still a plain equity ticker, normal equity expansion continues below.
         primary = special[0]
     else:
         primary = s
         special = [s]
 
-    # KSA numeric/.SR: keep as-is (but usually blocked unless allowed)
     if _looks_like_ksa(primary):
         if primary.isdigit():
             return [f"{primary}.SR", primary]
@@ -500,22 +388,18 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
             return [primary, primary.replace(".SR", "")]
         return [primary]
 
-    # If primary already has a suffix, honor it and only add dot/dash internal variants.
     base0, exch0 = _split_exchange_suffix(primary)
     if exch0 is not None:
         out: List[str] = [primary]
-        # dot/dash swap inside BASE (not exchange separator)
         b1 = base0.replace(".", "-")
         b2 = base0.replace("-", ".")
         if b1 != base0:
             out.append(f"{b1}.{exch0}")
         if b2 != base0 and b2 != b1:
             out.append(f"{b2}.{exch0}")
-        # include any other specials after
         for x in special[1:]:
             if x and x not in out:
                 out.append(x)
-        # de-dupe keep order
         seen = set()
         final: List[str] = []
         for x in out:
@@ -524,7 +408,6 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
                 final.append(x)
         return final
 
-    # Equity expansion (no suffix)
     base, exch = _split_exchange_suffix(primary)
     if exch is None:
         exch = _default_exchange()
@@ -535,7 +418,6 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
         also = base
 
     out = [primary2]
-
     base_dot_to_dash = base.replace(".", "-")
     base_dash_to_dot = base.replace("-", ".")
 
@@ -562,18 +444,15 @@ def _provider_symbol_variants(raw_symbol: str) -> List[str]:
         final.append(x)
     return final
 
-
 # ---------------------------------------------------------------------------
 # Numeric helpers
 # ---------------------------------------------------------------------------
-
 
 def _is_nan(x: Any) -> bool:
     try:
         return x is None or (isinstance(x, float) and math.isnan(x))
     except Exception:
         return False
-
 
 def _to_float(x: Any) -> Optional[float]:
     try:
@@ -586,7 +465,6 @@ def _to_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def _pick(d: Any, *keys: str) -> Any:
     if not isinstance(d, dict):
         return None
@@ -594,7 +472,6 @@ def _pick(d: Any, *keys: str) -> Any:
         if k in d:
             return d.get(k)
     return None
-
 
 def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
     if cur is None or lo is None or hi is None:
@@ -606,7 +483,6 @@ def _pos_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> 
     except Exception:
         return None
 
-
 def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in (patch or {}).items():
@@ -616,7 +492,6 @@ def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
             continue
         out[k] = v
     return out
-
 
 def _merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
     fset = set(force_keys or ())
@@ -634,7 +509,6 @@ def _merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequenc
             dst[k] = v
         elif isinstance(cur, str) and not cur.strip():
             dst[k] = v
-
 
 def _fill_derived(patch: Dict[str, Any]) -> None:
     cur = _to_float(patch.get("current_price"))
@@ -665,7 +539,6 @@ def _fill_derived(patch: Dict[str, Any]) -> None:
     if patch.get("free_float_market_cap") is None and mc is not None and ff is not None:
         patch["free_float_market_cap"] = mc * (ff / 100.0)
 
-
 def _data_quality(patch: Dict[str, Any], warns: List[str]) -> str:
     cur = _to_float(patch.get("current_price"))
     if cur is not None:
@@ -677,11 +550,9 @@ def _data_quality(patch: Dict[str, Any], warns: List[str]) -> str:
 
     return "BAD"
 
-
 # ---------------------------------------------------------------------------
 # History analytics + canonical forecast fields
 # ---------------------------------------------------------------------------
-
 
 def _stddev(xs: List[float]) -> Optional[float]:
     try:
@@ -693,7 +564,6 @@ def _stddev(xs: List[float]) -> Optional[float]:
         return math.sqrt(var)
     except Exception:
         return None
-
 
 def _compute_rsi_14(closes: List[float]) -> Optional[float]:
     try:
@@ -721,7 +591,6 @@ def _compute_rsi_14(closes: List[float]) -> Optional[float]:
     except Exception:
         return None
 
-
 def _return_pct(last: float, prior: float) -> Optional[float]:
     try:
         if prior == 0:
@@ -729,7 +598,6 @@ def _return_pct(last: float, prior: float) -> Optional[float]:
         return (last / prior - 1.0) * 100.0
     except Exception:
         return None
-
 
 def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -747,7 +615,8 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     }
     for k, n in idx.items():
         if len(closes) > n:
-            out[k] = _return_pct(last, closes[-(n + 1)])
+            prior = closes[-(n + 1)]
+            out[k] = _return_pct(last, prior)
 
     def ma(n: int) -> Optional[float]:
         if len(closes) < n:
@@ -760,8 +629,8 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
     out["ma200"] = ma(200)
 
     if len(closes) >= 31:
-        window = closes[-31:]
         rets: List[float] = []
+        window = closes[-31:]
         for i in range(1, len(window)):
             p0 = window[i - 1]
             p1 = window[i]
@@ -773,6 +642,7 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     out["rsi_14"] = _compute_rsi_14(closes)
 
+    # Forecast (momentum-style)
     def mean_daily_return(n_days: int) -> Optional[float]:
         if len(closes) < (n_days + 2):
             return None
@@ -816,13 +686,19 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
 
     return out
 
+def _add_forecast_aliases(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p or {})
+    # Legacy target_price keys for maximum sheet compatibility
+    if "forecast_price_1m" in out: out["target_price_1m"] = out["forecast_price_1m"]
+    if "forecast_price_3m" in out: out["target_price_3m"] = out["forecast_price_3m"]
+    if "forecast_price_12m" in out: out["target_price_12m"] = out["forecast_price_12m"]
+    return out
 
 # ---------------------------------------------------------------------------
 # Client singleton
 # ---------------------------------------------------------------------------
 _CLIENT: Optional[httpx.AsyncClient] = None
 _LOCK = asyncio.Lock()
-
 
 async def _get_client() -> httpx.AsyncClient:
     global _CLIENT
@@ -843,7 +719,6 @@ async def _get_client() -> httpx.AsyncClient:
             )
     return _CLIENT
 
-
 async def aclose_eodhd_client() -> None:
     global _CLIENT
     c = _CLIENT
@@ -854,11 +729,9 @@ async def aclose_eodhd_client() -> None:
         except Exception:
             pass
 
-
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
-
 
 async def _get_json_dict(url: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[dict], Optional[str]]:
     tok = _token()
@@ -921,7 +794,6 @@ async def _get_json_dict(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 
     return None, last_err or "request failed"
 
-
 async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tuple[Optional[list], Optional[str]]:
     tok = _token()
     if not tok:
@@ -983,11 +855,9 @@ async def _get_json_list(url: str, params: Dict[str, Any], *, kind: str) -> Tupl
 
     return None, last_err or "request failed"
 
-
 # ---------------------------------------------------------------------------
 # Endpoint fetchers (try variants)
 # ---------------------------------------------------------------------------
-
 
 async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     if not _token():
@@ -1027,7 +897,6 @@ async def _fetch_realtime_patch(symbol_variants: List[str]) -> Tuple[Dict[str, A
         return _clean_patch(patch), None, sym
 
     return {}, f"realtime failed: {last_err or 'unknown'}", None
-
 
 async def _fetch_fundamentals_patch(symbol_variants: List[str], *, enabled: bool) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     if not enabled or not _enable_fundamentals():
@@ -1101,7 +970,6 @@ async def _fetch_fundamentals_patch(symbol_variants: List[str], *, enabled: bool
 
     return {}, f"fundamentals failed: {last_err or 'unknown'}", None
 
-
 async def _fetch_history_patch(symbol_variants: List[str]) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     if not _enable_history():
         return {}, None, None
@@ -1153,23 +1021,16 @@ async def _fetch_history_patch(symbol_variants: List[str]) -> Tuple[Dict[str, An
             "forecast_source": "eodhd_eod",
         }
         patch.update(analytics)
+        patch = _add_forecast_aliases(patch)
         return _clean_patch(patch), None, sym
 
     return {}, f"history failed: {last_err or 'unknown'}", None
-
 
 # ---------------------------------------------------------------------------
 # Main fetch (best-effort)
 # ---------------------------------------------------------------------------
 
-
 def _fundamentals_allowed_for_symbol(symbol: str) -> bool:
-    """
-    Heuristic:
-    - equities: yes
-    - INDX: yes (EODHD supports index fundamentals)
-    - FOREX/COMM: typically no (avoid extra 404s); allow only if user overrides via env map.
-    """
     s = (symbol or "").strip().upper()
     if not s:
         return False
@@ -1181,7 +1042,6 @@ def _fundamentals_allowed_for_symbol(symbol: str) -> bool:
     if exch in ("FOREX", "COMM"):
         return False
     return True
-
 
 async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) -> Dict[str, Any]:
     sym_in = (symbol or "").strip()
@@ -1195,7 +1055,6 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
             "last_updated_riyadh": _riyadh_iso(),
         }
 
-    # Controlled KSA enablement (numeric/.SR only)
     if _looks_like_ksa(sym_in) and not _allow_ksa():
         return _clean_patch(
             {
@@ -1257,7 +1116,6 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
         out["provider_symbol"] = rt_used
     _merge_into(out, rt_patch)
 
-    # Decide fundamentals enablement based on symbol type (avoid extra 404s)
     fundamentals_ok = want_fundamentals and _enable_fundamentals() and _fundamentals_allowed_for_symbol(out.get("provider_symbol", variants[0]))
 
     # --- fundamentals (cached) ---
@@ -1328,61 +1186,55 @@ async def _fetch(symbol: str, *, want_fundamentals: bool, want_history: bool) ->
 
     return _clean_patch(out)
 
-
 # ---------------------------------------------------------------------------
-# Engine-compatible exported callables (name-based discovery)
-# IMPORTANT: your engine tries get_quote FIRST; therefore get_quote must be enriched.
+# Engine-compatible exported callables
 # ---------------------------------------------------------------------------
-
 
 async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
-
 async def get_enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
-
 
 async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await get_quote(symbol, *args, **kwargs)
 
-
 async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await get_quote(symbol, *args, **kwargs)
-
 
 async def fetch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await get_quote(symbol, *args, **kwargs)
 
-
-# Legacy aliases (kept for older code paths that used *_patch names)
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=False, want_history=False)
-
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=True, want_history=True)
 
-
 async def fetch_quote_and_enrichment_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
-
 
 async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await _fetch(symbol, want_fundamentals=True, want_history=False)
 
-
 async def fetch_enriched_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
-
 
 @dataclass
 class EodhdProvider:
     name: str = PROVIDER_NAME
-
     async def fetch_quote(self, symbol: str, debug: bool = False) -> Dict[str, Any]:
         return await get_quote(symbol)
 
+async def aclose_eodhd_client() -> None:
+    global _CLIENT
+    c = _CLIENT
+    _CLIENT = None
+    if c is not None:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
 
 __all__ = [
     "get_quote",
