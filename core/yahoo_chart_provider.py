@@ -1,8 +1,8 @@
-# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.3
+# core/yahoo_chart_provider.py  (FULL REPLACEMENT) — v0.3.4
 """
 core/yahoo_chart_provider.py
 ===========================================================
-Compatibility + Repo-Hygiene Shim — v0.3.3 (PROD SAFE)
+Compatibility + Repo-Hygiene Shim — v0.3.4 (PROD SAFE)
 
 Why this exists
 - The canonical Yahoo Chart provider lives here:
@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("core.yahoo_chart_provider_shim")
 
-SHIM_VERSION = "0.3.3"
+SHIM_VERSION = "0.3.4"
 
 # Backward-compat constant (not necessarily used by canonical provider)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
@@ -50,10 +50,15 @@ def _is_awaitable(x: Any) -> bool:
 
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    out = fn(*args, **kwargs)
-    if _is_awaitable(out):
-        return await out
-    return out
+    try:
+        out = fn(*args, **kwargs)
+        if _is_awaitable(out):
+            return await out
+        return out
+    except Exception as e:
+        # If call fails, re-raise or return None depending on strictness
+        # Here we re-raise to catch in outer try/except
+        raise e
 
 
 async def _call_with_optional_kw(
