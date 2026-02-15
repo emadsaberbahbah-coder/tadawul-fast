@@ -1,5 +1,5 @@
 """
-TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.1.0-shim) – PROD SAFE
+TADAWUL FAST BRIDGE – CORE CONFIG SHIM (v3.1.1-shim) – PROD SAFE
 
 Purpose
 - Backward compatibility for imports like:
@@ -8,11 +8,11 @@ Purpose
 - Never crashes startup (defensive import + safe fallbacks)
 - Avoid circular imports: do NOT import anything else from core at import-time.
 
-Improvements in v3.1.0-shim
-- ✅ Robust canonical import: supports missing optional exports.
-- ✅ OPEN fallback still works even if root config.py changes shape.
-- ✅ Minimal debug tracing via CORE_CONFIG_DEBUG=true.
-- ✅ Aligned with root config.py v3.1.0 (Auth Header support).
+Enhancements in v3.1.1-shim
+- ✅ Fixes signature drift safely: auth_ok() accepts flexible args/kwargs and adapts to root config shape.
+- ✅ Removes “brittle” assumptions about root exports (all optional).
+- ✅ Better bool parsing + safer fallbacks.
+- ✅ Optional debug tracing via CORE_CONFIG_DEBUG=true.
 
 Exports (stable)
 - CONFIG_VERSION
@@ -26,20 +26,24 @@ Exports (stable)
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, cast
 import os
+from importlib import import_module
+from typing import Any, Dict, List, Optional, Set
 
-CONFIG_VERSION = "3.1.0-shim"
+CONFIG_VERSION = "3.1.1-shim"
 
-_DEBUG = str(os.getenv("CORE_CONFIG_DEBUG", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+_DEBUG = str(os.getenv("CORE_CONFIG_DEBUG", "false")).strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
 
 
 def _dbg(msg: str) -> None:
-    if _DEBUG:
-        try:
-            print(f"[core.config] {msg}")  # noqa: T201
-        except Exception:
-            pass
+    if not _DEBUG:
+        return
+    try:
+        print(f"[core.config] {msg}")  # noqa: T201
+    except Exception:
+        pass
 
 
 def _fallback_settings_obj() -> object:
@@ -49,14 +53,32 @@ def _fallback_settings_obj() -> object:
 
 def _safe_list(x: Any) -> List[str]:
     try:
-        if isinstance(x, (list, tuple)):
-            return [str(i) for i in x if str(i).strip()]
+        if isinstance(x, (list, tuple, set)):
+            out: List[str] = []
+            for i in x:
+                s = str(i).strip()
+                if s:
+                    out.append(s)
+            return out
         return []
     except Exception:
         return []
 
 
-def _safe_bool(x: Any, default: bool = True) -> bool:
+def _parse_bool(x: Any, default: bool) -> bool:
+    if x is None:
+        return default
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    if isinstance(x, str):
+        v = x.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
     try:
         return bool(x)
     except Exception:
@@ -76,13 +98,14 @@ def _safe_dict(x: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, An
 # Canonical import (repo-root)
 # ----------------------------
 try:
-    # Import module first (more resilient than importing many names at once)
-    from importlib import import_module
-
     _m = import_module("config")
 
     # Optional: root may expose CONFIG_VERSION or version
-    _root_ver = getattr(_m, "CONFIG_VERSION", None) or getattr(_m, "version", None) or getattr(_m, "__version__", None)
+    _root_ver = (
+        getattr(_m, "CONFIG_VERSION", None)
+        or getattr(_m, "version", None)
+        or getattr(_m, "__version__", None)
+    )
     if _root_ver is not None:
         CONFIG_VERSION = str(_root_ver)
 
@@ -100,7 +123,6 @@ try:
         try:
             if callable(_get_settings):
                 return _get_settings()
-            # If root doesn't expose get_settings, still stay safe.
             return _fallback_settings_obj()
         except Exception as e:
             _dbg(f"get_settings() failed -> {e.__class__.__name__}: {e}")
@@ -110,7 +132,6 @@ try:
         try:
             if callable(_allowed_tokens):
                 return _safe_list(_allowed_tokens())
-            # If root doesn't expose allowed_tokens, assume open mode
             return []
         except Exception as e:
             _dbg(f"allowed_tokens() failed -> {e.__class__.__name__}: {e}")
@@ -119,19 +140,68 @@ try:
     def is_open_mode() -> bool:
         try:
             if callable(_is_open_mode):
-                return _safe_bool(_is_open_mode(), True)
-            # No function => treat as open mode
+                return _parse_bool(_is_open_mode(), True)
             return True
         except Exception as e:
             _dbg(f"is_open_mode() failed -> {e.__class__.__name__}: {e}")
             return True
 
-    def auth_ok(x_app_token: Optional[str]) -> bool:
+    def auth_ok(
+        x_app_token: Optional[str] = None,
+        authorization: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """
+        Backward/forward compatible auth shim.
+
+        Supports older calls:
+          auth_ok(x_app_token)
+
+        And newer/root shapes like:
+          auth_ok(x_app_token=..., authorization=..., headers=...)
+          auth_ok(headers)
+          auth_ok(request_headers_dict)
+        """
         try:
-            if callable(_auth_ok):
-                return _safe_bool(_auth_ok(x_app_token), True)
-            # No function => open
-            return True
+            if not callable(_auth_ok):
+                return True  # open mode fallback
+
+            # If headers dict not provided, synthesize it
+            hdrs: Dict[str, str] = {}
+            if isinstance(headers, dict):
+                hdrs.update({str(k): str(v) for k, v in headers.items()})
+
+            if x_app_token:
+                hdrs.setdefault("x-app-token", str(x_app_token))
+            if authorization:
+                hdrs.setdefault("authorization", str(authorization))
+
+            # Try the most expressive call first
+            try:
+                return _parse_bool(
+                    _auth_ok(x_app_token=x_app_token, authorization=authorization, headers=hdrs, *args, **kwargs),
+                    True,
+                )
+            except TypeError:
+                pass
+
+            # Try passing headers only (common pattern)
+            try:
+                return _parse_bool(_auth_ok(hdrs, *args, **kwargs), True)
+            except TypeError:
+                pass
+
+            # Try legacy single-arg token
+            try:
+                return _parse_bool(_auth_ok(x_app_token), True)
+            except TypeError:
+                pass
+
+            # As a last resort, call without args
+            return _parse_bool(_auth_ok(), True)
+
         except Exception as e:
             _dbg(f"auth_ok() failed -> {e.__class__.__name__}: {e}")
             return True
@@ -141,7 +211,6 @@ try:
             if callable(_mask_settings_dict):
                 d = _mask_settings_dict()
                 return _safe_dict(d, {"status": "ok", "config_version": CONFIG_VERSION})
-            # If root doesn't expose it, provide a safe minimal shape
             return {"status": "ok", "open_mode": is_open_mode(), "config_version": CONFIG_VERSION}
         except Exception as e:
             _dbg(f"mask_settings_dict() failed -> {e.__class__.__name__}: {e}")
@@ -164,9 +233,14 @@ except Exception as e:
     def is_open_mode() -> bool:
         return True
 
-    def auth_ok(x_app_token: Optional[str]) -> bool:  # noqa: ARG001
-        # OPEN mode (no token required)
-        return True
+    def auth_ok(
+        x_app_token: Optional[str] = None,  # noqa: ARG001
+        authorization: Optional[str] = None,  # noqa: ARG001
+        headers: Optional[Dict[str, str]] = None,  # noqa: ARG001
+        *args: Any,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> bool:
+        return True  # OPEN mode fallback
 
     def mask_settings_dict() -> Dict[str, Any]:
         return {"status": "fallback", "open_mode": True, "config_version": CONFIG_VERSION}
