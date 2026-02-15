@@ -3,14 +3,15 @@
 """
 core/providers/finnhub_provider.py
 ============================================================
-Finnhub Provider (GLOBAL enrichment fallback) — v2.1.1
+Finnhub Provider (GLOBAL enrichment fallback) — v2.2.0
 (PROD SAFE + ENGINE PATCH + ALIGNED ROI KEYS + RIYADH TIME)
 
-What’s improved in v2.1.1
-- ✅ ROI Key Alignment: Uses 'expected_roi_1m/3m/12m' to match EODHD standard.
+What’s improved in v2.2.0
+- ✅ ROI Key Alignment: Uses 'expected_roi_1m/3m/12m' to match EODHD/Finnhub.
 - ✅ Riyadh Localization: Adds 'forecast_updated_riyadh' (UTC+3).
 - ✅ Provenance: Explicitly sets 'data_source="finnhub"'.
 - ✅ Routing Guard: Rejects KSA and Yahoo-special symbols (^GSPC, GC=F).
+- ✅ Robustness: Improved error handling and retry logic.
 """
 
 from __future__ import annotations
@@ -31,12 +32,12 @@ import httpx
 
 logger = logging.getLogger("core.providers.finnhub_provider")
 
-PROVIDER_VERSION = "2.1.1"
+PROVIDER_VERSION = "2.2.0"
 PROVIDER_NAME = "finnhub"
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
-DEFAULT_TIMEOUT_SEC = 8.0
-DEFAULT_RETRY_ATTEMPTS = 2
+DEFAULT_TIMEOUT_SEC = 10.0
+DEFAULT_RETRY_ATTEMPTS = 3
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
@@ -164,7 +165,7 @@ async def _get_client() -> httpx.AsyncClient:
 
 async def _fetch(symbol_raw: str, want_profile: bool, want_history: bool) -> Dict[str, Any]:
     sym = symbol_raw.strip().upper()
-    if not sym or _SHARED_LOOKS_KSA and _SHARED_LOOKS_KSA(sym):
+    if not sym or (_SHARED_LOOKS_KSA and _SHARED_LOOKS_KSA(sym)):
         return {"error": "KSA not supported in Finnhub"}
     
     # Routing: Reject indices/commodities
@@ -190,10 +191,23 @@ async def _fetch(symbol_raw: str, want_profile: bool, want_history: bool) -> Dic
             "current_price": _to_float(js.get("c")),
             "previous_close": _to_float(js.get("pc")),
             "percent_change": _to_float(js.get("dp")),
+            "day_high": _to_float(js.get("h")),
+            "day_low": _to_float(js.get("l")),
             "data_source": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "last_updated_utc": _utc_iso()
         }
+
+        # Profile Call (Enrichment)
+        if want_profile:
+            p_res = await client.get(f"{DEFAULT_BASE_URL}/stock/profile2", params=params)
+            p_js = p_res.json()
+            if p_js:
+                out["name"] = p_js.get("name")
+                out["sector"] = p_js.get("finnhubIndustry")
+                out["currency"] = p_js.get("currency")
+                out["market_cap"] = _to_float(p_js.get("marketCapitalization"))
+                out["shares_outstanding"] = _to_float(p_js.get("shareOutstanding"))
 
         # History Call (Enrichment)
         if want_history:
