@@ -3,7 +3,7 @@
 """
 test_sheets_auth.py
 ===========================================================
-Advanced Google Sheets Auth & Permission Tester (v1.5.0)
+Advanced Google Sheets Auth & Permission Tester (v1.6.0)
 ===========================================================
 TFB PROD SAFE — Intelligent Diagnostic Edition
 
@@ -13,7 +13,7 @@ Purpose
 - Probes Spreadsheet Metadata (Title, Tabs, Timezone).
 - Tests localized Riyadh-time writing for dashboard alignment.
 
-v1.5.0 Enhancements:
+v1.6.0 Enhancements:
 - ✅ **Key Repair**: Auto-fixes double-escaped newlines in private keys.
 - ✅ **Tab Discovery**: Lists all sheets in the file to help debug 404s.
 - ✅ **Metadata Probe**: Verifies Title, Locale, and TZ connectivity.
