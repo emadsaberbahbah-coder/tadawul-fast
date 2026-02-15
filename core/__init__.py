@@ -1,7 +1,7 @@
 """
 core/__init__.py
 ------------------------------------------------------------
-Core package initialization (PROD SAFE) — v1.7.0 (LAZY + SYMBOL ALIGNED)
+Core package initialization (PROD SAFE) — v1.8.0 (LAZY + SYMBOL ALIGNED)
 
 Goals:
 - Keep imports LIGHT to avoid circular-import + cold-start issues on Render.
@@ -9,7 +9,7 @@ Goals:
 - Prioritize core.symbols.normalize v1.1.0 for all symbol logic.
 - Never crash app startup because of optional modules.
 
-Key improvement in v1.7.0
+Key improvement in v1.8.0
 - ✅ Explicit Normalization: Directly exports normalize_symbol, normalize_ksa_symbol, and is_ksa.
 - ✅ Engine Resilience: Better signature matching for DataEngineV2 vs DataEngine.
 - ✅ Schema Wrappers: Hardened get_headers_for_sheet to align with vNext Registry.
@@ -30,7 +30,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 
-CORE_INIT_VERSION = "1.7.0"
+CORE_INIT_VERSION = "1.8.0"
 
 # -----------------------------------------------------------------------------
 # Optional debug logging for import issues (set CORE_IMPORT_DEBUG=true)
