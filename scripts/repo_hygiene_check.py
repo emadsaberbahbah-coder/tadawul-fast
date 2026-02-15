@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # scripts/repo_hygiene_check.py
 """
-Repo Hygiene Check — PROD SAFE (v1.3.0)
+Repo Hygiene Check — PROD SAFE (v1.4.0)
 
 Goal
 - Fail CI if markdown code fences or other common LLM copy-paste artifacts
@@ -16,6 +16,7 @@ What it checks
   - triple backticks (```)
   - triple tildes (~~~)
   - "```python" or "```sh" remnants
+  - Common LLM placeholders like "[your code here]"
 - Scans all *.py files under the given root.
 - Respects common ignore patterns (venv, .git, __pycache__).
 - Never crashes startup; best-effort scanning with clear reporting.
@@ -42,16 +43,15 @@ import pathlib
 import sys
 from typing import Iterable, List, Optional, Tuple, Set
 
+SCRIPT_VERSION = "1.4.0"
 
-SCRIPT_VERSION = "1.3.0"
-
-# Default skip directories
+# Default skip directories (expanded)
 SKIP_DIRS = {
     "venv", ".venv", "env", ".env",
-    "__pycache__", ".git", ".hg", ".svn",
+    "__pycache__", ".git", ".hg", ".svn", ".idea", ".vscode",
     ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "node_modules", "dist", "build", ".eggs", ".tox",
-    "htmlcov", "site-packages"
+    "htmlcov", "site-packages", "coverage"
 }
 
 def _make_bad_tokens() -> List[str]:
@@ -67,14 +67,24 @@ def _make_bad_tokens() -> List[str]:
     sh_fence = bt + "sh"
     bash_fence = bt + "bash"
     
-    return [bt, td, py_fence, sh_fence, bash_fence]
+    # LLM placeholders
+    placeholder_1 = "[your code here]"
+    placeholder_2 = ""
+    
+    return [bt, td, py_fence, sh_fence, bash_fence, placeholder_1, placeholder_2]
 
 
 def _should_skip(path: pathlib.Path, skip_set: Set[str]) -> bool:
     # Check if any part of the path is in the skip set
-    parts = set(p.lower() for p in path.parts)
-    if not skip_set.isdisjoint(parts):
-        return True
+    # Also skip hidden files/dirs starting with . (except .github which is useful to check)
+    parts = path.parts
+    for p in parts:
+        p_lower = p.lower()
+        if p_lower in skip_set:
+            return True
+        # Skip hidden folders generally, unless it's the current dir "."
+        if p.startswith(".") and p != "." and p_lower not in {".github"}: 
+             return True
     return False
 
 
@@ -158,11 +168,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     read_errors: List[str] = []
     
     checked_count = 0
+    skipped_count = 0
+
+    print(f"Starting Repo Hygiene Check v{SCRIPT_VERSION}...")
+    print(f"Scanning root: {root}")
+    print(f"Checking for tokens: {', '.join([repr(t) for t in bad_tokens])}")
 
     for p in _iter_py_files(root, skip_set):
         # Don't scan ourselves if we are inside the root
         try:
             if p.resolve() == this_file:
+                skipped_count += 1
                 continue
         except OSError:
             pass
@@ -196,12 +212,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             except ValueError:
                 rel_path = p
                 
-            msg = f"Markdown fence found: {repr(found_token)}"
+            msg = f"Artifact found: {repr(found_token)}"
             offenders.append(f"{rel_path}:{line}:{col} -> {msg}")
             offenders_gha.append((str(rel_path), line, col, msg))
 
     # Reporting
-    print(f"Checked {checked_count} Python files.")
+    print(f"\n--- Summary ---")
+    print(f"Checked: {checked_count} files")
     
     if read_errors:
         print(f"\n⚠️  Repo hygiene check: {len(read_errors)} files could not be read:")
@@ -212,7 +229,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("")
 
     if offenders:
-        print(f"\n❌ Repo hygiene check FAILED (v{SCRIPT_VERSION}). Found markdown fences inside .py files:\n")
+        print(f"\n❌ Repo hygiene check FAILED (v{SCRIPT_VERSION}). Found artifacts inside .py files:\n")
         for o in offenders:
             print(" -", o)
 
