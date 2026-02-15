@@ -1,19 +1,21 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) – v1.9.0 (Financial Leader Edition)
+Routes package initialization (PROD SAFE) — v2.2.0 (TFB Hardened)
 
-Design rules:
-- ZERO heavy imports here (no FastAPI, no routers, no app state).
-- No side effects (no network, no env validation, no file IO).
-- Safe helpers for version reporting and dynamic module discovery.
-- Aligned with core/symbols/normalize.py v1.2.0 standards.
+Design rules (kept)
+- ZERO heavy imports here (no FastAPI, no routers, no app state)
+- No side effects (no network, no env validation, no file IO)
+- Safe helpers for version reporting and dynamic module discovery
+- Deterministic mount order helpers for main.py
 
-v1.9.0 Changes:
-- ✅ **Advanced Mapping**: Probes for both 'advisor' and 'investment_advisor' variants.
-- ✅ **Dependency Auditing**: Verifies presence of 'zoneinfo' and 'yfinance'.
-- ✅ **Mount Priority**: Optimized deterministic order for main.py integration.
-- ✅ **Environment Hints**: Tracks Riyadh localization and Auth Header status.
+v2.2.0 upgrades
+- ✅ Stronger discovery: handles package + legacy root modules safely
+- ✅ Deterministic ordering: stable sort with explicit priority + grouping
+- ✅ Better module_exists: avoids surprises, supports "routes.xxx" and "xxx"
+- ✅ Dependency audit: optional, configurable, no heavy imports
+- ✅ Env hints: stricter parsing, includes auth transport + timezone intent
+- ✅ Render-friendly snapshots: compact + consistent keys for logging
 """
 
 from __future__ import annotations
@@ -22,198 +24,308 @@ import importlib.util
 import os
 import pkgutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-ROUTES_PACKAGE_VERSION = "1.9.0"
+ROUTES_PACKAGE_VERSION = "2.2.0"
+
+# ---------------------------------------------------------------------
+# Small utils (no heavy work)
+# ---------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_FALSY = {"0", "false", "no", "n", "off", "f"}
 
 
-# -----------------------------------------------------------------------------
-# Public helpers
-# -----------------------------------------------------------------------------
 def get_routes_version() -> str:
     return ROUTES_PACKAGE_VERSION
 
 
-def _discover_route_modules() -> List[str]:
-    """
-    Dynamically scans the 'routes' directory for python modules.
-    Returns a list of module names (e.g., 'routes.enriched_quote').
-    """
-    modules = []
-    package_path = Path(__file__).parent
-    
-    for _, name, _ in pkgutil.iter_modules([str(package_path)]):
-        if name not in ("__init__", "__pycache__"):
-            modules.append(f"routes.{name}")
-            
-    # Add legacy root modules if they exist (best-effort compatibility)
-    root_candidates = ["routes_argaam", "legacy_service", "advisor", "advanced_analysis"]
-    for rc in root_candidates:
-        if module_exists(rc):
-            modules.append(rc)
-            
-    return modules
+def _env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
 
 
-def get_expected_router_modules() -> List[str]:
-    """
-    Returns a list of all discoverable route modules plus known core routes.
-    """
-    discovered = _discover_route_modules()
-    
-    # Explicit list of canonical routes to ensure they are tracked
-    core_routes = [
-        "routes.enriched_quote",
-        "routes.ai_analysis", 
-        "routes.advanced_analysis",
-        "routes.advisor",
-        "routes.investment_advisor",
-        "routes.routes_argaam",
-        "routes.legacy_service",
-        "routes.config"
-    ]
-    
-    # Merge and dedupe
-    all_routes = sorted(list(set(discovered + core_routes)))
-    return all_routes
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = _env_str(name, "")
+    if not v:
+        return default
+    vv = v.lower()
+    if vv in _TRUTHY:
+        return True
+    if vv in _FALSY:
+        return False
+    return default
 
 
-def get_expected_router_groups() -> Dict[str, List[str]]:
-    """
-    Grouped reference list for mounting logic in main.py.
-    """
-    all_mods = get_expected_router_modules()
-    
-    groups = {
-        "core": [],
-        "advisor": [],
-        "ksa": [],
-        "system": []
-    }
-    
-    for m in all_mods:
-        m_low = m.lower()
-        if "enriched" in m_low or "analysis" in m_low or "legacy" in m_low:
-            groups["core"].append(m)
-        elif "advisor" in m_low:
-            groups["advisor"].append(m)
-        elif "argaam" in m_low or "tadawul" in m_low:
-            groups["ksa"].append(m)
-        elif "config" in m_low or "health" in m_low:
-            groups["system"].append(m)
-            
-    return groups
+def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items or []:
+        s = str(x or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
+# ---------------------------------------------------------------------
+# Existence checks (NO imports)
+# ---------------------------------------------------------------------
 def module_exists(module_path: str) -> bool:
     """
     Check module availability WITHOUT importing it.
-    Uses importlib.util.find_spec which is safe and side-effect free.
+    Safe + side-effect free: uses importlib.util.find_spec.
+
+    Supports:
+    - "routes.enriched_quote"
+    - "enriched_quote" (legacy root module)
     """
     if not module_path or not isinstance(module_path, str):
         return False
+    mp = module_path.strip()
+    if not mp:
+        return False
     try:
-        # Standard lookup
-        spec = importlib.util.find_spec(module_path)
-        return spec is not None
+        return importlib.util.find_spec(mp) is not None
     except Exception:
         return False
 
 
-# -----------------------------------------------------------------------------
-# Deterministic router discovery (still NO imports)
-# -----------------------------------------------------------------------------
-def _first_existing(candidates: List[str]) -> Optional[str]:
-    for c in candidates:
+def _first_existing(candidates: Sequence[str]) -> Optional[str]:
+    for c in candidates or []:
         if module_exists(c):
             return c
     return None
 
 
+# ---------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------
+def _routes_dir() -> Path:
+    return Path(__file__).parent
+
+
+def _discover_route_modules_in_package() -> List[str]:
+    """
+    Scan the 'routes' package directory for python modules.
+    Returns: ["routes.xxx", ...] (no imports performed).
+    """
+    modules: List[str] = []
+    package_path = _routes_dir()
+    for _, name, _ in pkgutil.iter_modules([str(package_path)]):
+        if name in ("__init__", "__pycache__"):
+            continue
+        modules.append(f"routes.{name}")
+    return modules
+
+
+def _legacy_root_candidates() -> List[str]:
+    """
+    Best-effort legacy modules that might live at repo root or older layout.
+    These are NOT imported; only checked via find_spec.
+    """
+    return [
+        # legacy names observed in refactors
+        "routes_argaam",
+        "legacy_service",
+        "advisor",
+        "advanced_analysis",
+        "ai_analysis",
+        "enriched_quote",
+        "config",
+        # alt advisor naming variants
+        "investment_advisor",
+        "advisor_engine",
+        "advisor_router",
+    ]
+
+
+def get_expected_router_modules() -> List[str]:
+    """
+    Returns a deduped list of:
+    - discovered package modules (routes.*)
+    - known canonical modules (routes.*)
+    - legacy root candidates (best-effort)
+    """
+    discovered = _discover_route_modules_in_package()
+
+    canonical = [
+        "routes.enriched_quote",
+        "routes.ai_analysis",
+        "routes.advanced_analysis",
+        "routes.advisor",
+        "routes.investment_advisor",
+        "routes.routes_argaam",
+        "routes.legacy_service",
+        "routes.config",
+    ]
+
+    legacy = _legacy_root_candidates()
+
+    # Keep a stable ordering: discovered first, then canonical, then legacy.
+    # Dedupe while preserving order.
+    return _dedupe_keep_order(discovered + canonical + legacy)
+
+
+def get_available_router_modules(expected: Optional[Sequence[str]] = None) -> List[str]:
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    return [m for m in exp if module_exists(m)]
+
+
+# ---------------------------------------------------------------------
+# Grouping helpers (for main.py mounting logic)
+# ---------------------------------------------------------------------
+def get_expected_router_groups() -> Dict[str, List[str]]:
+    """
+    Group modules by intent to help main.py mount in a clean order.
+    """
+    mods = get_expected_router_modules()
+
+    groups: Dict[str, List[str]] = {
+        "security": [],
+        "core": [],
+        "advisor": [],
+        "ksa": [],
+        "system": [],
+        "other": [],
+    }
+
+    for m in mods:
+        ml = m.lower()
+
+        # system/config/health-ish
+        if any(x in ml for x in ("config", "health", "system", "status")):
+            groups["system"].append(m)
+            continue
+
+        # advisor (includes investment_advisor variants)
+        if "advisor" in ml:
+            groups["advisor"].append(m)
+            continue
+
+        # KSA-focused (argaam/tadawul)
+        if any(x in ml for x in ("argaam", "tadawul", "ksa")):
+            groups["ksa"].append(m)
+            continue
+
+        # core analytics/quotes/legacy
+        if any(x in ml for x in ("enriched", "analysis", "legacy", "quote")):
+            groups["core"].append(m)
+            continue
+
+        groups["other"].append(m)
+
+    # Dedupe within each group (keep order)
+    for k in list(groups.keys()):
+        groups[k] = _dedupe_keep_order(groups[k])
+
+    return groups
+
+
+# ---------------------------------------------------------------------
+# Deterministic router discovery map
+# ---------------------------------------------------------------------
 def get_router_discovery() -> Dict[str, Dict[str, object]]:
     """
-    Returns a structured view of where each router SHOULD be imported from.
-    This logic handles repo-refactoring (e.g. moving investment_advisor to advisor).
+    Structured view of where each router SHOULD be imported from.
+    Handles refactors (package route vs legacy root).
+    No imports performed.
     """
     discovery: Dict[str, Dict[str, object]] = {}
 
-    def _probe(key: str, candidates: List[str]):
+    def _probe(key: str, candidates: Sequence[str]) -> None:
         sel = _first_existing(candidates)
         discovery[key] = {
-            "candidates": candidates,
+            "candidates": list(candidates),
             "selected": sel,
             "exists": bool(sel),
-            "status": "ready" if sel else "missing"
+            "status": "ready" if sel else "missing",
         }
 
-    # Probing patterns based on the most robust project structure
-    _probe("enriched", ["routes.enriched_quote", "routes.enriched"])
-    _probe("ai_analysis", ["routes.ai_analysis", "routes.ai"])
-    _probe("advanced_analysis", ["routes.advanced_analysis"])
-    _probe("advisor", ["routes.advisor", "routes.investment_advisor", "routes.advisor_engine"])
-    _probe("argaam", ["routes.routes_argaam", "routes_argaam"])
+    # Priority candidates: package module first, then older alternates, then root
+    _probe("enriched", ["routes.enriched_quote", "routes.enriched", "enriched_quote"])
+    _probe("ai_analysis", ["routes.ai_analysis", "routes.ai", "ai_analysis"])
+    _probe("advanced_analysis", ["routes.advanced_analysis", "advanced_analysis"])
+    _probe(
+        "advisor",
+        [
+            "routes.advisor",
+            "routes.investment_advisor",
+            "routes.advisor_engine",
+            "investment_advisor",
+            "advisor_engine",
+            "advisor",
+        ],
+    )
+    _probe("argaam", ["routes.routes_argaam", "routes.argaam", "routes_argaam"])
     _probe("legacy", ["routes.legacy_service", "legacy_service"])
-    _probe("config", ["routes.config"])
+    _probe("config", ["routes.config", "config"])
 
     return discovery
 
 
 def get_recommended_imports() -> List[Tuple[str, str]]:
     """
-    Returns a deterministic list of recommended module imports for main.py.
-    Used for mounting order: Security -> Core -> KSA -> Optional.
+    Deterministic list of recommended imports for main.py mounting.
+    Return: [(key, module_path), ...]
     """
     d = get_router_discovery()
     out: List[Tuple[str, str]] = []
-    
-    # Execution/Mount Order: Enriched Quote first (primary), then Analysis, then Advisor
-    priority = ["enriched", "ai_analysis", "advanced_analysis", "advisor", "argaam", "legacy", "config"]
-    
+
+    # Mount order: System/Config -> Enriched -> Analysis -> Advisor -> KSA -> Legacy
+    priority = ["config", "enriched", "ai_analysis", "advanced_analysis", "advisor", "argaam", "legacy"]
+
     for key in priority:
         sel = d.get(key, {}).get("selected")
         if isinstance(sel, str) and sel:
             out.append((key, sel))
+
     return out
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Dependency audit (optional)
+# ---------------------------------------------------------------------
+def get_dependency_audit(extra: Optional[Sequence[str]] = None) -> Dict[str, bool]:
+    """
+    Lightweight "presence" check only (find_spec). No imports.
+    """
+    base = [
+        "pandas",
+        "numpy",
+        "httpx",
+        "zoneinfo",  # timezone support (py>=3.9)
+        "yfinance",
+    ]
+    if extra:
+        base.extend(list(extra))
+    base = _dedupe_keep_order(base)
+    return {name: module_exists(name) for name in base}
+
+
+# ---------------------------------------------------------------------
 # Debug snapshot (Render logs friendly)
-# -----------------------------------------------------------------------------
-def _env_flag(name: str) -> bool:
-    return bool((os.getenv(name) or "").strip())
-
-
-def get_available_router_modules(expected: Optional[List[str]] = None) -> List[str]:
-    exp = expected or get_expected_router_modules()
-    return [m for m in exp if module_exists(m)]
-
-
+# ---------------------------------------------------------------------
 def get_routes_debug_snapshot() -> Dict[str, object]:
     """
     Extremely lightweight debug snapshot for logs.
-    Safe to call during startup without triggering network/FastAPI.
+    Safe to call during startup without triggering FastAPI/router imports.
     """
     expected = get_expected_router_modules()
     available = get_available_router_modules(expected)
     missing = [m for m in expected if m not in available]
 
-    # Dependency Checks (Critical libs for the modern data engine)
-    deps = {
-        "pandas": module_exists("pandas"),
-        "numpy": module_exists("numpy"),
-        "zoneinfo": module_exists("zoneinfo"), # Critical for Riyadh Time
-        "httpx": module_exists("httpx"),
-        "yfinance": module_exists("yfinance") # Essential for Fundamentals
-    }
-
-    # Environment hints
     env_hints = {
-        "app_token_set": _env_flag("APP_TOKEN"),
-        "riyadh_time_enforced": _env_bool_safe("ENFORCE_RIYADH_TIME", True),
-        "debug_mode": _env_bool_safe("DEBUG_ERRORS", False),
-        "log_level": (os.getenv("LOG_LEVEL") or "info").lower(),
-        "app_env": (os.getenv("APP_ENV") or "production").lower(),
-        "advisor_active": _env_bool_safe("ADVISOR_ENABLED", True),
+        "app_env": (_env_str("APP_ENV", "production") or "production").lower(),
+        "log_level": (_env_str("LOG_LEVEL", "info") or "info").lower(),
+        "debug_mode": _env_bool("DEBUG_ERRORS", False),
+        "advisor_enabled": _env_bool("ADVISOR_ENABLED", True),
+        "enforce_riyadh_time": _env_bool("ENFORCE_RIYADH_TIME", True),
+        # auth hints
+        "app_token_set": bool(_env_str("APP_TOKEN", "")),
+        "auth_header_expected": _env_bool("EXPECT_AUTH_HEADER", True),
+        "token_transport": (_env_str("TOKEN_TRANSPORT", "") or _env_str("APPS_SCRIPT_TOKEN_TRANSPORT", "header,query")).lower(),
+        # timezone intent (string only; no tz import)
+        "tz": _env_str("TZ", "") or _env_str("TIMEZONE", "") or "Asia/Riyadh",
     }
 
     return {
@@ -221,19 +333,16 @@ def get_routes_debug_snapshot() -> Dict[str, object]:
         "summary": {
             "expected_count": len(expected),
             "available_count": len(available),
-            "missing_count": len(missing)
+            "missing_count": len(missing),
         },
+        "recommended_imports": get_recommended_imports(),
         "available": available,
+        "missing": missing[:50],  # cap to keep logs short
         "discovery": get_router_discovery(),
-        "system_deps": deps,
+        "groups": get_expected_router_groups(),
+        "deps": get_dependency_audit(),
         "env_hints": env_hints,
     }
-
-
-def _env_bool_safe(name: str, default: bool) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
-    if not v: return default
-    return v in ("1", "true", "yes", "on", "t")
 
 
 __all__ = [
@@ -246,4 +355,5 @@ __all__ = [
     "get_router_discovery",
     "get_recommended_imports",
     "get_routes_debug_snapshot",
+    "get_dependency_audit",
 ]
