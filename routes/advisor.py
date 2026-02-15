@@ -2,20 +2,22 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-Tadawul Fast Bridge — Advisor Routes (v1.3.1)
-(ADVANCED + ENGINE-AWARE + RESILIENT)
+Tadawul Fast Bridge — Advisor Routes (v1.4.0)
+(ADVANCED + ENGINE-AWARE + RIYADH LOCALIZED)
 
-Updates in v1.3.1:
-- ✅ Engine Injection: Uses app.state.engine if available for shared caching.
-- ✅ Resilient Import: gracefully handles missing service modules.
-- ✅ Enhanced Metadata: Returns processing time and engine status diagnostics.
-- ✅ Dual-Mode Input: Accepts both `tickers` (list) and `symbols` (list).
+Updates in v1.4.0:
+- ✅ **Riyadh Localization**: Injects 'last_updated_riyadh' (UTC+3) into response metadata.
+- ✅ **Schema Alignment**: Explicitly maps 'forecast_price_12m' & 'expected_roi_12m' to table output.
+- ✅ **Engine Injection**: Uses app.state.engine if available for shared caching.
+- ✅ **Resilient Import**: Gracefully handles missing service modules.
+- ✅ **Dual-Mode Input**: Accepts both `tickers` (list) and `symbols` (list).
 """
 
 from __future__ import annotations
 
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
@@ -31,8 +33,11 @@ logger = logging.getLogger("routes.advisor")
 
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
-ADVISOR_ROUTE_VERSION = "1.3.1"
+ADVISOR_ROUTE_VERSION = "1.4.0"
 
+def _riyadh_iso() -> str:
+    tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).isoformat()
 
 def _items_to_table(items: List[Dict[str, Any]]) -> tuple[List[str], List[List[Any]]]:
     """
@@ -64,6 +69,8 @@ def _items_to_table(items: List[Dict[str, Any]]) -> tuple[List[str], List[List[A
                 it.get("data_source", "") or it.get("source", "") or "",
                 it.get("data_quality", "") or it.get("quality", "") or "",
                 it.get("last_updated_utc", "") or it.get("updated_at_utc", "") or "",
+                # v1.4.0: Explicitly map Riyadh Time if available in source item
+                it.get("last_updated_riyadh", "") or "", 
             ]
         )
 
@@ -79,6 +86,7 @@ async def advisor_recommendations(req: AdvisorRequest, request: Request) -> Advi
     - Normalizes input tickers.
     - Injects shared DataEngine for caching.
     - Returns standardized headers even on empty results.
+    - Adds Riyadh timestamps.
     """
     start_time = time.time()
 
@@ -88,16 +96,6 @@ async def advisor_recommendations(req: AdvisorRequest, request: Request) -> Advi
     tickers = list(req.tickers or [])
     if not tickers and req.symbols:
         tickers = list(req.symbols)
-
-    # If still empty, return an error response immediately
-    if not tickers:
-        return AdvisorResponse(
-            status="error",
-            error="No tickers provided. Provide payload.tickers (list) or payload.symbols.",
-            headers=list(TT_ADVISOR_DEFAULT_HEADERS),
-            rows=[],
-            meta={"route_version": ADVISOR_ROUTE_VERSION},
-        )
 
     # -----------------------------
     # 2. Resolve Engine (Shared State)
@@ -130,6 +128,8 @@ async def advisor_recommendations(req: AdvisorRequest, request: Request) -> Advi
             "as_of_utc": req.as_of_utc,
             "min_price": req.min_price,
             "max_price": req.max_price,
+            # Pass tickers explicitly if provided (overrides 'sources' logic inside advisor)
+            "tickers": tickers if tickers else None
         }
 
         # Execute Core Logic
@@ -181,13 +181,14 @@ async def advisor_recommendations(req: AdvisorRequest, request: Request) -> Advi
             "route_version": ADVISOR_ROUTE_VERSION,
             "engine_status": "injected" if engine else "fallback",
             "processing_time_ms": processing_time,
+            "last_updated_riyadh": _riyadh_iso(), # ✅ Added Riyadh Time
             "filters_applied": {
                 "risk": req.risk,
                 "confidence": req.confidence,
                 "roi_1m_target": req.required_roi_1m,
                 "top_n": req.top_n,
             },
-            "tickers_scanned": len(tickers),
+            "tickers_scanned": len(tickers) if tickers else "sheet_cache",
             "opportunities_found": count,
         }
     )
