@@ -1,14 +1,13 @@
-Tadawul Fast Bridge / FastAPI + Render + Google Sheets — v1.4.0 (PROD SAFE)
+# Tadawul Fast Bridge — Git Configuration (v1.5.0)
+# =============================================================================
+# PROD SAFE EXCLUSION LIST
+# Prevents secrets, local environments, and runtime artifacts from being committed.
+# =============================================================================
 
-=============================================================================
-
-------------------------------
-
-Python / FastAPI Core
-
-------------------------------
-
-pycache/
+# ------------------------------
+# Python / FastAPI Core
+# ------------------------------
+__pycache__/
 *.py[cod]
 *$py.class
 *.pyd
@@ -16,18 +15,19 @@ pycache/
 .python-version
 .ipynb_checkpoints/
 
-------------------------------
-
-Virtual Environments
-
-------------------------------
-
+# ------------------------------
+# Virtual Environments
+# ------------------------------
 venv/
 .venv/
 env/
 ENV/
 .ENV/
 env.bak/
+
+# ------------------------------
+# Distribution / Build
+# ------------------------------
 build/
 develop-eggs/
 dist/
@@ -43,15 +43,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-------------------------------
-
-Security & Secrets (CRITICAL)
-
-------------------------------
-
-General Env files
-
+# ------------------------------
+# Security & Secrets (CRITICAL)
+# ------------------------------
+# General Env files
 .env
 .env.*
 !.env.example
@@ -62,8 +59,7 @@ env.local
 .env.production.local
 .env.development.local
 
-Google Cloud / Service Account JSONs (Aggressive Guard)
-
+# Google Cloud / Service Account JSONs (Aggressive Guard)
 credentials.json
 service-account.json
 service_account.json
@@ -71,15 +67,16 @@ google_sa.json
 google_creds.json
 sa_key.json
 key.json
-keys/.json
-secrets/.json
-private/.json
+keys/*.json
+secrets/*.json
+private/*.json
 token.json
 client_secret.json
 oauth*.json
+gcp-*.json
+*.json.key
 
-Private Keys / Certificates
-
+# Private Keys / Certificates
 *.pem
 *.key
 *.crt
@@ -88,30 +85,27 @@ Private Keys / Certificates
 *.csr
 *.der
 
-------------------------------
-
-Logs & Performance Metrics
-
-------------------------------
-
+# ------------------------------
+# Logs & Performance Metrics
+# ------------------------------
 *.log
 logs/
 *.out
 *.err
 *.pid
 *.pid.lock
+celerybeat-schedule
+celerybeat.pid
 
-------------------------------
-
-Modern Python Tooling Caches
-
-------------------------------
-
+# ------------------------------
+# Modern Python Tooling Caches
+# ------------------------------
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .cache/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 .tox/
@@ -121,32 +115,25 @@ htmlcov/
 .pytype/
 .pylint.d/
 
-------------------------------
-
-Local Databases & Snapshots
-
-------------------------------
-
+# ------------------------------
+# Local Databases & Snapshots
+# ------------------------------
 *.sqlite
 *.sqlite3
 *.db
 *.dump
-/.snapshots/
-/data/
-/tmp/
-/cache/
-/exports/
-/reports/
-/artifacts/
+.snapshots/
+data/
+tmp/
+cache/
+exports/
+reports/
+artifacts/
 
-------------------------------
-
-IDE & System Garbage
-
-------------------------------
-
-VS Code
-
+# ------------------------------
+# IDE & System Garbage
+# ------------------------------
+# VS Code
 .vscode/
 !.vscode/settings.json
 !.vscode/tasks.json
@@ -154,13 +141,13 @@ VS Code
 !.vscode/extensions.json
 *.code-workspace
 
-JetBrains (PyCharm)
-
+# JetBrains (PyCharm)
 .idea/
 *.iws
+*.iml
+*.ipr
 
-OS Specific
-
+# OS Specific
 .DS_Store
 .DS_Store?
 ._*
@@ -168,25 +155,21 @@ OS Specific
 .Trashes
 ehthumbs.db
 Thumbs.db
+Desktop.ini
 
-------------------------------
-
-Local Deployment Junk
-
-------------------------------
-
+# ------------------------------
+# Local Deployment / Serverless
+# ------------------------------
 .render/
 .vercel/
 .serverless/
 pip-log.txt
 pip-delete-this-directory.txt
+.elasticbeanstalk/
 
-------------------------------
-
-Application Runtime State
-
-------------------------------
-
+# ------------------------------
+# Application Runtime State
+# ------------------------------
 *.bak
 *.swp
 *.swo
