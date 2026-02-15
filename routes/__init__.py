@@ -1,23 +1,19 @@
-# routes/__init__.py
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) – v1.8.1 (Intelligent Discovery)
+Routes package initialization (PROD SAFE) – v1.9.0 (Financial Leader Edition)
 
-Design rules
+Design rules:
 - ZERO heavy imports here (no FastAPI, no routers, no app state).
 - No side effects (no network, no env validation, no file IO).
-- Safe helpers for:
-  • version reporting
-  • dynamic module discovery (scans directory)
-  • optional availability checks (without importing routers directly)
-  • debug snapshot (Render logs friendly)
+- Safe helpers for version reporting and dynamic module discovery.
+- Aligned with core/symbols/normalize.py v1.2.0 standards.
 
-v1.8.1 changes
-- ✅ Dynamic Discovery: Scans routes/ folder for new modules.
-- ✅ Router Verification: Checks if module likely exports 'router'.
-- ✅ Dependency Checks: Verifies critical libraries in debug snapshot.
-- ✅ Advisor-aware: Explicitly tracks investment_advisor status.
+v1.9.0 Changes:
+- ✅ **Advanced Mapping**: Probes for both 'advisor' and 'investment_advisor' variants.
+- ✅ **Dependency Auditing**: Verifies presence of 'zoneinfo' and 'yfinance'.
+- ✅ **Mount Priority**: Optimized deterministic order for main.py integration.
+- ✅ **Environment Hints**: Tracks Riyadh localization and Auth Header status.
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ import pkgutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
-ROUTES_PACKAGE_VERSION = "1.8.1"
+ROUTES_PACKAGE_VERSION = "1.9.0"
 
 
 # -----------------------------------------------------------------------------
@@ -50,8 +46,8 @@ def _discover_route_modules() -> List[str]:
         if name not in ("__init__", "__pycache__"):
             modules.append(f"routes.{name}")
             
-    # Add legacy root modules if they exist (best-effort)
-    root_candidates = ["routes_argaam", "legacy_service"]
+    # Add legacy root modules if they exist (best-effort compatibility)
+    root_candidates = ["routes_argaam", "legacy_service", "advisor", "advanced_analysis"]
     for rc in root_candidates:
         if module_exists(rc):
             modules.append(rc)
@@ -65,11 +61,12 @@ def get_expected_router_modules() -> List[str]:
     """
     discovered = _discover_route_modules()
     
-    # Ensure core routes are always listed even if discovery fails
+    # Explicit list of canonical routes to ensure they are tracked
     core_routes = [
         "routes.enriched_quote",
         "routes.ai_analysis", 
         "routes.advanced_analysis",
+        "routes.advisor",
         "routes.investment_advisor",
         "routes.routes_argaam",
         "routes.legacy_service",
@@ -83,7 +80,7 @@ def get_expected_router_modules() -> List[str]:
 
 def get_expected_router_groups() -> Dict[str, List[str]]:
     """
-    Grouped reference list for mounting logic.
+    Grouped reference list for mounting logic in main.py.
     """
     all_mods = get_expected_router_modules()
     
@@ -91,18 +88,19 @@ def get_expected_router_groups() -> Dict[str, List[str]]:
         "core": [],
         "advisor": [],
         "ksa": [],
-        "optional": []
+        "system": []
     }
     
     for m in all_mods:
-        if "enriched" in m or "analysis" in m or "legacy" in m:
+        m_low = m.lower()
+        if "enriched" in m_low or "analysis" in m_low or "legacy" in m_low:
             groups["core"].append(m)
-        elif "advisor" in m:
+        elif "advisor" in m_low:
             groups["advisor"].append(m)
-        elif "argaam" in m or "tadawul" in m:
+        elif "argaam" in m_low or "tadawul" in m_low:
             groups["ksa"].append(m)
-        else:
-            groups["optional"].append(m)
+        elif "config" in m_low or "health" in m_low:
+            groups["system"].append(m)
             
     return groups
 
@@ -115,33 +113,11 @@ def module_exists(module_path: str) -> bool:
     if not module_path or not isinstance(module_path, str):
         return False
     try:
-        return importlib.util.find_spec(module_path) is not None
+        # Standard lookup
+        spec = importlib.util.find_spec(module_path)
+        return spec is not None
     except Exception:
         return False
-
-
-def get_available_router_modules(expected: Optional[List[str]] = None) -> List[str]:
-    """
-    Returns the subset of expected modules that appear importable.
-    """
-    exp = expected or get_expected_router_modules()
-    out: List[str] = []
-    for m in exp:
-        if module_exists(m):
-            out.append(m)
-    return out
-
-
-def get_missing_router_modules(expected: Optional[List[str]] = None) -> List[str]:
-    """
-    Returns the subset of expected modules that appear missing/unimportable.
-    """
-    exp = expected or get_expected_router_modules()
-    out: List[str] = []
-    for m in exp:
-        if not module_exists(m):
-            out.append(m)
-    return out
 
 
 # -----------------------------------------------------------------------------
@@ -157,7 +133,7 @@ def _first_existing(candidates: List[str]) -> Optional[str]:
 def get_router_discovery() -> Dict[str, Dict[str, object]]:
     """
     Returns a structured view of where each router SHOULD be imported from.
-    Includes 'status' to indicate if it's found or missing.
+    This logic handles repo-refactoring (e.g. moving investment_advisor to advisor).
     """
     discovery: Dict[str, Dict[str, object]] = {}
 
@@ -170,12 +146,13 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
             "status": "ready" if sel else "missing"
         }
 
+    # Probing patterns based on the most robust project structure
     _probe("enriched", ["routes.enriched_quote", "routes.enriched"])
-    _probe("ai_analysis", ["routes.ai_analysis"])
+    _probe("ai_analysis", ["routes.ai_analysis", "routes.ai"])
     _probe("advanced_analysis", ["routes.advanced_analysis"])
-    _probe("legacy_service", ["routes.legacy_service"])
-    _probe("investment_advisor", ["routes.investment_advisor"])
+    _probe("advisor", ["routes.advisor", "routes.investment_advisor", "routes.advisor_engine"])
     _probe("argaam", ["routes.routes_argaam", "routes_argaam"])
+    _probe("legacy", ["routes.legacy_service", "legacy_service"])
     _probe("config", ["routes.config"])
 
     return discovery
@@ -184,11 +161,13 @@ def get_router_discovery() -> Dict[str, Dict[str, object]]:
 def get_recommended_imports() -> List[Tuple[str, str]]:
     """
     Returns a deterministic list of recommended module imports for main.py.
+    Used for mounting order: Security -> Core -> KSA -> Optional.
     """
     d = get_router_discovery()
     out: List[Tuple[str, str]] = []
-    # Order matters for mounting priority
-    priority = ["enriched", "ai_analysis", "advanced_analysis", "investment_advisor", "argaam", "legacy_service", "config"]
+    
+    # Execution/Mount Order: Enriched Quote first (primary), then Analysis, then Advisor
+    priority = ["enriched", "ai_analysis", "advanced_analysis", "advisor", "argaam", "legacy", "config"]
     
     for key in priority:
         sel = d.get(key, {}).get("selected")
@@ -204,51 +183,57 @@ def _env_flag(name: str) -> bool:
     return bool((os.getenv(name) or "").strip())
 
 
+def get_available_router_modules(expected: Optional[List[str]] = None) -> List[str]:
+    exp = expected or get_expected_router_modules()
+    return [m for m in exp if module_exists(m)]
+
+
 def get_routes_debug_snapshot() -> Dict[str, object]:
     """
     Extremely lightweight debug snapshot for logs.
-    Safe to call during startup.
+    Safe to call during startup without triggering network/FastAPI.
     """
     expected = get_expected_router_modules()
     available = get_available_router_modules(expected)
     missing = [m for m in expected if m not in available]
 
-    # Dependency Checks (Critical libs for data engine)
+    # Dependency Checks (Critical libs for the modern data engine)
     deps = {
         "pandas": module_exists("pandas"),
         "numpy": module_exists("numpy"),
-        "google-auth": module_exists("google.auth"),
+        "zoneinfo": module_exists("zoneinfo"), # Critical for Riyadh Time
         "httpx": module_exists("httpx"),
-        "yfinance": module_exists("yfinance")
+        "yfinance": module_exists("yfinance") # Essential for Fundamentals
     }
 
     # Environment hints
     env_hints = {
         "app_token_set": _env_flag("APP_TOKEN"),
-        "backup_app_token_set": _env_flag("BACKUP_APP_TOKEN"),
-        "tfb_app_token_set": _env_flag("TFB_APP_TOKEN"),
-        "allow_query_token": (os.getenv("ALLOW_QUERY_TOKEN") or "").strip().lower() in ("1", "true", "yes", "on"),
-        "debug_errors": (os.getenv("DEBUG_ERRORS") or "").strip().lower() in ("1", "true", "yes", "on"),
-        "log_level": (os.getenv("LOG_LEVEL") or "").strip().lower() or "info",
-        "app_env": (os.getenv("APP_ENV") or "").strip().lower() or "production",
-        "advisor_enabled": (os.getenv("ADVISOR_ENABLED") or "").strip().lower() in ("", "1", "true", "yes", "on"),
+        "riyadh_time_enforced": _env_bool_safe("ENFORCE_RIYADH_TIME", True),
+        "debug_mode": _env_bool_safe("DEBUG_ERRORS", False),
+        "log_level": (os.getenv("LOG_LEVEL") or "info").lower(),
+        "app_env": (os.getenv("APP_ENV") or "production").lower(),
+        "advisor_active": _env_bool_safe("ADVISOR_ENABLED", True),
     }
 
-    discovery = get_router_discovery()
-    
     return {
         "routes_pkg_version": ROUTES_PACKAGE_VERSION,
-        "modules": {
-            "expected": len(expected),
-            "available": len(available),
-            "missing": len(missing)
+        "summary": {
+            "expected_count": len(expected),
+            "available_count": len(available),
+            "missing_count": len(missing)
         },
-        "available_modules": available,
-        "missing_modules": missing,
-        "discovery_map": discovery,
-        "dependencies": deps,
+        "available": available,
+        "discovery": get_router_discovery(),
+        "system_deps": deps,
         "env_hints": env_hints,
     }
+
+
+def _env_bool_safe(name: str, default: bool) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if not v: return default
+    return v in ("1", "true", "yes", "on", "t")
 
 
 __all__ = [
@@ -258,7 +243,6 @@ __all__ = [
     "get_expected_router_groups",
     "module_exists",
     "get_available_router_modules",
-    "get_missing_router_modules",
     "get_router_discovery",
     "get_recommended_imports",
     "get_routes_debug_snapshot",
