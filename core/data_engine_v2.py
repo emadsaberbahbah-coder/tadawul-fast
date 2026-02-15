@@ -1,20 +1,34 @@
+#!/usr/bin/env python3
 """
 core/data_engine_v2.py
 ===============================================================
-UNIFIED DATA ENGINE (v2.17.0) — PROD SAFE + ADVANCED ANALYTICS
+UNIFIED DATA ENGINE (v2.20.0) — PROD SAFE + ADVANCED ANALYTICS (PURE PY)
 
-What’s improved in v2.17.0
-- ✅ Non-blocking provider calls: sync providers run in a thread via asyncio.to_thread (prevents event-loop blocking).
-- ✅ Provider timeouts: optional per-provider timeout via PROVIDER_TIMEOUT_SEC (default 12s).
-- ✅ Clearer provider diagnostics: captures module/function used + exception class.
-- ✅ Trend intelligence hardened: slope uses last N bars, adds neutral threshold, keeps backward-compatible keys.
-- ✅ Safer math: guards for None/NaN/Inf everywhere (best-effort, never raises outward).
-- ✅ Cache stability preserved: cache key remains (symbol_norm + fields); sheet snapshot keys remain deterministic.
+FULL REPLACEMENT (v2.20.0) — What’s improved vs v2.17.0
+- ✅ Stronger provider orchestration:
+    - per-provider timeout override: PROVIDER_TIMEOUT_<PROVIDER>_SEC
+    - structured diagnostics per provider: module, function, latency_ms, error_class, error
+- ✅ Deterministic, Sheets-safe output keys:
+    - always returns: symbol, symbol_normalized, requested_symbol, symbol_input, market, data_source, data_quality
+- ✅ Field-scoped fetching:
+    - "fields" supports groups: price, fundamentals, history, technicals, forecast, scores, all
+    - providers still receive the original "fields" string (backward-compatible)
+- ✅ Cache resilience:
+    - optional stale-on-error fallback: ENGINE_CACHE_STALE_ON_ERROR=true
+    - cache entries include cached_at_utc / cached_at_riyadh and cache_hit boolean
+- ✅ History analytics hardened:
+    - robust extraction for multiple payload shapes
+    - adds: atr_14, sma/ema convenience, trend strength, neutral thresholds
+- ✅ Forecast synthesis upgraded (no external deps):
+    - uses momentum + trend + volatility + fundamentals presence
+    - clamps confidence into [0.20..0.90]
+- ✅ Safe math everywhere: guards None/NaN/Inf + Arabic digit parsing
+- ✅ Sheet snapshot cache kept (key-stable), improved meta payload
 
 Design goals
-- ✅ PROD SAFE: Pure Python math (no pandas/numpy hard deps) for fast boot.
-- ✅ Router-friendly: Returns dicts (Sheets-safe) and never raises outward.
-- ✅ Cache key includes (symbol_norm + fields) and remains stable.
+- ✅ PROD SAFE: no pandas/numpy hard deps; no external network in this module.
+- ✅ Router-friendly: returns dicts only; never raises outward.
+- ✅ Cache key remains stable: (symbol_norm + fields).
 """
 
 from __future__ import annotations
@@ -32,7 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.17.0"
+ENGINE_VERSION = "2.20.0"
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
@@ -46,8 +60,8 @@ _TD_6M = 126
 _TD_12M = 252
 
 # Provider runtime controls
-_PROVIDER_TIMEOUT_SEC_DEFAULT = 12  # seconds
-_PROVIDER_TIMEOUT_SEC = None  # lazy env read
+_PROVIDER_TIMEOUT_SEC_DEFAULT = 12.0  # seconds
+_PROVIDER_TIMEOUT_SEC: Optional[float] = None  # lazy env read
 
 
 def _provider_timeout_sec() -> float:
@@ -67,6 +81,26 @@ def _provider_timeout_sec() -> float:
     except Exception:
         _PROVIDER_TIMEOUT_SEC = float(_PROVIDER_TIMEOUT_SEC_DEFAULT)
         return _PROVIDER_TIMEOUT_SEC
+
+
+def _provider_timeout_override(provider_key: str) -> float:
+    """
+    Optional per-provider override:
+      PROVIDER_TIMEOUT_EODHD_SEC=8
+      PROVIDER_TIMEOUT_FINNHUB_SEC=10
+    """
+    key = re.sub(r"[^A-Za-z0-9]+", "_", (provider_key or "").strip().upper())
+    env_name = f"PROVIDER_TIMEOUT_{key}_SEC"
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return _provider_timeout_sec()
+    try:
+        v = float(raw)
+        if v <= 0:
+            return _provider_timeout_sec()
+        return float(min(120.0, max(2.0, v)))
+    except Exception:
+        return _provider_timeout_sec()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +213,9 @@ def _norm_reco(x: Any, default: str = "HOLD") -> str:
         return d
 
 
+# ============================================================
+# Helpers (time, env, parsing)
+# ============================================================
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -201,10 +238,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _safe_int(v: Any, default: int) -> int:
     try:
-        n = int(str(v).strip())
-        return n
+        return int(str(v).strip())
     except Exception:
         return default
+
+
+def _is_nan_inf(f: float) -> bool:
+    try:
+        return math.isnan(f) or math.isinf(f)
+    except Exception:
+        return True
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -213,9 +256,7 @@ def _safe_float(val: Any) -> Optional[float]:
     try:
         if isinstance(val, (int, float)) and not isinstance(val, bool):
             f = float(val)
-            if math.isnan(f) or math.isinf(f):
-                return None
-            return f
+            return None if _is_nan_inf(f) else f
 
         s = str(val).strip()
         if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
@@ -237,9 +278,7 @@ def _safe_float(val: Any) -> Optional[float]:
             s = num
 
         f = float(s) * mult
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
+        return None if _is_nan_inf(f) else f
     except Exception:
         return None
 
@@ -249,6 +288,7 @@ def _maybe_percent(v: Any) -> Optional[float]:
     if x is None:
         return None
     try:
+        # if appears like fraction, convert to percent
         if abs(x) <= 1.5:
             return x * 100.0
         return x
@@ -328,18 +368,13 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _provider_symbol(sym_norm: str, provider_key: str) -> str:
-    """
-    Provider-specific symbol adjustments (best-effort).
-    """
     s = (sym_norm or "").strip().upper()
     k = (provider_key or "").strip().lower()
 
-    # Most providers accept the canonical symbol as-is.
-    # Keep rule minimal; do not break KSA (.SR) handling.
-    if k in {"finnhub", "yahoo_chart", "yahoo", "yfinance"}:
-        # If some upstream code ever produces ".US", strip it for Yahoo-style consumers.
+    # Keep KSA numeric normalization intact.
+    # Only strip ".US" if upstream accidentally adds it and provider prefers plain.
+    if k in {"yahoo", "yahoo_chart", "yfinance"}:
         return s[:-3] if s.endswith(".US") else s
-
     return s
 
 
@@ -351,10 +386,13 @@ def _merge_patch(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
             dst[k] = v
 
 
+# ============================================================
+# Provider calls (compat + non-blocking + timeout)
+# ============================================================
 def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
     """
     Calls a provider in a compatibility manner, trying multiple common signatures.
-    This function is synchronous; if fn is async it will return an awaitable.
+    This function is synchronous; if fn is async it returns an awaitable.
     """
     try:
         return fn(symbol, refresh=refresh, fields=fields)
@@ -398,14 +436,19 @@ def _call_provider_best_effort(fn: Callable[..., Any], symbol: str, refresh: boo
     return fn(symbol)
 
 
-async def _call_provider_nonblocking(fn: Callable[..., Any], symbol: str, refresh: bool, fields: Optional[str]) -> Any:
+async def _call_provider_nonblocking(
+    fn: Callable[..., Any],
+    symbol: str,
+    refresh: bool,
+    fields: Optional[str],
+    timeout_sec: float,
+) -> Any:
     """
     Non-blocking wrapper:
     - If provider is async/coro -> await it.
     - If provider is sync -> run in thread via asyncio.to_thread.
-    - Always applies a timeout (best-effort) with asyncio.wait_for.
+    - Always applies a timeout with asyncio.wait_for.
     """
-    timeout = _provider_timeout_sec()
 
     async def _runner() -> Any:
         if inspect.iscoroutinefunction(fn):
@@ -413,18 +456,13 @@ async def _call_provider_nonblocking(fn: Callable[..., Any], symbol: str, refres
             if inspect.isawaitable(raw):
                 return await raw
             return raw
-        # sync provider: execute in thread to avoid blocking loop
+
         raw = await asyncio.to_thread(_call_provider_best_effort, fn, symbol, refresh, fields)
         if inspect.isawaitable(raw):
             return await raw
         return raw
 
-    try:
-        return await asyncio.wait_for(_runner(), timeout=timeout)
-    except asyncio.TimeoutError:
-        raise
-    except Exception:
-        raise
+    return await asyncio.wait_for(_runner(), timeout=timeout_sec)
 
 
 def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable[..., Any]], Optional[str]]:
@@ -463,27 +501,50 @@ def _discover_callable(mod: Any, fn_names: List[str]) -> Tuple[Optional[Callable
 
 
 async def _try_provider_call(
+    provider_key: str,
     module_name: str,
     fn_names: List[str],
     symbol: str,
     refresh: bool,
     fields: Optional[str],
-) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+) -> Tuple[Dict[str, Any], Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Returns:
+      patch, err_msg, used_callable, diag
+    """
+    diag: Dict[str, Any] = {
+        "provider": provider_key,
+        "module": module_name,
+        "callable": None,
+        "latency_ms": None,
+        "ok": False,
+        "error_class": None,
+        "error": None,
+        "timeout_sec": _provider_timeout_override(provider_key),
+    }
+
+    t0 = time.time()
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
-        return {}, f"{module_name}: import failed ({e.__class__.__name__}: {e})", None
+        diag["error_class"] = e.__class__.__name__
+        diag["error"] = str(e)
+        return {}, f"{module_name}: import failed ({diag['error_class']}: {e})", None, diag
 
     fn, used = _discover_callable(mod, fn_names)
+    diag["callable"] = used
     if fn is None:
-        return {}, f"{module_name}: no callable in {fn_names}", None
+        return {}, f"{module_name}: no callable in {fn_names}", None, diag
 
+    sym_for_provider = symbol
     try:
-        raw = await _call_provider_nonblocking(fn, symbol, refresh, fields)
+        timeout = float(diag["timeout_sec"])
+        raw = await _call_provider_nonblocking(fn, sym_for_provider, refresh, fields, timeout_sec=timeout)
 
         patch: Any = raw
         err: Optional[str] = None
 
+        # Unwrap common tuple envelopes
         try:
             if isinstance(raw, tuple) and len(raw) >= 2:
                 patch = raw[0]
@@ -496,37 +557,54 @@ async def _try_provider_call(
             err = None
 
         if isinstance(patch, dict):
-            return patch, err, used
-        return {}, f"{module_name}.{used}: unexpected return type", used
+            diag["ok"] = True
+            diag["latency_ms"] = round((time.time() - t0) * 1000.0, 2)
+            return patch, err, used, diag
+
+        diag["error"] = "unexpected return type"
+        diag["latency_ms"] = round((time.time() - t0) * 1000.0, 2)
+        return {}, f"{module_name}.{used}: unexpected return type", used, diag
 
     except asyncio.TimeoutError:
-        return {}, f"{module_name}.{used}: timeout after {_provider_timeout_sec():g}s", used
+        diag["error_class"] = "TimeoutError"
+        diag["error"] = f"timeout after {diag['timeout_sec']}s"
+        diag["latency_ms"] = round((time.time() - t0) * 1000.0, 2)
+        return {}, f"{module_name}.{used}: timeout after {diag['timeout_sec']}s", used, diag
+
     except Exception as e:
-        return {}, f"{module_name}.{used}: call failed ({e.__class__.__name__}: {e})", used
+        diag["error_class"] = e.__class__.__name__
+        diag["error"] = str(e)
+        diag["latency_ms"] = round((time.time() - t0) * 1000.0, 2)
+        return {}, f"{module_name}.{used}: call failed ({diag['error_class']}: {e})", used, diag
 
 
 async def _try_provider_candidates(
+    provider_key: str,
     module_candidates: List[str],
     fn_candidates: List[str],
     symbol: str,
     refresh: bool,
     fields: Optional[str],
-) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
-    last_err: Optional[str] = None
-    last_used: Optional[str] = None
+) -> Tuple[Dict[str, Any], List[str], List[Dict[str, Any]]]:
+    errs: List[str] = []
+    diags: List[Dict[str, Any]] = []
     for mod in module_candidates:
-        patch, err, used = await _try_provider_call(mod, fn_candidates, symbol=symbol, refresh=refresh, fields=fields)
+        patch, err, _used, diag = await _try_provider_call(
+            provider_key=provider_key,
+            module_name=mod,
+            fn_names=fn_candidates,
+            symbol=symbol,
+            refresh=refresh,
+            fields=fields,
+        )
+        diags.append(diag)
         if patch:
-            return patch, err, mod
-        last_err = err
-        last_used = used
-    return {}, last_err, last_used
-
-
-def _tadawul_configured() -> bool:
-    tq = (os.getenv("TADAWUL_QUOTE_URL") or "").strip()
-    tf = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip()
-    return bool(tq or tf)
+            if err:
+                errs.append(f"{provider_key}: {err}")
+            return patch, errs, diags
+        if err:
+            errs.append(f"{provider_key}: {err}")
+    return {}, errs, diags
 
 
 # ============================================================
@@ -563,6 +641,7 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
         if payload is None:
             return out
 
+        # common dict shapes
         if isinstance(payload, dict):
             if isinstance(payload.get("candles"), dict):
                 c = payload.get("candles") or {}
@@ -588,7 +667,8 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                 out.sort(key=lambda x: x[0])
                 return out
 
-            for key in ("history", "prices", "price_history", "ohlc", "candles_list"):
+            # nested arrays
+            for key in ("history", "prices", "price_history", "ohlc", "candles_list", "bars"):
                 arr = payload.get(key)
                 if isinstance(arr, list) and arr:
                     payload = arr
@@ -598,6 +678,7 @@ def _extract_close_series(payload: Any) -> List[Tuple[int, float]]:
                 if isinstance(arr, list) and arr:
                     payload = arr
 
+        # list shapes
         if isinstance(payload, list):
             for item in payload:
                 if item is None:
@@ -638,7 +719,6 @@ def _ema(values: List[float], period: int) -> List[Optional[float]]:
 
     alpha = 2.0 / (period + 1.0)
 
-    # Simple MA for first point
     sma_first = sum(values[:period]) / float(period)
     ema: List[Optional[float]] = [None] * (period - 1) + [sma_first]
 
@@ -653,7 +733,6 @@ def _ema(values: List[float], period: int) -> List[Optional[float]]:
 
 
 def _macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    # MACD(12, 26, 9) - last values
     if len(closes) < 35:
         return None, None, None
 
@@ -682,7 +761,6 @@ def _macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Option
 
 
 def _linear_slope(values: List[float]) -> Optional[float]:
-    """Simple linear regression slope."""
     n = len(values)
     if n < 2:
         return None
@@ -694,17 +772,34 @@ def _linear_slope(values: List[float]) -> Optional[float]:
     sum_xy = sum(i * j for i, j in zip(x, y))
     sum_xx = sum(i * i for i in x)
 
-    denominator = (n * sum_xx - sum_x * sum_x)
-    if denominator == 0:
+    denom = (n * sum_xx - sum_x * sum_x)
+    if denom == 0:
         return 0.0
 
-    slope = (n * sum_xy - sum_x * sum_y) / denominator
-    return float(slope)
+    return float((n * sum_xy - sum_x * sum_y) / denom)
 
 
-# ============================================================
-# Basic Math Helpers
-# ============================================================
+def _atr_14(series: List[Tuple[int, float]]) -> Optional[float]:
+    """
+    ATR requires high/low/close ideally; we approximate with absolute close-to-close moves.
+    This is a proxy ATR (still useful for rough volatility scaling).
+    """
+    try:
+        closes = [c for _, c in series if c is not None]
+        if len(closes) < 20:
+            return None
+        period = 14
+        trs: List[float] = []
+        for i in range(1, len(closes)):
+            trs.append(abs(closes[i] - closes[i - 1]))
+        if len(trs) < period:
+            return None
+        chunk = trs[-period:]
+        return sum(chunk) / float(period)
+    except Exception:
+        return None
+
+
 def _pct(a: float, b: float) -> Optional[float]:
     try:
         if b == 0:
@@ -811,6 +906,7 @@ def _apply_history_analytics(out: Dict[str, Any]) -> None:
         out.setdefault("ma20", _sma(closes, 20))
         out.setdefault("ma50", _sma(closes, 50))
         out.setdefault("ma200", _sma(closes, 200))
+        out.setdefault("ema20", (_ema(closes, 20)[-1] if len(closes) >= 20 else None))
         out.setdefault("volatility_30d", _volatility_30d(closes))
         out.setdefault("rsi_14", _rsi_14(closes))
 
@@ -819,35 +915,44 @@ def _apply_history_analytics(out: Dict[str, Any]) -> None:
         out.setdefault("macd_signal", sig)
         out.setdefault("macd_hist", hist)
 
-        # Trend Analysis (last 30 bars by default)
-        window = min(30, len(closes))
+        # Trend Analysis (last N bars)
+        window = min(_safe_int(os.getenv("TREND_WINDOW_BARS", "30"), 30), len(closes))
         slope = _linear_slope(closes[-window:])
         out.setdefault("trend_30d", slope)
 
-        # Trend signal with a small neutral threshold (avoid noisy flips)
+        # Neutral threshold
         trend_sig = "NEUTRAL"
+        thr_env = (os.getenv("TREND_SLOPE_THRESHOLD") or "").strip()
+        thr = _safe_float(thr_env) if thr_env else None
+        if thr is None:
+            last = closes[-1]
+            thr = max(0.0, abs(last) * 0.00002)  # ~0.002% of price per bar
+
         if slope is not None:
-            thr = float(os.getenv("TREND_SLOPE_THRESHOLD", "0") or "0")
-            # If not provided, derive a tiny threshold from recent price scale
-            if thr == 0.0:
-                last = closes[-1]
-                thr = max(0.0, abs(last) * 0.00002)  # ~0.002% of price per bar
-            if slope > thr:
+            if slope > float(thr):
                 trend_sig = "UPTREND"
-            elif slope < -thr:
+            elif slope < -float(thr):
                 trend_sig = "DOWNTREND"
             else:
                 trend_sig = "NEUTRAL"
+
         out.setdefault("trend_signal", trend_sig)
+
+        # Trend strength proxy (normalized)
+        if slope is not None and closes[-1] not in (None, 0):
+            out.setdefault("trend_strength", abs(slope) / max(1e-9, abs(closes[-1])))
+
+        out.setdefault("atr_14", _atr_14(series))
 
         if not _env_bool("KEEP_RAW_HISTORY", False):
             out.pop("history_payload", None)
+
     except Exception:
         return
 
 
 # ============================================================
-# Canonical + alias mapping
+# Canonical + alias mapping + derived fields
 # ============================================================
 def _map_common_aliases(out: Dict[str, Any]) -> None:
     if out.get("current_price") is None:
@@ -972,6 +1077,7 @@ def _apply_derived(out: Dict[str, Any]) -> None:
         if cur is not None and hi is not None and lo is not None and hi != lo:
             out["position_52w_percent"] = (cur - lo) / (hi - lo) * 100.0
 
+    # percent-like fields
     for k in ("dividend_yield", "roe", "roa", "payout_ratio", "net_margin", "ebitda_margin"):
         if out.get(k) is not None:
             out[k] = _maybe_percent(out.get(k))
@@ -998,6 +1104,7 @@ def _apply_derived(out: Dict[str, Any]) -> None:
             else:
                 out["free_float_market_cap"] = mc * ff
 
+    # valuation convenience
     cur2 = _safe_float(out.get("current_price"))
     fv = _safe_float(out.get("fair_value"))
     if fv is None:
@@ -1104,6 +1211,12 @@ def _mirror_forecast_aliases(out: Dict[str, Any]) -> None:
 
 
 def _forecast_from_momentum(out: Dict[str, Any]) -> None:
+    """
+    Pure-python forecast synthesizer:
+    - uses returns as baseline if present
+    - adjusts by trend signal and volatility
+    - sets confidence with fundamentals and stability heuristics
+    """
     cur = _safe_float(out.get("current_price"))
     if cur is None or cur <= 0:
         return
@@ -1125,6 +1238,9 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
             out["expected_roi_1m"] = float(out["expected_roi_1m"]) * 0.5
         if out.get("expected_roi_3m") is not None and float(out["expected_roi_3m"]) > 0:
             out["expected_roi_3m"] = float(out["expected_roi_3m"]) * 0.7
+    elif trend_sig == "UPTREND":
+        if out.get("expected_roi_1m") is not None and float(out["expected_roi_1m"]) > 0:
+            out["expected_roi_1m"] = float(out["expected_roi_1m"]) * 1.10
 
     er1 = _safe_float(out.get("expected_roi_1m"))
     er3 = _safe_float(out.get("expected_roi_3m"))
@@ -1140,21 +1256,33 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
     if out.get("forecast_confidence") is None:
         vol = _safe_float(out.get("volatility_30d"))
         has_f = _has_any_fundamentals(out)
-        base = 0.60 if has_f else 0.48
+        base = 0.62 if has_f else 0.50
+
         if vol is None:
             conf = base
         else:
-            conf = base - min(0.25, max(0.0, (vol - 20.0) / 200.0))
+            # higher vol => lower confidence
+            conf = base - min(0.28, max(0.0, (vol - 20.0) / 180.0))
 
+        # trend alignment bonus
         if trend_sig == "UPTREND" and (er3 or 0) > 0:
             conf += 0.10
         elif trend_sig == "DOWNTREND" and (er3 or 0) < 0:
             conf += 0.10
 
+        # stabilize with ATR proxy if available
+        atr = _safe_float(out.get("atr_14"))
+        if atr is not None and atr > 0 and cur > 0:
+            atr_pct = (atr / cur) * 100.0
+            if atr_pct < 1.5:
+                conf += 0.05
+            elif atr_pct > 4.0:
+                conf -= 0.05
+
         conf = max(0.20, min(0.90, conf))
         out["forecast_confidence"] = conf
 
-    out.setdefault("forecast_method", "momentum_trend_v2")
+    out.setdefault("forecast_method", "momentum_trend_v2.20")
     out.setdefault("forecast_updated_utc", _utc_iso())
     out.setdefault("forecast_updated_riyadh", _riyadh_iso())
 
@@ -1165,6 +1293,7 @@ def _forecast_from_momentum(out: Dict[str, Any]) -> None:
 class UnifiedQuote(BaseModel):
     symbol: str = Field(default="")
     symbol_normalized: str = Field(default="")
+    requested_symbol: str = Field(default="")
     symbol_input: str = Field(default="")
 
     name: Optional[str] = None
@@ -1206,8 +1335,6 @@ class UnifiedQuote(BaseModel):
     roa: Optional[float] = None
     net_margin: Optional[float] = None
     ebitda_margin: Optional[float] = None
-    revenue_growth: Optional[float] = None
-    net_income_growth: Optional[float] = None
 
     beta: Optional[float] = None
     volatility_30d: Optional[float] = None
@@ -1218,6 +1345,8 @@ class UnifiedQuote(BaseModel):
     macd_hist: Optional[float] = None
     trend_30d: Optional[float] = None
     trend_signal: Optional[str] = None
+    trend_strength: Optional[float] = None
+    atr_14: Optional[float] = None
 
     fair_value: Optional[float] = None
     upside_percent: Optional[float] = None
@@ -1231,6 +1360,7 @@ class UnifiedQuote(BaseModel):
     ma20: Optional[float] = None
     ma50: Optional[float] = None
     ma200: Optional[float] = None
+    ema20: Optional[float] = None
 
     expected_roi_1m: Optional[float] = None
     expected_roi_3m: Optional[float] = None
@@ -1341,6 +1471,49 @@ _PROVIDER_REGISTRY: Dict[str, Dict[str, Any]] = {
         "functions": ["get_enriched_quote", "get_quote", "fetch_quote", "quote", "fetch"],
     },
 }
+
+
+def _tadawul_configured() -> bool:
+    tq = (os.getenv("TADAWUL_QUOTE_URL") or "").strip()
+    tf = (os.getenv("TADAWUL_FUNDAMENTALS_URL") or "").strip()
+    return bool(tq or tf)
+
+
+# ============================================================
+# Field-scoped fetching (groups)
+# ============================================================
+_FIELD_GROUPS: Dict[str, set] = {
+    "price": {"price", "quote", "quotes", "market"},
+    "fundamentals": {"fundamentals", "fundamental", "financials", "valuation"},
+    "history": {"history", "chart", "candles", "bars"},
+    "technicals": {"technicals", "technical", "ta", "rsi", "macd", "trend"},
+    "forecast": {"forecast", "forecasts", "expected", "roi"},
+    "scores": {"scores", "score", "scoring", "badges", "reco", "recommendation"},
+    "all": {"all", "*"},
+}
+
+
+def _parse_fields(fields: Optional[str]) -> set:
+    if not fields:
+        return {"all"}
+    s = str(fields).strip().lower()
+    if not s:
+        return {"all"}
+    tokens = [t.strip() for t in re.split(r"[,\s;|]+", s) if t.strip()]
+    out = set()
+    for t in tokens:
+        if t in _FIELD_GROUPS:
+            out |= _FIELD_GROUPS[t]
+        else:
+            out.add(t)
+    return out or {"all"}
+
+
+def _want(group: str, parsed_fields: set) -> bool:
+    if "all" in parsed_fields or "*" in parsed_fields:
+        return True
+    return bool(_FIELD_GROUPS.get(group, set()) & parsed_fields) or (group in parsed_fields)
+
 
 # ============================================================
 # Sheet-name canonicalization (KEY-STABLE cache)
@@ -1456,6 +1629,10 @@ class DataEngine:
 
         self._cache: TTLCache = TTLCache(maxsize=maxsize, ttl=self.cache_ttl_sec)  # type: ignore
 
+        # Cache behavior
+        self.cache_stale_on_error = _env_bool("ENGINE_CACHE_STALE_ON_ERROR", True)
+
+        # Sheet cache
         sheet_ttl = _safe_int(os.getenv("SHEET_CACHE_TTL_SEC", "180"), 180)
         sheet_ttl = max(30, min(3600, sheet_ttl))
         sheet_max = _safe_int(os.getenv("SHEET_CACHE_MAXSIZE", "64"), 64)
@@ -1464,6 +1641,7 @@ class DataEngine:
         self.sheet_cache_ttl_sec = sheet_ttl
         self._sheet_cache: TTLCache = TTLCache(maxsize=sheet_max, ttl=self.sheet_cache_ttl_sec)  # type: ignore
 
+        # Providers (settings override env)
         default_global = (os.getenv("PROVIDERS") or os.getenv("ENABLED_PROVIDERS") or "eodhd,finnhub").strip() or "eodhd,finnhub"
         default_ksa = (os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam").strip() or "yahoo_chart,argaam"
 
@@ -1487,11 +1665,13 @@ class DataEngine:
         if _tadawul_configured() and "tadawul" not in self.ksa_providers:
             self.ksa_providers.append("tadawul")
 
+        # Analytics toggles
         self.enable_history = _env_bool("ENABLE_HISTORY_ANALYTICS", True)
         self.include_warnings = _env_bool("ENGINE_INCLUDE_WARNINGS", False)
+        self.include_provider_diag = _env_bool("ENGINE_INCLUDE_PROVIDER_DIAG", False)
 
         logger.info(
-            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s | sheet_ttl=%ss | sheet_max=%s | provider_timeout=%ss",
+            "DataEngine v%s | ttl=%ss | maxsize=%s | conc=%s | global=%s | ksa=%s | history=%s | cachetools=%s | sheet_ttl=%ss | sheet_max=%s | provider_timeout=%ss | stale_on_error=%s",
             ENGINE_VERSION,
             self.cache_ttl_sec,
             maxsize,
@@ -1503,6 +1683,7 @@ class DataEngine:
             self.sheet_cache_ttl_sec,
             sheet_max,
             _provider_timeout_sec(),
+            self.cache_stale_on_error,
         )
 
     async def aclose(self) -> None:
@@ -1603,22 +1784,45 @@ class DataEngine:
         if not sym_norm:
             return self._placeholder(sym_in, err="Missing symbol")
 
-        cache_key = f"q::{sym_norm}::{(fields or '').strip()}"
+        fields_norm = (fields or "").strip()
+        cache_key = f"q::{sym_norm}::{fields_norm}"
+
         if not refresh:
             cached = self._cache.get(cache_key)
             if isinstance(cached, dict) and cached.get("symbol_normalized") == sym_norm:
-                return dict(cached)
+                out = dict(cached)
+                out["cache_hit"] = True
+                return out
+
+        # if refresh requested, keep a stale copy for fallback
+        stale = None
+        try:
+            stale = self._cache.get(cache_key)
+            if not isinstance(stale, dict):
+                stale = None
+        except Exception:
+            stale = None
 
         try:
             async with self._sem:
-                out = await self._fetch_and_build(sym_in, sym_norm, refresh=refresh, fields=fields)
+                out = await self._fetch_and_build(sym_in, sym_norm, refresh=refresh, fields=fields_norm)
         except Exception as e:
             out = self._placeholder(sym_in, err=f"Engine error: {e.__class__.__name__}: {e}")
+            if self.cache_stale_on_error and isinstance(stale, dict) and _safe_float(stale.get("current_price")) is not None:
+                out = dict(stale)
+                out["error"] = f"STALE_CACHE_USED: {e.__class__.__name__}"
+                out["data_quality"] = out.get("data_quality") or "PARTIAL"
+                out["cache_hit"] = True
+
+        out.setdefault("cached_at_utc", _utc_iso())
+        out.setdefault("cached_at_riyadh", _riyadh_iso())
+        out["cache_hit"] = bool(out.get("cache_hit", False))
 
         try:
             self._cache[cache_key] = dict(out)  # type: ignore[index]
         except Exception:
             pass
+
         return out
 
     async def get_quote(self, symbol: str, refresh: bool = False, fields: Optional[str] = None) -> Dict[str, Any]:
@@ -1652,9 +1856,12 @@ class DataEngine:
     # Core build
     # --------------------
     async def _fetch_and_build(self, symbol_input: str, sym_norm: str, refresh: bool, fields: Optional[str]) -> Dict[str, Any]:
+        parsed_fields = _parse_fields(fields)
+
         out: Dict[str, Any] = {
             "symbol": sym_norm,
             "symbol_normalized": sym_norm,
+            "requested_symbol": sym_norm,  # explicit for Sheets alignment
             "symbol_input": (symbol_input or "").strip(),
             "market": "KSA" if _is_ksa(sym_norm) else "GLOBAL",
             "last_updated_utc": _utc_iso(),
@@ -1666,59 +1873,81 @@ class DataEngine:
 
         used_sources: List[str] = []
         warnings: List[str] = []
+        provider_diags: List[Dict[str, Any]] = []
 
-        for key in providers:
-            reg = _PROVIDER_REGISTRY.get(key)
-            if not reg:
-                warnings.append(f"{key}: unknown provider key")
-                continue
+        # If user only wants "scores", skip providers and rely on scoring_engine + placeholders
+        skip_providers = (_want("scores", parsed_fields) and not any(_want(g, parsed_fields) for g in ("price", "fundamentals", "history", "technicals")))
+        if not skip_providers:
+            for key in providers:
+                reg = _PROVIDER_REGISTRY.get(key)
+                if not reg:
+                    warnings.append(f"{key}: unknown provider key")
+                    continue
 
-            sym_for_provider = _provider_symbol(sym_norm, key)
+                sym_for_provider = _provider_symbol(sym_norm, key)
 
-            patch, err, mod_used = await _try_provider_candidates(
-                module_candidates=list(reg.get("modules") or []),
-                fn_candidates=list(reg.get("functions") or []),
-                symbol=sym_for_provider,
-                refresh=refresh,
-                fields=fields,
-            )
+                patch, errs, diags = await _try_provider_candidates(
+                    provider_key=key,
+                    module_candidates=list(reg.get("modules") or []),
+                    fn_candidates=list(reg.get("functions") or []),
+                    symbol=sym_for_provider,
+                    refresh=refresh,
+                    fields=fields,
+                )
 
-            if patch:
-                p_err = patch.get("error")
-                if isinstance(p_err, str) and p_err.strip():
-                    warnings.append(f"{key}: {p_err.strip()}")
-                    try:
-                        patch = dict(patch)
-                        patch.pop("error", None)
-                    except Exception:
-                        pass
+                provider_diags.extend(diags)
 
-                _merge_patch(out, patch)
+                if patch:
+                    # if provider included "error" inline, keep as warning but do not override output
+                    p_err = patch.get("error")
+                    if isinstance(p_err, str) and p_err.strip():
+                        warnings.append(f"{key}: {p_err.strip()}")
+                        try:
+                            patch = dict(patch)
+                            patch.pop("error", None)
+                        except Exception:
+                            pass
 
-                tag = key
-                if mod_used:
-                    tag = f"{key}:{mod_used.split('.')[-1]}"
-                used_sources.append(tag)
+                    _merge_patch(out, patch)
 
-            if err:
-                warnings.append(f"{key}: {err}")
+                    tag = key
+                    # prefer best "ok" diag
+                    ok_diag = None
+                    for d in diags:
+                        if d.get("ok") is True:
+                            ok_diag = d
+                            break
+                    if ok_diag and ok_diag.get("module"):
+                        tag = f"{key}:{str(ok_diag.get('module')).split('.')[-1]}"
+                    used_sources.append(tag)
+
+                for e in errs:
+                    if e:
+                        warnings.append(e)
 
         _map_common_aliases(out)
         _apply_derived(out)
-        out["data_quality"] = _quality_label(out)
 
-        _map_forecast_aliases(out)
-
-        if self.enable_history:
+        # History analytics only if requested/allowed
+        if self.enable_history and (_want("history", parsed_fields) or _want("technicals", parsed_fields) or "all" in parsed_fields):
             _apply_history_analytics(out)
 
-        _forecast_from_momentum(out)
+        # Forecast synthesis only if requested
+        _map_forecast_aliases(out)
+        if _want("forecast", parsed_fields) or "all" in parsed_fields:
+            _forecast_from_momentum(out)
         _mirror_forecast_aliases(out)
 
-        # Scoring integration
-        out = _enrich_with_scores(out)
-        out["recommendation"] = _norm_reco(out.get("recommendation"), default="HOLD")
+        # Scoring only if requested (or all)
+        if _want("scores", parsed_fields) or "all" in parsed_fields:
+            out = _enrich_with_scores(out)
+            out["recommendation"] = _norm_reco(out.get("recommendation"), default="HOLD")
+        else:
+            out.setdefault("recommendation", "HOLD")
+            out.setdefault("badges", [])
 
+        # Quality + source
+        out["data_quality"] = _quality_label(out)
         out["data_source"] = ",".join(_dedup_preserve(used_sources)) if used_sources else "none"
 
         if _safe_float(out.get("current_price")) is None:
@@ -1726,7 +1955,11 @@ class DataEngine:
             out["data_quality"] = "BAD"
         else:
             if warnings and self.include_warnings:
-                out["error"] = " | ".join(warnings[:6])
+                out["error"] = " | ".join(warnings[:8])
+
+        # Attach provider diagnostics if enabled (safe)
+        if self.include_provider_diag:
+            out["provider_diag"] = provider_diags[:12]  # cap size for Sheets
 
         return out
 
@@ -1737,6 +1970,7 @@ class DataEngine:
         return {
             "symbol": sym_norm or (symbol_input or ""),
             "symbol_normalized": sym_norm or (symbol_input or ""),
+            "requested_symbol": sym_norm or (symbol_input or ""),
             "symbol_input": (symbol_input or "").strip(),
             "market": "KSA" if _is_ksa(sym_norm) else "GLOBAL",
             "current_price": None,
@@ -1752,9 +1986,13 @@ class DataEngine:
             "forecast_updated": now_utc,
             "forecast_confidence": 0.20,
             "confidence_score": 20.0,
+            "cache_hit": False,
+            "cached_at_utc": now_utc,
+            "cached_at_riyadh": now_riy,
         }
 
 
+# Backward-compatible alias
 DataEngineV2 = DataEngine
 
 _ENGINE_SINGLETON: Optional[DataEngine] = None
