@@ -2,7 +2,7 @@
 """
 core/scoring_engine_contract_test.py
 ===========================================================
-Contract Tests for Scoring Engine (v1.0.0) — PROD SAFE
+Contract Tests for Scoring Engine (v1.1.0) — PROD SAFE
 
 Purpose
 - Validate that core.scoring_engine outputs remain aligned with:
@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.scoring_engine import SCORING_ENGINE_VERSION, compute_scores, enrich_with_scores  # type: ignore
 
 
-TEST_VERSION = "1.0.0"
+TEST_VERSION = "1.1.0"
 _RIYADH_TZ = timezone(timedelta(hours=3))
 _RECO_ENUM = {"BUY", "HOLD", "REDUCE", "SELL"}
 
@@ -159,6 +159,14 @@ def _fixtures() -> List[QuoteFixture]:
         "data_quality": "PARTIAL",
     }
 
+    # Zero price => treat same as missing
+    zero_price = {
+        "symbol": "ZERO_PRICE",
+        "current_price": 0.0,
+        "fair_value": 100.0,
+        "data_quality": "BAD",
+    }
+
     # Downtrend + high risk case
     risky_down = {
         "symbol": "RISKY",
@@ -190,11 +198,36 @@ def _fixtures() -> List[QuoteFixture]:
         "data_quality": "OK",
     }
 
+    # Extreme inputs that should be clamped
+    extreme_inputs = {
+        "symbol": "EXTREME",
+        "current_price": 1000.0,
+        "fair_value": 5000.0,  # +400% upside
+        "volatility_30d": 5.0, # 500%
+        "rsi_14": 150, # invalid > 100
+        "beta": 15.0,
+        "data_quality": "OK",
+    }
+
+    # Non-equity asset (e.g. Commodity/FX) often lacks fundamentals
+    non_equity = {
+        "symbol": "GC=F",
+        "current_price": 2000.0,
+        "trend_signal": "UPTREND",
+        "rsi_14": 65,
+        "volatility_30d": 0.15,
+        "data_quality": "OK", # price exists
+        # No PE, EPS, etc.
+    }
+
     return [
         QuoteFixture("base_ok", base_ok, True),
         QuoteFixture("no_price", no_price, False),
+        QuoteFixture("zero_price", zero_price, False),
         QuoteFixture("risky_down", risky_down, True),
         QuoteFixture("gross_hint", gross_hint, True),
+        QuoteFixture("extreme_inputs", extreme_inputs, True), # should clamp forecasts
+        QuoteFixture("non_equity", non_equity, False), # likely no forecast without fair_value
     ]
 
 
@@ -259,10 +292,16 @@ def _check_forecast_contract(
     has_forecast = _is_finite_number(fp1) and _is_finite_number(roi1)
 
     if expect_forecast:
-        _assert(has_forecast, f"[{ctx}] expected forecast but values are missing/invalid", errors)
+        # It's possible extreme inputs might still fail to generate a forecast if filters apply, 
+        # but generally we expect it. We'll warn if missing.
+        if not has_forecast:
+             # Check if it was because of missing critical inputs despite fixture flag
+             # For now, treat as error if fixture says True
+             _assert(has_forecast, f"[{ctx}] expected forecast but values are missing/invalid", errors)
     else:
-        # if no forecast expected, allow None
-        return
+        # if no forecast expected, allow None. If present, validate it.
+        if not has_forecast:
+            return
 
     # Price forecasts must be > 0
     for k in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m"):
@@ -299,10 +338,17 @@ def _check_forecast_contract(
     _assert(riy_dt is not None, f"[{ctx}] forecast_updated_riyadh not parseable ISO: {riy_iso}", errors)
 
     if utc_dt and riy_dt:
-        # Convert to same tz and check about 3 hours diff (allow DST/format variations ±0.25h)
+        # Convert to same tz and check about 3 hours diff (allow DST/format variations ±0.5h)
         utc_as_riy = utc_dt.astimezone(_RIYADH_TZ)
+        # Using total_seconds to avoid issues with naive vs aware subtraction if helper failed
         diff_h = _approx_hours_diff(utc_as_riy, riy_dt.astimezone(_RIYADH_TZ))
-        _assert(diff_h <= 0.5, f"[{ctx}] Riyadh timestamp not aligned with UTC+3 (diff~{diff_h:.2f}h)", errors)
+        # They should be virtually identical time instants, just different offsets. 
+        # Wait, the stored strings represent the SAME instant in different TZs? 
+        # Yes, usually "2023-01-01T12:00Z" and "2023-01-01T15:00+03:00".
+        # So comparing them as datetimes should yield 0 difference.
+        
+        diff_absolute = abs((utc_dt - riy_dt).total_seconds())
+        _assert(diff_absolute <= 60, f"[{ctx}] Riyadh time mismatch (diff={diff_absolute}s)", errors)
 
 
 def _check_enrich_path(q: Dict[str, Any], errors: List[str], ctx: str) -> None:
@@ -315,6 +361,10 @@ def _check_enrich_path(q: Dict[str, Any], errors: List[str], ctx: str) -> None:
     # Enrichment must include canonical keys
     for k in ("forecast_price_1m", "expected_roi_1m", "forecast_updated_utc", "forecast_updated_riyadh"):
         _assert(k in ed, f"[{ctx}] enrich missing key: {k}", errors)
+    
+    # Original keys preserved
+    for k in q.keys():
+         _assert(k in ed, f"[{ctx}] original key lost: {k}", errors)
 
 
 def run_contract_tests(verbose: bool = True) -> Tuple[bool, List[str]]:
