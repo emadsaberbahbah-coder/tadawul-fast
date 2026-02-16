@@ -1,1 +1,1 @@
-web: bash ./scripts/start_web.sh
+web: bash -lc 'set -euo pipefail; if [ -f ./scripts/start_web.sh ]; then chmod +x ./scripts/start_web.sh >/dev/null 2>&1 || true; exec ./scripts/start_web.sh; else exec python -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}" --proxy-headers --forwarded-allow-ips "*" --lifespan on; fi'
