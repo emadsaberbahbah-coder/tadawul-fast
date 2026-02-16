@@ -1,18 +1,18 @@
 # render.yaml
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# EDITION: Advanced Production (v1.6.1) — Render/Free-Safe
+# EDITION: Advanced Production (v1.6.2) — Render/Free-Safe
 # ============================================================
 #
-# Key fixes vs your current file:
-# - ✅ startCommand uses POSIX sh (your launcher is #!/usr/bin/env sh)
-# - ✅ buildCommand avoids compiling tests (your tests had a syntax error before)
-# - ✅ fixes typo: ENABLE_YAHOO_FUNDAMENTALS_KSA (was NABLE_...)
-# - ✅ avoids empty WEB_CONCURRENCY (use 0 => auto-detect in start_web.sh)
+# Key Enhancements (v1.6.2)
+# - Booleans use "0/1" to avoid string parsing ambiguity (fixes DEFER_ROUTER_MOUNT confusion).
+# - Aligns APP/SERVICE version to 6.6.1 (matches your runtime log).
+# - WEB_CONCURRENCY set to "1" to match your current start_web.sh clamp1() logic.
+# - Keeps compileall limited to app folders (avoids tests causing build failure).
 #
-# IMPORTANT:
-# - Do NOT set LOG_FORMAT="detailed" in Render dashboard (your main.py expects a real %-format string).
-#   If you want “detailed”, set LOG_JSON=true OR set LOG_FORMAT to an actual formatter pattern.
+# NOTE:
+# - Render Dashboard env vars override this file. If you see DEFER_ROUTER_MOUNT=1 in logs,
+#   you must remove/override it in Render Dashboard.
 
 services:
   - type: web
@@ -69,35 +69,36 @@ services:
       - key: ENVIRONMENT
         value: "production"
       - key: APP_VERSION
-        value: "6.6.0"
+        value: "6.6.1"
       - key: SERVICE_VERSION
-        value: "6.6.0"
+        value: "6.6.1"
 
       # --- Logging ---
       - key: LOG_LEVEL
         value: "info"
       - key: LOG_JSON
-        value: "false"
-      # NOTE: Only set LOG_FORMAT if it is a real python logging %-format string, e.g.:
+        value: "0"
+      # Only set LOG_FORMAT if it is a real python logging %-format string
       # - key: LOG_FORMAT
       #   value: "%(asctime)s | %(levelname)s | [%(request_id)s] %(name)s | %(message)s"
 
       # --- Docs / UI ---
       - key: ENABLE_SWAGGER
-        value: "true"
+        value: "1"
       - key: ENABLE_REDOC
-        value: "true"
+        value: "1"
 
       # --- Fast Boot / Mounting ---
+      # Use numeric flags to avoid ambiguity (and to match log behavior)
       - key: INIT_ENGINE_ON_BOOT
-        value: "true"
+        value: "1"
       - key: DEFER_ROUTER_MOUNT
-        value: "false"
+        value: "0"
 
       # --- Server Tuning (start_web.sh reads these) ---
-      # Use 0 to force AUTO-detect (your script treats <=0 as "not set")
+      # IMPORTANT: Your current start_web.sh clamps WEB_CONCURRENCY to >= 1
       - key: WEB_CONCURRENCY
-        value: "0"
+        value: "1"
       - key: WEB_CONCURRENCY_MAX
         value: "4"
       - key: UVICORN_KEEPALIVE
@@ -106,6 +107,7 @@ services:
         value: "30"
       - key: UVICORN_ACCESS_LOG
         value: "1"
+      # 0 => treated as "not set" by your launcher helper (pos_int_or_empty)
       - key: UVICORN_LIMIT_CONCURRENCY
         value: "0"
       - key: UVICORN_LIMIT_MAX_REQUESTS
@@ -117,7 +119,7 @@ services:
 
       # --- Security / Auth ---
       - key: REQUIRE_AUTH
-        value: "true"
+        value: "1"
       - key: AUTH_HEADER_NAME
         value: "X-APP-TOKEN"
       - key: APP_TOKEN
@@ -127,13 +129,13 @@ services:
 
       # --- Features ---
       - key: ADVISOR_ENABLED
-        value: "true"
+        value: "1"
       - key: AI_ANALYSIS_ENABLED
-        value: "true"
+        value: "1"
       - key: ADVANCED_ANALYSIS_ENABLED
-        value: "true"
+        value: "1"
       - key: ENABLE_RATE_LIMITING
-        value: "true"
+        value: "1"
       - key: MAX_REQUESTS_PER_MINUTE
         value: "300"
 
@@ -145,15 +147,15 @@ services:
       - key: PRIMARY_PROVIDER
         value: "eodhd"
       - key: KSA_DISALLOW_EODHD
-        value: "true"
+        value: "1"
       - key: ENABLE_YAHOO_CHART_KSA
-        value: "true"
+        value: "1"
       - key: ENABLE_YAHOO_CHART_SUPPLEMENT
-        value: "true"
+        value: "1"
       - key: ENABLE_YFINANCE_KSA
-        value: "true"
+        value: "1"
       - key: ENABLE_YAHOO_FUNDAMENTALS_KSA
-        value: "true"
+        value: "1"
 
       # --- Provider API Keys (Secrets in Dashboard) ---
       - key: EODHD_API_KEY
@@ -184,8 +186,9 @@ services:
         sync: false
       - key: TADAWUL_FUNDAMENTALS_URL
         sync: false
+
       - key: TADAWUL_MARKET_ENABLED
-        value: "true"
+        value: "1"
       - key: TADAWUL_MAX_SYMBOLS
         value: "2500"
       - key: TADAWUL_REFRESH_INTERVAL
@@ -229,19 +232,19 @@ services:
       - key: CACHE_SAVE_INTERVAL
         value: "60"
       - key: CACHE_BACKUP_ENABLED
-        value: "true"
+        value: "1"
 
       # --- CORS ---
       - key: ENABLE_CORS_ALL_ORIGINS
-        value: "true"
+        value: "1"
       - key: CORS_ALL_ORIGINS
-        value: "true"
+        value: "1"
       - key: CORS_ORIGINS
         value: "*"
 
       # --- Debug / Diagnostics ---
       - key: DEBUG
-        value: "false"
+        value: "0"
 
       # --- Render API (optional, secrets) ---
       - key: RENDER_API_KEY
