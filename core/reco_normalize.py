@@ -106,9 +106,9 @@ _AR_SELL = {
 
 # light non-English (very common broker words) — optional but helpful
 # kept minimal to avoid false positives
-_OTHER_BUY = {"ACHETER", "COMPRAR"}       # FR/ES buy
-_OTHER_SELL = {"VENDRE", "VENDER"}        # FR/ES sell
-_OTHER_HOLD = {"CONSERVER", "MANTENER"}   # FR/ES hold-ish
+_OTHER_BUY = {"ACHETER", "COMPRAR"}        # FR/ES buy
+_OTHER_SELL = {"VENDRE", "VENDER"}         # FR/ES sell
+_OTHER_HOLD = {"CONSERVER", "MANTENER"}    # FR/ES hold-ish
 
 # ---------------------------------------------------------------------
 # Regex patterns (compiled, ordered by severity)
