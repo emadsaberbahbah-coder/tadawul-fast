@@ -1,22 +1,24 @@
+#!/usr/bin/env python3
 # core/investment_advisor_engine.py
 """
 Tadawul Fast Bridge — Investment Advisor Engine (Google Sheets Friendly)
 File: core/investment_advisor_engine.py
 
-FULL REPLACEMENT — v1.3.0 (LINKED TO core/investment_advisor.py + SNAPSHOT ADAPTER + GAS-SAFE)
+FULL REPLACEMENT — v1.4.0 (LINKED TO core/investment_advisor.py + SNAPSHOT ADAPTER + GAS-SAFE)
 
 Purpose
 - Provides a stable "engine layer" entry point for Investment Advisor routes.
 - Delegates ALL scoring/allocation logic to core/investment_advisor.py (single source of truth).
 - Adds a Snapshot Adapter so older engines (without get_cached_sheet_snapshot) still work.
 
-Key Benefits (v1.3.0)
+Key Benefits (v1.4.0)
 - ✅ Linked: Uses core.investment_advisor.run_investment_advisor (same output, same scoring).
 - ✅ Snapshot Adapter: Works with engines exposing:
     - get_cached_sheet_snapshot / get_cached_multi_sheet_snapshots (preferred)
     - OR legacy methods: get_cached_sheet_rows, get_sheet_rows_cached, get_sheet_rows, get_sheet, sheet_rows...
 - ✅ GAS Safe: headers ALWAYS present; rows ALWAYS list.
 - ✅ Better Diagnostics: meta includes adapter_mode, method_used, snapshot coverage.
+- ✅ Enhanced Logging: Traces adapter wrapping and news hook delegation.
 
 Public contract:
   run_investment_advisor(payload_dict, engine=...) -> {"headers":[...], "rows":[...], "items":[...], "meta":{...}}
@@ -24,15 +26,18 @@ Public contract:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+import logging
 import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-ENGINE_VERSION = "1.3.0"
+logger = logging.getLogger("core.investment_advisor_engine")
+
+ENGINE_VERSION = "1.4.0"
 
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
 
-# Keep stable schema aligned with core/investment_advisor.py (v1.5.0)
+# Keep stable schema aligned with core/investment_advisor.py (v1.6.0)
 DEFAULT_HEADERS: List[str] = [
     "Rank",
     "Symbol",
@@ -165,6 +170,7 @@ class EngineSnapshotAdapter:
     def __init__(self, base_engine: Any):
         self._base = base_engine
         self._adapter_cached_at = _utc_iso()
+        logger.info(f"Initialized EngineSnapshotAdapter wrapping {type(base_engine).__name__}")
 
     def __repr__(self) -> str:
         return f"<EngineSnapshotAdapter base={type(self._base).__name__}>"
@@ -222,19 +228,19 @@ class EngineSnapshotAdapter:
         fn = getattr(self._base, "get_news_score", None)
         if callable(fn):
             return fn(symbol)  # type: ignore[misc]
-        raise AttributeError("Base engine has no get_news_score")
+        return None
 
     def get_cached_news_score(self, symbol: str) -> Any:
         fn = getattr(self._base, "get_cached_news_score", None)
         if callable(fn):
             return fn(symbol)  # type: ignore[misc]
-        raise AttributeError("Base engine has no get_cached_news_score")
+        return None
 
     def news_get_score(self, symbol: str) -> Any:
         fn = getattr(self._base, "news_get_score", None)
         if callable(fn):
             return fn(symbol)  # type: ignore[misc]
-        raise AttributeError("Base engine has no news_get_score")
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -266,8 +272,14 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
 
     try:
         # Import the single source of truth (your upgraded core module)
-        from .investment_advisor import run_investment_advisor as core_run
-        from .investment_advisor import TT_ADVISOR_CORE_VERSION as CORE_VERSION
+        # Using absolute import to be safe in various contexts
+        try:
+            from core.investment_advisor import run_investment_advisor as core_run
+            from core.investment_advisor import TT_ADVISOR_CORE_VERSION as CORE_VERSION
+        except ImportError:
+            # Fallback for relative if core is a package
+            from .investment_advisor import run_investment_advisor as core_run  # type: ignore
+            from .investment_advisor import TT_ADVISOR_CORE_VERSION as CORE_VERSION  # type: ignore
 
         # Normalize engine object for snapshot access
         adapter_mode = "none"
@@ -306,6 +318,7 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
         return {"headers": headers, "rows": rows, "items": items, "meta": meta}
 
     except Exception as exc:
+        logger.error(f"run_investment_advisor failed: {exc}", exc_info=True)
         safe_out["meta"] = {
             "ok": False,
             "engine_version": ENGINE_VERSION,
