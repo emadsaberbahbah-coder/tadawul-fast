@@ -15,7 +15,7 @@ FULL REPLACEMENT (v4.2.0-shim) — What’s improved vs v3.1.1-shim
     - if root Settings missing, provides minimal shim Settings class with dict() support
 - ✅ Adds helpers widely used across codebase:
     - get_setting(name, default=None)  (safe attribute/dict getter)
-    - as_dict(settings)               (safe serialization)
+    - as_dict(settings)                (safe serialization)
 - ✅ Optional debug tracing:
     CORE_CONFIG_DEBUG=true
     CORE_CONFIG_DEBUG_LEVEL=info|warn|error
