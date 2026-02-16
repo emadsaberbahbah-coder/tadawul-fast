@@ -2,8 +2,8 @@
 """
 routes/enriched_quote.py
 ------------------------------------------------------------
-Enriched Quote Router — PROD SAFE (v6.4.0)
-(SHEETS-ROWS ADDED + ROUTES.CONFIG AUTH + SCORING + NORMALIZATION + RIYADH TIME)
+Enriched Quote Router — PROD SAFE (v6.6.0)
+(SHEETS-ROWS + ROUTES.CONFIG AUTH + SCORING + NORMALIZATION + RIYADH TIME + TIMEOUTS)
 
 What this router provides
 - GET  /v1/enriched/health
@@ -25,9 +25,21 @@ Design rules
 
 Alignment
 - Canonical ROI keys: expected_roi_1m / expected_roi_3m / expected_roi_12m
-- Canonical forecast price keys: forecast_price_1m / 3m / 12m
+- Canonical forecast price keys: forecast_price_1m / forecast_price_3m / forecast_price_12m
 - Aliases mirrored for legacy columns:
     expected_return_* , expected_price_* , target_price_*
+
+Environment (safe defaults)
+- ENRICHED_BATCH_SIZE (default 80)
+- ENRICHED_CONCURRENCY (default 6)
+- ENRICHED_MAX_SYMBOLS (default 3000)
+- ENRICHED_TIMEOUT_SEC (default 45)
+- ALLOW_QUERY_TOKEN=1 (optional, only used if tokens are set)
+- APP_TOKEN / BACKUP_APP_TOKEN / TFB_APP_TOKEN (if any set -> auth enforced)
+
+Notes
+- No heavy work at import-time. Engines/providers resolved lazily.
+- HTTP 200 always (Sheets safe), with {status,...} payload.
 """
 
 from __future__ import annotations
@@ -40,23 +52,22 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Query, Request
-from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ENRICHED_ROUTE_VERSION = "6.4.0"
-
+ENRICHED_ROUTE_VERSION = "6.6.0"
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _HKEY_RE = re.compile(r"[^a-z0-9]+")
+_RIYADH_TZ = timezone(timedelta(hours=3))
 
 
 # =============================================================================
-# Light config
+# Small helpers
 # =============================================================================
 def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
@@ -68,15 +79,14 @@ def _now_utc_iso() -> str:
 
 def _riyadh_iso(utc_iso: Optional[str] = None) -> str:
     try:
-        ksa_tz = timezone(timedelta(hours=3))
         if utc_iso:
             s = str(utc_iso).replace("Z", "+00:00")
             dt = datetime.fromisoformat(s)
         else:
             dt = datetime.now(timezone.utc)
-        return dt.astimezone(ksa_tz).isoformat()
+        return dt.astimezone(_RIYADH_TZ).isoformat()
     except Exception:
-        return datetime.now(timezone(timedelta(hours=3))).isoformat()
+        return datetime.now(_RIYADH_TZ).isoformat()
 
 
 def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
@@ -88,6 +98,16 @@ def _hkey(name: Any) -> str:
     if not s:
         return ""
     return _HKEY_RE.sub("", s)
+
+
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        s = str(x).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -106,13 +126,13 @@ def _safe_float(x: Any) -> Optional[float]:
 
 def _cfg() -> Dict[str, Any]:
     # Keep defaults conservative for Render
-    batch_size = int(float(os.getenv("ENRICHED_BATCH_SIZE", "80") or "80"))
-    concurrency = int(float(os.getenv("ENRICHED_CONCURRENCY", "6") or "6"))
-    max_symbols = int(float(os.getenv("ENRICHED_MAX_SYMBOLS", "3000") or "3000"))
+    batch_size = _safe_int(os.getenv("ENRICHED_BATCH_SIZE", "80"), 80)
+    concurrency = _safe_int(os.getenv("ENRICHED_CONCURRENCY", "6"), 6)
+    max_symbols = _safe_int(os.getenv("ENRICHED_MAX_SYMBOLS", "3000"), 3000)
     timeout_sec = float(os.getenv("ENRICHED_TIMEOUT_SEC", "45") or "45")
 
     batch_size = max(10, min(400, batch_size))
-    concurrency = max(1, min(25, concurrency))
+    concurrency = max(1, min(30, concurrency))
     max_symbols = max(50, min(10000, max_symbols))
     timeout_sec = max(5.0, min(180.0, timeout_sec))
 
@@ -131,6 +151,7 @@ def _cfg() -> Dict[str, Any]:
 def _get_scoring_enricher():
     try:
         from core.scoring_engine import enrich_with_scores  # type: ignore
+
         return enrich_with_scores
     except Exception:
         return None
@@ -143,6 +164,7 @@ def _get_normalizer():
     """
     try:
         from core.symbols.normalize import normalize_symbol, is_ksa  # type: ignore
+
         return normalize_symbol, is_ksa
     except Exception:
         return None, None
@@ -152,6 +174,7 @@ def _get_normalizer():
 def _get_schemas():
     try:
         import core.schemas as schemas  # type: ignore
+
         return schemas
     except Exception:
         return None
@@ -161,6 +184,7 @@ def _get_schemas():
 def _get_enriched_quote_model():
     try:
         from core.enriched_quote import EnrichedQuote  # type: ignore
+
         return EnrichedQuote
     except Exception:
         return None
@@ -174,14 +198,13 @@ def _get_routes_config():
     try:
         from routes.config import (  # type: ignore
             AUTH_HEADER_NAME,
-            allowed_tokens,
             auth_ok_request,
             is_open_mode,
             mask_settings_dict,
         )
+
         return {
             "AUTH_HEADER_NAME": AUTH_HEADER_NAME,
-            "allowed_tokens": allowed_tokens,
             "auth_ok_request": auth_ok_request,
             "is_open_mode": is_open_mode,
             "mask_settings_dict": mask_settings_dict,
@@ -206,6 +229,9 @@ def _fallback_normalize(raw: str) -> str:
         return s
     if s.isdigit():
         return f"{s}.SR"
+    # normalize Saudi .SA => .SR
+    if s.endswith(".SA"):
+        s = s[:-3] + ".SR"
     return s
 
 
@@ -214,9 +240,10 @@ def _normalize_symbol(sym: str) -> str:
     if callable(norm_fn):
         try:
             out = norm_fn(sym)
-            return (str(out or "").strip().upper()) if out else ""
+            out = (str(out or "").strip().upper()) if out else ""
+            return out or _fallback_normalize(sym)
         except Exception:
-            pass
+            return _fallback_normalize(sym)
     return _fallback_normalize(sym)
 
 
@@ -243,6 +270,7 @@ def _market_hint_for(sym: str) -> str:
 def _parse_symbols_like(items: Sequence[Any]) -> List[str]:
     """
     Accepts list elements that might contain comma/space separated strings.
+    Returns normalized, de-duped, order-preserving list.
     """
     out: List[str] = []
     seen = set()
@@ -251,16 +279,17 @@ def _parse_symbols_like(items: Sequence[Any]) -> List[str]:
         raw = str(it or "").strip()
         if not raw:
             continue
-        parts = re.split(r"[\s,]+", raw)
+        parts = re.split(r"[\s,;|]+", raw)
         for p in parts:
-            if not p.strip():
+            p = p.strip()
+            if not p:
                 continue
             n = _normalize_symbol(p)
-            if not n:
+            if not n or n in seen:
                 continue
-            if n not in seen:
-                seen.add(n)
-                out.append(n)
+            seen.add(n)
+            out.append(n)
+
     return out
 
 
@@ -277,6 +306,9 @@ def _symbols_from_payload(body: Dict[str, Any]) -> List[str]:
     raw = body.get("symbols")
     if raw is None:
         raw = body.get("tickers")
+    if raw is None:
+        raw = body.get("all_tickers") or body.get("ksa_tickers") or body.get("global_tickers")
+
     if isinstance(raw, str):
         return _parse_symbols_like([raw])
     if isinstance(raw, list):
@@ -287,33 +319,23 @@ def _symbols_from_payload(body: Dict[str, Any]) -> List[str]:
 # =============================================================================
 # Auth (centralized via routes.config when available)
 # =============================================================================
-def _extract_token_from_request(request: Request) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _extract_tokens_for_auth(request: Request) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Returns: (header_token, bearer_token, query_token)
+    Returns: (header_token_value, authorization_header, query_token_value)
     """
-    # configured header name (if available)
     cfg = _get_routes_config()
-    hdr_name = None
-    if cfg and cfg.get("AUTH_HEADER_NAME"):
-        hdr_name = str(cfg["AUTH_HEADER_NAME"])
-    hdr_name = hdr_name or "X-APP-TOKEN"
+    hdr_name = (str(cfg.get("AUTH_HEADER_NAME")).strip() if cfg and cfg.get("AUTH_HEADER_NAME") else "") or "X-APP-TOKEN"
 
     header_token = request.headers.get(hdr_name) or request.headers.get("X-APP-TOKEN")
     authorization = request.headers.get("Authorization")
-    bearer_token = None
-    if authorization:
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            bearer_token = parts[1].strip()
-
     query_token = request.query_params.get("token")
 
-    return header_token, bearer_token, query_token
+    return header_token, authorization, query_token
 
 
 def _auth_ok_request(request: Request) -> bool:
     cfg = _get_routes_config()
-    header_token, bearer_token, query_token = _extract_token_from_request(request)
+    header_token, authorization, query_token = _extract_tokens_for_auth(request)
 
     # If centralized helper exists, use it
     if cfg and callable(cfg.get("auth_ok_request")):
@@ -321,7 +343,7 @@ def _auth_ok_request(request: Request) -> bool:
             return bool(
                 cfg["auth_ok_request"](
                     x_app_token=header_token,
-                    authorization=("Bearer " + bearer_token) if bearer_token else None,
+                    authorization=authorization,
                     query_token=query_token,
                 )
             )
@@ -341,10 +363,19 @@ def _auth_ok_request(request: Request) -> bool:
 
     if header_token and header_token.strip() in valid:
         return True
-    if bearer_token and bearer_token.strip() in valid:
+
+    # Bearer extraction locally
+    bearer_token = None
+    if authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            bearer_token = parts[1].strip()
+    if bearer_token and bearer_token in valid:
         return True
+
     if query_token and _truthy(os.getenv("ALLOW_QUERY_TOKEN")) and query_token.strip() in valid:
         return True
+
     return False
 
 
@@ -369,62 +400,76 @@ async def _get_engine(request: Request) -> Any:
     # 2) Singleton fallback
     try:
         from core.data_engine_v2 import get_engine  # type: ignore
+
         return await _maybe_await(get_engine())
     except Exception:
         return None
 
 
-async def _call_engine_batch(eng: Any, symbols: List[str], refresh: bool) -> Tuple[Any, str]:
+async def _call_engine_batch(eng: Any, symbols: List[str], refresh: bool, timeout_sec: float) -> Tuple[Any, str]:
     if not eng:
         return None, "none"
 
-    # Preferred: enriched batch
     fn = getattr(eng, "get_enriched_quotes", None)
     if callable(fn):
         try:
-            return await _maybe_await(fn(symbols, refresh=refresh)), "batch_enriched"
+            coro = fn(symbols, refresh=refresh)
         except TypeError:
-            # older signature
-            return await _maybe_await(fn(symbols)), "batch_enriched_legacy"
+            coro = fn(symbols)
+        try:
+            return await asyncio.wait_for(_maybe_await(coro), timeout=timeout_sec), "batch_enriched"
+        except asyncio.TimeoutError:
+            return None, "batch_enriched_timeout"
         except Exception:
             return None, "batch_enriched_failed"
 
-    # Secondary: standard batch
     fn2 = getattr(eng, "get_quotes", None)
     if callable(fn2):
         try:
-            return await _maybe_await(fn2(symbols, refresh=refresh)), "batch_standard"
+            coro = fn2(symbols, refresh=refresh)
         except TypeError:
-            return await _maybe_await(fn2(symbols)), "batch_standard_legacy"
+            coro = fn2(symbols)
+        try:
+            return await asyncio.wait_for(_maybe_await(coro), timeout=timeout_sec), "batch_standard"
+        except asyncio.TimeoutError:
+            return None, "batch_standard_timeout"
         except Exception:
             return None, "batch_standard_failed"
 
     return None, "none"
 
 
-async def _call_engine_single(eng: Any, symbol: str, refresh: bool) -> Any:
+async def _call_engine_single(eng: Any, symbol: str, refresh: bool, timeout_sec: float) -> Tuple[Any, str]:
     if not eng:
-        return None
+        return None, "none"
 
     fn = getattr(eng, "get_enriched_quote", None)
     if callable(fn):
         try:
-            return await _maybe_await(fn(symbol, refresh=refresh))
+            coro = fn(symbol, refresh=refresh)
         except TypeError:
-            return await _maybe_await(fn(symbol))
+            coro = fn(symbol)
+        try:
+            return await asyncio.wait_for(_maybe_await(coro), timeout=timeout_sec), "single_enriched"
+        except asyncio.TimeoutError:
+            return None, "single_enriched_timeout"
         except Exception:
-            return None
+            return None, "single_enriched_failed"
 
     fn2 = getattr(eng, "get_quote", None)
     if callable(fn2):
         try:
-            return await _maybe_await(fn2(symbol, refresh=refresh))
+            coro = fn2(symbol, refresh=refresh)
         except TypeError:
-            return await _maybe_await(fn2(symbol))
+            coro = fn2(symbol)
+        try:
+            return await asyncio.wait_for(_maybe_await(coro), timeout=timeout_sec), "single_standard"
+        except asyncio.TimeoutError:
+            return None, "single_standard_timeout"
         except Exception:
-            return None
+            return None, "single_standard_failed"
 
-    return None
+    return None, "none"
 
 
 # =============================================================================
@@ -469,25 +514,51 @@ def _apply_roi_aliases(item: Dict[str, Any]) -> None:
             item[legacy_tp] = pf
 
 
+def _coerce_common_fields(item: Dict[str, Any]) -> None:
+    """
+    Fill common convenience keys without breaking existing provider keys.
+    """
+    if item.get("price") is None:
+        item["price"] = item.get("current_price")
+    if item.get("current_price") is None:
+        item["current_price"] = item.get("price")
+
+    if item.get("percent_change") is None:
+        item["percent_change"] = item.get("change_pct")
+    if item.get("change_pct") is None:
+        item["change_pct"] = item.get("percent_change")
+
+
 def _enrich_item(raw: Any, requested_symbol: str, *, engine_source: str = "") -> Dict[str, Any]:
-    # unwrap tuple style (data, err)
+    """
+    Normalize one item into a dict with stable keys + timestamps.
+    """
     if isinstance(raw, tuple) and len(raw) == 2:
         raw = raw[0]
 
-    item: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    if raw is None:
+        item: Dict[str, Any] = {"error": "No Data"}
+    elif isinstance(raw, dict):
+        item = dict(raw)
+    else:
+        # best-effort object -> dict
+        item = dict(getattr(raw, "__dict__", {}) or {})
+        if not item:
+            item = {"raw": str(raw)}
 
-    # Always keep requested symbol (debug + Sheets alignment)
     req = (requested_symbol or "").strip().upper()
     item.setdefault("requested_symbol", req)
 
-    # Ensure symbol field
     sym = str(item.get("symbol") or item.get("ticker") or req).strip().upper()
     item["symbol"] = sym or req
+    item.setdefault("symbol_normalized", item["symbol"])
+
+    _coerce_common_fields(item)
 
     # Data quality (basic)
     if not item.get("data_quality"):
-        price = item.get("current_price") or item.get("price")
-        item["data_quality"] = "OK" if _safe_float(price) is not None else "MISSING"
+        px = item.get("current_price") or item.get("price")
+        item["data_quality"] = "OK" if _safe_float(px) is not None else "MISSING"
 
     # Scoring engine (best effort)
     enricher = _get_scoring_enricher()
@@ -503,14 +574,15 @@ def _enrich_item(raw: Any, requested_symbol: str, *, engine_source: str = "") ->
         reco = "HOLD"
     item["recommendation"] = reco
 
-    # Timestamps
+    # Timestamps (authoritative route-level injection)
     utc = item.get("last_updated_utc") or _now_utc_iso()
     item["last_updated_utc"] = str(utc)
     item["last_updated_riyadh"] = _to_riyadh_iso(str(utc))
 
-    f_utc = item.get("forecast_updated_utc") or utc
+    # Forecast timestamps (keep provider utc if present; default to last_updated)
+    f_utc = item.get("forecast_updated_utc") or item.get("forecast_updated") or utc
     item["forecast_updated_utc"] = str(f_utc)
-    item["forecast_updated_riyadh"] = _to_riyadh_iso(str(f_utc))
+    item["forecast_updated_riyadh"] = item.get("forecast_updated_riyadh") or _to_riyadh_iso(str(f_utc))
 
     # ROI/forecast alignment
     _apply_roi_aliases(item)
@@ -537,20 +609,19 @@ def _shape_batch_result(requested: List[str], res: Any, engine_source: str) -> D
         return out
 
     if isinstance(res, dict):
-        # normalize keys for lookup
         lookup: Dict[str, Any] = {}
         for k, v in res.items():
             kk = str(k or "").strip().upper()
-            if kk:
-                lookup[kk] = v
-                lookup[_normalize_symbol(kk)] = v
+            if not kk:
+                continue
+            lookup[kk] = v
+            lookup[_normalize_symbol(kk)] = v
 
         for req in requested:
             raw = lookup.get(req) or lookup.get(_normalize_symbol(req))
             out[req] = _enrich_item(raw, req, engine_source=engine_source)
         return out
 
-    # fallback empty
     for req in requested:
         out[req] = _enrich_item({"error": "Invalid batch format"}, req, engine_source=engine_source)
     return out
@@ -558,49 +629,65 @@ def _shape_batch_result(requested: List[str], res: Any, engine_source: str) -> D
 
 async def _fetch_quotes_map(engine: Any, symbols: List[str], *, refresh: bool) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
-    Returns (map, meta)
+    Returns (map, meta). Ensures every requested symbol has a row.
+    Chunked + concurrency-limited + timeout-protected.
     """
     cfg = _cfg()
     start = time.time()
 
-    symbols = symbols[: cfg["max_symbols"]]
+    symbols = (symbols or [])[: cfg["max_symbols"]]
     if not symbols:
-        return {}, {"mode": "empty", "batch": cfg["batch_size"]}
+        return {}, {"mode": "empty", "route_version": ENRICHED_ROUTE_VERSION}
 
-    # Grouping (hint only; engine may ignore)
+    # Market hint grouping (optional metadata only)
     groups: Dict[str, List[str]] = {}
     for s in symbols:
         groups.setdefault(_market_hint_for(s), []).append(s)
 
-    sem = asyncio.Semaphore(cfg["concurrency"])
+    batch = int(cfg["batch_size"])
+    timeout_sec = float(cfg["timeout_sec"])
+    sem = asyncio.Semaphore(int(cfg["concurrency"]))
+
     final_map: Dict[str, Dict[str, Any]] = {}
 
-    async def process_group(hint: str, syms: List[str]) -> None:
-        # chunk inside group to keep payload reasonable
-        batch = cfg["batch_size"]
-        chunks = [syms[i : i + batch] for i in range(0, len(syms), batch)]
+    # Build chunk tasks across all groups (concurrency applies per chunk)
+    chunk_tasks: List[Tuple[str, List[str]]] = []
+    for hint, syms in groups.items():
+        for i in range(0, len(syms), batch):
+            chunk_tasks.append((hint, syms[i : i + batch]))
 
+    async def process_chunk(hint: str, ch: List[str]) -> None:
         async with sem:
-            for ch in chunks:
-                res, src = await _call_engine_batch(engine, ch, refresh)
-                if res is not None:
-                    final_map.update(_shape_batch_result(ch, res, src))
-                else:
-                    # per-symbol fallback
-                    for one in ch:
-                        raw = await _call_engine_single(engine, one, refresh)
-                        final_map[one] = _enrich_item(raw, one, engine_source=src or "single_fallback")
+            res, src = await _call_engine_batch(engine, ch, refresh, timeout_sec)
+            if res is not None:
+                final_map.update(_shape_batch_result(ch, res, src))
+                return
 
-    await asyncio.gather(*[process_group(h, syms) for h, syms in groups.items()])
+            # per-symbol fallback (still within semaphore)
+            for one in ch:
+                raw, ssrc = await _call_engine_single(engine, one, refresh, timeout_sec)
+                if raw is None:
+                    final_map[one] = _enrich_item({"error": "No Data", "market_hint": hint}, one, engine_source=ssrc or src or "single_fallback")
+                else:
+                    final_map[one] = _enrich_item(raw, one, engine_source=ssrc or src or "single_fallback")
+
+    await asyncio.gather(*[process_chunk(hint, ch) for hint, ch in chunk_tasks])
+
+    # Ensure all requested symbols exist
+    for s in symbols:
+        if s not in final_map:
+            final_map[s] = _enrich_item({"error": "Missing from engine response"}, s, engine_source="missing")
 
     ms = round((time.time() - start) * 1000, 2)
     meta = {
         "batch_size": cfg["batch_size"],
         "concurrency": cfg["concurrency"],
         "max_symbols": cfg["max_symbols"],
+        "timeout_sec": cfg["timeout_sec"],
         "refresh": bool(refresh),
         "processing_time_ms": ms,
         "groups": {k: len(v) for k, v in groups.items()},
+        "chunks": len(chunk_tasks),
     }
     return final_map, meta
 
@@ -634,6 +721,8 @@ def _fallback_headers() -> List[str]:
         "Error",
         "Last Updated (UTC)",
         "Last Updated (Riyadh)",
+        "Forecast Updated (UTC)",
+        "Forecast Updated (Riyadh)",
     ]
 
 
@@ -645,17 +734,19 @@ def _headers_for_sheet(sheet_name: str) -> List[str]:
             try:
                 h = fn(sheet_name)
                 if isinstance(h, list) and h:
-                    return [str(x).strip() for x in h if str(x).strip()]
+                    out = [str(x).strip() for x in h if str(x).strip()]
+                    if out:
+                        return out
             except Exception:
                 pass
 
-    # fallback to a known default list if present
-    schemas = _get_schemas()
-    if schemas:
+        # fallback to known default lists if present
         for attr in ("DEFAULT_HEADERS_59", "DEFAULT_HEADERS"):
             hh = getattr(schemas, attr, None)
             if isinstance(hh, (list, tuple)) and len(hh) >= 10:
-                return [str(x).strip() for x in hh if str(x).strip()]
+                out2 = [str(x).strip() for x in hh if str(x).strip()]
+                if out2:
+                    return out2
 
     return _fallback_headers()
 
@@ -666,25 +757,25 @@ def _dict_to_row_by_headers(d: Dict[str, Any], headers: List[str]) -> List[Any]:
     """
     km = {_hkey(k): v for k, v in (d or {}).items()}
 
-    # extra common aliases to map friendly headers
+    # common aliases for friendly headers
     alias: Dict[str, str] = {
         "price": "current_price",
         "prevclose": "prev_close",
-        "change": "change",
         "change%": "percent_change",
         "forecastconfidence": "forecast_confidence",
-        "datquality": "data_quality",
+        "dataquality": "data_quality",
         "lastupdatedutc": "last_updated_utc",
         "lastupdatedriyadh": "last_updated_riyadh",
+        "forecastupdatedutc": "forecast_updated_utc",
+        "forecastupdatedriyadh": "forecast_updated_riyadh",
     }
-    # pre-normalize alias keys
     alias2 = {_hkey(k): _hkey(v) for k, v in alias.items()}
 
     row: List[Any] = []
     for h in headers:
         hk = _hkey(h)
 
-        # special handling: Expected ROI % (1M/3M/12M) and Forecast Price (1M/..)
+        # Expected ROI % (1M/3M/12M)
         if "expectedroi" in hk and ("1m" in hk or "3m" in hk or "12m" in hk):
             if "1m" in hk:
                 row.append(km.get("expectedroi1m", km.get("expectedreturn1m")))
@@ -696,6 +787,7 @@ def _dict_to_row_by_headers(d: Dict[str, Any], headers: List[str]) -> List[Any]:
                 row.append(km.get("expectedroi12m", km.get("expectedreturn12m")))
                 continue
 
+        # Forecast Price (1M/3M/12M)
         if "forecastprice" in hk and ("1m" in hk or "3m" in hk or "12m" in hk):
             if "1m" in hk:
                 row.append(km.get("forecastprice1m", km.get("expectedprice1m", km.get("targetprice1m"))))
@@ -707,12 +799,12 @@ def _dict_to_row_by_headers(d: Dict[str, Any], headers: List[str]) -> List[Any]:
                 row.append(km.get("forecastprice12m", km.get("expectedprice12m", km.get("targetprice12m"))))
                 continue
 
-        # direct key
+        # Direct key
         if hk in km:
             row.append(km.get(hk))
             continue
 
-        # alias mapping
+        # Alias
         ak = alias2.get(hk)
         if ak and ak in km:
             row.append(km.get(ak))
@@ -731,6 +823,18 @@ async def enriched_health(request: Request):
     eng = await _get_engine(request)
     cfg = _cfg()
     rc = _get_routes_config()
+
+    open_mode = None
+    auth_header = None
+    config_mask = None
+    try:
+        if rc and callable(rc.get("is_open_mode")):
+            open_mode = bool(rc["is_open_mode"]())
+        auth_header = str(rc.get("AUTH_HEADER_NAME")) if rc and rc.get("AUTH_HEADER_NAME") else "X-APP-TOKEN"
+        config_mask = rc["mask_settings_dict"]() if rc and callable(rc.get("mask_settings_dict")) else None
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "module": "routes.enriched_quote",
@@ -738,10 +842,10 @@ async def enriched_health(request: Request):
         "engine": type(eng).__name__ if eng else "none",
         "time_utc": _now_utc_iso(),
         "time_riyadh": _riyadh_iso(),
-        "open_mode": bool(rc["is_open_mode"]()) if rc and callable(rc.get("is_open_mode")) else (not bool(os.getenv("APP_TOKEN") or os.getenv("BACKUP_APP_TOKEN") or os.getenv("TFB_APP_TOKEN"))),
-        "auth_header": str(rc["AUTH_HEADER_NAME"]) if rc and rc.get("AUTH_HEADER_NAME") else "X-APP-TOKEN",
+        "open_mode": open_mode,
+        "auth_header": auth_header or "X-APP-TOKEN",
         "cfg": cfg,
-        "config_mask": (rc["mask_settings_dict"]() if rc and callable(rc.get("mask_settings_dict")) else None),
+        "config_mask": config_mask,
     }
 
 
@@ -764,11 +868,14 @@ async def get_single_quote(
     if not norm_sym:
         return {"status": "error", "error": "Invalid Symbol", "version": ENRICHED_ROUTE_VERSION}
 
+    cfg = _cfg()
     try:
-        raw = await _call_engine_single(eng, norm_sym, bool(refresh))
-        item = _enrich_item(raw, norm_sym, engine_source="single")
+        raw, src = await _call_engine_single(eng, norm_sym, bool(refresh), float(cfg["timeout_sec"]))
+        item = _enrich_item(raw, norm_sym, engine_source=src or "single")
         item["status"] = "ok"
         item["version"] = ENRICHED_ROUTE_VERSION
+        if debug:
+            item["debug"] = {"engine_source": src, "refresh": bool(refresh), "timeout_sec": cfg["timeout_sec"]}
         return item
     except Exception as e:
         out = {"status": "error", "error": str(e), "symbol": norm_sym, "version": ENRICHED_ROUTE_VERSION}
@@ -845,7 +952,6 @@ async def enriched_sheet_rows(
             "meta": {"time_utc": _now_utc_iso(), "time_riyadh": _riyadh_iso()},
         }
 
-    # Resolve symbols
     symbols_list = _symbols_from_payload(body)
     if not symbols_list:
         return {
@@ -857,16 +963,16 @@ async def enriched_sheet_rows(
             "meta": {"time_utc": _now_utc_iso(), "time_riyadh": _riyadh_iso()},
         }
 
-    # Resolve sheet name
-    sheet_name = str(body.get("sheet_name") or body.get("sheetName") or "Enriched").strip() or "Enriched"
+    sheet_name = str(body.get("sheet_name") or body.get("sheetName") or body.get("sheet") or "Enriched").strip() or "Enriched"
     refresh = _truthy(body.get("refresh")) or str(body.get("refresh") or "").strip() == "1"
+
+    headers = _headers_for_sheet(sheet_name)
+    if not isinstance(headers, list) or len(headers) == 0:
+        headers = ["Symbol", "Error"]
 
     eng = await _get_engine(request)
     if not eng:
-        # return placeholders so Sheets can still write rows
-        headers = _headers_for_sheet(sheet_name)
-        if not headers:
-            headers = ["Symbol", "Error"]
+        # Return placeholders so Sheets can still write rows
         err_idx = next((i for i, h in enumerate(headers) if _hkey(h) == "error"), None)
         sym_idx = next((i for i, h in enumerate(headers) if _hkey(h) in ("symbol", "ticker")), 0)
         rows: List[List[Any]] = []
@@ -885,13 +991,7 @@ async def enriched_sheet_rows(
             "meta": {"time_utc": _now_utc_iso(), "time_riyadh": _riyadh_iso(), "sheet": sheet_name},
         }
 
-    # Fetch quotes
     quotes_map, meta = await _fetch_quotes_map(eng, symbols_list, refresh=bool(refresh))
-
-    # Resolve headers and map rows
-    headers = _headers_for_sheet(sheet_name)
-    if not headers:
-        headers = ["Symbol", "Error"]
 
     EnrichedQuote = _get_enriched_quote_model()
     rows: List[List[Any]] = []
@@ -904,11 +1004,11 @@ async def enriched_sheet_rows(
             try:
                 eq = EnrichedQuote.from_unified(item)  # type: ignore
                 row = eq.to_row(headers)               # type: ignore
-                # Ensure exact length
+                row = list(row)
                 if len(row) < len(headers):
-                    row = list(row) + [None] * (len(headers) - len(row))
+                    row.extend([None] * (len(headers) - len(row)))
                 elif len(row) > len(headers):
-                    row = list(row)[: len(headers)]
+                    row = row[: len(headers)]
                 rows.append(row)
                 continue
             except Exception as e:
@@ -918,14 +1018,10 @@ async def enriched_sheet_rows(
         # Fallback mapping by header name
         row2 = _dict_to_row_by_headers(item, headers)
         if len(row2) < len(headers):
-            row2 = row2 + [None] * (len(headers) - len(row2))
+            row2.extend([None] * (len(headers) - len(row2)))
         elif len(row2) > len(headers):
             row2 = row2[: len(headers)]
         rows.append(row2)
-
-    # Never return empty headers
-    if not isinstance(headers, list) or len(headers) == 0:
-        headers = ["Symbol", "Error"]
 
     return {
         "status": "success",
