@@ -18,32 +18,13 @@ What’s improved in v2.2.0 (vs your v1.9.0)
       max_drawdown, trend slopes, R²
     - Forecast uses log-price regression (more stable than mean-daily-return)
     - Confidence uses points + R² + volatility penalty
-- ✅ Riyadh timestamp conversion based on history_last_utc when available (not “now”)
+- ✅ Riyadh timestamp conversion based on history_last_utc when available (not "now")
 - ✅ Keeps key guarantees:
     - import-safe (cachetools optional)
     - no network at import-time
     - silent {} when not configured
     - strict KSA-only (non-KSA ignored)
     - patch returns only useful fields + optional _warn when enabled
-
-Environment variables (optional)
-- ARGAAM_ENABLED=true/false
-- ARGAAM_QUOTE_URL / ARGAAM_PROFILE_URL / ARGAAM_HISTORY_URL or ARGAAM_CANDLES_URL
-  Templates can use {symbol} (e.g., 1120.SR) and {code} (e.g., 1120) and {days}
-- ARGAAM_TIMEOUT_SEC (or HTTP_TIMEOUT_SEC / HTTP_TIMEOUT)
-- ARGAAM_RETRY_ATTEMPTS (or HTTP_RETRY_ATTEMPTS / MAX_RETRIES)
-- ARGAAM_RETRY_DELAY_SEC
-- ARGAAM_TTL_SEC, ARGAAM_PROFILE_TTL_SEC, ARGAAM_HISTORY_TTL_SEC
-- ARGAAM_ENABLE_HISTORY=true/false
-- ARGAAM_ENABLE_FORECAST=true/false
-- ARGAAM_VERBOSE_WARNINGS=true/false
-
-Advanced controls
-- ARGAAM_MAX_CONCURRENCY (default 20)
-- ARGAAM_RATE_LIMIT_PER_SEC (0 disables; default 0)
-- ARGAAM_CIRCUIT_BREAKER=true/false (default true)
-- ARGAAM_CB_FAIL_THRESHOLD (default 6)
-- ARGAAM_CB_COOLDOWN_SEC (default 30)
 """
 
 from __future__ import annotations
@@ -82,6 +63,7 @@ _FALSY = {"0", "false", "no", "n", "off", "f"}
 # KSA code: 3-6 digits
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 
+
 # ------------------------------------------------------------
 # Optional shared normalizer (PROD SAFE)
 # ------------------------------------------------------------
@@ -100,6 +82,7 @@ def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
 
 
 _SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
+
 
 # ------------------------------------------------------------
 # Env + safe helpers
@@ -831,9 +814,9 @@ def _compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
             return None
         return _log_regression([float(x) for x in closes[-n:]])
 
-    reg_1m = reg_on_last(min(len(closes), 84))   # ~4 months cap for stability
-    reg_3m = reg_on_last(min(len(closes), 252))  # up to 12 months
-    reg_12m = reg_on_last(min(len(closes), 400)) # cap
+    reg_1m = reg_on_last(min(len(closes), 84))    # ~4 months cap for stability
+    reg_3m = reg_on_last(min(len(closes), 252))   # up to 12 months
+    reg_12m = reg_on_last(min(len(closes), 400))  # cap
 
     def roi_from_reg(reg: Optional[Dict[str, float]], horizon_days: int) -> Optional[float]:
         if not reg:
@@ -1482,9 +1465,12 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
     if not _configured():
         return {}
 
-    q_patch = await _fetch_quote_patch(symbol)
-    p_patch = await _fetch_profile_identity_patch(symbol)
-    h_patch = await _fetch_history_patch(symbol)
+    # Run fetches concurrently for performance
+    q_patch, p_patch, h_patch = await asyncio.gather(
+        _fetch_quote_patch(symbol),
+        _fetch_profile_identity_patch(symbol),
+        _fetch_history_patch(symbol),
+    )
 
     out: Dict[str, Any] = {}
     warns: List[str] = []
@@ -1541,7 +1527,7 @@ async def fetch_enriched_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[s
 
 
 async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    # Argaam doesn’t provide true fundamentals here; alias to enriched quote patch
+    # Argaam doesn't provide true fundamentals here; alias to enriched quote patch
     return await fetch_enriched_quote_patch(symbol)
 
 
