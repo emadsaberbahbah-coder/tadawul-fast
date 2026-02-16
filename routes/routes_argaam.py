@@ -2,18 +2,19 @@
 """
 routes/routes_argaam.py
 ===============================================================
-Argaam Router (delegate) — FULL REPLACEMENT — v4.4.0
-(PROD SAFE + CONFIG-AWARE AUTH + SCORING + SCHEMA MAPPING + RIYADH TIME)
+Argaam Router (delegate) — FULL REPLACEMENT — v4.6.0
+(PROD SAFE + CONFIG-AWARE AUTH + SCORING + SCHEMA MAPPING + RIYADH TIME + ADVANCED META REPORT)
 
 What this route does
 - ✅ Fetches KSA quotes from Argaam (URL template via env)
-- ✅ Normalizes symbols (core.symbols.normalize > fallback)
+- ✅ Normalizes symbols (core.symbols.normalize.normalize_ksa_symbol > fallback)
 - ✅ Optional scoring (core.scoring_engine.enrich_with_scores)
 - ✅ Schema-aware mapping (core.enriched_quote.EnrichedQuote + core.schemas.get_headers_for_sheet)
 - ✅ GAS-safe outputs: stable headers + rectangular rows
 - ✅ Robust batching: mixed success/failure never crashes
 - ✅ Config-aware auth header name (routes.config.AUTH_HEADER_NAME / settings.auth_header_name)
 - ✅ Open mode if no tokens configured (routes.config.allowed_tokens or env tokens empty)
+- ✅ Advanced meta report: cache hits/misses, timings, configured flags, per-item status summary
 
 Endpoints
 - GET  /v1/argaam/health
@@ -37,6 +38,7 @@ Optional env
 - ARGAAM_CACHE_TTL_SEC=20
 - ARGAAM_CACHE_MAX=4000
 - ARGAAM_USER_AGENT=...
+- AUTH_HEADER_NAME=... (optional override)
 """
 
 from __future__ import annotations
@@ -52,24 +54,15 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from fastapi import APIRouter, Body, Header, Query, Request
-from fastapi.responses import JSONResponse
-
-# Pydantic v2 preferred, v1 fallback
-try:
-    from pydantic import BaseModel, ConfigDict, Field  # type: ignore
-    _PYDANTIC_V2 = True
-except Exception:  # pragma: no cover
-    from pydantic import BaseModel, Field  # type: ignore
-    ConfigDict = None  # type: ignore
-    _PYDANTIC_V2 = False
+from fastapi import APIRouter, Body, Query, Request
 
 logger = logging.getLogger("routes.routes_argaam")
 
-ROUTE_VERSION = "4.4.0"
+ROUTE_VERSION = "4.6.0"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_RIYADH_TZ = timezone(timedelta(hours=3))
 
 
 # =============================================================================
@@ -85,9 +78,8 @@ def _httpx():
 
 
 class _TinyTTLCache:
-    """
-    Minimal TTL cache fallback if cachetools is unavailable.
-    """
+    """Minimal TTL cache fallback if cachetools is unavailable."""
+
     def __init__(self, maxsize: int, ttl: float):
         self.maxsize = max(10, int(maxsize))
         self.ttl = max(1.0, float(ttl))
@@ -106,9 +98,8 @@ class _TinyTTLCache:
 
     def set(self, k: str, v: Any) -> None:
         now = time.time()
-        # simple eviction if over maxsize
         if len(self._d) >= self.maxsize:
-            # drop a random key (fast + good enough)
+            # Fast eviction (good enough)
             try:
                 self._d.pop(next(iter(self._d.keys())), None)
             except Exception:
@@ -141,7 +132,37 @@ def _truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
+def _allowed_tokens_env() -> List[str]:
+    toks: List[str] = []
+    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            toks.append(v)
+    out: List[str] = []
+    seen = set()
+    for t in toks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _open_mode() -> bool:
+    rc = _routes_config_mod()
+    try:
+        if rc is not None and callable(getattr(rc, "allowed_tokens", None)):
+            return len(rc.allowed_tokens() or []) == 0  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return len(_allowed_tokens_env()) == 0
+
+
 def _auth_header_name() -> str:
+    # env override wins (handy for hotfix without code change)
+    env_name = (os.getenv("AUTH_HEADER_NAME") or "").strip()
+    if env_name:
+        return env_name
+
     rc = _routes_config_mod()
     name = None
     if rc is not None:
@@ -154,23 +175,7 @@ def _auth_header_name() -> str:
                     name = getattr(s, "auth_header_name", None)
             except Exception:
                 name = None
-    return str(name or "X-APP-TOKEN")
-
-
-def _allowed_tokens_env() -> List[str]:
-    toks: List[str] = []
-    for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
-        v = (os.getenv(k) or "").strip()
-        if v:
-            toks.append(v)
-    # de-dupe preserve order
-    out: List[str] = []
-    seen = set()
-    for t in toks:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    return str(name or "X-APP-TOKEN").strip() or "X-APP-TOKEN"
 
 
 def _extract_token(request: Request, query_token: Optional[str]) -> Optional[str]:
@@ -228,7 +233,7 @@ def _auth_ok(request: Request, query_token: Optional[str]) -> bool:
                 allowed = fn3() or []
                 if not allowed:
                     return True
-                allowed_set = set([str(x).strip() for x in allowed if str(x).strip()])
+                allowed_set = {str(x).strip() for x in allowed if str(x).strip()}
                 return bool(provided and provided.strip() in allowed_set)
             except Exception:
                 pass
@@ -324,15 +329,14 @@ def _utc_iso() -> str:
 
 
 def _riyadh_iso(utc_iso: Optional[str] = None) -> str:
-    tz = timezone(timedelta(hours=3))
     try:
         if utc_iso:
             dt = datetime.fromisoformat(str(utc_iso).replace("Z", "+00:00"))
         else:
             dt = datetime.now(timezone.utc)
-        return dt.astimezone(tz).isoformat()
+        return dt.astimezone(_RIYADH_TZ).isoformat()
     except Exception:
-        return datetime.now(tz).isoformat()
+        return datetime.now(_RIYADH_TZ).isoformat()
 
 
 # =============================================================================
@@ -349,10 +353,8 @@ def _fallback_normalize_ksa(symbol: str) -> str:
     # numeric code => .SR
     if s.isdigit():
         return f"{s}.SR"
-    # allow already .SR
     if s.endswith(".SR"):
         return s
-    # accept plain code "1120" etc
     if re.fullmatch(r"\d{3,6}", s):
         return f"{s}.SR"
     return ""
@@ -369,46 +371,50 @@ def _normalize_ksa_symbol(symbol: str) -> str:
     return _fallback_normalize_ksa(symbol)
 
 
-def _parse_symbols(raw: Any) -> List[str]:
+def _parse_symbols_like(items: Sequence[Any]) -> List[str]:
     """
-    Accepts list/tuple OR string with comma/space separators.
-    Returns normalized .SR symbols (dedup preserving order).
+    Accepts list elements that might contain comma/space separated strings.
+    Dedup (preserve order).
     """
-    if raw is None:
-        return []
-
-    parts: List[str] = []
-    if isinstance(raw, (list, tuple)):
-        for it in raw:
-            s = str(it or "").strip()
-            if s:
-                s = s.replace(",", " ")
-                parts.extend([p.strip() for p in s.split() if p.strip()])
-    else:
-        s = str(raw or "").strip()
-        if s:
-            s = s.replace(",", " ")
-            parts = [p.strip() for p in s.split() if p.strip()]
-
     out: List[str] = []
     seen = set()
-    for p in parts:
-        sym = _normalize_ksa_symbol(p)
-        if sym and sym not in seen:
-            seen.add(sym)
-            out.append(sym)
+    for it in items or []:
+        raw = str(it or "").strip()
+        if not raw:
+            continue
+        parts = re.split(r"[\s,]+", raw)
+        for p in parts:
+            if not p.strip():
+                continue
+            sym = _normalize_ksa_symbol(p)
+            if sym and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
     return out
+
+
+def _symbols_from_query(symbols: Optional[List[str]], tickers: Optional[List[str]]) -> List[str]:
+    if symbols:
+        return _parse_symbols_like(symbols)
+    if tickers:
+        return _parse_symbols_like(tickers)
+    return []
+
+
+def _symbols_from_body(body: Dict[str, Any]) -> List[str]:
+    raw = body.get("symbols")
+    if raw is None:
+        raw = body.get("tickers")
+    if isinstance(raw, str):
+        return _parse_symbols_like([raw])
+    if isinstance(raw, list):
+        return _parse_symbols_like(raw)
+    return []
 
 
 def _format_url(template: str, symbol: str) -> str:
     code = symbol.split(".")[0] if "." in symbol else symbol
     return (template or "").replace("{code}", code).replace("{symbol}", symbol)
-
-
-async def _maybe_await(x: Any) -> Any:
-    if inspect.isawaitable(x):
-        return await x
-    return x
 
 
 # =============================================================================
@@ -433,12 +439,14 @@ def _cache_get(k: str) -> Any:
 
 
 def _cache_set(k: str, v: Any) -> None:
+    # cachetools TTLCache supports __setitem__
     try:
         if hasattr(_quote_cache, "__setitem__"):
             _quote_cache[k] = v  # type: ignore[index]
             return
     except Exception:
         pass
+    # Tiny cache uses .set()
     try:
         if hasattr(_quote_cache, "set"):
             _quote_cache.set(k, v)  # type: ignore[attr-defined]
@@ -476,17 +484,17 @@ def _extract_data_container(payload: Any) -> Dict[str, Any]:
     - dict directly
     - {data:{...}}
     - {result:{...}}
+    - {quote:{...}}
     """
     if isinstance(payload, dict):
-        if isinstance(payload.get("data"), dict):
-            return payload["data"]
-        if isinstance(payload.get("result"), dict):
-            return payload["result"]
+        for k in ("data", "result", "quote"):
+            if isinstance(payload.get(k), dict):
+                return payload[k]
         return payload
     return {}
 
 
-def _unified_from_argaam(symbol: str, raw: Any, *, source_url: str) -> Dict[str, Any]:
+def _unified_from_argaam(symbol: str, raw: Any, *, source_url: str, cache_hit: bool) -> Dict[str, Any]:
     """
     Convert Argaam response into UnifiedQuote-like dict.
     Keep keys compatible with core.enriched_quote mapping.
@@ -494,14 +502,18 @@ def _unified_from_argaam(symbol: str, raw: Any, *, source_url: str) -> Dict[str,
     now_utc = _utc_iso()
     d0 = _extract_data_container(raw)
 
-    # Price + changes
+    # Common Argaam-ish keys
     last = _pick(d0, ["last", "price", "close", "lastPrice", "tradedPrice"])
     prev = _pick(d0, ["previous_close", "prev_close", "previousClose", "prevClose"])
     chg = _pick(d0, ["change", "price_change", "delta", "chg"])
     chg_pct = _pick(d0, ["change_pct", "percentage_change", "chgPct", "percent_change", "pctChange"])
+    vol = _pick(d0, ["volume", "vol", "tradedVolume"])
+    mcap = _pick(d0, ["market_cap", "marketCap", "mcap"])
+    vtraded = _pick(d0, ["value_traded", "valueTraded", "tradedValue"])
 
     out: Dict[str, Any] = {
         "status": "ok",
+        "requested_symbol": symbol,
         "symbol": symbol,
         "symbol_normalized": symbol,
         "market": "KSA",
@@ -510,82 +522,94 @@ def _unified_from_argaam(symbol: str, raw: Any, *, source_url: str) -> Dict[str,
         "previous_close": _coerce_float(prev),
         "price_change": _coerce_float(chg),
         "percent_change": _coerce_float(chg_pct),
-        "volume": _coerce_float(_pick(d0, ["volume", "vol", "tradedVolume"])),
-
-        # Descriptors
+        "volume": _coerce_float(vol),
+        "market_cap": _coerce_float(mcap),
+        "value_traded": _coerce_float(vtraded),
         "name": _pick(d0, ["companyName", "nameAr", "nameEn", "name"]),
         "sector": _pick(d0, ["sectorName", "sector", "sector_name"]),
         "sub_sector": _pick(d0, ["subSector", "sub_sector"]),
-
-        # Provenance
         "data_source": "argaam",
         "engine_source": "argaam_direct",
         "provider_url": source_url,
         "data_quality": "OK" if _coerce_float(last) is not None else "PARTIAL",
         "last_updated_utc": now_utc,
         "last_updated_riyadh": _riyadh_iso(now_utc),
+        "_cache_hit": bool(cache_hit),
     }
 
     # Scoring (best-effort; never fail)
     enricher = _get_scoring_enricher()
     if callable(enricher):
         try:
-            out = enricher(out)  # may mutate or return new
+            out = enricher(out) or out
         except Exception:
             pass
 
     # Recommendation normalization if present
     try:
         reco = str(out.get("recommendation") or "HOLD").upper()
-        if reco not in ("BUY", "HOLD", "REDUCE", "SELL"):
-            out["recommendation"] = "HOLD"
-        else:
-            out["recommendation"] = reco
+        out["recommendation"] = reco if reco in ("BUY", "HOLD", "REDUCE", "SELL") else "HOLD"
     except Exception:
         out["recommendation"] = "HOLD"
 
     return out
 
 
-async def _fetch_json(url: str, *, timeout_sec: float, retry_attempts: int, user_agent: str) -> Tuple[Optional[Any], Optional[str]]:
+async def _fetch_json(
+    url: str,
+    *,
+    timeout_sec: float,
+    retry_attempts: int,
+    user_agent: str,
+) -> Tuple[Optional[Any], Optional[str]]:
     httpx = _httpx()
     if httpx is None:
         return None, "httpx is not installed on server"
 
     headers = {"User-Agent": user_agent or DEFAULT_USER_AGENT, "Accept": "application/json,*/*"}
-    # retry with exponential backoff + jitter
     last_err = None
-    for attempt in range(0, max(1, retry_attempts + 1)):
-        try:
-            async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
-                r = await client.get(url, headers=headers)
-                if r.status_code != 200:
-                    last_err = f"HTTP {r.status_code}"
-                else:
-                    # Try JSON; if not JSON, return text error
-                    try:
-                        return r.json(), None
-                    except Exception:
-                        txt = (r.text or "").strip()
-                        return None, "Non-JSON response from Argaam"
-        except Exception as e:
-            last_err = str(e)
 
-        # backoff before next attempt
-        if attempt < retry_attempts:
-            base = 0.35 * (2 ** attempt)
-            jitter = random.uniform(0.0, 0.25)
-            await asyncio.sleep(min(3.0, base + jitter))
+    # Create ONE client for all retries (faster + fewer sockets)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
+            for attempt in range(0, max(1, retry_attempts + 1)):
+                try:
+                    r = await client.get(url, headers=headers)
+                    if r.status_code != 200:
+                        last_err = f"HTTP {r.status_code}"
+                    else:
+                        try:
+                            return r.json(), None
+                        except Exception:
+                            return None, "Non-JSON response from Argaam"
+
+                except Exception as e:
+                    last_err = str(e)
+
+                if attempt < retry_attempts:
+                    base = 0.35 * (2**attempt)
+                    jitter = random.uniform(0.0, 0.25)
+                    await asyncio.sleep(min(3.0, base + jitter))
+    except Exception as e:
+        return None, str(e)
 
     return None, last_err or "Unknown fetch error"
 
 
-async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Dict[str, Any]:
+async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Returns (quote_item, diag)
+    diag includes cache_hit/cache_key/url/error
+    """
     cfg = _cfg()
     sym = _normalize_ksa_symbol(symbol)
+
+    diag: Dict[str, Any] = {"requested": (symbol or "").strip(), "normalized": sym, "cache_hit": False}
+
     if not sym:
-        return {
+        out = {
             "status": "error",
+            "requested_symbol": (symbol or "").strip(),
             "symbol": (symbol or "").strip(),
             "error": "Invalid KSA symbol",
             "data_source": "argaam",
@@ -593,11 +617,13 @@ async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Dict[str,
             "last_updated_utc": _utc_iso(),
             "last_updated_riyadh": _riyadh_iso(),
         }
+        return out, diag
 
     tpl = cfg["quote_url"]
     if not tpl:
-        return {
+        out = {
             "status": "error",
+            "requested_symbol": sym,
             "symbol": sym,
             "error": "ARGAAM_QUOTE_URL is not configured",
             "data_source": "argaam",
@@ -605,14 +631,24 @@ async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Dict[str,
             "last_updated_utc": _utc_iso(),
             "last_updated_riyadh": _riyadh_iso(),
         }
+        return out, diag
 
     ck = f"argaam::{sym}"
+    diag["cache_key"] = ck
+
     if not refresh:
         hit = _cache_get(ck)
         if isinstance(hit, dict):
-            return hit
+            diag["cache_hit"] = True
+            # Ensure we never lose requested_symbol
+            hit.setdefault("requested_symbol", sym)
+            hit.setdefault("symbol", sym)
+            hit.setdefault("_cache_hit", True)
+            return hit, diag
 
     url = _format_url(tpl, sym)
+    diag["url"] = url
+
     raw, err = await _fetch_json(
         url,
         timeout_sec=cfg["timeout_sec"],
@@ -623,6 +659,7 @@ async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Dict[str,
     if raw is None:
         out = {
             "status": "error",
+            "requested_symbol": sym,
             "symbol": sym,
             "error": err or "No data",
             "provider_url": url,
@@ -634,11 +671,11 @@ async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Dict[str,
         if debug:
             out["debug"] = {"url": url}
         _cache_set(ck, out)
-        return out
+        return out, diag
 
-    out = _unified_from_argaam(sym, raw, source_url=url)
+    out = _unified_from_argaam(sym, raw, source_url=url, cache_hit=False)
     _cache_set(ck, out)
-    return out
+    return out, diag
 
 
 # =============================================================================
@@ -647,8 +684,7 @@ async def _get_quote(symbol: str, *, refresh: bool, debug: int = 0) -> Dict[str,
 def _rectangularize(headers: List[Any], rows: List[Any]) -> Tuple[List[str], List[List[Any]]]:
     h = [str(x).strip() for x in (headers or []) if str(x).strip()]
     if not h:
-        # Safe minimal fallback
-        h = ["Symbol", "Price", "Change %", "Data Quality", "Error", "Last Updated (UTC)", "Last Updated (Riyadh)"]
+        h = ["Symbol", "Name", "Price", "Change %", "Volume", "Recommendation", "Overall Score", "Data Quality", "Error", "Last Updated (UTC)", "Last Updated (Riyadh)"]
 
     out_rows: List[List[Any]] = []
     w = len(h)
@@ -665,51 +701,54 @@ def _rectangularize(headers: List[Any], rows: List[Any]) -> Tuple[List[str], Lis
 
 def _headers_for_sheet(sheet_name: Optional[str]) -> List[str]:
     get_headers, default_59 = _get_headers_helper()
+
     # 1) sheet-specific headers if possible
     if sheet_name and callable(get_headers):
         try:
             h = get_headers(sheet_name)
-            if isinstance(h, list) and len(h) > 0:
+            if isinstance(h, list) and h:
                 return [str(x).strip() for x in h if str(x).strip()]
         except Exception:
             pass
+
     # 2) fallback: 59-col schema if present
-    if isinstance(default_59, (list, tuple)) and len(default_59) > 0:
+    if isinstance(default_59, (list, tuple)) and len(default_59) >= 10:
         return [str(x).strip() for x in list(default_59) if str(x).strip()]
+
     # 3) minimal fallback
     return ["Symbol", "Name", "Price", "Change %", "Volume", "Recommendation", "Overall Score", "Data Quality", "Error", "Last Updated (UTC)", "Last Updated (Riyadh)"]
 
 
 def _map_to_row(item: Dict[str, Any], headers: List[str]) -> List[Any]:
     EnrichedQuote = _get_enriched_quote_class()
-    if EnrichedQuote and isinstance(item, dict) and item.get("status") == "ok":
+    if EnrichedQuote and isinstance(item, dict):
         try:
-            eq = EnrichedQuote.from_unified(item)
-            row = eq.to_row(headers)
+            eq = EnrichedQuote.from_unified(item)  # type: ignore
+            row = eq.to_row(headers)  # type: ignore
             if isinstance(row, list):
                 return row
         except Exception:
             pass
 
-    # Basic fallback mapping for error or if EnrichedQuote missing
+    # Basic fallback mapping (works for both ok/error)
     hlow = [h.lower() for h in headers]
     row = [""] * len(headers)
 
-    def put(col_name_sub: str, val: Any):
+    def put(sub: str, val: Any):
         try:
-            idx = next((i for i, hh in enumerate(hlow) if col_name_sub in hh), None)
+            idx = next((i for i, hh in enumerate(hlow) if sub in hh), None)
             if idx is not None:
                 row[idx] = val
         except Exception:
             pass
 
-    put("symbol", item.get("symbol") or item.get("symbol_normalized") or "")
+    put("symbol", item.get("symbol") or item.get("symbol_normalized") or item.get("requested_symbol") or "")
     put("name", item.get("name") or "")
     put("price", item.get("current_price") or "")
     put("change %", item.get("percent_change") or "")
     put("volume", item.get("volume") or "")
     put("recommendation", item.get("recommendation") or "HOLD")
-    put("overall", item.get("overall_score") or "")
+    put("overall", item.get("overall_score") or item.get("advisor_score") or "")
     put("data quality", item.get("data_quality") or "MISSING")
     put("error", item.get("error") or "")
     put("last updated (utc)", item.get("last_updated_utc") or _utc_iso())
@@ -718,23 +757,22 @@ def _map_to_row(item: Dict[str, Any], headers: List[str]) -> List[Any]:
     return row
 
 
-# =============================================================================
-# Models
-# =============================================================================
-class _ExtraIgnore(BaseModel):
-    if _PYDANTIC_V2:
-        model_config = ConfigDict(extra="ignore")
-    else:
-        class Config:  # type: ignore
-            extra = "ignore"
-
-
-class SheetRowsIn(_ExtraIgnore):
-    tickers: Optional[List[str]] = Field(default=None)
-    symbols: Optional[List[str]] = Field(default=None)
-    sheet_name: Optional[str] = Field(default=None)
-    refresh: Optional[int] = Field(default=0)
-    debug: Optional[int] = Field(default=0)
+def _envelope(status: str, *, headers: List[str], rows: List[List[Any]], error: Optional[str], meta: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "status": status,
+        "headers": headers,
+        "rows": rows,
+        "count": len(rows),
+        "version": ROUTE_VERSION,
+        "time_utc": _utc_iso(),
+        "time_riyadh": _riyadh_iso(),
+        "meta": meta or {},
+    }
+    if error is not None:
+        out["error"] = error
+    if extra and isinstance(extra, dict):
+        out.update(extra)
+    return out
 
 
 # =============================================================================
@@ -743,28 +781,31 @@ class SheetRowsIn(_ExtraIgnore):
 @router.get("/health")
 async def health() -> Dict[str, Any]:
     cfg = _cfg()
-    open_mode = True
+
+    # Mask settings (if config provides)
     rc = _routes_config_mod()
+    config_mask = None
     try:
-        if rc is not None and callable(getattr(rc, "allowed_tokens", None)):
-            open_mode = len(rc.allowed_tokens() or []) == 0  # type: ignore[attr-defined]
-        else:
-            open_mode = len(_allowed_tokens_env()) == 0
+        if rc is not None and callable(getattr(rc, "mask_settings_dict", None)):
+            config_mask = rc.mask_settings_dict()  # type: ignore[attr-defined]
     except Exception:
-        open_mode = len(_allowed_tokens_env()) == 0
+        config_mask = None
 
     return {
         "status": "ok",
         "module": "routes.routes_argaam",
         "version": ROUTE_VERSION,
         "configured": bool(cfg["quote_url"]),
+        "quote_url_has_placeholder": ("{code}" in (cfg["quote_url"] or "") or "{symbol}" in (cfg["quote_url"] or "")),
         "auth_header": _auth_header_name(),
-        "open_mode": open_mode,
+        "open_mode": _open_mode(),
         "timeout_sec": cfg["timeout_sec"],
         "retry_attempts": cfg["retry_attempts"],
         "concurrency": cfg["concurrency"],
         "cache_ttl_sec": cfg["cache_ttl"],
         "cache_max": cfg["cache_max"],
+        "cache_type": type(_quote_cache).__name__,
+        "config_mask": config_mask,
         "time_utc": _utc_iso(),
         "time_riyadh": _riyadh_iso(),
     }
@@ -777,48 +818,80 @@ async def quote(
     refresh: int = Query(0, description="refresh=1 bypasses cache"),
     token: Optional[str] = Query(None, description="(optional) query token if ALLOW_QUERY_TOKEN=1"),
     debug: int = Query(0, description="debug=1 adds small debug info"),
-) -> Union[Dict[str, Any], JSONResponse]:
+) -> Dict[str, Any]:
+    # GAS-safe: HTTP 200 always
     if not _auth_ok(request, token):
-        return JSONResponse({"status": "error", "error": "Unauthorized"}, status_code=401)
+        return {
+            "status": "error",
+            "requested_symbol": (symbol or "").strip(),
+            "symbol": (symbol or "").strip(),
+            "error": "Unauthorized",
+            "version": ROUTE_VERSION,
+            "time_utc": _utc_iso(),
+            "time_riyadh": _riyadh_iso(),
+        }
 
-    item = await _get_quote(symbol, refresh=bool(refresh), debug=int(debug or 0))
-    # Keep HTTP 200 for GAS safety unless explicit unauthorized
+    item, diag = await _get_quote(symbol, refresh=bool(refresh), debug=int(debug or 0))
+    if int(debug or 0):
+        item.setdefault("debug", {})
+        if isinstance(item["debug"], dict):
+            item["debug"]["diag"] = diag
+            item["debug"]["route_version"] = ROUTE_VERSION
+    item["version"] = ROUTE_VERSION
     return item
 
 
 @router.get("/quotes")
 async def quotes(
     request: Request,
-    symbols: Optional[str] = Query(None, description="Comma/space list: 1120.SR,2222.SR"),
-    tickers: Optional[str] = Query(None, description="Alias of symbols"),
+    symbols: Optional[List[str]] = Query(None, description="Repeated or CSV/space list"),
+    tickers: Optional[List[str]] = Query(None, description="Alias of symbols"),
     refresh: int = Query(0, description="refresh=1 bypasses cache"),
     token: Optional[str] = Query(None, description="(optional) query token if ALLOW_QUERY_TOKEN=1"),
     debug: int = Query(0, description="debug=1 adds small debug info"),
-) -> Union[Dict[str, Any], JSONResponse]:
+) -> Dict[str, Any]:
+    # GAS-safe: HTTP 200 always
     if not _auth_ok(request, token):
-        return JSONResponse({"status": "error", "error": "Unauthorized"}, status_code=401)
+        return {"status": "error", "error": "Unauthorized", "items": [], "count": 0, "version": ROUTE_VERSION, "time_utc": _utc_iso(), "time_riyadh": _riyadh_iso()}
 
-    syms = _parse_symbols(symbols or tickers or "")
+    syms = _symbols_from_query(symbols, tickers)
     if not syms:
-        return {"status": "error", "error": "No symbols provided", "items": [], "count": 0, "version": ROUTE_VERSION}
+        return {"status": "error", "error": "No symbols provided", "items": [], "count": 0, "version": ROUTE_VERSION, "time_utc": _utc_iso(), "time_riyadh": _riyadh_iso()}
 
     cfg = _cfg()
     syms = syms[: cfg["sheet_max"]]
 
     sem = asyncio.Semaphore(cfg["concurrency"])
+    started = time.time()
+
+    cache_hits = 0
+    cache_misses = 0
 
     async def one(s: str) -> Dict[str, Any]:
+        nonlocal cache_hits, cache_misses
         async with sem:
-            return await _get_quote(s, refresh=bool(refresh), debug=int(debug or 0))
+            item, diag = await _get_quote(s, refresh=bool(refresh), debug=int(debug or 0))
+            if diag.get("cache_hit"):
+                cache_hits += 1
+            else:
+                cache_misses += 1
+            if int(debug or 0):
+                item.setdefault("debug", {})
+                if isinstance(item["debug"], dict):
+                    item["debug"]["diag"] = diag
+            return item
 
-    items = await asyncio.gather(*[one(s) for s in syms], return_exceptions=True)
+    results = await asyncio.gather(*[one(s) for s in syms], return_exceptions=True)
 
-    out_items: List[Dict[str, Any]] = []
-    for i, it in enumerate(items):
+    items: List[Dict[str, Any]] = []
+    errors = 0
+    for i, it in enumerate(results):
         if isinstance(it, Exception):
-            out_items.append(
+            errors += 1
+            items.append(
                 {
                     "status": "error",
+                    "requested_symbol": syms[i],
                     "symbol": syms[i],
                     "error": str(it),
                     "data_source": "argaam",
@@ -828,13 +901,29 @@ async def quotes(
                 }
             )
         else:
-            out_items.append(it)
+            items.append(it)
+
+    ok_count = sum(1 for it in items if isinstance(it, dict) and it.get("status") == "ok")
+    processing_ms = round((time.time() - started) * 1000, 2)
 
     return {
-        "status": "ok",
-        "count": len(out_items),
-        "items": out_items,
+        "status": "ok" if ok_count > 0 else "error",
+        "count": len(items),
+        "items": items,
         "version": ROUTE_VERSION,
+        "meta": {
+            "route_version": ROUTE_VERSION,
+            "requested": len(syms),
+            "ok": ok_count,
+            "errors": errors,
+            "refresh": bool(refresh),
+            "configured": bool(cfg["quote_url"]),
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "processing_time_ms": processing_ms,
+            "time_utc": _utc_iso(),
+            "time_riyadh": _riyadh_iso(),
+        },
         "time_utc": _utc_iso(),
         "time_riyadh": _riyadh_iso(),
     }
@@ -851,49 +940,64 @@ async def sheet_rows(
 
     Request JSON (examples):
       {"tickers":["1120.SR","2222.SR"], "sheet_name":"Market_Leaders"}
-      {"symbols":["1120","2222"], "sheet_name":"Market_Leaders", "refresh":1}
+      {"symbols":"1120,2222", "sheetName":"Market_Leaders", "refresh":1}
 
     Response:
       { status, headers, rows, count, meta }
     """
+    started = time.time()
+
+    sheet_name = str(body.get("sheet_name") or body.get("sheetName") or body.get("sheet") or body.get("tab") or "").strip() or None
+    refresh = _truthy(body.get("refresh")) or str(body.get("refresh") or "").strip() == "1"
+    debug = _truthy(body.get("debug")) or str(body.get("debug") or "").strip() == "1"
+
+    headers = _headers_for_sheet(sheet_name)
+    if not headers:
+        headers = ["Symbol", "Error"]
+
+    # Auth error but still return stable grid contract
     if not _auth_ok(request, token):
-        # GAS safe: always include headers/rows even on auth error
-        headers = _headers_for_sheet(body.get("sheet_name"))
-        headers, rows = _rectangularize(headers, [])
-        return {
-            "status": "error",
-            "error": "Unauthorized",
-            "headers": headers,
-            "rows": rows,
-            "count": 0,
-            "meta": {"version": ROUTE_VERSION, "auth_header": _auth_header_name(), "time_riyadh": _riyadh_iso()},
-        }
+        h, r = _rectangularize(headers, [])
+        return _envelope(
+            "error",
+            headers=h,
+            rows=r,
+            error="Unauthorized",
+            meta={"route_version": ROUTE_VERSION, "auth_header": _auth_header_name(), "sheet_name": sheet_name, "time_riyadh": _riyadh_iso()},
+        )
 
-    # Parse input robustly (list OR string)
-    sheet_name = body.get("sheet_name") or body.get("sheet") or body.get("tab") or None
-    refresh = int(body.get("refresh") or 0)
-    debug = int(body.get("debug") or 0)
-
-    syms = _parse_symbols(body.get("tickers") or body.get("symbols") or [])
+    # Resolve symbols (payload supports list OR string)
+    syms = _symbols_from_body(body)
     cfg = _cfg()
     syms = syms[: cfg["sheet_max"]]
 
-    headers = _headers_for_sheet(sheet_name)
     if not syms:
-        headers, rows0 = _rectangularize(headers, [])
-        return {
-            "status": "skipped",
-            "headers": headers,
-            "rows": rows0,
-            "count": 0,
-            "meta": {"version": ROUTE_VERSION, "reason": "No symbols", "time_riyadh": _riyadh_iso()},
-        }
+        h, r0 = _rectangularize(headers, [])
+        return _envelope(
+            "skipped",
+            headers=h,
+            rows=r0,
+            error=None,
+            meta={"route_version": ROUTE_VERSION, "reason": "No symbols", "sheet_name": sheet_name, "time_riyadh": _riyadh_iso()},
+        )
 
     sem = asyncio.Semaphore(cfg["concurrency"])
+    cache_hits = 0
+    cache_misses = 0
 
     async def one(s: str) -> Dict[str, Any]:
+        nonlocal cache_hits, cache_misses
         async with sem:
-            return await _get_quote(s, refresh=bool(refresh), debug=debug)
+            item, diag = await _get_quote(s, refresh=bool(refresh), debug=int(debug))
+            if diag.get("cache_hit"):
+                cache_hits += 1
+            else:
+                cache_misses += 1
+            if debug:
+                item.setdefault("debug", {})
+                if isinstance(item["debug"], dict):
+                    item["debug"]["diag"] = diag
+            return item
 
     raw_items = await asyncio.gather(*[one(s) for s in syms], return_exceptions=True)
 
@@ -905,6 +1009,7 @@ async def sheet_rows(
             items.append(
                 {
                     "status": "error",
+                    "requested_symbol": syms[i],
                     "symbol": syms[i],
                     "error": str(it),
                     "data_source": "argaam",
@@ -916,31 +1021,40 @@ async def sheet_rows(
         else:
             items.append(it)
 
-    rows = []
+    rows: List[List[Any]] = []
     for it in items:
         try:
             rows.append(_map_to_row(it, headers))
         except Exception as e:
             errors += 1
-            # Absolute safety: never break row count
             rows.append(_map_to_row({"status": "error", "symbol": it.get("symbol"), "error": str(e), "data_quality": "MISSING"}, headers))
 
-    headers, rows = _rectangularize(headers, rows)
-
+    h2, r2 = _rectangularize(headers, rows)
     ok_count = sum(1 for it in items if isinstance(it, dict) and it.get("status") == "ok")
+    processing_ms = round((time.time() - started) * 1000, 2)
+
     meta = {
-        "version": ROUTE_VERSION,
+        "route_version": ROUTE_VERSION,
         "sheet_name": sheet_name,
         "requested": len(syms),
         "ok": ok_count,
         "errors": errors,
         "refresh": bool(refresh),
         "configured": bool(cfg["quote_url"]),
+        "quote_url_has_placeholder": ("{code}" in (cfg["quote_url"] or "") or "{symbol}" in (cfg["quote_url"] or "")),
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "headers_len": len(h2),
+        "rows_len": len(r2),
+        "processing_time_ms": processing_ms,
         "time_utc": _utc_iso(),
         "time_riyadh": _riyadh_iso(),
     }
 
-    return {"status": "ok" if ok_count > 0 else "error", "headers": headers, "rows": rows, "count": len(rows), "meta": meta}
+    status = "ok" if ok_count > 0 else "error"
+    err_text = None if status == "ok" else "No successful rows returned"
+
+    return _envelope(status, headers=h2, rows=r2, error=err_text, meta=meta)
 
 
 __all__ = ["router"]
