@@ -3,26 +3,23 @@
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (v6.6.0)
+Tadawul Fast Bridge – FastAPI Entry Point (v6.6.1)
 Mission Critical Edition — OBSERVE + PROTECT + SCALE (Render-Optimized)
 
-Design goals
-- Ultra-safe boot (no hard dependency on psutil/slowapi)
-- Router mounting is resilient + optionally deferrable (DEFER_ROUTER_MOUNT)
-- Riyadh-aware timestamps across health/diagnostics
-- Structured logging with request correlation (X-Request-ID)
-- Production security headers + CORS policy via env keys
-- Engine boot is resilient with backoff (INIT_ENGINE_ON_BOOT)
+🚨 IMPORTANT FIX (your Render crash):
+- Handles LOG_FORMAT values like "detailed" safely.
+  If LOG_FORMAT is a preset name (detailed/compact/simple/json) OR an invalid format,
+  we auto-fallback to a safe default and DO NOT crash at import-time.
 
-Key env knobs (aligned with your Render environment keys)
-- LOG_LEVEL, LOG_JSON, LOG_FORMAT
+Key env knobs (aligned with your Render keys)
+- LOG_LEVEL, LOG_JSON, LOG_FORMAT, LOG_DATEFMT
 - ENABLE_RATE_LIMITING, MAX_REQUESTS_PER_MINUTE
 - ENABLE_SWAGGER, ENABLE_REDOC
-- ENABLE_CORS_ALL_ORIGINS, CORS_ALL_ORIGINS, CORS_ORIGINS
+- ENABLE_CORS_ALL_ORIGINS, CORS_ORIGINS
 - ALLOWED_HOSTS
 - INIT_ENGINE_ON_BOOT
 - DEFER_ROUTER_MOUNT
-- APP_NAME, APP_TITLE, SERVICE_NAME, APP_VERSION, SERVICE_VERSION, APP_ENV, ENVIRONMENT
+- APP_NAME, APP_TITLE, SERVICE_NAME, APP_VERSION, APP_ENV, ENVIRONMENT
 """
 
 from __future__ import annotations
@@ -71,6 +68,7 @@ try:
 except Exception:
     _PSUTIL = None
 
+
 # -----------------------------------------------------------------------------
 # Path safety
 # -----------------------------------------------------------------------------
@@ -78,7 +76,8 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "6.6.0"
+APP_ENTRY_VERSION = "6.6.1"
+
 
 # -----------------------------------------------------------------------------
 # Helpers (env coercion)
@@ -130,11 +129,8 @@ def _service_name() -> str:
 
 
 def _service_version() -> str:
-    return _strip(os.getenv("SERVICE_VERSION") or os.getenv("APP_VERSION") or "dev")
-
-
-def _backend_base_url() -> str:
-    return (_strip(os.getenv("BACKEND_BASE_URL") or os.getenv("TFB_BASE_URL") or "")).rstrip("/")
+    # keep compatibility with your render.yaml: APP_VERSION is set there
+    return _strip(os.getenv("SERVICE_VERSION") or os.getenv("APP_VERSION") or APP_ENTRY_VERSION)
 
 
 def _safe_import(mod_path: str) -> Optional[Any]:
@@ -152,8 +148,7 @@ def _read_proc_status_rss_mb() -> float:
             for line in f:
                 if line.startswith("VmRSS:"):
                     parts = line.split()
-                    # VmRSS: <kB>
-                    kb = float(parts[1])
+                    kb = float(parts[1])  # VmRSS: <kB>
                     return kb / 1024.0
     except Exception:
         pass
@@ -174,7 +169,6 @@ def _cpu_pct() -> float:
     if _PSUTIL is not None:
         try:
             p = _PSUTIL.Process(os.getpid())
-            # first call often 0; still useful over time
             return float(p.cpu_percent(interval=None))
         except Exception:
             pass
@@ -195,7 +189,7 @@ def _get_request_id() -> str:
 
 
 # -----------------------------------------------------------------------------
-# Logging (text or JSON)
+# Logging (text or JSON) — SAFE vs LOG_FORMAT="detailed"
 # -----------------------------------------------------------------------------
 class _RequestIDFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -217,33 +211,67 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+_DEFAULT_FMT_DETAILED = "%(asctime)s | %(levelname)s | [%(request_id)s] %(name)s | %(message)s"
+_DEFAULT_FMT_COMPACT = "%(asctime)s | %(levelname)s | %(message)s"
+_DEFAULT_FMT_SIMPLE = "%(levelname)s | %(message)s"
+
+
+def _resolve_text_formatter(fmt_raw: str, datefmt: str) -> logging.Formatter:
+    """
+    Never raises. If fmt_raw is invalid (like 'detailed'), falls back safely.
+    Supports presets + real %-style format strings.
+    """
+    raw = (fmt_raw or "").strip()
+    low = raw.lower()
+
+    # Presets (this is what prevents your crash)
+    if low in {"detailed", "detail", "default", "prod", "production"} or not raw:
+        fmt = _DEFAULT_FMT_DETAILED
+    elif low in {"compact", "short"}:
+        fmt = _DEFAULT_FMT_COMPACT
+    elif low in {"simple"}:
+        fmt = _DEFAULT_FMT_SIMPLE
+    elif low in {"json"}:
+        # caller should have chosen JSON formatter; still safe fallback
+        fmt = _DEFAULT_FMT_DETAILED
+    else:
+        fmt = raw
+
+    # Validate: must contain at least one %(...)s token, otherwise it's likely invalid
+    # (but we still try in case user intentionally wants constant string)
+    try:
+        return logging.Formatter(fmt, datefmt=datefmt)
+    except Exception:
+        # ultimate fallback (never crash import)
+        return logging.Formatter(_DEFAULT_FMT_DETAILED, datefmt=datefmt)
+
+
 def _configure_logging() -> None:
     lvl = _strip(os.getenv("LOG_LEVEL") or "INFO").upper()
     json_mode = _truthy(os.getenv("LOG_JSON"), default=False)
 
-    # Allow override, else default format
-    fmt = _strip(os.getenv("LOG_FORMAT")) or "%(asctime)s | %(levelname)s | [%(request_id)s] %(name)s | %(message)s"
-    datefmt = "%H:%M:%S"
+    fmt_raw = _strip(os.getenv("LOG_FORMAT"))  # may be "detailed" in Render => now safe
+    datefmt = _strip(os.getenv("LOG_DATEFMT")) or "%H:%M:%S"
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, lvl, logging.INFO))
 
-    # If handlers already exist (uvicorn), update them
+    # If handlers already exist (uvicorn), update them; else add one
     if not root.handlers:
-        h = logging.StreamHandler()
-        root.addHandler(h)
+        root.addHandler(logging.StreamHandler())
 
     for h in root.handlers:
         h.addFilter(_RequestIDFilter())
         if json_mode:
             h.setFormatter(_JsonFormatter())
         else:
-            h.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+            h.setFormatter(_resolve_text_formatter(fmt_raw, datefmt=datefmt))
 
 
 _configure_logging()
 logger = logging.getLogger("main")
 boot_logger = logging.getLogger("boot")
+
 
 # -----------------------------------------------------------------------------
 # System Guardian (event-loop lag + memory pressure + degraded mode)
@@ -262,7 +290,6 @@ class SystemGuardian:
         self.boot_ts_riyadh: str = _now_riyadh_iso()
 
     def get_load_status(self) -> str:
-        # conservative thresholds
         if self.latency_ms > 300:
             return "overloaded"
         if self.latency_ms > 100:
@@ -273,7 +300,6 @@ class SystemGuardian:
         self.running = True
         self.last_gc_ts = time.time()
         boot_logger.info("🛡️ System Guardian started. TZ=Asia/Riyadh")
-        # warm up cpu sampling if psutil exists
         _ = _cpu_pct()
 
         while self.running:
@@ -285,16 +311,18 @@ class SystemGuardian:
             self.memory_mb = _rss_mb()
             self.cpu_pct = _cpu_pct()
 
-            # Memory self-heal (tunable)
             gc_threshold = float(_strip(os.getenv("GC_PRESSURE_MB")) or "420")
             gc_cooldown = float(_strip(os.getenv("GC_COOLDOWN_SEC")) or "60")
 
             if self.memory_mb >= gc_threshold and (time.time() - self.last_gc_ts) >= gc_cooldown:
-                boot_logger.warning("Memory pressure: %.1fMB (>=%.0f). Triggering gc.collect().", self.memory_mb, gc_threshold)
+                boot_logger.warning(
+                    "Memory pressure: %.1fMB (>=%.0f). Triggering gc.collect().",
+                    self.memory_mb,
+                    gc_threshold,
+                )
                 gc.collect()
                 self.last_gc_ts = time.time()
 
-            # Degraded mode on large lag
             enter_ms = float(_strip(os.getenv("DEGRADED_ENTER_LAG_MS")) or "500")
             exit_ms = float(_strip(os.getenv("DEGRADED_EXIT_LAG_MS")) or "150")
 
@@ -310,6 +338,7 @@ class SystemGuardian:
 
 
 guardian = SystemGuardian()
+
 
 # -----------------------------------------------------------------------------
 # Middleware
@@ -329,43 +358,47 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
 
         t0 = time.perf_counter()
 
-        # Optional overload shedding for expensive paths
-        shed_enabled = _truthy(os.getenv("DEGRADED_SHED_ENABLED"), default=True)
-        shed_paths = _strip(os.getenv("DEGRADED_SHED_PATHS") or "/v1/analysis,/v1/advanced,/v1/advisor").split(",")
-        if shed_enabled and guardian.degraded_mode:
-            p = request.url.path or ""
-            if any(p.startswith(x.strip()) for x in shed_paths if x.strip()):
-                _request_id_ctx.reset(token)
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "status": "degraded",
-                        "message": "System under load. Please retry shortly.",
-                        "request_id": rid,
-                        "load": guardian.get_load_status(),
-                        "time_riyadh": _now_riyadh_iso(),
-                    },
-                )
-
         try:
+            shed_enabled = _truthy(os.getenv("DEGRADED_SHED_ENABLED"), default=True)
+            shed_paths = _strip(os.getenv("DEGRADED_SHED_PATHS") or "/v1/analysis,/v1/advanced,/v1/advisor").split(",")
+
+            if shed_enabled and guardian.degraded_mode:
+                p = request.url.path or ""
+                if any(p.startswith(x.strip()) for x in shed_paths if x.strip()):
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "status": "degraded",
+                            "message": "System under load. Please retry shortly.",
+                            "request_id": rid,
+                            "load": guardian.get_load_status(),
+                            "time_riyadh": _now_riyadh_iso(),
+                        },
+                    )
+
             response = await call_next(request)
+            return response
+
         finally:
+            # Always attach headers if we have a response object
+            # (Starlette will ignore if response wasn't created)
             dt = time.perf_counter() - t0
+            try:
+                # If response exists in local scope, set headers
+                if "response" in locals() and locals()["response"] is not None:
+                    resp = locals()["response"]
+                    resp.headers["X-Request-ID"] = rid
+                    resp.headers["X-Process-Time"] = f"{dt:.4f}s"
+                    resp.headers["X-System-Load"] = guardian.get_load_status()
 
-        # Core telemetry headers
-        response.headers["X-Request-ID"] = rid
-        response.headers["X-Process-Time"] = f"{dt:.4f}s"
-        response.headers["X-System-Load"] = guardian.get_load_status()
+                    resp.headers["X-Content-Type-Options"] = "nosniff"
+                    resp.headers["X-Frame-Options"] = "DENY"
+                    resp.headers["Referrer-Policy"] = "no-referrer"
+                    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+            except Exception:
+                pass
 
-        # Security headers (safe defaults)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        # HSTS is harmless behind TLS; if not TLS, browsers ignore it
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-
-        _request_id_ctx.reset(token)
-        return response
+            _request_id_ctx.reset(token)
 
 
 # -----------------------------------------------------------------------------
@@ -425,7 +458,7 @@ def _mount_routers(app_: FastAPI) -> Dict[str, Any]:
         ("System", ["routes.config", "routes.system"]),
     ]
 
-    report = {"mounted": [], "failed": []}
+    report: Dict[str, Any] = {"mounted": [], "failed": []}
     for label, candidates in router_plan:
         mounted = False
         last_err = ""
@@ -465,7 +498,6 @@ def _route_inventory(app_: FastAPI) -> List[Dict[str, Any]]:
 # Settings masking (optional config.py integration)
 # -----------------------------------------------------------------------------
 def _masked_settings() -> Dict[str, Any]:
-    # Prefer config.py (new), else env.py compatibility
     mod = _safe_import("config") or _safe_import("core.config")
     if mod and hasattr(mod, "mask_settings_dict"):
         try:
@@ -480,10 +512,14 @@ def _masked_settings() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Minimal fallback
     return {
         "app": {"name": _service_name(), "version": _service_version(), "env": _env_name()},
         "auth": {"tokens_present": bool(_strip(os.getenv("APP_TOKEN") or "") or _strip(os.getenv("BACKUP_APP_TOKEN") or ""))},
+        "logging": {
+            "log_level": _strip(os.getenv("LOG_LEVEL") or "INFO"),
+            "log_json": _truthy(os.getenv("LOG_JSON"), default=False),
+            "log_format": _strip(os.getenv("LOG_FORMAT") or ""),
+        },
     }
 
 
@@ -501,7 +537,6 @@ def create_app() -> FastAPI:
     docs_url = "/docs" if enable_docs else None
     redoc_url = "/redoc" if enable_redoc else None
 
-    # SlowAPI limiter (optional)
     limiter = None
     if HAS_SLOWAPI and _truthy(os.getenv("ENABLE_RATE_LIMITING"), default=True):
         rpm = int(float(_strip(os.getenv("MAX_REQUESTS_PER_MINUTE") or "240")))
@@ -509,7 +544,6 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
-        # ---- state init
         app_.state.boot_time_utc = _now_utc_iso()
         app_.state.boot_time_riyadh = _now_riyadh_iso()
         app_.state.boot_completed = False
@@ -518,15 +552,11 @@ def create_app() -> FastAPI:
         app_.state.router_report = {"mounted": [], "failed": []}
         app_.state.routes_snapshot = []
 
-        # ---- guardian monitor
         guardian_task = asyncio.create_task(guardian.start())
 
-        # ---- boot sequence
         async def _boot():
-            # Yield once
             await asyncio.sleep(0)
 
-            # Optionally defer router mounting for ultra-fast boot
             defer_mount = _truthy(os.getenv("DEFER_ROUTER_MOUNT"), default=False)
             if not defer_mount:
                 app_.state.router_report = _mount_routers(app_)
@@ -535,25 +565,18 @@ def create_app() -> FastAPI:
             else:
                 boot_logger.warning("DEFER_ROUTER_MOUNT=1 -> routers will NOT be mounted at boot.")
 
-            # Engine init (optional)
             if _truthy(os.getenv("INIT_ENGINE_ON_BOOT"), default=True):
-                await _init_engine_resilient(app_, max_retries=int(float(_strip(os.getenv("MAX_RETRIES") or "3"))))
+                maxr = int(float(_strip(os.getenv("MAX_RETRIES") or "3")))
+                await _init_engine_resilient(app_, max_retries=maxr)
 
-            # Post-boot cleanup
             gc.collect()
             app_.state.boot_completed = True
-            boot_logger.info(
-                "🚀 Ready v%s | env=%s | mem=%.1fMB | tz=Asia/Riyadh",
-                version,
-                app_env,
-                guardian.memory_mb,
-            )
+            boot_logger.info("🚀 Ready v%s | env=%s | mem=%.1fMB | tz=Asia/Riyadh", version, app_env, guardian.memory_mb)
 
         boot_task = asyncio.create_task(_boot())
 
         yield
 
-        # ---- shutdown
         boot_logger.info("Shutdown initiated.")
         boot_task.cancel()
         guardian.stop()
@@ -562,7 +585,6 @@ def create_app() -> FastAPI:
         except Exception:
             pass
 
-        # best-effort engine shutdown
         eng = getattr(app_.state, "engine", None)
         if eng is not None:
             try:
@@ -576,17 +598,14 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title=title, version=version, lifespan=lifespan, docs_url=docs_url, redoc_url=redoc_url)
 
-    # ---- rate limit handler
     if limiter is not None:
         app.state.limiter = limiter
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # ---- middleware stack
     app.add_middleware(TelemetryMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=512)
 
-    # ---- CORS policy (aligned with your env keys)
-    cors_all = _truthy(os.getenv("ENABLE_CORS_ALL_ORIGINS") or os.getenv("CORS_ALL_ORIGINS"), default=True)
+    cors_all = _truthy(os.getenv("ENABLE_CORS_ALL_ORIGINS"), default=True)
     cors_origins_raw = _strip(os.getenv("CORS_ORIGINS") or "")
     if cors_all or not cors_origins_raw:
         allow_origins = ["*"]
@@ -601,15 +620,14 @@ def create_app() -> FastAPI:
         allow_credentials=False,
     )
 
-    # ---- Trusted hosts in production (safe default "*")
     if app_env == "production":
         allowed_hosts_raw = _strip(os.getenv("ALLOWED_HOSTS") or "*")
         allowed_hosts = [h.strip() for h in allowed_hosts_raw.split(",") if h.strip()] or ["*"]
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # System Endpoints
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     @app.get("/", include_in_schema=False)
     async def root():
         return {"status": "online", "service": title, "version": version, "time_riyadh": _now_riyadh_iso()}
@@ -624,7 +642,6 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
-        # lightweight health alias for platforms
         return {"status": "ok", "time_utc": _now_utc_iso(), "time_riyadh": _now_riyadh_iso()}
 
     @app.get("/health", tags=["system"])
@@ -653,26 +670,33 @@ def create_app() -> FastAPI:
 
     @app.get("/system/info", tags=["system"])
     async def system_info():
-        # Safe/masked settings for troubleshooting
         return {"status": "ok", "settings": _masked_settings(), "time_riyadh": _now_riyadh_iso()}
 
     @app.post("/system/mount-routers", tags=["system"])
     async def mount_routers_now():
-        # Allows mounting after boot when DEFER_ROUTER_MOUNT=1
         report = _mount_routers(app)
         app.state.router_report = report
         app.state.routes_snapshot = _route_inventory(app)
-        return {"status": "success", "mounted": report["mounted"], "failed": report["failed"], "routes": len(app.state.routes_snapshot)}
+        return {
+            "status": "success",
+            "mounted": report["mounted"],
+            "failed": report["failed"],
+            "routes": len(app.state.routes_snapshot),
+        }
 
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Error handling
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     @app.exception_handler(StarletteHTTPException)
     async def http_exc_handler(request: Request, exc: StarletteHTTPException):
         logger.warning("HTTP error %s on %s: %s", exc.status_code, request.url.path, exc.detail)
         return JSONResponse(
             status_code=exc.status_code,
-            content={"status": "error", "message": exc.detail, "request_id": getattr(request.state, "request_id", "n/a")},
+            content={
+                "status": "error",
+                "message": exc.detail,
+                "request_id": getattr(request.state, "request_id", "n/a"),
+            },
         )
 
     @app.exception_handler(Exception)
