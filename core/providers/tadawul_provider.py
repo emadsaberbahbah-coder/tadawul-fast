@@ -23,7 +23,7 @@ Environment variables
 
 Endpoints (templates support {symbol} and {code} and optional {days})
 - TADAWUL_QUOTE_URL            (required for quote)
-- TADAWUL_FUNDAMENTALS_URL     (optional)
+- TADAWUL_FUNDAMENTALS_URL      (optional)
 - TADAWUL_HISTORY_URL          (optional; {days} supported)
 - TADAWUL_CANDLES_URL          (optional alias if HISTORY_URL missing)
 
@@ -765,7 +765,7 @@ def _compute_history_analytics(closes: List[float], highs: Optional[List[float]]
         conf_pct = (0.55 * base) + (0.45 * (r2 * 100.0)) - vol_pen
         conf_pct = max(0.0, min(100.0, conf_pct))
 
-        out["confidence_score"] = float(conf_pct)                     # 0..100 (human readable)
+        out["confidence_score"] = float(conf_pct)                             # 0..100 (human readable)
         out["forecast_confidence"] = float(conf_pct / 100.0)          # 0..1 (engine-friendly)
         out["forecast_method"] = "tadawul_history_logreg_v3"
     else:
