@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import traceback
+import uuid
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -663,7 +664,7 @@ def _hkey(h: str) -> str:
 
 def _payload_symbol_key(p: Dict[str, Any]) -> str:
     try:
-        for k in ("symbol_normalized", "symbol", "Symbol", "ticker", "code"):
+        for k in ("symbol_normalized", "symbol", "ticker", "code"):
             v = p.get(k)
             if v is not None:
                 s = str(v).strip().upper()
@@ -1328,14 +1329,15 @@ async def _call_engine_batch_best_effort(
 # =============================================================================
 # Finalization rules for API payloads
 # =============================================================================
-def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: str) -> Dict[str, Any]:
+def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: str, request_id: str) -> Dict[str, Any]:
     sym = (norm or raw or "").strip().upper() or ""
 
     try:
         payload.setdefault("symbol", sym)
+        payload["requested_symbol"] = payload.get("requested_symbol") or raw
         payload["symbol_input"] = payload.get("symbol_input") or raw
         payload["symbol_normalized"] = payload.get("symbol_normalized") or sym
-        payload["requested_symbol"] = raw  # stable mapping for sheet clients
+        payload["request_id"] = payload.get("request_id") or request_id
 
         # origin default
         if not payload.get("origin"):
@@ -1395,14 +1397,13 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
         except Exception:
             pass
 
-        # compute 52w position if missing
+        # 52w position if missing
         if payload.get("position_52w_percent") is None:
-            cp = _safe_get(payload, "current_price", "last_price", "price")
-            lo = _safe_get(payload, "week_52_low", "low_52w", "52w_low")
-            hi = _safe_get(payload, "week_52_high", "high_52w", "52w_high")
-            pos = _compute_52w_position_pct(cp, lo, hi)
-            if pos is not None:
-                payload["position_52w_percent"] = pos
+            payload["position_52w_percent"] = _compute_52w_position_pct(
+                _safe_get(payload, "current_price", "last_price", "price"),
+                _safe_get(payload, "week_52_low", "low_52w", "52w_low"),
+                _safe_get(payload, "week_52_high", "high_52w", "52w_high"),
+            )
 
         # turnover / free float mkt cap / liquidity score
         if payload.get("turnover_percent") is None:
@@ -1437,16 +1438,16 @@ def _finalize_payload(payload: Dict[str, Any], *, raw: str, norm: str, source: s
             {
                 "status": "error",
                 "symbol": sym,
+                "requested_symbol": raw,
                 "symbol_input": raw,
                 "symbol_normalized": sym,
-                "requested_symbol": raw,
-                "origin": _origin_default_from_payload({"symbol_normalized": sym}),
                 "recommendation": "HOLD",
                 "data_quality": "MISSING",
                 "data_source": source or "unknown",
                 "error": "payload_finalize_failed",
                 "last_updated_utc": _now_utc().isoformat(),
                 "last_updated_riyadh": "",
+                "request_id": request_id,
             }
         )
 
@@ -1481,6 +1482,42 @@ def _cfg() -> Dict[str, Any]:
 
 
 # =============================================================================
+# Query parsing (supports repeated params)
+# =============================================================================
+def _extract_symbols_from_request(req: Request, symbols_param: str, tickers_param: str) -> List[str]:
+    vals: List[str] = []
+    try:
+        vals.extend([v for v in req.query_params.getlist("symbols") if v])
+    except Exception:
+        pass
+    try:
+        vals.extend([v for v in req.query_params.getlist("tickers") if v])
+    except Exception:
+        pass
+
+    if not vals:
+        if symbols_param:
+            vals.append(symbols_param)
+        if tickers_param:
+            vals.append(tickers_param)
+
+    out: List[str] = []
+    for v in vals:
+        out.extend(_split_symbols(v))
+    # de-dupe while preserving order
+    seen = set()
+    final: List[str] = []
+    for s in out:
+        k = s.strip()
+        if not k:
+            continue
+        if k not in seen:
+            seen.add(k)
+            final.append(k)
+    return final
+
+
+# =============================================================================
 # Routes
 # =============================================================================
 @router.get("/headers", include_in_schema=False)
@@ -1491,41 +1528,51 @@ async def enriched_headers():
 @router.get("/quote")
 async def enriched_quote(
     request: Request,
-    symbol: str = Query(..., description="Ticker symbol (AAPL, MSFT.US, 1120.SR, ^GSPC, GC=F)"),
+    symbol: str = Query("", description="Ticker symbol (AAPL, MSFT.US, 1120.SR, ^GSPC, GC=F)"),
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
     include_headers: int = Query(0, description="Set 1 to include headers in response"),
     include_rows: int = Query(0, description="Set 1 to include sheet-ready row aligned to headers"),
 ):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:18]
     dbg = _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(debug)
+
+    if not _is_authorized(request):
+        return JSONResponse(
+            status_code=200,
+            content=_schema_fill_best_effort(
+                {
+                    "status": "error",
+                    "message": "unauthorized",
+                    "error": "unauthorized",
+                    "request_id": request_id,
+                    "time_utc": _now_utc().isoformat(),
+                }
+            ),
+        )
 
     raw = (symbol or "").strip()
     norm = _normalize_symbol_safe(raw)
 
     if not raw:
-        out = _schema_fill_best_effort(
-            {
-                "status": "error",
-                "symbol": "",
-                "symbol_input": "",
-                "symbol_normalized": "",
-                "requested_symbol": "",
-                "origin": "",
-                "recommendation": "HOLD",
-                "data_quality": "MISSING",
-                "data_source": "none",
-                "error": "Empty symbol",
-                "last_updated_utc": _now_utc().isoformat(),
-                "last_updated_riyadh": "",
-            }
+        return JSONResponse(
+            status_code=200,
+            content=_schema_fill_best_effort(
+                {
+                    "status": "error",
+                    "symbol": "",
+                    "requested_symbol": "",
+                    "symbol_input": "",
+                    "symbol_normalized": "",
+                    "recommendation": "HOLD",
+                    "data_quality": "MISSING",
+                    "data_source": "none",
+                    "error": "Empty symbol",
+                    "last_updated_utc": _now_utc().isoformat(),
+                    "last_updated_riyadh": "",
+                    "request_id": request_id,
+                }
+            ),
         )
-        body: Dict[str, Any] = out
-        if include_headers:
-            body = dict(body)
-            body["headers"] = ENRICHED_HEADERS_59
-        if include_rows:
-            body = dict(body)
-            body["rows"] = [EnrichedQuote.from_unified(out).to_row(ENRICHED_HEADERS_59)]
-        return JSONResponse(status_code=200, content=body)
 
     try:
         result, source, err = await _call_engine_best_effort(request, norm or raw)
@@ -1534,188 +1581,182 @@ async def enriched_quote(
                 {
                     "status": "error",
                     "symbol": norm or raw,
+                    "requested_symbol": raw,
                     "symbol_input": raw,
                     "symbol_normalized": norm or raw,
-                    "requested_symbol": raw,
-                    "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                     "recommendation": "HOLD",
                     "data_quality": "MISSING",
                     "data_source": "none",
                     "error": err or "Enriched quote engine not available (no working provider).",
                     "last_updated_utc": _now_utc().isoformat(),
                     "last_updated_riyadh": "",
+                    "request_id": request_id,
                 }
             )
-            body2: Dict[str, Any] = out
-            if include_headers:
-                body2 = dict(body2)
-                body2["headers"] = ENRICHED_HEADERS_59
-            if include_rows:
-                body2 = dict(body2)
-                body2["rows"] = [EnrichedQuote.from_unified(out).to_row(ENRICHED_HEADERS_59)]
-            return JSONResponse(status_code=200, content=body2)
+            return JSONResponse(status_code=200, content=out)
 
         payload = _as_payload(result)
-        payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
-
-        body3: Dict[str, Any] = payload
-        if include_headers:
-            body3 = dict(body3)
-            body3["headers"] = ENRICHED_HEADERS_59
-        if include_rows:
-            body3 = dict(body3)
-            body3["rows"] = [EnrichedQuote.from_unified(payload).to_row(ENRICHED_HEADERS_59)]
-        return JSONResponse(status_code=200, content=body3)
+        payload = _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown", request_id=request_id)
+        return JSONResponse(status_code=200, content=payload)
 
     except Exception as e:
         out2: Dict[str, Any] = {
             "status": "error",
             "symbol": norm or raw,
+            "requested_symbol": raw,
             "symbol_input": raw,
             "symbol_normalized": norm or raw,
-            "requested_symbol": raw,
-            "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
             "recommendation": "HOLD",
             "data_quality": "MISSING",
             "data_source": "none",
             "error": _safe_error_message(e),
             "last_updated_utc": _now_utc().isoformat(),
             "last_updated_riyadh": "",
+            "request_id": request_id,
         }
         if dbg:
             out2["traceback"] = _clamp(traceback.format_exc(), 8000)
-
-        out2 = _schema_fill_best_effort(out2)
-
-        body4: Dict[str, Any] = out2
-        if include_headers:
-            body4 = dict(body4)
-            body4["headers"] = ENRICHED_HEADERS_59
-        if include_rows:
-            body4 = dict(body4)
-            body4["rows"] = [EnrichedQuote.from_unified(out2).to_row(ENRICHED_HEADERS_59)]
-        return JSONResponse(status_code=200, content=body4)
+        return JSONResponse(status_code=200, content=_schema_fill_best_effort(out2))
 
 
 @router.get("/quotes")
 async def enriched_quotes(
     request: Request,
-    symbols: Optional[str] = Query(None, description="Comma/space-separated symbols, e.g. AAPL,MSFT,1120.SR"),
+    symbols: str = Query("", description="Comma/space-separated symbols OR repeated ?symbols=..."),
+    tickers: str = Query("", description="Alias of symbols (supports repeated ?tickers=...)"),
+    format: str = Query("items", description="items | sheet"),
     debug: int = Query(0, description="Set 1 to include traceback (or enable DEBUG_ERRORS=1)"),
-    include_headers: int = Query(0, description="Set 1 to include headers in response"),
-    include_rows: int = Query(0, description="Set 1 to include sheet-ready rows aligned to headers"),
 ):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:18]
     dbg = _truthy(os.getenv("DEBUG_ERRORS", "0")) or bool(debug)
+    fmt = (format or "items").strip().lower()
 
-    raw_list = _extract_symbols_from_request(request, symbols)
+    if not _is_authorized(request):
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "error",
+                "message": "unauthorized",
+                "error": "unauthorized",
+                "request_id": request_id,
+                "items": [],
+                "count": 0,
+            },
+        )
+
+    raw_list = _extract_symbols_from_request(request, symbols, tickers)
     if not raw_list:
-        body = {"status": "error", "error": "Empty symbols list", "items": []}
-        if include_headers:
-            body["headers"] = ENRICHED_HEADERS_59
-        if include_rows:
-            body["rows"] = []
-        return JSONResponse(status_code=200, content=body)
+        return JSONResponse(status_code=200, content={"status": "error", "error": "Empty symbols list", "items": [], "count": 0, "request_id": request_id})
 
-    norms = [_normalize_symbol_safe(r) or (r or "").strip() for r in raw_list]
+    norms = [(_normalize_symbol_safe(r) or r).strip().upper() for r in raw_list]
     norms = [n for n in norms if n]
 
     batch_res, batch_source, batch_err = await _call_engine_batch_best_effort(request, norms)
 
+    def _to_sheet(items_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
+        rows = [EnrichedQuote.from_unified(p).to_row(ENRICHED_HEADERS_59) for p in items_payload]
+        return {
+            "status": "success",
+            "format": "sheet",
+            "headers": ENRICHED_HEADERS_59,
+            "rows": rows,
+            "count": len(rows),
+            "request_id": request_id,
+        }
+
     items: List[Dict[str, Any]] = []
 
-    # FAST PATH: batch returned list or dict
-    if isinstance(batch_res, (list, dict)) and batch_res:
-        # dict case
-        if isinstance(batch_res, dict):
-            mp: Dict[str, Dict[str, Any]] = {}
-            for k, v in batch_res.items():
-                pv = _as_payload(_unwrap_tuple_payload(v))
-                kk = str(k or "").strip().upper()
-                if kk:
-                    mp.setdefault(kk, pv)
-                symk = _payload_symbol_key(pv)
-                if symk:
-                    mp.setdefault(symk, pv)
+    # FAST PATH: batch returned dict
+    if isinstance(batch_res, dict) and batch_res:
+        mp: Dict[str, Dict[str, Any]] = {}
+        for k, v in batch_res.items():
+            pv = _as_payload(_unwrap_tuple_payload(v))
+            kk = str(k or "").strip().upper()
+            if kk:
+                mp.setdefault(kk, pv)
+            symk = _payload_symbol_key(pv)
+            if symk:
+                mp.setdefault(symk, pv)
 
-            for raw in raw_list:
-                norm = (_normalize_symbol_safe(raw) or raw).strip().upper()
-                p = mp.get(norm)
-                if p is None:
-                    out = {
-                        "status": "error",
-                        "symbol": norm,
-                        "symbol_input": raw,
-                        "symbol_normalized": norm,
-                        "requested_symbol": raw,
-                        "origin": _origin_default_from_payload({"symbol_normalized": norm}),
-                        "recommendation": "HOLD",
-                        "data_quality": "MISSING",
-                        "data_source": "none",
-                        "error": "Engine returned no item for this symbol.",
-                        "last_updated_utc": _now_utc().isoformat(),
-                        "last_updated_riyadh": "",
-                    }
-                    if dbg and batch_err:
-                        out["batch_error_hint"] = _clamp(batch_err, 1200)
-                    items.append(_schema_fill_best_effort(out))
-                else:
-                    items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
-
-        else:
-            # list case
-            payloads: List[Dict[str, Any]] = [_as_payload(_unwrap_tuple_payload(x)) for x in list(batch_res)]
-
-            # If list length matches request, map by order
-            if len(payloads) == len(raw_list):
-                for i, raw in enumerate(raw_list):
-                    norm = _normalize_symbol_safe(raw) or raw
-                    p = payloads[i] if i < len(payloads) else {}
-                    items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
+        for raw, norm in zip(raw_list, norms):
+            p = mp.get(norm)
+            if p is None:
+                out = {
+                    "status": "error",
+                    "symbol": norm,
+                    "requested_symbol": raw,
+                    "symbol_input": raw,
+                    "symbol_normalized": norm,
+                    "recommendation": "HOLD",
+                    "data_quality": "MISSING",
+                    "data_source": "none",
+                    "error": "Engine returned no item for this symbol.",
+                    "last_updated_utc": _now_utc().isoformat(),
+                    "last_updated_riyadh": "",
+                    "request_id": request_id,
+                }
+                if dbg and batch_err:
+                    out["batch_error_hint"] = _clamp(batch_err, 1200)
+                items.append(_schema_fill_best_effort(out))
             else:
-                # else build dict by symbol key
-                mp2: Dict[str, Dict[str, Any]] = {}
-                for p in payloads:
-                    k = _payload_symbol_key(p)
-                    if k and k not in mp2:
-                        mp2[k] = p
+                items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown", request_id=request_id))
 
-                for raw in raw_list:
-                    norm = (_normalize_symbol_safe(raw) or raw).strip().upper()
-                    p = mp2.get(norm)
-                    if p is None:
-                        out = {
-                            "status": "error",
-                            "symbol": norm,
-                            "symbol_input": raw,
-                            "symbol_normalized": norm,
-                            "requested_symbol": raw,
-                            "origin": _origin_default_from_payload({"symbol_normalized": norm}),
-                            "recommendation": "HOLD",
-                            "data_quality": "MISSING",
-                            "data_source": "none",
-                            "error": "Engine returned no item for this symbol.",
-                            "last_updated_utc": _now_utc().isoformat(),
-                            "last_updated_riyadh": "",
-                        }
-                        if dbg and batch_err:
-                            out["batch_error_hint"] = _clamp(batch_err, 1200)
-                        items.append(_schema_fill_best_effort(out))
-                    else:
-                        items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown"))
+        if fmt == "sheet":
+            return JSONResponse(status_code=200, content=_to_sheet(items))
+        return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items, "request_id": request_id})
 
-        body_ok: Dict[str, Any] = {"status": "success", "count": len(items), "items": items}
-        if include_headers:
-            body_ok["headers"] = ENRICHED_HEADERS_59
-        if include_rows:
-            body_ok["rows"] = [EnrichedQuote.from_unified(it).to_row(ENRICHED_HEADERS_59) for it in items]
-        return JSONResponse(status_code=200, content=body_ok)
+    # FAST PATH: batch returned list
+    if isinstance(batch_res, list) and batch_res:
+        payloads: List[Dict[str, Any]] = [_as_payload(_unwrap_tuple_payload(x)) for x in batch_res]
+
+        # if order matches
+        if len(payloads) == len(raw_list):
+            for i, (raw, norm) in enumerate(zip(raw_list, norms)):
+                p = payloads[i] if i < len(payloads) else {}
+                items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown", request_id=request_id))
+            if fmt == "sheet":
+                return JSONResponse(status_code=200, content=_to_sheet(items))
+            return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items, "request_id": request_id})
+
+        # else map by symbol key
+        mp2: Dict[str, Dict[str, Any]] = {}
+        for p in payloads:
+            k = _payload_symbol_key(p)
+            if k and k not in mp2:
+                mp2[k] = p
+
+        for raw, norm in zip(raw_list, norms):
+            p = mp2.get(norm)
+            if p is None:
+                out = {
+                    "status": "error",
+                    "symbol": norm,
+                    "requested_symbol": raw,
+                    "symbol_input": raw,
+                    "symbol_normalized": norm,
+                    "recommendation": "HOLD",
+                    "data_quality": "MISSING",
+                    "data_source": "none",
+                    "error": "Engine returned no item for this symbol.",
+                    "last_updated_utc": _now_utc().isoformat(),
+                    "last_updated_riyadh": "",
+                    "request_id": request_id,
+                }
+                if dbg and batch_err:
+                    out["batch_error_hint"] = _clamp(batch_err, 1200)
+                items.append(_schema_fill_best_effort(out))
+            else:
+                items.append(_finalize_payload(p, raw=raw, norm=norm, source=batch_source or "unknown", request_id=request_id))
+
+        if fmt == "sheet":
+            return JSONResponse(status_code=200, content=_to_sheet(items))
+        return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items, "request_id": request_id})
 
     # SLOW PATH: per-symbol (bounded concurrency + timeout)
     cfg = _cfg()
     sem = asyncio.Semaphore(cfg["concurrency"])
 
-    async def _one(raw: str) -> Dict[str, Any]:
-        norm = _normalize_symbol_safe(raw)
+    async def _one(raw: str, norm: str) -> Dict[str, Any]:
         async with sem:
             try:
                 result, source, err = await asyncio.wait_for(
@@ -1725,55 +1766,56 @@ async def enriched_quotes(
                     out = {
                         "status": "error",
                         "symbol": norm or raw,
+                        "requested_symbol": raw,
                         "symbol_input": raw,
                         "symbol_normalized": norm or raw,
-                        "requested_symbol": raw,
-                        "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                         "recommendation": "HOLD",
                         "data_quality": "MISSING",
                         "data_source": "none",
                         "error": err or "Engine not available for this symbol.",
                         "last_updated_utc": _now_utc().isoformat(),
                         "last_updated_riyadh": "",
+                        "request_id": request_id,
                     }
                     if dbg and batch_err:
                         out["batch_error_hint"] = _clamp(batch_err, 1200)
                     return _schema_fill_best_effort(out)
 
                 payload = _as_payload(result)
-                return _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown")
+                return _finalize_payload(payload, raw=raw, norm=norm, source=source or "unknown", request_id=request_id)
 
             except asyncio.TimeoutError:
-                out = {
-                    "status": "error",
-                    "symbol": norm or raw,
-                    "symbol_input": raw,
-                    "symbol_normalized": norm or raw,
-                    "requested_symbol": raw,
-                    "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
-                    "recommendation": "HOLD",
-                    "data_quality": "MISSING",
-                    "data_source": "none",
-                    "error": "timeout",
-                    "last_updated_utc": _now_utc().isoformat(),
-                    "last_updated_riyadh": "",
-                }
-                return _schema_fill_best_effort(out)
+                return _schema_fill_best_effort(
+                    {
+                        "status": "error",
+                        "symbol": norm or raw,
+                        "requested_symbol": raw,
+                        "symbol_input": raw,
+                        "symbol_normalized": norm or raw,
+                        "recommendation": "HOLD",
+                        "data_quality": "MISSING",
+                        "data_source": "none",
+                        "error": "timeout",
+                        "last_updated_utc": _now_utc().isoformat(),
+                        "last_updated_riyadh": "",
+                        "request_id": request_id,
+                    }
+                )
 
             except Exception as e:
                 out2: Dict[str, Any] = {
                     "status": "error",
                     "symbol": norm or raw,
+                    "requested_symbol": raw,
                     "symbol_input": raw,
                     "symbol_normalized": norm or raw,
-                    "requested_symbol": raw,
-                    "origin": _origin_default_from_payload({"symbol_normalized": norm or raw}),
                     "recommendation": "HOLD",
                     "data_quality": "MISSING",
                     "data_source": "none",
                     "error": _safe_error_message(e),
                     "last_updated_utc": _now_utc().isoformat(),
                     "last_updated_riyadh": "",
+                    "request_id": request_id,
                 }
                 if dbg:
                     out2["traceback"] = _clamp(traceback.format_exc(), 8000)
@@ -1781,19 +1823,16 @@ async def enriched_quotes(
                         out2["batch_error_hint"] = _clamp(batch_err, 1200)
                 return _schema_fill_best_effort(out2)
 
-    items = await asyncio.gather(*[_one(r) for r in raw_list])
+    items = await asyncio.gather(*[_one(r, n) for r, n in zip(raw_list, norms)])
 
-    body_ok2: Dict[str, Any] = {"status": "success", "count": len(items), "items": items}
-    if include_headers:
-        body_ok2["headers"] = ENRICHED_HEADERS_59
-    if include_rows:
-        body_ok2["rows"] = [EnrichedQuote.from_unified(it).to_row(ENRICHED_HEADERS_59) for it in items]
-    return JSONResponse(status_code=200, content=body_ok2)
+    if fmt == "sheet":
+        return JSONResponse(status_code=200, content=_to_sheet(items))
+    return JSONResponse(status_code=200, content={"status": "success", "count": len(items), "items": items, "request_id": request_id})
 
 
 @router.get("/health", include_in_schema=False)
 async def enriched_health():
-    return {"status": "ok", "module": "core.enriched_quote", "version": ROUTER_VERSION}
+    return {"status": "ok", "module": "enriched_quote", "version": ROUTER_VERSION, "time_utc": _now_utc().isoformat()}
 
 
 def get_router() -> APIRouter:
