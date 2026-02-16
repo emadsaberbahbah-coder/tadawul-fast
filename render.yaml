@@ -1,19 +1,18 @@
 # render.yaml
 # ============================================================
 # Tadawul Fast Bridge (FastAPI) — Render Blueprint
-# EDITION: Advanced Production (v1.6.0) — Render/Free-Safe
+# EDITION: Advanced Production (v1.6.1) — Render/Free-Safe
 # ============================================================
 #
-# Goals
-# - Uses hardened start script: scripts/start_web.sh (auto workers + uvloop/httptools)
-# - Riyadh timezone default
-# - Secrets stay in Render Dashboard (sync: false)
-# - Aligns with your available env keys list (APP_ENV/ENVIRONMENT, LOG_JSON, CORS, CACHE, etc.)
-# - Healthcheck targets /readyz (boot completed)
+# Key fixes vs your current file:
+# - ✅ startCommand uses POSIX sh (your launcher is #!/usr/bin/env sh)
+# - ✅ buildCommand avoids compiling tests (your tests had a syntax error before)
+# - ✅ fixes typo: ENABLE_YAHOO_FUNDAMENTALS_KSA (was NABLE_...)
+# - ✅ avoids empty WEB_CONCURRENCY (use 0 => auto-detect in start_web.sh)
 #
-# Notes
-# - Do NOT commit real secrets here.
-# - Keep APP_VERSION aligned with main.py (currently 6.6.0 in your enhanced main.py)
+# IMPORTANT:
+# - Do NOT set LOG_FORMAT="detailed" in Render dashboard (your main.py expects a real %-format string).
+#   If you want “detailed”, set LOG_JSON=true OR set LOG_FORMAT to an actual formatter pattern.
 
 services:
   - type: web
@@ -29,11 +28,14 @@ services:
     buildCommand: |
       python -m pip install --upgrade pip
       python -m pip install -r requirements.txt
+      # Compile ONLY app code (skip tests to avoid build failure)
+      python -m compileall -q main.py core routes scripts
+      echo "COMPILEALL_OK"
 
     # ----------------------------
     # Start (delegates to hardened launcher)
     # ----------------------------
-    startCommand: bash ./scripts/start_web.sh
+    startCommand: sh scripts/start_web.sh
 
     # ----------------------------
     # Health Check
@@ -73,10 +75,10 @@ services:
 
       # --- Logging ---
       - key: LOG_LEVEL
-        value: "INFO"
+        value: "info"
       - key: LOG_JSON
         value: "false"
-      # If you want a custom text format, set LOG_FORMAT in Render dashboard
+      # NOTE: Only set LOG_FORMAT if it is a real python logging %-format string, e.g.:
       # - key: LOG_FORMAT
       #   value: "%(asctime)s | %(levelname)s | [%(request_id)s] %(name)s | %(message)s"
 
@@ -93,9 +95,9 @@ services:
         value: "false"
 
       # --- Server Tuning (start_web.sh reads these) ---
-      # Leave WEB_CONCURRENCY empty to auto-detect by CPU
+      # Use 0 to force AUTO-detect (your script treats <=0 as "not set")
       - key: WEB_CONCURRENCY
-        value: ""
+        value: "0"
       - key: WEB_CONCURRENCY_MAX
         value: "4"
       - key: UVICORN_KEEPALIVE
@@ -110,12 +112,10 @@ services:
         value: "0"
       - key: UVICORN_ROOT_PATH
         value: ""
-      # Backlog is not used by your start_web.sh, but kept for future compatibility
       - key: UVICORN_BACKLOG
         value: "2048"
 
       # --- Security / Auth ---
-      # REQUIRE_AUTH can be used by your auth layer (if implemented)
       - key: REQUIRE_AUTH
         value: "true"
       - key: AUTH_HEADER_NAME
@@ -152,7 +152,7 @@ services:
         value: "true"
       - key: ENABLE_YFINANCE_KSA
         value: "true"
-      - key: NABLE_YAHOO_FUNDAMENTALS_KSA
+      - key: ENABLE_YAHOO_FUNDAMENTALS_KSA
         value: "true"
 
       # --- Provider API Keys (Secrets in Dashboard) ---
@@ -221,7 +221,7 @@ services:
       - key: RETRY_DELAY
         value: "1.5"
 
-      # --- Cache Controls (aligns to your env key list) ---
+      # --- Cache Controls ---
       - key: CACHE_DEFAULT_TTL
         value: "20"
       - key: CACHE_MAX_SIZE
