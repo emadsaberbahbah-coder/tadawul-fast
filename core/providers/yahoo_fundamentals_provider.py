@@ -3,12 +3,14 @@
 """
 core/providers/yahoo_fundamentals_provider.py
 ============================================================
-Yahoo Fundamentals Provider (via yfinance) — v3.0.0
+Yahoo Fundamentals Provider (via yfinance) — v3.1.0
 (PROD SAFE + ASYNC + ENGINE PATCH-STYLE + ADVANCED FUNDAMENTALS + ANALYST TARGETS)
 
-FULL REPLACEMENT (v3.0.0) — What’s improved vs v1.9.0
-- ✅ Import-safe: no network calls at import-time, yfinance import guarded
-- ✅ Patch-style output: only useful fields, always Dict[str, Any]
+FULL REPLACEMENT (v3.1.0) — What’s improved vs v3.0.0
+- ✅ Shared Normalizer: Integrates `core.symbols.normalize` if available.
+- ✅ Traceability: Adds `provider_symbol` to output.
+- ✅ Import-safe: no network calls at import-time, yfinance import guarded.
+- ✅ Patch-style output: only useful fields, always Dict[str, Any].
 - ✅ Strict key alignment:
     - Identity: name, sector, industry, sub_sector, market, currency, exchange, country
     - Fundamentals: market_cap, shares_outstanding, pe_ttm, forward_pe, pb, ps, eps_ttm, forward_eps, beta
@@ -27,8 +29,6 @@ FULL REPLACEMENT (v3.0.0) — What’s improved vs v1.9.0
     - Circuit breaker (YF_CIRCUIT_BREAKER, threshold + cooldown)
     - Singleflight (anti-stampede): concurrent calls for same symbol share one fetch
     - TTL caches for fundamentals + short error backoff cache
-- ✅ Engine-compat exports:
-    fetch_fundamentals_patch(), fetch_enriched_quote_patch() aliases
 
 Environment variables
 - YF_ENABLED=true/false (default true)
@@ -45,10 +45,6 @@ Caches
 
 Toggles
 - YF_VERBOSE_WARNINGS=true/false (default false)
-
-Notes
-- Yahoo recommendationKey is normalized to BUY/HOLD/REDUCE/SELL best-effort
-- forecast_confidence is returned as 0..1 (float), confidence_score as 0..100 (float)
 """
 
 from __future__ import annotations
@@ -62,12 +58,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "3.0.0"
+PROVIDER_VERSION = "3.1.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
@@ -82,6 +78,21 @@ try:
 except Exception:
     yf = None  # type: ignore
     _HAS_YFINANCE = False
+
+
+# ---------------------------------------------------------------------------
+# Shared Normalizer Import (optional)
+# ---------------------------------------------------------------------------
+def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
+    try:
+        from core.symbols.normalize import normalize_symbol as _ns  # type: ignore
+        from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
+        return _ns, _lk
+    except Exception:
+        return None, None
+
+
+_SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +298,15 @@ def _normalize_symbol(symbol: str) -> str:
     if not s:
         return ""
     s = s.translate(_ARABIC_DIGITS).strip().upper()
+
+    # Try shared normalizer first
+    if callable(_SHARED_NORMALIZE):
+        try:
+            res = _SHARED_NORMALIZE(s)
+            if res:
+                return res
+        except Exception:
+            pass
 
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
@@ -568,6 +588,7 @@ class YahooFundamentalsProvider:
                     out: Dict[str, Any] = {
                         "requested_symbol": symbol,
                         "symbol": u_sym,
+                        "provider_symbol": u_sym,
                         "name": _safe_str(name),
                         "sector": _safe_str(sector),
                         "industry": _safe_str(industry),
