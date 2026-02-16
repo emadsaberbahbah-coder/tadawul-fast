@@ -1,31 +1,40 @@
 # routes/ai_analysis.py
 """
-TADAWUL FAST BRIDGE – AI ANALYSIS ROUTES (v5.3.0) – PROD SAFE
+TADAWUL FAST BRIDGE — AI ANALYSIS ROUTES (v6.2.0) — PROD SAFE (ENHANCED)
 ------------------------------------------------------------
 
-What this router provides
-- /v1/analysis/health
-- /v1/analysis/quotes           (batch JSON)
-- /v1/analysis/quote            (single JSON)
-- /v1/analysis/sheet-rows       (dual mode: PUSH cache OR COMPUTE grid)
-- /v1/analysis/scoreboard       (quick ranking table for dashboards)
+Provides
+- GET  /v1/analysis/health
+- GET  /v1/analysis/quote?symbol=...
+- POST /v1/analysis/quote              (single JSON: {symbol} OR {ticker})
+- GET  /v1/analysis/quotes?tickers=...  (batch via query string)
+- POST /v1/analysis/quotes             (batch JSON)
+- POST /v1/analysis/sheet-rows         (dual mode: PUSH cache OR COMPUTE grid)
+- GET  /v1/analysis/scoreboard         (quick ranking table)
 
 Key guarantees (Sheets + Backend safety)
-- ✅ ROI canonical keys: expected_roi_1m / expected_roi_3m / expected_roi_12m
-- ✅ Price canonical keys: forecast_price_1m / forecast_price_3m / forecast_price_12m
-- ✅ Riyadh timestamps injected: last_updated_riyadh / forecast_updated_riyadh
+- ✅ Canonical ROI keys:
+    expected_roi_1m / expected_roi_3m / expected_roi_12m
+- ✅ Canonical forecast keys:
+    forecast_price_1m / forecast_price_3m / forecast_price_12m
+- ✅ Canonical timestamps (UTC + Riyadh):
+    last_updated_utc / last_updated_riyadh
+    forecast_updated_utc / forecast_updated_riyadh
 - ✅ Robust input parsing: tickers may arrive as list, string, or nested dict payloads
 - ✅ Engine-aware: uses request.app.state.engine if present; else get_engine fallback
-- ✅ Concurrency-controlled chunked calls with timeout protection
-- ✅ Push-mode supports sync/async set_cached_sheet_snapshot
-- ✅ Always returns stable non-empty headers to Google Sheets writers
+- ✅ Method probing: supports multiple engine versions (single + batch)
+- ✅ Chunked + concurrency-limited + timeout protected
+- ✅ Push-mode supports sync/async snapshot setters (multiple method names, optional meta)
+- ✅ Always returns stable non-empty headers for Sheets writers
 - ✅ Optional auth guard (X-APP-TOKEN / Bearer / ?token when ALLOW_QUERY_TOKEN=1)
+- ✅ Output rows are always padded/truncated to headers length
 
 Environment
 - AI_BATCH_SIZE (default 25)
 - AI_BATCH_TIMEOUT_SEC (default 60)
 - AI_BATCH_CONCURRENCY (default 6)
 - AI_MAX_TICKERS (default 1200)
+- AI_ROUTE_TIMEOUT_SEC (default 120)  # total soft deadline for heavy endpoints
 - ALLOW_QUERY_TOKEN=1 to allow query token
 - APP_TOKEN / BACKUP_APP_TOKEN / TFB_APP_TOKEN for auth (if set, auth is enforced)
 
@@ -40,13 +49,13 @@ import inspect
 import logging
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Body, Header, Query, Request
 
-# Pydantic v2 preferred
+# Pydantic v2 preferred, v1 fallback
 try:
     from pydantic import BaseModel, ConfigDict, Field  # type: ignore
 
@@ -59,71 +68,93 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "5.3.0"
+AI_ANALYSIS_VERSION = "6.2.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_RIYADH_TZ = timezone(timedelta(hours=3))
-
 
 # =============================================================================
-# Settings Shim
+# Small env helpers
 # =============================================================================
-try:
-    from core.config import get_settings  # type: ignore
-except Exception:  # pragma: no cover
-    def get_settings():  # type: ignore
-        return None
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
 
-# =============================================================================
-# Small config helpers
-# =============================================================================
-def _safe_int(x: Any, default: int) -> int:
-    try:
-        return int(float(str(x).strip())) if x is not None and str(x).strip() != "" else default
-    except Exception:
-        return default
-
-
-def _safe_float(x: Any, default: float) -> float:
-    try:
-        return float(str(x).strip()) if x is not None and str(x).strip() != "" else default
-    except Exception:
-        return default
+def _env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
+    v = _env_str(name, "")
     if not v:
         return default
-    return v in _TRUTHY
+    vv = v.lower()
+    if vv in _TRUTHY:
+        return True
+    if vv in _FALSY:
+        return False
+    return default
+
+
+def _env_int(name: str, default: int, *, lo: int = -10**9, hi: int = 10**9) -> int:
+    v = _env_str(name, "")
+    if not v:
+        return int(default)
+    try:
+        x = int(float(v))
+        return max(lo, min(hi, x))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float, *, lo: float = -1e18, hi: float = 1e18) -> float:
+    v = _env_str(name, "")
+    if not v:
+        return float(default)
+    try:
+        x = float(v)
+        return max(lo, min(hi, x))
+    except Exception:
+        return float(default)
 
 
 def _cfg() -> Dict[str, Any]:
-    # Sensible defaults
-    batch_size = _safe_int(os.getenv("AI_BATCH_SIZE"), 25)
-    timeout = _safe_float(os.getenv("AI_BATCH_TIMEOUT_SEC"), 60.0)
-    concurrency = _safe_int(os.getenv("AI_BATCH_CONCURRENCY"), 6)
-    max_tickers = _safe_int(os.getenv("AI_MAX_TICKERS"), 1200)
+    batch_size = _env_int("AI_BATCH_SIZE", 25, lo=5, hi=250)
+    timeout = _env_float("AI_BATCH_TIMEOUT_SEC", 60.0, lo=5.0, hi=240.0)
+    concurrency = _env_int("AI_BATCH_CONCURRENCY", 6, lo=1, hi=40)
+    max_tickers = _env_int("AI_MAX_TICKERS", 1200, lo=10, hi=5000)
+    route_timeout = _env_float("AI_ROUTE_TIMEOUT_SEC", 120.0, lo=10.0, hi=300.0)
 
     return {
-        "batch_size": max(5, min(250, batch_size)),
-        "timeout_sec": max(5.0, min(240.0, timeout)),
-        "max_tickers": max(10, min(5000, max_tickers)),
-        "concurrency": max(1, min(40, concurrency)),
+        "batch_size": batch_size,
+        "timeout_sec": timeout,
+        "concurrency": concurrency,
+        "max_tickers": max_tickers,
+        "route_timeout_sec": route_timeout,
     }
 
 
 # =============================================================================
-# Date/time helpers
+# Time helpers (Riyadh via ZoneInfo preferred)
 # =============================================================================
+@lru_cache(maxsize=1)
+def _riyadh_tz():
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo("Asia/Riyadh")
+    except Exception:
+        # fallback fixed offset (+03:00)
+        from datetime import timedelta
+
+        return timezone(timedelta(hours=3))
+
+
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _riyadh_iso() -> str:
-    return datetime.now(_RIYADH_TZ).isoformat()
+    return datetime.now(_riyadh_tz()).isoformat(timespec="seconds")
 
 
 def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
@@ -131,7 +162,9 @@ def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
         return ""
     try:
         dt = datetime.fromisoformat(str(utc_iso).replace("Z", "+00:00"))
-        return dt.astimezone(_RIYADH_TZ).isoformat()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_riyadh_tz()).isoformat(timespec="seconds")
     except Exception:
         return ""
 
@@ -146,10 +179,9 @@ _ALLOW_QUERY_TOKEN = _env_bool("ALLOW_QUERY_TOKEN", False)
 def _allowed_tokens() -> List[str]:
     toks: List[str] = []
     for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
-        v = (os.getenv(k) or "").strip()
+        v = _env_str(k, "")
         if v:
             toks.append(v)
-    # stable de-dupe
     out: List[str] = []
     seen = set()
     for t in toks:
@@ -169,11 +201,7 @@ def _extract_bearer(authorization: Optional[str]) -> str:
     return ""
 
 
-def _auth_ok(
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-    query_token: Optional[str],
-) -> bool:
+def _auth_ok(x_app_token: Optional[str], authorization: Optional[str], query_token: Optional[str]) -> bool:
     allowed = _allowed_tokens()
     if not allowed:
         return True  # open mode
@@ -283,12 +311,10 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     price: Optional[float] = None
     change_pct: Optional[float] = None
 
-    # Fundamental
     market_cap: Optional[float] = None
     pe_ttm: Optional[float] = None
     dividend_yield: Optional[float] = None
 
-    # Scores
     value_score: Optional[float] = None
     quality_score: Optional[float] = None
     momentum_score: Optional[float] = None
@@ -297,7 +323,6 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     recommendation: Optional[str] = "HOLD"
     rec_badge: Optional[str] = None
 
-    # Forecast (Canonical)
     expected_roi_1m: Optional[float] = None
     expected_roi_3m: Optional[float] = None
     expected_roi_12m: Optional[float] = None
@@ -310,7 +335,6 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
     forecast_updated_utc: Optional[str] = None
     forecast_updated_riyadh: Optional[str] = None
 
-    # Meta
     data_quality: str = "MISSING"
     last_updated_utc: Optional[str] = None
     last_updated_riyadh: Optional[str] = None
@@ -318,10 +342,10 @@ class SingleAnalysisResponse(_ExtraIgnoreBase):
 
 
 class BatchAnalysisRequest(_ExtraIgnoreBase):
-    tickers: Any = Field(default_factory=list)  # allow list/str/dict (we normalize)
+    tickers: Any = Field(default_factory=list)
     symbols: Any = Field(default_factory=list)
     sheet_name: Optional[str] = None
-    top_n: Optional[int] = None  # optional soft cap
+    top_n: Optional[int] = None
 
 
 class BatchAnalysisResponse(_ExtraIgnoreBase):
@@ -382,10 +406,14 @@ async def _resolve_engine(request: Request) -> Any:
         return None
 
 
+async def _wait_for(coro, timeout: float):
+    return await asyncio.wait_for(coro, timeout=timeout)
+
+
 # =============================================================================
 # Input normalization
 # =============================================================================
-def _split_string_symbols(s: str) -> List[str]:
+def _split_symbols(s: str) -> List[str]:
     raw = (s or "").replace(",", " ").replace("|", " ").replace(";", " ")
     return [p.strip() for p in raw.split() if p.strip()]
 
@@ -396,12 +424,13 @@ def _extract_symbols_from_any(obj: Any) -> List[str]:
     - list[str]
     - str
     - dict with keys: tickers/symbols/all_tickers/ksa_tickers/global_tickers
+    - pydantic-like objects
     """
     if obj is None:
         return []
 
     if isinstance(obj, str):
-        return _split_string_symbols(obj)
+        return _split_symbols(obj)
 
     if isinstance(obj, (list, tuple)):
         return [str(x) for x in obj if str(x or "").strip()]
@@ -411,12 +440,11 @@ def _extract_symbols_from_any(obj: Any) -> List[str]:
         for k in ("tickers", "symbols", "all_tickers", "ksa_tickers", "global_tickers"):
             v = obj.get(k)
             if isinstance(v, str):
-                acc.extend(_split_string_symbols(v))
+                acc.extend(_split_symbols(v))
             elif isinstance(v, (list, tuple)):
                 acc.extend([str(x) for x in v if str(x or "").strip()])
         return acc
 
-    # pydantic objects
     try:
         md = getattr(obj, "model_dump", None)
         if callable(md):
@@ -430,18 +458,18 @@ def _extract_symbols_from_any(obj: Any) -> List[str]:
     return []
 
 
-def _normalize_symbols(inputs: Sequence[Any]) -> List[str]:
+def _normalize_symbols(raw: Sequence[Any]) -> List[str]:
     norm = _try_import_normalizer()
     seen = set()
     out: List[str] = []
-    for x in inputs or []:
-        raw = str(x or "").strip()
-        if not raw:
+    for x in raw or []:
+        s0 = str(x or "").strip()
+        if not s0:
             continue
         try:
-            s = (norm(raw) or "").strip().upper()
+            s = (norm(s0) or "").strip().upper()
         except Exception:
-            s = raw.strip().upper()
+            s = s0.strip().upper()
         if not s or s in seen:
             continue
         seen.add(s)
@@ -451,8 +479,8 @@ def _normalize_symbols(inputs: Sequence[Any]) -> List[str]:
 
 def _clean_tickers_from_request(req: BatchAnalysisRequest, *, body: Optional[Dict[str, Any]] = None) -> List[str]:
     raw: List[str] = []
-    raw.extend(_extract_symbols_from_any(req.tickers))
-    raw.extend(_extract_symbols_from_any(req.symbols))
+    raw.extend(_extract_symbols_from_any(getattr(req, "tickers", None)))
+    raw.extend(_extract_symbols_from_any(getattr(req, "symbols", None)))
     if body:
         raw.extend(_extract_symbols_from_any(body))
     return _normalize_symbols(raw)
@@ -461,22 +489,6 @@ def _clean_tickers_from_request(req: BatchAnalysisRequest, *, body: Optional[Dic
 # =============================================================================
 # Quote shaping (placeholders + canonicalization)
 # =============================================================================
-def _make_placeholder(symbol: str, dq: str = "MISSING", err: str = "No Data") -> Dict[str, Any]:
-    utc = _now_utc_iso()
-    sym = str(symbol or "").strip().upper() or "UNKNOWN"
-    return {
-        "symbol": sym,
-        "symbol_normalized": sym,
-        "data_quality": dq,
-        "error": err,
-        "recommendation": "HOLD",
-        "last_updated_utc": utc,
-        "last_updated_riyadh": _to_riyadh_iso(utc),
-        "forecast_updated_utc": None,
-        "forecast_updated_riyadh": None,
-    }
-
-
 def _coerce_float(x: Any) -> Optional[float]:
     if x is None:
         return None
@@ -489,46 +501,98 @@ def _coerce_float(x: Any) -> Optional[float]:
         return None
 
 
+def _make_placeholder(symbol: str, dq: str = "MISSING", err: str = "No Data") -> Dict[str, Any]:
+    utc = _now_utc_iso()
+    sym = str(symbol or "").strip().upper() or "UNKNOWN"
+    return {
+        "symbol": sym,
+        "symbol_normalized": sym,
+        "name": None,
+        "market_region": None,
+        "price": None,
+        "change_pct": None,
+        "recommendation": "HOLD",
+        "data_quality": dq,
+        "error": err,
+        "last_updated_utc": utc,
+        "last_updated_riyadh": _to_riyadh_iso(utc),
+        "forecast_updated_utc": None,
+        "forecast_updated_riyadh": None,
+    }
+
+
 def _canonicalize_quote(d: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Bring various provider keys into the canonical keys used by the sheet.
+    Bring various provider keys into canonical keys used by Sheets.
+    Never deletes values, only fills missing.
     """
     if not isinstance(d, dict):
         return {}
 
     out = dict(d)
 
+    # Identity
+    if out.get("symbol") is None:
+        out["symbol"] = out.get("ticker") or out.get("symbol_normalized")
+
     # Price
     if out.get("price") is None:
-        out["price"] = out.get("current_price")
+        out["price"] = out.get("current_price") or out.get("last_price")
 
-    # Change percent
+    # Change %
     if out.get("change_pct") is None:
-        out["change_pct"] = out.get("percent_change")
+        out["change_pct"] = out.get("percent_change") or out.get("change_percent")
 
-    # ROI aliases (if backend provides sheet-style names)
+    # ROI aliases (wide net)
     roi_aliases = {
-        "expected_roi_1m": ["expected_roi_1m", "expected_roi_pct_1m", "expected_roi_percent_1m", "expected_roi1m"],
-        "expected_roi_3m": ["expected_roi_3m", "expected_roi_pct_3m", "expected_roi_percent_3m", "expected_roi3m"],
-        "expected_roi_12m": ["expected_roi_12m", "expected_roi_pct_12m", "expected_roi_percent_12m", "expected_roi12m"],
+        "expected_roi_1m": [
+            "expected_roi_1m",
+            "expected_roi_pct_1m",
+            "expected_roi_percent_1m",
+            "expectedroi1m",
+            "expected_roi_30d",
+            "expected_roi_pct_30d",
+            "roi_1m",
+            "roi1m",
+        ],
+        "expected_roi_3m": [
+            "expected_roi_3m",
+            "expected_roi_pct_3m",
+            "expected_roi_percent_3m",
+            "expectedroi3m",
+            "expected_roi_90d",
+            "expected_roi_pct_90d",
+            "roi_3m",
+            "roi3m",
+        ],
+        "expected_roi_12m": [
+            "expected_roi_12m",
+            "expected_roi_pct_12m",
+            "expected_roi_percent_12m",
+            "expectedroi12m",
+            "expected_roi_1y",
+            "expected_roi_pct_1y",
+            "roi_12m",
+            "roi12m",
+        ],
     }
     for canon, keys in roi_aliases.items():
         if out.get(canon) is None:
             for k in keys:
-                if k in out and out.get(k) is not None:
+                if k in out and out.get(k) not in (None, ""):
                     out[canon] = out.get(k)
                     break
 
     # Forecast price aliases
     px_aliases = {
-        "forecast_price_1m": ["forecast_price_1m", "forecast_1m", "forecast_price1m"],
-        "forecast_price_3m": ["forecast_price_3m", "forecast_3m", "forecast_price3m"],
-        "forecast_price_12m": ["forecast_price_12m", "forecast_12m", "forecast_price12m"],
+        "forecast_price_1m": ["forecast_price_1m", "forecast_1m", "forecastprice1m", "target_price_1m", "target1m"],
+        "forecast_price_3m": ["forecast_price_3m", "forecast_3m", "forecastprice3m", "target_price_3m", "target3m"],
+        "forecast_price_12m": ["forecast_price_12m", "forecast_12m", "forecastprice12m", "target_price_12m", "target12m"],
     }
     for canon, keys in px_aliases.items():
         if out.get(canon) is None:
             for k in keys:
-                if k in out and out.get(k) is not None:
+                if k in out and out.get(k) not in (None, ""):
                     out[canon] = out.get(k)
                     break
 
@@ -539,26 +603,35 @@ def _canonicalize_quote(d: Dict[str, Any]) -> Dict[str, Any]:
     if out.get("forecast_updated_riyadh") is None:
         out["forecast_updated_riyadh"] = _to_riyadh_iso(out.get("forecast_updated_utc"))
 
-    # last_updated Riyadh
+    # last_updated timestamps
+    if out.get("last_updated_utc") is None:
+        out["last_updated_utc"] = out.get("updated_at") or out.get("last_updated") or _now_utc_iso()
+
     if out.get("last_updated_riyadh") is None:
         out["last_updated_riyadh"] = _to_riyadh_iso(out.get("last_updated_utc"))
+
+    # Normalize recommendation
+    if not out.get("recommendation"):
+        out["recommendation"] = "HOLD"
 
     return out
 
 
 def _quote_to_response(q: Any) -> SingleAnalysisResponse:
     d = q if isinstance(q, dict) else (q.__dict__ if hasattr(q, "__dict__") else {})
+    if not isinstance(d, dict):
+        d = {}
+
     d = _enrich_scores_best_effort(d)
     d = _canonicalize_quote(d)
 
     sym = str(d.get("symbol") or d.get("symbol_normalized") or "UNKNOWN").strip().upper()
 
-    # ensure timestamps exist
     last_utc = d.get("last_updated_utc") or _now_utc_iso()
     last_riy = d.get("last_updated_riyadh") or _to_riyadh_iso(last_utc)
 
     f_utc = d.get("forecast_updated_utc")
-    f_riy = d.get("forecast_updated_riyadh") or _to_riyadh_iso(f_utc) if f_utc else None
+    f_riy = d.get("forecast_updated_riyadh") or (_to_riyadh_iso(f_utc) if f_utc else None)
 
     return SingleAnalysisResponse(
         symbol=sym,
@@ -593,84 +666,163 @@ def _quote_to_response(q: Any) -> SingleAnalysisResponse:
 
 
 # =============================================================================
+# Engine method probing (single + batch)
+# =============================================================================
+async def _engine_get_one(engine: Any, symbol: str) -> Any:
+    if not engine:
+        return _make_placeholder(symbol, err="No Engine")
+
+    for name in (
+        "get_enriched_quote",
+        "fetch_enriched_quote",
+        "get_quote_unified",
+        "get_unified_quote",
+        "get_quote",
+        "fetch_quote",
+    ):
+        fn = getattr(engine, name, None)
+        if callable(fn):
+            try:
+                return await _maybe_await(fn(symbol))
+            except Exception:
+                raise
+
+    raise RuntimeError("Engine has no supported single-quote method")
+
+
+async def _engine_get_batch(engine: Any, symbols: List[str]) -> Optional[Any]:
+    if not engine:
+        return None
+
+    for name in (
+        "get_enriched_quotes_batch",
+        "get_enriched_quotes",
+        "get_quotes_batch",
+        "fetch_quotes_batch",
+        "get_unified_quotes",
+    ):
+        fn = getattr(engine, name, None)
+        if callable(fn):
+            try:
+                return await _maybe_await(fn(symbols))
+            except Exception:
+                return None
+    return None
+
+
+def _align_batch_result(symbols: List[str], out: Any) -> Dict[str, Any]:
+    """
+    Normalize batch output into {SYMBOL: quote_obj_or_dict}.
+    Supports dict map OR list of dict/objects that include symbol fields.
+    """
+    res: Dict[str, Any] = {}
+
+    if isinstance(out, dict):
+        for k, v in out.items():
+            kk = str(k or "").strip().upper()
+            if kk:
+                res[kk] = v
+
+    elif isinstance(out, list):
+        for item in out:
+            if isinstance(item, dict):
+                sym = str(item.get("symbol") or item.get("symbol_normalized") or item.get("ticker") or "").strip().upper()
+                if sym:
+                    res[sym] = item
+            else:
+                sym = ""
+                try:
+                    sym = str(getattr(item, "symbol", "") or getattr(item, "symbol_normalized", "") or "").strip().upper()
+                except Exception:
+                    sym = ""
+                if sym:
+                    res[sym] = item
+
+    # ensure every requested symbol exists
+    for s in symbols:
+        ss = str(s).strip().upper()
+        if ss and ss not in res:
+            res[ss] = _make_placeholder(ss, err="Missing from engine batch response")
+
+    return res
+
+
+# =============================================================================
 # Batch execution (chunked, concurrency-limited, timeout-protected)
 # =============================================================================
-async def _get_quotes_chunked(engine: Any, symbols: List[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
+async def _get_quotes_chunked(engine: Any, symbols: List[str], cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Returns a dict mapping symbol->quote(dict or object). Ensures every requested symbol has an entry.
+    Returns (quotes_map, stats)
+    quotes_map ensures every requested symbol exists.
     """
+    stats: Dict[str, Any] = {
+        "requested": len(symbols),
+        "chunks": 0,
+        "timeouts": 0,
+        "chunk_failures": 0,
+        "single_failures": 0,
+        "used_batch_api": False,
+    }
+
     if not symbols:
-        return {}
+        return {}, stats
 
     if not engine:
-        return {s: _make_placeholder(s, err="No Engine") for s in symbols}
+        return {s: _make_placeholder(s, err="No Engine") for s in symbols}, stats
 
     batch_size = int(cfg["batch_size"])
     concurrency = int(cfg["concurrency"])
     timeout_sec = float(cfg["timeout_sec"])
 
     chunks = [symbols[i : i + batch_size] for i in range(0, len(symbols), batch_size)]
-    sem = asyncio.Semaphore(concurrency)
+    stats["chunks"] = len(chunks)
 
+    sem = asyncio.Semaphore(concurrency)
     results: Dict[str, Any] = {}
 
-    async def _call_engine_batch(chunk_syms: List[str]) -> None:
+    async def _run_chunk(chunk_syms: List[str]) -> None:
+        nonlocal results
         async with sem:
+            # 1) try engine batch method for the chunk
             try:
-                # Prefer batch API
-                if hasattr(engine, "get_enriched_quotes") and callable(getattr(engine, "get_enriched_quotes")):
-                    coro = engine.get_enriched_quotes(chunk_syms)
-                    res = await asyncio.wait_for(_maybe_await(coro), timeout=timeout_sec)
-
-                    if isinstance(res, dict):
-                        # try to map keys to uppercase symbols
-                        for k, v in res.items():
-                            kk = str(k or "").strip().upper()
-                            if kk:
-                                results[kk] = v
-                    elif isinstance(res, list):
-                        for item in res:
-                            if isinstance(item, dict):
-                                sym = str(item.get("symbol") or item.get("symbol_normalized") or "").strip().upper()
-                                if sym:
-                                    results[sym] = item
-                    else:
-                        # unknown type: fill placeholders
-                        raise RuntimeError("engine.get_enriched_quotes returned unsupported type")
-                else:
-                    # Serial fallback
-                    for s in chunk_syms:
-                        try:
-                            coro = engine.get_enriched_quote(s)
-                            q = await asyncio.wait_for(_maybe_await(coro), timeout=timeout_sec)
-                            results[str(s).upper()] = q
-                        except Exception as e:
-                            results[str(s).upper()] = _make_placeholder(s, err=str(e))
-
+                out = await _wait_for(_engine_get_batch(engine, chunk_syms), timeout=timeout_sec)
+                if out is not None:
+                    stats["used_batch_api"] = True
+                    aligned = _align_batch_result(chunk_syms, out)
+                    results.update(aligned)
+                    return
             except asyncio.TimeoutError:
-                for s in chunk_syms:
+                stats["timeouts"] += 1
+            except Exception:
+                pass
+
+            # 2) fallback: per-symbol single fetch with same timeout
+            for s in chunk_syms:
+                try:
+                    q = await _wait_for(_engine_get_one(engine, s), timeout=timeout_sec)
+                    results[str(s).upper()] = q
+                except asyncio.TimeoutError:
+                    stats["single_failures"] += 1
                     results[str(s).upper()] = _make_placeholder(s, err=f"Timeout>{timeout_sec}s")
-            except Exception as e:
-                logger.warning("Chunk failed (%s syms): %s", len(chunk_syms), e)
-                for s in chunk_syms:
+                except Exception as e:
+                    stats["single_failures"] += 1
                     results[str(s).upper()] = _make_placeholder(s, err=str(e))
 
-    await asyncio.gather(*[_call_engine_batch(c) for c in chunks])
+    await asyncio.gather(*[_run_chunk(c) for c in chunks])
 
-    # Ensure all requested symbols exist in map
+    # Ensure all requested symbols exist
     for s in symbols:
         key = str(s).strip().upper()
-        if key not in results:
-            results[key] = _make_placeholder(key, err="Missing from engine response")
+        if key and key not in results:
+            results[key] = _make_placeholder(key, err="Missing after processing")
 
-    return results
+    return results, stats
 
 
 # =============================================================================
 # Sheet helpers (headers + row mapping)
 # =============================================================================
 def _fallback_sheet_headers(sheet_name: str) -> List[str]:
-    # Basic, stable default. Your canonical schemas should override this.
     return [
         "Symbol",
         "Name",
@@ -709,72 +861,105 @@ def _get_headers_for_sheet(sheet_name: str) -> List[str]:
     return _fallback_sheet_headers(sheet_name)
 
 
+def _pad_row(row: List[Any], n: int) -> List[Any]:
+    if len(row) == n:
+        return row
+    if len(row) < n:
+        return row + [None] * (n - len(row))
+    return row[:n]
+
+
 def _map_rows_for_sheet(headers: List[str], quotes_in_order: List[Dict[str, Any]]) -> List[List[Any]]:
+    headers = headers or ["Symbol", "Error"]
     EnrichedQuote = _try_import_enriched_quote()
     rows: List[List[Any]] = []
 
+    # Prefer project mapper if available
     if EnrichedQuote:
         for q in quotes_in_order:
             try:
-                if isinstance(q, dict):
-                    eq = EnrichedQuote.from_unified(q)  # type: ignore
-                    rows.append(eq.to_row(headers))  # type: ignore
+                eq = EnrichedQuote.from_unified(q)  # type: ignore
+                to_row = getattr(eq, "to_row", None)
+                if callable(to_row):
+                    r = list(to_row(headers))  # type: ignore
                 else:
-                    rows.append([str(q)] + [None] * (len(headers) - 1))
+                    r = [q.get("symbol")] + [None] * (len(headers) - 1)
+                rows.append(_pad_row(r, len(headers)))
             except Exception as e:
-                sym = str(q.get("symbol") or "ERROR").upper() if isinstance(q, dict) else "ERROR"
-                # put error best-effort in last column
+                sym = str(q.get("symbol") or "ERROR").upper()
                 r = [None] * len(headers)
-                if headers:
-                    r[0] = sym
-                    r[-1] = f"Mapping error: {e}"
+                r[0] = sym
+                r[-1] = f"Mapping error: {e}"
                 rows.append(r)
         return rows
 
-    # Simple fallback mapping if EnrichedQuote missing:
-    # We fill a few common columns by searching header names.
+    # Lightweight fallback mapping by header label
     def _hkey(s: str) -> str:
         return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
 
-    hmap = {_hkey(h): i for i, h in enumerate(headers or [])}
+    hmap = {_hkey(h): i for i, h in enumerate(headers)}
 
-    def _set(row: List[Any], key_variants: Sequence[str], val: Any):
-        for k in key_variants:
-            idx = hmap.get(_hkey(k))
-            if idx is not None and 0 <= idx < len(row):
-                row[idx] = val
-                return
+    def _set(row: List[Any], header_label: str, val: Any):
+        idx = hmap.get(_hkey(header_label))
+        if idx is not None and 0 <= idx < len(row):
+            row[idx] = val
 
     for q in quotes_in_order:
-        d = q if isinstance(q, dict) else {}
-        d = _canonicalize_quote(_enrich_scores_best_effort(d) if isinstance(d, dict) else {})
+        d = _canonicalize_quote(_enrich_scores_best_effort(q))
         row = [None] * len(headers)
 
         sym = str(d.get("symbol") or "UNKNOWN").upper()
-        _set(row, ["Symbol", "Ticker"], sym)
-        _set(row, ["Name"], d.get("name"))
-        _set(row, ["Price"], d.get("price"))
-        _set(row, ["Change %", "ChangePct"], d.get("change_pct"))
-        _set(row, ["Overall Score"], d.get("overall_score"))
-        _set(row, ["Recommendation"], d.get("recommendation"))
-        _set(row, ["Rec Badge"], d.get("rec_badge"))
-        _set(row, ["Expected ROI % (1M)"], d.get("expected_roi_1m"))
-        _set(row, ["Forecast Price (1M)"], d.get("forecast_price_1m"))
-        _set(row, ["Expected ROI % (3M)"], d.get("expected_roi_3m"))
-        _set(row, ["Forecast Price (3M)"], d.get("forecast_price_3m"))
-        _set(row, ["Expected ROI % (12M)"], d.get("expected_roi_12m"))
-        _set(row, ["Forecast Price (12M)"], d.get("forecast_price_12m"))
-        _set(row, ["Forecast Confidence"], d.get("forecast_confidence"))
-        _set(row, ["Data Quality"], d.get("data_quality"))
-        _set(row, ["Error"], d.get("error"))
-        _set(row, ["Last Updated (UTC)"], d.get("last_updated_utc"))
-        _set(row, ["Last Updated (Riyadh)"], d.get("last_updated_riyadh"))
-        _set(row, ["Forecast Updated (UTC)"], d.get("forecast_updated_utc"))
-        _set(row, ["Forecast Updated (Riyadh)"], d.get("forecast_updated_riyadh"))
+        _set(row, "Symbol", sym)
+        _set(row, "Name", d.get("name"))
+        _set(row, "Price", d.get("price"))
+        _set(row, "Change %", d.get("change_pct"))
+        _set(row, "Overall Score", d.get("overall_score"))
+        _set(row, "Recommendation", d.get("recommendation") or "HOLD")
+        _set(row, "Rec Badge", d.get("rec_badge"))
+        _set(row, "Expected ROI % (1M)", d.get("expected_roi_1m"))
+        _set(row, "Forecast Price (1M)", d.get("forecast_price_1m"))
+        _set(row, "Expected ROI % (3M)", d.get("expected_roi_3m"))
+        _set(row, "Forecast Price (3M)", d.get("forecast_price_3m"))
+        _set(row, "Expected ROI % (12M)", d.get("expected_roi_12m"))
+        _set(row, "Forecast Price (12M)", d.get("forecast_price_12m"))
+        _set(row, "Forecast Confidence", d.get("forecast_confidence"))
+        _set(row, "Data Quality", d.get("data_quality"))
+        _set(row, "Error", d.get("error"))
+        _set(row, "Last Updated (UTC)", d.get("last_updated_utc"))
+        _set(row, "Last Updated (Riyadh)", d.get("last_updated_riyadh"))
+        _set(row, "Forecast Updated (UTC)", d.get("forecast_updated_utc"))
+        _set(row, "Forecast Updated (Riyadh)", d.get("forecast_updated_riyadh"))
 
         rows.append(row)
 
     return rows
+
+
+# =============================================================================
+# Snapshot push support
+# =============================================================================
+async def _engine_set_snapshot(engine: Any, sheet: str, headers: List[str], rows: List[List[Any]], meta: Dict[str, Any]) -> None:
+    """
+    Probe multiple setter names and signatures (sync/async, meta optional).
+    """
+    if not engine:
+        raise RuntimeError("Engine missing")
+
+    candidates = [
+        getattr(engine, "set_cached_sheet_snapshot", None),
+        getattr(engine, "set_sheet_snapshot", None),
+        getattr(engine, "cache_sheet_snapshot", None),
+    ]
+    setter = next((fn for fn in candidates if callable(fn)), None)
+    if not callable(setter):
+        raise RuntimeError("Engine does not support snapshot caching")
+
+    # Try with meta kwarg first, then without
+    try:
+        await _maybe_await(setter(sheet, headers, rows, meta=meta))  # type: ignore
+        return
+    except TypeError:
+        await _maybe_await(setter(sheet, headers, rows))  # type: ignore
 
 
 # =============================================================================
@@ -783,6 +968,7 @@ def _map_rows_for_sheet(headers: List[str], quotes_in_order: List[Dict[str, Any]
 @router.get("/health")
 async def health(request: Request):
     eng = await _resolve_engine(request)
+    cfg = _cfg()
     return {
         "status": "ok",
         "version": AI_ANALYSIS_VERSION,
@@ -790,11 +976,13 @@ async def health(request: Request):
         "time_utc": _now_utc_iso(),
         "time_riyadh": _riyadh_iso(),
         "auth_enabled": True if _allowed_tokens() else False,
+        "allow_query_token": bool(_ALLOW_QUERY_TOKEN),
+        "cfg": cfg,
     }
 
 
-@router.post("/quote", response_model=SingleAnalysisResponse)
-async def single_quote(
+@router.get("/quote", response_model=SingleAnalysisResponse)
+async def get_quote(
     request: Request,
     symbol: str = Query(..., description="Ticker/Symbol"),
     token: Optional[str] = Query(default=None),
@@ -812,13 +1000,93 @@ async def single_quote(
         return _quote_to_response(_make_placeholder(s, err="No Engine"))
 
     try:
-        coro = engine.get_enriched_quote(s)
-        q = await _maybe_await(coro)
+        q = await _maybe_await(_engine_get_one(engine, s))
         if not q:
             q = _make_placeholder(s, err="Empty quote")
         return _quote_to_response(q)
     except Exception as e:
         return _quote_to_response(_make_placeholder(s, err=str(e)))
+
+
+@router.post("/quote", response_model=SingleAnalysisResponse)
+async def post_quote(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """
+    POST single quote:
+      { "symbol": "1120.SR" } OR { "ticker": "AAPL" }
+    """
+    if not _auth_ok(x_app_token, authorization, token):
+        sym = str(body.get("symbol") or body.get("ticker") or "UNKNOWN").upper()
+        return SingleAnalysisResponse(symbol=sym, data_quality="MISSING", error="Unauthorized")
+
+    sym_in = body.get("symbol") or body.get("ticker") or body.get("Symbol") or body.get("Ticker")
+    norm = _try_import_normalizer()
+    s = (norm(sym_in) or "").strip().upper() if sym_in is not None else ""
+    if not s:
+        return SingleAnalysisResponse(symbol="UNKNOWN", data_quality="MISSING", error="No symbol provided")
+
+    engine = await _resolve_engine(request)
+    if not engine:
+        return _quote_to_response(_make_placeholder(s, err="No Engine"))
+
+    try:
+        q = await _maybe_await(_engine_get_one(engine, s))
+        if not q:
+            q = _make_placeholder(s, err="Empty quote")
+        return _quote_to_response(q)
+    except Exception as e:
+        return _quote_to_response(_make_placeholder(s, err=str(e)))
+
+
+@router.get("/quotes", response_model=BatchAnalysisResponse)
+async def get_quotes(
+    request: Request,
+    tickers: str = Query(default="", description="Tickers: 'AAPL,MSFT 1120.SR'"),
+    top_n: int = Query(default=0, ge=0, le=5000),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    if not _auth_ok(x_app_token, authorization, token):
+        return BatchAnalysisResponse(status="error", error="Unauthorized", results=[], meta={"ok": False, "version": AI_ANALYSIS_VERSION})
+
+    syms = _normalize_symbols(_split_symbols(tickers))
+    if not syms:
+        return BatchAnalysisResponse(status="skipped", results=[], meta={"ok": True, "reason": "No tickers", "version": AI_ANALYSIS_VERSION})
+
+    cfg = _cfg()
+    cap = cfg["max_tickers"]
+    if top_n and top_n > 0:
+        cap = min(cap, int(top_n))
+    if len(syms) > cap:
+        syms = syms[:cap]
+
+    t0 = time.perf_counter()
+    engine = await _resolve_engine(request)
+    m, stats = await _get_quotes_chunked(engine, syms, cfg)
+
+    results = [_quote_to_response(m.get(s) or _make_placeholder(s)) for s in syms]
+
+    return BatchAnalysisResponse(
+        status="success",
+        results=results,
+        version=AI_ANALYSIS_VERSION,
+        meta={
+            "ok": True,
+            "tickers_requested": len(syms),
+            "engine": type(engine).__name__ if engine else "none",
+            "time_utc": _now_utc_iso(),
+            "time_riyadh": _riyadh_iso(),
+            "processing_time_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            "batch_stats": stats,
+            "cfg": cfg,
+        },
+    )
 
 
 @router.post("/quotes", response_model=BatchAnalysisResponse)
@@ -831,8 +1099,7 @@ async def batch_quotes(
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     """
-    Batch analysis endpoint.
-    Returns structured JSON list of analyzed stocks.
+    Batch analysis endpoint (JSON).
     """
     if not _auth_ok(x_app_token, authorization, token):
         return BatchAnalysisResponse(status="error", error="Unauthorized", results=[], meta={"ok": False, "version": AI_ANALYSIS_VERSION})
@@ -846,17 +1113,28 @@ async def batch_quotes(
 
     # request-level cap (top_n) if provided
     if req.top_n is not None:
-        cap = min(cap, max(1, int(req.top_n)))
+        try:
+            cap = min(cap, max(1, int(req.top_n)))
+        except Exception:
+            pass
 
     if len(tickers) > cap:
         tickers = tickers[:cap]
 
+    t0 = time.perf_counter()
     engine = await _resolve_engine(request)
-    raw_map = await _get_quotes_chunked(engine, tickers, cfg)
+
+    # Soft deadline (route level)
+    try:
+        m, stats = await _wait_for(_get_quotes_chunked(engine, tickers, cfg), timeout=float(cfg["route_timeout_sec"]))
+    except asyncio.TimeoutError:
+        # Return placeholders but keep stable response for Sheets
+        m = {s: _make_placeholder(s, err=f"Route timeout>{cfg['route_timeout_sec']}s") for s in tickers}
+        stats = {"requested": len(tickers), "route_timeout": True}
 
     results: List[SingleAnalysisResponse] = []
     for t in tickers:
-        q = raw_map.get(t) or _make_placeholder(t)
+        q = m.get(t) or _make_placeholder(t)
         results.append(_quote_to_response(q))
 
     return BatchAnalysisResponse(
@@ -866,12 +1144,12 @@ async def batch_quotes(
         meta={
             "ok": True,
             "tickers_requested": len(tickers),
-            "batch_size": cfg["batch_size"],
-            "concurrency": cfg["concurrency"],
-            "timeout_sec": cfg["timeout_sec"],
             "engine": type(engine).__name__ if engine else "none",
             "time_utc": _now_utc_iso(),
             "time_riyadh": _riyadh_iso(),
+            "processing_time_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            "batch_stats": stats,
+            "cfg": cfg,
         },
     )
 
@@ -886,11 +1164,13 @@ async def sheet_rows(
 ) -> Union[SheetAnalysisResponse, Dict[str, Any]]:
     """
     Dual-Mode Endpoint:
-    1) PUSH MODE: receives {"items":[{sheet,headers,rows},...]} from Sheets to cache snapshots.
-    2) COMPUTE MODE: receives {"tickers":[...]} to return analyzed grid rows.
+    1) PUSH MODE: {"items":[{sheet,headers,rows},...]} -> cache snapshots inside engine
+    2) COMPUTE MODE: {"tickers":[...], "sheet_name":"Market_Leaders"} -> return {headers, rows}
     """
     if not _auth_ok(x_app_token, authorization, token):
         return {"status": "error", "error": "Unauthorized", "version": AI_ANALYSIS_VERSION}
+
+    cfg = _cfg()
 
     # -----------------------
     # 1) PUSH MODE
@@ -900,21 +1180,24 @@ async def sheet_rows(
             req = PushSheetRowsRequest.model_validate(body) if _PYDANTIC_V2 else PushSheetRowsRequest.parse_obj(body)  # type: ignore
             engine = await _resolve_engine(request)
 
-            fn = getattr(engine, "set_cached_sheet_snapshot", None) if engine else None
-            if not callable(fn):
-                return {"status": "error", "error": "Engine does not support snapshots", "version": AI_ANALYSIS_VERSION}
-
             written: List[Dict[str, Any]] = []
             for item in req.items:
                 try:
-                    meta = {"source": "push_api", "ts_utc": _now_utc_iso(), "ts_riyadh": _riyadh_iso(), "route": "ai_analysis"}
-                    # allow sync or async engine
-                    await _maybe_await(fn(item.sheet, item.headers, item.rows, meta=meta))  # type: ignore
+                    meta = {
+                        "source": str(req.source or "push_api"),
+                        "universe_rows": req.universe_rows,
+                        "ts_utc": _now_utc_iso(),
+                        "ts_riyadh": _riyadh_iso(),
+                        "route": "ai_analysis",
+                        "version": AI_ANALYSIS_VERSION,
+                    }
+                    await _engine_set_snapshot(engine, item.sheet, item.headers, item.rows, meta=meta)
                     written.append({"sheet": item.sheet, "rows": len(item.rows), "status": "cached"})
                 except Exception as e:
                     written.append({"sheet": item.sheet, "rows": len(item.rows), "status": "error", "error": str(e)})
 
-            return {"status": "success", "mode": "push", "written": written, "version": AI_ANALYSIS_VERSION}
+            st = "success" if not any(w.get("status") == "error" for w in written) else "partial"
+            return {"status": st, "mode": "push", "written": written, "version": AI_ANALYSIS_VERSION}
 
         except Exception as e:
             return {"status": "error", "error": str(e), "version": AI_ANALYSIS_VERSION}
@@ -924,40 +1207,52 @@ async def sheet_rows(
     # -----------------------
     sheet_name = str(body.get("sheet_name") or body.get("sheetName") or body.get("sheet") or "Analysis").strip() or "Analysis"
 
-    # Normalize tickers from many shapes
     req_like = BatchAnalysisRequest(tickers=body.get("tickers", []), symbols=body.get("symbols", []), sheet_name=sheet_name)  # type: ignore
     tickers = _clean_tickers_from_request(req_like, body=body)
-
-    if not tickers:
-        return SheetAnalysisResponse(status="skipped", error="No tickers", headers=_get_headers_for_sheet(sheet_name), rows=[], meta={"ok": True})
-
-    cfg = _cfg()
-    if len(tickers) > cfg["max_tickers"]:
-        tickers = tickers[: cfg["max_tickers"]]
-
-    engine = await _resolve_engine(request)
-    quotes_map = await _get_quotes_chunked(engine, tickers, cfg)
-
-    # Ensure scoring + timestamps + canonical keys BEFORE mapping
-    ordered_quotes: List[Dict[str, Any]] = []
-    for t in tickers:
-        q = quotes_map.get(t) or _make_placeholder(t)
-        d = q if isinstance(q, dict) else (q.__dict__ if hasattr(q, "__dict__") else {})
-        d = _enrich_scores_best_effort(d) if isinstance(d, dict) else _make_placeholder(t, err="Invalid quote type")
-        d = _canonicalize_quote(d)
-        # Always inject Riyadh forecast timestamp "now" if missing (route-level standard)
-        if not d.get("forecast_updated_riyadh"):
-            d["forecast_updated_riyadh"] = _riyadh_iso()
-        if not d.get("forecast_updated_utc") and d.get("forecast_updated_riyadh"):
-            # keep utc optional; do not fabricate unless desired
-            pass
-        ordered_quotes.append(d)
 
     headers = _get_headers_for_sheet(sheet_name)
     if not headers:
         headers = _fallback_sheet_headers(sheet_name)
 
+    if not tickers:
+        return SheetAnalysisResponse(
+            status="skipped",
+            error="No tickers",
+            headers=headers,
+            rows=[],
+            version=AI_ANALYSIS_VERSION,
+            meta={"ok": True, "sheet_name": sheet_name, "time_utc": _now_utc_iso(), "time_riyadh": _riyadh_iso()},
+        )
+
+    if len(tickers) > cfg["max_tickers"]:
+        tickers = tickers[: cfg["max_tickers"]]
+
+    t0 = time.perf_counter()
+    engine = await _resolve_engine(request)
+
+    try:
+        m, stats = await _wait_for(_get_quotes_chunked(engine, tickers, cfg), timeout=float(cfg["route_timeout_sec"]))
+    except asyncio.TimeoutError:
+        m = {s: _make_placeholder(s, err=f"Route timeout>{cfg['route_timeout_sec']}s") for s in tickers}
+        stats = {"requested": len(tickers), "route_timeout": True}
+
+    # Ensure scoring + canonical keys + timestamps BEFORE mapping
+    ordered_quotes: List[Dict[str, Any]] = []
+    for t in tickers:
+        q = m.get(t) or _make_placeholder(t)
+        d = q if isinstance(q, dict) else (q.__dict__ if hasattr(q, "__dict__") else _make_placeholder(t, err="Invalid quote type"))
+        if not isinstance(d, dict):
+            d = _make_placeholder(t, err="Invalid quote type")
+        d = _enrich_scores_best_effort(d)
+        d = _canonicalize_quote(d)
+        # If forecast Riyadh missing, set now (route-level standard)
+        if not d.get("forecast_updated_riyadh"):
+            d["forecast_updated_riyadh"] = _riyadh_iso()
+        ordered_quotes.append(d)
+
     rows = _map_rows_for_sheet(headers, ordered_quotes)
+    # pad/truncate rows to headers length
+    rows = [_pad_row(list(r), len(headers)) for r in rows]
 
     return SheetAnalysisResponse(
         status="success",
@@ -968,12 +1263,12 @@ async def sheet_rows(
             "ok": True,
             "sheet_name": sheet_name,
             "tickers_count": len(tickers),
-            "batch_size": cfg["batch_size"],
-            "concurrency": cfg["concurrency"],
-            "timeout_sec": cfg["timeout_sec"],
             "engine": type(engine).__name__ if engine else "none",
             "time_utc": _now_utc_iso(),
             "time_riyadh": _riyadh_iso(),
+            "processing_time_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            "batch_stats": stats,
+            "cfg": cfg,
         },
     )
 
@@ -987,31 +1282,27 @@ async def scoreboard(
     x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
-    """
-    Lightweight scoreboard for quick dashboards.
-    Returns: {status, headers, rows, meta}
-    """
     if not _auth_ok(x_app_token, authorization, token):
         return {"status": "error", "error": "Unauthorized", "version": AI_ANALYSIS_VERSION}
 
-    syms = _normalize_symbols(_split_string_symbols(tickers))
+    syms = _normalize_symbols(_split_symbols(tickers))
     if not syms:
         return {"status": "skipped", "headers": ["Symbol", "Overall Score", "Recommendation"], "rows": [], "meta": {"ok": True}}
 
     cfg = _cfg()
     syms = syms[: min(len(syms), cfg["max_tickers"], top_n)]
 
+    t0 = time.perf_counter()
     engine = await _resolve_engine(request)
-    m = await _get_quotes_chunked(engine, syms, cfg)
+    m, stats = await _get_quotes_chunked(engine, syms, cfg)
 
     items: List[Dict[str, Any]] = []
     for s in syms:
         q = m.get(s) or _make_placeholder(s)
-        d = q if isinstance(q, dict) else (q.__dict__ if hasattr(q, "__dict__") else {})
-        d = _canonicalize_quote(_enrich_scores_best_effort(d) if isinstance(d, dict) else _make_placeholder(s, err="Invalid quote type"))
+        d = q if isinstance(q, dict) else (q.__dict__ if hasattr(q, "__dict__") else _make_placeholder(s, err="Invalid quote type"))
+        d = _canonicalize_quote(_enrich_scores_best_effort(d))
         items.append(d)
 
-    # Sort by overall_score desc (None last)
     def _score(x: Dict[str, Any]) -> float:
         v = _coerce_float(x.get("overall_score"))
         return v if v is not None else -1e18
@@ -1048,6 +1339,9 @@ async def scoreboard(
             "engine": type(engine).__name__ if engine else "none",
             "time_utc": _now_utc_iso(),
             "time_riyadh": _riyadh_iso(),
+            "processing_time_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+            "batch_stats": stats,
+            "cfg": cfg,
         },
     }
 
