@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-# main.py
 """
 main.py
 ------------------------------------------------------------
-Tadawul Fast Bridge – FastAPI Entry Point (v6.6.1)
+Tadawul Fast Bridge – FastAPI Entry Point (v6.6.2)
 Mission Critical Edition — OBSERVE + PROTECT + SCALE (Render-Optimized)
 
-🚨 IMPORTANT FIX (your Render crash):
-- Handles LOG_FORMAT values like "detailed" safely.
-  If LOG_FORMAT is a preset name (detailed/compact/simple/json) OR an invalid format,
-  we auto-fallback to a safe default and DO NOT crash at import-time.
+Major upgrades vs your current v6.6.1:
+- ✅ Fix Render HEAD check: explicit GET+HEAD for "/"
+- ✅ Lazy Router Mount: if DEFER_ROUTER_MOUNT=1 by mistake, first /v1 request auto-mounts routers safely
+- ✅ Idempotent router mounting (prevents duplicates / double-include crashes)
+- ✅ Telemetry middleware rewritten to ALWAYS attach headers (no locals() trick)
+- ✅ Optional SlowAPI middleware actually enabled when rate limiting is on
+- ✅ Stronger /readyz (reflects boot + router + engine readiness)
+- ✅ Better boot report + route inventory endpoints for troubleshooting
 
 Key env knobs (aligned with your Render keys)
 - LOG_LEVEL, LOG_JSON, LOG_FORMAT, LOG_DATEFMT
@@ -47,7 +50,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 # Optional: Rate limiting (slowapi)
@@ -56,9 +59,18 @@ try:
     from slowapi.errors import RateLimitExceeded
     from slowapi.util import get_remote_address
 
+    # The middleware is required to enforce limits (many setups forget this).
+    try:
+        from slowapi.middleware import SlowAPIMiddleware  # type: ignore
+
+        HAS_SLOWAPI_MW = True
+    except Exception:
+        HAS_SLOWAPI_MW = False
+
     HAS_SLOWAPI = True
 except Exception:
     HAS_SLOWAPI = False
+    HAS_SLOWAPI_MW = False
 
 # Optional: psutil (memory/cpu)
 try:
@@ -76,7 +88,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "6.6.1"
+APP_ENTRY_VERSION = "6.6.2"
 
 
 # -----------------------------------------------------------------------------
@@ -129,7 +141,7 @@ def _service_name() -> str:
 
 
 def _service_version() -> str:
-    # keep compatibility with your render.yaml: APP_VERSION is set there
+    # keep compatibility with your render.yaml: APP_VERSION/SERVICE_VERSION set there
     return _strip(os.getenv("SERVICE_VERSION") or os.getenv("APP_VERSION") or APP_ENTRY_VERSION)
 
 
@@ -224,7 +236,6 @@ def _resolve_text_formatter(fmt_raw: str, datefmt: str) -> logging.Formatter:
     raw = (fmt_raw or "").strip()
     low = raw.lower()
 
-    # Presets (this is what prevents your crash)
     if low in {"detailed", "detail", "default", "prod", "production"} or not raw:
         fmt = _DEFAULT_FMT_DETAILED
     elif low in {"compact", "short"}:
@@ -232,17 +243,13 @@ def _resolve_text_formatter(fmt_raw: str, datefmt: str) -> logging.Formatter:
     elif low in {"simple"}:
         fmt = _DEFAULT_FMT_SIMPLE
     elif low in {"json"}:
-        # caller should have chosen JSON formatter; still safe fallback
         fmt = _DEFAULT_FMT_DETAILED
     else:
         fmt = raw
 
-    # Validate: must contain at least one %(...)s token, otherwise it's likely invalid
-    # (but we still try in case user intentionally wants constant string)
     try:
         return logging.Formatter(fmt, datefmt=datefmt)
     except Exception:
-        # ultimate fallback (never crash import)
         return logging.Formatter(_DEFAULT_FMT_DETAILED, datefmt=datefmt)
 
 
@@ -250,18 +257,20 @@ def _configure_logging() -> None:
     lvl = _strip(os.getenv("LOG_LEVEL") or "INFO").upper()
     json_mode = _truthy(os.getenv("LOG_JSON"), default=False)
 
-    fmt_raw = _strip(os.getenv("LOG_FORMAT"))  # may be "detailed" in Render => now safe
+    fmt_raw = _strip(os.getenv("LOG_FORMAT"))  # may be "detailed" in Render => safe
     datefmt = _strip(os.getenv("LOG_DATEFMT")) or "%H:%M:%S"
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, lvl, logging.INFO))
 
-    # If handlers already exist (uvicorn), update them; else add one
     if not root.handlers:
         root.addHandler(logging.StreamHandler())
 
     for h in root.handlers:
-        h.addFilter(_RequestIDFilter())
+        try:
+            h.addFilter(_RequestIDFilter())
+        except Exception:
+            pass
         if json_mode:
             h.setFormatter(_JsonFormatter())
         else:
@@ -349,6 +358,7 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
     - Performance headers
     - Security headers
     - Optional overload shedding (DEGRADED_SHED_PATHS)
+    - Optional lazy router mount for /v1 if routers deferred/missing
     """
 
     async def dispatch(self, request: Request, call_next: Callable):
@@ -359,13 +369,24 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         t0 = time.perf_counter()
 
         try:
+            app_: FastAPI = request.app  # type: ignore
+
+            # Lazy mount routers for /v1 if needed (protects you from DEFER_ROUTER_MOUNT=1 misconfig)
+            path = request.url.path or ""
+            if path.startswith("/v1/"):
+                try:
+                    await _ensure_routers_mounted(app_)
+                except Exception:
+                    # never block requests due to mount attempt; routes may still 404 if missing
+                    pass
+
+            # Shed under load (optional)
             shed_enabled = _truthy(os.getenv("DEGRADED_SHED_ENABLED"), default=True)
             shed_paths = _strip(os.getenv("DEGRADED_SHED_PATHS") or "/v1/analysis,/v1/advanced,/v1/advisor").split(",")
 
             if shed_enabled and guardian.degraded_mode:
-                p = request.url.path or ""
-                if any(p.startswith(x.strip()) for x in shed_paths if x.strip()):
-                    return JSONResponse(
+                if any(path.startswith(x.strip()) for x in shed_paths if x.strip()):
+                    resp = JSONResponse(
                         status_code=503,
                         content={
                             "status": "degraded",
@@ -375,30 +396,32 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
                             "time_riyadh": _now_riyadh_iso(),
                         },
                     )
+                    _attach_std_headers(resp, rid, t0)
+                    return resp
 
             response = await call_next(request)
+            _attach_std_headers(response, rid, t0)
             return response
 
         finally:
-            # Always attach headers if we have a response object
-            # (Starlette will ignore if response wasn't created)
-            dt = time.perf_counter() - t0
-            try:
-                # If response exists in local scope, set headers
-                if "response" in locals() and locals()["response"] is not None:
-                    resp = locals()["response"]
-                    resp.headers["X-Request-ID"] = rid
-                    resp.headers["X-Process-Time"] = f"{dt:.4f}s"
-                    resp.headers["X-System-Load"] = guardian.get_load_status()
-
-                    resp.headers["X-Content-Type-Options"] = "nosniff"
-                    resp.headers["X-Frame-Options"] = "DENY"
-                    resp.headers["Referrer-Policy"] = "no-referrer"
-                    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-            except Exception:
-                pass
-
             _request_id_ctx.reset(token)
+
+
+def _attach_std_headers(response: Any, rid: str, t0: float) -> None:
+    try:
+        dt = time.perf_counter() - t0
+        response.headers["X-Request-ID"] = rid
+        response.headers["X-Process-Time"] = f"{dt:.4f}s"
+        response.headers["X-System-Load"] = guardian.get_load_status()
+        response.headers["X-Time-UTC"] = _now_utc_iso()
+        response.headers["X-Time-Riyadh"] = _now_riyadh_iso()
+
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -442,35 +465,56 @@ async def _init_engine_resilient(app_: FastAPI, max_retries: int = 3) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Router mounting (priority + resilience)
+# Router mounting (priority + resilience + idempotent)
 # -----------------------------------------------------------------------------
-def _mount_routers(app_: FastAPI) -> Dict[str, Any]:
+ROUTER_PLAN: List[Tuple[str, List[str]]] = [
+    ("Advanced", ["routes.advanced_analysis", "routes.advanced"]),
+    ("Advisor", ["routes.investment_advisor", "routes.advisor"]),
+    ("KSA", ["routes.routes_argaam", "routes.argaam"]),
+    ("Enriched", ["routes.enriched_quote", "routes.enriched"]),
+    ("Analysis", ["routes.ai_analysis", "routes.analysis"]),
+    ("System", ["routes.config", "routes.system"]),
+]
+
+
+def _route_inventory(app_: FastAPI) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in app.routes:
+        if isinstance(r, Route):
+            out.append({"path": r.path, "methods": sorted(list(r.methods or []))})
+    return out
+
+
+def _mount_routers_once(app_: FastAPI) -> Dict[str, Any]:
     """
-    Mounts routers in priority order. Does not crash if any router fails.
+    Mounts routers in priority order. Idempotent per-process (won't double-include).
     Returns mount report for /health.
     """
-    router_plan: List[Tuple[str, List[str]]] = [
-        ("Advanced", ["routes.advanced_analysis", "routes.advanced"]),
-        ("Advisor", ["routes.investment_advisor", "routes.advisor"]),
-        ("KSA", ["routes.routes_argaam", "routes.argaam"]),
-        ("Enriched", ["routes.enriched_quote", "routes.enriched"]),
-        ("Analysis", ["routes.ai_analysis", "routes.analysis"]),
-        ("System", ["routes.config", "routes.system"]),
-    ]
+    if not hasattr(app.state, "mounted_router_modules"):
+        app.state.mounted_router_modules = set()
 
     report: Dict[str, Any] = {"mounted": [], "failed": []}
-    for label, candidates in router_plan:
+
+    for label, candidates in ROUTER_PLAN:
         mounted = False
         last_err = ""
+
         for mod_path in candidates:
+            if mod_path in app.state.mounted_router_modules:
+                mounted = True
+                break
+
             mod = _safe_import(mod_path)
             if not mod:
                 continue
+
             router_obj = getattr(mod, "router", None) or getattr(mod, "api_router", None)
             if not router_obj:
                 continue
+
             try:
-                app_.include_router(router_obj)
+                app.include_router(router_obj)
+                app.state.mounted_router_modules.add(mod_path)
                 boot_logger.info("✅ Mounted %s via %s", label, mod_path)
                 report["mounted"].append({"label": label, "module": mod_path})
                 mounted = True
@@ -483,15 +527,29 @@ def _mount_routers(app_: FastAPI) -> Dict[str, Any]:
             boot_logger.warning("⚠️ Router '%s' not mounted. (%s)", label, last_err or "no module found")
             report["failed"].append({"label": label, "error": last_err or "not found"})
 
+    app.state.router_report = report
+    app.state.routes_snapshot = _route_inventory(app)
+    app.state.routers_mounted = True
+    app.state.routers_mounted_at_utc = _now_utc_iso()
     return report
 
 
-def _route_inventory(app_: FastAPI) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for r in app_.routes:
-        if isinstance(r, Route):
-            out.append({"path": r.path, "methods": sorted(list(r.methods or []))})
-    return out
+async def _ensure_routers_mounted(app_: FastAPI) -> None:
+    """
+    Lazy mount guard. Safe under concurrent requests.
+    """
+    if getattr(app_.state, "routers_mounted", False):
+        return
+
+    lock = getattr(app_.state, "router_mount_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app_.state.router_mount_lock = lock
+
+    async with lock:
+        if getattr(app_.state, "routers_mounted", False):
+            return
+        _mount_routers_once(app_)
 
 
 # -----------------------------------------------------------------------------
@@ -520,6 +578,10 @@ def _masked_settings() -> Dict[str, Any]:
             "log_json": _truthy(os.getenv("LOG_JSON"), default=False),
             "log_format": _strip(os.getenv("LOG_FORMAT") or ""),
         },
+        "flags": {
+            "defer_router_mount": _truthy(os.getenv("DEFER_ROUTER_MOUNT"), default=False),
+            "init_engine_on_boot": _truthy(os.getenv("INIT_ENGINE_ON_BOOT"), default=True),
+        },
     }
 
 
@@ -538,6 +600,7 @@ def create_app() -> FastAPI:
     redoc_url = "/redoc" if enable_redoc else None
 
     limiter = None
+    rpm = None
     if HAS_SLOWAPI and _truthy(os.getenv("ENABLE_RATE_LIMITING"), default=True):
         rpm = int(float(_strip(os.getenv("MAX_REQUESTS_PER_MINUTE") or "240")))
         limiter = Limiter(key_func=get_remote_address, default_limits=[f"{rpm} per minute"])
@@ -547,23 +610,26 @@ def create_app() -> FastAPI:
         app_.state.boot_time_utc = _now_utc_iso()
         app_.state.boot_time_riyadh = _now_riyadh_iso()
         app_.state.boot_completed = False
+
         app_.state.engine_ready = False
         app_.state.engine_error = None
+
+        app_.state.routers_mounted = False
         app_.state.router_report = {"mounted": [], "failed": []}
         app_.state.routes_snapshot = []
 
+        # Start guardian
         guardian_task = asyncio.create_task(guardian.start())
 
         async def _boot():
             await asyncio.sleep(0)
 
             defer_mount = _truthy(os.getenv("DEFER_ROUTER_MOUNT"), default=False)
-            if not defer_mount:
-                app_.state.router_report = _mount_routers(app_)
-                app_.state.routes_snapshot = _route_inventory(app_)
-                boot_logger.info("Route inventory loaded (%d routes).", len(app_.state.routes_snapshot))
+            if defer_mount:
+                boot_logger.warning("DEFER_ROUTER_MOUNT=1 -> routers will NOT be mounted at boot (lazy-mount enabled).")
             else:
-                boot_logger.warning("DEFER_ROUTER_MOUNT=1 -> routers will NOT be mounted at boot.")
+                _mount_routers_once(app_)
+                boot_logger.info("Route inventory loaded (%d routes).", len(app_.state.routes_snapshot))
 
             if _truthy(os.getenv("INIT_ENGINE_ON_BOOT"), default=True):
                 maxr = int(float(_strip(os.getenv("MAX_RETRIES") or "3")))
@@ -571,10 +637,17 @@ def create_app() -> FastAPI:
 
             gc.collect()
             app_.state.boot_completed = True
-            boot_logger.info("🚀 Ready v%s | env=%s | mem=%.1fMB | tz=Asia/Riyadh", version, app_env, guardian.memory_mb)
+
+            boot_logger.info(
+                "🚀 Ready v%s | env=%s | mem=%.1fMB | tz=Asia/Riyadh | routers=%s | engine=%s",
+                version,
+                app_env,
+                guardian.memory_mb,
+                "mounted" if getattr(app_.state, "routers_mounted", False) else "deferred",
+                "ready" if getattr(app_.state, "engine_ready", False) else "not-ready",
+            )
 
         boot_task = asyncio.create_task(_boot())
-
         yield
 
         boot_logger.info("Shutdown initiated.")
@@ -598,13 +671,20 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title=title, version=version, lifespan=lifespan, docs_url=docs_url, redoc_url=redoc_url)
 
+    # Rate limiting
     if limiter is not None:
         app.state.limiter = limiter
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        if HAS_SLOWAPI_MW:
+            app.add_middleware(SlowAPIMiddleware)
+        else:
+            boot_logger.warning("SlowAPI enabled but middleware not available; limits may not be enforced.")
 
+    # Core middleware
     app.add_middleware(TelemetryMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=512)
 
+    # CORS
     cors_all = _truthy(os.getenv("ENABLE_CORS_ALL_ORIGINS"), default=True)
     cors_origins_raw = _strip(os.getenv("CORS_ORIGINS") or "")
     if cors_all or not cors_origins_raw:
@@ -620,6 +700,7 @@ def create_app() -> FastAPI:
         allow_credentials=False,
     )
 
+    # Trusted hosts in production
     if app_env == "production":
         allowed_hosts_raw = _strip(os.getenv("ALLOWED_HOSTS") or "*")
         allowed_hosts = [h.strip() for h in allowed_hosts_raw.split(",") if h.strip()] or ["*"]
@@ -628,16 +709,38 @@ def create_app() -> FastAPI:
     # -------------------------------------------------------------------------
     # System Endpoints
     # -------------------------------------------------------------------------
-    @app.get("/", include_in_schema=False)
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
         return {"status": "online", "service": title, "version": version, "time_riyadh": _now_riyadh_iso()}
 
+    @app.get("/robots.txt", include_in_schema=False)
+    async def robots():
+        return PlainTextResponse("User-agent: *\nDisallow: /\n", status_code=200)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return PlainTextResponse("", status_code=204)
+
     @app.get("/readyz", include_in_schema=False)
     async def readiness():
-        ready = bool(getattr(app.state, "boot_completed", False))
+        boot_ok = bool(getattr(app.state, "boot_completed", False))
+        routers_ok = bool(getattr(app.state, "routers_mounted", False)) or _truthy(os.getenv("DEFER_ROUTER_MOUNT"), False)
+        # engine can be optional; readiness should still pass if you want “service up”
+        engine_required = _truthy(os.getenv("ENGINE_REQUIRED_FOR_READYZ"), default=False)
+        engine_ok = bool(getattr(app.state, "engine_ready", False)) or (not engine_required)
+
+        ready = boot_ok and routers_ok and engine_ok
         return JSONResponse(
             status_code=200 if ready else 503,
-            content={"ready": ready, "load": guardian.get_load_status(), "time_riyadh": _now_riyadh_iso()},
+            content={
+                "ready": ready,
+                "boot_completed": boot_ok,
+                "routers_mounted": bool(getattr(app.state, "routers_mounted", False)),
+                "engine_ready": bool(getattr(app.state, "engine_ready", False)),
+                "engine_error": getattr(app.state, "engine_error", None),
+                "load": guardian.get_load_status(),
+                "time_riyadh": _now_riyadh_iso(),
+            },
         )
 
     @app.get("/healthz", include_in_schema=False)
@@ -660,10 +763,14 @@ def create_app() -> FastAPI:
                 "boot_time_utc": getattr(app.state, "boot_time_utc", None),
                 "boot_time_riyadh": getattr(app.state, "boot_time_riyadh", None),
                 "boot_completed": bool(getattr(app.state, "boot_completed", False)),
+                "routers_mounted": bool(getattr(app.state, "routers_mounted", False)),
+                "routers_mounted_at_utc": getattr(app.state, "routers_mounted_at_utc", None),
                 "engine_ready": bool(getattr(app.state, "engine_ready", False)),
                 "engine_error": getattr(app.state, "engine_error", None),
             },
             "routers": getattr(app.state, "router_report", {"mounted": [], "failed": []}),
+            "routes_count": len(getattr(app.state, "routes_snapshot", []) or []),
+            "rate_limit": {"enabled": limiter is not None, "rpm": rpm},
             "time": {"utc": _now_utc_iso(), "riyadh": _now_riyadh_iso()},
             "trace_id": getattr(request.state, "request_id", "n/a"),
         }
@@ -672,16 +779,20 @@ def create_app() -> FastAPI:
     async def system_info():
         return {"status": "ok", "settings": _masked_settings(), "time_riyadh": _now_riyadh_iso()}
 
+    @app.get("/system/routes", tags=["system"])
+    async def system_routes():
+        inv = _route_inventory(app)
+        return {"status": "ok", "count": len(inv), "routes": inv, "time_riyadh": _now_riyadh_iso()}
+
     @app.post("/system/mount-routers", tags=["system"])
     async def mount_routers_now():
-        report = _mount_routers(app)
-        app.state.router_report = report
-        app.state.routes_snapshot = _route_inventory(app)
+        await _ensure_routers_mounted(app)
         return {
             "status": "success",
-            "mounted": report["mounted"],
-            "failed": report["failed"],
-            "routes": len(app.state.routes_snapshot),
+            "mounted": app.state.router_report.get("mounted", []),
+            "failed": app.state.router_report.get("failed", []),
+            "routes": len(app.state.routes_snapshot or []),
+            "time_riyadh": _now_riyadh_iso(),
         }
 
     # -------------------------------------------------------------------------
@@ -696,6 +807,7 @@ def create_app() -> FastAPI:
                 "status": "error",
                 "message": exc.detail,
                 "request_id": getattr(request.state, "request_id", "n/a"),
+                "time_riyadh": _now_riyadh_iso(),
             },
         )
 
