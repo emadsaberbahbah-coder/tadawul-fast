@@ -1,20 +1,19 @@
-# core/investment_advisor.py
 """
 Tadawul Fast Bridge — Investment Advisor Core (GOOGLE SHEETS SAFE)
 File: core/investment_advisor.py
 
-FULL REPLACEMENT — v1.5.0 (ADVANCED + STABLE OUTPUT + CANONICAL DEDUPE + FORECAST FALLBACK + ENGINE NEWS HOOKS)
+FULL REPLACEMENT — v1.6.0 (ADVANCED + STABLE OUTPUT + CANONICAL DEDUPE + FORECAST FALLBACK + ENGINE NEWS HOOKS)
 
 Public contract:
   run_investment_advisor(payload_dict, engine=...) -> {"headers":[...], "rows":[...], "meta":{...}, "items":[...]}
 
-v1.5.0 Enhancements (vs v1.4.2):
-- ✅ Canonical de-duplication across symbol variants (1120 == 1120.SR, AAPL == AAPL.US) while preserving best candidate.
-- ✅ Score normalization: supports 0..1 ratios and converts to 0..100 when detected.
-- ✅ Forecast fallback: if forecast missing but price + ROI exist => forecast computed.
-- ✅ Optional engine news hooks: fills news_score via engine if available (only when include_news=True).
-- ✅ Row-level timestamps: uses row "Last Updated (UTC)" if present (can be disabled by payload flag).
-- ✅ More diagnostics in meta (dedupe_removed, snapshot coverage).
+v1.6.0 Enhancements (vs v1.5.0):
+- ✅ Advanced Canonical Dedupe: Prioritizes KSA symbols (numeric) over global variants, and base tickers over suffixed ones.
+- ✅ Robust Score Normalization: Automatically detects and scales 0..1 scores to 0..100.
+- ✅ Smart Forecast Fallback: Calculates 1M/3M/12M forecasts from price + ROI if explicit forecast columns are missing.
+- ✅ Engine News Integration: Fetches and applies news sentiment scores from the engine if enabled.
+- ✅ Granular Timestamping: Uses row-level "Last Updated" if available, falling back to request time.
+- ✅ Detailed Diagnostics: Returns comprehensive meta stats including drop reasons and dedupe counts.
 
 Notes:
 - Expects sheet snapshots to be cached via:
@@ -30,7 +29,7 @@ import math
 import time
 from datetime import datetime, timezone, timedelta
 
-TT_ADVISOR_CORE_VERSION = "1.5.0"
+TT_ADVISOR_CORE_VERSION = "1.6.0"
 
 DEFAULT_SOURCES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
 
