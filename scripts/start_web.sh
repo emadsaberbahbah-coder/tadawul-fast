@@ -1,25 +1,27 @@
 #!/usr/bin/env sh
 # ============================================================
-# Tadawul Fast Bridge — PROD SAFE Start Script (v2.4.0)
+# Tadawul Fast Bridge — PROD SAFE Start Script (v2.5.0)
 # ============================================================
 # Render/FastAPI bootstrap with defensive checks + smart scaling.
 #
-# Key upgrades vs your v2.3.0:
-# - Always runs from PROJECT ROOT (so main.py/core/routes import paths are correct)
-# - Zero “string command” exec (no word-splitting risk) — exec uses argv safely
-# - Better Gunicorn vs Uvicorn selection + loglevel mapping (gunicorn has no "trace")
-# - Optional backlog support for uvicorn
-# - Clear banner + prints resolved mode/workers/port so you can confirm Render is using this script
+# v2.5.0 Enhancements
+# - Stronger argv-safe assembly (no risky word-splitting for perf flags)
+# - Clear config dump + warns if DEFER_ROUTER_MOUNT is enabled (common root cause)
+# - Better worker auto-detect: WEB_CONCURRENCY=0/empty => auto
+# - Gunicorn optional + can be forced off via DISABLE_GUNICORN=1
+# - Uvicorn graceful flag auto-detected across versions
+# - Keeps POSIX sh compatibility (Render safe)
 #
-# Start in Render should be:  sh scripts/start_web.sh
+# Start in Render:
+#   sh scripts/start_web.sh
 # ============================================================
 
 set -eu
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 
 # ----------------------------
-# Resolve project root (so "main.py" check is real)
+# Resolve project root
 # ----------------------------
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 APP_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
@@ -45,11 +47,13 @@ as_int() {
   esac
 }
 
+as_lower() { printf "%s" "${1:-}" | tr "[:upper:]" "[:lower:]"; }
+
 as_bool() {
-  v="$(printf "%s" "${1:-}" | tr "[:upper:]" "[:lower:]")"
+  v="$(as_lower "${1:-}")"
   case "$v" in
     1|true|yes|y|on) printf "1" ;;
-    *)              printf "0" ;;
+    *)               printf "0" ;;
   esac
 }
 
@@ -59,8 +63,16 @@ clamp_min_1() {
   printf "%s" "$v"
 }
 
+pos_int_or_empty() {
+  raw="${1:-}"
+  case "$raw" in
+    ""|*[!0-9]*) printf "%s" "" ;;
+    *) if [ "$raw" -gt 0 ]; then printf "%s" "$raw"; else printf "%s" ""; fi ;;
+  esac
+}
+
 loglvl_uvicorn() {
-  v="$(printf "%s" "${1:-info}" | tr "[:upper:]" "[:lower:]")"
+  v="$(as_lower "${1:-info}")"
   case "$v" in
     critical|error|warning|info|debug|trace) printf "%s" "$v" ;;
     *)                                      printf "%s" "info" ;;
@@ -69,7 +81,7 @@ loglvl_uvicorn() {
 
 # Gunicorn doesn't support "trace"
 loglvl_gunicorn() {
-  v="$(printf "%s" "${1:-info}" | tr "[:upper:]" "[:lower:]")"
+  v="$(as_lower "${1:-info}")"
   case "$v" in
     critical|error|warning|info|debug) printf "%s" "$v" ;;
     trace)                             printf "%s" "debug" ;;
@@ -127,7 +139,7 @@ detect_ram_mb() {
 }
 
 detect_workers() {
-  # Manual override
+  # Manual override: WEB_CONCURRENCY must be > 0, otherwise auto
   if [ -n "${WEB_CONCURRENCY:-}" ] && [ "$(as_int "$WEB_CONCURRENCY" 0)" -gt 0 ]; then
     printf "%s" "$(as_int "$WEB_CONCURRENCY" 1)"
     return 0
@@ -166,16 +178,34 @@ detect_uvicorn_grace_flag() {
   fi
 }
 
-# Build perf flags as positional args via echo tokens
+# Perf flags printed as newline-separated tokens (stdout only).
+# Any informational output MUST go to stderr.
 detect_uvicorn_perf_flags() {
   if python -c "import uvloop" >/dev/null 2>&1; then
-    printf "%s\n" "--loop" "uvloop"
+    printf "%s\n" "--loop"
+    printf "%s\n" "uvloop"
     printf "✨ Performance: uvloop detected and enabled.\n" >&2
   fi
   if python -c "import httptools" >/dev/null 2>&1; then
-    printf "%s\n" "--http" "httptools"
+    printf "%s\n" "--http"
+    printf "%s\n" "httptools"
     printf "✨ Performance: httptools detected and enabled.\n" >&2
   fi
+}
+
+# Append newline-separated tokens to argv safely (no space-splitting).
+append_nl_tokens_to_argv() {
+  tokens="${1:-}"
+  [ -z "$tokens" ] && return 0
+  oldifs=$IFS
+  IFS='
+'
+  for t in $tokens; do
+    [ -n "$t" ] && set -- "$@" "$t"
+  done
+  IFS=$oldifs
+  # export back to caller scope via printing? Not needed: caller uses this inside same scope
+  printf "%s" "" >/dev/null
 }
 
 # ----------------------------
@@ -205,6 +235,12 @@ if [ "$PREFLIGHT" = "1" ]; then
   printf "✅ Preflight: main.app import OK.\n"
 fi
 
+# Warn early for common misconfig seen in your logs
+if [ "$(as_bool "${DEFER_ROUTER_MOUNT:-0}")" = "1" ]; then
+  printf "⚠️  WARNING: DEFER_ROUTER_MOUNT=1 -> routers will NOT be mounted at boot.\n" >&2
+  printf "    Fix: set DEFER_ROUTER_MOUNT=0 in Render Dashboard env vars (dashboard overrides render.yaml).\n" >&2
+fi
+
 # ----------------------------
 # Environment Resolution
 # ----------------------------
@@ -216,22 +252,25 @@ LL_GN="$(loglvl_gunicorn "${LOG_LEVEL:-info}")"
 
 UV_KA="$(clamp_min_1 "$(as_int "${UVICORN_KEEPALIVE:-75}" "75")")"
 UV_GR="$(clamp_min_1 "$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")")"
-UV_ACCESS_RAW="$(printf "%s" "${UVICORN_ACCESS_LOG:-1}" | tr "[:upper:]" "[:lower:]")"
+UV_ACCESS_RAW="$(as_lower "${UVICORN_ACCESS_LOG:-1}")"
 UV_GRACE_FLAG="$(detect_uvicorn_grace_flag)"
 
-UV_BACKLOG_RAW="$(as_int "${UVICORN_BACKLOG:-0}" "0")"
-UV_BACKLOG="$UV_BACKLOG_RAW"
+UV_BACKLOG="$(as_int "${UVICORN_BACKLOG:-0}" "0")"
 
 WC="$(detect_workers)"
 
-START_MODE="$(printf "%s" "${START_MODE:-auto}" | tr "[:upper:]" "[:lower:]")"
+START_MODE="$(as_lower "${START_MODE:-auto}")"            # auto|gunicorn|uvicorn
+DISABLE_GUNICORN="$(as_bool "${DISABLE_GUNICORN:-0}")"   # 1 => force uvicorn
 USE_GUNICORN="0"
-if [ "$START_MODE" = "gunicorn" ]; then
+
+if [ "$DISABLE_GUNICORN" = "1" ]; then
+  USE_GUNICORN="0"
+elif [ "$START_MODE" = "gunicorn" ]; then
   USE_GUNICORN="1"
 elif [ "$START_MODE" = "uvicorn" ]; then
   USE_GUNICORN="0"
 else
-  # auto
+  # auto: prefer gunicorn if present and usable
   if have_cmd gunicorn || python -c "import gunicorn" >/dev/null 2>&1; then
     USE_GUNICORN="1"
   else
@@ -239,13 +278,18 @@ else
   fi
 fi
 
-printf "✅ Resolved: port=%s log=%s mode=%s workers=%s\n" "$P" "$LL_UV" "$START_MODE" "$WC"
+printf "✅ Resolved:\n"
+printf "   - port=%s\n" "$P"
+printf "   - log_uvicorn=%s | log_gunicorn=%s\n" "$LL_UV" "$LL_GN"
+printf "   - workers=%s (WEB_CONCURRENCY=%s, max=%s)\n" "$WC" "${WEB_CONCURRENCY:-auto}" "${WEB_CONCURRENCY_MAX:-4}"
+printf "   - mode=%s (disable_gunicorn=%s)\n" "$START_MODE" "$DISABLE_GUNICORN"
+printf "   - keepalive=%s | graceful=%s | backlog=%s\n" "$UV_KA" "$UV_GR" "$UV_BACKLOG"
+printf "------------------------------------------------------------\n"
 
 # ----------------------------
 # Start with Gunicorn (preferred when available)
 # ----------------------------
 if [ "$USE_GUNICORN" = "1" ]; then
-  # Ensure gunicorn exists and uvicorn worker class importable
   if (have_cmd gunicorn || python -c "import gunicorn" >/dev/null 2>&1) && python -c "import uvicorn.workers" >/dev/null 2>&1; then
     GT="$(clamp_min_1 "$(as_int "${GUNICORN_TIMEOUT:-120}" "120")")"
     GGT="$(clamp_min_1 "$(as_int "${GUNICORN_GRACEFUL_TIMEOUT:-30}" "30")")"
@@ -268,7 +312,6 @@ if [ "$USE_GUNICORN" = "1" ]; then
       --keep-alive "$GKA" \
       --worker-tmp-dir "/dev/shm"
 
-    # Optional request recycling
     if [ "$GMR" -gt 0 ]; then
       set -- "$@" --max-requests "$GMR"
     fi
@@ -276,7 +319,7 @@ if [ "$USE_GUNICORN" = "1" ]; then
       set -- "$@" --max-requests-jitter "$GMRJ"
     fi
 
-    # Propagate root-path if you use reverse proxy subpath
+    # Root path support if you deploy behind a subpath proxy
     if [ -n "${UVICORN_ROOT_PATH:-}" ]; then
       set -- "$@" --env "UVICORN_ROOT_PATH=$UVICORN_ROOT_PATH"
     fi
@@ -285,7 +328,7 @@ if [ "$USE_GUNICORN" = "1" ]; then
     exec "$@"
   fi
 
-  printf "⚠️  Gunicorn requested/auto-selected but not usable (missing gunicorn or uvicorn.workers). Falling back to Uvicorn.\n"
+  printf "⚠️  Gunicorn selected but not usable (missing gunicorn or uvicorn.workers). Falling back to Uvicorn.\n" >&2
 fi
 
 # ----------------------------
@@ -304,9 +347,17 @@ set -- python -m uvicorn main:app \
   --log-level "$LL_UV" \
   --no-server-header
 
-# Perf flags (emit tokens one-per-line, append safely)
-# shellcheck disable=SC2046
-set -- "$@" $(detect_uvicorn_perf_flags || true)
+# Perf flags (safe append, newline-tokens)
+perf_tokens="$(detect_uvicorn_perf_flags 2>/dev/null || true)"
+if [ -n "$perf_tokens" ]; then
+  oldifs=$IFS
+  IFS='
+'
+  for t in $perf_tokens; do
+    [ -n "$t" ] && set -- "$@" "$t"
+  done
+  IFS=$oldifs
+fi
 
 # Graceful flag (uvicorn version differences)
 if [ -n "$UV_GRACE_FLAG" ]; then
@@ -319,29 +370,26 @@ case "$UV_ACCESS_RAW" in
   *)              set -- "$@" --access-log ;;
 esac
 
-# Optional backlog (if you set UVICORN_BACKLOG > 0)
+# Optional backlog
 if [ "$UV_BACKLOG" -gt 0 ]; then
   set -- "$@" --backlog "$UV_BACKLOG"
 fi
 
 # Concurrency shaping
-if [ -n "${UVICORN_LIMIT_CONCURRENCY:-}" ]; then
-  lc="$(as_int "$UVICORN_LIMIT_CONCURRENCY" 0)"
-  [ "$lc" -gt 0 ] && set -- "$@" --limit-concurrency "$lc"
-fi
+lc="$(pos_int_or_empty "${UVICORN_LIMIT_CONCURRENCY:-}")"
+[ -n "$lc" ] && set -- "$@" --limit-concurrency "$lc"
 
-if [ -n "${UVICORN_LIMIT_MAX_REQUESTS:-}" ]; then
-  lmr="$(as_int "$UVICORN_LIMIT_MAX_REQUESTS" 0)"
-  [ "$lmr" -gt 0 ] && set -- "$@" --limit-max-requests "$lmr"
-fi
+lmr="$(pos_int_or_empty "${UVICORN_LIMIT_MAX_REQUESTS:-}")"
+[ -n "$lmr" ] && set -- "$@" --limit-max-requests "$lmr"
 
+# Root path
 if [ -n "${UVICORN_ROOT_PATH:-}" ]; then
   set -- "$@" --root-path "$UVICORN_ROOT_PATH"
 fi
 
 # Workers (uvicorn supports --workers)
 if [ "$WC" -gt 1 ]; then
-  printf "🌐 Scaling: uvicorn workers=%s (auto)\n" "$WC"
+  printf "🌐 Scaling: uvicorn workers=%s\n" "$WC"
   set -- "$@" --workers "$WC"
 else
   printf "🌐 Scaling: uvicorn single worker\n"
