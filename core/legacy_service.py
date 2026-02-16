@@ -1,4 +1,3 @@
-# core/legacy_service.py
 """
 core/legacy_service.py
 ------------------------------------------------------------
