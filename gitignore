@@ -1,36 +1,56 @@
-# Tadawul Fast Bridge — Git Ignore Rules (v2.1.0)
-# =============================================================================
-# PROD-SAFE EXCLUSION LIST (Hardened + Render/GitHub Friendly)
-# Prevent secrets, local envs, caches, build outputs, and runtime artifacts
-# from being committed.
-#
-# Principles
-# - Track templates (e.g., .env.example) but never real secrets
-# - Prefer narrow ignores over broad ignores
-# - Keep .github/ tracked
-# - Keep core source tracked (core/, routes/, scripts/, tests/, schemas/)
-#
-# Version notes (v2.1.0)
-# - ✅ Hardened secret patterns (Google SA, OAuth, tokens, PEM/PFX, SSH keys)
-# - ✅ Added common local/CI artifacts (ruff/uv, poetry/pdm, pytest, coverage)
-# - ✅ Added Render-specific runtime artifacts + local overrides
-# - ✅ Added Jupyter + data science artifacts (without ignoring real source)
-# - ✅ Safe JSON rules: do NOT ignore all JSON globally (only secret JSON names)
-# =============================================================================
+Tadawul Fast Bridge — Git Ignore Rules (v2.1.0)
 
-# -----------------------------------------------------------------------------
-# Python Bytecode / C Extensions
-# -----------------------------------------------------------------------------
-__pycache__/
+=============================================================================
+
+PROD-SAFE EXCLUSION LIST (Hardened + Render/GitHub Friendly)
+
+Prevent secrets, local envs, caches, build outputs, and runtime artifacts
+
+from being committed.
+
+Principles
+
+- Track templates (e.g., .env.example) but never real secrets
+
+- Prefer narrow ignores over broad ignores
+
+- Keep .github/ tracked
+
+- Keep core source tracked (core/, routes/, schemas/, scripts/, tests/, integrations/)
+
+Version notes (v2.1.0)
+
+- ✅ Hardened secret patterns (Google SA, OAuth, tokens, PEM/PFX, SSH keys)
+
+- ✅ Added common local/CI artifacts (ruff/uv, poetry/pdm, pytest, coverage)
+
+- ✅ Added Render-specific runtime artifacts + local overrides
+
+- ✅ Added Jupyter + data science artifacts (without ignoring real source)
+
+- ✅ Safe JSON rules: do NOT ignore all JSON globally (only secret JSON names)
+
+=============================================================================
+
+-----------------------------------------------------------------------------
+
+Python Bytecode / C Extensions
+
+-----------------------------------------------------------------------------
+
+pycache/
 *.py[cod]
 *$py.class
 *.pyd
 *.so
 *.dylib
 
-# -----------------------------------------------------------------------------
-# Python Virtual Environments / Env Managers
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Python Virtual Environments / Env Managers
+
+-----------------------------------------------------------------------------
+
 venv/
 .venv/
 env/
@@ -45,13 +65,17 @@ pip-wheel-metadata/
 .pyenv/
 .python-version
 
-# uv (optional) / pipx
+uv (optional) / pipx
+
 .uv/
 pipx/
 
-# -----------------------------------------------------------------------------
-# Python Packaging / Build / Distribution
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Python Packaging / Build / Distribution
+
+-----------------------------------------------------------------------------
+
 build/
 dist/
 downloads/
@@ -66,14 +90,18 @@ var/
 MANIFEST
 .installed.cfg
 
-# Poetry / PDM / Pipenv
+Poetry / PDM / Pipenv
+
 poetry.lock
 pdm.lock
 Pipfile.lock
 
-# -----------------------------------------------------------------------------
-# Tests / Coverage / Linters / Type Checkers
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Tests / Coverage / Linters / Type Checkers
+
+-----------------------------------------------------------------------------
+
 .pytest_cache/
 .coverage
 .coverage.*
@@ -91,9 +119,12 @@ htmlcov/
 .dmypy.json
 .pyre/
 
-# -----------------------------------------------------------------------------
-# Logs / Runtime Artifacts
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Logs / Runtime Artifacts
+
+-----------------------------------------------------------------------------
+
 *.log
 logs/
 *.out
@@ -103,13 +134,17 @@ logs/
 *.prof
 *.profile
 
-# Uvicorn / Gunicorn runtime
+Uvicorn / Gunicorn runtime
+
 gunicorn.conf.local.py
 uvicorn.conf.local.py
 
-# -----------------------------------------------------------------------------
-# Temporary Files / Editor Swap
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Temporary Files / Editor Swap
+
+-----------------------------------------------------------------------------
+
 *.swp
 *.swo
 *.tmp
@@ -118,9 +153,12 @@ uvicorn.conf.local.py
 *.lock
 *.lock.bak
 
-# -----------------------------------------------------------------------------
-# Local Databases / Snapshots / Exports
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Local Databases / Snapshots / Exports
+
+-----------------------------------------------------------------------------
+
 *.sqlite
 *.sqlite3
 *.db
@@ -134,22 +172,31 @@ reports/
 artifacts/
 data/
 
-# Keep sample datasets if needed:
-# !data/samples/
-# !data/README.md
+Keep sample datasets if needed:
 
-# -----------------------------------------------------------------------------
-# Notebooks / Data Science
-# -----------------------------------------------------------------------------
+!data/samples/
+
+!data/README.md
+
+-----------------------------------------------------------------------------
+
+Notebooks / Data Science
+
+-----------------------------------------------------------------------------
+
 .ipynb_checkpoints/
 *.ipynb
 !notebooks/.gitkeep
 notebooks/.ipynb_checkpoints/
 
-# -----------------------------------------------------------------------------
-# Security & Secrets (CRITICAL)
-# -----------------------------------------------------------------------------
-# 1) Env files (track only .env.example)
+-----------------------------------------------------------------------------
+
+Security & Secrets (CRITICAL)
+
+-----------------------------------------------------------------------------
+
+1) Env files (track only .env.example)
+
 .env
 .env.*
 !.env.example
@@ -161,7 +208,8 @@ env.local
 .env.development.local
 .env.test.local
 
-# 2) Secrets directories (common patterns)
+2) Secrets directories (common patterns)
+
 secrets/
 private/
 .credentials/
@@ -171,7 +219,8 @@ keyring/
 vault/
 .ssh/
 
-# 3) Google Cloud / Service Account / OAuth secrets (Aggressive Guard)
+3) Google Cloud / Service Account / OAuth secrets (Aggressive Guard)
+
 credentials.json
 service-account.json
 service_account.json
@@ -184,7 +233,8 @@ oauth*.json
 gcp-*.json
 *.json.key
 
-# 4) Cryptographic material
+4) Cryptographic material
+
 *.pem
 *.key
 *.crt
@@ -195,17 +245,22 @@ gcp-*.json
 *.jks
 *.keystore
 
-# 5) Common secret outputs / configs
+5) Common secret outputs / configs
+
 *.secret
 *.secrets
 *.sops
 *.age
 *.enc
 
-# -----------------------------------------------------------------------------
-# IDE / Editor
-# -----------------------------------------------------------------------------
-# VS Code
+-----------------------------------------------------------------------------
+
+IDE / Editor
+
+-----------------------------------------------------------------------------
+
+VS Code
+
 .vscode/
 !.vscode/settings.json
 !.vscode/tasks.json
@@ -213,15 +268,19 @@ gcp-*.json
 !.vscode/extensions.json
 *.code-workspace
 
-# JetBrains
+JetBrains
+
 .idea/
 *.iws
 *.iml
 *.ipr
 
-# -----------------------------------------------------------------------------
-# OS files
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+OS files
+
+-----------------------------------------------------------------------------
+
 .DS_Store
 .DS_Store?
 ._*
@@ -231,9 +290,12 @@ ehthumbs.db
 Thumbs.db
 Desktop.ini
 
-# -----------------------------------------------------------------------------
-# Node / Frontend Tooling (if present)
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Node / Frontend Tooling (if present)
+
+-----------------------------------------------------------------------------
+
 node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -245,9 +307,12 @@ pnpm-debug.log*
 .vite/
 dist-ssr/
 
-# -----------------------------------------------------------------------------
-# Local Deployment / Platforms
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+Local Deployment / Platforms
+
+-----------------------------------------------------------------------------
+
 .render/
 .vercel/
 .serverless/
@@ -255,20 +320,27 @@ dist-ssr/
 firebase-debug.log*
 .firebaserc
 
-# Docker local overrides
+Docker local overrides
+
 docker-compose.override.yml
 compose.override.yml
 
-# -----------------------------------------------------------------------------
-# LLM / Copy-Paste Artifact Files (optional safety)
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+LLM / Copy-Paste Artifact Files (optional safety)
+
+-----------------------------------------------------------------------------
+
 *.md.backup
 *.txt.backup
 *.chatgpt
 *.prompt
 *.llm
 
-# -----------------------------------------------------------------------------
-# DO NOT ignore these source folders (keep tracked):
-# core/, routes/, schemas/, scripts/, tests/, integrations/, assets/
-# -----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+DO NOT ignore these source folders (keep tracked):
+
+core/, routes/, schemas/, scripts/, tests/, integrations/, assets/
+
+-----------------------------------------------------------------------------
