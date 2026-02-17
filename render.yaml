@@ -5,7 +5,7 @@
 # ============================================================
 #
 # Key Enhancements (v1.6.2)
-# - Booleans use "0/1" to avoid string parsing ambiguity (fixes DEFER_ROUTER_MOUNT confusion).
+# - Booleans use "0"/"1" to avoid string parsing ambiguity (fixes DEFER_ROUTER_MOUNT confusion).
 # - Aligns APP/SERVICE version to 6.6.1 (matches your runtime log).
 # - WEB_CONCURRENCY set to "1" to match your current start_web.sh clamp1() logic.
 # - Keeps compileall limited to app folders (avoids tests causing build failure).
@@ -204,6 +204,12 @@ services:
       - key: GOOGLE_APPS_SCRIPT_BACKUP_URL
         sync: false
 
+      # --- Sheets Safety ---
+      - key: SHEETS_SAFE_MODE
+        value: "1"
+      - key: SHEETS_BLOCK_ON_EMPTY_ROWS
+        value: "0"
+
       # --- Batch / Performance Controls ---
       - key: HTTP_TIMEOUT_SEC
         value: "45"
@@ -244,6 +250,8 @@ services:
 
       # --- Debug / Diagnostics ---
       - key: DEBUG
+        value: "0"
+      - key: DEBUG_ERRORS
         value: "0"
 
       # --- Render API (optional, secrets) ---
