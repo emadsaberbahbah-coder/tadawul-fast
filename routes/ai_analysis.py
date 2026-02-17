@@ -49,6 +49,7 @@ import inspect
 import logging
 import os
 import time
+from dataclasses import is_dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -161,7 +162,8 @@ def _to_riyadh_iso(utc_iso: Optional[str]) -> str:
     if not utc_iso:
         return ""
     try:
-        dt = datetime.fromisoformat(str(utc_iso).replace("Z", "+00:00"))
+        s = str(utc_iso).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(_riyadh_tz()).isoformat(timespec="seconds")
