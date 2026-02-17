@@ -23,7 +23,7 @@ Usage
   python scripts/audit_data_quality.py --json-out audit_report.json
   python scripts/audit_data_quality.py --csv-out audit_report.csv
   python scripts/audit_data_quality.py --refresh 1 --concurrency 16
-  python scripts/audit_data_quality.py --strict 1   (exit non-zero if CRITICAL found)
+  python scripts/audit_data_quality.py --strict 1    (exit non-zero if CRITICAL found)
 
 Notes
 - PROD SAFE: If optional dependencies (engine/symbols_reader) are missing, exits 0 unless --strict 1.
@@ -126,25 +126,25 @@ AUDIT_VERSION = "2.1.0"
 
 DEFAULT_THRESHOLDS: Dict[str, Any] = {
     # Freshness
-    "stale_hours": 72,                 # older than 3 days
-    "hard_stale_hours": 168,           # older than 7 days => CRITICAL
+    "stale_hours": 72,                  # older than 3 days
+    "hard_stale_hours": 168,            # older than 7 days => CRITICAL
     # Price sanity
-    "min_price": 0.01,                 # <= considered zero
-    "max_abs_change_pct": 60.0,        # extreme daily move suspicion
+    "min_price": 0.01,                  # <= considered zero
+    "max_abs_change_pct": 60.0,         # extreme daily move suspicion
     # Forecast confidence (if 0..1 ratio or 0..100 percent handled)
     "min_confidence_pct": 30.0,
     # Technical requirements (minimum history points)
-    "min_hist_macd": 35,               # MACD(26)+signal(9)
-    "min_hist_rsi": 20,                # RSI(14) needs >14, plus buffer
-    "min_hist_vol30": 35,              # volatility 30D
+    "min_hist_macd": 35,                # MACD(26)+signal(9)
+    "min_hist_rsi": 20,                 # RSI(14) needs >14, plus buffer
+    "min_hist_vol30": 35,               # volatility 30D
     "min_hist_ma50": 55,
     "min_hist_ma200": 210,
     # Strategy reality checks
-    "trend_tolerance_pct": 4.0,        # move against trend triggers note
-    "mom_divergence_drop_pct": 5.0,    # MACD bullish but -5% 1W
-    "aggressive_roi_1m_pct": 20.0,     # high forecast in 1M
-    "low_vol_pct": 10.0,               # low volatility threshold
-    "risk_overest_score": 85.0,        # high risk but low vol
+    "trend_tolerance_pct": 4.0,         # move against trend triggers note
+    "mom_divergence_drop_pct": 5.0,     # MACD bullish but -5% 1W
+    "aggressive_roi_1m_pct": 20.0,      # high forecast in 1M
+    "low_vol_pct": 10.0,                # low volatility threshold
+    "risk_overest_score": 85.0,         # high risk but low vol
 }
 
 DEFAULT_PAGES = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX"]
