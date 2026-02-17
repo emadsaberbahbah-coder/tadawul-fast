@@ -11,22 +11,22 @@ Purpose
 
 Key Enhancements (v3.2.0)
 - ✅ Ultra-robust credentials loader:
-     - raw JSON, Base64 JSON, quoted JSON, and escaped private_key repair
-     - supports GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_APPLICATION_CREDENTIALS (file)
+      - raw JSON, Base64 JSON, quoted JSON, and escaped private_key repair
+      - supports GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS / GOOGLE_APPLICATION_CREDENTIALS (file)
 - ✅ Adaptive column detection:
-     - Header-based (Symbol/Ticker/Code/Stock) with fuzzy matching
-     - Data-based fallback scan (find the column with the highest “ticker-likeness”)
+      - Header-based (Symbol/Ticker/Code/Stock) with fuzzy matching
+      - Data-based fallback scan (find the column with the highest “ticker-likeness”)
 - ✅ Better normalization:
-     - Uses core.symbols.normalize if available
-     - Safe fallback normalization for KSA/Global parity
+      - Uses core.symbols.normalize if available
+      - Safe fallback normalization for KSA/Global parity
 - ✅ Composite caching:
-     - TTL cache keyed by (spreadsheet_id, sheet_key, header_row/start_row/max_rows)
-     - optional cache disable via env
+      - TTL cache keyed by (spreadsheet_id, sheet_key, header_row/start_row/max_rows)
+      - optional cache disable via env
 - ✅ Observability:
-     - metadata includes strategy used, column selected, counts, durations, cache hit
+      - metadata includes strategy used, column selected, counts, durations, cache hit
 - ✅ Registry flexibility:
-     - aliases + multiple candidate sheet names per page
-     - easy to extend without touching core logic
+      - aliases + multiple candidate sheet names per page
+      - easy to extend without touching core logic
 
 Environment (aligned)
 - DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID
