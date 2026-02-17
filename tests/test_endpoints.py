@@ -114,7 +114,7 @@ def _parse_iso_dt(s: Any) -> Optional[datetime]:
 
 def _has_any_key(d: Dict[str, Any], keys: List[str]) -> bool:
     for k in keys:
-        if k in d and d.get(k) not in (None, ""):
+        if k in d and d.get(k) is not None:
             return True
     return False
 
@@ -399,7 +399,7 @@ class SmokeTester:
         ok = (code == 200) and _is_dict(data) and _safe_lower(data.get("status")) in {"success", "ok"}
         status = "PASS" if ok else ("WARN" if code == 200 else "FAIL")
         self._add("Advanced: Push", status, dt, f"HTTP {code}", http=code, url=url)
-        log(f"  Push API     : {status} ({dt:.2f}s)")
+        log(f"  Push API      : {status} ({dt:.2f}s)")
 
         payload_compute = {"tickers": [GLB_SYM], "symbols": [GLB_SYM], "sheet_name": "Test"}
         code2, data2, dt2 = run_request(self.session, "POST", url, headers, payload_compute, timeout=self.timeout)
@@ -429,7 +429,7 @@ class SmokeTester:
 
         if code != 200 or not _is_dict(data):
             self._add("Sanity: Enriched Quote", "FAIL", dt, f"HTTP {code}", http=code, url=url)
-            log(f"  Enriched     : FAIL ({dt:.2f}s)")
+            log(f"  Enriched      : FAIL ({dt:.2f}s)")
             return
 
         riyadh_ok = False
