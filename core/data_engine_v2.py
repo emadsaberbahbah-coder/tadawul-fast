@@ -2,7 +2,7 @@
 """
 core/data_engine_v2.py
 ============================================================
-Data Engine V2 (THE MASTER ORCHESTRATOR) — v2.11.0
+Data Engine V2 (THE MASTER ORCHESTRATOR) — v2.11.1
 (PROD SAFE + DEEP FETCH GUARANTEE + ROBUST MERGE)
 
 What this module does:
@@ -12,11 +12,11 @@ What this module does:
     Fundamentals (EPS, PE) and History (RSI, Volatility) are present.
 4.  Calculates final scores (0-100) and recommendation.
 
-✅ v2.11.0 Enhancements:
+✅ v2.11.1 Enhancements:
+- ✅ **Fix:** Resolved IndentationError/Truncation in previous version.
 - ✅ **Deep Fetch Strategy:** If a symbol lacks fundamentals/history after the primary fetch,
      it explicitly triggers secondary providers (Yahoo/Finnhub) to fill the gaps.
-- ✅ **Smart Merging:** Keeps the *best* data. Won't overwrite a valid P/E with None.
-- ✅ **History Integration:** Ensures price history is fetched so technicals (RSI, MA200) can be computed.
+- ✅ **Smart Merging:** Keeps the *best* data using a reverse-priority overlay strategy.
 - ✅ **Forecast enablement:** With history now guaranteed, forecasts will generate.
 
 Environment variables:
@@ -63,7 +63,7 @@ from core.providers import (
 
 logger = logging.getLogger("core.data_engine_v2")
 
-ENGINE_VERSION = "2.11.0"
+ENGINE_VERSION = "2.11.1"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -254,7 +254,7 @@ class DataEngineV2:
             return {}
         except Exception as e:
             logger.warning(f"Provider {provider_name} failed for {symbol}: {e}")
-            return {}
+            return {"error": str(e), "provider": provider_name}
 
     async def get_enriched_quote(self, symbol: str) -> UnifiedQuote:
         return await self._sf.do(symbol, lambda: self._get_enriched_quote_impl(symbol))
@@ -269,9 +269,12 @@ class DataEngineV2:
             tasks = [self._fetch_provider_patch(p, norm_sym) for p in providers]
             patches = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 2. Merge Patches (Smart Merge)
-        # We start with an empty dict and layer data on top.
-        # Valid data overwrites None/Empty.
+        # 2. Merge Patches (Reverse Priority Merge)
+        # Strategy: Iterate valid patches and overlay them. 
+        # We process in REVERSE order of priority (Fallback -> Primary).
+        # This ensures that Primary (index 0) overwrites Fallback (index N) 
+        # for any field that Primary actually provides.
+        
         merged_data: Dict[str, Any] = {
             "symbol": norm_sym,
             "requested_symbol": symbol,
@@ -282,28 +285,54 @@ class DataEngineV2:
             "status": "success"
         }
 
-        # Apply patches in order of provider priority (as returned by _get_providers)
-        # BUT, we only overwrite if the new value is truthy/valid.
-        # This prevents a "lite" provider from wiping out good data from a "heavy" one.
+        valid_patches = []
         for i, res in enumerate(patches):
             if isinstance(res, dict) and "error" not in res:
-                prov_name = providers[i]
-                merged_data["data_sources"].append(prov_name)
-                
-                for k, v in res.items():
-                    # If we don't have it, take it.
-                    if k not in merged_data or merged_data[k] in (None, ""):
-                        merged_data[k] = v
-                    # If we have it, but new value is "better" (e.g. not None), update it?
-                    # For now, let's assume the provider list order IS the priority order.
-                    # So later providers (fallbacks) should NOT overwrite early ones (primary)
-                    # UNLESS the primary value was None.
-                    # Wait, _get_providers returns [Primary, ..., Fallback].
-                    # So iterating 0..N means Primary is processed FIRST.
-                    # We should keep Primary's value if it exists.
-                    # So: only update if current value is None/Empty.
-                    elif v is not None and v != "":
-                         # Only overwrite if current is "weak" (placeholder)
-                         # Actually, let's trust the provider order:
-                         # We iterate 0..N. 0 is highest priority.
-                         # So
+                valid_patches.append((providers[i], res))
+                merged_data["data_sources"].append(providers[i])
+
+        # Apply in reverse: Fallback first, then Primary overwrites
+        for prov_name, patch in reversed(valid_patches):
+            # Clean none/empty values from patch to avoid overwriting valid data with None
+            clean_patch = {k: v for k, v in patch.items() if v is not None and v != ""}
+            merged_data.update(clean_patch)
+
+        # 3. Construct UnifiedQuote
+        uq = UnifiedQuote(**merged_data)
+
+        # 4. Post-Process (Scores, Recommendations)
+        _calculate_scores(uq)
+        
+        # Ensure data quality flag
+        if not uq.current_price:
+            uq.data_quality = "MISSING"
+        elif uq.data_quality == "MISSING":
+            uq.data_quality = "PARTIAL" # Promoted because we have price
+
+        uq.latency_ms = (time.monotonic() - start_ts) * 1000.0
+        return uq
+
+    async def get_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
+        """Batch fetch."""
+        return await asyncio.gather(*[self.get_enriched_quote(s) for s in symbols])
+    
+    # Aliases
+    get_quote = get_enriched_quote
+    get_enriched_quotes = get_quotes
+    fetch_quote = get_enriched_quote
+    fetch_quotes = get_quotes
+
+# ---------------------------------------------------------------------------
+# Singleton Accessor
+# ---------------------------------------------------------------------------
+_INSTANCE: Optional[DataEngineV2] = None
+
+def get_engine() -> DataEngineV2:
+    global _INSTANCE
+    if _INSTANCE is None:
+        _INSTANCE = DataEngineV2()
+    return _INSTANCE
+
+# Re-exports for compatibility
+DataEngine = DataEngineV2
+Engine = DataEngineV2
