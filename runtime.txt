@@ -1,5 +1,7 @@
-# runtime.txt
-# Render / Heroku-style Python runtime pin
-# Tadawul Fast Bridge — Runtime (v1.1.0)
+runtime.txt
+
+Render / Heroku-style Python runtime pin
+
+Tadawul Fast Bridge — Runtime (v1.1.0)
 
 python-3.11.9
