@@ -26,7 +26,7 @@ What this route guarantees (Google Sheets safe)
 
 Contract:
 POST /v1/advisor/recommendations
-POST /v1/advisor/run   (alias)
+POST /v1/advisor/run    (alias)
 
 Response (AdvisorResponse):
 { status, headers, rows, meta, error? }
