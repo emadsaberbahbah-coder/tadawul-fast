@@ -29,7 +29,7 @@ Usage
   python scripts/track_performance.py --audit
   python scripts/track_performance.py --record --source-tab Market_Scan --horizons 1M 3M
   python scripts/track_performance.py --audit --refresh 0
-  STRICT=1 python scripts/track_performance.py --record   (fail if deps missing)
+  STRICT=1 python scripts/track_performance.py --record    (fail if deps missing)
 
 Notes
 - Expects your project wrapper google_sheets_service.py to expose read_range/write_range/append_rows
