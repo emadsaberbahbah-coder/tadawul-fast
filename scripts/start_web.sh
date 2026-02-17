@@ -75,7 +75,7 @@ loglvl_uvicorn() {
   v="$(as_lower "${1:-info}")"
   case "$v" in
     critical|error|warning|info|debug|trace) printf "%s" "$v" ;;
-    *)                                      printf "%s" "info" ;;
+    *)                                       printf "%s" "info" ;;
   esac
 }
 
@@ -259,8 +259,8 @@ UV_BACKLOG="$(as_int "${UVICORN_BACKLOG:-0}" "0")"
 
 WC="$(detect_workers)"
 
-START_MODE="$(as_lower "${START_MODE:-auto}")"            # auto|gunicorn|uvicorn
-DISABLE_GUNICORN="$(as_bool "${DISABLE_GUNICORN:-0}")"   # 1 => force uvicorn
+START_MODE="$(as_lower "${START_MODE:-auto}")"             # auto|gunicorn|uvicorn
+DISABLE_GUNICORN="$(as_bool "${DISABLE_GUNICORN:-0}")"    # 1 => force uvicorn
 USE_GUNICORN="0"
 
 if [ "$DISABLE_GUNICORN" = "1" ]; then
