@@ -1,16 +1,11 @@
 """
 core/schemas.py
 ===========================================================
-CANONICAL SHEET SCHEMAS + HEADERS — v3.9.1 (PROD SAFE + ALIGNED)
+CANONICAL SHEET SCHEMAS + HEADERS — v3.9.2 (PROD SAFE + ALIGNED)
 
-v3.9.1 improvements (safe / no breaking API):
-- ✅ Stronger header normalization & synonym tolerance (more variants handled).
-- ✅ Hardening: more defensive fallbacks in registry selection.
-- ✅ Import-safe: still no DataEngine imports, no network, no heavy deps.
-- ✅ get_headers_for_sheet(): never raises, always returns COPIES, stable defaults.
-- ✅ Clearer internal separation: legacy vs vNext, with safer fuzzy matching.
-
-Keeps the same public API as v3.9.0.
+v3.9.2 improvements:
+- ✅ Added missing fields to UnifiedQuote model to support scoring engine (roe, roa, net_margin, etc.)
+- ✅ Kept all existing header definitions stable.
 """
 
 from __future__ import annotations
@@ -32,7 +27,127 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "3.9.1"
+SCHEMAS_VERSION = "3.9.2"
+
+# =============================================================================
+# UNIFIED QUOTE MODEL (The core data structure)
+# =============================================================================
+class UnifiedQuote(BaseModel):
+    # Identity
+    symbol: str
+    symbol_normalized: Optional[str] = None
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    market: Optional[str] = None
+    currency: Optional[str] = None
+    
+    # Price
+    price: Optional[float] = None
+    current_price: Optional[float] = None
+    previous_close: Optional[float] = None
+    price_change: Optional[float] = None
+    percent_change: Optional[float] = None
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+    open_price: Optional[float] = None
+
+    # 52 Week
+    week_52_high: Optional[float] = None
+    week_52_low: Optional[float] = None
+    position_52w_percent: Optional[float] = None
+
+    # Volume / Liquidity
+    volume: Optional[float] = None
+    avg_volume_30d: Optional[float] = None
+    value_traded: Optional[float] = None
+    turnover_percent: Optional[float] = None
+    shares_outstanding: Optional[float] = None
+    free_float: Optional[float] = None
+    market_cap: Optional[float] = None
+    free_float_market_cap: Optional[float] = None
+    liquidity_score: Optional[float] = None
+
+    # Fundamentals (Valuation)
+    pe_ttm: Optional[float] = None
+    forward_pe: Optional[float] = None
+    eps_ttm: Optional[float] = None
+    forward_eps: Optional[float] = None
+    pb: Optional[float] = None
+    ps: Optional[float] = None
+    ev_ebitda: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    dividend_rate: Optional[float] = None
+    payout_ratio: Optional[float] = None
+
+    # Fundamentals (Quality/Growth) -- ADDED THESE
+    roe: Optional[float] = None
+    roa: Optional[float] = None
+    net_margin: Optional[float] = None
+    ebitda_margin: Optional[float] = None
+    revenue_growth: Optional[float] = None
+    net_income_growth: Optional[float] = None
+    debt_to_equity: Optional[float] = None
+    beta: Optional[float] = None
+
+    # Technicals
+    rsi_14: Optional[float] = None
+    volatility_30d: Optional[float] = None
+    trend_signal: Optional[str] = None
+    ma20: Optional[float] = None
+    ma50: Optional[float] = None
+    ma200: Optional[float] = None
+    macd_hist: Optional[float] = None
+
+    # Forecast / Targets
+    fair_value: Optional[float] = None
+    upside_percent: Optional[float] = None
+    valuation_label: Optional[str] = None
+    
+    forecast_price_1m: Optional[float] = None
+    forecast_price_3m: Optional[float] = None
+    forecast_price_12m: Optional[float] = None
+    expected_roi_1m: Optional[float] = None
+    expected_roi_3m: Optional[float] = None
+    expected_roi_12m: Optional[float] = None
+    forecast_confidence: Optional[float] = None
+    forecast_updated_utc: Optional[str] = None
+    forecast_updated_riyadh: Optional[str] = None
+
+    # Scores
+    value_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    momentum_score: Optional[float] = None
+    risk_score: Optional[float] = None
+    opportunity_score: Optional[float] = None
+    overall_score: Optional[float] = None
+    recommendation: Optional[str] = None
+    scoring_reason: Optional[str] = None
+
+    # Badges
+    rec_badge: Optional[str] = None
+    momentum_badge: Optional[str] = None
+    opportunity_badge: Optional[str] = None
+    risk_badge: Optional[str] = None
+
+    # News
+    news_score: Optional[float] = None
+
+    # Meta
+    data_source: Optional[str] = None
+    data_quality: Optional[str] = None
+    last_updated_utc: Optional[str] = None
+    last_updated_riyadh: Optional[str] = None
+    error: Optional[str] = None
+
+    # Extra
+    latency_ms: Optional[float] = None
+
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")
+    else:
+        class Config:
+            extra = "ignore"
+
 
 # =============================================================================
 # LEGACY: Canonical 59-column schema (kept for backward compatibility)
@@ -1401,6 +1516,7 @@ class BatchProcessRequest(_ExtraIgnore):
 
 __all__ = [
     "SCHEMAS_VERSION",
+    "UnifiedQuote",  # ✅ Added
     # Legacy exports (kept)
     "DEFAULT_HEADERS_59",
     "DEFAULT_HEADERS_ANALYSIS",
