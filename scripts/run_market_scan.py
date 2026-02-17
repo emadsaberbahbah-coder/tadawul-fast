@@ -31,7 +31,7 @@ Exit Codes
 
 Usage
 - python scripts/run_market_scan.py
-- python scripts/run_market_scan.py --keys KSA GLOBAL LEADERS
+- python scripts/run_market_scan.py --keys MARKET_LEADERS GLOBAL_MARKETS
 - python scripts/run_market_scan.py --top 75 --sheet-name Market_Scan
 - python scripts/run_market_scan.py --no-sheet
 - python scripts/run_market_scan.py --json-out market_scan_report.json
