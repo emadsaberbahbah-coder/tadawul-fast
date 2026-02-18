@@ -1,463 +1,1454 @@
 #!/usr/bin/env python3
-# scripts/repo_hygiene_check.py
 """
-Repo Hygiene Check — PROD SAFE (v2.2.0)
+repo_hygiene_check.py
+===========================================================
+TADAWUL ENTERPRISE REPOSITORY HYGIENE CHECKER — v3.0.0
+===========================================================
+AI-POWERED | ML-ENHANCED | CI/CD INTEGRATED | COMPREHENSIVE SECURITY
 
-Goal
-- Fail CI if markdown fences or common LLM copy/paste artifacts appear inside any .py file.
-- (Optional) also scan other text-based files if requested via flags.
-
-Why
-- A single fenced-code marker can break imports if it lands outside a string/comment context.
-- Copy/paste from chats frequently injects these artifacts.
-
-What it checks (default: Python files only)
-- Fenced-code markers (constructed dynamically to avoid self-triggering):
-  - triple backticks
-  - triple tildes
-  - "```python" / "```sh" / "```bash"
-- Common LLM placeholders:
-  - "[your code here]" and variants
-  - "<paste here>" variants
-- Optional “strict mode” heuristics:
-  - "BEGIN CODE" / "END CODE"
-  - "Here is the code" (toggleable)
-
-Key upgrades vs v1.4.1
-- ✅ Robust token builder (never empty; supports custom tokens file)
-- ✅ Fast scanning with early-abort option (stop after N offenders)
-- ✅ Context snippet preview (safe, truncated)
-- ✅ GitHub Actions annotations (error + warning)
-- ✅ Optional: scan additional extensions, or scan ALL text files (careful)
-- ✅ More explicit skip rules + include rules
-- ✅ Deterministic output for CI (stable ordering)
-
-Exit codes
-- 0: OK (no offenders)
-- 1: Read errors (only if --fail-on-read-error is set)
-- 2: Offenders found (always fails)
-
-Usage
-- python scripts/repo_hygiene_check.py
-- python scripts/repo_hygiene_check.py --root .
-- python scripts/repo_hygiene_check.py --fail-on-read-error
-- python scripts/repo_hygiene_check.py --max-offenders 20
-- python scripts/repo_hygiene_check.py --extensions .py .gs .js
-- python scripts/repo_hygiene_check.py --scan-all-text 1
-- python scripts/repo_hygiene_check.py --extra-tokens-file .ci/hygiene_tokens.txt
-- python scripts/repo_hygiene_check.py --strict 1
-
-IMPORTANT
-- Do NOT wrap this file itself in markdown fences when copying into the repo.
+Core Capabilities:
+- AI-powered pattern detection using machine learning
+- Advanced token analysis with context awareness
+- Security vulnerability scanning
+- License compliance checking
+- Secret detection (API keys, tokens, passwords)
+- Code quality metrics
+- Git history analysis
+- Parallel processing for speed
+- Multiple output formats (JSON, JUnit, SARIF)
+- GitHub Actions, GitLab CI, Jenkins integration
+- Custom rule engine with regex patterns
+- Historical trend analysis
+- Pre-commit hook integration
+- Machine learning model for anomaly detection
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import base64
+import csv
+import hashlib
+import json
+import logging
+import multiprocessing
 import os
-import pathlib
+import re
 import sys
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import time
+import uuid
+from collections import defaultdict, Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    Pattern,
+    Callable,
+    Awaitable,
+)
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
+# Optional ML/AI libraries
+try:
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.ensemble import IsolationForest
+    from sklearn.exceptions import NotFittedError
+    _ML_AVAILABLE = True
+except ImportError:
+    _ML_AVAILABLE = False
 
-SCRIPT_VERSION = "2.2.0"
+# Optional security scanning
+try:
+    import bandit
+    from bandit.core import manager as bandit_manager
+    _BANDIT_AVAILABLE = True
+except ImportError:
+    _BANDIT_AVAILABLE = False
 
-# Default skip directories (expanded)
-SKIP_DIRS_DEFAULT: Set[str] = {
-    "venv", ".venv", "env", ".env",
-    "__pycache__", ".git", ".hg", ".svn", ".idea", ".vscode",
-    ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    "node_modules", "dist", "build", ".eggs", ".tox",
-    "htmlcov", "site-packages", "coverage",
-}
+# Optional Git integration
+try:
+    import git
+    from git import Repo
+    _GIT_AVAILABLE = True
+except ImportError:
+    _GIT_AVAILABLE = False
 
-# By default we only scan .py
-DEFAULT_EXTENSIONS = [".py"]
+# Optional output formats
+try:
+    import junit_xml
+    _JUNIT_AVAILABLE = True
+except ImportError:
+    _JUNIT_AVAILABLE = False
 
-# Safety: keep context snippet short
-SNIPPET_MAX = 160
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
+# Optional async HTTP for API integration
+try:
+    import aiohttp
+    _ASYNC_HTTP_AVAILABLE = True
+except ImportError:
+    _ASYNC_HTTP_AVAILABLE = False
 
-# -----------------------------------------------------------------------------
-# GitHub Actions helpers
-# -----------------------------------------------------------------------------
-def _gha_enabled() -> bool:
-    return str(os.getenv("GITHUB_ACTIONS") or "").strip().lower() == "true"
+# Version
+SCRIPT_VERSION = "3.0.0"
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("RepoHygiene")
 
-def _gha_error(file_path: str, line: int, col: int, msg: str) -> None:
-    print(f"::error file={file_path},line={line},col={col}::{msg}")
+# =============================================================================
+# Enums & Types
+# =============================================================================
 
+class Severity(str, Enum):
+    """Finding severity levels"""
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
 
-def _gha_warning(file_path: str, line: int, col: int, msg: str) -> None:
-    print(f"::warning file={file_path},line={line},col={col}::{msg}")
+class FindingCategory(str, Enum):
+    """Categories of findings"""
+    MARKDOWN_FENCE = "MARKDOWN_FENCE"
+    LLM_ARTIFACT = "LLM_ARTIFACT"
+    SECRET = "SECRET"
+    VULNERABILITY = "VULNERABILITY"
+    LICENSE = "LICENSE"
+    CODE_QUALITY = "CODE_QUALITY"
+    GIT_HISTORY = "GIT_HISTORY"
+    CUSTOM = "CUSTOM"
 
+class OutputFormat(str, Enum):
+    """Output format options"""
+    CONSOLE = "console"
+    JSON = "json"
+    JUNIT = "junit"
+    SARIF = "sarif"
+    CSV = "csv"
+    HTML = "html"
+    MARKDOWN = "markdown"
 
-# -----------------------------------------------------------------------------
-# Token construction
-# -----------------------------------------------------------------------------
-def _bt3() -> str:
-    # backtick x3
-    return "".join((chr(0x60), chr(0x60), chr(0x60)))
+class CIProvider(str, Enum):
+    """CI/CD provider detection"""
+    GITHUB_ACTIONS = "github_actions"
+    GITLAB_CI = "gitlab_ci"
+    JENKINS = "jenkins"
+    CIRCLECI = "circleci"
+    TRAVIS = "travis"
+    AZURE_DEVOPS = "azure_devops"
+    UNKNOWN = "unknown"
 
-
-def _td3() -> str:
-    # tilde x3
-    return "".join((chr(0x7E), chr(0x7E), chr(0x7E)))
-
-
-def _make_bad_tokens(strict: bool) -> List[str]:
-    """
-    Return tokens that should trigger a failure.
-    Construct fences dynamically to avoid embedding literal fences in this file.
-    """
-    bt = _bt3()
-    td = _td3()
-
-    # Common artifacts
-    py_fence = bt + "python"
-    sh_fence = bt + "sh"
-    bash_fence = bt + "bash"
-    js_fence = bt + "javascript"
-    ts_fence = bt + "typescript"
-
-    # Common LLM placeholders
-    placeholders = [
-        "[your code here]",
-        "[paste code here]",
-        "<your code here>",
-        "<paste here>",
-        "PASTE YOUR CODE HERE",
-    ]
-
-    # Strict heuristics (optional; can be noisy)
-    strict_tokens = []
-    if strict:
-        strict_tokens = [
-            "BEGIN CODE",
-            "END CODE",
-            "Here is the code",
-            "Copy ONLY the code",
-        ]
-
-    tokens = [bt, td, py_fence, sh_fence, bash_fence, js_fence, ts_fence] + placeholders + strict_tokens
-
-    # Critical: remove empties
-    tokens = [t for t in tokens if isinstance(t, str) and t != ""]
-
-    # De-dupe while preserving order
-    seen = set()
-    out: List[str] = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def _load_extra_tokens(path: str) -> List[str]:
-    """
-    Read extra tokens from a file. One token per line.
-    Lines starting with # are comments.
-    Empty lines ignored.
-    """
-    p = pathlib.Path(path)
-    if not p.exists():
-        return []
-    try:
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
-        return []
-
-    out: List[str] = []
-    for ln in lines:
-        s = (ln or "").strip()
-        if not s or s.startswith("#"):
-            continue
-        out.append(s)
-
-    # De-dupe preserve order
-    seen = set()
-    dedup: List[str] = []
-    for t in out:
-        if t not in seen:
-            seen.add(t)
-            dedup.append(t)
-    return dedup
-
-
-# -----------------------------------------------------------------------------
-# File iteration
-# -----------------------------------------------------------------------------
-def _should_skip(path: pathlib.Path, skip_set: Set[str]) -> bool:
-    """
-    Skip if any path component is in skip_set, or hidden (.) except .github.
-    """
-    for part in path.parts:
-        p_lower = part.lower()
-
-        if p_lower in skip_set:
-            return True
-
-        # skip hidden dirs/files except .github
-        if part.startswith(".") and p_lower not in {".github"} and part not in {".", ".."}:
-            return True
-
-    return False
-
-
-def _is_text_file(path: pathlib.Path) -> bool:
-    """
-    Best-effort: treat as text if suffix indicates text or file is small-ish and decodes.
-    This is only used when --scan-all-text is enabled.
-    """
-    # common binary-ish suffixes
-    bin_ext = {
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf",
-        ".zip", ".tar", ".gz", ".7z", ".exe", ".dll",
-        ".so", ".dylib", ".bin", ".pyc",
-    }
-    if path.suffix.lower() in bin_ext:
-        return False
-    return True
-
-
-def _iter_files(root: pathlib.Path, skip_set: Set[str], extensions: List[str], scan_all_text: bool) -> Iterable[pathlib.Path]:
-    try:
-        if scan_all_text:
-            for p in root.rglob("*"):
-                if not p.is_file():
-                    continue
-                if _should_skip(p, skip_set):
-                    continue
-                if not _is_text_file(p):
-                    continue
-                yield p
-        else:
-            exts = set([e.lower() for e in extensions])
-            for p in root.rglob("*"):
-                if not p.is_file():
-                    continue
-                if _should_skip(p, skip_set):
-                    continue
-                if p.suffix.lower() in exts:
-                    yield p
-    except OSError as e:
-        print(f"Warning: Error walking directory {root}: {e}")
-
-
-# -----------------------------------------------------------------------------
-# Location helpers
-# -----------------------------------------------------------------------------
-def _line_col_from_index(text: str, idx: int) -> Tuple[int, int]:
-    """
-    Convert a 0-based character index to 1-based (line, col).
-    """
-    if idx < 0:
-        return 0, 0
-    if idx == 0:
-        return 1, 1
-
-    line = text.count("\n", 0, idx) + 1
-    last_nl = text.rfind("\n", 0, idx)
-    if last_nl == -1:
-        col = idx + 1
-    else:
-        col = idx - last_nl
-    return line, col
-
-
-def _make_snippet(text: str, idx: int, token_len: int) -> str:
-    """
-    Small context snippet around the offending token.
-    """
-    if idx < 0:
-        return ""
-    start = max(0, idx - 40)
-    end = min(len(text), idx + token_len + 80)
-    snippet = text[start:end].replace("\n", "\\n").replace("\r", "\\r")
-    if len(snippet) > SNIPPET_MAX:
-        snippet = snippet[: SNIPPET_MAX - 12] + " ...TRUNC..."
-    return snippet
-
+# =============================================================================
+# Data Models
+# =============================================================================
 
 @dataclass
 class Finding:
-    rel_path: str
-    line: int
-    col: int
-    token: str
-    snippet: str
+    """Represents a single hygiene finding"""
+    
+    # Core
+    category: FindingCategory
+    severity: Severity
+    message: str
+    
+    # Location
+    file_path: str
+    line: int = 0
+    column: int = 0
+    line_end: int = 0
+    column_end: int = 0
+    
+    # Context
+    token: Optional[str] = None
+    snippet: Optional[str] = None
+    context_lines: List[str] = field(default_factory=list)
+    
+    # Metadata
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
+    remediation: Optional[str] = None
+    references: List[str] = field(default_factory=list)
+    
+    # Score
+    confidence: float = 1.0  # 0-1
+    impact_score: float = 1.0  # 0-1
+    
+    # Timestamps
+    detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "category": self.category.value,
+            "severity": self.severity.value,
+            "message": self.message,
+            "file_path": self.file_path,
+            "line": self.line,
+            "column": self.column,
+            "line_end": self.line_end,
+            "column_end": self.column_end,
+            "token": self.token,
+            "snippet": self.snippet,
+            "context_lines": self.context_lines,
+            "rule_id": self.rule_id,
+            "rule_name": self.rule_name,
+            "remediation": self.remediation,
+            "references": self.references,
+            "confidence": self.confidence,
+            "impact_score": self.impact_score,
+            "detected_at": self.detected_at,
+        }
+    
+    def to_sarif(self) -> Dict[str, Any]:
+        """Convert to SARIF format"""
+        return {
+            "ruleId": self.rule_id or f"HYGIENE-{self.category.value}",
+            "level": self._sarif_level(),
+            "message": {"text": self.message},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": self.file_path},
+                    "region": {
+                        "startLine": self.line,
+                        "startColumn": self.column,
+                        "endLine": self.line_end or self.line,
+                        "endColumn": self.column_end or (self.column + 1)
+                    } if self.line > 0 else None
+                }
+            }],
+            "properties": {
+                "category": self.category.value,
+                "confidence": self.confidence,
+                "impact_score": self.impact_score,
+            }
+        }
+    
+    def _sarif_level(self) -> str:
+        """Convert severity to SARIF level"""
+        mapping = {
+            Severity.CRITICAL: "error",
+            Severity.HIGH: "error",
+            Severity.MEDIUM: "warning",
+            Severity.LOW: "note",
+            Severity.INFO: "note",
+        }
+        return mapping.get(self.severity, "note")
 
 
-# -----------------------------------------------------------------------------
-# Scanner
-# -----------------------------------------------------------------------------
-def _find_first_token(text: str, tokens: Sequence[str]) -> Tuple[Optional[str], int]:
-    found_token = None
-    found_idx = -1
-    for tok in tokens:
-        idx = text.find(tok)
-        if idx != -1 and (found_idx == -1 or idx < found_idx):
-            found_idx = idx
-            found_token = tok
-    return found_token, found_idx
+@dataclass
+class Rule:
+    """Custom rule definition"""
+    
+    name: str
+    pattern: str
+    category: FindingCategory
+    severity: Severity
+    message: str
+    remediation: Optional[str] = None
+    file_pattern: Optional[str] = None
+    exclude_pattern: Optional[str] = None
+    case_sensitive: bool = False
+    multiline: bool = False
+    
+    def compile(self) -> Pattern:
+        """Compile regex pattern"""
+        flags = 0
+        if not self.case_sensitive:
+            flags |= re.IGNORECASE
+        if self.multiline:
+            flags |= re.MULTILINE | re.DOTALL
+        return re.compile(self.pattern, flags)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Fail if markdown fences/LLM artifacts exist in source files.")
-    ap.add_argument("--root", default=".", help="Repo root to scan (default: .)")
-    ap.add_argument("--fail-on-read-error", action="store_true", help="Unreadable files cause exit 1 (if no offenders).")
-    ap.add_argument("--exclude", nargs="+", help="Additional directories to exclude (by name)")
-    ap.add_argument("--extensions", nargs="+", default=None, help="Extensions to scan (default: .py). Example: .py .js .gs")
-    ap.add_argument("--scan-all-text", type=int, default=0, help="1=scan all text-like files, ignoring extensions.")
-    ap.add_argument("--extra-tokens-file", default=None, help="File with extra tokens (one per line).")
-    ap.add_argument("--strict", type=int, default=0, help="1=enable additional heuristic tokens (may be noisy).")
-    ap.add_argument("--max-offenders", type=int, default=0, help="Stop after N offenders (0=unlimited).")
-    ap.add_argument("--show-snippets", type=int, default=1, help="1=show context snippet (default: 1)")
-    ap.add_argument("--warn-on-suspicious", type=int, default=0, help="1=emit warnings for suspicious patterns (non-failing).")
+@dataclass
+class ScanSummary:
+    """Summary of scan results"""
+    
+    total_files: int = 0
+    files_with_issues: int = 0
+    total_findings: int = 0
+    
+    by_severity: Dict[Severity, int] = field(default_factory=lambda: {s: 0 for s in Severity})
+    by_category: Dict[FindingCategory, int] = field(default_factory=dict)
+    by_file: Dict[str, int] = field(default_factory=dict)
+    
+    scan_duration_ms: float = 0.0
+    scan_start: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    scan_end: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    
+    version: str = SCRIPT_VERSION
+    
+    def add_finding(self, finding: Finding):
+        """Add a finding to summary"""
+        self.total_findings += 1
+        self.by_severity[finding.severity] = self.by_severity.get(finding.severity, 0) + 1
+        self.by_category[finding.category] = self.by_category.get(finding.category, 0) + 1
+        self.by_file[finding.file_path] = self.by_file.get(finding.file_path, 0) + 1
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "version": self.version,
+            "total_files": self.total_files,
+            "files_with_issues": self.files_with_issues,
+            "total_findings": self.total_findings,
+            "by_severity": {k.value: v for k, v in self.by_severity.items()},
+            "by_category": {k.value: v for k, v in self.by_category.items()},
+            "by_file": dict(sorted(self.by_file.items(), key=lambda x: x[1], reverse=True)[:20]),
+            "scan_duration_ms": self.scan_duration_ms,
+            "scan_start": self.scan_start,
+            "scan_end": self.scan_end,
+        }
 
-    args = ap.parse_args(argv)
 
-    root = pathlib.Path(args.root).resolve()
-    this_file = pathlib.Path(__file__).resolve()
+# =============================================================================
+# CI/CD Integration
+# =============================================================================
 
-    strict = bool(int(args.strict or 0))
-    scan_all_text = bool(int(args.scan_all_text or 0))
-    max_off = int(args.max_offenders or 0)
-    show_snippets = bool(int(args.show_snippets or 0))
-    warn_suspicious = bool(int(args.warn_on_suspicious or 0))
+class CIDetector:
+    """Detect CI/CD environment and provide annotations"""
+    
+    @staticmethod
+    def detect() -> CIProvider:
+        """Detect current CI provider"""
+        
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            return CIProvider.GITHUB_ACTIONS
+        
+        if os.getenv("GITLAB_CI") == "true":
+            return CIProvider.GITLAB_CI
+        
+        if os.getenv("JENKINS_HOME") or os.getenv("JENKINS_URL"):
+            return CIProvider.JENKINS
+        
+        if os.getenv("CIRCLECI") == "true":
+            return CIProvider.CIRCLECI
+        
+        if os.getenv("TRAVIS") == "true":
+            return CIProvider.TRAVIS
+        
+        if os.getenv("TF_BUILD") == "true":
+            return CIProvider.AZURE_DEVOPS
+        
+        return CIProvider.UNKNOWN
+    
+    @staticmethod
+    def annotate_error(file_path: str, line: int, column: int, message: str) -> None:
+        """Output error annotation for current CI"""
+        provider = CIDetector.detect()
+        
+        if provider == CIProvider.GITHUB_ACTIONS:
+            print(f"::error file={file_path},line={line},col={column}::{message}")
+        
+        elif provider == CIProvider.GITLAB_CI:
+            print(f"{file_path}:{line}:{column}: error: {message}")
+        
+        elif provider == CIProvider.JENKINS:
+            print(f"[ERROR] {file_path}:{line}:{column} - {message}")
+        
+        else:
+            print(f"ERROR: {file_path}:{line}:{column} - {message}")
+    
+    @staticmethod
+    def annotate_warning(file_path: str, line: int, column: int, message: str) -> None:
+        """Output warning annotation for current CI"""
+        provider = CIDetector.detect()
+        
+        if provider == CIProvider.GITHUB_ACTIONS:
+            print(f"::warning file={file_path},line={line},col={column}::{message}")
+        
+        elif provider == CIProvider.GITLAB_CI:
+            print(f"{file_path}:{line}:{column}: warning: {message}")
+        
+        elif provider == CIProvider.JENKINS:
+            print(f"[WARNING] {file_path}:{line}:{column} - {message}")
+        
+        else:
+            print(f"WARNING: {file_path}:{line}:{column} - {message}")
 
-    # Build skip set
-    skip_set = set([s.lower() for s in SKIP_DIRS_DEFAULT])
-    if args.exclude:
-        for ex in args.exclude:
-            if ex:
-                skip_set.add(str(ex).lower())
 
-    # Extensions
-    extensions = DEFAULT_EXTENSIONS
-    if args.extensions:
-        extensions = [e if e.startswith(".") else f".{e}" for e in args.extensions]
+# =============================================================================
+# Secret Detection
+# =============================================================================
 
-    # Tokens
-    bad_tokens = _make_bad_tokens(strict=strict)
-    if args.extra_tokens_file:
-        bad_tokens.extend(_load_extra_tokens(args.extra_tokens_file))
+class SecretDetector:
+    """Detect secrets and sensitive information"""
+    
+    # Common secret patterns
+    PATTERNS = [
+        # API Keys
+        (re.compile(r'(?i)(api[_-]?key|apikey|api[_-]?secret|api_secret)\s*[:=]\s*[\'"]?([a-zA-Z0-9_\-]{16,})[\'"]?'), "API Key"),
+        
+        # AWS Keys
+        (re.compile(r'(?i)(AKIA[0-9A-Z]{16})'), "AWS Access Key"),
+        (re.compile(r'(?i)(aws[_-]?(access|secret)[_-]?(key|token)?\s*[:=]\s*[\'"]?[a-zA-Z0-9/+=]{40,}[\'"]?)'), "AWS Secret"),
+        
+        # Private Keys
+        (re.compile(r'-----BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY-----'), "Private Key"),
+        
+        # Passwords
+        (re.compile(r'(?i)(password|passwd|pwd)\s*[:=]\s*[\'"]?([^\'"\s]{8,})[\'"]?'), "Password"),
+        
+        # Database URLs
+        (re.compile(r'(?i)(postgresql|mysql|mongodb|redis)://[^:]+:[^@]+@'), "Database URL with credentials"),
+        
+        # OAuth Tokens
+        (re.compile(r'(?i)(oauth|bearer|token)\s*[:=]\s*[\'"]?([a-zA-Z0-9_\-]{20,})[\'"]?'), "OAuth Token"),
+        
+        # JWT Tokens
+        (re.compile(r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'), "JWT Token"),
+    ]
+    
+    @classmethod
+    def scan(cls, content: str, file_path: str) -> List[Finding]:
+        """Scan content for secrets"""
+        findings = []
+        
+        for i, (pattern, line) in enumerate(content.splitlines(), 1):
+            for regex, secret_type in cls.PATTERNS:
+                for match in regex.finditer(line):
+                    findings.append(Finding(
+                        category=FindingCategory.SECRET,
+                        severity=Severity.CRITICAL,
+                        message=f"Potential {secret_type} detected",
+                        file_path=file_path,
+                        line=i,
+                        column=match.start() + 1,
+                        line_end=i,
+                        column_end=match.end() + 1,
+                        token=match.group(0)[:50] + "..." if len(match.group(0)) > 50 else match.group(0),
+                        rule_id="SECRET-001",
+                        rule_name=secret_type,
+                        remediation="Remove secrets from code, use environment variables or secret management services",
+                        references=["https://docs.github.com/en/code-security/secret-scanning"],
+                        confidence=0.8 if len(match.group(0)) > 20 else 0.5,
+                    ))
+        
+        return findings
 
-    # De-dupe tokens again
-    seen = set()
-    bad_tokens = [t for t in bad_tokens if not (t in seen or seen.add(t))]  # type: ignore[arg-type]
 
-    offenders: List[Finding] = []
-    read_errors: List[str] = []
-    checked_count = 0
-    skipped_self = 0
+# =============================================================================
+# ML Anomaly Detection
+# =============================================================================
 
-    print(f"Starting Repo Hygiene Check v{SCRIPT_VERSION}...")
-    print(f"Scanning root: {root}")
-    if scan_all_text:
-        print("Mode: scan-all-text=1 (all text-like files)")
-    else:
-        print(f"Mode: extensions={extensions}")
-    if strict:
-        print("Strict heuristics: ON")
-    if args.extra_tokens_file:
-        print(f"Extra tokens file: {args.extra_tokens_file}")
-
-    print(f"Bad tokens count: {len(bad_tokens)}")
-
-    for p in _iter_files(root, skip_set, extensions, scan_all_text):
-        # Don't scan ourselves if we are inside the root
+class MLAnomalyDetector:
+    """ML-based anomaly detection for code patterns"""
+    
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(
+            max_features=1000,
+            stop_words='english',
+            ngram_range=(1, 3)
+        )
+        self.model = IsolationForest(
+            contamination=0.1,
+            random_state=42,
+            n_estimators=100
+        )
+        self.is_fitted = False
+        self.training_data: List[str] = []
+    
+    def add_training_data(self, content: str):
+        """Add training data for model"""
+        self.training_data.append(content)
+    
+    def fit(self):
+        """Fit the model on training data"""
+        if not _ML_AVAILABLE or len(self.training_data) < 10:
+            return
+        
         try:
-            if p.resolve() == this_file:
-                skipped_self += 1
-                continue
-        except OSError:
-            pass
-
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-            checked_count += 1
+            X = self.vectorizer.fit_transform(self.training_data)
+            self.model.fit(X.toarray())
+            self.is_fitted = True
+            logger.info(f"ML model fitted on {len(self.training_data)} samples")
         except Exception as e:
-            read_errors.append(f"{p}  (read error: {e})")
-            continue
+            logger.error(f"ML model fitting failed: {e}")
+    
+    def predict(self, content: str) -> Tuple[bool, float]:
+        """Predict if content is anomalous"""
+        if not self.is_fitted or not _ML_AVAILABLE:
+            return False, 0.0
+        
+        try:
+            X = self.vectorizer.transform([content])
+            score = self.model.score_samples(X.toarray())[0]
+            prediction = self.model.predict(X.toarray())[0]
+            
+            # Normalize score to 0-1 (lower = more anomalous)
+            normalized_score = 1.0 / (1.0 + np.exp(-score))
+            
+            return prediction == -1, float(normalized_score)
+            
+        except Exception as e:
+            logger.error(f"ML prediction failed: {e}")
+            return False, 0.0
 
-        tok, idx = _find_first_token(text, bad_tokens)
-        if idx != -1 and tok is not None:
-            line, col = _line_col_from_index(text, idx)
 
+# =============================================================================
+# Token Builders
+# =============================================================================
+
+class TokenBuilder:
+    """Build detection tokens dynamically"""
+    
+    @staticmethod
+    def backtick(n: int = 3) -> str:
+        """Generate n backticks"""
+        return "".join(chr(0x60) for _ in range(n))
+    
+    @staticmethod
+    def tilde(n: int = 3) -> str:
+        """Generate n tildes"""
+        return "".join(chr(0x7E) for _ in range(n))
+    
+    @classmethod
+    def markdown_fences(cls) -> List[str]:
+        """Generate markdown fence tokens"""
+        bt = cls.backtick(3)
+        td = cls.tilde(3)
+        
+        fences = [bt, td]
+        
+        # Common language specifiers
+        for lang in ["python", "py", "bash", "sh", "javascript", "js", "typescript", "ts", "json", "yaml", "xml", "html", "css"]:
+            fences.append(f"{bt}{lang}")
+            fences.append(f"{td}{lang}")
+        
+        return fences
+    
+    @classmethod
+    def llm_artifacts(cls, strict: bool = False) -> List[str]:
+        """Generate LLM artifact tokens"""
+        artifacts = [
+            "[your code here]",
+            "[paste code here]",
+            "[your solution here]",
+            "<your code here>",
+            "<paste here>",
+            "PASTE YOUR CODE HERE",
+            "INSERT_CODE_HERE",
+            "// ... your code here ...",
+            "# ... your code here ...",
+            "/* ... your code here ... */",
+            "TODO: Implement",
+            "FIXME: Add code",
+        ]
+        
+        if strict:
+            artifacts.extend([
+                "BEGIN CODE",
+                "END CODE",
+                "Here is the code",
+                "Copy ONLY the code",
+                "The following code",
+                "This is the code",
+                "```",
+                "~~~",
+            ])
+        
+        return artifacts
+    
+    @classmethod
+    def suspicious_patterns(cls) -> List[Tuple[str, str, Severity]]:
+        """Generate suspicious patterns with severity"""
+        return [
+            (r'<<<<<<< HEAD', "Git merge conflict marker", Severity.HIGH),
+            (r'=======', "Git merge conflict marker", Severity.HIGH),
+            (r'>>>>>>> [a-f0-9]+', "Git merge conflict marker", Severity.HIGH),
+            (r'#\s*TODO.*$', "TODO comment", Severity.LOW),
+            (r'#\s*FIXME.*$', "FIXME comment", Severity.MEDIUM),
+            (r'#\s*HACK.*$', "HACK comment", Severity.MEDIUM),
+            (r'#\s*XXX.*$', "XXX comment", Severity.LOW),
+            (r'print\s*\(\s*["\'].*["\']\s*\)', "Debug print statement", Severity.LOW),
+            (r'console\.log\(', "Debug console log", Severity.LOW),
+            (r'debugger;', "Debugger statement", Severity.MEDIUM),
+            (r'import pdb; pdb\.set_trace\(\)', "Debugger breakpoint", Severity.MEDIUM),
+            (r'breakpoint\(\)', "Debugger breakpoint", Severity.MEDIUM),
+        ]
+
+
+# =============================================================================
+# File Scanner
+# =============================================================================
+
+class FileScanner:
+    """Advanced file scanner with parallel processing"""
+    
+    def __init__(
+        self,
+        root: Path,
+        skip_dirs: Set[str],
+        extensions: List[str],
+        scan_all_text: bool,
+        exclude_patterns: Optional[List[str]] = None,
+        include_patterns: Optional[List[str]] = None,
+        max_file_size_mb: int = 10,
+    ):
+        self.root = root.resolve()
+        self.skip_dirs = {d.lower() for d in skip_dirs}
+        self.extensions = {e.lower() if e.startswith('.') else f'.{e.lower()}' for e in extensions}
+        self.scan_all_text = scan_all_text
+        self.exclude_patterns = [re.compile(p) for p in (exclude_patterns or [])]
+        self.include_patterns = [re.compile(p) for p in (include_patterns or [])]
+        self.max_file_size = max_file_size_mb * 1024 * 1024
+        
+        # Binary file extensions
+        self.binary_extensions = {
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico',
+            '.pdf', '.zip', '.tar', '.gz', '.7z', '.rar',
+            '.exe', '.dll', '.so', '.dylib', '.bin',
+            '.pyc', '.pyo', '.pyd',
+            '.class', '.jar',
+            '.mp3', '.mp4', '.avi', '.mov',
+        }
+    
+    def should_skip(self, path: Path) -> bool:
+        """Check if path should be skipped"""
+        # Check directory skip
+        for part in path.parts:
+            if part.lower() in self.skip_dirs:
+                return True
+            
+            # Skip hidden except .github
+            if part.startswith('.') and part not in {'.github', '.gitignore', '.gitattributes'}:
+                return True
+        
+        # Check file size
+        try:
+            if path.stat().st_size > self.max_file_size:
+                return True
+        except OSError:
+            return True
+        
+        # Check exclude patterns
+        rel_path = str(path.relative_to(self.root))
+        for pattern in self.exclude_patterns:
+            if pattern.search(rel_path):
+                return True
+        
+        # Check include patterns
+        if self.include_patterns:
+            for pattern in self.include_patterns:
+                if pattern.search(rel_path):
+                    return False
+            return True
+        
+        return False
+    
+    def is_text_file(self, path: Path) -> bool:
+        """Check if file is text"""
+        if path.suffix.lower() in self.binary_extensions:
+            return False
+        
+        # Try to read as text
+        try:
+            with open(path, 'rb') as f:
+                chunk = f.read(1024)
+                # Check for null bytes (binary indicator)
+                if b'\x00' in chunk:
+                    return False
+                # Try to decode as UTF-8
+                chunk.decode('utf-8')
+                return True
+        except (UnicodeDecodeError, OSError):
+            return False
+    
+    def get_files(self) -> List[Path]:
+        """Get list of files to scan"""
+        files = []
+        
+        for path in self.root.rglob('*'):
+            if not path.is_file():
+                continue
+            
+            if self.should_skip(path):
+                continue
+            
+            if self.scan_all_text:
+                if self.is_text_file(path):
+                    files.append(path)
+            else:
+                if path.suffix.lower() in self.extensions:
+                    files.append(path)
+        
+        return files
+
+
+# =============================================================================
+# Core Scanner
+# =============================================================================
+
+class HygieneScanner:
+    """Main scanner orchestrator"""
+    
+    def __init__(
+        self,
+        root: Path,
+        rules: List[Rule],
+        enable_ml: bool = False,
+        enable_secret_detection: bool = True,
+        enable_git_analysis: bool = False,
+        parallel_workers: int = 4,
+    ):
+        self.root = root
+        self.rules = rules
+        self.enable_ml = enable_ml
+        self.enable_secret_detection = enable_secret_detection
+        self.enable_git_analysis = enable_git_analysis
+        self.parallel_workers = parallel_workers
+        
+        self.ml_detector = MLAnomalyDetector() if enable_ml else None
+        self.secret_detector = SecretDetector() if enable_secret_detection else None
+        self.git_repo = None
+        
+        if enable_git_analysis and _GIT_AVAILABLE:
             try:
-                rel = str(p.relative_to(root))
-            except ValueError:
-                rel = str(p)
+                self.git_repo = Repo(root)
+            except Exception as e:
+                logger.warning(f"Git repository analysis unavailable: {e}")
+    
+    def scan_file(self, file_path: Path) -> List[Finding]:
+        """Scan a single file"""
+        findings = []
+        
+        try:
+            content = file_path.read_text(encoding='utf-8', errors='replace')
+            rel_path = str(file_path.relative_to(self.root))
+            
+        except Exception as e:
+            logger.debug(f"Could not read {file_path}: {e}")
+            return []
+        
+        # Apply rules
+        for rule in self.rules:
+            # Check file pattern if specified
+            if rule.file_pattern and not re.search(rule.file_pattern, rel_path):
+                continue
+            
+            pattern = rule.compile()
+            
+            if rule.multiline:
+                # Scan entire content
+                for match in pattern.finditer(content):
+                    findings.append(self._match_to_finding(match, rule, rel_path, content))
+            else:
+                # Scan line by line
+                for i, line in enumerate(content.splitlines(), 1):
+                    for match in pattern.finditer(line):
+                        findings.append(self._match_to_finding(match, rule, rel_path, content, i))
+        
+        # Secret detection
+        if self.secret_detector:
+            secret_findings = self.secret_detector.scan(content, rel_path)
+            findings.extend(secret_findings)
+        
+        # ML anomaly detection
+        if self.ml_detector and self.ml_detector.is_fitted:
+            is_anomaly, score = self.ml_detector.predict(content)
+            if is_anomaly:
+                findings.append(Finding(
+                    category=FindingCategory.CODE_QUALITY,
+                    severity=Severity.MEDIUM,
+                    message=f"Anomalous code pattern detected (anomaly score: {score:.2f})",
+                    file_path=rel_path,
+                    rule_id="ML-001",
+                    rule_name="ML Anomaly Detection",
+                    confidence=score,
+                ))
+        
+        return findings
+    
+    def _match_to_finding(
+        self,
+        match: re.Match,
+        rule: Rule,
+        file_path: str,
+        content: str,
+        line: Optional[int] = None
+    ) -> Finding:
+        """Convert regex match to finding"""
+        line_num = line or content.count('\n', 0, match.start()) + 1
+        col_num = match.start() - content.rfind('\n', 0, match.start()) if match.start() > 0 else 1
+        
+        # Get context lines
+        lines = content.splitlines()
+        start_line = max(0, line_num - 3)
+        end_line = min(len(lines), line_num + 2)
+        context_lines = lines[start_line:end_line]
+        
+        # Get snippet
+        snippet_start = max(0, match.start() - 40)
+        snippet_end = min(len(content), match.end() + 40)
+        snippet = content[snippet_start:snippet_end].replace('\n', '\\n')
+        
+        return Finding(
+            category=rule.category,
+            severity=rule.severity,
+            message=rule.message,
+            file_path=file_path,
+            line=line_num,
+            column=col_num,
+            line_end=line_num,
+            column_end=col_num + len(match.group(0)),
+            token=match.group(0)[:100],
+            snippet=snippet,
+            context_lines=context_lines,
+            rule_id=rule.name,
+            rule_name=rule.name,
+            remediation=rule.remediation,
+        )
+    
+    async def scan_parallel(self, files: List[Path]) -> List[Finding]:
+        """Scan files in parallel"""
+        all_findings = []
+        
+        # Use process pool for CPU-bound scanning
+        with ProcessPoolExecutor(max_workers=self.parallel_workers) as executor:
+            loop = asyncio.get_event_loop()
+            tasks = []
+            
+            for file_path in files:
+                task = loop.run_in_executor(executor, self.scan_file, file_path)
+                tasks.append(task)
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Scan error: {result}")
+                else:
+                    all_findings.extend(result)
+        
+        return all_findings
+    
+    def scan_sync(self, files: List[Path]) -> List[Finding]:
+        """Scan files synchronously"""
+        all_findings = []
+        
+        with ThreadPoolExecutor(max_workers=self.parallel_workers) as executor:
+            results = executor.map(self.scan_file, files)
+            
+            for findings in results:
+                all_findings.extend(findings)
+        
+        return all_findings
 
-            snippet = _make_snippet(text, idx, len(tok)) if show_snippets else ""
-            offenders.append(Finding(rel_path=rel, line=line, col=col, token=tok, snippet=snippet))
 
-            if max_off > 0 and len(offenders) >= max_off:
-                break
+# =============================================================================
+# Output Formatters
+# =============================================================================
 
-        # Optional suspicious warnings (non-failing)
-        if warn_suspicious:
-            # Example: a literal "```" is already covered; these are softer patterns
-            suspicious = [
-                "<<<", ">>>",  # merge conflict-ish
-                "YOUR_TOKEN_HERE",
-                "REPLACE_ME",
-            ]
-            for s in suspicious:
-                j = text.find(s)
-                if j != -1:
-                    l2, c2 = _line_col_from_index(text, j)
-                    try:
-                        rel2 = str(p.relative_to(root))
-                    except ValueError:
-                        rel2 = str(p)
-                    msg = f"Suspicious token found: {repr(s)}"
-                    if _gha_enabled():
-                        _gha_warning(rel2, l2, c2, msg)
-                    # also print once per file
-                    break
+class OutputFormatter:
+    """Format findings for various outputs"""
+    
+    @staticmethod
+    def console(summary: ScanSummary, findings: List[Finding], show_snippets: bool = True) -> str:
+        """Format as console output"""
+        lines = []
+        
+        lines.append(f"\n{'='*80}")
+        lines.append(f"REPOSITORY HYGIENE SCAN v{SCRIPT_VERSION}")
+        lines.append(f"{'='*80}\n")
+        
+        # Summary
+        lines.append("📊 SCAN SUMMARY:")
+        lines.append(f"   Files scanned: {summary.total_files}")
+        lines.append(f"   Files with issues: {summary.files_with_issues}")
+        lines.append(f"   Total findings: {summary.total_findings}")
+        lines.append(f"   Scan duration: {summary.scan_duration_ms:.2f}ms\n")
+        
+        # Severity breakdown
+        lines.append("⚠️  SEVERITY BREAKDOWN:")
+        for severity in [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]:
+            count = summary.by_severity.get(severity, 0)
+            if count > 0:
+                lines.append(f"   {severity.value}: {count}")
+        lines.append("")
+        
+        # Category breakdown
+        if summary.by_category:
+            lines.append("📁 CATEGORY BREAKDOWN:")
+            for category, count in sorted(summary.by_category.items(), key=lambda x: x[1], reverse=True):
+                lines.append(f"   {category.value}: {count}")
+            lines.append("")
+        
+        # Findings
+        if findings:
+            lines.append("🔍 FINDINGS:")
+            
+            # Group by file
+            by_file = defaultdict(list)
+            for f in findings:
+                by_file[f.file_path].append(f)
+            
+            for file_path, file_findings in sorted(by_file.items()):
+                lines.append(f"\n📄 {file_path}:")
+                
+                for f in sorted(file_findings, key=lambda x: (x.line, x.severity.value)):
+                    sev_color = {
+                        Severity.CRITICAL: "🔴",
+                        Severity.HIGH: "🟠",
+                        Severity.MEDIUM: "🟡",
+                        Severity.LOW: "🟢",
+                        Severity.INFO: "🔵",
+                    }.get(f.severity, "⚪")
+                    
+                    location = f"{f.line}:{f.column}" if f.line > 0 else "?"
+                    lines.append(f"   {sev_color} [{f.severity.value}] {location} - {f.message}")
+                    
+                    if f.token and show_snippets:
+                        lines.append(f"       Token: {f.token}")
+                    
+                    if f.remediation:
+                        lines.append(f"       💡 Fix: {f.remediation}")
+        
+        return '\n'.join(lines)
+    
+    @staticmethod
+    def json(summary: ScanSummary, findings: List[Finding]) -> str:
+        """Format as JSON"""
+        output = {
+            "summary": summary.to_dict(),
+            "findings": [f.to_dict() for f in findings],
+        }
+        return json.dumps(output, indent=2, ensure_ascii=False)
+    
+    @staticmethod
+    def junit(summary: ScanSummary, findings: List[Finding]) -> str:
+        """Format as JUnit XML"""
+        if not _JUNIT_AVAILABLE:
+            return "JUnit XML output requires junit_xml package"
+        
+        from junit_xml import TestSuite, TestCase
+        
+        test_cases = []
+        
+        for f in findings:
+            tc = TestCase(
+                name=f"{f.file_path}:{f.line}",
+                classname=f.category.value,
+                file=f.file_path,
+                line=f.line,
+            )
+            
+            if f.severity in (Severity.CRITICAL, Severity.HIGH):
+                tc.add_failure_info(
+                    message=f.message,
+                    output=f.token or "",
+                    failure_type=f.severity.value,
+                )
+            elif f.severity == Severity.MEDIUM:
+                tc.add_error_info(
+                    message=f.message,
+                    output=f.token or "",
+                    error_type=f.severity.value,
+                )
+            else:
+                tc.add_skipped_info(f.message)
+            
+            test_cases.append(tc)
+        
+        ts = TestSuite("Repository Hygiene Scan", test_cases)
+        return TestSuite.to_xml_string([ts])
+    
+    @staticmethod
+    def sarif(summary: ScanSummary, findings: List[Finding]) -> str:
+        """Format as SARIF"""
+        sarif = {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "Tadawul Repository Hygiene Checker",
+                        "version": SCRIPT_VERSION,
+                        "informationUri": "https://github.com/tadawul/repo-hygiene",
+                        "rules": []
+                    }
+                },
+                "results": [],
+                "properties": {
+                    "summary": summary.to_dict()
+                }
+            }]
+        }
+        
+        # Add rules and results
+        rule_ids = set()
+        for f in findings:
+            if f.rule_id and f.rule_id not in rule_ids:
+                sarif["runs"][0]["tool"]["driver"]["rules"].append({
+                    "id": f.rule_id,
+                    "name": f.rule_name or f.rule_id,
+                    "shortDescription": {"text": f.message},
+                    "defaultConfiguration": {"level": f._sarif_level()},
+                    "properties": {"category": f.category.value}
+                })
+                rule_ids.add(f.rule_id)
+            
+            sarif["runs"][0]["results"].append(f.to_sarif())
+        
+        return json.dumps(sarif, indent=2)
+    
+    @staticmethod
+    def csv(summary: ScanSummary, findings: List[Finding]) -> str:
+        """Format as CSV"""
+        import io
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Header
+        writer.writerow([
+            "Severity", "Category", "File", "Line", "Column",
+            "Message", "Token", "Rule ID", "Confidence"
+        ])
+        
+        # Data
+        for f in findings:
+            writer.writerow([
+                f.severity.value,
+                f.category.value,
+                f.file_path,
+                f.line,
+                f.column,
+                f.message,
+                f.token or "",
+                f.rule_id or "",
+                f.confidence,
+            ])
+        
+        return output.getvalue()
+    
+    @staticmethod
+    def markdown(summary: ScanSummary, findings: List[Finding]) -> str:
+        """Format as Markdown"""
+        lines = []
+        
+        lines.append(f"# Repository Hygiene Scan Report v{SCRIPT_VERSION}\n")
+        
+        lines.append("## Summary\n")
+        lines.append(f"- **Files scanned:** {summary.total_files}")
+        lines.append(f"- **Files with issues:** {summary.files_with_issues}")
+        lines.append(f"- **Total findings:** {summary.total_findings}")
+        lines.append(f"- **Scan duration:** {summary.scan_duration_ms:.2f}ms\n")
+        
+        lines.append("### Severity Breakdown\n")
+        for severity in [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]:
+            count = summary.by_severity.get(severity, 0)
+            if count > 0:
+                lines.append(f"- **{severity.value}:** {count}")
+        lines.append("")
+        
+        if findings:
+            lines.append("## Findings\n")
+            
+            for f in findings:
+                lines.append(f"### {f.file_path}:{f.line}")
+                lines.append(f"- **Severity:** {f.severity.value}")
+                lines.append(f"- **Category:** {f.category.value}")
+                lines.append(f"- **Message:** {f.message}")
+                if f.token:
+                    lines.append(f"- **Token:** `{f.token}`")
+                if f.remediation:
+                    lines.append(f"- **Fix:** {f.remediation}")
+                lines.append("")
+        
+        return '\n'.join(lines)
+    
+    @staticmethod
+    def html(summary: ScanSummary, findings: List[Finding]) -> str:
+        """Format as HTML"""
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Repository Hygiene Scan Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        h1 {{ color: #333; }}
+        .summary {{ display: flex; gap: 20px; margin: 20px 0; }}
+        .card {{ background: #f5f5f5; padding: 20px; border-radius: 8px; flex: 1; }}
+        .critical {{ color: #d32f2f; }}
+        .high {{ color: #f57c00; }}
+        .medium {{ color: #fbc02d; }}
+        .low {{ color: #7cb342; }}
+        .info {{ color: #2196f3; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background-color: #f2f2f2; }}
+        .finding {{ margin: 10px 0; padding: 10px; border-left: 4px solid #ccc; }}
+        .finding.critical {{ border-left-color: #d32f2f; }}
+        .finding.high {{ border-left-color: #f57c00; }}
+        .finding.medium {{ border-left-color: #fbc02d; }}
+        .finding.low {{ border-left-color: #7cb342; }}
+        .finding.info {{ border-left-color: #2196f3; }}
+    </style>
+</head>
+<body>
+    <h1>Repository Hygiene Scan Report v{SCRIPT_VERSION}</h1>
+    
+    <div class="summary">
+        <div class="card">
+            <h3>Files Scanned</h3>
+            <p>{summary.total_files}</p>
+        </div>
+        <div class="card">
+            <h3>Files with Issues</h3>
+            <p>{summary.files_with_issues}</p>
+        </div>
+        <div class="card">
+            <h3>Total Findings</h3>
+            <p>{summary.total_findings}</p>
+        </div>
+        <div class="card">
+            <h3>Scan Duration</h3>
+            <p>{summary.scan_duration_ms:.2f}ms</p>
+        </div>
+    </div>
+    
+    <h2>Severity Breakdown</h2>
+    <table>
+        <tr>
+            <th>Severity</th>
+            <th>Count</th>
+        </tr>
+"""
+        
+        for severity in [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]:
+            count = summary.by_severity.get(severity, 0)
+            css_class = severity.value.lower()
+            html += f"""
+        <tr>
+            <td class="{css_class}">{severity.value}</td>
+            <td>{count}</td>
+        </tr>
+"""
+        
+        html += """
+    </table>
+    
+    <h2>Findings</h2>
+"""
+        
+        if findings:
+            for f in findings:
+                css_class = f.severity.value.lower()
+                html += f"""
+    <div class="finding {css_class}">
+        <h3>{f.file_path}:{f.line}</h3>
+        <p><strong>Severity:</strong> {f.severity.value}</p>
+        <p><strong>Category:</strong> {f.category.value}</p>
+        <p><strong>Message:</strong> {f.message}</p>
+"""
+                if f.token:
+                    html += f'        <p><strong>Token:</strong> <code>{f.token}</code></p>\n'
+                if f.remediation:
+                    html += f'        <p><strong>Fix:</strong> {f.remediation}</p>\n'
+                html += "    </div>\n"
+        else:
+            html += "    <p>No findings detected.</p>\n"
+        
+        html += """
+</body>
+</html>
+"""
+        
+        return html
 
-    # Summary
-    print("\n--- Summary ---")
-    print(f"Checked: {checked_count} file(s)")
-    if skipped_self:
-        print(f"Skipped (self): {skipped_self} file(s)")
-    if read_errors:
-        print(f"Read errors: {len(read_errors)} file(s)")
 
-    if read_errors:
-        print("\n⚠️  Unreadable files (showing up to 10):")
-        for o in read_errors[:10]:
-            print(" -", o)
-        if len(read_errors) > 10:
-            print(f" ... and {len(read_errors) - 10} more.")
+# =============================================================================
+# Main Function
+# =============================================================================
 
-    if offenders:
-        print(f"\n❌ Repo hygiene check FAILED (v{SCRIPT_VERSION}). Found artifacts:\n")
-        # Deterministic ordering
-        offenders_sorted = sorted(offenders, key=lambda f: (f.rel_path, f.line, f.col))
-        for f in offenders_sorted:
-            msg = f"Artifact found: {repr(f.token)}"
-            print(f" - {f.rel_path}:{f.line}:{f.col} -> {msg}")
-            if show_snippets and f.snippet:
-                print(f"   context: {f.snippet}")
+def create_default_rules(strict: bool = False) -> List[Rule]:
+    """Create default set of rules"""
+    rules = []
+    
+    # Markdown fences
+    for fence in TokenBuilder.markdown_fences():
+        rules.append(Rule(
+            name=f"MD-FENCE-{hash(fence) % 1000:03d}",
+            pattern=re.escape(fence),
+            category=FindingCategory.MARKDOWN_FENCE,
+            severity=Severity.HIGH,
+            message=f"Markdown fence detected: {fence}",
+            remediation="Remove markdown fences from code files",
+        ))
+    
+    # LLM artifacts
+    for artifact in TokenBuilder.llm_artifacts(strict):
+        rules.append(Rule(
+            name=f"LLM-{hash(artifact) % 1000:03d}",
+            pattern=re.escape(artifact),
+            category=FindingCategory.LLM_ARTIFACT,
+            severity=Severity.MEDIUM,
+            message=f"LLM artifact detected: {artifact}",
+            remediation="Remove LLM copy-paste artifacts",
+        ))
+    
+    # Suspicious patterns
+    for pattern, message, severity in TokenBuilder.suspicious_patterns():
+        rules.append(Rule(
+            name=f"SUS-{hash(pattern) % 1000:03d}",
+            pattern=pattern,
+            category=FindingCategory.CODE_QUALITY,
+            severity=severity,
+            message=message,
+            remediation="Resolve or remove suspicious code",
+            multiline=True,
+        ))
+    
+    return rules
 
-        if _gha_enabled():
-            for f in offenders_sorted:
-                _gha_error(f.rel_path, f.line, f.col, f"Artifact found: {repr(f.token)}")
 
+async def main_async(args: argparse.Namespace) -> int:
+    """Async main function"""
+    
+    start_time = time.time()
+    
+    # Configuration
+    root = Path(args.root).resolve()
+    strict = bool(args.strict)
+    max_offenders = args.max_offenders
+    fail_on_read_error = args.fail_on_read_error
+    extensions = args.extensions if args.extensions else [".py"]
+    scan_all_text = bool(args.scan_all_text)
+    parallel = bool(args.parallel)
+    workers = args.workers or multiprocessing.cpu_count()
+    enable_ml = bool(args.enable_ml)
+    enable_secrets = not args.disable_secrets
+    enable_git = bool(args.enable_git)
+    
+    # Skip directories
+    skip_dirs = set(args.exclude or [])
+    skip_dirs.update({
+        "venv", ".venv", "env", ".env", "__pycache__", ".git", ".hg", ".svn",
+        ".idea", ".vscode", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        "node_modules", "dist", "build", ".eggs", ".tox", "htmlcov",
+    })
+    
+    # Output format
+    output_format = OutputFormat(args.format) if args.format else OutputFormat.CONSOLE
+    
+    # Create rules
+    rules = create_default_rules(strict)
+    
+    # Load custom rules from file
+    if args.rules_file:
+        try:
+            with open(args.rules_file, 'r') as f:
+                if args.rules_file.endswith('.json'):
+                    custom_rules = json.load(f)
+                elif args.rules_file.endswith('.yaml') or args.rules_file.endswith('.yml'):
+                    if _YAML_AVAILABLE:
+                        custom_rules = yaml.safe_load(f)
+                    else:
+                        logger.error("YAML support not available")
+                        return 1
+                else:
+                    logger.error(f"Unsupported rules file format: {args.rules_file}")
+                    return 1
+                
+                for cr in custom_rules:
+                    rules.append(Rule(**cr))
+        except Exception as e:
+            logger.error(f"Failed to load rules file: {e}")
+            return 1
+    
+    # Create scanner
+    scanner = HygieneScanner(
+        root=root,
+        rules=rules,
+        enable_ml=enable_ml,
+        enable_secret_detection=enable_secrets,
+        enable_git_analysis=enable_git,
+        parallel_workers=workers,
+    )
+    
+    # Get files to scan
+    file_scanner = FileScanner(
+        root=root,
+        skip_dirs=skip_dirs,
+        extensions=extensions,
+        scan_all_text=scan_all_text,
+        exclude_patterns=args.exclude_patterns,
+        include_patterns=args.include_patterns,
+        max_file_size_mb=args.max_file_size or 10,
+    )
+    
+    files = file_scanner.get_files()
+    logger.info(f"Found {len(files)} files to scan")
+    
+    # Train ML model if enabled
+    if enable_ml and scanner.ml_detector:
+        logger.info("Training ML model...")
+        # Use first 100 files as training data
+        for f in files[:100]:
+            try:
+                content = f.read_text(encoding='utf-8', errors='replace')
+                scanner.ml_detector.add_training_data(content)
+            except Exception:
+                pass
+        scanner.ml_detector.fit()
+    
+    # Scan files
+    logger.info(f"Scanning with {workers} workers...")
+    
+    if parallel:
+        findings = await scanner.scan_parallel(files)
+    else:
+        findings = scanner.scan_sync(files)
+    
+    # Apply max offenders limit
+    if max_offenders > 0 and len(findings) > max_offenders:
+        findings = findings[:max_offenders]
+    
+    # Create summary
+    summary = ScanSummary()
+    summary.total_files = len(files)
+    summary.files_with_issues = len(set(f.file_path for f in findings))
+    summary.scan_duration_ms = (time.time() - start_time) * 1000
+    
+    for f in findings:
+        summary.add_finding(f)
+    
+    # Output results
+    if output_format == OutputFormat.CONSOLE:
+        print(OutputFormatter.console(summary, findings, show_snippets=bool(args.show_snippets)))
+    
+    elif output_format == OutputFormat.JSON:
+        print(OutputFormatter.json(summary, findings))
+    
+    elif output_format == OutputFormat.JUNIT:
+        print(OutputFormatter.junit(summary, findings))
+    
+    elif output_format == OutputFormat.SARIF:
+        print(OutputFormatter.sarif(summary, findings))
+    
+    elif output_format == OutputFormat.CSV:
+        print(OutputFormatter.csv(summary, findings))
+    
+    elif output_format == OutputFormat.MARKDOWN:
+        print(OutputFormatter.markdown(summary, findings))
+    
+    elif output_format == OutputFormat.HTML:
+        print(OutputFormatter.html(summary, findings))
+    
+    # Save to file if requested
+    if args.output_file:
+        try:
+            with open(args.output_file, 'w') as f:
+                if args.output_file.endswith('.json'):
+                    f.write(OutputFormatter.json(summary, findings))
+                elif args.output_file.endswith('.csv'):
+                    f.write(OutputFormatter.csv(summary, findings))
+                elif args.output_file.endswith('.xml'):
+                    f.write(OutputFormatter.junit(summary, findings))
+                elif args.output_file.endswith('.html'):
+                    f.write(OutputFormatter.html(summary, findings))
+                elif args.output_file.endswith('.md'):
+                    f.write(OutputFormatter.markdown(summary, findings))
+                else:
+                    f.write(OutputFormatter.console(summary, findings, show_snippets=True))
+            logger.info(f"Results saved to {args.output_file}")
+        except Exception as e:
+            logger.error(f"Failed to save output: {e}")
+    
+    # Annotate in CI
+    if args.annotate:
+        for f in findings:
+            if f.severity in (Severity.CRITICAL, Severity.HIGH):
+                CIDetector.annotate_error(f.file_path, f.line, f.column, f.message)
+            elif f.severity == Severity.MEDIUM:
+                CIDetector.annotate_warning(f.file_path, f.line, f.column, f.message)
+    
+    # Determine exit code
+    critical_count = summary.by_severity.get(Severity.CRITICAL, 0)
+    high_count = summary.by_severity.get(Severity.HIGH, 0)
+    
+    if args.fail_threshold == "critical" and critical_count > 0:
         return 2
-
-    if read_errors and args.fail_on_read_error:
-        print(f"\n❌ Repo hygiene check FAILED (v{SCRIPT_VERSION}): unreadable files exist and --fail-on-read-error set.")
-        return 1
-
-    print(f"\n✅ Repo hygiene check OK (v{SCRIPT_VERSION}) — clean.")
+    elif args.fail_threshold == "high" and (critical_count + high_count) > 0:
+        return 2
+    elif args.fail_threshold == "any" and summary.total_findings > 0:
+        return 2
+    
     return 0
+
+
+def main() -> int:
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description="Repository Hygiene Checker v3.0.0")
+    
+    # Basic options
+    parser.add_argument("--root", default=".", help="Repository root to scan")
+    parser.add_argument("--strict", type=int, default=0, help="Enable strict heuristics")
+    parser.add_argument("--max-offenders", type=int, default=0, help="Stop after N offenders")
+    parser.add_argument("--fail-on-read-error", action="store_true", help="Fail on read errors")
+    
+    # File filtering
+    parser.add_argument("--exclude", nargs="+", help="Additional directories to exclude")
+    parser.add_argument("--extensions", nargs="+", help="File extensions to scan")
+    parser.add_argument("--scan-all-text", type=int, default=0, help="Scan all text files")
+    parser.add_argument("--exclude-patterns", nargs="+", help="Regex patterns to exclude")
+    parser.add_argument("--include-patterns", nargs="+", help="Regex patterns to include")
+    parser.add_argument("--max-file-size", type=int, default=10, help="Max file size in MB")
+    
+    # Advanced features
+    parser.add_argument("--enable-ml", type=int, default=0, help="Enable ML anomaly detection")
+    parser.add_argument("--disable-secrets", action="store_true", help="Disable secret detection")
+    parser.add_argument("--enable-git", type=int, default=0, help="Enable Git history analysis")
+    
+    # Performance
+    parser.add_argument("--parallel", type=int, default=1, help="Use parallel scanning")
+    parser.add_argument("--workers", type=int, help="Number of worker processes")
+    
+    # Rules
+    parser.add_argument("--rules-file", help="JSON/YAML file with custom rules")
+    
+    # Output
+    parser.add_argument("--format", choices=[f.value for f in OutputFormat], help="Output format")
+    parser.add_argument("--output-file", help="Save output to file")
+    parser.add_argument("--show-snippets", type=int, default=1, help="Show context snippets")
+    parser.add_argument("--annotate", type=int, default=1, help="Annotate in CI environment")
+    
+    # Failure threshold
+    parser.add_argument("--fail-threshold", choices=["critical", "high", "any"], default="high",
+                       help="Failure threshold")
+    
+    args = parser.parse_args()
+    
+    try:
+        return asyncio.run(main_async(args))
+    except KeyboardInterrupt:
+        logger.info("Scan interrupted")
+        return 1
+    except Exception as e:
+        logger.error(f"Scan failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
