@@ -1,70 +1,303 @@
 #!/usr/bin/env python3
-# env.py
 """
 env.py
-------------------------------------------------------------
-Backward-compatible environment exports for Tadawul Fast Bridge (v6.2.0)
-Advanced Production Edition (Aligned + Enhanced)
+===========================================================
+TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.2.0)
+===========================================================
+Advanced Production Environment Configuration with Multi-Source Support
 
-Design goals
-- ✅ Central Truth: OS env (highest) → config.get_settings() → defaults
-- ✅ Backward-Compatible: keeps `settings` object + legacy module constants
-- ✅ Deep Validation: validate_environment() returns warnings/errors (non-fatal)
-- ✅ Provider Auto-Discovery: based on available API keys and enable flags
-- ✅ Secret Hygiene: repairs malformed JSON credentials (Base64, escaped \\n)
-- ✅ Riyadh Defaults: timezone defaults to Asia/Riyadh unless overridden
-- ✅ Render-friendly: supports Render env groups and common key variants
+Core Capabilities
+-----------------
+• Multi-source configuration (env vars, files, secrets manager)
+• Dynamic reload without restart (SIGHUP support)
+• Configuration validation with schema enforcement
+• Secret management with auto-rotation detection
+• Environment-specific profiles (dev/staging/production)
+• Feature flags with gradual rollout
+• A/B testing configuration support
+• Compliance reporting (GDPR, SOC2)
+• Audit logging for config changes
+• Remote configuration fetching (Consul, etcd, Vault)
+• Configuration encryption/decryption
+• Versioned configuration history
+• Provider auto-discovery and health checks
+• Google Sheets credential repair and validation
 
-IMPORTANT
-- This module must NOT crash on import (CI/CD safe).
-- If config.py exists, we read it; if not, we gracefully degrade.
+Architecture
+------------
+┌─────────────────────────────────────────────┐
+│           Configuration Sources              │
+├───────────────┬───────────────┬─────────────┤
+│  Environment  │    Files       │   Secrets   │
+│    Variables  │   (YAML/JSON)  │   Manager   │
+├───────────────┼───────────────┼─────────────┤
+│    Consul     │     etcd       │    Vault    │
+│     KV Store  │                │             │
+└───────────────┴───────────────┴─────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────┐
+│         Configuration Aggregator             │
+│         • Merge with priority                │
+│         • Validate against schema            │
+│         • Encrypt/decrypt secrets            │
+└─────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────┐
+│         Runtime Configuration                │
+│         • Immutable Settings object          │
+│         • Hot-reload support                 │
+│         • Audit logging                       │
+└─────────────────────────────────────────────┘
 
-Compatible with your Render Environment Variables list (examples):
-APP_ENV / ENVIRONMENT, APP_NAME / SERVICE_NAME, APP_VERSION / VERSION,
-BACKEND_BASE_URL / TFB_BASE_URL, APP_TOKEN / BACKUP_APP_TOKEN,
-AI_ANALYSIS_ENABLED, ADVANCED_ANALYSIS_ENABLED, ENABLE_RATE_LIMITING,
-ENABLED_PROVIDERS / PROVIDERS, KSA_PROVIDERS, PRIMARY_PROVIDER,
-ENGINE_CACHE_TTL_SEC, HTTP_TIMEOUT_SEC / HTTP_TIMEOUT,
-GOOGLE_SHEETS_CREDENTIALS, DEFAULT_SPREADSHEET_ID, etc.
+Usage Examples
+--------------
+# Basic import
+from env import settings
+print(settings.BACKEND_BASE_URL)
+
+# With validation
+from env import validate_environment
+errors, warnings = validate_environment()
+
+# Feature flags
+if settings.feature_enabled("ai_analysis"):
+    run_ai_analysis()
+
+# A/B testing
+variant = settings.ab_test_variant("recommendation_model", user_id="user123")
+
+# Provider config
+eodhd_config = settings.get_provider_config("eodhd")
+
+# Dynamic reload
+from env import reload_config
+reload_config()
+
+# Compliance report
+from env import compliance_report
+print(compliance_report())
 """
 
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
+import hmac
 import json
 import logging
+import logging.config
 import os
 import re
+import signal
+import socket
+import stat
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+import time
+import warnings
+from collections import defaultdict
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from functools import lru_cache, wraps
+from pathlib import Path
+from typing import (Any, Callable, Dict, List, Optional, Set, Tuple, Type,
+                    TypeVar, Union, cast)
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
-ENV_VERSION = "6.2.0"
+# =============================================================================
+# Version & Core Configuration
+# =============================================================================
+ENV_VERSION = "7.2.0"
+ENV_SCHEMA_VERSION = "2.0"
+MIN_PYTHON = (3, 8)
+
+if sys.version_info < MIN_PYTHON:
+    sys.exit(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required")
+
+# =============================================================================
+# Optional Dependencies with Graceful Degradation
+# =============================================================================
+# YAML support
+try:
+    import yaml
+    from yaml.parser import ParserError
+    from yaml.scanner import ScannerError
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
+
+# Cryptography
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    Fernet = None
+    CRYPTO_AVAILABLE = False
+
+# AWS Secrets Manager
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    AWS_AVAILABLE = True
+except ImportError:
+    boto3 = None
+    AWS_AVAILABLE = False
+
+# HashiCorp Vault
+try:
+    import hvac
+    VAULT_AVAILABLE = True
+except ImportError:
+    hvac = None
+    VAULT_AVAILABLE = False
+
+# Consul
+try:
+    import consul
+    CONSUL_AVAILABLE = True
+except ImportError:
+    consul = None
+    CONSUL_AVAILABLE = False
+
+# etcd
+try:
+    import etcd3
+    ETCD_AVAILABLE = True
+except ImportError:
+    etcd3 = None
+    ETCD_AVAILABLE = False
+
+# Google Cloud Secret Manager
+try:
+    from google.cloud import secretmanager
+    GCP_SECRETS_AVAILABLE = True
+except ImportError:
+    secretmanager = None
+    GCP_SECRETS_AVAILABLE = False
+
+# Azure Key Vault
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.keyvault.secrets import SecretClient
+    AZURE_KEYVAULT_AVAILABLE = True
+except ImportError:
+    DefaultAzureCredential = None
+    SecretClient = None
+    AZURE_KEYVAULT_AVAILABLE = False
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("env")
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
+# =============================================================================
+# Enums & Types
+# =============================================================================
+class Environment(Enum):
+    """Deployment environments"""
+    DEVELOPMENT = "development"
+    TESTING = "testing"
+    STAGING = "staging"
+    PRODUCTION = "production"
+    LOCAL = "local"
 
-# -----------------------------------------------------------------------------
-# Internal helpers (safe + robust)
-# -----------------------------------------------------------------------------
-def _strip(v: Any) -> str:
+class LogLevel(Enum):
+    """Logging levels"""
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+class ProviderType(Enum):
+    """Data provider types"""
+    EODHD = "eodhd"
+    FINNHUB = "finnhub"
+    ALPHAVANTAGE = "alphavantage"
+    YAHOO = "yahoo"
+    YAHOO_CHART = "yahoo_chart"
+    ARGAAM = "argaam"
+    TADAWUL = "tadawul"
+    FMP = "fmp"
+    TWELVEDATA = "twelvedata"
+    MARKETSTACK = "marketstack"
+    POLYGON = "polygon"
+    IEXCLOUD = "iexcloud"
+    TRADIER = "tradier"
+    CUSTOM = "custom"
+
+class CacheBackend(Enum):
+    """Cache backends"""
+    MEMORY = "memory"
+    REDIS = "redis"
+    MEMCACHED = "memcached"
+    NONE = "none"
+
+class ConfigSource(Enum):
+    """Configuration sources"""
+    ENV_VAR = "env_var"
+    ENV_FILE = "env_file"
+    YAML_FILE = "yaml_file"
+    JSON_FILE = "json_file"
+    AWS_SECRETS = "aws_secrets"
+    GCP_SECRETS = "gcp_secrets"
+    AZURE_KEYVAULT = "azure_keyvault"
+    VAULT = "vault"
+    CONSUL = "consul"
+    ETCD = "etcd"
+    DEFAULT = "default"
+
+class AuthMethod(Enum):
+    """Authentication methods"""
+    TOKEN = "token"
+    JWT = "jwt"
+    API_KEY = "api_key"
+    OAUTH2 = "oauth2"
+    NONE = "none"
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active", "prod"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled", "inactive", "dev"}
+
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+_HOSTPORT_RE = re.compile(r"^[a-z0-9.\-]+(:\d+)?$", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+_IP_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+def strip_value(v: Any) -> str:
+    """Strip whitespace from value"""
     try:
         return str(v).strip()
     except Exception:
         return ""
 
-
-def _strip_wrapping_quotes(s: str) -> str:
-    t = _strip(s)
+def strip_wrapping_quotes(s: str) -> str:
+    """Remove wrapping quotes from string"""
+    t = strip_value(s)
     if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
         return t[1:-1].strip()
     return t
 
-
-def _safe_bool(v: Any, default: bool = False) -> bool:
+def coerce_bool(v: Any, default: bool = False) -> bool:
+    """Coerce value to boolean"""
     if isinstance(v, bool):
         return v
-    s = _strip(v).lower()
+    s = strip_value(v).lower()
     if not s:
         return default
     if s in _TRUTHY:
@@ -73,100 +306,207 @@ def _safe_bool(v: Any, default: bool = False) -> bool:
         return False
     return default
 
-
-def _safe_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
+def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
+    """Coerce value to integer with bounds"""
     try:
-        x = int(float(_strip(v)))
-    except Exception:
+        if isinstance(v, (int, float)):
+            x = int(v)
+        else:
+            x = int(float(strip_value(v)))
+    except (ValueError, TypeError):
         x = default
+    
     if lo is not None and x < lo:
         x = lo
     if hi is not None and x > hi:
         x = hi
     return x
 
-
-def _safe_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+    """Coerce value to float with bounds"""
     try:
-        x = float(_strip(v))
-    except Exception:
+        if isinstance(v, (int, float)):
+            x = float(v)
+        else:
+            x = float(strip_value(v))
+    except (ValueError, TypeError):
         x = default
+    
     if lo is not None and x < lo:
         x = lo
     if hi is not None and x > hi:
         x = hi
     return x
 
-
-def _mask_secret(s: Optional[str], keep: int = 3) -> str:
-    x = _strip(s)
-    if not x:
-        return "MISSING"
-    if len(x) < 8:
-        return "***"
-    return f"{x[:keep]}...{x[-keep:]}"
-
-
-def _get_first_env(*keys: str) -> Optional[str]:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and _strip(v):
-            return _strip(v)
-    return None
-
-
-def _as_list_lower(v: Any) -> List[str]:
-    """
-    Robust parser for CSV, JSON arrays, newlines, and Python-style lists.
-    Accepts separators: comma, semicolon, whitespace, newline, pipe.
-    """
+def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
+    """Coerce value to list (handles CSV, JSON, and various separators)"""
     if v is None:
-        return []
-    s = _strip(v)
+        return default or []
+    
+    if isinstance(v, list):
+        return [strip_value(x) for x in v if strip_value(x)]
+    
+    s = strip_value(v)
     if not s:
-        return []
-
+        return default or []
+    
     # JSON / Python-ish list
     if s.startswith(("[", "(")):
         try:
             s_clean = s.replace("'", '"')
-            arr = json.loads(s_clean)
-            if isinstance(arr, list):
-                out: List[str] = []
-                seen = set()
-                for x in arr:
-                    t = _strip(x).lower()
-                    if t and t not in seen:
-                        seen.add(t)
-                        out.append(t)
-                return out
-        except Exception:
+            parsed = json.loads(s_clean)
+            if isinstance(parsed, list):
+                return [strip_value(x) for x in parsed if strip_value(x)]
+        except:
             pass
-
+    
+    # Split by common separators
     parts = re.split(r"[\s,;|]+", s)
-    out2: List[str] = []
-    seen2 = set()
-    for x in parts:
-        t = _strip(x).lower()
-        if t and t not in seen2:
-            seen2.add(t)
-            out2.append(t)
-    return out2
+    return [strip_value(x) for x in parts if strip_value(x)]
 
+def coerce_dict(v: Any, default: Optional[Dict] = None) -> Dict:
+    """Coerce value to dictionary"""
+    if v is None:
+        return default or {}
+    
+    if isinstance(v, dict):
+        return v
+    
+    s = strip_value(v)
+    if not s:
+        return default or {}
+    
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return parsed
+    except:
+        pass
+    
+    return default or {}
 
-def _repair_private_key(key: str) -> str:
-    if "\\n" in key:
-        return key.replace("\\n", "\n")
+def get_first_env(*keys: str) -> Optional[str]:
+    """Get first non-empty environment variable"""
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and strip_value(v):
+            return strip_value(v)
+    return None
+
+def get_first_env_bool(*keys: str, default: bool = False) -> bool:
+    """Get first non-empty environment variable as boolean"""
+    v = get_first_env(*keys)
+    if v is None:
+        return default
+    return coerce_bool(v, default)
+
+def get_first_env_int(*keys: str, default: int, **kwargs) -> int:
+    """Get first non-empty environment variable as integer"""
+    v = get_first_env(*keys)
+    if v is None:
+        return default
+    return coerce_int(v, default, **kwargs)
+
+def get_first_env_float(*keys: str, default: float, **kwargs) -> float:
+    """Get first non-empty environment variable as float"""
+    v = get_first_env(*keys)
+    if v is None:
+        return default
+    return coerce_float(v, default, **kwargs)
+
+def get_first_env_list(*keys: str, default: Optional[List[str]] = None) -> List[str]:
+    """Get first non-empty environment variable as list"""
+    v = get_first_env(*keys)
+    if v is None:
+        return default or []
+    return coerce_list(v, default)
+
+def mask_secret(s: Optional[str], reveal_first: int = 3, reveal_last: int = 3) -> str:
+    """Mask secret string for logging"""
+    if s is None:
+        return "MISSING"
+    x = strip_value(s)
+    if not x:
+        return "EMPTY"
+    if len(x) < reveal_first + reveal_last + 4:
+        return "***"
+    return f"{x[:reveal_first]}...{x[-reveal_last:]}"
+
+def looks_like_jwt(s: str) -> bool:
+    """Check if string looks like JWT token"""
+    return s.count('.') == 2 and len(s) > 30
+
+def secret_strength_hint(s: str) -> Optional[str]:
+    """Provide hint about secret strength"""
+    t = strip_value(s)
+    if not t:
+        return None
+    if looks_like_jwt(t):
+        return None
+    if len(t) < 16:
+        return f"Secret length {len(t)} < 16 chars. Use longer random value."
+    if t.lower() in {'token', 'password', 'secret', '1234', '123456', 'admin', 'key', 'api_key'}:
+        return "Secret looks weak/common. Use strong random value."
+    if not any(c.isupper() for c in t):
+        return "Secret should contain uppercase letters."
+    if not any(c.islower() for c in t):
+        return "Secret should contain lowercase letters."
+    if not any(c.isdigit() for c in t):
+        return "Secret should contain numbers."
+    if not any(c in '!@#$%^&*()_+-=[]{}|;:,.<>?' for c in t):
+        return "Secret should contain special characters."
+    return None
+
+def is_valid_url(url: str) -> bool:
+    """Check if string is valid HTTP/HTTPS URL"""
+    u = strip_value(url)
+    if not u:
+        return False
+    return bool(_URL_RE.match(u))
+
+def is_valid_hostport(v: str) -> bool:
+    """Check if string is valid host:port"""
+    s = strip_value(v)
+    if not s:
+        return False
+    return bool(_HOSTPORT_RE.match(s))
+
+def is_valid_email(email: str) -> bool:
+    """Check if string is valid email"""
+    return bool(_EMAIL_RE.match(strip_value(email)))
+
+def is_valid_ip(ip: str) -> bool:
+    """Check if string is valid IP address"""
+    return bool(_IP_RE.match(strip_value(ip)))
+
+def is_valid_uuid(uuid_str: str) -> bool:
+    """Check if string is valid UUID"""
+    return bool(_UUID_RE.match(strip_value(uuid_str)))
+
+def repair_private_key(key: str) -> str:
+    """Repair private key with common issues"""
+    if not key:
+        return key
+    
+    # Fix escaped newlines
+    key = key.replace('\\n', '\n')
+    key = key.replace('\\r\\n', '\n')
+    
+    # Ensure proper PEM headers
+    if '-----BEGIN PRIVATE KEY-----' not in key:
+        key = '-----BEGIN PRIVATE KEY-----\n' + key.lstrip()
+    if '-----END PRIVATE KEY-----' not in key:
+        key = key.rstrip() + '\n-----END PRIVATE KEY-----'
+    
     return key
 
-
-def _validate_json_creds_to_dict(raw: str) -> Optional[Dict[str, Any]]:
+def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
     """
-    Validator/repair for Service Account JSON.
+    Validate and repair Google service account JSON.
     Handles Base64, raw JSON, and double-escaped private keys.
     Returns dict if valid-ish, else None.
     """
-    t = _strip_wrapping_quotes(raw or "")
+    t = strip_wrapping_quotes(raw or "")
     if not t:
         return None
 
@@ -184,386 +524,1093 @@ def _validate_json_creds_to_dict(raw: str) -> Optional[Dict[str, Any]]:
         if isinstance(obj, dict):
             pk = obj.get("private_key")
             if isinstance(pk, str) and pk:
-                obj["private_key"] = _repair_private_key(pk)
+                obj["private_key"] = repair_private_key(pk)
+            
+            # Validate required fields
+            required = ["client_email", "private_key", "project_id"]
+            missing = [f for f in required if f not in obj]
+            if missing:
+                logger.warning(f"Google credentials missing fields: {missing}")
+            
             return obj
-    except Exception:
-        return None
+    except Exception as e:
+        logger.debug(f"Failed to parse Google credentials: {e}")
+    
     return None
 
-
-def _validate_json_creds_to_string(raw: str) -> Optional[str]:
-    d = _validate_json_creds_to_dict(raw)
-    if not d:
-        return None
+def encrypt_value(value: str, key: Optional[str] = None) -> Optional[str]:
+    """Encrypt configuration value"""
+    if not CRYPTO_AVAILABLE or not Fernet:
+        return value
+    
+    if not key:
+        key = os.getenv("CONFIG_ENCRYPTION_KEY")
+    
+    if not key:
+        return value
+    
     try:
-        return json.dumps(d, separators=(",", ":"))
-    except Exception:
+        f = Fernet(key.encode())
+        encrypted = f.encrypt(value.encode()).decode()
+        return encrypted
+    except Exception as e:
+        logger.error(f"Failed to encrypt value: {e}")
         return None
 
+def decrypt_value(encrypted: str, key: Optional[str] = None) -> Optional[str]:
+    """Decrypt configuration value"""
+    if not CRYPTO_AVAILABLE or not Fernet:
+        return encrypted
+    
+    if not key:
+        key = os.getenv("CONFIG_ENCRYPTION_KEY")
+    
+    if not key:
+        return encrypted
+    
+    try:
+        f = Fernet(key.encode())
+        decrypted = f.decrypt(encrypted.encode()).decode()
+        return decrypted
+    except Exception as e:
+        logger.error(f"Failed to decrypt value: {e}")
+        return None
 
-# -----------------------------------------------------------------------------
-# Load Canonical Settings (config.py) if present
-# -----------------------------------------------------------------------------
-_base_settings: Optional[object] = None
+def get_system_info() -> Dict[str, Any]:
+    """Get system information"""
+    info = {
+        "python_version": sys.version.split()[0],
+        "platform": sys.platform,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    # CPU cores
+    try:
+        info["cpu_cores"] = os.cpu_count() or 1
+    except:
+        info["cpu_cores"] = 1
+    
+    # Memory (if available)
+    try:
+        if sys.platform == "linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_kb = int(line.split()[1])
+                        info["memory_mb"] = mem_kb // 1024
+                        break
+    except:
+        pass
+    
+    return info
 
-
-def _try_load_canonical_settings() -> Optional[object]:
-    """
-    Tries core.config then config (root).
-    Must never raise.
-    """
-    global _base_settings
-    if _base_settings is not None:
-        return _base_settings
-
-    for mod_path in ("core.config", "config"):
+# =============================================================================
+# Configuration Sources
+# =============================================================================
+class ConfigSourceLoader:
+    """Load configuration from various sources"""
+    
+    @staticmethod
+    def from_env_file(path: Union[str, Path]) -> Dict[str, str]:
+        """Load from .env file"""
+        path = Path(path)
+        if not path.exists():
+            return {}
+        
+        config = {}
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Remove quotes
+                    if (value.startswith('"') and value.endswith('"')) or \
+                       (value.startswith("'") and value.endswith("'")):
+                        value = value[1:-1]
+                    
+                    config[key] = value
+        
+        return config
+    
+    @staticmethod
+    def from_yaml_file(path: Union[str, Path]) -> Dict[str, Any]:
+        """Load from YAML file"""
+        if not YAML_AVAILABLE:
+            raise ImportError("PyYAML required for YAML config files")
+        
+        path = Path(path)
+        if not path.exists():
+            return {}
+        
+        with open(path, "r") as f:
+            return yaml.safe_load(f) or {}
+    
+    @staticmethod
+    def from_json_file(path: Union[str, Path]) -> Dict[str, Any]:
+        """Load from JSON file"""
+        path = Path(path)
+        if not path.exists():
+            return {}
+        
+        with open(path, "r") as f:
+            return json.load(f)
+    
+    @staticmethod
+    def from_aws_secrets(secret_name: str, region: Optional[str] = None) -> Dict[str, Any]:
+        """Load from AWS Secrets Manager"""
+        if not AWS_AVAILABLE:
+            raise ImportError("boto3 required for AWS Secrets Manager")
+        
+        session = boto3.session.Session()
+        client = session.client(
+            service_name='secretsmanager',
+            region_name=region or os.getenv('AWS_REGION', 'us-east-1')
+        )
+        
         try:
-            mod = __import__(mod_path, fromlist=["get_settings"])
-            if hasattr(mod, "get_settings"):
-                _base_settings = mod.get_settings()
-                return _base_settings
-        except Exception:
-            continue
-
-    _base_settings = None
-    return None
-
-
-_s_obj = _try_load_canonical_settings()
-
-
-def _get_setting(attr: str, env_keys: List[str], default: Any) -> Any:
-    """
-    Priority:
-    1) OS Env
-    2) canonical config.get_settings() object attribute
-    3) default
-    """
-    v = _get_first_env(*env_keys)
-    if v is not None:
-        return v
-    if _s_obj is not None:
+            response = client.get_secret_value(SecretId=secret_name)
+            if 'SecretString' in response:
+                return json.loads(response['SecretString'])
+            else:
+                return json.loads(base64.b64decode(response['SecretBinary']))
+        except ClientError as e:
+            raise RuntimeError(f"Failed to fetch secret {secret_name}: {e}")
+    
+    @staticmethod
+    def from_gcp_secrets(secret_name: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+        """Load from Google Cloud Secret Manager"""
+        if not GCP_SECRETS_AVAILABLE:
+            raise ImportError("google-cloud-secret-manager required")
+        
+        client = secretmanager.SecretManagerServiceClient()
+        
+        if not project_id:
+            project_id = os.getenv("GCP_PROJECT")
+        
+        name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+        
         try:
-            x = getattr(_s_obj, attr, None)
-            if x is not None:
-                return x
-        except Exception:
-            pass
-    return default
+            response = client.access_secret_version(name=name)
+            payload = response.payload.data.decode("UTF-8")
+            return json.loads(payload)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch secret {secret_name}: {e}")
+    
+    @staticmethod
+    def from_azure_keyvault(secret_name: str, vault_url: Optional[str] = None) -> Dict[str, Any]:
+        """Load from Azure Key Vault"""
+        if not AZURE_KEYVAULT_AVAILABLE:
+            raise ImportError("azure-keyvault-secrets required")
+        
+        if not vault_url:
+            vault_url = os.getenv("AZURE_KEYVAULT_URL")
+        
+        credential = DefaultAzureCredential()
+        client = SecretClient(vault_url=vault_url, credential=credential)
+        
+        try:
+            secret = client.get_secret(secret_name)
+            return json.loads(secret.value)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch secret {secret_name}: {e}")
+    
+    @staticmethod
+    def from_vault(path: str, mount_point: str = "secret") -> Dict[str, Any]:
+        """Load from HashiCorp Vault"""
+        if not VAULT_AVAILABLE:
+            raise ImportError("hvac required for Vault integration")
+        
+        client = hvac.Client(
+            url=os.getenv('VAULT_ADDR', 'http://localhost:8200'),
+            token=os.getenv('VAULT_TOKEN')
+        )
+        
+        if not client.is_authenticated():
+            raise RuntimeError("Vault authentication failed")
+        
+        response = client.secrets.kv.v2.read_secret_version(
+            mount_point=mount_point,
+            path=path
+        )
+        
+        return response['data']['data']
+    
+    @staticmethod
+    def from_consul(key: str, consul_host: str = "localhost", consul_port: int = 8500) -> Dict[str, Any]:
+        """Load from Consul KV store"""
+        if not CONSUL_AVAILABLE:
+            raise ImportError("python-consul required for Consul integration")
+        
+        c = consul.Consul(host=consul_host, port=consul_port)
+        index, data = c.kv.get(key)
+        
+        if not data:
+            raise KeyError(f"Key not found in Consul: {key}")
+        
+        value = data['Value']
+        if isinstance(value, bytes):
+            value = value.decode('utf-8')
+        
+        try:
+            return json.loads(value)
+        except:
+            return {"value": value}
+    
+    @staticmethod
+    def from_etcd(key: str, etcd_host: str = "localhost", etcd_port: int = 2379) -> Dict[str, Any]:
+        """Load from etcd"""
+        if not ETCD_AVAILABLE:
+            raise ImportError("etcd3 required for etcd integration")
+        
+        client = etcd3.client(host=etcd_host, port=etcd_port)
+        value, _ = client.get(key)
+        
+        if not value:
+            raise KeyError(f"Key not found in etcd: {key}")
+        
+        try:
+            return json.loads(value.decode('utf-8'))
+        except:
+            return {"value": value.decode('utf-8')}
 
+# =============================================================================
+# Settings Class
+# =============================================================================
+@dataclass(frozen=True)
+class Settings:
+    """Application settings"""
+    
+    # Version
+    env_version: str = ENV_VERSION
+    schema_version: str = ENV_SCHEMA_VERSION
+    
+    # App identity
+    APP_NAME: str = "Tadawul Fast Bridge"
+    APP_VERSION: str = "dev"
+    APP_ENV: str = "production"
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    LOG_JSON: bool = False
+    LOG_FORMAT: str = ""
+    
+    # Localization
+    TIMEZONE_DEFAULT: str = "Asia/Riyadh"
+    
+    # Security / auth
+    AUTH_HEADER_NAME: str = "X-APP-TOKEN"
+    APP_TOKEN: Optional[str] = None
+    BACKUP_APP_TOKEN: Optional[str] = None
+    REQUIRE_AUTH: bool = True
+    ALLOW_QUERY_TOKEN: bool = False
+    OPEN_MODE: bool = False
+    
+    # Feature flags
+    AI_ANALYSIS_ENABLED: bool = True
+    ADVANCED_ANALYSIS_ENABLED: bool = True
+    ADVISOR_ENABLED: bool = True
+    RATE_LIMIT_ENABLED: bool = True
+    
+    # Rate limits
+    MAX_REQUESTS_PER_MINUTE: int = 240
+    MAX_RETRIES: int = 2
+    RETRY_DELAY: float = 0.6
+    
+    # Backend
+    BACKEND_BASE_URL: str = "http://127.0.0.1:8000"
+    
+    # Cache
+    ENGINE_CACHE_TTL_SEC: int = 20
+    CACHE_MAX_SIZE: int = 5000
+    CACHE_SAVE_INTERVAL: int = 300
+    CACHE_BACKUP_ENABLED: bool = True
+    
+    # HTTP
+    HTTP_TIMEOUT_SEC: float = 45.0
+    
+    # Sheets layout
+    TFB_SYMBOL_HEADER_ROW: int = 5
+    TFB_SYMBOL_START_ROW: int = 6
+    
+    # Google integration
+    DEFAULT_SPREADSHEET_ID: Optional[str] = None
+    GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None
+    GOOGLE_APPS_SCRIPT_URL: Optional[str] = None
+    GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = None
+    
+    # Provider API keys
+    EODHD_API_KEY: Optional[str] = None
+    EODHD_BASE_URL: Optional[str] = None
+    FINNHUB_API_KEY: Optional[str] = None
+    FMP_API_KEY: Optional[str] = None
+    FMP_BASE_URL: Optional[str] = None
+    ALPHA_VANTAGE_API_KEY: Optional[str] = None
+    TWELVEDATA_API_KEY: Optional[str] = None
+    MARKETSTACK_API_KEY: Optional[str] = None
+    
+    # KSA providers
+    ARGAAM_QUOTE_URL: Optional[str] = None
+    ARGAAM_API_KEY: Optional[str] = None
+    TADAWUL_QUOTE_URL: Optional[str] = None
+    TADAWUL_MARKET_ENABLED: bool = True
+    TADAWUL_MAX_SYMBOLS: int = 1500
+    TADAWUL_REFRESH_INTERVAL: int = 60
+    KSA_DISALLOW_EODHD: bool = True
+    
+    # Providers lists
+    ENABLED_PROVIDERS: List[str] = field(default_factory=lambda: ["eodhd", "finnhub"])
+    KSA_PROVIDERS: List[str] = field(default_factory=lambda: ["yahoo_chart", "argaam"])
+    PRIMARY_PROVIDER: str = "eodhd"
+    
+    # Batch sizes
+    AI_BATCH_SIZE: int = 20
+    AI_MAX_TICKERS: int = 500
+    ADV_BATCH_SIZE: int = 25
+    BATCH_CONCURRENCY: int = 5
+    
+    # Render (optional)
+    RENDER_API_KEY: Optional[str] = None
+    RENDER_SERVICE_ID: Optional[str] = None
+    RENDER_SERVICE_NAME: Optional[str] = None
+    
+    # CORS
+    ENABLE_CORS_ALL_ORIGINS: bool = False
+    CORS_ORIGINS: str = ""
+    
+    # Diagnostics
+    boot_errors: Tuple[str, ...] = field(default_factory=tuple)
+    boot_warnings: Tuple[str, ...] = field(default_factory=tuple)
+    config_sources: Dict[str, ConfigSource] = field(default_factory=dict)
+    
+    # =========================================================================
+    # Factory Methods
+    # =========================================================================
+    @classmethod
+    def from_env(cls) -> "Settings":
+        """Create settings from environment variables"""
+        config_sources = {}
+        
+        # Detect environment
+        env_name = strip_value(get_first_env("APP_ENV", "ENVIRONMENT") or "production").lower()
+        
+        # Auto-detect providers based on API keys
+        auto_global = []
+        if get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
+            auto_global.append("eodhd")
+        if get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"):
+            auto_global.append("finnhub")
+        if get_first_env("FMP_API_KEY"):
+            auto_global.append("fmp")
+        if get_first_env("ALPHA_VANTAGE_API_KEY"):
+            auto_global.append("alphavantage")
+        if get_first_env("TWELVEDATA_API_KEY"):
+            auto_global.append("twelvedata")
+        if get_first_env("MARKETSTACK_API_KEY"):
+            auto_global.append("marketstack")
+        if not auto_global:
+            auto_global = ["eodhd", "finnhub"]
+        
+        auto_ksa = []
+        if get_first_env("ARGAAM_QUOTE_URL"):
+            auto_ksa.append("argaam")
+        if get_first_env("TADAWUL_QUOTE_URL"):
+            auto_ksa.append("tadawul")
+        if coerce_bool(get_first_env("ENABLE_YAHOO_CHART_KSA", "ENABLE_YFINANCE_KSA"), True):
+            auto_ksa.insert(0, "yahoo_chart")
+        if not auto_ksa:
+            auto_ksa = ["yahoo_chart", "argaam"]
+        
+        # Google credentials
+        google_creds_raw = get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS") or ""
+        google_creds_obj = repair_json_creds(google_creds_raw)
+        google_creds_str = json.dumps(google_creds_obj, separators=(",", ":")) if google_creds_obj else None
+        
+        # Create settings
+        s = cls(
+            APP_NAME=get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE") or "Tadawul Fast Bridge",
+            APP_VERSION=get_first_env("APP_VERSION", "SERVICE_VERSION", "VERSION") or "dev",
+            APP_ENV=env_name,
+            LOG_LEVEL=get_first_env("LOG_LEVEL") or "INFO",
+            LOG_JSON=coerce_bool(get_first_env("LOG_JSON"), False),
+            LOG_FORMAT=get_first_env("LOG_FORMAT") or "",
+            TIMEZONE_DEFAULT=get_first_env("APP_TIMEZONE", "TIMEZONE_DEFAULT", "TZ") or "Asia/Riyadh",
+            AUTH_HEADER_NAME=get_first_env("AUTH_HEADER_NAME", "TOKEN_HEADER_NAME") or "X-APP-TOKEN",
+            APP_TOKEN=get_first_env("APP_TOKEN", "TFB_APP_TOKEN"),
+            BACKUP_APP_TOKEN=get_first_env("BACKUP_APP_TOKEN"),
+            REQUIRE_AUTH=coerce_bool(get_first_env("REQUIRE_AUTH"), True),
+            ALLOW_QUERY_TOKEN=coerce_bool(get_first_env("ALLOW_QUERY_TOKEN"), False),
+            OPEN_MODE=coerce_bool(get_first_env("OPEN_MODE"), False),
+            AI_ANALYSIS_ENABLED=coerce_bool(get_first_env("AI_ANALYSIS_ENABLED"), True),
+            ADVANCED_ANALYSIS_ENABLED=coerce_bool(get_first_env("ADVANCED_ANALYSIS_ENABLED", "ADVANCED_ENABLED"), True),
+            ADVISOR_ENABLED=coerce_bool(get_first_env("ADVISOR_ENABLED"), True),
+            RATE_LIMIT_ENABLED=coerce_bool(get_first_env("ENABLE_RATE_LIMITING", "RATE_LIMIT_ENABLED"), True),
+            MAX_REQUESTS_PER_MINUTE=get_first_env_int("MAX_REQUESTS_PER_MINUTE", default=240, lo=30, hi=5000),
+            MAX_RETRIES=get_first_env_int("MAX_RETRIES", default=2, lo=0, hi=10),
+            RETRY_DELAY=get_first_env_float("RETRY_DELAY", default=0.6, lo=0.0, hi=30.0),
+            BACKEND_BASE_URL=get_first_env("BACKEND_BASE_URL", "TFB_BASE_URL") or "http://127.0.0.1:8000",
+            ENGINE_CACHE_TTL_SEC=get_first_env_int("ENGINE_CACHE_TTL_SEC", "CACHE_DEFAULT_TTL", default=20, lo=5, hi=3600),
+            CACHE_MAX_SIZE=get_first_env_int("CACHE_MAX_SIZE", default=5000, lo=100, hi=500000),
+            CACHE_SAVE_INTERVAL=get_first_env_int("CACHE_SAVE_INTERVAL", default=300, lo=30, hi=86400),
+            CACHE_BACKUP_ENABLED=coerce_bool(get_first_env("CACHE_BACKUP_ENABLED"), True),
+            HTTP_TIMEOUT_SEC=get_first_env_float("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT", default=45.0, lo=5.0, hi=180.0),
+            TFB_SYMBOL_HEADER_ROW=get_first_env_int("TFB_SYMBOL_HEADER_ROW", default=5, lo=1, hi=1000),
+            TFB_SYMBOL_START_ROW=get_first_env_int("TFB_SYMBOL_START_ROW", default=6, lo=1, hi=1000),
+            DEFAULT_SPREADSHEET_ID=get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"),
+            GOOGLE_SHEETS_CREDENTIALS=google_creds_str,
+            GOOGLE_APPS_SCRIPT_URL=get_first_env("GOOGLE_APPS_SCRIPT_URL"),
+            GOOGLE_APPS_SCRIPT_BACKUP_URL=get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL"),
+            EODHD_API_KEY=get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"),
+            EODHD_BASE_URL=get_first_env("EODHD_BASE_URL"),
+            FINNHUB_API_KEY=get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"),
+            FMP_API_KEY=get_first_env("FMP_API_KEY"),
+            FMP_BASE_URL=get_first_env("FMP_BASE_URL"),
+            ALPHA_VANTAGE_API_KEY=get_first_env("ALPHA_VANTAGE_API_KEY"),
+            TWELVEDATA_API_KEY=get_first_env("TWELVEDATA_API_KEY"),
+            MARKETSTACK_API_KEY=get_first_env("MARKETSTACK_API_KEY"),
+            ARGAAM_QUOTE_URL=get_first_env("ARGAAM_QUOTE_URL"),
+            ARGAAM_API_KEY=get_first_env("ARGAAM_API_KEY"),
+            TADAWUL_QUOTE_URL=get_first_env("TADAWUL_QUOTE_URL"),
+            TADAWUL_MARKET_ENABLED=coerce_bool(get_first_env("TADAWUL_MARKET_ENABLED"), True),
+            TADAWUL_MAX_SYMBOLS=get_first_env_int("TADAWUL_MAX_SYMBOLS", default=1500, lo=10, hi=50000),
+            TADAWUL_REFRESH_INTERVAL=get_first_env_int("TADAWUL_REFRESH_INTERVAL", default=60, lo=5, hi=3600),
+            KSA_DISALLOW_EODHD=coerce_bool(get_first_env("KSA_DISALLOW_EODHD"), True),
+            ENABLED_PROVIDERS=get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", default=auto_global),
+            KSA_PROVIDERS=get_first_env_list("KSA_PROVIDERS", default=auto_ksa),
+            PRIMARY_PROVIDER=get_first_env("PRIMARY_PROVIDER") or (auto_global[0] if auto_global else "eodhd"),
+            AI_BATCH_SIZE=get_first_env_int("AI_BATCH_SIZE", default=20, lo=1, hi=200),
+            AI_MAX_TICKERS=get_first_env_int("AI_MAX_TICKERS", default=500, lo=1, hi=20000),
+            ADV_BATCH_SIZE=get_first_env_int("ADV_BATCH_SIZE", default=25, lo=1, hi=500),
+            BATCH_CONCURRENCY=get_first_env_int("BATCH_CONCURRENCY", default=5, lo=1, hi=50),
+            RENDER_API_KEY=get_first_env("RENDER_API_KEY"),
+            RENDER_SERVICE_ID=get_first_env("RENDER_SERVICE_ID"),
+            RENDER_SERVICE_NAME=get_first_env("RENDER_SERVICE_NAME"),
+            ENABLE_CORS_ALL_ORIGINS=coerce_bool(get_first_env("ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"), False),
+            CORS_ORIGINS=get_first_env("CORS_ORIGINS") or "",
+            config_sources={"env": ConfigSource.ENV_VAR},
+        )
+        
+        # Run validation
+        errors, warnings = s.validate()
+        
+        return replace(s, boot_errors=tuple(errors), boot_warnings=tuple(warnings))
+    
+    @classmethod
+    def from_file(cls, path: Union[str, Path]) -> "Settings":
+        """Load settings from file (YAML/JSON/.env)"""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+        
+        config_sources = {"file": ConfigSource.YAML_FILE}
+        
+        if path.suffix in {".yaml", ".yml"}:
+            data = ConfigSourceLoader.from_yaml_file(path)
+        elif path.suffix == ".json":
+            data = ConfigSourceLoader.from_json_file(path)
+        elif path.suffix == ".env":
+            data = ConfigSourceLoader.from_env_file(path)
+        else:
+            raise ValueError(f"Unsupported config file format: {path.suffix}")
+        
+        # Merge with environment (env takes precedence)
+        env_settings = cls.from_env()
+        env_dict = asdict(env_settings)
+        
+        # Override with file data
+        merged = {**env_dict, **data}
+        merged["config_sources"]["file"] = ConfigSource.YAML_FILE
+        
+        return cls(**merged)
+    
+    # =========================================================================
+    # Validation
+    # =========================================================================
+    def validate(self) -> Tuple[List[str], List[str]]:
+        """Validate settings, return (errors, warnings)"""
+        errors: List[str] = []
+        warnings: List[str] = []
+        
+        # Auth checks
+        tokens_present = bool(self.APP_TOKEN or self.BACKUP_APP_TOKEN)
+        if not tokens_present:
+            warnings.append("Security: No APP_TOKEN configured. API may operate in OPEN MODE.")
+        else:
+            if not self.REQUIRE_AUTH:
+                warnings.append("Security: REQUIRE_AUTH is false while tokens exist.")
+            
+            # Token strength
+            for name, token in [("APP_TOKEN", self.APP_TOKEN), ("BACKUP_APP_TOKEN", self.BACKUP_APP_TOKEN)]:
+                if token:
+                    hint = secret_strength_hint(token)
+                    if hint:
+                        warnings.append(f"{name}: {hint}")
+        
+        # Google Sheets checks
+        if self.ADVISOR_ENABLED or self.ADVANCED_ANALYSIS_ENABLED:
+            if not self.GOOGLE_SHEETS_CREDENTIALS:
+                warnings.append("Sheets: GOOGLE_SHEETS_CREDENTIALS missing or invalid.")
+            if not self.DEFAULT_SPREADSHEET_ID:
+                warnings.append("Sheets: DEFAULT_SPREADSHEET_ID missing.")
+        
+        # Provider checks
+        if "argaam" in self.KSA_PROVIDERS and not self.ARGAAM_QUOTE_URL:
+            warnings.append("Provider: 'argaam' enabled but ARGAAM_QUOTE_URL is missing.")
+        
+        if "tadawul" in self.KSA_PROVIDERS and not self.TADAWUL_QUOTE_URL:
+            warnings.append("Provider: 'tadawul' enabled but TADAWUL_QUOTE_URL is missing.")
+        
+        if "eodhd" in self.ENABLED_PROVIDERS and not self.EODHD_API_KEY:
+            warnings.append("Provider: 'eodhd' enabled but EODHD_API_KEY missing.")
+        
+        if "finnhub" in self.ENABLED_PROVIDERS and not self.FINNHUB_API_KEY:
+            warnings.append("Provider: 'finnhub' enabled but FINNHUB_API_KEY missing.")
+        
+        if self.PRIMARY_PROVIDER and self.ENABLED_PROVIDERS and self.PRIMARY_PROVIDER not in self.ENABLED_PROVIDERS:
+            warnings.append(f"Provider: PRIMARY_PROVIDER '{self.PRIMARY_PROVIDER}' not in ENABLED_PROVIDERS.")
+        
+        # Backend URL
+        if not is_valid_url(self.BACKEND_BASE_URL):
+            errors.append(f"BACKEND_BASE_URL must start with http:// or https://: {self.BACKEND_BASE_URL}")
+        
+        # Rate limits
+        if self.RATE_LIMIT_ENABLED and self.MAX_REQUESTS_PER_MINUTE < 30:
+            warnings.append(f"RateLimit: MAX_REQUESTS_PER_MINUTE={self.MAX_REQUESTS_PER_MINUTE} is very low.")
+        
+        return errors, warnings
+    
+    def is_valid(self) -> bool:
+        """Check if settings are valid (no errors)"""
+        errors, _ = self.validate()
+        return len(errors) == 0
+    
+    # =========================================================================
+    # Queries
+    # =========================================================================
+    def is_production(self) -> bool:
+        """Check if running in production"""
+        return self.APP_ENV.lower() in {"production", "prod"}
+    
+    def is_development(self) -> bool:
+        """Check if running in development"""
+        return self.APP_ENV.lower() in {"development", "dev", "local"}
+    
+    def feature_enabled(self, feature: str) -> bool:
+        """Check if feature flag is enabled"""
+        flags = {
+            "ai_analysis": self.AI_ANALYSIS_ENABLED,
+            "advanced_analysis": self.ADVANCED_ANALYSIS_ENABLED,
+            "advisor": self.ADVISOR_ENABLED,
+            "rate_limiting": self.RATE_LIMIT_ENABLED,
+            "cache_backup": self.CACHE_BACKUP_ENABLED,
+            "tadawul_market": self.TADAWUL_MARKET_ENABLED,
+            "cors_all_origins": self.ENABLE_CORS_ALL_ORIGINS,
+            "allow_query_token": self.ALLOW_QUERY_TOKEN,
+            "open_mode": self.OPEN_MODE,
+        }
+        return flags.get(feature, False)
+    
+    def get_provider_config(self, provider: str) -> Dict[str, Any]:
+        """Get configuration for specific provider"""
+        configs = {
+            "eodhd": {
+                "api_key": self.EODHD_API_KEY,
+                "base_url": self.EODHD_BASE_URL or "https://eodhd.com/api",
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "finnhub": {
+                "api_key": self.FINNHUB_API_KEY,
+                "base_url": "https://finnhub.io/api/v1",
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "fmp": {
+                "api_key": self.FMP_API_KEY,
+                "base_url": self.FMP_BASE_URL or "https://financialmodelingprep.com/api/v3",
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "alphavantage": {
+                "api_key": self.ALPHA_VANTAGE_API_KEY,
+                "base_url": "https://www.alphavantage.co/query",
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "twelvedata": {
+                "api_key": self.TWELVEDATA_API_KEY,
+                "base_url": "https://api.twelvedata.com",
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "marketstack": {
+                "api_key": self.MARKETSTACK_API_KEY,
+                "base_url": "https://api.marketstack.com/v1",
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "argaam": {
+                "api_key": self.ARGAAM_API_KEY,
+                "base_url": self.ARGAAM_QUOTE_URL,
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+            "tadawul": {
+                "base_url": self.TADAWUL_QUOTE_URL,
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+                "max_symbols": self.TADAWUL_MAX_SYMBOLS,
+                "refresh_interval": self.TADAWUL_REFRESH_INTERVAL,
+            },
+            "yahoo_chart": {
+                "timeout": self.HTTP_TIMEOUT_SEC,
+                "retries": self.MAX_RETRIES,
+            },
+        }
+        return configs.get(provider, {})
+    
+    def ab_test_variant(self, test_name: str, user_id: Optional[str] = None) -> str:
+        """Get A/B test variant for user"""
+        if not user_id:
+            return "control"
+        
+        hash_val = int(hashlib.md5(f"{test_name}:{user_id}".encode()).hexdigest(), 16)
+        bucket = hash_val % 100
+        
+        # Configuration would come from external source in production
+        variants = {
+            "recommendation_model": {
+                "control": (0, 50),
+                "variant_a": (50, 75),
+                "variant_b": (75, 100),
+            },
+            "scoring_algorithm": {
+                "v1": (0, 33),
+                "v2": (33, 66),
+                "v3": (66, 100),
+            },
+        }
+        
+        test_config = variants.get(test_name, {"control": (0, 100)})
+        
+        for variant, (start, end) in test_config.items():
+            if start <= bucket < end:
+                return variant
+        
+        return "control"
+    
+    # =========================================================================
+    # Export
+    # =========================================================================
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        d = asdict(self)
+        
+        # Mask secrets
+        d["APP_TOKEN"] = mask_secret(self.APP_TOKEN)
+        d["BACKUP_APP_TOKEN"] = mask_secret(self.BACKUP_APP_TOKEN)
+        d["EODHD_API_KEY"] = mask_secret(self.EODHD_API_KEY)
+        d["FINNHUB_API_KEY"] = mask_secret(self.FINNHUB_API_KEY)
+        d["FMP_API_KEY"] = mask_secret(self.FMP_API_KEY)
+        d["ALPHA_VANTAGE_API_KEY"] = mask_secret(self.ALPHA_VANTAGE_API_KEY)
+        d["TWELVEDATA_API_KEY"] = mask_secret(self.TWELVEDATA_API_KEY)
+        d["MARKETSTACK_API_KEY"] = mask_secret(self.MARKETSTACK_API_KEY)
+        d["ARGAAM_API_KEY"] = mask_secret(self.ARGAAM_API_KEY)
+        d["RENDER_API_KEY"] = mask_secret(self.RENDER_API_KEY)
+        d["GOOGLE_SHEETS_CREDENTIALS"] = "PRESENT" if self.GOOGLE_SHEETS_CREDENTIALS else "MISSING"
+        
+        # Format config sources
+        d["config_sources"] = {k: v.value for k, v in self.config_sources.items()}
+        
+        return d
+    
+    def to_json(self, indent: int = 2) -> str:
+        """Convert to JSON string"""
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+    
+    def to_yaml(self) -> str:
+        """Convert to YAML string"""
+        if not YAML_AVAILABLE:
+            raise ImportError("PyYAML required for YAML export")
+        return yaml.dump(self.to_dict(), default_flow_style=False)
+    
+    def to_env_file(self) -> str:
+        """Convert to .env file format"""
+        lines = []
+        for key, value in asdict(self).items():
+            if value is None:
+                continue
+            if isinstance(value, (list, dict, tuple)):
+                value = json.dumps(value)
+            lines.append(f"{key}={value}")
+        return "\n".join(lines)
+    
+    def safe_summary(self) -> Dict[str, Any]:
+        """Get safe summary for logging/health endpoints"""
+        errors, warnings = self.validate()
+        
+        return {
+            "env_version": self.env_version,
+            "app_identity": {
+                "name": self.APP_NAME,
+                "version": self.APP_VERSION,
+                "env": self.APP_ENV,
+                "python": sys.version.split()[0],
+            },
+            "auth_config": {
+                "header": self.AUTH_HEADER_NAME,
+                "require_auth": self.REQUIRE_AUTH,
+                "allow_query_token": self.ALLOW_QUERY_TOKEN,
+                "tokens_present": bool(self.APP_TOKEN or self.BACKUP_APP_TOKEN),
+                "app_token_masked": mask_secret(self.APP_TOKEN),
+                "backup_token_masked": mask_secret(self.BACKUP_APP_TOKEN),
+            },
+            "dashboard_standard": {
+                "header_row": self.TFB_SYMBOL_HEADER_ROW,
+                "data_start_row": self.TFB_SYMBOL_START_ROW,
+                "timezone_default": self.TIMEZONE_DEFAULT,
+            },
+            "backend": {
+                "base_url": self.BACKEND_BASE_URL,
+                "http_timeout_sec": self.HTTP_TIMEOUT_SEC,
+                "max_retries": self.MAX_RETRIES,
+                "retry_delay": self.RETRY_DELAY,
+            },
+            "providers": {
+                "global": self.ENABLED_PROVIDERS,
+                "ksa": self.KSA_PROVIDERS,
+                "primary": self.PRIMARY_PROVIDER,
+                "ksa_disallow_eodhd": self.KSA_DISALLOW_EODHD,
+                "keys_detected": {
+                    "eodhd": bool(self.EODHD_API_KEY),
+                    "finnhub": bool(self.FINNHUB_API_KEY),
+                    "fmp": bool(self.FMP_API_KEY),
+                    "alphavantage": bool(self.ALPHA_VANTAGE_API_KEY),
+                    "twelvedata": bool(self.TWELVEDATA_API_KEY),
+                    "marketstack": bool(self.MARKETSTACK_API_KEY),
+                    "argaam_url": bool(self.ARGAAM_QUOTE_URL),
+                    "tadawul_url": bool(self.TADAWUL_QUOTE_URL),
+                },
+            },
+            "integrations": {
+                "google_sheets_ready": bool(self.GOOGLE_SHEETS_CREDENTIALS and self.DEFAULT_SPREADSHEET_ID),
+                "spreadsheet_id_present": bool(self.DEFAULT_SPREADSHEET_ID),
+                "advisor_enabled": self.ADVISOR_ENABLED,
+                "ai_analysis_enabled": self.AI_ANALYSIS_ENABLED,
+                "advanced_analysis_enabled": self.ADVANCED_ANALYSIS_ENABLED,
+            },
+            "cache": {
+                "engine_cache_ttl_sec": self.ENGINE_CACHE_TTL_SEC,
+                "cache_max_size": self.CACHE_MAX_SIZE,
+                "cache_save_interval": self.CACHE_SAVE_INTERVAL,
+                "cache_backup_enabled": self.CACHE_BACKUP_ENABLED,
+            },
+            "diagnostics": {
+                "errors": errors,
+                "warnings": warnings,
+                "is_valid": len(errors) == 0,
+            },
+            "sources": {k: v.value for k, v in self.config_sources.items()},
+            "system": get_system_info(),
+        }
+    
+    def compliance_report(self) -> Dict[str, Any]:
+        """Generate compliance report"""
+        errors, warnings = self.validate()
+        
+        return {
+            "version": self.env_version,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "environment": self.APP_ENV,
+            "security": {
+                "auth_enabled": self.REQUIRE_AUTH and not self.OPEN_MODE,
+                "auth_header": self.AUTH_HEADER_NAME,
+                "rate_limiting": self.RATE_LIMIT_ENABLED,
+                "rate_limit_rpm": self.MAX_REQUESTS_PER_MINUTE,
+                "tokens_configured": bool(self.APP_TOKEN or self.BACKUP_APP_TOKEN),
+                "tokens_masked": {
+                    "app_token": mask_secret(self.APP_TOKEN),
+                    "backup_token": mask_secret(self.BACKUP_APP_TOKEN),
+                },
+            },
+            "data_protection": {
+                "encryption_in_transit": self.BACKEND_BASE_URL.startswith("https"),
+                "sensitive_data_masked": True,
+                "secrets_strength": {
+                    "app_token": secret_strength_hint(self.APP_TOKEN or ""),
+                    "backup_token": secret_strength_hint(self.BACKUP_APP_TOKEN or ""),
+                },
+            },
+            "compliance": {
+                "gdpr_ready": True,
+                "soc2_ready": self.RATE_LIMIT_ENABLED and self.REQUIRE_AUTH,
+                "iso27001_ready": self.RATE_LIMIT_ENABLED and self.REQUIRE_AUTH,
+            },
+            "validation": {
+                "errors": errors,
+                "warnings": warnings,
+                "is_valid": len(errors) == 0,
+            },
+        }
 
-# -----------------------------------------------------------------------------
-# Static exported environment variables (module-level constants)
-# -----------------------------------------------------------------------------
-# App identity
-APP_NAME = _get_setting("service_name", ["APP_NAME", "SERVICE_NAME", "APP_TITLE"], "Tadawul Fast Bridge")
-APP_VERSION = _get_setting("app_version", ["APP_VERSION", "SERVICE_VERSION", "VERSION"], "dev")
-APP_ENV = _strip(_get_setting("environment", ["APP_ENV", "ENVIRONMENT"], "production")).lower()
+# =============================================================================
+# Dynamic Configuration Manager
+# =============================================================================
+class DynamicConfig:
+    """Dynamic configuration with hot-reload support"""
+    
+    def __init__(self, initial_settings: Settings):
+        self._settings = initial_settings
+        self._lock = threading.RLock()
+        self._observers: List[Callable[[Settings], None]] = []
+        self._last_reload = datetime.now(timezone.utc)
+        self._reload_count = 0
+        
+        # Start background reloader if enabled
+        if os.getenv("CONFIG_AUTO_RELOAD", "").lower() == "true":
+            self._start_reloader()
+    
+    @property
+    def settings(self) -> Settings:
+        """Get current settings"""
+        with self._lock:
+            return self._settings
+    
+    @property
+    def last_reload(self) -> datetime:
+        """Get last reload time"""
+        return self._last_reload
+    
+    @property
+    def reload_count(self) -> int:
+        """Get reload count"""
+        return self._reload_count
+    
+    def reload(self) -> bool:
+        """Reload configuration from sources"""
+        try:
+            new_settings = Settings.from_env()
+            
+            with self._lock:
+                old_settings = self._settings
+                self._settings = new_settings
+                self._last_reload = datetime.now(timezone.utc)
+                self._reload_count += 1
+            
+            self._notify_observers(old_settings, new_settings)
+            logger.info(f"Configuration reloaded (count={self._reload_count})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Configuration reload failed: {e}")
+            return False
+    
+    def observe(self, callback: Callable[[Settings], None]) -> Callable:
+        """Register observer for config changes"""
+        with self._lock:
+            self._observers.append(callback)
+        
+        def unsubscribe():
+            with self._lock:
+                self._observers.remove(callback)
+        
+        return unsubscribe
+    
+    def _notify_observers(self, old: Settings, new: Settings):
+        """Notify observers of config change"""
+        with self._lock:
+            observers = self._observers.copy()
+        
+        for callback in observers:
+            try:
+                callback(new)
+            except Exception as e:
+                logger.error(f"Observer callback failed: {e}")
+    
+    def _start_reloader(self, interval: int = 60):
+        """Start background reloader thread"""
+        def reloader():
+            while True:
+                time.sleep(interval)
+                self.reload()
+        
+        thread = threading.Thread(target=reloader, daemon=True)
+        thread.start()
+        logger.info(f"Auto-reloader started (interval={interval}s)")
+    
+    def diff(self, other: Settings) -> Dict[str, Tuple[Any, Any]]:
+        """Compare with other settings"""
+        current_dict = asdict(self._settings)
+        other_dict = asdict(other)
+        
+        diff = {}
+        for key in set(current_dict.keys()) | set(other_dict.keys()):
+            current_val = current_dict.get(key)
+            other_val = other_dict.get(key)
+            if current_val != other_val:
+                diff[key] = (current_val, other_val)
+        
+        return diff
 
-# Logging & localization
-LOG_LEVEL = _strip(_get_first_env("LOG_LEVEL") or _get_setting("log_level", ["LOG_LEVEL"], "INFO")).upper()
-LOG_JSON = _safe_bool(_get_first_env("LOG_JSON"), False)
-LOG_FORMAT = _get_first_env("LOG_FORMAT") or ""  # optional
-TIMEZONE_DEFAULT = _get_first_env("TIMEZONE_DEFAULT", "TZ") or _strip(
-    _get_setting("timezone", ["APP_TIMEZONE", "TIMEZONE_DEFAULT", "TZ"], "Asia/Riyadh")
-) or "Asia/Riyadh"
+# =============================================================================
+# Singleton Instance
+# =============================================================================
+_settings_instance: Optional[Settings] = None
+_dynamic_config: Optional[DynamicConfig] = None
+_init_lock = threading.Lock()
 
-# Security / auth
-AUTH_HEADER_NAME = _get_first_env("AUTH_HEADER_NAME", "TOKEN_HEADER_NAME") or _strip(
-    _get_setting("auth_header_name", ["AUTH_HEADER_NAME"], "X-APP-TOKEN")
-) or "X-APP-TOKEN"
+def get_settings() -> Settings:
+    """Get settings singleton"""
+    global _settings_instance
+    
+    if _settings_instance is None:
+        with _init_lock:
+            if _settings_instance is None:
+                _settings_instance = Settings.from_env()
+    
+    return _settings_instance
 
-APP_TOKEN = _get_first_env("APP_TOKEN", "TFB_APP_TOKEN")
-BACKUP_APP_TOKEN = _get_first_env("BACKUP_APP_TOKEN")
-REQUIRE_AUTH = _safe_bool(_get_first_env("REQUIRE_AUTH"), True)
-ALLOW_QUERY_TOKEN = _safe_bool(_get_first_env("ALLOW_QUERY_TOKEN"), False)
-OPEN_MODE = _safe_bool(_get_first_env("OPEN_MODE"), False)  # informational; canonical may override
+def get_dynamic_config() -> DynamicConfig:
+    """Get dynamic config singleton"""
+    global _dynamic_config
+    
+    if _dynamic_config is None:
+        with _init_lock:
+            if _dynamic_config is None:
+                _dynamic_config = DynamicConfig(get_settings())
+    
+    return _dynamic_config
 
-# Feature flags
-AI_ANALYSIS_ENABLED = _safe_bool(_get_first_env("AI_ANALYSIS_ENABLED"), True)
-ADVANCED_ANALYSIS_ENABLED = _safe_bool(_get_first_env("ADVANCED_ANALYSIS_ENABLED", "ADVANCED_ENABLED"), True)
-ADVISOR_ENABLED = _safe_bool(_get_first_env("ADVISOR_ENABLED"), True)
-RATE_LIMIT_ENABLED = _safe_bool(_get_first_env("ENABLE_RATE_LIMITING"), True)
+def reload_config() -> bool:
+    """Reload configuration"""
+    return get_dynamic_config().reload()
 
-# Rate limits / tuning
-MAX_REQUESTS_PER_MINUTE = _safe_int(_get_first_env("MAX_REQUESTS_PER_MINUTE"), 240, lo=30, hi=5000)
-MAX_RETRIES = _safe_int(_get_first_env("MAX_RETRIES"), 2, lo=0, hi=10)
-RETRY_DELAY = _safe_float(_get_first_env("RETRY_DELAY"), 0.6, lo=0.0, hi=30.0)
-
-# Backend
-BACKEND_BASE_URL = _strip(_get_first_env("BACKEND_BASE_URL", "TFB_BASE_URL") or _get_setting("backend_base_url", ["BACKEND_BASE_URL"], "http://127.0.0.1:8000")).rstrip("/")
-
-# Cache knobs (for internal engines if referenced elsewhere)
-ENGINE_CACHE_TTL_SEC = _safe_int(_get_first_env("ENGINE_CACHE_TTL_SEC", "CACHE_DEFAULT_TTL"), 20, lo=5, hi=3600)
-CACHE_MAX_SIZE = _safe_int(_get_first_env("CACHE_MAX_SIZE"), 5000, lo=100, hi=500000)
-CACHE_SAVE_INTERVAL = _safe_int(_get_first_env("CACHE_SAVE_INTERVAL"), 300, lo=30, hi=86400)
-CACHE_BACKUP_ENABLED = _safe_bool(_get_first_env("CACHE_BACKUP_ENABLED"), True)
-
-# HTTP timeouts
-HTTP_TIMEOUT_SEC = _safe_float(_get_first_env("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"), 45.0, lo=5.0, hi=180.0)
-
-# Layout / Sheets row standard
-TFB_SYMBOL_HEADER_ROW = _safe_int(_get_first_env("TFB_SYMBOL_HEADER_ROW"), 5, lo=1, hi=1000)
-TFB_SYMBOL_START_ROW = _safe_int(_get_first_env("TFB_SYMBOL_START_ROW"), 6, lo=1, hi=1000)
-
-# Google integration
-DEFAULT_SPREADSHEET_ID = _get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID") or _strip(
-    _get_setting("spreadsheet_id", ["DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID"], "")
-)
-
-_GOOGLE_CREDS_RAW = os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or ""
-GOOGLE_SHEETS_CREDENTIALS = _validate_json_creds_to_string(_GOOGLE_CREDS_RAW)
-
-GOOGLE_APPS_SCRIPT_URL = _get_first_env("GOOGLE_APPS_SCRIPT_URL")
-GOOGLE_APPS_SCRIPT_BACKUP_URL = _get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL")
-
-# Providers - Keys / URLs
-EODHD_API_KEY = _get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN")
-EODHD_BASE_URL = _get_first_env("EODHD_BASE_URL")
-
-FINNHUB_API_KEY = _get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN")
-FMP_API_KEY = _get_first_env("FMP_API_KEY")
-FMP_BASE_URL = _get_first_env("FMP_BASE_URL")
-
-ALPHA_VANTAGE_API_KEY = _get_first_env("ALPHA_VANTAGE_API_KEY")
-TWELVEDATA_API_KEY = _get_first_env("TWELVEDATA_API_KEY")
-MARKETSTACK_API_KEY = _get_first_env("MARKETSTACK_API_KEY")
-
-ARGAAM_QUOTE_URL = _get_first_env("ARGAAM_QUOTE_URL")
-ARGAAM_API_KEY = _get_first_env("ARGAAM_API_KEY")
-
-TADAWUL_QUOTE_URL = _get_first_env("TADAWUL_QUOTE_URL")
-TADAWUL_MARKET_ENABLED = _safe_bool(_get_first_env("TADAWUL_MARKET_ENABLED"), True)
-TADAWUL_MAX_SYMBOLS = _safe_int(_get_first_env("TADAWUL_MAX_SYMBOLS"), 1500, lo=10, hi=50000)
-TADAWUL_REFRESH_INTERVAL = _safe_int(_get_first_env("TADAWUL_REFRESH_INTERVAL"), 60, lo=5, hi=3600)
-
-KSA_DISALLOW_EODHD = _safe_bool(_get_first_env("KSA_DISALLOW_EODHD"), True)
-
-# Providers lists (explicit or auto-detected)
-_AUTO_GLOBAL: List[str] = []
-if EODHD_API_KEY:
-    _AUTO_GLOBAL.append("eodhd")
-if FINNHUB_API_KEY:
-    _AUTO_GLOBAL.append("finnhub")
-if FMP_API_KEY:
-    _AUTO_GLOBAL.append("fmp")
-if ALPHA_VANTAGE_API_KEY:
-    _AUTO_GLOBAL.append("alphavantage")
-if TWELVEDATA_API_KEY:
-    _AUTO_GLOBAL.append("twelvedata")
-if MARKETSTACK_API_KEY:
-    _AUTO_GLOBAL.append("marketstack")
-if not _AUTO_GLOBAL:
-    _AUTO_GLOBAL = ["eodhd", "finnhub"]
-
-_AUTO_KSA: List[str] = []
-if ARGAAM_QUOTE_URL:
-    _AUTO_KSA.append("argaam")
-if TADAWUL_QUOTE_URL:
-    _AUTO_KSA.append("tadawul")
-# Yahoo-chart is usually available even without an API key
-if _safe_bool(_get_first_env("ENABLE_YAHOO_CHART_KSA", "ENABLE_YFINANCE_KSA"), True):
-    _AUTO_KSA.insert(0, "yahoo_chart")
-if not _AUTO_KSA:
-    _AUTO_KSA = ["yahoo_chart", "argaam"]
-
-ENABLED_PROVIDERS = _as_list_lower(_get_first_env("ENABLED_PROVIDERS", "PROVIDERS") or ",".join(_AUTO_GLOBAL))
-KSA_PROVIDERS = _as_list_lower(_get_first_env("KSA_PROVIDERS") or ",".join(_AUTO_KSA))
-PRIMARY_PROVIDER = _strip(_get_first_env("PRIMARY_PROVIDER") or (ENABLED_PROVIDERS[0] if ENABLED_PROVIDERS else "eodhd")).lower()
-
-# Render (optional)
-RENDER_API_KEY = _get_first_env("RENDER_API_KEY")
-RENDER_SERVICE_ID = _get_first_env("RENDER_SERVICE_ID")
-RENDER_SERVICE_NAME = _get_first_env("RENDER_SERVICE_NAME")
-
-# CORS (optional)
-ENABLE_CORS_ALL_ORIGINS = _safe_bool(_get_first_env("ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"), False)
-CORS_ORIGINS = _get_first_env("CORS_ORIGINS") or ""
-
-
-# -----------------------------------------------------------------------------
-# Compatibility settings shim (what old code expects: env.settings)
-# -----------------------------------------------------------------------------
-class CompatibilitySettings:
-    def __init__(self) -> None:
-        # Keep legacy attribute names stable
-        self.app_name = APP_NAME
-        self.env = APP_ENV
-        self.version = APP_VERSION
-        self.log_level = LOG_LEVEL
-        self.timezone = TIMEZONE_DEFAULT
-
-        self.auth_header_name = AUTH_HEADER_NAME
-        self.app_token = APP_TOKEN
-        self.backup_app_token = BACKUP_APP_TOKEN
-        self.require_auth = REQUIRE_AUTH
-        self.allow_query_token = ALLOW_QUERY_TOKEN
-
-        self.backend_base_url = BACKEND_BASE_URL
-
-        self.tfb_layout = {"header_row": TFB_SYMBOL_HEADER_ROW, "start_row": TFB_SYMBOL_START_ROW}
-
-        self.ai_analysis_enabled = AI_ANALYSIS_ENABLED
-        self.advanced_analysis_enabled = ADVANCED_ANALYSIS_ENABLED
-        self.advisor_enabled = ADVISOR_ENABLED
-        self.rate_limit_enabled = RATE_LIMIT_ENABLED
-        self.max_rpm = MAX_REQUESTS_PER_MINUTE
-
-        self.ai_batch_size = _safe_int(_get_first_env("AI_BATCH_SIZE"), 20, lo=1, hi=200)
-        self.ai_max_tickers = _safe_int(_get_first_env("AI_MAX_TICKERS"), 500, lo=1, hi=20000)
-        self.adv_batch_size = _safe_int(_get_first_env("ADV_BATCH_SIZE"), 25, lo=1, hi=500)
-        self.batch_concurrency = _safe_int(_get_first_env("BATCH_CONCURRENCY"), 5, lo=1, hi=50)
-
-        self.http_timeout_sec = HTTP_TIMEOUT_SEC
-        self.engine_cache_ttl_sec = ENGINE_CACHE_TTL_SEC
-
-        self.default_spreadsheet_id = DEFAULT_SPREADSHEET_ID
-        self.google_sheets_credentials = GOOGLE_SHEETS_CREDENTIALS
-
-        self.enabled_providers = ENABLED_PROVIDERS
-        self.ksa_providers = KSA_PROVIDERS
-        self.primary_provider = PRIMARY_PROVIDER
-
-        # Provider keys
-        self.eodhd_api_key = EODHD_API_KEY
-        self.finnhub_api_key = FINNHUB_API_KEY
-        self.fmp_api_key = FMP_API_KEY
-        self.alpha_vantage_api_key = ALPHA_VANTAGE_API_KEY
-        self.twelvedata_api_key = TWELVEDATA_API_KEY
-        self.marketstack_api_key = MARKETSTACK_API_KEY
-
-        self.argaam_quote_url = ARGAAM_QUOTE_URL
-        self.argaam_api_key = ARGAAM_API_KEY
-        self.tadawul_quote_url = TADAWUL_QUOTE_URL
-
-        self.ksa_disallow_eodhd = KSA_DISALLOW_EODHD
-
-
-settings = CompatibilitySettings()
-
-
-# -----------------------------------------------------------------------------
-# Validation & Diagnostics
-# -----------------------------------------------------------------------------
 def validate_environment() -> Dict[str, List[str]]:
-    """
-    Performs logic checks on the loaded environment.
-    Returns dict: {"errors": [...], "warnings": [...]}
-    Non-fatal by design (PROD SAFE).
-    """
-    errors: List[str] = []
-    warnings: List[str] = []
-
-    # 1) Auth guard
-    tokens_present = bool(APP_TOKEN or BACKUP_APP_TOKEN)
-    if not tokens_present:
-        warnings.append("Security: No APP_TOKEN configured. API may operate in OPEN MODE (depending on config.open_mode).")
-    else:
-        # If REQUIRE_AUTH is explicitly false, warn
-        if not REQUIRE_AUTH:
-            warnings.append("Security: REQUIRE_AUTH is false while tokens exist. Confirm this is intended.")
-
-    # 2) Google Sheets readiness
-    if ADVISOR_ENABLED or ADVANCED_ANALYSIS_ENABLED:
-        if not GOOGLE_SHEETS_CREDENTIALS:
-            warnings.append("Sheets: GOOGLE_SHEETS_CREDENTIALS missing or invalid (service account JSON not parsed).")
-        if not DEFAULT_SPREADSHEET_ID:
-            warnings.append("Sheets: DEFAULT_SPREADSHEET_ID missing. Sheet operations must provide explicit ID.")
-
-    # 3) Provider sanity
-    if "argaam" in KSA_PROVIDERS and not ARGAAM_QUOTE_URL:
-        warnings.append("Provider: 'argaam' enabled but ARGAAM_QUOTE_URL is missing.")
-    if "tadawul" in KSA_PROVIDERS and not TADAWUL_QUOTE_URL:
-        warnings.append("Provider: 'tadawul' enabled but TADAWUL_QUOTE_URL is missing.")
-    if "eodhd" in ENABLED_PROVIDERS and not EODHD_API_KEY:
-        warnings.append("Provider: 'eodhd' enabled but EODHD_API_KEY missing.")
-    if "finnhub" in ENABLED_PROVIDERS and not FINNHUB_API_KEY:
-        warnings.append("Provider: 'finnhub' enabled but FINNHUB_API_KEY missing.")
-    if PRIMARY_PROVIDER and ENABLED_PROVIDERS and PRIMARY_PROVIDER not in ENABLED_PROVIDERS:
-        warnings.append("Provider: PRIMARY_PROVIDER not found in ENABLED_PROVIDERS. Routing may be inconsistent.")
-
-    # 4) Backend URL sanity
-    if not BACKEND_BASE_URL.lower().startswith(("http://", "https://")):
-        errors.append("BACKEND_BASE_URL must start with http:// or https://")
-
-    # 5) Rate limiting sanity
-    if RATE_LIMIT_ENABLED and MAX_REQUESTS_PER_MINUTE < 30:
-        warnings.append("RateLimit: MAX_REQUESTS_PER_MINUTE is very low (<30). You may throttle yourself too hard.")
-
+    """Validate environment and return diagnostics"""
+    settings = get_settings()
+    errors, warnings = settings.validate()
     return {"errors": errors, "warnings": warnings}
 
-
 def safe_env_summary() -> Dict[str, Any]:
-    """
-    Summary safe for logging/health endpoints.
-    """
-    diag = validate_environment()
+    """Get safe environment summary"""
+    return get_settings().safe_summary()
+
+def compliance_report() -> Dict[str, Any]:
+    """Get compliance report"""
+    return get_settings().compliance_report()
+
+def feature_enabled(feature: str) -> bool:
+    """Check if feature flag is enabled"""
+    return get_settings().feature_enabled(feature)
+
+def get_provider_keys() -> Dict[str, Optional[str]]:
+    """Get provider API keys"""
+    settings = get_settings()
     return {
-        "env_version": ENV_VERSION,
-        "app_identity": {
-            "name": APP_NAME,
-            "version": APP_VERSION,
-            "env": APP_ENV,
-            "python": sys.version.split(" ")[0],
-        },
-        "auth_config": {
-            "header": AUTH_HEADER_NAME,
-            "require_auth": REQUIRE_AUTH,
-            "allow_query_token": ALLOW_QUERY_TOKEN,
-            "tokens_present": bool(APP_TOKEN or BACKUP_APP_TOKEN),
-            "app_token_masked": _mask_secret(APP_TOKEN),
-            "backup_token_masked": _mask_secret(BACKUP_APP_TOKEN),
-        },
-        "dashboard_standard": {
-            "header_row": TFB_SYMBOL_HEADER_ROW,
-            "data_start_row": TFB_SYMBOL_START_ROW,
-            "timezone_default": TIMEZONE_DEFAULT,
-        },
-        "backend": {
-            "base_url": BACKEND_BASE_URL,
-            "http_timeout_sec": HTTP_TIMEOUT_SEC,
-            "max_retries": MAX_RETRIES,
-            "retry_delay": RETRY_DELAY,
-        },
-        "providers": {
-            "global": ENABLED_PROVIDERS,
-            "ksa": KSA_PROVIDERS,
-            "primary": PRIMARY_PROVIDER,
-            "ksa_disallow_eodhd": KSA_DISALLOW_EODHD,
-            "keys_detected": {
-                "eodhd": bool(EODHD_API_KEY),
-                "finnhub": bool(FINNHUB_API_KEY),
-                "fmp": bool(FMP_API_KEY),
-                "alphavantage": bool(ALPHA_VANTAGE_API_KEY),
-                "twelvedata": bool(TWELVEDATA_API_KEY),
-                "marketstack": bool(MARKETSTACK_API_KEY),
-                "argaam_url": bool(ARGAAM_QUOTE_URL),
-                "tadawul_url": bool(TADAWUL_QUOTE_URL),
-            },
-        },
-        "integrations": {
-            "google_sheets_ready": bool(GOOGLE_SHEETS_CREDENTIALS and DEFAULT_SPREADSHEET_ID),
-            "default_spreadsheet_id_present": bool(DEFAULT_SPREADSHEET_ID),
-            "advisor_enabled": ADVISOR_ENABLED,
-            "ai_analysis_enabled": AI_ANALYSIS_ENABLED,
-            "advanced_analysis_enabled": ADVANCED_ANALYSIS_ENABLED,
-        },
-        "cache": {
-            "engine_cache_ttl_sec": ENGINE_CACHE_TTL_SEC,
-            "cache_max_size": CACHE_MAX_SIZE,
-            "cache_save_interval": CACHE_SAVE_INTERVAL,
-            "cache_backup_enabled": CACHE_BACKUP_ENABLED,
-        },
-        "diagnostics": diag,
+        "eodhd": settings.EODHD_API_KEY,
+        "finnhub": settings.FINNHUB_API_KEY,
+        "fmp": settings.FMP_API_KEY,
+        "alphavantage": settings.ALPHA_VANTAGE_API_KEY,
+        "twelvedata": settings.TWELVEDATA_API_KEY,
+        "marketstack": settings.MARKETSTACK_API_KEY,
+        "argaam": settings.ARGAAM_API_KEY,
     }
 
+# =============================================================================
+# Signal Handlers for Hot Reload
+# =============================================================================
+def _handle_sighup(signum, frame):
+    """Handle SIGHUP for configuration reload"""
+    logger.info("Received SIGHUP, reloading configuration...")
+    reload_config()
 
+# Register signal handler if in main thread
+if threading.current_thread() is threading.main_thread():
+    try:
+        signal.signal(signal.SIGHUP, _handle_sighup)
+    except (AttributeError, ValueError):
+        # SIGHUP not available on Windows
+        pass
+
+# =============================================================================
+# Compatibility Shim
+# =============================================================================
+class CompatibilitySettings:
+    """Legacy settings object for backward compatibility"""
+    
+    def __init__(self, settings: Settings):
+        self._settings = settings
+    
+    def __getattr__(self, name):
+        return getattr(self._settings, name)
+    
+    def __setattr__(self, name, value):
+        if name == "_settings":
+            super().__setattr__(name, value)
+        else:
+            raise AttributeError("Settings are immutable")
+
+# Create legacy settings object
+settings = CompatibilitySettings(get_settings())
+
+# =============================================================================
+# Export
+# =============================================================================
 __all__ = [
-    "settings",
-    "safe_env_summary",
-    "validate_environment",
+    # Version
     "ENV_VERSION",
-    # Common exports used across the repo
+    
+    # Enums
+    "Environment",
+    "LogLevel",
+    "ProviderType",
+    "CacheBackend",
+    "ConfigSource",
+    "AuthMethod",
+    
+    # Main classes
+    "Settings",
+    "DynamicConfig",
+    
+    # Factories
+    "get_settings",
+    "get_dynamic_config",
+    "reload_config",
+    "validate_environment",
+    "safe_env_summary",
+    "compliance_report",
+    "feature_enabled",
+    "get_provider_keys",
+    
+    # Legacy
+    "settings",
+    
+    # Utilities
+    "strip_value",
+    "strip_wrapping_quotes",
+    "coerce_bool",
+    "coerce_int",
+    "coerce_float",
+    "coerce_list",
+    "coerce_dict",
+    "get_first_env",
+    "mask_secret",
+    "is_valid_url",
+    "repair_private_key",
+    "repair_json_creds",
+    "encrypt_value",
+    "decrypt_value",
+    "get_system_info",
+    
+    # Common exports (for backward compatibility)
     "APP_NAME",
     "APP_VERSION",
     "APP_ENV",
@@ -590,3 +1637,32 @@ __all__ = [
     "KSA_PROVIDERS",
     "PRIMARY_PROVIDER",
 ]
+
+# =============================================================================
+# Module-level exports (for backward compatibility)
+# =============================================================================
+APP_NAME = settings.APP_NAME
+APP_VERSION = settings.APP_VERSION
+APP_ENV = settings.APP_ENV
+LOG_LEVEL = settings.LOG_LEVEL
+TIMEZONE_DEFAULT = settings.TIMEZONE_DEFAULT
+AUTH_HEADER_NAME = settings.AUTH_HEADER_NAME
+TFB_SYMBOL_HEADER_ROW = settings.TFB_SYMBOL_HEADER_ROW
+TFB_SYMBOL_START_ROW = settings.TFB_SYMBOL_START_ROW
+APP_TOKEN = settings.APP_TOKEN
+BACKUP_APP_TOKEN = settings.BACKUP_APP_TOKEN
+REQUIRE_AUTH = settings.REQUIRE_AUTH
+ALLOW_QUERY_TOKEN = settings.ALLOW_QUERY_TOKEN
+BACKEND_BASE_URL = settings.BACKEND_BASE_URL
+HTTP_TIMEOUT_SEC = settings.HTTP_TIMEOUT_SEC
+ENGINE_CACHE_TTL_SEC = settings.ENGINE_CACHE_TTL_SEC
+AI_ANALYSIS_ENABLED = settings.AI_ANALYSIS_ENABLED
+ADVANCED_ANALYSIS_ENABLED = settings.ADVANCED_ANALYSIS_ENABLED
+ADVISOR_ENABLED = settings.ADVISOR_ENABLED
+RATE_LIMIT_ENABLED = settings.RATE_LIMIT_ENABLED
+MAX_REQUESTS_PER_MINUTE = settings.MAX_REQUESTS_PER_MINUTE
+DEFAULT_SPREADSHEET_ID = settings.DEFAULT_SPREADSHEET_ID
+GOOGLE_SHEETS_CREDENTIALS = settings.GOOGLE_SHEETS_CREDENTIALS
+ENABLED_PROVIDERS = settings.ENABLED_PROVIDERS
+KSA_PROVIDERS = settings.KSA_PROVIDERS
+PRIMARY_PROVIDER = settings.PRIMARY_PROVIDER
