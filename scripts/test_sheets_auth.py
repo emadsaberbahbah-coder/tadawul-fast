@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 test_sheets_auth.py
@@ -52,6 +51,9 @@ python scripts/test_sheets_auth.py --diagnose-network
 
 # CI/CD friendly output
 python scripts/test_sheets_auth.py --ci-mode --junit-xml results.xml
+
+Version: 3.5.0
+Last Updated: 2024-03-21
 """
 
 from __future__ import annotations
@@ -218,6 +220,16 @@ class CredentialType(Enum):
     """Credential source types"""
     SERVICE_ACCOUNT = "service_account"
     OAUTH2 = "oauth2"
+    API_KEY = "api_key"
+    JWT = "jwt"
+    NONE = "none"
+
+class AuthMethod(Enum):
+    """Authentication methods"""
+    SERVICE_ACCOUNT_JSON = "service_account_json"
+    SERVICE_ACCOUNT_FILE = "service_account_file"
+    OAUTH2_TOKEN = "oauth2_token"
+    OAUTH2_CLIENT = "oauth2_client"
     API_KEY = "api_key"
     JWT = "jwt"
     NONE = "none"
@@ -411,6 +423,7 @@ class CredentialManager:
         self.logger = logger
         self.credential_data: Optional[Dict[str, Any]] = None
         self.credential_type = CredentialType.NONE
+        self.auth_method = AuthMethod.NONE
         self.credential_source: Optional[str] = None
         self.credentials = None
         
@@ -531,10 +544,19 @@ class CredentialManager:
         # Detect credential type
         if 'client_email' in data and 'private_key' in data:
             self.credential_type = CredentialType.SERVICE_ACCOUNT
+            self.auth_method = AuthMethod.SERVICE_ACCOUNT_JSON
         elif 'access_token' in data:
             self.credential_type = CredentialType.OAUTH2
+            if 'refresh_token' in data:
+                self.auth_method = AuthMethod.OAUTH2_TOKEN
+            else:
+                self.auth_method = AuthMethod.OAUTH2_CLIENT
         elif 'api_key' in data:
             self.credential_type = CredentialType.API_KEY
+            self.auth_method = AuthMethod.API_KEY
+        elif 'token' in data and 'email' in data:
+            self.credential_type = CredentialType.JWT
+            self.auth_method = AuthMethod.JWT
         else:
             return False, "Unknown credential format"
         
@@ -620,6 +642,10 @@ class CredentialManager:
         if self.credential_data:
             return self.credential_data.get('project_id')
         return None
+    
+    def get_auth_method(self) -> str:
+        """Get authentication method as string"""
+        return self.auth_method.value if self.auth_method else "unknown"
 
 # =============================================================================
 # Network Diagnostics
@@ -1251,6 +1277,7 @@ class DiagnosticEngine:
         
         details = {
             'credential_type': self.credential_manager.credential_type.value if self.credential_manager.credential_type else None,
+            'auth_method': self.credential_manager.get_auth_method(),
             'source': self.credential_manager.credential_source,
             'service_account': self.credential_manager.get_service_account_email(),
             'project_id': self.credential_manager.get_project_id()
@@ -1294,6 +1321,7 @@ class DiagnosticEngine:
                 )
             
             # Test token refresh
+            expiry = None
             if credentials.token:
                 expiry = credentials.expiry.isoformat() if credentials.expiry else 'unknown'
                 
@@ -1322,8 +1350,9 @@ class DiagnosticEngine:
                 message="Successfully authenticated with Google APIs",
                 duration_ms=(time.time() - start) * 1000,
                 details={
-                    'token_expiry': expiry if 'expiry' in locals() else None,
-                    'scopes': credentials.scopes
+                    'token_expiry': expiry if expiry else 'N/A',
+                    'scopes': credentials.scopes,
+                    'auth_method': self.credential_manager.get_auth_method()
                 }
             )
             
@@ -1920,4 +1949,40 @@ def create_parser() -> argparse.ArgumentParser:
     # Test modes
     parser.add_argument("--write", action="store_true", help="Include write tests")
     parser.add_argument("--benchmark", action="store_true", help="Run performance benchmarks")
-    parser.add
+    parser.add_argument("--iterations", type=int, default=10, help="Iterations for benchmarks")
+    parser.add_argument("--full-diagnostic", action="store_true", help="Run all diagnostic tests")
+    parser.add_argument("--audit-permissions", action="store_true", help="Audit spreadsheet permissions")
+    parser.add_argument("--diagnose-network", action="store_true", help="Run network diagnostics only")
+    parser.add_argument("--compliance-report", action="store_true", help="Generate compliance report")
+    
+    # Output options
+    parser.add_argument("--output", help="Output file path (json, html, xml)")
+    parser.add_argument("--ci-mode", action="store_true", help="CI/CD friendly output")
+    parser.add_argument("--quiet", action="store_true", help="Quiet mode - minimal output")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--junit-xml", help="JUnit XML output file")
+    
+    # Configuration
+    parser.add_argument("--data-residency", choices=["SA", "US", "EU"], help="Data residency requirement")
+    
+    return parser
+
+
+def main():
+    """Main entry point"""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Handle junit-xml as output
+    if args.junit_xml and not args.output:
+        args.output = args.junit_xml
+    
+    # Run diagnostics
+    engine = DiagnosticEngine(args)
+    exit_code = engine.run()
+    
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
