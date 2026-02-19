@@ -2,10 +2,12 @@
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA Market Data) — v3.0.0 (Advanced Production)
+Argaam Provider (KSA Market Data) — v3.1.0 (Advanced Production)
 PROD SAFE + ASYNC + ML FORECASTING + MARKET INTELLIGENCE
 
-What's new in v3.0.0:
+What's new in v3.1.0:
+- ✅ Fixed 'async with' outside async function (line 1477)
+- ✅ Enhanced token bucket rate limiter with proper async context
 - ✅ Multi-model ensemble forecasting (ARIMA, Prophet-style, LSTM-inspired)
 - ✅ Market regime detection (bull/bear/volatile/sideways)
 - ✅ Technical indicator suite (MACD, Bollinger Bands, ATR, OBV)
@@ -58,7 +60,7 @@ except ImportError:
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "3.0.0"
+PROVIDER_VERSION = "3.1.0"
 
 # ============================================================================
 # Configuration & Constants
@@ -98,6 +100,14 @@ class MarketRegime(Enum):
     VOLATILE = "volatile"
     SIDEWAYS = "sideways"
     UNKNOWN = "unknown"
+
+
+class Sentiment(Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    NEUTRAL = "neutral"
+    VERY_BULLISH = "very_bullish"
+    VERY_BEARISH = "very_bearish"
 
 
 @dataclass
@@ -848,6 +858,99 @@ class TechnicalIndicators:
         # Pad to match original length
         vol = [None] + vol
         return vol[:len(prices)]
+    
+    @staticmethod
+    def adx(highs: List[float], lows: List[float], closes: List[float], window: int = 14) -> Dict[str, List[Optional[float]]]:
+        """Average Directional Index."""
+        if len(highs) < window + 1:
+            return {"adx": [None] * len(highs), "plus_di": [None] * len(highs), "minus_di": [None] * len(highs)}
+        
+        # Calculate True Range and Directional Movement
+        tr: List[float] = []
+        plus_dm: List[float] = []
+        minus_dm: List[float] = []
+        
+        for i in range(1, len(highs)):
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - closes[i-1])
+            lc = abs(lows[i] - closes[i-1])
+            tr.append(max(hl, hc, lc))
+            
+            up_move = highs[i] - highs[i-1]
+            down_move = lows[i-1] - lows[i]
+            
+            if up_move > down_move and up_move > 0:
+                plus_dm.append(up_move)
+            else:
+                plus_dm.append(0)
+            
+            if down_move > up_move and down_move > 0:
+                minus_dm.append(down_move)
+            else:
+                minus_dm.append(0)
+        
+        # Smooth with Wilder's method
+        atr_values: List[float] = []
+        plus_di_values: List[Optional[float]] = []
+        minus_di_values: List[Optional[float]] = []
+        
+        for i in range(len(tr)):
+            if i < window:
+                atr_values.append(sum(tr[:i+1]) / (i+1))
+                plus_di_values.append(None)
+                minus_di_values.append(None)
+            else:
+                atr_values.append((atr_values[-1] * (window - 1) + tr[i]) / window)
+                
+                # Calculate smoothed +DM and -DM
+                if i == window:
+                    smoothed_plus_dm = sum(plus_dm[:window])
+                    smoothed_minus_dm = sum(minus_dm[:window])
+                else:
+                    smoothed_plus_dm = (smoothed_plus_dm * (window - 1) + plus_dm[i-1]) / window
+                    smoothed_minus_dm = (smoothed_minus_dm * (window - 1) + minus_dm[i-1]) / window
+                
+                # Calculate +DI and -DI
+                if atr_values[-1] != 0:
+                    plus_di = (smoothed_plus_dm / atr_values[-1]) * 100
+                    minus_di = (smoothed_minus_dm / atr_values[-1]) * 100
+                    plus_di_values.append(plus_di)
+                    minus_di_values.append(minus_di)
+                else:
+                    plus_di_values.append(None)
+                    minus_di_values.append(None)
+        
+        # Calculate ADX
+        dx_values: List[float] = []
+        for i in range(len(plus_di_values)):
+            if plus_di_values[i] is not None and minus_di_values[i] is not None:
+                plus = plus_di_values[i]
+                minus = minus_di_values[i]
+                if plus + minus != 0:
+                    dx = abs(plus - minus) / (plus + minus) * 100
+                    dx_values.append(dx)
+                else:
+                    dx_values.append(0)
+            else:
+                dx_values.append(0)
+        
+        adx_values: List[Optional[float]] = [None] * (window * 2)
+        for i in range(window * 2, len(dx_values)):
+            if i == window * 2:
+                adx = sum(dx_values[:window]) / window
+            else:
+                adx = (adx * (window - 1) + dx_values[i-1]) / window
+            adx_values.append(adx)
+        
+        # Pad to match original length
+        pad_len = len(highs) - len(adx_values)
+        adx_values = [None] * pad_len + adx_values
+        
+        return {
+            "adx": adx_values,
+            "plus_di": plus_di_values,
+            "minus_di": minus_di_values
+        }
 
 
 # ============================================================================
@@ -921,6 +1024,128 @@ class MarketRegimeDetector:
             return MarketRegime.BEAR
         else:
             return MarketRegime.SIDEWAYS
+
+
+# ============================================================================
+# Sentiment Analysis
+# ============================================================================
+
+class SentimentAnalyzer:
+    """Analyze market sentiment from price action."""
+    
+    def __init__(self, prices: List[float], volumes: Optional[List[float]] = None):
+        self.prices = prices
+        self.volumes = volumes or []
+    
+    def analyze(self) -> Dict[str, Any]:
+        """Perform comprehensive sentiment analysis."""
+        if len(self.prices) < 20:
+            return {"sentiment": Sentiment.NEUTRAL.value, "score": 0.0}
+        
+        # Calculate various sentiment indicators
+        scores = []
+        
+        # 1. Price vs Moving Averages
+        sma_20 = sum(self.prices[-20:]) / 20
+        sma_50 = sum(self.prices[-50:]) / 50 if len(self.prices) >= 50 else sma_20
+        sma_200 = sum(self.prices[-200:]) / 200 if len(self.prices) >= 200 else sma_50
+        
+        current = self.prices[-1]
+        
+        # Golden/Death cross signals
+        if sma_20 > sma_50 > sma_200:
+            scores.append(1.0)  # Strong bullish
+        elif current > sma_20 > sma_50:
+            scores.append(0.5)  # Mild bullish
+        elif sma_20 < sma_50 < sma_200:
+            scores.append(-1.0)  # Strong bearish
+        elif current < sma_20 < sma_50:
+            scores.append(-0.5)  # Mild bearish
+        else:
+            scores.append(0.0)  # Neutral
+        
+        # 2. RSI
+        ti = TechnicalIndicators()
+        rsi_values = ti.rsi(self.prices, 14)
+        if rsi_values and rsi_values[-1] is not None:
+            rsi = rsi_values[-1]
+            if rsi > 70:
+                scores.append(-0.3)  # Overbought (bearish)
+            elif rsi < 30:
+                scores.append(0.3)  # Oversold (bullish)
+            else:
+                scores.append(0.1)  # Slightly bullish
+        
+        # 3. MACD
+        macd = ti.macd(self.prices)
+        if macd["macd"][-1] is not None and macd["signal"][-1] is not None:
+            macd_val = macd["macd"][-1]
+            signal_val = macd["signal"][-1]
+            
+            if macd_val > signal_val:
+                if macd_val > 0:
+                    scores.append(0.8)  # Strong bullish
+                else:
+                    scores.append(0.3)  # Mild bullish
+            elif macd_val < signal_val:
+                if macd_val < 0:
+                    scores.append(-0.8)  # Strong bearish
+                else:
+                    scores.append(-0.3)  # Mild bearish
+        
+        # 4. Volume trend (if available)
+        if len(self.volumes) >= 20:
+            recent_vol = sum(self.volumes[-5:]) / 5
+            prior_vol = sum(self.volumes[-20:-5]) / 15
+            
+            if recent_vol > prior_vol * 1.5:
+                # High volume on recent price move
+                if current > self.prices[-2]:
+                    scores.append(0.6)  # Bullish volume confirmation
+                else:
+                    scores.append(-0.6)  # Bearish volume confirmation
+            elif recent_vol < prior_vol * 0.7:
+                scores.append(-0.2)  # Low volume (uncertainty)
+        
+        # 5. Price momentum
+        returns = [self.prices[i] / self.prices[i-1] - 1 for i in range(1, len(self.prices))]
+        recent_returns = returns[-10:] if len(returns) >= 10 else returns
+        
+        if recent_returns:
+            momentum = sum(recent_returns) / len(recent_returns) * 100  # Percent
+            if momentum > 2:
+                scores.append(0.7)
+            elif momentum > 1:
+                scores.append(0.4)
+            elif momentum < -2:
+                scores.append(-0.7)
+            elif momentum < -1:
+                scores.append(-0.4)
+        
+        # Calculate overall sentiment
+        if scores:
+            avg_score = sum(scores) / len(scores)
+            
+            # Determine sentiment level
+            if avg_score >= 0.6:
+                sentiment = Sentiment.VERY_BULLISH
+            elif avg_score >= 0.2:
+                sentiment = Sentiment.BULLISH
+            elif avg_score <= -0.6:
+                sentiment = Sentiment.VERY_BEARISH
+            elif avg_score <= -0.2:
+                sentiment = Sentiment.BEARISH
+            else:
+                sentiment = Sentiment.NEUTRAL
+            
+            return {
+                "sentiment": sentiment.value,
+                "score": avg_score,
+                "confidence": min(100, abs(avg_score) * 100 + 20),
+                "signals_count": len(scores)
+            }
+        
+        return {"sentiment": Sentiment.NEUTRAL.value, "score": 0.0, "confidence": 0}
 
 
 # ============================================================================
@@ -1357,25 +1582,32 @@ class AnomalyDetector:
 
 
 # ============================================================================
-# Rate Limiter & Circuit Breaker
+# Rate Limiter & Circuit Breaker - FIXED: Proper async context management
 # ============================================================================
 
 class TokenBucket:
-    """Async token bucket rate limiter."""
+    """Async token bucket rate limiter with proper context management."""
     
     def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
         self.rate = max(0.0, rate_per_sec)
         self.capacity = capacity or max(1.0, self.rate)
         self.tokens = self.capacity
         self.last = time.monotonic()
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+    
+    async def _get_lock(self) -> asyncio.Lock:
+        """Lazy initialization of lock to avoid event loop issues."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
     
     async def acquire(self, tokens: float = 1.0) -> bool:
         """Acquire tokens, returns True if successful."""
         if self.rate <= 0:
             return True
         
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             now = time.monotonic()
             elapsed = max(0.0, now - self.last)
             self.last = now
@@ -1396,11 +1628,19 @@ class TokenBucket:
                 return
             
             # Calculate wait time
-            async with self._lock:
+            lock = await self._get_lock()
+            async with lock:
                 need = tokens - self.tokens
                 wait = need / self.rate if self.rate > 0 else 0.1
             
             await asyncio.sleep(min(1.0, wait))
+    
+    async def reset(self) -> None:
+        """Reset the token bucket."""
+        lock = await self._get_lock()
+        async with lock:
+            self.tokens = self.capacity
+            self.last = time.monotonic()
 
 
 class SmartCircuitBreaker:
@@ -1418,11 +1658,18 @@ class SmartCircuitBreaker:
         
         self.stats = CircuitBreakerStats()
         self.half_open_calls = 0
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+    
+    async def _get_lock(self) -> asyncio.Lock:
+        """Lazy initialization of lock."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
     
     async def allow_request(self) -> bool:
         """Check if request is allowed."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             now = time.monotonic()
             
             if self.stats.state == CircuitState.CLOSED:
@@ -1446,7 +1693,8 @@ class SmartCircuitBreaker:
     
     async def on_success(self) -> None:
         """Record successful request."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             self.stats.successes += 1
             self.stats.last_success = time.monotonic()
             
@@ -1457,7 +1705,8 @@ class SmartCircuitBreaker:
     
     async def on_failure(self) -> None:
         """Record failed request."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             self.stats.failures += 1
             self.stats.last_failure = time.monotonic()
             
@@ -1472,9 +1721,10 @@ class SmartCircuitBreaker:
                 self.stats.open_until = time.monotonic() + self.cooldown_sec
                 logger.warning("Circuit breaker returned to OPEN after half-open failure")
     
-    def get_stats(self) -> Dict[str, Any]:
+    async def get_stats(self) -> Dict[str, Any]:
         """Get circuit breaker statistics."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             return {
                 "state": self.stats.state.value,
                 "failures": self.stats.failures,
@@ -1498,11 +1748,18 @@ class SmartCache:
         self._cache: Dict[str, Any] = {}
         self._expires: Dict[str, float] = {}
         self._access_times: Dict[str, float] = {}
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+    
+    async def _get_lock(self) -> asyncio.Lock:
+        """Lazy initialization of lock."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
     
     async def get(self, key: str) -> Optional[Any]:
         """Get value if exists and not expired."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             now = time.monotonic()
             
             if key in self._cache:
@@ -1517,7 +1774,8 @@ class SmartCache:
     
     async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
         """Set value with TTL."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             # Evict if at capacity
             if len(self._cache) >= self.maxsize and key not in self._cache:
                 await self._evict_lru()
@@ -1528,17 +1786,18 @@ class SmartCache:
     
     async def delete(self, key: str) -> None:
         """Delete key."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             await self._delete(key)
     
     async def _delete(self, key: str) -> None:
-        """Internal delete (no lock)."""
+        """Internal delete (no lock required - caller must hold lock)."""
         self._cache.pop(key, None)
         self._expires.pop(key, None)
         self._access_times.pop(key, None)
     
     async def _evict_lru(self) -> None:
-        """Evict least recently used item."""
+        """Evict least recently used item (caller must hold lock)."""
         if not self._access_times:
             return
         
@@ -1548,14 +1807,16 @@ class SmartCache:
     
     async def clear(self) -> None:
         """Clear cache."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             self._cache.clear()
             self._expires.clear()
             self._access_times.clear()
     
     async def size(self) -> int:
         """Get current cache size."""
-        async with self._lock:
+        lock = await self._get_lock()
+        async with lock:
             return len(self._cache)
 
 
@@ -1621,7 +1882,7 @@ class ArgaamClient:
             "rate_limit_waits": 0,
             "circuit_breaker_blocks": 0
         }
-        self._metrics_lock = asyncio.Lock()
+        self._metrics_lock: Optional[asyncio.Lock] = None
         
         logger.info(
             f"ArgaamClient v{PROVIDER_VERSION} initialized | "
@@ -1629,6 +1890,12 @@ class ArgaamClient:
             f"history={bool(self.history_url)} | rate={rate}/s | "
             f"cb={cb_threshold}/{cb_timeout}s"
         )
+    
+    async def _get_metrics_lock(self) -> asyncio.Lock:
+        """Lazy initialization of metrics lock."""
+        if self._metrics_lock is None:
+            self._metrics_lock = asyncio.Lock()
+        return self._metrics_lock
     
     def _base_headers(self) -> Dict[str, str]:
         """Base headers for all requests."""
@@ -1667,7 +1934,8 @@ class ArgaamClient:
     
     async def _update_metric(self, name: str, inc: int = 1) -> None:
         """Update metric atomically."""
-        async with self._metrics_lock:
+        lock = await self._get_metrics_lock()
+        async with lock:
             self.metrics[name] = self.metrics.get(name, 0) + inc
     
     async def _request(
@@ -2168,6 +2436,12 @@ class ArgaamClient:
             result["bb_bandwidth"] = float(bb["bandwidth"][-1]) if bb["bandwidth"][-1] else None
             result["bb_position"] = float((prices[-1] - bb["lower"][-1]) / (bb["upper"][-1] - bb["lower"][-1])) if bb["upper"][-1] != bb["lower"][-1] else 0.5
         
+        # ATR (if high/low data available - using close as proxy)
+        atr_values = ti.atr(prices, prices, prices, 14)
+        if atr_values and atr_values[-1] is not None:
+            result["atr_14"] = float(atr_values[-1])
+            result["atr_percent"] = float(atr_values[-1] / prices[-1] * 100)
+        
         # On-Balance Volume (if volume available)
         if volumes and len(volumes) == len(prices):
             obv_values = ti.obv(prices, volumes)
@@ -2233,14 +2507,23 @@ class ArgaamClient:
         }.get(regime, 0.0)
         
         # ====================================================================
+        # Sentiment Analysis
+        # ====================================================================
+        sentiment_analyzer = SentimentAnalyzer(prices, volumes)
+        sentiment = sentiment_analyzer.analyze()
+        result["sentiment"] = sentiment.get("sentiment", Sentiment.NEUTRAL.value)
+        result["sentiment_score"] = sentiment.get("score", 0.0)
+        result["sentiment_confidence"] = sentiment.get("confidence", 0)
+        
+        # ====================================================================
         # Anomaly Detection
         # ====================================================================
-        detector = AnomalyDetector(prices, volumes)
-        result["data_quality_score"] = detector.data_quality_score()
-        result["price_spikes"] = len(detector.detect_price_spikes())
-        result["price_gaps"] = len(detector.detect_gaps())
+        anomaly_detector = AnomalyDetector(prices, volumes)
+        result["data_quality_score"] = anomaly_detector.data_quality_score()
+        result["price_spikes"] = len(anomaly_detector.detect_price_spikes())
+        result["price_gaps"] = len(anomaly_detector.detect_gaps())
         if volumes:
-            result["volume_surges"] = len(detector.detect_volume_surges())
+            result["volume_surges"] = len(anomaly_detector.detect_volume_surges())
         
         # ====================================================================
         # Ensemble Forecast (if enabled)
@@ -2270,10 +2553,11 @@ class ArgaamClient:
     
     async def get_metrics(self) -> Dict[str, Any]:
         """Get client metrics."""
-        async with self._metrics_lock:
+        lock = await self._get_metrics_lock()
+        async with lock:
             metrics = dict(self.metrics)
         
-        metrics["circuit_breaker"] = self.circuit_breaker.get_stats()
+        metrics["circuit_breaker"] = await self.circuit_breaker.get_stats()
         metrics["cache_sizes"] = {
             "quote": await self.quote_cache.size(),
             "profile": await self.profile_cache.size(),
@@ -2384,5 +2668,6 @@ __all__ = [
     "normalize_symbol",
     "close_client",
     "MarketRegime",
-    "CircuitState"
+    "CircuitState",
+    "Sentiment"
 ]
