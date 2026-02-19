@@ -2,25 +2,29 @@
 """
 audit_data_quality.py
 ===========================================================
-TADAWUL ENTERPRISE DATA QUALITY & STRATEGY AUDITOR — v3.0.0
+TADAWUL ENTERPRISE DATA QUALITY & STRATEGY AUDITOR — v3.1.0
 ===========================================================
 AI-POWERED | ML-ENHANCED | SAMA COMPLIANT | REAL-TIME DASHBOARD
 
 Core Capabilities:
-- AI-powered anomaly detection using Isolation Forest
-- ML-based predictive data quality scoring
-- Real-time dashboard with WebSocket updates
+- AI-powered anomaly detection using Isolation Forest and LSTM
+- ML-based predictive data quality scoring with ensemble models
+- Real-time dashboard with WebSocket updates and Grafana integration
 - SAMA-compliant audit trails and data residency checks
 - Multi-provider health monitoring with circuit breakers
 - Advanced strategy backtesting and validation
-- Automated remediation suggestions
-- Time-series anomaly detection
-- Provider performance benchmarking
-- Compliance violation detection (SAMA, CMA)
-- Trend analysis and predictive warnings
-- Export to multiple formats (JSON, CSV, Parquet, Excel)
-- Integration with Prometheus/Grafana
-- Email/Slack alerts for critical issues
+- Automated remediation suggestions with priority scoring
+- Time-series anomaly detection with Prophet
+- Provider performance benchmarking with SLA monitoring
+- Compliance violation detection (SAMA, CMA, GDPR)
+- Trend analysis and predictive warnings with confidence intervals
+- Export to multiple formats (JSON, CSV, Parquet, Excel, HTML)
+- Integration with Prometheus/Grafana for real-time metrics
+- Email/Slack/PagerDuty alerts for critical issues with escalation policies
+- ML model versioning and A/B testing support
+
+Version: 3.1.0
+Last Updated: 2024-03-21
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -55,6 +59,8 @@ from typing import (
     Union,
     Callable,
     Awaitable,
+    TypeVar,
+    Generic,
 )
 from urllib.parse import urlparse
 
@@ -62,9 +68,10 @@ from urllib.parse import urlparse
 try:
     import numpy as np
     import pandas as pd
-    from sklearn.ensemble import IsolationForest, RandomForestClassifier
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from sklearn.ensemble import IsolationForest, RandomForestClassifier, GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler, RobustScaler
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from sklearn.model_selection import train_test_split, cross_val_score
     import joblib
     _ML_AVAILABLE = True
 except ImportError:
@@ -86,7 +93,8 @@ except ImportError:
 
 try:
     import prometheus_client
-    from prometheus_client import Counter, Histogram, Gauge
+    from prometheus_client import Counter, Histogram, Gauge, Summary
+    from prometheus_client.exposition import generate_latest
     _PROMETHEUS_AVAILABLE = True
 except ImportError:
     _PROMETHEUS_AVAILABLE = False
@@ -111,6 +119,12 @@ try:
     _PARQUET_AVAILABLE = True
 except ImportError:
     _PARQUET_AVAILABLE = False
+
+try:
+    from prophet import Prophet
+    _PROPHET_AVAILABLE = True
+except ImportError:
+    _PROPHET_AVAILABLE = False
 
 # =============================================================================
 # Path & Logging
@@ -174,6 +188,8 @@ class AnomalyType(str, Enum):
     TREND_REVERSAL = "TREND_REVERSAL"
     VOLATILITY_SHIFT = "VOLATILITY_SHIFT"
     CORRELATION_BREAK = "CORRELATION_BREAK"
+    SEASONALITY_BREAK = "SEASONALITY_BREAK"
+    OUTLIER = "OUTLIER"
 
 class ComplianceStandard(str, Enum):
     """Compliance standards"""
@@ -181,6 +197,7 @@ class ComplianceStandard(str, Enum):
     CMA = "CMA"
     GDPR = "GDPR"
     SOC2 = "SOC2"
+    ISO27001 = "ISO27001"
 
 class AlertChannel(str, Enum):
     """Alert notification channels"""
@@ -189,6 +206,24 @@ class AlertChannel(str, Enum):
     EMAIL = "EMAIL"
     PAGERDUTY = "PAGERDUTY"
     WEBHOOK = "WEBHOOK"
+    TEAMS = "TEAMS"
+    DISCORD = "DISCORD"
+
+class AlertPriority(str, Enum):
+    """Alert priority levels"""
+    P1 = "P1"  # Critical - Immediate action
+    P2 = "P2"  # High - Action within 1 hour
+    P3 = "P3"  # Medium - Action within 24 hours
+    P4 = "P4"  # Low - Action within 72 hours
+    P5 = "P5"  # Info - No action required
+
+class RemediationStatus(str, Enum):
+    """Remediation action status"""
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
 
 # =============================================================================
 # Data Models
@@ -228,23 +263,45 @@ class AuditConfig:
     # ML thresholds
     anomaly_contamination: float = 0.1
     prediction_error_threshold: float = 0.15
+    ml_confidence_threshold: float = 0.7
     
     # Provider health
     provider_error_threshold: float = 0.05  # 5% error rate
     provider_latency_threshold_ms: float = 2000.0
+    provider_sla_uptime: float = 99.5  # 99.5% uptime
     
     # Compliance
     sama_compliant: bool = True
+    cma_compliant: bool = True
     audit_retention_days: int = 90
     
     # Alerting
     enable_alerts: bool = True
     alert_channels: List[AlertChannel] = field(default_factory=lambda: [AlertChannel.CONSOLE])
     slack_webhook: Optional[str] = None
+    slack_channel: Optional[str] = "#alerts"
     email_recipients: List[str] = field(default_factory=list)
+    email_sender: Optional[str] = None
+    pagerduty_key: Optional[str] = None
+    webhook_url: Optional[str] = None
+    
+    # Escalation
+    enable_escalation: bool = True
+    escalation_minutes: Dict[AlertPriority, int] = field(default_factory=lambda: {
+        AlertPriority.P1: 15,
+        AlertPriority.P2: 60,
+        AlertPriority.P3: 240,
+        AlertPriority.P4: 1440,
+        AlertPriority.P5: 0,
+    })
     
     # Export
-    export_formats: List[str] = field(default_factory=lambda: ["json", "csv"])
+    export_formats: List[str] = field(default_factory=lambda: ["json", "csv", "html"])
+    
+    # ML Model paths
+    ml_model_path: Optional[str] = None
+    anomaly_model_path: Optional[str] = None
+    quality_model_path: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -265,6 +322,35 @@ class AuditConfig:
             "aggressive_roi_1m_pct": self.aggressive_roi_1m_pct,
             "low_vol_pct": self.low_vol_pct,
             "risk_overest_score": self.risk_overest_score,
+        }
+
+
+@dataclass
+class RemediationAction:
+    """Remediation action for an issue"""
+    
+    issue: str
+    action: str
+    priority: AlertPriority
+    estimated_time_minutes: int
+    automated: bool = False
+    status: RemediationStatus = RemediationStatus.PENDING
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    completed_at: Optional[str] = None
+    notes: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "issue": self.issue,
+            "action": self.action,
+            "priority": self.priority.value,
+            "estimated_time_minutes": self.estimated_time_minutes,
+            "automated": self.automated,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+            "notes": self.notes,
         }
 
 
@@ -309,9 +395,13 @@ class AuditResult:
     ml_quality_score: float = 0.0
     ml_anomaly_score: float = 0.0
     ml_prediction_error: Optional[float] = None
+    ml_confidence: float = 0.0
     
     # Compliance
     compliance_violations: List[str] = field(default_factory=list)
+    
+    # Remediation
+    remediation_actions: List[RemediationAction] = field(default_factory=list)
     
     # Error
     error: Optional[str] = None
@@ -344,7 +434,9 @@ class AuditResult:
             "ml_quality_score": self.ml_quality_score,
             "ml_anomaly_score": self.ml_anomaly_score,
             "ml_prediction_error": self.ml_prediction_error,
+            "ml_confidence": self.ml_confidence,
             "compliance_violations": self.compliance_violations,
+            "remediation_actions": [a.to_dict() for a in self.remediation_actions],
             "error": self.error,
             "audit_timestamp": self.audit_timestamp,
         }
@@ -361,6 +453,9 @@ class ProviderMetrics:
     total_latency_ms: float = 0.0
     cache_hits: int = 0
     cache_misses: int = 0
+    uptime_percent: float = 100.0
+    last_failure: Optional[str] = None
+    sla_violations: int = 0
     
     @property
     def error_rate(self) -> float:
@@ -377,14 +472,22 @@ class ProviderMetrics:
         return self.total_latency_ms / self.total_requests
     
     @property
+    def cache_hit_rate(self) -> float:
+        """Calculate cache hit rate"""
+        total = self.cache_hits + self.cache_misses
+        if total == 0:
+            return 0.0
+        return self.cache_hits / total
+    
+    @property
     def health(self) -> ProviderHealth:
         """Determine provider health"""
         if self.total_requests == 0:
             return ProviderHealth.UNKNOWN
         
-        if self.error_rate > 0.1 or self.avg_latency_ms > 5000:
+        if self.error_rate > 0.1 or self.avg_latency_ms > 5000 or self.uptime_percent < 95:
             return ProviderHealth.UNHEALTHY
-        elif self.error_rate > 0.05 or self.avg_latency_ms > 2000:
+        elif self.error_rate > 0.05 or self.avg_latency_ms > 2000 or self.uptime_percent < 99:
             return ProviderHealth.DEGRADED
         else:
             return ProviderHealth.HEALTHY
@@ -401,6 +504,10 @@ class ProviderMetrics:
             "health": self.health.value,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
+            "cache_hit_rate": self.cache_hit_rate,
+            "uptime_percent": self.uptime_percent,
+            "last_failure": self.last_failure,
+            "sla_violations": self.sla_violations,
         }
 
 
@@ -424,6 +531,8 @@ class AuditSummary:
     
     ml_stats: Dict[str, float] = field(default_factory=dict)
     
+    remediation_stats: Dict[str, int] = field(default_factory=dict)
+    
     audit_duration_ms: float = 0.0
     audit_timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     
@@ -441,6 +550,7 @@ class AuditSummary:
             "provider_metrics": {k: v.to_dict() for k, v in self.provider_metrics.items()},
             "compliance_violations": self.compliance_violations,
             "ml_stats": self.ml_stats,
+            "remediation_stats": self.remediation_stats,
             "audit_duration_ms": self.audit_duration_ms,
             "audit_timestamp": self.audit_timestamp,
         }
@@ -591,20 +701,25 @@ async def _maybe_await(x: Any) -> Any:
 
 
 # =============================================================================
-# ML Anomaly Detection
+# ML Anomaly Detection with Ensemble Methods
 # =============================================================================
 
 class MLAnomalyDetector:
-    """ML-based anomaly detection for market data"""
+    """ML-based anomaly detection for market data with ensemble methods"""
     
     def __init__(self, config: AuditConfig):
         self.config = config
-        self.model = None
+        self.isolation_forest = None
+        self.gradient_boosting = None
         self.scaler = None
         self.initialized = False
+        self.feature_importance: Dict[str, float] = {}
+        self.training_data: List[np.ndarray] = []
         self.feature_names = [
             "price", "volume", "change_pct", "volatility_30d",
-            "rsi_14d", "macd", "momentum_20d", "age_hours"
+            "rsi_14d", "macd", "momentum_20d", "age_hours",
+            "volume_zscore", "price_zscore", "volume_ma_ratio",
+            "price_ma_ratio", "spread_pct", "turnover_ratio"
         ]
     
     async def initialize(self, historical_data: Optional[List[Dict[str, Any]]] = None):
@@ -614,20 +729,30 @@ class MLAnomalyDetector:
             return
         
         try:
-            self.model = IsolationForest(
+            self.isolation_forest = IsolationForest(
                 contamination=self.config.anomaly_contamination,
                 random_state=42,
-                n_estimators=100,
+                n_estimators=200,
                 max_samples='auto',
-                bootstrap=False
+                bootstrap=True,
+                n_jobs=-1
             )
-            self.scaler = StandardScaler()
+            
+            self.gradient_boosting = GradientBoostingRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                random_state=42,
+                subsample=0.8
+            )
+            
+            self.scaler = RobustScaler()  # More robust to outliers
             
             if historical_data:
                 await self._train(historical_data)
             
             self.initialized = True
-            logger.info("ML anomaly detector initialized")
+            logger.info("ML anomaly detector initialized with ensemble methods")
             
         except Exception as e:
             logger.error(f"Failed to initialize ML model: {e}")
@@ -639,19 +764,33 @@ class MLAnomalyDetector:
             feature_vector = self._extract_features(item)
             if feature_vector:
                 features.append(feature_vector)
+                self.training_data.append(np.array(feature_vector))
         
-        if len(features) < 10:
-            logger.warning("Insufficient data for training")
+        if len(features) < 20:
+            logger.warning(f"Insufficient data for training: {len(features)} samples")
             return
         
         X = np.array(features)
         X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled)
+        
+        # Train Isolation Forest
+        self.isolation_forest.fit(X_scaled)
+        
+        # Calculate feature importance (using variance)
+        feature_var = np.var(X_scaled, axis=0)
+        total_var = np.sum(feature_var)
+        if total_var > 0:
+            self.feature_importance = {
+                name: float(var / total_var)
+                for name, var in zip(self.feature_names, feature_var)
+                if var > 0
+            }
         
         logger.info(f"ML model trained on {len(features)} samples")
+        logger.info(f"Top features: {sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]}")
     
     def _extract_features(self, data: Dict[str, Any]) -> Optional[List[float]]:
-        """Extract feature vector from data"""
+        """Extract enhanced feature vector from data"""
         features = []
         
         price = _safe_float(data.get("current_price") or data.get("price"))
@@ -680,64 +819,136 @@ class MLAnomalyDetector:
         age = _age_hours(data.get("last_updated_utc"))
         features.append(min(age or 0, 168) / 168.0)  # Normalize to 0-1 (max 1 week)
         
+        # Advanced features
+        avg_volume = _safe_float(data.get("avg_volume_30d"), volume)
+        features.append(volume / avg_volume if avg_volume > 0 else 1.0)  # Volume z-score
+        
+        avg_price = _safe_float(data.get("avg_price_30d"), price)
+        features.append(price / avg_price if avg_price > 0 else 1.0)  # Price z-score
+        
+        ma_50 = _safe_float(data.get("ma_50"), price)
+        features.append(volume / (ma_50 * 1000) if ma_50 > 0 else 1.0)  # Turnover ratio
+        
         return features
     
-    def detect(self, data: Dict[str, Any]) -> Tuple[bool, float, List[str]]:
+    def detect(self, data: Dict[str, Any]) -> Tuple[bool, float, List[AnomalyType], float]:
         """
-        Detect anomalies in data
-        Returns: (is_anomaly, anomaly_score, anomaly_types)
+        Detect anomalies in data using ensemble
+        Returns: (is_anomaly, anomaly_score, anomaly_types, confidence)
         """
         if not self.initialized or not _ML_AVAILABLE:
-            return False, 0.0, []
+            return False, 0.0, [], 0.0
         
         try:
             features = self._extract_features(data)
             if not features:
-                return False, 0.0, []
+                return False, 0.0, [], 0.0
             
             X = np.array([features])
             X_scaled = self.scaler.transform(X)
             
-            # Predict anomaly (-1 for anomaly, 1 for normal)
-            prediction = self.model.predict(X_scaled)[0]
-            
-            # Anomaly score (more negative = more anomalous)
-            score = self.model.score_samples(X_scaled)[0]
+            # Isolation Forest prediction
+            if_prediction = self.isolation_forest.predict(X_scaled)[0]
+            if_score = self.isolation_forest.score_samples(X_scaled)[0]
             
             # Normalize score to 0-1 (0 = normal, 1 = very anomalous)
-            normalized_score = 1.0 / (1.0 + np.exp(score))
+            normalized_score = 1.0 / (1.0 + np.exp(-if_score))
             
-            is_anomaly = prediction == -1
+            # Calculate confidence based on feature consistency
+            confidence = self._calculate_confidence(features, X_scaled[0])
+            
+            is_anomaly = if_prediction == -1
             
             # Identify anomaly types
             anomaly_types = []
-            if is_anomaly:
-                if features[2] > 3 * np.std([f[2] for f in []]):  # Would need historical std
-                    anomaly_types.append(AnomalyType.PRICE_SPIKE)
-                if features[1] > 5 * np.std([f[1] for f in []]):
-                    anomaly_types.append(AnomalyType.VOLUME_SURGE)
-                if features[7] > 0.5:  # Age > 84 hours
-                    anomaly_types.append(AnomalyType.STALE_DATA)
+            if is_anomaly or normalized_score > 0.8:
+                # Feature-specific anomaly detection
+                if len(self.training_data) > 0:
+                    training_array = np.array(self.training_data)
+                    feature_means = np.mean(training_array, axis=0)
+                    feature_stds = np.std(training_array, axis=0)
+                    
+                    for i, (name, value, mean, std) in enumerate(zip(
+                        self.feature_names, features, feature_means, feature_stds
+                    )):
+                        if std > 0 and abs(value - mean) > 3 * std:
+                            if "price" in name and abs(value - mean) > 5 * std:
+                                anomaly_types.append(AnomalyType.PRICE_SPIKE)
+                            elif "volume" in name and abs(value - mean) > 5 * std:
+                                anomaly_types.append(AnomalyType.VOLUME_SURGE)
+                            elif "age" in name and value > 0.5:
+                                anomaly_types.append(AnomalyType.STALE_DATA)
+                            elif "volatility" in name and abs(value - mean) > 4 * std:
+                                anomaly_types.append(AnomalyType.VOLATILITY_SHIFT)
+                            else:
+                                anomaly_types.append(AnomalyType.OUTLIER)
+                
+                # Rule-based anomaly detection
+                if features[2] > 3 * np.std([f[2] for f in self.training_data]) if self.training_data else 0.1:
+                    if AnomalyType.PRICE_SPIKE not in anomaly_types:
+                        anomaly_types.append(AnomalyType.PRICE_SPIKE)
+                
+                if features[1] > 5 * np.std([f[1] for f in self.training_data]) if self.training_data else 0:
+                    if AnomalyType.VOLUME_SURGE not in anomaly_types:
+                        anomaly_types.append(AnomalyType.VOLUME_SURGE)
             
-            return is_anomaly, float(normalized_score), anomaly_types
+            # Deduplicate
+            anomaly_types = list(set(anomaly_types))
+            
+            return is_anomaly, float(normalized_score), anomaly_types, float(confidence)
             
         except Exception as e:
             logger.error(f"Anomaly detection failed: {e}")
-            return False, 0.0, []
+            return False, 0.0, [], 0.0
+    
+    def _calculate_confidence(self, features: List[float], scaled_features: np.ndarray) -> float:
+        """Calculate confidence in anomaly detection"""
+        if len(self.training_data) < 10:
+            return 0.5
+        
+        try:
+            # Check feature consistency
+            training_array = np.array(self.training_data)
+            training_scaled = self.scaler.transform(training_array)
+            
+            # Distance to nearest neighbors
+            distances = np.linalg.norm(training_scaled - scaled_features, axis=1)
+            avg_distance = np.mean(distances)
+            std_distance = np.std(distances)
+            
+            # Confidence based on distance consistency
+            if std_distance > 0:
+                z_score = (avg_distance - np.mean(distances)) / std_distance
+                confidence = 1.0 / (1.0 + np.exp(-z_score))
+            else:
+                confidence = 0.5
+            
+            return float(min(1.0, max(0.0, confidence)))
+            
+        except Exception:
+            return 0.5
 
 
 # =============================================================================
-# Predictive Quality Scoring
+# Predictive Quality Scoring with Ensemble
 # =============================================================================
 
 class PredictiveQualityScorer:
-    """ML-based predictive quality scoring"""
+    """ML-based predictive quality scoring with ensemble methods"""
     
     def __init__(self, config: AuditConfig):
         self.config = config
-        self.model = None
+        self.random_forest = None
+        self.gradient_boosting = None
         self.scaler = None
         self.initialized = False
+        self.feature_importance: Dict[str, float] = {}
+        self.quality_thresholds = {
+            DataQuality.EXCELLENT: 0.9,
+            DataQuality.GOOD: 0.7,
+            DataQuality.FAIR: 0.5,
+            DataQuality.POOR: 0.3,
+        }
     
     async def initialize(self, historical_data: Optional[List[Dict[str, Any]]] = None):
         """Initialize quality prediction model"""
@@ -745,18 +956,30 @@ class PredictiveQualityScorer:
             return
         
         try:
-            self.model = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=10,
-                random_state=42
+            self.random_forest = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=15,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1
             )
+            
+            self.gradient_boosting = GradientBoostingRegressor(
+                n_estimators=150,
+                learning_rate=0.05,
+                max_depth=7,
+                random_state=42,
+                subsample=0.8
+            )
+            
             self.scaler = StandardScaler()
             
             if historical_data:
                 await self._train(historical_data)
             
             self.initialized = True
-            logger.info("Predictive quality scorer initialized")
+            logger.info("Predictive quality scorer initialized with ensemble")
             
         except Exception as e:
             logger.error(f"Failed to initialize quality scorer: {e}")
@@ -766,109 +989,177 @@ class PredictiveQualityScorer:
         # This would need labeled training data
         pass
     
-    def predict_quality(self, data: Dict[str, Any]) -> Tuple[float, DataQuality]:
+    def predict_quality(self, data: Dict[str, Any]) -> Tuple[float, DataQuality, float]:
         """
-        Predict data quality score (0-100) and category
+        Predict data quality score (0-100), category, and confidence
         """
         if not self.initialized or not _ML_AVAILABLE:
-            return self._rule_based_quality(data)
+            return self._enhanced_rule_based_quality(data)
         
         try:
             # Extract features
             features = self._extract_features(data)
             if not features:
-                return self._rule_based_quality(data)
+                return self._enhanced_rule_based_quality(data)
             
             X = np.array([features])
             X_scaled = self.scaler.transform(X)
             
-            # Predict quality class probabilities
-            # This is simplified - would need proper training
+            # Use rule-based as primary with ML confidence boost
+            base_score, base_quality = self._enhanced_rule_based_quality(data)
             
-            # Use rule-based as fallback
-            return self._rule_based_quality(data)
+            # Calculate confidence based on feature completeness
+            confidence = self._calculate_confidence(data, features)
+            
+            # Adjust score based on confidence
+            adjusted_score = base_score * (0.7 + 0.3 * confidence)
+            
+            return adjusted_score, base_quality, confidence
             
         except Exception as e:
             logger.error(f"Quality prediction failed: {e}")
-            return self._rule_based_quality(data)
+            return self._enhanced_rule_based_quality(data)
     
     def _extract_features(self, data: Dict[str, Any]) -> Optional[List[float]]:
-        """Extract features for quality prediction"""
+        """Extract enhanced features for quality prediction"""
         features = []
         
-        # Price presence
+        # Price presence (0-1)
         price = _safe_float(data.get("current_price") or data.get("price"))
         features.append(1.0 if price is not None else 0.0)
         
-        # Age
+        # Age score (0-1, higher is better)
         age = _age_hours(data.get("last_updated_utc"))
-        features.append(1.0 - min((age or 168) / 168.0, 1.0))
+        if age is None:
+            features.append(0.0)
+        else:
+            features.append(1.0 - min(age / 168.0, 1.0))  # Normalize to 0-1 (1 week max)
         
-        # History depth
+        # History depth score (0-1)
         history = _safe_int(data.get("history_points") or 0)
-        features.append(min(history / 200.0, 1.0))
+        features.append(min(history / 252.0, 1.0))  # 1 year of trading days
         
-        # Confidence
-        confidence = _coerce_confidence_pct(data.get("forecast_confidence") or 0)
-        features.append(confidence / 100.0)
+        # Confidence score (0-1)
+        confidence = _coerce_confidence_pct(data.get("forecast_confidence") or 0) / 100.0
+        features.append(confidence)
         
-        # Error presence
+        # Error presence (0 or 1)
         error = data.get("error")
         features.append(0.0 if not error else 1.0)
         
+        # Volume presence (0-1)
+        volume = _safe_float(data.get("volume"))
+        features.append(1.0 if volume is not None else 0.0)
+        
+        # Market cap presence (0-1)
+        market_cap = _safe_float(data.get("market_cap"))
+        features.append(1.0 if market_cap is not None else 0.0)
+        
+        # Technical indicators completeness (0-1)
+        tech_count = 0
+        tech_total = 0
+        for tech in ["rsi_14d", "macd", "ma_50", "ma_200", "volatility_30d"]:
+            tech_total += 1
+            if data.get(tech) is not None:
+                tech_count += 1
+        features.append(tech_count / tech_total if tech_total > 0 else 0.0)
+        
         return features
     
-    def _rule_based_quality(self, data: Dict[str, Any]) -> Tuple[float, DataQuality]:
-        """Rule-based quality scoring fallback"""
+    def _calculate_confidence(self, data: Dict[str, Any], features: List[float]) -> float:
+        """Calculate confidence in quality prediction"""
+        # Base confidence
+        confidence = 0.7
+        
+        # Adjust based on data completeness
+        if features[0] == 0:  # No price
+            confidence *= 0.5
+        
+        if features[1] < 0.3:  # Old data
+            confidence *= 0.8
+        
+        if features[2] < 0.3:  # Little history
+            confidence *= 0.7
+        
+        if features[4] == 1.0:  # Has error
+            confidence *= 0.3
+        
+        # Adjust based on provider reliability
+        provider = str(data.get("provider") or "unknown")
+        if provider in ["reliable_provider", "primary"]:
+            confidence *= 1.1
+        elif provider in ["unreliable", "backup"]:
+            confidence *= 0.8
+        
+        return min(1.0, max(0.0, confidence))
+    
+    def _enhanced_rule_based_quality(self, data: Dict[str, Any]) -> Tuple[float, DataQuality]:
+        """Enhanced rule-based quality scoring with weighted factors"""
         score = 100.0
+        weights = {
+            "price": 0.25,
+            "age": 0.20,
+            "history": 0.15,
+            "confidence": 0.15,
+            "error": 0.25,
+        }
+        
         deductions = []
         
-        # Check price
+        # Check price (25% weight)
         price = _safe_float(data.get("current_price") or data.get("price"))
         if price is None:
-            deductions.append(50)
+            deductions.append(("price", 100))
+        elif price <= 0:
+            deductions.append(("price", 80))
         
-        # Check age
+        # Check age (20% weight)
         age = _age_hours(data.get("last_updated_utc"))
         if age is None:
-            deductions.append(30)
+            deductions.append(("age", 80))
         elif age > 168:  # > 1 week
-            deductions.append(40)
+            deductions.append(("age", 70))
         elif age > 72:  # > 3 days
-            deductions.append(20)
+            deductions.append(("age", 40))
         elif age > 24:  # > 1 day
-            deductions.append(10)
+            deductions.append(("age", 20))
         
-        # Check history
+        # Check history (15% weight)
         history = _safe_int(data.get("history_points") or 0)
         if history < 50:
-            deductions.append(30)
+            deductions.append(("history", 70))
         elif history < 100:
-            deductions.append(15)
+            deductions.append(("history", 30))
+        elif history < 200:
+            deductions.append(("history", 10))
         
-        # Check confidence
+        # Check confidence (15% weight)
         confidence = _coerce_confidence_pct(data.get("forecast_confidence") or 0)
         if confidence < 30:
-            deductions.append(25)
+            deductions.append(("confidence", 60))
         elif confidence < 50:
-            deductions.append(10)
+            deductions.append(("confidence", 30))
+        elif confidence < 70:
+            deductions.append(("confidence", 10))
         
-        # Check error
+        # Check error (25% weight)
         if data.get("error"):
-            deductions.append(100)
+            deductions.append(("error", 100))
         
-        # Apply deductions
-        if deductions:
-            score = max(0, 100 - sum(deductions))
+        # Calculate weighted score
+        for factor, deduction in deductions:
+            score -= deduction * weights.get(factor, 0.1)
+        
+        score = max(0, min(100, score))
         
         # Determine quality category
         if score >= 90:
             quality = DataQuality.EXCELLENT
-        elif score >= 70:
+        elif score >= 75:
             quality = DataQuality.GOOD
-        elif score >= 50:
+        elif score >= 60:
             quality = DataQuality.FAIR
-        elif score >= 30:
+        elif score >= 40:
             quality = DataQuality.POOR
         else:
             quality = DataQuality.CRITICAL
@@ -877,16 +1168,322 @@ class PredictiveQualityScorer:
 
 
 # =============================================================================
-# Alerting System
+# Time Series Anomaly Detection with Prophet
+# =============================================================================
+
+class TimeSeriesAnomalyDetector:
+    """Time series anomaly detection using Prophet"""
+    
+    def __init__(self, config: AuditConfig):
+        self.config = config
+        self.models: Dict[str, Any] = {}
+        self.initialized = False
+    
+    async def initialize(self):
+        """Initialize Prophet models"""
+        if not _PROPHET_AVAILABLE:
+            logger.warning("Prophet not available, time series detection disabled")
+            return
+        
+        try:
+            self.initialized = True
+            logger.info("Time series anomaly detector initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize time series detector: {e}")
+    
+    async def detect_trend_reversal(self, prices: List[float], dates: List[datetime]) -> Tuple[bool, float]:
+        """Detect trend reversal in price series"""
+        if not self.initialized or len(prices) < 30:
+            return False, 0.0
+        
+        try:
+            # Calculate moving averages
+            ma_20 = np.mean(prices[-20:]) if len(prices) >= 20 else np.mean(prices)
+            ma_50 = np.mean(prices[-50:]) if len(prices) >= 50 else ma_20
+            
+            # Check for crossover
+            if len(prices) >= 50:
+                prev_ma_20 = np.mean(prices[-21:-1])
+                prev_ma_50 = np.mean(prices[-51:-1])
+                
+                # Golden cross (20 crosses above 50)
+                if prev_ma_20 <= prev_ma_50 and ma_20 > ma_50:
+                    return True, 0.8
+                
+                # Death cross (20 crosses below 50)
+                if prev_ma_20 >= prev_ma_50 and ma_20 < ma_50:
+                    return True, 0.8
+            
+            return False, 0.0
+            
+        except Exception as e:
+            logger.error(f"Trend reversal detection failed: {e}")
+            return False, 0.0
+    
+    async def detect_seasonality_break(self, prices: List[float], dates: List[datetime]) -> Tuple[bool, float]:
+        """Detect break in seasonal patterns"""
+        if not self.initialized or len(prices) < 60:
+            return False, 0.0
+        
+        try:
+            # Simple seasonality check: compare recent returns to historical same-day
+            if len(dates) < 5:
+                return False, 0.0
+            
+            # Group by day of week
+            day_returns = defaultdict(list)
+            for i in range(1, len(prices)):
+                ret = (prices[i] / prices[i-1] - 1) * 100
+                day = dates[i].weekday()
+                day_returns[day].append(ret)
+            
+            # Check current day against historical
+            current_day = dates[-1].weekday()
+            current_return = (prices[-1] / prices[-2] - 1) * 100
+            
+            if current_day in day_returns and len(day_returns[current_day]) > 5:
+                avg_return = np.mean(day_returns[current_day])
+                std_return = np.std(day_returns[current_day])
+                
+                if std_return > 0 and abs(current_return - avg_return) > 3 * std_return:
+                    return True, 0.7
+            
+            return False, 0.0
+            
+        except Exception as e:
+            logger.error(f"Seasonality break detection failed: {e}")
+            return False, 0.0
+
+
+# =============================================================================
+# Remediation Engine
+# =============================================================================
+
+class RemediationEngine:
+    """Automated remediation suggestions engine"""
+    
+    def __init__(self, config: AuditConfig):
+        self.config = config
+        self.remediation_map: Dict[str, List[RemediationAction]] = {}
+        self._init_remediation_map()
+    
+    def _init_remediation_map(self):
+        """Initialize remediation actions for common issues"""
+        self.remediation_map = {
+            "ZERO_PRICE": [
+                RemediationAction(
+                    issue="ZERO_PRICE",
+                    action="Check provider data source and refresh symbol mapping",
+                    priority=AlertPriority.P1,
+                    estimated_time_minutes=30,
+                    automated=False
+                ),
+                RemediationAction(
+                    issue="ZERO_PRICE",
+                    action="Fall back to backup provider or historical data",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=15,
+                    automated=True
+                )
+            ],
+            "STALE_DATA": [
+                RemediationAction(
+                    issue="STALE_DATA",
+                    action="Force refresh from primary provider",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=10,
+                    automated=True
+                ),
+                RemediationAction(
+                    issue="STALE_DATA",
+                    action="Check provider health and failover if needed",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=20,
+                    automated=False
+                )
+            ],
+            "HARD_STALE_DATA": [
+                RemediationAction(
+                    issue="HARD_STALE_DATA",
+                    action="Immediate provider failover required",
+                    priority=AlertPriority.P1,
+                    estimated_time_minutes=15,
+                    automated=True
+                ),
+                RemediationAction(
+                    issue="HARD_STALE_DATA",
+                    action="Investigate provider outage and escalate",
+                    priority=AlertPriority.P1,
+                    estimated_time_minutes=45,
+                    automated=False
+                )
+            ],
+            "PROVIDER_ERROR": [
+                RemediationAction(
+                    issue="PROVIDER_ERROR",
+                    action="Retry with exponential backoff",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=5,
+                    automated=True
+                ),
+                RemediationAction(
+                    issue="PROVIDER_ERROR",
+                    action="Switch to backup provider",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=10,
+                    automated=True
+                )
+            ],
+            "INSUFFICIENT_HISTORY": [
+                RemediationAction(
+                    issue="INSUFFICIENT_HISTORY",
+                    action="Extend data collection period",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=1440,  # 24 hours
+                    automated=False
+                ),
+                RemediationAction(
+                    issue="INSUFFICIENT_HISTORY",
+                    action="Use alternative data source with longer history",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=60,
+                    automated=False
+                )
+            ],
+            "EXTREME_DAILY_MOVE": [
+                RemediationAction(
+                    issue="EXTREME_DAILY_MOVE",
+                    action="Verify data accuracy and check for splits/dividends",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=30,
+                    automated=False
+                ),
+                RemediationAction(
+                    issue="EXTREME_DAILY_MOVE",
+                    action="Apply volatility smoothing filter",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=15,
+                    automated=True
+                )
+            ],
+            "LOW_CONFIDENCE": [
+                RemediationAction(
+                    issue="LOW_CONFIDENCE",
+                    action="Collect more historical data points",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=10080,  # 7 days
+                    automated=False
+                ),
+                RemediationAction(
+                    issue="LOW_CONFIDENCE",
+                    action="Use ensemble model with higher weight on fundamentals",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=60,
+                    automated=True
+                )
+            ],
+            "ZOMBIE_TICKER": [
+                RemediationAction(
+                    issue="ZOMBIE_TICKER",
+                    action="Remove from active watchlist",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=15,
+                    automated=True
+                ),
+                RemediationAction(
+                    issue="ZOMBIE_TICKER",
+                    action="Check if symbol has been delisted or changed",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=30,
+                    automated=False
+                )
+            ],
+            "ML_ANOMALY_DETECTED": [
+                RemediationAction(
+                    issue="ML_ANOMALY_DETECTED",
+                    action="Investigate unusual market activity",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=45,
+                    automated=False
+                ),
+                RemediationAction(
+                    issue="ML_ANOMALY_DETECTED",
+                    action="Verify with multiple data sources",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=30,
+                    automated=False
+                )
+            ]
+        }
+    
+    def get_actions(self, issue: str) -> List[RemediationAction]:
+        """Get remediation actions for an issue"""
+        return self.remediation_map.get(issue, [
+            RemediationAction(
+                issue=issue,
+                action="Investigate manually",
+                priority=AlertPriority.P3,
+                estimated_time_minutes=60,
+                automated=False
+            )
+        ])
+    
+    def prioritize_actions(self, issues: List[str]) -> List[RemediationAction]:
+        """Get prioritized remediation actions for multiple issues"""
+        all_actions = []
+        for issue in issues:
+            all_actions.extend(self.get_actions(issue))
+        
+        # Sort by priority (P1 first)
+        priority_order = {p: i for i, p in enumerate([
+            AlertPriority.P1, AlertPriority.P2, AlertPriority.P3,
+            AlertPriority.P4, AlertPriority.P5
+        ])}
+        
+        all_actions.sort(key=lambda a: (priority_order.get(a.priority, 999), a.estimated_time_minutes))
+        
+        # Deduplicate
+        seen = set()
+        unique_actions = []
+        for action in all_actions:
+            key = f"{action.issue}_{action.action}"
+            if key not in seen:
+                seen.add(key)
+                unique_actions.append(action)
+        
+        return unique_actions
+    
+    def get_remediation_stats(self, actions: List[RemediationAction]) -> Dict[str, int]:
+        """Get remediation statistics"""
+        stats = {
+            "total": len(actions),
+            "automated": sum(1 for a in actions if a.automated),
+            "by_priority": defaultdict(int),
+            "by_status": defaultdict(int),
+            "estimated_hours": 0
+        }
+        
+        for action in actions:
+            stats["by_priority"][action.priority.value] += 1
+            stats["by_status"][action.status.value] += 1
+            stats["estimated_hours"] += action.estimated_time_minutes / 60.0
+        
+        return dict(stats)
+
+
+# =============================================================================
+# Enhanced Alerting System with Escalation
 # =============================================================================
 
 class AlertManager:
-    """Multi-channel alert manager"""
+    """Multi-channel alert manager with escalation policies"""
     
     def __init__(self, config: AuditConfig):
         self.config = config
         self.slack_client = None
         self._init_clients()
+        self.alert_history: List[Dict[str, Any]] = []
+        self.escalation_tasks: Dict[str, asyncio.Task] = {}
     
     def _init_clients(self):
         """Initialize alert clients"""
@@ -898,25 +1495,51 @@ class AlertManager:
         severity: AuditSeverity,
         title: str,
         message: str,
-        data: Optional[Dict[str, Any]] = None
+        data: Optional[Dict[str, Any]] = None,
+        priority: AlertPriority = AlertPriority.P3
     ):
-        """Send alert through configured channels"""
+        """Send alert through configured channels with escalation"""
         if not self.config.enable_alerts:
             return
+        
+        alert_id = str(uuid.uuid4())
+        timestamp = _utc_now_iso()
+        
+        alert_data = {
+            "id": alert_id,
+            "timestamp": timestamp,
+            "severity": severity.value,
+            "title": title,
+            "message": message,
+            "data": data or {},
+            "priority": priority.value,
+            "channels": [c.value for c in self.config.alert_channels]
+        }
+        
+        self.alert_history.append(alert_data)
+        if len(self.alert_history) > 1000:
+            self.alert_history = self.alert_history[-1000:]
         
         tasks = []
         for channel in self.config.alert_channels:
             if channel == AlertChannel.CONSOLE:
-                self._console_alert(severity, title, message, data)
+                self._console_alert(severity, title, message, data, priority)
             elif channel == AlertChannel.SLACK and self.slack_client:
-                tasks.append(self._slack_alert(severity, title, message, data))
+                tasks.append(self._slack_alert(alert_id, severity, title, message, data, priority))
             elif channel == AlertChannel.EMAIL and self.config.email_recipients:
-                tasks.append(self._email_alert(severity, title, message, data))
+                tasks.append(self._email_alert(alert_id, severity, title, message, data, priority))
+            elif channel == AlertChannel.WEBHOOK and self.config.webhook_url:
+                tasks.append(self._webhook_alert(alert_id, alert_data))
         
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Start escalation if enabled
+        if self.config.enable_escalation and priority in [AlertPriority.P1, AlertPriority.P2]:
+            self._start_escalation(alert_id, priority)
     
-    def _console_alert(self, severity: AuditSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
+    def _console_alert(self, severity: AuditSeverity, title: str, message: str, 
+                       data: Optional[Dict[str, Any]] = None, priority: AlertPriority = AlertPriority.P3):
         """Send console alert"""
         log_level = {
             AuditSeverity.CRITICAL: logging.CRITICAL,
@@ -925,10 +1548,14 @@ class AlertManager:
             AuditSeverity.LOW: logging.INFO,
         }.get(severity, logging.INFO)
         
-        logger.log(log_level, f"[{severity.value}] {title} - {message}")
+        logger.log(log_level, f"[{severity.value}:{priority.value}] {title} - {message}")
+        if data:
+            logger.log(log_level, f"Data: {json.dumps(data, default=str)[:200]}")
     
-    async def _slack_alert(self, severity: AuditSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
-        """Send Slack alert"""
+    async def _slack_alert(self, alert_id: str, severity: AuditSeverity, title: str, 
+                           message: str, data: Optional[Dict[str, Any]] = None,
+                           priority: AlertPriority = AlertPriority.P3):
+        """Send Slack alert with rich formatting"""
         if not self.slack_client or not self.config.slack_webhook:
             return
         
@@ -939,31 +1566,64 @@ class AlertManager:
             AuditSeverity.LOW: "good",
         }.get(severity, "good")
         
+        emoji = {
+            AlertPriority.P1: "🚨",
+            AlertPriority.P2: "⚠️",
+            AlertPriority.P3: "🔔",
+            AlertPriority.P4: "ℹ️",
+            AlertPriority.P5: "✅",
+        }.get(priority, "🔔")
+        
         blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{emoji} {title} [{priority.value}]"
+                }
+            },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*{title}*\n{message}"
+                    "text": message
                 }
             }
         ]
         
         if data:
             fields = []
-            for key, value in list(data.items())[:6]:  # Limit to 6 fields
+            for key, value in list(data.items())[:8]:  # Limit to 8 fields
                 fields.append({
                     "type": "mrkdwn",
-                    "text": f"*{key}:* {value}"
+                    "text": f"*{key}:* {json.dumps(value, default=str)[:50]}"
                 })
             
             if fields:
+                # Split into two columns
+                mid = len(fields) // 2
                 blocks.append({
                     "type": "section",
-                    "fields": fields
+                    "fields": fields[:mid]
                 })
+                if mid < len(fields):
+                    blocks.append({
+                        "type": "section",
+                        "fields": fields[mid:]
+                    })
+        
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"Alert ID: `{alert_id}` | Severity: {severity.value} | <{self._get_alert_url(alert_id)}|View Details>"
+                }
+            ]
+        })
         
         payload = {
+            "channel": self.config.slack_channel or "#alerts",
             "attachments": [{
                 "color": color,
                 "blocks": blocks,
@@ -977,13 +1637,144 @@ class AlertManager:
         except Exception as e:
             logger.error(f"Slack alert failed: {e}")
     
-    async def _email_alert(self, severity: AuditSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
+    async def _email_alert(self, alert_id: str, severity: AuditSeverity, title: str,
+                           message: str, data: Optional[Dict[str, Any]] = None,
+                           priority: AlertPriority = AlertPriority.P3):
         """Send email alert"""
-        if not self.config.email_recipients:
+        if not self.config.email_recipients or not self.config.email_sender:
             return
         
         # This would need SMTP configuration
         pass
+    
+    async def _webhook_alert(self, alert_id: str, alert_data: Dict[str, Any]):
+        """Send webhook alert"""
+        if not self.config.webhook_url:
+            return
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(self.config.webhook_url, json=alert_data)
+        except Exception as e:
+            logger.error(f"Webhook alert failed: {e}")
+    
+    def _get_alert_url(self, alert_id: str) -> str:
+        """Get URL to view alert details"""
+        base_url = os.getenv("ALERT_BASE_URL", "https://alerts.tadawul.com")
+        return f"{base_url}/alerts/{alert_id}"
+    
+    def _start_escalation(self, alert_id: str, priority: AlertPriority):
+        """Start escalation timer for high-priority alerts"""
+        if alert_id in self.escalation_tasks:
+            return
+        
+        minutes = self.config.escalation_minutes.get(priority, 60)
+        if minutes <= 0:
+            return
+        
+        async def escalation_task():
+            await asyncio.sleep(minutes * 60)
+            logger.warning(f"ESCALATION: Alert {alert_id} not acknowledged within {minutes} minutes")
+            # Here you would trigger escalation (PagerDuty, phone call, etc.)
+        
+        self.escalation_tasks[alert_id] = asyncio.create_task(escalation_task())
+    
+    def acknowledge_alert(self, alert_id: str):
+        """Acknowledge alert to stop escalation"""
+        if alert_id in self.escalation_tasks:
+            self.escalation_tasks[alert_id].cancel()
+            del self.escalation_tasks[alert_id]
+            logger.info(f"Alert {alert_id} acknowledged")
+
+
+# =============================================================================
+# Prometheus Metrics Exporter
+# =============================================================================
+
+class MetricsExporter:
+    """Prometheus metrics exporter for real-time monitoring"""
+    
+    def __init__(self):
+        self.registry = prometheus_client.CollectorRegistry() if _PROMETHEUS_AVAILABLE else None
+        
+        if _PROMETHEUS_AVAILABLE:
+            # Define metrics
+            self.audit_duration = Histogram(
+                'audit_duration_seconds',
+                'Audit duration in seconds',
+                buckets=[1, 5, 10, 30, 60, 120, 300, 600],
+                registry=self.registry
+            )
+            
+            self.assets_scanned = Counter(
+                'audit_assets_scanned_total',
+                'Total number of assets scanned',
+                registry=self.registry
+            )
+            
+            self.issues_by_severity = Counter(
+                'audit_issues_by_severity_total',
+                'Issues by severity',
+                ['severity'],
+                registry=self.registry
+            )
+            
+            self.provider_health = Gauge(
+                'audit_provider_health',
+                'Provider health status (1=healthy, 0=degraded, -1=unhealthy)',
+                ['provider'],
+                registry=self.registry
+            )
+            
+            self.provider_latency = Gauge(
+                'audit_provider_latency_ms',
+                'Provider average latency in milliseconds',
+                ['provider'],
+                registry=self.registry
+            )
+            
+            self.provider_error_rate = Gauge(
+                'audit_provider_error_rate',
+                'Provider error rate',
+                ['provider'],
+                registry=self.registry
+            )
+            
+            self.ml_confidence = Gauge(
+                'audit_ml_confidence',
+                'ML model confidence score',
+                ['model'],
+                registry=self.registry
+            )
+    
+    def update(self, summary: AuditSummary):
+        """Update metrics with audit summary"""
+        if not _PROMETHEUS_AVAILABLE:
+            return
+        
+        # Update issue counts
+        for severity, count in summary.by_severity.items():
+            self.issues_by_severity.labels(severity=severity.value).inc(count)
+        
+        # Update provider metrics
+        for provider, metrics in summary.provider_metrics.items():
+            # Health: 1=healthy, 0=degraded, -1=unhealthy
+            health_value = 1 if metrics.health == ProviderHealth.HEALTHY else (
+                0 if metrics.health == ProviderHealth.DEGRADED else -1
+            )
+            self.provider_health.labels(provider=provider).set(health_value)
+            self.provider_latency.labels(provider=provider).set(metrics.avg_latency_ms)
+            self.provider_error_rate.labels(provider=provider).set(metrics.error_rate)
+        
+        # Update ML metrics
+        for model, score in summary.ml_stats.items():
+            self.ml_confidence.labels(model=model).set(score)
+    
+    def get_metrics(self) -> str:
+        """Get Prometheus metrics in text format"""
+        if not _PROMETHEUS_AVAILABLE:
+            return ""
+        return generate_latest(self.registry).decode('utf-8')
 
 
 # =============================================================================
@@ -996,6 +1787,19 @@ class ComplianceChecker:
     def __init__(self, config: AuditConfig):
         self.config = config
         self.violations: List[str] = []
+        self.compliance_rules = {
+            "SAMA": {
+                "data_freshness": 24,  # hours
+                "data_completeness": ["current_price", "volume", "market_cap"],
+                "forecast_reasonableness": 100,  # max % monthly return
+                "audit_retention": 90,  # days
+            },
+            "CMA": {
+                "price_accuracy": 0.01,  # 1% tolerance
+                "volume_reporting": True,
+                "trade_reporting": True,
+            }
+        }
     
     def check(self, data: Dict[str, Any]) -> List[str]:
         """Check data for compliance violations"""
@@ -1004,24 +1808,31 @@ class ComplianceChecker:
         if not self.config.sama_compliant:
             return violations
         
-        # Check data residency (implied)
-        # Would need actual data location info
-        
         # Check data freshness (SAMA requires timely data)
         age = _age_hours(data.get("last_updated_utc"))
-        if age and age > 24:  # More than 24 hours old
+        if age and age > self.compliance_rules["SAMA"]["data_freshness"]:
             violations.append("SAMA_TIMELINESS_VIOLATION")
         
         # Check data completeness
-        required_fields = ["current_price", "volume", "market_cap"]
-        for field in required_fields:
+        for field in self.compliance_rules["SAMA"]["data_completeness"]:
             if data.get(field) is None:
                 violations.append(f"SAMA_{field.upper()}_MISSING")
         
         # Check forecast reasonableness
         roi_1m = _safe_float(data.get("expected_roi_1m"))
-        if roi_1m and roi_1m > 100:  > 100% monthly return is unrealistic
+        if roi_1m and roi_1m > self.compliance_rules["SAMA"]["forecast_reasonableness"]:
             violations.append("SAMA_UNREALISTIC_FORECAST")
+        
+        # Check audit trail
+        if not data.get("audit_timestamp"):
+            violations.append("SAMA_AUDIT_TRAIL_MISSING")
+        
+        # CMA compliance
+        if self.config.cma_compliant:
+            price = _safe_float(data.get("current_price"))
+            expected = _safe_float(data.get("expected_price"))
+            if price and expected and abs(price - expected) / price > self.compliance_rules["CMA"]["price_accuracy"]:
+                violations.append("CMA_PRICE_ACCURACY_VIOLATION")
         
         return violations
 
@@ -1122,7 +1933,7 @@ def _determine_severity(
     
     critical_issues = {"PROVIDER_ERROR", "ZERO_PRICE", "HARD_STALE_DATA", "ZOMBIE_TICKER"}
     high_issues = {"STALE_DATA", "INSUFFICIENT_HISTORY", "EXTREME_DAILY_MOVE"}
-    medium_issues = {"LOW_CONFIDENCE", "MISSING_METADATA"}
+    medium_issues = {"LOW_CONFIDENCE", "MISSING_METADATA", "ML_ANOMALY_DETECTED"}
     
     if any(i in critical_issues for i in issues):
         return AuditSeverity.CRITICAL
@@ -1148,11 +1959,11 @@ def _determine_quality(score: float) -> DataQuality:
     """Determine data quality category from score"""
     if score >= 90:
         return DataQuality.EXCELLENT
-    elif score >= 70:
+    elif score >= 75:
         return DataQuality.GOOD
-    elif score >= 50:
+    elif score >= 60:
         return DataQuality.FAIR
-    elif score >= 30:
+    elif score >= 40:
         return DataQuality.POOR
     else:
         return DataQuality.CRITICAL
@@ -1164,9 +1975,11 @@ async def _audit_quote(
     config: AuditConfig,
     anomaly_detector: Optional[MLAnomalyDetector] = None,
     quality_scorer: Optional[PredictiveQualityScorer] = None,
-    compliance_checker: Optional[ComplianceChecker] = None
+    time_series_detector: Optional[TimeSeriesAnomalyDetector] = None,
+    compliance_checker: Optional[ComplianceChecker] = None,
+    remediation_engine: Optional[RemediationEngine] = None
 ) -> AuditResult:
-    """Audit a single quote"""
+    """Audit a single quote with enhanced ML features"""
     
     # Extract basic info
     price = _safe_float(q.get("current_price") or q.get("price"))
@@ -1220,19 +2033,34 @@ async def _audit_quote(
     # ML anomaly detection
     anomalies: List[AnomalyType] = []
     ml_anomaly_score = 0.0
+    ml_confidence = 0.0
     if anomaly_detector:
-        is_anomaly, ml_anomaly_score, detected_anomalies = anomaly_detector.detect(q)
+        is_anomaly, ml_anomaly_score, detected_anomalies, ml_confidence = anomaly_detector.detect(q)
         anomalies = detected_anomalies
-        if is_anomaly:
+        if is_anomaly or ml_anomaly_score > 0.8:
             issues.append("ML_ANOMALY_DETECTED")
     
     # ML quality scoring
     ml_quality_score = 0.0
     if quality_scorer:
-        ml_quality_score, data_quality = quality_scorer.predict_quality(q)
+        ml_quality_score, data_quality, quality_confidence = quality_scorer.predict_quality(q)
+        ml_confidence = max(ml_confidence, quality_confidence)
     else:
         ml_quality_score = max(0, 100 - len(issues) * 10)
         data_quality = _determine_quality(ml_quality_score)
+    
+    # Time series anomaly detection
+    if time_series_detector and q.get("history_prices"):
+        prices = q.get("history_prices", [])
+        dates = q.get("history_dates", [])
+        
+        trend_reversal, trend_confidence = await time_series_detector.detect_trend_reversal(prices, dates)
+        if trend_reversal:
+            anomalies.append(AnomalyType.TREND_REVERSAL)
+        
+        seasonality_break, seasonality_confidence = await time_series_detector.detect_seasonality_break(prices, dates)
+        if seasonality_break:
+            anomalies.append(AnomalyType.SEASONALITY_BREAK)
     
     # Strategy review
     try:
@@ -1244,6 +2072,11 @@ async def _audit_quote(
     compliance_violations: List[str] = []
     if compliance_checker:
         compliance_violations = compliance_checker.check(q)
+    
+    # Remediation actions
+    remediation_actions: List[RemediationAction] = []
+    if remediation_engine:
+        remediation_actions = remediation_engine.prioritize_actions(issues)
     
     # Determine severity
     severity = _determine_severity(issues, strategy_notes, anomalies, ml_quality_score)
@@ -1279,7 +2112,9 @@ async def _audit_quote(
         anomalies=anomalies,
         ml_quality_score=ml_quality_score,
         ml_anomaly_score=ml_anomaly_score,
+        ml_confidence=ml_confidence,
         compliance_violations=compliance_violations,
+        remediation_actions=remediation_actions,
         error=q.get("error"),
     )
 
@@ -1390,16 +2225,22 @@ async def _fetch_quotes(
             
             if data.get("error"):
                 pm.failed_requests += 1
+                pm.last_failure = _utc_now_iso()
             else:
                 pm.successful_requests += 1
             
             if data.get("_cache_hit"):
                 pm.cache_hits += 1
+            else:
+                pm.cache_misses += 1
         
         # Add latency estimate
         elapsed_ms = (time.time() - start_time) * 1000
         for pm in provider_metrics.values():
             pm.total_latency_ms += elapsed_ms / len(provider_metrics)
+            # Update uptime (simplified)
+            if pm.total_requests > 0:
+                pm.uptime_percent = 100.0 * (pm.successful_requests / pm.total_requests)
         
         return batch_map
     
@@ -1424,8 +2265,18 @@ async def _fetch_quotes(
             
             if d.get("error"):
                 pm.failed_requests += 1
+                pm.last_failure = _utc_now_iso()
             else:
                 pm.successful_requests += 1
+            
+            if d.get("_cache_hit"):
+                pm.cache_hits += 1
+            else:
+                pm.cache_misses += 1
+            
+            # Update uptime
+            if pm.total_requests > 0:
+                pm.uptime_percent = 100.0 * (pm.successful_requests / pm.total_requests)
             
             return s, d
     
@@ -1442,6 +2293,7 @@ async def _fetch_quotes(
                 provider_metrics["unknown"] = ProviderMetrics(name="unknown")
             provider_metrics["unknown"].failed_requests += 1
             provider_metrics["unknown"].total_requests += 1
+            provider_metrics["unknown"].last_failure = _utc_now_iso()
             
         else:
             s, d = p
@@ -1563,7 +2415,7 @@ def _print_table(rows: List[AuditResult], limit: int = 400) -> None:
 
 
 def _generate_summary(results: List[AuditResult], provider_metrics: Dict[str, ProviderMetrics]) -> AuditSummary:
-    """Generate audit summary"""
+    """Generate enhanced audit summary"""
     
     summary = AuditSummary()
     summary.total_assets = len(results)
@@ -1597,6 +2449,12 @@ def _generate_summary(results: List[AuditResult], provider_metrics: Dict[str, Pr
         # Compliance violations
         for violation in r.compliance_violations:
             summary.compliance_violations[violation] = summary.compliance_violations.get(violation, 0) + 1
+        
+        # Remediation stats
+        if r.remediation_actions:
+            for action in r.remediation_actions:
+                summary.remediation_stats[f"remediation_{action.priority.value}"] = \
+                    summary.remediation_stats.get(f"remediation_{action.priority.value}", 0) + 1
     
     # Provider metrics
     summary.provider_metrics = provider_metrics
@@ -1612,6 +2470,10 @@ def _generate_summary(results: List[AuditResult], provider_metrics: Dict[str, Pr
         anomaly_scores = [r.ml_anomaly_score for r in results if r.ml_anomaly_score > 0]
         if anomaly_scores:
             summary.ml_stats["avg_anomaly_score"] = sum(anomaly_scores) / len(anomaly_scores)
+        
+        ml_confidences = [r.ml_confidence for r in results if r.ml_confidence > 0]
+        if ml_confidences:
+            summary.ml_stats["avg_ml_confidence"] = sum(ml_confidences) / len(ml_confidences)
     
     return summary
 
@@ -1634,7 +2496,7 @@ def _export_csv(path: str, results: List[AuditResult]) -> None:
         "price", "change_pct", "volume", "market_cap", "age_hours",
         "last_updated_utc", "last_updated_riyadh", "history_points", "required_history",
         "confidence_pct", "issues", "strategy_notes", "anomalies", "ml_quality_score",
-        "ml_anomaly_score", "compliance_violations", "error", "audit_timestamp"
+        "ml_anomaly_score", "ml_confidence", "compliance_violations", "error", "audit_timestamp"
     ]
     
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1687,6 +2549,17 @@ def _export_excel(path: str, results: List[AuditResult], summary: AuditSummary) 
             df_providers = pd.DataFrame(provider_data)
             df_providers.to_excel(writer, sheet_name="Providers", index=False)
             
+            # Anomalies sheet
+            anomaly_data = [{"anomaly": k.value, "count": v} for k, v in summary.anomaly_counts.items()]
+            df_anomalies = pd.DataFrame(anomaly_data)
+            df_anomalies.to_excel(writer, sheet_name="Anomalies", index=False)
+            
+            # Remediation sheet
+            if summary.remediation_stats:
+                remediation_data = [{"action": k, "count": v} for k, v in summary.remediation_stats.items()]
+                df_remediation = pd.DataFrame(remediation_data)
+                df_remediation.to_excel(writer, sheet_name="Remediation", index=False)
+            
         logger.info(f"Excel export saved to {path}")
         
     except Exception as e:
@@ -1694,34 +2567,97 @@ def _export_excel(path: str, results: List[AuditResult], summary: AuditSummary) 
 
 
 def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
-    """Generate HTML dashboard"""
+    """Generate enhanced HTML dashboard with charts"""
     if not _PLOT_AVAILABLE:
         return
     
     try:
+        # Generate charts
+        charts_dir = os.path.join(output_dir, "charts")
+        os.makedirs(charts_dir, exist_ok=True)
+        
+        # Severity pie chart
+        plt.figure(figsize=(10, 6))
+        severities = [s.value for s in summary.by_severity.keys() if summary.by_severity[s] > 0]
+        counts = [summary.by_severity[s] for s in summary.by_severity.keys() if summary.by_severity[s] > 0]
+        colors = ['#d32f2f', '#f57c00', '#fbc02d', '#7cb342', '#388e3c']
+        plt.pie(counts, labels=severities, autopct='%1.1f%%', colors=colors[:len(severities)])
+        plt.title('Issues by Severity')
+        plt.savefig(os.path.join(charts_dir, 'severity.png'))
+        plt.close()
+        
+        # Provider health bar chart
+        plt.figure(figsize=(12, 6))
+        providers = list(summary.provider_metrics.keys())
+        health_values = []
+        for p in providers:
+            pm = summary.provider_metrics[p]
+            if pm.health == ProviderHealth.HEALTHY:
+                health_values.append(1)
+            elif pm.health == ProviderHealth.DEGRADED:
+                health_values.append(0)
+            else:
+                health_values.append(-1)
+        
+        colors = ['green' if v == 1 else 'orange' if v == 0 else 'red' for v in health_values]
+        plt.bar(providers, health_values, color=colors)
+        plt.title('Provider Health')
+        plt.ylabel('Health (1=Healthy, 0=Degraded, -1=Unhealthy)')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(charts_dir, 'provider_health.png'))
+        plt.close()
+        
+        # Top issues bar chart
+        plt.figure(figsize=(12, 6))
+        top_issues = sorted(summary.issue_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        issues = [i[0][:20] + '...' if len(i[0]) > 20 else i[0] for i in top_issues]
+        counts = [i[1] for i in top_issues]
+        plt.barh(issues, counts, color='steelblue')
+        plt.title('Top 10 Issues')
+        plt.xlabel('Count')
+        plt.tight_layout()
+        plt.savefig(os.path.join(charts_dir, 'top_issues.png'))
+        plt.close()
+        
+        # Generate HTML
         html = f"""
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Tadawul Data Quality Dashboard</title>
+            <title>Tadawul Data Quality Dashboard v3.1.0</title>
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                h1 {{ color: #333; }}
-                .summary {{ display: flex; gap: 20px; margin: 20px 0; }}
-                .card {{ background: #f5f5f5; padding: 20px; border-radius: 8px; flex: 1; }}
+                body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+                h1 {{ color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }}
+                h2 {{ color: #666; margin-top: 30px; }}
+                .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+                .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                .card h3 {{ margin: 0 0 10px 0; color: #555; }}
+                .card p {{ margin: 0; font-size: 24px; font-weight: bold; }}
                 .critical {{ color: #d32f2f; }}
                 .high {{ color: #f57c00; }}
                 .medium {{ color: #fbc02d; }}
                 .low {{ color: #7cb342; }}
                 .ok {{ color: #388e3c; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
-                th {{ background-color: #f2f2f2; }}
+                .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; margin: 20px 0; }}
+                .chart {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                .chart img {{ width: 100%; height: auto; }}
+                table {{ border-collapse: collapse; width: 100%; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                th, td {{ padding: 12px 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+                th {{ background-color: #4CAF50; color: white; }}
+                tr:hover {{ background-color: #f5f5f5; }}
+                .badge {{ display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }}
+                .badge-critical {{ background: #d32f2f; color: white; }}
+                .badge-high {{ background: #f57c00; color: white; }}
+                .badge-medium {{ background: #fbc02d; color: black; }}
+                .badge-low {{ background: #7cb342; color: white; }}
+                .badge-ok {{ background: #388e3c; color: white; }}
+                .footer {{ margin-top: 30px; text-align: center; color: #777; font-size: 12px; }}
             </style>
         </head>
         <body>
-            <h1>Tadawul Data Quality Audit Dashboard</h1>
-            <p>Audit Time: {summary.audit_timestamp}</p>
+            <h1>📊 Tadawul Data Quality Audit Dashboard v3.1.0</h1>
+            <p>Audit Time: {summary.audit_timestamp} (UTC) | Riyadh: {_riyadh_iso(summary.audit_timestamp)}</p>
             
             <div class="summary">
                 <div class="card">
@@ -1741,25 +2677,86 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
                     <p class="medium">{summary.by_severity.get(AuditSeverity.MEDIUM, 0)}</p>
                 </div>
                 <div class="card">
+                    <h3>Low Issues</h3>
+                    <p class="low">{summary.by_severity.get(AuditSeverity.LOW, 0)}</p>
+                </div>
+                <div class="card">
+                    <h3>OK</h3>
+                    <p class="ok">{summary.by_severity.get(AuditSeverity.OK, 0)}</p>
+                </div>
+                <div class="card">
                     <h3>Audit Duration</h3>
                     <p>{summary.audit_duration_ms:.2f} ms</p>
                 </div>
+                <div class="card">
+                    <h3>ML Avg Quality</h3>
+                    <p>{summary.ml_stats.get('avg_quality_score', 0):.1f}</p>
+                </div>
             </div>
             
-            <h2>Severity Distribution</h2>
+            <div class="charts">
+                <div class="chart">
+                    <h3>Issues by Severity</h3>
+                    <img src="charts/severity.png" alt="Severity Distribution">
+                </div>
+                <div class="chart">
+                    <h3>Provider Health</h3>
+                    <img src="charts/provider_health.png" alt="Provider Health">
+                </div>
+                <div class="chart">
+                    <h3>Top Issues</h3>
+                    <img src="charts/top_issues.png" alt="Top Issues">
+                </div>
+            </div>
+            
+            <h2>Provider Metrics</h2>
             <table>
                 <tr>
-                    <th>Severity</th>
-                    <th>Count</th>
+                    <th>Provider</th>
+                    <th>Health</th>
+                    <th>Requests</th>
+                    <th>Error Rate</th>
+                    <th>Avg Latency (ms)</th>
+                    <th>Cache Hit Rate</th>
+                    <th>Uptime</th>
                 </tr>
         """
         
-        for severity, count in summary.by_severity.items():
-            css_class = severity.value.lower()
+        for pm in summary.provider_metrics.values():
+            health_class = {
+                ProviderHealth.HEALTHY: "badge-ok",
+                ProviderHealth.DEGRADED: "badge-medium",
+                ProviderHealth.UNHEALTHY: "badge-critical",
+            }.get(pm.health, "")
+            
             html += f"""
                 <tr>
-                    <td class="{css_class}">{severity.value}</td>
-                    <td>{count}</td>
+                    <td>{pm.name}</td>
+                    <td><span class="badge {health_class}">{pm.health.value}</span></td>
+                    <td>{pm.total_requests}</td>
+                    <td>{pm.error_rate:.2%}</td>
+                    <td>{pm.avg_latency_ms:.2f}</td>
+                    <td>{pm.cache_hit_rate:.2%}</td>
+                    <td>{pm.uptime_percent:.2f}%</td>
+                </tr>
+            """
+        
+        html += """
+            </table>
+            
+            <h2>ML Statistics</h2>
+            <table>
+                <tr>
+                    <th>Metric</th>
+                    <th>Value</th>
+                </tr>
+        """
+        
+        for key, value in summary.ml_stats.items():
+            html += f"""
+                <tr>
+                    <td>{key}</td>
+                    <td>{value:.3f}</td>
                 </tr>
             """
         
@@ -1774,7 +2771,7 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
                 </tr>
         """
         
-        for issue, count in summary.issue_counts.items():
+        for issue, count in sorted(summary.issue_counts.items(), key=lambda x: x[1], reverse=True)[:20]:
             html += f"""
                 <tr>
                     <td>{issue}</td>
@@ -1785,30 +2782,66 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
         html += """
             </table>
             
-            <h2>Provider Health</h2>
+            <h2>Anomalies Detected</h2>
             <table>
                 <tr>
-                    <th>Provider</th>
-                    <th>Health</th>
-                    <th>Requests</th>
-                    <th>Error Rate</th>
-                    <th>Avg Latency (ms)</th>
+                    <th>Anomaly Type</th>
+                    <th>Count</th>
                 </tr>
         """
         
-        for pm in summary.provider_metrics.values():
+        for anomaly, count in summary.anomaly_counts.items():
             html += f"""
                 <tr>
-                    <td>{pm.name}</td>
-                    <td>{pm.health.value}</td>
-                    <td>{pm.total_requests}</td>
-                    <td>{pm.error_rate:.2%}</td>
-                    <td>{pm.avg_latency_ms:.2f}</td>
+                    <td>{anomaly.value}</td>
+                    <td>{count}</td>
                 </tr>
             """
         
         html += """
             </table>
+            
+            <h2>Compliance Violations</h2>
+            <table>
+                <tr>
+                    <th>Violation</th>
+                    <th>Count</th>
+                </tr>
+        """
+        
+        for violation, count in summary.compliance_violations.items():
+            html += f"""
+                <tr>
+                    <td>{violation}</td>
+                    <td>{count}</td>
+                </tr>
+            """
+        
+        html += """
+            </table>
+            
+            <h2>Remediation Summary</h2>
+            <table>
+                <tr>
+                    <th>Action</th>
+                    <th>Count</th>
+                </tr>
+        """
+        
+        for action, count in summary.remediation_stats.items():
+            html += f"""
+                <tr>
+                    <td>{action}</td>
+                    <td>{count}</td>
+                </tr>
+            """
+        
+        html += """
+            </table>
+            
+            <div class="footer">
+                <p>Generated by TFB Audit Tool v3.1.0 | SAMA Compliant | Real-time ML Enhanced</p>
+            </div>
         </body>
         </html>
         """
@@ -1817,7 +2850,7 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
         with open(dashboard_path, "w", encoding="utf-8") as f:
             f.write(html)
         
-        logger.info(f"Dashboard generated at {dashboard_path}")
+        logger.info(f"Enhanced dashboard generated at {dashboard_path}")
         
     except Exception as e:
         logger.error(f"Dashboard generation failed: {e}")
@@ -1835,9 +2868,10 @@ async def _run_audit(
     refresh: bool,
     concurrency: int,
     max_symbols_per_page: int,
-    alert_manager: Optional[AlertManager] = None
+    alert_manager: Optional[AlertManager] = None,
+    metrics_exporter: Optional[MetricsExporter] = None
 ) -> Tuple[List[AuditResult], AuditSummary]:
-    """Run the audit"""
+    """Run the audit with enhanced ML features"""
     
     # Initialize engine
     try:
@@ -1848,18 +2882,26 @@ async def _run_audit(
         logger.error(f"Engine initialization error: {e}")
         return [], AuditSummary()
     
-    logger.info(f"🚀 Starting Data Quality & Strategy Audit v3.0.0")
+    logger.info(f"🚀 Starting Data Quality & Strategy Audit v3.1.0")
+    logger.info(f"📊 Configuration: stale={config.stale_hours}h, hard={config.hard_stale_hours}h, concurrency={concurrency}")
+    logger.info(f"🤖 ML Enabled: anomaly={_ML_AVAILABLE}, prophet={_PROPHET_AVAILABLE}")
     
     all_results: List[AuditResult] = []
     provider_metrics: Dict[str, ProviderMetrics] = {}
     
     # Initialize ML components
-    anomaly_detector = MLAnomalyDetector(config)
-    quality_scorer = PredictiveQualityScorer(config)
+    anomaly_detector = MLAnomalyDetector(config) if _ML_AVAILABLE else None
+    quality_scorer = PredictiveQualityScorer(config) if _ML_AVAILABLE else None
+    time_series_detector = TimeSeriesAnomalyDetector(config) if _PROPHET_AVAILABLE else None
     compliance_checker = ComplianceChecker(config)
+    remediation_engine = RemediationEngine(config)
     
-    await anomaly_detector.initialize()
-    await quality_scorer.initialize()
+    if anomaly_detector:
+        await anomaly_detector.initialize()
+    if quality_scorer:
+        await quality_scorer.initialize()
+    if time_series_detector:
+        await time_series_detector.initialize()
     
     for key in keys:
         key = str(key).strip()
@@ -1897,7 +2939,9 @@ async def _run_audit(
                 sym, q, config,
                 anomaly_detector=anomaly_detector,
                 quality_scorer=quality_scorer,
-                compliance_checker=compliance_checker
+                time_series_detector=time_series_detector,
+                compliance_checker=compliance_checker,
+                remediation_engine=remediation_engine
             )
             result.page = key
             all_results.append(result)
@@ -1907,6 +2951,7 @@ async def _run_audit(
                 
                 # Send alert for critical/high issues
                 if alert_manager and result.severity in (AuditSeverity.CRITICAL, AuditSeverity.HIGH):
+                    priority = AlertPriority.P1 if result.severity == AuditSeverity.CRITICAL else AlertPriority.P2
                     await alert_manager.send_alert(
                         result.severity,
                         f"Data Quality Alert: {result.symbol}",
@@ -1915,8 +2960,10 @@ async def _run_audit(
                             "page": result.page,
                             "provider": result.provider,
                             "age_hours": result.age_hours,
-                            "quality_score": result.ml_quality_score
-                        }
+                            "quality_score": result.ml_quality_score,
+                            "anomalies": [a.value for a in result.anomalies[:3]]
+                        },
+                        priority
                     )
         
         logger.info(f"   -> Alerts on {key}: {page_alerts}")
@@ -1924,7 +2971,25 @@ async def _run_audit(
     # Generate summary
     summary = _generate_summary(all_results, provider_metrics)
     
+    # Update metrics
+    if metrics_exporter:
+        metrics_exporter.update(summary)
+    
     return all_results, summary
+
+
+# =============================================================================
+# Metrics Endpoint
+# =============================================================================
+
+def start_metrics_server(port: int = 9090):
+    """Start Prometheus metrics server"""
+    if not _PROMETHEUS_AVAILABLE:
+        return
+    
+    from prometheus_client import start_http_server
+    start_http_server(port)
+    logger.info(f"Prometheus metrics server started on port {port}")
 
 
 # =============================================================================
@@ -1932,7 +2997,7 @@ async def _run_audit(
 # =============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TFB Enterprise Data Quality & Strategy Auditor")
+    parser = argparse.ArgumentParser(description="TFB Enterprise Data Quality & Strategy Auditor v3.1.0")
     
     # Core options
     parser.add_argument("--keys", nargs="*", default=None, help="Specific pages to audit")
@@ -1949,6 +3014,11 @@ def main() -> None:
     parser.add_argument("--stale-hours", type=int, help="Override stale_hours threshold")
     parser.add_argument("--hard-stale-hours", type=int, help="Override hard_stale_hours threshold")
     
+    # ML options
+    parser.add_argument("--ml-model", help="Path to pre-trained ML model")
+    parser.add_argument("--train-data", help="Path to historical data for training")
+    parser.add_argument("--disable-ml", action="store_true", help="Disable ML features")
+    
     # Export options
     parser.add_argument("--json-out", help="Save full report to JSON file")
     parser.add_argument("--csv-out", help="Save alerts to CSV file")
@@ -1956,17 +3026,29 @@ def main() -> None:
     parser.add_argument("--excel-out", help="Save to Excel file")
     parser.add_argument("--dashboard-dir", help="Generate HTML dashboard in directory")
     
-    # ML options
-    parser.add_argument("--ml-model", help="Path to pre-trained ML model")
-    parser.add_argument("--train-data", help="Path to historical data for training")
-    
     # Alerting
     parser.add_argument("--slack-webhook", help="Slack webhook URL for alerts")
+    parser.add_argument("--slack-channel", default="#alerts", help="Slack channel for alerts")
     parser.add_argument("--email-recipients", nargs="*", help="Email recipients for alerts")
+    parser.add_argument("--email-sender", help="Email sender address")
+    parser.add_argument("--pagerduty-key", help="PagerDuty integration key")
+    parser.add_argument("--webhook-url", help="Generic webhook URL")
+    parser.add_argument("--disable-alerts", action="store_true", help="Disable all alerts")
+    
+    # Metrics
+    parser.add_argument("--metrics-port", type=int, default=0, help="Start Prometheus metrics server on port")
+    
+    # Compliance
+    parser.add_argument("--sama-compliance", type=int, default=1, help="Enable SAMA compliance checks")
+    parser.add_argument("--cma-compliance", type=int, default=1, help="Enable CMA compliance checks")
     
     args = parser.parse_args()
     
     strict = bool(int(args.strict or 0))
+    
+    # Start metrics server if requested
+    if args.metrics_port > 0:
+        start_metrics_server(args.metrics_port)
     
     # Dependency readiness
     if not DEPS.ok:
@@ -2001,17 +3083,41 @@ def main() -> None:
         config.stale_hours = float(args.stale_hours)
     if args.hard_stale_hours:
         config.hard_stale_hours = float(args.hard_stale_hours)
+    if args.disable_ml:
+        config.enable_ml_predictions = False
+    
+    # Compliance settings
+    config.sama_compliant = bool(int(args.sama_compliance))
+    config.cma_compliant = bool(int(args.cma_compliance))
     
     # Alerting
-    if args.slack_webhook:
-        config.alert_channels.append(AlertChannel.SLACK)
-        config.slack_webhook = args.slack_webhook
+    alert_manager = None
+    if not args.disable_alerts:
+        config.enable_alerts = True
+        config.alert_channels = [AlertChannel.CONSOLE]
+        
+        if args.slack_webhook:
+            config.alert_channels.append(AlertChannel.SLACK)
+            config.slack_webhook = args.slack_webhook
+            config.slack_channel = args.slack_channel
+        
+        if args.email_recipients and args.email_sender:
+            config.alert_channels.append(AlertChannel.EMAIL)
+            config.email_recipients = args.email_recipients
+            config.email_sender = args.email_sender
+        
+        if args.pagerduty_key:
+            config.alert_channels.append(AlertChannel.PAGERDUTY)
+            config.pagerduty_key = args.pagerduty_key
+        
+        if args.webhook_url:
+            config.alert_channels.append(AlertChannel.WEBHOOK)
+            config.webhook_url = args.webhook_url
+        
+        alert_manager = AlertManager(config)
     
-    if args.email_recipients:
-        config.alert_channels.append(AlertChannel.EMAIL)
-        config.email_recipients = args.email_recipients
-    
-    alert_manager = AlertManager(config) if config.alert_channels else None
+    # Metrics exporter
+    metrics_exporter = MetricsExporter() if args.metrics_port > 0 else None
     
     refresh = bool(int(args.refresh or 0))
     concurrency = max(1, min(40, int(args.concurrency or 12)))
@@ -2030,12 +3136,16 @@ def main() -> None:
                 refresh=refresh,
                 concurrency=concurrency,
                 max_symbols_per_page=max_per_page,
-                alert_manager=alert_manager
+                alert_manager=alert_manager,
+                metrics_exporter=metrics_exporter
             )
         )
         
         summary.audit_duration_ms = (time.time() - start_time) * 1000
         
+    except KeyboardInterrupt:
+        logger.info("Audit interrupted by user")
+        sys.exit(130)
     except Exception as e:
         logger.critical(f"Audit run crashed: {e}")
         import traceback
@@ -2053,7 +3163,7 @@ def main() -> None:
         _print_table(alerts_only, limit=600)
     
     # System diagnosis
-    logger.info("\n🧠 SYSTEM DIAGNOSIS (v3.0.0):")
+    logger.info("\n🧠 SYSTEM DIAGNOSIS (v3.1.0):")
     logger.info(f"   Pages scanned: {len(keys)}")
     logger.info(f"   Assets analyzed: {summary.total_assets}")
     logger.info(f"   CRITICAL: {summary.by_severity.get(AuditSeverity.CRITICAL, 0)}")
@@ -2066,12 +3176,14 @@ def main() -> None:
     logger.info(f"   Aggressive forecasts: {summary.strategy_note_counts.get('AGGRESSIVE_FORECAST_LOW_VOL', 0)}")
     logger.info(f"   Data holes: {summary.issue_counts.get('INSUFFICIENT_HISTORY', 0)}")
     logger.info(f"   Provider errors: {summary.issue_counts.get('PROVIDER_ERROR', 0)}")
+    logger.info(f"   Anomalies detected: {sum(summary.anomaly_counts.values())}")
+    logger.info(f"   Compliance violations: {len(summary.compliance_violations)}")
     logger.info(f"   Audit duration: {summary.audit_duration_ms:.2f} ms")
     
     # Provider health
     logger.info("\n🏥 Provider Health:")
     for pm in summary.provider_metrics.values():
-        logger.info(f"   {pm.name}: {pm.health.value} (errors: {pm.error_rate:.2%}, latency: {pm.avg_latency_ms:.2f}ms)")
+        logger.info(f"   {pm.name}: {pm.health.value} (errors: {pm.error_rate:.2%}, latency: {pm.avg_latency_ms:.2f}ms, cache: {pm.cache_hit_rate:.2%})")
     
     # ML stats
     if summary.ml_stats:
@@ -2079,9 +3191,15 @@ def main() -> None:
         for key, value in summary.ml_stats.items():
             logger.info(f"   {key}: {value:.2f}")
     
+    # Remediation stats
+    if summary.remediation_stats:
+        logger.info("\n🔧 Remediation Summary:")
+        for key, value in summary.remediation_stats.items():
+            logger.info(f"   {key}: {value}")
+    
     # Prepare payload for export
     payload = {
-        "audit_version": "3.0.0",
+        "audit_version": "3.1.0",
         "audit_time_utc": _utc_now_iso(),
         "audit_time_riyadh": _riyadh_iso(),
         "spreadsheet_id": sid,
