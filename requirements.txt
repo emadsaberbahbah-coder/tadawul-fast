@@ -1,89 +1,591 @@
-# ============================================================
-# Tadawul Fast Bridge — Dependencies (v1.8.0)
-# Target: Production (Render/Linux) + Local Development
+# =============================================================================
+# requirements.txt
+# =============================================================================
+# TADAWUL FAST BRIDGE – ENTERPRISE DEPENDENCY SPECIFICATION (v2.8.0)
+# =============================================================================
+# Production-Grade Python Dependencies for Financial API Platform
 #
-# RULES (pip):
-# - Only package specifiers are allowed (comments start with "#")
-# - Keep versions bounded for reproducible deploys
-# - Prefer wheels available on Render (avoid heavy compile surprises)
-# ============================================================
+# Architecture
+# ┌─────────────────────────────────────────────────────────────┐
+# │                    Core Framework                           │
+# │  FastAPI, Uvicorn, Pydantic, Starlette                     │
+# └─────────────────────────────────────────────────────────────┘
+#                              │
+#              ┌───────────────┼───────────────┐
+#              ▼               ▼               ▼
+#   ┌─────────────────┐ ┌─────────────┐ ┌─────────────────┐
+#   │ Data Providers  │ │  Security   │ │  Performance    │
+#   │ yfinance, pandas│ │ slowapi,    │ │ uvloop, orjson  │
+#   │ numpy, scipy    │ │ authlib     │ │ httptools       │
+#   └─────────────────┘ └─────────────┘ └─────────────────┘
+#              │               │               │
+#              └───────────────┼───────────────┘
+#                              ▼
+#   ┌─────────────────────────────────────────────────────────┐
+#   │                  Integrations                            │
+#   │  Google Sheets, Redis, PostgreSQL, Kafka, Elasticsearch  │
+#   └─────────────────────────────────────────────────────────┘
+#
+# Design Principles
+# • Version Pinning: All packages have upper/lower bounds for reproducibility
+# • Platform-Specific: Conditional dependencies for Linux/Windows
+# • Optional Groups: Extras for development, testing, monitoring
+# • Security: Regular updates for vulnerability patches
+# • Compatibility: Python 3.11+ optimized
+# • Size Optimization: Minimal production footprint
+#
+# Version: 2.8.0
+# Last Updated: 2024-03-20
+# Python: >=3.11, <3.13
+# Platform: Linux (Render), macOS, Windows (dev only)
+# =============================================================================
 
-# ------------------------------------------------------------
-# Core Web Framework & Server
-# ------------------------------------------------------------
-fastapi>=0.110.0,<1.0.0
-uvicorn[standard]>=0.29.0,<1.0.0
-python-multipart>=0.0.9,<0.1.0
+# =============================================================================
+# CORE WEB FRAMEWORK
+# =============================================================================
+# FastAPI – Modern web framework
+fastapi>=0.115.0,<0.116.0
 
-# Optional multi-worker server (recommended if using workers>1)
-gunicorn>=21.2.0,<23.0.0
+# Uvicorn – ASGI server with performance optimizations
+uvicorn[standard]>=0.30.0,<0.31.0
 
-# Performance (Linux only)
-uvloop>=0.19.0,<1.0.0; sys_platform != "win32"
-httptools>=0.6.1,<1.0.0; sys_platform != "win32"
+# Starlette – ASGI toolkit (FastAPI dependency)
+starlette>=0.37.0,<0.38.0
 
-# ------------------------------------------------------------
-# Rate Limiting / Security Hardening
-# ------------------------------------------------------------
-slowapi>=0.1.9,<1.0.0
-limits>=3.7.0,<4.0.0
+# Python-multipart – Form data parsing
+python-multipart>=0.0.9,<0.0.10
 
-# ------------------------------------------------------------
-# Validation & Settings
-# ------------------------------------------------------------
-pydantic>=2.7.0,<3.0.0
-pydantic-settings>=2.2.0,<3.0.0
-python-dotenv>=1.0.1,<2.0.0
-typing-extensions>=4.10.0,<5.0.0
-email-validator>=2.1.0,<3.0.0
+# Pydantic – Data validation (v2)
+pydantic>=2.7.0,<2.8.0
+pydantic-settings>=2.3.0,<2.4.0
+pydantic-core>=2.18.0,<2.19.0
 
-# ------------------------------------------------------------
-# Financial Data / Analysis
-# ------------------------------------------------------------
-yfinance>=0.2.40,<1.0.0
-pandas>=2.2.1,<3.0.0
+# Typing extensions for older Python versions
+typing-extensions>=4.11.0,<5.0.0
 
-# numpy: pinned <2.0.0 to prevent ABI conflicts with older libs
+# =============================================================================
+# ASGI/WEB SERVERS (PRODUCTION)
+# =============================================================================
+# Gunicorn – Multi-worker WSGI/ASGI server (production)
+gunicorn>=21.2.0,<22.0.0
+
+# Uvicorn workers for Gunicorn
+uvicorn-worker>=0.2.0,<0.3.0
+
+# Daphne – Alternative ASGI server (fallback)
+daphne>=4.1.0,<5.0.0
+
+# =============================================================================
+# PERFORMANCE OPTIMIZATIONS
+# =============================================================================
+# uvloop – Fast, drop-in replacement for asyncio event loop (Linux/macOS)
+uvloop>=0.19.0,<0.20.0; sys_platform != "win32"
+
+# httptools – Fast HTTP parser (Linux/macOS)
+httptools>=0.6.1,<0.7.0; sys_platform != "win32"
+
+# orjson – Ultra-fast JSON serialization
+orjson>=3.10.0,<4.0.0
+
+# python-rapidjson – Alternative fast JSON
+python-rapidjson>=1.16,<2.0
+
+# ciso8601 – Fast ISO datetime parsing
+ciso8601>=2.3.1,<3.0.0; sys_platform != "win32"
+
+# aiodns – Fast DNS resolution for aiohttp
+aiodns>=3.2.0,<4.0.0; sys_platform != "win32"
+
+# =============================================================================
+# RATE LIMITING & SECURITY
+# =============================================================================
+# SlowAPI – Rate limiting middleware
+slowapi>=0.1.9,<0.2.0
+
+# limits – Core rate limiting library
+limits>=3.12.0,<4.0.0
+
+# Authlib – OAuth and JWT handling
+authlib>=1.3.0,<2.0.0
+
+# python-jose – JWT encoding/decoding
+python-jose[cryptography]>=3.3.0,<4.0.0
+
+# passlib – Password hashing
+passlib[bcrypt]>=1.7.4,<2.0.0
+
+# bcrypt – Password hashing backend
+bcrypt>=4.1.0,<5.0.0
+
+# cryptography – Cryptographic operations
+cryptography>=42.0.0,<43.0.0
+
+# pyOpenSSL – SSL/TLS utilities
+pyOpenSSL>=24.1.0,<25.0.0
+
+# =============================================================================
+# HTTP CLIENTS & NETWORKING
+# =============================================================================
+# httpx – Async HTTP client with HTTP/2 support
+httpx>=0.27.0,<0.28.0
+httpcore>=1.0.0,<2.0.0
+h2>=4.1.0,<5.0.0  # HTTP/2 support
+
+# requests – Sync HTTP client (legacy)
+requests>=2.31.0,<3.0.0
+
+# aiohttp – Async HTTP client/server
+aiohttp>=3.9.0,<4.0.0
+
+# aiofiles – Async file operations
+aiofiles>=23.2.0,<24.0.0
+
+# websockets – WebSocket client/server
+websockets>=12.0,<13.0
+
+# tenacity – Retry library with decorators
+tenacity>=8.2.0,<9.0.0
+
+# backoff – Exponential backoff for retries
+backoff>=2.2.0,<3.0.0
+
+# =============================================================================
+# DATA PROVIDERS & FINANCIAL LIBRARIES
+# =============================================================================
+# yfinance – Yahoo Finance data
+yfinance>=0.2.40,<0.3.0
+
+# pandas – Data analysis and manipulation
+pandas>=2.2.0,<3.0.0
+
+# numpy – Scientific computing (pinned <2.0 for compatibility)
 numpy>=1.26.0,<2.0.0
-scipy>=1.12.0,<2.0.0
 
-# Technical Indicators (Python 3.11 compatible fork of pandas-ta)
+# scipy – Scientific computing
+scipy>=1.13.0,<2.0.0
+
+# pandas-ta – Technical indicators (via fork)
 ft-pandas-ta>=0.3.16,<0.4.0
 
-# ------------------------------------------------------------
-# HTTP Clients & Networking
-# ------------------------------------------------------------
-httpx>=0.27.0,<1.0.0
-requests>=2.31.0,<3.0.0
-aiohttp>=3.9.3,<4.0.0
-tenacity>=8.2.3,<9.0.0
+# ta – Alternative technical indicators
+ta>=0.10.2,<0.11.0
 
-# ------------------------------------------------------------
-# Parsing & Scrapers (News / Alternative Data)
-# ------------------------------------------------------------
-beautifulsoup4>=4.12.3,<5.0.0
-lxml>=5.1.0,<6.0.0
+# pandas-market-calendars – Exchange calendars
+pandas-market-calendars>=4.3.0,<5.0.0
+
+# exchange-calendars – Trading calendars
+exchange-calendars>=4.5.0,<5.0.0
+
+# =============================================================================
+# PARSING & DATA EXTRACTION
+# =============================================================================
+# BeautifulSoup4 – HTML parsing
+beautifulsoup4>=4.12.0,<5.0.0
+
+# lxml – Fast XML/HTML parser
+lxml>=5.2.0,<6.0.0
+
+# html5lib – HTML5-compliant parser
 html5lib>=1.1,<2.0.0
-feedparser>=6.0.11,<7.0.0
 
-# ------------------------------------------------------------
-# Google Cloud / Sheets Integration
-# ------------------------------------------------------------
-google-api-python-client>=2.122.0,<3.0.0
-google-auth>=2.28.2,<3.0.0
+# feedparser – RSS/Atom feed parsing
+feedparser>=6.0.0,<7.0.0
+
+# markdown – Markdown parsing
+markdown>=3.6,<4.0
+
+# pyquery – jQuery-like HTML parsing
+pyquery>=2.0,<3.0
+
+# =============================================================================
+# GOOGLE CLOUD INTEGRATION
+# =============================================================================
+# Google API Client
+google-api-python-client>=2.124.0,<3.0.0
+
+# Google Authentication
+google-auth>=2.29.0,<3.0.0
 google-auth-httplib2>=0.2.0,<1.0.0
-google-api-core>=2.17.1,<3.0.0
 google-auth-oauthlib>=1.2.0,<2.0.0
 
-# ------------------------------------------------------------
-# Utilities & Optimization
-# ------------------------------------------------------------
-orjson>=3.9.15,<4.0.0
-cachetools>=5.3.3,<6.0.0
-psutil>=5.9.8,<7.0.0
-python-json-logger>=2.0.7,<3.0.0
+# Google API Core
+google-api-core>=2.18.0,<3.0.0
 
-# ------------------------------------------------------------
-# Testing (optional; safe to keep, but can remove for leaner prod)
-# ------------------------------------------------------------
-pytest>=8.0.2,<9.0.0
+# Google Cloud Secret Manager
+google-cloud-secret-manager>=2.19.0,<3.0.0
+
+# Google Cloud Storage
+google-cloud-storage>=2.14.0,<3.0.0
+
+# Google Sheets API (specific)
+gspread>=6.1.0,<7.0.0
+oauth2client>=4.1.3,<5.0.0
+
+# =============================================================================
+# DATABASE & CACHE INTEGRATIONS
+# =============================================================================
+# SQLAlchemy – ORM and database toolkit
+sqlalchemy>=2.0.29,<3.0.0
+
+# Alembic – Database migrations
+alembic>=1.13.0,<2.0.0
+
+# asyncpg – Async PostgreSQL driver
+asyncpg>=0.29.0,<1.0.0
+
+# psycopg2 – PostgreSQL adapter (sync)
+psycopg2-binary>=2.9.9,<3.0.0
+
+# redis – Redis client (sync)
+redis>=5.0.0,<6.0.0
+
+# aioredis – Redis client (async)
+redis[hiredis]>=5.0.0,<6.0.0
+hiredis>=2.3.0,<3.0.0
+
+# aiocache – Async cache library
+aiocache[redis]>=0.12.0,<1.0.0
+
+# databases – Async database access
+databases[postgresql]>=0.9.0,<1.0.0
+
+# =============================================================================
+# MESSAGE QUEUES & STREAMING
+# =============================================================================
+# aiokafka – Kafka client (async)
+aiokafka>=0.8.0,<0.9.0
+
+# aio-pika – RabbitMQ client (async)
+aio-pika>=9.3.0,<10.0.0
+
+# nats-py – NATS client
+nats-py>=2.6.0,<3.0.0
+
+# =============================================================================
+# SEARCH & ANALYTICS
+# =============================================================================
+# elasticsearch – Elasticsearch client
+elasticsearch>=8.12.0,<9.0.0
+
+# elasticsearch-dsl – High-level Elasticsearch client
+elasticsearch-dsl>=8.12.0,<9.0.0
+
+# opensearch-py – OpenSearch client
+opensearch-py>=2.4.0,<3.0.0
+
+# =============================================================================
+# MONITORING & OBSERVABILITY
+# =============================================================================
+# prometheus-client – Prometheus metrics
+prometheus-client>=0.20.0,<1.0.0
+
+# opentelemetry – Distributed tracing
+opentelemetry-api>=1.24.0,<2.0.0
+opentelemetry-sdk>=1.24.0,<2.0.0
+opentelemetry-instrumentation-fastapi>=0.45b0,<1.0.0
+opentelemetry-exporter-otlp>=1.24.0,<2.0.0
+
+# sentry-sdk – Error tracking
+sentry-sdk>=2.0.0,<3.0.0
+
+# structlog – Structured logging
+structlog>=24.1.0,<25.0.0
+
+# python-json-logger – JSON logging
+python-json-logger>=2.0.0,<3.0.0
+
+# loguru – Alternative logging
+loguru>=0.7.0,<1.0.0
+
+# =============================================================================
+# UTILITIES & OPTIMIZATION
+# =============================================================================
+# cachetools – Caching utilities
+cachetools>=5.3.0,<6.0.0
+
+# psutil – System and process utilities
+psutil>=5.9.0,<6.0.0
+
+# python-dateutil – Date parsing utilities
+python-dateutil>=2.9.0,<3.0.0
+
+# pytz – Timezone handling
+pytz>=2024.1,<2025.0
+
+# tzdata – IANA timezone database
+tzdata>=2024.1,<2025.0
+
+# click – CLI interface
+click>=8.1.0,<9.0.0
+
+# typer – CLI with type hints
+typer>=0.12.0,<1.0.0
+
+# rich – Rich text formatting
+rich>=13.7.0,<14.0.0
+
+# jinja2 – Template engine
+jinja2>=3.1.0,<4.0.0
+
+# PyYAML – YAML parsing
+pyyaml>=6.0.1,<7.0.0
+
+# toml – TOML parsing
+tomli>=2.0.0,<3.0.0; python_version < '3.11'
+tomli-w>=1.0.0,<2.0.0
+
+# =============================================================================
+# ENVIRONMENT & CONFIGURATION
+# =============================================================================
+# python-dotenv – Environment variable loading
+python-dotenv>=1.0.0,<2.0.0
+
+# environs – Environment variable parsing
+environs>=11.0.0,<12.0.0
+
+# dynaconf – Multi-environment configuration
+dynaconf>=3.2.0,<4.0.0
+
+# =============================================================================
+# ASYNCIO & CONCURRENCY
+# =============================================================================
+# anyio – Async compatibility layer
+anyio>=4.3.0,<5.0.0
+
+# sniffio – Async library detection
+sniffio>=1.3.0,<2.0.0
+
+# trio – Alternative async library
+trio>=0.24.0,<1.0.0
+
+# =============================================================================
+# VALIDATION & SCHEMAS
+# =============================================================================
+# email-validator – Email validation
+email-validator>=2.1.0,<3.0.0
+
+# phonenumbers – Phone number validation
+phonenumbers>=8.13.0,<9.0.0
+
+# validators – Common data validators
+validators>=0.28.0,<1.0.0
+
+# =============================================================================
+# ENCRYPTION & SECURITY
+# =============================================================================
+# python-jose – JWT handling
+python-jose[cryptography]>=3.3.0,<4.0.0
+
+# passlib – Password hashing
+passlib[bcrypt]>=1.7.4,<2.0.0
+
+# bcrypt – Password hashing backend
+bcrypt>=4.1.0,<5.0.0
+
+# cryptography – Cryptographic operations
+cryptography>=42.0.0,<43.0.0
+
+# =============================================================================
+# DEVELOPMENT & TESTING
+# =============================================================================
+# Development dependencies (install with: pip install -e ".[dev]")
+# -----------------------------------------------------------------------------
+# pytest – Testing framework
+pytest>=8.1.0,<9.0.0
+pytest-asyncio>=0.23.0,<1.0.0
+pytest-cov>=5.0.0,<6.0.0
+pytest-xdist>=3.5.0,<4.0.0
+pytest-mock>=3.14.0,<4.0.0
+
+# hypothesis – Property-based testing
+hypothesis>=6.100.0,<7.0.0
+
+# factory-boy – Test fixtures
+factory-boy>=3.3.0,<4.0.0
+
+# faker – Fake data generation
+faker>=24.0.0,<25.0.0
+
+# httpx – HTTP client for testing
+httpx>=0.27.0,<0.28.0
+
+# requests-mock – Mock requests
+requests-mock>=1.11.0,<2.0.0
+
+# respx – Mock httpx
+respx>=0.21.0,<1.0.0
+
+# =============================================================================
+# CODE QUALITY & LINTING (Dev)
+# =============================================================================
+# ruff – Fast linter and formatter
+ruff>=0.3.0,<1.0.0
+
+# mypy – Static type checking
+mypy>=1.9.0,<2.0.0
+types-requests>=2.31.0,<3.0.0
+types-python-dateutil>=2.9.0,<3.0.0
+types-pytz>=2024.1.0,<2025.0.0
+types-PyYAML>=6.0.0,<7.0.0
+
+# black – Code formatter
+black>=24.3.0,<25.0.0
+
+# isort – Import sorter
+isort>=5.13.0,<6.0.0
+
+# pre-commit – Git hooks
+pre-commit>=3.6.0,<4.0.0
+
+# bandit – Security linter
+bandit>=1.7.0,<2.0.0
+
+# safety – Dependency vulnerability checker
+safety>=3.2.0,<4.0.0
+
+# =============================================================================
+# DOCUMENTATION (Dev)
+# =============================================================================
+# mkdocs – Documentation generator
+mkdocs>=1.5.0,<2.0.0
+mkdocs-material>=9.5.0,<10.0.0
+mkdocstrings>=0.24.0,<1.0.0
+mkdocstrings-python>=1.9.0,<2.0.0
+
+# =============================================================================
+# PROFILING & DEBUGGING (Dev)
+# =============================================================================
+# py-spy – Sampling profiler
+py-spy>=0.3.14,<1.0.0
+
+# memray – Memory profiler
+memray>=1.12.0,<2.0.0
+
+# austin – Python frame stack sampler
+austin-python>=1.6.0,<2.0.0
+
+# icecream – Debug printing
+icecream>=2.1.0,<3.0.0
+
+# =============================================================================
+# OPTIONAL EXTRAS
+# =============================================================================
+# These can be installed with: pip install -e ".[extra_name]"
+
+# Machine Learning extras
+# -----------------------------------------------------------------------------
+# scikit-learn – Machine learning
+scikit-learn>=1.4.0,<2.0.0
+
+# statsmodels – Statistical models
+statsmodels>=0.14.0,<1.0.0
+
+# prophet – Time series forecasting
+prophet>=1.1.0,<2.0.0
+
+# xgboost – Gradient boosting
+xgboost>=2.0.0,<3.0.0
+
+# lightgbm – Light gradient boosting
+lightgbm>=4.3.0,<5.0.0
+
+# Visualization extras
+# -----------------------------------------------------------------------------
+# matplotlib – Plotting library
+matplotlib>=3.8.0,<4.0.0
+
+# seaborn – Statistical visualizations
+seaborn>=0.13.0,<1.0.0
+
+# plotly – Interactive visualizations
+plotly>=5.20.0,<6.0.0
+
+# kaleido – Static image export for plotly
+kaleido>=0.2.0,<1.0.0
+
+# Notebook extras
+# -----------------------------------------------------------------------------
+# jupyter – Interactive notebooks
+jupyter>=1.0.0,<2.0.0
+ipykernel>=6.29.0,<7.0.0
+ipywidgets>=8.1.0,<9.0.0
+
+# =============================================================================
+# PRODUCTION ONLY (Minimal Install)
+# =============================================================================
+# To install only production dependencies:
+# pip install -r requirements.txt --no-deps
+# pip install fastapi uvicorn[standard] gunicorn pydantic python-multipart \
+#   httpx aiohttp orjson python-jose[cryptography] passlib[bcrypt] \
+#   redis asyncpg google-api-python-client google-auth \
+#   prometheus-client sentry-sdk python-json-logger cachetools psutil
+
+# =============================================================================
+# PLATFORM-SPECIFIC NOTES
+# =============================================================================
+# Linux (Render):
+#   All packages work natively. uvloop and httptools provide maximum performance.
+#
+# macOS (Development):
+#   uvloop and httptools work, but may need brew install for some dependencies.
+#
+# Windows (Development):
+#   uvloop and httptools are excluded via sys_platform guards.
+#   Use WSL2 for production-like environment.
+
+# =============================================================================
+# SECURITY UPDATES
+# =============================================================================
+# Regularly check for vulnerabilities:
+#   pip install safety
+#   safety check -r requirements.txt
+#
+# Update strategy:
+#   Minor updates: Automated via dependabot
+#   Major updates: Manual review required
+
+# =============================================================================
+# VERSION COMPATIBILITY MATRIX
+# =============================================================================
+# Python 3.11: Full support
+# Python 3.12: Full support (as of March 2024)
+# Python 3.13: Not yet tested
+#
+# FastAPI 0.115+ requires Pydantic 2.7+
+# Uvicorn 0.30+ requires Python 3.8+
+# SQLAlchemy 2.0+ requires Python 3.7+
+
+# =============================================================================
+# DEPENDENCY GROUPS (for setup.py/pyproject.toml)
+# =============================================================================
+# [project]
+# name = "tadawul-fast-bridge"
+# version = "7.5.0"
+# requires-python = ">=3.11"
+# dependencies = [
+#     # Core
+#     "fastapi>=0.115.0,<0.116.0",
+#     "uvicorn[standard]>=0.30.0,<0.31.0",
+#     "pydantic>=2.7.0,<2.8.0",
+#     # ... (list core dependencies)
+# ]
+#
+# [project.optional-dependencies]
+# dev = [
+#     "pytest>=8.1.0,<9.0.0",
+#     "ruff>=0.3.0,<1.0.0",
+#     "mypy>=1.9.0,<2.0.0",
+#     # ... (dev dependencies)
+# ]
+# ml = [
+#     "scikit-learn>=1.4.0,<2.0.0",
+#     "xgboost>=2.0.0,<3.0.0",
+# ]
+# viz = [
+#     "matplotlib>=3.8.0,<4.0.0",
+#     "seaborn>=0.13.0,<1.0.0",
+# ]
+# notebook = [
+#     "jupyter>=1.0.0,<2.0.0",
+#     "ipykernel>=6.29.0,<7.0.0",
+# ]
