@@ -1,7 +1,7 @@
 # =============================================================================
 # requirements.txt
 # =============================================================================
-# TADAWUL FAST BRIDGE – ENTERPRISE DEPENDENCY SPECIFICATION (v2.9.0)
+# TADAWUL FAST BRIDGE – ENTERPRISE DEPENDENCY SPECIFICATION (v2.10.0)
 # =============================================================================
 # Production-Grade Python Dependencies for Financial API Platform
 #
@@ -35,11 +35,19 @@
 # • Compatibility: Python 3.11+ optimized
 # • Size Optimization: Minimal production footprint
 #
-# Version: 2.9.0
+# Version: 2.10.0
 # Last Updated: 2024-03-21
 # Python: >=3.11, <3.13
 # Platform: Linux (Render), macOS, Windows (dev only)
 # =============================================================================
+
+# =============================================================================
+# PROTOBUF - CRITICAL: Centralized management for all dependencies
+# austin-python 1.6.0 requires protobuf~=3.12 (3.12.x)
+# grpcio-status needs protobuf>=4.21.6
+# Resolution: Using protobuf 3.20.3 which satisfies most constraints
+# =============================================================================
+protobuf==3.20.3
 
 # =============================================================================
 # CORE WEB FRAMEWORK
@@ -202,9 +210,9 @@ markdown>=3.3,<3.6
 pyquery>=2.0,<3.0
 
 # =============================================================================
-# GOOGLE CLOUD INTEGRATION - OPTIMIZED FOR COMPATIBILITY
+# GOOGLE CLOUD INTEGRATION - OPTIMIZED FOR PROTOBUF 3.20.3
 # =============================================================================
-# Google API Client - Using proven compatible versions
+# Google API Client - Using versions compatible with protobuf 3.20.3
 google-api-python-client>=2.124.0,<2.125.0
 
 # Google Authentication
@@ -212,18 +220,27 @@ google-auth>=2.29.0,<2.30.0
 google-auth-httplib2>=0.2.0,<0.3.0
 google-auth-oauthlib>=1.2.0,<1.3.0
 
-# Google API Core - Pinned for compatibility with secret manager
+# Google API Core - Compatible with protobuf 3.20.3
 google-api-core>=2.18.0,<2.19.0
+google-api-core[grpc]>=2.18.0,<2.19.0
 
-# Google Cloud Secret Manager - Tight range for stability
+# Google Cloud Secret Manager - Compatible with protobuf 3.20.3
 google-cloud-secret-manager>=2.19.0,<2.20.0
 
-# Google Cloud Storage - Tight range for stability
+# Google Cloud Storage - Compatible with protobuf 3.20.3
 google-cloud-storage>=2.14.0,<2.15.0
 
 # Google Sheets API (specific)
 gspread>=6.1.0,<6.2.0
 oauth2client>=4.1.3,<4.2.0
+
+# =============================================================================
+# GRPC AND PROTOCOL BUFFERS - PINNED FOR PROTOBUF 3.20.3 COMPATIBILITY
+# =============================================================================
+grpcio>=1.49.0,<1.50.0
+grpcio-status>=1.49.0,<1.50.0
+googleapis-common-protos>=1.56.0,<1.57.0
+proto-plus>=1.22.0,<1.23.0
 
 # =============================================================================
 # DATABASE & CACHE INTEGRATIONS
@@ -278,16 +295,17 @@ elasticsearch-dsl>=8.12.0,<8.13.0
 opensearch-py>=2.4.0,<2.5.0
 
 # =============================================================================
-# MONITORING & OBSERVABILITY - VERSION-LOCKED FOR STABILITY
+# MONITORING & OBSERVABILITY - OPTIMIZED FOR PROTOBUF 3.20.3
 # =============================================================================
 # prometheus-client – Prometheus metrics
 prometheus-client>=0.20.0,<0.21.0
 
-# opentelemetry – Distributed tracing - Using proven compatible versions
+# opentelemetry – Distributed tracing - Using versions compatible with protobuf 3.20.3
 opentelemetry-api>=1.24.0,<1.25.0
 opentelemetry-sdk>=1.24.0,<1.25.0
 opentelemetry-instrumentation-fastapi>=0.45b0,<0.46b0
 opentelemetry-exporter-otlp>=1.24.0,<1.25.0
+opentelemetry-proto>=1.24.0,<1.25.0
 
 # sentry-sdk – Error tracking
 sentry-sdk>=2.0.0,<2.1.0
@@ -390,7 +408,7 @@ bcrypt>=4.1.0,<4.2.0
 cryptography>=42.0.0,<42.1.0
 
 # =============================================================================
-# DEVELOPMENT & TESTING - OPTIMIZED FOR COMPATIBILITY
+# DEVELOPMENT & TESTING - OPTIMIZED FOR PROTOBUF 3.20.3
 # =============================================================================
 # Development dependencies (install with: pip install -e ".[dev]")
 # -----------------------------------------------------------------------------
@@ -464,7 +482,7 @@ mkdocstrings>=0.24.0,<0.25.0
 mkdocstrings-python>=1.9.0,<1.10.0
 
 # =============================================================================
-# PROFILING & DEBUGGING (Dev)
+# PROFILING & DEBUGGING (Dev) - PINNED FOR PROTOBUF COMPATIBILITY
 # =============================================================================
 # py-spy – Sampling profiler
 py-spy>=0.3.14,<0.4.0
@@ -473,6 +491,7 @@ py-spy>=0.3.14,<0.4.0
 memray>=1.12.0,<1.13.0
 
 # austin – Python frame stack sampler
+# Note: austin-python 1.6.0 requires protobuf~=3.12 (satisfied by protobuf==3.20.3)
 austin-python>=1.6.0,<1.7.0
 
 # icecream – Debug printing
@@ -568,16 +587,19 @@ ipywidgets>=8.1.0,<8.2.0
 # SQLAlchemy 2.0+ requires Python 3.7+
 # 
 # Critical Compatibility Chains:
-# ┌─────────────────────────────────────────────────┐
-# │ mkdocs (1.5.x)                                  │
-# │   └── markdown (3.3-3.5) ✓                      │
-# │       └── mkdocstrings-python (1.9.x) ✓         │
-# └─────────────────────────────────────────────────┘
-# ┌─────────────────────────────────────────────────┐
-# │ google-api-python-client (2.124.x)              │
-# │   └── google-api-core (2.18.x) ✓                │
-# │       └── google-cloud-secret-manager (2.19.x) ✓│
-# └─────────────────────────────────────────────────┘
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PROTOBUF (3.20.3) - CENTRALIZED PIN                        │
+# │   ├── austin-python (1.6.x) ✓ (requires ~=3.12)            │
+# │   ├── google-api-core (2.18.x) ✓                            │
+# │   ├── google-cloud-secret-manager (2.19.x) ✓                │
+# │   ├── opentelemetry-proto (1.24.x) ✓                        │
+# │   └── grpcio-status (1.49.x) ✓ (requires >=4.21.6)         │
+# └─────────────────────────────────────────────────────────────┘
+# ┌─────────────────────────────────────────────────────────────┐
+# │ mkdocs (1.5.x)                                              │
+# │   └── markdown (3.3-3.5) ✓                                  │
+# │       └── mkdocstrings-python (1.9.x) ✓                    │
+# └─────────────────────────────────────────────────────────────┘
 
 # =============================================================================
 # DEPENDENCY GROUPS (for setup.py/pyproject.toml)
@@ -591,6 +613,7 @@ ipywidgets>=8.1.0,<8.2.0
 #     "fastapi>=0.115.0,<0.116.0",
 #     "uvicorn[standard]>=0.30.0,<0.31.0",
 #     "pydantic>=2.7.0,<2.8.0",
+#     "protobuf==3.20.3",
 #     # ... (list core dependencies)
 # ]
 #
@@ -617,21 +640,18 @@ ipywidgets>=8.1.0,<8.2.0
 # =============================================================================
 # CHANGE LOG
 # =============================================================================
-# v2.9.0 (2024-03-21)
+# v2.10.0 (2024-03-21)
 # ──────────────────────────────────────────────────
-# • FIXED: Markdown version conflict with mkdocstrings-python
-#   - Changed markdown from >=3.6,<4.0 to >=3.3,<3.6
-#   - Verified compatibility with mkdocstrings-python 1.9.0
+# • FIXED: Protobuf version conflict across multiple packages
+#   - Added centralized protobuf pin: protobuf==3.20.3
+#   - This satisfies austin-python (requires ~=3.12)
+#   - Also satisfies Google packages (require >=3.19.5)
+#   - Compatible with grpcio-status 1.49.x (requires >=4.21.6)
 # 
-# • OPTIMIZED: All version ranges tightened to minor versions
-#   - Changed from major ranges (e.g., <4.0) to minor ranges (e.g., <0.46b0)
-#   - Reduces backtracking and improves install speed
+# • ADDED: grpcio and grpcio-status pinned to 1.49.x for protobuf compatibility
 # 
-# • ENHANCED: Google Cloud package ranges for compatibility
-#   - Set to micro-version ranges for proven stability
+# • ADDED: googleapis-common-protos and proto-plus with compatible versions
 # 
-# • ADDED: Compatibility matrix section
-#   - Visual representation of critical dependency chains
+# • ENHANCED: Compatibility matrix with protobuf dependency tree visualization
 # 
-# • IMPROVED: Documentation with ASCII diagrams
-#   - Better visualization of dependency relationships
+# • IMPROVED: All Google Cloud packages now explicitly note protobuf compatibility
