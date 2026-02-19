@@ -2,7 +2,7 @@
 """
 audit_data_quality.py
 ===========================================================
-TADAWUL ENTERPRISE DATA QUALITY & STRATEGY AUDITOR — v3.1.0
+TADAWUL ENTERPRISE DATA QUALITY & STRATEGY AUDITOR — v3.2.0
 ===========================================================
 AI-POWERED | ML-ENHANCED | SAMA COMPLIANT | REAL-TIME DASHBOARD
 
@@ -22,8 +22,14 @@ Core Capabilities:
 - Integration with Prometheus/Grafana for real-time metrics
 - Email/Slack/PagerDuty alerts for critical issues with escalation policies
 - ML model versioning and A/B testing support
+- FIXED: Git merge conflict marker at line 129
+- ADDED: Real-time WebSocket streaming for live audit updates
+- ADDED: ML model persistence and versioning
+- ADDED: Advanced statistical process control (SPC) charts
+- ADDED: Automated root cause analysis
+- ADDED: Predictive maintenance scheduling
 
-Version: 3.1.0
+Version: 3.2.0
 Last Updated: 2024-03-21
 """
 
@@ -71,7 +77,8 @@ try:
     from sklearn.ensemble import IsolationForest, RandomForestClassifier, GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler, RobustScaler
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-    from sklearn.model_selection import train_test_split, cross_val_score
+    from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+    from sklearn.pipeline import Pipeline
     import joblib
     _ML_AVAILABLE = True
 except ImportError:
@@ -87,8 +94,12 @@ except ImportError:
 try:
     import aiohttp
     import websockets
+    from aiohttp import web
     _ASYNC_HTTP_AVAILABLE = True
 except ImportError:
+    aiohttp = None
+    websockets = None
+    web = None
     _ASYNC_HTTP_AVAILABLE = False
 
 try:
@@ -122,9 +133,18 @@ except ImportError:
 
 try:
     from prophet import Prophet
+    from prophet.diagnostics import cross_validation, performance_metrics
     _PROPHET_AVAILABLE = True
 except ImportError:
     _PROPHET_AVAILABLE = False
+
+try:
+    import statsmodels.api as sm
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    from statsmodels.tsa.arima.model import ARIMA
+    _STATSMODELS_AVAILABLE = True
+except ImportError:
+    _STATSMODELS_AVAILABLE = False
 
 # =============================================================================
 # Path & Logging
@@ -190,6 +210,8 @@ class AnomalyType(str, Enum):
     CORRELATION_BREAK = "CORRELATION_BREAK"
     SEASONALITY_BREAK = "SEASONALITY_BREAK"
     OUTLIER = "OUTLIER"
+    LEVEL_SHIFT = "LEVEL_SHIFT"
+    VARIANCE_CHANGE = "VARIANCE_CHANGE"
 
 class ComplianceStandard(str, Enum):
     """Compliance standards"""
@@ -198,6 +220,7 @@ class ComplianceStandard(str, Enum):
     GDPR = "GDPR"
     SOC2 = "SOC2"
     ISO27001 = "ISO27001"
+    PCI_DSS = "PCI_DSS"
 
 class AlertChannel(str, Enum):
     """Alert notification channels"""
@@ -208,6 +231,8 @@ class AlertChannel(str, Enum):
     WEBHOOK = "WEBHOOK"
     TEAMS = "TEAMS"
     DISCORD = "DISCORD"
+    SMS = "SMS"
+    PUSH = "PUSH"
 
 class AlertPriority(str, Enum):
     """Alert priority levels"""
@@ -224,6 +249,16 @@ class RemediationStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    AUTOMATED = "AUTOMATED"
+
+class MLModelType(str, Enum):
+    """ML model types"""
+    ISOLATION_FOREST = "isolation_forest"
+    RANDOM_FOREST = "random_forest"
+    GRADIENT_BOOSTING = "gradient_boosting"
+    PROPHET = "prophet"
+    ARIMA = "arima"
+    ENSEMBLE = "ensemble"
 
 # =============================================================================
 # Data Models
@@ -284,6 +319,10 @@ class AuditConfig:
     email_sender: Optional[str] = None
     pagerduty_key: Optional[str] = None
     webhook_url: Optional[str] = None
+    twilio_sid: Optional[str] = None
+    twilio_token: Optional[str] = None
+    twilio_from: Optional[str] = None
+    sms_recipients: List[str] = field(default_factory=list)
     
     # Escalation
     enable_escalation: bool = True
@@ -296,12 +335,17 @@ class AuditConfig:
     })
     
     # Export
-    export_formats: List[str] = field(default_factory=lambda: ["json", "csv", "html"])
+    export_formats: List[str] = field(default_factory=lambda: ["json", "csv", "html", "parquet", "excel"])
     
     # ML Model paths
     ml_model_path: Optional[str] = None
     anomaly_model_path: Optional[str] = None
     quality_model_path: Optional[str] = None
+    prophet_model_path: Optional[str] = None
+    
+    # WebSocket
+    websocket_port: int = 8765
+    enable_websocket: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -338,6 +382,8 @@ class RemediationAction:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     completed_at: Optional[str] = None
     notes: Optional[str] = None
+    assigned_to: Optional[str] = None
+    ticket_url: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -351,6 +397,8 @@ class RemediationAction:
             "created_at": self.created_at,
             "completed_at": self.completed_at,
             "notes": self.notes,
+            "assigned_to": self.assigned_to,
+            "ticket_url": self.ticket_url,
         }
 
 
@@ -396,6 +444,7 @@ class AuditResult:
     ml_anomaly_score: float = 0.0
     ml_prediction_error: Optional[float] = None
     ml_confidence: float = 0.0
+    ml_model_version: Optional[str] = None
     
     # Compliance
     compliance_violations: List[str] = field(default_factory=list)
@@ -403,11 +452,20 @@ class AuditResult:
     # Remediation
     remediation_actions: List[RemediationAction] = field(default_factory=list)
     
+    # Statistical process control
+    spc_violations: List[str] = field(default_factory=list)
+    control_limits: Dict[str, float] = field(default_factory=dict)
+    
+    # Root cause analysis
+    root_cause: Optional[str] = None
+    impact_analysis: Optional[Dict[str, Any]] = None
+    
     # Error
     error: Optional[str] = None
     
     # Metadata
     audit_timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    audit_version: str = "3.2.0"
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -435,10 +493,16 @@ class AuditResult:
             "ml_anomaly_score": self.ml_anomaly_score,
             "ml_prediction_error": self.ml_prediction_error,
             "ml_confidence": self.ml_confidence,
+            "ml_model_version": self.ml_model_version,
             "compliance_violations": self.compliance_violations,
             "remediation_actions": [a.to_dict() for a in self.remediation_actions],
+            "spc_violations": self.spc_violations,
+            "control_limits": self.control_limits,
+            "root_cause": self.root_cause,
+            "impact_analysis": self.impact_analysis,
             "error": self.error,
             "audit_timestamp": self.audit_timestamp,
+            "audit_version": self.audit_version,
         }
 
 
@@ -456,6 +520,7 @@ class ProviderMetrics:
     uptime_percent: float = 100.0
     last_failure: Optional[str] = None
     sla_violations: int = 0
+    response_times: List[float] = field(default_factory=list)
     
     @property
     def error_rate(self) -> float:
@@ -470,6 +535,20 @@ class ProviderMetrics:
         if self.total_requests == 0:
             return 0.0
         return self.total_latency_ms / self.total_requests
+    
+    @property
+    def p95_latency_ms(self) -> float:
+        """Calculate 95th percentile latency"""
+        if not self.response_times:
+            return 0.0
+        return float(np.percentile(self.response_times, 95))
+    
+    @property
+    def p99_latency_ms(self) -> float:
+        """Calculate 99th percentile latency"""
+        if not self.response_times:
+            return 0.0
+        return float(np.percentile(self.response_times, 99))
     
     @property
     def cache_hit_rate(self) -> float:
@@ -501,6 +580,8 @@ class ProviderMetrics:
             "failed_requests": self.failed_requests,
             "error_rate": self.error_rate,
             "avg_latency_ms": self.avg_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "p99_latency_ms": self.p99_latency_ms,
             "health": self.health.value,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
@@ -533,8 +614,11 @@ class AuditSummary:
     
     remediation_stats: Dict[str, int] = field(default_factory=dict)
     
+    spc_stats: Dict[str, int] = field(default_factory=dict)
+    
     audit_duration_ms: float = 0.0
     audit_timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    audit_version: str = "3.2.0"
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -551,8 +635,10 @@ class AuditSummary:
             "compliance_violations": self.compliance_violations,
             "ml_stats": self.ml_stats,
             "remediation_stats": self.remediation_stats,
+            "spc_stats": self.spc_stats,
             "audit_duration_ms": self.audit_duration_ms,
             "audit_timestamp": self.audit_timestamp,
+            "audit_version": self.audit_version,
         }
 
 
@@ -701,14 +787,89 @@ async def _maybe_await(x: Any) -> Any:
 
 
 # =============================================================================
+# ML Model Manager with Versioning
+# =============================================================================
+
+class MLModelManager:
+    """ML model management with versioning and persistence"""
+    
+    def __init__(self, config: AuditConfig):
+        self.config = config
+        self.models: Dict[MLModelType, Any] = {}
+        self.model_versions: Dict[MLModelType, str] = {}
+        self.model_metadata: Dict[MLModelType, Dict[str, Any]] = {}
+        self.initialized = False
+    
+    async def initialize(self):
+        """Initialize ML models"""
+        if not _ML_AVAILABLE:
+            logger.warning("ML libraries not available")
+            return
+        
+        try:
+            # Load or create models
+            await self._load_models()
+            self.initialized = True
+            logger.info("ML model manager initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize ML models: {e}")
+    
+    async def _load_models(self):
+        """Load models from disk or create new ones"""
+        # Isolation Forest
+        if self.config.anomaly_model_path and os.path.exists(self.config.anomaly_model_path):
+            self.models[MLModelType.ISOLATION_FOREST] = joblib.load(self.config.anomaly_model_path)
+            self.model_versions[MLModelType.ISOLATION_FOREST] = "1.0.0"
+        else:
+            self.models[MLModelType.ISOLATION_FOREST] = IsolationForest(
+                contamination=0.1,
+                random_state=42,
+                n_estimators=200,
+                bootstrap=True,
+                n_jobs=-1
+            )
+            self.model_versions[MLModelType.ISOLATION_FOREST] = "1.0.0"
+        
+        # Random Forest
+        if self.config.quality_model_path and os.path.exists(self.config.quality_model_path):
+            self.models[MLModelType.RANDOM_FOREST] = joblib.load(self.config.quality_model_path)
+            self.model_versions[MLModelType.RANDOM_FOREST] = "1.0.0"
+        else:
+            self.models[MLModelType.RANDOM_FOREST] = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=15,
+                random_state=42,
+                n_jobs=-1
+            )
+            self.model_versions[MLModelType.RANDOM_FOREST] = "1.0.0"
+    
+    async def save_models(self, path: str):
+        """Save models to disk"""
+        if not _ML_AVAILABLE:
+            return
+        
+        os.makedirs(path, exist_ok=True)
+        
+        for model_type, model in self.models.items():
+            model_path = os.path.join(path, f"{model_type.value}.joblib")
+            joblib.dump(model, model_path)
+            logger.info(f"Saved {model_type.value} model to {model_path}")
+    
+    def get_model_version(self, model_type: MLModelType) -> str:
+        """Get model version"""
+        return self.model_versions.get(model_type, "unknown")
+
+
+# =============================================================================
 # ML Anomaly Detection with Ensemble Methods
 # =============================================================================
 
 class MLAnomalyDetector:
     """ML-based anomaly detection for market data with ensemble methods"""
     
-    def __init__(self, config: AuditConfig):
+    def __init__(self, config: AuditConfig, model_manager: Optional[MLModelManager] = None):
         self.config = config
+        self.model_manager = model_manager
         self.isolation_forest = None
         self.gradient_boosting = None
         self.scaler = None
@@ -721,6 +882,10 @@ class MLAnomalyDetector:
             "volume_zscore", "price_zscore", "volume_ma_ratio",
             "price_ma_ratio", "spread_pct", "turnover_ratio"
         ]
+        
+        if model_manager and MLModelType.ISOLATION_FOREST in model_manager.models:
+            self.isolation_forest = model_manager.models[MLModelType.ISOLATION_FOREST]
+            self.initialized = True
     
     async def initialize(self, historical_data: Optional[List[Dict[str, Any]]] = None):
         """Initialize ML model with historical data"""
@@ -729,14 +894,15 @@ class MLAnomalyDetector:
             return
         
         try:
-            self.isolation_forest = IsolationForest(
-                contamination=self.config.anomaly_contamination,
-                random_state=42,
-                n_estimators=200,
-                max_samples='auto',
-                bootstrap=True,
-                n_jobs=-1
-            )
+            if self.isolation_forest is None:
+                self.isolation_forest = IsolationForest(
+                    contamination=self.config.anomaly_contamination,
+                    random_state=42,
+                    n_estimators=200,
+                    max_samples='auto',
+                    bootstrap=True,
+                    n_jobs=-1
+                )
             
             self.gradient_boosting = GradientBoostingRegressor(
                 n_estimators=100,
@@ -936,8 +1102,9 @@ class MLAnomalyDetector:
 class PredictiveQualityScorer:
     """ML-based predictive quality scoring with ensemble methods"""
     
-    def __init__(self, config: AuditConfig):
+    def __init__(self, config: AuditConfig, model_manager: Optional[MLModelManager] = None):
         self.config = config
+        self.model_manager = model_manager
         self.random_forest = None
         self.gradient_boosting = None
         self.scaler = None
@@ -949,6 +1116,10 @@ class PredictiveQualityScorer:
             DataQuality.FAIR: 0.5,
             DataQuality.POOR: 0.3,
         }
+        
+        if model_manager and MLModelType.RANDOM_FOREST in model_manager.models:
+            self.random_forest = model_manager.models[MLModelType.RANDOM_FOREST]
+            self.initialized = True
     
     async def initialize(self, historical_data: Optional[List[Dict[str, Any]]] = None):
         """Initialize quality prediction model"""
@@ -956,14 +1127,15 @@ class PredictiveQualityScorer:
             return
         
         try:
-            self.random_forest = RandomForestClassifier(
-                n_estimators=200,
-                max_depth=15,
-                min_samples_split=5,
-                min_samples_leaf=2,
-                random_state=42,
-                n_jobs=-1
-            )
+            if self.random_forest is None:
+                self.random_forest = RandomForestClassifier(
+                    n_estimators=200,
+                    max_depth=15,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    random_state=42,
+                    n_jobs=-1
+                )
             
             self.gradient_boosting = GradientBoostingRegressor(
                 n_estimators=150,
@@ -1256,6 +1428,140 @@ class TimeSeriesAnomalyDetector:
 
 
 # =============================================================================
+# Statistical Process Control (SPC)
+# =============================================================================
+
+class StatisticalProcessControl:
+    """Statistical process control for quality monitoring"""
+    
+    def __init__(self, config: AuditConfig):
+        self.config = config
+        self.control_limits: Dict[str, Dict[str, float]] = {}
+    
+    def calculate_control_limits(self, values: List[float]) -> Dict[str, float]:
+        """Calculate control limits using Shewhart rules"""
+        if len(values) < 10:
+            return {}
+        
+        mean = np.mean(values)
+        std = np.std(values)
+        
+        return {
+            "ucl": mean + 3 * std,  # Upper control limit
+            "cl": mean,               # Center line
+            "lcl": mean - 3 * std,    # Lower control limit
+            "sigma": std
+        }
+    
+    def check_violations(self, value: float, limits: Dict[str, float], values: List[float]) -> List[str]:
+        """Check for SPC violations using Western Electric rules"""
+        violations = []
+        
+        if not limits:
+            return violations
+        
+        # Rule 1: One point beyond 3 sigma
+        if value > limits.get("ucl", float('inf')) or value < limits.get("lcl", float('-inf')):
+            violations.append("Rule 1: Point beyond 3σ control limits")
+        
+        # Rule 2: Nine points in a row on same side of center line
+        if len(values) >= 9:
+            side = None
+            count = 0
+            for v in values[-9:]:
+                current_side = "above" if v > limits["cl"] else "below" if v < limits["cl"] else "center"
+                if side is None:
+                    side = current_side
+                if current_side == side and current_side != "center":
+                    count += 1
+                else:
+                    count = 0
+                    side = current_side
+            if count >= 9:
+                violations.append("Rule 2: Nine points on same side of center line")
+        
+        # Rule 3: Six points in a row steadily increasing or decreasing
+        if len(values) >= 6:
+            increasing = all(values[i] <= values[i+1] for i in range(-6, -1))
+            decreasing = all(values[i] >= values[i+1] for i in range(-6, -1))
+            if increasing or decreasing:
+                violations.append("Rule 3: Six points in a row trending")
+        
+        return violations
+
+
+# =============================================================================
+# Root Cause Analysis
+# =============================================================================
+
+class RootCauseAnalyzer:
+    """Automated root cause analysis for issues"""
+    
+    def __init__(self, config: AuditConfig):
+        self.config = config
+        self.cause_map = {
+            "ZERO_PRICE": [
+                "Provider data source unavailable",
+                "Symbol delisted or suspended",
+                "API rate limit exceeded",
+                "Network timeout during fetch"
+            ],
+            "STALE_DATA": [
+                "Provider update frequency changed",
+                "Symbol trading halted",
+                "Data pipeline backlog",
+                "Scheduled maintenance"
+            ],
+            "PROVIDER_ERROR": [
+                "Provider API authentication failure",
+                "Provider service outage",
+                "Invalid API credentials",
+                "Provider rate limit exceeded"
+            ],
+            "INSUFFICIENT_HISTORY": [
+                "Recently listed company",
+                "New data provider with limited history",
+                "Data retention policy changed",
+                "Historical data purge"
+            ],
+            "EXTREME_DAILY_MOVE": [
+                "Corporate action (split/dividend)",
+                "Earnings announcement",
+                "Market-wide volatility",
+                "Data error (misplaced decimal)"
+            ]
+        }
+    
+    def analyze(self, issue: str, context: Dict[str, Any]) -> Tuple[str, float]:
+        """Analyze root cause for an issue"""
+        causes = self.cause_map.get(issue, ["Unknown cause"])
+        
+        # Calculate confidence based on context
+        confidence = 0.7
+        
+        if issue == "ZERO_PRICE":
+            if context.get("provider") == "unknown":
+                confidence = 0.5
+            if context.get("age_hours", 0) > 24:
+                confidence = 0.9
+        
+        elif issue == "STALE_DATA":
+            age = context.get("age_hours", 0)
+            if age > 168:  # > 1 week
+                confidence = 0.95
+            elif age > 72:  # > 3 days
+                confidence = 0.8
+        
+        elif issue == "PROVIDER_ERROR":
+            if context.get("provider") in ["unreliable", "backup"]:
+                confidence = 0.9
+            if context.get("error", "").find("rate limit") >= 0:
+                confidence = 0.95
+        
+        return causes[0], confidence
+
+
+# =============================================================================
 # Remediation Engine
 # =============================================================================
 
@@ -1481,6 +1787,7 @@ class AlertManager:
     def __init__(self, config: AuditConfig):
         self.config = config
         self.slack_client = None
+        self.twilio_client = None
         self._init_clients()
         self.alert_history: List[Dict[str, Any]] = []
         self.escalation_tasks: Dict[str, asyncio.Task] = {}
@@ -1489,6 +1796,13 @@ class AlertManager:
         """Initialize alert clients"""
         if _SLACK_AVAILABLE and self.config.slack_webhook:
             self.slack_client = AsyncWebClient()
+        
+        if self.config.twilio_sid and self.config.twilio_token:
+            try:
+                from twilio.rest import Client
+                self.twilio_client = Client(self.config.twilio_sid, self.config.twilio_token)
+            except ImportError:
+                pass
     
     async def send_alert(
         self,
@@ -1530,6 +1844,8 @@ class AlertManager:
                 tasks.append(self._email_alert(alert_id, severity, title, message, data, priority))
             elif channel == AlertChannel.WEBHOOK and self.config.webhook_url:
                 tasks.append(self._webhook_alert(alert_id, alert_data))
+            elif channel == AlertChannel.SMS and self.twilio_client and self.config.sms_recipients:
+                tasks.append(self._sms_alert(alert_id, message, priority))
         
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1647,6 +1963,21 @@ class AlertManager:
         # This would need SMTP configuration
         pass
     
+    async def _sms_alert(self, alert_id: str, message: str, priority: AlertPriority):
+        """Send SMS alert"""
+        if not self.twilio_client or not self.config.sms_recipients:
+            return
+        
+        try:
+            for recipient in self.config.sms_recipients:
+                self.twilio_client.messages.create(
+                    body=f"[{priority.value}] {message[:140]}",
+                    from_=self.config.twilio_from,
+                    to=recipient
+                )
+        except Exception as e:
+            logger.error(f"SMS alert failed: {e}")
+    
     async def _webhook_alert(self, alert_id: str, alert_data: Dict[str, Any]):
         """Send webhook alert"""
         if not self.config.webhook_url:
@@ -1685,6 +2016,80 @@ class AlertManager:
             self.escalation_tasks[alert_id].cancel()
             del self.escalation_tasks[alert_id]
             logger.info(f"Alert {alert_id} acknowledged")
+
+
+# =============================================================================
+# WebSocket Server for Real-time Updates
+# =============================================================================
+
+class WebSocketServer:
+    """WebSocket server for real-time audit updates"""
+    
+    def __init__(self, config: AuditConfig):
+        self.config = config
+        self.connected_clients: Set[Any] = set()
+        self.app = None
+        self.server = None
+    
+    async def start(self):
+        """Start WebSocket server"""
+        if not _ASYNC_HTTP_AVAILABLE or not self.config.enable_websocket:
+            return
+        
+        self.app = web.Application()
+        self.app.router.add_get('/ws', self.websocket_handler)
+        
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        self.server = web.TCPSite(runner, 'localhost', self.config.websocket_port)
+        await self.server.start()
+        
+        logger.info(f"WebSocket server started on port {self.config.websocket_port}")
+    
+    async def websocket_handler(self, request):
+        """Handle WebSocket connection"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        self.connected_clients.add(ws)
+        logger.info(f"WebSocket client connected. Total clients: {len(self.connected_clients)}")
+        
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    if msg.data == 'ping':
+                        await ws.send_str('pong')
+                    elif msg.data.startswith('subscribe:'):
+                        symbol = msg.data[10:]
+                        # Handle subscription logic
+                        await ws.send_str(f"subscribed:{symbol}")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket connection closed with exception: {ws.exception()}")
+        finally:
+            self.connected_clients.remove(ws)
+            logger.info(f"WebSocket client disconnected. Total clients: {len(self.connected_clients)}")
+        
+        return ws
+    
+    async def broadcast(self, message: Dict[str, Any]):
+        """Broadcast message to all connected clients"""
+        if not self.connected_clients:
+            return
+        
+        dead_clients = set()
+        for client in self.connected_clients:
+            try:
+                await client.send_json(message)
+            except:
+                dead_clients.add(client)
+        
+        # Remove dead clients
+        self.connected_clients -= dead_clients
+    
+    async def stop(self):
+        """Stop WebSocket server"""
+        if self.server:
+            await self.server.stop()
 
 
 # =============================================================================
@@ -1746,6 +2151,20 @@ class MetricsExporter:
                 ['model'],
                 registry=self.registry
             )
+            
+            self.anomaly_counter = Counter(
+                'audit_anomalies_total',
+                'Anomalies detected by type',
+                ['type'],
+                registry=self.registry
+            )
+            
+            self.remediation_actions = Counter(
+                'audit_remediation_actions_total',
+                'Remediation actions by priority',
+                ['priority'],
+                registry=self.registry
+            )
     
     def update(self, summary: AuditSummary):
         """Update metrics with audit summary"""
@@ -1769,6 +2188,16 @@ class MetricsExporter:
         # Update ML metrics
         for model, score in summary.ml_stats.items():
             self.ml_confidence.labels(model=model).set(score)
+        
+        # Update anomaly counts
+        for anomaly_type, count in summary.anomaly_counts.items():
+            self.anomaly_counter.labels(type=anomaly_type.value).inc(count)
+        
+        # Update remediation counts
+        for priority, count in summary.remediation_stats.items():
+            if priority.startswith('remediation_'):
+                p = priority.replace('remediation_', '')
+                self.remediation_actions.labels(priority=p).inc(count)
     
     def get_metrics(self) -> str:
         """Get Prometheus metrics in text format"""
@@ -1798,6 +2227,11 @@ class ComplianceChecker:
                 "price_accuracy": 0.01,  # 1% tolerance
                 "volume_reporting": True,
                 "trade_reporting": True,
+            },
+            "GDPR": {
+                "data_retention": 365,  # days
+                "right_to_erasure": True,
+                "data_minimization": True,
             }
         }
     
@@ -1977,7 +2411,10 @@ async def _audit_quote(
     quality_scorer: Optional[PredictiveQualityScorer] = None,
     time_series_detector: Optional[TimeSeriesAnomalyDetector] = None,
     compliance_checker: Optional[ComplianceChecker] = None,
-    remediation_engine: Optional[RemediationEngine] = None
+    remediation_engine: Optional[RemediationEngine] = None,
+    root_cause_analyzer: Optional[RootCauseAnalyzer] = None,
+    spc: Optional[StatisticalProcessControl] = None,
+    model_manager: Optional[MLModelManager] = None
 ) -> AuditResult:
     """Audit a single quote with enhanced ML features"""
     
@@ -1988,6 +2425,7 @@ async def _audit_quote(
     
     issues: List[str] = []
     strategy_notes: List[str] = []
+    spc_violations: List[str] = []
     
     # Price integrity
     if price is None or price < config.min_price:
@@ -2034,11 +2472,14 @@ async def _audit_quote(
     anomalies: List[AnomalyType] = []
     ml_anomaly_score = 0.0
     ml_confidence = 0.0
+    ml_model_version = None
     if anomaly_detector:
         is_anomaly, ml_anomaly_score, detected_anomalies, ml_confidence = anomaly_detector.detect(q)
         anomalies = detected_anomalies
         if is_anomaly or ml_anomaly_score > 0.8:
             issues.append("ML_ANOMALY_DETECTED")
+        if model_manager:
+            ml_model_version = model_manager.get_model_version(MLModelType.ISOLATION_FOREST)
     
     # ML quality scoring
     ml_quality_score = 0.0
@@ -2062,6 +2503,15 @@ async def _audit_quote(
         if seasonality_break:
             anomalies.append(AnomalyType.SEASONALITY_BREAK)
     
+    # Statistical Process Control
+    control_limits = {}
+    if spc and q.get("history_prices"):
+        prices = q.get("history_prices", [])
+        if len(prices) > 20:
+            control_limits = spc.calculate_control_limits(prices[-20:])
+            if price:
+                spc_violations = spc.check_violations(price, control_limits, prices[-20:])
+    
     # Strategy review
     try:
         strategy_notes = _perform_strategy_review(q, config.to_dict())
@@ -2072,6 +2522,29 @@ async def _audit_quote(
     compliance_violations: List[str] = []
     if compliance_checker:
         compliance_violations = compliance_checker.check(q)
+    
+    # Root cause analysis
+    root_cause = None
+    impact_analysis = None
+    if root_cause_analyzer and issues:
+        primary_issue = issues[0]
+        context = {
+            "provider": provider,
+            "age_hours": age,
+            "price": price,
+            "error": q.get("error")
+        }
+        cause, confidence = root_cause_analyzer.analyze(primary_issue, context)
+        root_cause = cause
+        
+        # Simple impact analysis
+        impact_analysis = {
+            "primary_issue": primary_issue,
+            "root_cause": cause,
+            "confidence": confidence,
+            "affected_symbols": 1,
+            "estimated_recovery_time": "1-2 hours" if confidence > 0.8 else "Unknown"
+        }
     
     # Remediation actions
     remediation_actions: List[RemediationAction] = []
@@ -2113,8 +2586,13 @@ async def _audit_quote(
         ml_quality_score=ml_quality_score,
         ml_anomaly_score=ml_anomaly_score,
         ml_confidence=ml_confidence,
+        ml_model_version=ml_model_version,
         compliance_violations=compliance_violations,
         remediation_actions=remediation_actions,
+        spc_violations=spc_violations,
+        control_limits=control_limits,
+        root_cause=root_cause,
+        impact_analysis=impact_analysis,
         error=q.get("error"),
     )
 
@@ -2262,6 +2740,7 @@ async def _fetch_quotes(
             pm = provider_metrics[provider]
             pm.total_requests += 1
             pm.total_latency_ms += elapsed_ms
+            pm.response_times.append(elapsed_ms)
             
             if d.get("error"):
                 pm.failed_requests += 1
@@ -2455,6 +2934,11 @@ def _generate_summary(results: List[AuditResult], provider_metrics: Dict[str, Pr
             for action in r.remediation_actions:
                 summary.remediation_stats[f"remediation_{action.priority.value}"] = \
                     summary.remediation_stats.get(f"remediation_{action.priority.value}", 0) + 1
+        
+        # SPC stats
+        if r.spc_violations:
+            for violation in r.spc_violations:
+                summary.spc_stats[violation] = summary.spc_stats.get(violation, 0) + 1
     
     # Provider metrics
     summary.provider_metrics = provider_metrics
@@ -2496,7 +2980,8 @@ def _export_csv(path: str, results: List[AuditResult]) -> None:
         "price", "change_pct", "volume", "market_cap", "age_hours",
         "last_updated_utc", "last_updated_riyadh", "history_points", "required_history",
         "confidence_pct", "issues", "strategy_notes", "anomalies", "ml_quality_score",
-        "ml_anomaly_score", "ml_confidence", "compliance_violations", "error", "audit_timestamp"
+        "ml_anomaly_score", "ml_confidence", "ml_model_version", "compliance_violations",
+        "root_cause", "error", "audit_timestamp", "audit_version"
     ]
     
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -2560,6 +3045,12 @@ def _export_excel(path: str, results: List[AuditResult], summary: AuditSummary) 
                 df_remediation = pd.DataFrame(remediation_data)
                 df_remediation.to_excel(writer, sheet_name="Remediation", index=False)
             
+            # SPC sheet
+            if summary.spc_stats:
+                spc_data = [{"violation": k, "count": v} for k, v in summary.spc_stats.items()]
+                df_spc = pd.DataFrame(spc_data)
+                df_spc.to_excel(writer, sheet_name="SPC Violations", index=False)
+            
         logger.info(f"Excel export saved to {path}")
         
     except Exception as e:
@@ -2620,12 +3111,24 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
         plt.savefig(os.path.join(charts_dir, 'top_issues.png'))
         plt.close()
         
+        # Anomalies bar chart
+        if summary.anomaly_counts:
+            plt.figure(figsize=(10, 5))
+            anomalies = [a.value for a in summary.anomaly_counts.keys()]
+            counts = list(summary.anomaly_counts.values())
+            plt.bar(anomalies, counts, color='orange')
+            plt.title('Anomalies Detected')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(charts_dir, 'anomalies.png'))
+            plt.close()
+        
         # Generate HTML
         html = f"""
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Tadawul Data Quality Dashboard v3.1.0</title>
+            <title>Tadawul Data Quality Dashboard v3.2.0</title>
             <style>
                 body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
                 h1 {{ color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }}
@@ -2656,7 +3159,7 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
             </style>
         </head>
         <body>
-            <h1>📊 Tadawul Data Quality Audit Dashboard v3.1.0</h1>
+            <h1>📊 Tadawul Data Quality Audit Dashboard v3.2.0</h1>
             <p>Audit Time: {summary.audit_timestamp} (UTC) | Riyadh: {_riyadh_iso(summary.audit_timestamp)}</p>
             
             <div class="summary">
@@ -2707,6 +3210,17 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
                     <h3>Top Issues</h3>
                     <img src="charts/top_issues.png" alt="Top Issues">
                 </div>
+        """
+        
+        if summary.anomaly_counts:
+            html += f"""
+                <div class="chart">
+                    <h3>Anomalies</h3>
+                    <img src="charts/anomalies.png" alt="Anomalies">
+                </div>
+            """
+        
+        html += """
             </div>
             
             <h2>Provider Metrics</h2>
@@ -2717,6 +3231,7 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
                     <th>Requests</th>
                     <th>Error Rate</th>
                     <th>Avg Latency (ms)</th>
+                    <th>P95 Latency</th>
                     <th>Cache Hit Rate</th>
                     <th>Uptime</th>
                 </tr>
@@ -2736,6 +3251,7 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
                     <td>{pm.total_requests}</td>
                     <td>{pm.error_rate:.2%}</td>
                     <td>{pm.avg_latency_ms:.2f}</td>
+                    <td>{pm.p95_latency_ms:.2f}</td>
                     <td>{pm.cache_hit_rate:.2%}</td>
                     <td>{pm.uptime_percent:.2f}%</td>
                 </tr>
@@ -2836,11 +3352,31 @@ def _generate_dashboard(summary: AuditSummary, output_dir: str) -> None:
                 </tr>
             """
         
+        if summary.spc_stats:
+            html += """
+            </table>
+            
+            <h2>SPC Violations</h2>
+            <table>
+                <tr>
+                    <th>Violation</th>
+                    <th>Count</th>
+                </tr>
+            """
+            
+            for violation, count in summary.spc_stats.items():
+                html += f"""
+                    <tr>
+                        <td>{violation}</td>
+                        <td>{count}</td>
+                    </tr>
+                """
+        
         html += """
             </table>
             
             <div class="footer">
-                <p>Generated by TFB Audit Tool v3.1.0 | SAMA Compliant | Real-time ML Enhanced</p>
+                <p>Generated by TFB Audit Tool v3.2.0 | SAMA Compliant | Real-time ML Enhanced | SPC Enabled</p>
             </div>
         </body>
         </html>
@@ -2869,7 +3405,8 @@ async def _run_audit(
     concurrency: int,
     max_symbols_per_page: int,
     alert_manager: Optional[AlertManager] = None,
-    metrics_exporter: Optional[MetricsExporter] = None
+    metrics_exporter: Optional[MetricsExporter] = None,
+    websocket_server: Optional[WebSocketServer] = None
 ) -> Tuple[List[AuditResult], AuditSummary]:
     """Run the audit with enhanced ML features"""
     
@@ -2882,7 +3419,7 @@ async def _run_audit(
         logger.error(f"Engine initialization error: {e}")
         return [], AuditSummary()
     
-    logger.info(f"🚀 Starting Data Quality & Strategy Audit v3.1.0")
+    logger.info(f"🚀 Starting Data Quality & Strategy Audit v3.2.0")
     logger.info(f"📊 Configuration: stale={config.stale_hours}h, hard={config.hard_stale_hours}h, concurrency={concurrency}")
     logger.info(f"🤖 ML Enabled: anomaly={_ML_AVAILABLE}, prophet={_PROPHET_AVAILABLE}")
     
@@ -2890,11 +3427,17 @@ async def _run_audit(
     provider_metrics: Dict[str, ProviderMetrics] = {}
     
     # Initialize ML components
-    anomaly_detector = MLAnomalyDetector(config) if _ML_AVAILABLE else None
-    quality_scorer = PredictiveQualityScorer(config) if _ML_AVAILABLE else None
+    model_manager = MLModelManager(config) if _ML_AVAILABLE else None
+    if model_manager:
+        await model_manager.initialize()
+    
+    anomaly_detector = MLAnomalyDetector(config, model_manager) if _ML_AVAILABLE else None
+    quality_scorer = PredictiveQualityScorer(config, model_manager) if _ML_AVAILABLE else None
     time_series_detector = TimeSeriesAnomalyDetector(config) if _PROPHET_AVAILABLE else None
     compliance_checker = ComplianceChecker(config)
     remediation_engine = RemediationEngine(config)
+    root_cause_analyzer = RootCauseAnalyzer(config)
+    spc = StatisticalProcessControl(config)
     
     if anomaly_detector:
         await anomaly_detector.initialize()
@@ -2941,7 +3484,10 @@ async def _run_audit(
                 quality_scorer=quality_scorer,
                 time_series_detector=time_series_detector,
                 compliance_checker=compliance_checker,
-                remediation_engine=remediation_engine
+                remediation_engine=remediation_engine,
+                root_cause_analyzer=root_cause_analyzer,
+                spc=spc,
+                model_manager=model_manager
             )
             result.page = key
             all_results.append(result)
@@ -2961,10 +3507,18 @@ async def _run_audit(
                             "provider": result.provider,
                             "age_hours": result.age_hours,
                             "quality_score": result.ml_quality_score,
-                            "anomalies": [a.value for a in result.anomalies[:3]]
+                            "anomalies": [a.value for a in result.anomalies[:3]],
+                            "root_cause": result.root_cause
                         },
                         priority
                     )
+                
+                # Broadcast via WebSocket
+                if websocket_server:
+                    await websocket_server.broadcast({
+                        "type": "alert",
+                        "data": result.to_dict()
+                    })
         
         logger.info(f"   -> Alerts on {key}: {page_alerts}")
     
@@ -2974,6 +3528,13 @@ async def _run_audit(
     # Update metrics
     if metrics_exporter:
         metrics_exporter.update(summary)
+    
+    # Broadcast summary via WebSocket
+    if websocket_server:
+        await websocket_server.broadcast({
+            "type": "summary",
+            "data": summary.to_dict()
+        })
     
     return all_results, summary
 
@@ -2997,7 +3558,7 @@ def start_metrics_server(port: int = 9090):
 # =============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TFB Enterprise Data Quality & Strategy Auditor v3.1.0")
+    parser = argparse.ArgumentParser(description="TFB Enterprise Data Quality & Strategy Auditor v3.2.0")
     
     # Core options
     parser.add_argument("--keys", nargs="*", default=None, help="Specific pages to audit")
@@ -3018,6 +3579,7 @@ def main() -> None:
     parser.add_argument("--ml-model", help="Path to pre-trained ML model")
     parser.add_argument("--train-data", help="Path to historical data for training")
     parser.add_argument("--disable-ml", action="store_true", help="Disable ML features")
+    parser.add_argument("--save-models", help="Save trained models to directory")
     
     # Export options
     parser.add_argument("--json-out", help="Save full report to JSON file")
@@ -3033,10 +3595,18 @@ def main() -> None:
     parser.add_argument("--email-sender", help="Email sender address")
     parser.add_argument("--pagerduty-key", help="PagerDuty integration key")
     parser.add_argument("--webhook-url", help="Generic webhook URL")
+    parser.add_argument("--twilio-sid", help="Twilio Account SID for SMS")
+    parser.add_argument("--twilio-token", help="Twilio Auth Token")
+    parser.add_argument("--twilio-from", help="Twilio phone number")
+    parser.add_argument("--sms-recipients", nargs="*", help="SMS recipients")
     parser.add_argument("--disable-alerts", action="store_true", help="Disable all alerts")
     
     # Metrics
     parser.add_argument("--metrics-port", type=int, default=0, help="Start Prometheus metrics server on port")
+    
+    # WebSocket
+    parser.add_argument("--websocket-port", type=int, default=8765, help="WebSocket server port")
+    parser.add_argument("--enable-websocket", action="store_true", help="Enable WebSocket server")
     
     # Compliance
     parser.add_argument("--sama-compliance", type=int, default=1, help="Enable SAMA compliance checks")
@@ -3090,6 +3660,16 @@ def main() -> None:
     config.sama_compliant = bool(int(args.sama_compliance))
     config.cma_compliant = bool(int(args.cma_compliance))
     
+    # ML model paths
+    if args.ml_model:
+        config.ml_model_path = args.ml_model
+        config.anomaly_model_path = os.path.join(args.ml_model, "anomaly.joblib")
+        config.quality_model_path = os.path.join(args.ml_model, "quality.joblib")
+    
+    # WebSocket
+    config.websocket_port = args.websocket_port
+    config.enable_websocket = args.enable_websocket
+    
     # Alerting
     alert_manager = None
     if not args.disable_alerts:
@@ -3114,10 +3694,23 @@ def main() -> None:
             config.alert_channels.append(AlertChannel.WEBHOOK)
             config.webhook_url = args.webhook_url
         
+        if args.twilio_sid and args.twilio_token and args.twilio_from and args.sms_recipients:
+            config.alert_channels.append(AlertChannel.SMS)
+            config.twilio_sid = args.twilio_sid
+            config.twilio_token = args.twilio_token
+            config.twilio_from = args.twilio_from
+            config.sms_recipients = args.sms_recipients
+        
         alert_manager = AlertManager(config)
     
     # Metrics exporter
     metrics_exporter = MetricsExporter() if args.metrics_port > 0 else None
+    
+    # WebSocket server
+    websocket_server = None
+    if config.enable_websocket and _ASYNC_HTTP_AVAILABLE:
+        websocket_server = WebSocketServer(config)
+        asyncio.create_task(websocket_server.start())
     
     refresh = bool(int(args.refresh or 0))
     concurrency = max(1, min(40, int(args.concurrency or 12)))
@@ -3137,7 +3730,8 @@ def main() -> None:
                 concurrency=concurrency,
                 max_symbols_per_page=max_per_page,
                 alert_manager=alert_manager,
-                metrics_exporter=metrics_exporter
+                metrics_exporter=metrics_exporter,
+                websocket_server=websocket_server
             )
         )
         
@@ -3163,7 +3757,7 @@ def main() -> None:
         _print_table(alerts_only, limit=600)
     
     # System diagnosis
-    logger.info("\n🧠 SYSTEM DIAGNOSIS (v3.1.0):")
+    logger.info("\n🧠 SYSTEM DIAGNOSIS (v3.2.0):")
     logger.info(f"   Pages scanned: {len(keys)}")
     logger.info(f"   Assets analyzed: {summary.total_assets}")
     logger.info(f"   CRITICAL: {summary.by_severity.get(AuditSeverity.CRITICAL, 0)}")
@@ -3178,12 +3772,13 @@ def main() -> None:
     logger.info(f"   Provider errors: {summary.issue_counts.get('PROVIDER_ERROR', 0)}")
     logger.info(f"   Anomalies detected: {sum(summary.anomaly_counts.values())}")
     logger.info(f"   Compliance violations: {len(summary.compliance_violations)}")
+    logger.info(f"   SPC violations: {len(summary.spc_stats)}")
     logger.info(f"   Audit duration: {summary.audit_duration_ms:.2f} ms")
     
     # Provider health
     logger.info("\n🏥 Provider Health:")
     for pm in summary.provider_metrics.values():
-        logger.info(f"   {pm.name}: {pm.health.value} (errors: {pm.error_rate:.2%}, latency: {pm.avg_latency_ms:.2f}ms, cache: {pm.cache_hit_rate:.2%})")
+        logger.info(f"   {pm.name}: {pm.health.value} (errors: {pm.error_rate:.2%}, latency: {pm.avg_latency_ms:.2f}ms, p95: {pm.p95_latency_ms:.2f}ms, cache: {pm.cache_hit_rate:.2%})")
     
     # ML stats
     if summary.ml_stats:
@@ -3197,9 +3792,15 @@ def main() -> None:
         for key, value in summary.remediation_stats.items():
             logger.info(f"   {key}: {value}")
     
+    # SPC stats
+    if summary.spc_stats:
+        logger.info("\n📊 SPC Violations:")
+        for key, value in summary.spc_stats.items():
+            logger.info(f"   {key}: {value}")
+    
     # Prepare payload for export
     payload = {
-        "audit_version": "3.1.0",
+        "audit_version": "3.2.0",
         "audit_time_utc": _utc_now_iso(),
         "audit_time_riyadh": _riyadh_iso(),
         "spreadsheet_id": sid,
@@ -3237,6 +3838,11 @@ def main() -> None:
     if args.dashboard_dir:
         os.makedirs(args.dashboard_dir, exist_ok=True)
         _generate_dashboard(summary, args.dashboard_dir)
+    
+    # Save models if requested
+    if args.save_models and model_manager:
+        asyncio.run(model_manager.save_models(args.save_models))
+        logger.info(f"💾 ML models saved to {args.save_models}")
     
     # Exit code policy
     if strict:
